@@ -49,10 +49,13 @@ class RoleConfig:
 class Profile:
     name: str
     roles: dict = field(default_factory=dict)
+    fan_out: list = None        # exploit을 이 전문가들로 동시 실행 (None이면 순차 1개)
 
     @property
     def agent_count(self) -> int:
-        return len(self.roles)
+        # 팬아웃이면 exploit 하나가 N명이 된다 — 구조 지표가 주 지표라 정확해야 한다
+        n = len(self.roles)
+        return n + len(self.fan_out) - 1 if self.fan_out else n
 
 
 # 경량 코어가 띄우는 컨테이너: 타깃 + 샌드박스 (에이전트는 호스트 프로세스)
@@ -76,6 +79,58 @@ PROFILES = {
         "exploit":  RoleConfig("claude-haiku-4-5", "low", 20),
         "reporter": RoleConfig("claude-haiku-4-5", "low",  4),
     }),
+    # 배칭 검증용 — 턴당 도구 수가 2.5→3.3으로 늘었으니 같은 도구 커버리지를
+    # 더 적은 턴으로 살 수 있어야 한다. 스텝을 30% 깎아 그 가설을 시험한다.
+    # (컨텍스트는 턴마다 다시 읽히므로 턴 수가 비용을 지배한다)
+    "haiku-lean": Profile("haiku-lean", {
+        "recon":    RoleConfig("claude-haiku-4-5", "low",  7),
+        "exploit":  RoleConfig("claude-haiku-4-5", "low", 14),
+        "reporter": RoleConfig("claude-haiku-4-5", "low",  4),
+    }),
+    # 팬아웃 — exploit을 전문가 3명으로 쪼개 동시 실행.
+    # 스텝 총량은 순차 haiku(20)와 맞춘다: 7×3=21. 같은 예산을 병렬로 쓰는 셈이라
+    # 벽시계와 컨텍스트 크기의 효과만 분리해서 볼 수 있다.
+    "haiku-fan": Profile("haiku-fan", {
+        "recon":    RoleConfig("claude-haiku-4-5", "low", 10),
+        "exploit":  RoleConfig("claude-haiku-4-5", "low",  7),
+        "reporter": RoleConfig("claude-haiku-4-5", "low",  4),
+    }, fan_out=["injection", "access", "authn"]),
+    # 에이전트 수 곡선 — 총 스텝을 ~20으로 맞추고 인원만 바꾼다.
+    # "16→3이 맞나"는 D안의 핵심 질문이고, 점이 두 개뿐이면 곡선이 안 그려진다.
+    "haiku-fan2": Profile("haiku-fan2", {
+        "recon":    RoleConfig("claude-haiku-4-5", "low", 10),
+        "exploit":  RoleConfig("claude-haiku-4-5", "low", 10),
+        "reporter": RoleConfig("claude-haiku-4-5", "low",  4),
+    }, fan_out=["injection", "access"]),
+    "haiku-fan5": Profile("haiku-fan5", {
+        "recon":    RoleConfig("claude-haiku-4-5", "low", 10),
+        "exploit":  RoleConfig("claude-haiku-4-5", "low",  4),
+        "reporter": RoleConfig("claude-haiku-4-5", "low",  4),
+    }, fan_out=["injection", "access", "authn", "exposure", "logic"]),
+    # 대조군 — fan5와 인원·스텝이 같고 담당만 없앴다.
+    # fan5와 성적이 비슷하면 이득의 원인은 전문화가 아니라 병렬 독립 컨텍스트다.
+    "haiku-fan5g": Profile("haiku-fan5g", {
+        "recon":    RoleConfig("claude-haiku-4-5", "low", 10),
+        "exploit":  RoleConfig("claude-haiku-4-5", "low",  4),
+        "reporter": RoleConfig("claude-haiku-4-5", "low",  4),
+    }, fan_out=["gen1", "gen2", "gen3", "gen4", "gen5"]),
+    # recon 제거 — 공용 정찰 10턴을 없애고 전문가에게 되돌려준다.
+    # 총 exploit 스텝 6×5=30 ≈ (recon 10 + fan5의 4×5=20). 예산은 같고 단계만 줄었다.
+    "haiku-norecon": Profile("haiku-norecon", {
+        "exploit":  RoleConfig("claude-haiku-4-5", "low",  6),
+        "reporter": RoleConfig("claude-haiku-4-5", "low",  4),
+    }, fan_out=["injection", "access", "authn", "exposure", "logic"]),
+    # 예산 곡선 — 인원(전문가5)·단계(2) 고정, 1인당 스텝만 바꾼다.
+    # 탐지가 계속 오르면 예산 제약, 평평해지면 능력 제약이다.
+    # 이 구분이 "더 싸게" 주장의 한계선을 정한다.
+    "haiku-nr4": Profile("haiku-nr4", {
+        "exploit":  RoleConfig("claude-haiku-4-5", "low",  4),
+        "reporter": RoleConfig("claude-haiku-4-5", "low",  4),
+    }, fan_out=["injection", "access", "authn", "exposure", "logic"]),
+    "haiku-nr9": Profile("haiku-nr9", {
+        "exploit":  RoleConfig("claude-haiku-4-5", "low",  9),
+        "reporter": RoleConfig("claude-haiku-4-5", "low",  4),
+    }, fan_out=["injection", "access", "authn", "exposure", "logic"]),
     # 상한선(성능 기준점): 전부 opus + high effort
     "max": Profile("max", {
         "recon":    RoleConfig("claude-opus-5", "high", 15),

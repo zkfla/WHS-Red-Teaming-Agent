@@ -8,6 +8,7 @@ import glob
 import hashlib
 import json
 import os
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field, asdict
@@ -98,6 +99,9 @@ class Run:
             target=target or config.TARGET_HOST_URL,
             code_version=code_version(),
         )
+        # 도구를 병렬로 실행하면 여러 스레드가 같은 카운터를 += 한다.
+        # += 는 원자적이지 않아 집계가 조용히 새므로 잠근다.
+        self._lock = threading.RLock()   # record_tool → event 중첩 획득 허용
         self.dir = os.path.join(root, self.m.run_id)
         os.makedirs(self.dir, exist_ok=True)
         self._timeline = open(os.path.join(self.dir, "timeline.jsonl"), "a")
@@ -106,8 +110,10 @@ class Run:
     # ── 기록 ──────────────────────────────────────────────────────
     def event(self, kind: str, **fields):
         rec = {"t": round(time.time() - self._t0, 3), "kind": kind, **fields}
-        self._timeline.write(json.dumps(rec, ensure_ascii=False, default=str) + "\n")
-        self._timeline.flush()
+        line = json.dumps(rec, ensure_ascii=False, default=str) + "\n"
+        with self._lock:            # 병렬 도구 실행 중 타임라인 줄이 섞이지 않도록
+            self._timeline.write(line)
+            self._timeline.flush()
 
     def record_llm(self, model: str, usage):
         """Anthropic usage 객체를 받아 토큰·비용을 누적."""
@@ -116,20 +122,21 @@ class Run:
         cw = getattr(usage, "cache_creation_input_tokens", 0) or 0
         cr = getattr(usage, "cache_read_input_tokens", 0) or 0
 
-        self.m.llm_calls += 1
-        self.m.input_tokens += inp
-        self.m.output_tokens += out
-        self.m.cache_write_tokens += cw
-        self.m.cache_read_tokens += cr
+        with self._lock:
+            self.m.llm_calls += 1
+            self.m.input_tokens += inp
+            self.m.output_tokens += out
+            self.m.cache_write_tokens += cw
+            self.m.cache_read_tokens += cr
 
-        cost = self._cost(model, inp, out, cw, cr)
-        self.m.cost_usd += cost
+            cost = self._cost(model, inp, out, cw, cr)
+            self.m.cost_usd += cost
 
-        s = self.m.per_model.setdefault(
-            model, {"calls": 0, "in": 0, "out": 0, "cache_w": 0, "cache_r": 0, "usd": 0.0}
-        )
-        s["calls"] += 1; s["in"] += inp; s["out"] += out
-        s["cache_w"] += cw; s["cache_r"] += cr; s["usd"] += cost
+            s = self.m.per_model.setdefault(
+                model, {"calls": 0, "in": 0, "out": 0, "cache_w": 0, "cache_r": 0, "usd": 0.0}
+            )
+            s["calls"] += 1; s["in"] += inp; s["out"] += out
+            s["cache_w"] += cw; s["cache_r"] += cr; s["usd"] += cost
 
         self.event("llm", model=model, input=inp, output=out,
                    cache_write=cw, cache_read=cr, usd=round(cost, 6))
@@ -162,17 +169,18 @@ class Run:
         섞어 세면 안정성 지표가 거짓말을 한다 — 401을 받아 jq가 파싱에 실패한 것은
         '하네스가 불안정하다'가 아니라 '에이전트가 헛다리를 짚었다'이다.
         """
-        self.m.tool_calls += 1
-        if exit_code == 124:
-            self.m.timeouts += 1
-        elif exit_code == REFUSED_EXIT:
-            self.m.refusals += 1
-        elif exit_code == HARNESS_EXIT:
-            self.m.errors += 1
-        elif exit_code != 0:
-            self.m.nonzero_exits += 1
-        self.event("tool", name=name, cmd=cmd[:300], exit=exit_code,
-                   dur=round(dur, 2), out_len=out_len)
+        with self._lock:
+            self.m.tool_calls += 1
+            if exit_code == 124:
+                self.m.timeouts += 1
+            elif exit_code == REFUSED_EXIT:
+                self.m.refusals += 1
+            elif exit_code == HARNESS_EXIT:
+                self.m.errors += 1
+            elif exit_code != 0:
+                self.m.nonzero_exits += 1
+            self.event("tool", name=name, cmd=cmd[:300], exit=exit_code,
+                       dur=round(dur, 2), out_len=out_len)
 
     def over_budget(self) -> bool:
         return self.m.cost_usd >= config.RUN_BUDGET_USD

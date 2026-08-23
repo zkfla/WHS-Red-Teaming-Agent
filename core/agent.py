@@ -4,6 +4,8 @@
   · 컨텍스트 격리 — 에이전트가 끝나면 대화 기록은 버리고 산출물 파일만 남긴다
   · 계획-실행 분리 — 스코프 가드를 도구 계층에서 강제 (tools/shell.py)
 """
+from concurrent.futures import ThreadPoolExecutor
+
 import core.llm as llm
 from tools import shell
 from agents.prompts import BY_ROLE
@@ -40,13 +42,21 @@ def run_agent(role: str, task: str, role_cfg, run_ctx, out_file: str,
 
         messages.append({"role": "assistant", "content": resp.content})
 
-        # 병렬 tool_use는 결과를 '한 개의 user 메시지'에 모아 돌려줘야 한다
-        results = []
-        for tu in tool_uses:
+        # 모델이 한 턴에 여러 도구를 요청하면 실제로 동시에 돌린다.
+        # 각 호출은 docker exec + 네트워크 대기라 I/O 바운드고, 순차로 돌리면
+        # 벽시계가 호출 수에 비례해 늘어난다. 결과는 '한 개의 user 메시지'에
+        # 모아 돌려줘야 하고, 순서도 tool_use 순서와 맞아야 한다 (map이 보장).
+        def _run(tu):
             out, code = shell.run(tu.input.get("command", ""),
                                   tu.input.get("purpose", ""), run_ctx)
-            results.append({"type": "tool_result", "tool_use_id": tu.id,
-                            "content": out, "is_error": code not in (0,)})
+            return {"type": "tool_result", "tool_use_id": tu.id,
+                    "content": out, "is_error": code not in (0,)}
+
+        if len(tool_uses) == 1:
+            results = [_run(tool_uses[0])]
+        else:
+            with ThreadPoolExecutor(max_workers=min(len(tool_uses), 8)) as pool:
+                results = list(pool.map(_run, tool_uses))
         messages.append({"role": "user", "content": results})
     else:
         stop = "max_steps"
