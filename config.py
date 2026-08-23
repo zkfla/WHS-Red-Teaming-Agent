@@ -127,8 +127,23 @@ PROFILES = {
         "exploit":  RoleConfig("claude-haiku-4-5", "low",  4),
         "reporter": RoleConfig("claude-haiku-4-5", "low",  4),
     }, fan_out=["injection", "access", "authn", "exposure", "logic"]),
+    # ★ 권장 기본값. n=49 실행의 회귀 잔차에서 최고(+0.82).
+    # 전문가 5명 × 9스텝이 최적점이다 — 12스텝으로 늘리면 +0.36으로 떨어진다.
     "haiku-nr9": Profile("haiku-nr9", {
         "exploit":  RoleConfig("claude-haiku-4-5", "low",  9),
+        "reporter": RoleConfig("claude-haiku-4-5", "low",  4),
+    }, fan_out=["injection", "access", "authn", "exposure", "logic"]),
+    # 최소 recon — recon을 완전히 없앴더니 전문가 5명이 각자 정찰하며
+    # 도구 호출이 54→71로 늘었다. 공용 정찰을 3턴만 남겨 그 중복만 걷어낸다.
+    "haiku-minirecon": Profile("haiku-minirecon", {
+        "recon":    RoleConfig("claude-haiku-4-5", "low",  3),
+        "exploit":  RoleConfig("claude-haiku-4-5", "low",  5),
+        "reporter": RoleConfig("claude-haiku-4-5", "low",  4),
+    }, fan_out=["injection", "access", "authn", "exposure", "logic"]),
+    # 상관분석이 가리킨 방향: 탐지는 LLM 턴을 따라가고(r=+0.46) 컨텍스트 크기는
+    # 거의 무관하다(도구 r=+0.16). 턴을 늘리고 컨텍스트를 줄이는 조합을 잰다.
+    "haiku-nr12": Profile("haiku-nr12", {
+        "exploit":  RoleConfig("claude-haiku-4-5", "low", 12),
         "reporter": RoleConfig("claude-haiku-4-5", "low",  4),
     }, fan_out=["injection", "access", "authn", "exposure", "logic"]),
     # 상한선(성능 기준점): 전부 opus + high effort
@@ -139,9 +154,11 @@ PROFILES = {
     }),
 }
 
-DEFAULT_PROFILE = os.getenv("PROFILE", "haiku")
+DEFAULT_PROFILE = os.getenv("PROFILE", "haiku-nr9")
 
 # ── 실행 한계 ──────────────────────────────────────────────────────
 TOOL_TIMEOUT_SEC = int(os.getenv("TOOL_TIMEOUT_SEC", "120"))
-TOOL_OUTPUT_MAX_CHARS = 6000
+# 도구 출력 상한. 컨텍스트 비용을 직접 지배한다 — 잘린 출력은 대화에 남아
+# 이후 모든 턴에서 다시 읽히므로, 상한 1자당 비용이 턴 수만큼 곱해진다.
+TOOL_OUTPUT_MAX_CHARS = int(os.getenv("TOOL_OUTPUT_MAX_CHARS", "6000"))
 RUN_BUDGET_USD = float(os.getenv("RUN_BUDGET_USD", "2.00"))
