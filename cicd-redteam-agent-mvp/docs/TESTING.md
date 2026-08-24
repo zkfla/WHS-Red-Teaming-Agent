@@ -34,6 +34,8 @@
 - multiple provider keys require an explicit choice and model/provider mismatch is rejected
 - analyzed-repository `.env` cannot become an authentication source
 - Codex SDK contract surface and shared hackingBuddyGPT adapter references are checked statically
+- Codex runtime disables inherited plugins and configured MCP servers
+- semantic graph identifiers survive redaction while assignment-style secret values do not
 
 ## Release checks
 
@@ -44,5 +46,6 @@ uv run ruff check .
 uv run cicd-agent analyze tests/fixtures/oidc-risk --output <temporary-output>
 ```
 
-Actual LiteLLM/Codex model execution is intentionally excluded until a provider, credentials or
-ChatGPT login, and cost/usage ceiling are explicitly approved.
+The ChatGPT-login smoke was executed against `tests/fixtures/global-chain` with `gpt-5.6-terra` and
+completed through `proposal_validated`. A real LiteLLM provider call remains excluded until an
+external provider credential and cost/usage ceiling are available.

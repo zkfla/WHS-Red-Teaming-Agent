@@ -22,6 +22,9 @@ def redact(text: str) -> str:
         return f"__GH_SECRET_REF_{len(placeholders) - 1}__"
 
     protected = re.sub(r"\$\{\{\s*secrets\.[A-Za-z_][A-Za-z0-9_]*\s*}}", protect, text)
+    protected = re.sub(
+        r"credential:github-token:[A-Za-z0-9_.:-]+", protect, protected
+    )
     protected = _PRIVATE_KEY.sub("[REDACTED_PRIVATE_KEY]", protected)
     protected = _BEARER.sub(r"\1[REDACTED]", protected)
     protected = _ASSIGNMENT.sub(r"\1[REDACTED]", protected)

@@ -26,11 +26,16 @@ def test_slice_limit() -> None:
 
 
 def test_redaction_preserves_reference_but_hides_value() -> None:
-    value = "api_key=super-secret TOKEN: abc123 ${{ secrets.DEPLOY_TOKEN }}"
+    credential_id = "credential:github-token:wf_123:job:deploy"
+    value = (
+        "api_key=super-secret TOKEN: abc123 ${{ secrets.DEPLOY_TOKEN }} "
+        f"{credential_id}"
+    )
     result = redact(value)
     assert "super-secret" not in result
     assert "abc123" not in result
     assert "${{ secrets.DEPLOY_TOKEN }}" in result
+    assert credential_id in result
 
 
 def test_oversized_file_is_rejected(tmp_path: Path) -> None:

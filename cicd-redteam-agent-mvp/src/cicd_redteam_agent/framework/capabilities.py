@@ -189,7 +189,8 @@ class SubmitAnalysis(Capability):
     def describe(self) -> str:
         return (
             "Submit a JSON-encoded AnalysisProposal. It may reference only existing Evidence IDs; "
-            "static attack paths cannot be CONFIRMED."
+            "static attack paths cannot be CONFIRMED. The proposal JSON top-level keys are exactly "
+            "schema_version, findings, paths, and identities; use paths, not attack_paths."
         )
 
     async def __call__(self, proposal_json: str) -> str:

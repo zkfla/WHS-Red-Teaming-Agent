@@ -26,7 +26,8 @@ result to its existing history, and asks again until `submit_analysis` or a limi
 same Agent loop.
 
 The Codex runtime starts in an empty temporary directory with read-only sandbox and denied
-approvals. It receives capability schemas and the redacted hackingBuddyGPT conversation, while
+approvals. It disables inherited Codex plugins and every MCP server declared in the trusted user
+configuration. It receives capability schemas and the redacted hackingBuddyGPT conversation, while
 repository access remains exclusively in the existing bounded Capabilities.
 
 ## Global attack graph

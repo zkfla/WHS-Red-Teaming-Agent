@@ -43,7 +43,8 @@ because the SDK does not report per-run currency cost.
 - `deterministic_analysis_complete`: parser and deterministic domain completed without a model.
 - `proposal_validated`: Agent submitted one valid proposal.
 - `model_error`: a model round failed after deterministic results existed.
-- `no_progress`: repeated calls or four rounds without new inspected resources.
+- `no_progress`: four repetitions of the same call or four rounds without a new call signature or
+  newly inspected resource.
 - framework limit reason or `limit_reached`: round, token, cost or duration budget ended.
 
 All non-successful Agent termination reasons produce `PARTIAL` and preserve deterministic state.
@@ -54,6 +55,6 @@ Repository paths must remain below the resolved input root. `.git`, parent and a
 symlink escape, binary input and files above 1 MiB are rejected. File slices are at most 200 lines;
 literal search returns at most 50 redacted results and excludes dependency/build directories.
 Codex receives no direct repository path or repository tool. In an isolated temporary directory
-with read-only sandbox and approval denial, it selects one registered Capability per round. Only
-hackingBuddyGPT executes the Capability, and `submit_analysis` uses the existing deterministic
-proposal validator.
+with read-only sandbox, approval denial, plugins disabled and configured MCP servers disabled, it
+selects one registered Capability per round. Only hackingBuddyGPT executes the Capability, and
+`submit_analysis` uses the existing deterministic proposal validator.

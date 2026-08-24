@@ -86,6 +86,7 @@ PARTIAL 4, 최종 validation 실패 5입니다.
 - secret 값은 저장하지 않으며 GitHub secret expression은 참조로만 남깁니다.
 - 정적 Attack Path는 `CONFIRMED`로 승격하지 않습니다.
 - Codex LLM 연결은 빈 임시 작업 폴더, read-only sandbox, approval deny-all에서 실행됩니다.
+  사용자 Codex 설정에 등록된 plugin과 MCP server도 이 실행에서는 비활성화됩니다.
   Codex 자체 도구에는 대상 저장소를 주지 않고, hackingBuddyGPT 대화 기록과 Capability
   schema 및 redaction된 도구 결과만 전달합니다.
 - branch protection, environment approval, repository 기본 권한, IAM trust policy는
@@ -98,9 +99,11 @@ uv run pytest
 uv run ruff check .
 ```
 
-fixture 기반 E2E는 모델과 네트워크 없이 반복 실행됩니다. 실제 LiteLLM/Codex smoke는
-사용자가 provider, 자격 증명 또는 ChatGPT 로그인, 비용·사용량 한도를 승인했을 때만
-수행합니다.
+fixture 기반 E2E는 모델과 네트워크 없이 반복 실행됩니다. ChatGPT 로그인 기반 real-model
+smoke는 `tests/fixtures/global-chain`에서 `proposal_validated` COMPLETE까지 확인했습니다.
+실제 LiteLLM provider smoke는 해당 provider 자격 증명과 비용·사용량 한도가 있을 때만
+수행합니다. Codex 경로의 보고서 비용 `0.0`은 SDK가 통화 비용을 제공하지 않는다는 뜻이며,
+무료 사용을 보장하지 않습니다.
 
 Codex 인증과 자동화 방식은 OpenAI 공식 문서의
 [Authentication](https://developers.openai.com/codex/auth/),

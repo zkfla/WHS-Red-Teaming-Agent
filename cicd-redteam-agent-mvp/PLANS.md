@@ -2,10 +2,10 @@
 
 ## Goal
 
-실제 LLM API를 호출하지 않고도 GitHub Actions 저장소를 안전하게 분석하고, 개별 규칙의
-사실을 Evidence 기반 전역 공격 경로로 조합하며, fake LLM으로 Agent 계약과 종료 동작을
-재현할 수 있는 `v0.1.0` 프로토타입을 완성한다. 동일한 hackingBuddyGPT Single Agent를
-LiteLLM provider key 또는 ChatGPT 로그인 기반 Codex LLM adapter로 실행할 수 있게 한다.
+GitHub Actions 저장소를 안전하게 분석하고, 개별 규칙의 사실을 Evidence 기반 전역 공격
+경로로 조합하며, fake LLM으로 Agent 계약과 종료 동작을 재현할 수 있는 `v0.1.0`
+프로토타입을 완성한다. 동일한 hackingBuddyGPT Single Agent를 LiteLLM provider key 또는
+ChatGPT 로그인 기반 Codex LLM adapter로 실행하고 실제 로그인 smoke까지 검증한다.
 
 ## Deliverables
 
@@ -21,7 +21,7 @@ LiteLLM provider key 또는 ChatGPT 로그인 기반 Codex LLM adapter로 실행
 - GitHub, AWS 및 외부 action 네트워크에 접근하지 않는다.
 - 실제 Secret 값과 redaction 전 파일 내용을 저장하지 않는다.
 - 정적 Attack Path는 `CONFIRMED`가 될 수 없다.
-- 실제 LiteLLM/Codex 호출과 real-model smoke는 이번 작업에서 제외한다.
+- 실제 workflow·script·action 실행은 real-model smoke에서도 금지한다.
 - 분석 대상 저장소의 `.env`는 인증 입력으로 사용하지 않는다.
 
 ## Architecture decisions
@@ -65,7 +65,7 @@ LiteLLM provider key 또는 ChatGPT 로그인 기반 Codex LLM adapter로 실행
 
 - **Objective**: 전체 fixture, CLI, lint, 문서와 저장소 위생을 동결한다.
 - **Validation**: `uv sync`, 전체 pytest, Ruff, deterministic CLI smoke.
-- **Exit criteria**: 실제 LLM smoke만 명시적 미검증으로 남는다.
+- **Exit criteria**: deterministic 분석과 fake LLM 회귀가 통과한다.
 
 ### Phase 6: Provider와 Codex LLM 연결
 
@@ -75,6 +75,15 @@ LiteLLM provider key 또는 ChatGPT 로그인 기반 Codex LLM adapter로 실행
   두 provider 경로가 동일한 `run_agent_analysis`로 합류하는지 정적으로 검사한다.
 - **Exit criteria**: 키나 로그인 토큰을 노출하지 않고 두 인증 방식 모두 동일한
   `CICDChatAgent → Capability → submit_analysis` 경로를 사용한다.
+
+### Phase 7: ChatGPT 로그인 real-model smoke
+
+- **Objective**: 저장된 ChatGPT 로그인을 이용해 실제 모델이 Capability를 반복 호출하고
+  유효한 `AnalysisProposal`을 제출하도록 한다.
+- **Validation**: fixture 저장소에서 `list → get facts → submit_analysis` trace와
+  `proposal_validated` COMPLETE 결과를 확인한다.
+- **Exit criteria**: provider/model/token/round/termination과 결과 artifact가 저장되고,
+  Codex runtime의 inherited plugin·MCP server가 비활성화된다.
 
 ## Done definition
 

@@ -2,9 +2,13 @@ from __future__ import annotations
 
 import datetime
 import json
+import os
+import re
 import tempfile
+import tomllib
 import uuid
 from dataclasses import dataclass, field
+from pathlib import Path
 from types import SimpleNamespace
 
 from hackingBuddyGPT.capability import Capability, capabilities_to_tools
@@ -17,6 +21,32 @@ from cicd_redteam_agent.security.redaction import redact
 
 class CodexAuthenticationError(RuntimeError):
     pass
+
+
+def _isolated_config_overrides() -> tuple[str, ...]:
+    """Disable inherited Codex plugins and MCP servers for inference-only turns."""
+    overrides = ["features.plugins=false"]
+    configured_home = os.environ.get("CODEX_HOME")
+    codex_home = Path(configured_home).expanduser() if configured_home else Path.home() / ".codex"
+    config_path = codex_home / "config.toml"
+    if not config_path.is_file():
+        return tuple(overrides)
+    try:
+        with config_path.open("rb") as config_file:
+            config = tomllib.load(config_file)
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        raise RuntimeError(f"Unable to isolate Codex configuration: {exc}") from exc
+    servers = config.get("mcp_servers", {})
+    if not isinstance(servers, dict):
+        raise RuntimeError("Unable to isolate Codex configuration: mcp_servers must be a table")
+    for server_name in servers:
+        name = str(server_name)
+        if re.fullmatch(r"[A-Za-z0-9_-]+", name) is None:
+            raise RuntimeError(
+                f"Unable to isolate Codex configuration: unsupported MCP server name {name!r}"
+            )
+        overrides.append(f"mcp_servers.{name}.enabled=false")
+    return tuple(overrides)
 
 
 def _decision_schema(capability_names: list[str]) -> dict[str, object]:
@@ -44,8 +74,11 @@ class CodexChatGPTLLM(LLM):
     )
 
     def init(self) -> None:
-        self._workspace = tempfile.TemporaryDirectory(prefix="cicd-agent-codex-")
+        self._workspace = tempfile.TemporaryDirectory(
+            prefix="cicd-agent-codex-", ignore_cleanup_errors=True
+        )
         config = CodexConfig(
+            config_overrides=_isolated_config_overrides(),
             cwd=self._workspace.name,
             env={"OPENAI_API_KEY": "", "CODEX_API_KEY": ""},
         )

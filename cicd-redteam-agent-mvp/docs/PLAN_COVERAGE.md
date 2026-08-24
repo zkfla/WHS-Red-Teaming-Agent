@@ -12,16 +12,24 @@
 | Day 6 robustness | COMPLETE/PARTIAL/FAILED, exit codes, limits, model error, no-progress, redaction |
 | Day 7 local integration | deterministic CLI, full pytest, Ruff, README and schema `1.0` |
 | Auth extension | trusted `.env`, explicit provider resolution, Codex LLM adapter in the existing Agent loop |
+| Real-model smoke | ChatGPT-authenticated Codex adapter, four Capability rounds, valid submit and COMPLETE |
 
 The deterministic extension also composes local scenario paths into bounded attacker-to-credential
 paths. It does not add Graph DB, network access or execution capability.
 
+## Real-model verification
+
+The ChatGPT-authenticated smoke against `tests/fixtures/global-chain` completed with
+`proposal_validated`. It used `gpt-5.6-terra`, four rounds and 94,677 reported tokens, and wrote
+`analysis.json`, `summary.md` and `trace.jsonl`. The trace contains only the registered
+hackingBuddyGPT Capabilities. Reported monetary cost is `0.0` because the Codex SDK does not expose
+per-run currency cost; it must not be interpreted as proof that usage is free.
+
 ## Intentionally unverified
 
 - real LiteLLM provider initialization and API authentication
-- real ChatGPT-authenticated hackingBuddyGPT Agent run through the Codex LLM adapter
-- real-model `proposal_validated` COMPLETE run
-- provider token/cost accounting and external rate-limit behavior
+- LiteLLM provider token/cost accounting and external rate-limit behavior
+- currency-denominated Codex usage cost
 
-These require an explicitly selected provider, credentials and cost approval. Fake LLM and stubbed
-failure tests verify the local Agent contracts without making an API call.
+These require an external provider credential or billing data that was not available. Fake LLM and
+stubbed failure tests continue to verify the local Agent contracts without network usage.

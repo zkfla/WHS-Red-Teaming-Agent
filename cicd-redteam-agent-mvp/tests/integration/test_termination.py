@@ -60,6 +60,8 @@ class VaryingAgent:
         self.round += 1
         self.context.record_call("different-call", {"round": self.round})
         limits.rounds += 1
+        if self.round == 5:
+            self.context.submitted = True
 
 
 def _context(tmp_path: Path) -> CapabilityContext:
@@ -93,14 +95,14 @@ async def test_repeated_calls_stop_after_four_rounds(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_no_progress_stops_even_without_duplicate_calls(tmp_path: Path) -> None:
+async def test_unique_calls_count_as_progress_until_submission(tmp_path: Path) -> None:
     context = _context(tmp_path)
     limits = StubLimits()
 
     reason = await CICDUseCase(VaryingAgent(context), context, limits).run()
 
-    assert reason == "no_progress"
-    assert limits.rounds == 4
+    assert reason == "proposal_validated"
+    assert limits.rounds == 5
     assert max(context.state.repeated_calls.values()) == 1
 
 
