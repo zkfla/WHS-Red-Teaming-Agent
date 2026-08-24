@@ -31,6 +31,12 @@ SPECIALISTS = {
                  "readable files and directories, secrets and metadata left reachable",
     "logic":     "business logic and input validation — operations accepted in the "
                  "wrong order or with values the flow should reject",
+    "crypto":    "weak cryptography and predictable secrets — reversible or guessable "
+                 "hashes, tokens with weak entropy, secrets derivable from public data",
+    "config":    "security misconfiguration — permissive CORS, missing or wrong security "
+                 "headers, debug surfaces, default settings left in place",
+    "files":     "file handling — upload and download paths, traversal, type and size "
+                 "checks, anything the app reads from or writes to disk",
 }
 
 
@@ -71,7 +77,14 @@ def run_pipeline(run_ctx, profile_name: str):
 
     if run_ctx.m.stopped_reason not in HALT:
         fan = getattr(prof, "fan_out", None)
-        if fan:
+        wave2 = getattr(prof, "wave2", None)
+        if fan and wave2:
+            # 1차 → 동기화 한 번 → 2차. 총 스텝은 순수 팬아웃과 맞춰서
+            # '정보 공유' 효과만 분리해 본다 (턴 수를 늘린 효과와 섞이면 해석 불가).
+            first = _fan_out(run_ctx, base, roles["exploit"], fan, wave=1)
+            second = _fan_out(run_ctx, base, wave2, fan, wave=2, prior=first)
+            run_ctx.write("findings.md", f"{first}\n\n{second}")
+        elif fan:
             _fan_out(run_ctx, base, roles["exploit"], fan)
         else:
             _safe(run_ctx, "exploit", base, roles["exploit"], "findings.md")
@@ -91,12 +104,17 @@ def run_pipeline(run_ctx, profile_name: str):
 GENERIC = "no specific assignment — pursue whatever the recon plan makes most promising"
 
 
-def _fan_out(run_ctx, base_task: str, role_cfg, names: list):
+def _fan_out(run_ctx, base_task: str, role_cfg, names: list, wave: int = 0,
+             prior: str = ""):
     """exploit 전문가 N명을 동시에 돌리고 결과를 findings.md 하나로 합친다.
 
     각자 별도의 대화를 갖는다 — 공유하면 컨텍스트가 다시 커져서 팬아웃의
     비용 이점이 사라진다. 조율이 없으니 담당이 겹칠 수 있는데, 그건 의도한
     트레이드오프다: 조율에 드는 LLM 왕복이 중복보다 비싸다.
+
+    wave/prior 는 2차 웨이브용이다. 1차가 끝난 뒤 딱 한 번 동기화해서
+    서로의 발견을 넘긴다 — 예를 들어 authn 담당이 얻은 토큰을 access 담당이
+    쓸 수 있게. 동기화 지점이 하나뿐이라 컨텍스트는 거의 안 커진다.
     """
     def one(name):
         spec = SPECIALISTS.get(name.split("-")[0] if name.startswith("gen") else name)
@@ -105,11 +123,17 @@ def _fan_out(run_ctx, base_task: str, role_cfg, names: list):
         else:
             task = (f"{base_task}\n\nYOUR ASSIGNMENT: focus on {spec}. "
                     f"Other specialists cover the rest — do not spend your budget there.")
-        return _safe(run_ctx, "exploit", task, role_cfg, f"findings-{name}.md")
+        if prior:
+            task += ("\n\nWhat the other specialists found in the first pass is below. "
+                     "Use it — credentials, tokens, ids, and confirmed weaknesses are "
+                     "reusable. Do not re-confirm what is already proven; build on it.\n\n"
+                     f"<first_pass_findings>\n{prior}\n</first_pass_findings>")
+        suffix = f"-w{wave}" if wave else ""
+        return _safe(run_ctx, "exploit", task, role_cfg, f"findings-{name}{suffix}.md")
 
     with ThreadPoolExecutor(max_workers=len(names)) as pool:
         outs = list(pool.map(one, names))
 
     merged = "\n\n".join(f"<!-- {n} -->\n{o}" for n, o in zip(names, outs) if o)
-    run_ctx.write("findings.md", merged or "(no output)")
+    run_ctx.write(f"findings{'-w%d' % wave if wave else ''}.md", merged or "(no output)")
     return merged

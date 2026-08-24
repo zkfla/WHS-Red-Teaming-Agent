@@ -50,6 +50,7 @@ class Profile:
     name: str
     roles: dict = field(default_factory=dict)
     fan_out: list = None        # exploit을 이 전문가들로 동시 실행 (None이면 순차 1개)
+    wave2: RoleConfig = None    # 설정 시 2차 웨이브 실행 (1차 발견을 넘겨받음)
 
     @property
     def agent_count(self) -> int:
@@ -146,6 +147,22 @@ PROFILES = {
         "exploit":  RoleConfig("claude-haiku-4-5", "low", 12),
         "reporter": RoleConfig("claude-haiku-4-5", "low",  4),
     }, fan_out=["injection", "access", "authn", "exposure", "logic"]),
+    # 격자의 빈 칸 — 최적 스텝(9)에서 전문가 수를 늘려본 적이 없다.
+    # 스텝과 인원을 각각 다른 축에서 최적화해놓고 교차점을 안 봤으므로,
+    # 지금까지 찾은 "최적"은 십자 위의 국소해일 수 있다.
+    "haiku-nr9x8": Profile("haiku-nr9x8", {
+        "exploit":  RoleConfig("claude-haiku-4-5", "low",  9),
+        "reporter": RoleConfig("claude-haiku-4-5", "low",  4),
+    }, fan_out=["injection", "access", "authn", "exposure", "logic",
+                "crypto", "config", "files"]),
+    # 2차 웨이브 — 전문가들이 지금은 서로 완전히 격리되어 정보 공유가 0이다.
+    # authn이 얻은 토큰을 access가 못 쓴다. 딱 한 번 동기화해서 그 손실을 회수한다.
+    # 총 스텝을 nr9(5×9=45)와 맞춰(4+5)×5=45 잡아야 '공유' 효과만 분리된다.
+    "haiku-wave": Profile("haiku-wave", {
+        "exploit":  RoleConfig("claude-haiku-4-5", "low",  4),
+        "reporter": RoleConfig("claude-haiku-4-5", "low",  4),
+    }, fan_out=["injection", "access", "authn", "exposure", "logic"],
+       wave2=RoleConfig("claude-haiku-4-5", "low", 5)),
     # 상한선(성능 기준점): 전부 opus + high effort
     "max": Profile("max", {
         "recon":    RoleConfig("claude-opus-5", "high", 15),
