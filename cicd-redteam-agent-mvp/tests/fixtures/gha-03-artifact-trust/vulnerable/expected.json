@@ -1,0 +1,11 @@
+{
+  "scenario_id": "GHA-03",
+  "variant": "vulnerable",
+  "expected_findings": [
+    {
+      "rule_id": "GHA-03-WORKFLOW-RUN-ARTIFACT-EXECUTION",
+      "status": "SUPPORTED"
+    }
+  ],
+  "forbidden_rule_ids": []
+}

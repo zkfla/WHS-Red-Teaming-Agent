@@ -1,0 +1,6 @@
+{
+  "scenario_id": "GHA-03",
+  "variant": "secure",
+  "expected_findings": [],
+  "forbidden_rule_ids": ["GHA-03-WORKFLOW-RUN-ARTIFACT-EXECUTION"]
+}

@@ -1,0 +1,13 @@
+name: PR Build
+on: pull_request
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Upload structured test result
+        uses: actions/upload-artifact@1111111111111111111111111111111111111111
+        with:
+          name: pr-result
+          path: artifact/result.json

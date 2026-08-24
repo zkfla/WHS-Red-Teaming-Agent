@@ -1,0 +1,11 @@
+{
+  "scenario_id": "GHA-04",
+  "variant": "vulnerable",
+  "expected_findings": [
+    {
+      "rule_id": "GHA-04-MUTABLE-EXTERNAL-ACTION",
+      "status": "CANDIDATE"
+    }
+  ],
+  "forbidden_rule_ids": []
+}

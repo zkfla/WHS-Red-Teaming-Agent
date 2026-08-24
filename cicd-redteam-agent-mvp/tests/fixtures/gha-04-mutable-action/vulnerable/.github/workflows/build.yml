@@ -1,0 +1,10 @@
+name: Mutable action build
+on: push
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Run mutable external action
+        uses: example-org/build-action@v1

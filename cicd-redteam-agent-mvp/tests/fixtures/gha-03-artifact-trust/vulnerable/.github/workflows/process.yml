@@ -1,0 +1,19 @@
+name: Process PR artifact
+on:
+  workflow_run:
+    workflows: ["PR Build"]
+    types: [completed]
+permissions:
+  contents: write
+jobs:
+  process:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifact from triggering run
+        uses: actions/download-artifact@2222222222222222222222222222222222222222
+        with:
+          name: pr-payload
+          path: artifact
+          run-id: ${{ github.event.workflow_run.id }}
+      - name: Execute downloaded file
+        run: ./artifact/process.sh

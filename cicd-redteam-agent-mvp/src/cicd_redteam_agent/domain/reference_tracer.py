@@ -35,7 +35,7 @@ def _file_evidence(path: str, text: str) -> Evidence:
 def _resolve_reference(boundary: RepositoryBoundary, raw: str) -> str | None:
     clean = raw[2:] if raw.startswith("./") else raw
     try:
-        path = boundary.resolve(clean)
+        path = boundary.resolve(clean, must_exist=False)
     except RepositoryBoundaryError:
         return None
     if path.is_dir():

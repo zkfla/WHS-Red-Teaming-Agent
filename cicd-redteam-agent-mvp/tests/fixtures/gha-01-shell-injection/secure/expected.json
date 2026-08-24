@@ -1,0 +1,6 @@
+{
+  "scenario_id": "GHA-01",
+  "variant": "secure",
+  "expected_findings": [],
+  "forbidden_rule_ids": ["GHA-01-PR-SHELL-INJECTION"]
+}

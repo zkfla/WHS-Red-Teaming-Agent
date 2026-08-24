@@ -1,0 +1,10 @@
+name: Pinned action build
+on: push
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Run pinned external action
+        uses: example-org/build-action@0123456789abcdef0123456789abcdef01234567

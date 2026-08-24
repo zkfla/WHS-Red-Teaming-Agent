@@ -1,0 +1,9 @@
+name: Overprivileged check
+on: push
+permissions: write-all
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Run a simple check
+        run: echo checked

@@ -1,0 +1,11 @@
+{
+  "scenario_id": "GHA-01",
+  "variant": "vulnerable",
+  "expected_findings": [
+    {
+      "rule_id": "GHA-01-PR-SHELL-INJECTION",
+      "status": "SUPPORTED"
+    }
+  ],
+  "forbidden_rule_ids": []
+}

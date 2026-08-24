@@ -15,7 +15,8 @@ def _git_value(boundary: RepositoryBoundary, *arguments: str) -> str | None:
             cwd=boundary.root,
             check=True,
             capture_output=True,
-            text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=10,
         )
     except (OSError, subprocess.SubprocessError):

@@ -1,0 +1,6 @@
+{
+  "scenario_id": "GHA-04",
+  "variant": "secure",
+  "expected_findings": [],
+  "forbidden_rule_ids": ["GHA-04-MUTABLE-EXTERNAL-ACTION"]
+}

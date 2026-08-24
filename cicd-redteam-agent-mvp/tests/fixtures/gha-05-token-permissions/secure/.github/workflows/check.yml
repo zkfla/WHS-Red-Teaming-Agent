@@ -1,0 +1,10 @@
+name: Least-privilege check
+on: push
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Run a simple check
+        run: echo checked

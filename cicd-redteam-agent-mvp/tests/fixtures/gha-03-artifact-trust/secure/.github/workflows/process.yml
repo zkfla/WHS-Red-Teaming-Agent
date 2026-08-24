@@ -1,0 +1,19 @@
+name: Process PR result
+on:
+  workflow_run:
+    workflows: ["PR Build"]
+    types: [completed]
+permissions:
+  contents: read
+jobs:
+  process:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download structured result
+        uses: actions/download-artifact@2222222222222222222222222222222222222222
+        with:
+          name: pr-result
+          path: artifact
+          run-id: ${{ github.event.workflow_run.id }}
+      - name: Parse data without executing it
+        run: jq . artifact/result.json

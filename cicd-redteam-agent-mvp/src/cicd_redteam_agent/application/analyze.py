@@ -19,6 +19,7 @@ from cicd_redteam_agent.domain.models import (
     TraceMetadata,
 )
 from cicd_redteam_agent.domain.reference_tracer import trace_local_references
+from cicd_redteam_agent.domain.scenario_rules import derive_additional_scenario_results
 from cicd_redteam_agent.security.repository_boundary import RepositoryBoundary
 
 FRAMEWORK_COMMIT = "b2653771aed383ffe92933f8f2f9b7684403af8a"
@@ -56,6 +57,9 @@ async def analyze_repository(
     warnings.extend(reference_warnings)
     state.assessments = assess_attacker_control(state, config.attacker_profile)
     state.findings, state.paths = derive_attack_paths(state)
+    additional_findings, additional_paths = derive_additional_scenario_results(state)
+    state.findings.extend(additional_findings)
+    state.paths.extend(additional_paths)
     state.identities = derive_identity_candidates(state)
 
     status = ReportStatus.COMPLETE

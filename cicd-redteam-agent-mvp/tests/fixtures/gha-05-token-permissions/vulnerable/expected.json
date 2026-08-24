@@ -1,0 +1,11 @@
+{
+  "scenario_id": "GHA-05",
+  "variant": "vulnerable",
+  "expected_findings": [
+    {
+      "rule_id": "GHA-05-BROAD-GITHUB-TOKEN",
+      "status": "CANDIDATE"
+    }
+  ],
+  "forbidden_rule_ids": []
+}
