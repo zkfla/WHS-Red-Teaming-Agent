@@ -1,0 +1,40 @@
+[project]
+name = "cicd-redteam-agent"
+version = "0.0.0"
+description = "Development scaffold for a read-only GitHub Actions red-team agent"
+readme = "README.md"
+requires-python = ">=3.13,<3.14"
+license = { text = "MIT" }
+dependencies = [
+  "hackingBuddyGPT @ git+https://github.com/ipa-lab/hackingBuddyGPT.git@b2653771aed383ffe92933f8f2f9b7684403af8a",
+  "pydantic>=2.12,<3",
+  "ruamel-yaml>=0.18,<0.19",
+]
+
+[dependency-groups]
+dev = [
+  "pytest>=8.4,<9",
+  "pytest-asyncio>=1.2,<2",
+  "ruff>=0.14,<0.15",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/cicd_redteam_agent"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
