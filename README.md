@@ -28,7 +28,7 @@ pip install -r requirements.txt
 
 ```bash
 export GEMINI_API_KEY=<API키>
-python mobile_agent_gemini.py testbed/android-insecurebankv2/InsecureBankv2.apk
+python mobile_agent_gemini.py android-insecurebankv2/InsecureBankv2.apk
 ```
 
 
