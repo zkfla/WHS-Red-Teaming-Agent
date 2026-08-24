@@ -1,0 +1,40 @@
+[project]
+name = "cicd-redteam-agent"
+version = "0.1.0"
+description = "Read-only GitHub Actions attack-path analysis prototype"
+readme = "README.md"
+requires-python = ">=3.13"
+license = { text = "MIT" }
+dependencies = [
+  "hackingBuddyGPT @ git+https://github.com/ipa-lab/hackingBuddyGPT.git@b2653771aed383ffe92933f8f2f9b7684403af8a",
+  "pydantic>=2.12,<3",
+  "ruamel-yaml>=0.18,<0.19",
+]
+
+[project.scripts]
+cicd-agent = "cicd_redteam_agent.cli:main"
+
+[dependency-groups]
+dev = [
+  "pytest>=8.4,<9",
+  "pytest-asyncio>=1.2,<2",
+  "ruff>=0.14,<0.15",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]

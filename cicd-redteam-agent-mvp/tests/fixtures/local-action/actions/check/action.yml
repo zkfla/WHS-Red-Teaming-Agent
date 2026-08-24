@@ -1,0 +1,6 @@
+name: check
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: ./actions/check/check.sh

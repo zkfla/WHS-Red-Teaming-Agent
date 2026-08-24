@@ -1,0 +1,12 @@
+on: push
+permissions:
+  contents: write
+  id-token: write
+jobs:
+  reduced:
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo safe
+

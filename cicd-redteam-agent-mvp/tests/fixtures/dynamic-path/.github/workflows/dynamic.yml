@@ -1,0 +1,5 @@
+on: pull_request
+jobs:
+  dynamic:
+    uses: ./.github/workflows/${{ inputs.workflow }}.yml
+
