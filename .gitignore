@@ -1,0 +1,8 @@
+testbed/agent_workdir/ 
+
+venv/
+__pycache__/
+*.pyc
+ 
+.env
+*.key
