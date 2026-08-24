@@ -47,6 +47,11 @@ def stop(note: str = ""):
     s = juiceshop.score(st["before"], after)
 
     run = Run("decepticon", "default")
+    # Run.__init__은 _t0를 '지금'(이 stop() 호출 시점)으로 잡는다. 그런데 baseline은
+    # start()~stop() 사이의 실제 경과 시간을 재야 하므로, finish()가 wall_sec을
+    # 재계산할 때 쓸 기준점 자체를 진짜 시작 시각으로 바꿔치기한다.
+    # (아래 줄만 있으면 finish()가 그대로 덮어써 0에 가까운 값이 나온다 — 실제로 발견된 버그)
+    run._t0 = st["t0"]
     run.m.wall_sec = round(time.time() - st["t0"], 2)
     run.m.containers = st["containers"]
     run.m.agents = 16                     # Decepticon 전문 에이전트 수 (문서 기준)

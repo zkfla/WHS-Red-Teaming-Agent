@@ -104,9 +104,75 @@
 
 프레임워크 튜닝은 수확 체감 구간에 들어섰다. **다음은 Decepticon baseline.**
 
+## [갱신 2026-08-24] Decepticon Baseline 3회 완료 — 핵심 비교 확보
+
+### 실행 절차에서 배운 것 (재현 시 필수)
+
+- `decepticon start`는 TTY(bubbletea)가 필요해 비대화형 자동화 불가.
+  인프라만 `cd ~/.decepticon && docker compose up -d`로 직접 띄우고,
+  실제 인게이지먼트는 `docker attach decepticon-cli`로 사람이 진행해야 함.
+- **`DECEPTICON_MODEL_PROFILE=eco`는 쓰면 안 됨.** anthropic_oauth만 있는 상태에서
+  HIGH 티어(orchestrator)가 auth/claude-opus-4-8을 찾는데 폴백이 없어 429 루프에 빠짐.
+  `test` 프로파일로 바꿔야 전 역할이 auth/claude-haiku-4-5로 통일됨 (우리와 동일 모델).
+  langgraph 로그에서 `Creating LLM for role '...' → model 'auth/claude-haiku-4-5'`로 검증.
+- `opscontrol` 데몬 설치 실패는 무관함 — C2/AD/리버싱 전용, 웹 앱 타깃엔 안 씀.
+- **`bench.baseline.start()`는 반드시 Decepticon 시작 전에 먼저 실행.**
+  거꾸로 하면 타깃 컨테이너가 공격 도중 재생성되어 그 1회는 폐기해야 함
+  (실제로 1회 겪음 — decepticon-cli 세션 버리고 재시작으로 처리).
+- **`bench.baseline.stop()`의 wall_sec 버그 발견·수정함.**
+  `Run.__init__`이 `_t0`를 "지금"(stop 호출 시점)으로 잡고 `finish()`가 그걸로
+  덮어써서 wall_sec≈0이 나왔음. `bench/baseline.py`에 `run._t0 = st["t0"]` 추가로 수정.
+  1회차는 컨테이너 재생성 시각~stop 호출 시각으로 수동 복원(990s).
+  3회차는 "사람이 딴짓하다 늦게 stop 호출"한 경우까지 겪음 →
+  LiteLLM 스펜드로그의 마지막 활동 시각으로 복원(1036s→762s로 정정).
+  **교훈: wall_sec은 항상 컨테이너 재생성 시각~LiteLLM 마지막 스펜드 로그 시각으로
+  교차검증할 것.** `time.time()` 하나만 믿지 말 것.
+- 비용/토큰은 LiteLLM Postgres에서 직접 조회해야 함 (자동 기록 없음):
+  ```
+  docker exec decepticon-postgres psql -U decepticon -d litellm -t -c "
+  SELECT model, SUM(prompt_tokens), SUM(completion_tokens), SUM(spend), COUNT(*)
+  FROM \"LiteLLM_SpendLogs\" WHERE \"startTime\" > '<라운드 시작 시각>' GROUP BY model;"
+  ```
+  주의: 라운드 간격이 짧으면(같은 세션 내 연속 실행) 시간창이 겹친다 —
+  이전 라운드의 MAX(startTime) 이후로 반드시 하한을 끊을 것 (실제로 겹칠 뻔함).
+  `response`/`metadata` 컬럼에 캐시 토큰 분해가 없음 — cache_read/write는 0으로 남김,
+  cost_usd 총액만 신뢰 가능.
+
+### 결과 (n=3, haiku 고정)
+
+| | Decepticon | 우리 nr9 (n=6) |
+|---|---|---|
+| 시간 | 842s ±122 | 70s |
+| 컨테이너 | 7 | 2 |
+| 에이전트 | 16 | 6 |
+| 탐지 | 3.00 (4/3/2) | 4.33 |
+| 비용 | $0.303 | $0.363 |
+| 해결당 비용 | $0.101 | $0.084 |
+
+**시간 12.1배, 컨테이너 -71%, 에이전트 -63%, 탐지 +44%, 해결당비용 -17%.**
+
+### 한계 — 반드시 보고서에 명시
+
+1. **n=3/n=6 모두 작다.** 탐지 σ가 커서(우리 쪽 σ≈1.1 확인) 3.00 vs 4.33은
+   방향은 맞지만 통계적으로 확정적이지 않다. 추가 라운드가 있으면 좋음.
+2. **Decepticon 워크스페이스 오염 확인.** 2·3회차 exploit 에이전트가 전사에서
+   `cd /workspace/whs-baseline-1`처럼 이전 회차 디렉토리에 실제로 접근하는 게
+   보임. OPPLAN도 회차 간 전역 공유(누적 표시). 스코어보드 자체는 매회 리셋되어
+   오염되지 않지만, "얼마나 빨리/쉽게 찾았는가"는 회차 독립성이 깨졌을 수 있음.
+   우리 쪽(브라우저 탭 오염 방지 등)과 달리 Decepticon엔 이 격리를 못 넣음(외부 시스템).
+3. **자체 보고 vs 실제 채점 간극이 크다.** Decepticon은 매회 "100% 성공률", 5~6개
+   Critical/High 발견을 보고했지만 실제 오라클 채점은 3.7~7.4%였다. 이건 D안에
+   유리한 근거이기도 함 — 자동 채점 없이 자체 보고만 믿으면 과대평가된다.
+
+### 다음
+
+- 회차를 더 늘릴지(예산·시간 대비) 지금 n=3으로 갈지 결정 필요
+- report/status.html에 이 비교표와 세 가지 한계 반영
+- Gemini 멀티 프로바이더는 여전히 보류 상태 (미결정)
+
 ## 다음에 할 일 (우선순위)
 
-1. **Decepticon baseline 3회** ← 최우선 (우리 쪽 튜닝은 수확 체감. 비교 대상이 없으면 무의미). 비교 대상이 비어 있어 어떤 상대적 주장도 불가
+1. ~~Decepticon baseline 3회~~ ✅ 완료 (2026-08-24). 결과는 위 섹션 참조. 비교 대상이 비어 있어 어떤 상대적 주장도 불가
    ```
    .venv/bin/python -m bench.lab verify
    .venv/bin/python -m bench.baseline start   # 리셋+오염검증 포함
