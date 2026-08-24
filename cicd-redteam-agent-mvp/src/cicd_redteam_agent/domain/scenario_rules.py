@@ -155,6 +155,8 @@ def _derive_mutable_actions(state: AnalysisState) -> tuple[list[Finding], list[A
                 if mutable_ref is None:
                     continue
                 privileged = _privileged(job, state)
+                if not privileged:
+                    continue
                 finding, path = _finding_and_path(
                     workflow=workflow,
                     job=job,
@@ -167,7 +169,7 @@ def _derive_mutable_actions(state: AnalysisState) -> tuple[list[Finding], list[A
                         "commit SHA."
                     ),
                     status=FindingStatus.CANDIDATE,
-                    confidence=Confidence.MEDIUM if privileged else Confidence.LOW,
+                    confidence=Confidence.MEDIUM,
                     missing_evidence=["external action ref integrity", "upstream compromise"],
                 )
                 findings.append(finding)

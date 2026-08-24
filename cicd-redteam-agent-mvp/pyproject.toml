@@ -7,7 +7,9 @@ requires-python = ">=3.13"
 license = { text = "MIT" }
 dependencies = [
   "hackingBuddyGPT @ git+https://github.com/ipa-lab/hackingBuddyGPT.git@b2653771aed383ffe92933f8f2f9b7684403af8a",
+  "openai-codex>=0.1,<1",
   "pydantic>=2.12,<3",
+  "python-dotenv>=1.1,<2",
   "ruamel-yaml>=0.18,<0.19",
 ]
 

@@ -11,7 +11,10 @@ from cicd_redteam_agent.domain.github_actions_parser import stable_id
 from cicd_redteam_agent.domain.models import AnalysisProposal, AnalysisState, Evidence
 from cicd_redteam_agent.domain.validator import apply_analysis_proposal
 from cicd_redteam_agent.security.redaction import redact
-from cicd_redteam_agent.security.repository_boundary import RepositoryBoundary
+from cicd_redteam_agent.security.repository_boundary import (
+    RepositoryBoundary,
+    RepositoryBoundaryError,
+)
 
 
 @dataclass
@@ -63,10 +66,14 @@ class GetWorkflowFacts(Capability):
         )
         if workflow is None:
             return json.dumps({"error": "unknown_workflow_id", "workflow_id": workflow_id})
+        member_ids = {workflow.workflow_id}
+        for job in workflow.jobs:
+            member_ids.add(job.job_id)
+            member_ids.update(step.step_id for step in job.steps)
         relations = [
             item.model_dump(mode="json")
             for item in self.context.state.relations
-            if item.source_id.startswith(workflow_id)
+            if item.source_id in member_ids or item.target_id in member_ids
         ]
         secrets = [
             item.model_dump(mode="json")
@@ -78,6 +85,30 @@ class GetWorkflowFacts(Capability):
                 "workflow": workflow.model_dump(mode="json", by_alias=True),
                 "relations": relations,
                 "secret_references": secrets,
+                "assessments": [
+                    item.model_dump(mode="json")
+                    for item in self.context.state.assessments
+                    if item.subject_id in member_ids
+                ],
+                "findings": [
+                    item.model_dump(mode="json")
+                    for item in self.context.state.findings
+                    if any(
+                        path.path_id == stable_id("path", item.finding_id)
+                        and bool(member_ids & set(path.nodes))
+                        for path in self.context.state.paths
+                    )
+                ],
+                "attack_paths": [
+                    item.model_dump(mode="json")
+                    for item in self.context.state.paths
+                    if member_ids & set(item.nodes)
+                ],
+                "identities": [
+                    item.model_dump(mode="json")
+                    for item in self.context.state.identities
+                    if item.workflow_id == workflow_id
+                ],
             }
         )
 
@@ -93,7 +124,10 @@ class InspectRepositoryFile(Capability):
         self.context.record_call(
             self.get_name(), {"path": path, "start_line": start_line, "end_line": end_line}
         )
-        excerpt = self.context.boundary.read_slice(path, start_line, end_line)
+        try:
+            excerpt = self.context.boundary.read_slice(path, start_line, end_line)
+        except RepositoryBoundaryError as exc:
+            return json.dumps({"error": "repository_boundary_error", "detail": str(exc)})
         evidence_id = stable_id("ev", path, start_line, end_line, excerpt)
         evidence = Evidence(
             evidence_id=evidence_id,
@@ -126,7 +160,10 @@ class SearchRepository(Capability):
             self.get_name(),
             {"query": query, "include_globs": include_globs, "max_results": max_results},
         )
-        matches = self.context.boundary.search_literal(query, include_globs, max_results)
+        try:
+            matches = self.context.boundary.search_literal(query, include_globs, max_results)
+        except RepositoryBoundaryError as exc:
+            return json.dumps({"error": "repository_boundary_error", "detail": str(exc)})
         async with self.context.lock:
             for match in matches:
                 excerpt = str(match["excerpt"])

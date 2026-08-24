@@ -39,3 +39,38 @@ def test_oversized_file_is_rejected(tmp_path: Path) -> None:
     boundary = RepositoryBoundary(tmp_path)
     with pytest.raises(RepositoryBoundaryError):
         boundary.read_text("large.txt")
+
+
+def test_binary_file_is_rejected(tmp_path: Path) -> None:
+    (tmp_path / "binary.dat").write_bytes(b"prefix\x00suffix")
+    boundary = RepositoryBoundary(tmp_path)
+
+    with pytest.raises(RepositoryBoundaryError):
+        boundary.read_text("binary.dat")
+
+
+def test_symlink_escape_is_rejected(tmp_path: Path) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    outside = tmp_path / "outside.txt"
+    outside.write_text("outside", encoding="utf-8")
+    link = repository / "link.txt"
+    try:
+        link.symlink_to(outside)
+    except OSError:
+        pytest.skip("Symlink creation is unavailable on this Windows host")
+
+    boundary = RepositoryBoundary(repository)
+    with pytest.raises(RepositoryBoundaryError):
+        boundary.read_text("link.txt")
+
+
+def test_search_is_literal_redacted_and_capped(tmp_path: Path) -> None:
+    lines = [f"token=secret-{index} marker" for index in range(60)]
+    (tmp_path / "data.txt").write_text("\n".join(lines), encoding="utf-8")
+    boundary = RepositoryBoundary(tmp_path)
+
+    results = boundary.search_literal("marker", max_results=500)
+
+    assert len(results) == 50
+    assert all("secret-" not in str(item["excerpt"]) for item in results)

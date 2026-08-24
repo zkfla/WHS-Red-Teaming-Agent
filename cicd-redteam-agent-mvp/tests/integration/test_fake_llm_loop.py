@@ -8,7 +8,11 @@ from hackingBuddyGPT.utils import LLMResult
 from hackingBuddyGPT.utils.limits import Limits
 
 from cicd_redteam_agent.application.state import create_initial_state
-from cicd_redteam_agent.domain.github_actions_parser import discover_workflows, parse_workflow
+from cicd_redteam_agent.domain.github_actions_parser import (
+    discover_workflows,
+    parse_workflow,
+    stable_id,
+)
 from cicd_redteam_agent.framework.capabilities import CapabilityContext, build_capabilities
 from cicd_redteam_agent.framework.cicd_agent import CICDChatAgent
 from cicd_redteam_agent.framework.cicd_usecase import CICDUseCase
@@ -35,8 +39,9 @@ class FakeLogger:
 
 
 class FakeLLM:
-    def __init__(self):
+    def __init__(self, proposal: dict[str, object]):
         self.round = 0
+        self.proposal = proposal
 
     def get_response(self, _prompt, *, capabilities):
         calls = [
@@ -45,7 +50,7 @@ class FakeLLM:
                 "InspectRepositoryFile",
                 {"path": "scripts/deploy.sh", "start_line": 1, "end_line": 2},
             ),
-            ("SubmitAnalysis", {"proposal_json": json.dumps({"schema_version": "1.0"})}),
+            ("SubmitAnalysis", {"proposal_json": json.dumps(self.proposal)}),
         ]
         name, arguments = calls[self.round]
         self.round += 1
@@ -65,11 +70,33 @@ async def test_fake_llm_list_inspect_submit_flow() -> None:
     state.workflows = [parsed.workflow]
     state.evidence.update(parsed.evidence)
     context = CapabilityContext(state, boundary)
-    agent = CICDChatAgent(log=FakeLogger(), llm=FakeLLM(), prompt="trusted system prompt")
+    excerpt = boundary.read_slice("scripts/deploy.sh", 1, 2)
+    evidence_id = stable_id("ev", "scripts/deploy.sh", 1, 2, excerpt)
+    proposal = {
+        "schema_version": "1.0",
+        "findings": [
+            {
+                "schema_version": "1.0",
+                "finding_id": "finding_fake_llm_candidate",
+                "rule_id": "FAKE-LLM-CANDIDATE",
+                "title": "Fake LLM candidate",
+                "status": "CANDIDATE",
+                "evidence_ids": [evidence_id],
+                "missing_evidence": ["runtime behavior"],
+                "confidence": "LOW",
+                "summary": "The fake model submits a bounded evidence-backed candidate.",
+            }
+        ],
+    }
+    agent = CICDChatAgent(
+        log=FakeLogger(), llm=FakeLLM(proposal), prompt="trusted system prompt"
+    )
     agent._capabilities = build_capabilities(context)
     limits = Limits(max_rounds=5, max_tokens=100, max_cost=1, max_duration=30)
     reason = await CICDUseCase(agent, context, limits).run()
     assert reason == "proposal_validated"
     assert context.submitted
     assert "scripts/deploy.sh" in state.inspected_resources
+    assert state.findings[0].finding_id == "finding_fake_llm_candidate"
+    assert state.findings[0].evidence_ids == [evidence_id]
     assert limits.rounds == 3

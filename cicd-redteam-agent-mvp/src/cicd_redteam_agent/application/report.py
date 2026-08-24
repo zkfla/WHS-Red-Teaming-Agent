@@ -31,6 +31,8 @@ def write_report(report: AnalysisReport, run_dir: Path) -> None:
 
 def render_summary(report: AnalysisReport) -> str:
     state = report.state
+    global_paths = [path for path in state.paths if path.nodes[0].startswith("attacker:")]
+    local_paths = [path for path in state.paths if not path.nodes[0].startswith("attacker:")]
     lines = [
         "# CI/CD Red Team Analysis",
         "",
@@ -39,6 +41,7 @@ def render_summary(report: AnalysisReport) -> str:
         f"- Workflows: {len(state.workflows)}",
         f"- Findings: {len(state.findings)}",
         f"- Attack paths: {len(state.paths)}",
+        f"- Global source-to-credential paths: {len(global_paths)}",
         f"- Cloud identity candidates: {len(state.identities)}",
         "",
         "## Findings",
@@ -60,10 +63,20 @@ def render_summary(report: AnalysisReport) -> str:
                 "",
             ]
         )
-    lines.extend(["## Attack paths", ""])
-    if not state.paths:
-        lines.append("No attack path was generated.")
-    for path in state.paths:
+    lines.extend(["## Global attack paths", ""])
+    if not global_paths:
+        lines.append("No attacker-to-credential path was generated.")
+    for path in global_paths:
+        lines.extend(
+            [
+                f"- `{path.path_id}` — `{path.status}` — {' → '.join(path.nodes)}",
+                f"  - Missing evidence: {', '.join(path.missing_evidence) or 'none'}",
+            ]
+        )
+    lines.extend(["", "## Local attack paths", ""])
+    if not local_paths:
+        lines.append("No local attack path was generated.")
+    for path in local_paths:
         lines.extend(
             [
                 f"- `{path.path_id}` — `{path.status}` — {' → '.join(path.nodes)}",

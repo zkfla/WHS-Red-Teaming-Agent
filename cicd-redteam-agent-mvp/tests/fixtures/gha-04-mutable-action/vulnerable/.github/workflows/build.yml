@@ -1,7 +1,7 @@
 name: Mutable action build
 on: push
 permissions:
-  contents: read
+  contents: write
 jobs:
   build:
     runs-on: ubuntu-latest

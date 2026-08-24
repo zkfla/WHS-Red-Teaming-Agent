@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -10,6 +9,7 @@ from hackingBuddyGPT.utils.llm import LiteLLM
 from hackingBuddyGPT.utils.logging import JsonlLogger
 
 from cicd_redteam_agent.domain.models import AnalysisState, ReportStatus
+from cicd_redteam_agent.framework.auth import ModelProvider, resolve_litellm_credential
 from cicd_redteam_agent.framework.capabilities import CapabilityContext, build_capabilities
 from cicd_redteam_agent.framework.cicd_agent import CICDChatAgent
 from cicd_redteam_agent.framework.cicd_usecase import CICDUseCase
@@ -27,17 +27,7 @@ class AgentRunResult:
     cost: float
     warnings: list[str]
     trace_path: Path | None = None
-
-
-def _api_key() -> str:
-    names = (
-        "LITELLM_API_KEY",
-        "OPENAI_API_KEY",
-        "ANTHROPIC_API_KEY",
-        "OPENROUTER_API_KEY",
-        "GEMINI_API_KEY",
-    )
-    return next((os.environ[name] for name in names if os.environ.get(name)), "")
+    provider: str | None = None
 
 
 async def run_agent_analysis(
@@ -52,37 +42,61 @@ async def run_agent_analysis(
         max_cost=config.max_cost,
         max_duration=config.max_duration,
     )
-    llm = LiteLLM(
-        api_key=_api_key(),
-        model=config.model,
-        context_size=min(config.max_tokens, 128_000),
-    )
+    if config.provider is ModelProvider.CODEX_CHATGPT:
+        from cicd_redteam_agent.framework.codex_llm import CodexChatGPTLLM
+
+        llm = CodexChatGPTLLM(
+            model=config.model,
+            context_size=min(config.max_tokens, 128_000),
+        )
+        provider = "codex-chatgpt"
+    else:
+        credential = resolve_litellm_credential(
+            config.provider,
+            config.model,
+            env_file=config.env_file,
+            untrusted_repository_root=boundary.root,
+        )
+        llm = LiteLLM(
+            api_key=credential.api_key,
+            model=config.model,
+            context_size=min(config.max_tokens, 128_000),
+        )
+        provider = credential.provider.value
     llm.init()
-    context = CapabilityContext(state=state, boundary=boundary)
-    prompt_path = Path(__file__).parents[1] / "prompts" / "cicd_security.md"
-    prompt = prompt_path.read_text(encoding="utf-8")
-    agent = CICDChatAgent(log=logger, llm=llm, prompt=prompt)
-    agent._capabilities = build_capabilities(context)
-    await agent.init()
-    await logger.start_run(
-        "cicd-redteam-analysis",
-        (
-            f"model={config.model}; framework_commit={FRAMEWORK_COMMIT}; "
-            f"repository={state.repository.repository_id}"
-        ),
-    )
-    usecase = CICDUseCase(agent=agent, context=context, limits=limits)
-    reason = await usecase.run()
-    status = ReportStatus.COMPLETE if reason == "proposal_validated" else ReportStatus.PARTIAL
-    # Adapter deliberately avoids JsonlLogger.run_was_success(), whose generic state is "got root".
-    logger._finish_run("OK" if status is ReportStatus.COMPLETE else "ERROR", reason)
-    trace_path = Path(logger._writer.path) if logger._writer and logger._writer.path else None
-    return AgentRunResult(
-        status=status,
-        reason=reason,
-        rounds=limits.rounds,
-        tokens=limits.tokens,
-        cost=limits.cost,
-        warnings=usecase.warnings,
-        trace_path=trace_path,
-    )
+    try:
+        context = CapabilityContext(state=state, boundary=boundary)
+        prompt_path = Path(__file__).parents[1] / "prompts" / "cicd_security.md"
+        prompt = prompt_path.read_text(encoding="utf-8")
+        agent = CICDChatAgent(log=logger, llm=llm, prompt=prompt)
+        agent._capabilities = build_capabilities(context)
+        await agent.init()
+        await logger.start_run(
+            "cicd-redteam-analysis",
+            (
+                f"model={config.model}; framework_commit={FRAMEWORK_COMMIT}; "
+                f"repository={state.repository.repository_id}"
+            ),
+        )
+        usecase = CICDUseCase(agent=agent, context=context, limits=limits)
+        reason = await usecase.run()
+        status = (
+            ReportStatus.COMPLETE if reason == "proposal_validated" else ReportStatus.PARTIAL
+        )
+        # Avoid JsonlLogger.run_was_success(), whose generic state is "got root".
+        logger._finish_run("OK" if status is ReportStatus.COMPLETE else "ERROR", reason)
+        trace_path = Path(logger._writer.path) if logger._writer and logger._writer.path else None
+        return AgentRunResult(
+            status=status,
+            reason=reason,
+            rounds=limits.rounds,
+            tokens=limits.tokens,
+            cost=limits.cost,
+            warnings=usecase.warnings,
+            trace_path=trace_path,
+            provider=provider,
+        )
+    finally:
+        close = getattr(llm, "close", None)
+        if close is not None:
+            close()

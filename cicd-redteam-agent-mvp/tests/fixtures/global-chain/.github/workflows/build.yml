@@ -1,0 +1,13 @@
+name: PR build
+on:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/upload-artifact@0123456789abcdef0123456789abcdef01234567
+        with:
+          name: deployment
+          path: dist
