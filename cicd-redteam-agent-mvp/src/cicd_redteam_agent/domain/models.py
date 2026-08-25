@@ -73,6 +73,7 @@ class SecretReference(SchemaModel):
 
 class Step(SchemaModel):
     step_id: str
+    step_key: str | None = None
     name: str | None = None
     uses: str | None = None
     run: str | None = None
@@ -89,6 +90,8 @@ class Job(SchemaModel):
     with_: dict[str, Any] = Field(default_factory=dict, alias="with")
     needs: list[str] = Field(default_factory=list)
     condition: str | None = None
+    runs_on: str | list[str] | dict[str, Any] | None = None
+    container: str | dict[str, Any] | None = None
     permissions_declared: dict[str, str] | str | None = None
     permissions_effective: dict[str, str] | str | None = None
     permissions_source: Literal["job", "workflow", "repository-default-unknown"]
@@ -112,7 +115,12 @@ class Relation(SchemaModel):
     source_id: str
     relation_type: str
     target_id: str
+    category: Literal[
+        "source", "transform", "execution", "credential", "guard", "context"
+    ] | None = None
+    verdict: TriState = TriState.TRUE
     evidence_ids: list[str] = Field(default_factory=list)
+    missing_evidence: list[str] = Field(default_factory=list)
 
 
 class ControlAssessment(SchemaModel):
@@ -159,6 +167,7 @@ class CloudIdentityCandidate(SchemaModel):
     repository_id: str
     workflow_id: str
     job_id: str
+    identity_reference: str | None = None
     role_arn: str | None = None
     secret_reference_ids: list[str] = Field(default_factory=list)
     oidc_enabled: TriState

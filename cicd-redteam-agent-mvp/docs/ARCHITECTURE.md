@@ -8,6 +8,7 @@ CLI
 -> GitHub Actions parser
 -> Evidence and local Relation extraction
 -> attacker-control and identity assessment
+-> reusable security fact graph
 -> deterministic scenario rules
 -> global AttackPath composition
 -> optional hackingBuddyGPT Agent loop
@@ -43,6 +44,22 @@ workflow, job, step, artifact, file and identity identifiers remain repository-s
 An edge is `SUPPORTED` only when its Evidence exists locally. An uncertain control assessment or
 external trust assumption keeps the composed path `CANDIDATE` and records `missing_evidence`.
 `CONFIRMED` is forbidden because no workflow or exploit is executed.
+
+## Security fact graph and LLM reasoning
+
+The deterministic fact layer emits reusable `source`, `transform`, `execution`, `credential`,
+`guard` and `context` relations. These relations describe observable repository facts; they do not
+emit a vulnerability Finding. Examples include an untrusted event value flowing through an
+environment variable or step output, repository code executing in a local action, and a step being
+able to use a specific write-capable token permission.
+
+`ListSecurityFacts` exposes these relations with Evidence, a tri-state verdict and any missing
+evidence. The Agent may compose only returned relations into a proposed path. The validator rejects
+invented relations, omitted relation Evidence and a `SUPPORTED` path containing an `UNKNOWN` or
+`FALSE` relation. GHA fixture IDs remain evaluation labels rather than product rule identifiers.
+
+Legacy deterministic scenario rules remain available for regression compatibility while new
+inference scenarios are implemented on the reusable fact graph.
 
 ## Responsibility boundaries
 

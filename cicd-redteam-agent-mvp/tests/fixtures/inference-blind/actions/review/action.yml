@@ -1,0 +1,6 @@
+name: Review
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: ./actions/review/review.sh

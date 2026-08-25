@@ -21,6 +21,7 @@ from cicd_redteam_agent.domain.models import (
 )
 from cicd_redteam_agent.domain.reference_tracer import trace_local_references
 from cicd_redteam_agent.domain.scenario_rules import derive_additional_scenario_results
+from cicd_redteam_agent.domain.security_facts import derive_security_facts
 from cicd_redteam_agent.framework.auth import ModelProvider
 from cicd_redteam_agent.security.redaction import redact
 from cicd_redteam_agent.security.repository_boundary import RepositoryBoundary
@@ -112,6 +113,15 @@ async def analyze_repository(
         state.evidence.update(reference_evidence)
         warnings.extend(reference_warnings)
         state.assessments = assess_attacker_control(state, config.attacker_profile)
+        security_facts = derive_security_facts(state, config.attacker_profile)
+        state.relations.extend(security_facts)
+        state.pending_questions = sorted(
+            {
+                item
+                for relation in security_facts
+                for item in relation.missing_evidence
+            }
+        )
         state.findings, state.paths = derive_attack_paths(state)
         additional_findings, additional_paths = derive_additional_scenario_results(state)
         state.findings.extend(additional_findings)

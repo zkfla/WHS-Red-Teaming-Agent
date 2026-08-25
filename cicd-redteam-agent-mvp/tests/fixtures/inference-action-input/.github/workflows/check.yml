@@ -1,0 +1,16 @@
+name: Action input inference
+on: pull_request_target
+permissions:
+  contents: write
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout pull request revision
+        uses: actions/checkout@1111111111111111111111111111111111111111
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+      - name: Interpret pull request title
+        uses: actions/github-script@2222222222222222222222222222222222222222
+        with:
+          script: console.log(`${{ github.event.pull_request.title }}`)

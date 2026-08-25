@@ -56,6 +56,7 @@ def derive_identity_candidates(state: AnalysisState) -> list[CloudIdentityCandid
                         repository_id=state.repository.repository_id,
                         workflow_id=workflow.workflow_id,
                         job_id=job.job_id,
+                        identity_reference=str(role_arn) if role_arn else None,
                         role_arn=str(role_arn) if role_arn else None,
                         secret_reference_ids=secret_by_job.get(job.job_id, []),
                         oidc_enabled=TriState.TRUE if oidc else TriState.UNKNOWN,

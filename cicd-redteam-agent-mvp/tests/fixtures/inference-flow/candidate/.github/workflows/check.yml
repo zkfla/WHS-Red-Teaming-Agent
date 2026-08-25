@@ -1,0 +1,10 @@
+name: Inference flow candidate
+on: workflow_dispatch
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Interpret caller input
+        env:
+          COMMAND: ${{ inputs.command }}
+        run: bash -c "$COMMAND"

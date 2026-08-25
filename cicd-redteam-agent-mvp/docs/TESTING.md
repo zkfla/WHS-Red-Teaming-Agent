@@ -20,6 +20,10 @@
 - broad `GITHUB_TOKEN` permissions
 - secure counterparts must not produce their scenario Finding
 - composed path must reach a credential or cloud identity only through validated edges
+- inference-flow fixtures cover SUPPORTED, CANDIDATE/UNKNOWN and secure guard variants
+- env and step-output value flow reaches a command interpreter and granular token permission
+- a blind local-action fixture is represented through generic source, execution and credential facts
+- proposed paths with invented relations or unresolved UNKNOWN facts are rejected
 
 ## Agent and failure coverage
 

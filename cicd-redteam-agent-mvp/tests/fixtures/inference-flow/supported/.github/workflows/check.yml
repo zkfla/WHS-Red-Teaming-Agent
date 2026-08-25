@@ -1,0 +1,16 @@
+name: Inference flow supported
+on: pull_request
+permissions:
+  contents: write
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - id: capture
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: echo "payload=${PR_TITLE}" >> "$GITHUB_OUTPUT"
+      - name: Interpret propagated value
+        env:
+          PAYLOAD: ${{ steps.capture.outputs.payload }}
+        run: bash -c "$PAYLOAD"

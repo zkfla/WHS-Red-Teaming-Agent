@@ -210,6 +210,19 @@ def parse_workflow(boundary: RepositoryBoundary, relative_path: str) -> Workflow
         )
         evidence[job_ev.evidence_id] = job_ev
         job_evidence_ids = [job_ev.evidence_id]
+        for field_name in ("uses", "with", "if", "environment", "runs-on", "container"):
+            if raw_job.get(field_name) is None:
+                continue
+            field_line = _mapping_key_line(raw_job, field_name, job_line)
+            field_ev = _evidence(
+                relative_path,
+                field_name,
+                f"jobs.{raw_job_id}.{field_name}",
+                text.splitlines()[field_line - 1],
+                field_line,
+            )
+            evidence[field_ev.evidence_id] = field_ev
+            job_evidence_ids.append(field_ev.evidence_id)
         declared = _normalize_permissions(raw_job.get("permissions"))
         if declared is not None:
             permission_line = _mapping_key_line(raw_job, "permissions", job_line)
@@ -303,6 +316,11 @@ def parse_workflow(boundary: RepositoryBoundary, relative_path: str) -> Workflow
             with_values = {key: _redacted_plain(value) for key, value in raw_with.items()}
             step = Step(
                 step_id=step_id,
+                step_key=(
+                    str(raw_step["id"])
+                    if raw_step.get("id") is not None
+                    else None
+                ),
                 name=redact(str(raw_step["name"])) if raw_step.get("name") is not None else None,
                 uses=uses,
                 run=run,
@@ -335,6 +353,8 @@ def parse_workflow(boundary: RepositoryBoundary, relative_path: str) -> Workflow
                 **{"with": {str(k): _plain(v) for k, v in (raw_job.get("with") or {}).items()}},
                 needs=needs,
                 condition=redact(str(raw_job["if"])) if raw_job.get("if") is not None else None,
+                runs_on=_redacted_plain(raw_job.get("runs-on")),
+                container=_redacted_plain(raw_job.get("container")),
                 permissions_declared=declared,
                 permissions_effective=effective,
                 permissions_source=source,

@@ -32,7 +32,10 @@ because the SDK does not report per-run currency cost.
 
 - Findings, paths and identities may reference only Evidence already present in `AnalysisState`.
 - Every AttackPath node must exist in the state graph.
-- Edges must connect consecutive ordered nodes and carry known Evidence.
+- Edges must connect consecutive ordered nodes, match an extracted Relation and carry that
+  Relation's Evidence.
+- `SUPPORTED` paths cannot contain `UNKNOWN` or `FALSE` relations or non-empty missing evidence.
+- Candidate paths must preserve the missing evidence declared by uncertain relations.
 - Static paths cannot be `CONFIRMED`.
 - Duplicate IDs are rejected, including collisions with existing state.
 - A rejected proposal does not mutate state.
@@ -58,3 +61,7 @@ Codex receives no direct repository path or repository tool. In an isolated temp
 with read-only sandbox, approval denial, plugins disabled and configured MCP servers disabled, it
 selects one registered Capability per round. Only hackingBuddyGPT executes the Capability, and
 `submit_analysis` uses the existing deterministic proposal validator.
+
+The Agent can inspect the reusable security fact graph through `ListSecurityFacts`. Fact categories
+are `source`, `transform`, `execution`, `credential`, `guard` and `context`; optional filters cannot
+change graph state.

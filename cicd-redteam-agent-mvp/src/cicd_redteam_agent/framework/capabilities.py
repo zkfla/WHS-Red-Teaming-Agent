@@ -52,6 +52,61 @@ class ListWorkflows(Capability):
         return json.dumps({"workflows": payload})
 
 
+class ListSecurityFacts(Capability):
+    def __init__(self, context: CapabilityContext) -> None:
+        self.context = context
+
+    def describe(self) -> str:
+        return (
+            "List deterministic source, transform, execution, credential, guard and context "
+            "relations. Filters are optional. These are facts, not vulnerability conclusions."
+        )
+
+    async def __call__(
+        self, category: str | None = None, verdict: str | None = None
+    ) -> str:
+        arguments = {"category": category, "verdict": verdict}
+        self.context.record_call(self.get_name(), arguments)
+        allowed_categories = {
+            "source",
+            "transform",
+            "execution",
+            "credential",
+            "guard",
+            "context",
+        }
+        allowed_verdicts = {"TRUE", "FALSE", "UNKNOWN"}
+        if category is not None and category not in allowed_categories:
+            return json.dumps(
+                {"error": "invalid_category", "allowed": sorted(allowed_categories)}
+            )
+        if verdict is not None and verdict not in allowed_verdicts:
+            return json.dumps(
+                {"error": "invalid_verdict", "allowed": sorted(allowed_verdicts)}
+            )
+        facts = [
+            item
+            for item in self.context.state.relations
+            if item.category is not None
+            and (category is None or item.category == category)
+            and (verdict is None or item.verdict.value == verdict)
+        ]
+        counts: dict[str, int] = {}
+        for item in facts:
+            key = item.category or "uncategorized"
+            counts[key] = counts.get(key, 0) + 1
+        return json.dumps(
+            {
+                "facts": [item.model_dump(mode="json") for item in facts],
+                "counts": counts,
+                "guidance": (
+                    "Compose only returned relations into paths. UNKNOWN relations require a "
+                    "CANDIDATE or REJECTED path and their missing_evidence must be preserved."
+                ),
+            }
+        )
+
+
 class GetWorkflowFacts(Capability):
     def __init__(self, context: CapabilityContext) -> None:
         self.context = context
@@ -211,6 +266,7 @@ class SubmitAnalysis(Capability):
 def build_capabilities(context: CapabilityContext) -> dict[str, Capability]:
     capabilities = [
         ListWorkflows(context),
+        ListSecurityFacts(context),
         GetWorkflowFacts(context),
         InspectRepositoryFile(context),
         SearchRepository(context),

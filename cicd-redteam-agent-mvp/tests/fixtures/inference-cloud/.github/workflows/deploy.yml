@@ -1,0 +1,21 @@
+name: Multi-cloud identity inference
+on: pull_request
+permissions:
+  contents: read
+  id-token: write
+jobs:
+  gcp:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: google-github-actions/auth@1111111111111111111111111111111111111111
+        with:
+          workload_identity_provider: projects/123/locations/global/workloadIdentityPools/ci/providers/github
+          service_account: deploy@example.iam.gserviceaccount.com
+  azure:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: azure/login@2222222222222222222222222222222222222222
+        with:
+          client-id: 00000000-0000-0000-0000-000000000001
+          tenant-id: 00000000-0000-0000-0000-000000000002
+          subscription-id: 00000000-0000-0000-0000-000000000003

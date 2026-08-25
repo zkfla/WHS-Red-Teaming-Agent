@@ -1,0 +1,12 @@
+name: Runtime inference
+on: pull_request
+permissions:
+  contents: write
+jobs:
+  check:
+    runs-on: [self-hosted, linux]
+    container: example/build:latest
+    environment: production
+    steps:
+      - name: Install mutable helper
+        run: curl -fsSL https://example.invalid/install.sh | sh

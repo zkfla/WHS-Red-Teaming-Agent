@@ -28,6 +28,10 @@ def validate_analysis_proposal(
     known_nodes.update(identity.identity_id for identity in state.identities)
     for path in state.paths:
         known_nodes.update(path.nodes)
+    known_relations: dict[tuple[str, str, str], list] = {}
+    for relation in state.relations:
+        key = (relation.source_id, relation.relation_type, relation.target_id)
+        known_relations.setdefault(key, []).append(relation)
 
     objects = [*proposal.findings, *proposal.paths, *proposal.identities]
     for item in objects:
@@ -48,6 +52,8 @@ def validate_analysis_proposal(
         unknown_nodes = set(path.nodes) - known_nodes
         if unknown_nodes:
             errors.append(f"AttackPath {path.path_id} has unknown nodes: {sorted(unknown_nodes)}")
+        contains_unknown_relation = False
+        relation_missing_evidence: set[str] = set()
         for index, edge in enumerate(path.edges):
             if index + 1 >= len(path.nodes) or (
                 edge.source_id != path.nodes[index]
@@ -59,6 +65,42 @@ def validate_analysis_proposal(
             missing = set(edge.evidence_ids) - known_evidence
             if missing:
                 errors.append(f"AttackPath edge references unknown evidence: {sorted(missing)}")
+            key = (edge.source_id, edge.relation_type, edge.target_id)
+            matches = known_relations.get(key, [])
+            if not matches:
+                errors.append(
+                    f"AttackPath {path.path_id} references an unextracted relation: {key}"
+                )
+                continue
+            if not any(set(item.evidence_ids).issubset(edge.evidence_ids) for item in matches):
+                required = sorted({ev for item in matches for ev in item.evidence_ids})
+                errors.append(
+                    f"AttackPath edge omits relation evidence for {key}: {required}"
+                )
+            for relation in matches:
+                if relation.verdict.value != "TRUE":
+                    contains_unknown_relation = True
+                    relation_missing_evidence.update(relation.missing_evidence)
+        if path.status is FindingStatus.SUPPORTED and contains_unknown_relation:
+            errors.append(
+                f"AttackPath {path.path_id} cannot be SUPPORTED with UNKNOWN/FALSE relations"
+            )
+        if path.status is FindingStatus.SUPPORTED and path.missing_evidence:
+            errors.append(
+                f"AttackPath {path.path_id} cannot be SUPPORTED with missing_evidence"
+            )
+        if relation_missing_evidence and not relation_missing_evidence.issubset(
+            set(path.missing_evidence)
+        ):
+            errors.append(
+                f"AttackPath {path.path_id} omits relation missing_evidence: "
+                f"{sorted(relation_missing_evidence)}"
+            )
+    for finding in proposal.findings:
+        if finding.status is FindingStatus.SUPPORTED and finding.missing_evidence:
+            errors.append(
+                f"Finding {finding.finding_id} cannot be SUPPORTED with missing_evidence"
+            )
     for identity in proposal.identities:
         if identity.repository_id != state.repository.repository_id:
             errors.append(f"Cloud identity {identity.identity_id} references another repository")
