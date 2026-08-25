@@ -1,0 +1,205 @@
+# targets/configs/vulnbank.yaml
+#
+# 사람이 vuln-bank를 직접 공격해서 확인한 값만 기록한다 (instruction.md §20-1).
+# 에이전트 코드는 이 파일을 읽을 뿐, vuln-bank 소스코드를 직접 읽지 않는다.
+#
+# 대상 리포지토리: https://github.com/Commando-X/vuln-bank (docker-compose, Flask + Postgres)
+# 로컬 체크아웃: ../vulnbank-target  (에이전트 패키지 밖, 사람이 조사용으로만 clone)
+# 확인일: 2026-08-25
+#
+# ── 로컬 실행 시 주의 ──────────────────────────────────────────────
+# Windows에서 git clone 하면 start.sh 가 CRLF로 체크아웃되어 컨테이너가
+# "exec ./start.sh: no such file or directory" 로 즉시 크래시한다.
+# 재기동 전 1회: `sed -i 's/\r$//' vulnbank-target/start.sh` 후 `docker compose up -d --build`.
+# ────────────────────────────────────────────────────────────────
+
+adapter:
+  name: vulnbank
+  base_url: http://localhost:5000
+  default_currency: {code: USD, minor_unit: 2}
+  # 계좌 잔액(users.balance)에는 통화 필드가 없다 — 실질적으로 단일 통화(USD)다.
+  # 가상카드(virtual_cards)만 카드별로 통화가 다르다 (currency 컬럼, 아래 card_currencies 참고).
+
+  auth:
+    register:
+      method: POST
+      path: /register
+      content_type: application/json
+      fields: {username: username, password: password}
+      # 응답 실측 (POST /register):
+      # {"status":"success","message":"...",
+      #  "debug_data":{"user_id":2,"username":"...","account_number":"7946213593",
+      #                "balance":1000.0,"is_admin":false, ...}}
+      account_number_path: "$.debug_data.account_number"
+      initial_balance_path: "$.debug_data.balance"
+      note: >
+        Mass Assignment 취약점 — username/password 외 임의 필드를 함께 보내면
+        그대로 INSERT 된다 (예: is_admin=true 시도 가능). 부트스트랩 시 에이전트는
+        정상 필드만 보내 계정을 만든다 — 이 취약점 자체는 별도 Candidate(F1 인접)로
+        recon 단계 이후 시험 대상이지 부트스트랩 절차가 아니다.
+
+    login:
+      method: POST
+      path: /login
+      content_type: application/json
+      fields: {username: username, password: password}
+      # 응답 실측 (POST /login):
+      # {"status":"success","token":"<JWT>","accountNumber":"7946213593","isAdmin":false,
+      #  "debug_info":{"user_id":2,"username":"...","account_number":"...","is_admin":false, ...}}
+      token_path: "$.token"
+      account_number_path: "$.accountNumber"
+    token_header: "Authorization: Bearer {token}"
+    note: >
+      토큰은 Authorization 헤더 외에 ?token=, form field 'token', cookie 'token' 으로도
+      수락된다(의도된 취약점). 에이전트의 정상 세션 관리(probing/session.py)는
+      헤더 방식만 사용한다 — 나머지 경로는 시험 대상이지 정상 흐름이 아니다.
+      JWT는 HS256 고정 비밀키(하드코딩) + alg 'none' 허용 + exp 클레임 없음
+      → Generic Layer JWT 공격(oracles/generic.py JWT 판정)의 실제 대상.
+
+  observation:                                     # state_probe 용 읽기 전용
+    balance:
+      method: GET
+      path: "/check_balance/{account_number}"
+      auth_required: false                         # ★ BOLA — 인증 없이 타 계좌도 조회됨
+      value_path: "$.balance"
+      owner_username_path: "$.username"
+      note: >
+        정상 관측 채널로는 "자기 계좌번호로 호출"만 쓴다. 인증 없이 타 계좌를 조회하는
+        행위 자체가 F1/BOLA 후보이지 observation 용도가 아니다 — recon/entitlement.py는
+        이 엔드포인트를 관측에 쓰되, entitled_read 판단에는 쓰지 않는다(§5).
+    transactions:
+      method: GET
+      path: "/transactions/{account_number}"
+      auth_required: false                         # ★ 여기도 BOLA
+      id_path: "$.transactions[*].id"
+      amount_path: "$.transactions[*].amount"
+      from_path: "$.transactions[*].from_account"
+      to_path: "$.transactions[*].to_account"
+    cards:
+      method: GET
+      path: /api/virtual-cards
+      auth_required: true
+      id_path: "$.cards[*].id"
+      balance_path: "$.cards[*].balance"
+      limit_path: "$.cards[*].limit"
+      currency_path: "$.cards[*].currency"
+      card_number_path: "$.cards[*].card_number"   # 카드 원문(PAN) 노출 — evidence.py가 반드시 redact
+
+  entitlement:                                     # ★ 정상 권한 확정용
+    self_created:
+      - register            # 회원가입으로 만든 자기 계좌 → entitled_own(account)
+      - virtual_card_create  # POST /api/virtual-cards/create → entitled_own(card)
+    owner_field: null
+    # 응답에 principal id와 직접 대조 가능한 owner_id 필드가 없다(계좌는 account_number로만
+    # 식별). explicit_owner_field 규칙은 이 타겟에서는 사실상 미사용 — self_created 와
+    # normal_flow 두 경로로 entitlement를 확정한다.
+    normal_flow:
+      - {method: GET, path: /dashboard, auth_required: true, note: "HTML 렌더 — 본인 account_number/balance 포함, entitled_own(account) 보강용"}
+      - {method: GET, path: /api/virtual-cards, auth_required: true, note: "본인 카드 목록 — entitled_own(card) 보강용"}
+      - {method: GET, path: "/api/transactions", auth_required: true, note: "본인 거래내역 — 실제 쿼리 파라미터는 recon 시 확인 필요(§ 미확정)"}
+
+  baseline_ops:                                    # ★ 정상 동작 학습용
+    - op: transfer
+      method: POST
+      path: /transfer
+      auth: bearer
+      normal_params: {amount: 10, to_account: "{victim_account}", description: "baseline"}
+      semantics: "src.balance -= amount; dst.balance += amount"
+      response_new_balance_path: "$.new_balance"
+      # 실측 확인 (10 USD, attacker->victim): attacker 900.0->..., victim +100 반영됨.
+      # 음수 금액(amount=-500) 시 서버 로직이 부호를 그대로 적용해 반전된다:
+      #   if balance >= abs(amount): balance -= amount; recipient += amount
+      #   → amount=-500 이면 sender는 +500, recipient는 -500 (§18 예시와 동일 재현 확인).
+    - op: card_fund
+      method: POST
+      path: "/api/virtual-cards/{card_id}/fund"
+      auth: bearer
+      requires: "카드가 미리 존재해야 함 (virtual_card_create 로 생성)"
+      normal_params: {amount: 10}      # exchange_rate 를 보내지 않아야 "정상" 환율이 적용됨
+      semantics: "user.balance -= amount(USD); card.balance += amount * server_exchange_rate(card_currency)"
+      response_paths:
+        exchange_rate: "$.funding.exchange_rate"
+        converted_amount: "$.funding.converted_amount"
+        usd_amount: "$.funding.usd_amount"
+      # 실측 확인 (GBP 카드, amount=100, exchange_rate 미지정):
+      #   응답 exchange_rate=0.79, converted_amount=79.0 → CARD_CURRENCY_RATES 서버값과 일치.
+      note: >
+        Mass Assignment로 요청 바디의 exchange_rate가 서버 기본값을 덮어쓴다
+        (§6의 "클라이언트 제어 환율" 사례 그 자체). baseline은 exchange_rate 필드를
+        절대 보내지 않고 실행해 서버가 실제로 쓰는 환율을 실측한다 — 에이전트가
+        환율을 계산하지 않는다.
+
+  merchant_payments:                                # F3(멱등성) 시험 대상 — 별도 인증 주체
+    register: {method: POST, path: /api/v1/merchants/register,
+               fields: {name: name, email: email, password: password},
+               token_path: "$.token", api_key_path: "$.api_key"}
+    auth_header_options: ["Authorization: Bearer {token}", "X-Merchant-Api-Key: {api_key}"]
+    charge:
+      method: POST
+      path: /api/v1/payments/charge
+      auth: merchant_bearer
+      fields: {amount: amount, currency: currency, card_number: card_number,
+               cvv: cvv, expiry_date: expiry_date, merchant_order_id: merchant_order_id}
+      logical_txn_id_field: merchant_order_id       # ★ INV-4 판정 기준 필드
+      note: >
+        소스 주석에 "No idempotency, replay protection, amount limits, or
+        transaction locking" 이라고 명시되어 있음 — 동일 merchant_order_id로 복수 호출 시
+        복수 side effect 발생 여부가 F3 핵심 시험.
+
+  field_aliases:
+    account_id: [account_number, to_account, from_account, accountNumber]
+    amount:     [amount, usd_amount]
+    recipient:  [to_account]
+    order_id:   [merchant_order_id]
+    exchange_rate: [exchange_rate]
+
+  card_currencies:                                  # 실측 CARD_CURRENCY_RATES (서버 상수, 사람이 소스에서 확인)
+    USD: {rate: 1.0,      precision: 2}
+    GBP: {rate: 0.79,     precision: 2}
+    NGN: {rate: 1550.0,   precision: 2}
+    JPY: {rate: 149.5,    precision: 2}
+    EUR: {rate: 0.92,     precision: 2}
+    QAR: {rate: 3.64,     precision: 2}
+    BTC: {rate: 0.000014, precision: 8}
+    ETH: {rate: 0.0004,   precision: 8}
+    # ★ 주의: 에이전트는 이 표를 "정답"으로 오라클 판정에 쓰지 않는다(§6 위반).
+    # 이 표는 사람이 baseline_ops.card_fund 를 설계하기 위해 참고한 값일 뿐이고,
+    # 실제 판정 기준은 baseline.learn()이 실측한 exchange_rate 이다.
+
+  discovery:
+    openapi: null           # GET /apispec.json → 404 (OpenAPI 스펙 미제공, 실측 확인)
+    graphql: /graphql       # GET/POST 200 확인. 스키마는 recon 단계에서 introspection으로 확인
+    api_docs: /api/docs     # Swagger UI HTML 200 (원시 스펙 파일 경로는 아직 미확인)
+    seed_paths:
+      - /register
+      - /login
+      - /dashboard
+      - /check_balance
+      - /transfer
+      - /transactions
+      - /api/transactions
+      - /api/virtual-cards
+      - /api/virtual-cards/create
+      - /api/bill-categories
+      - /api/billers/by-category
+      - /api/bill-payments/create
+      - /api/bill-payments/history
+      - /api/v1/merchants/register
+      - /api/v1/merchants/login
+      - /api/v1/payments/charge
+      - /request_loan
+      - /forgot-password
+      - /reset-password
+      - /api/v1/forgot-password
+      - /api/v2/forgot-password
+      - /api/v3/forgot-password
+      - /api/v3/user
+      - /internal/secret
+      - /internal/config.json
+
+settings:
+  principals: [attacker_A, victim_V, merchant_M]
+  initial_balance: "1000.00"     # USD, /register 응답 debug_data.balance 로 실측 확인 (★ 문자열로 — YAML float 경유 금지)
+  layers: [generic, finance]
+  profile: sandbox
+  llm: {provider: anthropic, model: claude-sonnet-4-6}

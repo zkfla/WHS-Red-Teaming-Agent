@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# 대상 애플리케이션(vuln-bank) 클론 — 우리 프로젝트 코드가 아님, 사람이 recon용으로 clone
+vulnbank-target/
+
+# 실행 결과물 (에이전트 실행마다 생성되는 증거·매니페스트)
+runs/
+
+.env

@@ -1,0 +1,126 @@
+# templates/attacks.yaml — 개념만. 실행 절차 금지 (§11).
+#
+# procedure/payload/endpoint/steps 필드를 넣지 않는다 — 그 순간 이 파일을 순회
+# 실행하는 룰셋 엔진이 되어 에이전트가 스캐너로 퇴화한다. `agent_must_determine`
+# 은 실제로 planning/prompts.py 를 거쳐 LLM 프롬프트에 들어간다.
+
+- id: F1
+  layer: finance
+  name: 권한 경계 위반 (BOLA/IDOR)
+  concept: |
+    한 주체가 자신에게 귀속되지 않은 계좌·거래·카드 등 금융 객체에 접근하거나
+    조작한다. 취약점은 "접근이 됐다"는 사실이 아니라, 그 접근이 정상 경로에서
+    확정된 entitlement 없이 통했다는 데 있다.
+  oracle: [INV-2]
+  requires_baseline: false
+  preconditions:
+    - 객체 식별자(계좌번호 등)로 접근하는 엔드포인트가 존재
+    - 최소 2명의 주체와 그들 각각의 entitled_own 객체가 확정되어 있음
+  agent_must_determine:
+    - 어떤 엔드포인트가 식별자 기반으로 금융 객체를 반환/조작하는가
+    - 다른 주체의 식별자를 어떻게 알아내거나 추측할 것인가
+    - 어느 주체로 시도할 것인가
+  severity_if_violated: HIGH
+
+- id: F2
+  layer: finance
+  name: 금액 무결성 위반
+  concept: |
+    요청이 의도한 가치 이동 방향·금액과 실제 상태 변화가 일치하지 않는다.
+    음수 금액, 정밀도 남용, 클라이언트 제어 환율 등이 원인이 될 수 있다.
+  oracle: [INV-1B, INV-6]
+  requires_baseline: true
+  preconditions:
+    - 가치를 이동시키는 엔드포인트가 존재
+    - 최소 2개 주체의 잔액을 관측 가능
+  agent_must_determine:
+    - 어떤 엔드포인트가 가치를 이동시키는가
+    - 금액 필드가 무엇인가
+    - 어떤 값을 시도할 것인가 (부호·정밀도·환율 필드 등)
+    - 어느 주체로 실행할 것인가
+  severity_if_violated: HIGH
+
+- id: F3
+  layer: finance
+  name: 멱등성 위반 (중복 처리)
+  concept: |
+    동일한 논리 거래(같은 주문/결제 식별자)를 여러 번 시도했을 때, 서버가 이를
+    구분하지 못하고 side effect(차감/적립)를 여러 번 발생시킨다. 페이로드가
+    같아도 논리 식별자가 다르면 정상이다 — 식별자를 고정한 채 반복하는 것이 핵심.
+  oracle: [INV-4]
+  requires_baseline: true
+  preconditions:
+    - 논리 거래 식별자를 클라이언트가 지정하거나 서버가 반환하는 엔드포인트가 존재
+    - 단일 처리의 기대 델타를 baseline 으로 실측 가능
+  agent_must_determine:
+    - 논리 거래 식별자 필드가 무엇인가
+    - 동일 식별자로 몇 번, 어떤 간격으로 반복할 것인가 (상한 있음)
+  severity_if_violated: MEDIUM
+
+- id: F4
+  layer: finance
+  name: 잔액 경쟁 조건
+  concept: |
+    동시 요청 시 잔액 검사와 차감 사이의 시간차로 초과 인출이 발생한다.
+    확률적으로만 재현되므로 반복 시행이 필요하다.
+  oracle: [INV-1C]
+  requires_baseline: true
+  preconditions:
+    - 잔액을 차감하는 엔드포인트가 존재
+    - 현재 잔액 < 단위금액 × 동시요청수 (아니면 시험 자체가 무의미)
+  agent_must_determine:
+    - 어떤 엔드포인트가 잔액을 차감하는가
+    - 단위 금액을 얼마로 할 것인가
+    - 동시 요청 수 (상한 10)
+  severity_if_violated: HIGH
+
+- id: F8
+  layer: finance
+  name: 식별자 예측·열거를 통한 정보 노출
+  concept: |
+    계좌번호·거래ID 등 식별자가 예측 가능하거나 순차적이어서, 남용 통제 없이
+    타 주체의 정보를 열거할 수 있다. 식별자 예측가능성 하나만으로는 취약점이
+    아니다 — 권한 경계 부재 및 남용통제 부재와 함께일 때만 성립한다.
+  oracle: [INV-9, INV-2]
+  requires_baseline: false
+  preconditions:
+    - 식별자 기반 조회 엔드포인트가 존재
+    - 최소 몇 개의 실제 식별자 샘플을 확보 가능 (열거 상한 내)
+  agent_must_determine:
+    - 식별자에 예측 가능한 패턴이 있는가
+    - 그 패턴으로 접근했을 때 entitlement 없는 객체가 실제로 반환되는가
+  severity_if_violated: MEDIUM
+
+- id: G-SQLI
+  layer: generic
+  name: SQL Injection
+  concept: 사용자 입력이 SQL 쿼리에 삽입되어 쿼리 구조가 변경된다.
+  detection: [error_signature, boolean_differential, time_delay]
+  agent_must_determine:
+    - 어떤 파라미터가 DB 질의에 도달하는가
+    - 어떤 탐지 방식이 이 대상에 적합한가
+  severity_if_violated: CRITICAL
+
+- id: G-BOLA
+  layer: generic
+  name: Broken Object Level Authorization
+  concept: |
+    API가 객체 식별자만으로 접근을 허용하고, 요청 주체가 그 객체의 소유자인지
+    확인하지 않는다.
+  detection: [cross_principal_object_return]
+  agent_must_determine:
+    - 어떤 엔드포인트가 식별자로 객체를 반환하는가
+    - 타 주체의 식별자를 어떻게 확보할 것인가
+  severity_if_violated: HIGH
+
+- id: G-JWT
+  layer: generic
+  name: JWT 서명/알고리즘 취약점
+  concept: |
+    JWT 서명 검증이 우회 가능하거나(alg=none), 서명 키가 약하거나, 만료
+    검증이 없다.
+  detection: [alg_none_accepted, weak_secret_bruteforce, no_exp_claim]
+  agent_must_determine:
+    - 토큰 발급/검증 엔드포인트가 어디인가
+    - 어떤 변조를 시도할 것인가
+  severity_if_violated: CRITICAL
