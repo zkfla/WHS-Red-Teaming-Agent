@@ -7,7 +7,7 @@ from typing import TypeVar
 from pydantic import BaseModel
 
 from finredteam.config import LLMConfig
-from finredteam.llm.base import LLMClient, Usage
+from finredteam.llm.base import LLMClient, LLMTraceHook, Usage
 
 SchemaT = TypeVar("SchemaT", bound=BaseModel)
 
@@ -47,24 +47,40 @@ class _PricedLLMClient:
         )
 
 
-def build_llm_client(cfg: LLMConfig) -> LLMClient:
-    """벤더 SDK import 는 이 함수 내부(및 llm/anthropic_.py, llm/openai_.py)로 국한한다."""
+def build_llm_client(
+    cfg: LLMConfig, trace_hook: LLMTraceHook | None = None, api_key: str | None = None
+) -> LLMClient:
+    """설정 → LLMClient. 벤더 SDK import 는 이 함수 내부(및 llm/anthropic_.py,
+    llm/openai_.py)로 국한한다.
+
+    `trace_hook`: 호출 시작/각 시도의 원문 응답/종료를 알리는 콜백 — 벤더
+    클라이언트 내부(§ DEBUGGING.md)에서 직접 호출된다. 사람이 디버깅할 때만
+    쓰라고 있는 것이지, 판정 파이프라인에 다시 흘러들어가면 안 된다.
+
+    `api_key`: 명시적으로 주어지면 이걸 쓰고, 없으면 환경변수를 읽는다
+    (`credentials.py::resolve_api_key` 가 대화형 선택/입력까지 포함해 이 값을
+    만들어 넘긴다).
+    """
     if cfg.provider == "anthropic":
         from finredteam.llm.anthropic_ import AnthropicClient
 
-        api_key = os.environ.get("ANTHROPIC_API_KEY")
-        if not api_key:
+        key = api_key or os.environ.get("ANTHROPIC_API_KEY")
+        if not key:
             raise RuntimeError("ANTHROPIC_API_KEY 환경변수가 설정되어 있지 않다")
-        inner = AnthropicClient(model=cfg.model, api_key=api_key, max_tokens=cfg.max_tokens)
+        inner = AnthropicClient(
+            model=cfg.model, api_key=key, max_tokens=cfg.max_tokens, trace_hook=trace_hook
+        )
         return _PricedLLMClient(inner, provider="anthropic", model=cfg.model)
 
     if cfg.provider == "openai":
         from finredteam.llm.openai_ import OpenAIClient
 
-        api_key = os.environ.get("OPENAI_API_KEY")
-        if not api_key:
+        key = api_key or os.environ.get("OPENAI_API_KEY")
+        if not key:
             raise RuntimeError("OPENAI_API_KEY 환경변수가 설정되어 있지 않다")
-        inner = OpenAIClient(model=cfg.model, api_key=api_key, max_tokens=cfg.max_tokens)
+        inner = OpenAIClient(
+            model=cfg.model, api_key=key, max_tokens=cfg.max_tokens, trace_hook=trace_hook
+        )
         return _PricedLLMClient(inner, provider="openai", model=cfg.model)
 
     raise ValueError(f"알 수 없는 llm.provider: {cfg.provider!r}")

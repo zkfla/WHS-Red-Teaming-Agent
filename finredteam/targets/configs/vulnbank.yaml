@@ -170,32 +170,23 @@ adapter:
     openapi: null           # GET /apispec.json → 404 (OpenAPI 스펙 미제공, 실측 확인)
     graphql: /graphql       # GET/POST 200 확인. 스키마는 recon 단계에서 introspection으로 확인
     api_docs: /api/docs     # Swagger UI HTML 200 (원시 스펙 파일 경로는 아직 미확인)
+    # ★ Black-box 취지: 여기엔 "정상적으로 앱을 쓰면 자연히 보이는" 최소한만 둔다
+    # (가입/로그인/대시보드 + 흔한 API 관례 경로). check_balance/transfer/transactions
+    # 처럼 실제 판정에 필요한 엔드포인트는 seed_paths 가 아니라 observation/baseline_ops
+    # 설정으로 직접 참조되므로(§ resolve_skeleton), 여기서 빼도 정상 동작에는 영향이
+    # 없다 — 다만 passive recon 이 처음부터 그 존재를 "안다"는 스포일러는 없앤 것이다.
+    # bill-payments/merchants/payments/charge/request_loan/forgot-password(v1~v3)/
+    # internal/* 같은 나머지 표면은 세션 시작 시 다 나열하지 않는다 — recon 단계의
+    # 응답 본문 링크 추출(1홉, recon/mapper.py)과 ReAct 의 `discover_surface` 액션이
+    # 실행 중에 찾아내야 한다.
     seed_paths:
+      - /
       - /register
       - /login
       - /dashboard
-      - /check_balance
-      - /transfer
-      - /transactions
-      - /api/transactions
-      - /api/virtual-cards
-      - /api/virtual-cards/create
-      - /api/bill-categories
-      - /api/billers/by-category
-      - /api/bill-payments/create
-      - /api/bill-payments/history
-      - /api/v1/merchants/register
-      - /api/v1/merchants/login
-      - /api/v1/payments/charge
-      - /request_loan
-      - /forgot-password
-      - /reset-password
-      - /api/v1/forgot-password
-      - /api/v2/forgot-password
-      - /api/v3/forgot-password
-      - /api/v3/user
-      - /internal/secret
-      - /internal/config.json
+      - /api
+      - /api/v1
+      - /api/docs
 
 settings:
   principals: [attacker_A, victim_V, merchant_M]

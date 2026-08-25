@@ -4,10 +4,10 @@ from finredteam.storage.db import DB
 
 def test_report_build_counts_and_no_vvr(tmp_path):
     db = DB(tmp_path)
-    db.append("findings", {"verdict": "VIOLATION", "candidate": {"layer": "finance", "attack_class": "F2"}})
-    db.append("findings", {"verdict": "PASS", "candidate": {"layer": "finance", "attack_class": "F2"}})
-    db.append("findings", {"verdict": "ANOMALY", "candidate": {"layer": "generic", "attack_class": "G-SQLI"}})
-    db.append("findings", {"verdict": "UNKNOWN", "candidate": {"layer": "finance", "attack_class": "F1"}})
+    db.append("findings", {"verdict": "VIOLATION", "candidate": {"layer": "finance", "operation": "transfer"}})
+    db.append("findings", {"verdict": "PASS", "candidate": {"layer": "finance", "operation": "transfer"}})
+    db.append("findings", {"verdict": "ANOMALY", "candidate": {"layer": "generic", "operation": "probe"}})
+    db.append("findings", {"verdict": "UNKNOWN", "candidate": {"layer": "finance", "operation": "read_balance"}})
 
     manifest = {
         "run_id": "test", "target": "vulnbank", "llm": {"provider": "anthropic", "model": "x"},
@@ -25,7 +25,7 @@ def test_report_build_counts_and_no_vvr(tmp_path):
     assert result["verification_yield"] == 0.25
     assert result["by_layer"]["finance"]["VIOLATION"] == 1
     assert result["by_layer"]["generic"]["ANOMALY"] == 1
-    assert result["by_attack_class"]["F2"] == 2
+    assert result["by_operation"]["transfer"] == 2
 
     # ★ §9 — 에이전트 측 리포트는 VVR/Precision 을 계산하지 않는다.
     assert "vvr" not in {k.lower() for k in result}

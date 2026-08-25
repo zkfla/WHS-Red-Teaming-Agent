@@ -5,6 +5,7 @@ allowlist 검사(§16)와 Decimal 안전 JSON 파싱(§4 규칙 2)을 여기서 
 """
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -16,6 +17,8 @@ from finredteam.models.core import Principal
 from finredteam.money import loads_money_json
 from finredteam.storage.evidence import CapturedResponse
 from finredteam.targets.loader import TargetConfig
+
+logger = logging.getLogger(__name__)
 
 
 class SessionError(Exception):
@@ -74,6 +77,7 @@ class Session:
         # 수단으로 받아주는 취약점(§ configs/vulnbank.yaml auth 주석)이 있을 때 특히 그렇다.
         # 매 요청 직후 즉시 비워 다음 요청에 절대 새지 않게 한다.
         self._client.cookies.clear()
+        logger.debug("%s %s -> %d", method, path, resp.status_code)
         body: Any = None
         if resp.text:
             try:

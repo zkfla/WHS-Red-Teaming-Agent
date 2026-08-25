@@ -9,7 +9,7 @@ from finredteam.reporting.repro import to_curl
 def to_writeup(record: dict, base_url: str) -> str:
     candidate = record.get("candidate", {})
     return (
-        f"## [{candidate.get('attack_class')}] {record.get('invariant')} 위반 — "
+        f"## [{candidate.get('operation')}] {record.get('invariant')} 위반 — "
         f"{candidate.get('method')} {candidate.get('path')}\n\n"
         f"- 주체: {candidate.get('principal_id')}\n"
         f"- 파라미터: {candidate.get('params')}\n"

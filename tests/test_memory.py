@@ -11,8 +11,7 @@ def _candidate(i: int) -> CandidateFinding:
     return CandidateFinding(
         id=f"c{i}",
         layer="finance",
-        attack_class="F2",
-        invariants=["INV-1B"],
+        operation="F2",
         principal_id="attacker_A",
         method="POST",
         path="/transfer",
@@ -48,7 +47,7 @@ def test_episodic_memory_records_and_computes_success_rate():
     em.record(cand, pass_finding, Lesson(candidate_summary="c1", outcome="PASS", insight="no luck"))
 
     assert em.success_rate("F2") == 0.5
-    assert "F2" in em.tried_attack_classes()
+    assert "F2" in em.tried_operations()
     assert len(em.lessons()) == 2
 
 

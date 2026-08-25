@@ -1,9 +1,13 @@
-"""invariant id → 오라클 함수. `candidate.invariants` 에 선언된 것만 실행한다
-(§설계원칙 3 — 실행 전에 오라클을 선언한다).
+"""invariant id → 오라클 함수.
 
-대부분의 오라클은 (candidate, result) 만으로 판정하는 순수 함수다. INV-2 만
-`KnowledgeGraph` 가 필요해서(§5) 별도의 `GRAPH_REGISTRY` 로 디스패치한다 —
-그래프가 없으면(graph=None) 조용히 스킵된다.
+★ `candidate.invariants` 로 미리 좁히지 않는다 — 시스템이 실행 전에 고정해둔
+오라클 전체 집합(`REGISTRY` + `GRAPH_REGISTRY`)을 매 실행마다 예외 없이 전부
+돌린다. 각 오라클은 자기 판정 재료(예: `logical_txn_id`, `unit_amount`)가
+없으면 스스로 UNKNOWN 을 낸다 — "무엇을 검사할지"는 candidate 가 선언하는
+게 아니라 **실행 결과 + 그래프가 갖춘 재료**로 각 오라클이 스스로 결정한다.
+이게 "오라클은 실행 전에 선언한다"(§설계원칙 3)를 candidate 단위가 아니라
+시스템 단위로 더 강하게 지키는 방법이다 — LLM 이 오라클 범위를 스스로 좁혀
+불리한 판정을 피해가는 경로 자체가 없다.
 """
 from __future__ import annotations
 
@@ -21,7 +25,7 @@ from finredteam.oracles.value import check_inv_1a, check_inv_1b
 OracleFn = Callable[[CandidateFinding, ExecutionResult], OracleOutcome]
 GraphOracleFn = Callable[[CandidateFinding, ExecutionResult, KnowledgeGraph], OracleOutcome]
 
-# INV-9(exposure) 는 아직 없다 — candidate.invariants 에 있어도 여기 없으면 스킵된다.
+# INV-9(exposure) 는 아직 없다 — 여기 없으면 조용히 빠진다(verifier.py 참고).
 REGISTRY: dict[str, OracleFn] = {
     "INV-1A": check_inv_1a,
     "INV-1B": check_inv_1b,
@@ -35,18 +39,11 @@ GRAPH_REGISTRY: dict[str, GraphOracleFn] = {
 }
 
 
-def get(invariant: str) -> OracleFn | None:
-    return REGISTRY.get(invariant)
-
-
 def run_all(
     candidate: CandidateFinding, result: ExecutionResult, graph: KnowledgeGraph | None = None
 ) -> list[OracleOutcome]:
-    outcomes = [REGISTRY[inv](candidate, result) for inv in candidate.invariants if inv in REGISTRY]
+    """등록된 오라클을 예외 없이 전부 실행한다 — candidate 는 이 목록을 줄일 수 없다."""
+    outcomes = [fn(candidate, result) for fn in REGISTRY.values()]
     if graph is not None:
-        outcomes.extend(
-            GRAPH_REGISTRY[inv](candidate, result, graph)
-            for inv in candidate.invariants
-            if inv in GRAPH_REGISTRY
-        )
+        outcomes.extend(fn(candidate, result, graph) for fn in GRAPH_REGISTRY.values())
     return outcomes

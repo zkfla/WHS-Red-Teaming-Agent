@@ -4,9 +4,11 @@
 `knowledge/baseline.py` 의 실측 기준선에 선형으로 대입해서 계산한다 — LLM 은
 "어떤 값을 시도할지"만 정하고, "그 값이면 무엇이 정상인지"는 baseline 이 정한다(§6).
 
-ReAct 로 바뀌면서 "스켈레톤 일괄 refine"(LLM 이 파라미터도 골라줌) 대신, LLM 이
-이미 `propose_candidate` 액션 입력으로 파라미터까지 고른 채로 들어온다 — 이 모듈은
+"스켈레톤 일괄 refine"(LLM 이 파라미터도 골라줌) 대신, LLM 이 이미
+`propose_hypothesis` 액션 입력으로 파라미터까지 고른 채로 들어온다 — 이 모듈은
 그 파라미터를 검증된 skeleton 에 꽂아 CandidateFinding 을 만드는 순수 조립 단계다.
+오라클(어떤 invariant 를 검사할지)은 여기서 정하지 않는다 — `oracles/registry.py`
+가 실행 후 전체 집합을 돈다.
 """
 from __future__ import annotations
 
@@ -86,10 +88,9 @@ def build_candidate(
         )
 
     return CandidateFinding(
-        id=f"{skeleton.attack_class}-{uuid.uuid4().hex[:8]}",
+        id=f"{skeleton.operation}-{uuid.uuid4().hex[:8]}",
         layer=skeleton.layer,
-        attack_class=skeleton.attack_class,
-        invariants=skeleton.invariants,
+        operation=skeleton.operation,
         principal_id=skeleton.principal_id,
         method=skeleton.method,
         path=skeleton.path,

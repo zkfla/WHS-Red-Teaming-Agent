@@ -24,6 +24,7 @@ COLLECTIONS = (
     "entitlements",
     "baselines",
     "steps",  # ReAct 트레이스(thought/action/observation) — ReAct 전환 시 추가
+    "llm_calls",  # LLM 호출 원문(prompt/raw response)·이벤트 — 디버깅 전용(DEBUGGING.md)
 )
 
 

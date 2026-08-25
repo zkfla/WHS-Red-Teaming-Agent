@@ -38,8 +38,7 @@ def _baselines_with_transfer_10() -> BaselineRegistry:
 def _skeleton() -> CandidateSkeleton:
     return CandidateSkeleton(
         layer="finance",
-        attack_class="F2",
-        invariants=["INV-1B"],
+        operation="F2",
         principal_id="attacker_A",
         method="POST",
         path="/transfer",
@@ -92,8 +91,7 @@ def test_expected_delta_remaps_to_a_different_principals_accounts():
     baselines = _baselines_with_transfer_10()
     skeleton = CandidateSkeleton(
         layer="finance",
-        attack_class="F2",
-        invariants=["INV-1B"],
+        operation="F2",
         principal_id="victim_V",
         method="POST",
         path="/transfer",

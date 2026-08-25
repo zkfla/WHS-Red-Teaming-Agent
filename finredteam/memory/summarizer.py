@@ -20,7 +20,7 @@ def summarize(semantic: SemanticMemory, episodic: EpisodicMemory, max_tokens: in
     lines: list[str] = []
 
     for lesson in reversed(episodic.lessons()):
-        lines.append(f"- lesson[{lesson.attack_class or '?'}]: {lesson.insight}")
+        lines.append(f"- lesson[{lesson.operation or '?'}]: {lesson.insight}")
 
     for fact in reversed(semantic.observed()):
         lines.append(f"- fact: {fact.subject} {fact.predicate}={fact.object}")

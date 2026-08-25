@@ -2,6 +2,7 @@
 __pycache__/
 *.pyc
 .pytest_cache/
+*.egg-info/
 
 # 대상 애플리케이션(vuln-bank) 클론 — 우리 프로젝트 코드가 아님, 사람이 recon용으로 clone
 vulnbank-target/
@@ -10,3 +11,6 @@ vulnbank-target/
 runs/
 
 .env
+
+# 대화형으로 입력/선택한 API 키 저장소 (finredteam/credentials.py) — 평문, 커밋 금지
+.finredteam/

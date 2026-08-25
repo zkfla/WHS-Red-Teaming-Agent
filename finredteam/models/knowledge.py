@@ -20,12 +20,12 @@ class Fact(BaseModel):
 
 
 class Lesson(BaseModel):
-    """실패/성공 시도에서 추출한 교훈. planning/prioritizer.py 가 다음 후보 순위에 반영."""
+    """실패/성공 시도에서 추출한 교훈. Observation 요약(memory/summarizer.py)에 반영."""
 
     candidate_summary: str
     outcome: str  # verdict 문자열 또는 실행 오류 요약
     insight: str  # "GET /accounts/{id} 타 주체 요청은 403" 처럼 재사용 가능한 관찰
-    attack_class: str | None = None
+    operation: str | None = None  # 어떤 메커니즘(read_balance/transfer 등)이었는지
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 

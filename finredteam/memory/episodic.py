@@ -28,20 +28,18 @@ class EpisodicMemory:
     def lessons(self) -> list[Lesson]:
         return [e.lesson for e in self._episodes if e.lesson is not None]
 
-    def tried_attack_classes(self) -> set[str]:
-        return {e.candidate.attack_class for e in self._episodes}
+    def tried_operations(self) -> set[str]:
+        return {e.candidate.operation for e in self._episodes}
 
-    def success_rate(self, attack_class: str) -> float:
-        relevant = [e for e in self._episodes if e.candidate.attack_class == attack_class]
+    def success_rate(self, operation: str) -> float:
+        relevant = [e for e in self._episodes if e.candidate.operation == operation]
         if not relevant:
             return 0.0
         hits = sum(1 for e in relevant if e.verdict == Verdict.VIOLATION)
         return hits / len(relevant)
 
-    def similar_tried(self, attack_class: str, path: str) -> list[Episode]:
-        return [
-            e for e in self._episodes if e.candidate.attack_class == attack_class and e.candidate.path == path
-        ]
+    def similar_tried(self, operation: str, path: str) -> list[Episode]:
+        return [e for e in self._episodes if e.candidate.operation == operation and e.candidate.path == path]
 
     def consecutive_failures(self) -> int:
         """가장 최근부터 연속으로 VIOLATION 이 아니었던 시도 수 — agent/strategy.py(Day6) 가 PIVOT 판단에 쓴다."""

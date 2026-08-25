@@ -20,14 +20,17 @@ def build(db: DB, manifest: dict[str, Any]) -> dict[str, Any]:
     verdict_counts = Counter(f.get("verdict") for f in findings)
 
     by_layer: dict[str, Counter] = {layer: Counter() for layer in _LAYERS}
-    by_attack_class: Counter = Counter()
+    by_operation: Counter = Counter()  # 어떤 메커니즘을 시도했는지 (read_balance/transfer 등)
+    by_invariant: Counter = Counter()  # 실행 후 오라클이 실제로 무엇을 판정했는지
     for record in findings:
         candidate = record.get("candidate", {})
         layer = candidate.get("layer")
         verdict = record.get("verdict")
         if layer in by_layer:
             by_layer[layer][verdict] += 1
-        by_attack_class[candidate.get("attack_class", "unknown")] += 1
+        by_operation[candidate.get("operation", "unknown")] += 1
+        if record.get("invariant"):
+            by_invariant[record["invariant"]] += 1
 
     candidate_count = len(findings)
     verified_count = verdict_counts.get(Verdict.VIOLATION.value, 0)
@@ -44,7 +47,8 @@ def build(db: DB, manifest: dict[str, Any]) -> dict[str, Any]:
         "pass_count": verdict_counts.get(Verdict.PASS.value, 0),
         "verification_yield": yield_,
         "by_layer": {layer: dict(counts) for layer, counts in by_layer.items()},
-        "by_attack_class": dict(by_attack_class),
+        "by_operation": dict(by_operation),
+        "by_invariant": dict(by_invariant),
         "termination_reason": manifest.get("termination_reason"),
         "rounds": manifest.get("round"),
         "strategy_history": manifest.get("strategy_history"),

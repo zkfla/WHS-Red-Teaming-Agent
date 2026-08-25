@@ -58,7 +58,7 @@ class ScoreReport:
         g_rate = round(g_matched / g_total, 2) if g_total else 0.0
         p_rate = round(p_matched / p_total, 2) if p_total else 0.0
         missed_str = (
-            ", ".join(f"{m['id']} {m['attack_class']} {m['description'][:40]}" for m in self.missed)
+            ", ".join(f"{m['id']} {m['invariant']} {m['description'][:40]}" for m in self.missed)
             if self.missed
             else ""
         )
@@ -70,20 +70,24 @@ class ScoreReport:
 
 
 def score(run_dir: Path, ground_truth: list[dict] | None = None) -> ScoreReport:
-    """VIOLATION Finding 을 attack_class + endpoint 기준으로 GT 와 대조한다."""
+    """VIOLATION Finding 을 invariant + endpoint 기준으로 GT 와 대조한다.
+
+    ★ attack_class 가 아니라 invariant 로 맞춘다 — candidate 는 더 이상 "이건
+    F1 이다" 라고 자기가 어떤 취약점인지 선언하지 않는다(§ oracles/registry.py).
+    실제로 어떤 invariant 가 걸렸는지는 실행 후 오라클이 결정한 `record["invariant"]`
+    뿐이라, 채점도 그 값을 기준으로 맞춰야 candidate 가 스스로를 잘못 분류해도
+    (혹은 아예 분류하지 않아도) 정확히 매칭된다.
+    """
     db = DB(run_dir)
     violations = [r for r in db.read_all("findings") if r.get("verdict") == "VIOLATION"]
     gt = ground_truth if ground_truth is not None else load_ground_truth()
 
-    gt_by_key: dict[tuple[str, str], dict] = {
-        (item["attack_class"], item["endpoint"]): item for item in gt
-    }
+    gt_by_key: dict[tuple[str, str], dict] = {(item["invariant"], item["endpoint"]): item for item in gt}
 
     matched_findings = 0
     matched_gt_ids: set[str] = set()
     for record in violations:
-        candidate = record.get("candidate", {})
-        key = (candidate.get("attack_class"), _endpoint_of(record))
+        key = (record.get("invariant"), _endpoint_of(record))
         gt_item = gt_by_key.get(key)
         if gt_item is not None:
             matched_findings += 1

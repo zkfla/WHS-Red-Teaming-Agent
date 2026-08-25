@@ -20,8 +20,7 @@ def _candidate(**overrides) -> CandidateFinding:
     base = dict(
         id="race-1",
         layer="finance",
-        attack_class="F4",
-        invariants=["INV-1C"],
+        operation="F4",
         principal_id="attacker_A",
         method="POST",
         path="/transfer",

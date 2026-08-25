@@ -34,8 +34,7 @@ def _candidate(**overrides) -> CandidateFinding:
     base = dict(
         id="c1",
         layer="finance",
-        attack_class="F2",
-        invariants=["INV-1B"],
+        operation="F2",
         principal_id="attacker_A",
         method="POST",
         path="/transfer",
@@ -160,7 +159,7 @@ def test_inv_1b_unknown_when_provenance_is_llm_inferred():
 def test_inv_4_unknown_without_logical_txn_id():
     before = _state("m", {"MERCHANT": "0.00"})
     after = _state("m", {"MERCHANT": "10.00"})
-    cand = _candidate(attack_class="F3", invariants=["INV-4"], logical_txn_id=None)
+    cand = _candidate(operation="F3", logical_txn_id=None)
     result = _result(cand, before, after, [200])
     assert check_inv_4(cand, result).verdict == Verdict.UNKNOWN
 
@@ -172,8 +171,7 @@ def test_inv_4_passes_when_same_payload_different_logical_id_charged_thrice():
     before = _state("m", {"MERCHANT": "0.00"})
     after = _state("m", {"MERCHANT": "10.00"})
     cand = _candidate(
-        attack_class="F3",
-        invariants=["INV-4"],
+        operation="F3",
         logical_txn_id="order-123",
         subject_account="MERCHANT",
         expected_delta=ExpectedDelta(
@@ -189,8 +187,7 @@ def test_inv_4_violation_when_repeated_same_logical_id_multiplies_side_effect():
     before = _state("m", {"MERCHANT": "0.00"})
     after = _state("m", {"MERCHANT": "30.00"})  # 10.00 짜리 결제가 3번 다 반영됨
     cand = _candidate(
-        attack_class="F3",
-        invariants=["INV-4"],
+        operation="F3",
         logical_txn_id="order-123",
         subject_account="MERCHANT",
         expected_delta=ExpectedDelta(

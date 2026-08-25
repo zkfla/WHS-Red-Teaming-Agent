@@ -9,7 +9,7 @@ import json
 def to_curl(record: dict, base_url: str) -> str:
     candidate = record.get("candidate", {})
     lines = [
-        f"# {candidate.get('attack_class')} :: {record.get('invariant')} :: {record.get('verdict')}",
+        f"# {candidate.get('operation')} :: {record.get('invariant')} :: {record.get('verdict')}",
         f"# {record.get('reason', '')}",
     ]
     body_flag = ""

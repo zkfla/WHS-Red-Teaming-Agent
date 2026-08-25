@@ -1,13 +1,18 @@
 """planning/actions.py 단위 테스트 — 액션 입력 스키마 재검증."""
 from __future__ import annotations
 
+import pytest
+from pydantic import ValidationError
+
 from finredteam.planning.actions import (
+    DiscoverSurfaceInput,
+    ExecuteExperimentInput,
     FinishInput,
     LearnBaselineInput,
     ObserveGraphInput,
-    ProposeCandidateInput,
-    RecallMemoryInput,
+    ProposeHypothesisInput,
     ReActStep,
+    RecallMemoryInput,
     parse_action_input,
 )
 
@@ -17,20 +22,38 @@ def test_parse_observe_graph_empty_input_ok():
     assert isinstance(result, ObserveGraphInput)
 
 
-def test_parse_propose_candidate_valid():
+def test_parse_propose_hypothesis_valid():
     result = parse_action_input(
-        "propose_candidate",
-        {"attack_class": "F2", "principal_id": "attacker_A", "target": "account:1", "params": {"amount": "-5"}},
+        "propose_hypothesis",
+        {"operation": "transfer", "principal_id": "attacker_A", "target": "account:1", "params": {"amount": "-5"}},
     )
-    assert isinstance(result, ProposeCandidateInput)
-    assert result.attack_class == "F2"
+    assert isinstance(result, ProposeHypothesisInput)
+    assert result.operation == "transfer"
     assert result.params == {"amount": "-5"}
 
 
-def test_parse_propose_candidate_missing_required_field_returns_error_string():
-    result = parse_action_input("propose_candidate", {"target": "account:1"})
+def test_parse_propose_hypothesis_missing_required_field_returns_error_string():
+    result = parse_action_input("propose_hypothesis", {"target": "account:1"})
     assert isinstance(result, str)
-    assert "입력 형식 오류" in result or "propose_candidate" in result
+    assert "입력 형식 오류" in result
+
+
+def test_parse_execute_experiment_requires_hypothesis_id():
+    ok = parse_action_input("execute_experiment", {"hypothesis_id": "hyp_1"})
+    assert isinstance(ok, ExecuteExperimentInput)
+    bad = parse_action_input("execute_experiment", {})
+    assert isinstance(bad, str)
+
+
+def test_parse_discover_surface_defaults_method_to_get():
+    result = parse_action_input("discover_surface", {"path": "/api/v2/whatever"})
+    assert isinstance(result, DiscoverSurfaceInput)
+    assert result.method == "GET"
+
+
+def test_parse_discover_surface_rejects_mutating_method():
+    result = parse_action_input("discover_surface", {"path": "/x", "method": "POST"})
+    assert isinstance(result, str)
 
 
 def test_parse_learn_baseline_requires_op():
@@ -59,9 +82,6 @@ def test_parse_unknown_action_returns_error_string():
 
 
 def test_react_step_rejects_invalid_action_literal():
-    import pytest
-    from pydantic import ValidationError
-
     with pytest.raises(ValidationError):
         ReActStep.model_validate({"thought": "x", "action": "delete_everything", "action_input": {}})
 

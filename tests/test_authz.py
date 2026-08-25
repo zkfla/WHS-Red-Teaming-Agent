@@ -12,8 +12,7 @@ def _candidate(principal_id: str, subject_account: str | None) -> CandidateFindi
     return CandidateFinding(
         id="c1",
         layer="finance",
-        attack_class="F1",
-        invariants=["INV-2"],
+        operation="F1",
         principal_id=principal_id,
         method="GET",
         path=f"/check_balance/{subject_account}",

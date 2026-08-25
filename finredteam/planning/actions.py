@@ -1,9 +1,10 @@
-"""ReAct 액션 어휘 — LLM 이 고를 수 있는 액션은 이 5개뿐이다.
+"""ReAct 액션 어휘 — LLM 이 고를 수 있는 액션은 이 7개뿐이다.
 
-자유 텍스트 경로·페이로드를 LLM 이 직접 쓰게 하지 않는다. `propose_candidate`
-의 `target`은 그래프가 실제로 아는 노드 id(예: "account:1234567890")여야 하고,
-`invariants`(오라클 목록)는 LLM 이 정하지 않는다 — `attack_class` 로부터
-`templates/attacks.yaml` 에서 자동으로 끌어온다(§설계원칙 3, §11 규칙 1).
+자유 텍스트 경로·페이로드를 LLM 이 직접 쓰게 하지 않는다. 후보 생성(가설)과
+실제 실행(실험)을 분리한다 — `propose_hypothesis` 는 부작용이 없고,
+`execute_experiment` 만 실제로 요청을 보낸다. `execute_experiment` 의
+`hypothesis_id`가 가리키는 오라클 판정은 LLM 이 정하지 않는다 —
+`oracles/registry.py` 가 실행 전에 고정해둔 오라클 전체 집합을 매번 돈다.
 """
 from __future__ import annotations
 
@@ -11,16 +12,30 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
-ActionName = Literal["observe_graph", "recall_memory", "learn_baseline", "propose_candidate", "finish"]
+ActionName = Literal[
+    "observe_graph",
+    "recall_memory",
+    "learn_baseline",
+    "discover_surface",
+    "propose_hypothesis",
+    "execute_experiment",
+    "finish",
+]
 
 ACTION_CATALOG = """\
-- observe_graph: {} — 그래프 요약(알려진 계좌, entitled_own 관계)을 본다. 부작용 없음.
+- observe_graph: {} — 그래프 요약(알려진 계좌, entitled_own 관계, 발견된 엔드포인트)을 본다. 부작용 없음.
 - recall_memory: {"query": "<검색어>"} — 이전 사실·교훈을 검색한다. 부작용 없음.
 - learn_baseline: {"op": "<baseline_ops 의 op 이름, 예: transfer>"} — 정상 파라미터로
-  한 번 실행해 실측 기준선을 만든다. F2 류 금액 판정 전에 필요할 수 있다.
-- propose_candidate: {"attack_class": "F1|F2", "principal_id": "<시험 주체>",
-  "target": "account:<계좌번호>", "params": {...}} — 실제로 요청을 보내고 판정까지
-  받는다. attack_class 에 맞는 오라클은 자동으로 붙는다(직접 고르지 않는다).
+  한 번 실행해 실측 기준선을 만든다. 금액 관련 실험 전에 필요할 수 있다.
+- discover_surface: {"path": "/추측하는-경로", "method": "GET|HEAD|OPTIONS"} — 아직
+  모르는 경로를 안전하게(읽기 전용) 찔러본다. 존재하면 그래프에 새 사실로 남는다.
+  응답 안에서 다른 경로 후보가 발견되면 그것도 같이 알려준다. 횟수 제한 있음.
+- propose_hypothesis: {"operation": "read_balance|transfer", "principal_id": "<주체>",
+  "target": "account:<계좌번호>", "params": {...}} — 아직 실행하지 않는다. 그래프에
+  실존하는 대상인지만 검증하고 hypothesis_id 를 돌려준다. 부작용 없음.
+- execute_experiment: {"hypothesis_id": "<propose_hypothesis 가 준 id>"} — 실제로
+  요청을 보내고 판정까지 받는다. 어떤 invariant 를 검사할지는 LLM 이 정하지 않는다
+  — 관련된 오라클이 자동으로 전부 돈다.
 - finish: {"reason": "<왜 그만두는지>"} — 탐색을 종료한다. 예산 한도가 항상 우선한다.
 """
 
@@ -37,11 +52,20 @@ class LearnBaselineInput(BaseModel):
     op: str
 
 
-class ProposeCandidateInput(BaseModel):
-    attack_class: str
+class DiscoverSurfaceInput(BaseModel):
+    path: str
+    method: Literal["GET", "HEAD", "OPTIONS"] = "GET"
+
+
+class ProposeHypothesisInput(BaseModel):
+    operation: str
     principal_id: str
     target: str = ""
     params: dict[str, str] = {}
+
+
+class ExecuteExperimentInput(BaseModel):
+    hypothesis_id: str
 
 
 class FinishInput(BaseModel):
@@ -52,7 +76,9 @@ _INPUT_SCHEMAS: dict[str, type[BaseModel]] = {
     "observe_graph": ObserveGraphInput,
     "recall_memory": RecallMemoryInput,
     "learn_baseline": LearnBaselineInput,
-    "propose_candidate": ProposeCandidateInput,
+    "discover_surface": DiscoverSurfaceInput,
+    "propose_hypothesis": ProposeHypothesisInput,
+    "execute_experiment": ExecuteExperimentInput,
     "finish": FinishInput,
 }
 
