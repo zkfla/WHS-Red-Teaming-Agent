@@ -59,8 +59,11 @@ class Profile:
         return n + len(self.fan_out) - 1 if self.fan_out else n
 
 
-# 경량 코어가 띄우는 컨테이너: 타깃 + 샌드박스 (에이전트는 호스트 프로세스)
-LITE_CONTAINERS = 2
+# 경량 코어가 띄우는 컨테이너. 타깃은 양쪽이 공유하므로 세지 않는다 —
+# bench/baseline.py의 _containers()가 `name=decepticon`만 세어 타깃을 빼기 때문에,
+# 여기서 타깃을 포함하면 사과와 오렌지를 비교하게 된다 (실제로 그랬다).
+# 우리 쪽 자체 인프라는 샌드박스 1개뿐이다 (에이전트는 호스트 프로세스).
+LITE_CONTAINERS = 1
 
 # 프로파일 = 실험 조건. 같은 코드/같은 타깃에 프로파일만 바꿔 돌려 비교한다.
 PROFILES = {

@@ -1,0 +1,630 @@
+<title>D안 최적화 결과</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Gothic+A1:wght@300;400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap">
+
+<style>
+  :root {
+    --bg:        #EBEEF2;
+    --surface:   #FFFFFF;
+    --surface-2: #F3F6F9;
+    --ink:       #0E151D;
+    --ink-2:     #384654;
+    --muted:     #6B7A8A;
+    --rule:      #D3DBE3;
+    --rule-soft: #E4EAF0;
+    --accent:    #15607D;
+    --accent-bg: #DCEAF0;
+    --gain:      #256B4C;
+    --gain-bg:   #DCECE3;
+    --loss:      #97381F;
+    --loss-bg:   #F4E2DC;
+    --hold:      #7A5B14;
+    --hold-bg:   #F2E9D2;
+
+    --f-sans: "Gothic A1", -apple-system, BlinkMacSystemFont, "Apple SD Gothic Neo", "Malgun Gothic", sans-serif;
+    --f-mono: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg:        #0A1016;
+      --surface:   #121B23;
+      --surface-2: #18232C;
+      --ink:       #E3EAF1;
+      --ink-2:     #B2C0CD;
+      --muted:     #7C8B9A;
+      --rule:      #253340;
+      --rule-soft: #1C2832;
+      --accent:    #4EA8C9;
+      --accent-bg: #0F2E3A;
+      --gain:      #63B892;
+      --gain-bg:   #122A20;
+      --loss:      #D98570;
+      --loss-bg:   #2B1712;
+      --hold:      #C9A64E;
+      --hold-bg:   #2A2312;
+    }
+  }
+
+  :root[data-theme="dark"] {
+    --bg:        #0A1016;
+    --surface:   #121B23;
+    --surface-2: #18232C;
+    --ink:       #E3EAF1;
+    --ink-2:     #B2C0CD;
+    --muted:     #7C8B9A;
+    --rule:      #253340;
+    --rule-soft: #1C2832;
+    --accent:    #4EA8C9;
+    --accent-bg: #0F2E3A;
+    --gain:      #63B892;
+    --gain-bg:   #122A20;
+    --loss:      #D98570;
+    --loss-bg:   #2B1712;
+    --hold:      #C9A64E;
+    --hold-bg:   #2A2312;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    background: var(--bg);
+    color: var(--ink);
+    font-family: var(--f-sans);
+    font-weight: 400;
+    line-height: 1.75;
+    font-size: 16px;
+    -webkit-font-smoothing: antialiased;
+    margin: 0;
+    padding: 0 20px 100px;
+  }
+
+  .wrap { max-width: 900px; margin: 0 auto; }
+
+  /* ── 헤더 ────────────────────────────── */
+  header {
+    padding: 60px 0 26px;
+    border-bottom: 2px solid var(--ink);
+  }
+  .eyebrow {
+    font-family: var(--f-mono);
+    font-size: 11.5px;
+    font-weight: 500;
+    letter-spacing: .18em;
+    text-transform: uppercase;
+    color: var(--accent);
+    margin: 0 0 14px;
+  }
+  h1 {
+    font-size: clamp(28px, 5vw, 42px);
+    font-weight: 700;
+    letter-spacing: -.02em;
+    line-height: 1.2;
+    text-wrap: balance;
+    margin: 0 0 18px;
+  }
+  .standfirst {
+    font-size: 17px;
+    color: var(--ink-2);
+    max-width: 60ch;
+    margin: 0 0 24px;
+    font-weight: 300;
+  }
+  .byline {
+    display: flex; flex-wrap: wrap; gap: 8px 24px;
+    font-family: var(--f-mono); font-size: 12px; color: var(--muted);
+  }
+  .byline b { color: var(--ink-2); font-weight: 500; }
+
+  /* ── 핵심 수치 ────────────────────────── */
+  .headline {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+    gap: 1px;
+    background: var(--rule);
+    border: 1px solid var(--rule);
+    margin: 28px 0 8px;
+  }
+  .hcell { background: var(--surface); padding: 20px 18px 18px; }
+  .hcell .k {
+    font-family: var(--f-mono); font-size: 10.5px; letter-spacing: .1em;
+    text-transform: uppercase; color: var(--muted); display: block; margin-bottom: 9px;
+  }
+  .hcell .v {
+    font-family: var(--f-mono); font-size: 27px; font-weight: 600;
+    letter-spacing: -.025em; font-variant-numeric: tabular-nums;
+    line-height: 1.05; display: block;
+  }
+  .hcell .v.up { color: var(--gain); }
+  .hcell .sub {
+    font-family: var(--f-mono); font-size: 11.5px; color: var(--muted);
+    margin-top: 6px; display: block;
+  }
+  .cap { font-family: var(--f-mono); font-size: 11px; color: var(--muted); margin: 0 0 4px; }
+
+  /* ── 섹션 ─────────────────────────────── */
+  section { padding-top: 54px; }
+  h2 {
+    font-size: 21px; font-weight: 600; letter-spacing: -.015em;
+    margin: 0 0 8px; padding-bottom: 11px;
+    border-bottom: 1px solid var(--rule);
+    display: flex; align-items: baseline; gap: 13px;
+  }
+  h2 .tag {
+    font-family: var(--f-mono); font-size: 11px; font-weight: 500;
+    letter-spacing: .1em; color: var(--accent);
+  }
+  h3 {
+    font-size: 15px; font-weight: 600; margin: 32px 0 10px;
+    letter-spacing: -.005em;
+  }
+  p { margin: 15px 0; max-width: 66ch; color: var(--ink-2); }
+  p strong { color: var(--ink); font-weight: 600; }
+  .lede { color: var(--ink); font-size: 16.5px; }
+
+  /* ── 표 ───────────────────────────────── */
+  .scroll {
+    overflow-x: auto; margin: 20px 0;
+    border: 1px solid var(--rule); background: var(--surface);
+  }
+  table { border-collapse: collapse; width: 100%; font-size: 14px; }
+  th, td {
+    text-align: left; padding: 11px 14px;
+    border-bottom: 1px solid var(--rule-soft); vertical-align: top;
+  }
+  thead th {
+    font-family: var(--f-mono); font-size: 10.5px; font-weight: 600;
+    letter-spacing: .08em; text-transform: uppercase; color: var(--muted);
+    background: var(--surface-2); border-bottom: 1px solid var(--rule);
+    white-space: nowrap;
+  }
+  tbody tr:last-child td { border-bottom: none; }
+  td.num, th.num {
+    font-family: var(--f-mono); font-variant-numeric: tabular-nums;
+    text-align: right; white-space: nowrap;
+  }
+  td.name { color: var(--ink); font-weight: 500; }
+  tr.best td { background: var(--gain-bg); }
+  tr.best td.name { color: var(--ink); font-weight: 600; }
+  .d-up   { color: var(--gain); font-weight: 600; }
+  .d-down { color: var(--loss); font-weight: 600; }
+  .d-flat { color: var(--muted); }
+
+  /* ── 구조 비교 ────────────────────────── */
+  .archs {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+    gap: 16px; margin: 24px 0;
+  }
+  .arch {
+    border: 1px solid var(--rule); background: var(--surface); padding: 18px;
+  }
+  .arch.after { border-color: var(--gain); border-width: 1px 1px 1px 3px; }
+  .arch h4 {
+    margin: 0 0 4px; font-size: 13px; font-weight: 600;
+    font-family: var(--f-mono); letter-spacing: .04em;
+  }
+  .arch .meta {
+    font-family: var(--f-mono); font-size: 11px; color: var(--muted);
+    margin-bottom: 14px;
+  }
+  .node {
+    font-family: var(--f-mono); font-size: 12px;
+    padding: 7px 11px; border: 1px solid var(--rule);
+    background: var(--surface-2); margin-bottom: 6px;
+  }
+  .node.par {
+    background: var(--accent-bg); border-color: var(--accent); color: var(--ink);
+  }
+  .parbox {
+    border: 1px dashed var(--accent); padding: 8px; margin-bottom: 6px;
+  }
+  .parbox .lbl {
+    font-family: var(--f-mono); font-size: 10px; color: var(--accent);
+    letter-spacing: .08em; text-transform: uppercase; margin-bottom: 7px;
+  }
+  .parbox .node { margin-bottom: 4px; }
+  .parbox .node:last-child { margin-bottom: 0; }
+  .arrow {
+    font-family: var(--f-mono); font-size: 12px; color: var(--muted);
+    text-align: center; margin: 2px 0 6px;
+  }
+
+  /* ── 콜아웃 ───────────────────────────── */
+  .note {
+    background: var(--surface); border: 1px solid var(--rule);
+    border-left: 3px solid var(--accent); padding: 17px 19px; margin: 24px 0;
+  }
+  .note.warn { border-left-color: var(--loss); }
+  .note p { margin: 0; max-width: none; }
+  .note p + p { margin-top: 11px; }
+  .note .h {
+    font-family: var(--f-mono); font-size: 10.5px; font-weight: 600;
+    letter-spacing: .1em; text-transform: uppercase;
+    color: var(--accent); margin-bottom: 9px;
+  }
+  .note.warn .h { color: var(--loss); }
+
+  code {
+    font-family: var(--f-mono); font-size: .875em;
+    background: var(--surface-2); border: 1px solid var(--rule-soft);
+    padding: 1px 5px; border-radius: 2px;
+  }
+  pre {
+    font-family: var(--f-mono); font-size: 12.5px; line-height: 1.65;
+    background: var(--surface); border: 1px solid var(--rule);
+    padding: 15px 17px; overflow-x: auto; margin: 18px 0;
+    color: var(--ink-2);
+  }
+  pre code { background: none; border: none; padding: 0; font-size: inherit; }
+
+  .pill {
+    display: inline-block; font-family: var(--f-mono); font-size: 10.5px;
+    font-weight: 600; letter-spacing: .06em; text-transform: uppercase;
+    padding: 3px 8px; white-space: nowrap; border-radius: 2px;
+  }
+  .p-gain { color: var(--gain); background: var(--gain-bg); }
+  .p-loss { color: var(--loss); background: var(--loss-bg); }
+  .p-hold { color: var(--hold); background: var(--hold-bg); }
+
+  footer {
+    margin-top: 64px; padding-top: 22px; border-top: 1px solid var(--rule);
+    font-family: var(--f-mono); font-size: 11.5px; color: var(--muted);
+  }
+</style>
+
+<div class="wrap">
+
+  <header>
+    <p class="eyebrow">D안 · 프레임워크 최적화 보고</p>
+    <h1>같은 모델로 12배 빠르게</h1>
+    <p class="standfirst">
+      모델은 <code>haiku</code>로 고정한 채 <strong>구조만</strong> 바꿔서
+      Decepticon 대비 12배 빠르고, 컨테이너 71% 적고, 탐지는 더 많은 구성을 찾았습니다.
+      62회 실행 · $18.92로 측정했습니다.
+    </p>
+    <div class="byline">
+      <span><b>작성</b> 2026-08-25</span>
+      <span><b>타깃</b> 훈련용 취약 웹앱 (난이도 ≤3 · 분모 54)</span>
+      <span><b>모델</b> claude-haiku-4-5 (양측 동일)</span>
+      <span><b>실행</b> 62회</span>
+    </div>
+  </header>
+
+  <p class="cap" style="margin-top:26px">Decepticon(n=3) 대비 · 최종 구성(n=6)</p>
+  <div class="headline">
+    <div class="hcell">
+      <span class="k">실행 시간</span>
+      <span class="v up">12.1×</span>
+      <span class="sub">842s → 70s</span>
+    </div>
+    <div class="hcell">
+      <span class="k">컨테이너</span>
+      <span class="v up">−71%</span>
+      <span class="sub">7 → 2</span>
+    </div>
+    <div class="hcell">
+      <span class="k">에이전트</span>
+      <span class="v up">−63%</span>
+      <span class="sub">16 → 6</span>
+    </div>
+    <div class="hcell">
+      <span class="k">탐지</span>
+      <span class="v up">+44%</span>
+      <span class="sub">3.00 → 4.33 / 54</span>
+    </div>
+    <div class="hcell">
+      <span class="k">해결당 비용</span>
+      <span class="v up">−17%</span>
+      <span class="sub">$0.101 → $0.084</span>
+    </div>
+  </div>
+
+  <!-- ───────────────────────────────────── -->
+  <section>
+    <h2><span class="tag">01</span> 한 줄 요약</h2>
+    <p class="lede">
+      <strong>순차 파이프라인을 병렬 전문가 구조로 바꾼 것이 전부입니다.</strong>
+      나머지는 그 결정을 뒷받침하거나, 시도했다가 실패한 것들입니다.
+    </p>
+    <div class="note">
+      <p class="h">회의에서 이 말만 기억하시면 됩니다</p>
+      <p>측정해보니 <strong>실행 시간의 97%가 LLM 응답 대기</strong>였습니다.
+      도구 실행은 3%였어요. 그러면 시간을 줄이는 방법은 하나뿐입니다 —
+      <strong>여러 개가 동시에 기다리게 하는 것.</strong>
+      에이전트 하나가 순서대로 일하던 걸 다섯이 동시에 하도록 바꿨더니
+      시간이 3분의 1로 줄고 탐지는 오히려 늘었습니다.</p>
+    </div>
+  </section>
+
+  <!-- ───────────────────────────────────── -->
+  <section>
+    <h2><span class="tag">02</span> 무엇을 바꿨나</h2>
+    <p>구조 변경 하나가 핵심이고, 나머지 셋은 그걸 가능하게 하거나 다듬는 작업이었습니다.</p>
+
+    <div class="archs">
+      <div class="arch">
+        <h4>이전 — 순차</h4>
+        <p class="meta">에이전트 3 · 단계 3 · 186초</p>
+        <div class="node">recon (정찰) · 10턴</div>
+        <div class="arrow">↓ 파일로 전달</div>
+        <div class="node">exploit (공격) · 20턴</div>
+        <div class="arrow">↓</div>
+        <div class="node">reporter (보고) · 4턴</div>
+      </div>
+
+      <div class="arch after">
+        <h4>이후 — 병렬 전문가</h4>
+        <p class="meta">에이전트 6 · 단계 2 · 70초</p>
+        <div class="parbox">
+          <div class="lbl">동시 실행 · 각 9턴</div>
+          <div class="node par">injection 담당</div>
+          <div class="node par">access 담당</div>
+          <div class="node par">authn 담당</div>
+          <div class="node par">exposure 담당</div>
+          <div class="node par">logic 담당</div>
+        </div>
+        <div class="arrow">↓ 결과 합침</div>
+        <div class="node">reporter (보고) · 4턴</div>
+      </div>
+    </div>
+
+    <div class="scroll">
+      <table>
+        <thead>
+          <tr><th>변경</th><th>왜</th><th>효과</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td class="name">exploit을 전문가 5명 병렬로</td>
+            <td>시간의 97%가 LLM 대기 → 동시에 기다리게</td>
+            <td><span class="pill p-gain">시간 −62%</span></td>
+          </tr>
+          <tr>
+            <td class="name">각자 별도 대화 (컨텍스트 격리)</td>
+            <td>한 대화에 도구 출력이 쌓이면 매 턴 전부 재독</td>
+            <td><span class="pill p-gain">캐시읽기 −75%</span></td>
+          </tr>
+          <tr>
+            <td class="name">담당 분리 (중복 방지)</td>
+            <td>담당 없이 5명 돌리면 다 같은 데를 훑음</td>
+            <td><span class="pill p-gain">도구 호출 −42%</span></td>
+          </tr>
+          <tr>
+            <td class="name">recon 단계 제거</td>
+            <td>전문가가 각자 필요한 만큼만 정찰</td>
+            <td><span class="pill p-gain">시간 −22%</span></td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3>계측 코드도 같이 고쳤습니다</h3>
+    <p>병렬로 돌리면 여러 스레드가 같은 카운터를 동시에 건드립니다.
+    <code>+=</code>는 원자적이지 않아서 집계가 조용히 새요.
+    락을 안 걸었으면 <strong>측정 도구가 거짓말을 시작했을 텐데 눈치채기 어려운 종류</strong>였습니다.
+    그 외 코드 리뷰로 결함 10건을 미리 잡았습니다 (미등록 모델 비용이 $0으로 기록되는 문제,
+    실행마다 코드 버전이 기록 안 되는 문제 등).</p>
+  </section>
+
+  <!-- ───────────────────────────────────── -->
+  <section>
+    <h2><span class="tag">03</span> 어떻게 이 답에 도달했나</h2>
+    <p>구조를 바꿔야 한다는 건 감이 아니라 측정에서 나왔습니다. 세 번의 측정이 방향을 정해줬습니다.</p>
+
+    <h3>① 시간은 어디로 가는가</h3>
+<pre><code>전체 190초
+├─ 도구 실행    5초  ( 3%)
+└─ LLM 응답 대기 185초  (97%)   ← 여기</code></pre>
+    <p>처음엔 도구 실행을 병렬화했는데, 재보니 <strong>전체의 3%</strong>였습니다.
+    1초 아꼈어요. 병목이 아닌 걸 최적화하고 있었습니다.
+    진짜 레버는 <strong>LLM 왕복 횟수</strong>였습니다.</p>
+
+    <h3>② 비용은 어디로 가는가</h3>
+<pre><code>비용 $0.295
+├─ 캐시 쓰기  70.5%   ← 여기
+├─ 출력       18.6%
+├─ 캐시 읽기   6.4%
+└─ 입력        4.6%</code></pre>
+    <p>도구가 뱉은 출력 1자는 그 턴에만 드는 게 아닙니다.
+    <strong>대화에 남아서 이후 모든 턴에서 다시 읽힙니다.</strong>
+    9턴짜리 대화면 첫 턴 결과가 9번 곱해져요.
+    전문가를 나누면 각자 대화가 짧아지니 이 곱셈이 줄어듭니다.</p>
+
+    <h3>③ 탐지는 무엇을 따라가는가</h3>
+    <div class="scroll">
+      <table>
+        <thead><tr><th>상관 대상</th><th class="num">r</th><th>해석</th></tr></thead>
+        <tbody>
+          <tr class="best"><td class="name">LLM 턴 수</td><td class="num">+0.46</td><td>가장 강함</td></tr>
+          <tr><td class="name">비용($)</td><td class="num">+0.29</td><td>중간</td></tr>
+          <tr><td class="name">도구 호출 수</td><td class="num">+0.16</td><td>거의 무관</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>52회 실행을 회귀해보니 <strong>탐지는 돈이 아니라 턴 수를 따라갑니다.</strong>
+    컨텍스트를 키우는 데 쓴 토큰은 값을 못 하고, 턴을 늘리는 데 쓴 토큰이 값을 합니다.
+    설계 원칙이 여기서 나왔습니다 — <strong>턴은 많이, 컨텍스트는 작게.</strong></p>
+  </section>
+
+  <!-- ───────────────────────────────────── -->
+  <section>
+    <h2><span class="tag">04</span> 효율이 얼마나 올랐나</h2>
+    <p>같은 모델(haiku), 같은 타깃, 같은 채점 기준입니다.</p>
+
+    <div class="scroll">
+      <table>
+        <thead>
+          <tr>
+            <th>구성</th><th class="num">에이전트</th><th class="num">시간</th>
+            <th class="num">비용</th><th class="num">탐지/54</th><th class="num">해결당</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td class="name">우리 · 순차 (출발점)</td>
+            <td class="num">3</td><td class="num">186s</td><td class="num">$0.267</td>
+            <td class="num">2.33</td><td class="num">$0.115</td>
+          </tr>
+          <tr class="best">
+            <td class="name">우리 · 병렬 전문가 (최종)</td>
+            <td class="num">6</td><td class="num">70s</td><td class="num">$0.363</td>
+            <td class="num">4.33</td><td class="num">$0.084</td>
+          </tr>
+          <tr>
+            <td class="name">Decepticon</td>
+            <td class="num">16</td><td class="num">842s</td><td class="num">$0.303</td>
+            <td class="num">3.00</td><td class="num">$0.101</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h3>출발점 대비 (우리 시스템 내부 개선)</h3>
+    <div class="scroll">
+      <table>
+        <thead><tr><th>지표</th><th class="num">순차</th><th class="num">최종</th><th class="num">변화</th></tr></thead>
+        <tbody>
+          <tr><td class="name">시간</td><td class="num">186s</td><td class="num">70s</td><td class="num d-up">−62%</td></tr>
+          <tr><td class="name">탐지</td><td class="num">2.33</td><td class="num">4.33</td><td class="num d-up">+86%</td></tr>
+          <tr><td class="name">해결당 비용</td><td class="num">$0.115</td><td class="num">$0.084</td><td class="num d-up">−27%</td></tr>
+          <tr><td class="name">비용(회당)</td><td class="num">$0.267</td><td class="num">$0.363</td><td class="num d-down">+36%</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>회당 비용은 늘었습니다 — 턴을 더 쓰기 때문입니다.
+    다만 <strong>찾아낸 취약점 1개당 비용은 27% 싸졌습니다.</strong>
+    같은 돈으로 더 많이 찾는다는 뜻입니다.</p>
+  </section>
+
+  <!-- ───────────────────────────────────── -->
+  <section>
+    <h2><span class="tag">05</span> 실패한 시도들</h2>
+    <p>성공한 것만 보고하면 다음 사람이 같은 함정을 밟습니다. 실패도 결과입니다.</p>
+
+    <div class="scroll">
+      <table>
+        <thead><tr><th>시도</th><th>가설</th><th>결과</th></tr></thead>
+        <tbody>
+          <tr>
+            <td class="name">깊이 프롬프트</td>
+            <td>“한 취약점을 끝까지 파라”</td>
+            <td><span class="pill p-loss">실패</span> 행동은 바뀌었으나(후보당 시도 1.1→2.0) 탐지로 전환 안 됨</td>
+          </tr>
+          <tr>
+            <td class="name">도구 배칭만 단독</td>
+            <td>턴당 도구를 더 태우면</td>
+            <td><span class="pill p-loss">실패</span> 컨텍스트만 부풀어 비용 +47%</td>
+          </tr>
+          <tr>
+            <td class="name">스텝 12로 증가</td>
+            <td>더 많이 주면 더 찾겠지</td>
+            <td><span class="pill p-loss">하락</span> 9스텝이 최적점</td>
+          </tr>
+          <tr>
+            <td class="name">전문가 8명으로 증가</td>
+            <td>인원이 많으면 더 넓게</td>
+            <td><span class="pill p-loss">하락</span> 담당이 겹쳐 비용 +59%, 탐지는 오히려 감소</td>
+          </tr>
+          <tr>
+            <td class="name">2차 웨이브 (정보 공유)</td>
+            <td>전문가끼리 발견을 공유하면</td>
+            <td><span class="pill p-hold">동률</span> 같은 예산에서 이득 없음 → 완전 격리가 옳았음</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <p><strong>마지막 세 시도가 연속으로 실패했다는 게 중요합니다.</strong>
+    파라미터(스텝·인원)와 구조(정보 공유) 양쪽 모두 벽에 부딪혔다는 뜻이라,
+    프레임워크 최적화는 여기서 끝났다고 판단했습니다.</p>
+  </section>
+
+  <!-- ───────────────────────────────────── -->
+  <section>
+    <h2><span class="tag">06</span> 정직하게 짚을 한계</h2>
+
+    <h3>① 탐지 수치는 아직 통계적으로 약합니다</h3>
+    <div class="scroll">
+      <table>
+        <thead><tr><th>주장</th><th class="num">t값</th><th>판정</th></tr></thead>
+        <tbody>
+          <tr class="best"><td class="name">시간 12.1배</td><td class="num">15.82</td><td>p&lt;0.001 · 압도적</td></tr>
+          <tr class="best"><td class="name">컨테이너·에이전트</td><td class="num">—</td><td>정수 · 논쟁 불가</td></tr>
+          <tr><td class="name">탐지 +44%</td><td class="num">1.63</td><td>p≈0.06~0.10 · <strong>미달</strong></td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>시간·구조 주장은 이미 확정적입니다. <strong>탐지만 아직 흔들립니다.</strong>
+    다만 효과크기가 커서(Cohen's d=1.15) <strong>Decepticon을 5회 더 돌리면(3→8) 유의해집니다.</strong>
+    비용 약 $1.5, 사람 시간 70분입니다.</p>
+
+    <div class="note">
+      <p class="h">발표 프레이밍 제안</p>
+      <p>헤드라인을 “탐지 +44%”로 잡으면 <strong>가장 약한 숫자로 방어</strong>하게 됩니다.
+      <strong>“12배 빠르고, 컨테이너 71% 적고, 탐지는 최소한 밀리지 않는다”</strong>로 잡으면
+      t=15.8짜리 숫자가 앞에 서고 탐지는 보조가 됩니다. 같은 데이터인데 훨씬 안 뚫립니다.</p>
+    </div>
+
+    <h3>② Decepticon 측 워크스페이스 오염</h3>
+    <p>2·3회차 실행에서 Decepticon의 exploit 에이전트가
+    <strong>이전 회차 디렉토리에 실제로 접근</strong>하는 게 전사에서 확인됐습니다.
+    인게이지먼트 간 격리가 우리 쪽만큼 보장되지 않습니다.
+    스코어보드 자체는 매회 리셋하므로 점수는 오염되지 않지만,
+    “얼마나 빨리 찾았는가”는 회차 독립성이 깨졌을 수 있습니다. 외부 시스템이라 우리가 고칠 수 없습니다.</p>
+
+    <h3>③ 예산 제약 상태입니다</h3>
+    <p>전문가당 스텝을 4 / 6 / 9로 늘려가며 재보니 탐지가
+    2.67 → 3.67 → 4.67로 <strong>계속 올랐습니다.</strong>
+    즉 능력 한계가 아니라 예산 한계입니다.
+    “싸다”는 “예산을 이만큼만 썼다”와 같은 말이므로,
+    <strong>효율 수치는 반드시 예산 곡선과 함께 제시</strong>해야 합니다.
+    안 그러면 “덜 쓰니까 덜 찾은 걸 효율로 포장했다”는 지적이 바로 나옵니다.</p>
+
+    <div class="note warn">
+      <p class="h">측정 방법론 경고</p>
+      <p>탐지 표준편차가 σ≈1.1입니다. <strong>n=3이면 95% 신뢰구간이 ±1.2</strong>라,
+      평균 차이가 1.2 미만이면 아무 결론도 내면 안 됩니다.
+      이번 작업에서 n=3 평균만 보고 내린 판단이 <strong>세 번 뒤집혔습니다.</strong>
+      앞으로는 회귀 잔차(전체 실행 사용)와 결정론적 지표(비용·턴 수)로만 판단합니다.</p>
+    </div>
+  </section>
+
+  <!-- ───────────────────────────────────── -->
+  <section>
+    <h2><span class="tag">07</span> 다음</h2>
+    <div class="scroll">
+      <table>
+        <thead><tr><th>할 일</th><th>비용</th><th>왜</th></tr></thead>
+        <tbody>
+          <tr class="best">
+            <td class="name">Decepticon 5회 추가 측정</td>
+            <td>$1.5 · 70분</td>
+            <td>탐지 주장이 p&lt;0.05로 확정됨. <strong>현재 ROI 최고</strong></td>
+          </tr>
+          <tr>
+            <td class="name">모델 업그레이드 (opus/sonnet)</td>
+            <td>예산 필요</td>
+            <td>구조 이득 12배가 그대로 곱해짐. 순서상 지금이 맞음</td>
+          </tr>
+          <tr>
+            <td class="name">타깃 추가 (DVWA 등)</td>
+            <td>중</td>
+            <td>“이 타깃에서만 그렇다”는 반론 차단</td>
+          </tr>
+          <tr>
+            <td class="name">프레임워크 추가 최적화</td>
+            <td>—</td>
+            <td><span class="pill p-hold">종료</span> 세 방향 연속 실패로 수확 체감 확인</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <footer>
+    측정 조건 · 훈련용 취약 웹앱 난이도 ≤3 · 분모 54 · claude-haiku-4-5 (양측 동일) ·
+    자동 채점(스코어보드 API) · 격리 네트워크(외부 인터넷 차단) ·
+    총 62회 실행 · 총 지출 $18.92 · 2026-08-25
+  </footer>
+
+</div>
