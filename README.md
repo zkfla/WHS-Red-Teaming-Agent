@@ -222,8 +222,10 @@ finredteam/
 │                          finding(CandidateFinding — attack_class 없음, operation 로 대체),
 │                          knowledge(Fact/Lesson(operation)/Entitlement)
 │
-├── llm/                   base(LLMClient 프로토콜, LLMError, LLMEvent) · anthropic_ · openai_ · factory
-│                          · fake(가짜 LLM — API 키 없이 ReAct 배관 시험용)
+├── llm/                   base(LLMClient 프로토콜, LLMError, LLMEvent) · anthropic_ · openai_ ·
+│                          chatgpt_subscription(★ `codex login` 구독 인증, `complete_json()`만 구현 —
+│                          `chatgpt.com/backend-api/codex/responses`, API 요금 없음) · codex_auth
+│                          (`~/.codex/auth.json` 로더) · factory · fake(가짜 LLM — API 키 없이 배관 시험용)
 │
 ├── storage/                db(JSONL, steps/llm_calls/created_resources/cleanup 포함 16개 컬렉션)
 │                          · evidence(민감정보 redaction) · run_store(manifest.json — engagement_id/policy_hash 포함)
@@ -326,7 +328,12 @@ Day 1~7 전부 구현 완료 + 실제 vuln-bank(Commando-X/vuln-bank, 로컬 Doc
   의 `operation`으로 실험하는 자동 연결은 아직 없다(발견 → 그래프에 사실로
   남음 → 사람이 보거나 다음 설계 확장에서 자동화).
 - OpenAI 프로바이더(`llm/openai_.py`)는 코드는 있지만 실제 API 키로
-  라이브 테스트하지 않았다.
+  라이브 테스트하지 않았다. ChatGPT Subscription 프로바이더
+  (`llm/chatgpt_subscription.py`, `codex login` 구독 인증)는 실제 크리덴셜로
+  vuln-bank 대상 8스텝 라이브 실행까지 검증됐다(BOLA 2건 확정 탐지) — 단,
+  OpenAI 쪽 strict JSON schema 제약 때문에 `{"items":[...]}` 래퍼를 가끔
+  생략하고 응답하는 경향이 있어 방어적으로 언래핑한다(`_unwrap_items`),
+  토큰 자동 갱신은 없어 만료되면 사람이 `codex login` 을 다시 해야 한다.
 - **Engagement 레이어(§2)의 한계**: `max_concurrency`/`allow_file_upload`/
   `allow_race_testing`은 컴파일은 되지만 대응하는 실행 가능한 액션이 아직
   없어서(동시 요청을 실제로 보내는 ReAct 액션 자체가 없음) 소비되지 않는다.
@@ -368,7 +375,9 @@ finredteam --fake-llm --max-rounds 10
 # 실제 LLM 으로 — 진짜 탐색. 환경변수를 미리 안 넣으면 터미널에서 대화형으로
 # 물어본다(저장된 것 중 선택 또는 새로 입력 — 자세한 건 RUNNING.md 4절).
 # API 키 대신 `claude setup-token` 으로 만든 OAuth 토큰도 그대로 쓸 수 있다
-# (ANTHROPIC_AUTH_TOKEN).
+# (ANTHROPIC_AUTH_TOKEN). provider 는 세 가지(anthropic/openai/
+# chatgpt_subscription) 중 환경변수/`~/.codex/auth.json` 으로 자동 감지되고,
+# 대화형 터미널이면 감지된 걸 기본값으로 매번 직접 고를 수도 있다(RUNNING.md 4절).
 export ANTHROPIC_API_KEY=sk-ant-...
 finredteam --max-rounds 20
 

@@ -185,7 +185,7 @@ SDK가 `APITimeoutError`(→ `APIError` 계열)를 던지고, 이는 §3.4 의 `
 
 | 위치 | 레벨 | 내용 |
 |---|---|---|
-| `llm/anthropic_.py`/`openai_.py::complete_json` | DEBUG | 매 시도(최대 2회)의 raw 응답 텍스트(2000자까지), 파싱 성공/실패 |
+| `llm/anthropic_.py`/`openai_.py`/`chatgpt_subscription.py::complete_json` | DEBUG | 매 시도(최대 2회)의 raw 응답 텍스트(2000자까지), 파싱 성공/실패 |
 | 〃 | WARNING | 파싱/검증 실패 사유 |
 | `agent/react.py::run()` | INFO | 매 스텝 `action` 한 줄 요약 |
 | `agent/react.py::_dispatch` | WARNING | 액션 입력 검증 실패, `resolve_skeleton` 거절, 알 수 없는 `hypothesis_id`, 중복 실험 재실행 거절 |
@@ -336,6 +336,8 @@ reason=max_rounds, tokens=12,400, cost=$0.08
 | 실행 시작하자마자 `TypeError: ... unexpected keyword argument` 로 죽음 | 설치된 벤더 SDK 버전이 우리 코드가 쓰는 파라미터를 안 받음(§8.1) | `pip show anthropic`/`openai` 버전, `llm/anthropic_.py`·`llm/openai_.py` 의 `.create()` 호출부 |
 | `termination_reason: llm_unavailable`, `tokens_in`/`requests` 가 0 | LLM 호출이 처음부터 계속 실패(레이트리밋/인증/네트워크) — 오라클/그래프 문제가 아니다(§8.2) | `runs/<id>/agent.log` 의 `LLM 호출 실패` 줄들, 429면 API 사용량/한도 확인 |
 | 실행이 시작하자마자 `PolicyViolation` 트레이스백으로 죽음 | §3.7 의 사전 검사가 빠진 새 코드 경로(버그) — 정상 흐름이면 트레이스백 없이 붉은 메시지로 끝나야 한다 | `runs/<id>/agent.log` 에서 `PolicyViolation` 발생 지점, §3.7 |
+| `chatgpt_subscription` 사용 중 `구조화 출력 파싱 실패: 'items'` 반복 | strict 모드가 꺼진 스키마(자유형 `action_input` 포함)라 모델이 `{"items":[...]}` 래퍼를 가끔 생략함(§8.3, `_unwrap_items` 로 이미 방어됨 — 새 스키마 추가 시 회귀 확인용) | `llm_calls.jsonl` 의 `raw_response` |
+| `chatgpt_subscription` 사용 중 `ReauthenticationRequired`/"codex login 을 실행했는지 확인" | `~/.codex/auth.json` 토큰 만료 — 자동 갱신 없음(§8.3 근처, RUNNING.md §6) | `codex login` 재실행 후 재시도 |
 
 ---
 
@@ -457,3 +459,40 @@ distinctly_from_saturated` 가 우선순위를, 라이브 검증(실제 vuln-ban
 백오프를 아무리 늘려도 안 풀린다. `RUNNING.md` §4/§6에 이 함정을 명시했다.
 코드 관점에서 결론: `llm_unavailable` + backoff 는 정확히 설계대로 동작했다
 — 이건 소프트웨어 버그가 아니라 인증 수단 자체의 한도 문제였다.
+
+### 8.3 ChatGPT Subscription 프로바이더 — strict 모드 불가 스키마에서 `{"items":[...]}` 래퍼를 가끔 생략함
+
+**증상**: `chatgpt_subscription` 으로 vuln-bank 대상 8라운드 라이브 실행 중,
+1~2스텝은 정상 파싱됐는데 3스텝째부터 매번
+`ChatGPT 응답 파싱/검증 실패 (attempt=1/2): 구조화 출력 파싱 실패: 'items'`
+로 실패했다. `runs/<id>/llm_calls.jsonl` 의 `raw_response` 를 직접 열어보니
+모델이 `{"items":[...]}` 래퍼 없이 내부 객체(`{"thought":...,"action":...,
+"action_input":...}`)를 바로 돌려주고 있었다.
+
+**원인**: `ReActStep.action_input: dict` 는 자유 형식 필드라 OpenAI strict
+JSON schema 모드(`additionalProperties:false` + 모든 프로퍼티가 `required`)로
+표현이 불가능하다(`_strictify_schema()` 가 이런 경우 `strict_ok=False` 를
+돌려줌). strict 가 꺼지면 모델이 스키마의 추가 래퍼 레이어를 안 지켜도
+문법적으로는 위반이 아니라서, 가끔 무시하고 안쪽 객체를 그대로 반환한다.
+
+**고침**: `llm/chatgpt_subscription.py::_unwrap_items()` 를 신설해 응답
+payload 를 세 가지 모양(정상 `{"items":[...]}` 래퍼 / bare 배열 / bare
+단일 객체 — 이 경우 `[obj]` 로 감싸서 처리) 전부 받아들이게 방어적으로
+파싱한다. 재현 테스트(`tests/test_chatgpt_subscription.py`)로 세 모양
+전부 고정한 뒤, 같은 라이브 시나리오를 `--max-rounds 8` 로 재실행해 8스텝
+전부 정상 완주(BOLA 2건 확정)까지 확인했다.
+
+### 8.4 콘솔 한글 로그가 깨져서 출력됨(cp949 mojibake) — `stderr` 인코딩
+
+**증상**: 위 8.3 을 진단하던 중, `logger.warning()` 이 찍는 한글 메시지(예:
+"ChatGPT 응답 파싱/검증 실패")가 콘솔에서 `WARNING finredteam.llm.
+chatgpt_subscription: ChatGPT ���� �Ľ�/���� ����` 처럼 깨져 나왔다 —
+`rich.Console.print()` 로 찍는 다른 한글 출력은 멀쩡했다.
+
+**원인**: `logging.StreamHandler()`(`logging_setup.py`) 는 기본으로
+`sys.stderr` 를 쓰는데, `__main__.py::main()`/`replay.py::main()` 은
+`sys.stdout` 만 `reconfigure(encoding="utf-8")` 했고 `sys.stderr` 는 그대로
+뒀다 — Windows 콘솔 기본 코드페이지(cp949)로 인코딩되며 깨졌다.
+
+**고침**: 두 `main()` 모두 `sys.stderr.reconfigure(encoding="utf-8")` 를
+`sys.stdout` 바로 옆에 추가했다.

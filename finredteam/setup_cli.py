@@ -62,14 +62,17 @@ def _codex_login_available() -> bool:
 
 
 def _resolve_provider(args: argparse.Namespace, console: Console) -> str:
-    """명시적 플래그 > 환경변수/로컬 credential 로 자동 판단 > (대화형이면) 직접
-    질문 > 기본값 anthropic.
+    """명시적 플래그 > (대화형이면) 항상 직접 질문(감지된 걸 기본값으로) >
+    (비대화형이면) 환경변수/로컬 credential 자동 판단 > 기본값 anthropic.
 
     감지 대상 셋: `ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN`(anthropic),
     `OPENAI_API_KEY`(openai), `~/.codex/auth.json`(chatgpt_subscription, `codex
-    login` 결과). 정확히 하나만 감지되면 그걸 그대로 쓴다 — 둘 이상이거나
-    하나도 없으면 대화형 터미널일 때만 물어본다(비대화형이면 기존과 같이
-    anthropic 기본값, 스크립트/CI 를 새로 막지 않는다)."""
+    login` 결과). **대화형 터미널이면 몇 개가 감지되든 항상 1/2/3 중 고를 수
+    있게 물어본다** — 자동 감지는 그중 하나를 기본값(Enter 만 치면 선택됨)으로
+    미리 골라주는 용도일 뿐, 선택 자체를 대신하지 않는다(여러 provider를 오가며
+    비교해보고 싶을 때를 위해). 비대화형(CI/스크립트, `--no-key-prompt`, 파이프
+    입력)이면 물어볼 수 없으니 감지된 게 정확히 하나면 그걸, 아니면 기존처럼
+    anthropic 기본값을 쓴다."""
     if args.llm_provider:
         return args.llm_provider
 
@@ -90,22 +93,21 @@ def _resolve_provider(args: argparse.Namespace, console: Console) -> str:
         )
         if ok
     ]
-    if len(detected) == 1:
-        return detected[0]
 
     if args.no_key_prompt or not sys.stdin.isatty():
-        return "anthropic"
+        return detected[0] if len(detected) == 1 else "anthropic"
 
     labels = {
         "1": ("anthropic", "Anthropic (Claude)" + (" [감지됨]" if anthropic_available else "")),
         "2": ("openai", "OpenAI (GPT)" + (" [감지됨]" if openai_available else "")),
         "3": ("chatgpt_subscription", "ChatGPT Subscription (codex login)" + (" [감지됨]" if codex_available else "")),
     }
+    default_choice = next((k for k, (p, _) in labels.items() if p == detected[0]), "1") if len(detected) == 1 else "1"
     prompt_text = "어떤 LLM 을 쓸까요? " + "  ".join(f"{k}) {v[1]}" for k, v in labels.items())
     try:
-        choice = Prompt.ask(prompt_text, choices=list(labels), default="1", console=console)
+        choice = Prompt.ask(prompt_text, choices=list(labels), default=default_choice, console=console)
     except EOFError:
-        return "anthropic"
+        return detected[0] if len(detected) == 1 else "anthropic"
     return labels[choice][0]
 
 

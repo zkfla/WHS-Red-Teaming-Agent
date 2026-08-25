@@ -188,21 +188,42 @@ Anthropic 은 **두 가지 인증 방식**을 받는다 — 어느 쪽이든 아
    finredteam --max-rounds 20 --no-key-prompt
    ```
 
-**Anthropic 대신 OpenAI 를 쓰려면**(예: Anthropic 무료 플랜 한도에 막혔을 때)
-`--llm-provider openai --llm-model gpt-5` 처럼 명시하면 된다 —
-`OPENAI_API_KEY` 기준으로 같은 흐름이 적용된다(OpenAI 는 OAuth 토큰 방식이
-없다, API 키만).
+**Provider 는 세 가지다**: `anthropic`(Claude, API 키 또는 OAuth 토큰),
+`openai`(GPT, API 키만), `chatgpt_subscription`(ChatGPT 구독 계정 — `codex
+login` 으로 만든 `~/.codex/auth.json` 을 그대로 쓴다, 별도 API 키/과금 없음
+— 구독 사용량에 묶인다). `--llm-provider anthropic|openai|chatgpt_subscription`
+로 명시할 수 있고, 모델은 `--llm-model` 로 바꾼다(기본값은 provider 별로
+`claude-sonnet-4-6`/`gpt-5`/`gpt-5.4`).
 
-`--llm-provider` 를 안 주면 **환경변수로 자동 판단**한다 — `ANTHROPIC_API_KEY`/
-`ANTHROPIC_AUTH_TOKEN` 만 있으면 anthropic, `OPENAI_API_KEY` 만 있으면
-openai. 둘 다 있거나 둘 다 없으면(그리고 대화형 터미널이면) 직접 물어본다:
+```bash
+# 예: Anthropic 무료 플랜 한도에 막혔을 때 OpenAI 로
+finredteam --llm-provider openai --llm-model gpt-5
 
+# 예: codex login 으로 이미 로그인해둔 ChatGPT 구독 계정 그대로 쓰기
+codex login   # 아직 안 했으면 최초 1회
+finredteam --llm-provider chatgpt_subscription
 ```
-어떤 LLM 을 쓸까요? 1) Anthropic (Claude)  2) OpenAI (GPT) [1/2] (1):
-```
 
-비대화형이거나 `--no-key-prompt` 면 물어보지 않고 기존처럼 anthropic 을
-기본값으로 쓴다(스크립트/CI 안 깨지게).
+**`--llm-provider` 를 안 주면 자동 감지한다** — `ANTHROPIC_API_KEY`/
+`ANTHROPIC_AUTH_TOKEN`(anthropic), `OPENAI_API_KEY`(openai),
+`~/.codex/auth.json`(chatgpt_subscription) 셋 중 뭐가 있는지 본다.
+
+- **비대화형**(스크립트/CI, `--no-key-prompt`, 파이프 입력)이면: 감지된 게
+  정확히 하나면 그걸 그대로 쓰고, 아니면(0개 또는 2개 이상) 기존처럼
+  anthropic 을 기본값으로 쓴다(물어볼 방법이 없으니 조용히 진행 — 안 깨지게).
+- **대화형 터미널**이면 감지 개수와 무관하게 **항상** 직접 고를 수 있게
+  물어본다 — 자동 감지는 그중 하나를 기본값(그냥 Enter)으로 미리 채워줄
+  뿐, 선택 자체를 생략하지 않는다(여러 provider 성능을 비교해보고 싶을 때를
+  위해서다):
+
+  ```
+  어떤 LLM 을 쓸까요? 1) Anthropic (Claude) [감지됨]  2) OpenAI (GPT)  3) ChatGPT Subscription (codex login) [1/2/3] (1):
+  ```
+
+`chatgpt_subscription` 인증이 만료되면(`ReauthenticationRequired` 에러,
+"codex login 을 실행했는지 확인하세요" 메시지) `codex login` 을 다시 실행해
+`~/.codex/auth.json` 을 갱신한다 — 이 프로바이더는 만료 토큰을 자동으로
+갱신하지 않는다(수동 재로그인만 지원).
 
 ## 5. 실행 결과 보기
 
@@ -237,6 +258,19 @@ finredteam-scorer runs/<run_id>
 - **`termination_reason: llm_unavailable`, 매 스텝 `429 rate_limit_error`**
   (30초까지 백오프해도 안 풀림) → 십중팔구 **무료 플랜으로 받은 OAuth 토큰**
   이다(실측 확인, 4절 참고) — 결제 등록된 API 키나 Pro/Max 구독 토큰으로 바꾼다
+- **`... (codex login 을 실행했는지 확인하세요)` 에러** →
+  `chatgpt_subscription` 선택했는데 `~/.codex/auth.json` 이 없거나
+  `codex login` 이 만든 형식이 아니다 — `codex login` 을 실행해 갱신
+- **`ChatGPT 응답 재인증 필요` / `ReauthenticationRequired`** →
+  `~/.codex/auth.json` 의 access token 이 만료됐다 — `codex login` 을 다시
+  실행한다(이 프로바이더는 만료 토큰을 자동 갱신하지 않는다, 4절 참고)
+- **`saturated` 로 몇 스텝 만에 조기 종료됐는데 `discover_surface`/
+  `observe_graph`/`recall_memory` 만 반복하고 `propose_hypothesis`/
+  `execute_experiment` 를 한 번도 안 씀** → 코드 버그가 아니라 LLM이 탐색만
+  반복하고 가설 실행으로 못 넘어간 것(그래프가 6스텝 연속 안 자라면
+  `agent/react.py` 의 `_SATURATED_STEPS_WITHOUT_GROWTH` 로 정상 종료된다) —
+  `steps.jsonl` 에서 action 분포를 확인하고, 재현되면 다른 provider/모델로
+  바꿔보거나 `--max-rounds` 를 늘려도 이 임계값 자체는 안 바뀐다는 점 유의
 - **vuln-bank 연결 안 됨** (`ConnectionError` 등) → Docker 컨테이너 떠 있는지,
   `curl http://localhost:5000/` 로 확인
 - **왜 이런 판정이 나왔는지 궁금함** → `--log-level DEBUG` 로 다시 실행하거나,
