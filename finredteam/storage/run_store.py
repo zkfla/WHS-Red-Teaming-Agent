@@ -52,6 +52,16 @@ class RunStore:
     def append(self, collection: str, record: dict[str, Any]) -> int:
         return self.db.append(collection, record)
 
+    def set_llm_display(self, provider: str, model: str) -> None:
+        """실제로 쓰인 LLM 클라이언트를 manifest 에 정확히 남긴다.
+
+        `RunConfig.llm`(config.LLMConfig)은 provider 를 anthropic|openai 로만
+        허용하므로(§2), 그 타입에 담을 수 없는 값(예: 테스트용 fake 클라이언트)을
+        쓴 경우 이 메서드로 manifest 표시값만 따로 갱신한다.
+        """
+        self.manifest["llm"] = {"provider": provider, "model": model}
+        self._write_manifest()
+
     def record_strategy(self, round_no: int, strategy_name: str) -> None:
         self.manifest["strategy_history"].append({"round": round_no, "strategy": strategy_name})
         self._write_manifest()
@@ -59,7 +69,10 @@ class RunStore:
     def snapshot_round(self, round_no: int, extra: dict[str, Any] | None = None) -> None:
         self.manifest["round"] = round_no
         if extra:
-            self.manifest.update(extra)
+            # 얕은 복사 — 호출부가 자기 쪽에서 계속 append 하는 list/dict 를 그대로
+            # 넘기면, manifest 와 같은 객체를 공유하게 되어(list aliasing) 이후
+            # record_strategy() 같은 다른 메서드의 변경이 호출부 객체까지 오염시킨다.
+            self.manifest.update({k: (v.copy() if isinstance(v, (list, dict)) else v) for k, v in extra.items()})
         self._write_manifest()
 
     def finalize(self, termination_reason: str, usage: Usage | None = None) -> Path:

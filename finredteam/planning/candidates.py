@@ -1,19 +1,23 @@
-"""templates/attacks.yaml 로더 + 그래프에서 유도한 후보 뼈대(skeleton) 나열 (§설계원칙 5).
+"""templates/attacks.yaml 로더 + `propose_candidate` 액션 하나를 실제 후보 뼈대
+(skeleton)로 해석(resolve)한다 (§설계원칙 5).
+
+ReAct 로 바뀌면서 "미리 다 나열"(enumerate) 대신 "LLM 이 고른 target 하나를
+검증하고 채운다"(resolve) 로 바뀌었다 — LLM 은 그래프가 실제로 아는 노드만
+가리킬 수 있고, 존재하지 않는 계좌를 지어내면 에러 문자열이 돌아온다.
 
 skeleton 은 아직 구체 파라미터가 없다 — "어떤 엔드포인트를, 어떤 주체로" 까지만
-그래프·baseline 설정에서 결정적으로 정하고, "어떤 값을 시도할지"는
-`planning/planner.py` 가 LLM 으로 채운다.
+그래프·baseline 설정에서 결정적으로 정하고, "어떤 값을 시도할지"(params)는
+LLM 이 `propose_candidate` 액션 입력으로 이미 골라서 들어온다.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 
 import yaml
 from pydantic import BaseModel
 
-from finredteam.knowledge.baseline import BaselineRegistry
 from finredteam.knowledge.graph import KnowledgeGraph
 from finredteam.models.core import Principal
 from finredteam.targets.loader import TargetConfig
@@ -53,100 +57,142 @@ class CandidateSkeleton:
     hint: dict[str, Any] = field(default_factory=dict)
 
 
-def _f2_skeletons(
-    principals: list[Principal], graph: KnowledgeGraph, target: TargetConfig, template: AttackTemplate
-) -> list[CandidateSkeleton]:
-    """F2(금액 무결성): baseline_ops 중 계정 간 가치 이동을 하는 op(예: transfer)마다,
-    entitled_own(account) 가 확정된 각 principal 을 발신자로 하는 skeleton 을 만든다.
-    """
-    skeletons: list[CandidateSkeleton] = []
-    for op_cfg in target.baseline_ops():
-        if op_cfg.get("op") != "transfer":
-            continue
-        for principal in principals:
-            if not principal.account_number:
-                continue
-            if not graph.has_entitlement(principal.id, f"account:{principal.account_number}", "own"):
-                continue
-            others = [p for p in principals if p.id != principal.id and p.account_number]
-            if not others:
-                continue
-            counterparty = others[0]
-            skeletons.append(
-                CandidateSkeleton(
-                    layer="finance",
-                    attack_class=template.id,
-                    invariants=template.oracle,
-                    principal_id=principal.id,
-                    method=op_cfg.get("method", "POST"),
-                    path=op_cfg["path"],
-                    subject_account=principal.account_number,
-                    watch_accounts=[principal.account_number, counterparty.account_number],
-                    needs_baseline=template.requires_baseline,
-                    hint={"op": "transfer", "counterparty_account": counterparty.account_number},
-                )
-            )
-    return skeletons
+def _parse_account_target(target: str) -> str | None:
+    """"account:1234567890" -> "1234567890". 형식이 다르면 None."""
+    prefix = "account:"
+    return target[len(prefix) :] if target.startswith(prefix) else None
 
 
-def _f1_skeletons(
-    principals: list[Principal], graph: KnowledgeGraph, target: TargetConfig, template: AttackTemplate
-) -> list[CandidateSkeleton]:
-    """F1(권한 경계): 각 principal 이 다른 principal 의 entitled_own 계좌를
-    조회하는(BOLA) skeleton — `observation.balance` 엔드포인트를 그대로 쓴다.
-    """
-    obs = target.observation_config()
-    balance_cfg = obs.get("balance") if isinstance(obs, dict) else None
-    if not balance_cfg:
-        return []
-
-    skeletons: list[CandidateSkeleton] = []
-    for principal in principals:
-        for other in principals:
-            if other.id == principal.id or not other.account_number:
-                continue
-            if not graph.has_entitlement(other.id, f"account:{other.account_number}", "own"):
-                continue
-            path = balance_cfg["path"].replace("{account_number}", other.account_number)
-            skeletons.append(
-                CandidateSkeleton(
-                    layer="finance",
-                    attack_class=template.id,
-                    invariants=template.oracle,
-                    principal_id=principal.id,
-                    method=balance_cfg.get("method", "GET"),
-                    path=path,
-                    subject_account=other.account_number,
-                    watch_accounts=[],
-                    needs_baseline=False,
-                    hint={"target_principal": other.id},
-                )
-            )
-    return skeletons
+def _find_principal(principal_id: str, principals: list[Principal]) -> Principal | None:
+    return next((p for p in principals if p.id == principal_id), None)
 
 
-_BUILDERS = {"F2": _f2_skeletons, "F1": _f1_skeletons}
-
-
-def enumerate_skeletons(
+def _resolve_f1(
+    principal_id: str,
+    target: str,
     principals: list[Principal],
     graph: KnowledgeGraph,
-    target: TargetConfig,
-    templates: dict[str, AttackTemplate],
-    attack_classes: list[str] | None = None,
-) -> list[CandidateSkeleton]:
-    """§설계원칙 5 — 후보는 그래프(entitled_own 등)에서 유도한다.
+    target_cfg: TargetConfig,
+    template: AttackTemplate,
+) -> CandidateSkeleton | str:
+    """F1(권한 경계, BOLA): `target` 계좌를 `observation.balance` 엔드포인트로 조회."""
+    obs = target_cfg.observation_config()
+    balance_cfg = obs.get("balance") if isinstance(obs, dict) else None
+    if not balance_cfg:
+        return "이 대상에는 observation.balance 설정이 없어 F1 을 시험할 수 없음"
 
-    지원하는 attack_class 마다 전용 빌더가 필요하다. 아직 빌더가 없는 클래스는
-    조용히 스킵된다 — Day5 범위는 F2 뿐이고, 나머지는 해당 오라클/레이어가 갖춰지는
-    Day에 `_BUILDERS` 에 추가된다.
+    principal = _find_principal(principal_id, principals)
+    if principal is None:
+        return f"알 수 없는 principal_id: {principal_id!r}"
+
+    account = _parse_account_target(target)
+    if account is None:
+        return f"target 형식이 잘못됨: {target!r} (예: 'account:1234567890')"
+
+    if graph.entitlement_unknown(f"account:{account}"):
+        return f"account:{account} 는 그래프가 모르는 계좌 — observe_graph 로 먼저 실존 계좌를 확인하라"
+
+    path = balance_cfg["path"].replace("{account_number}", account)
+    return CandidateSkeleton(
+        layer="finance",
+        attack_class=template.id,
+        invariants=template.oracle,
+        principal_id=principal_id,
+        method=balance_cfg.get("method", "GET"),
+        path=path,
+        subject_account=account,
+        watch_accounts=[],
+        needs_baseline=False,
+        hint={"target_account": account},
+    )
+
+
+def _resolve_f2(
+    principal_id: str,
+    target: str,
+    principals: list[Principal],
+    graph: KnowledgeGraph,
+    target_cfg: TargetConfig,
+    template: AttackTemplate,
+) -> CandidateSkeleton | str:
+    """F2(금액 무결성): `principal_id` 가 발신자, `target` 이 수신 계좌인 송금."""
+    principal = _find_principal(principal_id, principals)
+    if principal is None or not principal.account_number:
+        return f"알 수 없는 principal_id 이거나 계좌가 없음: {principal_id!r}"
+    if not graph.has_entitlement(principal_id, f"account:{principal.account_number}", "own"):
+        return f"{principal_id} 는 자기 계좌에 대한 entitled_own 이 없음 (부트스트랩 이상)"
+
+    counterparty_account = _parse_account_target(target)
+    if counterparty_account is None:
+        return f"target 형식이 잘못됨: {target!r} (예: 'account:1234567890')"
+    if graph.entitlement_unknown(f"account:{counterparty_account}"):
+        return f"account:{counterparty_account} 는 그래프가 모르는 계좌 — observe_graph 로 먼저 확인하라"
+
+    op_cfg = next((o for o in target_cfg.baseline_ops() if o.get("op") == "transfer"), None)
+    if op_cfg is None:
+        return "이 대상 설정(baseline_ops)에 transfer 연산이 정의되어 있지 않음"
+
+    return CandidateSkeleton(
+        layer="finance",
+        attack_class=template.id,
+        invariants=template.oracle,
+        principal_id=principal_id,
+        method=op_cfg.get("method", "POST"),
+        path=op_cfg["path"],
+        subject_account=principal.account_number,
+        watch_accounts=[principal.account_number, counterparty_account],
+        needs_baseline=template.requires_baseline,
+        hint={"op": "transfer", "counterparty_account": counterparty_account},
+    )
+
+
+ResolverFn = Callable[
+    [str, str, list[Principal], KnowledgeGraph, TargetConfig, AttackTemplate], "CandidateSkeleton | str"
+]
+
+_RESOLVERS: dict[str, ResolverFn] = {"F1": _resolve_f1, "F2": _resolve_f2}
+
+
+def supported_attack_classes() -> list[str]:
+    return sorted(_RESOLVERS)
+
+
+def resolve_skeleton(
+    attack_class: str,
+    principal_id: str,
+    target: str,
+    principals: list[Principal],
+    graph: KnowledgeGraph,
+    target_cfg: TargetConfig,
+    templates: dict[str, AttackTemplate],
+) -> CandidateSkeleton | str:
+    """`propose_candidate` 액션 입력 하나를 검증하고 skeleton 으로 채운다.
+
+    실패하면(존재하지 않는 계좌, 지원 안 하는 attack_class 등) 사람이 읽을 수
+    있는 에러 문자열을 반환한다 — 이 문자열이 그대로 LLM 에게 Observation 으로
+    돌아가 다음 스텝에서 스스로 고치게 한다.
     """
-    classes = attack_classes if attack_classes is not None else list(templates.keys())
-    out: list[CandidateSkeleton] = []
-    for attack_class in classes:
-        template = templates.get(attack_class)
-        builder = _BUILDERS.get(attack_class)
-        if template is None or builder is None:
-            continue
-        out.extend(builder(principals, graph, target, template))
-    return out
+    template = templates.get(attack_class)
+    if template is None:
+        return f"알 수 없는 attack_class: {attack_class!r} (templates/attacks.yaml 참고)"
+    resolver = _RESOLVERS.get(attack_class)
+    if resolver is None:
+        return f"{attack_class} 는 아직 구현된 후보 생성기가 없음 (지원: {supported_attack_classes()})"
+    return resolver(principal_id, target, principals, graph, target_cfg, template)
+
+
+def graph_menu(principals: list[Principal], graph: KnowledgeGraph) -> dict[str, Any]:
+    """`observe_graph` 액션의 Observation — LLM 이 실존하는 대상만 고르도록 메뉴를 준다."""
+    entitled = graph.entitled_edges()
+    known_accounts = sorted({e["obj"] for e in entitled if e["obj"].startswith("account:")})
+    entitled_own = {
+        e["principal"]: e["obj"] for e in entitled if e["relation"] == "entitled_own"
+    }
+    return {
+        "principals": [p.id for p in principals],
+        "known_accounts": known_accounts,
+        "entitled_own": entitled_own,
+        "entitled_edge_count": len(entitled),
+        "observed_edge_count": len(graph.observed_edges()),
+        "supported_attack_classes": supported_attack_classes(),
+    }

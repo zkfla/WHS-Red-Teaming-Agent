@@ -23,6 +23,7 @@ COLLECTIONS = (
     "lessons",
     "entitlements",
     "baselines",
+    "steps",  # ReAct 트레이스(thought/action/observation) — ReAct 전환 시 추가
 )
 
 

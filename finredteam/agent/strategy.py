@@ -59,3 +59,24 @@ def choose(ctx: AgentContextLike) -> Strategy:
     if ctx.layer_untouched("generic"):
         return _GENERIC_SWEEP
     return _BROAD_SWEEP
+
+
+def suggest_nudge(ctx: AgentContextLike) -> str | None:
+    """ReAct 루프용 — "다음에 뭘 할지"를 코드가 강제하는 대신, LLM 의 Observation 에
+    끼워 넣을 힌트 한 줄만 만든다. 최종 판단은 여전히 LLM 의 Thought 몫이다.
+
+    `choose()` 와 같은 신호(성공/실패 연속, 그래프 성장, 미탐색 레이어)를 재사용해서
+    §14 "실패→전략 전환"의 취지를 ReAct 안에서도 유지한다 — 다만 강제 배치 대신
+    제안(nudge)으로만 작동한다.
+    """
+    if ctx.graph_grew_significantly():
+        return "힌트: 그래프가 방금 크게 자랐다 — 새로 알게 된 계좌·객체를 노려보라."
+    if ctx.recent_violations():
+        classes = ", ".join(ctx.successful_classes())
+        return f"힌트: 최근 성공한 공격군({classes})을 다른 주체/대상으로 더 시도해볼 만하다."
+    if ctx.consecutive_failures() >= 2:
+        classes = ", ".join(ctx.least_tried_classes())
+        return f"힌트: 같은 접근이 2회 연속 성과가 없었다 — 다른 공격 클래스({classes})로 전환을 고려하라."
+    if ctx.layer_untouched("generic"):
+        return "힌트: 아직 Generic Layer(SQLi 등)를 하나도 시도하지 않았다."
+    return None
