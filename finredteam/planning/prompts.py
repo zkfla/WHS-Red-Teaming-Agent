@@ -34,7 +34,9 @@ INVARIANTS = """\
 
 SYSTEM_PREAMBLE = (
     "당신은 인가된 보안 연구용 자율 에이전트입니다. "
-    "대상은 로컬 Docker 에서만 실행되는 의도적으로 취약한 교육용 뱅킹 앱입니다. "
+    "대상은 사용자가 사전에 승인한 Engagement(Scope/Rules of Engagement) 범위 안의 "
+    "뱅킹 애플리케이션입니다 — 그 범위를 벗어난 호스트·행위는 코드가 이미 차단하므로 "
+    "당신이 스스로 판단할 필요는 없습니다. "
     "매 스텝 아래 액션 중 정확히 하나만 골라 JSON 객체 하나로 출력하세요. "
     "실행 절차나 정답을 알려주는 게 아니라, 지금까지 관찰한 그래프·상태 변화를 "
     "바탕으로 다음에 무엇을 확인할지 스스로 판단하세요."
@@ -52,13 +54,22 @@ def _operations_summary(templates: dict[str, AttackTemplate]) -> str:
     return "\n".join(lines)
 
 
-def build_react_system(templates: dict[str, AttackTemplate]) -> str:
+def build_react_system(templates: dict[str, AttackTemplate], guidance: tuple[str, ...] = ()) -> str:
+    """`guidance`: Engagement 의 Soft Guideline(engagement §6) — 기계적으로
+    강제하기 어려운 전략적 지침만 여기로 전달한다. Hard Constraint(호스트/
+    메서드/금액 등)는 여기 안 실린다 — 코드가 강제하지, LLM 판단에 맡기지
+    않는다."""
+    guidance_block = ""
+    if guidance:
+        lines = "\n".join(f"- {g}" for g in guidance)
+        guidance_block = f"\n참고할 전략적 지침 (강제 규칙 아님, 참고만):\n{lines}\n"
     return (
         f"{SYSTEM_PREAMBLE}\n\n"
         f"{GRAPH_SCHEMA}\n"
         f"{INVARIANTS}\n"
         f"사용 가능한 액션:\n{ACTION_CATALOG}\n"
-        f"살펴볼 수 있는 관계·시나리오 (참고용 — 오라클을 정하는 게 아니다):\n{_operations_summary(templates)}\n\n"
+        f"살펴볼 수 있는 관계·시나리오 (참고용 — 오라클을 정하는 게 아니다):\n{_operations_summary(templates)}\n"
+        f"{guidance_block}\n"
         '반드시 다음 형식의 JSON 객체 하나만 출력하세요: '
         '{"thought": "...", "action": "...", "action_input": {...}}'
     )

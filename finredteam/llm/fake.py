@@ -45,6 +45,12 @@ class FakeLLMClient:
     ) -> list[SchemaT]:
         self._usage = self._usage + Usage(tokens_in=30, tokens_out=30, requests=1)
 
+        # engagement/setup.py::ClarificationTurn 도 같은 클라이언트로 시험할 수 있게 —
+        # 실제 추론 없이 "더 물어볼 것 없음"으로 즉시 끝낸다. 구조적으로 필요한 값
+        # (base_url/target_name)은 setup.py 가 이후 직접 물어봐서 확보한다.
+        if "next_question" in schema.model_fields and "updated_fields" in schema.model_fields:
+            return [schema.model_validate({"updated_fields": {}, "next_question": None})]
+
         principals = _extract_json_field(user, _PRINCIPALS_RE) or []
         entitled_own = _extract_json_field(user, _ENTITLED_OWN_RE) or {}
 

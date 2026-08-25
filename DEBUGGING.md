@@ -20,6 +20,7 @@ JSON이 깨지거나, 같은 실수를 반복하거나, 네트워크가 끊기�
 | 3.4 최상위 예외 처리 (finalize 보장) | ✅ 구현됨 |
 | 3.5 자동 트랜스크립트(`transcript.md`) | ✅ 구현됨 — `reporting/transcript.py`, 매 `store.finalize()` 직후 자동 생성 |
 | §3.6(신규) `replay` — 저장된 트레이스 색깔·표 입혀 재생 | ✅ 구현됨 — `finredteam/replay.py` |
+| §3.7(신규) 세 번째 실패 종류 — `PolicyViolation`(Engagement 정책 위반) | ✅ 구현됨 — `engagement/errors.py`, 아래 §3.7 |
 
 ### 3.6 `replay` — 저장된 트레이스를 색깔·표 입혀 다시 보기
 
@@ -32,7 +33,14 @@ python -m finredteam.replay latest              # 가장 최근 실행
 python -m finredteam.replay <run_id>             # run_id 로 (경로도 가능)
 python -m finredteam.replay <run_id> --full       # Observation 을 자르지 않고 전체
 python -m finredteam.replay <run_id> --step 5     # 스텝 5만 깊게 — 매칭되는 LLM 호출 원문(프롬프트·raw 응답)까지
+
+# pip install -e . 했으면 한 단어로: finredteam-replay latest
 ```
+
+헤더에 어떤 Engagement/정책으로 실행됐는지도 같이 보여준다(`engagement_id`
++ `policy_hash`, manifest.json 에 실행 시점에 고정 저장됨 — §3.7 참고).
+`__main__.py`(실시간 실행)와 `replay.py`(사후 재생)의 렌더링은
+`finredteam/cli_render.py` 하나를 공유한다 — 그래서 두 화면이 같은 모양이다.
 
 가독성을 위해 한 것들:
 - Observation 이 JSON 이면 `rich` 의 JSON 신택스 하이라이팅으로 예쁘게 찍는다.
@@ -48,6 +56,39 @@ python -m finredteam.replay <run_id> --step 5     # 스텝 5만 깊게 — 매�
 정확히 한 번 발생하는 것을 이용해 카운터로 `step` 번호를 그 자리에서 찍어
 저장한다. `tests/test_replay.py::test_llm_trace_hook_stamps_step_per_call_started`
 가 이 매칭을 고정한다.
+
+### 3.7 세 번째 실패 종류 — `PolicyViolation` (Engagement 정책 위반)
+
+§3.4 는 실패를 "API 자체의 실패(`LLMError`)" vs "우리 코드의 버그(그 외
+모든 예외)" 둘로만 나눴는데, Engagement 레이어가 생기면서 **의도적으로
+차단된 것**이라는 세 번째 종류가 생겼다 — 이건 버그도 API 실패도 아니라
+"LLM이 Engagement 가 허용하지 않는 걸 고름"이라는, 정상적으로 예상 가능한
+상황이다.
+
+`engagement/errors.py::PolicyViolation(rule, detail)` 이 이 실패를 나타낸다.
+두 군데서 다르게 처리한다:
+
+- **`agent/react.py::_handle_execute_experiment`(사전 검사)**: 메서드 허용
+  여부는 `policy.is_method_allowed()` 로 예외 없이 직접 물어보고, 금액
+  상한은 `policy.check_amount()` 가 던지는 `PolicyViolation` 을 그 자리에서
+  잡는다 — 두 경우 다 예외가 위로 새지 않고 `"정책 위반으로 차단됨(<rule>):
+  <detail>"` 을 Observation 으로 돌려준다. LLM이 다음 스텝에서 왜 막혔는지
+  보고 다른 걸 시도할 수 있다. `steps.jsonl`/`transcript.md` 에 다른 실패와
+  똑같이 남는다 — 별도 컬렉션 없음.
+- **`probing/session.py::_request()`(최종 강제, 방어 이중화)**: 여기서
+  `PolicyViolation` 이 실제로 발생하면(=위 사전 검사를 우회/누락한 버그가
+  있다는 뜻) 잡지 않고 그대로 위로 전파한다 — `agent/react.py::run()` 의
+  최상위 `except Exception` 이 잡아 `logger.exception` + `manifest.
+  termination_reason = "error: PolicyViolation"` 으로 남기고 크래시한다.
+  **의도적으로 조용히 넘기지 않는다** — 사전 검사가 뚫렸다는 건 코드 버그이지
+  "LLM이 이상한 걸 골랐다"는 정상 상황이 아니기 때문이다.
+- **`__main__.py::main()`**: 부트스트랩 단계의 `ACCOUNT_CREATION_FORBIDDEN`
+  처럼 루프 진입 전에 발생하는 `PolicyViolation` 은 여기서 잡아 붉은 글씨로
+  사유를 보여주고 `exit code 1` 로 깔끔히 끝낸다(트레이스백 없음).
+
+`runs/<id>/agent.log` 에서 `PolicyViolation` 을 찾으면(§4 표에도 추가) 코드
+버그(사전 검사 누락)인지 아니면 그냥 `manifest.termination_reason` 이
+`policy_violation:*` 로 끝난 정상적인 거부인지 구분해서 본다.
 
 `§3.1`, `§3.3`, `§3.4` 는 최초 계획에서 한 번 더 개정됐다 — 아래 내용이
 실제 구현과 일치하는 최신판이다. 원래 계획에서 뭐가, 왜 바뀌었는지는 각
@@ -103,7 +144,7 @@ python -m finredteam.replay <run_id> --step 5     # 스텝 5만 깊게 — 매�
 
 ---
 
-## 3. 관측 가능성 계층 (5개)
+## 3. 관측 가능성 계층 (7개)
 
 ### 3.1 실시간 콘솔 스트리밍 + LLM 호출 시작/종료 이벤트 + 타임아웃
 
@@ -291,14 +332,29 @@ reason=max_rounds, tokens=12,400, cost=$0.08
 | VIOLATION 이 하나도 안 나옴 | LLM이 `read_balance` 만 반복하고 `transfer` 를 안 씀(탐색이 얕음) | `transcript.md` 의 action 분포, `report.json` 의 `by_operation` |
 | 토큰이 예상보다 빨리 참 | 시스템 프롬프트(그래프 스키마+invariant 목록+액션 카탈로그+템플릿 요약)가 매 스텝 통째로 다시 들어감 | `llm_calls.jsonl` 의 `tokens_in` 추이 — 스텝이 늘어도 거의 고정값이어야 정상, 계속 커지면 스크래치패드가 새고 있는 것 |
 | `discover_surface` 를 안 씀 | 시스템 프롬프트에서 이 액션의 존재/효용이 잘 안 읽힘 | `planning/actions.py::ACTION_CATALOG` 문구 검토, `llm_calls.jsonl` 의 thought 에서 언급 여부 |
+| `execute_experiment` 가 매번 "정책 위반으로 차단됨" 만 냄 | Engagement 가 그 operation/method 를 허용 안 함(의도된 동작일 수 있음) | `engagements/<id>/engagement.md` 의 Allowed/Prohibited Activities, `manifest.json` 의 `policy_hash` 가 기대한 Engagement 것과 일치하는지 |
+| 실행 시작하자마자 `TypeError: ... unexpected keyword argument` 로 죽음 | 설치된 벤더 SDK 버전이 우리 코드가 쓰는 파라미터를 안 받음(§8.1) | `pip show anthropic`/`openai` 버전, `llm/anthropic_.py`·`llm/openai_.py` 의 `.create()` 호출부 |
+| `termination_reason: llm_unavailable`, `tokens_in`/`requests` 가 0 | LLM 호출이 처음부터 계속 실패(레이트리밋/인증/네트워크) — 오라클/그래프 문제가 아니다(§8.2) | `runs/<id>/agent.log` 의 `LLM 호출 실패` 줄들, 429면 API 사용량/한도 확인 |
+| 실행이 시작하자마자 `PolicyViolation` 트레이스백으로 죽음 | §3.7 의 사전 검사가 빠진 새 코드 경로(버그) — 정상 흐름이면 트레이스백 없이 붉은 메시지로 끝나야 한다 | `runs/<id>/agent.log` 에서 `PolicyViolation` 발생 지점, §3.7 |
 
 ---
 
 ## 5. CLI 플래그 (구현됨)
 
+`pip install -e .` 했으면 `finredteam`(=`python -m finredteam`)이 한 단어
+명령이다 — 아래는 디버깅에 관련된 플래그만 추린 것, 전체 사용법은
+`RUNNING.md` 참고.
+
 ```bash
-python -m finredteam --target vulnbank --max-rounds 20 \
-    --log-level DEBUG        # 콘솔 로그 레벨 (기본 WARNING). runs/<id>/agent.log 는 항상 DEBUG
+finredteam --max-rounds 20 --log-level DEBUG
+#    콘솔 로그 레벨 (기본 WARNING). runs/<id>/agent.log 는 항상 DEBUG
+
+# --target/--engagement 같은 선택 플래그는 없다 — 실행하면 바로 대화형
+# Engagement Setup 이 시작된다(이미 승인된 Engagement 가 있으면 재사용 여부만
+# 물어본다 — vuln-bank 예시가 이미 있으면 그대로 재사용된다).
+# --no-key-prompt          API 키 환경변수 없으면 대화형으로 안 묻고 바로 실패 (CI용)
+# --fake-llm               결정적 가짜 LLM — API 호출 자체가 없어서 §3의 진단 항목이 대부분 해당
+#                          없음. Engagement Setup 대화도 즉시 끝난다(질문 없이 최소 정보로 진행)
 ```
 
 ---
@@ -311,24 +367,93 @@ python -m finredteam --target vulnbank --max-rounds 20 \
 4. ✅ **구조화 로깅 + 파일 핸들러 (3.2)**
 5. ✅ **`llm_calls` 영속화 (3.3)** — provider 내부 trace hook 방식으로.
 6. ✅ **CLI 플래그 (§5)**
+7. ✅ **`PolicyViolation` — 세 번째 실패 종류 (3.7)** — Engagement 레이어 도입 시 추가.
 
 `tests/test_llm_error_handling.py` 로 §3.4 의 핵심 계약(벤더 `APIError`→
-`LLMError`, 그 외 예외는 안 감싸짐)을 고정했다. 나머지(로깅 호출 위치,
-트랜스크립트 포맷)는 `--fake-llm` 라이브 실행으로 `runs/<id>/agent.log`
-와 `runs/<id>/transcript.md` 가 실제로 만들어지는 것까지 확인했다 —
-실제 벤더 API 로 검증한 건 아니다(연결 실패/레이트리밋 자체를 재현하려면
-API 키가 필요하다).
+`LLMError`, 그 외 예외는 안 감싸짐)을 고정했고, `tests/test_policy_
+enforcement.py` 로 §3.7 의 계약(정책 위반이 사전 검사에서 잡히면 실제
+요청까지 도달하지 않고 Observation 으로만 남음)을 고정했다. 나머지(로깅
+호출 위치, 트랜스크립트 포맷)는 `--fake-llm` 라이브 실행으로
+`runs/<id>/agent.log` 와 `runs/<id>/transcript.md` 가 실제로 만들어지는
+것까지 확인했다 — 실제 벤더 API 로 검증한 건 아니다(연결 실패/레이트리밋
+자체를 재현하려면 API 키가 필요하다).
 
 ---
 
 ## 7. 이 계획에서 일부러 안 하는 것
 
-- **LLM 호출 자동 재시도(exponential backoff) 라이브러리 도입** — 지금은
-  실패한 스텝을 그냥 다음 스텝으로 넘기는 것으로 충분하다고 본다. 벤더
-  SDK가 이미 일부 자체 재시도를 한다. 진짜 필요해지면 별도로 판단한다.
+- ~~LLM 호출 자동 재시도(exponential backoff) 도입~~ — **철회됨**(§8 참고).
+  실측 결과 벤더 SDK 기본 재시도(2회)만으로 부족한 레이트리밋을 만났다 —
+  6스텝이 13초 만에 전부 실패하고 "saturated" 로 조용히 끝났다. 이제
+  `agent/react.py::run()` 이 LLM 호출 실패마다 backoff 로 쉬고, `config.
+  LLM_MAX_RETRIES` 로 벤더 SDK 자체 재시도 횟수도 늘렸다.
 - **대화형 스텝 단위 확인(step-through) 모드** — "한 스텝마다 사람이
   Enter 눌러야 진행" 같은 기능은 디버깅엔 유용할 수 있지만 지금 계획엔
-  넣지 않는다. 위 5개 계층으로 사후 분석이 충분히 가능하다고 판단되면
+  넣지 않는다. 위 계층들로 사후 분석이 충분히 가능하다고 판단되면
   스킵, 안 되면 추가 검토.
 - **원격 로그 수집(Sentry 등 외부 서비스 연동)** — 로컬 전용 프로젝트라
   범위 밖.
+
+---
+
+## 8. 실제 API 로 돌리다 발견된 버그 2건 (실측 기록)
+
+### 8.1 `Messages.create()` 가 `temperature` 를 안 받음 (설치된 SDK 버전 차이)
+
+**증상**: 실제 API 키를 넣고 첫 스텝에서 바로
+`TypeError: Messages.create() got an unexpected keyword argument 'temperature'`
+로 죽었다(`ReAct 루프가 처리되지 않은 예외로 중단됨`, 트레이스백까지).
+
+**원인**: 설치된 `anthropic` 패키지가 `temperature` 를 최상위 키워드로 안 받는
+버전이었다(신규 메이저 버전, `thinking`/`container`/`output_config` 등으로
+파라미터가 개편되며 빠짐) — `requirements.txt` 가 `anthropic>=0.34` 로만
+하한을 걸어놔서 버전에 따라 시그니처가 다를 수 있다.
+
+**고침**: `llm/anthropic_.py::complete_json()` 이 `temperature` 를 최상위
+키워드 대신 `extra_body={"temperature": temperature}` 로 보낸다 — SDK 가 그
+값을 타입으로 노출하든 안 하든 요청 본문에 그대로 실린다. 서버가 그 값 자체를
+거부해도(예: 특정 모델이 reasoning 모드라 온도 고정) `anthropic.APIError` →
+`LLMError` 로 이미 잡히므로 크래시가 아니라 그 스텝만 실패 처리된다.
+
+### 8.2 레이트리밋(429) 연속 실패가 "saturated" 로만 보임, 백오프 없음
+
+**증상**: 8.1 을 고친 뒤 다시 돌렸더니 크래시는 안 나는데 6스텝이 13초 만에
+전부 `LLM 호출 실패`(429 rate_limit_error)로 끝나고 `termination_reason:
+saturated` 로 조용히 종료됐다 — `tokens_in`/`tokens_out`/`requests` 전부
+0(성공한 호출이 단 한 번도 없었다는 뜻). "saturated"(그래프 정체)와 "LLM이
+아예 응답을 못 받음"이 같은 사유로 뭉뚱그려져서, `manifest.json` 만 봐서는
+원인을 알 수 없었다.
+
+**원인**: 두 가지 복합.
+1. `agent/react.py::run()` 이 `LLMError` 를 잡으면 그 스텝만 실패 처리하고
+   **곧바로 다음 스텝을 또 쏘았다** — 레이트리밋이 걸린 상태에서 텀도 없이
+   계속 두드리니 다음 스텝도 똑같이 걸린다(§7 의 원래 "그냥 넘어가면 충분"
+   가정이 실측으로 깨졌다).
+2. 벤더 SDK 자체 재시도(`anthropic.Anthropic(max_retries=2)` 기본값)만으로는
+   이 레이트리밋 윈도우를 못 버텼다.
+
+**고침**:
+- `config.py::LLM_MAX_RETRIES = 5` 를 신설해 `AnthropicClient`/`OpenAIClient`
+  생성 시 SDK 에 넘긴다 — 벤더 자체 재시도 기회를 늘린다.
+- `agent/react.py::run()`: `LLMError` 를 잡을 때마다 `ctx._consecutive_llm_
+  errors` 를 세고, `min(2 ** n, 30)`초만큼 잠깐 쉬었다가 다음 스텝으로
+  넘어간다(성공하면 즉시 0으로 리셋). 레이트리밋 윈도우가 풀릴 시간을 준다.
+- `AgentContext.llm_unavailable()`(신규, `target_unhealthy()`와 같은 자리) —
+  연속 실패가 `_LLM_UNAVAILABLE_THRESHOLD`(5)를 넘으면 `termination.py::
+  should_stop()` 이 `saturated` 보다 먼저 `"llm_unavailable"` 사유로 멈춘다 —
+  이제 `manifest.json` 만 봐도 "LLM이 아예 응답을 못 받아서 끝났다"를 바로
+  구분할 수 있다.
+
+`tests/test_termination_policy_stop.py::test_llm_unavailable_reported_
+distinctly_from_saturated` 가 우선순위를, 라이브 검증(실제 vuln-bank 대상,
+항상 `LLMError` 를 던지는 가짜 클라이언트로 5스텝 만에 `llm_unavailable` 로
+정확히 종료되는 것)이 실동작을 고정한다.
+
+**후기(실사용자 확인)**: 이 백오프를 실제로 적용한 뒤에도 사용자가 여전히
+5스텝 전부 429로 막히는 걸 관측(`runs/20260825-173529`, 2·4·8·16·30초까지
+다 기다렸는데도 매번 실패). 원인은 코드가 아니라 **`ANTHROPIC_AUTH_TOKEN` 이
+무료 Claude 플랜으로 발급한 `claude setup-token` 토큰**이었다 — 이 토큰은
+유료 구독(Pro/Max) 사용량에 묶여 있어서, 무료 플랜이면 할당량 자체가 없어
+백오프를 아무리 늘려도 안 풀린다. `RUNNING.md` §4/§6에 이 함정을 명시했다.
+코드 관점에서 결론: `llm_unavailable` + backoff 는 정확히 설계대로 동작했다
+— 이건 소프트웨어 버그가 아니라 인증 수단 자체의 한도 문제였다.

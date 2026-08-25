@@ -1,8 +1,18 @@
 """CLI 진입점.
 
-`--smoke`: 부트스트랩(주체 등록/로그인) + 매니페스트 생성만 확인하고 종료 (Day1 범위).
-그 외: `agent/react.py` 의 ReAct 루프를 돌린다 — BOOTSTRAP → RECON → ENTITLEMENT
-→ BASELINE → [Thought → Action → Observation] 반복.
+서브커맨드 없이 그냥 `finredteam` 실행 — 바로 대화형 Engagement Setup 이
+시작된다(`engagement/setup.py::run_setup`): 이미 승인된 Engagement 가 있으면
+재사용할지 먼저 묻고, 없거나 새로 만들기로 하면 자유 텍스트로 대상/목적을
+설명받아 LLM 이 부족한 정보를 한 번에 하나씩 질문해 구체화한다. 최종 승인을
+받으면 **그 Engagement 를 그 자리에서 바로 실행한다** — `--target`/
+`--engagement` 같은 별도 선택 플래그는 없다(engagement §2). `engagement_id`
+는 사용자가 짓지 않고 시스템이 자동 생성한다.
+
+`setup` 서브커맨드: 같은 대화형 흐름을 실행 없이 준비만 해둔다.
+
+`--smoke`: 부트스트랩(주체 등록/로그인) + 매니페스트 생성만 확인하고 종료.
+그 외: `agent/react.py` 의 ReAct 루프를 돌린다 — BOOTSTRAP → RECON →
+ENTITLEMENT → BASELINE → [Thought → Action → Observation] 반복.
 """
 from __future__ import annotations
 
@@ -17,7 +27,9 @@ from rich.panel import Panel
 from rich.table import Table
 
 from finredteam import cli_render
-from finredteam.config import MAX_ROUNDS, RunConfig
+from finredteam.config import MAX_ROUNDS, LLMConfig, RunConfig
+from finredteam.engagement.compiler import compile_policy
+from finredteam.engagement.errors import PolicyViolation
 from finredteam.logging_setup import configure_logging
 from finredteam.models.core import Principal
 from finredteam.probing.session import Session, SessionError
@@ -29,15 +41,20 @@ console = Console()
 
 def _parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(prog="finredteam")
-    parser.add_argument("--target", required=True, help="targets/configs/<name>.yaml")
     parser.add_argument("--smoke", action="store_true", help="부트스트랩 + 매니페스트만 확인하고 종료")
-    parser.add_argument("--llm-provider", choices=["anthropic", "openai"], default=None)
+    parser.add_argument(
+        "--llm-provider",
+        choices=["anthropic", "openai", "chatgpt_subscription"],
+        default=None,
+        help="생략하면 환경변수/~/.codex/auth.json 으로 자동 판단하고, 그래도 애매하면 물어본다.",
+    )
     parser.add_argument("--llm-model", default=None)
     parser.add_argument("--max-rounds", type=int, default=None)
     parser.add_argument(
         "--fake-llm",
         action="store_true",
-        help="API 키 없이 read_balance/transfer 배관만 시험하는 결정적 가짜 LLM 사용 (실제 취약점 탐색 품질 검증용 아님)",
+        help="결정적 가짜 LLM 사용 — Engagement Setup 대화와 ReAct 루프 둘 다 즉시/고정된 방식으로 "
+        "진행한다 (API 키 불필요, 실제 취약점 탐색 품질 검증용 아님)",
     )
     parser.add_argument(
         "--log-level",
@@ -95,7 +112,11 @@ def _check_observation(session: Session, principal: Principal, obs_cfg: dict) ->
     return ok, total
 
 
-def _run_smoke(target_cfg, session: Session, store: RunStore) -> None:
+def _run_smoke(target_cfg, session: Session, store: RunStore, policy) -> None:
+    if not policy.allow_account_creation:
+        raise PolicyViolation(
+            "ACCOUNT_CREATION_FORBIDDEN", "Engagement 정책이 계정 생성을 허용하지 않음 (--smoke 도 예외 없음)"
+        )
     currency = target_cfg.adapter.default_currency
     principals = _bootstrap_principals(session, target_cfg.settings.principals, store.run_id)
 
@@ -172,7 +193,7 @@ def _make_trace_hook(store: RunStore, console: Console) -> Callable:
     return _on_llm_event
 
 
-def _run_full(target_cfg, session: Session, store: RunStore, llm, max_rounds: int | None) -> None:
+def _run_full(target_cfg, session: Session, store: RunStore, llm, max_rounds: int | None, policy) -> None:
     from finredteam.agent import loop as agent_loop
     from finredteam.models.core import Verdict
     from finredteam.reporting import report as report_module
@@ -180,7 +201,7 @@ def _run_full(target_cfg, session: Session, store: RunStore, llm, max_rounds: in
     console.rule("[bold]Trace[/bold]", style="blue")
     console.print()
     ctx = agent_loop.run(
-        target_cfg, session, llm, store, max_rounds=max_rounds, on_step=_make_on_step(console)
+        target_cfg, session, llm, store, policy, max_rounds=max_rounds, on_step=_make_on_step(console)
     )
 
     summary = Table.grid(padding=(0, 2))
@@ -210,26 +231,63 @@ def _run_full(target_cfg, session: Session, store: RunStore, llm, max_rounds: in
 def main(argv: list[str] | None = None) -> int:
     try:
         sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")  # logging 콘솔 핸들러가 기본으로 stderr 를 씀
     except (AttributeError, ValueError):
         pass
 
-    args = _parse_args(argv if argv is not None else sys.argv[1:])
+    argv = argv if argv is not None else sys.argv[1:]
+    if argv and argv[0] == "setup":
+        from finredteam.setup_cli import run_setup_command
 
-    target_cfg = load_target(args.target)
-    llm_cfg = target_cfg.settings.llm
-    if args.llm_provider:
-        llm_cfg = llm_cfg.model_copy(update={"provider": args.llm_provider})
-    if args.llm_model:
-        llm_cfg = llm_cfg.model_copy(update={"model": args.llm_model})
+        return run_setup_command(argv[1:], console)
+
+    args = _parse_args(argv)
+
+    # LLM 클라이언트는 지연 생성한다(build_llm_factory) — 이미 승인된 Engagement 를
+    # 재사용하는 경로에서는 API 키를 물어볼 필요가 아예 없어야 하기 때문이다.
+    from finredteam.engagement.setup import run_setup
+    from finredteam.setup_cli import build_llm_factory
+
+    llm_factory = build_llm_factory(args, console)
+
+    try:
+        engagement = run_setup(console, llm_factory)
+    except RuntimeError as exc:
+        console.print(f"[red]{exc}[/red]")
+        return 1
+    if engagement is None:
+        return 1
+
+    policy = compile_policy(engagement)
+    target_name = engagement.target.name
+
+    try:
+        target_cfg = load_target(target_name)
+    except FileNotFoundError:
+        console.print(f"[red]targets/configs/{target_name}.yaml 없음[/red]")
+        console.print(
+            "[dim]이 Engagement 가 가리키는 어댑터 설정이 없다 — Engagement Setup 은 "
+            "Scope/Rules of Engagement 만 만든다. base_url, 회원가입/로그인 필드명 등은 "
+            f"사람이 대상을 직접 조사해서 targets/configs/{target_name}.yaml 로 따로 "
+            "작성해야 한다 (RUNNING.md 3절 참고).[/dim]"
+        )
+        return 1
+
+    # 아직 provider 를 실제로 정하기 전(그건 llm_factory() 안에서 지연 판단된다)
+    # manifest 기록용 임시값 — 실제 실행 후 아래 store.set_llm_display() 로 정정한다.
+    from finredteam.setup_cli import DEFAULT_MODEL
+
+    _guessed_provider = args.llm_provider or "anthropic"
+    llm_cfg = LLMConfig(provider=_guessed_provider, model=args.llm_model or DEFAULT_MODEL[_guessed_provider])
 
     run_cfg = RunConfig(
-        target_name=args.target,
-        target_config_path=Path("finredteam/targets/configs") / f"{args.target}.yaml",
+        target_name=target_name,
+        target_config_path=Path("finredteam/targets/configs") / f"{target_name}.yaml",
         llm=llm_cfg,
         smoke=args.smoke,
         max_rounds=args.max_rounds or MAX_ROUNDS,
     )
-    store = RunStore.start(run_cfg)
+    store = RunStore.start(run_cfg, engagement_id=engagement.engagement_id, policy_hash=policy.policy_hash)
 
     # 콘솔(레벨 조절 가능) + 파일(runs/<run_id>/agent.log, 항상 DEBUG) 로깅 —
     # LLMError 경고·처리되지 않은 예외·raw 응답 등이 여기 남는다(§ DEBUGGING.md).
@@ -237,45 +295,44 @@ def main(argv: list[str] | None = None) -> int:
 
     llm = None
     if not args.smoke:
-        if args.fake_llm:
-            from finredteam.llm.fake import FakeLLMClient
-
-            llm = FakeLLMClient()
-        else:
-            from finredteam.credentials import resolve_api_key
-            from finredteam.llm.factory import build_llm_client
-
-            try:
-                api_key = resolve_api_key(
-                    llm_cfg.provider, console, allow_prompt=not args.no_key_prompt
-                )
-                llm = build_llm_client(
-                    llm_cfg, trace_hook=_make_trace_hook(store, console), api_key=api_key
-                )
-            except RuntimeError as exc:
-                console.print(f"[red]{exc}[/red]")
-                console.print("API 키 없이 배관만 시험하려면 --fake-llm 을 쓰세요.")
-                return 1
+        try:
+            # Engagement Setup 대화에서 이미 만든 클라이언트가 있으면 그대로 재사용한다
+            # (캐시됨, `build_llm_factory`) — API 키를 두 번 묻지 않는다.
+            llm = llm_factory()
+        except RuntimeError as exc:
+            console.print(f"[red]{exc}[/red]")
+            console.print("API 키 없이 배관만 시험하려면 --fake-llm 을 쓰세요.")
+            return 1
+        if not args.fake_llm:
+            llm.set_trace_hook(_make_trace_hook(store, console))
 
     display_provider = llm.provider if llm is not None else llm_cfg.provider
     display_model = llm.model if llm is not None else llm_cfg.model
-    if args.fake_llm:
+    if llm is not None:
+        # provider 는 llm_factory() 안에서 지연 판단됐다(플래그/환경변수/대화형 질문) —
+        # 실제로 뭘 썼는지로 manifest 를 정정한다. fake-llm 뿐 아니라 항상 갱신한다.
         store.set_llm_display(display_provider, display_model)
 
     cli_render.print_run_header(
         console,
         run_id=store.run_id,
-        target=args.target,
+        target=target_name,
         provider=display_provider,
         model=display_model,
         mode="smoke" if args.smoke else ("fake-llm" if args.fake_llm else "full"),
     )
+    console.print(f"[dim]engagement: {engagement.engagement_id}  policy_hash: {policy.policy_hash}[/dim]\n")
 
-    with Session(target_cfg) as session:
-        if args.smoke:
-            _run_smoke(target_cfg, session, store)
-        else:
-            _run_full(target_cfg, session, store, llm, args.max_rounds)
+    try:
+        with Session(target_cfg, policy) as session:
+            if args.smoke:
+                _run_smoke(target_cfg, session, store, policy)
+            else:
+                _run_full(target_cfg, session, store, llm, args.max_rounds, policy)
+    except PolicyViolation as exc:
+        console.print(f"[red]정책 위반으로 실행이 거부됨 ({exc.rule}):[/red] {exc.detail}")
+        store.finalize(termination_reason=f"policy_violation:{exc.rule}")
+        return 1
 
     console.print(f"[bold]Run saved:[/bold] {store.run_dir}")
     console.print(f"[dim]다시 보기:  python -m finredteam.replay {store.run_id}[/dim]")

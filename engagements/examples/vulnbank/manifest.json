@@ -1,0 +1,7 @@
+{
+  "engagement_id": "vulnbank",
+  "created_at": "2026-08-25T16:36:52.528587+00:00",
+  "approved_at": "2026-08-25T16:36:52.537873+00:00",
+  "target": "http://localhost:5000",
+  "policy_hash": "sha256:cd38f263589eff9a802d80e084ed7216fb6addca61178dfc0eab8b20f007484a"
+}

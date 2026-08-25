@@ -8,7 +8,7 @@ from typing import TypeVar
 import openai
 from pydantic import BaseModel, ValidationError
 
-from finredteam.config import LLM_REQUEST_TIMEOUT
+from finredteam.config import LLM_MAX_RETRIES, LLM_REQUEST_TIMEOUT
 from finredteam.llm._json import extract_json_array
 from finredteam.llm.base import LLMError, LLMEvent, LLMEventKind, LLMTraceHook, Usage
 
@@ -28,9 +28,15 @@ class OpenAIClient:
         trace_hook: LLMTraceHook | None = None,
     ) -> None:
         self.model = model
-        self._client = openai.OpenAI(api_key=api_key, timeout=LLM_REQUEST_TIMEOUT)
+        self._client = openai.OpenAI(api_key=api_key, timeout=LLM_REQUEST_TIMEOUT, max_retries=LLM_MAX_RETRIES)
         self._max_tokens = max_tokens
         self._usage = Usage()
+        self._trace_hook = trace_hook
+
+    def set_trace_hook(self, trace_hook: LLMTraceHook | None) -> None:
+        """생성 이후에도 훅을 달 수 있게 — Engagement Setup 대화에 쓴 클라이언트를
+        ReAct 실행에도 그대로 재사용하되, `RunStore` 가 생긴 뒤에야 훅을 달 수
+        있을 때 쓴다(`__main__.py::main`)."""
         self._trace_hook = trace_hook
 
     def _emit(self, **fields: object) -> None:

@@ -58,6 +58,8 @@ def print_manifest_header(console: Console, manifest: dict[str, Any], *, title: 
     table.add_column()
     table.add_row("Run", str(manifest.get("run_id")))
     table.add_row("Target", str(manifest.get("target")))
+    if manifest.get("engagement_id"):
+        table.add_row("Engagement", f"{manifest['engagement_id']}  ({manifest.get('policy_hash', '?')})")
     table.add_row("LLM", f"{llm.get('provider')}/{llm.get('model')}")
     table.add_row("Termination", str(manifest.get("termination_reason")))
     table.add_row("Steps", str(manifest.get("round")))

@@ -1,0 +1,42 @@
+engagement_id: vulnbank
+created_at: '2026-08-25T16:36:52.528587Z'
+approved_at: '2026-08-25T16:36:52.537873Z'
+target:
+  name: vulnbank
+  base_url: http://localhost:5000
+scope:
+  allowed_hosts:
+  - localhost
+  - 127.0.0.1
+  denied_hosts: []
+external_services:
+  allowed: false
+requests:
+  max_requests_per_second: 20.0
+  max_concurrency: 10
+  max_amount: null
+actions:
+  allow_state_change: true
+  allow_account_creation: true
+  allow_file_upload: false
+  allow_delete: false
+  allow_race_testing: false
+  allow_dos: false
+  allow_bruteforce: false
+data_access:
+  allow_real_user_data: false
+  allow_raw_response_storage: true
+cleanup:
+  required: false
+  resource_types: []
+stop_conditions:
+  repeated_5xx: true
+  repeated_5xx_threshold: 5
+  latency_degradation: false
+  unexpected_sensitive_data: false
+  external_side_effect: false
+  request_budget_exceeded: true
+guidance:
+- 최소한의 요청으로 검증하라.
+- 개인정보/카드 원문(PAN) 노출 가능성을 우선적으로 확인하라.
+- 로컬 1회성 Docker 컨테이너이므로 정리(cleanup)는 요구되지 않는다.

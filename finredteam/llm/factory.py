@@ -18,6 +18,8 @@ PRICING: dict[tuple[str, str], tuple[float, float]] = {
     ("anthropic", "claude-haiku-4-5"): (0.8, 4.0),
     ("openai", "gpt-5"): (5.0, 15.0),
     ("openai", "gpt-5-mini"): (0.25, 2.0),
+    # chatgpt_subscription: 구독료로 이미 지불했고 벤더가 토큰당 과금 정보를
+    # 안 준다(§19) — 임의로 비용을 계산하지 않는다, 항상 $0 으로 취급한다.
 }
 
 
@@ -34,6 +36,9 @@ class _PricedLLMClient:
     ) -> list[SchemaT]:
         return self._inner.complete_json(system, user, schema, temperature)
 
+    def set_trace_hook(self, trace_hook: LLMTraceHook | None) -> None:
+        self._inner.set_trace_hook(trace_hook)
+
     @property
     def usage(self) -> Usage:
         raw = self._inner.usage
@@ -48,7 +53,10 @@ class _PricedLLMClient:
 
 
 def build_llm_client(
-    cfg: LLMConfig, trace_hook: LLMTraceHook | None = None, api_key: str | None = None
+    cfg: LLMConfig,
+    trace_hook: LLMTraceHook | None = None,
+    api_key: str | None = None,
+    auth_token: str | None = None,
 ) -> LLMClient:
     """설정 → LLMClient. 벤더 SDK import 는 이 함수 내부(및 llm/anthropic_.py,
     llm/openai_.py)로 국한한다.
@@ -57,18 +65,20 @@ def build_llm_client(
     클라이언트 내부(§ DEBUGGING.md)에서 직접 호출된다. 사람이 디버깅할 때만
     쓰라고 있는 것이지, 판정 파이프라인에 다시 흘러들어가면 안 된다.
 
-    `api_key`: 명시적으로 주어지면 이걸 쓰고, 없으면 환경변수를 읽는다
-    (`credentials.py::resolve_api_key` 가 대화형 선택/입력까지 포함해 이 값을
-    만들어 넘긴다).
+    `api_key`/`auth_token`: 명시적으로 주어지면 이걸 쓰고, 없으면 환경변수를
+    읽는다 (`credentials.py::resolve_credential` 이 대화형 선택/입력까지
+    포함해 이 값을 만들어 넘긴다). `auth_token` 은 `claude setup-token` 으로
+    만든 OAuth 토큰이다 — Anthropic 만 지원한다.
     """
     if cfg.provider == "anthropic":
         from finredteam.llm.anthropic_ import AnthropicClient
 
         key = api_key or os.environ.get("ANTHROPIC_API_KEY")
-        if not key:
-            raise RuntimeError("ANTHROPIC_API_KEY 환경변수가 설정되어 있지 않다")
+        token = auth_token or os.environ.get("ANTHROPIC_AUTH_TOKEN")
+        if not key and not token:
+            raise RuntimeError("ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN 환경변수가 설정되어 있지 않다")
         inner = AnthropicClient(
-            model=cfg.model, api_key=key, max_tokens=cfg.max_tokens, trace_hook=trace_hook
+            model=cfg.model, api_key=key, auth_token=token, max_tokens=cfg.max_tokens, trace_hook=trace_hook
         )
         return _PricedLLMClient(inner, provider="anthropic", model=cfg.model)
 
@@ -82,5 +92,14 @@ def build_llm_client(
             model=cfg.model, api_key=key, max_tokens=cfg.max_tokens, trace_hook=trace_hook
         )
         return _PricedLLMClient(inner, provider="openai", model=cfg.model)
+
+    if cfg.provider == "chatgpt_subscription":
+        from finredteam.llm.chatgpt_subscription import ChatGPTSubscriptionClient
+
+        # API 키 개념이 없다 — `codex login` 이 만든 ~/.codex/auth.json 을 생성자가
+        # 직접 읽는다. 없거나 잘못돼 있으면 CodexAuthFileNotFound 등이 여기서
+        # 그대로 올라간다(호출부가 RuntimeError 와 나란히 잡는다, setup_cli.py 참고).
+        inner = ChatGPTSubscriptionClient(model=cfg.model, max_tokens=cfg.max_tokens, trace_hook=trace_hook)
+        return _PricedLLMClient(inner, provider="chatgpt_subscription", model=cfg.model)
 
     raise ValueError(f"알 수 없는 llm.provider: {cfg.provider!r}")

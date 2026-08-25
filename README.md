@@ -1,9 +1,10 @@
 # FinRedTeam — 범용 + 금융 특화 Red Teaming Agent (ReAct)
 
-`instruction.md`의 계약을 구현한다. 대상은 로컬 Docker에서만 실행되는
-의도적 취약 교육용 뱅킹 앱(vuln-bank). Black-box 정찰 → 그래프 모델링 →
-가설/실험 → 오라클 검증 → Verified Finding. 지표(VVR 등)는 `evaluator/`에서만
-계산하고 에이전트는 계산하지 않는다.
+`instruction.md`의 계약을 구현한다. 하나의 로컬 대상(vuln-bank)에 종속되지
+않도록, 실제 Red Teaming/Bug Bounty처럼 **사람이 먼저 Scope/Rules of
+Engagement를 정의하고 승인해야만 실행되는 Engagement 레이어**(아래 §2)를
+거친다. Black-box 정찰 → 그래프 모델링 → 가설/실험 → 오라클 검증 → Verified
+Finding. 지표(VVR 등)는 `evaluator/`에서만 계산하고 에이전트는 계산하지 않는다.
 
 **루프 구조는 ReAct 다.** 원래 `instruction.md` §13 pseudocode 는 코드가
 전략을 배치로 정해 후보를 일괄 나열하는 결정적 파이프라인이었는데, 사용자
@@ -125,35 +126,113 @@ candidate 단위가 아니라 **시스템 단위**로 지킨다 — 매번 다�
 
 - **LLM 은 액션만 고른다. 판정은 `oracles/verifier.py`(순수 함수)만 한다.**
 - `expected_delta` 는 여전히 `knowledge/baseline.py` 실측값에서만 나온다.
-- Black-box, `entitled_*`/`observed_*` 분리, `Money`/`Decimal`, 안전장치
-  (`config.py`) 전부 그대로.
+- Black-box, `entitled_*`/`observed_*` 분리, `Money`/`Decimal` 전부 그대로.
 - `agent/termination.py` 의 예산·포화·수렴 조건은 LLM 의 `finish` 요청과
-  무관하게 항상 최종 결정권을 갖는다.
+  무관하게 항상 최종 결정권을 갖는다(Engagement 의 policy_stop 이 이보다도
+  먼저 체크된다 — §2).
+
+### 바뀐 것 — 안전장치가 config.py 하드코딩에서 Engagement 로
+
+`config.py` 의 안전장치는 이제 숫자/불리언 **상한**(전역 최대치)만 갖고
+있고, 실제 실행마다 어디까지 허용할지는 승인된 Engagement 가 정한다 — 특히
+허용 호스트는 더 이상 `config.py` 에 하드코딩돼 있지 않다(§2). `execute_
+experiment`도 실제 요청을 보내기 전에 `CompiledPolicy`(허용 메서드/금액
+상한)를 통과해야 한다 — 위 액션 표의 "실제 요청 실행"은 이제 이 검사를
+거친 뒤에만 일어난다.
 
 ---
 
-## 2. 모듈 구조 (현재)
+## 2. Engagement — Scope / Rules of Engagement
+
+vuln-bank 하나에 종속되지 않게, **CLI 인터페이스에 `--target`/`--engagement`
+같은 선택 플래그가 아예 없다.** `finredteam`(서브커맨드·인자 없이) 을 실행
+하면 바로 대화형 Engagement Setup 이 시작된다 — vuln-bank 도 특별 취급되는
+CLI 대상이 아니라, 대화에서 입력된 여러 Target 중 하나일 뿐이다(그저 저장소에
+미리 승인돼 커밋된 예시가 하나 있을 뿐이다).
+
+```
+finredteam
+      ↓ 이미 승인된 Engagement 가 있으면 재사용할지 먼저 묻는다(번호로 선택)
+      ↓ 없거나 새로 만들기로 하면 —
+"테스트하려는 대상과 목적을 자유롭게 설명해주세요" (자연어, 한 번에)
+      ↓
+LLM 이 그 설명을 구조화 필드(Target/Scope/허용·금지 행위/속도·금액 제한/
+민감정보/Cleanup/Stop Condition)로 해석하면서, 부족하거나 애매한 항목을
+**한 번에 하나씩** 질문으로 구체화한다 — 언급 안 된 항목은 항상 가장
+보수적인(거부) 값으로 남는다, LLM 이 스스로 허용 범위를 넓히는 건 스키마
+구조상 불가능하다(`engagement/setup.py::_draft_to_engagement`)
+      ↓
+engagement.md (사람이 읽는 RoE) + engagement.yaml (구조화 정책) + manifest.json
+(engagement_id 는 사용자가 짓지 않는다 — 시스템이 감사/저장용으로 자동 생성)
+      ↓ 사람이 최종 승인해야 approved_at 이 찍힘 — 그 전엔 저장도 안 됨
+      ↓
+Policy Compiler(`engagement/compiler.py::compile_policy`)
+      = Engagement ∩ Global Safety Ceiling(`config.py`)
+      ↓
+CompiledPolicy — `probing/session.py::Session._request()` 가 실제 네트워크
+전송 직전 항상 재검사(호스트/메서드/금액), `agent/react.py` 는 그 전에 한 번
+더 사전 검사해서 LLM 에게 왜 막혔는지 알려준다(이중 방어, 우회 불가)
+      ↓
+승인된 그 Engagement 를 **그 자리에서 바로 실행한다** (BOOTSTRAP → RECON →
+… → ReAct 루프, §1)
+```
+
+핵심 규칙: **Engagement는 전역 안전 상한보다 느슨해질 수 없다** — 숫자(속도/
+동시성/금액)는 `min(engagement, 전역상수)`, DoS/브루트포스/레이스 테스트는
+지금 코드베이스에 그걸 실행할 액션 자체가 없어서 전역 상한 자체가 항상 거짓
+으로 고정돼 있다.
+
+`finredteam setup` 서브커맨드는 같은 대화형 흐름을 실행 없이 준비만 해둔다
+(미리 만들어두고 싶을 때). vuln-bank는 `engagements/examples/vulnbank/`에
+미리 승인된 예시로 커밋돼 있어서, 그것 하나만 있는 상태로 그냥 `finredteam`
+을 실행하면(대화형이면 재사용 여부를 묻고, 자동화 환경이면 후보가 정확히
+하나뿐이라 자동 재사용) 바로 실행된다. 실행 방법은 `RUNNING.md` 참고.
+
+---
+
+## 3. 모듈 구조 (현재)
 
 ```
 finredteam/
-├── __main__.py          CLI — --smoke | --fake-llm | 실제 LLM
-├── config.py             안전장치 상수(ALLOWED_HOSTS, MAX_AMOUNT, MAX_PROBES, ...) + LLMConfig/RunConfig
+├── __main__.py          CLI — 인자 없이 실행하면 바로 Engagement Setup+실행 | setup 서브커맨드 | --smoke | --fake-llm
+├── setup_cli.py           `finredteam setup`/bare 실행 공용 — LLM 클라이언트 지연 생성(build_llm_factory) (로직은 engagement/setup.py)
+├── config.py              안전장치 상수(MAX_AMOUNT, MAX_PROBES, MAX_REQUESTS_PER_SECOND, ...) + LLMConfig/RunConfig
+│                          — 허용 호스트는 여기 없다, Engagement 가 실행마다 명시적으로 선언한다(§2)
+├── credentials.py          API 키 또는 `claude setup-token` OAuth 토큰 대화형 선택/입력 +
+│                          로컬 저장(.finredteam/credentials.json)
+├── logging_setup.py        콘솔(레벨 조절)+파일(runs/<id>/agent.log, 항상 DEBUG) 로깅 설정
+├── cli_render.py           rich 렌더링 공통 함수 — __main__.py(실시간)·replay.py(사후 재생)가 공유
+├── replay.py               저장된 트레이스를 색깔·표 입혀 재실행 없이 다시 보기
 ├── money.py               Decimal 전용 Money/Currency — float 유입을 타입 레벨에서 차단
 ├── jsonpath.py            targets/*.yaml 용 최소 JSONPath 서브셋
+│
+├── engagement/             ★ Scope/Rules of Engagement 레이어 (§2)
+│   ├── schema.py            구조화 Engagement 모델(bool/enum/숫자/list — 자유 텍스트는 guidance 하나뿐)
+│   ├── setup.py             자연어 설명 → LLM 이 한 번에 하나씩 질문해 구체화(EngagementDraft/
+│   │                          ClarificationTurn) + 재사용 제안 + engagement_id 자동 생성 +
+│   │                          `_draft_to_engagement`(언급 안 된 필드는 전부 False/보수적 기본값 강제)
+│   ├── store.py             engagement.md/engagement.yaml/manifest.json 저장 + 승인(approve)
+│   ├── loader.py             engagement.yaml 로드 + engagement_id/경로로 examples/ 또는 자체 디렉터리 자동 탐색
+│   ├── compiler.py           compile_policy() — Engagement ∩ Global Safety Ceiling(config.py)
+│   ├── policy.py             CompiledPolicy — is_host_allowed/is_method_allowed/check_request/check_amount
+│   ├── cleanup.py            생성 리소스 추적 + CLEANUP phase(정리 방법 없으면 정직하게 "not_configured")
+│   └── errors.py             PolicyViolation — 네트워크 경계에서 실제로 던져지는 예외
 │
 ├── models/                core(Verdict/Principal/Endpoint), state(ObservedState/StateDelta),
 │                          finding(CandidateFinding — attack_class 없음, operation 로 대체),
 │                          knowledge(Fact/Lesson(operation)/Entitlement)
 │
-├── llm/                   base(LLMClient 프로토콜) · anthropic_ · openai_ · factory
+├── llm/                   base(LLMClient 프로토콜, LLMError, LLMEvent) · anthropic_ · openai_ · factory
 │                          · fake(가짜 LLM — API 키 없이 ReAct 배관 시험용)
 │
-├── storage/                db(JSONL, steps 포함 13개 컬렉션) · evidence(민감정보 redaction)
-│                          · run_store(manifest.json)
+├── storage/                db(JSONL, steps/llm_calls/created_resources/cleanup 포함 16개 컬렉션)
+│                          · evidence(민감정보 redaction) · run_store(manifest.json — engagement_id/policy_hash 포함)
 │
-├── targets/                loader.py + configs/vulnbank.yaml(seed_paths 최소화, §1 참고)
+├── targets/                loader.py + configs/vulnbank.yaml(seed_paths 최소화, §1 참고 — 어댑터 설정,
+│                          Engagement 와는 별개 축)
 │
-├── probing/                session(allowlist+Decimal 안전 HTTP) · executor(실행)
+├── probing/                session(★ Engagement 정책 강제 + Decimal 안전 HTTP — 실제 네트워크로 나가는
+│                          유일한 지점) · executor(실행)
 │   ├── finance/            state(잔액 관측) · burst(F4 동시요청 + 재시행)
 │   └── generic/             web(SQLi boolean-diff) · api(JWT alg=none 위조) · external(인터페이스만)
 │
@@ -172,7 +251,7 @@ finredteam/
 │   ├── candidates.py        AttackTemplate 로더(개념 설명용) + resolve_skeleton(operation+target
 │   │                          검증, 오라클 안 정함) + graph_menu(발견된 엔드포인트 포함)
 │   ├── planner.py           baseline 선형 대입(_expected_delta_for) + build_candidate
-│   ├── prompts.py           그래프 스키마 + invariant 목록 + 액션 카탈로그 조립
+│   ├── prompts.py           그래프 스키마 + invariant 목록 + 액션 카탈로그 + Engagement guidance(소프트) 조립
 │   └── prioritizer.py       already_tried_and_failed (중복 실험 감지)
 │
 ├── oracles/                 base · value(INV-1A/1B) · amount(INV-6) · idempotency(INV-4)
@@ -186,19 +265,22 @@ finredteam/
 │   ├── budget.py            토큰/스텝 예산
 │   ├── phase.py             Phase 상수
 │   ├── strategy.py           suggest_nudge(ReAct 힌트 전용 — 강제 배치는 완전히 제거됨)
-│   ├── termination.py        예산/포화/수렴/대상이상 4조건, LLM 의 finish 요청보다 항상 우선
-│   ├── react.py              ★ 메인 루프 — AgentContext(pending_hypotheses 포함), Step, 액션 디스패치
+│   ├── termination.py        Engagement policy_stop(최우선) + 예산/포화/수렴/대상이상, LLM finish 요청보다 항상 우선
+│   ├── react.py              ★ 메인 루프 — AgentContext(policy/created_resources 포함), Step, 액션 디스패치,
+│   │                          CLEANUP phase(_finalize)
 │   └── loop.py               react.py 로 위임하는 얇은 진입점 (하위 호환용 이름 유지)
 │
 ├── templates/attacks.yaml   개념만 — procedure/payload/endpoint 금지. oracle 필드는 참고용일 뿐
 │                            (더 이상 오라클 실행 범위를 정하지 않는다)
 │
 ├── reporting/                report(by_operation + by_invariant 분리 집계, VVR 계산 안 함)
-│                          · repro(curl 재현) · bugbounty(서술)
+│                          · transcript(자동 생성 사람이 읽는 요약) · repro(curl 재현) · bugbounty(서술)
 │
 └── evaluator/                scorer(★ invariant+endpoint 기준으로 GT 매칭 — attack_class 없음)
                              · ground_truth.yaml(attack_class 라벨 없음, invariant 만)
                              · reset_env(에이전트와 완전 분리)
+
+engagements/examples/vulnbank/   vuln-bank 용 미리 승인된 Engagement (커밋됨) — §2
 ```
 
 **핵심 관례**: `oracles/`는 `llm/`·`probing/`·`storage/`를 import 하지 않는다
@@ -207,7 +289,7 @@ finredteam/
 
 ---
 
-## 3. 구현 현황
+## 4. 구현 현황
 
 Day 1~7 전부 구현 완료 + 실제 vuln-bank(Commando-X/vuln-bank, 로컬 Docker) 대상
 라이브로 검증. `vulnbank-target/`은 사람이 clone 해 손으로 공격해서 실측한
@@ -245,10 +327,19 @@ Day 1~7 전부 구현 완료 + 실제 vuln-bank(Commando-X/vuln-bank, 로컬 Doc
   남음 → 사람이 보거나 다음 설계 확장에서 자동화).
 - OpenAI 프로바이더(`llm/openai_.py`)는 코드는 있지만 실제 API 키로
   라이브 테스트하지 않았다.
+- **Engagement 레이어(§2)의 한계**: `max_concurrency`/`allow_file_upload`/
+  `allow_race_testing`은 컴파일은 되지만 대응하는 실행 가능한 액션이 아직
+  없어서(동시 요청을 실제로 보내는 ReAct 액션 자체가 없음) 소비되지 않는다.
+  `latency_degradation`/`unexpected_sensitive_data`/`external_side_effect`
+  Stop Condition은 값만 저장되고 자동 감지 로직은 없다(`repeated_5xx`만
+  실제로 `termination.py`에 연결돼 있다). `allow_account_creation=false`면
+  사전 제공 계정으로 로그인만 하는 흐름이 아직 없어 실행 자체를 거부한다
+  (fail-closed). `data_access.allow_raw_response_storage=false` 강제도
+  없다 — evidence 저장은 Finding 검증 체인의 핵심이라 이번엔 건드리지 않았다.
 
 ---
 
-## 4. 사용법
+## 5. 사용법
 
 빠르게 명령만 찾으려면 `RUNNING.md` 를 봐도 된다 (API 키 대화형 입력 방법 포함).
 
@@ -263,16 +354,26 @@ pip install -e .
 # 단위 테스트 (네트워크 불필요)
 python -m pytest tests/ -v
 
-# 부트스트랩 + manifest 만 확인 (Day1 범위)
-finredteam --target vulnbank --smoke
+# vuln-bank 는 engagements/examples/vulnbank/ 에 미리 승인된 Engagement 가
+# 커밋돼 있다 — 그것 하나만 있으면 아래처럼 인자 없이 실행할 때 자동으로
+# (또는 대화형이면 물어보고) 재사용된다. --target/--engagement 같은 선택
+# 플래그는 없다.
 
-# API 키 없이 ReAct 루프 배관 확인 (결정적 가짜 LLM)
-finredteam --target vulnbank --fake-llm --max-rounds 10
+# 부트스트랩 + manifest 만 확인 (Day1 범위)
+finredteam --smoke
+
+# API 키 없이 ReAct 루프 배관 확인 (결정적 가짜 LLM — Engagement Setup 대화도 즉시 끝남)
+finredteam --fake-llm --max-rounds 10
 
 # 실제 LLM 으로 — 진짜 탐색. 환경변수를 미리 안 넣으면 터미널에서 대화형으로
-# 물어본다(저장된 키 중 선택 또는 새로 입력 — 자세한 건 RUNNING.md 3절)
+# 물어본다(저장된 것 중 선택 또는 새로 입력 — 자세한 건 RUNNING.md 4절).
+# API 키 대신 `claude setup-token` 으로 만든 OAuth 토큰도 그대로 쓸 수 있다
+# (ANTHROPIC_AUTH_TOKEN).
 export ANTHROPIC_API_KEY=sk-ant-...
-finredteam --target vulnbank --max-rounds 20
+finredteam --max-rounds 20
+
+# 새 대상을 처음 테스트할 때는 그냥 finredteam 을 실행하면 대화가 시작된다
+# ("테스트하려는 대상과 목적을 자유롭게 설명해주세요" — RUNNING.md 3절)
 
 # GT 대비 채점 (에이전트와 완전 분리된 별도 프로세스)
 finredteam-scorer runs/<run_id>
@@ -297,7 +398,7 @@ finredteam-replay <run_id> --step 5   # 스텝 하나만 깊게(LLM 원문 포�
 
 ---
 
-## 5. 우선순위 (시간이 부족할 때)
+## 6. 우선순위 (시간이 부족할 때)
 
 `instruction.md` §17 그대로: **Day 5 > Day 6 > Day 4(baseline) > Day 7.**
 `money.py`, `entitled_*/observed_*` 분리, `expected_delta.provenance` 강제,

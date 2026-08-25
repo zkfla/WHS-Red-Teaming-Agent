@@ -25,6 +25,8 @@ COLLECTIONS = (
     "baselines",
     "steps",  # ReAct 트레이스(thought/action/observation) — ReAct 전환 시 추가
     "llm_calls",  # LLM 호출 원문(prompt/raw response)·이벤트 — 디버깅 전용(DEBUGGING.md)
+    "created_resources",  # 실행 중 생성한 리소스(테스트 계정 등) — CLEANUP phase 대상 (engagement §11)
+    "cleanup",  # CLEANUP phase 결과 — 성공/실패/미설정 모두 정직하게 기록 (engagement §11)
 )
 
 

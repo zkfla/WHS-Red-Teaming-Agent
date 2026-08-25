@@ -32,32 +32,66 @@ def test_add_key_and_list_keys_round_trip():
     assert credentials.list_keys("anthropic") == []
     credentials.add_key("anthropic", "personal", "sk-ant-xxx")
     entries = credentials.list_keys("anthropic")
-    assert entries == [{"label": "personal", "key": "sk-ant-xxx"}]
+    assert entries == [{"label": "personal", "key": "sk-ant-xxx", "kind": "api_key"}]
 
 
 def test_add_key_with_same_label_overwrites():
     credentials.add_key("anthropic", "personal", "sk-ant-old")
     credentials.add_key("anthropic", "personal", "sk-ant-new")
     entries = credentials.list_keys("anthropic")
-    assert entries == [{"label": "personal", "key": "sk-ant-new"}]
+    assert entries == [{"label": "personal", "key": "sk-ant-new", "kind": "api_key"}]
 
 
-def test_resolve_api_key_prefers_env_var_over_prompt(monkeypatch):
+def test_add_key_can_store_auth_token_kind():
+    credentials.add_key("anthropic", "oauth", "sk-token-xxx", kind="auth_token")
+    entries = credentials.list_keys("anthropic")
+    assert entries == [{"label": "oauth", "key": "sk-token-xxx", "kind": "auth_token"}]
+
+
+def test_resolve_credential_prefers_api_key_env_var_over_prompt(monkeypatch):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-from-env")
     console = Console(file=io.StringIO())
-    assert credentials.resolve_api_key("anthropic", console) == "sk-ant-from-env"
+    cred = credentials.resolve_credential("anthropic", console)
+    assert cred.kind == "api_key"
+    assert cred.value == "sk-ant-from-env"
 
 
-def test_resolve_api_key_without_env_and_prompt_disabled_raises(monkeypatch):
+def test_resolve_credential_falls_back_to_auth_token_env_var(monkeypatch):
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "oauth-token-from-env")
+    console = Console(file=io.StringIO())
+    cred = credentials.resolve_credential("anthropic", console)
+    assert cred.kind == "auth_token"
+    assert cred.value == "oauth-token-from-env"
+
+
+def test_resolve_credential_api_key_env_var_takes_priority_over_auth_token(monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-from-env")
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "oauth-token-from-env")
+    console = Console(file=io.StringIO())
+    cred = credentials.resolve_credential("anthropic", console)
+    assert cred.kind == "api_key"
+
+
+def test_resolve_credential_without_env_and_prompt_disabled_raises(monkeypatch):
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
     console = Console(file=io.StringIO())
     with pytest.raises(RuntimeError):
-        credentials.resolve_api_key("anthropic", console, allow_prompt=False)
+        credentials.resolve_credential("anthropic", console, allow_prompt=False)
 
 
-def test_resolve_api_key_without_env_non_interactive_raises(monkeypatch):
+def test_resolve_credential_without_env_non_interactive_raises(monkeypatch):
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
     monkeypatch.setattr("sys.stdin.isatty", lambda: False)
     console = Console(file=io.StringIO())
     with pytest.raises(RuntimeError):
-        credentials.resolve_api_key("anthropic", console, allow_prompt=True)
+        credentials.resolve_credential("anthropic", console, allow_prompt=True)
+
+
+def test_resolve_credential_openai_has_no_auth_token_fallback(monkeypatch):
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    console = Console(file=io.StringIO())
+    with pytest.raises(RuntimeError):
+        credentials.resolve_credential("openai", console, allow_prompt=False)

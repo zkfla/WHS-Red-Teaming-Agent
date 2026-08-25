@@ -78,6 +78,13 @@ class TargetConfig(BaseModel):
     def discovery_config(self) -> dict[str, Any]:
         return dict(self.adapter.model_extra or {}).get("discovery", {})
 
+    def cleanup_ops(self) -> dict[str, dict[str, Any]]:
+        """resource_type -> {method, path(= "{resource_id}" 플레이스홀더 포함)}.
+        정의 안 된 타겟(예: vuln-bank — 계정 삭제 엔드포인트 자체가 없음)은
+        빈 dict — `engagement/cleanup.py` 가 이를 "정리 방법 미설정"으로
+        정직하게 기록한다."""
+        return dict(self.adapter.model_extra or {}).get("cleanup_ops", {})
+
 
 def load_target_config(path: Path) -> TargetConfig:
     raw = yaml.safe_load(path.read_text(encoding="utf-8"))

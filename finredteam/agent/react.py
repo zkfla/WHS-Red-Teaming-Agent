@@ -16,13 +16,19 @@ from __future__ import annotations
 import json
 import logging
 import secrets
+import time
 from dataclasses import dataclass, field
+from decimal import Decimal, InvalidOperation
 from typing import Any, Callable
 
 from finredteam.agent import strategy as strategy_module
 from finredteam.agent import termination
 from finredteam.agent.budget import Budget
 from finredteam.config import MAX_PROBES
+from finredteam.engagement.cleanup import CreatedResource
+from finredteam.engagement.cleanup import run_cleanup as run_cleanup_phase
+from finredteam.engagement.errors import PolicyViolation
+from finredteam.engagement.policy import CompiledPolicy
 from finredteam.knowledge.baseline import BaselineRegistry
 from finredteam.knowledge.graph import KnowledgeGraph
 from finredteam.llm.base import LLMClient, LLMError, Usage
@@ -63,6 +69,8 @@ logger = logging.getLogger(__name__)
 _TARGET_UNHEALTHY_THRESHOLD = 5
 _SATURATED_STEPS_WITHOUT_GROWTH = 6
 _CONVERGED_STEPS_WITHOUT_GROWTH = 4
+_LLM_UNAVAILABLE_THRESHOLD = 5  # target_unhealthy()와 같은 자리 — "LLM이 계속 실패" 전용 신호
+_LLM_BACKOFF_CAP_SECONDS = 30.0
 
 Hypothesis = tuple[CandidateSkeleton, dict[str, str]]
 
@@ -83,6 +91,7 @@ class AgentContext:
     llm: LLMClient
     store: RunStore
     budget: Budget
+    policy: CompiledPolicy
 
     principals: list[Principal] = field(default_factory=list)
     graph: KnowledgeGraph = field(default_factory=KnowledgeGraph)
@@ -92,6 +101,7 @@ class AgentContext:
     baselines: BaselineRegistry = field(default_factory=BaselineRegistry)
     templates: dict[str, AttackTemplate] = field(default_factory=dict)
     pending_hypotheses: dict[str, Hypothesis] = field(default_factory=dict)
+    created_resources: list[CreatedResource] = field(default_factory=list)
 
     round: int = 0  # ReAct 스텝 카운터. termination.py/budget.py 가 참조하는 이름을 그대로 쓴다.
     steps: list[Step] = field(default_factory=list)
@@ -101,6 +111,8 @@ class AgentContext:
     _prev_edge_count: int = 0
     _steps_without_growth: int = 0
     _consecutive_request_errors: int = 0
+    _consecutive_5xx: int = 0
+    _consecutive_llm_errors: int = 0
     _finish_requested: str | None = None
     _hypothesis_counter: int = 0
     _discover_calls: int = 0
@@ -138,6 +150,19 @@ class AgentContext:
 
     def target_unhealthy(self) -> bool:
         return self._consecutive_request_errors >= _TARGET_UNHEALTHY_THRESHOLD
+
+    def llm_unavailable(self) -> bool:
+        """LLM 호출이 연속으로 실패(레이트리밋·타임아웃·인증 등, §DEBUGGING.md 3.4-a)
+        하는 경우 — `target_unhealthy()`는 대상(target) 요청 실패를 보는 신호라
+        구분한다. 이게 없으면 "saturated"(그래프 정체)로 뭉뚱그려져서, 실제로는
+        LLM이 한 번도 응답하지 못했는데 원인이 안 보이는 문제가 있었다."""
+        return self._consecutive_llm_errors >= _LLM_UNAVAILABLE_THRESHOLD
+
+    # ── Engagement Stop Condition (engagement §12) — LLM이 계속하자고 해도 우선한다 ──
+    def policy_stop_reason(self) -> str | None:
+        if self.policy.stop_repeated_5xx and self._consecutive_5xx >= self.policy.stop_repeated_5xx_threshold:
+            return f"policy_stop:repeated_5xx(>={self.policy.stop_repeated_5xx_threshold})"
+        return None
 
     def saturated(self) -> bool:
         return self._steps_without_growth >= _SATURATED_STEPS_WITHOUT_GROWTH
@@ -236,6 +261,30 @@ def _handle_execute_experiment(input_: ExecuteExperimentInput, ctx: AgentContext
 
     candidate = planner_module.build_candidate(skeleton, params, "", ctx.baselines)
 
+    # ★ Engagement Hard Constraint 사전 검사 — 실제 요청을 보내기 전에 막는다.
+    # `probing/session.py::Session._request()` 가 같은 걸 다시 검사하므로(방어
+    # 이중화) 여기가 빠지거나 우회돼도 네트워크로는 못 나간다 — 다만 여기서
+    # 막으면 LLM에게 "왜" 막혔는지 바로 알려주고 실행 자체를 안 하게 된다.
+    if not ctx.policy.is_method_allowed(candidate.method):
+        logger.warning("정책 위반으로 실행 차단 (step=%d): %s %s", ctx.round, candidate.method, candidate.path)
+        return (
+            f"정책 위반으로 차단됨(STATE_CHANGE_FORBIDDEN): {candidate.method} {candidate.path} 는 "
+            "이 Engagement 정책상 허용되지 않음 — 실제 요청을 보내지 않았음"
+        )
+
+    amount_raw = candidate.params.get("amount")
+    if amount_raw is not None:
+        try:
+            amount = Decimal(str(amount_raw))
+        except InvalidOperation:
+            amount = None
+        if amount is not None:
+            try:
+                ctx.policy.check_amount(amount)
+            except PolicyViolation as exc:
+                logger.warning("정책 위반으로 실행 차단 (step=%d): %s", ctx.round, exc)
+                return f"정책 위반으로 차단됨({exc.rule}): {exc.detail} — 실제 요청을 보내지 않았음"
+
     if prioritizer.already_tried_and_failed(candidate, ctx.episodic):
         logger.warning("이미 시도한 조합 재실행 거절 (step=%d): %s", ctx.round, candidate.id)
         return "이미 정확히 같은 조합(operation·주체·경로·파라미터)을 시도했고 VIOLATION 이 없었다 — 다른 파라미터나 대상을 시도하라"
@@ -248,6 +297,14 @@ def _handle_execute_experiment(input_: ExecuteExperimentInput, ctx: AgentContext
         ctx._consecutive_request_errors += 1
     else:
         ctx._consecutive_request_errors = 0
+
+    # Engagement Stop Condition: repeated_5xx (engagement §12) — target_unhealthy 와
+    # 별개 신호다. target_unhealthy 는 "요청 자체가 실패"(code==0), 이건 "대상이 5xx를
+    # 반환"이다 — 대상이 살아있고 응답은 하는데 계속 서버 에러를 내는 경우를 잡는다.
+    if result.status_codes and all(500 <= code < 600 for code in result.status_codes):
+        ctx._consecutive_5xx += 1
+    else:
+        ctx._consecutive_5xx = 0
 
     # ★ 오라클은 candidate 가 좁히지 않는다 — 등록된 전체 집합이 항상 돈다.
     outcomes = oracle_verifier.run_all_outcomes(candidate, result, ctx.graph)
@@ -373,11 +430,26 @@ def _build_observation_text(ctx: AgentContext) -> str:
     return "\n\n".join(lines)
 
 
-def _finalize(store: RunStore, reason: str, usage: Usage) -> None:
+def _finalize(ctx: "AgentContext", reason: str) -> None:
     """`store.finalize()` + 사람이 읽는 트레이스(`transcript.md`) 를 항상 같이 남긴다
-    (§ DEBUGGING.md 3.5) — 정상 종료·LLM 의 finish 요청·예외로 인한 중단 전부 여기를 거친다."""
-    store.finalize(reason, usage=usage)
-    write_transcript(store.db, store.manifest, store.run_dir)
+    (§ DEBUGGING.md 3.5) — 정상 종료·LLM 의 finish 요청·예외로 인한 중단 전부 여기를 거친다.
+
+    Engagement가 `cleanup.required` 면 CLEANUP phase(engagement §11)도 여기서
+    같이 돈다 — 종료 경로가 여럿이라도(정상/LLM finish/예외) 정리를 빼먹지
+    않는다. cleanup 자체가 실패해도(예: 대상이 이미 죽음) manifest 확정은
+    막지 않는다 — 실패를 조용히 넘기지 않고 기록만 남긴다(§11).
+    """
+    if ctx.policy.cleanup_required and ctx.created_resources:
+        try:
+            principal_by_id = {p.id: p for p in ctx.principals}
+            records = run_cleanup_phase(ctx.session, ctx.target, ctx.created_resources, principal_by_id)
+            for record in records:
+                ctx.store.append("cleanup", record.to_dict())
+        except Exception:
+            logger.exception("CLEANUP phase 자체가 예외로 실패함 — manifest 확정은 계속 진행")
+
+    ctx.store.finalize(reason, usage=ctx.llm_usage)
+    write_transcript(ctx.store.db, ctx.store.manifest, ctx.store.run_dir)
 
 
 def run(
@@ -385,6 +457,7 @@ def run(
     session: Session,
     llm: LLMClient,
     store: RunStore,
+    policy: CompiledPolicy,
     *,
     max_rounds: int | None = None,
     on_step: Callable[[Step], None] | None = None,
@@ -392,13 +465,31 @@ def run(
     """`on_step`: 스텝이 끝나는 즉시 호출되는 선택적 콜백 — 실시간 콘솔 출력용
     (§ DEBUGGING.md 3.1). `agent/react.py` 는 여기서도 rich/console 을 모른다 —
     콜백 시그니처만 안다.
+
+    `policy`: 승인된 Engagement 를 컴파일한 `CompiledPolicy` — Hard Constraint
+    는 `session`(네트워크 경계, 최종 강제)과 여기(사전 검사·계정생성 게이트·
+    stop condition)에서 이중으로 강제된다.
     """
     budget = Budget(max_rounds=max_rounds) if max_rounds else Budget()
-    ctx = AgentContext(target=target, session=session, llm=llm, store=store, budget=budget)
+    ctx = AgentContext(target=target, session=session, llm=llm, store=store, budget=budget, policy=policy)
+
+    # ★ 계정 생성 게이트 — LLM에게 절대 맡기면 안 되는 것(engagement §14). 사전 제공
+    # 계정으로 로그인만 하는 흐름은 아직 없다 — allow_account_creation=false면
+    # 지금은 부트스트랩 자체를 안전하게 거부한다(fail-closed).
+    if not policy.allow_account_creation:
+        raise PolicyViolation(
+            "ACCOUNT_CREATION_FORBIDDEN",
+            "Engagement 정책이 계정 생성을 허용하지 않음 — 사전 제공 계정 로그인 흐름은 아직 미구현",
+        )
 
     # Phase 1: BOOTSTRAP
     ctx.principals = bootstrap_principals(session, target)
     ctx.graph.add_entitlements(entitlement_module.from_self_created(ctx.principals))
+    for p in ctx.principals:
+        if p.account_number:
+            ctx.created_resources.append(
+                CreatedResource(resource_type="account", resource_id=p.account_number, created_by_step=0, principal_id=p.id)
+            )
 
     # Phase 2/3: RECON(passive, 응답 본문에서 발견되는 경로도 1홉만 추가로 훑음)
     # + ENTITLEMENT 확정 (정상 경로만)
@@ -417,7 +508,7 @@ def run(
     ctx.templates = candidates_module.load_templates()
     ctx._prev_edge_count = ctx.graph.edge_count()
 
-    system_prompt = prompts.build_react_system(ctx.templates)
+    system_prompt = prompts.build_react_system(ctx.templates, guidance=policy.guidance)
 
     # Phase 5~N: ReAct 순환
     # ★ 최상위 try/except — 처리되지 않은 예외(우리 코드의 버그)가 나면 조용히
@@ -428,10 +519,10 @@ def run(
         while True:
             stop, reason = termination.should_stop(ctx)
             if stop:
-                _finalize(store, reason, llm.usage)
+                _finalize(ctx, reason)
                 return ctx
             if ctx._finish_requested is not None:
-                _finalize(store, ctx._finish_requested, llm.usage)
+                _finalize(ctx, ctx._finish_requested)
                 return ctx
 
             ctx.round += 1
@@ -442,6 +533,7 @@ def run(
 
             try:
                 results = llm.complete_json(system_prompt, user_prompt, ReActStep, temperature=0.3)
+                ctx._consecutive_llm_errors = 0
             except LLMError as exc:
                 # ★ API 자체의 실패(네트워크·레이트리밋·타임아웃) — 우리 코드의
                 # 버그와 구분한다(§ DEBUGGING.md 3.4-a). 이번 스텝만 실패
@@ -449,6 +541,14 @@ def run(
                 # 잡는다, 위 최상위 try 로 전파되어 조용히 묻히지 않는다.
                 logger.warning("LLM 호출 실패 (step=%d): %s", ctx.round, exc)
                 results = []
+                ctx._consecutive_llm_errors += 1
+                # 레이트리밋 등으로 계속 실패할 때 곧장 다음 스텝을 또 쏘면 같은 제한에
+                # 다시 걸린다(실측: 429 6연속, 13초 안에 라운드 소진 — 벤더 SDK 자체
+                # 재시도만으로는 부족했다). 실패 횟수에 비례해 잠깐 쉬어 창이 풀릴
+                # 시간을 준다 — llm_unavailable() 로 완전히 막히면 그때 종료한다.
+                backoff = min(2.0 ** ctx._consecutive_llm_errors, _LLM_BACKOFF_CAP_SECONDS)
+                logger.info("LLM 재시도 전 %.0f초 대기 (연속 실패 %d회)", backoff, ctx._consecutive_llm_errors)
+                time.sleep(backoff)
 
             if not results:
                 observation = "LLM 이 유효한 JSON 액션을 내지 못함 (API 실패 또는 파싱 실패) — 다시 시도하라"
@@ -482,5 +582,5 @@ def run(
             store.snapshot_round(ctx.round)
     except Exception as exc:
         logger.exception("ReAct 루프가 처리되지 않은 예외로 중단됨 (step=%d)", ctx.round)
-        _finalize(store, f"error: {exc.__class__.__name__}", llm.usage)
+        _finalize(ctx, f"error: {exc.__class__.__name__}")
         raise

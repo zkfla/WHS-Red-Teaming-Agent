@@ -16,17 +16,29 @@ class TerminationContextLike(Protocol):
     @property
     def llm_usage(self) -> Usage: ...
     def target_unhealthy(self) -> bool: ...
+    def llm_unavailable(self) -> bool: ...
     def saturated(self) -> bool: ...
     def converged(self) -> bool: ...
+    def policy_stop_reason(self) -> str | None: ...
 
 
 def should_stop(ctx: TerminationContextLike) -> tuple[bool, str]:
+    # Engagement Stop Condition 이 제일 먼저다 — LLM이 계속하자고 해도, 예산이
+    # 남았어도 우선 멈춘다(engagement §12: "최종 실행 통제권은 LLM이 아니라 코드에").
+    policy_reason = ctx.policy_stop_reason()
+    if policy_reason:
+        return True, policy_reason
     if ctx.budget.rounds_exhausted(ctx.round):
         return True, "max_rounds"
     if ctx.budget.tokens_exhausted(ctx.llm_usage):
         return True, "budget"
     if ctx.target_unhealthy():
         return True, "target_unhealthy"
+    # saturated() 보다 먼저 본다 — LLM 호출이 계속 실패해서 그래프가 안 자란 것과
+    # (예: 레이트리밋) LLM이 정상적으로 응답하는데 탐색이 정체된 것은 원인이
+    # 다르다. 뭉뚱그려 "saturated" 로만 남으면 나중에 로그 없이는 구분이 안 된다.
+    if ctx.llm_unavailable():
+        return True, "llm_unavailable"
     if ctx.saturated():
         return True, "saturated"
     if ctx.converged():

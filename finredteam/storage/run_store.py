@@ -21,7 +21,18 @@ class RunStore:
         self.manifest = manifest
 
     @classmethod
-    def start(cls, cfg: RunConfig, runs_root: Path = Path("runs")) -> "RunStore":
+    def start(
+        cls,
+        cfg: RunConfig,
+        runs_root: Path = Path("runs"),
+        *,
+        engagement_id: str | None = None,
+        policy_hash: str | None = None,
+    ) -> "RunStore":
+        """`engagement_id`/`policy_hash`: 이 실행이 어떤 Engagement/정책으로
+        돌았는지 감사 가능하게 남긴다(engagement §15) — 승인된 정책을 실행 중
+        몰래 바꿔도 결과가 달라지지 않았다는 걸 나중에 확인할 수 있게, 컴파일된
+        정책의 해시를 실행 시작 시점에 고정해서 찍는다."""
         run_id = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
         run_dir = runs_root / run_id
         db = DB(run_dir)
@@ -30,6 +41,8 @@ class RunStore:
             "target": cfg.target_name,
             "smoke": cfg.smoke,
             "llm": {"provider": cfg.llm.provider, "model": cfg.llm.model},
+            "engagement_id": engagement_id,
+            "policy_hash": policy_hash,
             "started_at": datetime.now(timezone.utc).isoformat(),
             "finished_at": None,
             "round": 0,

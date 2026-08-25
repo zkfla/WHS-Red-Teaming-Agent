@@ -14,3 +14,8 @@ runs/
 
 # 대화형으로 입력/선택한 API 키 저장소 (finredteam/credentials.py) — 평문, 커밋 금지
 .finredteam/
+
+# `finredteam setup` 으로 만든 실제 Engagement — 실제 대상 도메인/범위라 민감정보다.
+# 저장소에 미는 건 engagements/examples/ 뿐(vuln-bank 등 공개 예시).
+engagements/*
+!engagements/examples/
