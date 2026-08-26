@@ -73,6 +73,11 @@ class ExecutionResult(BaseModel):
     delta: StateDelta | None = None
     executed_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     evidence_refs: list[str] = []
+    # Stop Condition 감지용 신호 (agent/react.py::policy_stop_reason) — 판정에는
+    # 쓰이지 않는다, 오라클은 여전히 status_codes/delta 만 본다.
+    latencies_ms: list[float] = []
+    sensitive_levels: list[str] = []
+    response_texts: list[str] = []
 
 
 class Finding(BaseModel):

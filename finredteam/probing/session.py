@@ -59,6 +59,7 @@ class RawExchange:
     response_body: Any
     response_text: str
     response_headers: dict[str, str] = field(default_factory=dict)
+    elapsed_ms: float = 0.0
 
 
 def _header_from_template(template: str, token: str) -> tuple[str, str]:
@@ -69,7 +70,11 @@ def _header_from_template(template: str, token: str) -> tuple[str, str]:
 class Session:
     """대상 애플리케이션과의 HTTP 세션. Engagement 정책·timeout·Decimal 안전 파싱을 강제한다."""
 
-    def __init__(self, target: TargetConfig, policy: CompiledPolicy) -> None:
+    def __init__(
+        self, target: TargetConfig, policy: CompiledPolicy, *, _transport: httpx.BaseTransport | None = None
+    ) -> None:
+        """`_transport`: 테스트 전용 — `httpx.MockTransport` 를 주입해서 실제
+        네트워크 없이 응답을 시뮬레이션한다(`tests/test_session.py`)."""
         self.target = target
         self.policy = policy
         self.base_url = target.adapter.base_url
@@ -77,8 +82,20 @@ class Session:
         # follow_redirects=False 를 명시한다 — 리다이렉트를 자동으로 따라가면 정책이 검사한
         # 호스트와 실제로 요청이 도달하는 호스트가 달라질 수 있다(§10). 이 프로젝트는
         # 리다이렉트를 절대 자동으로 쫓지 않는다 — 3xx 도 그냥 하나의 status_code 로 관측한다.
-        self._client = httpx.Client(base_url=self.base_url, timeout=REQUEST_TIMEOUT, follow_redirects=False)
+        self._client = httpx.Client(
+            base_url=self.base_url, timeout=REQUEST_TIMEOUT, follow_redirects=False, transport=_transport
+        )
         self._rate_limiter = _RateLimiter(policy.max_requests_per_second)
+        # ★ Black-box Auth Discovery(recon/auth_discovery.py)가 찾은 헤더 스킴 —
+        # 설정되면 `authed_request()`가 정적 `target.adapter.auth.token_header`
+        # 보다 이걸 우선한다. 설정 안 하면(예: 어댑터 YAML 이 있고 discovery가
+        # 실패해서 legacy 로그인으로 폴백한 경우) 기존처럼 정적 config 를 쓴다.
+        self._discovered_header_template: str | None = None
+
+    def set_discovered_auth_header(self, header_name: str, value_template: str) -> None:
+        """`recon/auth_discovery.py::DiscoveredAuth.header_name/header_value_template`
+        을 그대로 넘긴다 — 이후 모든 `authed_request()` 가 이 스킴을 쓴다."""
+        self._discovered_header_template = f"{header_name}: {value_template}"
 
     def close(self) -> None:
         self._client.close()
@@ -104,7 +121,9 @@ class Session:
         resolved_url = str(httpx.URL(self.base_url).join(path))
         self.policy.check_request(method, resolved_url)
         self._rate_limiter.wait()
+        start = time.monotonic()
         resp = self._client.request(method, path, json=json_body, headers=headers)
+        elapsed_ms = (time.monotonic() - start) * 1000
         # 인증은 오직 Authorization 헤더로만 한다(authed_request). httpx 의 쿠키 잭이
         # 로그인 응답의 Set-Cookie 를 저장해두면, 이후 "익명" 요청에도 그 쿠키가 자동
         # 첨부되어 BOLA/anon_status 관측이 오염된다 — 대상 서버가 쿠키도 유효한 인증
@@ -126,9 +145,16 @@ class Session:
             response_body=body,
             response_text=resp.text,
             response_headers=dict(resp.headers),
+            elapsed_ms=elapsed_ms,
         )
 
     def register(self, principal_id: str, username: str, password: str) -> Principal:
+        if self.target.adapter.auth is None:
+            raise SessionError(
+                "정적 어댑터 설정(auth)이 없음 — Black-box Auth Discovery 도 실패한 상태에서 "
+                "회원가입을 시도함 (targets/configs/<name>.yaml 에 auth.register 를 직접 "
+                "작성하거나, 이미 계정이 있다면 Engagement 에 credentials 로 제공하세요)"
+            )
         cfg = self.target.adapter.auth.register_ep
         fields = {
             cfg.fields.get("username", "username"): username,
@@ -149,6 +175,11 @@ class Session:
         )
 
     def login(self, principal: Principal) -> Principal:
+        if self.target.adapter.auth is None:
+            raise SessionError(
+                "정적 어댑터 설정(auth)이 없음 — Black-box Auth Discovery 도 실패한 상태에서 "
+                "로그인을 시도함 (targets/configs/<name>.yaml 에 auth.login 을 직접 작성하세요)"
+            )
         cfg = self.target.adapter.auth.login
         fields = {
             cfg.fields.get("username", "username"): principal.username,
@@ -180,9 +211,15 @@ class Session:
     ) -> RawExchange:
         if not principal.token:
             raise SessionError(f"{principal.id} 에 토큰이 없다 — login 을 먼저 호출하라")
-        header_name, header_value = _header_from_template(
-            self.target.adapter.auth.token_header, principal.token
-        )
+        template = self._discovered_header_template
+        if template is None:
+            if self.target.adapter.auth is None:
+                raise SessionError(
+                    "인증 헤더 스킴을 모름 — Black-box Auth Discovery 도 실패했고 정적 "
+                    "어댑터 설정(auth.token_header)도 없음"
+                )
+            template = self.target.adapter.auth.token_header
+        header_name, header_value = _header_from_template(template, principal.token)
         return self._request(method, path, json_body=json_body, headers={header_name: header_value})
 
     def anonymous_request(
@@ -199,9 +236,22 @@ class Session:
         `authed_request` 는 정상 발급된 `Principal.token` 만 받는다. 이 메서드는
         정상 흐름이 아님을 명시적으로 드러내기 위해 이름을 다르게 뒀다.
         """
-        header_name, header_value = _header_from_template(
-            self.target.adapter.auth.token_header, token
-        )
+        template = self._discovered_header_template
+        if template is None:
+            if self.target.adapter.auth is None:
+                raise SessionError("인증 헤더 스킴을 모름 — Auth Discovery 도 실패했고 정적 설정도 없음")
+            template = self.target.adapter.auth.token_header
+        header_name, header_value = _header_from_template(template, token)
+        return self._request(method, path, json_body=json_body, headers={header_name: header_value})
+
+    def request_with_header(
+        self, method: str, path: str, header_name: str, header_value: str, json_body: dict[str, Any] | None = None
+    ) -> RawExchange:
+        """임의의 헤더 이름/값 하나로 요청한다 — `target.adapter.auth.token_header`
+        (정적 config)를 거치지 않는다. `recon/auth_discovery.py`가 발견된 토큰을
+        어떤 헤더 스킴(Bearer/raw/Cookie)으로 실어야 통하는지 **검증**할 때만 쓴다.
+        읽기 전용 GET 대상에만 쓰는 걸 전제로 한다(정상 흐름이 아님을 명시적으로
+        드러내기 위해 이름을 다르게 뒀다 — `raw_token_request`와 같은 이유)."""
         return self._request(method, path, json_body=json_body, headers={header_name: header_value})
 
     def capture(self, ex: RawExchange) -> CapturedResponse:

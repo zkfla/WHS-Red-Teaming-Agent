@@ -48,6 +48,12 @@ def render_markdown(engagement: Engagement) -> str:
         f"- 어댑터 설정: `targets/configs/{engagement.target.name}.yaml`",
         f"- {engagement.target.base_url}",
         "",
+        "## 제공된 테스트 계정",
+        *(
+            [f"- {c.username} / {'*' * len(c.password)}" for c in engagement.target.credentials]
+            or ["- (없음 — 필요한 계정은 자동 등록됨, 허용된 경우)"]
+        ),
+        "",
         "## In Scope (allowed_hosts)",
         *allowed_hosts_lines,
         "",
@@ -76,10 +82,19 @@ def render_markdown(engagement: Engagement) -> str:
             [f"- 반복적인 HTTP 5xx ({s.repeated_5xx_threshold}회 연속)"] if s.repeated_5xx else []
         ),
         *(["- 요청/토큰 예산 초과"] if s.request_budget_exceeded else []),
-        *(["- 응답 지연 급증"] if s.latency_degradation else []),
-        *(["- 예상하지 못한 실제 사용자 데이터 노출"] if s.unexpected_sensitive_data else []),
-        *(["- 외부 시스템에 영향을 준 것으로 확인됨"] if s.external_side_effect else []),
+        *(
+            [f"- 응답 지연 급증 (baseline 대비 {s.latency_degradation_multiplier}배 이상, "
+              f"{s.latency_degradation_consecutive_threshold}회 연속)"]
+            if s.latency_degradation else []
+        ),
+        *(
+            [f"- 예상하지 못한 민감정보(비밀번호/카드번호 등) 노출 ({s.unexpected_sensitive_data_threshold}회)"]
+            if s.unexpected_sensitive_data else []
+        ),
     ]
+    if s.external_side_effect:
+        lines_note = "- 외부 시스템 부작용(미지원 — best-effort 참고 신호만 실행 로그에 기록, 자동 중단 아님)"
+        lines.append(lines_note)
 
     if engagement.guidance:
         lines += ["", "## Strategic Guidance (soft — 코드가 강제하지 않음)"]

@@ -30,11 +30,12 @@ from finredteam import cli_render
 from finredteam.config import MAX_ROUNDS, LLMConfig, RunConfig
 from finredteam.engagement.compiler import compile_policy
 from finredteam.engagement.errors import PolicyViolation
+from finredteam.engagement.schema import EngagementCredential
 from finredteam.logging_setup import configure_logging
 from finredteam.models.core import Principal
 from finredteam.probing.session import Session, SessionError
 from finredteam.storage.run_store import RunStore
-from finredteam.targets.loader import load_target
+from finredteam.targets.loader import load_target, minimal_target_config
 
 console = Console()
 
@@ -67,21 +68,53 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         action="store_true",
         help="API 키 환경변수가 없어도 대화형으로 묻지 않고 바로 실패 (CI 등 비대화형 실행용)",
     )
+    parser.add_argument(
+        "--new-engagement",
+        action="store_true",
+        help="이미 승인된 Engagement 가 있어도 재사용 여부를 묻지 않고 무조건 새로 인터뷰한다 "
+        "(isatty() 오판·비대화형 환경 등으로 재사용 여부를 물어볼 기회 자체가 없을 때 "
+        "확실하게 새 스코프 인터뷰를 강제하는 용도)",
+    )
     return parser.parse_args(argv)
 
 
-def _bootstrap_principals(session: Session, principal_ids: list[str], run_id: str) -> list[Principal]:
+def _bootstrap_principals(
+    session: Session,
+    principal_ids: list[str],
+    run_id: str,
+    credentials: list[EngagementCredential] | None = None,
+    *,
+    allow_account_creation: bool,
+) -> list[Principal]:
+    """`--smoke` 전용 경로 — `agent/react.py::bootstrap_principals` 와 동일한
+    credentials-aware 로직(§ engagement 3): 제공된 계정만큼은 로그인만, 나머지는
+    `allow_account_creation` 일 때만 새로 등록, 둘 다 아니면 실패."""
+    credentials = credentials or []
     principals: list[Principal] = []
-    for pid in principal_ids:
-        suffix = secrets.token_hex(3)
-        username = f"{pid}_{run_id}_{suffix}"
-        password = f"Rt!{secrets.token_urlsafe(8)}"
+    missing_without_creation: list[str] = []
+    for i, pid in enumerate(principal_ids):
         try:
-            principal = session.bootstrap(pid, username, password)
+            if i < len(credentials):
+                cred = credentials[i]
+                principal = session.login(Principal(id=pid, username=cred.username, password=cred.password))
+            elif allow_account_creation:
+                suffix = secrets.token_hex(3)
+                username = f"{pid}_{run_id}_{suffix}"
+                password = f"Rt!{secrets.token_urlsafe(8)}"
+                principal = session.bootstrap(pid, username, password)
+            else:
+                missing_without_creation.append(pid)
+                continue
         except SessionError as exc:
             console.print(f"[red]bootstrap 실패[/red] {pid}: {exc}")
             raise
         principals.append(principal)
+    if missing_without_creation:
+        raise PolicyViolation(
+            "ACCOUNT_CREATION_FORBIDDEN",
+            f"주체 {missing_without_creation} 에 대한 사전 제공 계정이 없고 "
+            "Engagement 정책이 계정 생성을 허용하지 않음 (--smoke 도 예외 없음)",
+        )
     return principals
 
 
@@ -112,13 +145,15 @@ def _check_observation(session: Session, principal: Principal, obs_cfg: dict) ->
     return ok, total
 
 
-def _run_smoke(target_cfg, session: Session, store: RunStore, policy) -> None:
-    if not policy.allow_account_creation:
-        raise PolicyViolation(
-            "ACCOUNT_CREATION_FORBIDDEN", "Engagement 정책이 계정 생성을 허용하지 않음 (--smoke 도 예외 없음)"
-        )
+def _run_smoke(target_cfg, session: Session, store: RunStore, policy, credentials: list[EngagementCredential]) -> None:
     currency = target_cfg.adapter.default_currency
-    principals = _bootstrap_principals(session, target_cfg.settings.principals, store.run_id)
+    principals = _bootstrap_principals(
+        session,
+        target_cfg.settings.principals,
+        store.run_id,
+        credentials,
+        allow_account_creation=policy.allow_account_creation,
+    )
 
     for p in principals:
         store.append(
@@ -141,7 +176,7 @@ def _run_smoke(target_cfg, session: Session, store: RunStore, policy) -> None:
     table = Table.grid(padding=(0, 2))
     table.add_column(style="bold")
     table.add_column()
-    table.add_row("Bootstrap", "  ".join(f"{p.id}({currency.code} {target_cfg.settings.initial_balance})" for p in principals))
+    table.add_row("Bootstrap", "  ".join(p.id for p in principals))
     table.add_row("Adapter", target_cfg.adapter.name)
     table.add_row("Observation", f"{ok}/{total} ok, currency {currency.code}({currency.minor_unit})")
     console.print(Panel(table, title="Smoke Test OK", border_style="bold green", expand=False))
@@ -193,7 +228,15 @@ def _make_trace_hook(store: RunStore, console: Console) -> Callable:
     return _on_llm_event
 
 
-def _run_full(target_cfg, session: Session, store: RunStore, llm, max_rounds: int | None, policy) -> None:
+def _run_full(
+    target_cfg,
+    session: Session,
+    store: RunStore,
+    llm,
+    max_rounds: int | None,
+    policy,
+    credentials: list[EngagementCredential],
+) -> None:
     from finredteam.agent import loop as agent_loop
     from finredteam.models.core import Verdict
     from finredteam.reporting import report as report_module
@@ -201,7 +244,14 @@ def _run_full(target_cfg, session: Session, store: RunStore, llm, max_rounds: in
     console.rule("[bold]Trace[/bold]", style="blue")
     console.print()
     ctx = agent_loop.run(
-        target_cfg, session, llm, store, policy, max_rounds=max_rounds, on_step=_make_on_step(console)
+        target_cfg,
+        session,
+        llm,
+        store,
+        policy,
+        credentials=credentials,
+        max_rounds=max_rounds,
+        on_step=_make_on_step(console),
     )
 
     summary = Table.grid(padding=(0, 2))
@@ -227,6 +277,17 @@ def _run_full(target_cfg, session: Session, store: RunStore, llm, max_rounds: in
         f"python -m finredteam.evaluator.scorer {store.run_dir}[/dim]"
     )
 
+    # ★ 이건 판정이 아니다 — 오라클이 이미 확정한 결과를 사람이 읽기 쉽게
+    # 풀어서 설명만 한다(§ reporting/summarize_run.py). 실패해도 실행 결과
+    # 자체는 이미 저장 완료된 뒤라 조용히 건너뛴다.
+    from finredteam.reporting import summarize_run
+
+    narrative = summarize_run.summarize(llm, rep, [f.model_dump(mode="json") for f in ctx.findings])
+    if narrative:
+        console.print()
+        console.print(Panel(narrative, title="AI 요약 (참고용 — 판정 근거 아님)", border_style="magenta"))
+        (store.run_dir / "ai_summary.md").write_text(narrative, encoding="utf-8")
+
 
 def main(argv: list[str] | None = None) -> int:
     try:
@@ -251,7 +312,7 @@ def main(argv: list[str] | None = None) -> int:
     llm_factory = build_llm_factory(args, console)
 
     try:
-        engagement = run_setup(console, llm_factory)
+        engagement = run_setup(console, llm_factory, allow_reuse=not args.new_engagement)
     except RuntimeError as exc:
         console.print(f"[red]{exc}[/red]")
         return 1
@@ -264,14 +325,23 @@ def main(argv: list[str] | None = None) -> int:
     try:
         target_cfg = load_target(target_name)
     except FileNotFoundError:
-        console.print(f"[red]targets/configs/{target_name}.yaml 없음[/red]")
+        # ★ Human pre-analysis 제거 — 어댑터 YAML이 없어도 실행을 막지 않는다.
+        # base_url만으로 최소 구성을 만들고, 로그인/회원가입/송금 등은 Black-box
+        # Auto-Discovery(recon/auth_discovery.py 등)가 실행 중에 직접 찾는다.
+        # 그 발견마저 실패하는 부분만 `probing/session.py`가 명확한 에러로
+        # 알린다 — 조용히 성공한 것처럼 보이지 않는다(§11).
         console.print(
-            "[dim]이 Engagement 가 가리키는 어댑터 설정이 없다 — Engagement Setup 은 "
-            "Scope/Rules of Engagement 만 만든다. base_url, 회원가입/로그인 필드명 등은 "
-            f"사람이 대상을 직접 조사해서 targets/configs/{target_name}.yaml 로 따로 "
-            "작성해야 한다 (RUNNING.md 3절 참고).[/dim]"
+            Panel(
+                f"[yellow]targets/configs/{target_name}.yaml 없음 — 어댑터 설정 없이 "
+                "Black-box Auto-Discovery만으로 진행합니다(로그인/회원가입/송금 등을 "
+                "실행 중에 직접 찾습니다). 발견에 실패하는 부분이 있으면 그 지점에서 "
+                "명확한 에러로 멈춥니다(조용히 넘어가지 않음).[/yellow]",
+                border_style="yellow",
+            )
         )
-        return 1
+        target_cfg = minimal_target_config(
+            target_name, engagement.target.base_url, principal_count=max(3, len(engagement.target.credentials))
+        )
 
     # 아직 provider 를 실제로 정하기 전(그건 llm_factory() 안에서 지연 판단된다)
     # manifest 기록용 임시값 — 실제 실행 후 아래 store.set_llm_display() 로 정정한다.
@@ -326,9 +396,9 @@ def main(argv: list[str] | None = None) -> int:
     try:
         with Session(target_cfg, policy) as session:
             if args.smoke:
-                _run_smoke(target_cfg, session, store, policy)
+                _run_smoke(target_cfg, session, store, policy, engagement.target.credentials)
             else:
-                _run_full(target_cfg, session, store, llm, args.max_rounds, policy)
+                _run_full(target_cfg, session, store, llm, args.max_rounds, policy, engagement.target.credentials)
     except PolicyViolation as exc:
         console.print(f"[red]정책 위반으로 실행이 거부됨 ({exc.rule}):[/red] {exc.detail}")
         store.finalize(termination_reason=f"policy_violation:{exc.rule}")

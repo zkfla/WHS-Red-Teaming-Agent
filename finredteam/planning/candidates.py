@@ -22,6 +22,7 @@ from pydantic import BaseModel
 from finredteam.knowledge.graph import KnowledgeGraph
 from finredteam.memory.semantic import SemanticMemory
 from finredteam.models.core import Principal
+from finredteam.recon.operation_discovery import DiscoveredOperation
 from finredteam.targets.loader import TargetConfig
 
 _DEFAULT_TEMPLATES_PATH = Path(__file__).resolve().parent.parent / "templates" / "attacks.yaml"
@@ -109,9 +110,21 @@ def _resolve_read_balance(
 
 
 def _resolve_transfer(
-    principal_id: str, target: str, principals: list[Principal], graph: KnowledgeGraph, target_cfg: TargetConfig
+    principal_id: str,
+    target: str,
+    principals: list[Principal],
+    graph: KnowledgeGraph,
+    target_cfg: TargetConfig,
+    discovered_operations: dict[str, DiscoveredOperation] | None = None,
 ) -> CandidateSkeleton | str:
-    """`principal_id` 가 발신자, `target` 이 수신 계좌인 송금."""
+    """`principal_id` 가 발신자, `target` 이 수신 계좌인 송금.
+
+    ★ endpoint/method/파라미터 이름은 우선 Black-box Operation Discovery(recon/
+    operation_discovery.py, `discovered_operations`)에서 온다 — 못 찾았을 때만
+    정적 `target_cfg.baseline_ops()`(LEGACY_BOOTSTRAP, 사람이 작성한 어댑터
+    YAML)로 폴백한다. 어느 쪽이든 LLM은 여전히 파라미터 *이름*을 스스로 못
+    짓는다 — `propose_hypothesis`가 채워주는 `hint`의 필드명 중에서만 값을 채운다.
+    """
     principal = _find_principal(principal_id, principals)
     if principal is None or not principal.account_number:
         return f"알 수 없는 principal_id 이거나 계좌가 없음: {principal_id!r}"
@@ -124,24 +137,36 @@ def _resolve_transfer(
     if graph.entitlement_unknown(f"account:{counterparty_account}"):
         return f"account:{counterparty_account} 는 그래프가 모르는 계좌 — observe_graph 나 discover_surface 로 먼저 확인하라"
 
-    op_cfg = next((o for o in target_cfg.baseline_ops() if o.get("op") == "transfer"), None)
-    if op_cfg is None:
-        return "이 대상 설정(baseline_ops)에 transfer 연산이 정의되어 있지 않음"
+    discovered = (discovered_operations or {}).get("transfer")
+    if discovered is not None:
+        method, path = discovered.method, discovered.endpoint
+        hint = {
+            "op": "transfer",
+            "counterparty_account": counterparty_account,
+            "amount_field": discovered.amount_field,
+            "recipient_field": discovered.recipient_field,
+        }
+    else:
+        op_cfg = next((o for o in target_cfg.baseline_ops() if o.get("op") == "transfer"), None)
+        if op_cfg is None:
+            return "이 대상에서 transfer 연산을 발견하지 못했고(Auto-Discovery 실패) 정적 설정에도 없음"
+        method, path = op_cfg.get("method", "POST"), op_cfg["path"]
+        hint = {"op": "transfer", "counterparty_account": counterparty_account}
 
     return CandidateSkeleton(
         layer="finance",
         operation="transfer",
         principal_id=principal_id,
-        method=op_cfg.get("method", "POST"),
-        path=op_cfg["path"],
+        method=method,
+        path=path,
         subject_account=principal.account_number,
         watch_accounts=[principal.account_number, counterparty_account],
         needs_baseline=True,
-        hint={"op": "transfer", "counterparty_account": counterparty_account},
+        hint=hint,
     )
 
 
-ResolverFn = Callable[[str, str, list[Principal], KnowledgeGraph, TargetConfig], "CandidateSkeleton | str"]
+ResolverFn = Callable[..., "CandidateSkeleton | str"]
 
 _RESOLVERS: dict[str, ResolverFn] = {
     "read_balance": _resolve_read_balance,
@@ -160,6 +185,7 @@ def resolve_skeleton(
     principals: list[Principal],
     graph: KnowledgeGraph,
     target_cfg: TargetConfig,
+    discovered_operations: dict[str, DiscoveredOperation] | None = None,
 ) -> CandidateSkeleton | str:
     """`propose_hypothesis` 액션 입력 하나를 검증하고 skeleton 으로 채운다.
 
@@ -170,6 +196,8 @@ def resolve_skeleton(
     resolver = _RESOLVERS.get(operation)
     if resolver is None:
         return f"{operation!r} 는 아직 구현된 후보 생성기가 없음 (지원: {supported_operations()})"
+    if operation == "transfer":
+        return resolver(principal_id, target, principals, graph, target_cfg, discovered_operations)
     return resolver(principal_id, target, principals, graph, target_cfg)
 
 

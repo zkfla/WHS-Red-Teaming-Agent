@@ -113,6 +113,58 @@ def test_wrapped_schema_plain_model_is_strict_compatible():
     assert strict_ok is True
 
 
+class _NestedCredential(BaseModel):
+    username: str
+    password: str
+
+
+class _NestedDraft(BaseModel):
+    target_name: str | None = None
+    credentials: list[_NestedCredential] | None = None
+
+
+class _ClarificationLike(BaseModel):
+    """`engagement/setup.py::ClarificationTurn`(updated_fields: EngagementDraft)의
+    중첩 구조를 그대로 흉내낸다 — 실측 버그 재현용."""
+
+    updated_fields: _NestedDraft
+    next_question: str | None = None
+
+
+def _collect_defs_refs(node: object) -> set[str]:
+    """스키마 트리를 순회하며 `#/$defs/X` 참조가 가리키는 이름을 전부 모은다."""
+    refs: set[str] = set()
+    if isinstance(node, dict):
+        ref = node.get("$ref")
+        if isinstance(ref, str) and ref.startswith("#/$defs/"):
+            refs.add(ref[len("#/$defs/") :])
+        for value in node.values():
+            refs |= _collect_defs_refs(value)
+    elif isinstance(node, list):
+        for item in node:
+            refs |= _collect_defs_refs(item)
+    return refs
+
+
+def test_wrapped_schema_hoists_nested_defs_to_document_root():
+    """★ 실측 버그 회귀 가드(2026-08-26): 중첩 모델(EngagementDraft 안의
+    EngagementCredential처럼)이 있는 스키마로 실제 Engagement Setup 인터뷰를
+    돌렸을 때 chatgpt.com 백엔드가 400(invalid_json_schema, "reference to
+    component '#/$defs/EngagementDraft' which was not found in the schema")
+    을 반환했다 — `$defs`가 문서 루트가 아니라 `properties.items.items` 밑에
+    남아있어서 `$ref: "#/$defs/..."`가 안 풀렸기 때문이다. `$defs`는 항상
+    래핑된 스키마의 최상위에 있어야 하고, 스키마 안의 모든 `$ref`가 실제로
+    그 최상위 `$defs`에서 풀려야 한다."""
+    schema, _ = _wrapped_schema(_ClarificationLike)
+
+    assert "$defs" in schema  # 루트에 있어야 함
+    assert "$defs" not in schema["properties"]["items"]["items"]  # 안쪽에 남으면 안 됨
+
+    refs = _collect_defs_refs(schema)
+    assert refs  # 이 스키마엔 실제로 $ref 가 있어야 의미 있는 테스트다
+    assert refs <= set(schema["$defs"])  # 모든 참조가 루트 $defs 에서 실제로 풀려야 함
+
+
 # ── items 래퍼 방어적 해석 (실측 확인된 버그: non-strict 모드에서 모델이
 # {"items":[...]} 래퍼를 무시하고 객체를 바로 돌려줄 때가 있다) ──────
 

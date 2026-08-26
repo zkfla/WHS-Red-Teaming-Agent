@@ -43,6 +43,11 @@ def _parse_setup_args(argv: list[str]) -> argparse.Namespace:
         action="store_true",
         help="API 키 환경변수가 없으면 대화형으로 안 묻고 바로 실패",
     )
+    parser.add_argument(
+        "--new-engagement",
+        action="store_true",
+        help="이미 승인된 Engagement 가 있어도 재사용 여부를 묻지 않고 무조건 새로 인터뷰한다",
+    )
     return parser.parse_args(argv)
 
 
@@ -168,7 +173,7 @@ def run_setup_command(argv: list[str], console: Console) -> int:
     llm_factory = build_llm_factory(args, console)
 
     try:
-        engagement = run_setup(console, llm_factory)
+        engagement = run_setup(console, llm_factory, allow_reuse=not args.new_engagement)
     except RuntimeError as exc:
         console.print(f"[red]{exc}[/red]")
         return 1

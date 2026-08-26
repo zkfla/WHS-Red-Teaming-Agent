@@ -29,7 +29,8 @@ from finredteam.engagement.cleanup import CreatedResource
 from finredteam.engagement.cleanup import run_cleanup as run_cleanup_phase
 from finredteam.engagement.errors import PolicyViolation
 from finredteam.engagement.policy import CompiledPolicy
-from finredteam.knowledge.baseline import BaselineRegistry
+from finredteam.engagement.schema import EngagementCredential
+from finredteam.knowledge.baseline import BaselineRecord, BaselineRegistry
 from finredteam.knowledge.graph import KnowledgeGraph
 from finredteam.llm.base import LLMClient, LLMError, Usage
 from finredteam.memory.episodic import EpisodicMemory
@@ -37,6 +38,7 @@ from finredteam.memory.semantic import SemanticMemory
 from finredteam.memory.summarizer import summarize
 from finredteam.memory.working import WorkingMemory
 from finredteam.models.core import Principal, Verdict
+from finredteam.money import Money
 from finredteam.models.finding import CandidateFinding, Finding
 from finredteam.models.knowledge import Fact, Lesson
 from finredteam.oracles import verifier as oracle_verifier
@@ -57,9 +59,11 @@ from finredteam.planning.actions import (
 from finredteam.planning.candidates import AttackTemplate, CandidateSkeleton
 from finredteam.probing import executor as executor_module
 from finredteam.probing.session import Session, SessionError
+from finredteam.recon import auth_discovery
 from finredteam.recon import entitlement as entitlement_module
 from finredteam.recon import fingerprint as fingerprint_module
 from finredteam.recon import mapper as mapper_module
+from finredteam.recon import operation_discovery
 from finredteam.reporting.transcript import write_transcript
 from finredteam.storage.run_store import RunStore
 from finredteam.targets.loader import TargetConfig
@@ -71,6 +75,18 @@ _SATURATED_STEPS_WITHOUT_GROWTH = 6
 _CONVERGED_STEPS_WITHOUT_GROWTH = 4
 _LLM_UNAVAILABLE_THRESHOLD = 5  # target_unhealthy()와 같은 자리 — "LLM이 계속 실패" 전용 신호
 _LLM_BACKOFF_CAP_SECONDS = 30.0
+_LATENCY_BASELINE_SAMPLES = 3  # latency_degradation 기준선으로 쓸 초기 표본 수
+
+# external_side_effect best-effort 힌트(engagement §12 한계, 확정 판정 아님) — 한국어+영어.
+_EXTERNAL_SIDE_EFFECT_MARKERS = (
+    "email sent", "notification sent", "sms sent", "webhook",
+    "이메일이 발송", "알림이 발송", "문자가 발송",
+)
+
+
+def _mentions_external_side_effect(texts: list[str]) -> bool:
+    return any(marker in t.lower() for t in texts for marker in _EXTERNAL_SIDE_EFFECT_MARKERS)
+
 
 Hypothesis = tuple[CandidateSkeleton, dict[str, str]]
 
@@ -102,6 +118,14 @@ class AgentContext:
     templates: dict[str, AttackTemplate] = field(default_factory=dict)
     pending_hypotheses: dict[str, Hypothesis] = field(default_factory=dict)
     created_resources: list[CreatedResource] = field(default_factory=list)
+    # ★ Black-box Auth Discovery(recon/auth_discovery.py)가 실패해서 사람이 작성한
+    # 어댑터 YAML(LEGACY_BOOTSTRAP)로 폴백한 부분 — 절대 숨기지 않는다(§11).
+    # 비어 있으면 이 실행의 인증 부분은 완전한 autonomous black-box 였다는 뜻.
+    legacy_bootstrap_used: list[str] = field(default_factory=list)
+    # ★ Operation Discovery(recon/operation_discovery.py)가 찾은 송금형 operation —
+    # operation 이름("transfer") -> 발견된 endpoint/method/필드. 있으면
+    # planning/candidates.py::resolve_skeleton 이 정적 baseline_ops 대신 이걸 쓴다.
+    discovered_operations: dict[str, operation_discovery.DiscoveredOperation] = field(default_factory=dict)
 
     round: int = 0  # ReAct 스텝 카운터. termination.py/budget.py 가 참조하는 이름을 그대로 쓴다.
     steps: list[Step] = field(default_factory=list)
@@ -116,6 +140,10 @@ class AgentContext:
     _finish_requested: str | None = None
     _hypothesis_counter: int = 0
     _discover_calls: int = 0
+    _latency_baseline_samples: list[float] = field(default_factory=list)
+    _consecutive_latency_degraded: int = 0
+    _critical_sensitive_hits: int = 0
+    _external_side_effect_hits: int = 0  # 로깅/향후 확장용 — policy_stop_reason() 은 안 봄
 
     # ── agent/strategy.py::suggest_nudge 가 요구하는 신호 ─────────────
     def has_pending_race_trials(self) -> bool:
@@ -123,6 +151,25 @@ class AgentContext:
 
     def graph_grew_significantly(self) -> bool:
         return self.graph.grew_significantly(self._prev_edge_count)
+
+    def baseline_learned_but_never_tried(self) -> list[str]:
+        """★ 실측 버그 대응: BOOTSTRAP 이 `target.baseline_ops()`(예: transfer)를
+        미리 다 학습해두는데도, read_balance 처럼 계속 VIOLATION 이 나오는
+        operation 에만 머물러 baseline까지 있는 다른 operation(transfer)을 한
+        번도 propose_hypothesis 로 안 내는 사례가 있었다(성과가 계속 나는 쪽에만
+        머무르니 §14 "2연속 실패 시 전환" 넛지도 안 켜졌다). 성공/실패와 무관하게
+        "이미 준비됐는데 안 써먹은" operation을 알려준다."""
+        tried = self.episodic.tried_operations()
+        return sorted(
+            op for op in candidates_module.supported_operations() if self.baselines.has(op) and op not in tried
+        )
+
+    def ready_for_hypothesis_but_none_proposed(self) -> bool:
+        """★ 실측 버그 대응: BOOTSTRAP 직후 이미 entitled_own(계좌)이 채워져
+        있는데도 LLM이 discover_surface/observe_graph 만 반복하다 saturated 로
+        끝나는 사례가 있었다 — propose_hypothesis 를 한 번도 안 낸 상태에서
+        가설을 낼 재료(계좌)가 이미 있으면 매 스텝 알려준다."""
+        return self._hypothesis_counter == 0 and bool(self.graph.entitled_edges())
 
     def recent_violations(self) -> bool:
         return any(f.verdict == Verdict.VIOLATION for f in self.findings[-5:])
@@ -162,6 +209,20 @@ class AgentContext:
     def policy_stop_reason(self) -> str | None:
         if self.policy.stop_repeated_5xx and self._consecutive_5xx >= self.policy.stop_repeated_5xx_threshold:
             return f"policy_stop:repeated_5xx(>={self.policy.stop_repeated_5xx_threshold})"
+        if (
+            self.policy.stop_unexpected_sensitive_data
+            and self._critical_sensitive_hits >= self.policy.stop_unexpected_sensitive_data_threshold
+        ):
+            return f"policy_stop:unexpected_sensitive_data(>={self.policy.stop_unexpected_sensitive_data_threshold})"
+        if (
+            self.policy.stop_latency_degradation
+            and self._consecutive_latency_degraded >= self.policy.stop_latency_degradation_consecutive_threshold
+        ):
+            return (
+                "policy_stop:latency_degradation("
+                f">={self.policy.stop_latency_degradation_consecutive_threshold}x"
+                f"{self.policy.stop_latency_degradation_multiplier}baseline)"
+            )
         return None
 
     def saturated(self) -> bool:
@@ -173,15 +234,252 @@ class AgentContext:
         return all_tried and self._steps_without_growth >= _CONVERGED_STEPS_WITHOUT_GROWTH
 
 
-def bootstrap_principals(session: Session, target: TargetConfig) -> list[Principal]:
-    run_tag = secrets.token_hex(3)
+# 대시보드류 "로그인 후 정상적으로 보이는 첫 페이지"를 찾기 위한 후보 — 사람이
+# *이* 대상을 조사해서 적어둔 값이 아니라, 웹앱 흔한 관례(§ Human pre-analysis
+# 제거, 기존 discovery.seed_paths 의 "정상적으로 앱을 쓰면 자연히 보이는 최소한"
+# 취지와 동일)다. seed_paths 에 이미 있으면 그것도 같이 시도한다(있어도 없어도
+# 동작).
+_AUTHED_HOME_CANDIDATES = ("/dashboard", "/home", "/account", "/profile", "/portal")
+
+
+def discover_and_learn_money_operation(
+    session: Session,
+    target: TargetConfig,
+    payer: Principal,
+    payee: Principal,
+    baselines: BaselineRegistry,
+) -> operation_discovery.DiscoveredOperation | None:
+    """로그인 후 정상적으로 보이는 페이지(대시보드류)에서 송금형 operation을
+    찾고, 소액(1) 정상 실행 한 번으로 diff 기반 baseline까지 학습한다 — 사람이
+    적어둔 `baseline_ops`(LEGACY_BOOTSTRAP) 없이도 동작한다. 실패하면(폼을 못
+    찾음, 잔액 관측 실패 등) `None` — 예외 없음, 호출부가 정적 config 로 폴백한다.
+
+    ★ 한계: payer 쪽 델타만 실측한다(payee 쪽까지 관측하려면 별도 로그인 페이지
+    재요청이 더 필요해 이번 패스에서는 범위 밖) — payer 델타만으로도
+    `ExpectedDelta.provenance="baseline_observed"`는 유효하다, 완전하지 않을 뿐이다.
+    """
+    # ★ _AUTHED_HOME_CANDIDATES 를 seed_paths 보다 먼저 본다 — `/`/`/login`/
+    # `/register` 처럼 seed_paths 에 흔히 있는 "공개" 경로는 인증 여부와
+    # 무관하게 200을 내서, 먼저 시도하면 그게 "홈"으로 잘못 뽑힌다(실측
+    # 버그: `/` 가 먼저 걸려 대시보드를 아예 못 봄).
+    disc = target.discovery_config() if isinstance(target.discovery_config(), dict) else {}
+    seed_hint = disc.get("seed_paths", []) if isinstance(disc, dict) else []
+    candidate_paths = list(dict.fromkeys(list(_AUTHED_HOME_CANDIDATES) + list(seed_hint)))[:MAX_PROBES]
+
+    home_path: str | None = None
+    home_html: str | None = None
+    pages: dict[str, str] = {}
+    for path in candidate_paths:
+        try:
+            ex = session.authed_request("GET", path, payer)
+        except SessionError:
+            continue
+        if ex.status_code >= 400:
+            continue
+        pages[path] = ex.response_text
+        home_path, home_html = path, ex.response_text
+        break
+
+    if home_html is None or home_path is None:
+        return None
+
+    for js_path in sorted(fingerprint_module.extract_discovered_paths(home_html))[:MAX_PROBES]:
+        if not js_path.endswith(".js") or js_path in pages:
+            continue
+        try:
+            js_ex = session.authed_request("GET", js_path, payer)
+        except SessionError:
+            continue
+        if js_ex.status_code < 400:
+            pages[js_path] = js_ex.response_text
+
+    op = operation_discovery.discover_money_operation(pages)
+    if op is None:
+        return None
+
+    before_balance = operation_discovery.discover_self_balance(home_html)
+    if before_balance is None or not payee.account_number or not payer.account_number:
+        return None
+
+    params = {op.amount_field: "1", op.recipient_field: payee.account_number}
+    try:
+        ex = session.authed_request(op.method, op.endpoint, payer, json_body=params)
+    except SessionError:
+        return None
+    if ex.status_code >= 400:
+        return None
+
+    try:
+        after_ex = session.authed_request("GET", home_path, payer)
+    except SessionError:
+        return None
+    after_balance = operation_discovery.discover_self_balance(after_ex.response_text)
+    if after_balance is None:
+        return None
+
+    delta = after_balance - before_balance
+    if delta == 0:
+        return None  # 실측 델타가 없으면 baseline 으로 못 쓴다(§6 — 판정 근거는 항상 실측)
+
+    baselines.register(
+        BaselineRecord(
+            ref_id="bl_transfer_discovered",
+            op="transfer",
+            path=op.endpoint,
+            principal_id=payer.id,
+            deltas={payer.account_number: Money(amount=delta, currency=target.adapter.default_currency)},
+            roles={payer.account_number: "payer"},
+            normal_params=params,
+        )
+    )
+    return op
+
+
+def pre_crawl_for_auth_discovery(session: Session) -> tuple[dict[str, str], str | None]:
+    """BOOTSTRAP 전에 비인증 상태로 로그인/회원가입 폼을 찾기 위한 가벼운 사전
+    크롤 — `/` 하나에서 시작해 응답 본문에서 발견된 경로를 1홉만 더 본다(기존
+    `recon/fingerprint.py::extract_discovered_paths` 재사용, `recon/mapper.py`와
+    같은 무한크롤 방지 철학, `MAX_PROBES` 상한). 실측 확인(2026-08-26): `/` 하나
+    만으로도 `/login`/`/register` 링크가 응답 본문에 있어 발견된다 — seed_paths
+    설정에 의존하지 않는다(Human pre-analysis 제거 취지).
+
+    두 번째 반환값은 인증이 필요한 것으로 관측된(401/403) 경로 하나 —
+    `recon/auth_discovery.py`가 발견한 토큰의 헤더 스킴을 검증할 때 쓴다.
+    """
+    pages: dict[str, str] = {}
+    seen: set[str] = set()
+    protected_path: str | None = None
+
+    def _fetch(path: str) -> set[str]:
+        nonlocal protected_path
+        if path in seen:
+            return set()
+        seen.add(path)
+        try:
+            ex = session.anonymous_request("GET", path)
+        except SessionError:
+            return set()
+        pages[path] = ex.response_text
+        if protected_path is None and ex.status_code in (401, 403):
+            protected_path = path
+        return fingerprint_module.extract_discovered_paths(ex.response_text) - seen
+
+    discovered = _fetch("/")
+    for path in sorted(discovered)[:MAX_PROBES]:
+        _fetch(path)
+
+    return pages, protected_path
+
+
+def _login_via_discovery_or_legacy(
+    session: Session,
+    principal_id: str,
+    cred: EngagementCredential,
+    discovery_pages: dict[str, str] | None,
+    protected_path: str | None,
+    legacy_bootstrap_used: set[str],
+) -> Principal:
+    if discovery_pages:
+        discovered = auth_discovery.discover_login(session, discovery_pages, cred, protected_path=protected_path)
+        if discovered is not None:
+            # ★ 이후 모든 authed_request() 가 이 스킴을 쓰게 한다 — 안 하면
+            # 정적 adapter.auth.token_header(없을 수도 있음, minimal_target_
+            # config) 로 조용히 폴백하다 크래시하거나 틀린 헤더로 나간다.
+            session.set_discovered_auth_header(discovered.header_name, discovered.header_value_template)
+            return Principal(
+                id=principal_id,
+                username=cred.username,
+                password=cred.password,
+                token=discovered.token,
+                account_number=discovered.account_number,
+            )
+    legacy_bootstrap_used.add("login")
+    return session.login(Principal(id=principal_id, username=cred.username, password=cred.password))
+
+
+def _register_and_login_via_discovery_or_legacy(
+    session: Session,
+    principal_id: str,
+    cred: EngagementCredential,
+    discovery_pages: dict[str, str] | None,
+    protected_path: str | None,
+    legacy_bootstrap_used: set[str],
+) -> Principal:
+    if discovery_pages and auth_discovery.discover_register(session, discovery_pages, cred):
+        discovered = auth_discovery.discover_login(session, discovery_pages, cred, protected_path=protected_path)
+        if discovered is not None:
+            session.set_discovered_auth_header(discovered.header_name, discovered.header_value_template)
+            return Principal(
+                id=principal_id,
+                username=cred.username,
+                password=cred.password,
+                token=discovered.token,
+                account_number=discovered.account_number,
+            )
+        # 등록은 discovery 로 성공했는데 로그인 discovery 만 실패했다 — 다시
+        # session.bootstrap() 을 부르면 같은 계정을 또 등록하려다 "이미 존재함"
+        # 에러가 난다. legacy 로그인만 폴백으로 쓴다(재등록 금지).
+        legacy_bootstrap_used.add("login")
+        return session.login(Principal(id=principal_id, username=cred.username, password=cred.password))
+    legacy_bootstrap_used.update({"register", "login"})
+    return session.bootstrap(principal_id, cred.username, cred.password)
+
+
+def bootstrap_principals(
+    session: Session,
+    target: TargetConfig,
+    credentials: list[EngagementCredential] | None = None,
+    *,
+    allow_account_creation: bool,
+    discovery_pages: dict[str, str] | None = None,
+    protected_path: str | None = None,
+) -> tuple[list[Principal], list[str]]:
+    """`target.settings.principals` 순서대로 `credentials`를 매칭한다 — 있으면
+    등록 없이 로그인만(§engagement 3: "Credentials → 사용자 제공 가능"),
+    없으면 `allow_account_creation` 일 때만 새로 등록한다. 어느 쪽도 안 되는
+    principal 이 하나라도 있으면 그 자리에서 실패한다(LLM에게 절대 안 맡기는
+    계정생성 판단 — engagement §14).
+
+    `discovery_pages`(BOOTSTRAP 전 비인증 사전 크롤 결과, `run()` 참고)가 있으면
+    먼저 Black-box Auth Discovery(recon/auth_discovery.py)로 로그인/회원가입
+    endpoint·필드·인증 헤더를 직접 찾아서 쓴다. 실패하면 `targets/configs/
+    <name>.yaml`의 정적 `adapter.auth.*`(LEGACY_BOOTSTRAP)로 폴백한다 — 이걸
+    조용히 넘어가지 않고 두 번째 반환값(`legacy_bootstrap_used`, 예:
+    `["login"]`)으로 정직하게 알린다(§11, 절대 숨기지 않는다).
+    """
+    credentials = credentials or []
     principals: list[Principal] = []
-    for principal_id in target.settings.principals:
-        suffix = secrets.token_hex(3)
-        username = f"{principal_id}_{run_tag}_{suffix}"
-        password = f"Rt!{secrets.token_urlsafe(8)}"
-        principals.append(session.bootstrap(principal_id, username, password))
-    return principals
+    missing_without_creation: list[str] = []
+    legacy_bootstrap_used: set[str] = set()
+
+    for i, principal_id in enumerate(target.settings.principals):
+        if i < len(credentials):
+            cred = credentials[i]
+            principal = _login_via_discovery_or_legacy(
+                session, principal_id, cred, discovery_pages, protected_path, legacy_bootstrap_used
+            )
+            principal.extra["bootstrap_source"] = "provisioned"
+        elif allow_account_creation:
+            cred = EngagementCredential(
+                username=f"{principal_id}_{secrets.token_hex(3)}_{secrets.token_hex(3)}",
+                password=f"Rt!{secrets.token_urlsafe(8)}",
+            )
+            principal = _register_and_login_via_discovery_or_legacy(
+                session, principal_id, cred, discovery_pages, protected_path, legacy_bootstrap_used
+            )
+            principal.extra["bootstrap_source"] = "self_created"
+        else:
+            missing_without_creation.append(principal_id)
+            continue
+        principals.append(principal)
+
+    if missing_without_creation:
+        raise PolicyViolation(
+            "ACCOUNT_CREATION_FORBIDDEN",
+            f"주체 {missing_without_creation} 에 대한 사전 제공 계정이 없고 "
+            "Engagement 정책이 계정 생성을 허용하지 않음",
+        )
+    return principals, sorted(legacy_bootstrap_used)
 
 
 def _watch_accounts_for(candidate: CandidateFinding, principal: Principal) -> list[str]:
@@ -231,7 +529,8 @@ def _handle_discover_surface(input_: DiscoverSurfaceInput, ctx: AgentContext) ->
 
 def _handle_propose_hypothesis(input_: ProposeHypothesisInput, ctx: AgentContext) -> str:
     skeleton = candidates_module.resolve_skeleton(
-        input_.operation, input_.principal_id, input_.target, ctx.principals, ctx.graph, ctx.target
+        input_.operation, input_.principal_id, input_.target, ctx.principals, ctx.graph, ctx.target,
+        ctx.discovered_operations,
     )
     if isinstance(skeleton, str):
         logger.warning("propose_hypothesis 거절 (step=%d): %s", ctx.round, skeleton)
@@ -306,6 +605,37 @@ def _handle_execute_experiment(input_: ExecuteExperimentInput, ctx: AgentContext
     else:
         ctx._consecutive_5xx = 0
 
+    # Engagement Stop Condition: unexpected_sensitive_data — CRITICAL 등급 필드
+    # (password/cvv/card_number/... knowledge/sensitive.py)만 이상 신호로 본다.
+    # HIGH(balance/token/account_number 등)는 정상 인증 응답에도 흔해 오탐 유발.
+    if any(level == "CRITICAL" for level in result.sensitive_levels):
+        ctx._critical_sensitive_hits += 1
+
+    # Engagement Stop Condition: latency_degradation — 단발성 스파이크 오탐을
+    # 피하려고 baseline(첫 N개 표본 평균) 대비 "연속" 초과만 카운트한다.
+    for lat in result.latencies_ms:
+        if len(ctx._latency_baseline_samples) < _LATENCY_BASELINE_SAMPLES:
+            ctx._latency_baseline_samples.append(lat)
+            ctx._consecutive_latency_degraded = 0
+            continue
+        baseline_avg = sum(ctx._latency_baseline_samples) / len(ctx._latency_baseline_samples)
+        if baseline_avg > 0 and lat > baseline_avg * ctx.policy.stop_latency_degradation_multiplier:
+            ctx._consecutive_latency_degraded += 1
+        else:
+            ctx._consecutive_latency_degraded = 0
+
+    # ★ external_side_effect 는 Hard Stop 이 아니다(engagement §12 한계) — 실제
+    # out-of-scope 요청은 이미 CompiledPolicy.check_request 가 원천 차단하므로,
+    # 여기서 볼 수 있는 건 "대상 백엔드가 제3자에게 뭔가를 했을 수도 있다"는
+    # 응답 본문 키워드뿐이다. best-effort 참고 신호로만 Observation 에 덧붙인다.
+    external_side_effect_note = ""
+    if _mentions_external_side_effect(result.response_texts):
+        ctx._external_side_effect_hits += 1
+        external_side_effect_note = (
+            "\n[참고] 응답에서 외부 부작용(이메일/webhook 등) 가능성 키워드 감지 — "
+            "best-effort 추정이며 확정된 판정이 아님."
+        )
+
     # ★ 오라클은 candidate 가 좁히지 않는다 — 등록된 전체 집합이 항상 돈다.
     outcomes = oracle_verifier.run_all_outcomes(candidate, result, ctx.graph)
     finding = oracle_verifier.verify_from_outcomes(candidate, result, outcomes)
@@ -329,11 +659,15 @@ def _handle_execute_experiment(input_: ExecuteExperimentInput, ctx: AgentContext
 
     noteworthy = [o for o in outcomes if o.verdict in (Verdict.VIOLATION, Verdict.ANOMALY)]
     if noteworthy:
-        return "\n".join(f"{o.invariant}: {o.verdict.value} — {o.reason}" for o in noteworthy)
-    passed = [o.invariant for o in outcomes if o.verdict == Verdict.PASS]
-    if passed:
-        return f"이상 없음 (PASS: {passed})"
-    return "판정 가능한 오라클 없음 (전부 UNKNOWN) — 그래프 정보나 baseline 이 더 필요할 수 있음"
+        observation = "\n".join(f"{o.invariant}: {o.verdict.value} — {o.reason}" for o in noteworthy)
+    else:
+        passed = [o.invariant for o in outcomes if o.verdict == Verdict.PASS]
+        observation = (
+            f"이상 없음 (PASS: {passed})"
+            if passed
+            else "판정 가능한 오라클 없음 (전부 UNKNOWN) — 그래프 정보나 baseline 이 더 필요할 수 있음"
+        )
+    return observation + external_side_effect_note
 
 
 def _dispatch(step: ReActStep, ctx: AgentContext) -> str:
@@ -459,6 +793,7 @@ def run(
     store: RunStore,
     policy: CompiledPolicy,
     *,
+    credentials: list[EngagementCredential] | None = None,
     max_rounds: int | None = None,
     on_step: Callable[[Step], None] | None = None,
 ) -> AgentContext:
@@ -469,23 +804,41 @@ def run(
     `policy`: 승인된 Engagement 를 컴파일한 `CompiledPolicy` — Hard Constraint
     는 `session`(네트워크 경계, 최종 강제)과 여기(사전 검사·계정생성 게이트·
     stop condition)에서 이중으로 강제된다.
+    `credentials`: Engagement 가 제공한 테스트 계정(있는 만큼만 로그인, 나머지는
+    `policy.allow_account_creation` 에 따라 자동 등록되거나 실패한다 — 계정생성
+    판단 자체는 여전히 LLM 이 아니라 `bootstrap_principals` 가 한다, engagement §14).
     """
     budget = Budget(max_rounds=max_rounds) if max_rounds else Budget()
     ctx = AgentContext(target=target, session=session, llm=llm, store=store, budget=budget, policy=policy)
 
-    # ★ 계정 생성 게이트 — LLM에게 절대 맡기면 안 되는 것(engagement §14). 사전 제공
-    # 계정으로 로그인만 하는 흐름은 아직 없다 — allow_account_creation=false면
-    # 지금은 부트스트랩 자체를 안전하게 거부한다(fail-closed).
-    if not policy.allow_account_creation:
-        raise PolicyViolation(
-            "ACCOUNT_CREATION_FORBIDDEN",
-            "Engagement 정책이 계정 생성을 허용하지 않음 — 사전 제공 계정 로그인 흐름은 아직 미구현",
-        )
+    # Phase 0: 사전 크롤(비인증) — BOOTSTRAP 이 Black-box Auth Discovery 로 로그인/
+    # 회원가입 endpoint 를 찾을 수 있게 `/` 에서 1홉만 미리 본다(§ Human
+    # pre-analysis 제거 — targets/configs/*.yaml 의 seed_paths 에 의존하지 않는다).
+    discovery_pages, protected_path = pre_crawl_for_auth_discovery(session)
 
     # Phase 1: BOOTSTRAP
-    ctx.principals = bootstrap_principals(session, target)
-    ctx.graph.add_entitlements(entitlement_module.from_self_created(ctx.principals))
-    for p in ctx.principals:
+    ctx.principals, ctx.legacy_bootstrap_used = bootstrap_principals(
+        session,
+        target,
+        credentials,
+        allow_account_creation=policy.allow_account_creation,
+        discovery_pages=discovery_pages,
+        protected_path=protected_path,
+    )
+    store.record_legacy_bootstrap(ctx.legacy_bootstrap_used)
+    if ctx.legacy_bootstrap_used:
+        logger.warning(
+            "Black-box Auth Discovery 실패 — 사람이 작성한 어댑터 설정(LEGACY_BOOTSTRAP)으로 "
+            "폴백함: %s (이 실행은 인증 부분에서 완전한 autonomous black-box 가 아님)",
+            ctx.legacy_bootstrap_used,
+        )
+    provisioned = [p for p in ctx.principals if p.extra.get("bootstrap_source") == "provisioned"]
+    self_created = [p for p in ctx.principals if p.extra.get("bootstrap_source") != "provisioned"]
+    ctx.graph.add_entitlements(entitlement_module.from_self_created(self_created))
+    ctx.graph.add_entitlements(entitlement_module.from_provisioned(provisioned))
+    # ★ 제공받은(등록하지 않은) 계정은 CLEANUP 대상이 아니다 — 이 실행이 만든
+    # 리소스가 아니므로 실수로 정리 시도하지 않는다(engagement §11).
+    for p in self_created:
         if p.account_number:
             ctx.created_resources.append(
                 CreatedResource(resource_type="account", resource_id=p.account_number, created_by_step=0, principal_id=p.id)
@@ -502,8 +855,18 @@ def run(
     principals_with_account = [p for p in ctx.principals if p.account_number]
     if len(principals_with_account) >= 2:
         payer, payee = principals_with_account[0], principals_with_account[1]
+        # ★ Operation/Parameter Discovery 우선(§ recon/operation_discovery.py) —
+        # 실패하면 정적 baseline_ops(LEGACY_BOOTSTRAP)로 폴백하고 정직하게 기록한다.
+        discovered_transfer = discover_and_learn_money_operation(session, target, payer, payee, ctx.baselines)
+        if discovered_transfer is not None:
+            ctx.discovered_operations["transfer"] = discovered_transfer
+        else:
+            ctx.legacy_bootstrap_used.append("transfer_operation")
         for op_cfg in target.baseline_ops():
+            if op_cfg.get("op") == "transfer" and discovered_transfer is not None:
+                continue  # 이미 discovery 로 학습됨 — 정적 config 로 덮어쓰지 않는다
             ctx.baselines.learn(session, target, op_cfg, payer, counterparty=payee)
+    store.record_legacy_bootstrap(ctx.legacy_bootstrap_used)
 
     ctx.templates = candidates_module.load_templates()
     ctx._prev_edge_count = ctx.graph.edge_count()
@@ -527,6 +890,7 @@ def run(
 
             ctx.round += 1
             edge_count_before = ctx.graph.edge_count()
+            hypothesis_counter_before = ctx._hypothesis_counter
 
             observation_text = _build_observation_text(ctx)
             user_prompt = prompts.build_react_user(observation_text)
@@ -573,7 +937,14 @@ def run(
             if on_step is not None:
                 on_step(step)
 
-            if ctx.graph.edge_count() > edge_count_before:
+            # ★ 실측 버그: propose_hypothesis 는 설계상 부작용(그래프 변화)이
+            # 없다(§ planning/candidates.py — 가설/실험 분리) — edge_count 만
+            # "성장"으로 인정하면, 정찰만 오래 하다 막 가설을 하나 등록한
+            # 스텝조차 "무성장"으로 잡혀서 saturated 로 조기 종료된다. 실제
+            # 사례: recon 5스텝 + propose_hypothesis 1스텝 = 6스텝 연속 무성장으로
+            # 판정되어 execute_experiment 를 시도해보지도 못하고 끝남. 새 가설
+            # 등록도 "성장"(=전진)으로 인정한다.
+            if ctx.graph.edge_count() > edge_count_before or ctx._hypothesis_counter > hypothesis_counter_before:
                 ctx._steps_without_growth = 0
             else:
                 ctx._steps_without_growth += 1

@@ -47,6 +47,11 @@ class CompiledPolicy:
 
     stop_repeated_5xx: bool
     stop_repeated_5xx_threshold: int
+    stop_latency_degradation: bool
+    stop_latency_degradation_multiplier: float
+    stop_latency_degradation_consecutive_threshold: int
+    stop_unexpected_sensitive_data: bool
+    stop_unexpected_sensitive_data_threshold: int
     stop_request_budget_exceeded: bool
 
     guidance: tuple[str, ...]

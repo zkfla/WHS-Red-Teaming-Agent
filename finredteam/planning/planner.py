@@ -39,7 +39,10 @@ def _expected_delta_for(
     if not op or not baselines.has(op):
         return None
 
-    unit_param = _UNIT_PARAM_BY_OP.get(op)
+    # ★ Operation Discovery(recon/operation_discovery.py)가 찾은 실제 필드명을
+    # 우선한다 — 대상마다 "amount"가 아닐 수 있다. 발견 못 했을 때만(LEGACY_
+    # BOOTSTRAP 정적 config 경로) 이 코드베이스의 관례값 "amount"로 폴백한다.
+    unit_param = skeleton.hint.get("amount_field") or _UNIT_PARAM_BY_OP.get(op)
     if not unit_param or unit_param not in params:
         return None
 

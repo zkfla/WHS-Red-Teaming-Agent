@@ -51,6 +51,11 @@ class FakeLLMClient:
         if "next_question" in schema.model_fields and "updated_fields" in schema.model_fields:
             return [schema.model_validate({"updated_fields": {}, "next_question": None})]
 
+        # reporting/summarize_run.py::RunNarrative 도 같은 클라이언트로 --fake-llm
+        # 배관 확인이 가능하게 — 실제 추론 없이 그렇다는 것만 밝히는 고정 문구.
+        if set(schema.model_fields) == {"narrative"}:
+            return [schema.model_validate({"narrative": "(--fake-llm) 결정적 가짜 응답 — 실제 요약이 아님."})]
+
         principals = _extract_json_field(user, _PRINCIPALS_RE) or []
         entitled_own = _extract_json_field(user, _ENTITLED_OWN_RE) or {}
 

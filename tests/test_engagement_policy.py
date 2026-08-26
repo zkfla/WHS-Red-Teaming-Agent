@@ -130,3 +130,46 @@ def test_delete_requires_explicit_allow_delete():
     engagement = _engagement(actions=EngagementActions(allow_state_change=True, allow_delete=True))
     policy = compile_policy(engagement)
     assert policy.is_method_allowed("DELETE") is True
+
+
+# ── Stop Condition 감지(§ agent/react.py) 를 위한 필드 컴파일 ──────────
+
+
+def test_stop_condition_defaults():
+    from finredteam.engagement.schema import EngagementStopConditions
+
+    defaults = EngagementStopConditions()
+    # 안전/Scope 보호 직결 — 기본 활성화 (사용자 확정 설계 결정).
+    assert defaults.unexpected_sensitive_data is True
+    # 오탐 위험 — 신뢰도 검증 전까지는 opt-in.
+    assert defaults.latency_degradation is False
+    # Hard Stop 미지원 — 항상 opt-in(사실상 미사용).
+    assert defaults.external_side_effect is False
+
+
+def test_latency_and_sensitive_data_stop_fields_pass_through():
+    from finredteam.engagement.schema import EngagementStopConditions
+
+    engagement = _engagement(
+        stop_conditions=EngagementStopConditions(
+            latency_degradation=True,
+            latency_degradation_multiplier=5.0,
+            latency_degradation_consecutive_threshold=3,
+            unexpected_sensitive_data=True,
+            unexpected_sensitive_data_threshold=2,
+        )
+    )
+    policy = compile_policy(engagement)
+    assert policy.stop_latency_degradation is True
+    assert policy.stop_latency_degradation_multiplier == 5.0
+    assert policy.stop_latency_degradation_consecutive_threshold == 3
+    assert policy.stop_unexpected_sensitive_data is True
+    assert policy.stop_unexpected_sensitive_data_threshold == 2
+
+
+def test_stop_condition_change_affects_policy_hash():
+    from finredteam.engagement.schema import EngagementStopConditions
+
+    e1 = _engagement(stop_conditions=EngagementStopConditions(latency_degradation=False))
+    e2 = _engagement(stop_conditions=EngagementStopConditions(latency_degradation=True))
+    assert compile_policy(e1).policy_hash != compile_policy(e2).policy_hash

@@ -30,6 +30,7 @@ from finredteam.engagement.schema import (
     Engagement,
     EngagementActions,
     EngagementCleanup,
+    EngagementCredential,
     EngagementDataAccess,
     EngagementExternalServices,
     EngagementRequests,
@@ -37,8 +38,10 @@ from finredteam.engagement.schema import (
     EngagementStopConditions,
     EngagementTarget,
 )
+from finredteam.targets.loader import load_target
 
 _MAX_CLARIFY_TURNS = 12
+_MAX_TARGET_NAME_RETRIES = 3
 
 
 class EngagementDraft(BaseModel):
@@ -61,6 +64,7 @@ class EngagementDraft(BaseModel):
     max_requests_per_second: float | None = None
     max_concurrency: int | None = None
     max_amount: str | None = None  # Decimal 문자열 그대로(§4 규칙 2 — float 경유 금지)
+    credentials: list[EngagementCredential] | None = None  # 이미 제공된 테스트 계정만 — 내부 구조 아님
     allow_real_user_data: bool | None = None
     cleanup_required: bool | None = None
     cleanup_resource_types: list[str] | None = None
@@ -90,9 +94,15 @@ _SYSTEM_PROMPT = """\
    여러 구체적 행위(예: 대량 요청/자원 고갈/반복 로그인/burst 요청 등)를
    금지 대상으로 제안하는 질문을 만들어서 사용자에게 확인받아라(스스로
    단정하지 마라).
+2c. 이미 제공받은 테스트 계정이 있는지 물어봐라(credentials) — 있다면
+   username/password 만 받는다. **절대로** 로그인/회원가입 endpoint, HTTP
+   method, 필드명, token이 반환되는 JSON 경로, Authorization header 형식,
+   잔액조회/송금 endpoint나 파라미터 이름 같은 애플리케이션 내부 구조는
+   묻지 않는다 — 그건 사람이 별도로 조사해서 어댑터 설정에 적어두는 몫이고,
+   장기적으로는 Agent가 Black-box Recon으로 스스로 알아내야 할 대상이다.
 3. 우선순위 있게 물어봐라 — base_url/target_name 을 가장 먼저, 그 다음
-   scope(allowed_hosts), 허용 행위, 금지 행위, 속도/금액 제한, 민감정보,
-   cleanup, stop condition 순서로.
+   scope(allowed_hosts), 이미 제공된 테스트 계정(credentials), 허용 행위,
+   금지 행위, 속도/금액 제한, 민감정보, cleanup, stop condition 순서로.
 4. 질문은 한국어로, 한 번에 하나씩, 짧고 구체적으로.
 5. JSON 으로만 답하라.
 """
@@ -134,7 +144,11 @@ def _draft_to_engagement(draft: EngagementDraft, engagement_id: str) -> Engageme
 
     return Engagement(
         engagement_id=engagement_id,
-        target=EngagementTarget(name=draft.target_name or "target", base_url=draft.base_url or ""),
+        target=EngagementTarget(
+            name=draft.target_name or "target",
+            base_url=draft.base_url or "",
+            credentials=draft.credentials or [],
+        ),
         scope=EngagementScope(allowed_hosts=allowed_hosts or [], denied_hosts=draft.denied_hosts or []),
         external_services=EngagementExternalServices(allowed=bool(draft.external_services_allowed)),
         requests=EngagementRequests(
@@ -227,14 +241,43 @@ def _run_conversation(console: Console, llm_factory) -> EngagementDraft:
     if not draft.base_url:
         base_url = Prompt.ask("서비스의 기본 URL은? (예: http://localhost:5000)", console=console)
         draft = _merge_draft(draft, EngagementDraft(base_url=base_url))
-    if not draft.target_name:
-        suggested = urlparse(draft.base_url).hostname or ""
-        target_name = Prompt.ask(
-            "이 Engagement 가 쓸 어댑터 설정 이름은? (targets/configs/<name>.yaml)",
-            default=suggested,
-            console=console,
+    # ★ 어댑터(Legacy Target Adapter) 존재 여부를 여기서 조기 확인한다 — 예전엔
+    # 이걸 전체 RoE 인터뷰 + 최종 승인까지 끝난 뒤 __main__.py 에서야 확인해서,
+    # 대상이 새 것이면 인터뷰 전체가 헛수고가 되는 문제가 있었다. 어댑터 자체를
+    # 여기서 만들어주지는 않는다 — 그건 여전히 사람이 직접 조사해서 작성해야
+    # 한다(RUNNING.md 3절), 이 루프는 "없으면 미리 알려주고 계속할지 묻는다"만 한다.
+    # 재입력 한도(_MAX_TARGET_NAME_RETRIES)를 둬서 — "다른 이름 다시 입력"을
+    # 골라도 매번 같은(빈) 값이 나오는 상황(비대화형 스텁 등)에서 무한루프에
+    # 빠지지 않게 한다 — 한도에 닿으면 경고만 남기고 그냥 진행한다.
+    for _ in range(_MAX_TARGET_NAME_RETRIES):
+        if not draft.target_name:
+            suggested = urlparse(draft.base_url).hostname or ""
+            target_name = Prompt.ask(
+                "이 Engagement 가 쓸 어댑터 설정 이름은? (targets/configs/<name>.yaml)",
+                default=suggested,
+                console=console,
+            )
+            draft = _merge_draft(draft, EngagementDraft(target_name=target_name))
+        try:
+            load_target(draft.target_name)
+            break
+        except FileNotFoundError:
+            console.print(
+                f"[yellow]targets/configs/{draft.target_name}.yaml 없음[/yellow] — Engagement Setup 은 "
+                "Scope/RoE 만 만든다, 어댑터 설정(회원가입/로그인 endpoint 등)은 사람이 직접 조사해서 "
+                "별도로 작성해야 한다(RUNNING.md 3절)."
+            )
+            if Confirm.ask(
+                "그래도 이 이름으로 계속 진행할까요? (아니오 = 다른 이름 다시 입력)",
+                default=False,
+                console=console,
+            ):
+                break
+            draft = draft.model_copy(update={"target_name": None})
+    else:
+        console.print(
+            f"[yellow]재입력 {_MAX_TARGET_NAME_RETRIES}회 한도 도달 — 어댑터 없이 그대로 진행합니다[/yellow]"
         )
-        draft = _merge_draft(draft, EngagementDraft(target_name=target_name))
 
     return draft
 
@@ -273,24 +316,40 @@ def _offer_reuse(console: Console) -> Engagement | None:
     return None
 
 
+def _print_credential_mapping(console: Console, engagement: Engagement) -> None:
+    """제공된 계정이 어느 principal(예: attacker_A)에 매칭될지 승인 전에 명시적으로
+    보여준다 — 순서 매칭이 암묵적이라 잘못된 역할로 쓰이는 실수를 승인 전에
+    잡을 수 있게 한다."""
+    try:
+        target_cfg = load_target(engagement.target.name)
+    except FileNotFoundError:
+        console.print("[dim](어댑터 설정이 아직 없어 계정→principal 매핑은 미리 보여줄 수 없음)[/dim]")
+        return
+
+    table = Table(title="제공된 테스트 계정 매핑", show_header=True)
+    table.add_column("계정")
+    table.add_column("→ principal")
+    principals = target_cfg.settings.principals
+    for i, cred in enumerate(engagement.target.credentials):
+        role = principals[i] if i < len(principals) else "[red](매칭되는 principal 없음 — 사용 안 됨)[/red]"
+        table.add_row(cred.username, role)
+    console.print(table)
+
+
 def run_setup(console: Console, llm_factory, *, allow_reuse: bool = True) -> Engagement | None:
     """`llm_factory`: 인자 없는 콜러블(`() -> LLMClient`) — 실제로 새 대화가
     시작될 때만 호출된다(API 키 지연 확보). 돌려주는 `Engagement` 는 항상
     승인된(`approved_at` 있는) 것이다 — 재사용이든 새로 만들었든 마찬가지.
     사용자가 새로 만드는 중 취소하면 `None`."""
-    if not sys.stdin.isatty():
-        if allow_reuse:
-            candidates = _load_approved_engagements()
-            if len(candidates) == 1:
-                console.print(
-                    f"[dim]비대화형 실행 — 기존 Engagement 자동 재사용: {candidates[0].engagement_id}[/dim]"
-                )
-                return candidates[0]
-        raise RuntimeError(
-            "대화형 터미널이 아니라서 Engagement Setup 을 진행할 수 없음 — "
-            "승인된 Engagement 가 정확히 하나만 있으면 비대화형에서도 자동 재사용됨."
-        )
-
+    # ★ 실측 버그 대응: 예전엔 `sys.stdin.isatty()`가 False면 실제로 물어보지도
+    # 않고 곧장 자동 재사용/에러로 빠졌다 — 그런데 일부 셸/터미널 조합(Windows
+    # PowerShell을 포함해 여럿에서 실측됨)에서 이 판정이 부정확하게 False를
+    # 줘서, 진짜 대화형 터미널인데도 스코프 인터뷰를 항상 건너뛰는 사례가
+    # 있었다. 이제는 isatty() 로 미리 걸러내지 않고 **항상 실제로 프롬프트를
+    # 시도**한다 — 정말 입력을 못 받는 환경(CI 등)이면 `Prompt`/`Confirm.ask`
+    # 자체가 `EOFError`를 던지므로 아래 `except EOFError`가 그 경우만 잡아
+    # 자동 재사용/에러 폴백을 한다(반대 방향의 오탐 — isatty()가 부정확하게
+    # True를 주는 경우 — 는 원래도 여기로 빠지도록 되어 있었다).
     try:
         if allow_reuse:
             reused = _offer_reuse(console)
@@ -302,6 +361,8 @@ def run_setup(console: Console, llm_factory, *, allow_reuse: bool = True) -> Eng
         engagement = _draft_to_engagement(draft, engagement_id)
 
         console.print()
+        if engagement.target.credentials:
+            _print_credential_mapping(console, engagement)
         console.print(Panel(store_module.render_markdown(engagement), title="최종 확인", border_style="bold blue"))
 
         if not Confirm.ask("이 설정을 확정하시겠습니까?", default=False, console=console):
@@ -315,8 +376,11 @@ def run_setup(console: Console, llm_factory, *, allow_reuse: bool = True) -> Eng
             candidates = _load_approved_engagements()
             if len(candidates) == 1:
                 console.print(
-                    f"[dim]입력을 읽을 수 없음(비대화형 환경) — 기존 Engagement 자동 재사용: "
-                    f"{candidates[0].engagement_id}[/dim]"
+                    Panel(
+                        f"[bold yellow]입력을 읽을 수 없어(비대화형 환경) 스코프 인터뷰를 건너뛰고, "
+                        f"이미 승인된 Engagement 를 자동 재사용합니다: {candidates[0].engagement_id}[/bold yellow]",
+                        border_style="yellow",
+                    )
                 )
                 return candidates[0]
         raise RuntimeError("입력을 읽을 수 없음(비대화형 환경) — Engagement Setup 은 대화형 터미널 전용") from exc

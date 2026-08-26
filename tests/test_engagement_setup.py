@@ -96,6 +96,24 @@ def test_draft_to_engagement_defaults_cleanup_required_true_when_unset():
     assert engagement.cleanup.required is True  # 보수적 기본값 — 정리하는 쪽
 
 
+def test_draft_to_engagement_carries_credentials_into_target():
+    from finredteam.engagement.schema import EngagementCredential
+
+    draft = EngagementDraft(
+        target_name="t",
+        base_url="http://localhost:5000",
+        credentials=[EngagementCredential(username="alice", password="pw1")],
+    )
+    engagement = _draft_to_engagement(draft, "t-abc123")
+    assert engagement.target.credentials == [EngagementCredential(username="alice", password="pw1")]
+
+
+def test_draft_to_engagement_no_credentials_defaults_to_empty_list():
+    draft = EngagementDraft(target_name="t", base_url="http://localhost:5000")
+    engagement = _draft_to_engagement(draft, "t-abc123")
+    assert engagement.target.credentials == []
+
+
 # ── 대화 루프 (Prompt/Confirm 스텁으로 TTY 없이 검증) ──────────────
 
 
@@ -132,6 +150,22 @@ def _stub_prompts(monkeypatch, answers: list[str], confirm: bool = True):
     monkeypatch.setattr(engagement_setup.Confirm, "ask", staticmethod(lambda *a, **k: confirm))
 
 
+def _stub_sequenced_prompts(monkeypatch, prompt_answers: list[str], confirm_answers: list[bool]):
+    """`_stub_prompts` 와 달리 Confirm.ask 도 호출 순서대로 다른 값을 낼 수 있게 한다
+    — 어댑터 존재 확인(재입력 여부)과 최종 승인이 서로 다른 답이어야 하는 시나리오용."""
+    p_queue = list(prompt_answers)
+    c_queue = list(confirm_answers)
+
+    def _ask(question, default="", console=None, **kwargs):
+        return p_queue.pop(0) if p_queue else default
+
+    def _confirm(question, default=False, console=None, **kwargs):
+        return c_queue.pop(0) if c_queue else default
+
+    monkeypatch.setattr(engagement_setup.Prompt, "ask", staticmethod(_ask))
+    monkeypatch.setattr(engagement_setup.Confirm, "ask", staticmethod(_confirm))
+
+
 def test_run_setup_new_engagement_full_flow(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     answers = [
@@ -150,6 +184,40 @@ def test_run_setup_new_engagement_full_flow(tmp_path, monkeypatch):
     assert engagement.actions.allow_state_change is True
     assert (tmp_path / "engagements" / engagement.engagement_id / "engagement.yaml").exists()
     assert (tmp_path / "engagements" / engagement.engagement_id / "engagement.md").exists()
+
+
+def test_run_setup_still_prompts_when_isatty_misreports_false(tmp_path, monkeypatch):
+    """실측 버그 회귀 가드: 일부 셸/터미널 조합에서 `sys.stdin.isatty()`가 실제로는
+    대화형인데도 False를 잘못 줬다 — 그 경우 예전엔 승인된 Engagement가 하나라도
+    있으면 묻지도 않고 조용히 그걸 재사용해버렸다. 이제는 isatty() 로 미리 걸러내지
+    않고 항상 프롬프트를 실제로 시도해야 한다(입력이 실제로 막혀 있을 때만
+    EOFError 로 자동 재사용 폴백을 탄다)."""
+    from finredteam.engagement import store as store_module
+
+    monkeypatch.chdir(tmp_path)
+    existing = _draft_to_engagement(
+        EngagementDraft(target_name="vulnbank", base_url="http://localhost:5000"), "vulnbank"
+    )
+    dir_path = store_module.save_engagement(existing)
+    store_module.approve(dir_path)
+
+    monkeypatch.setattr(engagement_setup.sys.stdin, "isatty", lambda: False)  # 오탐 재현
+    prompt_answers = [
+        "",  # _offer_reuse 프롬프트 — 빈 값 = "새로 만들기" 선택
+        "새 대상을 테스트하고 싶다",  # 초기 설명
+        "필요하다",  # LLM 의 유일한 clarify 질문에 대한 답
+        "http://localhost:9999",  # base_url 직접 질문
+        "newtarget",  # target_name 직접 질문 (어댑터 없음 → "계속 진행" 선택)
+    ]
+    confirm_answers = [True, True]  # 1) 어댑터 없어도 계속? Yes  2) 최종 확인? Yes
+    _stub_sequenced_prompts(monkeypatch, prompt_answers, confirm_answers)
+
+    llm = _FakeSetupLLM()
+    engagement = run_setup(_console(), lambda: llm, allow_reuse=True)
+
+    assert engagement is not None
+    assert engagement.engagement_id != "vulnbank"  # 조용히 자동 재사용되지 않았음
+    assert engagement.target.base_url == "http://localhost:9999"
 
 
 def test_run_setup_cancelled_at_final_confirm_saves_nothing(tmp_path, monkeypatch):
@@ -186,3 +254,47 @@ def test_run_setup_llm_factory_failure_falls_back_to_direct_questions(tmp_path, 
     assert engagement.target.name == "myapp"
     assert engagement.target.base_url == "http://localhost:9999"
     assert engagement.actions.allow_state_change is False  # 질문을 못 했으니 보수적 기본값
+
+
+# ── 어댑터(Legacy Target Adapter) 존재 조기 확인 ─────────────────────
+
+
+def test_run_setup_target_name_missing_adapter_prompts_retry(tmp_path, monkeypatch):
+    """어댑터가 없는 이름을 입력하면 전체 인터뷰가 끝날 때까지 기다리지 않고
+    바로 알려주고 다시 물어본다 — "아니오(재입력)" 선택 시 실제로 재입력 루프가
+    돈다. `vulnbank` 는 저장소에 실제로 커밋된 어댑터라 `load_target`이 cwd와
+    무관하게 성공한다(§ targets/loader.py — 패키지 디렉터리 기준)."""
+    monkeypatch.chdir(tmp_path)
+    prompt_answers = [
+        "설명",  # 초기 설명
+        "답",  # LLM 의 유일한 clarify 질문에 대한 답
+        "http://localhost:5000",  # base_url (LLM 이 못 정해서 직접 질문)
+        "totally-fake-adapter-name",  # target_name 1차 시도 — 어댑터 없음
+        "vulnbank",  # target_name 2차 시도 — 실제 존재
+    ]
+    confirm_answers = [False, True]  # 1) 그래도 계속? No(재입력)  2) 최종 확인? Yes
+    _stub_sequenced_prompts(monkeypatch, prompt_answers, confirm_answers)
+    monkeypatch.setattr(engagement_setup.sys.stdin, "isatty", lambda: True)
+
+    llm = _FakeSetupLLM()
+    engagement = run_setup(_console(), lambda: llm, allow_reuse=False)
+
+    assert engagement is not None
+    assert engagement.target.name == "vulnbank"
+
+
+def test_run_setup_target_name_missing_adapter_user_confirms_continue_anyway(tmp_path, monkeypatch):
+    """"그래도 계속할까요?" 에 예라고 답하면, 어댑터가 없어도 그 이름 그대로
+    Engagement 는 저장된다(실행 자체는 나중에 __main__.py 의 늦은 체크가 막는다
+    — 이 테스트는 그 안전망까지는 확인하지 않는다)."""
+    monkeypatch.chdir(tmp_path)
+    prompt_answers = ["설명", "답", "http://localhost:5000", "totally-fake-adapter-name"]
+    confirm_answers = [True, True]  # 1) 그래도 계속? Yes  2) 최종 확인? Yes
+    _stub_sequenced_prompts(monkeypatch, prompt_answers, confirm_answers)
+    monkeypatch.setattr(engagement_setup.sys.stdin, "isatty", lambda: True)
+
+    llm = _FakeSetupLLM()
+    engagement = run_setup(_console(), lambda: llm, allow_reuse=False)
+
+    assert engagement is not None
+    assert engagement.target.name == "totally-fake-adapter-name"

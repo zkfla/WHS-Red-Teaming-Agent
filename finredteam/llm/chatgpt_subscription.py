@@ -118,16 +118,30 @@ def _strictify_schema(schema: dict[str, Any]) -> tuple[dict[str, Any], bool]:
 def _wrapped_schema(schema: type[BaseModel]) -> tuple[dict[str, Any], bool]:
     """`complete_json` 은 `list[SchemaT]` 를 돌려줘야 하는데 구조화 출력은 객체
     하나만 받으므로 `{"items": [...]}` 로 감싼다(§9). 반환하는 bool 은 이
-    스키마가 strict 모드로 표현 가능한지(자유 형식 dict 필드가 없는지)다."""
-    inner, inner_strict_ok = _strictify_schema(schema.model_json_schema())
-    wrapped, outer_strict_ok = _strictify_schema(
-        {
-            "type": "object",
-            "properties": {"items": {"type": "array", "items": inner}},
-            "required": ["items"],
-            "additionalProperties": False,
-        }
-    )
+    스키마가 strict 모드로 표현 가능한지(자유 형식 dict 필드가 없는지)다.
+
+    ★ 실측 버그(2026-08-26, `EngagementDraft`처럼 중첩 모델이 있는 스키마로
+    Engagement Setup 인터뷰를 실제 실행했을 때 처음 드러남 — 그전엔 재사용
+    경로만 타서 이 스키마로 LLM을 호출한 적이 없었다): `model_json_schema()`
+    는 중첩 모델을 `$defs`에 모아두고 `$ref: "#/$defs/X"`로 참조하는데, 이
+    `$ref`는 항상 **문서 루트** 기준으로 풀린다. `$defs`를 그대로 둔 채
+    `inner`를 `properties.items.items` 밑에 감싸버리면 `$defs`가 루트가 아니라
+    `items.items.$defs`에 들어가서, 백엔드가 "#/$defs/X를 찾을 수 없다"고
+    거부한다(실측 에러: `chatgpt.com` 400 invalid_json_schema). `$defs`를
+    감싸기 전에 루트로 끌어올려야 한다 — 중첩 깊이와 무관하게 `model_json_
+    schema()`는 항상 `$defs`를 자기 스키마의 최상위 한 곳에만 둔다."""
+    inner_raw = schema.model_json_schema()
+    inner_defs = inner_raw.pop("$defs", None)
+    inner, inner_strict_ok = _strictify_schema(inner_raw)
+    wrapped_raw: dict[str, Any] = {
+        "type": "object",
+        "properties": {"items": {"type": "array", "items": inner}},
+        "required": ["items"],
+        "additionalProperties": False,
+    }
+    if inner_defs:
+        wrapped_raw["$defs"] = inner_defs
+    wrapped, outer_strict_ok = _strictify_schema(wrapped_raw)
     return wrapped, inner_strict_ok and outer_strict_ok
 
 

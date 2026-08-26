@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import TypeVar
+from typing import Any, TypeVar
 
 import openai
 from pydantic import BaseModel, ValidationError
@@ -55,12 +55,24 @@ class OpenAIClient:
         # {"items": [...]} 래퍼로 요청하고, 모델이 그걸 지원하지 않으면(BadRequestError)
         # 자유 JSON 텍스트 방식으로 그 자리에서 폴백한다 — 이건 API 실패가 아니라 예상된
         # 분기라 LLMError 로 취급하지 않는다.
+        # ★ 중첩 모델(예: EngagementDraft)이 있는 스키마는 `$defs`를 자기 스키마의
+        # 최상위에 두고 `$ref: "#/$defs/X"`로 참조한다 — 이 `$ref`는 항상 문서
+        # 루트 기준으로 풀리므로, `$defs`를 그대로 둔 채 item_schema 를
+        # `properties.items.items` 밑에 감싸면 `$defs`가 루트가 아니게 되어
+        # 참조가 깨진다(§chatgpt_subscription.py 와 동일한 실측 버그). 감싸기
+        # 전에 `$defs`를 wrapper_schema 루트로 끌어올린다.
         item_schema = schema.model_json_schema()
-        wrapper_schema = {
+        # `item_schema` 자체는 아래 자유 텍스트 폴백 프롬프트에도 그대로 쓰이므로
+        # (`$defs` 포함이 nested 필드 설명에 필요) 복사본에서만 `$defs`를 뺀다.
+        item_schema_for_wrapper = dict(item_schema)
+        item_defs = item_schema_for_wrapper.pop("$defs", None)
+        wrapper_schema: dict[str, Any] = {
             "type": "object",
-            "properties": {"items": {"type": "array", "items": item_schema}},
+            "properties": {"items": {"type": "array", "items": item_schema_for_wrapper}},
             "required": ["items"],
         }
+        if item_defs:
+            wrapper_schema["$defs"] = item_defs
 
         self._emit(kind=LLMEventKind.CALL_STARTED, system_prompt=system, user_prompt=user)
         started_at = time.monotonic()

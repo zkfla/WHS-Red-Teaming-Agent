@@ -240,6 +240,13 @@ finredteam/
 │
 ├── recon/                  discovery · fingerprint(passive + 응답 본문 경로 추출) ·
 │                          entitlement(self_created 등) · mapper(1홉 크롤 포함)
+│                          · ★ form_discovery(HTML form + 연결된 JS fetch() 핸들러
+│                          스크래핑 primitive) · auth_discovery(로그인/회원가입
+│                          endpoint·필드·토큰·헤더스킴 발견, BOOTSTRAP 전 사전 크롤
+│                          기반) · operation_discovery(송금형 폼 발견 + 자기 잔액
+│                          렌더링 텍스트 관측) — 전부 실패하면 예외 없이 None,
+│                          호출부가 LEGACY_BOOTSTRAP(사람이 작성한 어댑터 YAML)로
+│                          폴백한다
 │
 ├── knowledge/               graph(entitled_*/observed_* 분리, networkx) · baseline(실측 기준선)
 │                          · schema · sensitive(민감등급) · inference(관측→Fact)
@@ -294,9 +301,21 @@ engagements/examples/vulnbank/   vuln-bank 용 미리 승인된 Engagement (커�
 ## 4. 구현 현황
 
 Day 1~7 전부 구현 완료 + 실제 vuln-bank(Commando-X/vuln-bank, 로컬 Docker) 대상
-라이브로 검증. `vulnbank-target/`은 사람이 clone 해 손으로 공격해서 실측한
-값만 `targets/configs/vulnbank.yaml`에 반영했다(에이전트 코드는 그 소스를
-읽지 않는다).
+라이브로 검증.
+
+★ **Human pre-analysis 제거(2026-08-26)**: 사람은 Base URL, 허용 Scope,
+테스트 Credentials, Rules of Engagement만 제공한다. 로그인/회원가입 endpoint,
+인증 흐름, 파라미터 구조, 송금 같은 비즈니스 Operation, 정상 상태 변화는
+FinRedTeam이 Black-box 관측과 능동 Recon으로 직접 발견·학습한다
+(`recon/form_discovery.py` + `recon/auth_discovery.py` + `recon/
+operation_discovery.py`) — Target 소스코드나 사람이 사전 분석한 내부 구조·
+취약점 정보는 Agent 입력으로 쓰지 않는다. `targets/configs/vulnbank.yaml`의
+`adapter.auth`/`baseline_ops`는 이제 discovery가 실패했을 때만 쓰이는
+LEGACY_BOOTSTRAP 폴백이며, 실제로 쓰이면 `manifest.legacy_bootstrap_used`에
+정직하게 기록된다(숨기지 않음, §5절 "이 실행이 어느 범위까지 완전한
+autonomous black-box인지" 참고). 라이브 실측(2026-08-26): vuln-bank 대상
+로그인·회원가입·송금 Operation·baseline까지 전부 `legacy_bootstrap_used: []`
+(완전 자동 발견)로 부트스트랩 완료 확인.
 
 **라이브로 확인된 VIOLATION** (가장 최근 `--fake-llm` 실행, 오라클 전체 실행 기준):
 - **transfer/INV-1B + INV-6 동시 확정** — 음수 송금 시 부호 반전(INV-1B) 이자
@@ -319,6 +338,20 @@ Day 1~7 전부 구현 완료 + 실제 vuln-bank(Commando-X/vuln-bank, 로컬 Doc
 여부(405=존재, 404=없음)를 스스로 확인하는 것까지 확인.
 
 **정직하게 밝히는 한계**:
+- **Black-box Auto-Discovery(§ recon/form_discovery.py 등)의 한계**: 정규식/
+  `HTMLParser` 기반 best-effort라 완전한 JS 파서가 아니다 — `<form>` + 별도
+  정적 JS의 `fetch()` 호출(FormData 또는 이름 있는/인라인 익명 핸들러)
+  패턴에서는 실측 확인됐지만, 번들링·난독화된 JS나 SPA 프레임워크(React/Vue
+  등)가 가상 DOM으로 렌더링하는 폼에는 안 통할 수 있다 — 그 경우 예외 없이
+  `None`을 돌려주고 LEGACY_BOOTSTRAP(사람이 작성한 어댑터 YAML)으로 자동
+  폴백하며 `manifest.legacy_bootstrap_used`에 정직하게 기록된다. Operation
+  Discovery(`recon/operation_discovery.py`)로 학습한 baseline은 payer 쪽
+  델타만 실측한다(payee 쪽까지 관측하려면 로그인 페이지 재요청이 더 필요해
+  이번 패스에서는 범위 밖) — payer 델타만으로도 `provenance="baseline_
+  observed"`는 유효하다, 완전하지 않을 뿐이다. 인증된 "홈" 페이지 후보
+  경로(`/dashboard` 등)는 사람이 이 대상을 조사해 적어둔 값이 아니라 흔한
+  웹앱 관례 목록(기존 discovery.seed_paths 의 "정상적으로 앱을 쓰면 자연히
+  보이는 최소한" 취지와 동일)이다.
 - `resolve_skeleton` 에 `read_balance`/`transfer` 두 operation 만 구현되어
   있다. 멱등성(INV-4)/경쟁조건(INV-1C) 후보를 `propose_hypothesis` 로
   자동 생성하는 것은 아직 없다 — 오라클 자체는 있지만 실험 생성기가 없다.
@@ -337,11 +370,20 @@ Day 1~7 전부 구현 완료 + 실제 vuln-bank(Commando-X/vuln-bank, 로컬 Doc
 - **Engagement 레이어(§2)의 한계**: `max_concurrency`/`allow_file_upload`/
   `allow_race_testing`은 컴파일은 되지만 대응하는 실행 가능한 액션이 아직
   없어서(동시 요청을 실제로 보내는 ReAct 액션 자체가 없음) 소비되지 않는다.
-  `latency_degradation`/`unexpected_sensitive_data`/`external_side_effect`
-  Stop Condition은 값만 저장되고 자동 감지 로직은 없다(`repeated_5xx`만
-  실제로 `termination.py`에 연결돼 있다). `allow_account_creation=false`면
-  사전 제공 계정으로 로그인만 하는 흐름이 아직 없어 실행 자체를 거부한다
-  (fail-closed). `data_access.allow_raw_response_storage=false` 강제도
+  Stop Condition은 `repeated_5xx`/`request_budget_exceeded`/
+  `unexpected_sensitive_data`(CRITICAL 등급 필드 노출, 기본 활성화)/
+  `latency_degradation`(baseline 대비 연속 초과, 오탐 위험 때문에 기본
+  비활성화 — opt-in)이 실제로 `agent/react.py::AgentContext.policy_stop_reason()`
+  에 연결되어 있다. `external_side_effect`만 Hard Stop으로 승격하지 않았다
+  — 블랙박스 환경에서는 실제 외부(제3자) 부작용 발생을 결정적으로 관측할
+  방법이 없어서(out-of-scope 요청 자체는 이미 `CompiledPolicy.check_request`
+  가 원천 차단함), 응답 본문 키워드 기반 best-effort 신호만 Observation에
+  참고 노트로 남긴다(실행을 멈추지 않음, `ctx._external_side_effect_hits`
+  카운터는 로깅용으로만 존재). `allow_account_creation=false`라도
+  `engagement.target.credentials`(사용자가 이미 갖고 있는 테스트 계정)로
+  제공된 만큼은 등록 없이 로그인만 하고 실행된다 — 여전히 등록 없이는 못
+  채우는 principal이 남으면 `PolicyViolation("ACCOUNT_CREATION_FORBIDDEN")`
+  으로 fail-closed. `data_access.allow_raw_response_storage=false` 강제도
   없다 — evidence 저장은 Finding 검증 체인의 핵심이라 이번엔 건드리지 않았다.
 
 ---

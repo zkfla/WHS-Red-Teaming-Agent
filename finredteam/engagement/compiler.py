@@ -50,6 +50,11 @@ def compile_policy(engagement: Engagement) -> CompiledPolicy:
         "cleanup_resource_types": sorted(engagement.cleanup.resource_types),
         "stop_repeated_5xx": engagement.stop_conditions.repeated_5xx,
         "stop_repeated_5xx_threshold": engagement.stop_conditions.repeated_5xx_threshold,
+        "stop_latency_degradation": engagement.stop_conditions.latency_degradation,
+        "stop_latency_degradation_multiplier": engagement.stop_conditions.latency_degradation_multiplier,
+        "stop_latency_degradation_consecutive_threshold": engagement.stop_conditions.latency_degradation_consecutive_threshold,
+        "stop_unexpected_sensitive_data": engagement.stop_conditions.unexpected_sensitive_data,
+        "stop_unexpected_sensitive_data_threshold": engagement.stop_conditions.unexpected_sensitive_data_threshold,
         "stop_request_budget_exceeded": engagement.stop_conditions.request_budget_exceeded,
     }
 
@@ -76,6 +81,11 @@ def compile_policy(engagement: Engagement) -> CompiledPolicy:
         cleanup_resource_types=tuple(sorted(engagement.cleanup.resource_types)),
         stop_repeated_5xx=fields["stop_repeated_5xx"],
         stop_repeated_5xx_threshold=fields["stop_repeated_5xx_threshold"],
+        stop_latency_degradation=fields["stop_latency_degradation"],
+        stop_latency_degradation_multiplier=fields["stop_latency_degradation_multiplier"],
+        stop_latency_degradation_consecutive_threshold=fields["stop_latency_degradation_consecutive_threshold"],
+        stop_unexpected_sensitive_data=fields["stop_unexpected_sensitive_data"],
+        stop_unexpected_sensitive_data_threshold=fields["stop_unexpected_sensitive_data_threshold"],
         stop_request_budget_exceeded=fields["stop_request_budget_exceeded"],
         guidance=tuple(engagement.guidance),
         policy_hash=_policy_hash(fields),

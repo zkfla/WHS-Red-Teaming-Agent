@@ -32,6 +32,23 @@ def from_self_created(principals: list[Principal]) -> list[Entitlement]:
     ]
 
 
+def from_provisioned(principals: list[Principal]) -> list[Entitlement]:
+    """Engagement 가 제공한(이번 실행이 등록하지 않은) 계정 → entitled_own
+    (source=provisioned). self_created 와 근거 강도는 같다 — 등록 행위 자체가
+    아니라 "로그인에 성공했다"는 사실이 근거다."""
+    return [
+        Entitlement(
+            principal=p.id,
+            relation="entitled_own",
+            obj=f"account:{p.account_number}",
+            source="provisioned",
+            evidence_ref=None,
+        )
+        for p in principals
+        if p.account_number
+    ]
+
+
 def from_explicit_owner_field(
     principal: Principal, obj: str, response_body: dict, owner_field: str | None
 ) -> Entitlement | None:

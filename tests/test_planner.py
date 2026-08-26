@@ -83,6 +83,44 @@ def test_expected_delta_none_when_skeleton_does_not_need_baseline():
     assert _expected_delta_for(skeleton, {"amount": "-500.00"}, baselines) is None
 
 
+def test_expected_delta_uses_discovered_amount_field_name_not_hardcoded_amount():
+    # 실측 버그 회귀 가드: _UNIT_PARAM_BY_OP 가 "amount"를 하드코딩하고 있었는데,
+    # Operation Discovery(recon/operation_discovery.py)가 다른 이름(예: "value")을
+    # 찾아낸 대상에서는 그 필드가 params 에 있어도 무시되어 expected_delta 가
+    # 항상 None 이 되는 문제가 있었다. baseline 자체도 discovery 로 학습된 것이므로
+    # normal_params 도 discovered 필드명("value")을 쓴다(§ agent/react.py::
+    # discover_and_learn_money_operation 이 실제로 만드는 모양과 동일).
+    baselines = BaselineRegistry()
+    baselines.register(
+        BaselineRecord(
+            ref_id="bl_transfer_discovered",
+            op="transfer",
+            path="/api/v2/send-money",
+            principal_id="attacker_A",
+            deltas={"ATTACKER": Money.parse("-10.00", USD), "VICTIM": Money.parse("10.00", USD)},
+            roles={"ATTACKER": "payer", "VICTIM": "payee"},
+            normal_params={"value": 10, "dest": "VICTIM"},
+        )
+    )
+    skeleton = CandidateSkeleton(
+        layer="finance",
+        operation="F2",
+        principal_id="attacker_A",
+        method="POST",
+        path="/api/v2/send-money",
+        subject_account="ATTACKER",
+        watch_accounts=["ATTACKER", "VICTIM"],
+        needs_baseline=True,
+        hint={"op": "transfer", "counterparty_account": "VICTIM", "amount_field": "value", "recipient_field": "dest"},
+    )
+    # "amount" 키는 아예 없다 — discovered 필드명(value)만 있다.
+    exp = _expected_delta_for(skeleton, {"value": "-500.00", "dest": "VICTIM"}, baselines)
+
+    assert exp is not None
+    assert exp.deltas["ATTACKER"].amount == Decimal("-500.00")
+    assert exp.deltas["VICTIM"].amount == Decimal("500.00")
+
+
 def test_expected_delta_remaps_to_a_different_principals_accounts():
     # 회귀 테스트: baseline 은 attacker_A(-> ATTACKER)/victim_V(-> VICTIM) 로 실측됐지만,
     # 이번 후보는 다른 주체(victim_V 가 발신자, merchant_M 이 수신자)다. 원본 계좌번호를

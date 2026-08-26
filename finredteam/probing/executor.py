@@ -6,12 +6,13 @@
 from __future__ import annotations
 
 from finredteam.config import MAX_PROBES
+from finredteam.knowledge.sensitive import classify
 from finredteam.models.core import Principal
 from finredteam.models.finding import CandidateFinding, ExecutionResult
 from finredteam.probing.finance.state import compute_delta, observe_many
 from finredteam.probing.session import Session, SessionError
 from finredteam.storage.db import DB
-from finredteam.storage.evidence import store_response
+from finredteam.storage.evidence import extract_field_names, store_response
 from finredteam.targets.loader import TargetConfig
 
 
@@ -35,6 +36,9 @@ def run(
 
     status_codes: list[int] = []
     evidence_refs: list[str] = []
+    latencies_ms: list[float] = []
+    sensitive_levels: list[str] = []
+    response_texts: list[str] = []
     for _ in range(repeats):
         try:
             ex = session.authed_request(
@@ -48,6 +52,10 @@ def run(
             session.capture(ex), {"candidate_id": candidate.id, "principal": principal.id}, db
         )
         evidence_refs.append(ref.ref_id)
+        latencies_ms.append(ex.elapsed_ms)
+        field_names = extract_field_names(ex.response_body) if ex.response_body is not None else []
+        sensitive_levels.append(classify(field_names))
+        response_texts.append(ex.response_text or "")
 
     after = observe_many(session, target, watch_accounts, principal_id=principal.id)
     delta = compute_delta(before, after)
@@ -59,4 +67,7 @@ def run(
         after=after,
         delta=delta,
         evidence_refs=evidence_refs,
+        latencies_ms=latencies_ms,
+        sensitive_levels=sensitive_levels,
+        response_texts=response_texts,
     )

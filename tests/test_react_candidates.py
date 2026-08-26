@@ -120,6 +120,45 @@ def test_resolve_transfer_builds_skeleton_with_counterparty_hint():
     assert set(result.watch_accounts) == {"111", "222"}
 
 
+def test_resolve_transfer_prefers_discovered_operation_over_static_config():
+    from finredteam.recon.operation_discovery import DiscoveredOperation
+
+    discovered = {
+        "transfer": DiscoveredOperation(
+            endpoint="/api/v2/send-money", method="POST", amount_field="value", recipient_field="dest", other_fields=[]
+        )
+    }
+    result = resolve_skeleton(
+        "transfer",
+        "attacker_A",
+        "account:222",
+        _principals(),
+        _graph_with_both_owning_accounts(),
+        _target_cfg(),
+        discovered,
+    )
+    assert isinstance(result, CandidateSkeleton)
+    # 정적 baseline_ops(/transfer)가 아니라 discovery 가 찾은 endpoint 를 써야 한다.
+    assert result.path == "/api/v2/send-money"
+    assert result.hint["amount_field"] == "value"
+    assert result.hint["recipient_field"] == "dest"
+
+
+def test_resolve_transfer_falls_back_to_static_config_when_discovery_has_no_transfer():
+    result = resolve_skeleton(
+        "transfer",
+        "attacker_A",
+        "account:222",
+        _principals(),
+        _graph_with_both_owning_accounts(),
+        _target_cfg(),
+        {},  # discovery 실패 — 빈 dict
+    )
+    assert isinstance(result, CandidateSkeleton)
+    assert result.path == "/transfer"  # 정적 config 값
+    assert "amount_field" not in result.hint
+
+
 def test_resolve_transfer_rejects_sender_without_own_entitlement():
     empty_graph = KnowledgeGraph()  # 아무 entitlement 도 없음
     result = resolve_skeleton("transfer", "attacker_A", "account:222", _principals(), empty_graph, _target_cfg())

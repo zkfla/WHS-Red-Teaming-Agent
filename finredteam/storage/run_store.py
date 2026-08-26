@@ -43,6 +43,7 @@ class RunStore:
             "llm": {"provider": cfg.llm.provider, "model": cfg.llm.model},
             "engagement_id": engagement_id,
             "policy_hash": policy_hash,
+            "legacy_bootstrap_used": [],
             "started_at": datetime.now(timezone.utc).isoformat(),
             "finished_at": None,
             "round": 0,
@@ -73,6 +74,14 @@ class RunStore:
         쓴 경우 이 메서드로 manifest 표시값만 따로 갱신한다.
         """
         self.manifest["llm"] = {"provider": provider, "model": model}
+        self._write_manifest()
+
+    def record_legacy_bootstrap(self, used: list[str]) -> None:
+        """§11 — Black-box Auth Discovery(recon/auth_discovery.py)가 실패해서
+        사람이 작성한 어댑터 YAML(LEGACY_BOOTSTRAP)로 폴백한 부분을 정직하게
+        기록한다(절대 숨기지 않는다). 비어 있으면 이 실행의 인증 부분은 완전한
+        autonomous black-box 였다는 뜻."""
+        self.manifest["legacy_bootstrap_used"] = list(used)
         self._write_manifest()
 
     def record_strategy(self, round_no: int, strategy_name: str) -> None:

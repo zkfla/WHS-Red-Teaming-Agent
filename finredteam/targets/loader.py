@@ -1,22 +1,22 @@
-"""targets/configs/*.yaml → TargetConfig.
+"""targets/configs/*.yaml → TargetConfig — Legacy Target Adapter.
 
-사람이 손으로 확인해 적어둔 값을 읽기만 한다 — 에이전트 코드가 대상의 소스나
-DB를 직접 읽는 일은 없다 (§설계원칙 2, §20).
+★ Discovery(recon/auth_discovery.py 등)가 실패했을 때만 쓰이는 폴백이다 —
+로그인/회원가입 endpoint, 필드명, token 경로, 인증 헤더 형식, 정상 송금
+파라미터처럼 애플리케이션 내부 구조는 원칙적으로 Agent가 Black-box Recon으로
+직접 발견한다. base_url/allowed_hosts/credentials 처럼 사람이 제공해도 되는
+정보는 여기가 아니라 Engagement가 소유한다(finredteam/engagement/schema.py).
 
-observation/entitlement/baseline_ops/discovery 등 이후 Day에서 쓰는 하위 설정은
-아직 전용 스키마로 타입화하지 않고 `extra="allow"` 로 원시 dict 그대로 보존한다 —
-Day3(entitlement)·Day4(baseline)에서 필요한 만큼만 전용 파서를 추가한다.
+observation/baseline_ops/discovery 등의 하위 설정은 아직 전용 스키마로
+타입화하지 않고 `extra="allow"` 로 원시 dict 그대로 보존한다.
 """
 from __future__ import annotations
 
-from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field
 
-from finredteam.config import LLMConfig
 from finredteam.money import Currency
 
 
@@ -48,17 +48,17 @@ class AdapterConfig(BaseModel):
     name: str
     base_url: str
     default_currency: Currency
-    auth: AuthConfig
+    # ★ 없어도 된다 — Black-box Auth Discovery(recon/auth_discovery.py)가
+    # 실행 중에 직접 로그인/회원가입 방법을 찾는다. 이게 None 인데 discovery
+    # 도 실패하면 `probing/session.py`가 그 시점에 명확한 SessionError 를
+    # 낸다(조용히 죽지 않는다).
+    auth: AuthConfig | None = None
 
 
 class TargetSettings(BaseModel):
     model_config = ConfigDict(extra="allow")
 
     principals: list[str]
-    initial_balance: Decimal
-    layers: list[str] = ["generic", "finance"]
-    profile: str = "sandbox"
-    llm: LLMConfig = LLMConfig()
 
 
 class TargetConfig(BaseModel):
@@ -97,3 +97,23 @@ def load_target(name: str, configs_dir: Path | None = None) -> TargetConfig:
     if not path.exists():
         raise FileNotFoundError(f"target config 없음: {path}")
     return load_target_config(path)
+
+
+# principal 논리 이름은 대상 고유의 사전지식이 아니다 — 사람이 지어줄 필요 없이
+# 자동 생성한다(§ Human pre-analysis 제거). Engagement 가 제공한 credentials
+# 개수가 이보다 많으면 __main__.py 가 알아서 늘려 쓴다.
+_DEFAULT_PRINCIPAL_NAMES = ["principal_A", "principal_B", "principal_C"]
+
+
+def minimal_target_config(name: str, base_url: str, *, principal_count: int = 3) -> TargetConfig:
+    """어댑터 YAML이 아예 없을 때 쓰는 최소 구성 — base_url만 있으면 된다.
+    `auth`는 비워둔다(Black-box Auth Discovery가 실행 중에 직접 찾는다) —
+    그 발견마저 실패하면 `probing/session.py`가 명확한 에러를 낸다, 조용히
+    아무 일도 안 일어난 것처럼 넘어가지 않는다."""
+    principals = list(_DEFAULT_PRINCIPAL_NAMES)
+    while len(principals) < principal_count:
+        principals.append(f"principal_{len(principals) + 1}")
+    return TargetConfig(
+        adapter=AdapterConfig(name=name, base_url=base_url, default_currency=Currency(code="USD", minor_unit=2)),
+        settings=TargetSettings(principals=principals[:max(principal_count, 1)]),
+    )
