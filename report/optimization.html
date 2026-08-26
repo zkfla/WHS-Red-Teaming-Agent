@@ -280,7 +280,7 @@
     <h1>같은 모델로 12배 빠르게</h1>
     <p class="standfirst">
       모델은 <code>haiku</code>로 고정한 채 <strong>구조만</strong> 바꿔서
-      Decepticon 대비 12배 빠르고, 인프라는 7분의 1이고, 해결당 비용은 5분의 1입니다.
+      Decepticon 대비 11배 빠르고, 인프라는 7분의 1이고, 비용은 3.8분의 1입니다.
       62회 실행 · $18.92로 측정했습니다.
     </p>
     <div class="byline">
@@ -291,12 +291,12 @@
     </div>
   </header>
 
-  <p class="cap" style="margin-top:26px">Decepticon(n=3) 대비 · 최종 구성(n=6)</p>
+  <p class="cap" style="margin-top:26px">Decepticon(n=7) 대비 · 최종 구성(n=6)</p>
   <div class="headline">
     <div class="hcell">
       <span class="k">실행 시간</span>
-      <span class="v up">12.1×</span>
-      <span class="sub">842s → 70s</span>
+      <span class="v up">11.1×</span>
+      <span class="sub">775s → 70s</span>
     </div>
     <div class="hcell">
       <span class="k">인프라 컨테이너</span>
@@ -305,18 +305,18 @@
     </div>
     <div class="hcell">
       <span class="k">비용</span>
-      <span class="v up">3.4×</span>
-      <span class="sub">$1.220 → $0.363</span>
+      <span class="v up">3.8×</span>
+      <span class="sub">$1.370 → $0.363</span>
     </div>
     <div class="hcell">
       <span class="k">탐지</span>
-      <span class="v up">+44%</span>
-      <span class="sub">3.00 → 4.33 / 54</span>
+      <span class="v">3.29 → 4.33</span>
+      <span class="sub">/ 54 · 유의성 미달</span>
     </div>
     <div class="hcell">
       <span class="k">해결당 비용</span>
-      <span class="v up">4.9×</span>
-      <span class="sub">$0.407 → $0.084</span>
+      <span class="v up">5.0×</span>
+      <span class="sub">$0.417 → $0.084</span>
     </div>
   </div>
 
@@ -505,8 +505,8 @@
           <tr>
             <td class="name">Decepticon</td>
             <td class="num">19 <span style="color:var(--muted)">/ 3 실행</span></td>
-            <td class="num">842s</td><td class="num">$1.220</td>
-            <td class="num">3.00</td><td class="num">$0.407</td>
+            <td class="num">775s</td><td class="num">$1.370</td>
+            <td class="num">3.29</td><td class="num">$0.417</td>
           </tr>
         </tbody>
       </table>
@@ -601,21 +601,28 @@
       <table>
         <thead><tr><th>주장</th><th class="num">t값</th><th>판정</th></tr></thead>
         <tbody>
-          <tr class="best"><td class="name">시간 12.1배</td><td class="num">15.82</td><td>p&lt;0.001 · 압도적</td></tr>
-          <tr class="best"><td class="name">컨테이너·에이전트</td><td class="num">—</td><td>정수 · 논쟁 불가</td></tr>
-          <tr><td class="name">탐지 +44%</td><td class="num">1.63</td><td>p≈0.06~0.10 · <strong>미달</strong></td></tr>
+          <tr class="best"><td class="name">시간 11.1배</td><td class="num">13.47</td><td>p&lt;0.001 · 압도적</td></tr>
+          <tr class="best"><td class="name">비용 3.8배</td><td class="num">10.96</td><td>p&lt;0.001 · 압도적</td></tr>
+          <tr class="best"><td class="name">인프라 컨테이너 7→1</td><td class="num">—</td><td>정수 · 논쟁 불가</td></tr>
+          <tr><td class="name">탐지 3.29 → 4.33</td><td class="num">1.44</td><td>임계값 2.201 · <strong>미달</strong></td></tr>
         </tbody>
       </table>
     </div>
-    <p>시간·구조 주장은 이미 확정적입니다. <strong>탐지만 아직 흔들립니다.</strong>
-    다만 효과크기가 커서(Cohen's d=1.15) <strong>Decepticon을 5회 더 돌리면(3→8) 유의해집니다.</strong>
-    비용 약 $1.5, 사람 시간 70분입니다.</p>
+    <p>시간·비용·인프라 주장은 확정적입니다. <strong>탐지만 확정하지 못했습니다.</strong></p>
+    <p>Decepticon을 3회에서 <strong>7회로 늘려 재측정했지만 여전히 미달</strong>입니다.
+    초기 추정 효과크기(Cohen's d=1.15)가 데이터가 쌓이며 <strong>d=0.80으로 축소</strong>됐기 때문입니다 —
+    n=3의 우연한 조합이 효과를 부풀렸습니다. d=0.80이면 각 군 <strong>n=15</strong>가 필요합니다.</p>
+    <p>Decepticon 7회 원값은 <code>[1, 2, 3, 4, 4, 4, 5]</code>로 분산이 큽니다(σ=1.38).
+    우리는 <code>[3, 3, 4, 5, 5, 6]</code> (σ=1.21).</p>
 
     <div class="note">
       <p class="h">발표 프레이밍 제안</p>
-      <p>헤드라인을 “탐지 +44%”로 잡으면 <strong>가장 약한 숫자로 방어</strong>하게 됩니다.
-      <strong>“12배 빠르고, 컨테이너 71% 적고, 탐지는 최소한 밀리지 않는다”</strong>로 잡으면
-      t=15.8짜리 숫자가 앞에 서고 탐지는 보조가 됩니다. 같은 데이터인데 훨씬 안 뚫립니다.</p>
+      <p>탐지를 헤드라인에 올리면 <strong>가장 약한 숫자로 방어</strong>하게 됩니다. 이렇게 말하십시오:</p>
+      <p>“탐지는 우리가 4.33 vs 3.29로 높지만, <strong>분산이 커서 이 표본으로는 통계적으로
+      확정하지 않습니다.</strong> 확실한 건 <strong>밀리지 않는다</strong>는 것이고,
+      그 상태로 <strong>11배 빠르고 3.8배 쌉니다.</strong>”</p>
+      <p>파고들 지점을 먼저 인정하면 나머지 주장의 신뢰도가 올라갑니다.
+      t=13.5와 t=11.0짜리 숫자가 앞에 서게 하십시오.</p>
     </div>
 
     <div class="note warn">
@@ -689,7 +696,7 @@
   <footer>
     측정 조건 · 훈련용 취약 웹앱 난이도 ≤3 · 분모 54 · claude-haiku-4-5 (양측 동일) ·
     자동 채점(스코어보드 API) · 격리 네트워크(외부 인터넷 차단) ·
-    총 62회 실행 · 총 지출 $18.92 · 2026-08-25
+    Decepticon n=7 · 경량 n=6 · 총 80회 실행 · 2026-08-26
   </footer>
 
 </div>
