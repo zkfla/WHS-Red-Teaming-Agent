@@ -23,7 +23,7 @@
 - inference-flow fixtures cover SUPPORTED, CANDIDATE/UNKNOWN and secure guard variants
 - env and step-output value flow reaches a command interpreter and granular token permission
 - a blind local-action fixture is represented through generic source, execution and credential facts
-- proposed paths with invented relations or unresolved UNKNOWN facts are rejected
+- proposed paths with unknown `relation_id`, mismatched relation shape, or unresolved UNKNOWN facts are rejected
 
 ## Agent and failure coverage
 
@@ -33,7 +33,8 @@
 - model/rate-limit exception produces `model_error`
 - repeated calls and no-progress terminate deterministically
 - round/token/cost/duration limit reason produces PARTIAL
-- deterministic Evidence, Finding and identity survive all PARTIAL exits
+- reasoning PARTIAL exits preserve fact/Evidence/identity state without prepopulating deterministic Findings or AttackPaths
+- deterministic mode retains existing rule-based Finding/AttackPath regression behavior
 - trusted `.env` loading and process-environment precedence
 - multiple provider keys require an explicit choice and model/provider mismatch is rejected
 - analyzed-repository `.env` cannot become an authentication source

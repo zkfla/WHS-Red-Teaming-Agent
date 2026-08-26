@@ -3,7 +3,14 @@ from pathlib import Path
 import pytest
 
 from cicd_redteam_agent.application.analyze import AnalysisConfig, analyze_repository
-from cicd_redteam_agent.domain.models import AnalysisProposal, AttackEdge, AttackPath, FindingStatus
+from cicd_redteam_agent.domain.models import (
+    AnalysisProposal,
+    AttackEdge,
+    AttackPath,
+    FindingStatus,
+    Relation,
+    relation_id_for,
+)
 from cicd_redteam_agent.domain.validator import validate_analysis_proposal
 from cicd_redteam_agent.framework.capabilities import CapabilityContext, ListSecurityFacts
 from cicd_redteam_agent.security.repository_boundary import RepositoryBoundary
@@ -40,6 +47,17 @@ async def test_supported_env_output_path_is_extracted_without_a_scenario_rule(
         for item in state.relations
         if item.relation_type == "controls_workflow_input"
     )
+    assert source.relation_id == relation_id_for(
+        source.source_id, source.relation_type, source.target_id
+    )
+    duplicate = Relation(
+        source_id=source.source_id,
+        relation_type=source.relation_type,
+        target_id=source.target_id,
+        category=source.category,
+        evidence_ids=source.evidence_ids,
+    )
+    assert duplicate.relation_id == source.relation_id
     first_env = next(
         item
         for item in state.relations
@@ -121,6 +139,15 @@ async def test_unknown_facts_force_candidate_and_preserve_missing_evidence(
     rejected = validate_analysis_proposal(state, bad_proposal)
     assert not rejected.accepted
     assert any("UNKNOWN/FALSE" in error for error in rejected.errors)
+
+    invented_relation = bad_proposal.model_copy(deep=True)
+    invented_relation.paths[0].path_id = "path_invented_relation"
+    invented_relation.paths[0].status = FindingStatus.CANDIDATE
+    invented_relation.paths[0].missing_evidence = source.missing_evidence
+    invented_relation.paths[0].edges[0].relation_id = "rel_invented"
+    invented = validate_analysis_proposal(state, invented_relation)
+    assert not invented.accepted
+    assert any("unknown relation_id" in error for error in invented.errors)
 
     candidate = bad_proposal.model_copy(deep=True)
     candidate.paths[0].path_id = "path_candidate"

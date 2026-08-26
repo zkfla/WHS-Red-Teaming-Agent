@@ -11,7 +11,7 @@ FIXTURES = Path(__file__).parents[1] / "fixtures"
 
 
 @pytest.mark.asyncio
-async def test_partial_agent_result_preserves_deterministic_output(
+async def test_reasoning_mode_does_not_prepopulate_deterministic_conclusions(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     async def fake_run_agent_analysis(*_args, **_kwargs) -> AgentRunResult:
@@ -37,7 +37,10 @@ async def test_partial_agent_result_preserves_deterministic_output(
     persisted = json.loads((run_dir / "analysis.json").read_text(encoding="utf-8"))
     assert report.status is ReportStatus.PARTIAL
     assert report.termination_reason == "max_cost"
-    assert report.state.findings
+    assert report.state.findings == []
+    assert report.state.paths == []
     assert report.state.identities
-    assert persisted["state"]["findings"]
+    assert persisted["state"]["findings"] == []
+    assert persisted["state"]["paths"] == []
+    assert persisted["run_metadata"]["analysis_mode"] == "reasoning"
     assert persisted["state"]["termination"]["cost"] == 0.5

@@ -9,11 +9,11 @@ CLI
 -> Evidence and local Relation extraction
 -> attacker-control and identity assessment
 -> reusable security fact graph
--> deterministic scenario rules
--> global AttackPath composition
--> optional hackingBuddyGPT Agent loop
-   -> LiteLLM API-key adapter or Codex ChatGPT-login LLM adapter
--> deterministic proposal validation
+-> analysis mode split
+   -> deterministic: scenario rules -> global AttackPath composition
+   -> reasoning: hackingBuddyGPT Agent loop
+      -> LiteLLM API-key adapter or Codex ChatGPT-login LLM adapter
+      -> deterministic proposal validation
 -> analysis.json, summary.md, trace.jsonl
 ```
 
@@ -53,13 +53,17 @@ emit a vulnerability Finding. Examples include an untrusted event value flowing 
 environment variable or step output, repository code executing in a local action, and a step being
 able to use a specific write-capable token permission.
 
-`ListSecurityFacts` exposes these relations with Evidence, a tri-state verdict and any missing
-evidence. The Agent may compose only returned relations into a proposed path. The validator rejects
-invented relations, omitted relation Evidence and a `SUPPORTED` path containing an `UNKNOWN` or
-`FALSE` relation. GHA fixture IDs remain evaluation labels rather than product rule identifiers.
+`ListSecurityFacts` exposes these relations with a stable `relation_id`, Evidence, a tri-state
+verdict and any missing evidence. The Agent may compose only returned relations into a proposed
+path. The validator grounds each edge by `relation_id`, checks its source/type/target and Evidence,
+and rejects a `SUPPORTED` path containing an `UNKNOWN` or `FALSE` relation. GHA fixture IDs remain
+evaluation labels rather than product rule identifiers.
 
-Legacy deterministic scenario rules remain available for regression compatibility while new
-inference scenarios are implemented on the reusable fact graph.
+Deterministic and reasoning modes share parsing, Evidence and reusable fact extraction, then diverge
+at conclusion generation. Deterministic mode keeps the legacy scenario rules and global composer for
+fast/reproducible analysis. Reasoning mode does not prepopulate or expose deterministic Findings or
+AttackPaths; the Agent derives them from the fact graph and the validator accepts or rejects the
+proposal.
 
 ## Responsibility boundaries
 

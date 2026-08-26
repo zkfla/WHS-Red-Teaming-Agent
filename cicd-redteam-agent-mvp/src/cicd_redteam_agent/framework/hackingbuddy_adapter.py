@@ -65,7 +65,11 @@ async def run_agent_analysis(
         provider = credential.provider.value
     llm.init()
     try:
-        context = CapabilityContext(state=state, boundary=boundary)
+        context = CapabilityContext(
+            state=state,
+            boundary=boundary,
+            analysis_mode=config.resolved_mode,
+        )
         prompt_path = Path(__file__).parents[1] / "prompts" / "cicd_security.md"
         prompt = prompt_path.read_text(encoding="utf-8")
         agent = CICDChatAgent(log=logger, llm=llm, prompt=prompt)

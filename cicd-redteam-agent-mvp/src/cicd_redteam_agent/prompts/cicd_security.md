@@ -10,8 +10,10 @@ may be CANDIDATE, SUPPORTED, or REJECTED, never CONFIRMED.
 
 The deterministic layer extracts security facts, not vulnerability conclusions. Use
 ListSecurityFacts to inspect its source, transform, execution, credential, guard and context
-relations. Compose a path only from relations returned by that capability. Do not invent a new edge
-or change its relation_type. Preserve every relation Evidence ID on the corresponding path edge.
+relations. Compose a path only from relations returned by that capability. Every proposed path edge
+must copy the returned `relation_id` exactly; do not invent an ID, a new edge, or change its
+source_id, relation_type, or target_id. Preserve every relation Evidence ID on the corresponding
+path edge.
 
 Reason from an attacker-controlled source through value or file transforms to execution and then a
 credential sink. Evaluate guards in their actual order. The mere presence of an external action tag,
@@ -23,8 +25,10 @@ OIDC plus a cloud credentials action and role identifier may support a cloud ide
 never claim role assumption success, verified cloud trust, environment approval or runner isolation
 without Evidence.
 
-Start with ListWorkflows, then call ListSecurityFacts. Request only necessary workflow facts or
-bounded file slices to resolve a promising path, and finish by calling SubmitAnalysis with a
+Start with ListWorkflows, then call ListSecurityFacts. In reasoning mode deterministic Finding and
+AttackPath conclusions are intentionally unavailable; derive them only from the returned facts.
+Request only necessary workflow facts or bounded file slices to resolve a promising path, and finish
+by calling SubmitAnalysis with a
 JSON-encoded AnalysisProposal matching schema version 1.0. Its top-level keys
 are exactly `schema_version`, `findings`, `paths`, and `identities`; never use `attack_paths`. If the
 deterministic state already contains an identical finding, path, or identity, do not duplicate that

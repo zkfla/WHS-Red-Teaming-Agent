@@ -28,10 +28,9 @@ def validate_analysis_proposal(
     known_nodes.update(identity.identity_id for identity in state.identities)
     for path in state.paths:
         known_nodes.update(path.nodes)
-    known_relations: dict[tuple[str, str, str], list] = {}
+    known_relations: dict[str, list] = {}
     for relation in state.relations:
-        key = (relation.source_id, relation.relation_type, relation.target_id)
-        known_relations.setdefault(key, []).append(relation)
+        known_relations.setdefault(relation.relation_id, []).append(relation)
 
     objects = [*proposal.findings, *proposal.paths, *proposal.identities]
     for item in objects:
@@ -65,19 +64,38 @@ def validate_analysis_proposal(
             missing = set(edge.evidence_ids) - known_evidence
             if missing:
                 errors.append(f"AttackPath edge references unknown evidence: {sorted(missing)}")
-            key = (edge.source_id, edge.relation_type, edge.target_id)
-            matches = known_relations.get(key, [])
+            matches = known_relations.get(edge.relation_id, [])
             if not matches:
                 errors.append(
-                    f"AttackPath {path.path_id} references an unextracted relation: {key}"
+                    f"AttackPath {path.path_id} references an unknown relation_id: "
+                    f"{edge.relation_id}"
                 )
                 continue
-            if not any(set(item.evidence_ids).issubset(edge.evidence_ids) for item in matches):
-                required = sorted({ev for item in matches for ev in item.evidence_ids})
+            matching_shape = [
+                relation
+                for relation in matches
+                if relation.source_id == edge.source_id
+                and relation.relation_type == edge.relation_type
+                and relation.target_id == edge.target_id
+            ]
+            if not matching_shape:
                 errors.append(
-                    f"AttackPath edge omits relation evidence for {key}: {required}"
+                    f"AttackPath edge {edge.relation_id} does not match the extracted "
+                    "relation source/type/target"
                 )
-            for relation in matches:
+                continue
+            if not any(
+                set(item.evidence_ids).issubset(edge.evidence_ids)
+                for item in matching_shape
+            ):
+                required = sorted(
+                    {ev for item in matching_shape for ev in item.evidence_ids}
+                )
+                errors.append(
+                    f"AttackPath edge omits relation evidence for {edge.relation_id}: "
+                    f"{required}"
+                )
+            for relation in matching_shape:
                 if relation.verdict.value != "TRUE":
                     contains_unknown_relation = True
                     relation_missing_evidence.update(relation.missing_evidence)

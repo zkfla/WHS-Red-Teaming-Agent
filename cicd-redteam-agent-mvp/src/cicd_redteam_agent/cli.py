@@ -8,7 +8,7 @@ from pathlib import Path
 from pydantic import ValidationError
 
 from cicd_redteam_agent.application.analyze import AnalysisConfig, analyze_repository
-from cicd_redteam_agent.domain.models import AttackerProfile, ReportStatus
+from cicd_redteam_agent.domain.models import AnalysisMode, AttackerProfile, ReportStatus
 from cicd_redteam_agent.framework.auth import ModelProvider
 from cicd_redteam_agent.security.redaction import redact
 from cicd_redteam_agent.security.repository_boundary import RepositoryBoundaryError
@@ -29,6 +29,15 @@ def build_parser() -> argparse.ArgumentParser:
         choices=[item.value for item in ModelProvider],
         default=ModelProvider.AUTO.value,
         help="credential/backend selection; use codex-chatgpt for saved Codex login",
+    )
+    analyze.add_argument(
+        "--mode",
+        choices=[item.value for item in AnalysisMode],
+        default=None,
+        help=(
+            "analysis mode; defaults to reasoning when a model/Codex provider is configured, "
+            "otherwise deterministic"
+        ),
     )
     analyze.add_argument(
         "--env-file",
@@ -75,6 +84,7 @@ def main(argv: list[str] | None = None) -> int:
             attacker_profile=AttackerProfile(args.attacker_profile),
             model=args.model,
             provider=ModelProvider(args.provider),
+            analysis_mode=AnalysisMode(args.mode) if args.mode else None,
             env_file=args.env_file,
             max_rounds=args.max_rounds,
             max_tokens=args.max_tokens,

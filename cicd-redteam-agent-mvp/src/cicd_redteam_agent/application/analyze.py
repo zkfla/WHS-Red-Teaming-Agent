@@ -13,6 +13,7 @@ from cicd_redteam_agent.domain.attacker_control import assess_attacker_control, 
 from cicd_redteam_agent.domain.github_actions_parser import discover_workflows, parse_workflow
 from cicd_redteam_agent.domain.identity_analysis import derive_identity_candidates
 from cicd_redteam_agent.domain.models import (
+    AnalysisMode,
     AnalysisReport,
     AttackerProfile,
     ReportStatus,
@@ -35,17 +36,35 @@ class AnalysisConfig:
     attacker_profile: AttackerProfile = AttackerProfile.FORK_PR
     model: str | None = None
     provider: ModelProvider = ModelProvider.AUTO
+    analysis_mode: AnalysisMode | None = None
     env_file: Path | None = None
     max_rounds: int = 12
     max_tokens: int = 100_000
     max_cost: float = 2.0
     max_duration: int = 900
 
+    @property
+    def resolved_mode(self) -> AnalysisMode:
+        if self.analysis_mode is not None:
+            return self.analysis_mode
+        if self.model or self.provider is ModelProvider.CODEX_CHATGPT:
+            return AnalysisMode.REASONING
+        return AnalysisMode.DETERMINISTIC
+
 
 async def analyze_repository(
     repo_path: str | Path, config: AnalysisConfig
 ) -> tuple[AnalysisReport, Path]:
     started = time.monotonic()
+    mode = config.resolved_mode
+    if (
+        mode is AnalysisMode.REASONING
+        and not config.model
+        and config.provider is not ModelProvider.CODEX_CHATGPT
+    ):
+        raise ValueError(
+            "reasoning analysis requires --model or --provider codex-chatgpt"
+        )
     boundary = RepositoryBoundary(repo_path)
     state = create_initial_state(boundary)
     warnings: list[str] = []
@@ -89,6 +108,7 @@ async def analyze_repository(
                 "max_cost": config.max_cost,
                 "max_duration": config.max_duration,
                 "provider": provider or config.provider,
+                "analysis_mode": mode,
                 "framework_commit": FRAMEWORK_COMMIT,
                 "repository_commit": state.repository.git_commit,
             },
@@ -122,16 +142,17 @@ async def analyze_repository(
                 for item in relation.missing_evidence
             }
         )
-        state.findings, state.paths = derive_attack_paths(state)
-        additional_findings, additional_paths = derive_additional_scenario_results(state)
-        state.findings.extend(additional_findings)
-        state.paths.extend(additional_paths)
         state.identities = derive_identity_candidates(state)
-        graph_relations, global_paths = compose_global_attack_paths(
-            state, config.attacker_profile
-        )
-        state.relations.extend(graph_relations)
-        state.paths.extend(global_paths)
+        if mode is AnalysisMode.DETERMINISTIC:
+            state.findings, state.paths = derive_attack_paths(state)
+            additional_findings, additional_paths = derive_additional_scenario_results(state)
+            state.findings.extend(additional_findings)
+            state.paths.extend(additional_paths)
+            graph_relations, global_paths = compose_global_attack_paths(
+                state, config.attacker_profile
+            )
+            state.relations.extend(graph_relations)
+            state.paths.extend(global_paths)
     except Exception as exc:
         detail = f"{type(exc).__name__}: {redact(str(exc))}"
         warnings.append(f"Deterministic analysis failed: {detail}")
@@ -141,7 +162,7 @@ async def analyze_repository(
             detail=detail,
         )
 
-    if config.model or config.provider is ModelProvider.CODEX_CHATGPT:
+    if mode is AnalysisMode.REASONING:
         from cicd_redteam_agent.framework.hackingbuddy_adapter import run_agent_analysis
 
         agent_result = await run_agent_analysis(state, boundary, config)
@@ -156,5 +177,8 @@ async def analyze_repository(
             provider=agent_result.provider,
         )
 
-    warnings.append("No model configured; deterministic analysis completed without LLM review.")
+    if config.model or config.provider is ModelProvider.CODEX_CHATGPT:
+        warnings.append("Deterministic mode selected; configured model was not used.")
+    else:
+        warnings.append("No model configured; deterministic analysis completed without LLM review.")
     return finalize(ReportStatus.COMPLETE, "deterministic_analysis_complete")

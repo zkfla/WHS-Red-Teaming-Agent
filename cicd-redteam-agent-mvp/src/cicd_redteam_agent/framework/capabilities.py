@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from hackingBuddyGPT.capability import Capability
 
 from cicd_redteam_agent.domain.github_actions_parser import stable_id
-from cicd_redteam_agent.domain.models import AnalysisProposal, AnalysisState, Evidence
+from cicd_redteam_agent.domain.models import AnalysisMode, AnalysisProposal, AnalysisState, Evidence
 from cicd_redteam_agent.domain.validator import apply_analysis_proposal
 from cicd_redteam_agent.security.redaction import redact
 from cicd_redteam_agent.security.repository_boundary import (
@@ -21,6 +21,7 @@ from cicd_redteam_agent.security.repository_boundary import (
 class CapabilityContext:
     state: AnalysisState
     boundary: RepositoryBoundary
+    analysis_mode: AnalysisMode = AnalysisMode.DETERMINISTIC
     submitted: bool = False
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
@@ -100,8 +101,9 @@ class ListSecurityFacts(Capability):
                 "facts": [item.model_dump(mode="json") for item in facts],
                 "counts": counts,
                 "guidance": (
-                    "Compose only returned relations into paths. UNKNOWN relations require a "
-                    "CANDIDATE or REJECTED path and their missing_evidence must be preserved."
+                    "Compose only returned relations into paths and copy each relation_id exactly. "
+                    "UNKNOWN relations require a CANDIDATE or REJECTED path and their "
+                    "missing_evidence must be preserved."
                 ),
             }
         )
@@ -135,37 +137,37 @@ class GetWorkflowFacts(Capability):
             for item in self.context.state.secret_references
             if item.workflow_id == workflow_id
         ]
-        return json.dumps(
-            {
-                "workflow": workflow.model_dump(mode="json", by_alias=True),
-                "relations": relations,
-                "secret_references": secrets,
-                "assessments": [
-                    item.model_dump(mode="json")
-                    for item in self.context.state.assessments
-                    if item.subject_id in member_ids
-                ],
-                "findings": [
-                    item.model_dump(mode="json")
-                    for item in self.context.state.findings
-                    if any(
-                        path.path_id == stable_id("path", item.finding_id)
-                        and bool(member_ids & set(path.nodes))
-                        for path in self.context.state.paths
-                    )
-                ],
-                "attack_paths": [
-                    item.model_dump(mode="json")
-                    for item in self.context.state.paths
-                    if member_ids & set(item.nodes)
-                ],
-                "identities": [
-                    item.model_dump(mode="json")
-                    for item in self.context.state.identities
-                    if item.workflow_id == workflow_id
-                ],
-            }
-        )
+        payload = {
+            "workflow": workflow.model_dump(mode="json", by_alias=True),
+            "relations": relations,
+            "secret_references": secrets,
+            "assessments": [
+                item.model_dump(mode="json")
+                for item in self.context.state.assessments
+                if item.subject_id in member_ids
+            ],
+            "identities": [
+                item.model_dump(mode="json")
+                for item in self.context.state.identities
+                if item.workflow_id == workflow_id
+            ],
+        }
+        if self.context.analysis_mode is AnalysisMode.DETERMINISTIC:
+            payload["findings"] = [
+                item.model_dump(mode="json")
+                for item in self.context.state.findings
+                if any(
+                    path.path_id == stable_id("path", item.finding_id)
+                    and bool(member_ids & set(path.nodes))
+                    for path in self.context.state.paths
+                )
+            ]
+            payload["attack_paths"] = [
+                item.model_dump(mode="json")
+                for item in self.context.state.paths
+                if member_ids & set(item.nodes)
+            ]
+        return json.dumps(payload)
 
 
 class InspectRepositoryFile(Capability):
@@ -243,8 +245,9 @@ class SubmitAnalysis(Capability):
 
     def describe(self) -> str:
         return (
-            "Submit a JSON-encoded AnalysisProposal. It may reference only existing Evidence IDs; "
-            "static attack paths cannot be CONFIRMED. The proposal JSON top-level keys are exactly "
+            "Submit a JSON-encoded AnalysisProposal. Path edges must reference an extracted "
+            "relation_id and existing Evidence IDs; static attack paths cannot be CONFIRMED. "
+            "The proposal JSON top-level keys are exactly "
             "schema_version, findings, paths, and identities; use paths, not attack_paths."
         )
 

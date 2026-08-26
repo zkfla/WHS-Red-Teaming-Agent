@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import hashlib
 from datetime import datetime
 from enum import StrEnum
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class SchemaModel(BaseModel):
@@ -40,6 +41,11 @@ class ReportStatus(StrEnum):
     COMPLETE = "COMPLETE"
     PARTIAL = "PARTIAL"
     FAILED = "FAILED"
+
+
+class AnalysisMode(StrEnum):
+    DETERMINISTIC = "deterministic"
+    REASONING = "reasoning"
 
 
 class RepositorySnapshot(SchemaModel):
@@ -111,7 +117,15 @@ class Workflow(SchemaModel):
     evidence_ids: list[str] = Field(default_factory=list)
 
 
+def relation_id_for(source_id: str, relation_type: str, target_id: str) -> str:
+    digest = hashlib.sha256(
+        "|".join((source_id, relation_type, target_id)).encode()
+    ).hexdigest()[:16]
+    return f"rel_{digest}"
+
+
 class Relation(SchemaModel):
+    relation_id: str
     source_id: str
     relation_type: str
     target_id: str
@@ -121,6 +135,20 @@ class Relation(SchemaModel):
     verdict: TriState = TriState.TRUE
     evidence_ids: list[str] = Field(default_factory=list)
     missing_evidence: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def populate_relation_id(cls, data: Any) -> Any:
+        if isinstance(data, dict) and not data.get("relation_id"):
+            source_id = data.get("source_id")
+            relation_type = data.get("relation_type")
+            target_id = data.get("target_id")
+            if source_id is not None and relation_type is not None and target_id is not None:
+                data = dict(data)
+                data["relation_id"] = relation_id_for(
+                    str(source_id), str(relation_type), str(target_id)
+                )
+        return data
 
 
 class ControlAssessment(SchemaModel):
@@ -144,10 +172,25 @@ class Finding(SchemaModel):
 
 
 class AttackEdge(SchemaModel):
+    relation_id: str
     source_id: str
     relation_type: str
     target_id: str
     evidence_ids: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def populate_relation_id(cls, data: Any) -> Any:
+        if isinstance(data, dict) and not data.get("relation_id"):
+            source_id = data.get("source_id")
+            relation_type = data.get("relation_type")
+            target_id = data.get("target_id")
+            if source_id is not None and relation_type is not None and target_id is not None:
+                data = dict(data)
+                data["relation_id"] = relation_id_for(
+                    str(source_id), str(relation_type), str(target_id)
+                )
+        return data
 
 
 class AttackPath(SchemaModel):

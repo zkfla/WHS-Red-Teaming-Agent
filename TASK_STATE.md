@@ -2,14 +2,12 @@
 
 ## Snapshot
 
-`cicd-redteam-agent-mvp`는 첨부된 7일 계획과 ChatGPT 로그인 real-model smoke 범위를
-구현한 상태다.
-deterministic 분석은 개별 GitHub Actions 시나리오를 전역 attacker-to-credential 경로로
-조합하고 COMPLETE/PARTIAL/FAILED 보고서를 저장한다. trusted `.env`와 명시적 LiteLLM
-provider 선택을 지원하며, 같은 hackingBuddyGPT Single Agent가 공식 Codex SDK의 저장된
-ChatGPT 로그인을 LLM backend로 사용할 수도 있다. Codex가 별도 분석 단계나 두 번째 Agent로
-동작하지 않는다. 실제 모델이 네 번의 Capability 라운드 후 유효한 proposal을 제출해
-`COMPLETE / proposal_validated`로 종료했다.
+`cicd-redteam-agent-mvp`는 공통 Evidence/Fact/Relation 추출 뒤 `deterministic`과 `reasoning`
+분석 모드로 분기한다. deterministic은 기존 scenario rule과 global composer로 빠르고 재현
+가능한 결과를 만들고, reasoning은 deterministic Finding/AttackPath를 미리 생성하거나 Agent에
+노출하지 않은 채 security fact graph를 LLM이 조합하고 Validator가 검증한다. trusted `.env`,
+LiteLLM provider와 공식 Codex SDK의 저장된 ChatGPT 로그인을 지원하며 Codex는 별도 Agent가
+아니라 같은 hackingBuddyGPT Single Agent의 LLM backend다.
 
 ## Goal
 
@@ -22,9 +20,13 @@ AttackPath, CloudIdentityCandidate를 재현 가능하게 생성한다.
 - deterministic global path composer가 attacker source에서 write-capable GITHUB_TOKEN 또는
   Cloud Identity까지 Evidence-backed 경로를 생성한다.
 - mutable external action은 민감 권한과 결합된 경우에만 CANDIDATE가 된다.
-- Proposal validator가 기존 ID 충돌, ordered edge, node, Evidence와 identity 참조를 검사한다.
-- Capability가 boundary 오류를 구조화하고 workflow facts에 assessment, Finding, path,
-  identity를 포함한다.
+- Relation에 `(source_id, relation_type, target_id)` 기반 stable `relation_id`를 부여하고,
+  Proposal validator가 relation ID, source/type/target, ordered edge, Evidence와 identity 참조를
+  검사한다.
+- deterministic/reasoning 모드를 분리했고 reasoning에서는 기존 Finding/AttackPath 생성 및
+  `GetWorkflowFacts` 노출을 차단한다.
+- `ListSecurityFacts`가 relation ID와 source/transform/execution/credential/guard/context Fact를
+  Agent에 제공한다.
 - COMPLETE/PARTIAL/FAILED, exit 0/2/3/4/5, model error, no-progress, 반복 호출과 limits 보존을
   구현했다.
 - 과거 커밋에 남아 있던 추적 Python bytecode 18개를 작업 트리에서 추가 제거했다.
@@ -55,7 +57,7 @@ AttackPath, CloudIdentityCandidate를 재현 가능하게 생성한다.
   `COMPLETE / proposal_validated`.
 - real-model trace의 도구 호출은 `ListWorkflows`, `GetWorkflowFacts` 2회,
   `SubmitAnalysis`뿐이며 API-key 형태 원문 검색 결과는 0건이다.
-- 전체 pytest: 57 passed, 1 skipped. skip은 Windows symlink 권한 조건이다.
+- 전체 pytest: 67 passed, 1 skipped. skip은 Windows symlink 권한 조건이다.
 - `uv lock --check`, Ruff 및 `git diff --check`: 통과.
 
 ## Partial or Unverified
@@ -67,7 +69,11 @@ AttackPath, CloudIdentityCandidate를 재현 가능하게 생성한다.
 
 ## Key Decisions
 
-- 확실한 사실·edge·상태는 deterministic domain이 결정하고 LLM은 향후 추가 조사와 우선순위만 담당한다.
+- 공통 Fact/Relation/Guard/Evidence 추출까지는 두 모드가 공유한다. deterministic은 rule 기반
+  결론 생성, reasoning은 fact graph 기반 LLM 경로 추론을 담당하며 서로의 Finding/AttackPath를
+  입력으로 사용하지 않는다.
+- 현재 `relation_id`의 semantic key는 기존 tuple과 동일하게 유지하고 provenance/scope가 실제로
+  필요해질 때 키를 확장한다.
 - 실제 외부 provider API와 비용이 필요한 검증은 자격 증명과 사용 한도가 있을 때 수행한다.
 - 다중 provider key가 있으면 `auto`로 추측하지 않고 `--provider`를 요구한다.
 - 분석 대상 저장소의 `.env`는 인증 구성으로 읽지 않는다.
@@ -77,9 +83,9 @@ AttackPath, CloudIdentityCandidate를 재현 가능하게 생성한다.
 
 ## Recommended Next Actions
 
-1. 현재 변경과 real-model 결과를 팀 리뷰 후 `scenario/cicd`에 커밋한다.
-2. 외부 LiteLLM provider 자격 증명과 사용 한도가 준비되면 provider smoke를 수행한다.
-3. Windows Developer Mode 또는 CI 환경에서 symlink escape 테스트를 실행한다.
+1. Guard가 실제 공격 경로를 차단하는 의미 모델을 구체화한다.
+2. Secret flow와 Artifact/Cache provenance 모델을 구체화한다.
+3. 구조가 안정되면 복합 blind fixture로 reasoning 경로 조합을 평가한다.
 
 ## Relevant Artifacts
 
@@ -90,6 +96,6 @@ AttackPath, CloudIdentityCandidate를 재현 가능하게 생성한다.
 
 ## Updated
 
-- Date: 2026-08-25
-- Workflow: lean-vibe-workflow + task-state-sync
+- Date: 2026-08-26
+- Workflow: vibe-code-workflow + task-state-sync
 - Workspace: `C:\Users\qkrgu\Documents\GitHub\WHS-Red-Teaming-Agent`

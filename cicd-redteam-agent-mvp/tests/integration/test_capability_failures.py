@@ -5,6 +5,7 @@ import pytest
 
 from cicd_redteam_agent.application.analyze import AnalysisConfig, analyze_repository
 from cicd_redteam_agent.application.state import create_initial_state
+from cicd_redteam_agent.domain.models import AnalysisMode
 from cicd_redteam_agent.framework.capabilities import (
     CapabilityContext,
     GetWorkflowFacts,
@@ -64,3 +65,12 @@ async def test_workflow_facts_expose_deterministic_graph_context(tmp_path: Path)
     assert result["attack_paths"]
     assert result["identities"]
     assert unknown["error"] == "unknown_workflow_id"
+
+    reasoning = CapabilityContext(
+        report.state,
+        boundary,
+        analysis_mode=AnalysisMode.REASONING,
+    )
+    reasoning_result = json.loads(await GetWorkflowFacts(reasoning)(workflow_id))
+    assert "findings" not in reasoning_result
+    assert "attack_paths" not in reasoning_result
