@@ -1,6 +1,6 @@
 import json
 from pathlib import Path
-
+import subprocess
 from agent.mobile_agent import run_mobile_agent
 
 from tools.jadx_tool import decompile_apk
@@ -223,6 +223,25 @@ def main():
     )
 
 
+      # =================================
+    # STEP 5.5. 에뮬레이터에 APK 설치
+    # =================================
+
+    print()
+    print("[STEP 5.5] 에뮬레이터에 APK 설치")
+
+    ADB_PATH = r"C:\Users\pcybb\AppData\Local\Android\Sdk\platform-tools\adb.exe"
+
+    install_result = subprocess.run(
+        [ADB_PATH, "install", "-r", str(apk)],
+        capture_output=True, text=True
+    )
+
+    print(install_result.stdout.strip())
+
+    if "Success" not in install_result.stdout:
+        print("경고: APK 설치 실패 또는 이미 설치됨. 계속 진행합니다.")
+
     # =================================
     # STEP 6. Mobile Red Teaming Agent
     # =================================
@@ -233,7 +252,9 @@ def main():
     try:
 
         agent_result = run_mobile_agent(
-            output_dir=str(output_dir)
+            output_dir=str(output_dir),
+            adb_path=ADB_PATH,
+            package_name=package_name
         )
 
     except Exception as error:

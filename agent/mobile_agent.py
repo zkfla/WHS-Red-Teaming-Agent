@@ -9,7 +9,15 @@ from tools.agent_tools import (
     search_text,
     read_file,
 )
-
+from tools.dynamic_tool import (
+    configure_dynamic_target,
+    check_device_ready,
+    get_current_screen,
+    launch_activity,
+    inspect_app_storage,
+    capture_logcat,
+    take_screenshot,
+)
 
 MODEL = "gemini-3.1-flash-lite"
 
@@ -83,9 +91,13 @@ native library presence
 """
 
 
-def run_mobile_agent(output_dir: str) -> str:
+def run_mobile_agent(output_dir: str, adb_path: str = None, package_name: str = None) -> str:
 
     configure_analysis_root(output_dir)
+
+    dynamic_enabled = adb_path is not None and package_name is not None
+    if dynamic_enabled:
+        configure_dynamic_target(adb_path, package_name)
 
     client = genai.Client()
 
@@ -97,13 +109,49 @@ def run_mobile_agent(output_dir: str) -> str:
         read_file,
     ]
 
+    if dynamic_enabled:
+        tools += [
+            check_device_ready,
+            get_current_screen,
+            launch_activity,
+            inspect_app_storage,
+            capture_logcat,
+            take_screenshot,
+        ]
+
+    dynamic_prompt_addition = ""
+    if dynamic_enabled:
+        dynamic_prompt_addition = """
+
+동적분석 도구가 제공된다. 다음 두 가지 취약점 카테고리에 한해
+정적분석 결과를 실제 기기(에뮬레이터)에서 검증하라:
+
+1. Vulnerable Activity Components (exported activity 인증 우회)
+   - manifest에서 exported activity 목록을 확인한다.
+   - check_device_ready로 기기와 앱 상태를 먼저 확인한다.
+   - launch_activity로 인증 없이 해당 activity 진입을 시도한다.
+   - get_current_screen으로 실제 화면 전환 여부를 확인한다.
+   - 성공했다면 take_screenshot으로 증거를 남긴다.
+
+2. Insecure WebView
+   - search_text로 addJavascriptInterface, setJavaScriptEnabled,
+     onReceivedSslError, loadUrl 등의 패턴을 코드에서 찾는다.
+   - 발견된 파일과 관련된 activity가 있다면 launch_activity로 실행해서
+     get_current_screen으로 진입 여부를 확인한다.
+   - 필요하면 capture_logcat으로 관련 로그를 확인한다.
+
+동적 도구는 이미 설치된 대상 앱에 대해서만 사용하며,
+임의의 새로운 앱을 설치하거나 기기 설정을 변경하지 않는다.
+동적 검증 결과는 반드시 최종 보고서에 근거로 포함한다.
+"""
+
     config = types.GenerateContentConfig(
-        system_instruction=SYSTEM_PROMPT,
+        system_instruction=SYSTEM_PROMPT + dynamic_prompt_addition,
         temperature=0.1,
         tools=tools,
         automatic_function_calling=
             types.AutomaticFunctionCallingConfig(
-                maximum_remote_calls=20
+                maximum_remote_calls=25
             ),
     )
 
@@ -121,6 +169,9 @@ def run_mobile_agent(output_dir: str) -> str:
 주어진 파일 하나만 분석하지 말고,
 사용 가능한 도구를 이용하여 APK 전체 구조부터 파악하고
 필요한 파일을 스스로 탐색하라.
+
+동적분석 도구가 제공된 경우, Vulnerable Activity Components와
+Insecure WebView 두 카테고리에 대해서는 실제 기기에서 검증까지 수행하라.
 
 충분한 근거를 수집한 후 최종 보안 분석 결과를 작성하라.
 """
