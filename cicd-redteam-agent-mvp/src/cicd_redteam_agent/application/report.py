@@ -27,7 +27,11 @@ def write_report(report: AnalysisReport, run_dir: Path) -> None:
                     "event": "analysis.complete",
                     "status": report.status,
                     "termination_reason": report.termination_reason,
-                    "metadata": report.run_metadata,
+                    "metadata": {
+                        key: value
+                        for key, value in report.run_metadata.items()
+                        if key != "objective"
+                    },
                 },
                 default=str,
             )
@@ -167,6 +171,25 @@ def render_summary(report: AnalysisReport) -> str:
     steps = [step for job in jobs for step in job.steps]
     analysis_mode = report.run_metadata.get("analysis_mode", "unknown")
     provider = report.run_metadata.get("provider", report.trace.provider or "none")
+    objective = report.run_metadata.get("objective")
+    objective_digest = report.run_metadata.get("objective_hash")
+    objective_goal = report.run_metadata.get("objective_goal") or {}
+    objective_preview = None
+    if objective:
+        objective_text = str(objective)
+        objective_preview = objective_text[:500] + ("…" if len(objective_text) > 500 else "")
+    objective_focus = None
+    if isinstance(objective_goal, dict) and objective_goal.get("focused"):
+        focus_parts = []
+        for label, key in (
+            ("sources", "source_hints"),
+            ("mechanisms", "mechanism_hints"),
+            ("sinks", "sink_hints"),
+        ):
+            values = objective_goal.get(key) or []
+            if values:
+                focus_parts.append(f"{label}={','.join(str(item) for item in values)}")
+        objective_focus = "; ".join(focus_parts) or "focused"
 
     lines = [
         "# CI/CD Red Team Analysis",
@@ -189,6 +212,16 @@ def render_summary(report: AnalysisReport) -> str:
         f"| Global source-to-credential paths | {len(all_global_paths)} |",
         f"| Cloud identity candidates | {len(state.identities)} |",
         *(
+            [f"| Objective hash | {_code(objective_digest)} |"]
+            if objective_digest
+            else []
+        ),
+        *(
+            [f"| Objective focus | {_inline(objective_focus)} |"]
+            if objective_focus
+            else []
+        ),
+        *(
             [
                 f"| Model attempts / retries | {runtime.get('model_attempts', 0)} / "
                 f"{runtime.get('retries', 0)} |",
@@ -199,6 +232,11 @@ def render_summary(report: AnalysisReport) -> str:
             else []
         ),
         "",
+        *(
+            ["## User objective", "", _inline(objective_preview), ""]
+            if objective_preview
+            else []
+        ),
         "## Analysis coverage",
         "",
         "| Signal | Distribution |",

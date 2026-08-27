@@ -102,8 +102,18 @@ codex login status
 uv run cicd-agent analyze C:\path\to\repository `
   --output .\output `
   --provider codex-chatgpt `
-  --model gpt-5.6-luna
+  --model gpt-5.6-luna `
+  --objective "fork PR에서 OIDC와 Cloud Identity 연결 경로를 우선 조사해"
 ```
+
+긴 분석 목표는 `--objective-file C:\trusted\objective.md`로 전달할 수 있고, stdin은
+`--objective-file -`를 명시한 경우에만 읽습니다. Objective 파일은 분석 대상 저장소 밖의
+trusted operator 입력이어야 하며, deterministic 모드에서는 Objective를 받지 않습니다.
+System policy와 Validator 규칙이 Objective보다 우선하고 repository/tool 출력은 계속
+untrusted data로 취급됩니다. Reasoning 모드에서는 Objective에서 `fork_pr`, `artifact`, `cache`,
+`oidc`, `cloud_identity` 같은 제한된 탐색 힌트를 deterministic하게 컴파일합니다. 이 구조화 Goal은
+`ListSecurityFacts`의 관련 Relation 정렬과 모델의 조사 우선순위에만 쓰이며 Evidence, Fact, verdict,
+Guard 또는 취약점 결론을 생성하지 않습니다.
 
 `codex-chatgpt`는 API key나 Codex 인증 토큰을 프로그램으로 복사하지 않습니다. 공식
 `openai-codex` Python SDK가 저장된 ChatGPT 인증을 재사용하는 LLM 연결을 제공합니다.
@@ -124,9 +134,11 @@ Reasoning 실행이 모델 오류나 예산 제한으로 PARTIAL 종료됐다면
 uv run cicd-agent resume .\output\<run-id> --max-rounds 20 --max-duration 1800
 ```
 
-재개는 원래 저장소 커밋이 그대로이고 작업 트리가 깨끗할 때만 허용됩니다. 완료된 실행,
-다른 프롬프트 버전, 손상된 checkpoint/event journal, 이미 사용한 양 이하의 한도는
-거부됩니다. 중단된 라운드의 부분 상태와 대화 조각은 버리고 마지막 checkpoint부터 다시
+재개는 원래 저장소 커밋이 그대로이고 작업 트리가 깨끗할 때만 허용됩니다. reasoning
+Objective가 있던 실행은 exact Objective, SHA-256 hash와 deterministic compiled Goal을
+checkpoint에서 복원하며 재개 중 변경할 수 없습니다. 완료된 실행, 다른 프롬프트 버전,
+Objective hash/compiled Goal 불일치, 손상된
+checkpoint/event journal, 이미 사용한 양 이하의 한도는 거부됩니다. 중단된 라운드의 부분 상태와 대화 조각은 버리고 마지막 checkpoint부터 다시
 시도하며, 기존 `analysis.json`, `summary.md`, `trace.jsonl`은 같은 run 디렉터리에서 갱신됩니다.
 
 Reasoning Agent는 조사 중인 가설, 근거 Relation/Evidence, 부족한 정보와 다음 확인 대상을

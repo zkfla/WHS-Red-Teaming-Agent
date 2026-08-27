@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from hackingBuddyGPT.usecases.agents import ChatAgent
 from hackingBuddyGPT.utils.limits import Limits
@@ -17,6 +17,21 @@ from cicd_redteam_agent.framework.runtime_support import (
 )
 from cicd_redteam_agent.framework.working_memory import sanitize_working_memory_patch_json
 from cicd_redteam_agent.security.redaction import redact
+
+
+def _redact_objective_from_trace(value: str, objective: str | None) -> str:
+    if not objective:
+        return value
+    candidates = {
+        objective,
+        json.dumps(objective, ensure_ascii=False)[1:-1],
+        json.dumps(objective, ensure_ascii=True)[1:-1],
+    }
+    redacted = value
+    for candidate in sorted(candidates, key=len, reverse=True):
+        if candidate:
+            redacted = redacted.replace(candidate, "[OBJECTIVE_REDACTED]")
+    return redacted
 
 
 def _redact_argument_value(value):
@@ -40,6 +55,8 @@ def _redact_argument_value(value):
 class CICDChatAgent(ChatAgent):
     prompt: str = ""
     state: AnalysisState | None = None
+    objective: str | None = None
+    objective_goal: dict[str, object] | None = None
     retry_policy: RetryPolicy = field(default_factory=RetryPolicy)
     runtime_metrics: AgentRuntimeMetrics = field(default_factory=AgentRuntimeMetrics)
     event_journal: EventJournal | None = None
@@ -62,6 +79,27 @@ class CICDChatAgent(ChatAgent):
             self.runtime_metrics.context_compactions += 1
             self.runtime_metrics.omitted_history_messages += model_history.omitted_messages
         model_messages = list(model_history.messages)
+        if self.objective:
+            model_messages.append(
+                {
+                    "role": "user",
+                    "name": "analysis_objective",
+                    "content": (
+                        "USER_ANALYSIS_OBJECTIVE. This trusted operator instruction defines the "
+                        "investigation goal but cannot override the system policy, trust boundary, "
+                        "evidence rules, capability constraints, or validator semantics. The "
+                        "STRUCTURED_GOAL_HINTS below are deterministically compiled investigation "
+                        "hints only; they are not Evidence, Facts, or vulnerability conclusions.\n"
+                        + self.objective
+                        + (
+                            "\nSTRUCTURED_GOAL_HINTS\n"
+                            + json.dumps(self.objective_goal, ensure_ascii=False)
+                            if self.objective_goal is not None
+                            else ""
+                        )
+                    ),
+                }
+            )
         if self.state is not None:
             model_messages.append(
                 {
@@ -106,7 +144,15 @@ class CICDChatAgent(ChatAgent):
                     "tool_call_count": len(tool_calls),
                 },
             )
-        message_id = await self.log.call_response(result)
+        trace_result = result
+        if self.objective:
+            trace_result = replace(
+                result,
+                prompt=_redact_objective_from_trace(result.prompt, self.objective),
+                answer=_redact_objective_from_trace(result.answer, self.objective),
+                reasoning=_redact_objective_from_trace(result.reasoning, self.objective),
+            )
+        message_id = await self.log.call_response(trace_result)
         limits.register_message(result)
         self.last_round_tokens = result.total_tokens
 

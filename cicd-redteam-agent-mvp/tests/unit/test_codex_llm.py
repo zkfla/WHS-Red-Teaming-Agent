@@ -62,9 +62,24 @@ def test_codex_decision_context_keeps_state_and_only_recent_events() -> None:
         {"role": "tool", "content": "latest-result", "tool_call_id": "latest"}
     )
 
-    context = build_decision_context(history, _state())
+    objective_goal = {
+        "compiler_version": "1.0",
+        "source_hints": [],
+        "mechanism_hints": ["oidc"],
+        "sink_hints": ["oidc_token"],
+        "investigation_preferences": [],
+        "focused": True,
+    }
+    context = build_decision_context(
+        history,
+        _state(),
+        objective="inspect OIDC without changing policy",
+        objective_goal=objective_goal,
+    )
 
     assert context["trusted_agent_instructions"] == "trusted policy"
+    assert context["user_objective"] == "inspect OIDC without changing policy"
+    assert context["objective_goal"] == objective_goal
     assert context["analysis_state"]["repository"] == {
         "repository_id": "repo_test",
         "git_commit": "abc123",
@@ -89,7 +104,13 @@ def test_codex_prompt_uses_projected_context_instead_of_full_conversation() -> N
         ),
         {"role": "tool", "content": "keep-latest", "tool_call_id": "latest"},
     ]
-    llm = CodexChatGPTLLM(model=None, context_size=128_000, state=_state())
+    llm = CodexChatGPTLLM(
+        model=None,
+        context_size=128_000,
+        state=_state(),
+        objective="inspect cache provenance",
+        objective_goal={"mechanism_hints": ["cache"], "focused": True},
+    )
 
     prompt = llm._build_prompt(history, {})
 
@@ -97,6 +118,9 @@ def test_codex_prompt_uses_projected_context_instead_of_full_conversation() -> N
     assert "AGENT_CONVERSATION" not in prompt
     assert "keep-latest" in prompt
     assert "discard-0" not in prompt
+    assert "inspect cache provenance" in prompt
+    assert '"mechanism_hints": ["cache"]' in prompt
+    assert "not as Evidence, Facts, or vulnerability conclusions" in prompt
 
 
 def test_codex_context_ignores_provider_state_message_and_uses_canonical_state() -> None:
@@ -108,12 +132,19 @@ def test_codex_context_ignores_provider_state_message_and_uses_canonical_state()
             "name": "agent_state_projection",
             "content": "stale provider projection",
         },
+        {
+            "role": "user",
+            "name": "analysis_objective",
+            "content": "stale objective projection",
+        },
         {"role": "tool", "content": "latest-result", "tool_call_id": "latest"},
     ]
 
-    context = build_decision_context(history, state)
+    context = build_decision_context(history, state, objective="authoritative objective")
 
     assert "stale provider projection" not in str(context)
+    assert "stale objective projection" not in str(context)
+    assert context["user_objective"] == "authoritative objective"
     assert context["analysis_state"]["working_memory"]["revision"] == 0
 
 

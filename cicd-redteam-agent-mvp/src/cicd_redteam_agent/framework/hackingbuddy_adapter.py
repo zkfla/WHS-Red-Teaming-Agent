@@ -8,6 +8,7 @@ from hackingBuddyGPT.utils.limits import Limits
 from hackingBuddyGPT.utils.llm import LiteLLM
 from hackingBuddyGPT.utils.logging import JsonlLogger
 
+from cicd_redteam_agent.application.objective import compile_objective_goal, objective_hash
 from cicd_redteam_agent.domain.models import AnalysisState, ReportStatus
 from cicd_redteam_agent.framework.auth import ModelProvider, resolve_litellm_credential
 from cicd_redteam_agent.framework.capabilities import CapabilityContext, build_capabilities
@@ -92,6 +93,12 @@ async def _run_agent_analysis_locked(
             ),
         },
     )
+    objective_goal = compile_objective_goal(config.objective)
+    objective_goal_payload = objective_goal.as_dict()
+    runtime_objective_goal = objective_goal if config.objective is not None else None
+    runtime_objective_goal_payload = (
+        objective_goal_payload if config.objective is not None else None
+    )
     if config.provider is ModelProvider.CODEX_CHATGPT:
         from cicd_redteam_agent.framework.codex_llm import CodexChatGPTLLM
 
@@ -99,6 +106,8 @@ async def _run_agent_analysis_locked(
             model=config.model,
             context_size=min(config.max_tokens, 128_000),
             state=state,
+            objective=config.objective,
+            objective_goal=runtime_objective_goal_payload,
         )
         provider = "codex-chatgpt"
     else:
@@ -121,6 +130,7 @@ async def _run_agent_analysis_locked(
             state=state,
             boundary=boundary,
             analysis_mode=config.resolved_mode,
+            objective_goal=runtime_objective_goal,
         )
         prompt_path = Path(__file__).parents[1] / "prompts" / "cicd_security.md"
         prompt = prompt_path.read_text(encoding="utf-8")
@@ -132,6 +142,8 @@ async def _run_agent_analysis_locked(
             llm=llm,
             prompt=prompt,
             state=state,
+            objective=config.objective,
+            objective_goal=runtime_objective_goal_payload,
             runtime_metrics=runtime_metrics,
             event_journal=event_journal,
         )
@@ -162,6 +174,9 @@ async def _run_agent_analysis_locked(
                 "max_duration": config.max_duration,
                 "repository_commit": state.repository.git_commit,
                 "repository_dirty": state.repository.dirty,
+                "objective": config.objective,
+                "objective_hash": objective_hash(config.objective),
+                "objective_goal": objective_goal_payload,
             },
         )
         usecase = CICDUseCase(

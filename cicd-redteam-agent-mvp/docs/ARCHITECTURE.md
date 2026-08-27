@@ -18,7 +18,12 @@ CLI
 ```
 
 The optional Agent never parses YAML or creates Evidence. Repository text and tool output are
-untrusted data. Capabilities expose only bounded, redacted, read-only observations.
+untrusted data. Capabilities expose only bounded, redacted, read-only observations. Reasoning
+analysis may also carry one immutable trusted operator Objective. The Objective steers what the
+Agent investigates but cannot override the system policy, trust boundary, Evidence rules,
+Capability limits or deterministic validator. A bounded deterministic compiler derives structured
+source/mechanism/sink hints from the Objective. Those hints affect investigation priority only and
+never create or alter Evidence, Relations, verdicts, guards or final statuses.
 
 LiteLLM uses the explicitly resolved provider credential. `CodexChatGPTLLM` implements the same
 hackingBuddyGPT `LLM.get_response` boundary using the official Python SDK and saved ChatGPT login.
@@ -31,7 +36,9 @@ material hypothesis update is validated and applied before the selected Capabili
 field is removed from the underlying action arguments. This preserves native Tool selection and
 adds no model call or Agent round. The bounded memory stores at most eight concise, user-visible
 hypotheses with Evidence/Relation grounding and a next check; it is not chain-of-thought, Evidence,
-a Finding or an AttackPath. Both LiteLLM and Codex receive the same current-state projection.
+a Finding or an AttackPath. Both LiteLLM and Codex receive the same current-state projection. When an Objective exists, the
+runtime re-injects it as a dedicated user-level instruction on every model round rather than storing
+it in compactable history or concatenating it into the system prompt.
 
 `ListSecurityFacts` assigns run-local short references such as `R0001`. The preferred compact
 submission contains only ordered Relation references and user-facing Finding metadata. A
@@ -39,23 +46,28 @@ deterministic expander restores exact graph nodes, edges, Evidence, missing evid
 before the unchanged proposal Validator runs. The legacy full proposal remains accepted.
 The same refs may ground working-memory hypotheses; their exact Relation/Evidence and missing
 Evidence fields are restored before memory validation. Default Fact output omits those long IDs to
-reduce repeated model input, while an explicit compatibility option can expose them.
+reduce repeated model input, while an explicit compatibility option can expose them. When a compiled
+Objective Goal is focused, `ListSecurityFacts` stable-sorts matching Relations ahead of unrelated
+ones while preserving every underlying Fact and Validator semantic unchanged.
 
 The Agent runtime owns one bounded retry policy for both LLM backends; provider-internal retries are
 disabled where configurable to prevent attempt multiplication. Canonical history and structured
 state remain complete while a filtered model-input view removes superseded limits and old complete
 rounds near the context ceiling. Each successful round atomically replaces `checkpoint.json`, while
 bounded lifecycle metadata is appended to `events.jsonl`. A PARTIAL reasoning run can resume in the
-same run directory from that committed boundary after repository/prompt/limit validation; an
-incomplete round is rolled back and retried. Runtime counters and budgets remain cumulative across
+same run directory from that committed boundary after repository/prompt/Objective/limit validation;
+an incomplete round is rolled back and retried. The normalized Objective, its SHA-256 hash and the
+compiled Goal are part of the safe-run configuration and cannot change during resume. Runtime counters and budgets remain cumulative across
 attempts. See `docs/AGENT_RUNTIME.md`.
 
 The Codex runtime starts in an empty temporary directory with read-only sandbox and denied
 approvals. It disables inherited Codex plugins and every MCP server declared in the trusted user
 configuration. Each model decision uses an ephemeral Codex thread. Instead of duplicating the full
 hackingBuddyGPT conversation in Codex-owned memory, the adapter projects the trusted Agent policy,
-authoritative `AnalysisState`, current output identifiers, progress counters and the seven most
-recent Agent events into a bounded decision context. Older facts must be fetched again through the
+optional user Objective, authoritative `AnalysisState`, current output identifiers, progress
+counters and the seven most recent Agent events into a bounded decision context. The context marks
+policy as controlling instructions, Objective as subordinate trusted operator intent, and state/tool
+data as untrusted. Older facts must be fetched again through the
 existing bounded Capabilities, which remain the only repository-access path.
 
 ## Global attack graph

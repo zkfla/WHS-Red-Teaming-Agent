@@ -10,16 +10,22 @@ adding bounded runtime protections:
 - The canonical Agent history remains intact. The model-facing view removes superseded limit
   messages and, only near the context limit, drops the oldest complete round groups. Exact facts
   must be fetched again through capabilities. `ListSecurityFacts` returns at most 100 relations per
-  page and exposes `next_offset`.
+  page and exposes `next_offset`. An optional normalized user Objective is not stored only in this
+  compactable history; the runtime re-injects it as a dedicated user-level instruction every round.
+  A deterministic Objective compiler also derives bounded source/mechanism/sink hints. Focused hints
+  relevance-rank Fact pages but cannot alter Fact content, Relation verdicts or validator semantics.
 - The Codex backend keeps one SDK runtime for the analysis but uses an ephemeral thread for each
-  decision. It receives a bounded projection containing the trusted Agent policy, authoritative
-  structured state, current result identifiers, progress counters and the seven newest Agent
-  events. It does not maintain a second resumable conversation or receive the full canonical
-  history. Omitted facts are re-queried through Capabilities.
+  decision. It receives a bounded projection containing the trusted Agent policy, optional trusted
+  user Objective, authoritative structured state, current result identifiers, progress counters and
+  the seven newest Agent events. Policy outranks Objective, while state/tool output remains
+  untrusted data. It does not maintain a second resumable conversation or receive the full
+  canonical history. Omitted facts are re-queried through Capabilities.
 - `checkpoint.json` is rewritten after every completed round and at terminal Agent states. It is
   the authoritative safe-resume snapshot of structured analysis state, working memory, cumulative
   limits and runtime counters; it is not a provider-owned model conversation. The file is written
   beside the final report through a same-directory temporary file followed by atomic replacement.
+  The immutable normalized Objective, its SHA-256 hash and the compiled Objective Goal are part of
+  the checkpoint configuration.
 - `events.jsonl` is an append-only operational journal. It records bounded event metadata for
   attempts, rounds, model completions, capability requests/results and checkpoint commits without
   raw arguments, tool results or private chain-of-thought. A malformed final line is discarded;
@@ -27,7 +33,8 @@ adding bounded runtime protections:
 - `cicd-agent resume <run-dir>` resumes only at a committed round boundary. It restores cumulative
   round/token/cost/duration usage and runtime metrics, discards any incomplete round state/history,
   and increments the attempt ID. A per-run lease prevents concurrent resume. Completed runs,
-  prompt-version drift, repository commit drift and dirty Git worktrees are rejected.
+  prompt-version drift, Objective hash or compiled-Goal mismatch, repository commit drift and dirty
+  Git worktrees are rejected. Changing the Objective requires a new analysis run.
 - Structured working memory is piggybacked on the already selected Capability, so it requires no
   extra model call or round. The underlying action signature excludes the patch, preventing note
   rewrites from bypassing repeated-call detection. Only semantic changes increment memory revision.

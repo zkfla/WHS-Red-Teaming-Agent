@@ -13,6 +13,7 @@ from cicd_redteam_agent.application.analyze import (
     analyze_repository,
     resume_analysis,
 )
+from cicd_redteam_agent.application.objective import load_analysis_objective
 from cicd_redteam_agent.domain.models import AnalysisMode, AttackerProfile, ReportStatus
 from cicd_redteam_agent.framework.auth import ModelProvider
 from cicd_redteam_agent.security.redaction import redact
@@ -58,6 +59,15 @@ def build_parser() -> argparse.ArgumentParser:
     analyze.add_argument("--max-tokens", type=int, default=100_000)
     analyze.add_argument("--max-cost", type=float, default=2.0)
     analyze.add_argument("--max-duration", type=int, default=900)
+    objective_group = analyze.add_mutually_exclusive_group()
+    objective_group.add_argument(
+        "--objective",
+        help="trusted natural-language objective for reasoning analysis",
+    )
+    objective_group.add_argument(
+        "--objective-file",
+        help="read trusted analysis objective from UTF-8 file; use '-' for stdin",
+    )
     resume = subcommands.add_parser(
         "resume", help="resume a reasoning analysis from its last safe checkpoint"
     )
@@ -153,6 +163,14 @@ def main(argv: list[str] | None = None) -> int:
             if report.status is ReportStatus.PARTIAL:
                 return 4
             return 5
+        objective = None
+        if args.command == "analyze":
+            objective = load_analysis_objective(
+                objective=args.objective,
+                objective_file=args.objective_file,
+                repository_root=args.repo_path,
+                stdin=sys.stdin,
+            )
         config = AnalysisConfig(
             output_dir=args.output,
             attacker_profile=AttackerProfile(args.attacker_profile),
@@ -168,7 +186,10 @@ def main(argv: list[str] | None = None) -> int:
             max_tokens=args.max_tokens,
             max_cost=args.max_cost,
             max_duration=args.max_duration,
+            objective=objective,
         )
+        if objective is not None and config.resolved_mode is AnalysisMode.DETERMINISTIC:
+            raise ValueError("analysis objective requires reasoning mode")
         if args.command == "evaluate":
             from cicd_redteam_agent.application.evaluate import evaluate_reasoning_matrix
 

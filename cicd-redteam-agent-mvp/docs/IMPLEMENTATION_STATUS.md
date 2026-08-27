@@ -29,6 +29,10 @@ analysis.json + summary.md + trace.jsonl
 - Token, Secret reference, OIDC 및 Cloud Identity 후보와 연결된 경로를 만듭니다.
 - 로컬 근거가 부족한 외부·실행 시점 상태는 `UNKNOWN`으로 유지합니다.
 - LLM은 Fact를 연결해 제안하고, 최종 판정은 코드 Validator가 수행합니다.
+- Reasoning 분석은 선택적으로 trusted 자연어 Objective를 받아 조사 목표를 좁힐 수 있습니다.
+  Objective는 system policy나 Validator를 덮지 못하며 repository/tool 출력과 분리됩니다.
+  deterministic Goal compiler가 제한된 source/mechanism/sink 힌트를 만들고 관련 Relation을
+  우선 정렬하지만 Fact/verdict/최종 판정은 변경하지 않습니다.
 
 ## 구현 범위
 
@@ -47,6 +51,8 @@ analysis.json + summary.md + trace.jsonl
 | Self-hosted Runner | 부분 구현 | 공유·잔존 가능성 Fact 추출, 실제 격리 상태는 `UNKNOWN` |
 | Environment protection | 부분 구현 | Environment 사용 감지, 실제 승인 설정은 `UNKNOWN` |
 | 검토 우선순위·수정 방향 | 완료 | 전역 경로 정렬과 Relation 기반 권장 조치 표시 |
+| 자연어 Reasoning Objective | 완료 | text/file/explicit stdin, trust boundary, checkpoint/resume 보존 |
+| Objective Goal compilation | 완료 | source/mechanism/sink 힌트, goal-aware Fact 우선순위, verdict 비간섭 |
 | Reasoning matrix 평가 | 완료 | 10개 그룹 × 3개 variant의 정확도·시간 표 자동 생성 |
 | GitHub·Cloud API 연동 | 미구현 | 로컬 파일만 분석 |
 | Audit log·실제 Runner 조사 | 미구현 | 실행 환경과 과거 이벤트를 조회하지 않음 |
@@ -98,7 +104,8 @@ uv run cicd-agent analyze C:\analysis-targets\project --output .\output
 codex login
 uv run cicd-agent analyze C:\analysis-targets\project `
   --output .\output `
-  --provider codex-chatgpt
+  --provider codex-chatgpt `
+  --objective "fork PR에서 OIDC 경로를 우선 조사해"
 ```
 
 ### 30개 reasoning fixture 평가
@@ -112,6 +119,9 @@ uv run cicd-agent evaluate tests/fixtures/reasoning-matrix `
 평가 후 `matrix-evaluation/evaluation.json`과 `evaluation.md`에 Fact 추출, 상태 정확도,
 `missing_evidence` 보존, 안전 variant 오탐 및 deterministic/reasoning 시간을 기록합니다.
 30개 reasoning case는 실제 모델 호출을 포함하므로 사용량과 실행 시간을 확인한 뒤 실행합니다.
+일반 reasoning 분석의 긴 Objective는 `--objective-file`로 전달할 수 있으며 stdin은
+`--objective-file -`를 지정한 경우에만 읽습니다. 분석 대상 저장소 내부 파일은 trusted
+Objective source로 사용할 수 없습니다.
 
 ## 데모 절차
 

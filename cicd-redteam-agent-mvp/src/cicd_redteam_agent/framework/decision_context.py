@@ -140,7 +140,12 @@ def build_analysis_state_projection(state: AnalysisState) -> dict[str, Any]:
 
 
 def build_decision_context(
-    history: list[Any], state: AnalysisState, *, recent_event_limit: int = RECENT_EVENT_LIMIT
+    history: list[Any],
+    state: AnalysisState,
+    *,
+    objective: str | None = None,
+    objective_goal: dict[str, object] | None = None,
+    recent_event_limit: int = RECENT_EVENT_LIMIT,
 ) -> dict[str, Any]:
     """Project canonical Agent state into a bounded, provider-neutral model input."""
 
@@ -149,7 +154,7 @@ def build_decision_context(
         message
         for message in history
         if _field(message, "role") != "system"
-        and _field(message, "name") != "agent_state_projection"
+        and _field(message, "name") not in {"agent_state_projection", "analysis_objective"}
     ]
     recent_messages = non_system_messages[-max(1, recent_event_limit) :]
 
@@ -159,6 +164,10 @@ def build_decision_context(
             _field(system_messages[0], "content", "") if system_messages else "",
             INSTRUCTION_CHARACTER_LIMIT,
         ),
+        "user_objective": (
+            _bounded_text(objective, INSTRUCTION_CHARACTER_LIMIT) if objective else None
+        ),
+        "objective_goal": objective_goal,
         "analysis_state": build_analysis_state_projection(state),
         "recent_agent_events": [_project_message(message) for message in recent_messages],
         "omitted_earlier_events": max(0, len(non_system_messages) - len(recent_messages)),

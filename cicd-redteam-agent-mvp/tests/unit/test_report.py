@@ -1,6 +1,8 @@
+import json
 from datetime import UTC, datetime
+from pathlib import Path
 
-from cicd_redteam_agent.application.report import render_summary
+from cicd_redteam_agent.application.report import render_summary, write_report
 from cicd_redteam_agent.domain.models import (
     AnalysisReport,
     AnalysisState,
@@ -97,6 +99,50 @@ def test_summary_surfaces_coverage_and_evidence_locations() -> None:
     assert "Reduce GITHUB\\_TOKEN permissions" in summary
     assert "`.github/workflows/ci.yml`" not in summary
     assert "ev_1` (.github/workflows/ci.yml:4-5)" in summary
+
+
+def test_summary_includes_bounded_user_objective_and_hash() -> None:
+    report = _report()
+    report.run_metadata.update(
+        {
+            "objective": "inspect OIDC | then # cache",
+            "objective_hash": "abc123",
+            "objective_goal": {
+                "compiler_version": "1.0",
+                "source_hints": [],
+                "mechanism_hints": ["cache", "oidc"],
+                "sink_hints": ["oidc_token"],
+                "investigation_preferences": [],
+                "focused": True,
+            },
+        }
+    )
+
+    summary = render_summary(report)
+
+    assert "## User objective" in summary
+    assert "inspect OIDC \\| then \\# cache" in summary
+    assert "| Objective hash | `abc123` |" in summary
+    assert "Objective focus" in summary
+    assert "mechanisms=cache,oidc" in summary
+    assert "sinks=oidc\\_token" in summary
+
+
+def test_fallback_trace_does_not_repeat_raw_objective(tmp_path: Path) -> None:
+    report = _report()
+    report.run_metadata.update(
+        {
+            "objective": "sensitive operator objective",
+            "objective_hash": "abc123",
+        }
+    )
+
+    write_report(report, tmp_path)
+
+    trace = (tmp_path / "trace.jsonl").read_text(encoding="utf-8")
+    payload = json.loads(trace)
+    assert "sensitive operator objective" not in trace
+    assert payload["metadata"]["objective_hash"] == "abc123"
 
 
 def test_summary_escapes_untrusted_markdown_and_deduplicates_warnings() -> None:

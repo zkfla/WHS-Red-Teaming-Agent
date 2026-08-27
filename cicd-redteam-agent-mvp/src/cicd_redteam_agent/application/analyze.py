@@ -6,6 +6,11 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
+from cicd_redteam_agent.application.objective import (
+    compile_objective_goal,
+    normalize_objective,
+    objective_hash,
+)
 from cicd_redteam_agent.application.report import write_report
 from cicd_redteam_agent.application.state import create_initial_state
 from cicd_redteam_agent.domain.attack_graph import compose_global_attack_paths
@@ -42,6 +47,11 @@ class AnalysisConfig:
     max_tokens: int = 100_000
     max_cost: float = 2.0
     max_duration: int = 900
+    objective: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.objective is not None:
+            object.__setattr__(self, "objective", normalize_objective(self.objective))
 
     @property
     def resolved_mode(self) -> AnalysisMode:
@@ -114,6 +124,9 @@ def _finalize_analysis(
         "analysis_mode": mode,
         "framework_commit": FRAMEWORK_COMMIT,
         "repository_commit": state.repository.git_commit,
+        "objective": config.objective,
+        "objective_hash": objective_hash(config.objective),
+        "objective_goal": compile_objective_goal(config.objective).as_dict(),
     }
     if runtime_metrics is not None:
         run_metadata["agent_runtime"] = runtime_metrics
@@ -140,6 +153,8 @@ async def analyze_repository(
 ) -> tuple[AnalysisReport, Path]:
     started = time.monotonic()
     mode = config.resolved_mode
+    if config.objective is not None and mode is AnalysisMode.DETERMINISTIC:
+        raise ValueError("analysis objective requires reasoning mode")
     if (
         mode is AnalysisMode.REASONING
         and not config.model
@@ -279,12 +294,23 @@ async def resume_analysis(
         "max_tokens",
         "max_cost",
         "max_duration",
+        "objective",
+        "objective_hash",
+        "objective_goal",
     }
     missing = sorted(required - saved.keys())
     if missing:
         raise ValueError(f"checkpoint is missing resume configuration: {', '.join(missing)}")
     if AnalysisMode(saved["analysis_mode"]) is not AnalysisMode.REASONING:
         raise ValueError("only reasoning-mode analysis runs can be resumed")
+    saved_objective = saved["objective"]
+    if saved_objective is not None and not isinstance(saved_objective, str):
+        raise ValueError("checkpoint analysis objective is invalid")
+    if objective_hash(saved_objective) != saved["objective_hash"]:
+        raise ValueError("checkpoint analysis objective hash mismatch")
+    expected_goal = compile_objective_goal(saved_objective).as_dict()
+    if saved["objective_goal"] != expected_goal:
+        raise ValueError("checkpoint compiled objective goal mismatch")
 
     overrides = limits or ResumeLimitOverrides()
     config = AnalysisConfig(
@@ -298,6 +324,7 @@ async def resume_analysis(
         max_tokens=overrides.max_tokens or int(saved["max_tokens"]),
         max_cost=overrides.max_cost or float(saved["max_cost"]),
         max_duration=overrides.max_duration or int(saved["max_duration"]),
+        objective=saved_objective,
     )
     consumed = {
         "max_rounds": (config.max_rounds, checkpoint.rounds),

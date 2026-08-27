@@ -35,3 +35,6 @@ def test_security_prompt_keeps_static_verdict_safety_rules() -> None:
     assert "Any relation is `FALSE`" in text
     assert "Never `CONFIRMED`" in text
     assert "Do not duplicate an existing Finding, path, or identity" in text
+    assert "STRUCTURED_GOAL_HINTS" in text
+    assert "never Evidence" in text
+    assert "investigation hint" in text

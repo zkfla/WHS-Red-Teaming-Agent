@@ -7,6 +7,7 @@ import pytest
 from hackingBuddyGPT.utils import LLMResult
 from hackingBuddyGPT.utils.limits import Limits
 
+from cicd_redteam_agent.application.objective import compile_objective_goal
 from cicd_redteam_agent.application.state import create_initial_state
 from cicd_redteam_agent.domain.github_actions_parser import (
     discover_workflows,
@@ -23,13 +24,17 @@ FIXTURES = Path(__file__).parents[1] / "fixtures"
 
 
 class FakeLogger:
+    def __init__(self) -> None:
+        self.logged_results = []
+
     async def system_message(self, _message):
         return 0
 
     async def limit_message(self, _message):
         return 0
 
-    async def call_response(self, _result):
+    async def call_response(self, result):
+        self.logged_results.append(result)
         return 0
 
     async def add_tool_call(self, *_args):
@@ -88,7 +93,18 @@ class FakeLLM:
             function=SimpleNamespace(name=name, arguments=json.dumps(arguments)),
         )
         message = SimpleNamespace(tool_calls=[tool_call], content="")
-        return LLMResult(message, "", "", "", timedelta(), 1, 1, 0, "", 0.0)
+        return LLMResult(
+            message,
+            str(prompt),
+            "",
+            "",
+            timedelta(),
+            1,
+            1,
+            0,
+            "",
+            0.0,
+        )
 
 
 class TransientFakeLLM:
@@ -134,8 +150,16 @@ async def test_fake_llm_list_inspect_submit_flow(tmp_path: Path) -> None:
         ],
     }
     llm = FakeLLM(proposal)
+    logger = FakeLogger()
     agent = CICDChatAgent(
-        log=FakeLogger(), llm=llm, prompt="trusted system prompt", state=state
+        log=logger,
+        llm=llm,
+        prompt="trusted system prompt",
+        state=state,
+        objective="inspect the credential path only",
+        objective_goal=compile_objective_goal(
+            "inspect the credential path only"
+        ).as_dict(),
     )
     agent._capabilities = build_capabilities(context)
     limits = Limits(max_rounds=5, max_tokens=100, max_cost=1, max_duration=30)
@@ -155,6 +179,21 @@ async def test_fake_llm_list_inspect_submit_flow(tmp_path: Path) -> None:
     assert state.findings[0].evidence_ids == [evidence_id]
     assert state.working_memory.revision == 1
     assert state.working_memory.hypotheses[0].status.value == "ACTIVE"
+    for model_prompt in llm.prompts:
+        assert model_prompt[-2]["name"] == "analysis_objective"
+        assert "inspect the credential path only" in model_prompt[-2]["content"]
+        assert "STRUCTURED_GOAL_HINTS" in model_prompt[-2]["content"]
+        assert model_prompt[-1]["name"] == "agent_state_projection"
+    assert all(
+        getattr(message, "name", None) != "analysis_objective"
+        for message in agent._prompt_history
+    )
+    assert logger.logged_results
+    assert all(
+        "inspect the credential path only" not in result.prompt
+        for result in logger.logged_results
+    )
+    assert all("[OBJECTIVE_REDACTED]" in result.prompt for result in logger.logged_results)
     final_projection = llm.prompts[-1][-1]
     assert final_projection["name"] == "agent_state_projection"
     assert '"revision": 1' in final_projection["content"]

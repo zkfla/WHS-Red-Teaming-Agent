@@ -4,6 +4,10 @@ from pathlib import Path
 import pytest
 
 from cicd_redteam_agent.application.analyze import AnalysisConfig, analyze_repository
+from cicd_redteam_agent.application.objective import (
+    compile_objective_goal,
+    objective_relation_score,
+)
 from cicd_redteam_agent.domain.models import (
     AnalysisProposal,
     AttackEdge,
@@ -236,10 +240,37 @@ async def test_security_fact_capability_paginates_large_results(tmp_path: Path) 
     assert second["facts"][0]["relation_ref"] != first["facts"][0]["relation_ref"]
     assert "relation_id" not in first["facts"][0]
     assert "evidence_ids" not in first["facts"][0]
+    assert first["objective_focus"] is None
 
     grounded = json.loads(await capability(limit=1, include_grounding=True))
     assert grounded["facts"][0]["relation_id"]
     assert "evidence_ids" in grounded["facts"][0]
+
+
+@pytest.mark.asyncio
+async def test_security_fact_capability_ranks_goal_relevant_relations_first(
+    tmp_path: Path,
+) -> None:
+    state = await _analyze("oidc-risk", None, tmp_path)
+    boundary = RepositoryBoundary(FIXTURES / "oidc-risk")
+    goal = compile_objective_goal("OIDC와 Cloud Identity 연결 가능성을 우선 조사해")
+    capability = ListSecurityFacts(CapabilityContext(state, boundary, objective_goal=goal))
+
+    payload = json.loads(await capability(limit=100))
+    returned_scores = [
+        objective_relation_score(
+            goal,
+            source_id=item["source_id"],
+            relation_type=item["relation_type"],
+            target_id=item["target_id"],
+            category=item["category"],
+        )
+        for item in payload["facts"]
+    ]
+
+    assert payload["objective_focus"] == goal.as_dict()
+    assert returned_scores == sorted(returned_scores, reverse=True)
+    assert returned_scores[0] > 0
 
 
 @pytest.mark.asyncio

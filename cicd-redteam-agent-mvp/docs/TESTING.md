@@ -50,6 +50,17 @@
 - unknown Evidence/Relation IDs, FALSE supporting Relations and stale revisions are rejected
 - semantic no-op memory patches do not increase revision or bypass repeated-action detection
 - LiteLLM-style message input and Codex decision context receive the same current working memory
+- reasoning Objective text/file/explicit-stdin inputs normalize to one canonical instruction; empty,
+  oversized and analyzed-repository Objective files are rejected
+- deterministic mode rejects Objective input; reasoning without an Objective preserves existing behavior
+- the Objective is re-injected every model round outside compactable history, remains subordinate to
+  system policy, and is distinct from untrusted state/tool data in both LiteLLM and Codex paths
+- the deterministic Objective compiler extracts only bounded source/mechanism/sink investigation
+  hints; goal-relevant Fact ranking never mutates Relation verdicts or validator semantics
+- checkpoint/resume preserves the exact Objective and compiled Goal and rejects Objective/hash/Goal
+  tampering
+- report output records Objective/hash/compiled Goal for reproducibility while trace/event logging
+  does not repeat the raw Objective
 - PARTIAL output preserves active hypotheses without treating them as Findings
 - short Relation references expand to exact immutable nodes, edges and Evidence
 - unknown, duplicate and discontinuous compact path references are rejected before state mutation
@@ -61,7 +72,8 @@
 - event journal sequence is append-only; only a malformed final line is repairable
 - failed rounds roll back state, submission state and partial Agent history before checkpointing
 - resume reuses the same run directory and attempt lineage while preserving cumulative budgets
-- completed runs, commit drift, dirty repositories, stale/corrupt journals and concurrent leases are rejected
+- completed runs, Objective hash or compiled-Goal mismatch, commit drift, dirty repositories,
+  stale/corrupt journals and concurrent leases are rejected
 
 ## Release checks
 

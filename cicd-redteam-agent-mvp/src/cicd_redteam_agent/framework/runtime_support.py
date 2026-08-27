@@ -20,7 +20,7 @@ from cicd_redteam_agent.domain.models import AnalysisState
 
 CHECKPOINT_SCHEMA_VERSION = "2.0"
 EVENT_SCHEMA_VERSION = "1.0"
-PROMPT_VERSION = "1.0"
+PROMPT_VERSION = "1.2"
 
 
 class RecoverableModelOutputError(RuntimeError):

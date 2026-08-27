@@ -1,9 +1,10 @@
+import io
 import json
 from pathlib import Path
 
 import pytest
 
-from cicd_redteam_agent.cli import main
+from cicd_redteam_agent.cli import build_parser, main
 from cicd_redteam_agent.domain.models import ReportStatus
 from cicd_redteam_agent.framework.hackingbuddy_adapter import AgentRunResult
 
@@ -121,6 +122,114 @@ def test_partial_agent_result_returns_exit_4(
             ]
         )
         == 4
+    )
+
+
+def test_objective_requires_reasoning_mode(tmp_path: Path) -> None:
+    assert (
+        main(
+            [
+                "analyze",
+                str(FIXTURES / "oidc-risk"),
+                "--output",
+                str(tmp_path / "output"),
+                "--objective",
+                "inspect OIDC",
+            ]
+        )
+        == 2
+    )
+
+
+def test_objective_sources_are_mutually_exclusive() -> None:
+    with pytest.raises(SystemExit) as raised:
+        build_parser().parse_args(
+            [
+                "analyze",
+                "repo",
+                "--output",
+                "output",
+                "--objective",
+                "one",
+                "--objective-file",
+                "two.txt",
+            ]
+        )
+    assert raised.value.code == 2
+
+
+def test_reasoning_objective_reaches_agent_config(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    async def complete_agent(_state, _boundary, config, _run_dir, **_kwargs) -> AgentRunResult:
+        assert config.objective == "inspect OIDC\nthen cache"
+        return AgentRunResult(
+            status=ReportStatus.COMPLETE,
+            reason="proposal_validated",
+            rounds=1,
+            tokens=10,
+            cost=0.0,
+            warnings=[],
+            provider="codex-chatgpt",
+        )
+
+    monkeypatch.setattr(
+        "cicd_redteam_agent.framework.hackingbuddy_adapter.run_agent_analysis",
+        complete_agent,
+    )
+
+    assert (
+        main(
+            [
+                "analyze",
+                str(FIXTURES / "oidc-risk"),
+                "--output",
+                str(tmp_path / "output"),
+                "--provider",
+                "codex-chatgpt",
+                "--objective",
+                "  inspect OIDC\r\nthen cache  ",
+            ]
+        )
+        == 0
+    )
+
+
+def test_objective_can_be_read_from_explicit_stdin(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    async def complete_agent(_state, _boundary, config, _run_dir, **_kwargs) -> AgentRunResult:
+        assert config.objective == "inspect artifacts"
+        return AgentRunResult(
+            status=ReportStatus.COMPLETE,
+            reason="proposal_validated",
+            rounds=1,
+            tokens=10,
+            cost=0.0,
+            warnings=[],
+            provider="codex-chatgpt",
+        )
+
+    monkeypatch.setattr(
+        "cicd_redteam_agent.framework.hackingbuddy_adapter.run_agent_analysis",
+        complete_agent,
+    )
+    monkeypatch.setattr("sys.stdin", io.StringIO("  inspect artifacts\n"))
+
+    assert (
+        main(
+            [
+                "analyze",
+                str(FIXTURES / "oidc-risk"),
+                "--output",
+                str(tmp_path / "output"),
+                "--provider",
+                "codex-chatgpt",
+                "--objective-file",
+                "-",
+            ]
+        )
+        == 0
     )
 
 

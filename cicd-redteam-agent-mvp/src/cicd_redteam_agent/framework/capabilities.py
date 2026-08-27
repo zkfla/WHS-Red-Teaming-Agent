@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 
 from hackingBuddyGPT.capability import Capability
 
+from cicd_redteam_agent.application.objective import CompiledObjectiveGoal, objective_relation_score
 from cicd_redteam_agent.domain.github_actions_parser import stable_id
 from cicd_redteam_agent.domain.models import (
     AnalysisMode,
@@ -34,6 +35,7 @@ class CapabilityContext:
     state: AnalysisState
     boundary: RepositoryBoundary
     analysis_mode: AnalysisMode = AnalysisMode.DETERMINISTIC
+    objective_goal: CompiledObjectiveGoal | None = None
     submitted: bool = False
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
@@ -135,7 +137,23 @@ class ListSecurityFacts(Capability):
             "guard": 4,
             "context": 5,
         }
-        facts.sort(key=lambda pair: category_order.get(pair[1].category or "context", 6))
+        goal = self.context.objective_goal
+        if goal is not None and goal.focused:
+            facts.sort(
+                key=lambda pair: (
+                    -objective_relation_score(
+                        goal,
+                        source_id=pair[1].source_id,
+                        relation_type=pair[1].relation_type,
+                        target_id=pair[1].target_id,
+                        category=pair[1].category,
+                    ),
+                    category_order.get(pair[1].category or "context", 6),
+                    pair[0],
+                )
+            )
+        else:
+            facts.sort(key=lambda pair: category_order.get(pair[1].category or "context", 6))
         counts: dict[str, int] = {}
         for _, item in facts:
             key = item.category or "uncategorized"
@@ -166,7 +184,15 @@ class ListSecurityFacts(Capability):
                 "offset": offset,
                 "limit": limit,
                 "next_offset": next_offset if next_offset < len(facts) else None,
+                "objective_focus": (
+                    self.context.objective_goal.as_dict()
+                    if self.context.objective_goal is not None
+                    else None
+                ),
                 "guidance": (
+                    "When objective_focus.focused is true, rows are relevance-ranked only as an "
+                    "investigation hint; ranking never changes relation verdicts or validator "
+                    "semantics. "
                     "Compose only returned relations into paths. Use the short relation_ref values "
                     "for compact proposal and working-memory submissions so the runtime can "
                     "restore exact relation, node and Evidence fields. "

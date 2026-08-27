@@ -9,6 +9,7 @@ cicd-agent analyze <repo-path> --output <dir>
   [--mode deterministic|reasoning]
   [--env-file <trusted-env-path>]
   [--attacker-profile fork-pr|repo-writer]
+  [--objective <trusted-text> | --objective-file <trusted-path|->]
   [--max-rounds N] [--max-tokens N] [--max-cost N] [--max-duration N]
 
 cicd-agent evaluate <matrix-path> --output <dir>
@@ -26,14 +27,22 @@ oracle, writes ordinary per-run reports, and emits `matrix-evaluation/evaluation
 labels and expected states are never passed to the Agent.
 
 Exit codes are `0` COMPLETE, `2` input/configuration error, `3` framework/model initialization
-error, `4` PARTIAL and `5` internal validation failure.
+error, `4` PARTIAL and `5` internal validation failure. Natural-language Objective input is accepted
+only for reasoning analysis. `--objective-file -` explicitly consumes stdin; stdin is never
+auto-detected. Objective files inside the analyzed repository are rejected so repository data cannot
+be promoted into trusted operator instructions. A deterministic compiler derives bounded
+source/mechanism/sink Goal hints from the normalized Objective. These hints affect investigation
+ordering only; they cannot create Evidence, Relations, verdicts, guards or final findings.
 
 ## Output
 
 Each run writes `<output>/<run-id>/analysis.json`, `summary.md` and `trace.jsonl`. Reasoning runs
 also write atomic `checkpoint.json` schema 2.0 and append-only `events.jsonl` schema 1.0. All public models
 carry `schema_version="1.0"`. Run metadata records the repository commit, attacker profile, resolved
-analysis mode, configured limits, framework commit and optional provider/model identifier.
+analysis mode, configured limits, framework commit and optional provider/model identifier. When a
+reasoning Objective exists, `analysis.json` records its exact normalized text, SHA-256 hash and
+compiled Objective Goal; `summary.md` shows a bounded preview, hash and compact focus summary. Event
+journal entries and fallback trace metadata do not duplicate the raw Objective.
 
 `summary.md` is a human-readable view of the same report. It includes an execution overview,
 deterministic coverage counts, Finding details, global and local attack paths, cloud identity
@@ -51,9 +60,10 @@ false-positive checks and separately measured deterministic/reasoning wall time.
 
 `resume` accepts only a non-terminal reasoning checkpoint produced by the current prompt contract.
 It continues in the same run directory and restores cumulative rounds, tokens, cost, duration,
-runtime metrics and working memory. Optional limits are new cumulative maxima and must exceed the
-already consumed value. Repository commit drift, dirty Git state, an active run lease, an older or
-corrupt event journal, and completed runs are input errors. A failed/incomplete round never becomes
+runtime metrics, working memory and the immutable user Objective. Optional limits are new cumulative
+maxima and must exceed the already consumed value. Repository commit drift, dirty Git state, an
+Objective hash or compiled-Goal mismatch, an active run lease, an older or corrupt event journal,
+and completed runs are input errors. Changing the Objective requires a new analysis run. A failed/incomplete round never becomes
 the resumed state; the last committed boundary is retried.
 
 `auto` accepts exactly one configured provider key. More than one key requires explicit

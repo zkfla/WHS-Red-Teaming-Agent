@@ -1,8 +1,10 @@
+import json
 from pathlib import Path
 
 import pytest
 
 from cicd_redteam_agent.application.analyze import ResumeLimitOverrides, resume_analysis
+from cicd_redteam_agent.application.objective import compile_objective_goal, objective_hash
 from cicd_redteam_agent.application.state import create_initial_state
 from cicd_redteam_agent.domain.models import ReportStatus
 from cicd_redteam_agent.framework.hackingbuddy_adapter import AgentRunResult
@@ -43,6 +45,9 @@ async def test_resume_continues_in_the_same_run_directory(
             "max_duration": 30,
             "repository_commit": None,
             "repository_dirty": None,
+            "objective": "inspect OIDC",
+            "objective_hash": objective_hash("inspect OIDC"),
+            "objective_goal": compile_objective_goal("inspect OIDC").as_dict(),
         },
     )
     checkpoint.write(
@@ -61,6 +66,7 @@ async def test_resume_continues_in_the_same_run_directory(
         assert resume_checkpoint.rounds == 1
         assert resume_checkpoint.runtime_metrics.model_attempts == 2
         assert config.max_rounds == 5
+        assert config.objective == "inspect OIDC"
         resumed_state.pending_questions.append("resumed")
         return AgentRunResult(
             status=ReportStatus.COMPLETE,
@@ -112,9 +118,79 @@ async def test_resume_rejects_a_changed_repository_commit(tmp_path: Path) -> Non
             "max_tokens": 100,
             "max_cost": 1.0,
             "max_duration": 30,
+            "objective": None,
+            "objective_hash": None,
+            "objective_goal": compile_objective_goal(None).as_dict(),
         },
     )
     checkpoint.write(rounds=1, tokens=1, cost=0, reason="model_error")
 
     with pytest.raises(ValueError, match="repository commit changed"):
+        await resume_analysis(run_dir)
+
+
+@pytest.mark.asyncio
+async def test_resume_rejects_tampered_objective(tmp_path: Path) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    state = create_initial_state(RepositoryBoundary(repository))
+    run_dir = tmp_path / "output" / "run-1"
+    checkpoint = CheckpointWriter(
+        run_dir / "checkpoint.json",
+        state,
+        "codex-chatgpt",
+        "gpt-5.6-luna",
+        AgentRuntimeMetrics(),
+        config={
+            "attacker_profile": "fork-pr",
+            "analysis_mode": "reasoning",
+            "max_rounds": 3,
+            "max_tokens": 100,
+            "max_cost": 1.0,
+            "max_duration": 30,
+            "objective": "inspect OIDC",
+            "objective_hash": objective_hash("inspect OIDC"),
+            "objective_goal": compile_objective_goal("inspect OIDC").as_dict(),
+        },
+    )
+    checkpoint.write(rounds=1, tokens=1, cost=0, reason="model_error")
+    payload = json.loads((run_dir / "checkpoint.json").read_text(encoding="utf-8"))
+    payload["config"]["objective"] = "inspect cache"
+    (run_dir / "checkpoint.json").write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="objective hash mismatch"):
+        await resume_analysis(run_dir)
+
+
+@pytest.mark.asyncio
+async def test_resume_rejects_tampered_compiled_objective_goal(tmp_path: Path) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    state = create_initial_state(RepositoryBoundary(repository))
+    run_dir = tmp_path / "output" / "run-1"
+    objective = "inspect OIDC"
+    checkpoint = CheckpointWriter(
+        run_dir / "checkpoint.json",
+        state,
+        "codex-chatgpt",
+        "gpt-5.6-luna",
+        AgentRuntimeMetrics(),
+        config={
+            "attacker_profile": "fork-pr",
+            "analysis_mode": "reasoning",
+            "max_rounds": 3,
+            "max_tokens": 100,
+            "max_cost": 1.0,
+            "max_duration": 30,
+            "objective": objective,
+            "objective_hash": objective_hash(objective),
+            "objective_goal": compile_objective_goal(objective).as_dict(),
+        },
+    )
+    checkpoint.write(rounds=1, tokens=1, cost=0, reason="model_error")
+    payload = json.loads((run_dir / "checkpoint.json").read_text(encoding="utf-8"))
+    payload["config"]["objective_goal"]["mechanism_hints"] = ["cache"]
+    (run_dir / "checkpoint.json").write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="compiled objective goal mismatch"):
         await resume_analysis(run_dir)

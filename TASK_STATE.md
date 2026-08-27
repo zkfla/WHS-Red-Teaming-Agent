@@ -10,7 +10,11 @@ LiteLLM provider와 공식 Codex SDK의 저장된 ChatGPT 로그인을 지원하
 아니라 같은 hackingBuddyGPT Single Agent의 LLM backend다. Codex는 분석 중 별도 대화를
 소유하지 않고, 매 판단마다 구조화된 현재 상태와 최근 Agent 이벤트만 받는다. reasoning
 Agent는 최대 8개의 근거 기반 가설, 부족한 정보와 다음 확인 대상을 bounded working memory로
-유지하며 선택한 Capability 호출과 같은 라운드에서 이를 갱신한다.
+유지하며 선택한 Capability 호출과 같은 라운드에서 이를 갱신한다. reasoning 실행은 선택적으로
+trusted 자연어 Objective를 받아 조사 목표를 좁힐 수 있으며, Objective는 system policy 아래의
+immutable run instruction으로 매 라운드 재투영되고 repository/tool 데이터와 분리된다. bounded
+deterministic Goal compiler가 source/mechanism/sink 힌트를 추출해 관련 Fact를 우선 정렬하지만
+Evidence/Relation verdict/Validator 결과를 만들거나 변경하지 않는다.
 
 ## Goal
 
@@ -89,6 +93,24 @@ AttackPath, CloudIdentityCandidate를 재현 가능하게 생성한다.
 - Windows run lease의 프로세스 생존 확인은 신호를 보내는 `os.kill(pid, 0)` 대신 Win32
   process handle과 exit code 조회를 사용한다. pytest와 Codex에 `CTRL+C`가 전파되던 문제를
   제거했다.
+- reasoning 분석에 `--objective`와 `--objective-file`을 추가했다. 파일 입력은 분석 저장소
+  밖의 trusted operator source만 허용하고 stdin은 `--objective-file -`에서만 명시적으로
+  소비한다. Objective는 16,000자 한도와 정규화를 적용하며 deterministic 모드에서는 거부한다.
+- Objective는 system prompt에 concat하지 않고 매 모델 라운드 별도 user-level instruction으로
+  투영한다. LiteLLM 경로에서는 compactable history 밖에서 재주입하고 Codex decision context는
+  `trusted_agent_instructions`, `user_objective`, untrusted `analysis_state/events`를 구분한다.
+- checkpoint에 exact Objective와 SHA-256 hash를 저장하고 resume에서 복원·검증한다. Objective
+  변경이나 hash tampering은 거부하며 report는 재현성을 위해 Objective/hash를 기록하되
+  event/fallback trace metadata와 model trace에는 원문 Objective를 반복 저장하지 않는다.
+- Objective Phase 10으로 deterministic compiled Goal을 추가했다. `fork_pr`, artifact/cache,
+  local/reusable action, secret/OIDC/runner/dependency/permission 및 credential sink 같은 제한된
+  source/mechanism/sink 힌트를 추출하고 LiteLLM/Codex decision context에 동일하게 투영한다.
+  `ListSecurityFacts`는 이 힌트와 일치하는 Relation을 stable relevance ordering으로 앞세우지만
+  Relation 내용/verdict/Evidence와 Validator semantics는 그대로 유지한다.
+- checkpoint와 `analysis.json`에 compiled Goal을 기록하고 resume에서 Objective로 다시 컴파일한
+  결과와 일치하는지 검증한다. compiled Goal tampering도 거부하며 prompt contract는 1.2로
+  올렸다. `summary.md`에는 raw Objective 전체를 복제하지 않고 bounded Objective preview/hash와
+  compact focus만 표시한다.
 
 ## Validation or Review
 
@@ -120,8 +142,8 @@ AttackPath, CloudIdentityCandidate를 재현 가능하게 생성한다.
   검증 1/1 통과.
 - `gpt-5.6-luna` GHA-01 rejected 검증: 3 rounds, 65,285 reported tokens, Capability 3회,
   반복 0회, `COMPLETE / proposal_validated`, FALSE 관계가 REJECTED로 확정되고 1/1 통과.
-- checkpoint/resume 변경 포함 전체 pytest: 136 passed, 1 skipped. skip은 Windows symlink
-  권한 조건이다.
+- Objective Goal compilation 변경 포함 전체 pytest: 159 passed, 1 skipped(160 collected).
+  skip은 Windows symlink 권한 조건이다.
 - `uv lock --check`, Ruff 및 `git diff --check`: 통과.
 - checkpoint/event journal 및 resume CLI 독립 smoke, 변경 파일 compileall·Ruff,
   `git diff --check`: 통과.
@@ -146,6 +168,9 @@ AttackPath, CloudIdentityCandidate를 재현 가능하게 생성한다.
   입력으로 사용하지 않는다.
 - 현재 `relation_id`의 semantic key는 기존 tuple과 동일하게 유지하고 provenance/scope가 실제로
   필요해질 때 키를 확장한다.
+- compiled Objective Goal은 탐색 우선순위 힌트일 뿐 보안 사실이 아니다. 사용자 Objective가
+  취약함을 가정해도 해당 힌트는 Fact/verdict/status를 생성할 수 없고 최종 판단은 기존
+  Relation/Evidence와 deterministic Validator만 수행한다.
 - 실제 외부 provider API와 비용이 필요한 검증은 자격 증명과 사용 한도가 있을 때 수행한다.
 - 다중 provider key가 있으면 `auto`로 추측하지 않고 `--provider`를 요구한다.
 - 분석 대상 저장소의 `.env`는 인증 구성으로 읽지 않는다.
@@ -158,6 +183,9 @@ AttackPath, CloudIdentityCandidate를 재현 가능하게 생성한다.
   resume 원본이다. 모델 대화 전체를 복원하지 않으며 불완전 라운드는 버리고 다시 수행한다.
 - `AnalysisState`와 canonical hackingBuddyGPT history만 상태 원본으로 둔다. Codex persistent
   thread를 추가하지 않으며, 누락된 과거 Fact는 bounded Capability로 다시 조회한다.
+- 자연어 Objective는 `AnalysisState`의 Fact가 아니라 immutable run configuration이다. system
+  policy/Validator보다 낮고 repository/tool 데이터보다 높은 trust level을 가지며 Fact extraction
+  자체를 바꾸지 않는다. resume 중 Objective 변경 대신 새 analysis run을 시작한다.
 - working memory는 추론 원문이나 최종 Finding 저장소가 아니다. 사용자에게 설명 가능한 짧은
   가설·근거·미확인 정보·다음 확인 작업만 보존하며 최종 결과 validator를 우회하지 않는다.
 - 새 ChatGPT-login Codex 실모델 검증이 필요할 때는 `gpt-5.6-luna`를 명시한다. 기본 검증은
@@ -165,9 +193,11 @@ AttackPath, CloudIdentityCandidate를 재현 가능하게 생성한다.
 
 ## Recommended Next Actions
 
-1. 대형 저장소에서 decision projection, pagination과 context compaction 입력 절감량을 측정한다.
-2. 실제 LiteLLM provider 자격 증명이 준비되면 동일한 compact Fact/proposal 경로를 검증한다.
-3. 나머지 reasoning matrix 시나리오로 탐지 종류별 회귀 범위를 넓힌다.
+1. 자연어 Objective에 맞춰 관련 Relation만 확장하는 goal-aware graph frontier Capability를 설계한다.
+2. Guard/contradiction 탐색을 제출 전 필수 검토 단계로 구조화한다.
+3. working-memory 가설 scoring/pruning과 명시적 종료 정책을 추가한다.
+4. Validator의 구조화 오류를 이용한 부분 repair loop를 구현한다.
+5. 대형 저장소와 나머지 reasoning matrix에서 Objective/context 효율과 탐지 품질을 측정한다.
 
 ## Relevant Artifacts
 
