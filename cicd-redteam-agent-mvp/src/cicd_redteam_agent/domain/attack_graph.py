@@ -21,6 +21,35 @@ COMPOSABLE_LOCAL_RELATIONS = {
     "downloads_artifact",
     "artifact_file_executed_by",
 }
+COMPOSABLE_SECURITY_RELATIONS = {
+    "controls_workflow_input",
+    "value_flows_to_env",
+    "env_value_flows_to_step_output",
+    "env_value_interpreted_as_command",
+    "output_value_interpreted_as_command",
+    "untrusted_value_interpreted_as_command",
+    "untrusted_input_reaches_execution",
+    "controls_repository_file",
+    "repository_file_executes_in",
+    "attacker_may_control_artifact_content",
+    "artifact_content_reaches_execution",
+    "artifact_content_reaches_import",
+    "attacker_may_populate_cache",
+    "cache_restores_executable_or_dependency_path",
+    "can_request_oidc_token",
+    "oidc_may_assume_cloud_identity",
+    "external_code_may_execute_in_step",
+    "mutable_reusable_workflow_may_execute_in_job",
+    "mutable_container_image_executes_in_job",
+    "mutable_install_source_executes_in_step",
+}
+EXTERNAL_DEPENDENCY_RELATIONS = {
+    "external_code_may_execute_in_step",
+    "mutable_reusable_workflow_may_execute_in_job",
+    "mutable_container_image_executes_in_job",
+    "mutable_install_source_executes_in_step",
+}
+GENERIC_SINK_RELATIONS = {"oidc_may_assume_cloud_identity"}
 
 
 @dataclass
@@ -102,6 +131,36 @@ def compose_global_attack_paths(
                 edge.evidence_ids,
                 path.status,
                 path.missing_evidence,
+            )
+
+    external_attacker_id = "attacker:external-dependency"
+    for relation in state.relations:
+        if relation.relation_type not in COMPOSABLE_SECURITY_RELATIONS:
+            continue
+        if relation.verdict is TriState.FALSE:
+            continue
+        status = (
+            FindingStatus.SUPPORTED
+            if relation.verdict is TriState.TRUE
+            else FindingStatus.CANDIDATE
+        )
+        register(
+            relation.source_id,
+            relation.relation_type,
+            relation.target_id,
+            relation.evidence_ids,
+            status,
+            relation.missing_evidence,
+        )
+        if relation.relation_type in EXTERNAL_DEPENDENCY_RELATIONS:
+            register(
+                external_attacker_id,
+                "may_compromise_mutable_dependency",
+                relation.source_id,
+                relation.evidence_ids,
+                FindingStatus.CANDIDATE,
+                ["external dependency compromise"],
+                expose_relation=True,
             )
 
     attacker_id = f"attacker:{profile.value}"
@@ -206,7 +265,11 @@ def compose_global_attack_paths(
         fact.edge.target_id
         for fact in facts.values()
         if fact.edge.relation_type
-        in {"can_access_write_github_token", "can_request_cloud_identity"}
+        in {
+            "can_access_write_github_token",
+            "can_request_cloud_identity",
+            *GENERIC_SINK_RELATIONS,
+        }
     }
     paths: list[AttackPath] = []
 
@@ -252,6 +315,7 @@ def compose_global_attack_paths(
                 continue
             walk(target, [*nodes, target], [*edges, fact])
 
-    walk(attacker_id, [attacker_id], [])
+    for source_id in (attacker_id, external_attacker_id):
+        walk(source_id, [source_id], [])
     unique_paths = {path.path_id: path for path in paths}
     return list(graph_relations.values()), list(unique_paths.values())

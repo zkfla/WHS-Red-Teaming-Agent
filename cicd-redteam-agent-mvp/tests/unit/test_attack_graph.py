@@ -92,3 +92,64 @@ jobs:
     )
 
     assert not any(path.nodes[0].startswith("attacker:") for path in report.state.paths)
+
+
+@pytest.mark.asyncio
+async def test_cache_poisoning_reaches_privileged_token_sink(tmp_path: Path) -> None:
+    report, _ = await analyze_repository(
+        FIXTURES / "reasoning-matrix" / "gha-08" / "supported",
+        AnalysisConfig(output_dir=tmp_path),
+    )
+
+    cache_paths = [
+        path
+        for path in report.state.paths
+        if path.nodes[0] == "attacker:fork-pr"
+        and path.nodes[-1].startswith("credential:github-token:")
+        and "cache_restores_executable_or_dependency_path"
+        in {edge.relation_type for edge in path.edges}
+    ]
+
+    assert cache_paths
+    assert all(path.status is FindingStatus.SUPPORTED for path in cache_paths)
+
+
+@pytest.mark.asyncio
+async def test_mutable_action_is_candidate_path_to_token(tmp_path: Path) -> None:
+    report, _ = await analyze_repository(
+        FIXTURES / "gha-04-mutable-action" / "vulnerable",
+        AnalysisConfig(output_dir=tmp_path),
+    )
+
+    paths = [
+        path
+        for path in report.state.paths
+        if path.nodes[0] == "attacker:external-dependency"
+        and path.nodes[-1].startswith("credential:github-token:")
+    ]
+
+    assert paths
+    assert all(path.status is FindingStatus.CANDIDATE for path in paths)
+    assert all("external dependency compromise" in path.missing_evidence for path in paths)
+
+
+@pytest.mark.asyncio
+async def test_oidc_path_preserves_unknown_cloud_trust(tmp_path: Path) -> None:
+    report, _ = await analyze_repository(
+        FIXTURES / "oidc-risk",
+        AnalysisConfig(output_dir=tmp_path),
+    )
+
+    paths = [
+        path
+        for path in report.state.paths
+        if path.nodes[0] == "attacker:fork-pr"
+        and "oidc_may_assume_cloud_identity"
+        in {edge.relation_type for edge in path.edges}
+    ]
+
+    assert paths
+    assert all(path.status is FindingStatus.CANDIDATE for path in paths)
+    assert all(
+        any("trust policy" in item for item in path.missing_evidence) for path in paths
+    )

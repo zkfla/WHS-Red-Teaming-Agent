@@ -36,6 +36,14 @@ handoffs, warnings and status interpretation. Evidence references include their 
 source path and line range. Repository and model-derived text is Markdown-escaped before rendering.
 `analysis.json` remains the canonical machine-readable contract.
 
+Global paths are shown in deterministic review order: supported paths first, then fewer missing
+Evidence items, fewer applicable guards and shorter paths. The Markdown report derives remediation
+guidance from relation types without changing the version 1.0 JSON schema.
+
+Matrix evaluation writes `matrix-evaluation/evaluation.json` and `evaluation.md`. The scorecard
+contains Fact extraction completeness, status accuracy, missing-Evidence preservation, safe-variant
+false-positive checks and separately measured deterministic/reasoning wall time.
+
 `auto` accepts exactly one configured provider key. More than one key requires explicit
 `--provider`; provider/model prefix conflicts are configuration errors. Process variables take
 precedence over `.env`. Automatic `.env` discovery never loads a file inside the analyzed

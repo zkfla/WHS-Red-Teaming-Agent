@@ -1,0 +1,140 @@
+# 프로토타입 구현 현황
+
+> **현재 상태를 판단하는 기준 문서**
+>
+> 최종 확인일: 2026-08-28 · 대상 버전: `0.1.0`
+
+CI/CD Red Team Agent는 로컬 GitHub Actions 저장소를 실행하지 않고 분석해, 공격자 입력에서
+쓰기 권한 `GITHUB_TOKEN` 또는 Cloud Identity 후보까지 이어지는 경로를 Evidence와 함께
+제시하는 기술 검증용 프로토타입입니다.
+
+## 프로토타입이 하는 일
+
+```text
+Local repository path
+        ↓
+Workflow / Job / Step parser
+        ↓
+Fact / Relation / Guard / Evidence extraction
+        ↓
+deterministic graph or optional LLM reasoning
+        ↓
+deterministic validator
+        ↓
+analysis.json + summary.md + trace.jsonl
+```
+
+- GitHub Actions YAML, local action, reusable workflow, script 참조를 정적으로 분석합니다.
+- PR 입력, 저장소 파일, Artifact, Cache, 외부 의존성 등의 공격자 통제 가능성을 구분합니다.
+- Token, Secret reference, OIDC 및 Cloud Identity 후보와 연결된 경로를 만듭니다.
+- 로컬 근거가 부족한 외부·실행 시점 상태는 `UNKNOWN`으로 유지합니다.
+- LLM은 Fact를 연결해 제안하고, 최종 판정은 코드 Validator가 수행합니다.
+
+## 구현 범위
+
+| 기능 | 상태 | 현재 범위 |
+|---|---|---|
+| Workflow·Job·Step 파싱 | 완료 | Trigger, permission, environment, runner, action 및 script |
+| Evidence와 저장소 경계 | 완료 | 줄 번호, redaction, 크기·경로·검색 제한 |
+| PR 입력·파일 통제 분석 | 완료 | `fork-pr`, `repo-writer` attacker profile |
+| GitHub Token 경로 | 완료 | 공격자 통제 실행에서 write-capable Token까지 연결 |
+| Artifact 경로 | 완료 | PR 생산 → 특권 workflow 다운로드·실행 → Token |
+| Cache 경로 | 완료 | PR 오염 가능 Cache → 특권 Job 복원 → Token |
+| Mutable dependency 경로 | 완료 | 외부 Action·workflow·image·install source를 Candidate로 연결 |
+| OIDC·Cloud Identity | 완료 | OIDC 요청 → Identity 후보, 외부 Trust Policy는 `UNKNOWN` |
+| Secret 흐름 | 부분 구현 | env, shell, output, file, artifact, 외부 action Fact 추출 |
+| Reusable workflow | 부분 구현 | 호출·권한 경계 Fact 추출, 외부 유효 권한은 `UNKNOWN` |
+| Self-hosted Runner | 부분 구현 | 공유·잔존 가능성 Fact 추출, 실제 격리 상태는 `UNKNOWN` |
+| Environment protection | 부분 구현 | Environment 사용 감지, 실제 승인 설정은 `UNKNOWN` |
+| 검토 우선순위·수정 방향 | 완료 | 전역 경로 정렬과 Relation 기반 권장 조치 표시 |
+| Reasoning matrix 평가 | 완료 | 10개 그룹 × 3개 variant의 정확도·시간 표 자동 생성 |
+| GitHub·Cloud API 연동 | 미구현 | 로컬 파일만 분석 |
+| Audit log·실제 Runner 조사 | 미구현 | 실행 환경과 과거 이벤트를 조회하지 않음 |
+| Production·Kubernetes 영향 검증 | 미구현 | Token과 Cloud Identity 후보를 최종 sink로 사용 |
+| 실제 공격·배포 실행 | 미구현 | 프로토타입 안전 경계상 의도적으로 제외 |
+
+## 데모 핵심 시나리오
+
+| 시나리오 | 기대 결과 | 대표 fixture |
+|---|---|---|
+| PR Shell Injection | 직접 명령 해석을 `SUPPORTED`, 안전한 env 전달을 차단 경로로 구분 | `gha-01-shell-injection` |
+| `pull_request_target` PR 코드 실행 | Checkout provenance에 따라 `SUPPORTED/CANDIDATE` | `pr-target-controlled`, `pr-target-unknown` |
+| Artifact 특권 Workflow 실행 | PR Artifact에서 write Token까지 전역 경로 | `gha-03-artifact-trust` |
+| Mutable external Action + Token | 외부 compromise가 필요한 `CANDIDATE` 경로 | `gha-04-mutable-action` |
+| Cache poisoning | PR Cache에서 특권 Job write Token까지 전역 경로 | `reasoning-matrix/gha-08` |
+| OIDC + Cloud Identity | OIDC 요청과 Role 후보를 연결하고 Trust Policy는 `UNKNOWN` | `oidc-risk` |
+
+Secret, reusable workflow, self-hosted Runner는 프로토타입에서 Fact 추출과
+`CANDIDATE/UNKNOWN` 설명 범위로 제한합니다.
+
+## 현재 한계
+
+- GitHub URL을 직접 clone하지 않습니다. 사용자가 준비한 로컬 저장소 경로가 필요합니다.
+- branch protection, repository 기본 권한, Environment approval은 로컬 YAML만으로 확정할
+  수 없습니다.
+- AWS·Azure·GCP Trust Policy와 실제 Role assumption 성공 여부를 조회하지 않습니다.
+- Mutable dependency는 실제 침해가 아니라 외부 compromise를 전제로 한 Candidate입니다.
+- 정적 분석 결과는 실제 악용을 증명하지 않으므로 `CONFIRMED`를 사용하지 않습니다.
+- 지원하지 않는 동적 YAML 표현, 복잡한 JavaScript 및 런타임 생성 파일은 `UNKNOWN`이 될 수
+  있습니다.
+
+## 실행 명령
+
+### 분석 대상 준비
+
+```powershell
+git clone https://github.com/example/project.git C:\analysis-targets\project
+```
+
+### LLM 없는 deterministic 분석
+
+```powershell
+uv run cicd-agent analyze C:\analysis-targets\project --output .\output
+```
+
+### ChatGPT 로그인 기반 reasoning 분석
+
+```powershell
+codex login
+uv run cicd-agent analyze C:\analysis-targets\project `
+  --output .\output `
+  --provider codex-chatgpt
+```
+
+### 30개 reasoning fixture 평가
+
+```powershell
+uv run cicd-agent evaluate tests/fixtures/reasoning-matrix `
+  --output output/evaluation `
+  --provider codex-chatgpt
+```
+
+평가 후 `matrix-evaluation/evaluation.json`과 `evaluation.md`에 Fact 추출, 상태 정확도,
+`missing_evidence` 보존, 안전 variant 오탐 및 deterministic/reasoning 시간을 기록합니다.
+30개 reasoning case는 실제 모델 호출을 포함하므로 사용량과 실행 시간을 확인한 뒤 실행합니다.
+
+## 데모 절차
+
+1. 의존성을 설치합니다: `uv sync`
+2. 핵심 복합 fixture를 분석합니다.
+
+   ```powershell
+   uv run cicd-agent analyze tests/fixtures/global-chain --output output/demo
+   ```
+
+3. 출력된 run 디렉터리의 `summary.md`를 엽니다.
+4. 분석 범위와 판정 분포를 확인합니다.
+5. Global attack path의 검토 우선순위, Evidence 위치, missing Evidence를 설명합니다.
+6. `GITHUB_TOKEN` 및 Cloud Identity 경로의 권장 조치를 확인합니다.
+7. `analysis.json`에서 동일한 Evidence와 Relation이 구조화되어 있는지 확인합니다.
+
+## 프로토타입 완료 기준
+
+- 위 6개 핵심 시나리오가 회귀 테스트로 고정되어 있습니다.
+- 공격 경로가 기존 Relation과 Evidence만 참조합니다.
+- `UNKNOWN`과 `FALSE`가 각각 Candidate와 Rejected 규칙을 지킵니다.
+- CLI 명령 하나로 동일한 fixture 분석을 재현할 수 있습니다.
+- 보고서가 우선순위, 근거 위치, 추가 확인 항목과 수정 방향을 제공합니다.
+- 평가 결과가 JSON과 Markdown 표로 자동 저장됩니다.
+
+이 범위를 넘는 API 연동, GUI, 실제 공격 실행 및 다중 CI 제품 지원은 프로토타입 이후 작업입니다.

@@ -144,6 +144,7 @@ label은 parser, Agent capability, prompt에 전달되지 않습니다.
 
 | 문서 | 이런 때 읽으세요 |
 |---|---|
+| [Implementation status](docs/IMPLEMENTATION_STATUS.md) | 현재 완료·부분·미구현 범위와 데모 절차를 확인할 때 |
 | [Architecture](docs/ARCHITECTURE.md) | 처리 파이프라인과 모듈 경계를 이해할 때 |
 | [Public contracts](docs/CONTRACTS.md) | CLI, 출력 schema, 종료 조건을 구현하거나 연동할 때 |
 | [Testing](docs/TESTING.md) | 테스트 범위와 release check를 확인할 때 |
