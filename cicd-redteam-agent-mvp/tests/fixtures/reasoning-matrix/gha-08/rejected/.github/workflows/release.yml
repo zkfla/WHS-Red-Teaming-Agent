@@ -1,0 +1,12 @@
+name: Isolated release cache
+on: workflow_dispatch
+permissions:
+  contents: write
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/cache@2222222222222222222222222222222222222222
+        with:
+          path: .cache/release-data
+          key: release-data-v1

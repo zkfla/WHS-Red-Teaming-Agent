@@ -10,7 +10,16 @@ cicd-agent analyze <repo-path> --output <dir>
   [--env-file <trusted-env-path>]
   [--attacker-profile fork-pr|repo-writer]
   [--max-rounds N] [--max-tokens N] [--max-cost N] [--max-duration N]
+
+cicd-agent evaluate <matrix-path> --output <dir>
+  [--model <litellm-model>] [--provider ...]
+  [--scenario gha-01] [--variant supported|candidate|rejected]
+  [--max-rounds N] [--max-tokens N] [--max-cost N] [--max-duration N]
 ```
+
+`evaluate` always uses reasoning mode. It analyzes repositories before loading each adjacent hidden
+oracle, writes ordinary per-run reports, and emits `matrix-evaluation/evaluation.json`. Fixture GHA
+labels and expected states are never passed to the Agent.
 
 Exit codes are `0` COMPLETE, `2` input/configuration error, `3` framework/model initialization
 error, `4` PARTIAL and `5` internal validation failure.
@@ -37,7 +46,12 @@ because the SDK does not report per-run currency cost.
   Relation's source/type/target and carry its Evidence.
 - `SUPPORTED` paths cannot contain `UNKNOWN` or `FALSE` relations or non-empty missing evidence.
 - Candidate paths must preserve the missing evidence declared by uncertain relations.
+- A path containing a `FALSE` relation must be `REJECTED`.
+- A path-level Evidence set must contain every Evidence ID carried by its edges.
 - Static paths cannot be `CONFIRMED`.
+- A `SUPPORTED` Finding requires an Evidence-linked `SUPPORTED` path in the same proposal.
+- Proposed cloud identities must match an extracted repository/workflow/job/provider/mechanism
+  candidate and preserve its Evidence.
 - Duplicate IDs are rejected, including collisions with existing state.
 - A rejected proposal does not mutate state.
 - A successful `submit_analysis` may occur only once.

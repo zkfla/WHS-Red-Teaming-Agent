@@ -10,6 +10,8 @@
 | GHA-06 | `oidc-risk/` | Existing MVP creates an AWS identity candidate; IAM trust remains `UNKNOWN` |
 | Inference-01 | `inference-flow/` | Generic input, env, output, execution and credential facts; no scenario-specific Finding rule |
 | Inference-Blind | `inference-blind/` | Generic repository-file execution facts connect a PR-controlled local action to a token sink |
+| GHA-01..10 matrix | `reasoning-matrix/` | Evaluation-only labels with three variants per major scenario group; no product dispatch |
+| Blind composite | `blind-composite/` | Fork PR -> local action -> artifact/cache -> privileged workflow -> Token/OIDC |
 
 Each newly added scenario has `vulnerable/` and `secure/` repositories plus an
 `expected.json` oracle. `CANDIDATE` means the local configuration is risky but an

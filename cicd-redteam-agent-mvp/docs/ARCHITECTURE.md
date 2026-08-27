@@ -59,6 +59,17 @@ path. The validator grounds each edge by `relation_id`, checks its source/type/t
 and rejects a `SUPPORTED` path containing an `UNKNOWN` or `FALSE` relation. GHA fixture IDs remain
 evaluation labels rather than product rule identifiers.
 
+The reusable extractor covers event inputs, job/step environments, step outputs, repository files,
+local actions, reusable workflows, artifacts, caches, shell/import/network sinks, granular token
+permissions, Secret flows, AWS/GCP/Azure identity access, mutable dependencies, runner persistence
+and concrete guard application. A guard that locally negates a flow produces a `FALSE` execution
+relation; uncertain external state remains `UNKNOWN` with an explicit missing-Evidence list.
+
+The evaluation matrix lives only under `tests/fixtures/reasoning-matrix`. Its GHA labels and oracles
+are loaded after analysis and are never visible to the parser, fact extractor, Agent capabilities or
+prompt. A separate unlabeled blind fixture combines a fork PR, local action, artifact/cache,
+privileged workflow and GitHub Token/OIDC sinks.
+
 Deterministic and reasoning modes share parsing, Evidence and reusable fact extraction, then diverge
 at conclusion generation. Deterministic mode keeps the legacy scenario rules and global composer for
 fast/reproducible analysis. Reasoning mode does not prepopulate or expose deterministic Findings or
@@ -78,7 +89,8 @@ The `domain` package must not import hackingBuddyGPT or the framework package.
 
 ## Scenario policy
 
-Individual scenarios may emit local Findings and paths when their complete local condition is met.
-A hardening fact alone is not automatically an attack path. In particular, a mutable external
-action ref requires a privileged job context before it may become a `CANDIDATE`; upstream compromise
-remains unverified.
+Legacy deterministic mode retains its small regression rule set. New GHA expansion work must not add
+scenario-ID dispatch or scenario-specific Finding rules: it adds only reusable facts, relations,
+guards and Evidence. A hardening fact alone is not automatically an attack path. In particular, a
+mutable external action ref requires a connected privileged context before it may become a
+`CANDIDATE`; upstream compromise remains unverified.

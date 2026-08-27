@@ -1,0 +1,15 @@
+name: Effective allowlist
+on: pull_request
+permissions:
+  contents: write
+jobs:
+  guarded:
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          COMMAND: ${{ github.event.pull_request.title }}
+        run: |
+          case "$COMMAND" in
+            lint|test) bash -c "$COMMAND" ;;
+            *) exit 1 ;;
+          esac

@@ -1,0 +1,13 @@
+name: Event input candidates
+on: [issue_comment, issues, release]
+permissions:
+  contents: write
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          COMMENT: ${{ github.event.comment.body }}
+          ISSUE: ${{ github.event.issue.title }}
+          RELEASE: ${{ github.event.release.body }}
+        run: bash -c "$COMMENT $ISSUE $RELEASE"

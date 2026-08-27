@@ -1,0 +1,25 @@
+{
+  "scenario_ids": ["GHA-02B", "GHA-02C", "GHA-02D", "GHA-02E"],
+  "variants": {
+    "supported": {
+      "expected_status": "SUPPORTED",
+      "required_relations": [
+        ["controls_repository_file", "TRUE"],
+        ["repository_file_executes_in", "TRUE"],
+        ["calls_reusable_workflow", "TRUE"],
+        ["selects_pull_request_revision", "TRUE"]
+      ]
+    },
+    "candidate": {
+      "expected_status": "CANDIDATE",
+      "required_relations": [
+        ["controls_workflow_input", "UNKNOWN"],
+        ["untrusted_input_selects_checkout_revision", "TRUE"]
+      ]
+    },
+    "rejected": {
+      "expected_status": "REJECTED",
+      "forbidden_relations": ["controls_workflow_input", "controls_repository_file"]
+    }
+  }
+}

@@ -1,0 +1,11 @@
+name: PR cache producer
+on: pull_request
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/cache@1111111111111111111111111111111111111111
+        with:
+          path: node_modules
+          key: shared-dependencies-v1
+      - run: npm test

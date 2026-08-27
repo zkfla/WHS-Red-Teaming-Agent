@@ -1,0 +1,30 @@
+{
+  "scenario_ids": ["GHA-09A", "GHA-09B", "GHA-09C", "GHA-09D"],
+  "variants": {
+    "supported": {
+      "expected_status": "CANDIDATE",
+      "path_relations": ["runner_process_or_file_state_may_reach_privileged_job"],
+      "required_relations": [
+        ["attacker_code_executes_on_self_hosted_runner", "UNKNOWN"],
+        ["runner_process_or_file_state_may_reach_privileged_job", "UNKNOWN"],
+        ["workspace_may_be_reused_by_privileged_job", "UNKNOWN"],
+        ["runner_state_may_reach_job", "UNKNOWN"]
+      ]
+    },
+    "candidate": {
+      "expected_status": "CANDIDATE",
+      "required_relations": [
+        ["uses_self_hosted_runner", "UNKNOWN"],
+        ["runner_state_may_reach_job", "UNKNOWN"]
+      ]
+    },
+    "rejected": {
+      "expected_status": "REJECTED",
+      "forbidden_relations": [
+        "uses_self_hosted_runner",
+        "runner_state_may_reach_job",
+        "runner_process_or_file_state_may_reach_privileged_job"
+      ]
+    }
+  }
+}

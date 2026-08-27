@@ -1,0 +1,33 @@
+{
+  "scenario_ids": ["GHA-07A", "GHA-07B", "GHA-07C", "GHA-07D", "GHA-07E"],
+  "variants": {
+    "supported": {
+      "expected_status": "SUPPORTED",
+      "required_relations": [
+        ["secret_reaches_shell_argument", "TRUE"],
+        ["secret_passed_to_external_action", "TRUE"],
+        ["secret_written_to_file", "TRUE"],
+        ["file_uploaded_as_artifact", "TRUE"],
+        ["secret_reaches_step_output", "TRUE"],
+        ["secret_reaches_external_send", "TRUE"]
+      ]
+    },
+    "candidate": {
+      "expected_status": "CANDIDATE",
+      "required_relations": [
+        ["external_code_may_execute_in_step", "UNKNOWN"],
+        ["secret_passed_to_external_action", "TRUE"]
+      ]
+    },
+    "rejected": {
+      "expected_status": "REJECTED",
+      "required_relations": [["secret_passed_to_external_action", "TRUE"]],
+      "forbidden_relations": [
+        "secret_reaches_external_send",
+        "secret_reaches_step_output",
+        "secret_may_reach_log",
+        "secret_written_to_file"
+      ]
+    }
+  }
+}

@@ -81,6 +81,7 @@ class Step(SchemaModel):
     step_id: str
     step_key: str | None = None
     name: str | None = None
+    condition: str | None = None
     uses: str | None = None
     run: str | None = None
     shell: str | None = None
@@ -96,6 +97,8 @@ class Job(SchemaModel):
     with_: dict[str, Any] = Field(default_factory=dict, alias="with")
     needs: list[str] = Field(default_factory=list)
     condition: str | None = None
+    env: dict[str, str] = Field(default_factory=dict)
+    outputs: dict[str, Any] = Field(default_factory=dict)
     runs_on: str | list[str] | dict[str, Any] | None = None
     container: str | dict[str, Any] | None = None
     permissions_declared: dict[str, str] | str | None = None

@@ -1,0 +1,17 @@
+name: Consume artifact
+on:
+  workflow_run:
+    workflows: [PR artifact build]
+    types: [completed]
+permissions:
+  contents: write
+jobs:
+  consume:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@2222222222222222222222222222222222222222
+        with:
+          name: payload
+          path: .
+          run-id: ${{ github.event.workflow_run.id }}
+      - run: python payload/tool.py

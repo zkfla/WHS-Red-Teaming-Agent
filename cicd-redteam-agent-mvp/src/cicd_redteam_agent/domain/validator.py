@@ -52,7 +52,9 @@ def validate_analysis_proposal(
         if unknown_nodes:
             errors.append(f"AttackPath {path.path_id} has unknown nodes: {sorted(unknown_nodes)}")
         contains_unknown_relation = False
+        contains_false_relation = False
         relation_missing_evidence: set[str] = set()
+        edge_evidence: set[str] = set()
         for index, edge in enumerate(path.edges):
             if index + 1 >= len(path.nodes) or (
                 edge.source_id != path.nodes[index]
@@ -62,6 +64,7 @@ def validate_analysis_proposal(
                     f"AttackPath {path.path_id} contains an edge outside its ordered sequence"
                 )
             missing = set(edge.evidence_ids) - known_evidence
+            edge_evidence.update(edge.evidence_ids)
             if missing:
                 errors.append(f"AttackPath edge references unknown evidence: {sorted(missing)}")
             matches = known_relations.get(edge.relation_id, [])
@@ -96,16 +99,29 @@ def validate_analysis_proposal(
                     f"{required}"
                 )
             for relation in matching_shape:
-                if relation.verdict.value != "TRUE":
+                if relation.verdict.value == "UNKNOWN":
                     contains_unknown_relation = True
                     relation_missing_evidence.update(relation.missing_evidence)
-        if path.status is FindingStatus.SUPPORTED and contains_unknown_relation:
+                elif relation.verdict.value == "FALSE":
+                    contains_false_relation = True
+        if path.status is FindingStatus.SUPPORTED and (
+            contains_unknown_relation or contains_false_relation
+        ):
             errors.append(
                 f"AttackPath {path.path_id} cannot be SUPPORTED with UNKNOWN/FALSE relations"
+            )
+        if contains_false_relation and path.status is not FindingStatus.REJECTED:
+            errors.append(
+                f"AttackPath {path.path_id} with a FALSE relation must be REJECTED"
             )
         if path.status is FindingStatus.SUPPORTED and path.missing_evidence:
             errors.append(
                 f"AttackPath {path.path_id} cannot be SUPPORTED with missing_evidence"
+            )
+        if not edge_evidence.issubset(path.evidence_ids):
+            errors.append(
+                f"AttackPath {path.path_id} omits edge evidence: "
+                f"{sorted(edge_evidence - set(path.evidence_ids))}"
             )
         if relation_missing_evidence and not relation_missing_evidence.issubset(
             set(path.missing_evidence)
@@ -115,9 +131,19 @@ def validate_analysis_proposal(
                 f"{sorted(relation_missing_evidence)}"
             )
     for finding in proposal.findings:
+        if finding.status is FindingStatus.CONFIRMED:
+            errors.append(f"Static prototype forbids CONFIRMED finding {finding.finding_id}")
         if finding.status is FindingStatus.SUPPORTED and finding.missing_evidence:
             errors.append(
                 f"Finding {finding.finding_id} cannot be SUPPORTED with missing_evidence"
+            )
+        if finding.status is FindingStatus.SUPPORTED and not any(
+            path.status is FindingStatus.SUPPORTED
+            and bool(set(path.evidence_ids) & set(finding.evidence_ids))
+            for path in proposal.paths
+        ):
+            errors.append(
+                f"Finding {finding.finding_id} requires an evidence-linked SUPPORTED path"
             )
     for identity in proposal.identities:
         if identity.repository_id != state.repository.repository_id:
@@ -126,6 +152,30 @@ def validate_analysis_proposal(
             errors.append(f"Cloud identity {identity.identity_id} references an unknown workflow")
         if identity.job_id not in known_jobs:
             errors.append(f"Cloud identity {identity.identity_id} references an unknown job")
+        candidates = [
+            item
+            for item in state.identities
+            if item.repository_id == identity.repository_id
+            and item.workflow_id == identity.workflow_id
+            and item.job_id == identity.job_id
+            and item.provider == identity.provider
+            and item.mechanism == identity.mechanism
+        ]
+        if not candidates:
+            errors.append(
+                f"Cloud identity {identity.identity_id} is not grounded in an extracted candidate"
+            )
+        elif identity.identity_id not in {item.identity_id for item in candidates}:
+            errors.append(
+                f"Cloud identity {identity.identity_id} changes an extracted candidate ID"
+            )
+        elif not any(
+            set(candidate.evidence_ids).issubset(identity.evidence_ids)
+            for candidate in candidates
+        ):
+            errors.append(
+                f"Cloud identity {identity.identity_id} omits extracted identity evidence"
+            )
     if len({item.finding_id for item in proposal.findings}) != len(proposal.findings):
         errors.append("Duplicate finding IDs")
     if len({item.path_id for item in proposal.paths}) != len(proposal.paths):

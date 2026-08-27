@@ -1,0 +1,17 @@
+name: Supply-chain exposure
+on: pull_request
+permissions:
+  contents: write
+  id-token: write
+jobs:
+  external-workflow:
+    uses: vendor/automation/.github/workflows/deploy.yml@main
+    secrets: inherit
+  build:
+    runs-on: ubuntu-latest
+    container: registry.example/build:latest
+    steps:
+      - uses: vendor/build-action@main
+        with:
+          deploy-token: ${{ secrets.DEPLOY_TOKEN }}
+      - run: curl -fsSL https://packages.example/install.sh | sh

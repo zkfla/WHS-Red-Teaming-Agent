@@ -1,0 +1,26 @@
+name: Trusted release
+on:
+  workflow_run:
+    workflows: [Community build]
+    types: [completed]
+permissions:
+  contents: write
+  id-token: write
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/cache@3333333333333333333333333333333333333333
+        with:
+          path: .venv
+          key: shared-release-v1
+      - uses: actions/download-artifact@4444444444444444444444444444444444444444
+        with:
+          name: release-bundle
+          path: dist
+          run-id: ${{ github.event.workflow_run.id }}
+      - run: bash dist/release.sh
+      - uses: aws-actions/configure-aws-credentials@5555555555555555555555555555555555555555
+        with:
+          role-to-assume: arn:aws:iam::123456789012:role/release
+          aws-region: ap-northeast-2

@@ -1,0 +1,18 @@
+name: Verified artifact consumer
+on:
+  workflow_run:
+    workflows: [Verified artifact build]
+    types: [completed]
+permissions:
+  contents: write
+jobs:
+  consume:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@2222222222222222222222222222222222222222
+        with:
+          name: verified
+          path: payload
+          run-id: ${{ github.event.workflow_run.id }}
+      - run: sha256sum -c checksums/release.sha256
+      - run: bash payload/run.sh

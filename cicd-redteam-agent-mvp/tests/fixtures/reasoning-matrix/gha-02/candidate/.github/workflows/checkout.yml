@@ -1,0 +1,12 @@
+name: Dynamic checkout candidate
+on: workflow_dispatch
+permissions:
+  contents: write
+jobs:
+  checkout:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@1111111111111111111111111111111111111111
+        with:
+          ref: ${{ inputs.revision }}
+      - run: ./scripts/build.sh

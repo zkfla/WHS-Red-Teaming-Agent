@@ -1,0 +1,32 @@
+{
+  "scenario_ids": ["GHA-04B", "GHA-04C", "GHA-04D", "GHA-04E", "GHA-04F"],
+  "variants": {
+    "supported": {
+      "expected_status": "CANDIDATE",
+      "required_relations": [
+        ["external_code_may_execute_in_step", "UNKNOWN"],
+        ["mutable_reusable_workflow_may_execute_in_job", "UNKNOWN"],
+        ["mutable_container_image_executes_in_job", "UNKNOWN"],
+        ["mutable_install_source_executes_in_step", "UNKNOWN"],
+        ["secret_passed_to_external_action", "TRUE"],
+        ["can_request_oidc_token", "TRUE"]
+      ]
+    },
+    "candidate": {
+      "expected_status": "CANDIDATE",
+      "required_relations": [
+        ["external_code_may_execute_in_step", "UNKNOWN"],
+        ["github_token_permission_unknown", "UNKNOWN"]
+      ]
+    },
+    "rejected": {
+      "expected_status": "REJECTED",
+      "forbidden_relations": [
+        "external_code_may_execute_in_step",
+        "mutable_reusable_workflow_may_execute_in_job",
+        "mutable_container_image_executes_in_job",
+        "mutable_install_source_executes_in_step"
+      ]
+    }
+  }
+}

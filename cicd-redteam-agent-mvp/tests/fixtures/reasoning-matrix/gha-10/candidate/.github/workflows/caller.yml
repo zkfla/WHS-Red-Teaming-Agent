@@ -1,0 +1,11 @@
+name: Protected reusable caller
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  deploy:
+    uses: ./.github/workflows/deploy.yml
+    with:
+      target: ${{ inputs.target }}
+    permissions:
+      contents: read

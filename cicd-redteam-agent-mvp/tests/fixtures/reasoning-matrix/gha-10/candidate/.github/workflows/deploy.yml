@@ -1,0 +1,14 @@
+name: Protected reusable deploy
+on:
+  workflow_call:
+    inputs:
+      target:
+        type: string
+permissions:
+  contents: write
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - run: echo deploy

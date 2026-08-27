@@ -1,0 +1,14 @@
+name: Shared runner chain
+on: pull_request
+jobs:
+  pr-build:
+    runs-on: [self-hosted, linux, build]
+    steps:
+      - uses: ./actions/build
+  publish:
+    needs: pr-build
+    runs-on: [self-hosted, linux, build]
+    permissions:
+      contents: write
+    steps:
+      - run: ./scripts/publish.sh

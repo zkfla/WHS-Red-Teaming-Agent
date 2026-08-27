@@ -1,0 +1,30 @@
+{
+  "scenario_ids": ["GHA-08A", "GHA-08B", "GHA-08C", "GHA-08D"],
+  "variants": {
+    "supported": {
+      "expected_status": "SUPPORTED",
+      "required_relations": [
+        ["attacker_may_populate_cache", "TRUE"],
+        ["cache_producer_reaches_privileged_consumer", "TRUE"],
+        ["cache_restored_by_privileged_job", "TRUE"],
+        ["cache_restores_executable_or_dependency_path", "TRUE"]
+      ]
+    },
+    "candidate": {
+      "expected_status": "CANDIDATE",
+      "required_relations": [
+        ["writes_cache", "UNKNOWN"],
+        ["broad_restore_key_may_select_cache", "UNKNOWN"]
+      ]
+    },
+    "rejected": {
+      "expected_status": "REJECTED",
+      "path_relations": ["cache_producer_reaches_privileged_consumer"],
+      "forbidden_relations": [
+        "cache_producer_reaches_privileged_consumer",
+        "cache_restored_by_privileged_job",
+        "cache_restores_executable_or_dependency_path"
+      ]
+    }
+  }
+}

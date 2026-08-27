@@ -1,0 +1,29 @@
+{
+  "scenario_ids": ["GHA-10A", "GHA-10B", "GHA-10C", "GHA-10D", "GHA-10E"],
+  "variants": {
+    "supported": {
+      "expected_status": "CANDIDATE",
+      "path_relations": ["actor_or_event_guard_effectiveness_unknown"],
+      "required_relations": [
+        ["actor_or_event_guard_effectiveness_unknown", "UNKNOWN"],
+        ["label_or_comment_controls_job_condition", "UNKNOWN"]
+      ]
+    },
+    "candidate": {
+      "expected_status": "CANDIDATE",
+      "required_relations": [
+        ["environment_protection_unknown", "UNKNOWN"],
+        ["reusable_workflow_permission_boundary_unknown", "UNKNOWN"],
+        ["calls_reusable_workflow", "TRUE"]
+      ]
+    },
+    "rejected": {
+      "expected_status": "REJECTED",
+      "required_relations": [
+        ["validates_value_with_allowlist", "TRUE"],
+        ["env_value_interpreted_as_command", "FALSE"],
+        ["guard_blocks_untrusted_execution", "TRUE"]
+      ]
+    }
+  }
+}

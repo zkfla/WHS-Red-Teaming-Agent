@@ -210,7 +210,16 @@ def parse_workflow(boundary: RepositoryBoundary, relative_path: str) -> Workflow
         )
         evidence[job_ev.evidence_id] = job_ev
         job_evidence_ids = [job_ev.evidence_id]
-        for field_name in ("uses", "with", "if", "environment", "runs-on", "container"):
+        for field_name in (
+            "uses",
+            "with",
+            "if",
+            "env",
+            "outputs",
+            "environment",
+            "runs-on",
+            "container",
+        ):
             if raw_job.get(field_name) is None:
                 continue
             field_line = _mapping_key_line(raw_job, field_name, job_line)
@@ -284,7 +293,7 @@ def parse_workflow(boundary: RepositoryBoundary, relative_path: str) -> Workflow
             evidence[step_ev.evidence_id] = step_ev
             step_evidence_ids = [step_ev.evidence_id]
             field_evidence: dict[str, str] = {}
-            for field_name in ("uses", "run", "with", "env"):
+            for field_name in ("uses", "run", "with", "env", "if"):
                 if raw_step.get(field_name) is None:
                     continue
                 field_line = _mapping_key_line(raw_step, field_name, step_line)
@@ -322,6 +331,9 @@ def parse_workflow(boundary: RepositoryBoundary, relative_path: str) -> Workflow
                     else None
                 ),
                 name=redact(str(raw_step["name"])) if raw_step.get("name") is not None else None,
+                condition=(
+                    redact(str(raw_step["if"])) if raw_step.get("if") is not None else None
+                ),
                 uses=uses,
                 run=run,
                 shell=str(raw_step["shell"]) if raw_step.get("shell") is not None else None,
@@ -353,6 +365,11 @@ def parse_workflow(boundary: RepositoryBoundary, relative_path: str) -> Workflow
                 **{"with": {str(k): _plain(v) for k, v in (raw_job.get("with") or {}).items()}},
                 needs=needs,
                 condition=redact(str(raw_job["if"])) if raw_job.get("if") is not None else None,
+                env={key: redact(value) for key, value in raw_job_env.items()},
+                outputs={
+                    str(k): _redacted_plain(v)
+                    for k, v in (raw_job.get("outputs") or {}).items()
+                },
                 runs_on=_redacted_plain(raw_job.get("runs-on")),
                 container=_redacted_plain(raw_job.get("container")),
                 permissions_declared=declared,

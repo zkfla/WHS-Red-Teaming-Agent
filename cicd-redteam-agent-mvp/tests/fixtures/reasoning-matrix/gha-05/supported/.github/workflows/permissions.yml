@@ -1,0 +1,14 @@
+name: Granular token permissions
+on: pull_request
+permissions:
+  contents: read
+jobs:
+  mutate:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      actions: write
+      packages: write
+    steps:
+      - run: bash -c "${{ github.event.pull_request.title }}"

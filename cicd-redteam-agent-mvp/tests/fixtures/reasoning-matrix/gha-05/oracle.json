@@ -1,0 +1,29 @@
+{
+  "scenario_ids": ["GHA-05B", "GHA-05C", "GHA-05D", "GHA-05E", "GHA-05F", "GHA-05G"],
+  "variants": {
+    "supported": {
+      "expected_status": "SUPPORTED",
+      "required_relations": [
+        ["can_use_github_token_contents_write", "TRUE"],
+        ["can_use_github_token_pull-requests_write", "TRUE"],
+        ["can_use_github_token_actions_write", "TRUE"],
+        ["can_use_github_token_packages_write", "TRUE"],
+        ["untrusted_value_interpreted_as_command", "TRUE"]
+      ]
+    },
+    "candidate": {
+      "expected_status": "CANDIDATE",
+      "required_relations": [["github_token_permission_unknown", "UNKNOWN"]]
+    },
+    "rejected": {
+      "expected_status": "REJECTED",
+      "forbidden_relations": [
+        "can_use_github_token_contents_write",
+        "can_use_github_token_pull-requests_write",
+        "can_use_github_token_actions_write",
+        "can_use_github_token_packages_write",
+        "github_token_permission_unknown"
+      ]
+    }
+  }
+}

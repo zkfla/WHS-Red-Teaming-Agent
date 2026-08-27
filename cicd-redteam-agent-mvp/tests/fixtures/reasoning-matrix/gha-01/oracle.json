@@ -1,0 +1,35 @@
+{
+  "scenario_ids": ["GHA-01B", "GHA-01C", "GHA-01D", "GHA-01E"],
+  "variants": {
+    "supported": {
+      "expected_status": "SUPPORTED",
+      "required_relations": [
+        ["controls_workflow_input", "TRUE"],
+        ["value_flows_to_env", "TRUE"],
+        ["env_value_flows_to_step_output", "TRUE"],
+        ["env_value_interpreted_as_command", "TRUE"],
+        ["untrusted_input_interpreted_by_github_script", "TRUE"]
+      ]
+    },
+    "candidate": {
+      "expected_status": "CANDIDATE",
+      "required_relations": [
+        ["controls_workflow_input", "UNKNOWN"],
+        ["env_value_flows_to_step_output", "TRUE"],
+        ["env_value_interpreted_as_command", "TRUE"],
+        ["untrusted_input_interpreted_by_github_script", "TRUE"]
+      ],
+      "minimum_relation_counts": {"controls_workflow_input:UNKNOWN": 4}
+    },
+    "rejected": {
+      "expected_status": "REJECTED",
+      "path_relations": ["env_value_interpreted_as_command"],
+      "required_relations": [
+        ["env_value_flows_to_step_output", "TRUE"],
+        ["env_value_interpreted_as_command", "FALSE"],
+        ["validates_value_with_allowlist", "TRUE"],
+        ["guard_blocks_untrusted_execution", "TRUE"]
+      ]
+    }
+  }
+}

@@ -1,0 +1,7 @@
+name: Repository defaults candidate
+on: pull_request
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - run: bash -c "${{ github.event.pull_request.title }}"

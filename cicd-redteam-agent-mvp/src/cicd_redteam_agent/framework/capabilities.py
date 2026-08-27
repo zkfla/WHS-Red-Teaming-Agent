@@ -103,7 +103,9 @@ class ListSecurityFacts(Capability):
                 "guidance": (
                     "Compose only returned relations into paths and copy each relation_id exactly. "
                     "UNKNOWN relations require a CANDIDATE or REJECTED path and their "
-                    "missing_evidence must be preserved."
+                    "missing_evidence must be preserved. FALSE relations require a REJECTED path. "
+                    "Do not report isolated authority, dependency, guard, or context facts as an "
+                    "attack without an ordered source-to-execution-to-sensitive-sink chain."
                 ),
             }
         )

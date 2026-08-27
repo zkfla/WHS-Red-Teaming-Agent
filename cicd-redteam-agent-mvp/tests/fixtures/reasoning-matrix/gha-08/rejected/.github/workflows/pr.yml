@@ -1,0 +1,12 @@
+name: Isolated PR cache
+on: pull_request
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/cache@1111111111111111111111111111111111111111
+        with:
+          path: .cache/test-data
+          key: pr-test-data-v1

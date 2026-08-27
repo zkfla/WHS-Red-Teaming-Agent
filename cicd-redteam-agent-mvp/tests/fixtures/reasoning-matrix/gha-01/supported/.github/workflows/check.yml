@@ -1,0 +1,19 @@
+name: Input propagation supported
+on: pull_request
+permissions:
+  contents: write
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - id: capture
+        env:
+          RAW: ${{ github.event.pull_request.title }}
+        run: echo "payload=${RAW}" >> "$GITHUB_OUTPUT"
+      - name: Interpret propagated output
+        env:
+          COMMAND: ${{ steps.capture.outputs.payload }}
+        run: bash -c "$COMMAND"
+      - uses: actions/github-script@1111111111111111111111111111111111111111
+        with:
+          script: console.log(`${{ github.event.pull_request.body }}`)

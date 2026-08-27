@@ -1,0 +1,17 @@
+name: Cloud caller
+on: pull_request
+permissions:
+  contents: read
+  id-token: write
+jobs:
+  delegated:
+    uses: ./.github/workflows/cloud.yml
+    permissions:
+      id-token: write
+      contents: read
+  static:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: azure/login@1111111111111111111111111111111111111111
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}

@@ -1,0 +1,14 @@
+name: Protected cloud candidate
+on: workflow_dispatch
+permissions:
+  id-token: write
+  contents: read
+jobs:
+  cloud:
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: google-github-actions/auth@2222222222222222222222222222222222222222
+        with:
+          workload_identity_provider: projects/1/locations/global/workloadIdentityPools/ci/providers/gha
+          service_account: ${{ inputs.service_account }}

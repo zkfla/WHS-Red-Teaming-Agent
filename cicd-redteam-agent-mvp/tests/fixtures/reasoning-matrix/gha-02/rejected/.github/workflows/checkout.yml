@@ -1,0 +1,12 @@
+name: Base checkout rejected
+on: pull_request
+permissions:
+  contents: read
+jobs:
+  checkout:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@1111111111111111111111111111111111111111
+        with:
+          ref: refs/heads/main
+      - run: echo lint

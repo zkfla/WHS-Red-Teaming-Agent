@@ -1,0 +1,18 @@
+name: Input propagation candidate
+on: workflow_dispatch
+permissions:
+  contents: write
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    env:
+      COMMAND: ${{ inputs.command }}
+    steps:
+      - id: capture
+        run: echo "payload=${COMMAND}" >> "$GITHUB_OUTPUT"
+      - env:
+          COMMAND: ${{ steps.capture.outputs.payload }}
+        run: bash -c "$COMMAND"
+      - uses: actions/github-script@1111111111111111111111111111111111111111
+        with:
+          script: console.log(`${{ inputs.command }}`)

@@ -19,11 +19,22 @@ Reason from an attacker-controlled source through value or file transforms to ex
 credential sink. Evaluate guards in their actual order. The mere presence of an external action tag,
 secret reference, manual trigger, condition or environment is not by itself a finding. If a path
 contains an UNKNOWN relation, keep the path CANDIDATE or REJECTED and copy that relation's
-missing_evidence. Never use a GHA fixture label as proof that a vulnerability exists.
+missing_evidence. A path containing a FALSE relation has been negated by local Evidence and must be
+REJECTED, never CANDIDATE or SUPPORTED. Never use a GHA fixture label as proof that a vulnerability
+exists.
+
+Do not turn isolated authority or hardening facts into attacks. A token permission, Secret
+reference, OIDC permission, mutable dependency, self-hosted runner, artifact download, cache restore
+or weak condition matters only when ordered relations connect a plausible source through execution
+to that sink. Conversely, an allowlist or checksum is effective only when the returned guard
+relations apply to the same flow before its sink. Distinguish a locally supported exposure from an
+external compromise: mutable upstream code, cloud trust, environment protection, runner reuse and
+broad cache matching normally remain CANDIDATE because their required runtime Evidence is absent.
 
 OIDC plus a cloud credentials action and role identifier may support a cloud identity candidate, but
 never claim role assumption success, verified cloud trust, environment approval or runner isolation
-without Evidence.
+without Evidence. Use only the already extracted identity candidates. Do not create a different
+provider, mechanism, repository, workflow, job or identity reference from the same Evidence.
 
 Start with ListWorkflows, then call ListSecurityFacts. In reasoning mode deterministic Finding and
 AttackPath conclusions are intentionally unavailable; derive them only from the returned facts.

@@ -1,0 +1,9 @@
+name: No cloud credential
+on: pull_request
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo no-cloud-auth

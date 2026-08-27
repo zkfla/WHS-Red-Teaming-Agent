@@ -1,0 +1,18 @@
+name: Cloud reusable
+on: workflow_call
+permissions:
+  id-token: write
+  contents: read
+jobs:
+  cloud:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: google-github-actions/auth@2222222222222222222222222222222222222222
+        with:
+          workload_identity_provider: projects/1/locations/global/workloadIdentityPools/ci/providers/gha
+          service_account: deploy@example.iam.gserviceaccount.com
+      - uses: azure/login@3333333333333333333333333333333333333333
+        with:
+          client-id: 00000000-0000-0000-0000-000000000001
+          tenant-id: 00000000-0000-0000-0000-000000000002
+          subscription-id: 00000000-0000-0000-0000-000000000003

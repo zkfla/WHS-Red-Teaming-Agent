@@ -1,0 +1,14 @@
+name: PR delegated execution
+on: pull_request
+permissions:
+  contents: write
+jobs:
+  local:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: ./actions/build
+      - run: git fetch origin pull/${{ github.event.pull_request.head.sha }}/head
+  reusable:
+    uses: ./.github/workflows/reusable.yml
+    permissions:
+      contents: write

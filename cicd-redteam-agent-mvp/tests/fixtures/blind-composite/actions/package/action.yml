@@ -1,0 +1,6 @@
+name: Package
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: ./scripts/package.sh

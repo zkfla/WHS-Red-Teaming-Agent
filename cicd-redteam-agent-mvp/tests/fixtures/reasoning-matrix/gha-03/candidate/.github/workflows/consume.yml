@@ -1,0 +1,13 @@
+name: Artifact consumer candidate
+on: workflow_dispatch
+permissions:
+  contents: write
+jobs:
+  consume:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@2222222222222222222222222222222222222222
+        with:
+          name: config
+          path: config
+      - run: make CONFIG=config/build.mk

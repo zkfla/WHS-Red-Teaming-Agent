@@ -1,0 +1,10 @@
+name: Comment-controlled privileged job
+on: issue_comment
+permissions:
+  contents: write
+jobs:
+  command:
+    if: contains(github.event.comment.body, '/deploy') && github.actor != 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo deploy

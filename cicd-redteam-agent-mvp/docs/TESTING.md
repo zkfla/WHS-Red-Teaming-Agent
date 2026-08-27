@@ -24,6 +24,11 @@
 - env and step-output value flow reaches a command interpreter and granular token permission
 - a blind local-action fixture is represented through generic source, execution and credential facts
 - proposed paths with unknown `relation_id`, mismatched relation shape, or unresolved UNKNOWN facts are rejected
+- GHA-01 through GHA-10 reasoning labels each have supported/exposed, candidate/unknown and rejected/secure repositories
+- every matrix relation carries existing Evidence and every UNKNOWN relation names missing Evidence
+- matrix graph composition checks the expected SUPPORTED/CANDIDATE/REJECTED outcome without product-side GHA dispatch
+- the unlabeled blind fixture joins fork PR -> local action -> artifact/cache -> privileged workflow -> GitHub Token/OIDC
+- FALSE guard edges are accepted only in REJECTED paths; path-level Evidence must cover every edge
 
 ## Agent and failure coverage
 
@@ -49,6 +54,8 @@ uv sync
 uv run python -m pytest -q
 uv run ruff check .
 uv run cicd-agent analyze tests/fixtures/oidc-risk --output <temporary-output>
+uv run cicd-agent evaluate tests/fixtures/reasoning-matrix --output <temporary-output> `
+  --provider codex-chatgpt --scenario gha-01
 ```
 
 The ChatGPT-login smoke was executed against `tests/fixtures/global-chain` with `gpt-5.6-terra` and

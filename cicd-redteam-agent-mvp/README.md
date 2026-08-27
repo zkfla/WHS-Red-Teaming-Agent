@@ -16,6 +16,15 @@ Python 3.13과 `uv`가 필요합니다.
 ```powershell
 uv sync
 ```
+To evaluate real-model reasoning without leaking fixture answers into analysis:
+
+```powershell
+uv run cicd-agent evaluate tests/fixtures/reasoning-matrix --output output/evaluation `
+  --provider codex-chatgpt --scenario gha-01
+```
+
+The evaluator loads each `oracle.json` only after the corresponding repository analysis and writes
+an aggregate `matrix-evaluation/evaluation.json` with extraction and status accuracy.
 
 프레임워크는 hackingBuddyGPT 커밋
 `b2653771aed383ffe92933f8f2f9b7684403af8a`에 고정되며 전체 전이 의존성은

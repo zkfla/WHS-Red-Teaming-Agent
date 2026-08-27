@@ -1,0 +1,10 @@
+name: Verified artifact build
+on: pull_request
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/upload-artifact@1111111111111111111111111111111111111111
+        with:
+          name: verified
+          path: payload

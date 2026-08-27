@@ -53,6 +53,34 @@ def build_parser() -> argparse.ArgumentParser:
     analyze.add_argument("--max-tokens", type=int, default=100_000)
     analyze.add_argument("--max-cost", type=float, default=2.0)
     analyze.add_argument("--max-duration", type=int, default=900)
+    evaluate = subcommands.add_parser(
+        "evaluate", help="run reasoning mode against a hidden-oracle fixture matrix"
+    )
+    evaluate.add_argument("matrix_path", type=Path)
+    evaluate.add_argument("--output", required=True, type=Path)
+    evaluate.add_argument("--model")
+    evaluate.add_argument(
+        "--provider",
+        choices=[item.value for item in ModelProvider],
+        default=ModelProvider.AUTO.value,
+    )
+    evaluate.add_argument("--env-file", type=Path)
+    evaluate.add_argument(
+        "--attacker-profile",
+        choices=[item.value for item in AttackerProfile],
+        default=AttackerProfile.FORK_PR.value,
+    )
+    evaluate.add_argument("--max-rounds", type=int, default=12)
+    evaluate.add_argument("--max-tokens", type=int, default=100_000)
+    evaluate.add_argument("--max-cost", type=float, default=2.0)
+    evaluate.add_argument("--max-duration", type=int, default=900)
+    evaluate.add_argument("--scenario", action="append", default=[])
+    evaluate.add_argument(
+        "--variant",
+        action="append",
+        choices=["supported", "candidate", "rejected"],
+        default=[],
+    )
     return parser
 
 
@@ -84,13 +112,31 @@ def main(argv: list[str] | None = None) -> int:
             attacker_profile=AttackerProfile(args.attacker_profile),
             model=args.model,
             provider=ModelProvider(args.provider),
-            analysis_mode=AnalysisMode(args.mode) if args.mode else None,
+            analysis_mode=(
+                AnalysisMode(args.mode)
+                if args.command == "analyze" and args.mode
+                else (AnalysisMode.REASONING if args.command == "evaluate" else None)
+            ),
             env_file=args.env_file,
             max_rounds=args.max_rounds,
             max_tokens=args.max_tokens,
             max_cost=args.max_cost,
             max_duration=args.max_duration,
         )
+        if args.command == "evaluate":
+            from cicd_redteam_agent.application.evaluate import evaluate_reasoning_matrix
+
+            results, summary_path = asyncio.run(
+                evaluate_reasoning_matrix(
+                    args.matrix_path,
+                    config,
+                    scenario_filter=set(args.scenario) or None,
+                    variant_filter=set(args.variant) or None,
+                )
+            )
+            passed = sum(item.passed for item in results)
+            print(f"Evaluation: {passed}/{len(results)} passed: {summary_path}")
+            return 0 if results and passed == len(results) else 4
         report, run_dir = asyncio.run(analyze_repository(args.repo_path, config))
     except (RepositoryBoundaryError, ValueError, ValidationError) as exc:
         print(f"Input/configuration error: {redact(str(exc))}", file=sys.stderr)

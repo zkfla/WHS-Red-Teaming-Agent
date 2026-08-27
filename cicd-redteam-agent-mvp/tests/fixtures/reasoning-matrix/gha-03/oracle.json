@@ -1,0 +1,29 @@
+{
+  "scenario_ids": ["GHA-03B", "GHA-03C", "GHA-03D", "GHA-03E"],
+  "variants": {
+    "supported": {
+      "expected_status": "SUPPORTED",
+      "required_relations": [
+        ["attacker_may_control_artifact_content", "TRUE"],
+        ["downloads_artifact_into_step", "TRUE"],
+        ["artifact_content_reaches_import", "TRUE"],
+        ["artifact_may_overwrite_workspace_files", "TRUE"]
+      ]
+    },
+    "candidate": {
+      "expected_status": "CANDIDATE",
+      "required_relations": [
+        ["downloads_artifact_into_step", "UNKNOWN"],
+        ["artifact_content_reaches_command_argument", "UNKNOWN"]
+      ]
+    },
+    "rejected": {
+      "expected_status": "REJECTED",
+      "path_relations": ["artifact_content_reaches_execution"],
+      "required_relations": [
+        ["artifact_verified_by_integrity_guard", "TRUE"],
+        ["artifact_content_reaches_execution", "FALSE"]
+      ]
+    }
+  }
+}

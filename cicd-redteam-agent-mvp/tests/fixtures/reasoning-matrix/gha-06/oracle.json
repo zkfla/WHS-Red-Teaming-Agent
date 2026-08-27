@@ -1,0 +1,30 @@
+{
+  "scenario_ids": ["GHA-06B", "GHA-06C", "GHA-06D", "GHA-06E", "GHA-06F"],
+  "variants": {
+    "supported": {
+      "expected_status": "CANDIDATE",
+      "path_relations": ["oidc_may_assume_cloud_identity"],
+      "required_relations": [
+        ["oidc_may_assume_cloud_identity", "UNKNOWN"],
+        ["static_cloud_credential_may_authenticate_identity", "UNKNOWN"],
+        ["calls_reusable_workflow", "TRUE"],
+        ["can_request_oidc_token", "TRUE"]
+      ]
+    },
+    "candidate": {
+      "expected_status": "CANDIDATE",
+      "required_relations": [
+        ["oidc_may_assume_cloud_identity", "UNKNOWN"],
+        ["environment_protection_unknown", "UNKNOWN"]
+      ]
+    },
+    "rejected": {
+      "expected_status": "REJECTED",
+      "forbidden_relations": [
+        "can_request_oidc_token",
+        "oidc_may_assume_cloud_identity",
+        "static_cloud_credential_may_authenticate_identity"
+      ]
+    }
+  }
+}

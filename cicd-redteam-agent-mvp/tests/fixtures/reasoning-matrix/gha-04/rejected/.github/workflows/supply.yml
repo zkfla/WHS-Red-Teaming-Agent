@@ -1,0 +1,13 @@
+name: Pinned supply chain
+on: pull_request
+permissions:
+  contents: read
+jobs:
+  external-workflow:
+    uses: vendor/automation/.github/workflows/deploy.yml@1111111111111111111111111111111111111111
+  build:
+    runs-on: ubuntu-latest
+    container: registry.example/build@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    steps:
+      - uses: vendor/build-action@2222222222222222222222222222222222222222
+      - run: pip install package==1.2.3
