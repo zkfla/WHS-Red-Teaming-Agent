@@ -16,6 +16,7 @@ from cicd_redteam_agent.domain.github_actions_parser import (
 from cicd_redteam_agent.framework.capabilities import CapabilityContext, build_capabilities
 from cicd_redteam_agent.framework.cicd_agent import CICDChatAgent
 from cicd_redteam_agent.framework.cicd_usecase import CICDUseCase
+from cicd_redteam_agent.framework.runtime_support import CheckpointWriter, RetryPolicy
 from cicd_redteam_agent.security.repository_boundary import RepositoryBoundary
 
 FIXTURES = Path(__file__).parents[1] / "fixtures"
@@ -42,13 +43,41 @@ class FakeLLM:
     def __init__(self, proposal: dict[str, object]):
         self.round = 0
         self.proposal = proposal
+        self.prompts = []
 
-    def get_response(self, _prompt, *, capabilities):
+    def get_response(self, prompt, *, capabilities):
+        self.prompts.append(prompt)
         calls = [
             ("ListWorkflows", {}),
             (
                 "InspectRepositoryFile",
-                {"path": "scripts/deploy.sh", "start_line": 1, "end_line": 2},
+                {
+                    "path": "scripts/deploy.sh",
+                    "start_line": 1,
+                    "end_line": 2,
+                    "working_memory_patch_json": json.dumps(
+                        {
+                            "schema_version": "1.0",
+                            "expected_revision": 0,
+                            "upserts": [
+                                {
+                                    "schema_version": "1.0",
+                                    "claim": "The deploy script may expose a credential path",
+                                    "status": "ACTIVE",
+                                    "decision_summary": (
+                                        "The workflow points to a repository-controlled script."
+                                    ),
+                                    "next_check": {
+                                        "schema_version": "1.0",
+                                        "objective": "Inspect the deploy script",
+                                        "preferred_capability": "InspectRepositoryFile",
+                                        "target": "scripts/deploy.sh",
+                                    },
+                                }
+                            ],
+                        }
+                    ),
+                },
             ),
             ("SubmitAnalysis", {"proposal_json": json.dumps(self.proposal)}),
         ]
@@ -62,8 +91,24 @@ class FakeLLM:
         return LLMResult(message, "", "", "", timedelta(), 1, 1, 0, "", 0.0)
 
 
+class TransientFakeLLM:
+    def __init__(self) -> None:
+        self.attempts = 0
+
+    def get_response(self, _prompt, *, capabilities):
+        self.attempts += 1
+        if self.attempts < 3:
+            raise TimeoutError("temporary model timeout")
+        tool_call = SimpleNamespace(
+            id="call-after-retry",
+            function=SimpleNamespace(name="ListWorkflows", arguments="{}"),
+        )
+        message = SimpleNamespace(tool_calls=[tool_call], content="")
+        return LLMResult(message, "", "", "", timedelta(), 1, 1, 0, "", 0.0)
+
+
 @pytest.mark.asyncio
-async def test_fake_llm_list_inspect_submit_flow() -> None:
+async def test_fake_llm_list_inspect_submit_flow(tmp_path: Path) -> None:
     boundary = RepositoryBoundary(FIXTURES / "oidc-risk")
     state = create_initial_state(boundary)
     parsed = parse_workflow(boundary, discover_workflows(boundary)[0])
@@ -88,15 +133,58 @@ async def test_fake_llm_list_inspect_submit_flow() -> None:
             }
         ],
     }
+    llm = FakeLLM(proposal)
     agent = CICDChatAgent(
-        log=FakeLogger(), llm=FakeLLM(proposal), prompt="trusted system prompt"
+        log=FakeLogger(), llm=llm, prompt="trusted system prompt", state=state
     )
     agent._capabilities = build_capabilities(context)
     limits = Limits(max_rounds=5, max_tokens=100, max_cost=1, max_duration=30)
-    reason = await CICDUseCase(agent, context, limits).run()
+    checkpoint_path = tmp_path / "checkpoint.json"
+    checkpoint = CheckpointWriter(
+        checkpoint_path,
+        state,
+        "fake",
+        "fake-model",
+        agent.runtime_metrics,
+    )
+    reason = await CICDUseCase(agent, context, limits, checkpoint).run()
     assert reason == "proposal_validated"
     assert context.submitted
     assert "scripts/deploy.sh" in state.inspected_resources
     assert state.findings[0].finding_id == "finding_fake_llm_candidate"
     assert state.findings[0].evidence_ids == [evidence_id]
+    assert state.working_memory.revision == 1
+    assert state.working_memory.hypotheses[0].status.value == "ACTIVE"
+    final_projection = llm.prompts[-1][-1]
+    assert final_projection["name"] == "agent_state_projection"
+    assert '"revision": 1' in final_projection["content"]
     assert limits.rounds == 3
+    assert agent.runtime_metrics.model_attempts == 3
+    assert agent.runtime_metrics.checkpoints_written == 4
+    assert json.loads(checkpoint_path.read_text(encoding="utf-8"))["reason"] == (
+        "proposal_validated"
+    )
+
+
+@pytest.mark.asyncio
+async def test_agent_retries_one_model_turn_without_duplicating_history() -> None:
+    boundary = RepositoryBoundary(FIXTURES / "oidc-risk")
+    state = create_initial_state(boundary)
+    context = CapabilityContext(state, boundary)
+    llm = TransientFakeLLM()
+    agent = CICDChatAgent(
+        log=FakeLogger(),
+        llm=llm,
+        prompt="trusted system prompt",
+        state=state,
+        retry_policy=RetryPolicy(max_attempts=3, initial_delay=0, max_delay=0),
+    )
+    agent._capabilities = build_capabilities(context)
+    limits = Limits(max_rounds=1, max_tokens=100, max_cost=1, max_duration=30)
+
+    reason = await CICDUseCase(agent, context, limits).run()
+
+    assert reason == "Reached maximum rounds (1)"
+    assert llm.attempts == 3
+    assert agent.runtime_metrics.retries == 2
+    assert len(agent._prompt_history) == 4

@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import json
 import time
-from dataclasses import asdict, dataclass
+from collections import Counter
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from cicd_redteam_agent.application.analyze import AnalysisConfig, analyze_repository
-from cicd_redteam_agent.domain.models import AnalysisMode
+from cicd_redteam_agent.domain.models import AnalysisMode, AnalysisReport
 from cicd_redteam_agent.domain.reasoning_evaluation import (
     ReasoningExpectation,
     evaluate_reasoning_report,
@@ -22,6 +23,68 @@ class MatrixCaseResult:
     deterministic_duration_seconds: float
     reasoning_duration_seconds: float
     evaluation: dict[str, object]
+    agent_behavior: dict[str, object] = field(default_factory=dict)
+
+
+def collect_agent_behavior(report: AnalysisReport) -> dict[str, object]:
+    """Collect observable Agent behavior without exposing model reasoning text."""
+
+    state = report.state
+    termination = state.termination
+    capability_calls = sum(state.repeated_calls.values())
+    repeated_capability_calls = sum(
+        max(0, count - 1) for count in state.repeated_calls.values()
+    )
+    hypothesis_statuses = Counter(
+        hypothesis.status.value for hypothesis in state.working_memory.hypotheses
+    )
+    runtime = report.run_metadata.get("agent_runtime") or {}
+    return {
+        "status": report.status.value,
+        "termination_reason": report.termination_reason,
+        "rounds": termination.rounds if termination else 0,
+        "tokens": termination.tokens if termination else 0,
+        "duration_seconds": termination.duration_seconds if termination else 0.0,
+        "capability_calls": capability_calls,
+        "unique_capability_calls": len(state.repeated_calls),
+        "repeated_capability_calls": repeated_capability_calls,
+        "working_memory_revision": state.working_memory.revision,
+        "hypothesis_count": len(state.working_memory.hypotheses),
+        "hypothesis_statuses": dict(sorted(hypothesis_statuses.items())),
+        "model_attempts": int(runtime.get("model_attempts", 0)),
+        "model_retries": int(runtime.get("retries", 0)),
+        "context_compactions": int(runtime.get("context_compactions", 0)),
+    }
+
+
+def _aggregate_behavior(results: list[MatrixCaseResult]) -> dict[str, object]:
+    if not results:
+        return {
+            "total_rounds": 0,
+            "total_tokens": 0,
+            "total_capability_calls": 0,
+            "total_repeated_capability_calls": 0,
+            "total_working_memory_revisions": 0,
+            "total_hypotheses": 0,
+        }
+    behavior = [item.agent_behavior for item in results]
+    totals = {
+        "total_rounds": sum(int(item.get("rounds", 0)) for item in behavior),
+        "total_tokens": sum(int(item.get("tokens", 0)) for item in behavior),
+        "total_capability_calls": sum(
+            int(item.get("capability_calls", 0)) for item in behavior
+        ),
+        "total_repeated_capability_calls": sum(
+            int(item.get("repeated_capability_calls", 0)) for item in behavior
+        ),
+        "total_working_memory_revisions": sum(
+            int(item.get("working_memory_revision", 0)) for item in behavior
+        ),
+        "total_hypotheses": sum(int(item.get("hypothesis_count", 0)) for item in behavior),
+    }
+    totals["average_rounds"] = totals["total_rounds"] / len(results)
+    totals["average_tokens"] = totals["total_tokens"] / len(results)
+    return totals
 
 
 def _build_evaluation_payload(results: list[MatrixCaseResult]) -> dict[str, object]:
@@ -51,6 +114,7 @@ def _build_evaluation_payload(results: list[MatrixCaseResult]) -> dict[str, obje
         "passed_cases": sum(item.passed for item in results),
         "total_cases": total,
         "metrics": metrics,
+        "agent_behavior": _aggregate_behavior(results),
         "cases": [asdict(item) for item in results],
     }
 
@@ -157,6 +221,7 @@ async def evaluate_reasoning_matrix(
                     deterministic_duration_seconds=deterministic_duration,
                     reasoning_duration_seconds=reasoning_duration,
                     evaluation=asdict(evaluation),
+                    agent_behavior=collect_agent_behavior(report),
                 )
             )
     summary_path = evaluation_root / "evaluation.json"

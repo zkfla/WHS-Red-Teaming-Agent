@@ -48,6 +48,13 @@ class AnalysisMode(StrEnum):
     REASONING = "reasoning"
 
 
+class WorkingHypothesisStatus(StrEnum):
+    ACTIVE = "ACTIVE"
+    BLOCKED = "BLOCKED"
+    READY_FOR_PROPOSAL = "READY_FOR_PROPOSAL"
+    DISCARDED = "DISCARDED"
+
+
 class RepositorySnapshot(SchemaModel):
     repository_id: str
     root: str
@@ -241,6 +248,64 @@ class TraceMetadata(SchemaModel):
     trace_path: str | None = None
 
 
+class HypothesisNextCheck(SchemaModel):
+    objective: str = Field(min_length=1, max_length=300)
+    preferred_capability: str | None = Field(default=None, max_length=100)
+    target: str | None = Field(default=None, max_length=300)
+
+
+class WorkingHypothesis(SchemaModel):
+    hypothesis_id: str = Field(pattern=r"^hyp_[0-9a-f]{16}$")
+    claim: str = Field(min_length=1, max_length=300)
+    status: WorkingHypothesisStatus = WorkingHypothesisStatus.ACTIVE
+    supporting_relation_ids: list[str] = Field(default_factory=list, max_length=16)
+    contradicting_relation_ids: list[str] = Field(default_factory=list, max_length=16)
+    evidence_ids: list[str] = Field(default_factory=list, max_length=24)
+    missing_evidence: list[str] = Field(default_factory=list, max_length=12)
+    decision_summary: str = Field(min_length=1, max_length=600)
+    next_check: HypothesisNextCheck | None = None
+    created_revision: int = Field(ge=1)
+    updated_revision: int = Field(ge=1)
+
+
+class AgentWorkingMemory(SchemaModel):
+    revision: int = Field(default=0, ge=0)
+    focus_hypothesis_id: str | None = Field(
+        default=None, pattern=r"^hyp_[0-9a-f]{16}$"
+    )
+    hypotheses: list[WorkingHypothesis] = Field(default_factory=list, max_length=8)
+
+
+class WorkingHypothesisUpsert(SchemaModel):
+    hypothesis_id: str | None = Field(default=None, pattern=r"^hyp_[0-9a-f]{16}$")
+    claim: str | None = Field(default=None, min_length=1, max_length=300)
+    status: WorkingHypothesisStatus | None = None
+    supporting_relation_ids: list[str] | None = Field(default=None, max_length=16)
+    contradicting_relation_ids: list[str] | None = Field(default=None, max_length=16)
+    evidence_ids: list[str] | None = Field(default=None, max_length=24)
+    missing_evidence: list[str] | None = Field(default=None, max_length=12)
+    decision_summary: str | None = Field(default=None, min_length=1, max_length=600)
+    next_check: HypothesisNextCheck | None = None
+    clear_next_check: bool = False
+
+
+class WorkingMemoryPatch(SchemaModel):
+    expected_revision: int = Field(ge=0)
+    upserts: list[WorkingHypothesisUpsert] = Field(default_factory=list, max_length=3)
+    focus_hypothesis_id: str | None = Field(
+        default=None, pattern=r"^hyp_[0-9a-f]{16}$"
+    )
+    clear_focus: bool = False
+
+
+class WorkingMemoryUpdateResult(SchemaModel):
+    accepted: bool
+    changed: bool = False
+    revision: int = Field(ge=0)
+    updated_hypothesis_ids: list[str] = Field(default_factory=list)
+    errors: list[str] = Field(default_factory=list)
+
+
 class AnalysisState(SchemaModel):
     repository: RepositorySnapshot
     workflows: list[Workflow] = Field(default_factory=list)
@@ -254,6 +319,7 @@ class AnalysisState(SchemaModel):
     pending_questions: list[str] = Field(default_factory=list)
     inspected_resources: list[str] = Field(default_factory=list)
     repeated_calls: dict[str, int] = Field(default_factory=dict)
+    working_memory: AgentWorkingMemory = Field(default_factory=AgentWorkingMemory)
     termination: Termination | None = None
 
 
@@ -261,6 +327,25 @@ class AnalysisProposal(SchemaModel):
     findings: list[Finding] = Field(default_factory=list)
     paths: list[AttackPath] = Field(default_factory=list)
     identities: list[CloudIdentityCandidate] = Field(default_factory=list)
+
+
+class AttackPathDraft(SchemaModel):
+    path_id: str = Field(min_length=1, max_length=200)
+    relation_refs: list[str] = Field(min_length=1, max_length=24)
+
+
+class FindingDraft(SchemaModel):
+    finding_id: str = Field(min_length=1, max_length=200)
+    rule_id: str = Field(min_length=1, max_length=200)
+    title: str = Field(min_length=1, max_length=300)
+    path_id: str = Field(min_length=1, max_length=200)
+    confidence: Confidence
+    summary: str = Field(min_length=1, max_length=1_200)
+
+
+class AnalysisProposalDraft(SchemaModel):
+    finding_drafts: list[FindingDraft] = Field(default_factory=list, max_length=16)
+    path_drafts: list[AttackPathDraft] = Field(default_factory=list, max_length=16)
 
 
 class ValidationResult(SchemaModel):

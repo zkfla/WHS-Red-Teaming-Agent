@@ -52,6 +52,89 @@ class AnalysisConfig:
         return AnalysisMode.DETERMINISTIC
 
 
+@dataclass(frozen=True)
+class ResumeLimitOverrides:
+    max_rounds: int | None = None
+    max_tokens: int | None = None
+    max_cost: float | None = None
+    max_duration: int | None = None
+
+
+def _merge_trace(source_trace: Path | None, destination: Path, *, append: bool) -> None:
+    if source_trace is None or not source_trace.exists():
+        return
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if not append or not destination.exists():
+        shutil.copy2(source_trace, destination)
+        return
+    if source_trace.resolve() == destination.resolve():
+        return
+    with destination.open("a+b") as target, source_trace.open("rb") as source:
+        if target.tell() > 0:
+            target.seek(-1, 2)
+            if target.read(1) != b"\n":
+                target.write(b"\n")
+        shutil.copyfileobj(source, target)
+
+
+def _finalize_analysis(
+    *,
+    state,
+    config: AnalysisConfig,
+    mode: AnalysisMode,
+    run_dir: Path,
+    warnings: list[str],
+    status: ReportStatus,
+    reason: str,
+    duration_seconds: float,
+    rounds: int = 0,
+    tokens: int = 0,
+    cost: float = 0.0,
+    detail: str | None = None,
+    source_trace: Path | None = None,
+    provider: str | None = None,
+    runtime_metrics: dict[str, object] | None = None,
+    append_trace: bool = False,
+) -> tuple[AnalysisReport, Path]:
+    state.termination = Termination(
+        reason=reason,
+        detail=detail,
+        rounds=rounds,
+        tokens=tokens,
+        cost=cost,
+        duration_seconds=duration_seconds,
+    )
+    run_metadata: dict[str, object] = {
+        "attacker_profile": config.attacker_profile,
+        "max_rounds": config.max_rounds,
+        "max_tokens": config.max_tokens,
+        "max_cost": config.max_cost,
+        "max_duration": config.max_duration,
+        "provider": provider or config.provider,
+        "analysis_mode": mode,
+        "framework_commit": FRAMEWORK_COMMIT,
+        "repository_commit": state.repository.git_commit,
+    }
+    if runtime_metrics is not None:
+        run_metadata["agent_runtime"] = runtime_metrics
+    report = AnalysisReport(
+        status=status,
+        termination_reason=reason,
+        state=state,
+        warnings=warnings,
+        trace=TraceMetadata(
+            provider=provider,
+            model=config.model,
+            framework_commit=FRAMEWORK_COMMIT,
+            trace_path=str(run_dir / "trace.jsonl"),
+        ),
+        run_metadata=run_metadata,
+    )
+    _merge_trace(source_trace, run_dir / "trace.jsonl", append=append_trace)
+    write_report(report, run_dir)
+    return report, run_dir
+
+
 async def analyze_repository(
     repo_path: str | Path, config: AnalysisConfig
 ) -> tuple[AnalysisReport, Path]:
@@ -81,43 +164,25 @@ async def analyze_repository(
         detail: str | None = None,
         source_trace: Path | None = None,
         provider: str | None = None,
+        runtime_metrics: dict[str, object] | None = None,
     ) -> tuple[AnalysisReport, Path]:
-        state.termination = Termination(
+        return _finalize_analysis(
+            state=state,
+            config=config,
+            mode=mode,
+            run_dir=run_dir,
+            warnings=warnings,
+            status=status,
             reason=reason,
-            detail=detail,
+            duration_seconds=time.monotonic() - started,
             rounds=rounds,
             tokens=tokens,
             cost=cost,
-            duration_seconds=time.monotonic() - started,
+            detail=detail,
+            source_trace=source_trace,
+            provider=provider,
+            runtime_metrics=runtime_metrics,
         )
-        report = AnalysisReport(
-            status=status,
-            termination_reason=reason,
-            state=state,
-            warnings=warnings,
-            trace=TraceMetadata(
-                provider=provider,
-                model=config.model,
-                framework_commit=FRAMEWORK_COMMIT,
-                trace_path=str(run_dir / "trace.jsonl"),
-            ),
-            run_metadata={
-                "attacker_profile": config.attacker_profile,
-                "max_rounds": config.max_rounds,
-                "max_tokens": config.max_tokens,
-                "max_cost": config.max_cost,
-                "max_duration": config.max_duration,
-                "provider": provider or config.provider,
-                "analysis_mode": mode,
-                "framework_commit": FRAMEWORK_COMMIT,
-                "repository_commit": state.repository.git_commit,
-            },
-        )
-        if source_trace and source_trace.exists():
-            run_dir.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(source_trace, run_dir / "trace.jsonl")
-        write_report(report, run_dir)
-        return report, run_dir
 
     try:
         for workflow_path in discover_workflows(boundary):
@@ -165,7 +230,7 @@ async def analyze_repository(
     if mode is AnalysisMode.REASONING:
         from cicd_redteam_agent.framework.hackingbuddy_adapter import run_agent_analysis
 
-        agent_result = await run_agent_analysis(state, boundary, config)
+        agent_result = await run_agent_analysis(state, boundary, config, run_dir)
         warnings.extend(agent_result.warnings)
         return finalize(
             agent_result.status,
@@ -175,6 +240,8 @@ async def analyze_repository(
             cost=agent_result.cost,
             source_trace=agent_result.trace_path,
             provider=agent_result.provider,
+            runtime_metrics=agent_result.runtime_metrics,
+            detail=None,
         )
 
     if config.model or config.provider is ModelProvider.CODEX_CHATGPT:
@@ -182,3 +249,117 @@ async def analyze_repository(
     else:
         warnings.append("No model configured; deterministic analysis completed without LLM review.")
     return finalize(ReportStatus.COMPLETE, "deterministic_analysis_complete")
+
+
+async def resume_analysis(
+    run_dir: str | Path,
+    *,
+    env_file: Path | None = None,
+    limits: ResumeLimitOverrides | None = None,
+) -> tuple[AnalysisReport, Path]:
+    from cicd_redteam_agent.framework.hackingbuddy_adapter import run_agent_analysis
+    from cicd_redteam_agent.framework.runtime_support import (
+        PROMPT_VERSION,
+        EventJournal,
+        load_checkpoint,
+    )
+
+    resolved_run_dir = Path(run_dir).expanduser().resolve()
+    checkpoint = load_checkpoint(resolved_run_dir / "checkpoint.json")
+    if checkpoint.reason == "proposal_validated" or checkpoint.resume_phase == "TERMINAL":
+        raise ValueError("analysis is already complete and cannot be resumed")
+    if checkpoint.prompt_version != PROMPT_VERSION:
+        raise ValueError("system prompt version changed; start a new analysis run")
+
+    saved = checkpoint.config
+    required = {
+        "attacker_profile",
+        "analysis_mode",
+        "max_rounds",
+        "max_tokens",
+        "max_cost",
+        "max_duration",
+    }
+    missing = sorted(required - saved.keys())
+    if missing:
+        raise ValueError(f"checkpoint is missing resume configuration: {', '.join(missing)}")
+    if AnalysisMode(saved["analysis_mode"]) is not AnalysisMode.REASONING:
+        raise ValueError("only reasoning-mode analysis runs can be resumed")
+
+    overrides = limits or ResumeLimitOverrides()
+    config = AnalysisConfig(
+        output_dir=resolved_run_dir.parent,
+        attacker_profile=AttackerProfile(saved["attacker_profile"]),
+        model=checkpoint.model,
+        provider=ModelProvider(checkpoint.provider),
+        analysis_mode=AnalysisMode.REASONING,
+        env_file=env_file,
+        max_rounds=overrides.max_rounds or int(saved["max_rounds"]),
+        max_tokens=overrides.max_tokens or int(saved["max_tokens"]),
+        max_cost=overrides.max_cost or float(saved["max_cost"]),
+        max_duration=overrides.max_duration or int(saved["max_duration"]),
+    )
+    consumed = {
+        "max_rounds": (config.max_rounds, checkpoint.rounds),
+        "max_tokens": (config.max_tokens, checkpoint.tokens),
+        "max_cost": (config.max_cost, checkpoint.cost),
+        "max_duration": (config.max_duration, checkpoint.active_duration_seconds),
+    }
+    exhausted = [name for name, (maximum, used) in consumed.items() if maximum <= used]
+    if exhausted:
+        raise ValueError(
+            "resume limits must exceed cumulative usage: " + ", ".join(exhausted)
+        )
+    if config.provider is ModelProvider.CODEX_CHATGPT and env_file is not None:
+        raise ValueError("--env-file is not used with the saved Codex login provider")
+
+    boundary = RepositoryBoundary(checkpoint.state.repository.root)
+    current_repository = create_initial_state(boundary).repository
+    saved_repository = checkpoint.state.repository
+    if current_repository.git_commit != saved_repository.git_commit:
+        raise ValueError("repository commit changed after checkpoint; start a new analysis run")
+    if saved_repository.dirty is True or current_repository.dirty is True:
+        raise ValueError("dirty repositories cannot be safely resumed; start a new analysis run")
+
+    journal = EventJournal(
+        resolved_run_dir / "events.jsonl",
+        attempt_id=checkpoint.attempt_id + 1,
+    )
+    if journal.last_sequence < checkpoint.committed_event_seq:
+        raise ValueError("execution journal is older than the checkpoint")
+
+    state = checkpoint.state
+    state.termination = None
+    started = time.monotonic()
+    agent_result = await run_agent_analysis(
+        state,
+        boundary,
+        config,
+        resolved_run_dir,
+        resume_checkpoint=checkpoint,
+    )
+    warnings = [
+        f"Resumed from checkpoint attempt {checkpoint.attempt_id} at round "
+        f"{checkpoint.rounds}."
+    ]
+    warnings.extend(agent_result.warnings)
+    return _finalize_analysis(
+        state=state,
+        config=config,
+        mode=AnalysisMode.REASONING,
+        run_dir=resolved_run_dir,
+        warnings=warnings,
+        status=agent_result.status,
+        reason=agent_result.reason,
+        duration_seconds=max(
+            agent_result.duration_seconds,
+            checkpoint.active_duration_seconds + (time.monotonic() - started),
+        ),
+        rounds=agent_result.rounds,
+        tokens=agent_result.tokens,
+        cost=agent_result.cost,
+        source_trace=agent_result.trace_path,
+        provider=agent_result.provider,
+        runtime_metrics=agent_result.runtime_metrics,
+        append_trace=True,
+    )

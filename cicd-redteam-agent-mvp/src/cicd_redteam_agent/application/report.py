@@ -4,7 +4,13 @@ import json
 from collections import Counter
 from pathlib import Path
 
-from cicd_redteam_agent.domain.models import AnalysisReport, AttackPath, Evidence, FindingStatus
+from cicd_redteam_agent.domain.models import (
+    AnalysisReport,
+    AttackPath,
+    Evidence,
+    FindingStatus,
+    ReportStatus,
+)
 
 
 def write_report(report: AnalysisReport, run_dir: Path) -> None:
@@ -148,6 +154,7 @@ def _recommendations(path: AttackPath) -> list[str]:
 
 def render_summary(report: AnalysisReport) -> str:
     state = report.state
+    runtime = report.run_metadata.get("agent_runtime") or {}
     all_global_paths = sorted(
         [
         path for path in state.paths if path.nodes and path.nodes[0].startswith("attacker:")
@@ -181,6 +188,16 @@ def render_summary(report: AnalysisReport) -> str:
         f"| Findings / attack paths | {len(state.findings)} / {len(state.paths)} |",
         f"| Global source-to-credential paths | {len(all_global_paths)} |",
         f"| Cloud identity candidates | {len(state.identities)} |",
+        *(
+            [
+                f"| Model attempts / retries | {runtime.get('model_attempts', 0)} / "
+                f"{runtime.get('retries', 0)} |",
+                f"| Context compactions | {runtime.get('context_compactions', 0)} |",
+                f"| Checkpoints written | {runtime.get('checkpoints_written', 0)} |",
+            ]
+            if runtime
+            else []
+        ),
         "",
         "## Analysis coverage",
         "",
@@ -195,7 +212,6 @@ def render_summary(report: AnalysisReport) -> str:
         "## Findings",
         "",
     ]
-
     if not state.findings:
         lines.extend(
             [
@@ -303,7 +319,43 @@ def render_summary(report: AnalysisReport) -> str:
                 "",
             ]
         )
-
+    active_hypotheses = [
+        hypothesis
+        for hypothesis in state.working_memory.hypotheses
+        if hypothesis.status.value in {"ACTIVE", "BLOCKED", "READY_FOR_PROPOSAL"}
+    ]
+    if report.status is ReportStatus.PARTIAL and active_hypotheses:
+        lines.extend(["## Active investigation state", ""])
+        for hypothesis in active_hypotheses:
+            next_check = (
+                _inline(hypothesis.next_check.objective)
+                if hypothesis.next_check
+                else "none"
+            )
+            lines.extend(
+                [
+                    f"### {_inline(hypothesis.claim)}",
+                    "",
+                    f"- Status: {_code(hypothesis.status)}",
+                    f"- Missing evidence: {_missing_list(hypothesis.missing_evidence)}",
+                    f"- Next check: {next_check}",
+                    "",
+                    _inline(hypothesis.decision_summary),
+                    "",
+                ]
+            )
+    if runtime:
+        lines.extend(
+            [
+                "## Agent runtime",
+                "",
+                f"- Model attempts: {runtime.get('model_attempts', 0)}",
+                f"- Model retries: {runtime.get('retries', 0)}",
+                f"- Context compactions: {runtime.get('context_compactions', 0)}",
+                f"- Checkpoints written: {runtime.get('checkpoints_written', 0)}",
+                "",
+            ]
+        )
     lines.extend(["## Warnings and unknowns", ""])
     pending = list(dict.fromkeys([*report.warnings, *state.pending_questions]))
     lines.extend(f"- {_inline(item)}" for item in pending)

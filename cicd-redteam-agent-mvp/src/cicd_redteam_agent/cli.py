@@ -7,7 +7,12 @@ from pathlib import Path
 
 from pydantic import ValidationError
 
-from cicd_redteam_agent.application.analyze import AnalysisConfig, analyze_repository
+from cicd_redteam_agent.application.analyze import (
+    AnalysisConfig,
+    ResumeLimitOverrides,
+    analyze_repository,
+    resume_analysis,
+)
 from cicd_redteam_agent.domain.models import AnalysisMode, AttackerProfile, ReportStatus
 from cicd_redteam_agent.framework.auth import ModelProvider
 from cicd_redteam_agent.security.redaction import redact
@@ -53,6 +58,15 @@ def build_parser() -> argparse.ArgumentParser:
     analyze.add_argument("--max-tokens", type=int, default=100_000)
     analyze.add_argument("--max-cost", type=float, default=2.0)
     analyze.add_argument("--max-duration", type=int, default=900)
+    resume = subcommands.add_parser(
+        "resume", help="resume a reasoning analysis from its last safe checkpoint"
+    )
+    resume.add_argument("run_dir", type=Path)
+    resume.add_argument("--env-file", type=Path)
+    resume.add_argument("--max-rounds", type=int)
+    resume.add_argument("--max-tokens", type=int)
+    resume.add_argument("--max-cost", type=float)
+    resume.add_argument("--max-duration", type=int)
     evaluate = subcommands.add_parser(
         "evaluate", help="run reasoning mode against a hidden-oracle fixture matrix"
     )
@@ -85,6 +99,19 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _validate_positive(args: argparse.Namespace) -> None:
+    if args.command == "resume":
+        values = {
+            "max_rounds": args.max_rounds,
+            "max_tokens": args.max_tokens,
+            "max_cost": args.max_cost,
+            "max_duration": args.max_duration,
+        }
+        invalid = [
+            name for name, value in values.items() if value is not None and value <= 0
+        ]
+        if invalid:
+            raise ValueError(f"Limits must be positive: {', '.join(invalid)}")
+        return
     values = {
         "max_rounds": args.max_rounds,
         "max_tokens": args.max_tokens,
@@ -107,6 +134,25 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         _validate_positive(args)
+        if args.command == "resume":
+            report, run_dir = asyncio.run(
+                resume_analysis(
+                    args.run_dir,
+                    env_file=args.env_file,
+                    limits=ResumeLimitOverrides(
+                        max_rounds=args.max_rounds,
+                        max_tokens=args.max_tokens,
+                        max_cost=args.max_cost,
+                        max_duration=args.max_duration,
+                    ),
+                )
+            )
+            print(f"{report.status}: {run_dir}")
+            if report.status is ReportStatus.COMPLETE:
+                return 0
+            if report.status is ReportStatus.PARTIAL:
+                return 4
+            return 5
         config = AnalysisConfig(
             output_dir=args.output,
             attacker_profile=AttackerProfile(args.attacker_profile),
@@ -145,7 +191,11 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Framework initialization error: {redact(str(exc))}", file=sys.stderr)
         return 3
     except Exception as exc:
-        if args.model or args.provider == ModelProvider.CODEX_CHATGPT.value:
+        if (
+            getattr(args, "model", None)
+            or getattr(args, "provider", None) == ModelProvider.CODEX_CHATGPT.value
+            or args.command == "resume"
+        ):
             print(
                 "Framework or model initialization error: "
                 f"{type(exc).__name__}: {redact(str(exc))}",

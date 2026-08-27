@@ -26,10 +26,37 @@ It returns one capability decision per round; `CICDChatAgent` executes that capa
 result to its existing history, and asks again until `submit_analysis` or a limit terminates the
 same Agent loop.
 
+Every reasoning Capability schema carries one optional `working_memory_patch_json` field. A
+material hypothesis update is validated and applied before the selected Capability runs, then the
+field is removed from the underlying action arguments. This preserves native Tool selection and
+adds no model call or Agent round. The bounded memory stores at most eight concise, user-visible
+hypotheses with Evidence/Relation grounding and a next check; it is not chain-of-thought, Evidence,
+a Finding or an AttackPath. Both LiteLLM and Codex receive the same current-state projection.
+
+`ListSecurityFacts` assigns run-local short references such as `R0001`. The preferred compact
+submission contains only ordered Relation references and user-facing Finding metadata. A
+deterministic expander restores exact graph nodes, edges, Evidence, missing evidence and status
+before the unchanged proposal Validator runs. The legacy full proposal remains accepted.
+The same refs may ground working-memory hypotheses; their exact Relation/Evidence and missing
+Evidence fields are restored before memory validation. Default Fact output omits those long IDs to
+reduce repeated model input, while an explicit compatibility option can expose them.
+
+The Agent runtime owns one bounded retry policy for both LLM backends; provider-internal retries are
+disabled where configurable to prevent attempt multiplication. Canonical history and structured
+state remain complete while a filtered model-input view removes superseded limits and old complete
+rounds near the context ceiling. Each successful round atomically replaces `checkpoint.json`, while
+bounded lifecycle metadata is appended to `events.jsonl`. A PARTIAL reasoning run can resume in the
+same run directory from that committed boundary after repository/prompt/limit validation; an
+incomplete round is rolled back and retried. Runtime counters and budgets remain cumulative across
+attempts. See `docs/AGENT_RUNTIME.md`.
+
 The Codex runtime starts in an empty temporary directory with read-only sandbox and denied
 approvals. It disables inherited Codex plugins and every MCP server declared in the trusted user
-configuration. It receives capability schemas and the redacted hackingBuddyGPT conversation, while
-repository access remains exclusively in the existing bounded Capabilities.
+configuration. Each model decision uses an ephemeral Codex thread. Instead of duplicating the full
+hackingBuddyGPT conversation in Codex-owned memory, the adapter projects the trusted Agent policy,
+authoritative `AnalysisState`, current output identifiers, progress counters and the seven most
+recent Agent events into a bounded decision context. Older facts must be fetched again through the
+existing bounded Capabilities, which remain the only repository-access path.
 
 ## Global attack graph
 
@@ -53,9 +80,10 @@ emit a vulnerability Finding. Examples include an untrusted event value flowing 
 environment variable or step output, repository code executing in a local action, and a step being
 able to use a specific write-capable token permission.
 
-`ListSecurityFacts` exposes these relations with a stable `relation_id`, Evidence, a tri-state
-verdict and any missing evidence. The Agent may compose only returned relations into a proposed
-path. The validator grounds each edge by `relation_id`, checks its source/type/target and Evidence,
+Internally each relation retains a stable `relation_id`, Evidence, a tri-state verdict and any
+missing evidence. `ListSecurityFacts` normally exposes a compact run-local ref plus the semantic
+fields needed for reasoning. The Agent may compose only returned relations into a proposed path.
+The runtime restores the stable IDs before the validator checks source/type/target and Evidence,
 and rejects a `SUPPORTED` path containing an `UNKNOWN` or `FALSE` relation. GHA fixture IDs remain
 evaluation labels rather than product rule identifiers.
 

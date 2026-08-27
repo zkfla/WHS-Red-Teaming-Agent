@@ -91,6 +91,25 @@ ChatGPT 로그인 기반 Codex LLM adapter로 실행하고 실제 로그인 smok
 - **Exit criteria**: provider/model/token/round/termination과 결과 artifact가 저장되고,
   Codex runtime의 inherited plugin·MCP server가 비활성화된다.
 
+### Phase 8: 구조화 가설과 작업 메모
+
+- **Objective**: Agent가 대화 기록과 별개로 현재 가설, 근거, 반증, 부족한 Evidence와 다음
+  확인 대상을 `AnalysisState`에 보존한다.
+- **Validation**: 메모 patch가 기존 Capability와 같은 라운드에서 실행되고, unknown ID,
+  FALSE support, stale revision, semantic no-op과 반복 우회를 거부하며 두 provider 입력에 같은
+  상태가 투영되는지 검사한다.
+- **Exit criteria**: 추가 모델 호출·Agent 라운드 없이 최대 8개의 bounded hypothesis가
+  checkpoint와 PARTIAL handoff에 보존되고 기존 Finding/AttackPath 결과가 변하지 않는다.
+
+### Phase 9: 안전한 checkpoint 재개
+
+- **Objective**: PARTIAL reasoning 실행을 마지막으로 확정된 라운드 경계에서 동일 run
+  디렉터리로 재개하고, 실행 이력과 누적 예산을 보존한다.
+- **Validation**: atomic checkpoint 복원, append-only event journal, 불완전 라운드 rollback,
+  attempt 증가, 동시 실행 잠금, 저장소 commit·dirty·prompt·limit 검사를 확인한다.
+- **Exit criteria**: `cicd-agent resume <run-dir>`가 provider와 무관한 `AnalysisState`를 원본으로
+  사용하며, 모델 대화나 raw chain-of-thought 없이 중단 지점 이후 분석을 계속한다.
+
 ## Done definition
 
 - 계획의 비-LLM API 완료 조건을 자동 테스트가 검증한다.

@@ -36,6 +36,21 @@ class FailingAgent:
         raise RuntimeError("rate limit")
 
 
+class PartiallyMutatingAgent:
+    def __init__(self, context: CapabilityContext) -> None:
+        self.context = context
+        self._prompt_history = ["committed"]
+
+    async def before_run(self, _limits: StubLimits) -> None:
+        return None
+
+    async def perform_round(self, _limits: StubLimits) -> None:
+        self.context.state.pending_questions.append("uncommitted")
+        self.context.submitted = True
+        self._prompt_history.append("uncommitted assistant output")
+        raise RuntimeError("tool failed")
+
+
 class RepeatingAgent:
     def __init__(self, context: CapabilityContext) -> None:
         self.context = context
@@ -64,6 +79,15 @@ class VaryingAgent:
             self.context.submitted = True
 
 
+class TokenReserveLimits(StubLimits):
+    def tokens_remaining(self) -> int:
+        return 1_000
+
+
+class TokenHeavyAgent(RepeatingAgent):
+    last_round_tokens = 20_000
+
+
 def _context(tmp_path: Path) -> CapabilityContext:
     boundary = RepositoryBoundary(tmp_path)
     state = create_initial_state(boundary)
@@ -81,6 +105,19 @@ async def test_model_error_preserves_existing_state(tmp_path: Path) -> None:
     assert reason == "model_error"
     assert context.state.pending_questions == ["preserve deterministic state"]
     assert "RuntimeError: rate limit" in usecase.warnings[0]
+
+
+@pytest.mark.asyncio
+async def test_failed_round_rolls_back_state_submission_and_history(tmp_path: Path) -> None:
+    context = _context(tmp_path)
+    agent = PartiallyMutatingAgent(context)
+
+    reason = await CICDUseCase(agent, context, StubLimits()).run()
+
+    assert reason == "model_error"
+    assert context.state.pending_questions == ["preserve deterministic state"]
+    assert not context.submitted
+    assert agent._prompt_history == ["committed"]
 
 
 @pytest.mark.asyncio
@@ -118,3 +155,18 @@ async def test_limit_reason_is_returned_without_losing_state(
 
     assert reason == limit_reason
     assert context.state.pending_questions == ["preserve deterministic state"]
+
+
+@pytest.mark.asyncio
+async def test_round_is_not_started_when_token_reserve_is_too_small(
+    tmp_path: Path,
+) -> None:
+    context = _context(tmp_path)
+    limits = TokenReserveLimits()
+
+    usecase = CICDUseCase(TokenHeavyAgent(context), context, limits)
+    reason = await usecase.run()
+
+    assert reason == "insufficient_token_reserve"
+    assert limits.rounds == 0
+    assert "remaining token budget" in usecase.warnings[0]

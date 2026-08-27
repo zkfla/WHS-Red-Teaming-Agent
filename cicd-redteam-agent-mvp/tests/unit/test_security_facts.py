@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 import pytest
@@ -217,6 +218,28 @@ async def test_security_fact_capability_groups_relations(tmp_path: Path) -> None
     payload = await ListSecurityFacts(CapabilityContext(state, boundary))("credential", "TRUE")
     assert "can_use_github_token_contents_write" in payload
     assert '"credential"' in payload
+
+
+@pytest.mark.asyncio
+async def test_security_fact_capability_paginates_large_results(tmp_path: Path) -> None:
+    state = await _analyze("inference-flow", "supported", tmp_path)
+    boundary = RepositoryBoundary(FIXTURES / "inference-flow" / "supported")
+    capability = ListSecurityFacts(CapabilityContext(state, boundary))
+
+    first = json.loads(await capability(limit=1))
+    second = json.loads(await capability(offset=first["next_offset"], limit=1))
+
+    assert first["total"] == len([item for item in state.relations if item.category])
+    assert len(first["facts"]) == 1
+    assert first["next_offset"] == 1
+    assert second["offset"] == 1
+    assert second["facts"][0]["relation_ref"] != first["facts"][0]["relation_ref"]
+    assert "relation_id" not in first["facts"][0]
+    assert "evidence_ids" not in first["facts"][0]
+
+    grounded = json.loads(await capability(limit=1, include_grounding=True))
+    assert grounded["facts"][0]["relation_id"]
+    assert "evidence_ids" in grounded["facts"][0]
 
 
 @pytest.mark.asyncio

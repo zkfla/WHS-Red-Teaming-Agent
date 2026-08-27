@@ -46,6 +46,22 @@
 - Codex SDK contract surface and shared hackingBuddyGPT adapter references are checked statically
 - Codex runtime disables inherited plugins and configured MCP servers
 - semantic graph identifiers survive redaction while assignment-style secret values do not
+- working-memory patches update a grounded hypothesis in the same Capability round
+- unknown Evidence/Relation IDs, FALSE supporting Relations and stale revisions are rejected
+- semantic no-op memory patches do not increase revision or bypass repeated-action detection
+- LiteLLM-style message input and Codex decision context receive the same current working memory
+- PARTIAL output preserves active hypotheses without treating them as Findings
+- short Relation references expand to exact immutable nodes, edges and Evidence
+- unknown, duplicate and discontinuous compact path references are rejected before state mutation
+- compact drafts still pass the ordinary AnalysisProposal Validator before atomic submission
+- compact Fact output omits long grounding IDs unless compatibility mode is requested
+- working-memory Relation refs restore exact Evidence and missing Evidence; unknown refs do not mutate state
+- compact drafts derive CANDIDATE from UNKNOWN and REJECTED from FALSE without accepting a model status override
+- checkpoint replacement is atomic and restores AnalysisState, working memory, limits and runtime metrics
+- event journal sequence is append-only; only a malformed final line is repairable
+- failed rounds roll back state, submission state and partial Agent history before checkpointing
+- resume reuses the same run directory and attempt lineage while preserving cumulative budgets
+- completed runs, commit drift, dirty repositories, stale/corrupt journals and concurrent leases are rejected
 
 ## Release checks
 
@@ -55,9 +71,16 @@ uv run python -m pytest -q
 uv run ruff check .
 uv run cicd-agent analyze tests/fixtures/oidc-risk --output <temporary-output>
 uv run cicd-agent evaluate tests/fixtures/reasoning-matrix --output <temporary-output> `
-  --provider codex-chatgpt --scenario gha-01
+  --provider codex-chatgpt --model gpt-5.6-luna --scenario gha-01
 ```
 
 The ChatGPT-login smoke was executed against `tests/fixtures/global-chain` with `gpt-5.6-terra` and
 completed through `proposal_validated`. A real LiteLLM provider call remains excluded until an
 external provider credential and cost/usage ceiling are available.
+All new Codex live tests use `gpt-5.6-luna`; the historical Terra result remains provenance rather
+than the current test-model policy.
+
+`matrix-evaluation/evaluation.json` also records observable Agent behavior per case and in aggregate:
+rounds, reported tokens, Capability call/repeat counts, working-memory revisions, hypothesis counts
+and final statuses, retries and context compactions. These fields support later A/B comparison but
+do not claim causal token savings without matched runs.
