@@ -1,5 +1,11 @@
 # CI/CD Red Team Agent 구현 계획
 
+> **문서 상태: v0.1.0 구현 이력**
+>
+> 현재 사용법은 [README](README.md), 공개 계약은
+> [docs/CONTRACTS.md](docs/CONTRACTS.md), 완료 범위는
+> [docs/PLAN_COVERAGE.md](docs/PLAN_COVERAGE.md)를 기준으로 합니다.
+
 ## Goal
 
 GitHub Actions 저장소를 안전하게 분석하고, 개별 규칙의 사실을 Evidence 기반 전역 공격

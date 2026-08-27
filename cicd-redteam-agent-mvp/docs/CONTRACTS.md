@@ -30,6 +30,12 @@ Each run writes `<output>/<run-id>/analysis.json`, `summary.md` and `trace.jsonl
 carry `schema_version="1.0"`. Run metadata records the repository commit, attacker profile, resolved
 analysis mode, configured limits, framework commit and optional provider/model identifier.
 
+`summary.md` is a human-readable view of the same report. It includes an execution overview,
+deterministic coverage counts, Finding details, global and local attack paths, cloud identity
+handoffs, warnings and status interpretation. Evidence references include their repository-relative
+source path and line range. Repository and model-derived text is Markdown-escaped before rendering.
+`analysis.json` remains the canonical machine-readable contract.
+
 `auto` accepts exactly one configured provider key. More than one key requires explicit
 `--provider`; provider/model prefix conflicts are configuration errors. Process variables take
 precedence over `.env`. Automatic `.env` discovery never loads a file inside the analyzed

@@ -1,5 +1,11 @@
 # CI/CD Red Team Agent 확장 계획
 
+> **문서 상태: 설계 참고 자료**
+>
+> 현재 구현 구조와 계약은 [Architecture](ARCHITECTURE.md),
+> [Public contracts](CONTRACTS.md)를 기준으로 합니다. 전체 문서 안내는
+> [문서 허브](README.md)를 참고하세요.
+
 > **중요 — 구현 입력으로 사용 금지**
 >
 > **구현 에이전트는 구현 작업 시 이 문서를 읽거나 입력으로 사용하지 않는다.**
