@@ -27,6 +27,12 @@ class KnowledgeGraph:
     def add_entitlement(self, ent: Entitlement) -> None:
         if not is_entitled_relation(ent.relation):
             raise ValueError(f"entitled_* 관계가 아님: {ent.relation!r}")
+        if self._has_entitled_edge(ent.principal, ent.obj, ent.relation):
+            # 같은 (주체, 대상, 관계)의 entitled_* 간선이 이미 있으면 중복 추가하지 않는다.
+            # 부트스트랩(react.py)과 정찰(recon/entitlement.py::discover)이 self_created 를
+            # 각각 넣어 같은 소유권한이 두 번 그려지던 문제를 그래프 레벨에서 방어한다 —
+            # 호출부와 무관하게 안전하고, 먼저 들어온(=더 정확한 source) 간선이 유지된다.
+            return
         key = f"entitled:{ent.relation}:{ent.source}:{next(_counter)}"
         self._g.add_edge(
             ent.principal,
@@ -41,6 +47,15 @@ class KnowledgeGraph:
     def add_entitlements(self, entitlements: Iterable[Entitlement]) -> None:
         for ent in entitlements:
             self.add_entitlement(ent)
+
+    def _has_entitled_edge(self, principal: str, obj: str, relation: str) -> bool:
+        """(주체, 대상, 관계)가 일치하는 entitled_* 간선이 이미 있으면 True (중복 방지용)."""
+        if principal not in self._g:
+            return False
+        for _, target, data in self._g.out_edges(principal, data=True):
+            if target == obj and data.get("kind") == "entitled" and data.get("relation") == relation:
+                return True
+        return False
 
     # ── observed_* — 시험 중 관측된 실제 접근. entitled_* 로 절대 승격되지 않는다 ──
 

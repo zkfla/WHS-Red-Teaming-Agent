@@ -75,3 +75,15 @@ def test_apply_observed_is_alias_for_add_observed():
     assert len(graph.observed_edges()) == 1
     assert graph.observed_edges()[0]["evidence_ref"] == "ev_abc"
     assert len(graph.entitled_edges()) == 0
+
+
+def test_duplicate_entitlement_is_deduped():
+    graph = KnowledgeGraph()
+    ent = Entitlement(
+        principal="attacker_A", relation="entitled_own",
+        obj="account:111", source="self_created",
+    )
+    graph.add_entitlement(ent)
+    graph.add_entitlement(ent)          # 같은 간선을 두 번
+    own = [e for e in graph.entitled_edges() if e["relation"] == "entitled_own"]
+    assert len(own) == 1                # 중복 제거 기대
