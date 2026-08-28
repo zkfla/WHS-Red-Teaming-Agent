@@ -188,6 +188,31 @@ whs-redteam status configs/engagement.example.yaml RUN_ID
 whs-redteam resume configs/engagement.example.yaml RUN_ID
 ```
 
+YAML을 직접 작성하지 않고 허가받은 단일 URL에서 SQLi 전용 흐름을 시작하려면 다음
+명령을 사용합니다. 첫 실행은 발견과 계획 후 서명 승인을 기다립니다.
+
+```bash
+whs-redteam sqli-scan 'http://127.0.0.1:8765/sql?id=1'
+```
+
+출력된 `config_path`로 `sqli_safe` 승인 토큰을 발급하고, `run_id`와 토큰 파일을 함께
+전달하면 승인·검증·보고서 생성까지 재개합니다.
+
+```bash
+whs-redteam issue-approval CONFIG_PATH \
+  --output /tmp/sqli-approval.token \
+  --capability sqli_safe \
+  --max-uses 1
+whs-redteam sqli-scan 'http://127.0.0.1:8765/sql?id=1' \
+  --run-id RUN_ID \
+  --token-file /tmp/sqli-approval.token
+```
+
+`sqli-scan`은 입력 URL의 query 값 자체를 저장하지 않고 자료형만 추론합니다. 실제
+SQLi 변형 요청은 기존 `SQLInjectionProbe`가 생성하며 scope, 요청 예산, 승인 정책을
+그대로 통과합니다. CLI와 향후 웹 UI는 공통 `RunService`를 사용하므로 실행·상태 조회·
+승인·재개 동작의 정책 경로가 동일합니다.
+
 MCP SDK를 거치는 개발·회귀시험 모드는 다음처럼 실행합니다. 이 모드는 실제 MCP
 Client/Server 호출을 사용하지만 server는 같은 프로세스 안에 있으므로 운영 배포 구성이
 아닙니다.
