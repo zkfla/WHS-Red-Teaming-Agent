@@ -223,3 +223,30 @@ def test_concurrent_transfer_flows_through_spine_to_race_violation():
     assert summary["judged"] >= 1
     assert summary["violations"] >= 1
     assert summary["reproduction_rate"] > 0
+
+
+def test_bola_read_of_unentitled_account_flows_to_inv2_violation():
+    """공격자가 권한 없는 타 계좌(victim)를 조회 → INV-2 VIOLATION 으로 확정된다.
+
+    코드 변경 없이 read_balance 리졸버 + INV-2(그래프 오라클) + entitled_* 그래프가
+    이어져 BOLA 익스 클래스가 스파인으로 확정되는지 검증한다.
+    """
+    session = _mock_target_session()  # GET /check_balance/<acct> 는 인증 무관하게 잔액 반환(BOLA)
+    target = session.target
+    principals = _principals()
+    graph = _graph(principals)  # attacker→111, victim→222 (attacker 는 222 에 권한 없음)
+    baselines = _seed_baseline()
+
+    # attacker 가 victim(222) 계좌를 조회한다 — 자기 것이 아니다
+    skeleton = resolve_skeleton("read_balance", "attacker_A", f"account:{VICTIM_ACCT}", principals, graph, target)
+    assert not isinstance(skeleton, str), skeleton
+    assert skeleton.subject_account == VICTIM_ACCT
+
+    candidate = build_candidate(skeleton, {}, "", baselines)
+    attacker = principals[0]
+    result = execute(session, target, candidate, attacker, watch_accounts=candidate.watch_accounts)
+    assert all(code < 400 for code in result.status_codes)
+
+    finding = verify(candidate, result, graph)
+    assert finding.verdict == Verdict.VIOLATION
+    assert finding.invariant == "INV-2"
