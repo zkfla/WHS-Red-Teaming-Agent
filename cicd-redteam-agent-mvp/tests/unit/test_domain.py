@@ -2,10 +2,12 @@ from pathlib import Path
 
 from cicd_redteam_agent.application.state import create_initial_state
 from cicd_redteam_agent.domain.attacker_control import assess_attacker_control, derive_attack_paths
+from cicd_redteam_agent.domain.execution_semantics import derive_execution_semantics
 from cicd_redteam_agent.domain.github_actions_parser import discover_workflows, parse_workflow
 from cicd_redteam_agent.domain.identity_analysis import derive_identity_candidates
 from cicd_redteam_agent.domain.models import AttackerProfile, FindingStatus, TriState
 from cicd_redteam_agent.domain.reference_tracer import trace_local_references
+from cicd_redteam_agent.domain.security_facts import derive_security_facts
 from cicd_redteam_agent.security.repository_boundary import RepositoryBoundary
 
 FIXTURES = Path(__file__).parents[1] / "fixtures"
@@ -24,14 +26,20 @@ def build_state():
     return state
 
 
-def test_fork_pr_supported_path_and_unknown_cloud_trust() -> None:
+def test_fork_pr_permission_uncertainty_propagates_to_path_and_cloud_trust() -> None:
     state = build_state()
     state.assessments = assess_attacker_control(state, AttackerProfile.FORK_PR)
     assert any(item.verdict is TriState.TRUE for item in state.assessments)
+    semantics = derive_execution_semantics(state, AttackerProfile.FORK_PR)
+    state.trigger_contexts = semantics.trigger_contexts
+    state.job_execution_contexts = semantics.job_contexts
+    state.relations.extend(semantics.relations)
+    state.relations.extend(derive_security_facts(state, AttackerProfile.FORK_PR))
     state.findings, state.paths = derive_attack_paths(state)
-    assert state.paths[0].status is FindingStatus.SUPPORTED
+    assert state.paths
+    assert all(path.status is FindingStatus.CANDIDATE for path in state.paths)
     state.identities = derive_identity_candidates(state)
-    assert state.identities[0].oidc_enabled is TriState.TRUE
+    assert state.identities[0].oidc_enabled is TriState.UNKNOWN
     assert state.identities[0].trust_verified is TriState.UNKNOWN
 
 
@@ -70,8 +78,10 @@ def _assess_fixture(name: str):
 def test_pull_request_target_checkout_provenance_is_tri_state() -> None:
     unknown = _assess_fixture("pr-target-unknown")
     controlled = _assess_fixture("pr-target-controlled")
-    assert unknown[0].verdict is TriState.UNKNOWN
+    blocked = _assess_fixture("pr-target-blocked")
+    assert unknown[0].verdict is TriState.FALSE
     assert controlled[0].verdict is TriState.TRUE
+    assert blocked[0].verdict is TriState.FALSE
 
 
 def test_reference_cycle_is_bounded() -> None:

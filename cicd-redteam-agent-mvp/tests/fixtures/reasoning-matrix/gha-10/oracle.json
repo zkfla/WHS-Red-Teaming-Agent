@@ -13,7 +13,7 @@
       "expected_status": "CANDIDATE",
       "required_relations": [
         ["environment_protection_unknown", "UNKNOWN"],
-        ["reusable_workflow_permission_boundary_unknown", "UNKNOWN"],
+        ["reusable_workflow_permission_ceiling_applied", "TRUE"],
         ["calls_reusable_workflow", "TRUE"]
       ]
     },

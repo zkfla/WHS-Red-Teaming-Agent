@@ -216,6 +216,36 @@ async def test_local_reusable_workflow_is_an_attacker_controlled_source(
 
 
 @pytest.mark.asyncio
+async def test_pull_request_target_cache_write_is_read_only_in_default_branch_context(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repository"
+    workflows = repository / ".github" / "workflows"
+    workflows.mkdir(parents=True)
+    (workflows / "cache.yml").write_text(
+        "on: pull_request_target\npermissions:\n  contents: read\njobs:\n  cache:\n"
+        "    runs-on: ubuntu-latest\n    steps:\n"
+        "      - uses: actions/cache@2222222222222222222222222222222222222222\n"
+        "        with:\n          path: node_modules\n          key: default-branch-cache\n",
+        encoding="utf-8",
+    )
+    report, _ = await analyze_repository(
+        repository, AnalysisConfig(output_dir=tmp_path / "output")
+    )
+    cache_access = [
+        relation
+        for relation in report.state.relations
+        if relation.relation_type == "cache_write_access_in_context"
+    ]
+    assert cache_access
+    assert all(relation.verdict.value == "FALSE" for relation in cache_access)
+    assert not any(
+        relation.relation_type == "attacker_may_populate_cache"
+        for relation in report.state.relations
+    )
+
+
+@pytest.mark.asyncio
 async def test_security_fact_capability_groups_relations(tmp_path: Path) -> None:
     state = await _analyze("inference-flow", "supported", tmp_path)
     boundary = RepositoryBoundary(FIXTURES / "inference-flow" / "supported")
@@ -282,8 +312,12 @@ async def test_oidc_fact_preserves_external_cloud_trust_as_unknown(tmp_path: Pat
         if item.relation_type == "oidc_may_assume_cloud_identity"
     )
     assert cloud.verdict.value == "UNKNOWN"
-    assert cloud.missing_evidence == ["aws federated identity trust policy"]
+    assert cloud.missing_evidence == [
+        "aws federated identity trust policy",
+        "fork pull-request OIDC token availability",
+    ]
     assert "aws federated identity trust policy" in state.pending_questions
+    assert "fork pull-request OIDC token availability" in state.pending_questions
 
 
 @pytest.mark.asyncio
@@ -334,5 +368,6 @@ async def test_gcp_and_azure_oidc_trust_remains_unknown(tmp_path: Path) -> None:
     missing = {item for relation in cloud for item in relation.missing_evidence}
     assert missing == {
         "azure federated identity trust policy",
+        "fork pull-request OIDC token availability",
         "gcp federated identity trust policy",
     }

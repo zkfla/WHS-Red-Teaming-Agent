@@ -111,7 +111,12 @@ async def test_cache_poisoning_reaches_privileged_token_sink(tmp_path: Path) -> 
     ]
 
     assert cache_paths
-    assert all(path.status is FindingStatus.SUPPORTED for path in cache_paths)
+    assert any(path.status is FindingStatus.SUPPORTED for path in cache_paths)
+    assert all(
+        path.status is FindingStatus.SUPPORTED
+        or "repository default GITHUB_TOKEN permissions" in path.missing_evidence
+        for path in cache_paths
+    )
 
 
 @pytest.mark.asyncio

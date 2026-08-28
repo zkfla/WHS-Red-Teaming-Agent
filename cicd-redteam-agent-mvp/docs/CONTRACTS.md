@@ -38,7 +38,10 @@ ordering only; they cannot create Evidence, Relations, verdicts, guards or final
 
 Each run writes `<output>/<run-id>/analysis.json`, `summary.md` and `trace.jsonl`. Reasoning runs
 also write atomic `checkpoint.json` schema 2.0 and append-only `events.jsonl` schema 1.0. All public models
-carry `schema_version="1.0"`. Run metadata records the repository commit, attacker profile, resolved
+carry `schema_version="1.0"`. `AnalysisState` includes parsed workflow syntax plus event-scoped
+`trigger_contexts` and `job_execution_contexts`; effective `GITHUB_TOKEN` authority is carried by the
+execution contexts and semantic Relations rather than inferred by consumers from the parser's legacy
+permission summary. Run metadata records the repository commit, attacker profile, resolved
 analysis mode, configured limits, framework commit and optional provider/model identifier. When a
 reasoning Objective exists, `analysis.json` records its exact normalized text, SHA-256 hash and
 compiled Objective Goal; `summary.md` shows a bounded preview, hash and compact focus summary. Event

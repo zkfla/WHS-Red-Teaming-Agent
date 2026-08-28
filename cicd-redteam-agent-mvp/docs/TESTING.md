@@ -4,7 +4,10 @@
 
 - workflow-free repository and ordinary CI
 - YAML 1.2 `on`, malformed YAML and job permission override
-- fork PR and `pull_request_target` checkout provenance
+- fork PR and `pull_request_target` checkout provenance, including current floating-major checkout fork protection and explicit unsafe opt-out
+- event-scoped execution contexts, job/step reachability and effective permission lattice
+- local reusable-workflow caller permission ceiling and fresh `workflow_run` consumer context
+- cache write policy: `pull_request` merge-ref scope remains read-write while low-trust default-branch triggers are read-only
 - local composite action, reusable workflow, static script and reference cycle
 - dynamic expression path preserved as UNKNOWN
 - Secret/GITHUB_TOKEN reference and redaction
@@ -17,7 +20,7 @@
 - PR expression shell injection
 - PR artifact consumed and executed by privileged `workflow_run`
 - mutable external action combined with privileged context
-- broad `GITHUB_TOKEN` permissions
+- broad `GITHUB_TOKEN` permissions resolved from execution-context authority rather than parser-level permission summaries
 - secure counterparts must not produce their scenario Finding
 - composed path must reach a credential or cloud identity only through validated edges
 - inference-flow fixtures cover SUPPORTED, CANDIDATE/UNKNOWN and secure guard variants

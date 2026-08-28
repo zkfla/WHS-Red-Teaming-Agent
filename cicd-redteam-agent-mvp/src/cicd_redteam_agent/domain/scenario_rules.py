@@ -12,6 +12,7 @@ from cicd_redteam_agent.domain.models import (
     Finding,
     FindingStatus,
     Job,
+    PermissionLevel,
     Step,
     TriState,
     Workflow,
@@ -29,17 +30,21 @@ EXECUTED_ARTIFACT = re.compile(
 )
 
 
-def _privileged(job: Job, state: AnalysisState) -> bool:
-    permissions = job.permissions_effective
-    if permissions == "write-all":
-        return True
-    if isinstance(permissions, dict) and any(
-        str(value).lower() == "write" for value in permissions.values()
-    ):
-        return True
+def _privilege_verdict(job: Job, state: AnalysisState) -> TriState:
     if any(reference.job_id == job.job_id for reference in state.secret_references):
-        return True
-    return False
+        return TriState.TRUE
+    contexts = [item for item in state.job_execution_contexts if item.job_id == job.job_id]
+    sensitive = {"actions", "contents", "deployments", "id-token", "packages", "pull-requests"}
+    levels = [
+        context.effective_permissions.get(scope)
+        for context in contexts
+        for scope in sensitive
+    ]
+    if any(level is PermissionLevel.WRITE for level in levels):
+        return TriState.TRUE
+    if any(level is PermissionLevel.UNKNOWN for level in levels):
+        return TriState.UNKNOWN
+    return TriState.FALSE
 
 
 def _edges_for_step(workflow: Workflow, job: Job, step: Step) -> list[AttackEdge]:
@@ -154,8 +159,8 @@ def _derive_mutable_actions(state: AnalysisState) -> tuple[list[Finding], list[A
                 mutable_ref = _external_action_ref(step.uses)
                 if mutable_ref is None:
                     continue
-                privileged = _privileged(job, state)
-                if not privileged:
+                privilege = _privilege_verdict(job, state)
+                if privilege is TriState.FALSE:
                     continue
                 finding, path = _finding_and_path(
                     workflow=workflow,
@@ -170,7 +175,15 @@ def _derive_mutable_actions(state: AnalysisState) -> tuple[list[Finding], list[A
                     ),
                     status=FindingStatus.CANDIDATE,
                     confidence=Confidence.MEDIUM,
-                    missing_evidence=["external action ref integrity", "upstream compromise"],
+                    missing_evidence=[
+                        "external action ref integrity",
+                        "upstream compromise",
+                        *(
+                            ["effective credential availability"]
+                            if privilege is TriState.UNKNOWN
+                            else []
+                        ),
+                    ],
                 )
                 findings.append(finding)
                 paths.append(path)
@@ -185,7 +198,12 @@ def _derive_broad_token_permissions(
     paths: list[AttackPath] = []
     for workflow in state.workflows:
         for job in workflow.jobs:
-            if job.permissions_effective != "write-all":
+            declared = (
+                job.permissions_declared
+                if job.permissions_declared is not None
+                else workflow.permissions
+            )
+            if declared != "write-all":
                 continue
             controlled_steps = [
                 step
@@ -200,7 +218,8 @@ def _derive_broad_token_permissions(
             )
             if step is None:
                 continue
-            supported = bool(controlled_steps)
+            privilege = _privilege_verdict(job, state)
+            supported = bool(controlled_steps) and privilege is TriState.TRUE
             finding, path = _finding_and_path(
                 workflow=workflow,
                 job=job,
@@ -220,7 +239,15 @@ def _derive_broad_token_permissions(
                 ),
                 status=FindingStatus.SUPPORTED if supported else FindingStatus.CANDIDATE,
                 confidence=Confidence.HIGH if supported else Confidence.MEDIUM,
-                missing_evidence=[] if supported else ["workflow permission requirements"],
+                missing_evidence=(
+                    []
+                    if supported
+                    else [
+                        "effective event-scoped GITHUB_TOKEN permissions"
+                        if privilege is TriState.UNKNOWN
+                        else "workflow permission requirements"
+                    ]
+                ),
             )
             findings.append(finding)
             paths.append(path)
@@ -261,7 +288,8 @@ def _derive_artifact_execution(state: AnalysisState) -> tuple[list[Finding], lis
         if not producer_names:
             continue
         for job in consumer.jobs:
-            if not _privileged(job, state):
+            privilege = _privilege_verdict(job, state)
+            if privilege is TriState.FALSE:
                 continue
             downloads = list(_steps_using(job, "actions/download-artifact@"))
             for download in downloads:
@@ -308,6 +336,16 @@ def _derive_artifact_execution(state: AnalysisState) -> tuple[list[Finding], lis
                                 consumer.workflow_id,
                                 execute.step_id,
                             )
+                            finding_status = (
+                                FindingStatus.SUPPORTED
+                                if privilege is TriState.TRUE
+                                else FindingStatus.CANDIDATE
+                            )
+                            privilege_missing = (
+                                []
+                                if privilege is TriState.TRUE
+                                else ["effective workflow_run consumer credential permissions"]
+                            )
                             findings.append(
                                 Finding(
                                     finding_id=finding_id,
@@ -316,9 +354,14 @@ def _derive_artifact_execution(state: AnalysisState) -> tuple[list[Finding], lis
                                         "Privileged workflow executes an artifact produced by "
                                         "a PR workflow"
                                     ),
-                                    status=FindingStatus.SUPPORTED,
+                                    status=finding_status,
                                     evidence_ids=evidence_ids,
-                                    confidence=Confidence.HIGH,
+                                    missing_evidence=privilege_missing,
+                                    confidence=(
+                                        Confidence.HIGH
+                                        if privilege is TriState.TRUE
+                                        else Confidence.MEDIUM
+                                    ),
                                     summary=(
                                         f"PR workflow {producer_name!r} uploads artifact "
                                         f"{upload_name!r}; a privileged workflow_run job downloads "
@@ -368,8 +411,9 @@ def _derive_artifact_execution(state: AnalysisState) -> tuple[list[Finding], lis
                                             ),
                                         ),
                                     ],
-                                    status=FindingStatus.SUPPORTED,
+                                    status=finding_status,
                                     evidence_ids=evidence_ids,
+                                    missing_evidence=privilege_missing,
                                 )
                             )
     return findings, paths

@@ -27,7 +27,13 @@ CI/CD Red Team Agent는 workflow, job, step, artifact, credential 사이의 관�
 Local repository
       │
       ▼
-Safe parser ──▶ Fact / Relation / Guard / Evidence
+Safe parser
+      │
+      ▼
+Event-scoped execution semantics
+      │
+      ▼
+Fact / Relation / Guard / Evidence
       │
       ├── deterministic mode ──▶ scenario rules + attack graph
       │
@@ -37,6 +43,9 @@ Safe parser ──▶ Fact / Relation / Guard / Evidence
                               analysis.json + summary.md + trace.jsonl
 ```
 
+Parser의 permission 요약은 문법 호환용이고 보안 판정의 권한 원본이 아닙니다. 별도 execution
+semantic layer가 event별 trigger/job context, reachability, effective `GITHUB_TOKEN` permission,
+local reusable-workflow caller ceiling과 `workflow_run` 경계를 계산한 뒤 Fact를 발행합니다.
 LLM은 저장소를 직접 읽거나 Evidence를 만들지 않습니다. 제한된 capability로 redaction된
 정보만 확인하고 경로를 제안하며, 최종 결과는 deterministic validator가 검증합니다.
 

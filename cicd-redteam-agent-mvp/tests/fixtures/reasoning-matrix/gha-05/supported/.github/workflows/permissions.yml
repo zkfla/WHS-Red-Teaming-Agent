@@ -1,5 +1,5 @@
 name: Granular token permissions
-on: pull_request
+on: pull_request_target
 permissions:
   contents: read
 jobs:

@@ -15,6 +15,7 @@ from cicd_redteam_agent.application.report import write_report
 from cicd_redteam_agent.application.state import create_initial_state
 from cicd_redteam_agent.domain.attack_graph import compose_global_attack_paths
 from cicd_redteam_agent.domain.attacker_control import assess_attacker_control, derive_attack_paths
+from cicd_redteam_agent.domain.execution_semantics import derive_execution_semantics
 from cicd_redteam_agent.domain.github_actions_parser import discover_workflows, parse_workflow
 from cicd_redteam_agent.domain.identity_analysis import derive_identity_candidates
 from cicd_redteam_agent.domain.models import (
@@ -213,12 +214,16 @@ async def analyze_repository(
         state.evidence.update(reference_evidence)
         warnings.extend(reference_warnings)
         state.assessments = assess_attacker_control(state, config.attacker_profile)
+        execution_semantics = derive_execution_semantics(state, config.attacker_profile)
+        state.trigger_contexts = execution_semantics.trigger_contexts
+        state.job_execution_contexts = execution_semantics.job_contexts
+        state.relations.extend(execution_semantics.relations)
         security_facts = derive_security_facts(state, config.attacker_profile)
         state.relations.extend(security_facts)
         state.pending_questions = sorted(
             {
                 item
-                for relation in security_facts
+                for relation in [*execution_semantics.relations, *security_facts]
                 for item in relation.missing_evidence
             }
         )

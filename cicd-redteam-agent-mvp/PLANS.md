@@ -110,6 +110,53 @@ ChatGPT 로그인 기반 Codex LLM adapter로 실행하고 실제 로그인 smok
 - **Exit criteria**: `cicd-agent resume <run-dir>`가 provider와 무관한 `AnalysisState`를 원본으로
   사용하며, 모델 대화나 raw chain-of-thought 없이 중단 지점 이후 분석을 계속한다.
 
+### Phase 10: GitHub Actions semantic IR
+
+- **Objective**: YAML 문법 객체와 event-scoped 실행 의미론을 분리하고, permission/trust를
+  deterministic semantic core에서 한 번만 계산한다.
+- **Tasks**: `TriggerExecutionContext`, `JobExecutionContext`, permission lattice를 도입하고
+  기존 `Workflow/Job/Step`와 Evidence는 그대로 유지한다. Context는 필요할 때만 materialize해
+  syntax node 복제를 피한다.
+- **Validation**: 다중 trigger workflow가 event별 context를 만들고 기존 parser 결과가 변하지
+  않는다. Objective/Agent/Validator 계약은 영향받지 않는다.
+- **Exit criteria**: `AnalysisState`가 syntax graph와 execution semantic state를 동시에 보존한다.
+- **Dependencies**: 기존 parser/Evidence.
+
+### Phase 11: Triggerability와 cross-workflow trust boundary
+
+- **Objective**: `pull_request`, `pull_request_target`, `push`, `workflow_run`, `workflow_call`,
+  `workflow_dispatch`, `issue_comment`의 triggerability와 trust provenance를 명시한다.
+- **Tasks**: attacker→event→workflow→job reachability relation을 만들고 local reusable workflow와
+  `workflow_run` 경계를 조기에 모델링한다. Nested reusable workflow는 현재 GitHub 제한인 최대
+  10 level 안에서 cycle-safe하게 처리한다.
+- **Validation**: `pull_request_target` trigger 가능성과 attacker code execution을 분리하고,
+  local `workflow_call`은 caller context를 보존한다.
+- **Exit criteria**: cross-workflow 경계가 privilege 계산보다 먼저 semantic graph에 존재한다.
+- **Dependencies**: Phase 10.
+
+### Phase 12: Effective permission / credential semantics
+
+- **Objective**: `GITHUB_TOKEN` 권한을 Job의 평면 속성이 아니라 execution context의 권한으로
+  계산한다.
+- **Tasks**: repository default UNKNOWN → workflow declaration → job declaration → fork PR adjustment
+  → reusable caller ceiling 순으로 permission lattice를 적용한다. Explicit mapping에서 누락 scope는
+  `NONE`, 선언 자체가 없고 repository default를 모르면 `UNKNOWN`으로 구분한다.
+- **Validation**: push/write, fork PR/write-setting UNKNOWN, explicit read, reusable caller ceiling을
+  각각 검증한다.
+- **Exit criteria**: credential relation은 effective permission state에서만 생성된다.
+- **Dependencies**: Phase 10-11.
+
+### Phase 13: Reachability / provenance / semantic relation migration
+
+- **Objective**: condition의 안전한 deterministic subset과 code provenance를 결합해 실제 실행
+  가능 context만 credential sink와 연결한다.
+- **Tasks**: event-name/literal/status-function 중심 condition evaluator, step reachability,
+  attacker-controlled checkout/provenance를 semantic relation으로 발행한다. 기존 flat permission
+  edge와 `attack_graph.py`의 중복 permission 계산을 단계적으로 제거한다.
+- **Validation**: SUPPORTED/UNKNOWN/BLOCKED fixture와 기존 reasoning matrix 회귀를 함께 돌린다.
+- **Exit criteria**: attack graph는 GitHub semantics를 재계산하지 않고 semantic Relations만 조합한다.
+- **Dependencies**: Phase 10-12.
+
 ## Done definition
 
 - 계획의 비-LLM API 완료 조건을 자동 테스트가 검증한다.

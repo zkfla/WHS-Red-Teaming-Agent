@@ -6,9 +6,12 @@
 CLI
 -> RepositoryBoundary
 -> GitHub Actions parser
--> Evidence and local Relation extraction
--> attacker-control and identity assessment
--> reusable security fact graph
+-> Evidence and local reference extraction
+-> attacker-control assessment
+-> event-scoped execution semantics
+   -> TriggerExecutionContext / JobExecutionContext
+   -> permission lattice / reachability / trust provenance
+-> reusable security fact graph and identity assessment
 -> analysis mode split
    -> deterministic: scenario rules -> global AttackPath composition
    -> reasoning: hackingBuddyGPT Agent loop
@@ -76,9 +79,13 @@ Scenario rules produce local paths. The composer converts their supported facts 
 directed graph and joins only repository-backed edges. It does not enumerate hard-coded complete
 attacks.
 
-Sources are attacker profiles connected to repository-controlled execution or an untrusted GitHub
-event. Sinks are write-capable `GITHUB_TOKEN` contexts and `CloudIdentityCandidate` objects. Exact
-workflow, job, step, artifact, file and identity identifiers remain repository-specific.
+Sources are attacker profiles connected to event-scoped execution contexts, repository-controlled
+execution or an untrusted GitHub event. Sinks are write-capable `GITHUB_TOKEN` contexts and
+`CloudIdentityCandidate` objects. `GITHUB_TOKEN` authority is resolved in a deterministic permission
+lattice (`NONE < READ < WRITE`, plus `UNKNOWN`) per execution context rather than from the parser's
+legacy `Job.permissions_effective` summary. Workflow/job declarations, fork-PR adjustments and local
+reusable-workflow caller ceilings are applied before credential Relations are emitted. Exact workflow,
+job, step, artifact, file and identity identifiers remain repository-specific.
 
 An edge is `SUPPORTED` only when its Evidence exists locally. An uncertain control assessment or
 external trust assumption keeps the composed path `CANDIDATE` and records `missing_evidence`.
@@ -102,8 +109,15 @@ evaluation labels rather than product rule identifiers.
 The reusable extractor covers event inputs, job/step environments, step outputs, repository files,
 local actions, reusable workflows, artifacts, caches, shell/import/network sinks, granular token
 permissions, Secret flows, AWS/GCP/Azure identity access, mutable dependencies, runner persistence
-and concrete guard application. A guard that locally negates a flow produces a `FALSE` execution
-relation; uncertain external state remains `UNKNOWN` with an explicit missing-Evidence list.
+and concrete guard application. The execution-semantic layer separately models triggerability,
+job/step reachability, `workflow_run` privilege boundaries and local `workflow_call` permission
+ceilings. Current GitHub.com hardening is reflected where it is deterministic: supported floating
+`actions/checkout` majors block common fork-head checkout patterns in `pull_request_target` and
+fork-derived `workflow_run` contexts unless the workflow explicitly opts out, and low-trust
+default-branch cache contexts such as `pull_request_target`, `issue_comment` and `workflow_run` are
+read-only while ordinary `pull_request` cache scope remains read-write. A guard that locally negates
+a flow produces a `FALSE` execution relation; uncertain external state remains `UNKNOWN` with an
+explicit missing-Evidence list.
 
 The evaluation matrix lives only under `tests/fixtures/reasoning-matrix`. Its GHA labels and oracles
 are loaded after analysis and are never visible to the parser, fact extractor, Agent capabilities or

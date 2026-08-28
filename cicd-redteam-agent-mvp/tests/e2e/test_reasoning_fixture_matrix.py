@@ -99,6 +99,9 @@ async def test_reasoning_fixture_extracts_oracle_facts(
         assert set(relation.evidence_ids).issubset(report.state.evidence)
         if relation.verdict.value == "UNKNOWN":
             assert relation.missing_evidence
-    assert _inferred_graph_status(
-        relations, set(expected.get("path_relations", []))
-    ).value == expected["expected_status"]
+    path_relations = set(expected.get("path_relations", []))
+    if path_relations:
+        assert (
+            _inferred_graph_status(relations, path_relations).value
+            == expected["expected_status"]
+        )

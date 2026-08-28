@@ -42,6 +42,9 @@ COMPOSABLE_SECURITY_RELATIONS = {
     "mutable_reusable_workflow_may_execute_in_job",
     "mutable_container_image_executes_in_job",
     "mutable_install_source_executes_in_step",
+    "step_definition_may_execute_as_context",
+    "executes_with_effective_write_github_token",
+    "grants_effective_permission",
 }
 EXTERNAL_DEPENDENCY_RELATIONS = {
     "external_code_may_execute_in_step",
@@ -49,7 +52,10 @@ EXTERNAL_DEPENDENCY_RELATIONS = {
     "mutable_container_image_executes_in_job",
     "mutable_install_source_executes_in_step",
 }
-GENERIC_SINK_RELATIONS = {"oidc_may_assume_cloud_identity"}
+GENERIC_SINK_RELATIONS = {
+    "oidc_may_assume_cloud_identity",
+    "executes_with_effective_write_github_token",
+}
 
 
 @dataclass
@@ -61,14 +67,6 @@ class _EdgeFact:
 
 def _supported(status: FindingStatus) -> bool:
     return status is FindingStatus.SUPPORTED
-
-
-def _credential_write_enabled(value: dict[str, str] | str | None) -> bool:
-    if value == "write-all":
-        return True
-    return isinstance(value, dict) and any(
-        str(permission).lower() == "write" for permission in value.values()
-    )
 
 
 def compose_global_attack_paths(
@@ -176,16 +174,6 @@ def compose_global_attack_paths(
                 expose_relation=True,
             )
         for job in workflow.jobs:
-            token_id = f"credential:github-token:{job.job_id}"
-            if _credential_write_enabled(job.permissions_effective):
-                for step in job.steps:
-                    register(
-                        step.step_id,
-                        "can_access_write_github_token",
-                        token_id,
-                        sorted(set(job.evidence_ids + step.evidence_ids)),
-                        expose_relation=True,
-                    )
             for step in job.steps:
                 assessment = assessments.get(step.step_id)
                 if assessment and assessment.verdict is not TriState.FALSE:

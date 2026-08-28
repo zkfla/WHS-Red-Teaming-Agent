@@ -48,6 +48,13 @@ class AnalysisMode(StrEnum):
     REASONING = "reasoning"
 
 
+class PermissionLevel(StrEnum):
+    NONE = "NONE"
+    READ = "READ"
+    WRITE = "WRITE"
+    UNKNOWN = "UNKNOWN"
+
+
 class WorkingHypothesisStatus(StrEnum):
     ACTIVE = "ACTIVE"
     BLOCKED = "BLOCKED"
@@ -125,6 +132,43 @@ class Workflow(SchemaModel):
     jobs: list[Job] = Field(default_factory=list)
     parse_warnings: list[str] = Field(default_factory=list)
     evidence_ids: list[str] = Field(default_factory=list)
+
+
+class EffectivePermissionSet(SchemaModel):
+    levels: dict[str, PermissionLevel] = Field(default_factory=dict)
+    default_level: PermissionLevel = PermissionLevel.UNKNOWN
+    provenance: list[str] = Field(default_factory=list)
+    missing_evidence: list[str] = Field(default_factory=list)
+
+    def get(self, scope: str) -> PermissionLevel:
+        return self.levels.get(scope, self.default_level)
+
+
+class TriggerExecutionContext(SchemaModel):
+    context_id: str
+    workflow_id: str
+    event_name: str
+    activation_type: str
+    attacker_can_trigger: TriState
+    event_payload_attacker_controlled: TriState
+    workflow_revision_trusted: TriState
+    caller_job_context_id: str | None = None
+    call_depth: int = Field(default=0, ge=0, le=10)
+    evidence_ids: list[str] = Field(default_factory=list)
+    missing_evidence: list[str] = Field(default_factory=list)
+
+
+class JobExecutionContext(SchemaModel):
+    context_id: str
+    trigger_context_id: str
+    workflow_id: str
+    job_id: str
+    reachable: TriState
+    effective_permissions: EffectivePermissionSet
+    github_token_available: TriState = TriState.TRUE
+    attacker_code_execution: TriState = TriState.UNKNOWN
+    evidence_ids: list[str] = Field(default_factory=list)
+    missing_evidence: list[str] = Field(default_factory=list)
 
 
 def relation_id_for(source_id: str, relation_type: str, target_id: str) -> str:
@@ -309,6 +353,8 @@ class WorkingMemoryUpdateResult(SchemaModel):
 class AnalysisState(SchemaModel):
     repository: RepositorySnapshot
     workflows: list[Workflow] = Field(default_factory=list)
+    trigger_contexts: list[TriggerExecutionContext] = Field(default_factory=list)
+    job_execution_contexts: list[JobExecutionContext] = Field(default_factory=list)
     evidence: dict[str, Evidence] = Field(default_factory=dict)
     relations: list[Relation] = Field(default_factory=list)
     assessments: list[ControlAssessment] = Field(default_factory=list)

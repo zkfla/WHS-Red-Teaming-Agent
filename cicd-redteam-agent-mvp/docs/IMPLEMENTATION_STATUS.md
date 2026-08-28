@@ -15,6 +15,8 @@ Local repository path
         ↓
 Workflow / Job / Step parser
         ↓
+Event-scoped execution semantics
+        ↓
 Fact / Relation / Guard / Evidence extraction
         ↓
 deterministic graph or optional LLM reasoning
@@ -38,16 +40,17 @@ analysis.json + summary.md + trace.jsonl
 
 | 기능 | 상태 | 현재 범위 |
 |---|---|---|
-| Workflow·Job·Step 파싱 | 완료 | Trigger, permission, environment, runner, action 및 script |
+| Workflow·Job·Step 파싱 | 완료 | Trigger, permission 선언, environment, runner, action 및 script |
+| GitHub Actions 실행 의미론 | 완료 | event-scoped trigger/job context, reachability, permission lattice, workflow_run/workflow_call |
 | Evidence와 저장소 경계 | 완료 | 줄 번호, redaction, 크기·경로·검색 제한 |
 | PR 입력·파일 통제 분석 | 완료 | `fork-pr`, `repo-writer` attacker profile |
-| GitHub Token 경로 | 완료 | 공격자 통제 실행에서 write-capable Token까지 연결 |
+| GitHub Token 경로 | 완료 | event별 effective permission을 계산해 공격자 통제 실행에서 write-capable Token까지 연결 |
 | Artifact 경로 | 완료 | PR 생산 → 특권 workflow 다운로드·실행 → Token |
-| Cache 경로 | 완료 | PR 오염 가능 Cache → 특권 Job 복원 → Token |
+| Cache 경로 | 완료 | PR merge-ref cache 오염 경로 + low-trust default-branch cache read-only 정책 구분 |
 | Mutable dependency 경로 | 완료 | 외부 Action·workflow·image·install source를 Candidate로 연결 |
 | OIDC·Cloud Identity | 완료 | OIDC 요청 → Identity 후보, 외부 Trust Policy는 `UNKNOWN` |
 | Secret 흐름 | 부분 구현 | env, shell, output, file, artifact, 외부 action Fact 추출 |
-| Reusable workflow | 부분 구현 | 호출·권한 경계 Fact 추출, 외부 유효 권한은 `UNKNOWN` |
+| Reusable workflow | 부분 구현 | local caller→callee context와 permission ceiling은 deterministic, 외부 callee 상태는 `UNKNOWN` |
 | Self-hosted Runner | 부분 구현 | 공유·잔존 가능성 Fact 추출, 실제 격리 상태는 `UNKNOWN` |
 | Environment protection | 부분 구현 | Environment 사용 감지, 실제 승인 설정은 `UNKNOWN` |
 | 검토 우선순위·수정 방향 | 완료 | 전역 경로 정렬과 Relation 기반 권장 조치 표시 |
@@ -64,7 +67,7 @@ analysis.json + summary.md + trace.jsonl
 | 시나리오 | 기대 결과 | 대표 fixture |
 |---|---|---|
 | PR Shell Injection | 직접 명령 해석을 `SUPPORTED`, 안전한 env 전달을 차단 경로로 구분 | `gha-01-shell-injection` |
-| `pull_request_target` PR 코드 실행 | Checkout provenance에 따라 `SUPPORTED/CANDIDATE` | `pr-target-controlled`, `pr-target-unknown` |
+| `pull_request_target` PR 코드 실행 | checkout version/provenance와 2026 built-in fork 보호에 따라 차단/UNKNOWN/통제 실행 구분 | `pr-target-blocked`, `pr-target-controlled`, `pr-target-unknown` |
 | Artifact 특권 Workflow 실행 | PR Artifact에서 write Token까지 전역 경로 | `gha-03-artifact-trust` |
 | Mutable external Action + Token | 외부 compromise가 필요한 `CANDIDATE` 경로 | `gha-04-mutable-action` |
 | Cache poisoning | PR Cache에서 특권 Job write Token까지 전역 경로 | `reasoning-matrix/gha-08` |

@@ -14,7 +14,9 @@ Agent는 최대 8개의 근거 기반 가설, 부족한 정보와 다음 확인 
 trusted 자연어 Objective를 받아 조사 목표를 좁힐 수 있으며, Objective는 system policy 아래의
 immutable run instruction으로 매 라운드 재투영되고 repository/tool 데이터와 분리된다. bounded
 deterministic Goal compiler가 source/mechanism/sink 힌트를 추출해 관련 Fact를 우선 정렬하지만
-Evidence/Relation verdict/Validator 결과를 만들거나 변경하지 않는다.
+Evidence/Relation verdict/Validator 결과를 만들거나 변경하지 않는다. GitHub Actions domain에는
+별도 event-scoped execution semantic layer가 추가되어 trigger/job context, reachability,
+`GITHUB_TOKEN` permission lattice와 cross-workflow trust boundary를 Fact 생성 전에 계산한다.
 
 ## Goal
 
@@ -108,9 +110,22 @@ AttackPath, CloudIdentityCandidate를 재현 가능하게 생성한다.
   `ListSecurityFacts`는 이 힌트와 일치하는 Relation을 stable relevance ordering으로 앞세우지만
   Relation 내용/verdict/Evidence와 Validator semantics는 그대로 유지한다.
 - checkpoint와 `analysis.json`에 compiled Goal을 기록하고 resume에서 Objective로 다시 컴파일한
-  결과와 일치하는지 검증한다. compiled Goal tampering도 거부하며 prompt contract는 1.2로
-  올렸다. `summary.md`에는 raw Objective 전체를 복제하지 않고 bounded Objective preview/hash와
-  compact focus만 표시한다.
+  결과와 일치하는지 검증한다. compiled Goal tampering도 거부하며 `summary.md`에는 raw Objective
+  전체를 복제하지 않고 bounded Objective preview/hash와 compact focus만 표시한다.
+- GitHub Actions semantic IR을 추가했다. `TriggerExecutionContext`, `JobExecutionContext`와
+  `NONE/READ/WRITE/UNKNOWN` permission lattice가 parser syntax와 분리되어 event별 실행 가능성,
+  effective `GITHUB_TOKEN` 권한 및 local reusable-workflow caller ceiling을 deterministic하게
+  계산한다. `workflow_run` consumer는 producer 권한을 복사하지 않고 새 context에서 권한을
+  재계산한다.
+- 보안 판정 계층에서 parser의 legacy `Job.permissions_effective` 직접 사용을 제거했다. 이 필드는
+  parser/model 호환용으로만 남고 Security Facts, identity, scenario rules 및 global attack graph는
+  execution semantic state/Relations를 authoritative source로 사용한다.
+- 현재 GitHub.com의 2026 Actions hardening을 semantic layer에 반영했다. supported floating-major
+  `actions/checkout`은 `pull_request_target`/fork-derived `workflow_run`의 흔한 fork-head checkout을
+  기본 차단하고 명시적 unsafe opt-out/manual fetch는 별도 처리한다. Cache는 `pull_request`의
+  merge-ref scope는 read-write로 유지하되 `pull_request_target`, `issue_comment`, `workflow_run`
+  default-branch context는 read-only로 모델링한다.
+- semantic-state resume 비호환을 막기 위해 prompt/runtime contract를 1.3으로 올렸다.
 
 ## Validation or Review
 
@@ -142,8 +157,8 @@ AttackPath, CloudIdentityCandidate를 재현 가능하게 생성한다.
   검증 1/1 통과.
 - `gpt-5.6-luna` GHA-01 rejected 검증: 3 rounds, 65,285 reported tokens, Capability 3회,
   반복 0회, `COMPLETE / proposal_validated`, FALSE 관계가 REJECTED로 확정되고 1/1 통과.
-- Objective Goal compilation 변경 포함 전체 pytest: 159 passed, 1 skipped(160 collected).
-  skip은 Windows symlink 권한 조건이다.
+- Execution semantics, current checkout/cache policy 회귀까지 포함한 전체 pytest: 167 passed,
+  1 skipped(168 collected). skip은 Windows symlink 권한 조건이다.
 - `uv lock --check`, Ruff 및 `git diff --check`: 통과.
 - checkpoint/event journal 및 resume CLI 독립 smoke, 변경 파일 compileall·Ruff,
   `git diff --check`: 통과.
@@ -158,6 +173,9 @@ AttackPath, CloudIdentityCandidate를 재현 가능하게 생성한다.
   추론의 완료율·토큰 절감 효과는 matched matrix 실행 전까지 입증되지 않았다.
 - **PARTIAL**: working memory의 짧은 참조와 자동 grounding은 Luna Candidate 실행에서 확인했지만,
   여러 차례의 장기 후속 조사가 필요한 대형 저장소에서의 효과는 더 검증해야 한다.
+- **PARTIAL**: execution semantics는 현재 GitHub.com 정책을 기준으로 한다. 분석 대상이 구형 GHES인
+  경우 checkout/cache hardening 적용 여부는 서버 버전에 따라 달라질 수 있으나 현재 CLI에는
+  platform/version 입력이 없으므로 해당 차이를 자동 해석하지 않는다.
 - Codex SDK는 실행별 통화 비용을 제공하지 않아 보고서의 cost `0.0`은 무료 사용 증거가 아니다.
 - hackingBuddyGPT 내부에서 Pydantic v2 deprecated `dict()` 경고가 발생하지만 테스트는 통과한다.
 
@@ -193,11 +211,9 @@ AttackPath, CloudIdentityCandidate를 재현 가능하게 생성한다.
 
 ## Recommended Next Actions
 
-1. 자연어 Objective에 맞춰 관련 Relation만 확장하는 goal-aware graph frontier Capability를 설계한다.
-2. Guard/contradiction 탐색을 제출 전 필수 검토 단계로 구조화한다.
-3. working-memory 가설 scoring/pruning과 명시적 종료 정책을 추가한다.
-4. Validator의 구조화 오류를 이용한 부분 repair loop를 구현한다.
-5. 대형 저장소와 나머지 reasoning matrix에서 Objective/context 효율과 탐지 품질을 측정한다.
+1. 새 execution semantic graph를 이용하는 goal-aware graph frontier Capability를 구현한다.
+2. Guard/contradiction 탐색과 working-memory hypothesis scoring/pruning/stop policy를 결합한다.
+3. Validator 부분 repair와 대형 실제 저장소/real-model A/B benchmark로 정확도·토큰 효과를 측정한다.
 
 ## Relevant Artifacts
 
@@ -210,6 +226,8 @@ AttackPath, CloudIdentityCandidate를 재현 가능하게 생성한다.
   append-only event journal, cumulative limit 복원과 run lease
 - `cicd-redteam-agent-mvp/src/cicd_redteam_agent/domain/proposal_draft.py`: 짧은 Relation 참조를
   기존 validator용 완전한 proposal로 확장
+- `cicd-redteam-agent-mvp/src/cicd_redteam_agent/domain/execution_semantics.py`: event-scoped 실행,
+  permission lattice, reusable/workflow_run 및 current checkout/cache semantics
 - `cicd-redteam-agent-mvp/src/cicd_redteam_agent/domain/attack_graph.py`: 전역 경로 조합
 - `cicd-redteam-agent-mvp/output/real-model/20260824T160152.198638Z/`: real-model 결과
 - `cicd-redteam-agent-mvp/output/working-memory-luna-retry/matrix-evaluation/evaluation.json`:

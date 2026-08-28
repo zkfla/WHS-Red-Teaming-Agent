@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from cicd_redteam_agent.domain.execution_semantics import fork_pr_checkout_execution_verdict
 from cicd_redteam_agent.domain.github_actions_parser import stable_id
 from cicd_redteam_agent.domain.models import (
     AnalysisState,
@@ -12,14 +13,6 @@ from cicd_redteam_agent.domain.models import (
     FindingStatus,
     TriState,
 )
-
-
-def _permission_is_privileged(value: dict[str, str] | str | None) -> bool:
-    if isinstance(value, str):
-        return value == "write-all"
-    if not isinstance(value, dict):
-        return False
-    return any(str(permission).lower() == "write" for permission in value.values())
 
 
 def assess_attacker_control(
@@ -52,25 +45,27 @@ def assess_attacker_control(
                     reason = "No fork-PR-capable trigger was found for this workflow."
                     missing = []
                 elif "pull_request_target" in trigger_names:
-                    checkout = " ".join(
-                        f"{candidate.uses} {candidate.with_}"
-                        for candidate in job.steps
-                        if candidate.uses and candidate.uses.startswith("actions/checkout@")
+                    verdict, missing = fork_pr_checkout_execution_verdict(
+                        job,
+                        event_name="pull_request_target",
+                        profile=profile,
                     )
-                    if "pull_request.head" in checkout or "head.sha" in checkout:
-                        verdict = TriState.TRUE
+                    if verdict is TriState.TRUE:
                         reason = (
-                            "pull_request_target explicitly checks out "
-                            "pull-request-controlled content."
+                            "pull_request_target fetches fork-controlled content through an "
+                            "explicit unsafe checkout opt-out or manual fetch path."
                         )
-                        missing = []
+                    elif verdict is TriState.FALSE:
+                        reason = (
+                            "pull_request_target uses trusted default-branch content or a "
+                            "protected actions/checkout major that refuses the fork PR head."
+                        )
                     else:
-                        verdict = TriState.UNKNOWN
                         reason = (
-                            "pull_request_target normally uses base content; "
-                            "checkout provenance is unresolved."
+                            "pull_request_target selects fork-controlled content through a pinned "
+                            "checkout revision whose 2026 protection behavior is not locally "
+                            "proven."
                         )
-                        missing = ["runtime checkout revision", "repository settings"]
                 else:
                     verdict = TriState.TRUE
                     reason = (
@@ -104,24 +99,64 @@ def derive_attack_paths(state: AnalysisState) -> tuple[list[Finding], list[Attac
     for workflow in state.workflows:
         for job in workflow.jobs:
             for step in job.steps:
-                privileged = (
-                    _permission_is_privileged(job.permissions_effective)
-                    or job.job_id in secret_jobs
-                    or step.step_id in secret_steps
-                )
+                privilege_relations = [
+                    relation
+                    for relation in state.relations
+                    if relation.source_id == step.step_id
+                    and (
+                        relation.relation_type.startswith("can_use_github_token_")
+                        or relation.relation_type == "can_request_oidc_token"
+                        or relation.relation_type == "can_access_secret_reference"
+                    )
+                ]
+                if job.job_id in secret_jobs or step.step_id in secret_steps:
+                    privilege_relations.extend(
+                        relation
+                        for relation in state.relations
+                        if relation.source_id in {job.job_id, step.step_id}
+                        and relation.relation_type == "can_access_secret_reference"
+                    )
                 assessment = assessments.get(step.step_id)
                 if not assessment or assessment.verdict is TriState.FALSE:
                     continue
-                oidc = isinstance(job.permissions_effective, dict) and (
-                    job.permissions_effective.get("id-token") == "write"
-                )
-                if not privileged and not oidc:
+                if not privilege_relations:
                     continue
-                supported = assessment.verdict is TriState.TRUE
+                privilege_true = any(
+                    relation.verdict is TriState.TRUE for relation in privilege_relations
+                )
+                privilege_unknown = any(
+                    relation.verdict is TriState.UNKNOWN for relation in privilege_relations
+                )
+                supported = assessment.verdict is TriState.TRUE and privilege_true
                 status = FindingStatus.SUPPORTED if supported else FindingStatus.CANDIDATE
-                evidence_ids = sorted(set(assessment.evidence_ids + job.evidence_ids))
+                evidence_ids = sorted(
+                    set(
+                        assessment.evidence_ids
+                        + job.evidence_ids
+                        + [
+                            evidence
+                            for relation in privilege_relations
+                            for evidence in relation.evidence_ids
+                        ]
+                    )
+                )
                 finding_id = stable_id("finding", workflow.workflow_id, job.job_id, step.step_id)
-                missing = [] if supported else assessment.missing_evidence
+                missing = [] if supported else sorted(
+                    set(
+                        assessment.missing_evidence
+                        + [
+                            item
+                            for relation in privilege_relations
+                            if relation.verdict is TriState.UNKNOWN
+                            for item in relation.missing_evidence
+                        ]
+                        + (
+                            ["effective credential availability"]
+                            if not privilege_true and not privilege_unknown
+                            else []
+                        )
+                    )
+                )
                 findings.append(
                     Finding(
                         finding_id=finding_id,

@@ -3,11 +3,16 @@ from __future__ import annotations
 import re
 from collections import defaultdict
 
+from cicd_redteam_agent.domain.execution_semantics import (
+    cache_write_access_for_event,
+    fork_pr_checkout_execution_verdict,
+)
 from cicd_redteam_agent.domain.github_actions_parser import stable_id
 from cicd_redteam_agent.domain.models import (
     AnalysisState,
     AttackerProfile,
     Job,
+    PermissionLevel,
     Relation,
     Step,
     TriState,
@@ -180,12 +185,20 @@ def _env_referenced(run: str, name: str) -> bool:
 
 
 def _job_has_sensitive_authority(state: AnalysisState, job: Job) -> bool:
-    permissions = job.permissions_effective
-    if permissions == "write-all":
-        return True
-    if isinstance(permissions, dict) and any(
-        name != "__default__" and str(value).lower() == "write"
-        for name, value in permissions.items()
+    contexts = [item for item in state.job_execution_contexts if item.job_id == job.job_id]
+    sensitive_scopes = {
+        "actions",
+        "contents",
+        "deployments",
+        "id-token",
+        "packages",
+        "pull-requests",
+    }
+    if any(
+        context.effective_permissions.get(scope)
+        in {PermissionLevel.WRITE, PermissionLevel.UNKNOWN}
+        for context in contexts
+        for scope in sensitive_scopes
     ):
         return True
     return any(reference.job_id == job.job_id for reference in state.secret_references)
@@ -371,7 +384,12 @@ def _containment_facts(workflow: Workflow) -> list[Relation]:
     return relations
 
 
-def _step_flow_facts(workflow: Workflow, job: Job) -> list[Relation]:
+def _step_flow_facts(
+    state: AnalysisState,
+    workflow: Workflow,
+    job: Job,
+    profile: AttackerProfile,
+) -> list[Relation]:
     relations: list[Relation] = []
     keyed_steps = {step.step_key.lower(): step for step in job.steps if step.step_key}
     outputs: dict[tuple[str, str], str] = {}
@@ -524,6 +542,34 @@ def _step_flow_facts(workflow: Workflow, job: Job) -> list[Relation]:
             else:
                 relation_type = "untrusted_input_reaches_action"
                 category = "transform"
+            relation_verdict = TriState.TRUE
+            relation_missing: list[str] = []
+            if relation_type == "untrusted_input_selects_checkout_revision":
+                relevant_events = [
+                    context.event_name
+                    for context in state.trigger_contexts
+                    if context.workflow_id == workflow.workflow_id
+                    and context.event_name in {"pull_request_target", "workflow_run"}
+                ]
+                checkout_results = [
+                    fork_pr_checkout_execution_verdict(
+                        job,
+                        event_name=event_name,
+                        profile=profile,
+                    )
+                    for event_name in relevant_events
+                ]
+                if checkout_results:
+                    verdicts = [item[0] for item in checkout_results]
+                    if any(item is TriState.TRUE for item in verdicts):
+                        relation_verdict = TriState.TRUE
+                    elif any(item is TriState.UNKNOWN for item in verdicts):
+                        relation_verdict = TriState.UNKNOWN
+                    else:
+                        relation_verdict = TriState.FALSE
+                    relation_missing = sorted(
+                        {missing for _, items in checkout_results for missing in items}
+                    )
             relations.append(
                 _relation(
                     _input_node(expression),
@@ -531,6 +577,8 @@ def _step_flow_facts(workflow: Workflow, job: Job) -> list[Relation]:
                     step.step_id,
                     step.evidence_ids,
                     category=category,
+                    verdict=relation_verdict,
+                    missing_evidence=relation_missing,
                 )
             )
         for key, value in step.env.items():
@@ -645,34 +693,84 @@ def _step_flow_facts(workflow: Workflow, job: Job) -> list[Relation]:
     return relations
 
 
+def _permission_summary(
+    state: AnalysisState,
+    job: Job,
+    scope: str,
+) -> tuple[TriState, list[str]]:
+    contexts = [item for item in state.job_execution_contexts if item.job_id == job.job_id]
+    if not contexts:
+        return TriState.UNKNOWN, ["execution-context permission semantics"]
+    levels = [item.effective_permissions.get(scope) for item in contexts]
+    missing = sorted(
+        {
+            evidence
+            for item in contexts
+            if item.effective_permissions.get(scope) is PermissionLevel.UNKNOWN
+            for evidence in item.effective_permissions.missing_evidence
+            if not (
+                scope == "id-token"
+                and evidence == "fork pull-request write-token repository setting"
+            )
+            and not (
+                scope != "id-token"
+                and evidence == "fork pull-request OIDC token availability"
+            )
+        }
+    )
+    if all(level is PermissionLevel.WRITE for level in levels):
+        return TriState.TRUE, []
+    if any(level in {PermissionLevel.WRITE, PermissionLevel.UNKNOWN} for level in levels):
+        return TriState.UNKNOWN, missing or ["event-scoped GITHUB_TOKEN permission"]
+    return TriState.FALSE, []
+
+
 def _credential_facts(state: AnalysisState, workflow: Workflow, job: Job) -> list[Relation]:
     relations: list[Relation] = []
-    permissions = job.permissions_effective
-    write_permissions: list[str] = []
-    permission_unknown = False
-    if permissions == "write-all":
-        write_permissions = ["write-all"]
-    elif isinstance(permissions, dict):
-        write_permissions = [
-            name for name, value in permissions.items() if str(value).lower() == "write"
-        ]
-        permission_unknown = permissions.get("__default__") == "UNKNOWN"
+    contexts = [item for item in state.job_execution_contexts if item.job_id == job.job_id]
+    explicit_scopes = sorted(
+        {
+            scope
+            for context in contexts
+            for scope in context.effective_permissions.levels
+            if scope != "__default__"
+        }
+    )
+    write_all = bool(contexts) and all(
+        context.effective_permissions.default_level is PermissionLevel.WRITE
+        for context in contexts
+    )
+    default_unknown = any(
+        context.effective_permissions.default_level is PermissionLevel.UNKNOWN
+        for context in contexts
+    )
     subjects: list[Step | Job] = list(job.steps) if job.steps else [job]
     for subject in subjects:
-        for permission in write_permissions:
+        subject_id = subject.step_id if isinstance(subject, Step) else subject.job_id
+        permission_names = ["write-all"] if write_all else explicit_scopes
+        for permission in permission_names:
+            verdict, missing = (
+                (TriState.TRUE, [])
+                if permission == "write-all"
+                else _permission_summary(state, job, permission)
+            )
+            if verdict is TriState.FALSE:
+                continue
             relations.append(
                 _relation(
-                    subject.step_id if isinstance(subject, Step) else subject.job_id,
+                    subject_id,
                     f"can_use_github_token_{permission}_write",
                     f"credential:github-token:{job.job_id}:{permission}",
                     job.evidence_ids + subject.evidence_ids,
                     category="credential",
+                    verdict=verdict,
+                    missing_evidence=missing,
                 )
             )
-        if permission_unknown:
+        if default_unknown:
             relations.append(
                 _relation(
-                    subject.step_id if isinstance(subject, Step) else subject.job_id,
+                    subject_id,
                     "github_token_permission_unknown",
                     f"credential:github-token:{job.job_id}:unknown",
                     job.evidence_ids + subject.evidence_ids,
@@ -681,8 +779,9 @@ def _credential_facts(state: AnalysisState, workflow: Workflow, job: Job) -> lis
                     missing_evidence=["repository default GITHUB_TOKEN permissions"],
                 )
             )
-        if isinstance(permissions, dict) and permissions.get("id-token") == "write":
-            subject_id = subject.step_id if isinstance(subject, Step) else subject.job_id
+
+        oidc_verdict, oidc_missing = _permission_summary(state, job, "id-token")
+        if oidc_verdict is not TriState.FALSE:
             relations.append(
                 _relation(
                     subject_id,
@@ -690,6 +789,8 @@ def _credential_facts(state: AnalysisState, workflow: Workflow, job: Job) -> lis
                     f"credential:oidc:{job.job_id}",
                     job.evidence_ids + subject.evidence_ids,
                     category="credential",
+                    verdict=oidc_verdict,
+                    missing_evidence=oidc_missing,
                 )
             )
             uses = subject.uses or ""
@@ -721,7 +822,9 @@ def _credential_facts(state: AnalysisState, workflow: Workflow, job: Job) -> lis
                         job.evidence_ids + subject.evidence_ids,
                         category="credential",
                         verdict=TriState.UNKNOWN,
-                        missing_evidence=[f"{provider} federated identity trust policy"],
+                        missing_evidence=sorted(
+                            set(oidc_missing + [f"{provider} federated identity trust policy"])
+                        ),
                     )
                 )
     for reference in state.secret_references:
@@ -1148,16 +1251,70 @@ def _artifact_and_cache_facts(state: AnalysisState) -> list[Relation]:
                             ),
                         ]
                     )
-                    if "pull_request" in workflow.triggers:
+                    trigger_by_id = {
+                        context.context_id: context for context in state.trigger_contexts
+                    }
+                    job_contexts = [
+                        context
+                        for context in state.job_execution_contexts
+                        if context.job_id == job.job_id
+                        and context.workflow_id == workflow.workflow_id
+                    ]
+                    for job_context in job_contexts:
+                        trigger = trigger_by_id.get(job_context.trigger_context_id)
+                        if trigger is None:
+                            continue
+                        cache_write, cache_missing = cache_write_access_for_event(
+                            trigger.event_name
+                        )
+                        context_missing = sorted(set(missing + cache_missing))
+                        relations.append(
+                            _relation(
+                                job_context.context_id,
+                                "cache_write_access_in_context",
+                                cache_id,
+                                job_context.evidence_ids + step.evidence_ids,
+                                category="context",
+                                verdict=cache_write,
+                                missing_evidence=context_missing,
+                            )
+                        )
+                        if trigger.attacker_can_trigger is TriState.FALSE:
+                            attacker_cache_write = TriState.FALSE
+                        elif cache_write is TriState.FALSE:
+                            attacker_cache_write = TriState.FALSE
+                        elif (
+                            trigger.attacker_can_trigger is TriState.TRUE
+                            and cache_write is TriState.TRUE
+                        ):
+                            attacker_cache_write = verdict
+                        else:
+                            attacker_cache_write = TriState.UNKNOWN
+                        if attacker_cache_write is TriState.FALSE:
+                            continue
+                        attacker_missing = sorted(
+                            set(
+                                context_missing
+                                + trigger.missing_evidence
+                                + (
+                                    []
+                                    if attacker_cache_write is TriState.TRUE
+                                    else ["attacker cache-write execution context"]
+                                )
+                            )
+                        )
                         relations.append(
                             _relation(
                                 "attacker:fork-pr",
                                 "attacker_may_populate_cache",
                                 cache_id,
-                                workflow.evidence_ids + job.evidence_ids + step.evidence_ids,
+                                workflow.evidence_ids
+                                + job.evidence_ids
+                                + step.evidence_ids
+                                + job_context.evidence_ids,
                                 category="source",
-                                verdict=verdict,
-                                missing_evidence=missing,
+                                verdict=attacker_cache_write,
+                                missing_evidence=attacker_missing,
                             )
                         )
                     for prior in job.steps:
@@ -1403,42 +1560,6 @@ def _reusable_workflow_facts(state: AnalysisState) -> list[Relation]:
                     missing_evidence=[] if called else ["local reusable workflow parse result"],
                 )
             )
-            if called:
-                caller_permissions = job.permissions_effective
-                for called_job in called.jobs:
-                    called_permissions = called_job.permissions_effective
-                    caller_write = {
-                        name
-                        for name, value in (
-                            caller_permissions.items()
-                            if isinstance(caller_permissions, dict)
-                            else []
-                        )
-                        if str(value).lower() == "write"
-                    }
-                    called_write = {
-                        name
-                        for name, value in (
-                            called_permissions.items()
-                            if isinstance(called_permissions, dict)
-                            else []
-                        )
-                        if str(value).lower() == "write"
-                    }
-                    if called_permissions == "write-all" or not called_write.issubset(caller_write):
-                        relations.append(
-                            _relation(
-                                job.job_id,
-                                "reusable_workflow_permission_boundary_unknown",
-                                called_job.job_id,
-                                job.evidence_ids + called_job.evidence_ids,
-                                category="credential",
-                                verdict=TriState.UNKNOWN,
-                                missing_evidence=[
-                                    "effective reusable workflow permission intersection"
-                                ],
-                            )
-                        )
     return relations
 
 
@@ -1575,7 +1696,7 @@ def derive_security_facts(
         relations.extend(_containment_facts(workflow))
         relations.extend(_source_facts(state, workflow, profile))
         for job in workflow.jobs:
-            relations.extend(_step_flow_facts(workflow, job))
+            relations.extend(_step_flow_facts(state, workflow, job, profile))
             relations.extend(_credential_facts(state, workflow, job))
             relations.extend(_secret_flow_facts(state, workflow, job))
             relations.extend(_guard_facts(workflow, job))

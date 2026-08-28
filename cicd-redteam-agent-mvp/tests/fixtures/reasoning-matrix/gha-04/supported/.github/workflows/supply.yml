@@ -1,5 +1,5 @@
 name: Supply-chain exposure
-on: pull_request
+on: pull_request_target
 permissions:
   contents: write
   id-token: write
