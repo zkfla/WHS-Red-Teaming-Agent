@@ -157,6 +157,23 @@ ChatGPT 로그인 기반 Codex LLM adapter로 실행하고 실제 로그인 smok
 - **Exit criteria**: attack graph는 GitHub semantics를 재계산하지 않고 semantic Relations만 조합한다.
 - **Dependencies**: Phase 10-12.
 
+### Phase 14: Goal-aware graph frontier와 guard 우선 판정
+
+- **Objective**: 전체 Relation 목록을 LLM이 직접 조립하기 전에 deterministic 계층이
+  source→sink 연속 경로 후보, 동일 실행 context의 guard/contradiction, missing evidence와 다음
+  확장 지점을 bounded Frontier로 제공한다.
+- **Tasks**: Relation semantic registry, trigger/job-context를 포함한 typed traversal state,
+  fail-closed relation allowlist, conservative dominance pruning, diversity-preserving top-K,
+  `ListAttackFrontiers` pagination/cache를 구현한다. Objective는 순위와 목표 sink까지의 탐색에만
+  사용하고 Fact/verdict/Evidence/Validator를 변경하지 않는다.
+- **Validation**: 모든 반환 `relation_ref`가 실제 그래프에서 연속이고, trigger-only authority는
+  proposal-ready가 아니며, FALSE 또는 같은 scope의 hard guard는 `BLOCKED/REJECTED` 상한이 된다.
+  UNKNOWN은 local/external/unmodeled로 구분되고 탐색·응답 truncation이 명시된다.
+- **Exit criteria**: `COMPLETE + proposal_ready`만 compact proposal 후보가 되고 `PARTIAL`은
+  진단 전용이다. 동일 state/Goal에서 결과가 안정적이며 기존 scenario rules와 Validator 결과는
+  변하지 않는다.
+- **Dependencies**: Phase 10-13.
+
 ## Done definition
 
 - 계획의 비-LLM API 완료 조건을 자동 테스트가 검증한다.

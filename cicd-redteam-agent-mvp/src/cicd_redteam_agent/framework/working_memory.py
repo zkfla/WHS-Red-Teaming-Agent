@@ -403,7 +403,8 @@ class MemoryAwareCapability(Capability):
             f"{self.inner.describe()} Optionally include working_memory_patch_json to update "
             "bounded investigation hypotheses in the same round before this action runs. "
             "Prefer supporting_relation_refs and contradicting_relation_refs from "
-            "ListSecurityFacts; the runtime restores exact Relation and Evidence fields."
+            "ListAttackFrontiers or ListSecurityFacts; the runtime restores exact Relation and "
+            "Evidence fields."
         )
 
     async def __call__(self, *args, **kwargs) -> str:
@@ -430,12 +431,12 @@ class MemoryAwareCapability(Capability):
         async def execute(model):
             arguments = model.model_dump(exclude={"working_memory_patch_json"})
             update_result: WorkingMemoryUpdateResult | None = None
-            facts_were_listed = any(
-                item.startswith("security-facts:")
+            investigation_basis_was_listed = any(
+                item.startswith(("attack-frontiers:", "security-facts:"))
                 for item in self.state.inspected_resources
             )
             if (
-                facts_were_listed
+                investigation_basis_was_listed
                 and self.get_name() in FOLLOW_UP_INVESTIGATION_CAPABILITIES
                 and self.state.working_memory.revision == 0
                 and not model.working_memory_patch_json
@@ -444,8 +445,9 @@ class MemoryAwareCapability(Capability):
                     {
                         "error": "working_memory_patch_required_for_follow_up_investigation",
                         "guidance": (
-                            "Security facts are already available. Attach an ACTIVE or BLOCKED "
-                            "hypothesis with the concrete next check to this capability call."
+                            "Attack frontiers or security facts are already available. Attach an "
+                            "ACTIVE or BLOCKED hypothesis with the concrete next check to this "
+                            "capability call."
                         ),
                     }
                 )

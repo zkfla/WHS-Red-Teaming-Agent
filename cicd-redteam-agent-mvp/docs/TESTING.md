@@ -29,6 +29,12 @@
 - proposed paths with unknown `relation_id`, mismatched relation shape, or unresolved UNKNOWN facts are rejected
 - GHA-01 through GHA-10 reasoning labels each have supported/exposed, candidate/unknown and rejected/secure repositories
 - every matrix relation carries existing Evidence and every UNKNOWN relation names missing Evidence
+- every proposal-ready Frontier is source-to-sink continuous and uses only existing Relation refs
+- trigger-only authority routes remain non-proposal-ready without attacker-controlled influence
+- Frontier traversal keeps trigger/job contexts separate unless a registered bridge changes context
+- applicable hard guards and FALSE flow Relations terminate the candidate as BLOCKED/REJECTED
+- PARTIAL Frontier rows are diagnostic only; deterministic limits and result truncation are explicit
+- focused OIDC/cloud goals reach the cloud identity sink without changing state Facts or verdicts
 - matrix graph composition checks the expected SUPPORTED/CANDIDATE/REJECTED outcome without product-side GHA dispatch
 - the unlabeled blind fixture joins fork PR -> local action -> artifact/cache -> privileged workflow -> GitHub Token/OIDC
 - FALSE guard edges are accepted only in REJECTED paths; path-level Evidence must cover every edge

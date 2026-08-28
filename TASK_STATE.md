@@ -17,6 +17,9 @@ deterministic Goal compiler가 source/mechanism/sink 힌트를 추출해 관련 
 Evidence/Relation verdict/Validator 결과를 만들거나 변경하지 않는다. GitHub Actions domain에는
 별도 event-scoped execution semantic layer가 추가되어 trigger/job context, reachability,
 `GITHUB_TOKEN` permission lattice와 cross-workflow trust boundary를 Fact 생성 전에 계산한다.
+Reasoning 모드에는 이 semantic graph를 읽는 context-sensitive Goal-aware Frontier가 추가됐다.
+LLM은 전체 Fact를 직접 조립하기 전에 연속된 source→sink 후보, 적용 가능한 guard/contradiction,
+missing evidence와 상태 상한을 받으며, 최종 확정 권한은 계속 기존 Validator에만 있다.
 
 ## Goal
 
@@ -51,7 +54,7 @@ AttackPath, CloudIdentityCandidate를 재현 가능하게 생성한다.
   provider/model 불일치 거부를 구현했다.
 - `CodexChatGPTLLM`이 hackingBuddyGPT의 `LLM.get_response` 경계를 구현해 저장된 ChatGPT
   로그인을 공식 `openai-codex` SDK로 재사용한다.
-- LiteLLM과 Codex 로그인 방식 모두 동일한 `CICDChatAgent`, 6개 Capability,
+- LiteLLM과 Codex 로그인 방식 모두 동일한 `CICDChatAgent`, 7개 Capability,
   `CICDUseCase`, `submit_analysis` validator를 사용한다.
 - Codex runtime은 isolated temporary cwd, read-only sandbox, approval deny-all을 사용하며
   inherited plugin과 configured MCP server를 비활성화한다. 인증 토큰과 전체 model response를
@@ -62,7 +65,7 @@ AttackPath, CloudIdentityCandidate를 재현 가능하게 생성한다.
 - 구조화 작업 메모를 `AnalysisState`에 추가했다. 가설은 기존 Evidence/Relation ID만 참조하고,
   `FALSE` Relation을 지지 근거로 쓰거나 `UNKNOWN` Relation의 missing evidence를 누락하면
   갱신을 거부한다.
-- 작업 메모 patch는 별도 Tool이 아니라 기존 6개 Capability 호출에 선택적으로 동봉된다.
+- 작업 메모 patch는 별도 Tool이 아니라 기존 7개 Capability 호출에 선택적으로 동봉된다.
   따라서 추가 모델 호출·라운드를 소비하지 않으며, patch 내용은 반복 호출 판정 signature에서
   제외된다. revision 충돌, 중복 가설, 전체 8개/12,000자 제한도 적용한다.
 - LiteLLM과 Codex 모두 매 판단에 동일한 최신 working-memory projection을 받으며 PARTIAL
@@ -126,6 +129,14 @@ AttackPath, CloudIdentityCandidate를 재현 가능하게 생성한다.
   merge-ref scope는 read-write로 유지하되 `pull_request_target`, `issue_comment`, `workflow_run`
   default-branch context는 read-only로 모델링한다.
 - semantic-state resume 비호환을 막기 위해 prompt/runtime contract를 1.3으로 올렸다.
+- `ListAttackFrontiers`를 추가했다. fail-closed Relation semantic registry와 bounded graph traversal이
+  trigger/job context, flow label, permission state와 trust provenance를 함께 추적하고, 같은 실행
+  context의 hard guard/FALSE Relation을 조기에 `BLOCKED` 처리한다. 단순 trigger→write authority는
+  공격자 영향이 없으므로 proposal-ready가 아니며 `PARTIAL` 후보는 진단 전용이다.
+- Frontier는 conservative dominance pruning과 source/mechanism/sink/context diversity top-K를
+  적용하고, pagination, search completeness, truncation, depth/expansion limit, semantic version을
+  반환한다. UNKNOWN은 local-resolvable/external-required/unmodeled로 구분하며 Objective는 후보
+  탐색·순위에만 관여하고 Relation/Evidence/verdict/Validator를 바꾸지 않는다.
 
 ## Validation or Review
 
@@ -157,8 +168,8 @@ AttackPath, CloudIdentityCandidate를 재현 가능하게 생성한다.
   검증 1/1 통과.
 - `gpt-5.6-luna` GHA-01 rejected 검증: 3 rounds, 65,285 reported tokens, Capability 3회,
   반복 0회, `COMPLETE / proposal_validated`, FALSE 관계가 REJECTED로 확정되고 1/1 통과.
-- Execution semantics, current checkout/cache policy 회귀까지 포함한 전체 pytest: 167 passed,
-  1 skipped(168 collected). skip은 Windows symlink 권한 조건이다.
+- Frontier/guard 회귀를 포함한 전체 pytest: 176 passed, 1 skipped(177 collected). skip은 Windows
+  symlink 권한 조건이다. 전체 Ruff와 변경 파일 format check, `git diff --check`도 통과했다.
 - `uv lock --check`, Ruff 및 `git diff --check`: 통과.
 - checkpoint/event journal 및 resume CLI 독립 smoke, 변경 파일 compileall·Ruff,
   `git diff --check`: 통과.
@@ -211,9 +222,9 @@ AttackPath, CloudIdentityCandidate를 재현 가능하게 생성한다.
 
 ## Recommended Next Actions
 
-1. 새 execution semantic graph를 이용하는 goal-aware graph frontier Capability를 구현한다.
-2. Guard/contradiction 탐색과 working-memory hypothesis scoring/pruning/stop policy를 결합한다.
-3. Validator 부분 repair와 대형 실제 저장소/real-model A/B benchmark로 정확도·토큰 효과를 측정한다.
+1. Frontier 결과를 working-memory hypothesis scoring/pruning/stop policy와 결합한다.
+2. Validator 부분 repair를 구현해 전체 proposal 재생성 없이 잘못된 후보만 수정한다.
+3. 대형 실제 저장소와 `gpt-5.6-luna` matched A/B benchmark로 정확도·토큰 효과를 측정한다.
 
 ## Relevant Artifacts
 
@@ -229,6 +240,10 @@ AttackPath, CloudIdentityCandidate를 재현 가능하게 생성한다.
 - `cicd-redteam-agent-mvp/src/cicd_redteam_agent/domain/execution_semantics.py`: event-scoped 실행,
   permission lattice, reusable/workflow_run 및 current checkout/cache semantics
 - `cicd-redteam-agent-mvp/src/cicd_redteam_agent/domain/attack_graph.py`: 전역 경로 조합
+- `cicd-redteam-agent-mvp/src/cicd_redteam_agent/domain/graph_frontier.py`: context-sensitive
+  reasoning 후보 탐색과 guard/limit/diversity 판정
+- `cicd-redteam-agent-mvp/src/cicd_redteam_agent/domain/relation_semantics.py`: fail-closed Relation
+  semantic registry
 - `cicd-redteam-agent-mvp/output/real-model/20260824T160152.198638Z/`: real-model 결과
 - `cicd-redteam-agent-mvp/output/working-memory-luna-retry/matrix-evaluation/evaluation.json`:
   Luna GHA-01 성공 지표

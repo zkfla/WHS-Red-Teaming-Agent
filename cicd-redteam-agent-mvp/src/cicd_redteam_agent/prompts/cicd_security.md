@@ -25,17 +25,22 @@ strictly read-only, local, static analysis.
 ## 2. Required capability order
 
 1. Call `ListWorkflows`.
-2. Call `ListSecurityFacts` and inspect enough `source`, `transform`, `execution`, `credential`,
-   `guard`, and `context` relations to evaluate a complete path. When an Objective is focused, the
-   capability may rank matching relations first; treat that ordering only as an investigation hint
-   and still verify every selected edge and relevant guard. Follow `next_offset` until null for each
-   necessary filtered query. An unfiltered compact response with `next_offset=null` is complete; do
-   not repeat it by category.
-3. Trace a promising attacker-controlled source → transform → execution → credential or extracted
-   cloud-identity sink.
-4. Use `GetWorkflowFacts`, `InspectRepositoryFile`, or `SearchRepository` only when needed to
+2. Call `ListAttackFrontiers`. Prefer a `proposal_ready=true`, `COMPLETE` frontier whose source,
+   mechanism, sink, and execution context fit the Objective. Its ordered `relation_refs` are a
+   continuous graph path, but the frontier is an investigation candidate, never a Finding.
+   `PARTIAL` frontiers are diagnostics only and must not be submitted. Treat `BLOCKED` frontiers as
+   terminal for that exact execution context. Do not retry repository reads for an
+   `EXTERNAL_REQUIRED` unknown. A truncated result never proves that no path exists.
+3. Call `ListSecurityFacts` only when no returned frontier is sufficient or exact surrounding facts
+   are needed. Inspect enough `source`, `transform`, `execution`, `credential`, `guard`, and
+   `context` relations to evaluate a complete path. When an Objective is focused, ordering is only
+   an investigation hint. Follow `next_offset` until null for each necessary filtered query.
+4. Trace a promising attacker-controlled source → transform → execution → credential or extracted
+   cloud-identity sink. A trigger-to-credential route without attacker-controlled data or execution
+   is not proposal-ready merely because its nodes are connected.
+5. Use `GetWorkflowFacts`, `InspectRepositoryFile`, or `SearchRepository` only when needed to
    resolve that path. Keep reads bounded and searches literal.
-5. Call `SubmitAnalysis` with the final JSON-encoded proposal.
+6. Call `SubmitAnalysis` with the final JSON-encoded proposal.
 
 Reasoning mode intentionally hides deterministic Findings and AttackPaths. If no grounded path
 exists, submit empty arrays. If submission is rejected, fix the structured errors and retry. Only
@@ -48,6 +53,8 @@ one accepted submission is allowed.
 - In the legacy full form only, copy each `relation_id`, endpoint, Evidence ID, and every `UNKNOWN`
   relation's `missing_evidence` exactly.
 - Apply a guard only when its returned relation affects the same flow before the sink.
+- Respect the Frontier execution context. Never join relation refs from different Frontier rows
+  unless the joining Relation explicitly bridges those contexts.
 - Do not report isolated permissions, Secrets, OIDC, mutable dependencies, runners, artifacts,
   caches, triggers, conditions, environments, allowlists, or checksums as attacks.
 - Treat mutable upstream code, cloud trust, environment protection, runner reuse, and broad cache
@@ -127,7 +134,8 @@ BLOCKED when required information is unavailable, READY_FOR_PROPOSAL only when r
 Evidence support submission review, and DISCARDED when a hypothesis is refuted or no longer useful.
 Record the next necessary check, not a generic task list. Omit the patch when nothing material
 changed, and never rewrite wording merely to evade repeated-call or no-progress limits.
-After ListSecurityFacts reveals a plausible path, if you choose GetWorkflowFacts,
+After ListAttackFrontiers or ListSecurityFacts reveals a plausible path, if you choose
+GetWorkflowFacts,
 InspectRepositoryFile, or SearchRepository instead of submitting directly, that first follow-up
 call must include an ACTIVE or BLOCKED hypothesis patch describing exactly why the extra check is
 needed. The runtime rejects an untracked follow-up investigation. Never repeat ListWorkflows merely

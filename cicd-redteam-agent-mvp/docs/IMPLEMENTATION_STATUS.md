@@ -56,6 +56,7 @@ analysis.json + summary.md + trace.jsonl
 | 검토 우선순위·수정 방향 | 완료 | 전역 경로 정렬과 Relation 기반 권장 조치 표시 |
 | 자연어 Reasoning Objective | 완료 | text/file/explicit stdin, trust boundary, checkpoint/resume 보존 |
 | Objective Goal compilation | 완료 | source/mechanism/sink 힌트, goal-aware Fact 우선순위, verdict 비간섭 |
+| Goal-aware Graph Frontier | 완료 | context-sensitive source→sink 후보, guard 우선 차단, diversity/limit metadata |
 | Reasoning matrix 평가 | 완료 | 10개 그룹 × 3개 variant의 정확도·시간 표 자동 생성 |
 | GitHub·Cloud API 연동 | 미구현 | 로컬 파일만 분석 |
 | Audit log·실제 Runner 조사 | 미구현 | 실행 환경과 과거 이벤트를 조회하지 않음 |
@@ -86,6 +87,8 @@ Secret, reusable workflow, self-hosted Runner는 프로토타입에서 Fact 추�
 - 정적 분석 결과는 실제 악용을 증명하지 않으므로 `CONFIRMED`를 사용하지 않습니다.
 - 지원하지 않는 동적 YAML 표현, 복잡한 JavaScript 및 런타임 생성 파일은 `UNKNOWN`이 될 수
   있습니다.
+- Frontier는 등록된 Relation 의미만 fail-closed 방식으로 순회합니다. 새 Relation type은 semantic
+  registry에 명시적으로 추가하기 전까지 경로 후보에 포함되지 않습니다.
 
 ## 실행 명령
 

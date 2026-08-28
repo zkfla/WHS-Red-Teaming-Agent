@@ -121,8 +121,8 @@ trusted operator 입력이어야 하며, deterministic 모드에서는 Objective
 System policy와 Validator 규칙이 Objective보다 우선하고 repository/tool 출력은 계속
 untrusted data로 취급됩니다. Reasoning 모드에서는 Objective에서 `fork_pr`, `artifact`, `cache`,
 `oidc`, `cloud_identity` 같은 제한된 탐색 힌트를 deterministic하게 컴파일합니다. 이 구조화 Goal은
-`ListSecurityFacts`의 관련 Relation 정렬과 모델의 조사 우선순위에만 쓰이며 Evidence, Fact, verdict,
-Guard 또는 취약점 결론을 생성하지 않습니다.
+`ListAttackFrontiers`의 source→sink 후보 탐색·정렬과 `ListSecurityFacts`의 관련 Relation 정렬에만
+쓰이며 Evidence, Fact, verdict, Guard 또는 취약점 결론을 생성하지 않습니다.
 
 `codex-chatgpt`는 API key나 Codex 인증 토큰을 프로그램으로 복사하지 않습니다. 공식
 `openai-codex` Python SDK가 저장된 ChatGPT 인증을 재사용하는 LLM 연결을 제공합니다.
@@ -159,7 +159,11 @@ Evidence와 missing evidence는 런타임이 자동으로 복원합니다.
 최종 제출에서는 `R0001` 형태의 짧은 Relation 참조와 순서만 선택할 수 있으며, 정확한
 Relation ID·node·edge·Evidence·missing evidence와 상태는 런타임이 원본 Fact에서 조립합니다.
 따라서 모델이 긴 식별자를 다시 작성하면서 발생하는 오타가 최종 결과에 들어가지 않습니다.
-`ListSecurityFacts`는 기본적으로 이 선택에 필요한 compact Fact만 반환하며, legacy 전체 제출
+`ListAttackFrontiers`는 먼저 실행 context, guard, missing evidence와 연속된 Relation 참조를 묶은
+bounded 후보를 반환합니다. `COMPLETE`이면서 `proposal_ready=true`인 후보만 제출 검토 대상이고,
+`PARTIAL`은 다음 조사 지점을 보여주는 진단용입니다. 단순 trigger→권한 연결은 공격자 입력이나
+실행 통제가 이어지지 않으면 proposal-ready가 아닙니다. `ListSecurityFacts`는 Frontier가 충분하지
+않을 때 기본 compact Fact를 반환하며, legacy 전체 제출
 호환성이 필요할 때만 exact grounding ID를 명시적으로 요청합니다.
 
 ## 평가와 개발 검증

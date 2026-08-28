@@ -322,16 +322,19 @@ async def test_memory_patch_piggybacks_without_changing_action_signature(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "basis_capability", ["ListSecurityFacts", "ListAttackFrontiers"]
+)
 async def test_follow_up_investigation_requires_initial_hypothesis_patch(
-    tmp_path: Path,
+    tmp_path: Path, basis_capability: str
 ) -> None:
     state = _state(tmp_path)
     boundary = RepositoryBoundary(tmp_path / "repository")
     context = CapabilityContext(state, boundary)
     capabilities = build_capabilities(context)
 
-    list_facts = capabilities["ListSecurityFacts"].to_model().model_validate({})
-    await list_facts.execute()
+    list_basis = capabilities[basis_capability].to_model().model_validate({})
+    await list_basis.execute()
 
     follow_up_schema = capabilities["GetWorkflowFacts"].to_model()
     rejected = json.loads(

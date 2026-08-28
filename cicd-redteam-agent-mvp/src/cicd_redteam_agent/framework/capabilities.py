@@ -9,6 +9,13 @@ from hackingBuddyGPT.capability import Capability
 
 from cicd_redteam_agent.application.objective import CompiledObjectiveGoal, objective_relation_score
 from cicd_redteam_agent.domain.github_actions_parser import stable_id
+from cicd_redteam_agent.domain.graph_frontier import (
+    DEFAULT_MAX_EXPANSIONS,
+    DEFAULT_MAX_FRONTIERS,
+    FrontierQuery,
+    FrontierSearchResult,
+    build_attack_frontiers,
+)
 from cicd_redteam_agent.domain.models import (
     AnalysisMode,
     AnalysisProposal,
@@ -38,6 +45,7 @@ class CapabilityContext:
     objective_goal: CompiledObjectiveGoal | None = None
     submitted: bool = False
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    frontier_cache: dict[str, FrontierSearchResult] = field(default_factory=dict)
 
     def record_call(self, name: str, arguments: object) -> int:
         signature = stable_id("call", name, json.dumps(arguments, sort_keys=True, default=str))
@@ -205,6 +213,97 @@ class ListSecurityFacts(Capability):
                 ),
             }
         )
+
+
+class ListAttackFrontiers(Capability):
+    def __init__(self, context: CapabilityContext) -> None:
+        self.context = context
+
+    def describe(self) -> str:
+        return (
+            "List bounded, context-sensitive source-to-sink attack-path candidates derived from "
+            "deterministic Relations. Each candidate includes continuous relation_refs, relevant "
+            "guards, unresolved assumptions, execution context, status ceiling, and whether it is "
+            "proposal-ready. Frontiers are investigation aids, not Findings."
+        )
+
+    async def __call__(
+        self,
+        offset: int = 0,
+        limit: int = 10,
+        include_blocked: bool = True,
+    ) -> str:
+        arguments = {
+            "offset": offset,
+            "limit": limit,
+            "include_blocked": include_blocked,
+        }
+        self.context.record_call(self.get_name(), arguments)
+        if offset < 0:
+            return json.dumps({"error": "invalid_offset", "minimum": 0})
+        if limit < 1 or limit > 20:
+            return json.dumps({"error": "invalid_limit", "minimum": 1, "maximum": 20})
+
+        goal = self.context.objective_goal
+        sink_hints = goal.sink_hints if goal else ()
+        if "cloud_identity" in sink_hints:
+            sink_hints = tuple(item for item in sink_hints if item != "oidc_token")
+        query = FrontierQuery(
+            source_hints=goal.source_hints if goal else (),
+            mechanism_hints=goal.mechanism_hints if goal else (),
+            sink_hints=sink_hints,
+            max_frontiers=DEFAULT_MAX_FRONTIERS,
+            max_expansions=DEFAULT_MAX_EXPANSIONS,
+        )
+        cache_key = json.dumps(
+            {
+                "source_hints": query.source_hints,
+                "mechanism_hints": query.mechanism_hints,
+                "sink_hints": query.sink_hints,
+            },
+            sort_keys=True,
+        )
+        result = self.context.frontier_cache.get(cache_key)
+        if result is None:
+            result = build_attack_frontiers(self.context.state, query)
+            self.context.frontier_cache[cache_key] = result
+
+        frontiers = [
+            item
+            for item in result.frontiers
+            if include_blocked or item.disposition.value != "BLOCKED"
+        ]
+        page = frontiers[offset : offset + limit]
+        next_offset = offset + len(page)
+        counts: dict[str, int] = {}
+        for item in frontiers:
+            counts[item.disposition.value] = counts.get(item.disposition.value, 0) + 1
+        resource = f"attack-frontiers:{offset}:{limit}:{include_blocked}:{cache_key}"
+        if resource not in self.context.state.inspected_resources:
+            self.context.state.inspected_resources.append(resource)
+
+        payload = result.as_dict()
+        payload.update(
+            {
+                "frontiers": [item.as_dict() for item in page],
+                "total": len(frontiers),
+                "counts": counts,
+                "offset": offset,
+                "limit": limit,
+                "next_offset": next_offset if next_offset < len(frontiers) else None,
+                "objective_focus": goal.as_dict() if goal else None,
+                "guidance": (
+                    "Use proposal_ready COMPLETE frontiers as compact proposal candidates. "
+                    "PARTIAL frontiers are diagnostics only and must never be submitted. BLOCKED "
+                    "frontiers are terminal for that execution context and should not be "
+                    "repeatedly investigated. UNKNOWN reasons marked EXTERNAL_REQUIRED cannot be "
+                    "resolved by additional repository reads. Objective ranking changes neither "
+                    "Relations nor "
+                    "Validator semantics. A truncated response never proves that no path exists."
+                ),
+            }
+        )
+        return json.dumps(payload)
 
 
 class GetWorkflowFacts(Capability):
@@ -387,6 +486,7 @@ class SubmitAnalysis(Capability):
 def build_capabilities(context: CapabilityContext) -> dict[str, Capability]:
     capabilities = [
         ListWorkflows(context),
+        ListAttackFrontiers(context),
         ListSecurityFacts(context),
         GetWorkflowFacts(context),
         InspectRepositoryFile(context),

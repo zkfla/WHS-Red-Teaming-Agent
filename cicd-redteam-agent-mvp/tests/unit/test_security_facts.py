@@ -17,7 +17,11 @@ from cicd_redteam_agent.domain.models import (
     relation_id_for,
 )
 from cicd_redteam_agent.domain.validator import validate_analysis_proposal
-from cicd_redteam_agent.framework.capabilities import CapabilityContext, ListSecurityFacts
+from cicd_redteam_agent.framework.capabilities import (
+    CapabilityContext,
+    ListAttackFrontiers,
+    ListSecurityFacts,
+)
 from cicd_redteam_agent.security.repository_boundary import RepositoryBoundary
 
 FIXTURES = Path(__file__).parents[1] / "fixtures"
@@ -301,6 +305,39 @@ async def test_security_fact_capability_ranks_goal_relevant_relations_first(
     assert payload["objective_focus"] == goal.as_dict()
     assert returned_scores == sorted(returned_scores, reverse=True)
     assert returned_scores[0] > 0
+
+
+@pytest.mark.asyncio
+async def test_attack_frontier_capability_paginates_and_exposes_search_limits(
+    tmp_path: Path,
+) -> None:
+    state = await _analyze("oidc-risk", None, tmp_path)
+    boundary = RepositoryBoundary(FIXTURES / "oidc-risk")
+    goal = compile_objective_goal("fork PR의 OIDC cloud identity 경로를 우선 조사해")
+    capability = ListAttackFrontiers(CapabilityContext(state, boundary, objective_goal=goal))
+
+    first = json.loads(await capability(limit=1))
+    second = json.loads(await capability(offset=1, limit=1))
+
+    assert first["frontiers"][0]["sink_tag"] == "cloud_identity"
+    assert first["frontiers"][0]["proposal_ready"] is True
+    assert first["frontiers"][0]["relation_refs"]
+    assert first["next_offset"] == 1
+    assert second["offset"] == 1
+    assert first["frontier_engine_version"]
+    assert first["relation_semantics_version"]
+    assert isinstance(first["search_complete"], bool)
+    assert "truncated" in first
+
+
+@pytest.mark.asyncio
+async def test_attack_frontier_capability_rejects_invalid_page_size(tmp_path: Path) -> None:
+    state = await _analyze("inference-flow", "supported", tmp_path)
+    boundary = RepositoryBoundary(FIXTURES / "inference-flow" / "supported")
+
+    payload = json.loads(await ListAttackFrontiers(CapabilityContext(state, boundary))(limit=21))
+
+    assert payload == {"error": "invalid_limit", "minimum": 1, "maximum": 20}
 
 
 @pytest.mark.asyncio

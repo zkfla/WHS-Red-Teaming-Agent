@@ -106,6 +106,22 @@ The runtime restores the stable IDs before the validator checks source/type/targ
 and rejects a `SUPPORTED` path containing an `UNKNOWN` or `FALSE` relation. GHA fixture IDs remain
 evaluation labels rather than product rule identifiers.
 
+Before raw Fact inspection, reasoning mode exposes a derived attack Frontier. The Frontier engine
+walks only explicitly registered Relation semantics and carries the current trigger context, job
+context, flow labels, effective permission summary and trust provenance as part of traversal state.
+It therefore cannot join equal-looking syntax nodes from incompatible executions. A flow-specific
+FALSE Relation or applicable hard guard terminates that candidate; uncertain conditions and external
+settings remain visible without being treated as safety. Conservative dominance pruning removes only
+strictly longer states with no new mechanism and a superset of missing information, while top-K
+selection preserves source/mechanism/sink/context diversity.
+
+`ListAttackFrontiers` returns continuous run-local `relation_ref` sequences, guard assessments,
+status ceilings, missing-information classes, pagination and explicit search/truncation metadata.
+`COMPLETE + proposal_ready` is eligible for compact proposal review. `PARTIAL` is diagnostic only,
+and a trigger-to-authority route without attacker-controlled data or execution is never proposal-ready.
+The projection creates no Finding and is not persisted in `AnalysisState`; Relations and the existing
+Validator remain authoritative.
+
 The reusable extractor covers event inputs, job/step environments, step outputs, repository files,
 local actions, reusable workflows, artifacts, caches, shell/import/network sinks, granular token
 permissions, Secret flows, AWS/GCP/Azure identity access, mutable dependencies, runner persistence

@@ -20,7 +20,8 @@ def test_security_prompt_keeps_required_workflow_and_grounding_contracts() -> No
         "## 5. SubmitAnalysis output contract",
     ]
     assert all(heading in text for heading in headings)
-    assert text.index("`ListWorkflows`") < text.index("`ListSecurityFacts`")
+    assert text.index("`ListWorkflows`") < text.index("`ListAttackFrontiers`")
+    assert text.index("`ListAttackFrontiers`") < text.index("`ListSecurityFacts`")
     assert text.index("`ListSecurityFacts`") < text.index("`SubmitAnalysis`")
     assert '"schema_version": "1.0"' in text
     assert '"paths": []' in text
