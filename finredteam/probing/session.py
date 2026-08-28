@@ -122,7 +122,13 @@ class Session:
         self.policy.check_request(method, resolved_url)
         self._rate_limiter.wait()
         start = time.monotonic()
-        resp = self._client.request(method, path, json=json_body, headers=headers)
+        try:
+            resp = self._client.request(method, path, json=json_body, headers=headers)
+        except httpx.RequestError as exc:
+            # 전송 계층 실패(연결 거부·타임아웃·DNS 등)를 SessionError 로 변환한다 —
+            # 상위(executor/burst)는 SessionError 만 잡으므로, 이렇게 하지 않으면
+            # 실행 중 일시적 네트워크 장애 한 번에 전체 run 이 죽는다(§ sad path).
+            raise SessionError(f"요청 실패: {type(exc).__name__}: {exc}") from exc
         elapsed_ms = (time.monotonic() - start) * 1000
         # 인증은 오직 Authorization 헤더로만 한다(authed_request). httpx 의 쿠키 잭이
         # 로그인 응답의 Set-Cookie 를 저장해두면, 이후 "익명" 요청에도 그 쿠키가 자동

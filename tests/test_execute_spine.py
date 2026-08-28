@@ -250,3 +250,109 @@ def test_bola_read_of_unentitled_account_flows_to_inv2_violation():
     finding = verify(candidate, result, graph)
     assert finding.verdict == Verdict.VIOLATION
     assert finding.invariant == "INV-2"
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# sad path — 잘못된 입력·실패 상황에서도 사이클이 크래시하지 않고 우아하게 넘어간다.
+# (거짓 VIOLATION 도 내지 않는다 — 근거가 없으면 UNKNOWN)
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def test_unsupported_operation_returns_error_string_not_crash():
+    """지원 안 하는 operation → 예외가 아니라 에러 문자열(LLM 이 읽고 자가수정할 재료)."""
+    principals = _principals()
+    result = resolve_skeleton(
+        "withdraw_all_money", "attacker_A", f"account:{VICTIM_ACCT}", principals, _graph(principals), load_target("vulnbank")
+    )
+    assert isinstance(result, str)
+    assert "생성기가 없음" in result
+
+
+def test_transfer_to_unknown_account_returns_error_string():
+    """그래프가 모르는 계좌를 target 으로 지목 → 에러 문자열(크래시 X)."""
+    principals = _principals()
+    result = resolve_skeleton(
+        "transfer", "attacker_A", "account:99999999", principals, _graph(principals), load_target("vulnbank")
+    )
+    assert isinstance(result, str)
+    assert "모르는 계좌" in result
+
+
+def test_read_balance_of_unknown_account_returns_error_string():
+    principals = _principals()
+    result = resolve_skeleton(
+        "read_balance", "attacker_A", "account:99999999", principals, _graph(principals), load_target("vulnbank")
+    )
+    assert isinstance(result, str)
+    assert "모르는 계좌" in result
+
+
+def test_transfer_without_sender_entitlement_returns_error_string():
+    """발신자가 자기 계좌에 entitled_own 이 없으면(그래프 비어있음) 에러 문자열."""
+    principals = _principals()
+    empty_graph = KnowledgeGraph()  # 아무 entitlement 도 없음
+    result = resolve_skeleton(
+        "transfer", "attacker_A", f"account:{VICTIM_ACCT}", principals, empty_graph, load_target("vulnbank")
+    )
+    assert isinstance(result, str)
+    assert "entitled_own" in result
+
+
+def test_missing_baseline_does_not_produce_false_violation():
+    """baseline 없이 음수 송금 → INV-1B 는 확정 불가(UNKNOWN). 거짓 VIOLATION 이면 안 된다."""
+    session = _mock_target_session()  # 부호반전 버그는 있지만
+    principals = _principals()
+    graph = _graph(principals)
+    empty_baselines = BaselineRegistry()  # baseline 학습 안 함 → 판정 근거 없음
+
+    skeleton = resolve_skeleton("transfer", "attacker_A", f"account:{VICTIM_ACCT}", principals, graph, session.target)
+    assert not isinstance(skeleton, str)
+    candidate = build_candidate(skeleton, {"amount": "-500.00", "to_account": VICTIM_ACCT}, "", empty_baselines)
+
+    result = execute(session, session.target, candidate, principals[0], watch_accounts=[ATTACKER_ACCT, VICTIM_ACCT])
+    finding = verify(candidate, result, graph)
+    assert finding.verdict != Verdict.VIOLATION  # 근거 없이 위반이라 우기지 않는다
+
+
+def test_server_error_does_not_crash_or_false_violation():
+    """대상이 전부 500 을 뱉어도 → 크래시 없이, 거짓 VIOLATION 없이 넘어간다."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, json={"error": "internal"})
+
+    session = Session(load_target("vulnbank"), _policy(), _transport=httpx.MockTransport(handler))
+    principals = _principals()
+    graph = _graph(principals)
+    baselines = _seed_baseline()
+
+    skeleton = resolve_skeleton("transfer", "attacker_A", f"account:{VICTIM_ACCT}", principals, graph, session.target)
+    assert not isinstance(skeleton, str)
+    candidate = build_candidate(skeleton, {"amount": "-500.00", "to_account": VICTIM_ACCT}, "", baselines)
+
+    result = execute(session, session.target, candidate, principals[0], watch_accounts=[ATTACKER_ACCT, VICTIM_ACCT])
+    finding = verify(candidate, result, graph)  # 예외 없이 여기까지 온다
+    assert finding.verdict != Verdict.VIOLATION
+
+
+def test_connection_error_degrades_gracefully_not_crash():
+    """대상 연결이 끊겨도(ConnectError) 크래시 없이 넘어간다.
+
+    executor/burst 은 SessionError 만 잡으므로, 유일한 네트워크 지점인
+    session._request 가 httpx 전송 에러(ConnectError/TimeoutException 등)를
+    SessionError 로 변환해야 한다 — 안 그러면 실행 중 일시적 네트워크 장애로
+    전체 run 이 죽는다.
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused")
+
+    session = Session(load_target("vulnbank"), _policy(), _transport=httpx.MockTransport(handler))
+    principals = _principals()
+    graph = _graph(principals)
+    baselines = _seed_baseline()
+
+    skeleton = resolve_skeleton("transfer", "attacker_A", f"account:{VICTIM_ACCT}", principals, graph, session.target)
+    assert not isinstance(skeleton, str)
+    candidate = build_candidate(skeleton, {"amount": "-500.00", "to_account": VICTIM_ACCT}, "", baselines)
+
+    result = execute(session, session.target, candidate, principals[0], watch_accounts=[ATTACKER_ACCT, VICTIM_ACCT])
+    finding = verify(candidate, result, graph)  # 크래시 없이 여기까지
+    assert finding.verdict != Verdict.VIOLATION
