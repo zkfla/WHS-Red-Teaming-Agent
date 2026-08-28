@@ -443,11 +443,15 @@ class TestPlan(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
     plan_id: str = Field(default_factory=lambda: uuid4().hex)
     provider: str
+    planner_provider: str = "rules"
     model: str = "deterministic"
     items: tuple[PlanItem, ...]
     selected_candidate_ids: tuple[str, ...] | None = None
     planner_fallback_used: bool = False
     planner_round: int = Field(default=0, ge=0)
+    ai_api_calls: int = Field(default=0, ge=0)
+    ai_input_tokens: int = Field(default=0, ge=0)
+    ai_output_tokens: int = Field(default=0, ge=0)
 
 
 class FindingStatus(StrEnum):

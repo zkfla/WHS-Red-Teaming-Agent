@@ -118,6 +118,21 @@ def test_hybrid_planner_falls_back_on_unknown_candidate(tmp_path: Path) -> None:
     assert outcome.decision.selected_actions[0].candidate_id == "sql-candidate"
 
 
+def test_hybrid_planner_records_unconfigured_provider_as_fallback(tmp_path: Path) -> None:
+    config = _config(tmp_path, provider="none")
+    context = planning_context(
+        config.injection_fixtures,
+        remaining_requests=50,
+        planning_round=0,
+    )
+    outcome = asyncio.run(
+        HybridPlanner(config, AuditLogger(config.audit_log_path)).plan(context)
+    )
+    assert outcome.provider == "rules"
+    assert outcome.fallback_used is True
+    assert outcome.fallback_reason == "ValueError"
+
+
 def test_orchestrator_persists_hybrid_candidate_selection(tmp_path: Path) -> None:
     config = _config(tmp_path)
     logger = AuditLogger(config.audit_log_path)
@@ -129,7 +144,8 @@ def test_orchestrator_persists_hybrid_candidate_selection(tmp_path: Path) -> Non
             planner_provider=_SelectCandidate(),
         )
         plan = asyncio.run(orchestrator._plan_with_provider())
-    assert plan.provider == "fake"
+    assert plan.provider == "hybrid"
+    assert plan.planner_provider == "fake"
     assert plan.selected_candidate_ids == ("sql-candidate",)
     assert plan.planner_fallback_used is False
 
@@ -173,6 +189,118 @@ def test_openai_compatible_planner_parses_structured_json_without_raw_values(
     body = requests[0].content.decode()
     assert "sql-candidate" in body
     assert "baseline_value" not in body
+
+
+def test_openai_compatible_planner_retries_transient_errors_and_records_usage(
+    tmp_path: Path,
+) -> None:
+    attempts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            return httpx.Response(503)
+        return httpx.Response(
+            200,
+            json={
+                "usage": {"prompt_tokens": 12, "completion_tokens": 7},
+                "choices": [
+                    {
+                        "message": {
+                            "content": '{"selected_actions": [], "finish": true}'
+                        }
+                    }
+                ],
+            },
+        )
+
+    config = _config(tmp_path, provider="openai_compatible").model_copy(
+        update={"ai": AIConfig(
+            provider="openai_compatible",
+            model="test-model",
+            retry_attempts=1,
+            retry_backoff_seconds=0,
+        )}
+    )
+    provider = OpenAICompatiblePlanner(
+        config.ai,
+        AuditLogger(config.audit_log_path),
+        transport=httpx.MockTransport(handler),
+    )
+    context = planning_context(
+        config.injection_fixtures,
+        remaining_requests=50,
+        planning_round=0,
+    )
+    asyncio.run(provider.plan(context))
+    assert attempts == 2
+    assert provider.last_usage.api_calls == 2
+    assert provider.last_usage.input_tokens == 12
+    assert provider.last_usage.output_tokens == 7
+
+
+def test_hybrid_planner_stops_when_api_call_budget_is_exhausted(tmp_path: Path) -> None:
+    config = _config(tmp_path, provider="openai_compatible").model_copy(
+        update={"ai": AIConfig(
+            provider="openai_compatible",
+            model="test-model",
+            max_api_calls_per_run=1,
+        )}
+    )
+    context = planning_context(
+        config.injection_fixtures,
+        remaining_requests=50,
+        planning_round=1,
+    )
+    outcome = asyncio.run(
+        HybridPlanner(
+            config,
+            AuditLogger(config.audit_log_path),
+            provider=_SelectCandidate(),
+        ).plan(context, api_calls_used=1)
+    )
+    assert outcome.fallback_used is True
+    assert outcome.fallback_reason == "api_call_budget_exhausted"
+
+
+def test_hybrid_planner_hard_caps_provider_retries_to_remaining_budget(
+    tmp_path: Path,
+) -> None:
+    attempts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        return httpx.Response(503)
+
+    config = _config(tmp_path, provider="openai_compatible").model_copy(
+        update={"ai": AIConfig(
+            provider="openai_compatible",
+            model="test-model",
+            max_api_calls_per_run=1,
+            retry_attempts=4,
+            retry_backoff_seconds=0,
+        )}
+    )
+    provider = OpenAICompatiblePlanner(
+        config.ai,
+        AuditLogger(config.audit_log_path),
+        transport=httpx.MockTransport(handler),
+    )
+    context = planning_context(
+        config.injection_fixtures,
+        remaining_requests=50,
+        planning_round=0,
+    )
+    outcome = asyncio.run(
+        HybridPlanner(config, AuditLogger(config.audit_log_path), provider=provider).plan(
+            context
+        )
+    )
+    assert attempts == 1
+    assert outcome.fallback_used is True
+    assert outcome.usage.api_calls == 1
 
 
 def test_limited_replanning_only_selects_remaining_candidates(tmp_path: Path) -> None:

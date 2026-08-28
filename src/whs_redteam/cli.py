@@ -279,6 +279,13 @@ def sqli_scan(
         str,
         typer.Option("--ai-model", help="Model name used when --planner=hybrid."),
     ] = "",
+    ai_api_key_env: Annotated[
+        str | None,
+        typer.Option(
+            "--ai-api-key-env",
+            help="Environment variable name containing the AI API key (never the key itself).",
+        ),
+    ] = None,
     report_writer_enabled: Annotated[
         bool,
         typer.Option(
@@ -314,6 +321,7 @@ def sqli_scan(
             planner_mode=planner_mode,
             ai_base_url=ai_base_url,
             ai_model=ai_model,
+            ai_api_key_env=ai_api_key_env,
             report_writer_enabled=report_writer_enabled,
         )
         result = asyncio.run(service.run(run_id))

@@ -5,6 +5,7 @@ from whs_redteam.ai.models import (
     PlannerDecision,
     PlanningCandidate,
     PlanningContext,
+    ProviderUsage,
 )
 from whs_redteam.ai.provider import (
     AIProviderError,
@@ -17,6 +18,7 @@ __all__ = [
     "AIProviderError",
     "OpenAICompatiblePlanner",
     "PlannedAction",
+    "ProviderUsage",
     "PlannerDecision",
     "PlannerProvider",
     "PlanningCandidate",

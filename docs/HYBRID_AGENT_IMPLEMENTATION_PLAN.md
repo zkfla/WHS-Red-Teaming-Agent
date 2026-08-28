@@ -36,6 +36,7 @@ AI 계획, 재계획, 판정, 보고서, 웹 시연을 완성하는 데 집중�
 ### 2.2 이번 구현에서 완료된 부분
 
 - OpenAI-compatible AI planner와 환경변수 기반 선택적 인증
+- API timeout·429·5xx retry, 호출 예산, input/output token provenance
 - 값 없는 후보 Context와 구조화된 출력 검증
 - AI 장애·잘못된 후보·잘못된 설정의 rules fallback
 - 실행 결과를 근거로 한 최대 라운드 제한 재계획
@@ -149,6 +150,10 @@ engagement:
     api_key_env: WHS_AI_API_KEY
     timeout_seconds: 30
     max_output_tokens: 1200
+    max_api_calls_per_run: 4
+    retry_attempts: 2
+    retry_backoff_seconds: 0.5
+    max_input_characters: 40000
     max_planning_rounds: 3
     fallback_to_rules: true
     report_writer_enabled: true
@@ -157,6 +162,12 @@ engagement:
 API 키 값은 설정, SQLite, 감사 로그, 보고서에 저장하지 않는다. 설정에는 환경변수 이름만
 저장한다. 로컬 서버가 키를 요구하지 않더라도 provider 호환성을 위해 빈 값이 아닌 별도
 더미 환경변수를 선택적으로 사용할 수 있게 한다.
+
+`max_api_calls_per_run`은 계획 라운드의 API 호출 상한이다. 일시적인 429·5xx·timeout에
+대한 `retry_attempts`는 한 계획 호출 안에서만 허용된다. 보고서의 `api_calls`는 재시도를
+포함한 실제 HTTP 요청 수이며, provider가 usage를 반환하지 않으면 토큰 수는 0으로
+기록한다. 감사 로그에는 호출 횟수와 usage 제공 여부만 남기고, API 키·프롬프트 원문·응답
+원문은 감사 로그와 보고서에 기록하지 않는다.
 
 ### 4.3 AI 입력 제한
 

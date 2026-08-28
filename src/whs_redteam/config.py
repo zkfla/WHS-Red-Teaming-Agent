@@ -175,6 +175,10 @@ class AIConfig(BaseModel):
     )
     timeout_seconds: float = Field(default=30, gt=0, le=120)
     max_output_tokens: int = Field(default=1200, ge=128, le=8_192)
+    max_api_calls_per_run: int = Field(default=4, ge=1, le=20)
+    retry_attempts: int = Field(default=2, ge=0, le=4)
+    retry_backoff_seconds: float = Field(default=0.5, ge=0, le=10)
+    max_input_characters: int = Field(default=40_000, ge=1_000, le=200_000)
     max_planning_rounds: int = Field(default=3, ge=1, le=5)
     fallback_to_rules: bool = True
     report_writer_enabled: bool = False

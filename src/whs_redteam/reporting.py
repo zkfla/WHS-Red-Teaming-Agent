@@ -33,10 +33,14 @@ def build_markdown_report(
         "",
         "## Scope and planning",
         "",
-        f"- Planner: `{_text(planning.get('provider', 'rules'), 80)}`",
+        f"- Planner mode: `{_text(planning.get('mode', 'rules'), 80)}`",
+        f"- Planner provider: `{_text(planning.get('provider', 'rules'), 80)}`",
         f"- Planner model: `{_text(planning.get('model', 'deterministic'), 120)}`",
         f"- Planner round: {_text(planning.get('planner_round', 0), 20)}",
         f"- Fallback used: {_text(planning.get('fallback_used', False), 20)}",
+        f"- AI API calls: {_text(planning.get('api_calls', 0), 20)}",
+        f"- AI tokens (input/output): {_text(planning.get('input_tokens', 0), 20)}/"
+        f"{_text(planning.get('output_tokens', 0), 20)}",
         "- Selected SQLi candidates: "
         + (_text(", ".join(planning.get("selected_candidate_ids", [])), 500) or "none"),
         "",

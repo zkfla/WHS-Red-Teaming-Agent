@@ -54,6 +54,29 @@ SQLi run, `/api/runs/{run_id}/actions` lists metadata-only approval requests, an
 The generated JSON report is accompanied by a Markdown report; the machine verdict is
 authoritative and AI prose cannot promote a finding.
 
+직접 실행할 때 AI API를 계획 단계의 우선 provider로 선택하려면 키 값이 아니라
+환경변수 이름만 전달합니다.
+
+```bash
+export WHS_AI_API_KEY="..."
+whs-redteam sqli-scan https://authorized.example/items?id=1 \
+  --planner hybrid \
+  --ai-base-url https://provider.example/v1 \
+  --ai-model model-name \
+  --ai-api-key-env WHS_AI_API_KEY
+```
+
+`hybrid`는 AI가 후보를 선택한 뒤에도 모든 action을 scope·budget·서명 승인 gate로
+통과시킵니다. API timeout, 429, 5xx, 잘못된 JSON 또는 호출 예산 초과 시 rules
+planner로 전환하며, 전환 여부와 사용량은 보고서 provenance에 남습니다.
+
+외부 키 없이 실제 HTTP 계약과 전체 승인 흐름을 재현하려면 저장소의 mock
+OpenAI-compatible 서버를 포함한 데모를 실행합니다.
+
+```bash
+python scripts/run_ai_api_demo.py
+```
+
 For a fully local demonstration, run the intentionally vulnerable and safe negative-control
 targets separately:
 
@@ -253,8 +276,9 @@ whs-redteam run configs/mcp-in-memory.example.yaml
 ```
 
 실패한 run은 SQLite `agent_runs` 테이블에 실패 단계와 오류 유형을 저장합니다. 재개 시
-engagement 설정 hash가 달라졌으면 안전을 위해 실행을 거부합니다. 현재 오케스트레이터는
-결정론적 rules-only 파이프라인입니다. 공격표면 요약과 보수적인 exploitability 판정을
+engagement 설정 hash가 달라졌으면 안전을 위해 실행을 거부합니다. 기본 planner는
+결정론적 rules 모드이고, `--planner hybrid`를 선택하면 AI API가 후보 선택을 보조합니다.
+어느 모드에서도 공격표면 요약과 보수적인 exploitability 판정은
 run checkpoint와 최종 JSON 보고서에 함께 저장합니다. 일반 보안 설정 문제는
 HARDENING_GAPS, 명시 fixture에서 negative control과 반복 재현을 통과한 비인가 객체
 읽기는 CONFIRMED로 구분합니다. 발견이 없다는 사실은 안전함의 증명으로 해석하지 않습니다.

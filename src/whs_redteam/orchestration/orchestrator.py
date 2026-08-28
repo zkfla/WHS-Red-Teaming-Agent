@@ -1013,7 +1013,7 @@ class AgentOrchestrator:
             self.config,
             self.audit_logger,
             provider=self.planner_provider,
-        ).plan(context)
+        ).plan(context, api_calls_used=0)
         selected = tuple(
             action.candidate_id
             for action in outcome.decision.selected_actions
@@ -1021,11 +1021,15 @@ class AgentOrchestrator:
         )
         return base_plan.model_copy(
             update={
-                "provider": outcome.provider,
+                "provider": self.config.planner_mode,
+                "planner_provider": outcome.provider,
                 "model": outcome.model,
                 "selected_candidate_ids": selected,
                 "planner_fallback_used": outcome.fallback_used,
                 "planner_round": context.planning_round,
+                "ai_api_calls": outcome.usage.api_calls,
+                "ai_input_tokens": outcome.usage.input_tokens,
+                "ai_output_tokens": outcome.usage.output_tokens,
             }
         )
 
@@ -1105,7 +1109,7 @@ class AgentOrchestrator:
             self.config,
             self.audit_logger,
             provider=self.planner_provider,
-        ).plan(context)
+        ).plan(context, api_calls_used=plan.ai_api_calls)
         selected = tuple(
             action.candidate_id
             for action in outcome.decision.selected_actions
@@ -1131,11 +1135,15 @@ class AgentOrchestrator:
         )
         return plan.model_copy(
             update={
-                "provider": outcome.provider,
+                "provider": self.config.planner_mode,
+                "planner_provider": outcome.provider,
                 "model": outcome.model,
                 "selected_candidate_ids": selected,
                 "planner_fallback_used": outcome.fallback_used,
                 "planner_round": next_round,
+                "ai_api_calls": plan.ai_api_calls + outcome.usage.api_calls,
+                "ai_input_tokens": plan.ai_input_tokens + outcome.usage.input_tokens,
+                "ai_output_tokens": plan.ai_output_tokens + outcome.usage.output_tokens,
             }
         )
 
@@ -1386,11 +1394,17 @@ class AgentOrchestrator:
             "engagement_name": run.engagement_name,
             "attack_surface": attack_surface,
             "planning": {
-                "provider": planning.get("provider", "rules"),
+                "mode": planning.get("provider", "rules"),
+                "provider": planning.get(
+                    "planner_provider", planning.get("provider", "rules")
+                ),
                 "model": planning.get("model", "deterministic"),
                 "planner_round": planning.get("planner_round", 0),
                 "fallback_used": planning.get("planner_fallback_used", False),
                 "selected_candidate_ids": planning.get("selected_candidate_ids") or [],
+                "api_calls": planning.get("ai_api_calls", 0),
+                "input_tokens": planning.get("ai_input_tokens", 0),
+                "output_tokens": planning.get("ai_output_tokens", 0),
             },
             "api_request_schemas": schema_reports,
             "resources": [

@@ -7,6 +7,16 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 
+class ProviderUsage(BaseModel):
+    """Usage metadata returned by a provider; it never contains prompt text."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    api_calls: int = Field(default=0, ge=0)
+    input_tokens: int = Field(default=0, ge=0)
+    output_tokens: int = Field(default=0, ge=0)
+
+
 class PlanningCandidate(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -31,6 +41,10 @@ class PlanningContext(BaseModel):
     remaining_requests: int = Field(ge=0)
     planning_round: int = Field(ge=0)
     prior_results: tuple[dict[str, object], ...] = ()
+
+    @property
+    def serialized_size(self) -> int:
+        return len(self.model_dump_json())
 
 
 class PlannedAction(BaseModel):

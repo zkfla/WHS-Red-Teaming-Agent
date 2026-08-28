@@ -17,6 +17,10 @@ engagement:
     api_key_env: null
     timeout_seconds: 30
     max_output_tokens: 1200
+    max_api_calls_per_run: 4
+    retry_attempts: 2
+    retry_backoff_seconds: 0.5
+    max_input_characters: 40000
     max_planning_rounds: 3
     fallback_to_rules: true
     report_writer_enabled: true

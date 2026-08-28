@@ -27,6 +27,7 @@ class RunRequest(BaseModel):
     planner_mode: Literal["rules", "hybrid"] = "rules"
     ai_base_url: str = "http://127.0.0.1:11434/v1"
     ai_model: str = ""
+    ai_api_key_env: str | None = None
     ai_report: bool = False
 
 
@@ -53,6 +54,7 @@ code{word-break:break-all}
 <label><input id="private" type="checkbox"> allow local/private DNS</label>
 <label>planner <select id="planner"><option>rules</option><option>hybrid</option></select></label>
 <input id="model" placeholder="AI model (optional)">
+<input id="key-env" placeholder="API key env name (optional)">
 <label><input id="ai-report" type="checkbox"> AI explanation</label>
 <button>Start</button></form>
 <div id="output" class="card">Idle</div>
@@ -66,6 +68,7 @@ document.getElementById('run').onsubmit=async(e)=>{
  allow_private_dns:document.getElementById('private').checked,
  planner_mode:document.getElementById('planner').value,
  ai_model:document.getElementById('model').value,
+ ai_api_key_env:document.getElementById('key-env').value || null,
  ai_report:document.getElementById('ai-report').checked})});
  show(await r.json());
 };
@@ -120,6 +123,7 @@ def create_app() -> FastAPI:
                 planner_mode=request.planner_mode,
                 ai_base_url=request.ai_base_url,
                 ai_model=request.ai_model,
+                ai_api_key_env=request.ai_api_key_env,
                 report_writer_enabled=request.ai_report,
             )
             result = await service.run()
