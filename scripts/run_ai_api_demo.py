@@ -23,34 +23,51 @@ class PlannerApiHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
         length = int(self.headers.get("content-length", "0"))
         request = json.loads(self.rfile.read(length))
+        system_prompt = request["messages"][0]["content"]
         content = request["messages"][1]["content"]
-        context = json.loads(content)
-        candidates = context.get("candidates", [])
-        selected = []
-        if candidates:
-            selected.append(
-                {
-                    "candidate_id": candidates[0]["candidate_id"],
-                    "action": "run_sqli_safe",
-                    "reason": "Local compatibility API selected the first bounded candidate.",
-                    "confidence": 0.9,
-                }
-            )
+        if "summary, limitations, and next_steps" in system_prompt:
+            response_content = {
+                "summary": (
+                    "The bounded machine validator reproduced a SQL injection oracle."
+                ),
+                "limitations": (
+                    "No data extraction, persistence, or exploit chain was attempted."
+                ),
+                "next_steps": (
+                    "Replace string-built queries with parameterized statements and retest."
+                ),
+            }
+            usage = {"prompt_tokens": 36, "completion_tokens": 29}
+        else:
+            context = json.loads(content)
+            candidates = context.get("candidates", [])
+            selected = []
+            if candidates:
+                selected.append(
+                    {
+                        "candidate_id": candidates[0]["candidate_id"],
+                        "action": "run_sqli_safe",
+                        "reason": (
+                            "Local compatibility API selected the first bounded candidate."
+                        ),
+                        "confidence": 0.9,
+                    }
+                )
+            response_content = {
+                "schema_version": "planner-decision-v1",
+                "selected_actions": selected,
+                "finish": not bool(selected),
+            }
+            usage = {"prompt_tokens": 42, "completion_tokens": 18}
         payload = {
             "choices": [
                 {
                     "message": {
-                        "content": json.dumps(
-                            {
-                                "schema_version": "planner-decision-v1",
-                                "selected_actions": selected,
-                                "finish": not bool(selected),
-                            }
-                        )
+                        "content": json.dumps(response_content)
                     }
                 }
             ],
-            "usage": {"prompt_tokens": 42, "completion_tokens": 18},
+            "usage": usage,
         }
         encoded = json.dumps(payload).encode()
         self.send_response(200)

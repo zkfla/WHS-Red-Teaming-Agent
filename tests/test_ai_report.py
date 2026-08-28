@@ -16,6 +16,7 @@ def test_ai_report_writer_uses_redacted_machine_summary(tmp_path: Path) -> None:
         return httpx.Response(
             200,
             json={
+                "usage": {"prompt_tokens": 5, "completion_tokens": 3},
                 "choices": [
                     {
                         "message": {
@@ -50,3 +51,6 @@ def test_ai_report_writer_uses_redacted_machine_summary(tmp_path: Path) -> None:
     )
     assert explanation["summary"] == "bounded result"
     assert "must-not-be-sent" not in requests[0].content.decode()
+    assert writer.last_usage.api_calls == 1
+    assert writer.last_usage.input_tokens == 5
+    assert writer.last_usage.output_tokens == 3

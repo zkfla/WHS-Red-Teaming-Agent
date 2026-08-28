@@ -23,6 +23,7 @@ def build_markdown_report(
     findings = report.get("findings") or []
     injection_tests = report.get("injection_tests") or []
     planning = report.get("planning") or {}
+    ai_report = report.get("ai_report") or {}
     lines = [
         f"# Red-teaming report: {_text(report.get('engagement_name', 'engagement'), 200)}",
         "",
@@ -38,9 +39,12 @@ def build_markdown_report(
         f"- Planner model: `{_text(planning.get('model', 'deterministic'), 120)}`",
         f"- Planner round: {_text(planning.get('planner_round', 0), 20)}",
         f"- Fallback used: {_text(planning.get('fallback_used', False), 20)}",
-        f"- AI API calls: {_text(planning.get('api_calls', 0), 20)}",
-        f"- AI tokens (input/output): {_text(planning.get('input_tokens', 0), 20)}/"
+        f"- Planner AI API calls: {_text(planning.get('api_calls', 0), 20)}",
+        f"- Planner AI tokens (input/output): {_text(planning.get('input_tokens', 0), 20)}/"
         f"{_text(planning.get('output_tokens', 0), 20)}",
+        f"- Report AI API calls: {_text(ai_report.get('api_calls', 0), 20)}",
+        f"- Report AI tokens (input/output): {_text(ai_report.get('input_tokens', 0), 20)}/"
+        f"{_text(ai_report.get('output_tokens', 0), 20)}",
         "- Selected SQLi candidates: "
         + (_text(", ".join(planning.get("selected_candidate_ids", [])), 500) or "none"),
         "",

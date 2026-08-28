@@ -77,6 +77,10 @@ OpenAI-compatible 서버를 포함한 데모를 실행합니다.
 python scripts/run_ai_api_demo.py
 ```
 
+구조, URL 처리, 제한 SQLi 검증, 상용 API 전환 절차, 실제 실행 수치와 화면 증거는
+[`docs/PROTOTYPE_COMMERCIAL_API_VALIDATION.md`](docs/PROTOTYPE_COMMERCIAL_API_VALIDATION.md)에
+정리되어 있습니다.
+
 For a fully local demonstration, run the intentionally vulnerable and safe negative-control
 targets separately:
 

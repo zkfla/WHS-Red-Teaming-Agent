@@ -3,7 +3,10 @@ import subprocess
 import sys
 from pathlib import Path
 
+from whs_redteam.audit import AuditLogger
 from whs_redteam.config import load_config
+from whs_redteam.inventory import InventoryStore
+from whs_redteam.orchestration.orchestrator import AgentOrchestrator
 from whs_redteam.run_service import RunService
 
 
@@ -62,3 +65,28 @@ def test_sqli_url_service_creates_value_free_resumable_profile(
         loaded.approval_required_capabilities
         == service.engagement.approval_required_capabilities
     )
+
+
+def test_generated_profile_keeps_same_config_hash_after_yaml_reload(
+    tmp_path: Path,
+) -> None:
+    service = RunService.from_sqli_url(
+        "https://example.test/products?id=7",
+        output_dir=tmp_path / "profiles",
+        planner_mode="hybrid",
+        ai_model="compatibility-model",
+    )
+    reloaded = RunService.from_config_path(service.config_path)
+    with InventoryStore(service.engagement.inventory_db_path) as inventory:
+        direct_hash = AgentOrchestrator(
+            service.engagement,
+            inventory,
+            AuditLogger(service.engagement.audit_log_path),
+        ).config_hash
+    with InventoryStore(reloaded.engagement.inventory_db_path) as inventory:
+        reloaded_hash = AgentOrchestrator(
+            reloaded.engagement,
+            inventory,
+            AuditLogger(reloaded.engagement.audit_log_path),
+        ).config_hash
+    assert reloaded_hash == direct_hash

@@ -84,6 +84,8 @@ from whs_redteam.validation import FindingValidator
 def _canonical_config_value(value: object) -> object:
     """Normalize unordered config containers before hashing across processes."""
 
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
     if isinstance(value, dict):
         return {
             str(key): _canonical_config_value(item)
@@ -1421,11 +1423,26 @@ class AgentOrchestrator:
             "markdown_report_path": str(markdown_path),
         }
         ai_explanation: dict[str, object] | None = None
+        ai_report_provenance: dict[str, object] = {
+            "enabled": self.config.ai.report_writer_enabled,
+            "provider": (
+                self.config.ai.provider
+                if self.config.ai.report_writer_enabled
+                else "none"
+            ),
+            "model": self.config.ai.model or None,
+            "fallback_used": False,
+            "api_calls": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+        }
         if self.config.ai.report_writer_enabled:
+            report_writer: OpenAICompatibleReportWriter | None = None
             try:
-                ai_explanation = await OpenAICompatibleReportWriter(
+                report_writer = OpenAICompatibleReportWriter(
                     self.config.ai, self.audit_logger
-                ).explain(report_payload)
+                )
+                ai_explanation = await report_writer.explain(report_payload)
                 verdict = str(decision.get("verdict", ""))
                 explanation_text = " ".join(
                     str(value) for value in ai_explanation.values()
@@ -1441,6 +1458,16 @@ class AgentOrchestrator:
                     "ai_report_explanation_fallback",
                     reason=type(exc).__name__,
                 )
+            if report_writer is not None:
+                ai_report_provenance.update(
+                    {
+                        "api_calls": report_writer.last_usage.api_calls,
+                        "input_tokens": report_writer.last_usage.input_tokens,
+                        "output_tokens": report_writer.last_usage.output_tokens,
+                    }
+                )
+            ai_report_provenance["fallback_used"] = ai_explanation is None
+        report_payload["ai_report"] = ai_report_provenance
         report_payload["ai_explanation"] = ai_explanation
         write_json_report(output_path, report_payload)
         write_markdown_report(

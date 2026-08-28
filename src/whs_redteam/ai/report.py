@@ -8,7 +8,8 @@ from typing import Any
 import httpx
 from pydantic import BaseModel, ConfigDict, Field
 
-from whs_redteam.ai.provider import AIProviderError, _extract_json
+from whs_redteam.ai.models import ProviderUsage
+from whs_redteam.ai.provider import AIProviderError, _extract_json, _nonnegative_int
 from whs_redteam.audit import AuditLogger
 from whs_redteam.config import AIConfig
 
@@ -38,8 +39,10 @@ class OpenAICompatibleReportWriter:
         self.config = config
         self.audit_logger = audit_logger
         self.transport = transport
+        self.last_usage = ProviderUsage()
 
     async def explain(self, report: dict[str, Any]) -> dict[str, str]:
+        self.last_usage = ProviderUsage()
         variable = self.config.api_key_env
         api_key = os.environ.get(variable) if variable else None
         if variable and api_key is None:
@@ -64,25 +67,44 @@ class OpenAICompatibleReportWriter:
         headers = {"content-type": "application/json"}
         if api_key:
             headers["authorization"] = f"Bearer {api_key}"
+        request_attempted = False
         try:
             async with httpx.AsyncClient(
                 transport=self.transport,
                 timeout=self.config.timeout_seconds,
             ) as client:
+                request_attempted = True
                 response = await client.post(endpoint, json=payload, headers=headers)
                 response.raise_for_status()
                 body = response.json()
+            if not isinstance(body, dict):
+                raise ValueError("AI report response is not an object")
+            usage = body.get("usage")
+            if isinstance(usage, dict):
+                self.last_usage = ProviderUsage(
+                    api_calls=1,
+                    input_tokens=_nonnegative_int(usage.get("prompt_tokens")),
+                    output_tokens=_nonnegative_int(usage.get("completion_tokens")),
+                )
+            else:
+                self.last_usage = ProviderUsage(api_calls=1)
             content = body["choices"][0]["message"]["content"]
             if not isinstance(content, str):
                 raise ValueError("AI report response content is not text")
             explanation = AIReportExplanation.model_validate_json(_extract_json(content))
         except (httpx.HTTPError, KeyError, IndexError, TypeError, ValueError) as exc:
+            if request_attempted and self.last_usage.api_calls == 0:
+                self.last_usage = ProviderUsage(api_calls=1)
             raise AIProviderError("AI report writer returned invalid JSON") from exc
         if self.audit_logger is not None:
             self.audit_logger.emit(
                 "ai_report_explanation_succeeded",
                 provider=self.provider_name,
                 model=self.config.model,
+                api_call_count=self.last_usage.api_calls,
+                provider_usage_reported=bool(
+                    self.last_usage.input_tokens or self.last_usage.output_tokens
+                ),
             )
         return explanation.model_dump(mode="json")
 
