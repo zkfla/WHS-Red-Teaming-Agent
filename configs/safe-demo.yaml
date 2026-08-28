@@ -1,0 +1,33 @@
+engagement:
+  name: local-safe-negative-control-demo
+  targets: [http://127.0.0.1:8766]
+  allowed_methods: [GET, HEAD, OPTIONS]
+  max_requests: 200
+  requests_per_second: 20
+  max_runtime_minutes: 5
+  max_pages: 10
+  max_depth: 2
+  test_level: safe_active
+  allow_state_change: false
+  audit_log_path: outputs/safe-demo/events.jsonl
+  inventory_db_path: outputs/safe-demo/inventory.db
+  screenshots_dir: outputs/safe-demo/screenshots
+  capture_screenshots: false
+  browser_headless: true
+  discovery_mode: http
+  follow_discovered_links: true
+  allow_private_dns: false
+  actors: []
+  injection_fixtures: []
+  auto_injection_discovery: true
+  auto_injection_checks: [sqli, xss_reflection]
+  max_auto_injection_fixtures: 10
+  auto_injection_actor_id: null
+  planner_mode: rules
+  tool_backend: local
+  validation_repetitions: 2
+  enabled_capabilities: [discovery, api_schema, auth_session, resource_model,
+    finding_validation, sqli_safe, xss_safe]
+  approval_required_capabilities: [sqli_safe, xss_safe]
+  max_mutations_per_endpoint: 10
+  approval_hmac_secret_env: WHS_SAFE_DEMO_APPROVAL_SECRET

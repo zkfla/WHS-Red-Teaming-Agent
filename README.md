@@ -31,9 +31,39 @@ Python 3.12 이상이 필요합니다.
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-python -m pip install -e '.[dev]'
+python -m pip install -e '.[dev,web]'
 playwright install chromium
 ```
+
+## Hybrid SQLi planning and local preview
+
+The optional `hybrid` planner sends only value-free candidate metadata (fixture ID,
+endpoint template, parameter name, and type) to an OpenAI-compatible `/chat/completions`
+endpoint. The deterministic SQLi probe still creates every test value, and an invalid or
+unavailable model response falls back to the rules planner. Set `report_writer_enabled` to
+`true` only when you also want a conservative AI explanation in the final report.
+
+```bash
+whs-redteam validate-config configs/hybrid-sqli.example.yaml
+whs-redteam serve --host 127.0.0.1 --port 8080
+```
+
+Open `http://127.0.0.1:8080/` for the local preview. `POST /api/runs` starts a bounded
+SQLi run, `/api/runs/{run_id}/actions` lists metadata-only approval requests, and
+`POST /api/runs/{run_id}/resume` continues after the signed approvals are released.
+The generated JSON report is accompanied by a Markdown report; the machine verdict is
+authoritative and AI prose cannot promote a finding.
+
+For a fully local demonstration, run the intentionally vulnerable and safe negative-control
+targets separately:
+
+```bash
+python scripts/run_vulnerability_demo.py
+python scripts/run_safe_demo.py
+```
+
+Both scripts bind to loopback only, issue signed approvals, and exercise the same discovery,
+validation, cleanup, and report lifecycle.
 
 ## 설정 및 정책 확인
 

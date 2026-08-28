@@ -8,6 +8,8 @@ import json
 from pathlib import Path
 from uuid import uuid4
 
+from whs_redteam.ai.provider import AIProviderError, PlannerProvider
+from whs_redteam.ai.report import OpenAICompatibleReportWriter
 from whs_redteam.audit import AuditLogger
 from whs_redteam.authorization import AuthorizationMatrixProbe
 from whs_redteam.config import EngagementConfig, InjectionFixture
@@ -63,11 +65,12 @@ from whs_redteam.orchestration.probes import (
 )
 from whs_redteam.orchestration.queue import ActionQueue, QueueExecutor
 from whs_redteam.orchestration.retry import RetryPolicy
-from whs_redteam.planning import RulesPlanner
+from whs_redteam.planning import HybridPlanner, RulesPlanner, planning_context
 from whs_redteam.policy.budget import PersistentRequestBudget, RequestBudget
 from whs_redteam.policy.capabilities import CapabilityPolicy
 from whs_redteam.policy.capability_catalog import CAPABILITY_CATALOG
 from whs_redteam.policy.scope import ScopeGuard
+from whs_redteam.reporting import write_json_report, write_markdown_report
 from whs_redteam.resource_model import model_resources, template_endpoint_url
 from whs_redteam.tools.actor_sessions import ActorSessionPool, summarize_actor_sessions
 from whs_redteam.tools.browser import WebExplorer
@@ -108,11 +111,13 @@ class AgentOrchestrator:
         inventory: InventoryStore,
         audit_logger: AuditLogger,
         retry_policy: RetryPolicy | None = None,
+        planner_provider: PlannerProvider | None = None,
     ) -> None:
         self.config = config
         self.inventory = inventory
         self.audit_logger = audit_logger
         self.retry_policy = retry_policy or RetryPolicy()
+        self.planner_provider = planner_provider
         self.scope_guard = ScopeGuard(config, audit_logger)
         config_material = _canonical_config_value(
             config.model_dump(
@@ -232,11 +237,13 @@ class AgentOrchestrator:
                         attack_surface_json=surface.model_dump_json(),
                     )
                 elif current is AgentRunStatus.PLANNING:
-                    plan = self._plan(run.exploration_run_id)
+                    plan = await self._plan_with_provider(run.exploration_run_id)
                     self._enqueue_validation_action(run.run_id, plan)
                     self._enqueue_authorization_actions(run.run_id)
                     self._enqueue_injection_actions(
-                        run.run_id, run.exploration_run_id
+                        run.run_id,
+                        run.exploration_run_id,
+                        plan.selected_candidate_ids,
                     )
                     run = self._save(
                         run,
@@ -262,6 +269,20 @@ class AgentOrchestrator:
                         raise RuntimeError(
                             "validation action did not complete successfully"
                         )
+                    replanned = await self._maybe_replan(run, validation_id)
+                    if replanned is not None:
+                        self._enqueue_injection_actions(
+                            run.run_id,
+                            run.exploration_run_id,
+                            replanned.selected_candidate_ids,
+                        )
+                        run = self._save(
+                            run,
+                            status=AgentRunStatus.EXECUTING,
+                            plan_json=replanned.model_dump_json(),
+                            validation_id=validation_id,
+                        )
+                        continue
                     run = self._save(
                         run,
                         status=AgentRunStatus.EXPLOITABILITY_DECISION,
@@ -274,7 +295,9 @@ class AgentOrchestrator:
                     self._enqueue_validation_action(run.run_id, plan)
                     self._enqueue_authorization_actions(run.run_id)
                     self._enqueue_injection_actions(
-                        run.run_id, run.exploration_run_id
+                        run.run_id,
+                        run.exploration_run_id,
+                        plan.selected_candidate_ids,
                     )
                     run = self._save(
                         run,
@@ -312,7 +335,7 @@ class AgentOrchestrator:
                 elif current is AgentRunStatus.REPORTING:
                     if run.validation_id is None:
                         raise RuntimeError("reporting checkpoint has no validation id")
-                    output_path = self._report(run)
+                    output_path = await self._report(run)
                     run = self._save(
                         run,
                         status=AgentRunStatus.COMPLETED,
@@ -885,7 +908,10 @@ class AgentOrchestrator:
             )
 
     def _enqueue_injection_actions(
-        self, agent_run_id: str, exploration_run_id: str | None
+        self,
+        agent_run_id: str,
+        exploration_run_id: str | None,
+        selected_candidate_ids: tuple[str, ...] | None = None,
     ) -> None:
         fixtures = self._injection_fixtures(exploration_run_id)
         if not fixtures:
@@ -908,6 +934,12 @@ class AgentOrchestrator:
         }
         for fixture in fixtures:
             for check in sorted(fixture.checks):
+                if (
+                    selected_candidate_ids is not None
+                    and check == "sqli"
+                    and fixture.fixture_id not in selected_candidate_ids
+                ):
+                    continue
                 capability = capability_by_check[check]
                 queue.enqueue(
                     agent_run_id,
@@ -962,6 +994,150 @@ class AgentOrchestrator:
             if self.scope_guard.evaluate(candidate, "GET").allowed:
                 targets.append(candidate)
         return RulesPlanner(self.config).plan(targets)
+
+    async def _plan_with_provider(
+        self, exploration_run_id: str | None = None
+    ) -> TestPlan:
+        """Plan hardening checks and optionally select SQLi candidates with AI."""
+
+        base_plan = self._plan(exploration_run_id)
+        fixtures = self._injection_fixtures(exploration_run_id)
+        if self.config.planner_mode == "rules" or not fixtures:
+            return base_plan
+        context = planning_context(
+            tuple(fixture for fixture in fixtures if "sqli" in fixture.checks),
+            remaining_requests=self.config.max_requests,
+            planning_round=0,
+        )
+        outcome = await HybridPlanner(
+            self.config,
+            self.audit_logger,
+            provider=self.planner_provider,
+        ).plan(context)
+        selected = tuple(
+            action.candidate_id
+            for action in outcome.decision.selected_actions
+            if action.action == "run_sqli_safe"
+        )
+        return base_plan.model_copy(
+            update={
+                "provider": outcome.provider,
+                "model": outcome.model,
+                "selected_candidate_ids": selected,
+                "planner_fallback_used": outcome.fallback_used,
+                "planner_round": context.planning_round,
+            }
+        )
+
+    async def _maybe_replan(
+        self,
+        run: AgentRun,
+        validation_id: str,
+    ) -> TestPlan | None:
+        """Select untested SQLi candidates for at most a few bounded rounds.
+
+        Replanning is deliberately narrow: it cannot add a new capability, alter
+        a method, or manufacture a fixture.  The deterministic rules provider is
+        used when the optional AI provider is unavailable or returns an invalid
+        decision.  A confirmed SQLi finding ends the loop immediately.
+        """
+
+        if self.config.planner_mode == "rules":
+            return None
+        if run.plan_json is None or run.exploration_run_id is None:
+            return None
+        plan = TestPlan.model_validate_json(run.plan_json)
+        next_round = plan.planner_round + 1
+        if next_round >= self.config.ai.max_planning_rounds:
+            return None
+        findings = self.inventory.list_findings(validation_id)
+        if any(
+            item["status"] == "CONFIRMED" and str(item["category"]).lower() == "sqli"
+            for item in findings
+        ):
+            return None
+
+        fixtures = tuple(
+            fixture
+            for fixture in self._injection_fixtures(run.exploration_run_id)
+            if "sqli" in fixture.checks
+        )
+        if not fixtures:
+            return None
+        tested_ids: set[str] = set()
+        prior_results: list[dict[str, object]] = []
+        for action in self.inventory.list_action_results(run.run_id):
+            if (
+                action["capability"] != Capability.SQLI_SAFE.value
+                or action["status"] != "SUCCEEDED"
+            ):
+                continue
+            output = action["output"]
+            if not isinstance(output, dict):
+                continue
+            fixture_id = output.get("fixture_id")
+            if not isinstance(fixture_id, str):
+                continue
+            tested_ids.add(fixture_id)
+            prior_results.append(
+                {
+                    "fixture_id": fixture_id,
+                    "confirmed": bool(output.get("confirmed", False)),
+                    "confirmed_modes": tuple(
+                        str(mode)
+                        for mode in output.get("confirmed_modes", ())
+                        if isinstance(mode, str)
+                    ),
+                }
+            )
+        remaining = tuple(
+            fixture for fixture in fixtures if fixture.fixture_id not in tested_ids
+        )
+        if not remaining:
+            return None
+        context = planning_context(
+            remaining,
+            remaining_requests=max(0, self.config.max_requests - len(tested_ids)),
+            planning_round=next_round,
+            prior_results=tuple(prior_results[-50:]),
+        )
+        outcome = await HybridPlanner(
+            self.config,
+            self.audit_logger,
+            provider=self.planner_provider,
+        ).plan(context)
+        selected = tuple(
+            action.candidate_id
+            for action in outcome.decision.selected_actions
+            if action.action == "run_sqli_safe"
+        )
+        if not selected:
+            self.audit_logger.emit(
+                "planner_finished",
+                run_id=run.run_id,
+                planning_round=next_round,
+                provider=outcome.provider,
+                remaining_candidates=len(remaining),
+            )
+            return None
+        self.audit_logger.emit(
+            "planner_replanned",
+            run_id=run.run_id,
+            planning_round=next_round,
+            provider=outcome.provider,
+            fallback_used=outcome.fallback_used,
+            remaining_candidates=len(remaining),
+            selected_candidates=len(selected),
+        )
+        return plan.model_copy(
+            update={
+                "provider": outcome.provider,
+                "model": outcome.model,
+                "selected_candidate_ids": selected,
+                "planner_fallback_used": outcome.fallback_used,
+                "planner_round": next_round,
+            }
+        )
 
     async def _validate(
         self,
@@ -1135,7 +1311,7 @@ class AgentOrchestrator:
                 "cleanup receipts are required before reporting: " + names
             )
 
-    def _report(self, run: AgentRun) -> Path:
+    async def _report(self, run: AgentRun) -> Path:
         if run.validation_id is None:
             raise RuntimeError("cannot report without a validation id")
         output_path = (
@@ -1198,34 +1374,66 @@ class AgentOrchestrator:
             finding["target_url"] = template_endpoint_url(
                 str(finding["target_url"])
             )
-        temporary_path = output_path.with_suffix(output_path.suffix + ".tmp")
-        temporary_path.write_text(
-            json.dumps(
-                {
-                    "report_version": "orchestrator-report-v3",
-                    "run_id": run.run_id,
-                    "engagement_name": run.engagement_name,
-                    "attack_surface": attack_surface,
-                    "api_request_schemas": schema_reports,
-                    "resources": [
-                        resource.model_dump(mode="json") for resource in resources
-                    ],
-                    "resource_ownership": [
-                        record.model_dump(mode="json") for record in ownership
-                    ],
-                    "actor_sessions": actor_sessions,
-                    "authorization_tests": authorization_tests,
-                    "injection_tests": injection_tests,
-                    "exploitability_decision": decision,
-                    "findings": finding_reports,
-                },
-                ensure_ascii=False,
-                indent=2,
-                default=str,
-            ),
-            encoding="utf-8",
+        planning = (
+            json.loads(run.plan_json)
+            if run.plan_json
+            else {"provider": "rules", "planner_round": 0}
         )
-        temporary_path.replace(output_path)
+        markdown_path = output_path.with_suffix(".md")
+        report_payload: dict[str, object] = {
+            "report_version": "orchestrator-report-v3",
+            "run_id": run.run_id,
+            "engagement_name": run.engagement_name,
+            "attack_surface": attack_surface,
+            "planning": {
+                "provider": planning.get("provider", "rules"),
+                "model": planning.get("model", "deterministic"),
+                "planner_round": planning.get("planner_round", 0),
+                "fallback_used": planning.get("planner_fallback_used", False),
+                "selected_candidate_ids": planning.get("selected_candidate_ids") or [],
+            },
+            "api_request_schemas": schema_reports,
+            "resources": [
+                resource.model_dump(mode="json") for resource in resources
+            ],
+            "resource_ownership": [
+                record.model_dump(mode="json") for record in ownership
+            ],
+            "actor_sessions": actor_sessions,
+            "authorization_tests": authorization_tests,
+            "injection_tests": injection_tests,
+            "exploitability_decision": decision,
+            "findings": finding_reports,
+            "markdown_report_path": str(markdown_path),
+        }
+        ai_explanation: dict[str, object] | None = None
+        if self.config.ai.report_writer_enabled:
+            try:
+                ai_explanation = await OpenAICompatibleReportWriter(
+                    self.config.ai, self.audit_logger
+                ).explain(report_payload)
+                verdict = str(decision.get("verdict", ""))
+                explanation_text = " ".join(
+                    str(value) for value in ai_explanation.values()
+                ).lower()
+                if verdict != "CONFIRMED" and "confirmed" in explanation_text:
+                    self.audit_logger.emit(
+                        "ai_report_explanation_fallback",
+                        reason="machine_verdict_conflict",
+                    )
+                    ai_explanation = None
+            except (AIProviderError, ValueError, TypeError) as exc:
+                self.audit_logger.emit(
+                    "ai_report_explanation_fallback",
+                    reason=type(exc).__name__,
+                )
+        report_payload["ai_explanation"] = ai_explanation
+        write_json_report(output_path, report_payload)
+        write_markdown_report(
+            markdown_path,
+            report_payload,
+            ai_explanation=ai_explanation,
+        )
         return output_path
 
     def _save(self, run: AgentRun, **updates: object) -> AgentRun:

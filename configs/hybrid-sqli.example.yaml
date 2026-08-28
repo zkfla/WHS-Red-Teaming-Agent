@@ -1,0 +1,32 @@
+engagement:
+  name: hybrid-sqli-example
+  targets: [https://staging.example.test]
+  allowed_methods: [GET, HEAD, OPTIONS]
+  max_requests: 100
+  max_pages: 20
+  max_depth: 2
+  discovery_mode: http
+  allow_state_change: false
+  auto_injection_discovery: true
+  auto_injection_checks: [sqli]
+  planner_mode: hybrid
+  ai:
+    provider: openai_compatible
+    base_url: http://127.0.0.1:11434/v1
+    model: local-model-name
+    api_key_env: null
+    timeout_seconds: 30
+    max_output_tokens: 1200
+    max_planning_rounds: 3
+    fallback_to_rules: true
+    report_writer_enabled: true
+  enabled_capabilities:
+    - discovery
+    - api_schema
+    - auth_session
+    - resource_model
+    - finding_validation
+    - sqli_safe
+    - llm_planning
+  approval_required_capabilities: [sqli_safe]
+  approval_hmac_secret_env: WHS_APPROVAL_SECRET

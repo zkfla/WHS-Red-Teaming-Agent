@@ -48,8 +48,10 @@ class PlanPolicy:
         self.scope_guard = scope_guard
 
     def approve(self, plan: TestPlan) -> TestPlan:
-        if plan.provider != "rules":
-            raise PlanPolicyViolation("only the rules planner is enabled in this prototype")
+        if plan.provider not in {"rules", "hybrid", "llm"}:
+            raise PlanPolicyViolation(
+                "planner provider is not allowlisted; use rules, hybrid, or llm"
+            )
         if not plan.items:
             raise PlanPolicyViolation("test plan is empty")
         seen: set[tuple[str, TestCategory]] = set()

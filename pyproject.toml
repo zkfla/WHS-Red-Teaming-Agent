@@ -20,6 +20,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest>=8.3,<10", "ruff>=0.9,<1"]
 mcp = ["mcp>=2.0,<3"]
+web = ["fastapi>=0.115,<1", "uvicorn>=0.32,<1"]
 
 [project.scripts]
 whs-redteam = "whs_redteam.cli:app"

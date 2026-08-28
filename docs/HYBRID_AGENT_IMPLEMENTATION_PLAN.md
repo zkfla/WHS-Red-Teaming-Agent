@@ -33,16 +33,19 @@ AI 계획, 재계획, 판정, 보고서, 웹 시연을 완성하는 데 집중�
 - SQLite inventory, 감사 로그, JSON 보고서
 - 로컬 취약 서버를 이용한 end-to-end 데모
 
-### 2.2 아직 구현되지 않은 부분
+### 2.2 이번 구현에서 완료된 부분
 
-- 실제 AI 모델 호출과 provider 설정
-- AI가 사용할 정제된 공격표면 Context
-- 구조화된 AI 계획 출력과 정책 검증
-- 관찰 결과를 보고 제한적으로 재계획하는 루프
-- AI가 작성한 보고서 설명과 기계 판정의 분리
-- 실행 상태, 승인, 발견 결과를 확인할 웹 UI
-- 웹 서버 실행 명령과 Docker 서비스
-- AI 장애/잘못된 JSON/프롬프트 주입에 대한 테스트
+- OpenAI-compatible AI planner와 환경변수 기반 선택적 인증
+- 값 없는 후보 Context와 구조화된 출력 검증
+- AI 장애·잘못된 후보·잘못된 설정의 rules fallback
+- 실행 결과를 근거로 한 최대 라운드 제한 재계획
+- 기계 판정과 선택적 AI 설명을 분리한 JSON·Markdown 보고서
+- 공통 `RunService`를 호출하는 FastAPI 로컬 미리보기
+- 취약 서버와 안전 negative-control 서버의 CLI E2E
+
+아직 후속 범위로 남긴 항목은 다중 사용자 인증 흐름, 새로운 취약점 종류, 실제
+exploit 체인 자동화, 분산 worker/Docker 운영 화면이다. 이 프로토타입은 의도적으로
+안전한 GET SQLi 검증 수직 기능에 집중한다.
 
 ### 2.3 웹 미리보기 상태
 
@@ -240,7 +243,7 @@ AI는 자유 형식 명령이 아니라 아래 스키마만 반환한다.
 ```bash
 whs-redteam sqli-scan https://authorized.example \
   --planner hybrid \
-  --approval-token-file /tmp/approval.token
+  --token-file /tmp/approval.token
 ```
 
 완료된 세부 작업:
@@ -259,35 +262,32 @@ whs-redteam sqli-scan https://authorized.example \
 - 사용자가 YAML을 직접 작성하지 않아도 실행할 수 있다.
 - POST, 파일 업로드, 상태 변경 요청은 생성하지 않는다.
 
-### 작업 C. AI Client와 Provider
+### 작업 C. AI Client와 Provider — 완료
 
-신규 파일:
+구현 파일:
 
 ```text
 src/whs_redteam/ai/__init__.py
 src/whs_redteam/ai/models.py
 src/whs_redteam/ai/provider.py
-src/whs_redteam/ai/openai_compatible.py
-src/whs_redteam/ai/fallback.py
-src/whs_redteam/ai/sanitization.py
+src/whs_redteam/ai/report.py
 ```
 
 세부 작업:
 
-1. timeout과 취소를 지원하는 비동기 HTTP client를 구현한다.
-2. 모델 목록 확인과 간단한 structured response health check를 구현한다.
-3. 응답에서 JSON 객체만 추출해 Pydantic으로 검증한다.
-4. 잘못된 JSON은 1회 형식 수정 요청 후 rules fallback한다.
-5. API 오류, 429, 5xx, timeout은 민감정보 없는 오류 유형으로 기록한다.
-6. API 키와 prompt 원문은 기본 감사 로그에서 제외한다.
-7. provider, model, prompt version, fallback 여부만 provenance로 남긴다.
+1. timeout을 적용한 비동기 `httpx` client를 구현했다.
+2. 응답에서 JSON 객체만 추출해 Pydantic으로 검증한다.
+3. API 오류, 429, 5xx, timeout, 잘못된 JSON은 rules fallback한다.
+4. API 키와 prompt 원문은 감사 로그에 남기지 않는다.
+5. provider, model, 라운드, fallback 여부만 provenance로 남긴다.
+6. 선택적으로 이미 redacted된 보고서의 AI 설명을 생성한다.
 
 완료 조건:
 
 - 로컬/상용 OpenAI-compatible endpoint를 설정만 바꿔 교체할 수 있다.
 - 모델 서버가 꺼져 있어도 rules-only 결과와 보고서가 생성된다.
 
-### 작업 D. 후보 Registry와 Hybrid Planner
+### 작업 D. 후보 Registry와 Hybrid Planner — 완료
 
 신규 또는 변경 파일:
 
@@ -315,15 +315,15 @@ src/whs_redteam/orchestration/orchestrator.py
 - 동일 inventory에서는 동일 candidate ID가 생성된다.
 - AI 유무와 관계없이 정책 계층이 동일하게 적용된다.
 
-### 작업 E. 제한된 재계획 루프
+### 작업 E. 제한된 재계획 루프 — 완료
 
-오케스트레이터 상태를 다음처럼 확장한다.
+오케스트레이터는 별도 상태 이름을 늘리지 않고 `EXECUTING` checkpoint 안에서 다음처럼
+제한된 재계획을 수행한다.
 
 ```text
 PLANNING
   -> EXECUTING
-  -> OBSERVING
-  -> REPLANNING
+  -> (bounded replan, if needed)
        -> EXECUTING
        -> EXPLOITABILITY_DECISION
 ```
@@ -344,7 +344,7 @@ PLANNING
 - 승인되지 않은 action은 어떤 라운드에서도 실행되지 않는다.
 - 재시작 후에도 현재 라운드와 남은 예산이 복원된다.
 
-### 작업 F. 판정과 보고서 분리
+### 작업 F. 판정과 보고서 분리 — 완료
 
 보고서는 다음 구조로 분리한다.
 
@@ -389,7 +389,7 @@ PLANNING
 - 모든 문장형 결론에 연결된 finding ID가 존재한다.
 - 모델 장애 중에도 보고서 파일이 생성된다.
 
-### 작업 G. 웹 미리보기와 운영 화면
+### 작업 G. 웹 미리보기와 운영 화면 — 프로토타입 완료
 
 경량 프로토타입은 FastAPI + Jinja2 + 소량의 vanilla JavaScript를 권장한다. React 빌드
 체인은 현재 시점에 불필요한 복잡도를 추가한다.
@@ -399,11 +399,7 @@ PLANNING
 ```text
 src/whs_redteam/web/__init__.py
 src/whs_redteam/web/app.py
-src/whs_redteam/web/schemas.py
-src/whs_redteam/web/templates/index.html
-src/whs_redteam/web/templates/run.html
-src/whs_redteam/web/static/app.js
-src/whs_redteam/web/static/style.css
+단일 파일 inline HTML로 시작하고, 운영 화면 분리는 후속 범위로 둔다.
 ```
 
 필수 API:

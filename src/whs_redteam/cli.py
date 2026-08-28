@@ -257,6 +257,35 @@ def sqli_scan(
             help="Environment variable name used to verify signed approvals.",
         ),
     ] = "WHS_APPROVAL_SECRET",
+    allow_private_dns: Annotated[
+        bool,
+        typer.Option(
+            "--allow-private-dns",
+            help="Allow loopback/private targets for an explicitly authorised local test.",
+        ),
+    ] = False,
+    planner_mode: Annotated[
+        Literal["rules", "hybrid"],
+        typer.Option(
+            "--planner",
+            help="Use deterministic rules or a bounded AI-first hybrid planner.",
+        ),
+    ] = "rules",
+    ai_base_url: Annotated[
+        str,
+        typer.Option("--ai-base-url", help="OpenAI-compatible model base URL."),
+    ] = "http://127.0.0.1:11434/v1",
+    ai_model: Annotated[
+        str,
+        typer.Option("--ai-model", help="Model name used when --planner=hybrid."),
+    ] = "",
+    report_writer_enabled: Annotated[
+        bool,
+        typer.Option(
+            "--ai-report/--no-ai-report",
+            help="Ask the configured model for a conservative report explanation.",
+        ),
+    ] = False,
     run_id: Annotated[
         str | None,
         typer.Option(
@@ -281,6 +310,11 @@ def sqli_scan(
             discovery_mode=discovery_mode,
             follow_discovered_links=follow_links,
             approval_secret_env=approval_secret_env,
+            allow_private_dns=allow_private_dns,
+            planner_mode=planner_mode,
+            ai_base_url=ai_base_url,
+            ai_model=ai_model,
+            report_writer_enabled=report_writer_enabled,
         )
         result = asyncio.run(service.run(run_id))
         released = 0
@@ -325,6 +359,23 @@ def resume_agent(config_path: Path, run_id: str) -> None:
         typer.echo(f"Agent resume failed: {exc}", err=True)
         raise typer.Exit(code=8) from exc
     typer.echo(json.dumps(result.to_dict(), ensure_ascii=False, indent=2))
+
+
+@app.command("serve")
+def serve_preview(
+    host: Annotated[str, typer.Option("--host")] = "127.0.0.1",
+    port: Annotated[int, typer.Option("--port", min=1, max=65535)] = 8080,
+) -> None:
+    """Start the optional local FastAPI preview for the shared run service."""
+
+    try:
+        import uvicorn
+
+        from whs_redteam.web.app import create_app
+    except (ImportError, RuntimeError) as exc:
+        typer.echo("Web preview requires `pip install -e '.[web]'`.", err=True)
+        raise typer.Exit(code=14) from exc
+    uvicorn.run(create_app(), host=host, port=port)
 
 
 @app.command("status")

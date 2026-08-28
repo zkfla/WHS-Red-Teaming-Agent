@@ -162,6 +162,34 @@ class InjectionFixture(BaseModel):
         return self
 
 
+class AIConfig(BaseModel):
+    """Optional OpenAI-compatible model settings; secrets stay in the environment."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    provider: Literal["none", "openai_compatible"] = "none"
+    base_url: str = "http://127.0.0.1:11434/v1"
+    model: str = Field(default="", max_length=200)
+    api_key_env: str | None = Field(
+        default=None,
+        pattern=r"^[A-Z][A-Z0-9_]{1,127}$",
+    )
+    timeout_seconds: float = Field(default=30, gt=0, le=120)
+    max_output_tokens: int = Field(default=1200, ge=128, le=8_192)
+    max_planning_rounds: int = Field(default=3, ge=1, le=5)
+    fallback_to_rules: bool = True
+    report_writer_enabled: bool = False
+
+    @field_validator("base_url")
+    @classmethod
+    def validate_base_url(cls, value: str) -> str:
+        parsed = urlsplit(value)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            raise ValueError("AI base_url must be an absolute HTTP(S) URL")
+        if parsed.username or parsed.password or parsed.fragment or parsed.query:
+            raise ValueError("AI base_url must not contain credentials, query, or fragment")
+        return value.rstrip("/")
+
+
 class EngagementConfig(BaseModel):
     """Safety boundaries and budgets for one authorized engagement."""
 
@@ -209,7 +237,8 @@ class EngagementConfig(BaseModel):
     max_auto_injection_fixtures: int = Field(default=20, ge=1, le=100)
     auto_injection_actor_id: str | None = None
     xss_browser_confirmation: bool = False
-    planner_mode: str = Field(default="rules", pattern=r"^rules$")
+    planner_mode: Literal["rules", "hybrid", "llm"] = "rules"
+    ai: AIConfig = Field(default_factory=AIConfig)
     tool_backend: Literal["local", "mcp_in_memory"] = "local"
     validation_repetitions: int = Field(default=2, ge=2, le=3)
     enabled_capabilities: frozenset[str] = frozenset(
@@ -429,6 +458,13 @@ class EngagementConfig(BaseModel):
                 raise ValueError(
                     "XSS browser confirmation currently requires the local backend"
                 )
+        if self.planner_mode in {"hybrid", "llm"}:
+            if Capability.LLM_PLANNING.value not in self.enabled_capabilities:
+                raise ValueError(
+                    "hybrid or llm planner mode requires llm_planning capability"
+                )
+            if self.planner_mode == "llm" and self.ai.provider == "none":
+                raise ValueError("llm planner mode requires an AI provider")
         return self
 
     @staticmethod

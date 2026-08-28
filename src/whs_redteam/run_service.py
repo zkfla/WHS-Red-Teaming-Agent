@@ -12,7 +12,7 @@ import yaml
 
 from whs_redteam.api_schema import canonical_endpoint_url, infer_query_schema
 from whs_redteam.audit import AuditLogger
-from whs_redteam.config import EngagementConfig, load_config
+from whs_redteam.config import AIConfig, EngagementConfig, load_config
 from whs_redteam.injection import discover_injection_fixtures
 from whs_redteam.inventory import InventoryStore
 from whs_redteam.models import (
@@ -51,6 +51,10 @@ class RunResult:
             "updated_at": run.updated_at.isoformat(),
             "queue": dict(self.queue_counts),
         }
+        if run.findings_path:
+            result["markdown_report_path"] = str(
+                Path(run.findings_path).with_suffix(".md")
+            )
         if self.config_path is not None:
             result["config_path"] = str(self.config_path)
         return result
@@ -87,6 +91,11 @@ class RunService:
         discovery_mode: DiscoveryMode = "http",
         follow_discovered_links: bool = False,
         approval_secret_env: str = "WHS_APPROVAL_SECRET",
+        allow_private_dns: bool = False,
+        planner_mode: Literal["rules", "hybrid"] = "rules",
+        ai_base_url: str = "http://127.0.0.1:11434/v1",
+        ai_model: str = "",
+        report_writer_enabled: bool = False,
         max_requests: int = 100,
         max_pages: int = 20,
         max_depth: int = 2,
@@ -118,6 +127,21 @@ class RunService:
         digest = hashlib.sha256(target_url.encode()).hexdigest()[:16]
         profile_dir = Path(output_dir) / digest
         config_path = profile_dir / "engagement.yaml"
+        ai_provider = (
+            "openai_compatible"
+            if planner_mode == "hybrid" or report_writer_enabled
+            else "none"
+        )
+        enabled_capabilities = {
+            "discovery",
+            "api_schema",
+            "auth_session",
+            "resource_model",
+            "finding_validation",
+            "sqli_safe",
+        }
+        if planner_mode == "hybrid":
+            enabled_capabilities.add("llm_planning")
         base_config = EngagementConfig(
             name=f"sqli-scan-{digest}",
             targets=(target_without_query,),
@@ -136,24 +160,21 @@ class RunService:
             browser_headless=True,
             discovery_mode=discovery_mode,
             follow_discovered_links=follow_discovered_links,
-            allow_private_dns=False,
+            allow_private_dns=allow_private_dns,
             injection_fixtures=(),
             auto_injection_discovery=True,
             auto_injection_checks=frozenset({"sqli"}),
             max_auto_injection_fixtures=20,
-            planner_mode="rules",
+            planner_mode=planner_mode,
+            ai=AIConfig(
+                provider=ai_provider,
+                base_url=ai_base_url,
+                model=ai_model,
+                report_writer_enabled=report_writer_enabled,
+            ),
             tool_backend="local",
             validation_repetitions=2,
-            enabled_capabilities=frozenset(
-                {
-                    "discovery",
-                    "api_schema",
-                    "auth_session",
-                    "resource_model",
-                    "finding_validation",
-                    "sqli_safe",
-                }
-            ),
+            enabled_capabilities=frozenset(enabled_capabilities),
             approval_hmac_secret_env=approval_secret_env,
         )
         direct_schema = ApiRequestSchemaRecord(
