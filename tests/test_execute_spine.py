@@ -17,6 +17,7 @@ Finding 까지 도달하는지를 못박는다:
 from __future__ import annotations
 
 import json
+import threading
 from decimal import Decimal
 
 import httpx
@@ -31,6 +32,7 @@ from finredteam.money import Currency, Money
 from finredteam.planning.candidates import resolve_skeleton
 from finredteam.planning.planner import build_candidate
 from finredteam.probing.executor import run as execute
+from finredteam.probing.finance.burst import run_race_candidate, summarize_race
 from finredteam.probing.session import Session
 from finredteam.oracles.verifier import verify
 from finredteam.targets.loader import load_target
@@ -152,3 +154,72 @@ def test_negative_transfer_flows_through_spine_to_violation():
     assert result.delta is not None
     assert result.delta.balance_delta[ATTACKER_ACCT].amount == Decimal("500.00")
     assert result.delta.balance_delta[VICTIM_ACCT].amount == Decimal("-500.00")
+
+
+def _race_mock_session() -> Session:
+    """lost-update 경쟁조건을 흉내내는 가짜 세션.
+
+    관측(GET /check_balance) 시점의 잔액을 스냅샷해두고, 동시에 들어온 모든
+    POST /transfer 가 그 스냅샷에서 계산·기록한다 — 그래서 N건이 전부 성공(200)해도
+    실제 차감은 1건분만 남는다(고전적 lost update). 실제 vuln-bank(단일스레드 Flask)는
+    이걸 재현 못 하지만, 우리 탐지 메커니즘(burst + INV-1C)이 도는지는 이렇게
+    결정적으로 검증할 수 있다.
+    """
+    balances = {ATTACKER_ACCT: Decimal("100000.00"), VICTIM_ACCT: Decimal("100000.00")}
+    snapshots: dict[str, Decimal] = {}
+    lock = threading.Lock()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if request.method == "GET" and path.startswith("/check_balance/"):
+            acct = path.rsplit("/", 1)[-1]
+            if acct not in balances:
+                return httpx.Response(404, json={"error": "no such account"})
+            with lock:
+                snapshots[acct] = balances[acct]  # 버스트 직전 잔액을 스냅샷
+                return httpx.Response(200, json={"balance": str(balances[acct]), "username": f"user_{acct}"})
+
+        if request.method == "POST" and path == "/transfer":
+            body = json.loads(request.content or b"{}")
+            amount = Decimal(str(body["amount"]))
+            to_acct = str(body["to_account"])
+            sender = ATTACKER_ACCT
+            with lock:
+                # ★ 모든 동시 요청이 같은 스냅샷에서 기록 → 최종 차감은 1건분만 반영
+                balances[sender] = snapshots.get(sender, balances[sender]) - amount
+                balances[to_acct] = snapshots.get(to_acct, balances[to_acct]) + amount
+            return httpx.Response(200, json={"new_balance": str(balances[sender]), "status": "success"})
+
+        return httpx.Response(404, json={"error": "unknown endpoint"})
+
+    return Session(load_target("vulnbank"), _policy(), _transport=httpx.MockTransport(handler))
+
+
+def test_concurrent_transfer_flows_through_spine_to_race_violation():
+    """동시 송금이 스파인(resolve→build→burst→INV-1C)을 예외 없이 통과해
+    재현율 있는 VIOLATION 으로 확정된다."""
+    session = _race_mock_session()
+    target = session.target
+    principals = _principals()
+    graph = _graph(principals)
+    baselines = _seed_baseline()
+
+    skeleton = resolve_skeleton("transfer", "attacker_A", f"account:{VICTIM_ACCT}", principals, graph, target)
+    assert not isinstance(skeleton, str)
+
+    candidate = build_candidate(skeleton, {"amount": "100.00", "to_account": VICTIM_ACCT, "description": "x"}, "", baselines)
+    # ★ 이번 수정의 핵심: unit_amount 가 채워져야 INV-1C 가 UNKNOWN 을 벗어난다.
+    assert candidate.unit_amount is not None
+    assert candidate.unit_amount.amount == Decimal("100.00")
+
+    attacker = principals[0]
+    # trials 를 낮춰 테스트를 빠르게 유지한다(결정적 목이라 매 시행이 동일하게 VIOLATION).
+    trials = run_race_candidate(
+        session, target, candidate, attacker, watch_accounts=[ATTACKER_ACCT, VICTIM_ACCT], n_concurrent=5, trials=2
+    )
+    summary = summarize_race(trials)
+
+    # 사이클이 안 끊기고 재현율 있는 VIOLATION 까지 도달했다
+    assert summary["judged"] >= 1
+    assert summary["violations"] >= 1
+    assert summary["reproduction_rate"] > 0

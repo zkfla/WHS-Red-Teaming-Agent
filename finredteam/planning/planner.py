@@ -17,6 +17,7 @@ from decimal import Decimal, InvalidOperation
 
 from finredteam.knowledge.baseline import BaselineRegistry
 from finredteam.models.finding import CandidateFinding, ExpectedDelta
+from finredteam.money import Money
 from finredteam.planning.candidates import CandidateSkeleton
 
 _UNIT_PARAM_BY_OP = {"transfer": "amount"}
@@ -78,6 +79,28 @@ def _expected_delta_for(
     return baselines.derive_expected(op, scale, account_by_role=account_by_role)
 
 
+def _unit_amount_for(
+    skeleton: CandidateSkeleton, params: dict[str, str], expected_delta: ExpectedDelta | None
+) -> Money | None:
+    """INV-1C(동시성) 판정용 단위 금액 — 요청 1건의 크기를 부호 없는 Money 로.
+
+    통화는 expected_delta(=baseline 실측)에서 가져온다 — baseline 이 없으면 통화를
+    확정할 수 없어 None 이고, 그 경우 oracles/concurrency.py 가 UNKNOWN 을 낸다.
+    금액 필드명은 Operation Discovery 가 찾은 것(hint.amount_field)을 우선한다.
+    """
+    if expected_delta is None or not expected_delta.deltas:
+        return None
+    op = skeleton.hint.get("op")
+    unit_param = skeleton.hint.get("amount_field") or _UNIT_PARAM_BY_OP.get(op or "")
+    if not unit_param or unit_param not in params:
+        return None
+    currency = next(iter(expected_delta.deltas.values())).currency
+    try:
+        return abs(Money.parse(params[unit_param], currency))
+    except (InvalidOperation, ValueError):
+        return None
+
+
 def build_candidate(
     skeleton: CandidateSkeleton,
     params: dict[str, str],
@@ -89,6 +112,7 @@ def build_candidate(
         expected_delta = ExpectedDelta(
             deltas={}, provenance="llm_inferred", note="baseline 미확보 — 판정 불가"
         )
+    unit_amount = _unit_amount_for(skeleton, params, expected_delta)
 
     return CandidateFinding(
         id=f"{skeleton.operation}-{uuid.uuid4().hex[:8]}",
@@ -102,5 +126,6 @@ def build_candidate(
         watch_accounts=skeleton.watch_accounts,
         needs_baseline=skeleton.needs_baseline,
         expected_delta=expected_delta,
+        unit_amount=unit_amount,
         rationale=rationale,
     )
