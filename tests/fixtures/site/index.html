@@ -1,0 +1,13 @@
+<!doctype html>
+<html lang="ko">
+  <head><meta charset="utf-8"><title>Day 2 Demo</title></head>
+  <body>
+    <a href="/next.html">Next page</a>
+    <a href="https://example.com/out-of-scope">Out of scope</a>
+    <form action="/search" method="get">
+      <input name="q" type="search">
+      <button type="submit">Search</button>
+    </form>
+    <script>fetch('/api.json').then(response => response.json());</script>
+  </body>
+</html>

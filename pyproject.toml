@@ -1,0 +1,39 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "whs-redteam"
+version = "0.1.0"
+description = "Safety-first web red-teaming agent prototype"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+dependencies = [
+  "httpx>=0.28,<1",
+  "playwright>=1.52,<2",
+  "pydantic>=2.10,<3",
+  "PyYAML>=6.0,<7",
+  "typer>=0.15,<1",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.3,<10", "ruff>=0.9,<1"]
+mcp = ["mcp>=2.0,<3"]
+
+[project.scripts]
+whs-redteam = "whs_redteam.cli:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/whs_redteam"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]

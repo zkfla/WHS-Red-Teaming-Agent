@@ -1,0 +1,27 @@
+engagement:
+  name: local-day2-demo
+  targets:
+    - http://127.0.0.1:8765
+  excluded_paths:
+    - /excluded
+  allowed_methods:
+    - GET
+    - HEAD
+    - OPTIONS
+  max_requests: 100
+  requests_per_second: 20
+  max_runtime_minutes: 2
+  max_pages: 10
+  max_depth: 2
+  test_level: safe_active
+  allow_state_change: false
+  audit_log_path: outputs/demo/events.jsonl
+  inventory_db_path: outputs/demo/inventory.db
+  screenshots_dir: outputs/demo/screenshots
+  capture_screenshots: true
+  browser_headless: true
+  follow_discovered_links: true
+  allow_private_dns: false
+  actors: []
+  planner_mode: rules
+  validation_repetitions: 2

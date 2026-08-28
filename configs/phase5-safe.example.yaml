@@ -1,0 +1,53 @@
+engagement:
+  name: authorized-staging-phase5
+  targets:
+    - https://staging.example.test
+  excluded_paths:
+    - /logout
+    - /api/delete
+    - /api/payment
+  allowed_methods: [GET, HEAD, OPTIONS]
+  max_requests: 500
+  requests_per_second: 2
+  max_runtime_minutes: 20
+  max_pages: 150
+  max_depth: 4
+  test_level: safe_active
+  allow_state_change: false
+  audit_log_path: outputs/phase5/events.jsonl
+  inventory_db_path: outputs/phase5/inventory.db
+  screenshots_dir: outputs/phase5/screenshots
+  capture_screenshots: false
+  browser_headless: true
+  follow_discovered_links: true
+  allow_private_dns: false
+  actors:
+    - actor_id: user_a
+      header_env:
+        Authorization: WHS_USER_A_AUTHORIZATION
+    - actor_id: user_b
+      header_env:
+        Authorization: WHS_USER_B_AUTHORIZATION
+  planner_mode: rules
+  tool_backend: local
+  validation_repetitions: 2
+  enabled_capabilities:
+    - discovery
+    - auth_session
+    - role_compare
+    - api_schema
+    - resource_model
+    - finding_validation
+  approval_required_capabilities:
+    - input_mutation
+    - sqli_safe
+    - xss_safe
+    - idor_safe
+    - csrf_safe
+    - ssrf_canary
+    - file_upload_benign
+    - path_traversal_canary
+    - business_logic
+    - poc_safe
+  max_mutations_per_endpoint: 10
+  approval_hmac_secret_env: WHS_APPROVAL_HMAC_SECRET

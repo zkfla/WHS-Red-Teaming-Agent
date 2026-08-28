@@ -1,0 +1,34 @@
+engagement:
+  name: local-mcp-security-test
+  targets:
+    - http://localhost:3000
+  excluded_paths:
+    - /logout
+    - /api/delete
+    - /api/payment
+  allowed_methods: [GET, HEAD, OPTIONS]
+  max_requests: 300
+  requests_per_second: 2
+  max_runtime_minutes: 15
+  max_pages: 100
+  max_depth: 3
+  test_level: safe_active
+  allow_state_change: false
+  audit_log_path: outputs/mcp/events.jsonl
+  inventory_db_path: outputs/mcp/inventory.db
+  screenshots_dir: outputs/mcp/screenshots
+  capture_screenshots: false
+  browser_headless: true
+  follow_discovered_links: false
+  allow_private_dns: false
+  actors: []
+  planner_mode: rules
+  tool_backend: mcp_in_memory
+  validation_repetitions: 2
+  enabled_capabilities:
+    - discovery
+    - api_schema
+    - auth_session
+    - resource_model
+    - finding_validation
+  max_mutations_per_endpoint: 10

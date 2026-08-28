@@ -1,0 +1,17 @@
+services:
+  explorer:
+    build: .
+    command: ["explore", "configs/engagement.example.yaml"]
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    mem_limit: 1g
+    cpus: 1.0
+    shm_size: 256mb
+    tmpfs:
+      - /tmp:size=256m,mode=1777
+    volumes:
+      - ./outputs:/app/outputs
