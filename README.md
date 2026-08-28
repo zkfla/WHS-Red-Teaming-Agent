@@ -250,7 +250,11 @@ openapi_spec_path: specs/openapi.yaml
 
 수동 승인 과정을 포함한 전체 흐름을 한 번에 검증하려면 다음 스크립트를 사용할 수도
 있습니다. 스크립트는 로컬 서버를 종료할 때까지 관리하고, 마지막에 `sqli`와
-`xss_reflection` finding이 보고서에 있는지 검사합니다.
+`xss_reflection` finding이 보고서에 있는지 검사합니다. 또한 SQLi finding이 반복 검증
+행렬에 남아 있고, 최종 `exploitability_decision.verdict`가 `CONFIRMED`,
+`bounded_exploit_demonstrated`가 `true`, `exploit_chain_demonstrated`가 `false`인지
+확인합니다. 즉 데이터 추출이나 후속 침투를 수행하지 않고, 승인된 안전한 SQLi 원시징후의
+검증·판정·보고서 연결만 입증합니다.
 
 ```bash
 .venv/bin/python scripts/run_vulnerability_demo.py

@@ -325,7 +325,15 @@ class SQLInjectionProbe(_InjectionProbe):
 
         for repetition in range(1, self.repetitions + 1):
             baseline_value = fixture.baseline_value
-            safe_control_value = baseline_value + "WHSCTRL"
+            # Keep the negative control valid for the declared parameter type.
+            # A malformed control (for example ``1WHSCTRL`` for an integer
+            # parameter) would create a database error by itself and weaken
+            # the evidence that the quote probe caused the signal.
+            safe_control_value = (
+                baseline_value + "0"
+                if fixture.parameter_kind == "integer"
+                else baseline_value + "WHSCTRL"
+            )
             quote_value = baseline_value + "'"
             if fixture.parameter_kind == "integer":
                 true_value = baseline_value + " AND 1=1"
