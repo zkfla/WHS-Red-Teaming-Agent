@@ -10,5 +10,6 @@ htmlcov/
 dist/
 build/
 output/
+output-*/
 logs/
 .agent-traces/

@@ -10,6 +10,8 @@ cicd-agent analyze <repo-path> --output <dir>
   [--env-file <trusted-env-path>]
   [--attacker-profile fork-pr|repo-writer]
   [--objective <trusted-text> | --objective-file <trusted-path|->]
+  [--no-mode-prompt]
+  [--no-objective-prompt]
   [--max-rounds N] [--max-tokens N] [--max-cost N] [--max-duration N]
 
 cicd-agent evaluate <matrix-path> --output <dir>
@@ -28,8 +30,16 @@ labels and expected states are never passed to the Agent.
 
 Exit codes are `0` COMPLETE, `2` input/configuration error, `3` framework/model initialization
 error, `4` PARTIAL and `5` internal validation failure. Natural-language Objective input is accepted
-only for reasoning analysis. `--objective-file -` explicitly consumes stdin; stdin is never
-auto-detected. Objective files inside the analyzed repository are rejected so repository data cannot
+only for reasoning analysis. In an interactive terminal, omitting mode, model and provider prompts
+for basic attack-path analysis or recommended AI-assisted deep analysis. The operator must select
+1 or 2, and interactive reasoning selects the saved Codex ChatGPT login.
+Explicit mode/provider/model options and non-interactive runs retain their existing behavior, and
+`--no-mode-prompt` preserves the non-interactive default in a terminal. When a reasoning analysis
+has no explicit Objective and stdin is an
+interactive terminal, the CLI prompts once for an optional trusted Objective; an empty response
+selects full-scope analysis. Non-interactive stdin is never auto-consumed. `--no-objective-prompt`
+disables the terminal prompt, while `--objective-file -` explicitly consumes stdin. Objective files
+inside the analyzed repository are rejected so repository data cannot
 be promoted into trusted operator instructions. A deterministic compiler derives bounded
 source/mechanism/sink Goal hints from the normalized Objective. These hints affect investigation
 ordering only; they cannot create Evidence, Relations, verdicts, guards or final findings.

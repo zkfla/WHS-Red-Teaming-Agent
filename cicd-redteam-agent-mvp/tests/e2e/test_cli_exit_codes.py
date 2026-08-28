@@ -11,6 +11,11 @@ from cicd_redteam_agent.framework.hackingbuddy_adapter import AgentRunResult
 FIXTURES = Path(__file__).parents[1] / "fixtures"
 
 
+class InteractiveInput(io.StringIO):
+    def isatty(self) -> bool:
+        return True
+
+
 def test_invalid_input_and_limits_return_exit_2(tmp_path: Path) -> None:
     assert main(["analyze", str(tmp_path / "missing"), "--output", str(tmp_path)]) == 2
     assert (
@@ -193,6 +198,156 @@ def test_reasoning_objective_reaches_agent_config(
         )
         == 0
     )
+
+
+def test_reasoning_prompts_for_objective_in_an_interactive_terminal(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    async def complete_agent(_state, _boundary, config, _run_dir, **_kwargs) -> AgentRunResult:
+        assert config.objective == "외부 PR에서 Artifact 경로를 조사해줘"
+        return AgentRunResult(
+            status=ReportStatus.COMPLETE,
+            reason="proposal_validated",
+            rounds=1,
+            tokens=10,
+            cost=0.0,
+            warnings=[],
+            provider="codex-chatgpt",
+        )
+
+    monkeypatch.setattr(
+        "cicd_redteam_agent.framework.hackingbuddy_adapter.run_agent_analysis",
+        complete_agent,
+    )
+
+    monkeypatch.setattr(
+        "sys.stdin", InteractiveInput("외부 PR에서 Artifact 경로를 조사해줘\n")
+    )
+
+    assert (
+        main(
+            [
+                "analyze",
+                str(FIXTURES / "oidc-risk"),
+                "--output",
+                str(tmp_path / "output"),
+                "--provider",
+                "codex-chatgpt",
+            ]
+        )
+        == 0
+    )
+    assert "분석 목표를 입력하세요" in capsys.readouterr().out
+
+
+def test_interactive_objective_prompt_can_be_disabled(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    async def complete_agent(_state, _boundary, config, _run_dir, **_kwargs) -> AgentRunResult:
+        assert config.objective is None
+        return AgentRunResult(
+            status=ReportStatus.COMPLETE,
+            reason="proposal_validated",
+            rounds=1,
+            tokens=10,
+            cost=0.0,
+            warnings=[],
+            provider="codex-chatgpt",
+        )
+
+    interactive_input = InteractiveInput("must not be consumed\n")
+    monkeypatch.setattr(
+        "cicd_redteam_agent.framework.hackingbuddy_adapter.run_agent_analysis",
+        complete_agent,
+    )
+    monkeypatch.setattr("sys.stdin", interactive_input)
+
+    assert (
+        main(
+            [
+                "analyze",
+                str(FIXTURES / "oidc-risk"),
+                "--output",
+                str(tmp_path / "output"),
+                "--provider",
+                "codex-chatgpt",
+                "--no-objective-prompt",
+            ]
+        )
+        == 0
+    )
+    assert interactive_input.tell() == 0
+
+
+def test_interactive_terminal_can_select_reasoning_mode_and_objective(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    async def complete_agent(_state, _boundary, config, _run_dir, **_kwargs) -> AgentRunResult:
+        assert config.resolved_mode is not None
+        assert config.resolved_mode.value == "reasoning"
+        assert config.provider.value == "codex-chatgpt"
+        assert config.objective == "Artifact에서 Cloud Identity까지 조사해줘"
+        return AgentRunResult(
+            status=ReportStatus.COMPLETE,
+            reason="proposal_validated",
+            rounds=1,
+            tokens=10,
+            cost=0.0,
+            warnings=[],
+            provider="codex-chatgpt",
+        )
+
+    monkeypatch.setattr(
+        "cicd_redteam_agent.framework.hackingbuddy_adapter.run_agent_analysis",
+        complete_agent,
+    )
+    monkeypatch.setattr(
+        "sys.stdin",
+        InteractiveInput("2\nArtifact에서 Cloud Identity까지 조사해줘\n"),
+    )
+
+    assert (
+        main(
+            [
+                "analyze",
+                str(FIXTURES / "oidc-risk"),
+                "--output",
+                str(tmp_path / "output"),
+            ]
+        )
+        == 0
+    )
+    output = capsys.readouterr().out
+    assert "분석 방식을 선택하세요" in output
+    assert "AI 심층 공격 경로 분석 (추천)" in output
+    assert "분석 목표를 입력하세요" in output
+
+
+def test_interactive_terminal_basic_analysis_skips_objective_prompt(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr("sys.stdin", InteractiveInput("1\n"))
+
+    assert (
+        main(
+            [
+                "analyze",
+                str(FIXTURES / "oidc-risk"),
+                "--output",
+                str(tmp_path / "output"),
+            ]
+        )
+        == 0
+    )
+    output = capsys.readouterr().out
+    assert "분석 방식을 선택하세요" in output
+    assert "분석 목표를 입력하세요" not in output
 
 
 def test_objective_can_be_read_from_explicit_stdin(

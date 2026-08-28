@@ -13,7 +13,10 @@ from cicd_redteam_agent.application.analyze import (
     analyze_repository,
     resume_analysis,
 )
-from cicd_redteam_agent.application.objective import load_analysis_objective
+from cicd_redteam_agent.application.objective import (
+    load_analysis_objective,
+    normalize_objective,
+)
 from cicd_redteam_agent.domain.models import AnalysisMode, AttackerProfile, ReportStatus
 from cicd_redteam_agent.framework.auth import ModelProvider
 from cicd_redteam_agent.security.redaction import redact
@@ -67,6 +70,16 @@ def build_parser() -> argparse.ArgumentParser:
     objective_group.add_argument(
         "--objective-file",
         help="read trusted analysis objective from UTF-8 file; use '-' for stdin",
+    )
+    analyze.add_argument(
+        "--no-objective-prompt",
+        action="store_true",
+        help="do not prompt for an analysis objective in an interactive reasoning session",
+    )
+    analyze.add_argument(
+        "--no-mode-prompt",
+        action="store_true",
+        help="keep the non-interactive default instead of prompting for an analysis mode",
     )
     resume = subcommands.add_parser(
         "resume", help="resume a reasoning analysis from its last safe checkpoint"
@@ -140,6 +153,39 @@ def _validate_positive(args: argparse.Namespace) -> None:
         raise ValueError("--env-file is not used with --provider codex-chatgpt")
 
 
+def _requested_analysis_mode(args: argparse.Namespace) -> AnalysisMode:
+    if args.mode:
+        return AnalysisMode(args.mode)
+    if args.model or args.provider == ModelProvider.CODEX_CHATGPT.value:
+        return AnalysisMode.REASONING
+    return AnalysisMode.DETERMINISTIC
+
+
+def _prompt_analysis_mode() -> AnalysisMode:
+    print("분석 방식을 선택하세요.")
+    print("1. 기본 공격 경로 분석")
+    print("   Evidence와 실행 흐름을 규칙·그래프로 빠르게 연결합니다.")
+    print("2. AI 심층 공격 경로 분석 (추천)")
+    print("   기본 분석 결과를 바탕으로 LLM이 복합 경로를 추가 조사합니다.")
+    while True:
+        print("선택 번호를 입력하세요 (1 또는 2): ", end="", flush=True)
+        value = sys.stdin.readline()
+        selected = value.strip().casefold()
+        if selected in {"1", "deterministic"}:
+            return AnalysisMode.DETERMINISTIC
+        if selected in {"2", "reasoning"}:
+            return AnalysisMode.REASONING
+        print("1 또는 2를 입력해주세요.")
+
+
+def _prompt_analysis_objective() -> str | None:
+    print("분석 목표를 입력하세요 (Enter: 전체 범위 분석): ", end="", flush=True)
+    value = sys.stdin.readline()
+    if not value or not value.strip():
+        return None
+    return normalize_objective(value)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
@@ -163,6 +209,20 @@ def main(argv: list[str] | None = None) -> int:
             if report.status is ReportStatus.PARTIAL:
                 return 4
             return 5
+        if (
+            args.command == "analyze"
+            and args.mode is None
+            and args.model is None
+            and args.provider == ModelProvider.AUTO.value
+            and not args.no_mode_prompt
+            and sys.stdin.isatty()
+        ):
+            selected_mode = _prompt_analysis_mode()
+            args.mode = selected_mode.value
+            if selected_mode is AnalysisMode.REASONING:
+                args.provider = ModelProvider.CODEX_CHATGPT.value
+                print("Reasoning 모드는 저장된 Codex ChatGPT 로그인을 사용합니다.")
+            _validate_positive(args)
         objective = None
         if args.command == "analyze":
             objective = load_analysis_objective(
@@ -171,6 +231,13 @@ def main(argv: list[str] | None = None) -> int:
                 repository_root=args.repo_path,
                 stdin=sys.stdin,
             )
+            if (
+                objective is None
+                and _requested_analysis_mode(args) is AnalysisMode.REASONING
+                and not args.no_objective_prompt
+                and sys.stdin.isatty()
+            ):
+                objective = _prompt_analysis_objective()
         config = AnalysisConfig(
             output_dir=args.output,
             attacker_profile=AttackerProfile(args.attacker_profile),

@@ -109,9 +109,24 @@ codex login
 codex login status
 
 uv run cicd-agent analyze C:\path\to\repository `
+  --output .\output
+```
+
+실제 터미널에서 모드 옵션을 생략하면 `기본 공격 경로 분석` 또는
+`AI 심층 공격 경로 분석 (추천)`을 선택하는 안내가 표시됩니다. 1 또는 2를 입력해 분석 방식을
+선택합니다. AI 심층 분석을 고르면 저장된 Codex ChatGPT 로그인을 사용하고 이어서
+`분석 목표를 입력하세요`라고 묻습니다. 한국어나 영어 문장으로 목표를 입력하거나 Enter를 눌러
+전체 범위를 분석할 수 있습니다.
+
+자동화된 실행에서는 질문을 표시하지 않습니다. 대화형 터미널에서도 `--no-mode-prompt`와
+`--no-objective-prompt`로 각 질문을 끌 수 있습니다.
+
+미리 목표를 전달하려면 기존처럼 다음 옵션을 사용합니다.
+
+```powershell
+uv run cicd-agent analyze C:\path\to\repository `
   --output .\output `
-  --provider codex-chatgpt `
-  --model gpt-5.6-luna `
+  --mode reasoning --provider codex-chatgpt --model gpt-5.6-luna `
   --objective "fork PR에서 OIDC와 Cloud Identity 연결 경로를 우선 조사해"
 ```
 

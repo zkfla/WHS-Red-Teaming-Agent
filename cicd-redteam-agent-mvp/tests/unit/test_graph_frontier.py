@@ -94,6 +94,32 @@ async def test_focused_oidc_frontier_reaches_cloud_identity(tmp_path: Path) -> N
 
 
 @pytest.mark.asyncio
+async def test_artifact_frontiers_separate_contents_write_from_oidc(tmp_path: Path) -> None:
+    state = await _analyze("global-chain", tmp_path)
+    relations = dict(indexed_relations(state))
+
+    result = build_attack_frontiers(state)
+    artifact_ready = [
+        item
+        for item in result.frontiers
+        if item.proposal_ready and "artifact" in item.mechanism_tags
+    ]
+
+    github_token = next(
+        item for item in artifact_ready if item.sink_tag == "github_token_write"
+    )
+    assert relations[github_token.relation_refs[-1]].relation_type == (
+        "can_use_github_token_contents_write"
+    )
+    assert any(item.sink_tag == "oidc_token" for item in artifact_ready)
+    assert all(
+        relations[item.relation_refs[-1]].relation_type
+        != "can_use_github_token_id-token_write"
+        for item in artifact_ready
+    )
+
+
+@pytest.mark.asyncio
 async def test_false_checkout_flow_is_terminal_blocked(tmp_path: Path) -> None:
     state = await _analyze("pr-target-blocked", tmp_path)
     relations = dict(indexed_relations(state))

@@ -54,7 +54,8 @@ analysis.json + summary.md + trace.jsonl
 | Self-hosted Runner | 부분 구현 | 공유·잔존 가능성 Fact 추출, 실제 격리 상태는 `UNKNOWN` |
 | Environment protection | 부분 구현 | Environment 사용 감지, 실제 승인 설정은 `UNKNOWN` |
 | 검토 우선순위·수정 방향 | 완료 | 전역 경로 정렬과 Relation 기반 권장 조치 표시 |
-| 자연어 Reasoning Objective | 완료 | text/file/explicit stdin, trust boundary, checkpoint/resume 보존 |
+| 대화형 분석 실행 | 완료 | 터미널 모드 선택, Reasoning 자연어 목표 입력, 자동화 비대화형 유지 |
+| 자연어 Reasoning Objective | 완료 | 대화형 입력, text/file/explicit stdin, trust boundary, checkpoint/resume 보존 |
 | Objective Goal compilation | 완료 | source/mechanism/sink 힌트, goal-aware Fact 우선순위, verdict 비간섭 |
 | Goal-aware Graph Frontier | 완료 | context-sensitive source→sink 후보, guard 우선 차단, diversity/limit metadata |
 | Reasoning matrix 평가 | 완료 | 10개 그룹 × 3개 variant의 정확도·시간 표 자동 생성 |

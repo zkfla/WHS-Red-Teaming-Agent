@@ -61,6 +61,10 @@ one accepted submission is allowed.
   matching as external or runtime assumptions unless local relations prove otherwise.
 - Use extracted cloud identities exactly as returned. Never claim successful role assumption,
   verified trust, approval, or isolation without Evidence.
+- Keep GitHub repository-token and OIDC conclusions distinct. A GitHub-token write path must end
+  in a non-`id-token` `can_use_github_token_<scope>_write` relation such as `contents_write`.
+  `id-token: write` only enables OIDC token requests; represent that path with
+  `can_request_oidc_token`, never as repository write access.
 - Do not duplicate or alter an existing Finding, path, or identity.
 
 ## 4. Status decision table

@@ -121,3 +121,41 @@ def test_false_relation_requires_rejected_status_and_complete_edge_evidence() ->
     rejected.paths[0].status = FindingStatus.REJECTED
     rejected.paths[0].evidence_ids = relation.evidence_ids
     assert validate_analysis_proposal(state, rejected).accepted
+
+
+def test_id_token_permission_cannot_be_submitted_as_github_token_write_path() -> None:
+    state = build_state()
+    evidence_id = next(iter(state.evidence))
+    relation = Relation(
+        source_id="step:test",
+        relation_type="can_use_github_token_id-token_write",
+        target_id="credential:github-token:test:id-token",
+        category="credential",
+        verdict=TriState.TRUE,
+        evidence_ids=[evidence_id],
+    )
+    state.relations.append(relation)
+    proposal = AnalysisProposal(
+        paths=[
+            AttackPath(
+                path_id="path_misclassified_id_token",
+                nodes=[relation.source_id, relation.target_id],
+                edges=[
+                    AttackEdge(
+                        relation_id=relation.relation_id,
+                        source_id=relation.source_id,
+                        relation_type=relation.relation_type,
+                        target_id=relation.target_id,
+                        evidence_ids=relation.evidence_ids,
+                    )
+                ],
+                status=FindingStatus.SUPPORTED,
+                evidence_ids=relation.evidence_ids,
+            )
+        ]
+    )
+
+    result = validate_analysis_proposal(state, proposal)
+
+    assert not result.accepted
+    assert any("id-token: write" in error for error in result.errors)

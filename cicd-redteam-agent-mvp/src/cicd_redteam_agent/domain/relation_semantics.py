@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-RELATION_SEMANTICS_VERSION = "1.0"
+RELATION_SEMANTICS_VERSION = "1.1"
 
 
 @dataclass(frozen=True)
@@ -117,6 +117,14 @@ _CONTEXT_BRIDGES = {
 
 def relation_semantics(relation_type: str) -> RelationSemantics:
     """Return fail-closed graph semantics for one deterministic Relation type."""
+    # ``id-token: write`` is the permission gate for GitHub OIDC, not a
+    # repository-writing GITHUB_TOKEN capability.  The separately extracted
+    # ``can_request_oidc_token`` relation is the canonical OIDC path edge.
+    # Keeping this permission fact non-traversable prevents the frontier layer
+    # from presenting it as a second, misleading GitHub-token write sink.
+    if relation_type == "can_use_github_token_id-token_write":
+        return RelationSemantics()
+
     source_tag = _SOURCE_RELATIONS.get(relation_type)
     mechanism_tags = _MECHANISM_RELATIONS.get(relation_type, ())
     sink_tag = _SINK_RELATIONS.get(relation_type)

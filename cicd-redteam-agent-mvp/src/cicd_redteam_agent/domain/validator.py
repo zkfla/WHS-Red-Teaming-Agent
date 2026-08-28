@@ -56,6 +56,12 @@ def validate_analysis_proposal(
         relation_missing_evidence: set[str] = set()
         edge_evidence: set[str] = set()
         for index, edge in enumerate(path.edges):
+            if edge.relation_type == "can_use_github_token_id-token_write":
+                errors.append(
+                    f"AttackPath {path.path_id} treats id-token: write as a "
+                    "GITHUB_TOKEN write sink; use the extracted "
+                    "can_request_oidc_token relation for an OIDC path"
+                )
             if index + 1 >= len(path.nodes) or (
                 edge.source_id != path.nodes[index]
                 or edge.target_id != path.nodes[index + 1]
