@@ -146,7 +146,18 @@ def launch_activity(component: str, extras: str = "") -> str:
 
         for line in dump.stdout.splitlines():
             if "mResumedActivity" in line or "topResumedActivity" in line:
-                return f"am start output: {start.stdout.strip()}\nForeground activity line: {line.strip()}"
+                # 코드가 직접 일치 여부를 계산해서 명시적으로 알려줌 --
+                # LLM이 직접 문자열을 비교하다가 실수하는 것을 방지
+                short_name = component.split("/")[-1].lstrip(".")
+                if short_name in line:
+                    verdict = f"MATCH: the requested component ({component}) IS the foreground activity."
+                else:
+                    verdict = (f"MISMATCH: the requested component was {component}, but the "
+                               f"actual foreground activity below is different. This does NOT "
+                               f"confirm the launch succeeded.")
+                return (f"{verdict}\n"
+                        f"am start output: {start.stdout.strip()}\n"
+                        f"Foreground activity line: {line.strip()}")
         return f"am start output: {start.stdout.strip()}\n[WARN] Could not find foreground activity line in dumpsys output."
     except FileNotFoundError as e:
         return f"[ERROR] {e}"
@@ -186,24 +197,145 @@ def push_file(device_path: str, content: str) -> str:
         return "[ERROR] adb command timed out. Is the emulator running and connected (adb devices)?"
 
 
-def read_recent_logcat(lines: int = 50) -> str:
+def read_recent_logcat(lines: int = 50, filter_text: str = "") -> str:
     """Reads the most recent lines of logcat. Use this after triggering
     something dynamically (e.g. after launch_activity loads a page in a
-    WebView) to check whether injected JavaScript or other code actually
-    executed, by looking for output it produced (e.g. console.log calls
-    show up here for WebView JS).
+    WebView, or after send_broadcast) to check whether injected code or
+    a target component actually executed, by looking for output it
+    produced.
 
     Args:
-        lines: How many recent logcat lines to return.
+        lines: How many recent logcat lines to return (before
+            filtering, if filter_text is used).
+        filter_text: Optional substring to filter for, e.g. the app's
+            package name ("com.android.insecurebankv2") or a specific
+            class name ("MyBroadCastReceiver"). System logcat is very
+            noisy, so filtering to the relevant app/class makes it much
+            easier to tell whether something you triggered actually
+            produced output, instead of unrelated system noise. Leave
+            empty to get the raw unfiltered tail.
 
     Returns:
-        The requested number of recent logcat lines.
+        The requested number of recent logcat lines, or only the lines
+        containing filter_text if it was given. If filter_text was
+        given and nothing matched, this returns a message saying so --
+        that itself is useful evidence (absence of expected output).
     """
     try:
         result = _adb(["logcat", "-d", "-t", str(lines)])
         if result.returncode != 0:
             return f"[ERROR] adb logcat failed:\n{result.stderr[:1000]}"
-        return result.stdout[-4000:]
+        output = result.stdout
+        if filter_text:
+            matched = [line for line in output.splitlines() if filter_text in line]
+            if not matched:
+                return f"[INFO] No logcat lines contained '{filter_text}' in the last {lines} lines."
+            return "\n".join(matched)[-4000:]
+        return output[-4000:]
+    except FileNotFoundError as e:
+        return f"[ERROR] {e}"
+    except subprocess.TimeoutExpired:
+        return "[ERROR] adb command timed out. Is the emulator running and connected (adb devices)?"
+
+
+def send_broadcast(action: str, extras: str = "") -> str:
+    """Sends a broadcast Intent via adb to test an exported
+    BroadcastReceiver for spoofing (e.g. triggering app logic without
+    proper authorization). Use this when the manifest shows a
+    <receiver> with android:exported="true".
+
+    Args:
+        action: Intent action string to broadcast, matching an
+            <action> found inside that receiver's intent-filter in the
+            manifest.
+        extras: Optional extra "am broadcast" arguments as a single
+            string, e.g. '--es phonenumber 1234567890'. Leave empty if
+            the receiver takes no extras (check the receiver's source
+            code with read_source_file to see what extras it reads).
+
+    Returns:
+        Raw "am broadcast" output only. This does NOT include logcat --
+        "result=0" here only means the OS delivered the broadcast, it
+        does NOT prove the receiver's code ran. You MUST separately
+        call read_recent_logcat with filter_text set to the receiver's
+        class name to check for actual evidence before claiming this
+        is Verified.
+    """
+    try:
+        cmd = ["shell", "am", "broadcast", "-a", action]
+        if extras:
+            cmd += extras.split()
+        result = _adb(cmd)
+        if result.returncode != 0:
+            return f"[ERROR] adb am broadcast failed:\n{result.stderr[:1000]}"
+
+        return (f"am broadcast output: {result.stdout.strip()}\n"
+                f"NOTE: this only confirms delivery, not that the receiver's code ran. "
+                f"Call read_recent_logcat(filter_text='<ReceiverClassName>') next to check "
+                f"for actual evidence before reporting this as Verified.")
+    except FileNotFoundError as e:
+        return f"[ERROR] {e}"
+    except subprocess.TimeoutExpired:
+        return "[ERROR] adb command timed out. Is the emulator running and connected (adb devices)?"
+
+
+def query_content_provider(uri: str) -> str:
+    """Queries an exported ContentProvider directly via adb, without
+    going through the app's UI. Use this when the manifest shows a
+    <provider> with android:exported="true", to check whether it
+    returns data without requiring authentication or a permission.
+
+    Args:
+        uri: Full content:// URI to query. Build it from the provider's
+            android:authorities value found in the manifest, e.g.
+            "content://com.example.app.SomeProvider/some_path".
+
+    Returns:
+        The rows returned by the provider (if any), or an [ERROR] if
+        the query failed (a permission error here would actually mean
+        the provider is NOT vulnerable).
+    """
+    try:
+        result = _adb(["shell", "content", "query", "--uri", uri])
+        if result.returncode != 0:
+            return f"[ERROR] adb content query failed:\n{result.stderr[:1000]}"
+        output = result.stdout.strip()
+        # 코드가 직접 판정해서 명시적으로 알려줌 -- "No result found"를
+        # LLM이 긍정적으로 오해석하는 것을 방지
+        if not output or "No result found" in output:
+            return ("INCONCLUSIVE: the query returned no rows. This does NOT confirm "
+                    "unauthorized data exposure -- it may mean the URI/table name was "
+                    "wrong, or the table is legitimately empty. Do not report this as "
+                    "Verified.")
+        if "Exception" in output or "SecurityException" in output or "Permission" in output:
+            return (f"BLOCKED: the query appears to have been rejected "
+                    f"(permission/security exception). This means the provider is "
+                    f"NOT vulnerable to unauthenticated access.\nRaw output: {output}")
+        return f"DATA RETURNED: the provider returned actual row data below.\n{output}"
+    except FileNotFoundError as e:
+        return f"[ERROR] {e}"
+    except subprocess.TimeoutExpired:
+        return "[ERROR] adb command timed out. Is the emulator running and connected (adb devices)?"
+
+
+def list_device_files(device_path: str) -> str:
+    """Lists files at a path on the device via adb, e.g. to check
+    whether the app writes sensitive data to world-readable external
+    storage (/sdcard) instead of app-private storage.
+
+    Args:
+        device_path: Directory to list, e.g. "/sdcard" or
+            "/sdcard/Android/data/<package_name>/files".
+
+    Returns:
+        Directory listing, or an [ERROR] if the path doesn't exist or
+        isn't accessible.
+    """
+    try:
+        result = _adb(["shell", "ls", "-la", device_path])
+        if result.returncode != 0:
+            return f"[ERROR] adb shell ls failed:\n{result.stderr[:1000]}"
+        return result.stdout.strip() or "[INFO] Directory is empty."
     except FileNotFoundError as e:
         return f"[ERROR] {e}"
     except subprocess.TimeoutExpired:
@@ -214,37 +346,58 @@ SYSTEM_PROMPT = """\
 You are a security analysis agent performing red teaming on an Android app.
 For the given APK file, follow this process:
 
-1. Call extract_manifest to inspect the manifest and identify exported
-   components and deep links.
+1. Call extract_manifest to inspect the manifest. List every exported
+   component you find (activities, receivers, providers -- look for
+   android:exported="true" on <activity>, <receiver>, and <provider>
+   tags), not just the first one you notice. Also note any deep links
+   (intent-filters with a scheme/host).
 2. Call decompile_apk to get the list of decompiled source files.
-3. Open suspicious files (e.g. classes with names related to encryption,
-   login, or authentication) with read_source_file to look for hardcoded
-   secrets, weak authentication logic, and similar issues.
-4. For any exported Activity you identified as suspicious in the
-   manifest (e.g. an activity that should only be reachable after
-   login), use launch_activity to try launching it directly and check
-   whether it bypasses expected screens.
-   Additionally, if source code shows an Activity trusts a file's
-   existence on external storage without verifying who created it
-   (e.g. it checks a file exists on the sdcard and then loads it into a
-   WebView), use push_file to stage an attacker-controlled file
-   matching the expected naming pattern, then launch_activity with the
-   matching intent extra, then read_recent_logcat to check whether
-   injected content (e.g. JavaScript) actually executed. Prefer
-   staging JavaScript with a visible effect (e.g. window.alert) over a
-   silent one (e.g. console.log), so the impact can also be confirmed
-   visually and not only via logcat.
+3. For EACH exported component listed in step 1 (not just one), read
+   its source file with read_source_file to understand what it does
+   and whether it trusts external input without validation.
+4. Test EVERY exported component from step 1 dynamically -- do not
+   stop after the first successful finding, keep going through the
+   rest of the list. For each component, use your own judgment to
+   decide which available tool (if any) would test whether it behaves
+   insecurely, based on what you observed in its source code and its
+   manifest declaration. You are not limited to the mapping below --
+   it is a set of examples, not an exhaustive or mandatory recipe:
+   - launch_activity: useful for an exported Activity that might be
+     reachable without going through expected screens (e.g. login).
+   - push_file + launch_activity + read_recent_logcat: useful when an
+     Activity trusts a file's existence on external storage without
+     verifying who created it (e.g. loads it into a WebView). Prefer
+     staging JavaScript with a visible effect (e.g. window.alert) over
+     a silent one (e.g. console.log), so the impact can also be
+     confirmed visually.
+   - send_broadcast: useful for an exported BroadcastReceiver, using
+     whatever action you find in its intent-filter. After calling it,
+     you MUST call read_recent_logcat with filter_text set to the
+     receiver's class name to check for actual evidence -- do not
+     conclude success from delivery alone.
+   - query_content_provider: useful for an exported ContentProvider,
+     using a URI built from its authorities value. It returns an
+     explicit "INCONCLUSIVE", "BLOCKED", or "DATA RETURNED" verdict --
+     trust that verdict as-is rather than re-judging the raw output
+     yourself.
+   - list_device_files: useful when source code shows the app writes
+     to external storage (e.g. Environment.getExternalStorageDirectory()),
+     to check whether sensitive files end up in a world-readable
+     location.
+   If none of the available tools fit a given component well, say so
+   explicitly in the report instead of forcing an irrelevant tool call.
    Only mark a finding as "Verified" if a dynamic tool actually
    confirmed the behavior. If a dynamic check fails or the tool errors
    out (e.g. no emulator connected), leave that finding as "Unverified"
    and say why.
-   When using launch_activity, only count it as confirmed if the
-   "Foreground activity line" in the result actually names the
-   component you tried to launch. If it names a different activity
-   (e.g. the app redirected elsewhere, or a stale foreground activity
-   from a previous call was reported), do not claim that launch
-   succeeded, even if the component name appears elsewhere in the
-   output (e.g. in the "am start output" line).
+   launch_activity returns an explicit "MATCH" or "MISMATCH" verdict at
+   the start of its result -- trust that verdict as-is; do not
+   independently re-decide based on other parts of the output (e.g.
+   the "am start output" line always contains the component name you
+   requested regardless of what actually happened, so it is never
+   evidence by itself). On a MISMATCH, either retry launch_activity for
+   that component or report it as Unverified -- do not silently ignore
+   a failed attempt and treat the component as verified anyway.
 5. Once analysis is complete, write a final report in this format:
 
 ## Findings
@@ -263,10 +416,12 @@ else stays "Unverified".
   error message to the user as-is, and stop the analysis.
 - You may only include findings that you actually confirmed by reading
   files directly (read_source_file, extract_manifest) or by running a
-  dynamic check (launch_activity, push_file + read_recent_logcat). Do
-  not speculate based on "this type of app generally has this
-  structure" without having checked it yourself. This is strictly
-  forbidden.
+  dynamic check (launch_activity, push_file + read_recent_logcat,
+  send_broadcast, query_content_provider, list_device_files). Do not
+  speculate based on "this type of app generally has this structure"
+  without having checked it yourself. This is strictly forbidden.
+- Do not stop after your first successful finding. Go through every
+  exported component identified in step 1 before writing the report.
 - Ending your response without any tool calls is not allowed. The
   report must be based solely on actual tool results.
 """
@@ -307,6 +462,109 @@ def call_with_rate_limit_retry(client, **kwargs):
                         "잠시 후 다시 실행하거나 더 여유로운 모델로 바꿔보세요.")
 
 
+def extract_exported_components(manifest_xml: str) -> dict:
+    """매니페스트 텍스트에서 exported="true"인 컴포넌트를 태그 종류별로
+    나눠서 짧은 이름(예: "PostLogin")을 추출한다.
+    ".ClassName" 축약형과 "com.pkg.ClassName" 풀네임 둘 다 마지막
+    점(.) 뒤의 클래스명만 정확히 뽑도록 처리한다.
+
+    Returns:
+        {"activity": [...], "receiver": [...], "provider": [...]}
+    """
+    result = {"activity": [], "receiver": [], "provider": []}
+    for tag in result.keys():
+        for block in re.findall(rf"<{tag}\b[^>]*>", manifest_xml):
+            if not re.search(r'exported\s*=\s*["\']true["\']', block):
+                continue
+            m = re.search(r'name\s*=\s*["\']([^"\']+)["\']', block)
+            if m:
+                full = m.group(1)
+                short = full.rsplit(".", 1)[-1] if "." in full else full
+                if short:
+                    result[tag].append(short)
+    return result
+
+
+def audit_report(report_text: str, tool_calls: list, exported: dict = None) -> str:
+    """LLM이 쓴 최종 리포트가 실제 도구 실행 결과와 모순되지 않는지 코드로
+    기계적으로 재검수한다. launch_activity의 MATCH/MISMATCH,
+    query_content_provider의 DATA RETURNED/INCONCLUSIVE 판정은 이미 코드가
+    계산해서 도구 결과에 박아둔 객관적 사실이므로, 리포트가 그 사실과
+    모순되면(예: MISMATCH였는데 [Verified]라고 적음) 자동으로 경고를 붙인다.
+    exported가 주어지면, 아예 시도조차 안 됐는데 [Verified]로 적힌
+    컴포넌트가 있는지도 잡아낸다 (커버리지 사각지대 방지 -- '틀린 판정'뿐
+    아니라 '아예 호출 안 하고 지어낸 것'까지 커버).
+    LLM에게 정확히 써달라고 부탁하는 것의 한계를 코드로 보완하는 마지막
+    방어선이다."""
+    activity_matched = {}   # short_name -> 그 컴포넌트에 대해 한 번이라도 MATCH가 있었는가
+    activity_attempted = set()  # launch_activity로 시도된 짧은 이름들
+    provider_has_data = {}  # uri -> 한 번이라도 DATA RETURNED가 있었는가
+
+    for name, args, result in tool_calls:
+        result_str = str(result).strip()
+        if name == "launch_activity":
+            component = args.get("component", "")
+            short_name = component.split("/")[-1].lstrip(".")
+            if short_name:
+                activity_attempted.add(short_name)
+                is_match = result_str.startswith("MATCH:")
+                activity_matched[short_name] = activity_matched.get(short_name, False) or is_match
+        elif name == "query_content_provider":
+            uri = args.get("uri", "")
+            is_data = result_str.startswith("DATA RETURNED:")
+            provider_has_data[uri] = provider_has_data.get(uri, False) or is_data
+
+    warnings = []
+    for line in report_text.splitlines():
+        if "[Verified]" not in line:
+            continue
+        for short_name, matched in activity_matched.items():
+            if short_name and short_name in line and not matched:
+                warnings.append(
+                    f"'{short_name}'가 [Verified]로 적혀 있지만, 실제 launch_activity "
+                    f"결과는 MATCH가 아니었습니다 (MISMATCH만 있었음). 해당 줄: {line.strip()}"
+                )
+        # 아예 launch_activity를 호출조차 안 한 exported activity가
+        # [Verified]로 적혀 있으면 잡아낸다 (activity_matched엔 애초에
+        # 키가 없으니 위 검사만으로는 못 잡는 사각지대)
+        if exported:
+            for exp_name in exported.get("activity", []):
+                if exp_name and exp_name in line and exp_name not in activity_attempted:
+                    warnings.append(
+                        f"'{exp_name}'가 [Verified]로 적혀 있지만, launch_activity가 "
+                        f"이 컴포넌트에 대해 단 한 번도 호출되지 않았습니다 (아예 시도 "
+                        f"안 한 것을 검증된 것처럼 서술함). 해당 줄: {line.strip()}"
+                    )
+        for uri, has_data in provider_has_data.items():
+            uri_tail = uri.split("/")[-2] if "/" in uri else uri
+            if uri_tail and uri_tail in line and not has_data:
+                warnings.append(
+                    f"ContentProvider 관련 줄이 [Verified]로 적혀 있지만, 실제 "
+                    f"query_content_provider 결과는 DATA RETURNED가 아니었습니다 "
+                    f"(INCONCLUSIVE/BLOCKED였음). 해당 줄: {line.strip()}"
+                )
+
+    coverage_notes = []
+    if exported:
+        untested_activities = [
+            n for n in exported.get("activity", []) if n and n not in activity_attempted
+        ]
+        if untested_activities:
+            coverage_notes.append(
+                f"매니페스트에서 exported activity로 확인됐지만 launch_activity로 "
+                f"한 번도 시도되지 않은 것: {', '.join(sorted(set(untested_activities)))}"
+            )
+
+    if warnings:
+        report_text += "\n\n---\n### ⚠️ 자동 재검수 경고 (기계적 사실 대조 결과)\n"
+        report_text += "위 리포트의 일부 [Verified] 표시가 실제 도구 실행 결과와 모순됩니다:\n"
+        report_text += "\n".join(f"- {w}" for w in warnings)
+    if coverage_notes:
+        report_text += "\n\n---\n### 📋 커버리지 점검 (기계적 계산)\n"
+        report_text += "\n".join(f"- {c}" for c in coverage_notes)
+    return report_text
+
+
 def run_agent(apk_path: str):
     global CURRENT_APK_PATH
     CURRENT_APK_PATH = apk_path
@@ -327,32 +585,46 @@ def run_agent(apk_path: str):
         config=types.GenerateContentConfig(
             system_instruction=SYSTEM_PROMPT,
             tools=[extract_manifest, decompile_apk, read_source_file,
-                   launch_activity, push_file, read_recent_logcat],
+                   launch_activity, push_file, read_recent_logcat,
+                   send_broadcast, query_content_provider, list_device_files],
             
             automatic_function_calling=types.AutomaticFunctionCallingConfig(
-                maximum_remote_calls=20
+                maximum_remote_calls=40
             ),
         ),
     )
 
     
     history = getattr(response, "automatic_function_calling_history", None)
+    tool_calls = []  # audit_report에 넘길 (도구명, 인자, 결과) 구조화 리스트
     if history:
         print("\n=== 실제 도구 호출 내역 (디버깅용) ===")
+        pending_call = None
         for item in history:
             for part in getattr(item, "parts", []):
                 if getattr(part, "function_call", None):
-                    print(f"[호출] {part.function_call.name}({dict(part.function_call.args or {})})")
+                    pending_call = (part.function_call.name, dict(part.function_call.args or {}))
+                    print(f"[호출] {pending_call[0]}({pending_call[1]})")
                 if getattr(part, "function_response", None):
                     resp = part.function_response.response
                     preview = str(resp)[:300]
                     print(f"[결과] {preview}...")
+                    if pending_call:
+                        result_value = resp.get("result") if isinstance(resp, dict) else resp
+                        tool_calls.append((pending_call[0], pending_call[1], result_value))
+                        pending_call = None
     else:
         print("\n[경고] automatic_function_calling_history가 비어 있습니다 -> 도구가 한 번도 호출되지 않았을 수 있습니다.")
 
     print("\n=== 최종 보고서 ===")
     if response.text:
-        print(response.text)
+        manifest_text = next(
+            (str(result) for name, args, result in tool_calls if name == "extract_manifest"),
+            ""
+        )
+        exported = extract_exported_components(manifest_text) if manifest_text else {}
+        final_report = audit_report(response.text, tool_calls, exported)
+        print(final_report)
     else:
         print("[경고] 최종 텍스트 응답이 없습니다.")
         print("가능한 원인: maximum_remote_calls 한도에 도달해서 LLM이 도구를 "
