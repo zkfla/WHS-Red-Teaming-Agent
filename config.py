@@ -174,6 +174,10 @@ PROFILES = {
     }),
 }
 
+# 대상 도메인. 로스터를 여기에 맞춰 고른다 (core/orchestrator.DOMAINS).
+# 지정하지 않으면 generic — 어떤 대상에도 적용되는 공통 각도로 떨어진다.
+TARGET_DOMAIN = os.getenv("TARGET_DOMAIN", "web")
+
 DEFAULT_PROFILE = os.getenv("PROFILE", "haiku-nr9")
 
 # ── 실행 한계 ──────────────────────────────────────────────────────

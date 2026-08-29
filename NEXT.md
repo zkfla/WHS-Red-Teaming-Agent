@@ -1,5 +1,84 @@
 # 다음 세션 재개 지점
 
+## ⚡ [최신 2026-08-29] 지금 당장 여기부터 읽을 것
+
+### 방향 전환 — 중요, 이유를 반드시 이해하고 시작할 것
+
+사용자가 "이거 범용 아니게 되는 거 아니냐"고 정확히 지적함.
+그동안 "경량화"라고 부른 것의 실체는 **에이전트를 웹 5종으로 하드코딩해서
+숫자를 낸 것**이었고, 이건 최적화가 아니라 기능 축소였다.
+
+**다행히 실측으로 확인됨: 실제 이득은 웹과 무관한 기전에서 나왔다.**
+순차(3종)→병렬(6종)로 갈 때 에이전트를 **늘리면서** 캐시읽기 -14%, 시간 -62%가
+같이 일어났다 (아래 표). 즉 이득의 정체는 "병렬 실행 + 컨텍스트 격리"이지
+"에이전트를 뺀 것"이 아니다. 이 기전은 도메인 무관이므로 범용성 복구가 가능하다.
+
+```
+                    에이전트   캐시읽기      시간
+Decepticon(19종)      17      3,181,877    775s
+우리 순차(3종)         3        393,462    186s
+우리 병렬(6종)         6        337,319     70s   ← 늘었는데 더 빠르고 캐시도 적음
+```
+
+### 지금 미커밋 상태 (다음 세션 시작하면 바로 이 파일들부터 볼 것)
+
+```
+git status
+ M config.py              — TARGET_DOMAIN 추가
+ M core/orchestrator.py   — DOMAINS 10종 23개 담당으로 확장, resolve_fanout() 추가
+?? bench/network.py       — network 도메인 채점 (신규, 미완성)
+```
+
+**core/orchestrator.py 변경 요지**: SPECIALISTS(웹 5종 고정)를 DOMAINS 딕셔너리로
+확장. web/network/ad/cloud/mobile/binary/ics/wireless/supply/generic 10개 도메인,
+총 23개 담당. `resolve_fanout(prof, target_domain)`이 프로파일에 fan_out이 명시돼
+있으면 그걸 쓰고, 없으면 `config.TARGET_DOMAIN`에 맞는 도메인 전원을 띄운다.
+`run_pipeline()`에 `target_domain` 파라미터 추가됨.
+
+**회귀 확인 완료**: TARGET_DOMAIN=web으로 haiku-nr9 2회 재검증 → 72.8s/$0.356,
+기존(70s/$0.363)과 동일 수준. 범용화가 성능을 깎지 않았음.
+
+**agents/prompts.py는 미수정 상태** — RCE 증거 파일(마커) 지시를 추가하려다
+사용자가 편집을 거부(interrupt)해서 반영 안 됨. 필요하면 다시 제안할 것.
+지금 EXPLOIT 프롬프트는 순차 실패 실험 이전의 원본 그대로:
+"pick highest-value hypothesis, test with one command, confirm or drop" 버전.
+
+### network 도메인 진행 상황 (bench/network.py, 미완성)
+
+- Metasploitable2를 실제로 띄워서 검증함: `tleemcjr/metasploitable2` 이미지가
+  작동함 (`peakkk/metasploitable`도 받아뒀으나 안 씀).
+  기동 명령: `docker run -d --name X --network Y IMAGE sh -c "/bin/services.sh; sleep infinity"`
+  (기본 CMD가 `services.sh && bash`인데 -d 모드는 stdin이 없어 bash가 바로 죽는다.
+  services.sh 뒤에 `sleep infinity`로 바꿔야 컨테이너가 안 죽는다.)
+- 포트 21/22/23/25/80/111/139/445/512/513/514/1099/1524/2121/3306/3632/5432/
+  5900/6000/6667/8009/8180 전부 응답 확인함 (nc 방식 — nmap -sV는 auto-mode
+  classifier가 막아서 사용자 승인 필요했음, 아직 안 받음).
+- **테스트용 컨테이너(`mtest`)와 네트워크(`metasploit-test`)는 정리해서 지움.**
+  지금 도커에 `net-target`이라는 이름의 컨테이너는 **존재하지 않음** —
+  `bench/network.py`의 `create()`를 아직 실행한 적이 없다.
+- 채점 설계: Juice Shop처럼 서버 측 '풀림' 기록이 없으므로, 에이전트가 RCE
+  성공 시 타깃에 증거 파일(`/tmp/pwned-<tag>`)을 남기게 하고 우리가 (에이전트는
+  접근 못 하는) `docker exec`로 직접 확인하는 방식. 목표 6종:
+  vsftpd_backdoor / distcc_rce / unreal_ircd_backdoor / samba_usermap /
+  java_rmi_rce / tomcat_deploy — 전부 Metasploitable2 문서화된 CVE라 논쟁 여지 없음.
+- **아직 안 된 것**: (1) 프롬프트에 마커 파일 지시 추가 (사용자가 중단시킴,
+  재확인 필요) (2) `create()`/`reset()` 실제 실행 및 검증 (3) main.py가
+  TARGET_DOMAIN·network 타깃을 실제로 쓰도록 배선 (지금 main.py는 juiceshop만
+  하드코딩돼 있어서 network 도메인을 실행할 방법이 아직 없음) (4) end-to-end
+  1회 실측.
+
+### 다음 세션에서 할 일 순서
+
+1. `git status`로 위 미커밋 변경 확인 → 이상 없으면 커밋부터
+2. `docker ps -a | grep net-target` → 없는 게 정상. `bench/network.py`의
+   `create()`를 직접 호출해서 띄우고 `_check_all()`이 빈 리스트 도는지 확인
+3. 프롬프트에 RCE 마커 지시 추가할지 사용자에게 재확인 (지난번 중단됨)
+4. main.py 또는 새 진입점에서 `TARGET_DOMAIN=network`로 실제 1회 실행
+5. nmap -sV 등 활성 스캔이 필요하면 사용자에게 명시적으로 승인받을 것
+   (auto-mode classifier가 이미 한 번 막았음 — 우회 시도 금지)
+
+---
+
 작성: 2026-08-23 / 모델 haiku 고정, 프레임워크 최적화 라운드 종료 시점
 
 ## 지금 상태

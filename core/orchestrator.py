@@ -19,25 +19,95 @@ from core.agent import run_agent
 
 HALT = ("budget", "refusal")
 
-# 팬아웃 시 전문가별 담당. 타깃 지식이 아니라 취약점 '분류'라 어떤 대상에도 쓰인다.
-SPECIALISTS = {
-    "injection": "injection flaws — SQL/NoSQL, command, template, and anything where "
-                 "input reaches an interpreter",
-    "access":    "broken access control — reading or changing data belonging to other "
-                 "users, missing authorization on endpoints, IDOR",
-    "authn":     "authentication and session handling — credential handling, token "
-                 "forgery or misuse, registration and password flows",
-    "exposure":  "sensitive data exposure — internal details in responses or errors, "
-                 "readable files and directories, secrets and metadata left reachable",
-    "logic":     "business logic and input validation — operations accepted in the "
-                 "wrong order or with values the flow should reject",
-    "crypto":    "weak cryptography and predictable secrets — reversible or guessable "
-                 "hashes, tokens with weak entropy, secrets derivable from public data",
-    "config":    "security misconfiguration — permissive CORS, missing or wrong security "
-                 "headers, debug surfaces, default settings left in place",
-    "files":     "file handling — upload and download paths, traversal, type and size "
-                 "checks, anything the app reads from or writes to disk",
+# ── 담당 로스터 ────────────────────────────────────────────────────
+# 대상 유형별 담당. Decepticon이 커버하는 도메인을 그대로 유지한다 —
+# 경량화는 '기능을 줄이는 것'이 아니라 '같은 기능을 적은 토큰·시간으로'이기 때문이다.
+#
+# 병렬 실행 + 컨텍스트 격리라는 기전 자체는 도메인과 무관하다. 실제로 순차(3종)에서
+# 병렬(6종)로 갈 때 에이전트를 늘리면서 토큰과 시간이 함께 줄었다. 따라서 로스터를
+# 넓혀도 최적화 효과는 유지된다는 것이 설계 전제이고, 이 전제는 측정으로 검증해야 한다.
+DOMAINS = {
+    "web": {
+        "injection": "injection flaws — SQL/NoSQL, command, template, and anything where "
+                     "input reaches an interpreter",
+        "access":    "broken access control — reading or changing data belonging to other "
+                     "users, missing authorization on endpoints, IDOR",
+        "authn":     "authentication and session handling — credential handling, token "
+                     "forgery or misuse, registration and password flows",
+        "exposure":  "sensitive data exposure — internal details in responses or errors, "
+                     "readable files and directories, secrets and metadata left reachable",
+        "logic":     "business logic and input validation — operations accepted in the "
+                     "wrong order or with values the flow should reject",
+    },
+    "network": {
+        "netrecon":  "service and version enumeration across the reachable address space — "
+                     "open ports, banners, protocol fingerprints",
+        "netexploit":"remotely reachable service weaknesses — default and reused credentials, "
+                     "unauthenticated administrative interfaces, known vulnerable versions",
+        "lateral":   "movement between hosts — credential reuse, exposed shares and mounts, "
+                     "trust relationships between services",
+    },
+    "ad": {
+        "adrecon":   "directory enumeration — domain, users, groups, computers, trusts, "
+                     "group policy, service principal names",
+        "adcreds":   "credential attacks against the directory — kerberoasting, AS-REP, "
+                     "password spraying, cached and stored secrets",
+        "adescalate":"privilege paths inside the domain — delegation, ACL abuse, "
+                     "certificate services, group nesting toward higher privilege",
+    },
+    "cloud": {
+        "cloudrecon":"cloud surface enumeration — exposed storage, metadata endpoints, "
+                     "public functions and registries, account and tenant structure",
+        "cloudiam":  "identity and access misconfiguration — over-permissive roles, "
+                     "assumable roles, key material left reachable",
+    },
+    "mobile": {
+        "mobstatic": "package inspection — hardcoded secrets, endpoints, permissions, "
+                     "certificate pinning and obfuscation posture",
+        "mobdynamic":"runtime and traffic behaviour — insecure storage, transport, "
+                     "interprocess surfaces exposed by the app",
+    },
+    "binary": {
+        "binstatic": "static analysis of the target binary — imports, strings, protections, "
+                     "obviously unsafe routines",
+        "bindynamic":"runtime behaviour — input handling, memory-safety triggers, "
+                     "reachable crash states",
+    },
+    "ics": {
+        "icsrecon":  "industrial protocol surface — device and controller identification, "
+                     "protocol dialects, exposed engineering interfaces",
+    },
+    "wireless": {
+        "wifi":      "wireless access — authentication posture, exposed management frames, "
+                     "credential capture opportunities",
+    },
+    "supply": {
+        "deps":      "dependency and artifact integrity — vulnerable or typosquatted "
+                     "components, unsigned artifacts, build and registry exposure",
+    },
+    # 대상 유형이 확정되지 않았을 때. 어떤 도메인에도 속하는 공통 각도.
+    "generic": {
+        "surface":   "what the target exposes at all — reachable services, interfaces, "
+                     "entry points, and what technology stack they reveal",
+        "authnz":    "authentication and authorization anywhere in the target — who can "
+                     "act as whom, and where that boundary is not enforced",
+        "exposure":  "information the target leaks — credentials, internals, configuration, "
+                     "data belonging to others",
+        "input":     "anywhere the target accepts input and does something with it — "
+                     "where that input reaches an interpreter, a file path, or a query",
+    },
 }
+
+# 하위 호환: 기존 프로파일이 평면 이름으로 담당을 지정한다.
+SPECIALISTS = {k: v for d in DOMAINS.values() for k, v in d.items()}
+
+
+def domain_of(name: str) -> str:
+    """담당 이름이 속한 도메인. 로그·집계용."""
+    for dom, members in DOMAINS.items():
+        if name in members:
+            return dom
+    return "unknown"
 
 
 def _safe(run_ctx, role, task, role_cfg, out_file, **kwargs):
@@ -56,7 +126,22 @@ def _safe(run_ctx, role, task, role_cfg, out_file, **kwargs):
         return run_ctx.read(out_file, "")
 
 
-def run_pipeline(run_ctx, profile_name: str):
+def resolve_fanout(prof, target_domain: str | None) -> list:
+    """이번 실행에서 띄울 담당을 정한다.
+
+    프로파일이 담당을 명시하면 그대로 쓰고(재현 실험용), 아니면 대상 도메인의
+    담당 전원을 띄운다. 도메인을 모르면 generic으로 떨어진다.
+
+    이 함수가 '범용'을 담보한다 — 아키텍처(병렬+컨텍스트 격리)는 그대로 두고
+    로스터만 대상에 맞춰 갈아끼운다. 웹 전용으로 굳어 있던 것을 푼 지점이다.
+    """
+    if getattr(prof, "fan_out", None):
+        return prof.fan_out
+    dom = target_domain or config.TARGET_DOMAIN
+    return list(DOMAINS.get(dom, DOMAINS["generic"]))
+
+
+def run_pipeline(run_ctx, profile_name: str, target_domain: str | None = None):
     prof = config.PROFILES[profile_name]
     roles = prof.roles
     t = config.TARGET_SANDBOX_URL
@@ -76,7 +161,7 @@ def run_pipeline(run_ctx, profile_name: str):
                 f"then confirm real vulnerabilities by exploiting them.")
 
     if run_ctx.m.stopped_reason not in HALT:
-        fan = getattr(prof, "fan_out", None)
+        fan = resolve_fanout(prof, target_domain)
         wave2 = getattr(prof, "wave2", None)
         if fan and wave2:
             # 1차 → 동기화 한 번 → 2차. 총 스텝은 순수 팬아웃과 맞춰서
@@ -117,6 +202,7 @@ def _fan_out(run_ctx, base_task: str, role_cfg, names: list, wave: int = 0,
     쓸 수 있게. 동기화 지점이 하나뿐이라 컨텍스트는 거의 안 커진다.
     """
     def one(name):
+        run_ctx.event("specialist", name=name, domain=domain_of(name), wave=wave or 1)
         spec = SPECIALISTS.get(name.split("-")[0] if name.startswith("gen") else name)
         if spec is None:      # 대조군 — 담당 없음
             task = base_task
