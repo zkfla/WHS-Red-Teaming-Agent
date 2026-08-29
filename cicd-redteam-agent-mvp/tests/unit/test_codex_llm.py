@@ -58,9 +58,7 @@ def test_codex_decision_context_keeps_state_and_only_recent_events() -> None:
         {"role": "tool", "content": f"old-result-{index}", "tool_call_id": f"old-{index}"}
         for index in range(10)
     )
-    history.append(
-        {"role": "tool", "content": "latest-result", "tool_call_id": "latest"}
-    )
+    history.append({"role": "tool", "content": "latest-result", "tool_call_id": "latest"})
 
     objective_goal = {
         "compiler_version": "1.0",
@@ -75,19 +73,19 @@ def test_codex_decision_context_keeps_state_and_only_recent_events() -> None:
         _state(),
         objective="inspect OIDC without changing policy",
         objective_goal=objective_goal,
+        investigation_policy={"transition": "SUBMIT", "portfolio": []},
     )
 
     assert context["trusted_agent_instructions"] == "trusted policy"
     assert context["user_objective"] == "inspect OIDC without changing policy"
     assert context["objective_goal"] == objective_goal
+    assert context["analysis_state"]["investigation_policy"]["transition"] == "SUBMIT"
     assert context["analysis_state"]["repository"] == {
         "repository_id": "repo_test",
         "git_commit": "abc123",
         "dirty": False,
     }
-    assert context["analysis_state"]["pending_questions"] == [
-        "Which credential sink is reachable?"
-    ]
+    assert context["analysis_state"]["pending_questions"] == ["Which credential sink is reachable?"]
     assert context["analysis_state"]["call_progress"]["repeated_calls"] == 2
     assert context["omitted_earlier_events"] == 4
     assert context["recent_agent_events"][-1]["content"] == "latest-result"
@@ -110,6 +108,7 @@ def test_codex_prompt_uses_projected_context_instead_of_full_conversation() -> N
         state=_state(),
         objective="inspect cache provenance",
         objective_goal={"mechanism_hints": ["cache"], "focused": True},
+        investigation_policy={"transition": "INVESTIGATE", "portfolio": []},
     )
 
     prompt = llm._build_prompt(history, {})
@@ -120,6 +119,7 @@ def test_codex_prompt_uses_projected_context_instead_of_full_conversation() -> N
     assert "discard-0" not in prompt
     assert "inspect cache provenance" in prompt
     assert '"mechanism_hints": ["cache"]' in prompt
+    assert '"transition": "INVESTIGATE"' in prompt
     assert "not as Evidence, Facts, or vulnerability conclusions" in prompt
 
 

@@ -13,11 +13,23 @@ from cicd_redteam_agent.application.analyze import (
     analyze_repository,
     resume_analysis,
 )
+from cicd_redteam_agent.application.github_event import load_github_event_locator
+from cicd_redteam_agent.application.natural_cli import (
+    is_github_repository_url,
+    materialize_target,
+    parse_natural_request,
+)
 from cicd_redteam_agent.application.objective import (
     load_analysis_objective,
     normalize_objective,
 )
-from cicd_redteam_agent.domain.models import AnalysisMode, AttackerProfile, ReportStatus
+from cicd_redteam_agent.application.report import render_terminal_brief
+from cicd_redteam_agent.domain.models import (
+    AnalysisMode,
+    AnalysisReport,
+    AttackerProfile,
+    ReportStatus,
+)
 from cicd_redteam_agent.framework.auth import ModelProvider
 from cicd_redteam_agent.security.redaction import redact
 from cicd_redteam_agent.security.repository_boundary import RepositoryBoundaryError
@@ -81,6 +93,42 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="keep the non-interactive default instead of prompting for an analysis mode",
     )
+    analyze.add_argument(
+        "--observe-github",
+        action="store_true",
+        help=(
+            "opt in to read-only GitHub.com repository-policy observation before model rounds; "
+            "requires GH_TOKEN or GITHUB_TOKEN from trusted operator configuration"
+        ),
+    )
+    analyze.add_argument(
+        "--observe-aws",
+        action="store_true",
+        help=(
+            "opt in to read-only AWS IAM role trust and OIDC provider observation; "
+            "requires --observe-github and AWS credentials"
+        ),
+    )
+    analyze.add_argument(
+        "--aws-profile",
+        help="optional AWS shared-config profile for --observe-aws",
+    )
+    analyze.add_argument(
+        "--github-run-id",
+        type=int,
+        help=(
+            "optional GitHub Actions workflow run ID for read-only runtime evidence such as "
+            "pending environment deployments; requires --observe-github"
+        ),
+    )
+    analyze.add_argument(
+        "--github-event-file",
+        type=Path,
+        help=(
+            "trusted GitHub webhook event JSON outside the analyzed repository; normalizes only "
+            "event/resource/principal locators and requires --github-run-id --observe-github"
+        ),
+    )
     resume = subcommands.add_parser(
         "resume", help="resume a reasoning analysis from its last safe checkpoint"
     )
@@ -129,9 +177,7 @@ def _validate_positive(args: argparse.Namespace) -> None:
             "max_cost": args.max_cost,
             "max_duration": args.max_duration,
         }
-        invalid = [
-            name for name, value in values.items() if value is not None and value <= 0
-        ]
+        invalid = [name for name, value in values.items() if value is not None and value <= 0]
         if invalid:
             raise ValueError(f"Limits must be positive: {', '.join(invalid)}")
         return
@@ -144,13 +190,32 @@ def _validate_positive(args: argparse.Namespace) -> None:
     invalid = [name for name, value in values.items() if value <= 0]
     if invalid:
         raise ValueError(f"Limits must be positive: {', '.join(invalid)}")
-    if (
-        not args.model
-        and args.provider not in {ModelProvider.AUTO.value, ModelProvider.CODEX_CHATGPT.value}
-    ):
+    if not args.model and args.provider not in {
+        ModelProvider.AUTO.value,
+        ModelProvider.CODEX_CHATGPT.value,
+    }:
         raise ValueError("--model is required when selecting a LiteLLM provider")
-    if args.env_file and args.provider == ModelProvider.CODEX_CHATGPT.value:
+    if (
+        args.env_file
+        and args.provider == ModelProvider.CODEX_CHATGPT.value
+        and not getattr(args, "observe_github", False)
+    ):
         raise ValueError("--env-file is not used with --provider codex-chatgpt")
+    github_run_id = getattr(args, "github_run_id", None)
+    if github_run_id is not None:
+        if github_run_id <= 0:
+            raise ValueError("--github-run-id must be positive")
+        if not getattr(args, "observe_github", False):
+            raise ValueError("--github-run-id requires --observe-github")
+    if getattr(args, "github_event_file", None) is not None:
+        if github_run_id is None:
+            raise ValueError("--github-event-file requires --github-run-id")
+        if not getattr(args, "observe_github", False):
+            raise ValueError("--github-event-file requires --observe-github")
+    if getattr(args, "observe_aws", False) and not getattr(args, "observe_github", False):
+        raise ValueError("--observe-aws requires --observe-github")
+    if getattr(args, "aws_profile", None) and not getattr(args, "observe_aws", False):
+        raise ValueError("--aws-profile requires --observe-aws")
 
 
 def _requested_analysis_mode(args: argparse.Namespace) -> AnalysisMode:
@@ -186,8 +251,147 @@ def _prompt_analysis_objective() -> str | None:
     return normalize_objective(value)
 
 
+def _result_exit_code(report: AnalysisReport) -> int:
+    if report.status is ReportStatus.COMPLETE:
+        return 0
+    if report.status is ReportStatus.PARTIAL:
+        return 4
+    return 5
+
+
+def _print_existing_result(result_file: Path) -> int:
+    run_dir = result_file.parent
+    report = AnalysisReport.model_validate_json(result_file.read_text(encoding="utf-8"))
+    print("기존 분석 결과를 읽어서 설명함.")
+    print(render_terminal_brief(report, run_dir))
+    return _result_exit_code(report)
+
+
+def _latest_analysis_result(root: Path) -> Path | None:
+    candidates = [
+        *root.glob("analysis.json"),
+        *root.glob("*/analysis.json"),
+        *root.glob("*/*/analysis.json"),
+    ]
+    files = [path for path in candidates if path.is_file()]
+    return max(files, key=lambda path: path.stat().st_mtime_ns) if files else None
+
+
+def _wants_latest_result(text: str) -> bool:
+    lowered = text.casefold()
+    return "마지막" in lowered and "분석" in lowered and any(
+        value in lowered for value in ("결과", "리포트", "보고서", "설명", "보여")
+    )
+
+
+def _natural_analysis(initial_request: str | None = None) -> int:
+    print("CI/CD Red Team Agent 자연어 모드")
+    print("저장소와 원하는 분석을 한 문장으로 적으면 됨.")
+    print("예: https://github.com/org/repo 이 저장소의 CI/CD 취약점과 공격 경로를 분석해줘")
+    request_text = initial_request
+    if request_text is None:
+        print("\n분석 요청> ", end="", flush=True)
+        request_text = sys.stdin.readline().strip()
+    if not request_text:
+        raise ValueError("분석 요청이 비어 있습니다.")
+
+    if _wants_latest_result(request_text):
+        latest = _latest_analysis_result(Path.cwd())
+        if latest is not None:
+            return _print_existing_result(latest)
+
+    try:
+        request = parse_natural_request(request_text)
+    except ValueError as exc:
+        if "분석 대상 저장소" not in str(exc):
+            raise
+        print("분석 대상 저장소의 로컬 경로 또는 GitHub URL> ", end="", flush=True)
+        target = sys.stdin.readline().strip()
+        if not target:
+            raise ValueError("분석 대상 저장소가 필요합니다.") from exc
+        request = parse_natural_request(request_text, explicit_target=target)
+
+    cache_root = Path.home() / ".cicd-redteam-agent" / "repositories"
+    if is_github_repository_url(request.target):
+        print("GitHub 저장소를 분석용 로컬 복제본으로 가져오는 중...")
+    repository = materialize_target(request.target, cache_root=cache_root)
+    result_file = repository if repository.is_file() else repository / "analysis.json"
+    if result_file.is_file() and result_file.name == "analysis.json":
+        return _print_existing_result(result_file)
+
+    output_dir = Path.cwd() / "cicd-agent-runs"
+
+    print(
+        "분석 설정: "
+        f"mode={request.mode.value}, model={request.model or 'codex-default'}, "
+        f"attacker={request.attacker_profile.value}, "
+        f"github-observation={'on' if request.observe_github else 'off'}, "
+        f"aws-observation={'on' if request.observe_aws else 'off'}"
+    )
+    if request.mode is AnalysisMode.REASONING:
+        print("AI 심층 분석은 저장된 Codex ChatGPT 로그인을 사용함.")
+
+    config = AnalysisConfig(
+        output_dir=output_dir,
+        attacker_profile=request.attacker_profile,
+        model=request.model,
+        provider=request.provider,
+        analysis_mode=request.mode,
+        max_rounds=16,
+        max_tokens=300_000,
+        max_cost=2.0,
+        max_duration=1800,
+        objective=request.objective,
+        observe_github=request.observe_github,
+        observe_aws=request.observe_aws,
+        github_run_id=request.github_run_id,
+    )
+    report, run_dir = asyncio.run(analyze_repository(repository, config))
+    print(f"{report.status}: {run_dir}")
+    print(render_terminal_brief(report, run_dir))
+    return _result_exit_code(report)
+
+
 def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    known_commands = {"analyze", "resume", "evaluate"}
+    natural_request: str | None = None
+    if not raw_argv:
+        try:
+            return _natural_analysis()
+        except (RepositoryBoundaryError, ValueError, ValidationError) as exc:
+            print(f"Input/configuration error: {redact(str(exc))}", file=sys.stderr)
+            return 2
+        except (ImportError, ModuleNotFoundError) as exc:
+            print(f"Framework initialization error: {redact(str(exc))}", file=sys.stderr)
+            return 3
+        except Exception as exc:
+            print(
+                "Framework or model initialization error: "
+                f"{type(exc).__name__}: {redact(str(exc))}",
+                file=sys.stderr,
+            )
+            return 3
+    elif raw_argv[0] not in known_commands and not raw_argv[0].startswith("-"):
+        natural_request = " ".join(raw_argv)
+    if natural_request is not None:
+        try:
+            return _natural_analysis(natural_request)
+        except (RepositoryBoundaryError, ValueError, ValidationError) as exc:
+            print(f"Input/configuration error: {redact(str(exc))}", file=sys.stderr)
+            return 2
+        except (ImportError, ModuleNotFoundError) as exc:
+            print(f"Framework initialization error: {redact(str(exc))}", file=sys.stderr)
+            return 3
+        except Exception as exc:
+            print(
+                "Framework or model initialization error: "
+                f"{type(exc).__name__}: {redact(str(exc))}",
+                file=sys.stderr,
+            )
+            return 3
+
+    args = build_parser().parse_args(raw_argv)
     try:
         _validate_positive(args)
         if args.command == "resume":
@@ -204,6 +408,7 @@ def main(argv: list[str] | None = None) -> int:
                 )
             )
             print(f"{report.status}: {run_dir}")
+            print(render_terminal_brief(report, run_dir))
             if report.status is ReportStatus.COMPLETE:
                 return 0
             if report.status is ReportStatus.PARTIAL:
@@ -238,6 +443,12 @@ def main(argv: list[str] | None = None) -> int:
                 and sys.stdin.isatty()
             ):
                 objective = _prompt_analysis_objective()
+        github_event_locator = None
+        if args.command == "analyze" and args.github_event_file is not None:
+            github_event_locator = load_github_event_locator(
+                args.github_event_file,
+                repository_root=args.repo_path,
+            )
         config = AnalysisConfig(
             output_dir=args.output,
             attacker_profile=AttackerProfile(args.attacker_profile),
@@ -254,6 +465,11 @@ def main(argv: list[str] | None = None) -> int:
             max_cost=args.max_cost,
             max_duration=args.max_duration,
             objective=objective,
+            observe_github=(bool(args.observe_github) if args.command == "analyze" else False),
+            observe_aws=(bool(args.observe_aws) if args.command == "analyze" else False),
+            aws_profile=(args.aws_profile if args.command == "analyze" else None),
+            github_run_id=(args.github_run_id if args.command == "analyze" else None),
+            github_event_locator=github_event_locator,
         )
         if objective is not None and config.resolved_mode is AnalysisMode.DETERMINISTIC:
             raise ValueError("analysis objective requires reasoning mode")
@@ -296,6 +512,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 5
     print(f"{report.status}: {run_dir}")
+    print(render_terminal_brief(report, run_dir))
     if report.status is ReportStatus.COMPLETE:
         return 0
     if report.status is ReportStatus.PARTIAL:

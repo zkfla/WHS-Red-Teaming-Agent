@@ -17,6 +17,7 @@ def test_cli_writes_complete_outputs(tmp_path: Path) -> None:
     data = json.loads((runs[0] / "analysis.json").read_text(encoding="utf-8"))
     summary = (runs[0] / "summary.md").read_text(encoding="utf-8")
     assert data["status"] == "COMPLETE"
+    assert data["run_metadata"]["observe_github"] is False
     assert data["state"]["identities"][0]["trust_verified"] == "UNKNOWN"
     assert "## Analysis coverage" in summary
     assert "## Cloud identity handoff" in summary

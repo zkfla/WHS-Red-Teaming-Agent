@@ -31,10 +31,67 @@ async def _analyze(name: str, variant: str | None, tmp_path: Path):
     repository = FIXTURES / name
     if variant:
         repository /= variant
-    report, _ = await analyze_repository(
-        repository, AnalysisConfig(output_dir=tmp_path / "output")
-    )
+    report, _ = await analyze_repository(repository, AnalysisConfig(output_dir=tmp_path / "output"))
     return report.state
+
+
+@pytest.mark.asyncio
+async def test_p4_condition_security_uses_one_canonical_relation_path(
+    tmp_path: Path,
+) -> None:
+    state = await _analyze("reasoning-matrix/gha-10", "supported", tmp_path)
+    relation_pairs = {(item.relation_type, item.verdict.value) for item in state.relations}
+    relation_types = {item.relation_type for item in state.relations}
+    assert ("attacker_can_satisfy_condition", "TRUE") in relation_pairs
+    assert relation_types.isdisjoint(
+        {
+            "execution_condition_present",
+            "actor_or_event_guard_effectiveness_unknown",
+            "event_content_controls_job_condition",
+            "label_controls_job_condition",
+            "label_or_comment_controls_job_condition",
+        }
+    )
+
+
+@pytest.mark.asyncio
+async def test_p4_label_guard_is_may_block_until_revision_binding_is_proven(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "label-guard"
+    workflows = repository / ".github" / "workflows"
+    workflows.mkdir(parents=True)
+    (workflows / "deploy.yml").write_text(
+        "on: pull_request_target\n"
+        "jobs:\n"
+        "  deploy:\n"
+        "    if: contains(github.event.pull_request.labels.*.name, 'safe')\n"
+        "    runs-on: ubuntu-latest\n"
+        "    steps:\n"
+        "      - run: echo deploy\n",
+        encoding="utf-8",
+    )
+    report, _ = await analyze_repository(
+        repository,
+        AnalysisConfig(output_dir=tmp_path / "label-output"),
+    )
+    condition = report.state.condition_evaluations[0]
+    guards = [
+        item
+        for item in report.state.relations
+        if item.relation_type == "guard_blocks_untrusted_execution"
+        and item.source_id == f"guard:condition:{condition.evaluation_id}"
+    ]
+    assert condition.revision_bound.value == "UNKNOWN"
+    assert len(guards) == 1
+    assert guards[0].verdict.value == "UNKNOWN"
+    assert "condition approval is not bound to the exact workflow revision" in (
+        guards[0].missing_evidence
+    )
+    assert not any(
+        item.relation_type == "attacker_can_satisfy_condition"
+        for item in report.state.relations
+    )
 
 
 @pytest.mark.asyncio
@@ -52,9 +109,7 @@ async def test_supported_env_output_path_is_extracted_without_a_scenario_rule(
     assert "can_use_github_token_contents_write" in relation_types
 
     source = next(
-        item
-        for item in state.relations
-        if item.relation_type == "controls_workflow_input"
+        item for item in state.relations if item.relation_type == "controls_workflow_input"
     )
     assert source.relation_id == relation_id_for(
         source.source_id, source.relation_type, source.target_id
@@ -170,8 +225,7 @@ async def test_secure_fixture_has_guard_without_write_credential(tmp_path: Path)
     state = await _analyze("inference-flow", "secure", tmp_path)
     assert any(item.category == "guard" for item in state.relations)
     assert not any(
-        item.relation_type.startswith("can_use_github_token_")
-        for item in state.relations
+        item.relation_type.startswith("can_use_github_token_") for item in state.relations
     )
 
 
@@ -233,9 +287,7 @@ async def test_pull_request_target_cache_write_is_read_only_in_default_branch_co
         "        with:\n          path: node_modules\n          key: default-branch-cache\n",
         encoding="utf-8",
     )
-    report, _ = await analyze_repository(
-        repository, AnalysisConfig(output_dir=tmp_path / "output")
-    )
+    report, _ = await analyze_repository(repository, AnalysisConfig(output_dir=tmp_path / "output"))
     cache_access = [
         relation
         for relation in report.state.relations
@@ -344,16 +396,18 @@ async def test_attack_frontier_capability_rejects_invalid_page_size(tmp_path: Pa
 async def test_oidc_fact_preserves_external_cloud_trust_as_unknown(tmp_path: Path) -> None:
     state = await _analyze("oidc-risk", None, tmp_path)
     cloud = next(
-        item
-        for item in state.relations
-        if item.relation_type == "oidc_may_assume_cloud_identity"
+        item for item in state.relations if item.relation_type == "oidc_may_assume_cloud_identity"
     )
     assert cloud.verdict.value == "UNKNOWN"
     assert cloud.missing_evidence == [
-        "aws federated identity trust policy",
+        "AWS IAM OIDC provider client IDs",
+        "AWS IAM role trust policy",
+        "GitHub OIDC subject configuration",
+        "GitHub repository metadata",
+        "configure-aws-credentials authentication mode",
         "fork pull-request OIDC token availability",
     ]
-    assert "aws federated identity trust policy" in state.pending_questions
+    assert "configure-aws-credentials authentication mode" in state.pending_questions
     assert "fork pull-request OIDC token availability" in state.pending_questions
 
 
@@ -396,9 +450,7 @@ async def test_checkout_and_github_script_inputs_become_execution_facts(
 async def test_gcp_and_azure_oidc_trust_remains_unknown(tmp_path: Path) -> None:
     state = await _analyze("inference-cloud", None, tmp_path)
     cloud = [
-        item
-        for item in state.relations
-        if item.relation_type == "oidc_may_assume_cloud_identity"
+        item for item in state.relations if item.relation_type == "oidc_may_assume_cloud_identity"
     ]
     assert len(cloud) == 2
     assert all(item.verdict.value == "UNKNOWN" for item in cloud)

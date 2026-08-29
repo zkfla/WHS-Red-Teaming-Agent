@@ -211,6 +211,7 @@ def parse_workflow(boundary: RepositoryBoundary, relative_path: str) -> Workflow
         evidence[job_ev.evidence_id] = job_ev
         job_evidence_ids = [job_ev.evidence_id]
         for field_name in (
+            "name",
             "uses",
             "with",
             "if",
@@ -269,6 +270,27 @@ def parse_workflow(boundary: RepositoryBoundary, relative_path: str) -> Workflow
             )
         )
         job_uses = str(raw_job["uses"]) if raw_job.get("uses") is not None else None
+        raw_job_continue_on_error = raw_job.get("continue-on-error")
+        job_continue_on_error = (
+            raw_job_continue_on_error
+            if isinstance(raw_job_continue_on_error, bool)
+            else str(raw_job_continue_on_error)
+            if raw_job_continue_on_error is not None
+            else None
+        )
+        raw_strategy = raw_job.get("strategy")
+        strategy_fail_fast: bool | str | None = None
+        has_matrix = False
+        if isinstance(raw_strategy, dict):
+            has_matrix = raw_strategy.get("matrix") is not None
+            raw_fail_fast = raw_strategy.get("fail-fast")
+            strategy_fail_fast = (
+                raw_fail_fast
+                if isinstance(raw_fail_fast, bool)
+                else str(raw_fail_fast)
+                if raw_fail_fast is not None
+                else None
+            )
         if job_uses and "${{" in job_uses:
             warnings.append(f"Dynamic reusable workflow path is UNKNOWN: jobs.{raw_job_id}.uses")
 
@@ -323,6 +345,14 @@ def parse_workflow(boundary: RepositoryBoundary, relative_path: str) -> Workflow
             raw_with = {str(k): _plain(v) for k, v in (raw_step.get("with") or {}).items()}
             env = {key: redact(value) for key, value in raw_env.items()}
             with_values = {key: _redacted_plain(value) for key, value in raw_with.items()}
+            raw_step_continue_on_error = raw_step.get("continue-on-error")
+            step_continue_on_error = (
+                raw_step_continue_on_error
+                if isinstance(raw_step_continue_on_error, bool)
+                else str(raw_step_continue_on_error)
+                if raw_step_continue_on_error is not None
+                else None
+            )
             step = Step(
                 step_id=step_id,
                 step_key=(
@@ -334,6 +364,7 @@ def parse_workflow(boundary: RepositoryBoundary, relative_path: str) -> Workflow
                 condition=(
                     redact(str(raw_step["if"])) if raw_step.get("if") is not None else None
                 ),
+                continue_on_error=step_continue_on_error,
                 uses=uses,
                 run=run,
                 shell=str(raw_step["shell"]) if raw_step.get("shell") is not None else None,
@@ -361,10 +392,19 @@ def parse_workflow(boundary: RepositoryBoundary, relative_path: str) -> Workflow
         jobs.append(
             Job(
                 job_id=job_id,
+                job_key=str(raw_job_id),
+                name=(
+                    redact(str(raw_job["name"]))
+                    if raw_job.get("name") is not None
+                    else None
+                ),
                 uses=job_uses,
                 **{"with": {str(k): _plain(v) for k, v in (raw_job.get("with") or {}).items()}},
                 needs=needs,
                 condition=redact(str(raw_job["if"])) if raw_job.get("if") is not None else None,
+                continue_on_error=job_continue_on_error,
+                has_matrix=has_matrix,
+                strategy_fail_fast=strategy_fail_fast,
                 env={key: redact(value) for key, value in raw_job_env.items()},
                 outputs={
                     str(k): _redacted_plain(v)

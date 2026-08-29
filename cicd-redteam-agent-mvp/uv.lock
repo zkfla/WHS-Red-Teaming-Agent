@@ -443,6 +443,7 @@ name = "cicd-redteam-agent"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "boto3" },
     { name = "hackingbuddygpt" },
     { name = "openai-codex" },
     { name = "pydantic" },
@@ -459,6 +460,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "boto3", specifier = ">=1.40,<2" },
     { name = "hackingbuddygpt", git = "https://github.com/ipa-lab/hackingBuddyGPT.git?rev=b2653771aed383ffe92933f8f2f9b7684403af8a" },
     { name = "openai-codex", specifier = ">=0.1,<1" },
     { name = "pydantic", specifier = ">=2.12,<3" },

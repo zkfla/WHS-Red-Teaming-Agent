@@ -8,6 +8,7 @@ from cicd_redteam_agent.application.objective import compile_objective_goal, obj
 from cicd_redteam_agent.application.state import create_initial_state
 from cicd_redteam_agent.domain.models import ReportStatus
 from cicd_redteam_agent.framework.hackingbuddy_adapter import AgentRunResult
+from cicd_redteam_agent.framework.investigation_runtime import create_red_team_session
 from cicd_redteam_agent.framework.runtime_support import (
     AgentRuntimeMetrics,
     CheckpointWriter,
@@ -28,6 +29,7 @@ async def test_resume_continues_in_the_same_run_directory(
     metrics = AgentRuntimeMetrics(model_attempts=2, no_progress_rounds=1)
     journal = EventJournal(run_dir / "events.jsonl", attempt_id=1)
     journal.append("RUN_STARTED")
+    investigation_session = create_red_team_session(state, github_run_id=4242)
     checkpoint = CheckpointWriter(
         run_dir / "checkpoint.json",
         state,
@@ -48,7 +50,10 @@ async def test_resume_continues_in_the_same_run_directory(
             "objective": "inspect OIDC",
             "objective_hash": objective_hash("inspect OIDC"),
             "objective_goal": compile_objective_goal("inspect OIDC").as_dict(),
+            "observe_github": True,
+            "github_run_id": 4242,
         },
+        investigation_session=investigation_session,
     )
     checkpoint.write(
         rounds=1,
@@ -67,6 +72,10 @@ async def test_resume_continues_in_the_same_run_directory(
         assert resume_checkpoint.runtime_metrics.model_attempts == 2
         assert config.max_rounds == 5
         assert config.objective == "inspect OIDC"
+        assert config.observe_github is True
+        assert config.github_run_id == 4242
+        assert resume_checkpoint.investigation_session is not None
+        assert resume_checkpoint.investigation_session.github_run_id == 4242
         resumed_state.pending_questions.append("resumed")
         return AgentRunResult(
             status=ReportStatus.COMPLETE,

@@ -3,6 +3,7 @@ from pathlib import Path
 import pytest
 
 from cicd_redteam_agent.application.state import create_initial_state
+from cicd_redteam_agent.domain.investigation_policy import InvestigationTransition
 from cicd_redteam_agent.framework.capabilities import CapabilityContext
 from cicd_redteam_agent.framework.cicd_usecase import CICDUseCase
 from cicd_redteam_agent.security.repository_boundary import RepositoryBoundary
@@ -129,6 +130,9 @@ async def test_repeated_calls_stop_after_four_rounds(tmp_path: Path) -> None:
 
     assert reason == "no_progress"
     assert limits.rounds == 4
+    assert context.investigation_policy is not None
+    assert context.investigation_policy.transition is InvestigationTransition.STOP_PARTIAL
+    assert context.investigation_policy.stop_reason == "no_progress"
 
 
 @pytest.mark.asyncio
@@ -155,6 +159,9 @@ async def test_limit_reason_is_returned_without_losing_state(
 
     assert reason == limit_reason
     assert context.state.pending_questions == ["preserve deterministic state"]
+    assert context.investigation_policy is not None
+    assert context.investigation_policy.transition is InvestigationTransition.STOP_PARTIAL
+    assert context.investigation_policy.stop_reason == limit_reason
 
 
 @pytest.mark.asyncio
@@ -170,3 +177,6 @@ async def test_round_is_not_started_when_token_reserve_is_too_small(
     assert reason == "insufficient_token_reserve"
     assert limits.rounds == 0
     assert "remaining token budget" in usecase.warnings[0]
+    assert context.investigation_policy is not None
+    assert context.investigation_policy.transition is InvestigationTransition.STOP_PARTIAL
+    assert context.investigation_policy.stop_reason == "insufficient_token_reserve"

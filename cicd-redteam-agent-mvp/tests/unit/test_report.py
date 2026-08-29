@@ -2,7 +2,14 @@ import json
 from datetime import UTC, datetime
 from pathlib import Path
 
-from cicd_redteam_agent.application.report import render_summary, write_report
+import pytest
+
+from cicd_redteam_agent.application.analyze import AnalysisConfig, analyze_repository
+from cicd_redteam_agent.application.report import (
+    render_summary,
+    render_terminal_brief,
+    write_report,
+)
 from cicd_redteam_agent.domain.models import (
     AnalysisReport,
     AnalysisState,
@@ -128,6 +135,20 @@ def test_summary_includes_bounded_user_objective_and_hash() -> None:
     assert "sinks=oidc\\_token" in summary
 
 
+def test_terminal_brief_strips_control_characters_from_untrusted_finding_text(
+    tmp_path: Path,
+) -> None:
+    report = _report()
+    report.state.findings[0].title = "Injected\x1b[31m title"
+    report.state.findings[0].summary = "line one\nline two"
+
+    brief = render_terminal_brief(report, tmp_path)
+
+    assert "\x1b" not in brief
+    assert "Injected [31m title" in brief
+    assert "line one line two" in brief
+
+
 def test_fallback_trace_does_not_repeat_raw_objective(tmp_path: Path) -> None:
     report = _report()
     report.run_metadata.update(
@@ -151,3 +172,29 @@ def test_summary_escapes_untrusted_markdown_and_deduplicates_warnings() -> None:
     assert "Untrusted \\| heading \\# injection" in summary
     assert "Candidate \\*summary\\* from repository text" in summary
     assert summary.count("- warning") == 1
+
+
+@pytest.mark.asyncio
+async def test_partial_summary_and_terminal_brief_surface_unresolved_frontiers(
+    tmp_path: Path,
+) -> None:
+    fixture = Path(__file__).parents[1] / "fixtures" / "inference-flow" / "candidate"
+    report, run_dir = await analyze_repository(
+        fixture,
+        AnalysisConfig(output_dir=tmp_path / "out"),
+    )
+    report.status = ReportStatus.PARTIAL
+    report.termination_reason = "insufficient_token_reserve"
+    report.state.findings = []
+    report.state.paths = []
+    report.run_metadata["max_tokens"] = 100_000
+    (run_dir / "checkpoint.json").write_text("{}", encoding="utf-8")
+
+    summary = render_summary(report)
+    brief = render_terminal_brief(report, run_dir)
+
+    assert "## Unresolved attack frontiers" in summary
+    assert "not equivalent to finding no vulnerability" in summary
+    assert "최종 Finding 제출 전 분석이 중단됐지만" in brief
+    assert "중단 이유:" in brief
+    assert "cicd-agent resume" in brief

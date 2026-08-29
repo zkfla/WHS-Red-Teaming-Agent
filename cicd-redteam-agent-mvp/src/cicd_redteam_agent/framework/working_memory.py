@@ -8,6 +8,10 @@ from typing import Any
 from hackingBuddyGPT.capability import Capability
 from pydantic import BaseModel, Field, create_model
 
+from cicd_redteam_agent.domain.graph_frontier import (
+    FrontierDisposition,
+    FrontierSearchResult,
+)
 from cicd_redteam_agent.domain.models import (
     AgentWorkingMemory,
     AnalysisState,
@@ -34,9 +38,7 @@ def _normalize_claim(claim: str) -> str:
 
 
 def _hypothesis_id(repository_id: str, claim: str) -> str:
-    digest = hashlib.sha256(
-        f"{repository_id}|{_normalize_claim(claim)}".encode()
-    ).hexdigest()[:16]
+    digest = hashlib.sha256(f"{repository_id}|{_normalize_claim(claim)}".encode()).hexdigest()[:16]
     return f"hyp_{digest}"
 
 
@@ -57,9 +59,7 @@ def _clean_upsert(upsert: WorkingHypothesisUpsert) -> WorkingHypothesisUpsert:
         payload["next_check"] = next_check
     if upsert.missing_evidence is not None:
         payload["missing_evidence"] = [
-            cleaned
-            for item in upsert.missing_evidence
-            if (cleaned := _clean_text(item))
+            cleaned for item in upsert.missing_evidence if (cleaned := _clean_text(item))
         ]
     for field_name in (
         "supporting_relation_ids",
@@ -84,9 +84,7 @@ def sanitize_working_memory_patch_json(value: str) -> str:
     return WorkingMemoryPatch.model_validate(payload).model_dump_json()
 
 
-def expand_working_memory_patch_refs(
-    state: AnalysisState, value: str
-) -> WorkingMemoryPatch:
+def expand_working_memory_patch_refs(state: AnalysisState, value: str) -> WorkingMemoryPatch:
     """Resolve run-local relation refs and derive their grounding fields."""
 
     payload = json.loads(value)
@@ -108,9 +106,7 @@ def expand_working_memory_patch_refs(
             refs = upsert.pop(ref_field, None)
             if refs is None:
                 continue
-            if not isinstance(refs, list) or not all(
-                isinstance(item, str) for item in refs
-            ):
+            if not isinstance(refs, list) or not all(isinstance(item, str) for item in refs):
                 raise ValueError(f"{ref_field} must be a list of strings")
             unknown_refs = [item for item in refs if item not in relation_index]
             if unknown_refs:
@@ -119,9 +115,7 @@ def expand_working_memory_patch_refs(
             referenced_relations.extend(relations)
             existing_ids = upsert.get(id_field) or []
             upsert[id_field] = list(
-                dict.fromkeys(
-                    [*existing_ids, *(relation.relation_id for relation in relations)]
-                )
+                dict.fromkeys([*existing_ids, *(relation.relation_id for relation in relations)])
             )
 
         if referenced_relations:
@@ -161,6 +155,179 @@ def _semantic_memory(memory: AgentWorkingMemory) -> dict[str, Any]:
         hypothesis.pop("created_revision", None)
         hypothesis.pop("updated_revision", None)
     return payload
+
+
+@dataclass(frozen=True)
+class HypothesisReconciliationResult:
+    changed: bool
+    revision: int
+    ready_hypothesis_ids: tuple[str, ...] = ()
+    discarded_hypothesis_ids: tuple[str, ...] = ()
+
+
+def reconcile_working_memory(
+    state: AnalysisState,
+    frontiers: FrontierSearchResult,
+) -> HypothesisReconciliationResult:
+    """Reconcile durable hypotheses against the current canonical Frontier graph."""
+
+    memory = state.working_memory
+    if not memory.hypotheses:
+        return HypothesisReconciliationResult(changed=False, revision=memory.revision)
+
+    relation_by_id = {relation.relation_id: relation for relation in state.relations}
+    relation_by_ref = dict(indexed_relations(state))
+
+    def relation_ids(frontier) -> frozenset[str]:
+        return frozenset(
+            relation.relation_id
+            for reference in frontier.relation_refs
+            if (relation := relation_by_ref.get(reference)) is not None
+        )
+
+    ready_sets = [
+        relation_ids(frontier) for frontier in frontiers.frontiers if frontier.proposal_ready
+    ]
+    blocked_sets = [
+        relation_ids(frontier)
+        for frontier in frontiers.frontiers
+        if frontier.disposition is FrontierDisposition.BLOCKED
+    ]
+    viable_sets = [
+        relation_ids(frontier)
+        for frontier in frontiers.frontiers
+        if frontier.disposition is not FrontierDisposition.BLOCKED
+    ]
+
+    next_revision = memory.revision + 1
+    seen_grounding: set[tuple[str, ...]] = set()
+    reconciled: list[WorkingHypothesis] = []
+    ready_ids: list[str] = []
+    discarded_ids: list[str] = []
+    for hypothesis in memory.hypotheses:
+        payload = hypothesis.model_dump()
+        original_support = tuple(hypothesis.supporting_relation_ids)
+        support = tuple(item for item in original_support if item in relation_by_id)
+        contradictions = tuple(
+            item for item in hypothesis.contradicting_relation_ids if item in relation_by_id
+        )
+        support_set = frozenset(support)
+        grounding_key = tuple(sorted(support))
+        duplicate = bool(support) and grounding_key in seen_grounding
+        if support and hypothesis.status is not WorkingHypothesisStatus.DISCARDED:
+            seen_grounding.add(grounding_key)
+
+        status = hypothesis.status
+        decision_summary = hypothesis.decision_summary
+        clear_next_check = False
+        stale_grounding = len(support) != len(original_support)
+        hard_contradiction = any(
+            relation_by_id[item].verdict.value == "FALSE" for item in support
+        ) or any(relation_by_id[item].verdict.value == "TRUE" for item in contradictions)
+        support_has_evidence = any(relation_by_id[item].evidence_ids for item in support)
+        covered_by_ready = (
+            bool(support_set)
+            and support_has_evidence
+            and any(support_set <= candidate for candidate in ready_sets)
+        )
+        covered_by_block = bool(support_set) and any(
+            support_set <= candidate for candidate in blocked_sets
+        )
+        covered_by_viable = bool(support_set) and any(
+            support_set <= candidate for candidate in viable_sets
+        )
+
+        if hypothesis.status is not WorkingHypothesisStatus.DISCARDED:
+            if duplicate:
+                status = WorkingHypothesisStatus.DISCARDED
+                decision_summary = "Discarded automatically as duplicate grounded investigation."
+                clear_next_check = True
+            elif stale_grounding or hard_contradiction:
+                status = WorkingHypothesisStatus.DISCARDED
+                decision_summary = "Discarded automatically after canonical semantic recompute."
+                clear_next_check = True
+            elif covered_by_ready:
+                status = WorkingHypothesisStatus.READY_FOR_PROPOSAL
+                decision_summary = "Canonical Frontier now supports proposal review."
+                clear_next_check = True
+            elif covered_by_block and not covered_by_viable:
+                status = WorkingHypothesisStatus.DISCARDED
+                decision_summary = "Discarded automatically because its execution path is blocked."
+                clear_next_check = True
+            elif (
+                support_set
+                and frontiers.search_complete
+                and not frontiers.truncated
+                and not covered_by_viable
+            ):
+                status = WorkingHypothesisStatus.DISCARDED
+                decision_summary = "Discarded automatically because no viable Frontier retains it."
+                clear_next_check = True
+
+        referenced = [relation_by_id[item] for item in (*support, *contradictions)]
+        payload.update(
+            {
+                "status": status,
+                "supporting_relation_ids": list(support),
+                "contradicting_relation_ids": list(contradictions),
+                "evidence_ids": list(
+                    dict.fromkeys(
+                        evidence_id
+                        for relation in referenced
+                        for evidence_id in relation.evidence_ids
+                    )
+                ),
+                "missing_evidence": list(
+                    dict.fromkeys(
+                        missing
+                        for relation in referenced
+                        if relation.verdict.value == "UNKNOWN"
+                        for missing in relation.missing_evidence
+                    )
+                ),
+                "decision_summary": decision_summary,
+                "next_check": None if clear_next_check else hypothesis.next_check,
+            }
+        )
+        candidate = WorkingHypothesis.model_validate(payload)
+        if candidate.model_dump() != hypothesis.model_dump():
+            payload["updated_revision"] = next_revision
+            candidate = WorkingHypothesis.model_validate(payload)
+        reconciled.append(candidate)
+        if candidate.status is WorkingHypothesisStatus.READY_FOR_PROPOSAL:
+            ready_ids.append(candidate.hypothesis_id)
+        if candidate.status is WorkingHypothesisStatus.DISCARDED:
+            discarded_ids.append(candidate.hypothesis_id)
+
+    focus = memory.focus_hypothesis_id
+    if focus in discarded_ids:
+        focus = next(
+            (
+                item.hypothesis_id
+                for item in reconciled
+                if item.status is not WorkingHypothesisStatus.DISCARDED
+            ),
+            None,
+        )
+    candidate_memory = AgentWorkingMemory(
+        revision=next_revision,
+        focus_hypothesis_id=focus,
+        hypotheses=reconciled,
+    )
+    if _semantic_memory(candidate_memory) == _semantic_memory(memory):
+        return HypothesisReconciliationResult(
+            changed=False,
+            revision=memory.revision,
+            ready_hypothesis_ids=tuple(ready_ids),
+            discarded_hypothesis_ids=tuple(discarded_ids),
+        )
+    state.working_memory = candidate_memory
+    return HypothesisReconciliationResult(
+        changed=True,
+        revision=next_revision,
+        ready_hypothesis_ids=tuple(ready_ids),
+        discarded_hypothesis_ids=tuple(discarded_ids),
+    )
 
 
 def _merge_hypothesis(
@@ -236,20 +403,14 @@ def _validate_hypothesis(
     ]
     if false_support:
         errors.append(f"FALSE relations cannot support a hypothesis: {sorted(false_support)}")
-    overlap = set(hypothesis.supporting_relation_ids) & set(
-        hypothesis.contradicting_relation_ids
-    )
+    overlap = set(hypothesis.supporting_relation_ids) & set(hypothesis.contradicting_relation_ids)
     if overlap:
         errors.append(f"relations cannot both support and contradict: {sorted(overlap)}")
     referenced_relations = [
-        relation_index[relation_id]
-        for relation_id in relation_ids
-        if relation_id in relation_index
+        relation_index[relation_id] for relation_id in relation_ids if relation_id in relation_index
     ]
     required_evidence = {
-        evidence_id
-        for relation in referenced_relations
-        for evidence_id in relation.evidence_ids
+        evidence_id for relation in referenced_relations for evidence_id in relation.evidence_ids
     }
     omitted_evidence = required_evidence - set(hypothesis.evidence_ids)
     if omitted_evidence:
@@ -280,10 +441,7 @@ def _validate_hypothesis(
         and hypothesis.next_check.preferred_capability
         and hypothesis.next_check.preferred_capability not in allowed_capabilities
     ):
-        errors.append(
-            "unknown preferred capability: "
-            f"{hypothesis.next_check.preferred_capability}"
-        )
+        errors.append(f"unknown preferred capability: {hypothesis.next_check.preferred_capability}")
     return errors
 
 
@@ -318,9 +476,7 @@ def apply_working_memory_patch(
         if raw_upsert.hypothesis_id is None and raw_upsert.claim:
             generated_id = _hypothesis_id(state.repository.repository_id, raw_upsert.claim)
             if generated_id in hypotheses:
-                errors.append(
-                    f"hypothesis already exists; update by ID: {generated_id}"
-                )
+                errors.append(f"hypothesis already exists; update by ID: {generated_id}")
                 continue
         existing = hypotheses.get(raw_upsert.hypothesis_id or "")
         if raw_upsert.hypothesis_id and existing is None:

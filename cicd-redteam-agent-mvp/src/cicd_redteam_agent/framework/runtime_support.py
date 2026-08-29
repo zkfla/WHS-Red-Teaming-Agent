@@ -16,11 +16,13 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from cicd_redteam_agent.domain.investigation import RedTeamSession
 from cicd_redteam_agent.domain.models import AnalysisState
 
 CHECKPOINT_SCHEMA_VERSION = "2.0"
+INVESTIGATION_CHECKPOINT_SCHEMA_VERSION = "1.0"
 EVENT_SCHEMA_VERSION = "1.0"
-PROMPT_VERSION = "1.3"
+PROMPT_VERSION = "1.7"
 
 
 class RecoverableModelOutputError(RuntimeError):
@@ -38,6 +40,16 @@ class AgentRuntimeMetrics:
     last_capability: str | None = None
     last_error_type: str | None = None
     no_progress_rounds: int = 0
+    investigation_tasks_completed: int = 0
+    observations_committed: int = 0
+    semantic_refreshes: int = 0
+    frontier_searches: int = 0
+    external_network_requests: int = 0
+    external_cache_hits: int = 0
+    external_not_modified_hits: int = 0
+    external_rate_limit_errors: int = 0
+    external_retries: int = 0
+    external_rate_limit_remaining: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -338,6 +350,7 @@ class ResumeCheckpoint:
     attempt_id: int
     prompt_version: str
     config: dict[str, Any]
+    investigation_session: RedTeamSession | None = None
 
 
 def load_checkpoint(path: Path) -> ResumeCheckpoint:
@@ -349,17 +362,46 @@ def load_checkpoint(path: Path) -> ResumeCheckpoint:
         raise ValueError(f"checkpoint is not valid JSON: {path}") from exc
     if payload.get("schema_version") != CHECKPOINT_SCHEMA_VERSION:
         raise ValueError(
-            "checkpoint cannot be resumed because its schema is not 2.0; "
-            "start a new analysis run"
+            "checkpoint cannot be resumed because its schema is not 2.0; start a new analysis run"
         )
     runtime_payload = dict(payload.get("runtime_metrics", {}))
     metric_fields = AgentRuntimeMetrics.__dataclass_fields__
     runtime_metrics = AgentRuntimeMetrics(
         **{key: value for key, value in runtime_payload.items() if key in metric_fields}
     )
+    state = AnalysisState.model_validate(payload["state"])
+    config = dict(payload.get("config", {}))
+    raw_session = payload.get("investigation_session")
+    investigation_session = None
+    if raw_session is not None:
+        if not isinstance(raw_session, dict) or raw_session.get("schema_version") != (
+            INVESTIGATION_CHECKPOINT_SCHEMA_VERSION
+        ):
+            raise ValueError(
+                "checkpoint investigation session schema is unsupported; start a new analysis run"
+            )
+        investigation_session = RedTeamSession.model_validate(raw_session.get("session"))
+    if bool(config.get("observe_github", False)) and investigation_session is None:
+        raise ValueError(
+            "checkpoint enabled GitHub observation but has no investigation session; "
+            "start a new analysis run"
+        )
+    if investigation_session is not None and not bool(config.get("observe_github", False)):
+        raise ValueError(
+            "checkpoint contains an investigation session without GitHub observation enabled"
+        )
+    if investigation_session is not None:
+        if investigation_session.investigation_state.active_lease is not None:
+            raise ValueError("checkpoint contains an unsafe active investigation lease")
+        if investigation_session.analysis_state.model_dump(mode="json", by_alias=True) != (
+            state.model_dump(mode="json", by_alias=True)
+        ):
+            raise ValueError(
+                "checkpoint investigation session does not match the canonical analysis state"
+            )
     return ResumeCheckpoint(
         path=path,
-        state=AnalysisState.model_validate(payload["state"]),
+        state=state,
         provider=str(payload["provider"]),
         model=payload.get("model"),
         rounds=int(payload.get("rounds", 0)),
@@ -372,7 +414,8 @@ def load_checkpoint(path: Path) -> ResumeCheckpoint:
         committed_event_seq=int(payload.get("committed_event_seq", 0)),
         attempt_id=int(payload.get("attempt_id", 1)),
         prompt_version=str(payload.get("prompt_version", "")),
-        config=dict(payload.get("config", {})),
+        config=config,
+        investigation_session=investigation_session,
     )
 
 
@@ -381,9 +424,7 @@ def restore_limits(limits: Any, checkpoint: ResumeCheckpoint) -> None:
     limits._tokens = checkpoint.tokens
     limits._cost = checkpoint.cost
     limits._reason = None
-    limits._start_time = datetime.now() - timedelta(
-        seconds=checkpoint.active_duration_seconds
-    )
+    limits._start_time = datetime.now() - timedelta(seconds=checkpoint.active_duration_seconds)
 
 
 class RunLease:
@@ -477,6 +518,7 @@ class CheckpointWriter:
     journal: EventJournal | None = None
     attempt_id: int = 1
     config: dict[str, Any] | None = None
+    investigation_session: RedTeamSession | None = None
 
     def write(
         self,
@@ -487,6 +529,24 @@ class CheckpointWriter:
         reason: str,
         active_duration_seconds: float = 0.0,
     ) -> None:
+        observe_github = bool((self.config or {}).get("observe_github", False))
+        if observe_github and self.investigation_session is None:
+            raise ValueError("GitHub observation checkpoint requires an investigation session")
+        session_payload: dict[str, Any] | None = None
+        if self.investigation_session is not None:
+            if self.investigation_session.investigation_state.active_lease is not None:
+                raise ValueError("cannot checkpoint while an investigation task lease is active")
+            session_snapshot = self.investigation_session.model_copy(deep=True)
+            session_snapshot.analysis_state = AnalysisState.model_validate(
+                self.state.model_dump(mode="json", by_alias=True)
+            )
+            session_snapshot = RedTeamSession.model_validate(
+                session_snapshot.model_dump(mode="json", by_alias=True)
+            )
+            session_payload = {
+                "schema_version": INVESTIGATION_CHECKPOINT_SCHEMA_VERSION,
+                "session": session_snapshot.model_dump(mode="json", by_alias=True),
+            }
         next_checkpoint_count = self.metrics.checkpoints_written + 1
         runtime_metrics = self.metrics.to_dict()
         runtime_metrics["checkpoints_written"] = next_checkpoint_count
@@ -518,6 +578,7 @@ class CheckpointWriter:
                 "prompt_version": PROMPT_VERSION,
                 "config": _json_safe(self.config or {}),
                 "state": self.state.model_dump(mode="json", by_alias=True),
+                "investigation_session": session_payload,
             },
         )
         self.metrics.checkpoints_written = next_checkpoint_count

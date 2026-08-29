@@ -80,9 +80,7 @@ def _parse_decision_response(
     if tool_name not in capabilities:
         raise ValueError(f"Codex selected an unknown capability: {tool_name}")
     if not isinstance(arguments, dict):
-        raise RecoverableModelOutputError(
-            "Codex capability arguments were not a JSON object"
-        )
+        raise RecoverableModelOutputError("Codex capability arguments were not a JSON object")
     return tool_name, arguments, content
 
 
@@ -95,6 +93,7 @@ class CodexChatGPTLLM(LLM):
     state: AnalysisState
     objective: str | None = None
     objective_goal: dict[str, object] | None = None
+    investigation_policy: dict[str, object] | None = None
     _runtime: Codex | None = field(default=None, init=False, repr=False)
     _workspace: tempfile.TemporaryDirectory[str] | None = field(
         default=None, init=False, repr=False
@@ -128,15 +127,14 @@ class CodexChatGPTLLM(LLM):
             self._workspace.cleanup()
             self._workspace = None
 
-    def _build_prompt(
-        self, history: list[object], capabilities: dict[str, Capability]
-    ) -> str:
+    def _build_prompt(self, history: list[object], capabilities: dict[str, Capability]) -> str:
         tools = list(capabilities_to_tools(capabilities))
         decision_context = build_decision_context(
             history,
             self.state,
             objective=self.objective,
             objective_goal=self.objective_goal,
+            investigation_policy=self.investigation_policy,
         )
         return (
             "You are the reasoning backend inside one hackingBuddyGPT CI/CD security agent.\n"
@@ -230,7 +228,14 @@ class CodexChatGPTLLM(LLM):
         if isinstance(query, str):
             text = query
         elif isinstance(query, list):
-            text = json.dumps(build_decision_context(query, self.state), ensure_ascii=False)
+            text = json.dumps(
+                build_decision_context(
+                    query,
+                    self.state,
+                    investigation_policy=self.investigation_policy,
+                ),
+                ensure_ascii=False,
+            )
         else:
             text = render_to_text(query)
         return max(1, len(text.encode("utf-8")) // 4)

@@ -5,6 +5,7 @@ from cicd_redteam_agent.domain.models import (
     AnalysisState,
     CloudIdentityCandidate,
     Confidence,
+    OidcAuthenticationMode,
     PermissionLevel,
     TriState,
 )
@@ -37,6 +38,14 @@ def derive_identity_candidates(state: AnalysisState) -> list[CloudIdentityCandid
                 ):
                     continue
                 role_arn = step.with_.get("role-to-assume")
+                trust = next(
+                    (
+                        item
+                        for item in state.aws_oidc_trust_assessments
+                        if item.step_id == step.step_id
+                    ),
+                    None,
+                )
                 related = [a for a in assessments.values() if a.subject_id == step.step_id]
                 if not related:
                     related = [
@@ -64,9 +73,7 @@ def derive_identity_candidates(state: AnalysisState) -> list[CloudIdentityCandid
                         provider="aws",
                         identity_type="iam-role" if role_arn else "unknown-aws-identity",
                         mechanism=(
-                            "github-oidc"
-                            if oidc is TriState.TRUE
-                            else "static-or-unknown"
+                            trust.authentication_mode.value if trust else "static-or-unknown"
                         ),
                         repository_id=state.repository.repository_id,
                         workflow_id=workflow.workflow_id,
@@ -74,9 +81,30 @@ def derive_identity_candidates(state: AnalysisState) -> list[CloudIdentityCandid
                         identity_reference=str(role_arn) if role_arn else None,
                         role_arn=str(role_arn) if role_arn else None,
                         secret_reference_ids=secret_by_job.get(job.job_id, []),
-                        oidc_enabled=oidc,
+                        oidc_enabled=(
+                            TriState.TRUE
+                            if trust
+                            and trust.authentication_mode is OidcAuthenticationMode.GITHUB_OIDC
+                            else TriState.FALSE
+                            if trust
+                            and trust.authentication_mode is not OidcAuthenticationMode.UNKNOWN
+                            else oidc
+                        ),
                         attacker_control=control,
-                        trust_verified=TriState.UNKNOWN,
+                        trust_verified=trust.verdict if trust else TriState.UNKNOWN,
+                        trust_assessment_id=trust.assessment_id if trust else None,
+                        audience=trust.audience if trust else None,
+                        subject_claims=(
+                            sorted(
+                                {
+                                    item.subject
+                                    for item in trust.claim_candidates
+                                    if item.subject is not None
+                                }
+                            )
+                            if trust
+                            else []
+                        ),
                         evidence_ids=evidence_ids,
                         confidence=(
                             Confidence.MEDIUM
@@ -84,8 +112,13 @@ def derive_identity_candidates(state: AnalysisState) -> list[CloudIdentityCandid
                             else Confidence.LOW
                         ),
                         summary=(
-                            "Local workflow evidence identifies an AWS credential path. "
-                            "The IAM trust policy and AssumeRole success were not verified."
+                            "The AWS OIDC trust policy was evaluated statically; actual "
+                            "AssumeRoleWithWebIdentity success and role permissions remain "
+                            "unverified."
+                            if trust
+                            and trust.authentication_mode is OidcAuthenticationMode.GITHUB_OIDC
+                            else "Local workflow evidence identifies an AWS credential path that "
+                            "does not deterministically use GitHub OIDC."
                         ),
                     )
                 )

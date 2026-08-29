@@ -82,6 +82,24 @@ def _model_provider(model: str) -> ModelProvider | None:
     return MODEL_PREFIXES.get(prefix.lower()) if separator else None
 
 
+def resolve_github_observer_token(
+    env_file: Path | None,
+    *,
+    untrusted_repository_root: Path,
+) -> str | None:
+    """Load an operator-controlled GitHub token without trusting repository-local config."""
+
+    load_project_environment(
+        env_file,
+        untrusted_repository_root=untrusted_repository_root,
+    )
+    for variable in ("GH_TOKEN", "GITHUB_TOKEN"):
+        token = os.environ.get(variable, "").strip()
+        if token:
+            return token
+    return None
+
+
 def resolve_litellm_credential(
     provider: ModelProvider,
     model: str,

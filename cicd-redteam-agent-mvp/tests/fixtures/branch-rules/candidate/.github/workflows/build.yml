@@ -1,0 +1,13 @@
+name: Default branch push
+on:
+  push:
+    branches:
+      - main
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Run repository script
+        run: ./scripts/build.sh

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-RELATION_SEMANTICS_VERSION = "1.1"
+RELATION_SEMANTICS_VERSION = "1.4"
 
 
 @dataclass(frozen=True)
@@ -21,7 +21,10 @@ _SOURCE_RELATIONS = {
     "controls_step_execution_context": "repository_writer",
     "attacker_may_control_artifact_content": "artifact",
     "attacker_may_populate_cache": "cache",
-    "label_or_comment_controls_job_condition": "pull_request",
+    "attacker_can_satisfy_condition": "pull_request",
+    "attacker_selects_current_pull_request_head": "pull_request",
+    "attacker_selects_event_pull_request_head_sha": "pull_request",
+    "may_compromise_mutable_dependency": "external_dependency",
 }
 
 _MECHANISM_RELATIONS = {
@@ -52,6 +55,7 @@ _MECHANISM_RELATIONS = {
     "workspace_may_be_reused_by_privileged_job": ("self_hosted_runner",),
     "secret_flows_to_env": ("secret",),
     "secret_written_to_file": ("secret",),
+    "may_compromise_mutable_dependency": ("mutable_dependency",),
     "external_code_may_execute_in_step": ("mutable_dependency",),
     "mutable_reusable_workflow_may_execute_in_job": (
         "mutable_dependency",
@@ -59,6 +63,20 @@ _MECHANISM_RELATIONS = {
     ),
     "mutable_container_image_executes_in_job": ("mutable_dependency",),
     "mutable_install_source_executes_in_step": ("mutable_dependency",),
+    "workspace_revision_reaches_execution": ("revision_checkout",),
+    "runtime_event_exactly_bound_to_step": ("runtime_telemetry",),
+    "runtime_process_observed_in_step": ("runtime_telemetry",),
+    "runtime_process_made_external_network_call": ("runtime_telemetry", "network"),
+    "runtime_process_modified_workspace_file": ("runtime_telemetry", "file_change"),
+    "action_ref_resolves_to_commit": ("action_provenance",),
+    "action_reference_is_immutable": ("action_provenance",),
+    "known_action_advisory_affects_reference": ("mutable_dependency", "known_advisory"),
+    "secret_metadata_observed": ("secret_metadata",),
+    "secret_metadata_scope_unresolved": ("secret_metadata",),
+    "secret_rotation_policy_unknown": ("secret_metadata",),
+    "secret_rotation_age_exceeds_policy": ("secret_metadata", "rotation"),
+    "audit_window_observed_for_repository": ("audit",),
+    "audit_event_observed": ("audit",),
 }
 
 _SINK_RELATIONS = {
@@ -68,6 +86,7 @@ _SINK_RELATIONS = {
     "untrusted_value_interpreted_as_command": "privileged_execution",
     "untrusted_input_interpreted_by_github_script": "privileged_execution",
     "untrusted_input_selects_checkout_revision": "privileged_execution",
+    "workspace_revision_reaches_execution": "privileged_execution",
     "artifact_content_reaches_command_argument": "privileged_execution",
     "artifact_content_reaches_execution": "privileged_execution",
     "artifact_content_reaches_import": "privileged_execution",
@@ -98,6 +117,11 @@ _PLUMBING_RELATIONS = {
     "executes_with_github_token",
     "grants_effective_permission",
     "selects_pull_request_revision",
+    "selects_trusted_base_revision",
+    "selects_exact_commit_revision",
+    "selects_mutable_workspace_ref",
+    "selects_unknown_workspace_revision",
+    "step_selects_workspace_revision",
     "workflow_run_may_trigger",
     "reusable_workflow_permission_ceiling_applied",
     "artifact_verified_by_integrity_guard",

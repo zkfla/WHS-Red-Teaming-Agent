@@ -1,0 +1,27 @@
+name: P2 Cancellation Semantics
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  long:
+    name: Long running
+    runs-on: ubuntu-latest
+    steps:
+      - name: Wait for cancellation
+        run: sleep 180
+  on_cancel:
+    name: On cancel
+    needs: long
+    if: cancelled()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Cancelled body
+        run: echo cancelled-handler
+  always_after_cancel:
+    name: Always after cancel
+    needs: long
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Always body
+        run: echo always-after-cancel

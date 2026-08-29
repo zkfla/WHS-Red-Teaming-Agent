@@ -25,9 +25,7 @@ def _bounded_text(value: Any, limit: int) -> str:
     tail_size = limit - head_size
     omitted = len(text) - limit
     return (
-        f"{text[:head_size]}\n"
-        f"...[projection omitted {omitted} characters]...\n"
-        f"{text[-tail_size:]}"
+        f"{text[:head_size]}\n...[projection omitted {omitted} characters]...\n{text[-tail_size:]}"
     )
 
 
@@ -105,7 +103,11 @@ def _current_outputs(state: AnalysisState) -> dict[str, list[dict[str, Any]]]:
     }
 
 
-def build_analysis_state_projection(state: AnalysisState) -> dict[str, Any]:
+def build_analysis_state_projection(
+    state: AnalysisState,
+    *,
+    investigation_policy: dict[str, object] | None = None,
+) -> dict[str, Any]:
     repeated_total = sum(max(0, count - 1) for count in state.repeated_calls.values())
     return {
         "repository": {
@@ -135,6 +137,7 @@ def build_analysis_state_projection(state: AnalysisState) -> dict[str, Any]:
             "repeated_calls": repeated_total,
         },
         "working_memory": state.working_memory.model_dump(mode="json"),
+        "investigation_policy": investigation_policy,
         "current_outputs": _current_outputs(state),
     }
 
@@ -145,6 +148,7 @@ def build_decision_context(
     *,
     objective: str | None = None,
     objective_goal: dict[str, object] | None = None,
+    investigation_policy: dict[str, object] | None = None,
     recent_event_limit: int = RECENT_EVENT_LIMIT,
 ) -> dict[str, Any]:
     """Project canonical Agent state into a bounded, provider-neutral model input."""
@@ -168,7 +172,10 @@ def build_decision_context(
             _bounded_text(objective, INSTRUCTION_CHARACTER_LIMIT) if objective else None
         ),
         "objective_goal": objective_goal,
-        "analysis_state": build_analysis_state_projection(state),
+        "analysis_state": build_analysis_state_projection(
+            state,
+            investigation_policy=investigation_policy,
+        ),
         "recent_agent_events": [_project_message(message) for message in recent_messages],
         "omitted_earlier_events": max(0, len(non_system_messages) - len(recent_messages)),
         "recovery_guidance": (

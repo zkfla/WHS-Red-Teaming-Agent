@@ -15,9 +15,12 @@ from cicd_redteam_agent.application.report import write_report
 from cicd_redteam_agent.application.state import create_initial_state
 from cicd_redteam_agent.domain.attack_graph import compose_global_attack_paths
 from cicd_redteam_agent.domain.attacker_control import assess_attacker_control, derive_attack_paths
+from cicd_redteam_agent.domain.aws_oidc import derive_aws_oidc_trust_assessments
+from cicd_redteam_agent.domain.evidence_requirement import annotate_external_evidence_requirements
 from cicd_redteam_agent.domain.execution_semantics import derive_execution_semantics
 from cicd_redteam_agent.domain.github_actions_parser import discover_workflows, parse_workflow
 from cicd_redteam_agent.domain.identity_analysis import derive_identity_candidates
+from cicd_redteam_agent.domain.investigation import GitHubEventLocator
 from cicd_redteam_agent.domain.models import (
     AnalysisMode,
     AnalysisReport,
@@ -49,10 +52,23 @@ class AnalysisConfig:
     max_cost: float = 2.0
     max_duration: int = 900
     objective: str | None = None
+    observe_github: bool = False
+    observe_aws: bool = False
+    aws_profile: str | None = None
+    github_run_id: int | None = None
+    github_event_locator: GitHubEventLocator | None = None
 
     def __post_init__(self) -> None:
         if self.objective is not None:
             object.__setattr__(self, "objective", normalize_objective(self.objective))
+        if self.github_run_id is not None and self.github_run_id <= 0:
+            raise ValueError("github_run_id must be positive")
+        if self.github_event_locator is not None and self.github_run_id is None:
+            raise ValueError("github_event_locator requires github_run_id")
+        if self.observe_aws and not self.observe_github:
+            raise ValueError("observe_aws requires observe_github for exact GitHub OIDC claims")
+        if self.aws_profile is not None and not self.observe_aws:
+            raise ValueError("aws_profile requires observe_aws")
 
     @property
     def resolved_mode(self) -> AnalysisMode:
@@ -128,6 +144,15 @@ def _finalize_analysis(
         "objective": config.objective,
         "objective_hash": objective_hash(config.objective),
         "objective_goal": compile_objective_goal(config.objective).as_dict(),
+        "observe_github": config.observe_github,
+        "observe_aws": config.observe_aws,
+        "aws_profile": config.aws_profile,
+        "github_run_id": config.github_run_id,
+        "github_event_locator": (
+            config.github_event_locator.model_dump(mode="json")
+            if config.github_event_locator is not None
+            else None
+        ),
     }
     if runtime_metrics is not None:
         run_metadata["agent_runtime"] = runtime_metrics
@@ -156,14 +181,18 @@ async def analyze_repository(
     mode = config.resolved_mode
     if config.objective is not None and mode is AnalysisMode.DETERMINISTIC:
         raise ValueError("analysis objective requires reasoning mode")
+    if config.observe_github and mode is AnalysisMode.DETERMINISTIC:
+        raise ValueError("--observe-github requires reasoning mode")
+    if config.github_run_id is not None and not config.observe_github:
+        raise ValueError("--github-run-id requires --observe-github")
+    if config.github_event_locator is not None and not config.observe_github:
+        raise ValueError("GitHub event provenance requires --observe-github")
     if (
         mode is AnalysisMode.REASONING
         and not config.model
         and config.provider is not ModelProvider.CODEX_CHATGPT
     ):
-        raise ValueError(
-            "reasoning analysis requires --model or --provider codex-chatgpt"
-        )
+        raise ValueError("reasoning analysis requires --model or --provider codex-chatgpt")
     boundary = RepositoryBoundary(repo_path)
     state = create_initial_state(boundary)
     warnings: list[str] = []
@@ -217,9 +246,12 @@ async def analyze_repository(
         execution_semantics = derive_execution_semantics(state, config.attacker_profile)
         state.trigger_contexts = execution_semantics.trigger_contexts
         state.job_execution_contexts = execution_semantics.job_contexts
+        state.condition_evaluations = execution_semantics.condition_evaluations
         state.relations.extend(execution_semantics.relations)
+        state.aws_oidc_trust_assessments = derive_aws_oidc_trust_assessments(state)
         security_facts = derive_security_facts(state, config.attacker_profile)
         state.relations.extend(security_facts)
+        annotate_external_evidence_requirements(state)
         state.pending_questions = sorted(
             {
                 item
@@ -330,6 +362,17 @@ async def resume_analysis(
         max_cost=overrides.max_cost or float(saved["max_cost"]),
         max_duration=overrides.max_duration or int(saved["max_duration"]),
         objective=saved_objective,
+        observe_github=bool(saved.get("observe_github", False)),
+        observe_aws=bool(saved.get("observe_aws", False)),
+        aws_profile=(str(saved["aws_profile"]) if saved.get("aws_profile") else None),
+        github_run_id=(
+            int(saved["github_run_id"]) if saved.get("github_run_id") is not None else None
+        ),
+        github_event_locator=(
+            GitHubEventLocator.model_validate(saved["github_event_locator"])
+            if saved.get("github_event_locator") is not None
+            else None
+        ),
     )
     consumed = {
         "max_rounds": (config.max_rounds, checkpoint.rounds),
@@ -339,10 +382,12 @@ async def resume_analysis(
     }
     exhausted = [name for name, (maximum, used) in consumed.items() if maximum <= used]
     if exhausted:
-        raise ValueError(
-            "resume limits must exceed cumulative usage: " + ", ".join(exhausted)
-        )
-    if config.provider is ModelProvider.CODEX_CHATGPT and env_file is not None:
+        raise ValueError("resume limits must exceed cumulative usage: " + ", ".join(exhausted))
+    if (
+        config.provider is ModelProvider.CODEX_CHATGPT
+        and env_file is not None
+        and not config.observe_github
+    ):
         raise ValueError("--env-file is not used with the saved Codex login provider")
 
     boundary = RepositoryBoundary(checkpoint.state.repository.root)
@@ -371,8 +416,7 @@ async def resume_analysis(
         resume_checkpoint=checkpoint,
     )
     warnings = [
-        f"Resumed from checkpoint attempt {checkpoint.attempt_id} at round "
-        f"{checkpoint.rounds}."
+        f"Resumed from checkpoint attempt {checkpoint.attempt_id} at round {checkpoint.rounds}."
     ]
     warnings.extend(agent_result.warnings)
     return _finalize_analysis(

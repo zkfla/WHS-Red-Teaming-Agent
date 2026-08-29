@@ -1,18 +1,39 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import PurePosixPath
 
+from cicd_redteam_agent.domain.condition_semantics import (
+    ConditionRuntimeContext,
+    evaluate_condition,
+)
 from cicd_redteam_agent.domain.github_actions_parser import stable_id
+from cicd_redteam_agent.domain.investigation import (
+    EventPrincipalEvidence,
+    ForkPullRequestPolicyEvidence,
+    RepositoryActorPermissionEvidence,
+    RepositoryMetadataEvidence,
+    WorkflowRunEventLinkageEvidence,
+    WorkflowRunIdentityEvidence,
+    WorkflowRunJobEvidence,
+    WorkflowRunJobsEvidence,
+    WorkflowRunStatusEvidence,
+    WorkflowRunStepEvidence,
+)
 from cicd_redteam_agent.domain.models import (
     AnalysisState,
     AttackerProfile,
+    ConditionEvaluation,
     EffectivePermissionSet,
+    EventPrincipalRole,
+    ExecutionResult,
     Job,
     JobExecutionContext,
     PermissionLevel,
     Relation,
+    RepositoryWorkflowPermissionDefault,
+    Step,
     TriggerExecutionContext,
     TriState,
     Workflow,
@@ -49,6 +70,7 @@ CACHE_READ_ONLY_DEFAULT_BRANCH_EVENTS = {
 class ExecutionSemanticsResult:
     trigger_contexts: list[TriggerExecutionContext]
     job_contexts: list[JobExecutionContext]
+    condition_evaluations: list[ConditionEvaluation]
     relations: list[Relation]
 
 
@@ -61,6 +83,7 @@ def _relation(
     category: str,
     verdict: TriState = TriState.TRUE,
     missing_evidence: list[str] | None = None,
+    evidence_requirements=None,
 ) -> Relation:
     return Relation(
         source_id=source_id,
@@ -70,6 +93,7 @@ def _relation(
         category=category,
         verdict=verdict,
         missing_evidence=sorted(set(missing_evidence or [])),
+        evidence_requirements=list(evidence_requirements or []),
     )
 
 
@@ -87,12 +111,28 @@ def _permission_level(value: object) -> PermissionLevel:
 def _declared_permission_set(
     workflow_permissions: dict[str, str] | str | None,
     job_permissions: dict[str, str] | str | None,
+    repository_default: RepositoryWorkflowPermissionDefault | None = None,
 ) -> EffectivePermissionSet:
     declaration = job_permissions if job_permissions is not None else workflow_permissions
     provenance = ["job-permissions"] if job_permissions is not None else []
     if job_permissions is None and workflow_permissions is not None:
         provenance = ["workflow-permissions"]
     if declaration is None:
+        if repository_default is RepositoryWorkflowPermissionDefault.READ:
+            return EffectivePermissionSet(
+                levels={
+                    "contents": PermissionLevel.READ,
+                    "packages": PermissionLevel.READ,
+                },
+                default_level=PermissionLevel.NONE,
+                provenance=["repository-default-observed:read"],
+            )
+        if repository_default is RepositoryWorkflowPermissionDefault.WRITE:
+            return EffectivePermissionSet(
+                levels={"id-token": PermissionLevel.NONE},
+                default_level=PermissionLevel.WRITE,
+                provenance=["repository-default-observed:write"],
+            )
         return EffectivePermissionSet(
             default_level=PermissionLevel.UNKNOWN,
             provenance=["repository-default-unknown"],
@@ -150,9 +190,7 @@ def _cap_permission_set(
         },
         default_level=_cap_permission(requested.default_level, ceiling.default_level),
         provenance=[*requested.provenance, "reusable-caller-ceiling", *ceiling.provenance],
-        missing_evidence=sorted(
-            set(requested.missing_evidence + ceiling.missing_evidence)
-        ),
+        missing_evidence=sorted(set(requested.missing_evidence + ceiling.missing_evidence)),
     )
 
 
@@ -161,29 +199,62 @@ def _apply_event_permission_adjustment(
     *,
     event_name: str,
     profile: AttackerProfile,
+    fork_policy: ForkPullRequestPolicyEvidence | None = None,
 ) -> EffectivePermissionSet:
     if profile is not AttackerProfile.FORK_PR or event_name != "pull_request":
         return permission_set
 
-    def adjust(level: PermissionLevel) -> PermissionLevel:
-        if level is PermissionLevel.WRITE:
+    write_setting = (
+        fork_policy.send_write_tokens_to_workflows
+        if fork_policy is not None and fork_policy.private_repo_settings_applicable
+        else None
+    )
+
+    def adjust(scope: str, level: PermissionLevel) -> PermissionLevel:
+        if level is not PermissionLevel.WRITE:
+            return level
+        if scope == "id-token":
             return PermissionLevel.UNKNOWN
-        return level
+        if write_setting is True:
+            return PermissionLevel.WRITE
+        if write_setting is False:
+            return PermissionLevel.READ
+        return PermissionLevel.UNKNOWN
 
     missing = list(permission_set.missing_evidence)
     write_scopes = {
         scope
-        for scope, level in permission_set.levels.items()
-        if level is PermissionLevel.WRITE
+        for scope in SENSITIVE_PERMISSION_SCOPES
+        if permission_set.get(scope) is PermissionLevel.WRITE
     }
-    if permission_set.default_level is PermissionLevel.WRITE or (write_scopes - {"id-token"}):
+    if write_scopes - {"id-token"} and write_setting is None:
         missing.append("fork pull-request write-token repository setting")
-    if permission_set.default_level is PermissionLevel.WRITE or "id-token" in write_scopes:
+    if "id-token" in write_scopes:
         missing.append("fork pull-request OIDC token availability")
+    levels = {
+        scope: adjust(scope, level) for scope, level in permission_set.levels.items()
+    }
+    default_level = permission_set.default_level
+    if default_level is PermissionLevel.WRITE:
+        if write_setting is True:
+            default_level = PermissionLevel.WRITE
+        elif write_setting is False:
+            default_level = PermissionLevel.READ
+        else:
+            default_level = PermissionLevel.UNKNOWN
+    observed_provenance = (
+        [f"fork-write-token-observed:{str(write_setting).lower()}"]
+        if write_setting is not None
+        else []
+    )
     return EffectivePermissionSet(
-        levels={scope: adjust(level) for scope, level in permission_set.levels.items()},
-        default_level=adjust(permission_set.default_level),
-        provenance=[*permission_set.provenance, "fork-pull-request-adjustment"],
+        levels=levels,
+        default_level=default_level,
+        provenance=[
+            *permission_set.provenance,
+            "fork-pull-request-adjustment",
+            *observed_provenance,
+        ],
         missing_evidence=sorted(set(missing)),
     )
 
@@ -195,12 +266,19 @@ def resolve_effective_permissions(
     event_name: str,
     profile: AttackerProfile,
     caller_ceiling: EffectivePermissionSet | None = None,
+    repository_default: RepositoryWorkflowPermissionDefault | None = None,
+    fork_policy: ForkPullRequestPolicyEvidence | None = None,
 ) -> EffectivePermissionSet:
-    permissions = _declared_permission_set(workflow.permissions, job.permissions_declared)
+    permissions = _declared_permission_set(
+        workflow.permissions,
+        job.permissions_declared,
+        repository_default,
+    )
     permissions = _apply_event_permission_adjustment(
         permissions,
         event_name=event_name,
         profile=profile,
+        fork_policy=fork_policy,
     )
     if caller_ceiling is not None:
         permissions = _cap_permission_set(permissions, caller_ceiling)
@@ -278,75 +356,13 @@ def evaluate_job_condition(
     event_name: str,
     profile: AttackerProfile,
 ) -> TriState:
-    if condition is None:
-        return TriState.TRUE
-    expression = condition.strip()
-    if expression.startswith("${{") and expression.endswith("}}"):
-        expression = expression[3:-2].strip()
-    if expression.startswith("(") and expression.endswith(")"):
-        expression = expression[1:-1].strip()
-
-    or_parts = _split_top_level(expression, "||")
-    if len(or_parts) > 1:
-        result = TriState.FALSE
-        for part in or_parts:
-            result = _tri_or(
-                result,
-                evaluate_job_condition(part, event_name=event_name, profile=profile),
-            )
-        return result
-    and_parts = _split_top_level(expression, "&&")
-    if len(and_parts) > 1:
-        result = TriState.TRUE
-        for part in and_parts:
-            result = _tri_and(
-                result,
-                evaluate_job_condition(part, event_name=event_name, profile=profile),
-            )
-        return result
-    if expression.startswith("!") and not expression.startswith("!="):
-        inner = evaluate_job_condition(
-            expression[1:].strip(), event_name=event_name, profile=profile
-        )
-        if inner is TriState.TRUE:
-            return TriState.FALSE
-        if inner is TriState.FALSE:
-            return TriState.TRUE
-        return TriState.UNKNOWN
-
-    lowered = expression.casefold()
-    if lowered in {"true", "success()", "always()"}:
-        return TriState.TRUE
-    if lowered == "false":
-        return TriState.FALSE
-    if lowered in {"failure()", "cancelled()"}:
-        return TriState.UNKNOWN
-
-    event_match = re.fullmatch(
-        r"github\.event_name\s*(==|!=)\s*(['\"])([^'\"]+)\2",
-        expression,
-        flags=re.IGNORECASE,
-    )
-    if event_match:
-        equal = event_name == event_match.group(3)
-        return TriState.TRUE if (equal == (event_match.group(1) == "==")) else TriState.FALSE
-
-    fork_match = re.fullmatch(
-        r"github\.event\.pull_request\.head\.repo\.fork\s*(==|!=)\s*(true|false)",
-        expression,
-        flags=re.IGNORECASE,
-    )
-    if fork_match:
-        if event_name not in {"pull_request", "pull_request_target"}:
-            actual = False
-        elif profile is AttackerProfile.FORK_PR:
-            actual = True
-        else:
-            return TriState.UNKNOWN
-        expected = fork_match.group(2).casefold() == "true"
-        equal = actual == expected
-        return TriState.TRUE if (equal == (fork_match.group(1) == "==")) else TriState.FALSE
-    return TriState.UNKNOWN
+    return evaluate_condition(
+        condition,
+        target_id="compatibility-job",
+        target_kind="job",
+        trigger_context_id="compatibility-trigger",
+        context=ConditionRuntimeContext(event_name=event_name, profile=profile),
+    ).verdict
 
 
 def _checkout_step_targets_fork_pr(step) -> bool:
@@ -509,6 +525,39 @@ def _local_reusable_path(value: str | None) -> str | None:
     return str(PurePosixPath(value[2:]))
 
 
+def exact_push_branches(workflow: Workflow) -> tuple[str, ...]:
+    """Return exact push branch filters that can be checked with GitHub's branch rules REST API.
+
+    Wildcard/negated filters are intentionally excluded because the REST endpoint accepts only a
+    concrete branch name. A push workflow without an exact allowlist remains branch-rule agnostic:
+    a repository writer may choose another branch, so default-branch protection must not be treated
+    as a global blocker.
+    """
+
+    config = workflow.triggers.get("push")
+    if not isinstance(config, dict):
+        return ()
+    raw = config.get("branches")
+    if isinstance(raw, str):
+        values = [raw]
+    elif isinstance(raw, list):
+        values = [str(item) for item in raw]
+    else:
+        return ()
+    branches: list[str] = []
+    for value in values:
+        branch = value.strip()
+        if (
+            not branch
+            or "${{" in branch
+            or branch.startswith("!")
+            or any(character in branch for character in "*?[")
+        ):
+            return ()
+        branches.append(branch)
+    return tuple(dict.fromkeys(branches))
+
+
 def _workflow_run_names(workflow: Workflow) -> set[str]:
     config = workflow.triggers.get("workflow_run")
     if not isinstance(config, dict):
@@ -525,6 +574,7 @@ def _trigger_context(
     event_name: str,
     activation_type: str,
     profile: AttackerProfile,
+    fork_policy: ForkPullRequestPolicyEvidence | None = None,
     attacker_can_trigger: TriState | None = None,
     payload_control: TriState | None = None,
     workflow_revision_trusted: TriState | None = None,
@@ -533,6 +583,17 @@ def _trigger_context(
     missing_evidence: list[str] | None = None,
 ) -> TriggerExecutionContext:
     root = _root_trigger_semantics(event_name, profile)
+    root_trigger = root[0]
+    root_missing = list(root[3])
+    if (
+        profile is AttackerProfile.FORK_PR
+        and event_name == "pull_request"
+        and fork_policy is not None
+        and fork_policy.private_repo_settings_applicable
+        and fork_policy.run_workflows_from_fork_pull_requests is False
+    ):
+        root_trigger = TriState.FALSE
+        root_missing = []
     return TriggerExecutionContext(
         context_id=stable_id(
             "trigger-context",
@@ -544,14 +605,182 @@ def _trigger_context(
         workflow_id=workflow.workflow_id,
         event_name=event_name,
         activation_type=activation_type,
-        attacker_can_trigger=attacker_can_trigger or root[0],
+        attacker_can_trigger=attacker_can_trigger or root_trigger,
         event_payload_attacker_controlled=payload_control or root[1],
         workflow_revision_trusted=workflow_revision_trusted or root[2],
         caller_job_context_id=caller_job_context_id,
         call_depth=call_depth,
         evidence_ids=workflow.evidence_ids,
-        missing_evidence=sorted(set((missing_evidence or []) + root[3])),
+        missing_evidence=sorted(set((missing_evidence or []) + root_missing)),
     )
+
+
+def _execution_result(value: str | None) -> ExecutionResult:
+    if value is None:
+        return ExecutionResult.UNKNOWN
+    try:
+        return ExecutionResult(value.strip().casefold())
+    except ValueError:
+        return ExecutionResult.UNKNOWN
+
+
+def _normalized_workflow_path(value: str) -> str:
+    return value.replace("\\", "/").removeprefix("./")
+
+
+def _runtime_workflow(
+    state: AnalysisState,
+    workflow_run_identity: WorkflowRunIdentityEvidence | None,
+) -> Workflow | None:
+    if workflow_run_identity is None or not workflow_run_identity.workflow_path:
+        return None
+    expected = _normalized_workflow_path(workflow_run_identity.workflow_path)
+    matches = [
+        workflow
+        for workflow in state.workflows
+        if _normalized_workflow_path(workflow.path) == expected
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _runtime_job_results(
+    state: AnalysisState,
+    workflow_run_jobs: WorkflowRunJobsEvidence | None,
+    workflow_run_identity: WorkflowRunIdentityEvidence | None,
+) -> dict[str, WorkflowRunJobEvidence]:
+    runtime_workflow = _runtime_workflow(state, workflow_run_identity)
+    if workflow_run_jobs is None or runtime_workflow is None:
+        return {}
+    static_by_name: dict[str, list[Job]] = {}
+    for workflow in (runtime_workflow,):
+        for job in workflow.jobs:
+            raw_name = job.name if job.name is not None else job.job_key
+            if not isinstance(raw_name, str):
+                continue
+            name = raw_name.strip()
+            if not name or "${{" in name:
+                continue
+            static_by_name.setdefault(name, []).append(job)
+    runtime_by_name: dict[str, list[WorkflowRunJobEvidence]] = {}
+    for runtime_job in workflow_run_jobs.jobs:
+        runtime_by_name.setdefault(runtime_job.name, []).append(runtime_job)
+    return {
+        jobs[0].job_id: runtime_by_name[name][0]
+        for name, jobs in static_by_name.items()
+        if len(jobs) == 1 and len(runtime_by_name.get(name, ())) == 1
+    }
+
+
+def _job_status_context(
+    job: Job,
+    jobs_by_key: dict[str, Job],
+    results_by_key: dict[str, ExecutionResult],
+) -> tuple[TriState, TriState, TriState, TriState, dict[str, ExecutionResult]]:
+    direct_results: dict[str, ExecutionResult] = {}
+    unresolved = False
+    for need in job.needs:
+        key = need.casefold()
+        if key not in jobs_by_key:
+            unresolved = True
+            direct_results[key] = ExecutionResult.UNKNOWN
+        else:
+            direct_results[key] = results_by_key.get(key, ExecutionResult.UNKNOWN)
+
+    ancestor_keys: set[str] = set()
+    visiting: set[str] = set()
+    cycle = False
+
+    def visit(key: str) -> None:
+        nonlocal cycle
+        if key in ancestor_keys:
+            return
+        if key in visiting:
+            cycle = True
+            return
+        dependency = jobs_by_key.get(key)
+        if dependency is None:
+            return
+        visiting.add(key)
+        ancestor_keys.add(key)
+        for parent in dependency.needs:
+            visit(parent.casefold())
+        visiting.remove(key)
+
+    for need in job.needs:
+        visit(need.casefold())
+    ancestor_results = [results_by_key.get(key, ExecutionResult.UNKNOWN) for key in ancestor_keys]
+    dependency_gate = TriState.UNKNOWN if unresolved or cycle else TriState.TRUE
+    if not ancestor_results:
+        return (
+            dependency_gate,
+            TriState.TRUE,
+            TriState.FALSE,
+            TriState.FALSE,
+            direct_results,
+        )
+    if any(result is ExecutionResult.FAILURE for result in ancestor_results):
+        failure = TriState.TRUE
+    elif any(result is ExecutionResult.UNKNOWN for result in ancestor_results):
+        failure = TriState.UNKNOWN
+    else:
+        failure = TriState.FALSE
+    if any(result is ExecutionResult.CANCELLED for result in ancestor_results):
+        cancelled = TriState.TRUE
+    elif any(result is ExecutionResult.UNKNOWN for result in ancestor_results):
+        cancelled = TriState.UNKNOWN
+    else:
+        cancelled = TriState.FALSE
+    if all(result is ExecutionResult.SUCCESS for result in ancestor_results):
+        success = TriState.TRUE
+    elif any(result is ExecutionResult.UNKNOWN for result in ancestor_results):
+        success = TriState.UNKNOWN
+    else:
+        success = TriState.FALSE
+    return dependency_gate, success, failure, cancelled, direct_results
+
+
+def _runtime_step_matches(
+    job: Job,
+    runtime_job: WorkflowRunJobEvidence | None,
+) -> dict[str, WorkflowRunStepEvidence]:
+    if runtime_job is None:
+        return {}
+    static_by_name: dict[str, list[Step]] = {}
+    for step in job.steps:
+        if not isinstance(step.name, str):
+            continue
+        name = step.name.strip()
+        if not name or "${{" in name:
+            continue
+        static_by_name.setdefault(name, []).append(step)
+    runtime_by_name: dict[str, list[WorkflowRunStepEvidence]] = {}
+    for runtime_step in runtime_job.steps:
+        runtime_by_name.setdefault(runtime_step.name, []).append(runtime_step)
+    return {
+        steps[0].step_id: runtime_by_name[name][0]
+        for name, steps in static_by_name.items()
+        if len(steps) == 1 and len(runtime_by_name.get(name, ())) == 1
+    }
+
+
+def _step_runtime_results(
+    step: Step,
+    runtime_step: WorkflowRunStepEvidence | None,
+    reachable: TriState,
+) -> tuple[ExecutionResult, ExecutionResult]:
+    if runtime_step is not None and runtime_step.status.casefold() == "completed":
+        conclusion = _execution_result(runtime_step.conclusion)
+        if step.continue_on_error in {None, False}:
+            return conclusion, conclusion
+        if step.continue_on_error is True:
+            if conclusion in {ExecutionResult.CANCELLED, ExecutionResult.SKIPPED}:
+                return conclusion, conclusion
+            if conclusion is ExecutionResult.SUCCESS:
+                return ExecutionResult.UNKNOWN, conclusion
+        return ExecutionResult.UNKNOWN, conclusion
+    if reachable is TriState.FALSE:
+        return ExecutionResult.SKIPPED, ExecutionResult.SKIPPED
+    return ExecutionResult.UNKNOWN, ExecutionResult.UNKNOWN
 
 
 def _job_context(
@@ -562,16 +791,26 @@ def _job_context(
     profile: AttackerProfile,
     *,
     caller_ceiling: EffectivePermissionSet | None = None,
+    repository_default: RepositoryWorkflowPermissionDefault | None = None,
+    fork_policy: ForkPullRequestPolicyEvidence | None = None,
+    condition_runtime: ConditionRuntimeContext,
+    condition_evaluations: list[ConditionEvaluation],
+    dependency_gate: TriState = TriState.TRUE,
+    runtime_result: ExecutionResult = ExecutionResult.UNKNOWN,
 ) -> JobExecutionContext:
-    condition = evaluate_job_condition(
+    condition_evaluation = evaluate_condition(
         job.condition,
-        event_name=trigger.event_name,
-        profile=profile,
+        target_id=job.job_id,
+        target_kind="job",
+        trigger_context_id=trigger.context_id,
+        context=condition_runtime,
     )
-    # Reachability answers whether this configured execution may run. Attacker triggerability is a
-    # separate trust property: persistence/cross-workflow paths can reach a privileged job even when
-    # the attacker cannot directly dispatch that job.
-    reachable = condition
+    condition_evaluations.append(condition_evaluation)
+    condition = condition_evaluation.verdict
+    # Reachability answers whether this configured execution may run. Dependency eligibility and
+    # expression truth remain separate so status-check functions can bypass the implicit success
+    # gate without bypassing an invalid/unresolved dependency graph.
+    reachable = _tri_and(dependency_gate, condition)
     attacker_code, assessment_evidence, assessment_missing = _assessment_verdict(state, job)
     attacker_code = _tri_and(trigger.attacker_can_trigger, _tri_and(reachable, attacker_code))
     permissions = resolve_effective_permissions(
@@ -580,10 +819,14 @@ def _job_context(
         event_name=trigger.event_name,
         profile=profile,
         caller_ceiling=caller_ceiling,
+        repository_default=repository_default,
+        fork_policy=fork_policy,
     )
     missing = list(trigger.missing_evidence)
+    if dependency_gate is TriState.UNKNOWN:
+        missing.append("workflow job dependency graph")
     if condition is TriState.UNKNOWN:
-        missing.append("job condition result")
+        missing.extend(condition_evaluation.missing_evidence or ["job condition result"])
     missing.extend(assessment_missing)
     missing.extend(permissions.missing_evidence)
     return JobExecutionContext(
@@ -592,8 +835,17 @@ def _job_context(
         workflow_id=workflow.workflow_id,
         job_id=job.job_id,
         reachable=reachable,
+        dependency_gate=dependency_gate,
+        predicted_result=(
+            runtime_result
+            if runtime_result is not ExecutionResult.UNKNOWN
+            else ExecutionResult.SKIPPED
+            if reachable is TriState.FALSE
+            else ExecutionResult.UNKNOWN
+        ),
         effective_permissions=permissions,
         attacker_code_execution=attacker_code,
+        condition_evaluation_id=condition_evaluation.evaluation_id,
         evidence_ids=sorted(set(trigger.evidence_ids + job.evidence_ids + assessment_evidence)),
         missing_evidence=sorted(set(missing)),
     )
@@ -618,7 +870,15 @@ def _semantic_relations_for_context(
     job: Job,
     job_context: JobExecutionContext,
     profile: AttackerProfile,
+    condition_runtime: ConditionRuntimeContext,
+    condition_evaluations: list[ConditionEvaluation],
+    runtime_job: WorkflowRunJobEvidence | None = None,
 ) -> list[Relation]:
+    job_condition = next(
+        item
+        for item in reversed(condition_evaluations)
+        if item.target_id == job.job_id and item.trigger_context_id == trigger.context_id
+    )
     attacker_id = f"attacker:{profile.value}"
     relations = [
         _relation(
@@ -645,6 +905,7 @@ def _semantic_relations_for_context(
             category="execution",
             verdict=job_context.reachable,
             missing_evidence=job_context.missing_evidence,
+            evidence_requirements=job_condition.evidence_requirements,
         ),
         _relation(
             job_context.context_id,
@@ -654,6 +915,7 @@ def _semantic_relations_for_context(
             category="context",
             verdict=job_context.reachable,
             missing_evidence=job_context.missing_evidence,
+            evidence_requirements=job_condition.evidence_requirements,
         ),
     ]
     token_id = f"credential:github-token:{job_context.context_id}"
@@ -693,19 +955,64 @@ def _semantic_relations_for_context(
             )
         )
 
+    runtime_steps = _runtime_step_matches(job, runtime_job)
+    prior_step_results: dict[str, tuple[ExecutionResult, ExecutionResult]] = {}
+    current_job_result = (
+        ExecutionResult.SKIPPED
+        if job_context.reachable is TriState.FALSE
+        else ExecutionResult.SUCCESS
+    )
+    implicit_step_gate = (
+        TriState.FALSE if job_context.reachable is TriState.FALSE else TriState.TRUE
+    )
+
     for step in job.steps:
         execution_id = stable_id("step-execution", job_context.context_id, step.step_id)
-        step_condition = evaluate_job_condition(
-            step.condition,
-            event_name=trigger.event_name,
-            profile=profile,
+        status_success = (
+            TriState.TRUE
+            if current_job_result is ExecutionResult.SUCCESS
+            else TriState.FALSE
+            if current_job_result
+            in {ExecutionResult.FAILURE, ExecutionResult.CANCELLED, ExecutionResult.SKIPPED}
+            else TriState.UNKNOWN
         )
+        status_failure = (
+            TriState.TRUE
+            if current_job_result is ExecutionResult.FAILURE
+            else TriState.FALSE
+            if current_job_result is not ExecutionResult.UNKNOWN
+            else TriState.UNKNOWN
+        )
+        status_cancelled = (
+            TriState.TRUE
+            if current_job_result is ExecutionResult.CANCELLED
+            else TriState.FALSE
+            if current_job_result is not ExecutionResult.UNKNOWN
+            else TriState.UNKNOWN
+        )
+        step_runtime = replace(
+            condition_runtime,
+            implicit_success_gate=implicit_step_gate,
+            status_success=status_success,
+            status_failure=status_failure,
+            status_cancelled=status_cancelled,
+            step_results=dict(prior_step_results),
+        )
+        step_evaluation = evaluate_condition(
+            step.condition,
+            target_id=step.step_id,
+            target_kind="step",
+            trigger_context_id=trigger.context_id,
+            context=step_runtime,
+        )
+        condition_evaluations.append(step_evaluation)
+        step_condition = step_evaluation.verdict
         step_reachable = _tri_and(job_context.reachable, step_condition)
         step_missing = list(job_context.missing_evidence)
         if step_condition is TriState.UNKNOWN:
-            step_missing.append("step condition result")
-        assessment_verdict, assessment_evidence, assessment_missing = (
-            _subject_assessment_verdict(state, step.step_id)
+            step_missing.extend(step_evaluation.missing_evidence or ["step condition result"])
+        assessment_verdict, assessment_evidence, assessment_missing = _subject_assessment_verdict(
+            state, step.step_id
         )
         controlled_execution = _tri_and(
             trigger.attacker_can_trigger,
@@ -721,6 +1028,7 @@ def _semantic_relations_for_context(
                 category="execution",
                 verdict=step_reachable,
                 missing_evidence=step_missing,
+                evidence_requirements=step_evaluation.evidence_requirements,
             )
         )
         relations.append(
@@ -732,6 +1040,7 @@ def _semantic_relations_for_context(
                 category="context",
                 verdict=step_reachable,
                 missing_evidence=step_missing,
+                evidence_requirements=step_evaluation.evidence_requirements,
             )
         )
         relations.append(
@@ -777,23 +1086,58 @@ def _semantic_relations_for_context(
                     step.evidence_ids + job_context.evidence_ids,
                     category="credential",
                     verdict=effective_write,
-                    missing_evidence=sorted(
-                        set(step_missing + write_token_missing)
-                    ),
+                    missing_evidence=sorted(set(step_missing + write_token_missing)),
                 )
             )
+
+        outcome, conclusion = _step_runtime_results(
+            step,
+            runtime_steps.get(step.step_id),
+            step_reachable,
+        )
+        if step.step_key:
+            prior_step_results[step.step_key.casefold()] = (outcome, conclusion)
+        if conclusion is ExecutionResult.FAILURE:
+            current_job_result = ExecutionResult.FAILURE
+            implicit_step_gate = TriState.FALSE
+        elif conclusion is ExecutionResult.CANCELLED:
+            current_job_result = ExecutionResult.CANCELLED
+            implicit_step_gate = TriState.FALSE
+        elif conclusion is ExecutionResult.UNKNOWN:
+            current_job_result = ExecutionResult.UNKNOWN
+        elif conclusion is ExecutionResult.SUCCESS:
+            if current_job_result is ExecutionResult.SUCCESS:
+                current_job_result = ExecutionResult.SUCCESS
+        # SKIPPED does not alter the current job result.
     return relations
 
 
 def derive_execution_semantics(
     state: AnalysisState,
     profile: AttackerProfile,
+    *,
+    repository_default: RepositoryWorkflowPermissionDefault | None = None,
+    repository_metadata: RepositoryMetadataEvidence | None = None,
+    fork_policy: ForkPullRequestPolicyEvidence | None = None,
+    workflow_run_identity: WorkflowRunIdentityEvidence | None = None,
+    actor_permissions: dict[str, RepositoryActorPermissionEvidence] | None = None,
+    event_linkage: WorkflowRunEventLinkageEvidence | None = None,
+    event_principals: dict[EventPrincipalRole, EventPrincipalEvidence] | None = None,
+    workflow_run_jobs: WorkflowRunJobsEvidence | None = None,
+    workflow_run_status: WorkflowRunStatusEvidence | None = None,
+    github_run_id: int | None = None,
 ) -> ExecutionSemanticsResult:
     workflows_by_id = {workflow.workflow_id: workflow for workflow in state.workflows}
     workflows_by_path = {workflow.path: workflow for workflow in state.workflows}
     trigger_contexts: dict[str, TriggerExecutionContext] = {}
     job_contexts: dict[str, JobExecutionContext] = {}
+    condition_evaluations: list[ConditionEvaluation] = []
     relations: dict[tuple[str, str, str], Relation] = {}
+    runtime_jobs_by_static_id = _runtime_job_results(
+        state,
+        workflow_run_jobs,
+        workflow_run_identity,
+    )
 
     def add_relation(relation: Relation) -> None:
         key = (relation.source_id, relation.relation_type, relation.target_id)
@@ -804,6 +1148,16 @@ def derive_execution_semantics(
         existing.evidence_ids = sorted(set(existing.evidence_ids + relation.evidence_ids))
         existing.missing_evidence = sorted(
             set(existing.missing_evidence + relation.missing_evidence)
+        )
+        existing.evidence_requirements = sorted(
+            {
+                (item.kind, item.provider, item.subject_id, item.qualifier): item
+                for item in [
+                    *existing.evidence_requirements,
+                    *relation.evidence_requirements,
+                ]
+            }.values(),
+            key=lambda item: (item.kind.value, item.subject_id, item.qualifier or ""),
         )
         if relation.verdict is TriState.TRUE:
             existing.verdict = TriState.TRUE
@@ -821,6 +1175,7 @@ def derive_execution_semantics(
                 event_name=event_name,
                 activation_type=event_name,
                 profile=profile,
+                fork_policy=fork_policy,
             )
             trigger_contexts[context.context_id] = context
             queue.append((context, None))
@@ -884,18 +1239,89 @@ def derive_execution_semantics(
             continue
         processed_triggers.add(trigger.context_id)
         workflow = workflows_by_id[trigger.workflow_id]
-        for job in workflow.jobs:
+        condition_runtime = ConditionRuntimeContext(
+            event_name=trigger.event_name,
+            profile=profile,
+            repository_full_name=(
+                f"{repository_metadata.owner}/{repository_metadata.repository}"
+                if repository_metadata
+                else None
+            ),
+            repository_owner=(repository_metadata.owner if repository_metadata else None),
+            default_branch=(repository_metadata.default_branch if repository_metadata else None),
+            trigger_config=workflow.triggers,
+            repository_id=state.repository.repository_id,
+            github_run_id=github_run_id,
+            actor_login=(workflow_run_identity.actor_login if workflow_run_identity else None),
+            actor_id=(workflow_run_identity.actor_id if workflow_run_identity else None),
+            triggering_actor_login=(
+                workflow_run_identity.triggering_actor_login
+                if workflow_run_identity
+                else None
+            ),
+            triggering_actor_id=(
+                workflow_run_identity.triggering_actor_id
+                if workflow_run_identity
+                else None
+            ),
+            run_event_name=(
+                workflow_run_identity.event_name if workflow_run_identity else None
+            ),
+            actor_permissions={
+                login.casefold(): (evidence.permission, evidence.actor_id)
+                for login, evidence in (actor_permissions or {}).items()
+            },
+            event_linkage=(
+                event_linkage
+                if event_linkage is not None
+                and event_linkage.event_name.casefold() == trigger.event_name.casefold()
+                else None
+            ),
+            event_principals=(
+                {
+                    role: evidence
+                    for role, evidence in (event_principals or {}).items()
+                    if evidence.event_name.casefold() == trigger.event_name.casefold()
+                }
+                if event_linkage is not None
+                and event_linkage.event_name.casefold() == trigger.event_name.casefold()
+                else {}
+            ),
+        )
+        jobs_by_key = {
+            job.job_key.casefold(): job
+            for job in workflow.jobs
+            if isinstance(job.job_key, str) and job.job_key.strip()
+        }
+        results_by_key: dict[str, ExecutionResult] = {}
+
+        def materialize_job(
+            job: Job,
+            *,
+            active_workflow: Workflow,
+            active_trigger: TriggerExecutionContext,
+            active_caller_ceiling: EffectivePermissionSet | None,
+            job_condition_runtime: ConditionRuntimeContext,
+            dependency_gate: TriState,
+            runtime_result: ExecutionResult,
+        ) -> JobExecutionContext:
             context = _job_context(
                 state,
-                workflow,
+                active_workflow,
                 job,
-                trigger,
+                active_trigger,
                 profile,
-                caller_ceiling=caller_ceiling,
+                caller_ceiling=active_caller_ceiling,
+                repository_default=repository_default,
+                fork_policy=fork_policy,
+                condition_runtime=job_condition_runtime,
+                condition_evaluations=condition_evaluations,
+                dependency_gate=dependency_gate,
+                runtime_result=runtime_result,
             )
             job_contexts[context.context_id] = context
-            if trigger.caller_job_context_id is not None:
-                caller_context = job_contexts.get(trigger.caller_job_context_id)
+            if active_trigger.caller_job_context_id is not None:
+                caller_context = job_contexts.get(active_trigger.caller_job_context_id)
                 if caller_context is not None:
                     add_relation(
                         _relation(
@@ -907,32 +1333,43 @@ def derive_execution_semantics(
                         )
                     )
             for relation in _semantic_relations_for_context(
-                state, trigger, workflow, job, context, profile
+                state,
+                active_trigger,
+                active_workflow,
+                job,
+                context,
+                profile,
+                job_condition_runtime,
+                condition_evaluations,
+                runtime_job=runtime_jobs_by_static_id.get(job.job_id),
             ):
                 add_relation(relation)
 
             reusable_path = _local_reusable_path(job.uses)
-            if reusable_path is None or trigger.call_depth >= MAX_REUSABLE_DEPTH - 1:
-                continue
+            if reusable_path is None or active_trigger.call_depth >= MAX_REUSABLE_DEPTH - 1:
+                return context
             callee = workflows_by_path.get(reusable_path)
             if callee is None or "workflow_call" not in callee.triggers:
-                continue
+                return context
             if any(
                 existing.workflow_id == callee.workflow_id
                 and existing.caller_job_context_id == context.context_id
                 for existing in trigger_contexts.values()
             ):
-                continue
+                return context
             callee_trigger = _trigger_context(
                 callee,
-                event_name=trigger.event_name,
+                event_name=active_trigger.event_name,
                 activation_type="workflow_call",
                 profile=profile,
-                attacker_can_trigger=_tri_and(trigger.attacker_can_trigger, context.reachable),
-                payload_control=trigger.event_payload_attacker_controlled,
+                attacker_can_trigger=_tri_and(
+                    active_trigger.attacker_can_trigger,
+                    context.reachable,
+                ),
+                payload_control=active_trigger.event_payload_attacker_controlled,
                 workflow_revision_trusted=TriState.TRUE,
                 caller_job_context_id=context.context_id,
-                call_depth=trigger.call_depth + 1,
+                call_depth=active_trigger.call_depth + 1,
                 missing_evidence=context.missing_evidence,
             )
             trigger_contexts[callee_trigger.context_id] = callee_trigger
@@ -948,9 +1385,89 @@ def derive_execution_semantics(
                 )
             )
             queue.append((callee_trigger, context.effective_permissions))
+            return context
+
+        pending = list(workflow.jobs)
+        while pending:
+            progressed = False
+            for job in list(pending):
+                waiting = [
+                    need.casefold()
+                    for need in job.needs
+                    if need.casefold() in jobs_by_key and need.casefold() not in results_by_key
+                ]
+                if waiting:
+                    continue
+                dependency_gate, success, failure, cancelled, direct_results = _job_status_context(
+                    job,
+                    jobs_by_key,
+                    results_by_key,
+                )
+                runtime_job = runtime_jobs_by_static_id.get(job.job_id)
+                runtime_result = (
+                    _execution_result(runtime_job.conclusion)
+                    if runtime_job is not None and runtime_job.status.casefold() == "completed"
+                    else ExecutionResult.UNKNOWN
+                )
+                job_runtime = replace(
+                    condition_runtime,
+                    implicit_success_gate=success,
+                    status_success=success,
+                    status_failure=failure,
+                    status_cancelled=cancelled,
+                    needs_results=direct_results,
+                )
+                context = materialize_job(
+                    job,
+                    active_workflow=workflow,
+                    active_trigger=trigger,
+                    active_caller_ceiling=caller_ceiling,
+                    job_condition_runtime=job_runtime,
+                    dependency_gate=dependency_gate,
+                    runtime_result=runtime_result,
+                )
+                if job.job_key:
+                    results_by_key[job.job_key.casefold()] = context.predicted_result
+                pending.remove(job)
+                progressed = True
+            if progressed:
+                continue
+
+            # Cycles or unresolved dependency ordering are not guessed. Materialize the
+            # remaining jobs with an UNKNOWN dependency gate so downstream Frontiers preserve
+            # missing evidence.
+            for job in list(pending):
+                direct_results = {
+                    need.casefold(): results_by_key.get(
+                        need.casefold(), ExecutionResult.UNKNOWN
+                    )
+                    for need in job.needs
+                }
+                job_runtime = replace(
+                    condition_runtime,
+                    implicit_success_gate=TriState.UNKNOWN,
+                    status_success=TriState.UNKNOWN,
+                    status_failure=TriState.UNKNOWN,
+                    status_cancelled=TriState.UNKNOWN,
+                    needs_results=direct_results,
+                )
+                context = materialize_job(
+                    job,
+                    active_workflow=workflow,
+                    active_trigger=trigger,
+                    active_caller_ceiling=caller_ceiling,
+                    job_condition_runtime=job_runtime,
+                    dependency_gate=TriState.UNKNOWN,
+                    runtime_result=ExecutionResult.UNKNOWN,
+                )
+                if job.job_key:
+                    results_by_key[job.job_key.casefold()] = context.predicted_result
+                pending.remove(job)
+            break
 
     return ExecutionSemanticsResult(
         trigger_contexts=list(trigger_contexts.values()),
         job_contexts=list(job_contexts.values()),
+        condition_evaluations=condition_evaluations,
         relations=list(relations.values()),
     )

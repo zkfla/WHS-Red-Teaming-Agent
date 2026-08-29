@@ -190,14 +190,20 @@ class FrontierSearchResult:
 
 
 _MAY_BLOCK_GUARDS = {
-    "execution_condition_present",
     "environment_protection_unknown",
-    "actor_or_event_guard_effectiveness_unknown",
+    "fork_pr_workflow_requires_approval",
+    "environment_requires_deployment_review",
+    "environment_restricts_deployment_branches",
+    "environment_custom_protection_rules_enabled",
+    "environment_deployment_branch_policy_unknown",
+    "branch_rules_may_block_direct_push",
 }
 _INFORMATIONAL_GUARDS = {
     "verifies_content_integrity",
     "validates_value_with_allowlist",
     "artifact_verified_by_integrity_guard",
+    "environment_wait_timer_configured",
+    "environment_has_no_deployment_protection",
 }
 _EXTERNAL_UNKNOWN_TERMS = (
     "trust policy",

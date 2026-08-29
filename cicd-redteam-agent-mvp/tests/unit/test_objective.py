@@ -46,7 +46,7 @@ def test_objective_goal_compiler_extracts_bounded_advisory_hints() -> None:
     irrelevant = objective_relation_score(
         goal,
         source_id="workflow:lint",
-        relation_type="execution_condition_present",
+        relation_type="guard_blocks_untrusted_execution",
         target_id="job:lint",
         category="guard",
     )

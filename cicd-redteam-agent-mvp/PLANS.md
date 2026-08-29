@@ -24,7 +24,8 @@ ChatGPT 로그인 기반 Codex LLM adapter로 실행하고 실제 로그인 smok
 ## Constraints
 
 - 대상 workflow, action, script를 실행하지 않는다.
-- GitHub, AWS 및 외부 action 네트워크에 접근하지 않는다.
+- 외부 관찰은 reasoning mode의 명시적 read-only opt-in에서만 수행하며 외부 action은 실행하거나
+  다운로드하지 않는다.
 - 실제 Secret 값과 redaction 전 파일 내용을 저장하지 않는다.
 - 정적 Attack Path는 `CONFIRMED`가 될 수 없다.
 - 실제 workflow·script·action 실행은 real-model smoke에서도 금지한다.
@@ -173,6 +174,117 @@ ChatGPT 로그인 기반 Codex LLM adapter로 실행하고 실제 로그인 smok
   진단 전용이다. 동일 state/Goal에서 결과가 안정적이며 기존 scenario rules와 Validator 결과는
   변하지 않는다.
 - **Dependencies**: Phase 10-13.
+
+### Phase 15: 동적 Observation과 재계획 runtime
+
+- **Objective**: 정적 분석의 외부 `UNKNOWN`을 typed read-only Observation으로 해소하고
+  `Observe → semantic recompute → Frontier replan`을 중단·재개 가능한 canonical loop로 만든다.
+- **Tasks**: `RedTeamSession`, Knowledge/Task/Observation ledger, one active Task lease, deterministic
+  planner와 Perceptor를 도입한다. repository 기본 workflow permission과 Frontier job의 concrete
+  Environment protection을 GitHub read-only observer로 연결한다. Frontier readiness/impact/
+  grounding/information-gain/Objective/cost score와 bounded diverse portfolio를 만들고 canonical
+  working memory를 재조정한 뒤 runtime budget/progress 신호까지 포함해 `OBSERVE`, `INVESTIGATE`,
+  `SUBMIT`, `STOP_PARTIAL` 전환을 결정한다.
+- **Validation**: 동일 Observation은 중복 반영되지 않고 semantic revision과 Frontier가 실제로
+  변경되어야 한다. checkpoint는 Knowledge revision, Task attempts, Observation을 복원하고 session
+  state 불일치, 잘못된 binding, active lease를 fail-closed 처리해야 한다. stale, contradicted,
+  blocked, duplicate-grounded hypothesis는 자동 폐기되고 조기/portfolio 밖 제출은 거부되어야 한다.
+- **Exit criteria**: resume 후에도 완료 Task를 재실행하지 않고 같은 canonical state에서 동일한
+  다음 조사 결정과 portfolio를 내린다. 관찰 실패는 `UNKNOWN`을 보존한 채 reasoning을 계속하고,
+  충분히 grounded된 proposal-ready portfolio 또는 완결된 empty 결과에서만 제출로 전환한다.
+  configured limit, token reserve 부족, 반복 호출·진행 정체는 `STOP_PARTIAL`로 정규화하고 현재
+  canonical partial state를 보존한다.
+- **Dependencies**: Phase 9, 12-14.
+
+### Phase 16: Generic Evidence A-G freeze
+
+- **Objective**: Frontier missing evidence를 provider-neutral typed requirement로 바꾸고 GitHub
+  resolver/transport/runtime evidence의 완료 계약을 한 회귀 경계로 고정한다.
+- **Tasks**: discriminated Evidence payload, `ResolverRegistry`, repository/fork/Actions/branch/
+  Environment/pending-deployment/workflow-run-jobs resolver, semantic recompute, serial request,
+  cache/conditional revalidation, request budget/rate limit metric을 통합한다.
+- **Validation**: resolver 하나당 `Relation → Requirement → Resolver → Observation → KnowledgeState
+  → semantic recompute`가 닫혀야 한다. runner job은 unique exact identity만 연결하고 다른
+  `runner_id`는 해당 persistence path를 `FALSE`, 같은 ID는 cleanup uncertainty를 보존한다.
+- **Exit criteria**: 전체 회귀와 Generic Evidence acceptance suite가 통과하고, 최대 3
+  Observations × resolver당 2 GET 상한, failure-preserves-UNKNOWN, checkpoint/resume conditional
+  revalidation 계약이 문서와 코드에서 일치한다.
+- **Dependencies**: Phase 15.
+
+### Phase 17 / P2: GitHub Actions status·dependency semantics freeze
+
+- **Objective**: `if:` 문자열 truth와 실제 scheduler reachability를 분리하고, `needs` DAG,
+  implicit `success()` status check, `success()/failure()/cancelled()/always()`, explicit
+  `needs.<job>.result`, step `outcome/conclusion`, runtime job/step 결과를 하나의 deterministic
+  execution-status semantic core로 연결한다.
+- **P2-A — Status contract/parser**: `SUCCESS/FAILURE/CANCELLED/SKIPPED/UNKNOWN` result model,
+  dependency/status context, step/job `continue-on-error`와 matrix/fail-fast 존재 여부를 bounded
+  syntax fact로 보존한다. Dynamic `continue-on-error`와 matrix aggregate는 추측하지 않는다.
+- **P2-B — Scheduler/dependency semantics**: workflow 내부 `needs` DAG를 job key로 resolve하고,
+  explicit status-check 함수가 없는 `if:`에는 implicit `success()` gate를 별도 계산한다.
+  `ConditionEvaluation`의 raw expression truth와 status-gate/effective truth, 최종
+  `JobExecutionContext.reachable`을 분리한다. failed/skipped dependency propagation과 ancestor
+  failure summary를 모델링하되 unknown/cycle/unresolved dependency는 fail-closed `UNKNOWN`으로 둔다.
+- **P2-C — Condition/status evaluator**: job-level `success/failure/cancelled/always`와 explicit
+  `needs.<job>.result`를 우선 지원하고, step-level은 이전 step의 순차 state transition을 사용해
+  status 함수와 `steps.<id>.outcome/conclusion`을 평가한다. `continue-on-error` 전 result는 outcome,
+  적용 후 result는 conclusion으로 분리한다. `needs.*` wildcard는 hosted GitHub live probe 전까지
+  `UNKNOWN`으로 유지한다.
+- **P2-D — Runtime Evidence**: 기존 `GITHUB_WORKFLOW_RUN_JOBS`를 확장해 bounded runtime step
+  status/conclusion을 보존하고, workflow-run status는 identity와 분리된 typed Evidence로 둔다.
+  static↔runtime job/step binding은 unique exact identity/name만 허용한다. REST가 제공하지 않는
+  step outcome은 conclusion과 static `continue-on-error`만으로 증명 가능한 경우에만 projection하고
+  나머지는 `UNKNOWN`이다. 기존 GET/cache/checkpoint budget을 유지하고 LLM resolver selection은 0이다.
+- **P2-E — Controlled live acceptance/freeze**: 별도 private fixture에서 implicit success,
+  `always` override, ancestor `failure()`, explicit `needs.X.result`, step continue-on-error,
+  cancellation, `needs.*` wildcard hard-negative를 실제 GitHub hosted scheduler로 관측한다. Fixture
+  preparation의 dispatch/cancel mutation과 acceptance GET-only 관찰을 분리한다. 문서와 실제 hosted
+  behavior가 충돌하면 관측 사실과 공식 계약을 분리하고 provider quirk는 별도 contract로 제한한다.
+- **Validation**: P0/P1 전체 회귀가 유지되고, status function truth와 dependency eligibility,
+  runtime observation, reachability가 각각 독립적으로 검증된다. 403/404/429/timeout/budget failure는
+  affirmative status evidence를 만들지 않는다. matrix/reusable/dynamic/wildcard ambiguity는
+  similarity나 transitive 추측 없이 `UNKNOWN`을 보존한다.
+- **Exit criteria**: targeted offline suite, 전체 pytest/Ruff/lock/diff check, controlled P2 live
+  acceptance가 통과하고 `docs/CONTRACTS.md`, `docs/TESTING.md`, `docs/IMPLEMENTATION_STATUS.md`,
+  `TASK_STATE.md`에 frozen boundary와 남은 UNKNOWN을 기록한다.
+- **Dependencies**: Phase 13, Phase 16, P0 actor/run freeze, P1 event-principal freeze.
+- **Status**: **COMPLETED / live-validated / frozen (2026-08-29)**. Controlled fixture status run
+  `33236505618`, cancellation run `33236538249`, GET-only live harness 2/2, targeted regression
+  64/64, full pytest/Ruff/lock/diff gates passed. Hosted `needs.*` indirect-ancestor behavior was
+  observed but remains an explicit provider quirk/`UNKNOWN` boundary rather than portable semantics.
+
+### Phase 18 / P3: AWS GitHub OIDC trust-policy semantics
+
+- **Objective**: `configure-aws-credentials`의 실제 인증 모드, GitHub `aud/sub` 후보와 AWS IAM
+  role trust를 분리해 `oidc_may_assume_cloud_identity`를 `TRUE/FALSE/UNKNOWN`으로 재계산한다.
+- **Scope**: direct official action, 기본 legacy/immutable subject, environment/PR/단일 push ref,
+  IAM federated principal, `sts:AssumeRoleWithWebIdentity`, Allow/Deny, `StringEquals/StringLike`.
+  custom subject template, reusable-workflow 전용 claim, 실제 STS 호출과 role permission은 제외한다.
+- **Evidence**: GitHub repository numeric metadata/OIDC subject configuration 및 명시적
+  `--observe-aws`의 `GetRole`/`GetOpenIDConnectProvider` read-only Observation만 사용한다.
+- **Semantics**: 필요한 관찰이 모두 있고 모든 가능한 subject 형식이 허용되며 적용 가능한
+  Deny가 없을 때만 `TRUE`; 증거가 완전하고 Allow가 없거나 Deny가 적용될 때만 `FALSE`;
+  unsupported/dynamic/custom/누락 상태는 `UNKNOWN`이다.
+- **Status**: **IMPLEMENTED / offline-validated (2026-08-29)**. 실제 AWS 계정·STS assumption은
+  실행하지 않았으며 계속 `UNKNOWN`이다.
+
+### Phase 19 / P4: GitHub Actions condition satisfier semantics
+
+- **Objective**: `if:` expression truth/reachability와 공격자가 그 식을 만족시킬 수 있는지를
+  독립된 축으로 보존하고, condition 기반 source/guard를 단일 canonical Relation 경로로 Frontier에
+  전달한다.
+- **Scope**: 기존 tokenizer/AST에 `contains`, `startsWith`, `endsWith`를 추가하고 event-aware
+  `ref/ref_name/head_ref/base_ref`, repository identity, actor/triggering actor, PR repository,
+  label/author association 및 P2 status context를 bounded 방식으로 판정한다.
+- **Semantics**: 보안 효과는 `ALWAYS_TRUE`, `ATTACKER_SATISFIABLE`, `TRUST_REQUIRED`, `BLOCKS`,
+  `UNKNOWN`이다. actor 문자열이나 `triggering_actor`는 권한 증명이 아니며, label/review 조건은
+  신뢰 주체 개입과 exact revision binding을 분리한다. 지원 밖 함수·coercion·dynamic context는
+  boolean short-circuit로 안전하게 결정되는 경우를 제외하고 `UNKNOWN`이다.
+- **Frontier contract**: 공격자 만족 가능성이 입증된 경우에만
+  `attacker_can_satisfy_condition`; 확정 차단 또는 신뢰 조건은 canonical
+  `guard_blocks_untrusted_execution`을 사용한다. 레거시 generic condition relation은 생성하지 않는다.
+- **Status**: **COMPLETED / offline-validated (2026-08-29)**. 전체 pytest 298 passed,
+  1 skipped, 12 deselected; Ruff와 `git diff --check`가 통과했다.
 
 ## Done definition
 

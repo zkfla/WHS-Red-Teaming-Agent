@@ -30,6 +30,12 @@ adding bounded runtime protections:
   attempts, rounds, model completions, capability requests/results and checkpoint commits without
   raw arguments, tool results or private chain-of-thought. A malformed final line is discarded;
   earlier corruption stops resume.
+- External GitHub evidence runs through a deterministic `ResolverRegistry` before a model round.
+  Requests are serialized, successful representations are deduplicated, and a resolution is capped
+  at two network calls. At most three Observations may precede the model, fixing the cycle ceiling at
+  six GitHub GETs. HTTP cache validators and bounded metrics are checkpointed separately from
+  semantic Evidence; resume deactivates restored external Evidence until conditional revalidation.
+  Permission, ambiguity, rate-limit, timeout and budget failures preserve `UNKNOWN`.
 - `cicd-agent resume <run-dir>` resumes only at a committed round boundary. It restores cumulative
   round/token/cost/duration usage and runtime metrics, discards any incomplete round state/history,
   and increments the attempt ID. A per-run lease prevents concurrent resume. Completed runs,
@@ -83,6 +89,8 @@ Any new live Codex verification must explicitly select `gpt-5.6-luna`. Unit, con
 deterministic regression checks remain the default and do not consume model usage.
 
 Before another model round, the runtime reserves at least the token count reported for the previous
-round; it stops with `insufficient_token_reserve` when the remaining budget is smaller. Malformed
-Codex structured Tool decisions are treated as recoverable provider output and retried under the
-same bounded retry/deadline policy without logging the malformed content.
+round. Configured limits, insufficient token reserve, repeated calls and no-progress are normalized
+into the deterministic investigation policy as `STOP_PARTIAL`; the existing termination reason such
+as `insufficient_token_reserve` is preserved for checkpoint/report compatibility. Malformed Codex
+structured Tool decisions are treated as recoverable provider output and retried under the same
+bounded retry/deadline policy without logging the malformed content.

@@ -4,6 +4,8 @@ import json
 from collections import Counter
 from pathlib import Path
 
+from cicd_redteam_agent.domain.graph_frontier import FrontierQuery, build_attack_frontiers
+from cicd_redteam_agent.domain.investigation_policy import PortfolioEntry, select_frontier_portfolio
 from cicd_redteam_agent.domain.models import (
     AnalysisReport,
     AttackPath,
@@ -11,6 +13,7 @@ from cicd_redteam_agent.domain.models import (
     FindingStatus,
     ReportStatus,
 )
+from cicd_redteam_agent.domain.proposal_draft import indexed_relations
 
 
 def write_report(report: AnalysisReport, run_dir: Path) -> None:
@@ -127,6 +130,52 @@ def _priority_reason(path: AttackPath) -> str:
     return f"{evidence_state}; reaches {_code(sink)} in {len(path.edges)} edge(s)"
 
 
+def _frontier_query(report: AnalysisReport) -> FrontierQuery:
+    goal = report.run_metadata.get("objective_goal") or {}
+    if not isinstance(goal, dict):
+        return FrontierQuery()
+    return FrontierQuery(
+        source_hints=tuple(str(item) for item in goal.get("source_hints") or ()),
+        mechanism_hints=tuple(str(item) for item in goal.get("mechanism_hints") or ()),
+        sink_hints=tuple(str(item) for item in goal.get("sink_hints") or ()),
+    )
+
+
+def unresolved_frontier_portfolio(
+    report: AnalysisReport, *, limit: int = 5
+) -> tuple[PortfolioEntry, ...]:
+    if not report.state.relations or limit < 1:
+        return ()
+    result = build_attack_frontiers(report.state, _frontier_query(report))
+    return select_frontier_portfolio(result, report.state, limit=limit)
+
+
+def _frontier_workflow_paths(report: AnalysisReport, entry: PortfolioEntry) -> list[str]:
+    relation_index = dict(indexed_relations(report.state))
+    paths: list[str] = []
+    for reference in entry.frontier.relation_refs:
+        relation = relation_index.get(reference)
+        if relation is None:
+            continue
+        for evidence_id in relation.evidence_ids:
+            evidence = report.state.evidence.get(evidence_id)
+            if evidence is not None and evidence.source_path.startswith(".github/workflows/"):
+                paths.append(evidence.source_path)
+    return list(dict.fromkeys(paths))
+
+
+def _frontier_sink_label(entry: PortfolioEntry) -> str:
+    labels = {
+        "github_token_write": "write-capable GITHUB_TOKEN",
+        "oidc_token": "OIDC token",
+        "cloud_identity": "cloud identity",
+        "privileged_execution": "privileged execution",
+        "secret_exposure": "secret exposure",
+    }
+    sink = entry.frontier.sink_tag or entry.frontier.potential_sink_node_id or "unresolved sink"
+    return labels.get(str(sink), str(sink))
+
+
 def _recommendations(path: AttackPath) -> list[str]:
     relation_types = {edge.relation_type for edge in path.edges}
     actions: list[str] = []
@@ -191,6 +240,12 @@ def render_summary(report: AnalysisReport) -> str:
                 focus_parts.append(f"{label}={','.join(str(item) for item in values)}")
         objective_focus = "; ".join(focus_parts) or "focused"
 
+    partial_frontiers = (
+        unresolved_frontier_portfolio(report, limit=5)
+        if report.status is ReportStatus.PARTIAL
+        else ()
+    )
+
     lines = [
         "# CI/CD Red Team Analysis",
         "",
@@ -247,18 +302,57 @@ def render_summary(report: AnalysisReport) -> str:
         "| Attacker-control assessments | "
         f"{_count_table([item.verdict for item in state.assessments])} |",
         "",
-        "## Findings",
-        "",
     ]
-    if not state.findings:
+    if partial_frontiers:
         lines.extend(
             [
-                "> No supported or candidate findings were generated.",
+                "## Unresolved attack frontiers",
                 "",
-                "This does not prove the repository is secure; "
-                "review the warnings and unknowns below.",
+                "> The Agent stopped before final proposal submission, but deterministic analysis "
+                "already found the following evidence-grounded investigation candidates.",
+                "",
             ]
         )
+        for entry in partial_frontiers:
+            frontier = entry.frontier
+            paths = _frontier_workflow_paths(report, entry)
+            missing = [item.description for item in frontier.missing]
+            lines.extend(
+                [
+                    f"### {entry.rank}. {_inline(frontier.source_tag)} → "
+                    f"{_inline(_frontier_sink_label(entry))}",
+                    "",
+                    f"- Connectivity: {_code(frontier.connectivity)}",
+                    f"- Status ceiling: {_code(frontier.proposal_status_ceiling)}",
+                    "- Workflow evidence: "
+                    f"{_inline(', '.join(paths) if paths else 'not isolated')}",
+                    f"- Missing evidence: {_missing_list(missing)}",
+                    f"- Relation refs: {_inline(', '.join(frontier.relation_refs))}",
+                    "",
+                ]
+            )
+
+    lines.extend(["## Findings", ""])
+    if not state.findings:
+        if report.status is ReportStatus.PARTIAL and partial_frontiers:
+            lines.extend(
+                [
+                    "> No final Finding was submitted before the partial stop. "
+                    "This is not equivalent to finding no vulnerability.",
+                    "",
+                    "Review the unresolved attack frontiers above and resume the run if deeper "
+                    "model investigation is required.",
+                ]
+            )
+        else:
+            lines.extend(
+                [
+                    "> No supported or candidate findings were generated.",
+                    "",
+                    "This does not prove the repository is secure; "
+                    "review the warnings and unknowns below.",
+                ]
+            )
     else:
         lines.extend(
             [
@@ -414,3 +508,99 @@ def render_summary(report: AnalysisReport) -> str:
         ]
     )
     return "\n".join(lines).rstrip() + "\n"
+
+
+def _terminal_text(value: object) -> str:
+    text = str(value).replace("\r", " ").replace("\n", " ")
+    return "".join(
+        character if character >= " " and character != "\x7f" else " "
+        for character in text
+    )
+
+
+def render_terminal_brief(report: AnalysisReport, run_dir: Path) -> str:
+    state = report.state
+    lines = [
+        "",
+        "=== CI/CD 보안 분석 결과 ===",
+        f"상태: {report.status}",
+        f"저장 위치: {run_dir}",
+        f"분석 범위: workflow {len(state.workflows)}개 / Evidence {len(state.evidence)}개 / "
+        f"Relation {len(state.relations)}개",
+    ]
+
+    if state.findings:
+        lines.extend(["", f"최종 취약점/후보: {len(state.findings)}개"])
+        for index, finding in enumerate(state.findings[:5], start=1):
+            lines.append(
+                f"  {index}. [{finding.status}] {_terminal_text(finding.title)} "
+                f"(confidence={finding.confidence})"
+            )
+            lines.append(f"     {_terminal_text(finding.summary)}")
+            if finding.missing_evidence:
+                missing = ", ".join(_terminal_text(item) for item in finding.missing_evidence[:3])
+                lines.append(f"     미확인: {missing}")
+    elif report.status is ReportStatus.PARTIAL:
+        portfolio = unresolved_frontier_portfolio(report, limit=5)
+        if portfolio:
+            lines.extend(
+                [
+                    "",
+                    "최종 Finding 제출 전 분석이 중단됐지만, 아래 공격 경로 후보는 이미 잡혔음:",
+                ]
+            )
+            for entry in portfolio:
+                frontier = entry.frontier
+                paths = _frontier_workflow_paths(report, entry)
+                missing = [item.description for item in frontier.missing]
+                source = frontier.source_tag.replace("_", " ")
+                lines.append(
+                    f"  {entry.rank}. {source} → {_frontier_sink_label(entry)} "
+                    f"[{frontier.proposal_status_ceiling}]"
+                )
+                if paths:
+                    workflow_text = ", ".join(_terminal_text(path) for path in paths[:2])
+                    lines.append(f"     관련 workflow: {workflow_text}")
+                if missing:
+                    missing_text = ", ".join(_terminal_text(item) for item in missing[:3])
+                    lines.append(f"     막힌 이유: {missing_text}")
+        else:
+            lines.extend(
+                ["", "최종 Finding은 아직 없고 제출 가능한 공격 경로 후보도 확인되지 않았음."]
+            )
+    else:
+        lines.extend(["", "최종 Finding은 생성되지 않았음."])
+
+    if report.status is ReportStatus.PARTIAL:
+        reason_messages = {
+            "insufficient_token_reserve": (
+                "다음 AI 라운드를 시작할 토큰 예산이 부족해서 안전하게 중단됨."
+            ),
+            "no_progress": "반복 조사로 새 정보가 늘지 않아 안전하게 중단됨.",
+            "limit_reached": "설정된 실행 한도에 도달해 중단됨.",
+        }
+        reason = report.termination_reason or "partial"
+        lines.extend(["", f"중단 이유: {reason_messages.get(reason, reason)}"])
+        if (run_dir / "checkpoint.json").exists():
+            used_tokens = 0
+            termination = getattr(state, "termination", None)
+            if termination is not None:
+                used_tokens = int(getattr(termination, "tokens", 0) or 0)
+            configured = int(report.run_metadata.get("max_tokens") or 0)
+            suggested = max(400_000, configured * 2, used_tokens * 4)
+            lines.extend(
+                [
+                    "이어가기:",
+                    f"  uv run cicd-agent resume \"{run_dir}\" --max-tokens {suggested} "
+                    "--max-rounds 24 --max-duration 1800",
+                ]
+            )
+
+    lines.extend(
+        [
+            "",
+            f"상세 자연어/근거 보고서: {run_dir / 'summary.md'}",
+            f"전체 구조화 결과: {run_dir / 'analysis.json'}",
+        ]
+    )
+    return "\n".join(lines)

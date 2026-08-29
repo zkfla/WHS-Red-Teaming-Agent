@@ -39,3 +39,12 @@ def test_dynamic_reusable_path_remains_unknown() -> None:
     boundary = RepositoryBoundary(FIXTURES / "dynamic-path")
     result = parse_workflow(boundary, discover_workflows(boundary)[0])
     assert any("UNKNOWN" in warning for warning in result.workflow.parse_warnings)
+
+
+def test_job_key_and_display_name_are_preserved_for_runtime_identity() -> None:
+    boundary = RepositoryBoundary(FIXTURES / "runner-runtime")
+    result = parse_workflow(boundary, discover_workflows(boundary)[0])
+    jobs = {job.job_key: job for job in result.workflow.jobs}
+
+    assert jobs["attack"].name == "Attack job"
+    assert jobs["privileged"].name == "Privileged job"

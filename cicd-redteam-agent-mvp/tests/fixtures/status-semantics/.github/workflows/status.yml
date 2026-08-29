@@ -1,0 +1,105 @@
+name: P2 Status Semantics
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  skipped:
+    name: Skipped
+    if: false
+    runs-on: ubuntu-latest
+    steps:
+      - name: Never runs
+        run: echo skipped
+
+  implicit-after-skip:
+    name: Implicit after skip
+    needs: skipped
+    if: needs.skipped.result == 'skipped'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Implicit body
+        run: echo implicit
+
+  always-after-skip:
+    name: Always after skip
+    needs: skipped
+    if: always() && needs.skipped.result == 'skipped'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Always body
+        run: echo always
+
+  source:
+    name: Source
+    runs-on: ubuntu-latest
+    steps:
+      - name: Source body
+        run: echo source
+
+  failure-handler:
+    name: Failure handler
+    needs: source
+    if: failure()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Failure body
+        run: echo failure
+
+  explicit-result:
+    name: Explicit result
+    needs: source
+    if: always() && needs.source.result == 'failure'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Explicit body
+        run: echo explicit
+
+  implicit-after-failure:
+    name: Implicit after failure
+    needs: source
+    if: needs.source.result == 'failure'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Implicit failure body
+        run: echo implicit-failure
+
+  middle:
+    name: Middle
+    needs: source
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Middle body
+        run: echo middle
+
+  ancestor-failure-handler:
+    name: Ancestor failure handler
+    needs: middle
+    if: failure()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ancestor body
+        run: echo ancestor
+
+  soft-fail:
+    name: Soft fail job
+    runs-on: ubuntu-latest
+    steps:
+      - id: softfail
+        name: Soft fail
+        continue-on-error: true
+        run: exit 1
+      - name: Outcome check
+        if: steps.softfail.outcome == 'failure'
+        run: echo outcome
+      - name: Conclusion check
+        if: steps.softfail.conclusion == 'success'
+        run: echo conclusion
+
+  on-cancel:
+    name: On cancel
+    if: cancelled()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Cancel body
+        run: echo cancelled

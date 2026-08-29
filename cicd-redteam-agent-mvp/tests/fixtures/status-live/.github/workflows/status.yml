@@ -1,0 +1,96 @@
+name: P2 Status Semantics
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  skipped:
+    name: Skipped
+    if: false
+    runs-on: ubuntu-latest
+    steps:
+      - name: Never runs
+        run: echo skipped
+  implicit_after_skip:
+    name: Implicit after skip
+    needs: skipped
+    if: needs.skipped.result == 'skipped'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Implicit body
+        run: echo implicit
+  always_after_skip:
+    name: Always after skip
+    needs: skipped
+    if: always() && needs.skipped.result == 'skipped'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Always body
+        run: echo always
+  failing:
+    name: Failing
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail
+        run: exit 1
+  failure_handler:
+    name: Failure handler
+    needs: failing
+    if: failure()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Failure body
+        run: echo failure-handler
+  explicit_result:
+    name: Explicit result
+    needs: failing
+    if: always() && needs.failing.result == 'failure'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Explicit body
+        run: echo explicit-result
+  implicit_after_failure:
+    name: Implicit after failure
+    needs: failing
+    if: needs.failing.result == 'failure'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Implicit failure body
+        run: echo should-not-run
+  middle:
+    name: Middle
+    needs: failing
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Middle body
+        run: echo middle
+  ancestor_failure_handler:
+    name: Ancestor failure handler
+    needs: middle
+    if: failure()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ancestor body
+        run: echo ancestor-failure
+  wildcard_indirect:
+    name: Wildcard indirect
+    needs: middle
+    if: always() && contains(needs.*.result, 'failure')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Wildcard body
+        run: echo wildcard-indirect
+  soft_fail:
+    name: Soft fail job
+    runs-on: ubuntu-latest
+    steps:
+      - id: softfail
+        name: Soft fail
+        continue-on-error: true
+        run: exit 1
+      - name: Outcome check
+        if: steps.softfail.outcome == 'failure'
+        run: echo outcome-failure
+      - name: Conclusion check
+        if: steps.softfail.conclusion == 'success'
+        run: echo conclusion-success

@@ -2,11 +2,16 @@
   "scenario_ids": ["GHA-10A", "GHA-10B", "GHA-10C", "GHA-10D", "GHA-10E"],
   "variants": {
     "supported": {
-      "expected_status": "CANDIDATE",
-      "path_relations": ["actor_or_event_guard_effectiveness_unknown"],
+      "expected_status": "SUPPORTED",
+      "path_relations": ["attacker_can_satisfy_condition"],
       "required_relations": [
-        ["actor_or_event_guard_effectiveness_unknown", "UNKNOWN"],
-        ["label_or_comment_controls_job_condition", "UNKNOWN"]
+        ["attacker_can_satisfy_condition", "TRUE"]
+      ],
+      "forbidden_relations": [
+        "actor_or_event_guard_effectiveness_unknown",
+        "event_content_controls_job_condition",
+        "label_controls_job_condition",
+        "execution_condition_present"
       ]
     },
     "candidate": {

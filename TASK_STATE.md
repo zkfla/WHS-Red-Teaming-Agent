@@ -28,6 +28,28 @@ AttackPath, CloudIdentityCandidate를 재현 가능하게 생성한다.
 
 ## Completed
 
+- P4 GitHub Actions condition satisfier semantics를 구현했다. 기존 expression truth/status
+  reachability와 별도로 `ALWAYS_TRUE/ATTACKER_SATISFIABLE/TRUST_REQUIRED/BLOCKS/UNKNOWN`, attacker
+  satisfiability, trusted-principal requirement와 exact revision binding을 보존한다.
+- 기존 AST에 bounded `contains/startsWith/endsWith`, event-aware ref, repository identity,
+  actor/triggering actor, PR repository, label/author-association 의미를 연결했다. label/review 신뢰
+  조건은 exact revision approval로 승격하지 않고, 지원 밖 동적 함수는 안전한 boolean short-circuit를
+  제외하면 `UNKNOWN`이다.
+- 조건 Fact는 `attacker_can_satisfy_condition`과 canonical
+  `guard_blocks_untrusted_execution`으로 정규화했다. 레거시 generic actor/comment/label condition
+  relation은 더 이상 생성하거나 Frontier `MAY_BLOCK` 집합에서 소비하지 않는다.
+- P3 AWS GitHub OIDC trust vertical slice를 구현했다. direct
+  `aws-actions/configure-aws-credentials`의 static credential/web identity token file/role chaining/
+  forced skip/GitHub OIDC 모드를 분리하고, legacy·immutable 기본 `sub`, audience, IAM
+  `Principal.Federated`, `sts:AssumeRoleWithWebIdentity`, `StringEquals/StringLike`, Allow와 explicit
+  Deny를 fail-closed `TRUE/FALSE/UNKNOWN`으로 계산한다.
+- GitHub repository numeric metadata와 OIDC subject customization, AWS `GetRole` 및
+  `GetOpenIDConnectProvider`를 기존 typed Evidence/Resolver/KnowledgeState/semantic recompute loop에
+  연결했다. AWS 관찰은 `--observe-github --observe-aws`의 명시적 read-only opt-in이며 선택적
+  `--aws-profile`을 지원한다. credential/token은 semantic evidence에 저장하지 않는다.
+- `CloudIdentityCandidate`와 `oidc_may_assume_cloud_identity`가 canonical trust assessment를
+  참조한다. custom/dynamic/unsupported subject나 IAM 조건은 낙관적으로 판단하지 않고
+  `UNKNOWN`이며 정적 trust와 실제 STS 성공 및 role permission은 계속 별도 상태다.
 - 계획·아키텍처·공개 계약·테스트 명세를 MVP 내부 문서로 동기화했다.
 - deterministic global path composer가 attacker source에서 write-capable GITHUB_TOKEN 또는
   Cloud Identity까지 Evidence-backed 경로를 생성한다.
@@ -128,7 +150,7 @@ AttackPath, CloudIdentityCandidate를 재현 가능하게 생성한다.
   기본 차단하고 명시적 unsafe opt-out/manual fetch는 별도 처리한다. Cache는 `pull_request`의
   merge-ref scope는 read-write로 유지하되 `pull_request_target`, `issue_comment`, `workflow_run`
   default-branch context는 read-only로 모델링한다.
-- semantic-state resume 비호환을 막기 위해 prompt/runtime contract를 1.3으로 올렸다.
+- semantic-state resume 비호환을 막기 위해 prompt/runtime contract를 현재 1.6으로 올렸다.
 - `ListAttackFrontiers`를 추가했다. fail-closed Relation semantic registry와 bounded graph traversal이
   trigger/job context, flow label, permission state와 trust provenance를 함께 추적하고, 같은 실행
   context의 hard guard/FALSE Relation을 조기에 `BLOCKED` 처리한다. 단순 trigger→write authority는
@@ -137,9 +159,44 @@ AttackPath, CloudIdentityCandidate를 재현 가능하게 생성한다.
   적용하고, pagination, search completeness, truncation, depth/expansion limit, semantic version을
   반환한다. UNKNOWN은 local-resolvable/external-required/unmodeled로 구분하며 Objective는 후보
   탐색·순위에만 관여하고 Relation/Evidence/verdict/Validator를 바꾸지 않는다.
+- 동적 조사 runtime의 첫 vertical slice를 구현했다. `RedTeamSession`이 immutable baseline과 live
+  `AnalysisState`, `KnowledgeState`, Task/Observation ledger를 분리하고 one active `TaskLease`로
+  repository 기본 workflow permission Observation을 Fake 또는 opt-in GitHub read-only observer에서
+  받아 semantic state와 Frontier를 전체 재계산한다. 관찰 실패는 `UNKNOWN`을 보존하고 reasoning을
+  계속한다.
+- 두 번째 vertical slice로 active Frontier job의 concrete Environment를 deterministic하게 선택하고
+  GitHub Environment endpoint에서 reviewer 수, self-review 차단, wait timer, deployment branch policy,
+  custom protection rule 수를 typed Observation으로 정규화한다. reviewer identity와 raw 응답은
+  저장하지 않으며 정책 확인 후 reviewer/branch/custom rule을 실행별 `MAY_BLOCK` guard로 재계산한다.
+- observation 실행의 atomic checkpoint가 versioned investigation snapshot을 함께 저장한다.
+  Knowledge revision, Task status/attempts, Task에 결속된 Observation과 lease-free 상태를 복원하며,
+  session/top-level `AnalysisState` 불일치, session 누락, 잘못된 Task/Observation binding과 active
+  lease는 fail-closed 처리한다.
+- Frontier 위에 deterministic investigation policy를 완성했다. readiness, sink impact, Evidence
+  grounding, information gain, Objective alignment와 조사 비용으로 후보를 점수화하고 Relation,
+  context, source/mechanism/sink 중복을 억제한 최대 6개 portfolio를 선택한다. semantic recompute마다
+  stale/contradicted/hard-blocked/duplicate-grounded 가설을 자동 `DISCARDED`하고 grounded viable 가설을
+  `READY_FOR_PROPOSAL`로 전환한다. `OBSERVE`/`INVESTIGATE`/`SUBMIT`/`STOP_PARTIAL` gate는 조기
+  제출과 portfolio 밖 경로를 거부하며 완결된 무경로 결과에만 empty submit을 허용한다. configured
+  limit, 다음 round token reserve 부족, 반복 호출·진행 정체는 policy의 `STOP_PARTIAL`과
+  `stop_reason`으로 정규화하고 외부 termination reason은 checkpoint/report 호환성을 위해 유지한다.
+- Generic Evidence A-G를 freeze했다. selected Frontier의 typed `EvidenceRequirement`만
+  `ResolverRegistry`로 직렬 resolve하고 discriminated Observation을 `KnowledgeState`에 commit한 뒤
+  semantic graph를 전체 재계산한다. repository/fork/Actions/branch/Environment/pending-deployment/
+  workflow-run-jobs GitHub resolver가 연결됐으며 resolver 선택은 모델 호출을 사용하지 않는다.
+- transport는 successful GET dedupe, ETag/Last-Modified conditional revalidation, `304` representation
+  reuse, bounded retry/rate-limit metadata와 checkpoint operational cache를 지원한다. model 전 최대
+  3 Observations와 resolver당 최대 2 GET으로 GitHub GET 상한은 model cycle당 6회다.
+- runner runtime vertical slice가 static job key/concrete name과 runtime name의 unique exact match만
+  허용한다. 실행된 job의 서로 다른 concrete `runner_id`는 해당 cross-job persistence path를
+  `FALSE`로 닫고, 같은 ID는 identity만 해소한 채 cleanup/ephemerality/workspace sanitation을
+  `UNKNOWN`으로 유지한다. matrix/reusable/dynamic/duplicate name, 미할당과 API 실패도 UNKNOWN이다.
 
 ## Validation or Review
 
+- P4 security-effect/boolean/ref/actor/label 행렬, canonical relation 및 GHA-10 oracle 전환을 포함한
+  전체 pytest가 `298 passed, 1 skipped, 12 deselected`로 통과했다. Ruff와
+  `git diff --check`도 통과했다. 실제 GitHub workflow 실행이나 외부 정책 변경은 하지 않았다.
 - 원본 계획 대조: Single Agent, `CICDChatAgent`, 반복 Capability 호출 및
   `submit_analysis`가 계획된 구조이며 별도 모델 분석 단계는 계획에 없음을 확인했다.
 - 정적 호출 경로 대조: LiteLLM/API key와 `CodexChatGPTLLM`이 모두
@@ -168,14 +225,26 @@ AttackPath, CloudIdentityCandidate를 재현 가능하게 생성한다.
   검증 1/1 통과.
 - `gpt-5.6-luna` GHA-01 rejected 검증: 3 rounds, 65,285 reported tokens, Capability 3회,
   반복 0회, `COMPLETE / proposal_validated`, FALSE 관계가 REJECTED로 확정되고 1/1 통과.
-- Frontier/guard 회귀를 포함한 전체 pytest: 176 passed, 1 skipped(177 collected). skip은 Windows
-  symlink 권한 조건이다. 전체 Ruff와 변경 파일 format check, `git diff --check`도 통과했다.
+- Generic Evidence A-G acceptance, runner runtime, 동적 observation/checkpoint/resume, Environment
+  policy와 deterministic investigation policy 회귀를 포함한 전체 pytest: 259 passed, 1 skipped
+  (260 collected). skip은 Windows symlink 권한
+  조건이다. duplicate Frontier는 portfolio에서 중복 선택하지 않고, Frontier 결과가 truncated된
+  경우 uncovered hypothesis를 자동 폐기하지 않는다. configured limit, token reserve 부족,
+  반복 호출·진행 정체는 `STOP_PARTIAL`로 결정되며 `SubmitAnalysis` 우회 제출도 거부하는
+  edge-case 회귀를 포함한다. 전체 Ruff, 변경 Python format check, `uv lock --check`, compileall,
+  `git diff --check`도 통과했다.
 - `uv lock --check`, Ruff 및 `git diff --check`: 통과.
 - checkpoint/event journal 및 resume CLI 독립 smoke, 변경 파일 compileall·Ruff,
   `git diff --check`: 통과.
 
 ## Partial or Unverified
 
+- **PARTIAL**: P4는 bounded static/offline semantics다. GitHub Expressions 전체 언어, matrix/object
+  projection, external actor/event allowlist, historical authorization과 label approval의 exact
+  revision binding은 관측 증거가 없으면 계속 `UNKNOWN`이다.
+- **UNVERIFIED**: 실제 AWS 계정에서 IAM role/provider read-only resolver와 GitHub immutable-subject
+  API를 호출하는 live acceptance. 실제 `AssumeRoleWithWebIdentity`는 안전 경계상 의도적으로
+  실행하지 않았고 `actual_assume_succeeded=UNKNOWN`이다.
 - **UNVERIFIED**: 외부 자격 증명이 필요한 실제 LiteLLM provider 인증과 API 호출
 - **UNVERIFIED**: LiteLLM provider의 token/cost 집계 및 외부 rate-limit 동작
 - **UNVERIFIED**: 새 retry, pagination, context compaction 경로를 포함한 실제 provider
@@ -187,6 +256,35 @@ AttackPath, CloudIdentityCandidate를 재현 가능하게 생성한다.
 - **PARTIAL**: execution semantics는 현재 GitHub.com 정책을 기준으로 한다. 분석 대상이 구형 GHES인
   경우 checkout/cache hardening 적용 여부는 서버 버전에 따라 달라질 수 있으나 현재 CLI에는
   platform/version 입력이 없으므로 해당 차이를 자동 해석하지 않는다.
+- **COMPLETED**: P0 actor/run/current-permission slice는 controlled fixture
+  `aoistar-kr/cicd-redteam-p0-fixture` run `33216265987`을 `run_attempt=2`로 rerun한 뒤
+  repository-scoped fine-grained read-only PAT로 live suite 4/4를 통과해 freeze했다. normal
+  actor/current permission → condition semantic recompute, rerun `triggering_actor` 비권한주체 처리,
+  live 404 ambiguity, checkpoint/resume revalidation을 실제 GitHub에서 검증했고 synthetic
+  403/429/retry/budget/404 commit-safety 회귀 6/6도 재통과했다. 동일 계정 rerun이라
+  `actor != triggering_actor` live 장면 자체는 미관측이며 후속 provenance 강화로 남긴다.
+- **COMPLETED**: P1 event principal provenance A-E는 controlled private fixture
+  `aoistar-kr/cicd-redteam-p1-fixture`에서 실제 `issue_comment`, `pull_request`, label-triggered
+  `pull_request_target`, `pull_request_review`, `pull_request_review_comment` 이벤트를 생성한 뒤
+  GET-only live acceptance 6/6을 통과해 freeze했다. exact event linkage와 comment/PR/review/
+  review-comment/sender/label principal role을 분리하고, 자동 조사 루프는 linkage → principal →
+  current repository permission의 최대 3 Observation으로 semantic recompute한다. 시간·actor 유사도
+  기반 event 추정은 금지하며 `author_association`과 observed action을 repository permission으로
+  승격하지 않는다. historical event-time effective permission은 별도 Evidence가 없으면 계속
+  `UNKNOWN`이다. targeted P1 offline vertical 65/65와 전체 pytest regression도 통과했다.
+- **COMPLETED**: P2 GitHub Actions status/dependency semantics A-E는 controlled private fixture
+  `aoistar-kr/cicd-redteam-p2-fixture`에서 status run `33236505618`과 cancellation run
+  `33236538249`를 생성하고 GET-only live acceptance 2/2를 통과해 freeze했다. `needs` DAG,
+  implicit `success()`, `success/failure/cancelled/always`, explicit `needs.<job>.result`, skipped/failed/
+  cancelled dependency propagation, step `outcome`/`conclusion`, `continue-on-error`, exact workflow/job/
+  step runtime binding을 typed semantics로 연결했다. final run cancellation을 과거 condition truth로
+  소급하지 않으며 `needs.*` wildcard는 2026-08-29 hosted GitHub에서 indirect failure를 보는 quirk가
+  재현됐지만 portable core semantics로 일반화하지 않고 `UNKNOWN`으로 유지한다. targeted P2
+  status/evidence regression 64/64, 전체 pytest, Ruff, `uv lock --check`, `git diff --check`가 모두
+  통과했다.
+- **PARTIAL**: repository/fork/Actions/branch/Environment/pending-deployment/workflow-run-jobs/status는 typed
+  observer에 연결됐다. runner cleanup/ephemerality/workspace sanitation, custom protection rule의
+  실제 실행 결과와 OIDC external trust는 아직 typed evidence로 해소하지 않는다.
 - Codex SDK는 실행별 통화 비용을 제공하지 않아 보고서의 cost `0.0`은 무료 사용 증거가 아니다.
 - hackingBuddyGPT 내부에서 Pydantic v2 deprecated `dict()` 경고가 발생하지만 테스트는 통과한다.
 
@@ -219,17 +317,38 @@ AttackPath, CloudIdentityCandidate를 재현 가능하게 생성한다.
   가설·근거·미확인 정보·다음 확인 작업만 보존하며 최종 결과 validator를 우회하지 않는다.
 - 새 ChatGPT-login Codex 실모델 검증이 필요할 때는 `gpt-5.6-luna`를 명시한다. 기본 검증은
   모델 사용량이 없는 unit/integration/fake-LLM 테스트로 수행한다.
+- 외부 관찰 결과는 기존 Relation을 덧칠하거나 LLM 메모로 확정하지 않는다. typed Knowledge 입력을
+  갱신한 뒤 baseline에서 semantic state와 Frontier를 deterministic하게 전체 재계산한다.
+- investigation checkpoint는 active lease가 없는 safe point만 허용한다. Task/Observation ledger와
+  canonical `AnalysisState`가 정확히 일치하지 않으면 추측 복구하지 않고 새 실행을 요구한다.
+- workflow-run jobs API의 `runner_id`는 machine identity evidence일 뿐 cleanup이나 ephemerality의
+  증거가 아니다. exact unique static/runtime job match가 없으면 문자열 유사도로 추측하지 않는다.
+- workflow-run actor와 event sender/comment/PR/review/review-comment/label principal은 별도 provenance
+  축이다. exact locator가 없으면 run metadata와 시간·actor 유사도로 원 이벤트를 추정하지 않는다.
+- `author_association`, observed label/review action, current collaborator permission은 서로 다른
+  Evidence다. current permission을 historical event-time authorization으로 소급하지 않는다.
 
 ## Recommended Next Actions
 
-1. Frontier 결과를 working-memory hypothesis scoring/pruning/stop policy와 결합한다.
-2. Validator 부분 repair를 구현해 전체 proposal 재생성 없이 잘못된 후보만 수정한다.
-3. 대형 실제 저장소와 `gpt-5.6-luna` matched A/B benchmark로 정확도·토큰 효과를 측정한다.
+1. runner cleanup/ephemerality와 historical authorization은 별도 runtime/audit Evidence 축으로
+   확장한다.
+2. 대형 실제 저장소와 `gpt-5.6-luna` matched A/B benchmark로 P0-P4 semantic enrichment 전후
+   오탐·라운드·토큰 효과를 측정한다.
 
 ## Relevant Artifacts
 
 - `cicd-redteam-agent-mvp/PLANS.md`: 구현 범위와 완료 조건
-- `cicd-redteam-agent-mvp/docs/`: 아키텍처, 계약, 테스트 및 계획 커버리지
+- `cicd-redteam-agent-mvp/docs/`: 아키텍처, 계약, 테스트 및 P0/P1/P2 live freeze gates
+- `cicd-redteam-agent-mvp/tests/live/test_github_actor_resolver_live.py`: 명시적 read-only GitHub
+  actor/run/current-permission, rerun provenance, 404, checkpoint/revalidation acceptance harness
+- `cicd-redteam-agent-mvp/tests/live/test_github_event_principal_live.py`: P1 exact event linkage,
+  comment/PR/review/review-comment/label principal 및 current authorization live acceptance harness
+- `cicd-redteam-agent-mvp/tests/live/test_github_status_semantics_live.py`: P2 implicit-success,
+  needs/status/step runtime evidence 및 hosted wildcard hard-negative live acceptance harness
+- `cicd-redteam-agent-mvp/src/cicd_redteam_agent/application/github_event.py`: trusted event-file을
+  bounded locator로 정규화하는 입력 경계
+- `cicd-redteam-agent-mvp/src/cicd_redteam_agent/domain/event_provenance.py`: event principal role과
+  typed requirement/qualifier semantic contract
 - `cicd-redteam-agent-mvp/docs/AGENT_RUNTIME.md`: runtime 정책과 참고한 공개 구현
 - `cicd-redteam-agent-mvp/src/cicd_redteam_agent/framework/working_memory.py`: bounded 가설
   patch 검증과 Capability 결합
@@ -242,6 +361,14 @@ AttackPath, CloudIdentityCandidate를 재현 가능하게 생성한다.
 - `cicd-redteam-agent-mvp/src/cicd_redteam_agent/domain/attack_graph.py`: 전역 경로 조합
 - `cicd-redteam-agent-mvp/src/cicd_redteam_agent/domain/graph_frontier.py`: context-sensitive
   reasoning 후보 탐색과 guard/limit/diversity 판정
+- `cicd-redteam-agent-mvp/src/cicd_redteam_agent/domain/investigation.py`: session Knowledge,
+  Task/Observation ledger와 one active lease 계약
+- `cicd-redteam-agent-mvp/src/cicd_redteam_agent/framework/investigation_runtime.py`: Observation 계획,
+  commit, semantic recompute와 live state 동기화
+- `cicd-redteam-agent-mvp/src/cicd_redteam_agent/framework/runtime_support.py`: AnalysisState와 versioned
+  investigation session의 atomic checkpoint/resume 계약
+- `cicd-redteam-agent-mvp/src/cicd_redteam_agent/domain/investigation_policy.py`: Frontier score,
+  bounded portfolio와 deterministic transition/submission 허용 계약
 - `cicd-redteam-agent-mvp/src/cicd_redteam_agent/domain/relation_semantics.py`: fail-closed Relation
   semantic registry
 - `cicd-redteam-agent-mvp/output/real-model/20260824T160152.198638Z/`: real-model 결과
@@ -258,6 +385,6 @@ AttackPath, CloudIdentityCandidate를 재현 가능하게 생성한다.
 
 ## Updated
 
-- Date: 2026-08-28
+- Date: 2026-08-29
 - Workflow: vibe-code-workflow + task-state-sync
 - Workspace: `C:\Users\qkrgu\Documents\GitHub\WHS-Red-Teaming-Agent`

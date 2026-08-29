@@ -2,15 +2,42 @@ from __future__ import annotations
 
 import re
 from collections import defaultdict
+from fnmatch import fnmatchcase
 
 from cicd_redteam_agent.domain.execution_semantics import (
     cache_write_access_for_event,
+    exact_push_branches,
     fork_pr_checkout_execution_verdict,
 )
 from cicd_redteam_agent.domain.github_actions_parser import stable_id
+from cicd_redteam_agent.domain.investigation import (
+    ActionAdvisoryEvidence,
+    ActionProvenanceEvidence,
+    ActionsPolicyEvidence,
+    AuditEventsEvidence,
+    DeploymentBranchPolicyMode,
+    EffectiveBranchRulesEvidence,
+    EnvironmentBranchPatternsEvidence,
+    EnvironmentProtectionPolicy,
+    ForkPullRequestPolicyEvidence,
+    PendingDeploymentStateEvidence,
+    RuntimeFileEvent,
+    RuntimeNetworkEvent,
+    RuntimeProcessEvent,
+    RuntimeTelemetryEvidence,
+    SecretMetadataEvidence,
+    SecretRotationPolicyEvidence,
+    WorkflowRunJobEvidence,
+    WorkflowRunJobsEvidence,
+    concrete_environment_name,
+)
 from cicd_redteam_agent.domain.models import (
     AnalysisState,
     AttackerProfile,
+    ConditionEvaluation,
+    ConditionSecurityEffect,
+    EvidenceRequirementKind,
+    EvidenceRequirementRef,
     Job,
     PermissionLevel,
     Relation,
@@ -18,6 +45,7 @@ from cicd_redteam_agent.domain.models import (
     TriState,
     Workflow,
 )
+from cicd_redteam_agent.domain.revision_semantics import derive_workspace_revision_relations
 
 INPUT_EXPRESSION = re.compile(
     r"\$\{\{\s*("
@@ -106,13 +134,6 @@ DEPENDENCY_OR_EXECUTABLE_PATH = re.compile(
     r"(?:^|/)(?:node_modules|\.venv|venv|bin|scripts?|site-packages|vendor)(?:/|$)",
     re.IGNORECASE,
 )
-WEAK_ACTOR_GUARD = re.compile(
-    r"github\.(?:actor|triggering_actor)|github\.event\.(?:comment|issue|pull_request)",
-    re.IGNORECASE,
-)
-LABEL_OR_COMMENT_CONTROL = re.compile(
-    r"(?:label|comment\.body|issue\.body|issue\.title)", re.IGNORECASE
-)
 
 
 def _relation(
@@ -124,6 +145,7 @@ def _relation(
     category: str,
     verdict: TriState = TriState.TRUE,
     missing_evidence: list[str] | None = None,
+    evidence_requirements: list[EvidenceRequirementRef] | None = None,
 ) -> Relation:
     return Relation(
         source_id=source_id,
@@ -133,6 +155,7 @@ def _relation(
         verdict=verdict,
         evidence_ids=sorted(set(evidence_ids)),
         missing_evidence=sorted(set(missing_evidence or [])),
+        evidence_requirements=evidence_requirements or [],
     )
 
 
@@ -147,6 +170,19 @@ def _deduplicate(relations: list[Relation]) -> list[Relation]:
         existing.evidence_ids = sorted(set(existing.evidence_ids + relation.evidence_ids))
         existing.missing_evidence = sorted(
             set(existing.missing_evidence + relation.missing_evidence)
+        )
+        requirement_refs = {
+            (ref.kind, ref.provider, ref.subject_id, ref.qualifier): ref
+            for ref in [*existing.evidence_requirements, *relation.evidence_requirements]
+        }
+        existing.evidence_requirements = sorted(
+            requirement_refs.values(),
+            key=lambda ref: (
+                ref.kind.value,
+                ref.provider.value,
+                ref.subject_id,
+                ref.qualifier or "",
+            ),
         )
         if relation.verdict is TriState.UNKNOWN:
             existing.verdict = TriState.UNKNOWN
@@ -195,8 +231,7 @@ def _job_has_sensitive_authority(state: AnalysisState, job: Job) -> bool:
         "pull-requests",
     }
     if any(
-        context.effective_permissions.get(scope)
-        in {PermissionLevel.WRITE, PermissionLevel.UNKNOWN}
+        context.effective_permissions.get(scope) in {PermissionLevel.WRITE, PermissionLevel.UNKNOWN}
         for context in contexts
         for scope in sensitive_scopes
     ):
@@ -301,9 +336,7 @@ def _source_facts(
             )
     assessments = {item.subject_id: item for item in state.assessments}
     job_ids = {job.job_id for job in workflow.jobs}
-    member_ids = job_ids | {
-        step.step_id for job in workflow.jobs for step in job.steps
-    }
+    member_ids = job_ids | {step.step_id for job in workflow.jobs for step in job.steps}
     for relation in state.relations:
         if relation.relation_type != "executes_repository_file":
             continue
@@ -649,12 +682,8 @@ def _step_flow_facts(
                         verdict=TriState.FALSE if guarded else TriState.TRUE,
                     )
                 )
-        controlled_nodes = [
-            _input_node(expression) for expression in _expressions(run)
-        ] + [
-            _env_node(step, name)
-            for name in step.env
-            if _env_referenced(run, name)
+        controlled_nodes = [_input_node(expression) for expression in _expressions(run)] + [
+            _env_node(step, name) for name in step.env if _env_referenced(run, name)
         ]
         for match in FILE_REDIRECTION.finditer(run):
             target = _file_node(match.group(1))
@@ -713,8 +742,7 @@ def _permission_summary(
                 and evidence == "fork pull-request write-token repository setting"
             )
             and not (
-                scope != "id-token"
-                and evidence == "fork pull-request OIDC token availability"
+                scope != "id-token" and evidence == "fork pull-request OIDC token availability"
             )
         }
     )
@@ -737,8 +765,7 @@ def _credential_facts(state: AnalysisState, workflow: Workflow, job: Job) -> lis
         }
     )
     write_all = bool(contexts) and all(
-        context.effective_permissions.default_level is PermissionLevel.WRITE
-        for context in contexts
+        context.effective_permissions.default_level is PermissionLevel.WRITE for context in contexts
     )
     default_unknown = any(
         context.effective_permissions.default_level is PermissionLevel.UNKNOWN
@@ -814,6 +841,26 @@ def _credential_facts(state: AnalysisState, workflow: Workflow, job: Job) -> lis
                     or "unknown-identity"
                 )
             if cloud_target is not None:
+                assessment = next(
+                    (
+                        item
+                        for item in state.aws_oidc_trust_assessments
+                        if isinstance(subject, Step) and item.step_id == subject.step_id
+                    ),
+                    None,
+                )
+                if provider == "aws" and assessment is not None:
+                    if assessment.authentication_mode.value not in {"github-oidc", "unknown"}:
+                        continue
+                    cloud_verdict = assessment.verdict
+                    cloud_missing = sorted(set(assessment.missing_evidence + oidc_missing))
+                    cloud_requirements = assessment.evidence_requirements
+                else:
+                    cloud_verdict = TriState.UNKNOWN
+                    cloud_missing = sorted(
+                        set(oidc_missing + [f"{provider} federated identity trust policy"])
+                    )
+                    cloud_requirements = []
                 relations.append(
                     _relation(
                         f"credential:oidc:{job.job_id}",
@@ -821,10 +868,9 @@ def _credential_facts(state: AnalysisState, workflow: Workflow, job: Job) -> lis
                         stable_id("cloud-identity", provider, cloud_target),
                         job.evidence_ids + subject.evidence_ids,
                         category="credential",
-                        verdict=TriState.UNKNOWN,
-                        missing_evidence=sorted(
-                            set(oidc_missing + [f"{provider} federated identity trust policy"])
-                        ),
+                        verdict=cloud_verdict,
+                        missing_evidence=cloud_missing,
+                        evidence_requirements=cloud_requirements,
                     )
                 )
     for reference in state.secret_references:
@@ -843,9 +889,7 @@ def _credential_facts(state: AnalysisState, workflow: Workflow, job: Job) -> lis
     return relations
 
 
-def _secret_flow_facts(
-    state: AnalysisState, workflow: Workflow, job: Job
-) -> list[Relation]:
+def _secret_flow_facts(state: AnalysisState, workflow: Workflow, job: Job) -> list[Relation]:
     """Connect secret credentials to their concrete local and external sinks."""
 
     relations: list[Relation] = []
@@ -927,9 +971,7 @@ def _secret_flow_facts(
                 sinks.add("secret_reaches_external_send")
             if "github_output" in run.lower():
                 sinks.add("secret_reaches_step_output")
-            if re.search(
-                r"(?<![\w-])(?:echo|printf|write-output)\b", run, re.IGNORECASE
-            ):
+            if re.search(r"(?<![\w-])(?:echo|printf|write-output)\b", run, re.IGNORECASE):
                 sinks.add("secret_may_reach_log")
             for sink in sinks:
                 relations.append(
@@ -947,11 +989,7 @@ def _secret_flow_facts(
             relations.append(
                 _relation(
                     secret,
-                    (
-                        "secret_passed_to_external_action"
-                        if external
-                        else "secret_passed_to_action"
-                    ),
+                    ("secret_passed_to_external_action" if external else "secret_passed_to_action"),
                     step.step_id,
                     reference.evidence_ids + step.evidence_ids,
                     category="credential",
@@ -1008,59 +1046,108 @@ def _secret_flow_facts(
     return relations
 
 
-def _guard_facts(workflow: Workflow, job: Job) -> list[Relation]:
-    relations: list[Relation] = []
-    if job.condition:
-        condition_guard = f"guard:condition:{job.job_id}"
-        for expression in _expressions(job.condition):
-            verdict, missing = _source_verdict(workflow, expression)
-            relations.append(
-                _relation(
-                    _input_node(expression),
-                    "untrusted_input_reaches_condition",
-                    condition_guard,
-                    job.evidence_ids,
-                    category="transform",
-                    verdict=verdict,
-                    missing_evidence=missing,
-                )
+def _condition_security_relations(
+    evaluation: ConditionEvaluation,
+    target_id: str,
+    evidence_ids: list[str],
+) -> list[Relation]:
+    guard_id = f"guard:condition:{evaluation.evaluation_id}"
+    if evaluation.security_effect is ConditionSecurityEffect.ATTACKER_SATISFIABLE:
+        return [
+            _relation(
+                f"attacker:condition:{evaluation.evaluation_id}",
+                "attacker_can_satisfy_condition",
+                target_id,
+                evidence_ids,
+                category="source",
+                verdict=TriState.TRUE,
             )
+        ]
+    if evaluation.security_effect is ConditionSecurityEffect.ALWAYS_TRUE:
+        return []
+    if evaluation.security_effect is ConditionSecurityEffect.BLOCKS:
+        verdict = TriState.TRUE
+        missing: list[str] = []
+    elif (
+        evaluation.security_effect is ConditionSecurityEffect.TRUST_REQUIRED
+        and evaluation.revision_bound is TriState.TRUE
+    ):
+        verdict = TriState.TRUE
+        missing = []
+    else:
+        verdict = TriState.UNKNOWN
+        missing = sorted(
+            set(evaluation.security_missing_evidence + evaluation.missing_evidence)
+        ) or ["condition satisfier or trust boundary"]
+    return [
+        _relation(
+            guard_id,
+            "guard_blocks_untrusted_execution",
+            target_id,
+            evidence_ids,
+            category="guard",
+            verdict=verdict,
+            missing_evidence=missing,
+            evidence_requirements=evaluation.evidence_requirements,
+        )
+    ]
+
+
+def _guard_facts(
+    state: AnalysisState,
+    repository_id: str,
+    workflow: Workflow,
+    job: Job,
+    environment_policies: dict[str, EnvironmentProtectionPolicy],
+    environment_branch_patterns: dict[str, EnvironmentBranchPatternsEvidence],
+    pending_deployment_state: PendingDeploymentStateEvidence | None = None,
+    fork_policy: ForkPullRequestPolicyEvidence | None = None,
+) -> list[Relation]:
+    relations: list[Relation] = []
+    job_evaluations = [
+        item
+        for item in state.condition_evaluations
+        if item.target_kind == "job" and item.target_id == job.job_id
+    ]
+    if (
+        fork_policy is not None
+        and fork_policy.require_approval_for_fork_pr_workflows is True
+        and "pull_request" in workflow.triggers
+    ):
         relations.append(
             _relation(
                 job.job_id,
-                "execution_condition_present",
-                condition_guard,
+                "fork_pr_workflow_requires_approval",
+                f"guard:fork-approval:{job.job_id}",
+                workflow.evidence_ids + job.evidence_ids,
+                category="guard",
+                verdict=TriState.UNKNOWN,
+                missing_evidence=["fork pull-request workflow approval state"],
+            )
+        )
+    if job.condition:
+        for evaluation in job_evaluations:
+            relations.extend(
+                _condition_security_relations(
+                    evaluation,
+                    job.job_id,
+                    workflow.evidence_ids + job.evidence_ids,
+                )
+            )
+    environment_name = concrete_environment_name(job)
+    if job.environment is not None and environment_name is None:
+        relations.append(
+            _relation(
+                job.job_id,
+                "environment_protection_unknown",
+                f"guard:environment:{job.job_id}",
                 job.evidence_ids,
                 category="guard",
                 verdict=TriState.UNKNOWN,
-                missing_evidence=["condition effectiveness"],
+                missing_evidence=["runtime GitHub environment name and protection settings"],
             )
         )
-        if WEAK_ACTOR_GUARD.search(job.condition):
-            relations.append(
-                _relation(
-                    f"guard:condition:{job.job_id}",
-                    "actor_or_event_guard_effectiveness_unknown",
-                    job.job_id,
-                    job.evidence_ids,
-                    category="guard",
-                    verdict=TriState.UNKNOWN,
-                    missing_evidence=["actor authorization and condition bypass analysis"],
-                )
-            )
-        if LABEL_OR_COMMENT_CONTROL.search(job.condition):
-            relations.append(
-                _relation(
-                    workflow.workflow_id,
-                    "label_or_comment_controls_job_condition",
-                    job.job_id,
-                    workflow.evidence_ids + job.evidence_ids,
-                    category="source",
-                    verdict=TriState.UNKNOWN,
-                    missing_evidence=["label/comment author authorization"],
-                )
-            )
-    if job.environment is not None:
+    elif environment_name is not None and environment_name not in environment_policies:
         relations.append(
             _relation(
                 job.job_id,
@@ -1072,33 +1159,133 @@ def _guard_facts(workflow: Workflow, job: Job) -> list[Relation]:
                 missing_evidence=["GitHub environment protection settings"],
             )
         )
+    elif environment_name is not None:
+        policy = environment_policies[environment_name]
+        guard = f"guard:environment:{job.job_id}"
+        if policy.required_reviewer_count:
+            relations.append(
+                _relation(
+                    job.job_id,
+                    "environment_requires_deployment_review",
+                    guard,
+                    job.evidence_ids,
+                    category="guard",
+                    verdict=TriState.UNKNOWN,
+                    missing_evidence=["environment deployment approval state"],
+                )
+            )
+        if pending_deployment_state is not None and any(
+            pending.environment_name.casefold() == environment_name.casefold()
+            for pending in pending_deployment_state.pending_environments
+        ):
+            relations.append(
+                _relation(
+                    f"guard:pending-deployment:{job.job_id}",
+                    "guard_blocks_untrusted_execution",
+                    job.job_id,
+                    job.evidence_ids,
+                    category="guard",
+                    verdict=TriState.TRUE,
+                )
+            )
+        if (
+            policy.deployment_branch_policy is DeploymentBranchPolicyMode.CUSTOM
+            and environment_name not in environment_branch_patterns
+        ):
+            relations.append(
+                _relation(
+                    job.job_id,
+                    "environment_restricts_deployment_branches",
+                    guard,
+                    job.evidence_ids,
+                    category="guard",
+                    verdict=TriState.UNKNOWN,
+                    missing_evidence=["environment deployment ref eligibility"],
+                    evidence_requirements=[
+                        EvidenceRequirementRef(
+                            kind=EvidenceRequirementKind.GITHUB_ENVIRONMENT_BRANCH_PATTERNS,
+                            subject_id=f"{repository_id}:environment:{environment_name}",
+                            qualifier=environment_name,
+                        )
+                    ],
+                )
+            )
+        elif policy.deployment_branch_policy is DeploymentBranchPolicyMode.PROTECTED:
+            relations.append(
+                _relation(
+                    job.job_id,
+                    "environment_restricts_deployment_branches",
+                    guard,
+                    job.evidence_ids,
+                    category="guard",
+                    verdict=TriState.UNKNOWN,
+                    missing_evidence=["environment deployment protected-branch eligibility"],
+                )
+            )
+        elif policy.deployment_branch_policy is DeploymentBranchPolicyMode.UNKNOWN:
+            relations.append(
+                _relation(
+                    job.job_id,
+                    "environment_deployment_branch_policy_unknown",
+                    guard,
+                    job.evidence_ids,
+                    category="guard",
+                    verdict=TriState.UNKNOWN,
+                    missing_evidence=["environment deployment branch policy"],
+                )
+            )
+        if policy.custom_protection_rule_count:
+            relations.append(
+                _relation(
+                    job.job_id,
+                    "environment_custom_protection_rules_enabled",
+                    guard,
+                    job.evidence_ids,
+                    category="guard",
+                    verdict=TriState.UNKNOWN,
+                    missing_evidence=["custom deployment protection rule result"],
+                )
+            )
+        if policy.wait_timer_minutes:
+            relations.append(
+                _relation(
+                    job.job_id,
+                    "environment_wait_timer_configured",
+                    guard,
+                    job.evidence_ids,
+                    category="guard",
+                )
+            )
+        if policy.deployment_branch_policy is DeploymentBranchPolicyMode.NONE and not any(
+            (
+                policy.required_reviewer_count,
+                policy.wait_timer_minutes,
+                policy.custom_protection_rule_count,
+            )
+        ):
+            relations.append(
+                _relation(
+                    job.job_id,
+                    "environment_has_no_deployment_protection",
+                    guard,
+                    job.evidence_ids,
+                    category="guard",
+                )
+            )
     for step in job.steps:
         run = step.run or ""
         if step.condition:
-            guard_id = f"guard:condition:{step.step_id}"
-            relations.append(
-                _relation(
-                    step.step_id,
-                    "execution_condition_present",
-                    guard_id,
-                    step.evidence_ids,
-                    category="guard",
-                    verdict=TriState.UNKNOWN,
-                    missing_evidence=["condition effectiveness"],
-                )
-            )
-            if WEAK_ACTOR_GUARD.search(step.condition):
-                relations.append(
-                    _relation(
-                        guard_id,
-                        "actor_or_event_guard_effectiveness_unknown",
+            step_evaluations = [
+                item
+                for item in state.condition_evaluations
+                if item.target_kind == "step" and item.target_id == step.step_id
+            ]
+            for evaluation in step_evaluations:
+                relations.extend(
+                    _condition_security_relations(
+                        evaluation,
                         step.step_id,
                         step.evidence_ids,
-                        category="guard",
-                        verdict=TriState.UNKNOWN,
-                        missing_evidence=[
-                            "actor authorization and condition bypass analysis"
-                        ],
                     )
                 )
         if CHECKSUM_GUARD.search(run):
@@ -1488,9 +1675,7 @@ def _artifact_and_cache_facts(state: AnalysisState) -> list[Relation]:
                         + consumer_step.evidence_ids,
                         category="transform",
                         verdict=TriState.UNKNOWN if "${{" in key else TriState.TRUE,
-                        missing_evidence=(
-                            ["runtime cache key value"] if "${{" in key else []
-                        ),
+                        missing_evidence=(["runtime cache key value"] if "${{" in key else []),
                     )
                 )
                 relations.append(
@@ -1501,16 +1686,78 @@ def _artifact_and_cache_facts(state: AnalysisState) -> list[Relation]:
                         consumer_job.evidence_ids + consumer_step.evidence_ids,
                         category="transform",
                         verdict=TriState.UNKNOWN if "${{" in key else TriState.TRUE,
-                        missing_evidence=(
-                            ["runtime cache key value"] if "${{" in key else []
-                        ),
+                        missing_evidence=(["runtime cache key value"] if "${{" in key else []),
                     )
                 )
     return relations
 
 
-def _supply_chain_facts(state: AnalysisState) -> list[Relation]:
+def _actions_policy_allows_external_reference(
+    reference: str,
+    policy: ActionsPolicyEvidence | None,
+) -> bool | None:
+    if policy is None:
+        return None
+    if not policy.enabled:
+        return False
+    target = reference.removeprefix("external:")
+    if policy.sha_pinning_required:
+        ref = target.rsplit("@", 1)[-1] if "@" in target else ""
+        if not re.fullmatch(r"[0-9a-fA-F]{40}", ref):
+            return False
+    if policy.allowed_actions == "all":
+        return True
+    if policy.allowed_actions == "local_only":
+        return False
+    if policy.allowed_actions != "selected":
+        return None
+    owner_repo = target.split("@", 1)[0]
+    if owner_repo.startswith("actions/") and policy.github_owned_allowed is True:
+        return True
+    if any(
+        fnmatchcase(target, pattern) or fnmatchcase(owner_repo, pattern)
+        for pattern in policy.patterns_allowed
+    ):
+        return True
+    if policy.verified_allowed is True:
+        return None
+    return False
+
+
+def _action_provenance_subject(payload: ActionProvenanceEvidence) -> str:
+    action = f"{payload.action_owner}/{payload.action_repository}"
+    if payload.subpath:
+        action += f"/{payload.subpath}"
+    return f"external:{action}@{payload.requested_ref}"
+
+
+def _external_action_package_ref(target_id: str) -> tuple[str, str] | None:
+    target = target_id.removeprefix("external:")
+    if "@" not in target:
+        return None
+    path, ref = target.rsplit("@", 1)
+    parts = [part for part in path.split("/") if part]
+    if len(parts) < 2:
+        return None
+    return f"{parts[0]}/{parts[1]}", ref
+
+
+def _supply_chain_facts(
+    state: AnalysisState,
+    actions_policy: ActionsPolicyEvidence | None = None,
+    *,
+    action_provenance: list[ActionProvenanceEvidence] | None = None,
+    action_advisories: list[ActionAdvisoryEvidence] | None = None,
+) -> list[Relation]:
     relations: list[Relation] = []
+    provenance_by_subject = {
+        _action_provenance_subject(payload).casefold(): payload
+        for payload in action_provenance or []
+    }
+    advisory_by_package_ref = {
+        (payload.package_name.casefold(), payload.requested_ref.casefold()): payload
+        for payload in action_advisories or []
+    }
     for relation in state.relations:
         if relation.relation_type not in {
             "uses_external_action_ref",
@@ -1519,8 +1766,73 @@ def _supply_chain_facts(state: AnalysisState) -> list[Relation]:
             continue
         target = relation.target_id.removeprefix("external:")
         ref = target.rsplit("@", 1)[-1] if "@" in target else ""
-        if re.fullmatch(r"[0-9a-fA-F]{40}", ref):
+        provenance = provenance_by_subject.get(relation.target_id.casefold())
+        immutable_reference = bool(
+            re.fullmatch(r"[0-9a-fA-F]{40}", ref)
+            or (
+                provenance is not None
+                and provenance.immutable_release_tag is TriState.TRUE
+            )
+        )
+        if provenance is not None:
+            immutable_verdict = (
+                TriState.TRUE
+                if immutable_reference
+                else TriState.FALSE
+                if provenance.ref_kind in {"tag", "branch"}
+                and provenance.immutable_release_tag is not TriState.UNKNOWN
+                else TriState.UNKNOWN
+            )
+            relations.append(
+                _relation(
+                    relation.target_id,
+                    "action_reference_is_immutable",
+                    relation.source_id,
+                    relation.evidence_ids,
+                    category="guard",
+                    verdict=immutable_verdict,
+                    missing_evidence=(
+                        []
+                        if immutable_verdict is not TriState.UNKNOWN
+                        else ["verified action reference immutability"]
+                    ),
+                )
+            )
+            if provenance.resolved_sha:
+                relations.append(
+                    _relation(
+                        relation.target_id,
+                        "action_ref_resolves_to_commit",
+                        f"git:commit:{provenance.resolved_sha.lower()}",
+                        relation.evidence_ids,
+                        category="context",
+                    )
+                )
+        package_ref = _external_action_package_ref(relation.target_id)
+        advisory = (
+            advisory_by_package_ref.get((package_ref[0].casefold(), package_ref[1].casefold()))
+            if package_ref is not None
+            else None
+        )
+        if advisory is not None:
+            relations.append(
+                _relation(
+                    relation.target_id,
+                    "known_action_advisory_affects_reference",
+                    relation.source_id,
+                    relation.evidence_ids,
+                    category="execution",
+                    verdict=advisory.affected,
+                    missing_evidence=(
+                        ["action advisory applicability"]
+                        if advisory.affected is TriState.UNKNOWN
+                        else []
+                    ),
+                )
+            )
+        if immutable_reference:
             continue
+        allowed = _actions_policy_allows_external_reference(relation.target_id, actions_policy)
         relations.append(
             _relation(
                 relation.target_id,
@@ -1532,8 +1844,12 @@ def _supply_chain_facts(state: AnalysisState) -> list[Relation]:
                 relation.source_id,
                 relation.evidence_ids,
                 category="execution",
-                verdict=TriState.UNKNOWN,
-                missing_evidence=["external dependency integrity", "upstream compromise"],
+                verdict=TriState.FALSE if allowed is False else TriState.UNKNOWN,
+                missing_evidence=(
+                    []
+                    if allowed is False
+                    else ["external dependency integrity", "upstream compromise"]
+                ),
             )
         )
     return relations
@@ -1563,8 +1879,135 @@ def _reusable_workflow_facts(state: AnalysisState) -> list[Relation]:
     return relations
 
 
-def _runtime_and_dependency_facts(state: AnalysisState) -> list[Relation]:
+def _runtime_job_matches(
+    state: AnalysisState,
+    workflow_run_jobs: WorkflowRunJobsEvidence | None,
+) -> dict[str, WorkflowRunJobEvidence]:
+    if workflow_run_jobs is None:
+        return {}
+    static_by_name: dict[str, list[Job]] = defaultdict(list)
+    for workflow in state.workflows:
+        for job in workflow.jobs:
+            raw_name = job.name if job.name is not None else job.job_key
+            if not isinstance(raw_name, str):
+                continue
+            name = raw_name.strip()
+            if not name or "${{" in name:
+                continue
+            static_by_name[name].append(job)
+    runtime_by_name: dict[str, list[WorkflowRunJobEvidence]] = defaultdict(list)
+    for runtime_job in workflow_run_jobs.jobs:
+        runtime_by_name[runtime_job.name].append(runtime_job)
+    return {
+        jobs[0].job_id: runtime_by_name[name][0]
+        for name, jobs in static_by_name.items()
+        if len(jobs) == 1 and len(runtime_by_name.get(name, ())) == 1
+    }
+
+
+def _runtime_job_executed(job: WorkflowRunJobEvidence | None) -> bool:
+    return bool(
+        job is not None
+        and job.runner_id is not None
+        and job.status.casefold() in {"in_progress", "completed"}
+    )
+
+
+def _runtime_telemetry_facts(
+    state: AnalysisState,
+    telemetry: list[RuntimeTelemetryEvidence],
+) -> list[Relation]:
+    """Bind normalized runtime events only to unique exact static identities."""
+
+    workflow_by_path = {workflow.path: workflow for workflow in state.workflows}
     relations: list[Relation] = []
+    for payload in telemetry:
+        for index, event in enumerate(payload.events):
+            workflow = workflow_by_path.get(event.identity.workflow_path)
+            if workflow is None:
+                continue
+            matching_jobs = [
+                job
+                for job in workflow.jobs
+                if event.identity.job_name
+                in {
+                    value
+                    for value in (job.name, job.job_key)
+                    if isinstance(value, str) and value
+                }
+            ]
+            if len(matching_jobs) != 1:
+                continue
+            job = matching_jobs[0]
+            step_candidates = list(job.steps)
+            if event.identity.step_number is not None:
+                number = event.identity.step_number
+                step_candidates = (
+                    [step_candidates[number - 1]] if number <= len(step_candidates) else []
+                )
+            if event.identity.step_name is not None:
+                step_candidates = [
+                    step for step in step_candidates if step.name == event.identity.step_name
+                ]
+            if len(step_candidates) != 1:
+                continue
+            step = step_candidates[0]
+            runtime_node = stable_id(
+                "runtime-event",
+                payload.run_id,
+                str(payload.run_attempt),
+                str(index),
+                event.kind,
+                step.step_id,
+            )
+            relations.append(
+                _relation(
+                    step.step_id,
+                    "runtime_event_exactly_bound_to_step",
+                    runtime_node,
+                    step.evidence_ids,
+                    category="context",
+                )
+            )
+            if isinstance(event, RuntimeProcessEvent):
+                relations.append(
+                    _relation(
+                        runtime_node,
+                        "runtime_process_observed_in_step",
+                        f"runtime:process:{event.process_name}",
+                        step.evidence_ids,
+                        category="execution",
+                    )
+                )
+            elif isinstance(event, RuntimeNetworkEvent):
+                relations.append(
+                    _relation(
+                        runtime_node,
+                        "runtime_process_made_external_network_call",
+                        f"runtime:network:{event.destination}:{event.port or 0}",
+                        step.evidence_ids,
+                        category="execution",
+                    )
+                )
+            elif isinstance(event, RuntimeFileEvent) and event.workspace_relative:
+                relations.append(
+                    _relation(
+                        runtime_node,
+                        "runtime_process_modified_workspace_file",
+                        _file_node(event.path),
+                        step.evidence_ids,
+                        category="transform",
+                    )
+                )
+    return relations
+
+
+def _runtime_and_dependency_facts(
+    state: AnalysisState,
+    workflow_run_jobs: WorkflowRunJobsEvidence | None = None,
+) -> list[Relation]:
+    relations: list[Relation] = []
+    runtime_jobs = _runtime_job_matches(state, workflow_run_jobs)
     runner_jobs: dict[str, list[tuple[Workflow, Job]]] = defaultdict(list)
     for workflow in state.workflows:
         for job in workflow.jobs:
@@ -1572,7 +2015,14 @@ def _runtime_and_dependency_facts(state: AnalysisState) -> list[Relation]:
             if "self-hosted" in runs_on.lower():
                 runner_id = stable_id("runner", runs_on.lower())
                 runner_jobs[runner_id].append((workflow, job))
-                missing = ["runner isolation", "runner ephemerality", "runtime machine identity"]
+                runtime_job = runtime_jobs.get(job.job_id)
+                runtime_self_hosted = bool(
+                    _runtime_job_executed(runtime_job)
+                    and any(label.casefold() == "self-hosted" for label in runtime_job.labels)
+                )
+                missing = ["runner isolation", "runner ephemerality"]
+                if not runtime_self_hosted:
+                    missing.append("runtime machine identity")
                 relations.extend(
                     [
                         _relation(
@@ -1581,8 +2031,8 @@ def _runtime_and_dependency_facts(state: AnalysisState) -> list[Relation]:
                             runner_id,
                             job.evidence_ids,
                             category="context",
-                            verdict=TriState.UNKNOWN,
-                            missing_evidence=missing,
+                            verdict=TriState.TRUE if runtime_self_hosted else TriState.UNKNOWN,
+                            missing_evidence=[] if runtime_self_hosted else missing,
                         ),
                         _relation(
                             runner_id,
@@ -1630,16 +2080,17 @@ def _runtime_and_dependency_facts(state: AnalysisState) -> list[Relation]:
                     )
     for runner_id, entries in runner_jobs.items():
         attacker_jobs = [
-            (workflow, job)
-            for workflow, job in entries
-            if "pull_request" in workflow.triggers
+            (workflow, job) for workflow, job in entries if "pull_request" in workflow.triggers
         ]
         privileged_jobs = [
-            (workflow, job)
-            for workflow, job in entries
-            if _job_has_sensitive_authority(state, job)
+            (workflow, job) for workflow, job in entries if _job_has_sensitive_authority(state, job)
         ]
         for source_workflow, source_job in attacker_jobs:
+            source_runtime_job = runtime_jobs.get(source_job.job_id)
+            source_executed = bool(
+                _runtime_job_executed(source_runtime_job)
+                and any(label.casefold() == "self-hosted" for label in source_runtime_job.labels)
+            )
             relations.append(
                 _relation(
                     "attacker:fork-pr",
@@ -1647,13 +2098,26 @@ def _runtime_and_dependency_facts(state: AnalysisState) -> list[Relation]:
                     runner_id,
                     source_workflow.evidence_ids + source_job.evidence_ids,
                     category="execution",
-                    verdict=TriState.UNKNOWN,
-                    missing_evidence=["runner assignment and runtime execution"],
+                    verdict=TriState.TRUE if source_executed else TriState.UNKNOWN,
+                    missing_evidence=(
+                        [] if source_executed else ["runner assignment and runtime execution"]
+                    ),
                 )
             )
             for target_workflow, target_job in privileged_jobs:
                 if source_job.job_id == target_job.job_id:
                     continue
+                target_runtime_job = runtime_jobs.get(target_job.job_id)
+                identities_known = _runtime_job_executed(
+                    source_runtime_job
+                ) and _runtime_job_executed(target_runtime_job)
+                same_runner = bool(
+                    identities_known
+                    and source_runtime_job is not None
+                    and target_runtime_job is not None
+                    and source_runtime_job.runner_id == target_runtime_job.runner_id
+                )
+                different_runner = bool(identities_known and not same_runner)
                 relations.append(
                     _relation(
                         source_job.job_id,
@@ -1664,12 +2128,18 @@ def _runtime_and_dependency_facts(state: AnalysisState) -> list[Relation]:
                         + target_workflow.evidence_ids
                         + target_job.evidence_ids,
                         category="transform",
-                        verdict=TriState.UNKNOWN,
-                        missing_evidence=[
-                            "runner identity match",
-                            "runner cleanup",
-                            "runner ephemerality",
-                        ],
+                        verdict=TriState.FALSE if different_runner else TriState.UNKNOWN,
+                        missing_evidence=(
+                            []
+                            if different_runner
+                            else ["runner cleanup", "runner ephemerality"]
+                            if same_runner
+                            else [
+                                "runner identity match",
+                                "runner cleanup",
+                                "runner ephemerality",
+                            ]
+                        ),
                     )
                 )
                 if source_job.job_id.split(":job:")[0] == target_job.job_id.split(":job:")[0]:
@@ -1680,15 +2150,411 @@ def _runtime_and_dependency_facts(state: AnalysisState) -> list[Relation]:
                             target_job.job_id,
                             source_job.evidence_ids + target_job.evidence_ids,
                             category="transform",
-                            verdict=TriState.UNKNOWN,
-                            missing_evidence=["workspace cleanup and runner scheduling"],
+                            verdict=TriState.FALSE if different_runner else TriState.UNKNOWN,
+                            missing_evidence=(
+                                []
+                                if different_runner
+                                else ["workspace cleanup"]
+                                if same_runner
+                                else ["workspace cleanup and runner scheduling"]
+                            ),
                         )
                     )
     return relations
 
 
+def _deployment_branch_pattern_matches(pattern: str, branch: str) -> TriState:
+    """Match GitHub deployment branch patterns without letting `*` cross `/`.
+
+    GitHub documents Ruby File.fnmatch-style path matching for environment deployment policies.
+    Character classes and escapes are left UNKNOWN here instead of approximated with Python's
+    fnmatch semantics, whose `*` handling across `/` is too permissive for this use case.
+    """
+
+    if any(character in pattern for character in "[]\\"):
+        return TriState.UNKNOWN
+    translated: list[str] = []
+    for character in pattern:
+        if character == "*":
+            translated.append("[^/]*")
+        elif character == "?":
+            translated.append("[^/]")
+        else:
+            translated.append(re.escape(character))
+    return (
+        TriState.TRUE if re.fullmatch("".join(translated), branch) is not None else TriState.FALSE
+    )
+
+
+def _environment_branch_pattern_facts(
+    state: AnalysisState,
+    environment_policies: dict[str, EnvironmentProtectionPolicy],
+    environment_branch_patterns: dict[str, EnvironmentBranchPatternsEvidence],
+) -> list[Relation]:
+    workflows = {workflow.workflow_id: workflow for workflow in state.workflows}
+    jobs = {job.job_id: job for workflow in state.workflows for job in workflow.jobs}
+    triggers = {trigger.context_id: trigger for trigger in state.trigger_contexts}
+    relations: list[Relation] = []
+    for context in state.job_execution_contexts:
+        job = jobs.get(context.job_id)
+        trigger = triggers.get(context.trigger_context_id)
+        workflow = workflows.get(context.workflow_id)
+        if job is None or trigger is None or workflow is None:
+            continue
+        environment_name = concrete_environment_name(job)
+        if environment_name is None:
+            continue
+        policy = environment_policies.get(environment_name)
+        evidence = environment_branch_patterns.get(environment_name)
+        if (
+            policy is None
+            or policy.deployment_branch_policy is not DeploymentBranchPolicyMode.CUSTOM
+            or evidence is None
+        ):
+            continue
+        guard_id = f"guard:environment-ref:{context.context_id}"
+        if trigger.event_name != "push":
+            relations.append(
+                _relation(
+                    context.context_id,
+                    "environment_restricts_deployment_branches",
+                    guard_id,
+                    context.evidence_ids,
+                    category="guard",
+                    verdict=TriState.UNKNOWN,
+                    missing_evidence=["runtime GITHUB_REF for environment deployment"],
+                )
+            )
+            continue
+        branches = exact_push_branches(workflow)
+        if not branches:
+            relations.append(
+                _relation(
+                    context.context_id,
+                    "environment_restricts_deployment_branches",
+                    guard_id,
+                    context.evidence_ids,
+                    category="guard",
+                    verdict=TriState.UNKNOWN,
+                    missing_evidence=["runtime GITHUB_REF for environment deployment"],
+                )
+            )
+            continue
+
+        branch_patterns = list(evidence.branch_patterns)
+        unknown_target_patterns = list(evidence.unknown_target_patterns)
+        if (
+            evidence.patterns
+            and not branch_patterns
+            and not evidence.tag_patterns
+            and not unknown_target_patterns
+        ):
+            # Old checkpoints did not preserve branch-vs-tag target type.
+            unknown_target_patterns = list(evidence.patterns)
+
+        unresolved_match = False
+        allowed = False
+        for branch in branches:
+            for pattern in branch_patterns:
+                match = _deployment_branch_pattern_matches(pattern, branch)
+                if match is TriState.TRUE:
+                    allowed = True
+                    break
+                if match is TriState.UNKNOWN:
+                    unresolved_match = True
+            if allowed:
+                break
+        if allowed:
+            continue
+        if unknown_target_patterns or unresolved_match:
+            relations.append(
+                _relation(
+                    context.context_id,
+                    "environment_restricts_deployment_branches",
+                    guard_id,
+                    context.evidence_ids,
+                    category="guard",
+                    verdict=TriState.UNKNOWN,
+                    missing_evidence=["deployment branch pattern matching semantics"],
+                )
+            )
+            continue
+        relations.append(
+            _relation(
+                guard_id,
+                "guard_blocks_untrusted_execution",
+                context.context_id,
+                context.evidence_ids,
+                category="guard",
+                verdict=TriState.TRUE,
+            )
+        )
+    return relations
+
+
+_BRANCH_RULES_DIRECT_PUSH_GATES = {
+    "update",
+    "required_status_checks",
+    "required_deployments",
+    "required_code_scanning",
+}
+_BRANCH_RULES_DIRECT_PUSH_NONBLOCKING = {
+    "creation",
+    "deletion",
+    "non_fast_forward",
+    "required_linear_history",
+    "required_signatures",
+    "commit_message_pattern",
+    "commit_author_email_pattern",
+    "committer_email_pattern",
+    "branch_name_pattern",
+}
+
+
+def _branch_rule_blocking_reasons(evidence: EffectiveBranchRulesEvidence) -> list[str]:
+    rule_types = set(evidence.active_rule_types)
+    reasons: list[str] = []
+    if evidence.update_restricted_to_bypass_actors or "update" in rule_types:
+        reasons.append("repository-writer branch update bypass eligibility")
+    if evidence.requires_pull_request or "pull_request" in rule_types:
+        approvals = evidence.required_approving_review_count
+        if approvals is None:
+            reasons.append("pull-request review requirement details")
+        elif approvals > 0 or evidence.require_last_push_approval is True:
+            reasons.append("required pull-request approval outcome")
+    if evidence.required_status_check_count is None and "required_status_checks" in rule_types:
+        reasons.append("required status check configuration")
+    elif (evidence.required_status_check_count or 0) > 0:
+        reasons.append("required status check outcome")
+    if rule_types & (_BRANCH_RULES_DIRECT_PUSH_GATES - {"update", "required_status_checks"}):
+        reasons.append("active branch rule outcome")
+    unknown_rule_types = (
+        rule_types
+        - _BRANCH_RULES_DIRECT_PUSH_GATES
+        - {
+            "pull_request",
+            *_BRANCH_RULES_DIRECT_PUSH_NONBLOCKING,
+        }
+    )
+    if unknown_rule_types:
+        reasons.append("unmodeled active branch rule effect")
+    if evidence.legacy_protection_present is TriState.TRUE:
+        reasons.append("legacy branch protection push/merge restrictions")
+    elif (
+        evidence.protected is TriState.TRUE
+        and not rule_types
+        and evidence.legacy_protection_present is not TriState.FALSE
+    ):
+        reasons.append("protected branch enforcement details")
+    elif evidence.protected is TriState.UNKNOWN and not rule_types:
+        reasons.append("branch protection state")
+    return sorted(set(reasons))
+
+
+def _branch_rule_facts(
+    state: AnalysisState,
+    profile: AttackerProfile,
+    branch_rules: dict[str, EffectiveBranchRulesEvidence],
+) -> list[Relation]:
+    if profile is not AttackerProfile.REPO_WRITER:
+        return []
+    workflows = {workflow.workflow_id: workflow for workflow in state.workflows}
+    relations: list[Relation] = []
+    for trigger in state.trigger_contexts:
+        if trigger.event_name != "push" or trigger.attacker_can_trigger is TriState.FALSE:
+            continue
+        workflow = workflows.get(trigger.workflow_id)
+        if workflow is None:
+            continue
+        branches = exact_push_branches(workflow)
+        if not branches:
+            continue
+        missing_branches = [branch for branch in branches if branch not in branch_rules]
+        if missing_branches:
+            reasons = ["branch protection and effective branch rules for configured push branches"]
+        else:
+            reasons = []
+            for branch in branches:
+                evidence = branch_rules[branch]
+                branch_reasons = _branch_rule_blocking_reasons(evidence)
+                # One allowed branch is enough for this push-triggered workflow to remain reachable.
+                if not branch_reasons:
+                    reasons = []
+                    break
+                reasons.extend(branch_reasons)
+        if not reasons:
+            continue
+        relations.append(
+            _relation(
+                trigger.context_id,
+                "branch_rules_may_block_direct_push",
+                f"guard:branch-rules:{trigger.context_id}",
+                trigger.evidence_ids,
+                category="guard",
+                verdict=TriState.UNKNOWN,
+                missing_evidence=sorted(set(reasons)),
+                evidence_requirements=[
+                    EvidenceRequirementRef(
+                        kind=EvidenceRequirementKind.GITHUB_EFFECTIVE_BRANCH_RULES,
+                        subject_id=state.repository.repository_id,
+                        qualifier=branch,
+                    )
+                    for branch in branches
+                ],
+            )
+        )
+    return relations
+
+
+def _secret_metadata_and_audit_facts(
+    state: AnalysisState,
+    *,
+    secret_metadata: list[SecretMetadataEvidence],
+    rotation_policy: SecretRotationPolicyEvidence | None,
+    audit_events: list[AuditEventsEvidence],
+) -> list[Relation]:
+    relations: list[Relation] = []
+    metadata_by_name: dict[str, list[tuple[SecretMetadataEvidence, object]]] = defaultdict(list)
+    for payload in secret_metadata:
+        for item in payload.secrets:
+            metadata_by_name[item.name.casefold()].append((payload, item))
+
+    for reference in state.secret_references:
+        match = re.search(r"secrets\.([A-Za-z_][A-Za-z0-9_]*)", reference.expression, re.IGNORECASE)
+        if match is None:
+            continue
+        name = match.group(1)
+        secret_node = f"secret:{reference.reference_id}"
+        matches = metadata_by_name.get(name.casefold(), [])
+        if matches:
+            relations.append(
+                _relation(
+                    secret_node,
+                    "secret_metadata_observed",
+                    f"secret-metadata:{name.casefold()}",
+                    reference.evidence_ids,
+                    category="credential",
+                )
+            )
+        elif secret_metadata:
+            relations.append(
+                _relation(
+                    secret_node,
+                    "secret_metadata_scope_unresolved",
+                    f"secret-metadata:{name.casefold()}",
+                    reference.evidence_ids,
+                    category="credential",
+                    verdict=TriState.UNKNOWN,
+                    missing_evidence=["environment secret metadata or inaccessible secret scope"],
+                )
+            )
+
+        if rotation_policy is None:
+            if matches:
+                relations.append(
+                    _relation(
+                        secret_node,
+                        "secret_rotation_policy_unknown",
+                        f"secret-metadata:{name.casefold()}",
+                        reference.evidence_ids,
+                        category="guard",
+                        verdict=TriState.UNKNOWN,
+                        missing_evidence=["operator secret rotation policy"],
+                    )
+                )
+            continue
+        if len(matches) != 1:
+            if matches:
+                relations.append(
+                    _relation(
+                        secret_node,
+                        "secret_rotation_age_exceeds_policy",
+                        f"secret-metadata:{name.casefold()}",
+                        reference.evidence_ids,
+                        category="guard",
+                        verdict=TriState.UNKNOWN,
+                        missing_evidence=["exact secret scope binding"],
+                    )
+                )
+            continue
+        payload, item = matches[0]
+        changed_at = item.updated_at or item.created_at
+        if changed_at is None:
+            verdict = TriState.UNKNOWN
+            missing = ["secret creation or update timestamp"]
+        else:
+            age_days = max((payload.observed_at - changed_at).days, 0)
+            verdict = (
+                TriState.TRUE if age_days > rotation_policy.max_age_days else TriState.FALSE
+            )
+            missing = []
+        relations.append(
+            _relation(
+                secret_node,
+                "secret_rotation_age_exceeds_policy",
+                f"secret-metadata:{name.casefold()}",
+                reference.evidence_ids,
+                category="guard",
+                verdict=verdict,
+                missing_evidence=missing,
+            )
+        )
+
+    for payload in audit_events:
+        audit_node = stable_id(
+            "audit-window",
+            payload.organization,
+            payload.query,
+            payload.coverage_start.isoformat(),
+            payload.coverage_end.isoformat(),
+        )
+        relations.append(
+            _relation(
+                state.repository.repository_id,
+                "audit_window_observed_for_repository",
+                audit_node,
+                [],
+                category="context",
+            )
+        )
+        for index, event in enumerate(payload.events):
+            event_node = stable_id(
+                "audit-event",
+                audit_node,
+                str(index),
+                event.action,
+                event.actor or "",
+                event.created_at.isoformat() if event.created_at else "",
+            )
+            relations.append(
+                _relation(
+                    audit_node,
+                    "audit_event_observed",
+                    event_node,
+                    [],
+                    category="context",
+                )
+            )
+    return relations
+
+
 def derive_security_facts(
-    state: AnalysisState, profile: AttackerProfile
+    state: AnalysisState,
+    profile: AttackerProfile,
+    *,
+    environment_policies: dict[str, EnvironmentProtectionPolicy] | None = None,
+    environment_branch_patterns: dict[str, EnvironmentBranchPatternsEvidence] | None = None,
+    fork_policy: ForkPullRequestPolicyEvidence | None = None,
+    actions_policy: ActionsPolicyEvidence | None = None,
+    branch_rules: dict[str, EffectiveBranchRulesEvidence] | None = None,
+    pending_deployment_state: PendingDeploymentStateEvidence | None = None,
+    workflow_run_jobs: WorkflowRunJobsEvidence | None = None,
+    runtime_telemetry: list[RuntimeTelemetryEvidence] | None = None,
+    action_provenance: list[ActionProvenanceEvidence] | None = None,
+    action_advisories: list[ActionAdvisoryEvidence] | None = None,
+    secret_metadata: list[SecretMetadataEvidence] | None = None,
+    rotation_policy: SecretRotationPolicyEvidence | None = None,
+    audit_events: list[AuditEventsEvidence] | None = None,
 ) -> list[Relation]:
     """Derive reusable facts without emitting vulnerability Findings."""
     relations: list[Relation] = []
@@ -1697,11 +2563,47 @@ def derive_security_facts(
         relations.extend(_source_facts(state, workflow, profile))
         for job in workflow.jobs:
             relations.extend(_step_flow_facts(state, workflow, job, profile))
+            relations.extend(derive_workspace_revision_relations(workflow, job, profile))
             relations.extend(_credential_facts(state, workflow, job))
             relations.extend(_secret_flow_facts(state, workflow, job))
-            relations.extend(_guard_facts(workflow, job))
+            relations.extend(
+                _guard_facts(
+                    state,
+                    state.repository.repository_id,
+                    workflow,
+                    job,
+                    environment_policies or {},
+                    environment_branch_patterns or {},
+                    pending_deployment_state=pending_deployment_state,
+                    fork_policy=fork_policy,
+                )
+            )
+    relations.extend(
+        _environment_branch_pattern_facts(
+            state,
+            environment_policies or {},
+            environment_branch_patterns or {},
+        )
+    )
+    relations.extend(_branch_rule_facts(state, profile, branch_rules or {}))
     relations.extend(_artifact_and_cache_facts(state))
-    relations.extend(_supply_chain_facts(state))
+    relations.extend(
+        _supply_chain_facts(
+            state,
+            actions_policy=actions_policy,
+            action_provenance=action_provenance,
+            action_advisories=action_advisories,
+        )
+    )
     relations.extend(_reusable_workflow_facts(state))
-    relations.extend(_runtime_and_dependency_facts(state))
+    relations.extend(_runtime_and_dependency_facts(state, workflow_run_jobs))
+    relations.extend(_runtime_telemetry_facts(state, runtime_telemetry or []))
+    relations.extend(
+        _secret_metadata_and_audit_facts(
+            state,
+            secret_metadata=secret_metadata or [],
+            rotation_policy=rotation_policy,
+            audit_events=audit_events or [],
+        )
+    )
     return _deduplicate(relations)

@@ -143,9 +143,9 @@ async def test_unknown_guard_caps_matching_flow_as_candidate(tmp_path: Path) -> 
     )
     state.relations.append(
         Relation(
-            source_id=execution.target_id,
-            relation_type="execution_condition_present",
-            target_id=f"guard:condition:{execution.target_id}",
+            source_id=f"guard:condition:{execution.target_id}",
+            relation_type="guard_blocks_untrusted_execution",
+            target_id=execution.target_id,
             category="guard",
             verdict=TriState.UNKNOWN,
             missing_evidence=["condition expression semantics"],

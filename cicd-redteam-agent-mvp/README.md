@@ -4,7 +4,9 @@
 
 CI/CD Red Team Agent는 workflow, job, step, artifact, credential 사이의 관계를 정적으로
 분석합니다. 저장소에서 확인한 사실은 deterministic 규칙으로 처리하고, 선택적으로 LLM을
-사용해 불확실한 연결을 조사합니다. 모든 결과는 원본 위치를 가리키는 Evidence와 함께
+사용해 불확실한 연결을 조사합니다. reasoning mode에서는 명시적인 `--observe-github`
+opt-in이 있을 때만 GitHub.com의 read-only repository policy를 관찰해 외부 `UNKNOWN`을
+semantic state에 반영할 수 있습니다. 모든 결과는 원본 위치를 가리키는 Evidence와 함께
 저장됩니다.
 
 > [!IMPORTANT]
@@ -17,7 +19,8 @@ CI/CD Red Team Agent는 workflow, job, step, artifact, credential 사이의 관�
 |---|---|
 | 정적 분석 | GitHub Actions YAML과 로컬 action/script 참조를 실행 없이 추적합니다. |
 | 공격 경로 구성 | 공격자 입력에서 `GITHUB_TOKEN` 또는 Cloud Identity까지 관계를 연결합니다. |
-| Evidence 기반 판정 | 로컬 근거만 `SUPPORTED`로 판정하고 외부 상태는 `UNKNOWN`으로 남깁니다. |
+| Evidence 기반 판정 | 로컬 근거를 우선하고 확인하지 못한 외부 상태는 `UNKNOWN`으로 보존합니다. |
+| 선택적 GitHub 관찰 | `--observe-github`에서 selected Frontier의 policy/runtime evidence만 읽고 semantic state를 재계산합니다. |
 | 선택적 LLM 추론 | LiteLLM 또는 ChatGPT 로그인 기반 Codex로 Fact/Relation을 조합합니다. |
 | 안전한 결과 저장 | secret을 redaction하고 구조화 결과, 요약, trace를 분리해 기록합니다. |
 
@@ -37,10 +40,16 @@ Fact / Relation / Guard / Evidence
       │
       ├── deterministic mode ──▶ scenario rules + attack graph
       │
-      └── reasoning mode ──────▶ LLM proposal ──▶ validator
-                                                   │
-                                                   ▼
-                              analysis.json + summary.md + trace.jsonl
+      └── reasoning mode ──────▶ optional GitHub read-only observation
+                                      │
+                                      ▼
+                                semantic recompute
+                                      │
+                                      ▼
+                                  LLM proposal ──▶ validator
+                                                     │
+                                                     ▼
+                                analysis.json + summary.md + trace.jsonl
 ```
 
 Parser의 permission 요약은 문법 호환용이고 보안 판정의 권한 원본이 아닙니다. 별도 execution
@@ -50,6 +59,45 @@ LLM은 저장소를 직접 읽거나 Evidence를 만들지 않습니다. 제한�
 정보만 확인하고 경로를 제안하며, 최종 결과는 deterministic validator가 검증합니다.
 
 ## 빠른 시작
+
+### 0. 자연어 모드 (추천)
+
+명령 옵션을 외울 필요 없이 다음처럼 실행할 수 있습니다.
+
+```powershell
+uv run cicd-agent
+```
+
+그 다음 한 문장으로 저장소와 원하는 분석을 입력합니다.
+
+```text
+분석 요청> https://github.com/step-security/github-actions-goat 이 저장소의 CI/CD 취약점과 공격 경로를 폭넓게 분석해줘
+```
+
+GitHub URL은 실행하지 않고 별도 로컬 분석용 복제본으로 가져온 뒤 분석합니다. 로컬 경로도
+그대로 사용할 수 있습니다. 자연어 모드는 기본적으로 저장된 Codex ChatGPT 로그인을 사용하는
+reasoning 분석을 선택하며, `AI 없이 정적 분석만 해줘`라고 명시하면 deterministic mode를
+사용합니다. `gpt-5.6-luna로 분석해줘`처럼 모델명을 적으면 해당 모델을 사용하고,
+`기본 모델로 분석해줘`라고 하면 Codex 기본 모델을 사용합니다. `실제 GitHub 설정과 실제
+권한까지 GitHub API로 확인해줘`처럼 외부 관찰을 명시한 경우에만 read-only GitHub
+observation을 opt-in 합니다.
+
+한 줄 실행도 가능합니다.
+
+```powershell
+uv run cicd-agent https://github.com/step-security/github-actions-goat 이 저장소 CI/CD 취약점 분석해줘
+```
+
+분석이 끝나면 `analysis.json`을 기반으로 최종 Finding 또는 아직 해결되지 않은 상위 attack
+frontier, 관련 workflow, missing Evidence와 PARTIAL 종료 원인을 터미널에 자연어로 출력합니다.
+PARTIAL은 `0 findings`와 동일하게 표시하지 않습니다. 기존 실행 결과도 다시 읽을 수 있습니다.
+
+```powershell
+uv run cicd-agent .\output\<run-id>\analysis.json 결과 설명해줘
+uv run cicd-agent 마지막 분석 결과 보여줘
+```
+
+기존 `analyze`, `resume`, `evaluate` 명령과 모든 고급 플래그는 그대로 유지됩니다.
 
 ### 1. 설치
 
@@ -76,7 +124,7 @@ output/<run-id>/
 ├── analysis.json   # schema version 1.0 구조화 결과
 ├── summary.md      # Finding, Attack Path, Cloud Identity 요약
 ├── trace.jsonl     # redaction된 분석 이벤트
-├── checkpoint.json # reasoning mode의 마지막 안전 라운드 상태
+├── checkpoint.json # reasoning mode의 마지막 안전 라운드·조사 세션 상태
 └── events.jsonl    # append-only Agent 실행 이력
 ```
 
@@ -101,6 +149,55 @@ uv run cicd-agent analyze C:\path\to\repository `
 
 프로세스 환경 변수가 `.env`보다 우선합니다. key가 여러 개라면 `--provider`를 명시해야
 하며, 분석 대상 저장소 내부의 `.env`는 인증 정보로 읽지 않습니다.
+
+### GitHub repository policy 관찰
+
+reasoning mode에서 repository/fork/Actions/branch/Environment policy 같은 외부 상태를 read-only로
+관찰하려면 명시적으로 `--observe-github`를 추가합니다. 기본 실행에서는 네트워크 관찰을
+하지 않습니다.
+
+```powershell
+# trusted operator 환경에 GH_TOKEN 또는 GITHUB_TOKEN 설정
+uv run cicd-agent analyze C:\path\to\repository `
+  --output .\output `
+  --mode reasoning `
+  --provider codex-chatgpt `
+  --observe-github
+```
+
+특정 workflow run의 pending deployment와 runner assignment까지 관찰할 때만 양수 run ID를
+추가합니다. `--github-run-id`는 `--observe-github` 없이 사용할 수 없습니다.
+
+```powershell
+uv run cicd-agent analyze C:\analysis-targets\project `
+  --output .\output `
+  --mode reasoning `
+  --provider codex-chatgpt `
+  --observe-github `
+  --github-run-id 4242
+```
+
+자동 repository 해석은 `github.com` origin만 허용하며 API credential은 `api.github.com`에만
+전송합니다. 관찰이 실패하면 해당 외부 상태는 `UNKNOWN`으로 유지되고 reasoning 분석은
+계속됩니다. Environment 응답은 reviewer identity를 저장하지 않고 reviewer 수, self-review 차단,
+wait timer, deployment branch policy와 custom protection rule 수만 정규화합니다.
+Runtime job은 정적 job key/name과 유일하게 정확히 일치할 때만 연결합니다. 같은 `runner_id`는
+identity만 해소하고 cleanup/ephemerality는 계속 `UNKNOWN`이며, 서로 다른 concrete ID만 해당
+run의 cross-job runner-state 경로를 `FALSE`로 닫습니다.
+
+AWS GitHub OIDC trust까지 판정하려면 GitHub 관찰에 `--observe-aws`를 함께 추가합니다.
+선택적으로 `--aws-profile <name>`을 지정할 수 있으며 IAM `GetRole`과
+`GetOpenIDConnectProvider`만 read-only로 호출합니다. 정적 trust가 `TRUE`여도 실제 STS
+AssumeRole 성공이나 role permission을 검증한 것은 아닙니다.
+
+```powershell
+uv run cicd-agent analyze C:\analysis-targets\project `
+  --output .\output `
+  --provider codex-chatgpt `
+  --observe-github `
+  --observe-aws `
+  --aws-profile security-audit
+```
 
 ### ChatGPT 로그인 기반 Codex
 
@@ -164,6 +261,9 @@ checkpoint에서 복원하며 재개 중 변경할 수 없습니다. 완료된 �
 Objective hash/compiled Goal 불일치, 손상된
 checkpoint/event journal, 이미 사용한 양 이하의 한도는 거부됩니다. 중단된 라운드의 부분 상태와 대화 조각은 버리고 마지막 checkpoint부터 다시
 시도하며, 기존 `analysis.json`, `summary.md`, `trace.jsonl`은 같은 run 디렉터리에서 갱신됩니다.
+`--observe-github` 실행은 `KnowledgeState`, Task ledger와 attempts, 정규화된 Observation을
+versioned investigation snapshot으로 함께 저장합니다. snapshot의 `AnalysisState`가 canonical
+state와 다르거나 active Task lease가 남아 있으면 안전한 재개 지점이 아니므로 거부합니다.
 
 Reasoning Agent는 조사 중인 가설, 근거 Relation/Evidence, 부족한 정보와 다음 확인 대상을
 `working_memory`에 최대 8개까지 보존합니다. 가설 변경은 선택한 Capability 호출에 함께
@@ -180,6 +280,15 @@ bounded 후보를 반환합니다. `COMPLETE`이면서 `proposal_ready=true`인 
 실행 통제가 이어지지 않으면 proposal-ready가 아닙니다. `ListSecurityFacts`는 Frontier가 충분하지
 않을 때 기본 compact Fact를 반환하며, legacy 전체 제출
 호환성이 필요할 때만 exact grounding ID를 명시적으로 요청합니다.
+
+각 Frontier에는 readiness, sink impact, Evidence grounding, 예상 information gain, Objective 적합도,
+조사 비용을 합친 deterministic candidate score가 적용됩니다. 런타임은 Relation·context 중복에
+패널티를 주는 bounded portfolio를 선택하고 `OBSERVE`, `INVESTIGATE`, `SUBMIT`, `STOP_PARTIAL` 중
+다음 전환을 결정합니다. `STOP_PARTIAL`은 round/token/cost/duration 한도, 다음 round token reserve
+부족, 반복 호출·진행 정체를 하나의 policy 입력으로 정규화하며 현재 부분 상태를 보존합니다.
+semantic recompute로 근거가 사라지거나 hard-block된 가설과 동일 Relation 묶음을 반복하는 가설은
+자동 `DISCARDED`됩니다. `SubmitAnalysis`는 `SUBMIT` 상태에서 선택된 portfolio의 정확한 Relation
+경로만 허용하며, 검색이 완결됐고 제출 가능한 경로가 없을 때만 빈 제출을 허용합니다.
 
 ## 평가와 개발 검증
 
@@ -210,7 +319,8 @@ Reasoning mode는 일시적인 모델 연결·timeout·rate-limit·server 오류
 ## 안전 경계
 
 - workflow, script, local action을 실행하지 않습니다.
-- 외부 action을 다운로드하거나 GitHub/AWS API에 접근하지 않습니다.
+- 외부 action을 다운로드하지 않습니다. GitHub/AWS API는 reasoning mode의 명시적
+  `--observe-github`/`--observe-aws` opt-in에서만 read-only로 접근합니다.
 - `.git`, binary, 1 MiB 초과 파일과 저장소 밖 symlink를 읽지 않습니다.
 - 파일 slice는 최대 200줄, literal 검색 결과는 최대 50건입니다.
 - secret 값은 저장하지 않고 GitHub secret expression은 참조로만 남깁니다.

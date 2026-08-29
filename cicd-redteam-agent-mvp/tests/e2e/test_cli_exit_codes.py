@@ -48,6 +48,43 @@ def test_invalid_input_and_limits_return_exit_2(tmp_path: Path) -> None:
     )
 
 
+def test_github_observation_is_explicit_and_requires_reasoning_mode(tmp_path: Path) -> None:
+    parser = build_parser()
+    default_args = parser.parse_args(
+        ["analyze", str(FIXTURES / "oidc-risk"), "--output", str(tmp_path / "default")]
+    )
+    assert not default_args.observe_github
+    assert default_args.github_run_id is None
+    assert (
+        main(
+            [
+                "analyze",
+                str(FIXTURES / "oidc-risk"),
+                "--output",
+                str(tmp_path / "run-id-without-observer"),
+                "--github-run-id",
+                "4242",
+                "--no-mode-prompt",
+            ]
+        )
+        == 2
+    )
+
+    exit_code = main(
+        [
+            "analyze",
+            str(FIXTURES / "oidc-risk"),
+            "--output",
+            str(tmp_path / "observed"),
+            "--mode",
+            "deterministic",
+            "--observe-github",
+            "--no-mode-prompt",
+        ]
+    )
+    assert exit_code == 2
+
+
 def test_deterministic_failure_writes_failed_report_and_returns_exit_5(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -57,9 +94,7 @@ def test_deterministic_failure_writes_failed_report_and_returns_exit_5(
     monkeypatch.setattr("cicd_redteam_agent.application.analyze.parse_workflow", fail_parse)
     output = tmp_path / "output"
 
-    exit_code = main(
-        ["analyze", str(FIXTURES / "oidc-risk"), "--output", str(output)]
-    )
+    exit_code = main(["analyze", str(FIXTURES / "oidc-risk"), "--output", str(output)])
 
     run_dir = next(output.iterdir())
     raw = (run_dir / "analysis.json").read_text(encoding="utf-8")
@@ -222,9 +257,7 @@ def test_reasoning_prompts_for_objective_in_an_interactive_terminal(
         complete_agent,
     )
 
-    monkeypatch.setattr(
-        "sys.stdin", InteractiveInput("외부 PR에서 Artifact 경로를 조사해줘\n")
-    )
+    monkeypatch.setattr("sys.stdin", InteractiveInput("외부 PR에서 Artifact 경로를 조사해줘\n"))
 
     assert (
         main(

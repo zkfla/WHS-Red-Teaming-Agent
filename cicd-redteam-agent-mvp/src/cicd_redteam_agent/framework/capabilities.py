@@ -16,6 +16,11 @@ from cicd_redteam_agent.domain.graph_frontier import (
     FrontierSearchResult,
     build_attack_frontiers,
 )
+from cicd_redteam_agent.domain.investigation_policy import (
+    InvestigationPolicy,
+    InvestigationTransition,
+    decide_investigation_policy,
+)
 from cicd_redteam_agent.domain.models import (
     AnalysisMode,
     AnalysisProposal,
@@ -46,6 +51,7 @@ class CapabilityContext:
     submitted: bool = False
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     frontier_cache: dict[str, FrontierSearchResult] = field(default_factory=dict)
+    investigation_policy: InvestigationPolicy | None = None
 
     def record_call(self, name: str, arguments: object) -> int:
         signature = stable_id("call", name, json.dumps(arguments, sort_keys=True, default=str))
@@ -113,13 +119,9 @@ class ListSecurityFacts(Capability):
         }
         allowed_verdicts = {"TRUE", "FALSE", "UNKNOWN"}
         if category is not None and category not in allowed_categories:
-            return json.dumps(
-                {"error": "invalid_category", "allowed": sorted(allowed_categories)}
-            )
+            return json.dumps({"error": "invalid_category", "allowed": sorted(allowed_categories)})
         if verdict is not None and verdict not in allowed_verdicts:
-            return json.dumps(
-                {"error": "invalid_verdict", "allowed": sorted(allowed_verdicts)}
-            )
+            return json.dumps({"error": "invalid_verdict", "allowed": sorted(allowed_verdicts)})
         if offset < 0:
             return json.dumps({"error": "invalid_offset", "minimum": 0})
         if limit < 1 or limit > 100:
@@ -283,6 +285,10 @@ class ListAttackFrontiers(Capability):
             self.context.state.inspected_resources.append(resource)
 
         payload = result.as_dict()
+        policy = self.context.investigation_policy or decide_investigation_policy(
+            result,
+            self.context.state,
+        )
         payload.update(
             {
                 "frontiers": [item.as_dict() for item in page],
@@ -292,6 +298,7 @@ class ListAttackFrontiers(Capability):
                 "limit": limit,
                 "next_offset": next_offset if next_offset < len(frontiers) else None,
                 "objective_focus": goal.as_dict() if goal else None,
+                "investigation_policy": policy.as_dict(),
                 "guidance": (
                     "Use proposal_ready COMPLETE frontiers as compact proposal candidates. "
                     "PARTIAL frontiers are diagnostics only and must never be submitted. BLOCKED "
@@ -477,10 +484,43 @@ class SubmitAnalysis(Capability):
         async with self.context.lock:
             if self.context.submitted:
                 return json.dumps({"accepted": False, "errors": ["analysis_already_submitted"]})
+            policy = self.context.investigation_policy
+            if policy is not None:
+                policy_errors = self._policy_errors(proposal, policy)
+                if policy_errors:
+                    return json.dumps({"accepted": False, "errors": policy_errors})
             result = apply_analysis_proposal(self.context.state, proposal)
             if result.accepted:
                 self.context.submitted = True
         return result.model_dump_json()
+
+    def _policy_errors(
+        self,
+        proposal: AnalysisProposal,
+        policy: InvestigationPolicy,
+    ) -> list[str]:
+        if policy.transition is not InvestigationTransition.SUBMIT:
+            return [f"submission_transition_not_ready:{policy.transition.value}"]
+        if not proposal.paths:
+            return [] if policy.empty_submission_allowed else ["empty_submission_not_allowed"]
+
+        relation_by_ref = dict(indexed_relations(self.context.state))
+        allowed = {
+            tuple(
+                relation.relation_id
+                for reference in references
+                if (relation := relation_by_ref.get(reference)) is not None
+            )
+            for references in policy.allowed_relation_ref_paths
+        }
+        rejected = [
+            path.path_id
+            for path in proposal.paths
+            if tuple(edge.relation_id for edge in path.edges) not in allowed
+        ]
+        if rejected:
+            return [f"proposal_path_outside_selected_portfolio:{','.join(sorted(rejected))}"]
+        return []
 
 
 def build_capabilities(context: CapabilityContext) -> dict[str, Capability]:

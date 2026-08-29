@@ -55,6 +55,78 @@ class PermissionLevel(StrEnum):
     UNKNOWN = "UNKNOWN"
 
 
+class RepositoryWorkflowPermissionDefault(StrEnum):
+    READ = "read"
+    WRITE = "write"
+
+
+class ExecutionResult(StrEnum):
+    SUCCESS = "success"
+    FAILURE = "failure"
+    CANCELLED = "cancelled"
+    SKIPPED = "skipped"
+    UNKNOWN = "unknown"
+
+
+class ConditionSecurityEffect(StrEnum):
+    ALWAYS_TRUE = "ALWAYS_TRUE"
+    ATTACKER_SATISFIABLE = "ATTACKER_SATISFIABLE"
+    TRUST_REQUIRED = "TRUST_REQUIRED"
+    BLOCKS = "BLOCKS"
+    UNKNOWN = "UNKNOWN"
+
+
+class EvidenceProvider(StrEnum):
+    LOCAL = "local"
+    GITHUB = "github"
+    AWS = "aws"
+    AZURE = "azure"
+    GCP = "gcp"
+
+
+class EventPrincipalRole(StrEnum):
+    EVENT_SENDER = "event_sender"
+    COMMENT_AUTHOR = "comment_author"
+    ISSUE_AUTHOR = "issue_author"
+    PULL_REQUEST_AUTHOR = "pull_request_author"
+    REVIEW_AUTHOR = "review_author"
+    REVIEW_COMMENT_AUTHOR = "review_comment_author"
+    LABEL_ACTOR = "label_actor"
+
+
+class EvidenceRequirementKind(StrEnum):
+    GITHUB_REPOSITORY_METADATA = "github.repository.metadata"
+    GITHUB_OIDC_SUBJECT_CONFIG = "github.oidc.subject_config"
+    AWS_IAM_ROLE_TRUST_POLICY = "aws.iam.role_trust_policy"
+    AWS_IAM_OIDC_PROVIDER = "aws.iam.oidc_provider"
+    GITHUB_REPOSITORY_DEFAULT_WORKFLOW_PERMISSION = "github.repository.default_workflow_permission"
+    GITHUB_FORK_PR_WORKFLOW_POLICY = "github.fork_pr.workflow_policy"
+    GITHUB_ACTIONS_POLICY = "github.actions.policy"
+    GITHUB_EFFECTIVE_BRANCH_RULES = "github.branch.effective_rules"
+    GITHUB_ENVIRONMENT_POLICY = "github.environment.policy"
+    GITHUB_ENVIRONMENT_BRANCH_PATTERNS = "github.environment.branch_patterns"
+    GITHUB_PENDING_DEPLOYMENT_STATE = "github.environment.pending_deployment"
+    GITHUB_WORKFLOW_RUN_JOBS = "github.workflow_run.jobs"
+    GITHUB_WORKFLOW_RUN_IDENTITY = "github.workflow_run.identity"
+    GITHUB_WORKFLOW_RUN_STATUS = "github.workflow_run.status"
+    GITHUB_WORKFLOW_RUN_EVENT_LINKAGE = "github.workflow_run.event_linkage"
+    GITHUB_EVENT_PRINCIPAL = "github.event.principal"
+    GITHUB_REPOSITORY_ACTOR_PERMISSION = "github.repository.actor_permission"
+    RUNTIME_TELEMETRY = "runtime.telemetry"
+    GITHUB_ACTION_PROVENANCE = "github.action.provenance"
+    GITHUB_ACTION_ADVISORY = "github.action.advisory"
+    GITHUB_SECRET_METADATA = "github.secret.metadata"
+    GITHUB_AUDIT_EVENTS = "github.audit.events"
+    OPERATOR_SECRET_ROTATION_POLICY = "operator.secret_rotation_policy"
+
+
+class EvidenceRequirementRef(SchemaModel):
+    kind: EvidenceRequirementKind
+    provider: EvidenceProvider = EvidenceProvider.GITHUB
+    subject_id: str = Field(min_length=1, max_length=300)
+    qualifier: str | None = Field(default=None, max_length=300)
+
+
 class WorkingHypothesisStatus(StrEnum):
     ACTIVE = "ACTIVE"
     BLOCKED = "BLOCKED"
@@ -96,6 +168,7 @@ class Step(SchemaModel):
     step_key: str | None = None
     name: str | None = None
     condition: str | None = None
+    continue_on_error: bool | str | None = None
     uses: str | None = None
     run: str | None = None
     shell: str | None = None
@@ -107,10 +180,16 @@ class Step(SchemaModel):
 
 class Job(SchemaModel):
     job_id: str
+    # Retained as optional fields so checkpoints created before runtime-job identity remain valid.
+    job_key: str | None = None
+    name: str | None = None
     uses: str | None = None
     with_: dict[str, Any] = Field(default_factory=dict, alias="with")
     needs: list[str] = Field(default_factory=list)
     condition: str | None = None
+    continue_on_error: bool | str | None = None
+    has_matrix: bool = False
+    strategy_fail_fast: bool | str | None = None
     env: dict[str, str] = Field(default_factory=dict)
     outputs: dict[str, Any] = Field(default_factory=dict)
     runs_on: str | list[str] | dict[str, Any] | None = None
@@ -164,17 +243,57 @@ class JobExecutionContext(SchemaModel):
     workflow_id: str
     job_id: str
     reachable: TriState
+    dependency_gate: TriState = TriState.TRUE
+    predicted_result: ExecutionResult = ExecutionResult.UNKNOWN
     effective_permissions: EffectivePermissionSet
     github_token_available: TriState = TriState.TRUE
     attacker_code_execution: TriState = TriState.UNKNOWN
+    condition_evaluation_id: str | None = None
     evidence_ids: list[str] = Field(default_factory=list)
     missing_evidence: list[str] = Field(default_factory=list)
 
 
+class PrincipalAuthorizationAssessment(SchemaModel):
+    principal_role: EventPrincipalRole
+    reference: str = Field(min_length=1, max_length=300)
+    principal_login: str | None = Field(default=None, max_length=100)
+    principal_id: int | None = Field(default=None, gt=0)
+    current_repository_authorization: TriState = TriState.UNKNOWN
+    authorization_scope: Literal["none", "current"] = "none"
+    event_action_observed: TriState = TriState.UNKNOWN
+    historical_repository_authorization: TriState = TriState.UNKNOWN
+    missing_evidence: list[str] = Field(default_factory=list)
+
+
+class ConditionEvaluation(SchemaModel):
+    evaluation_id: str
+    target_id: str
+    target_kind: Literal["job", "step"]
+    trigger_context_id: str
+    expression: str
+    normalized_expression: str
+    verdict: TriState
+    raw_expression_verdict: TriState | None = None
+    status_gate_verdict: TriState | None = None
+    implicit_success_applied: bool = False
+    referenced_contexts: list[str] = Field(default_factory=list)
+    missing_evidence: list[str] = Field(default_factory=list)
+    evidence_requirements: list[EvidenceRequirementRef] = Field(default_factory=list)
+    current_actor_authorization: TriState | None = None
+    authorization_missing_evidence: list[str] = Field(default_factory=list)
+    authorization_scope: Literal["none", "current"] = "none"
+    principal_assessments: list[PrincipalAuthorizationAssessment] = Field(default_factory=list)
+    security_effect: ConditionSecurityEffect = ConditionSecurityEffect.UNKNOWN
+    attacker_satisfiable: TriState = TriState.UNKNOWN
+    trusted_principal_required: TriState = TriState.UNKNOWN
+    revision_bound: TriState = TriState.UNKNOWN
+    security_missing_evidence: list[str] = Field(default_factory=list)
+
+
 def relation_id_for(source_id: str, relation_type: str, target_id: str) -> str:
-    digest = hashlib.sha256(
-        "|".join((source_id, relation_type, target_id)).encode()
-    ).hexdigest()[:16]
+    digest = hashlib.sha256("|".join((source_id, relation_type, target_id)).encode()).hexdigest()[
+        :16
+    ]
     return f"rel_{digest}"
 
 
@@ -183,12 +302,13 @@ class Relation(SchemaModel):
     source_id: str
     relation_type: str
     target_id: str
-    category: Literal[
-        "source", "transform", "execution", "credential", "guard", "context"
-    ] | None = None
+    category: (
+        Literal["source", "transform", "execution", "credential", "guard", "context"] | None
+    ) = None
     verdict: TriState = TriState.TRUE
     evidence_ids: list[str] = Field(default_factory=list)
     missing_evidence: list[str] = Field(default_factory=list)
+    evidence_requirements: list[EvidenceRequirementRef] = Field(default_factory=list, max_length=16)
 
     @model_validator(mode="before")
     @classmethod
@@ -270,9 +390,49 @@ class CloudIdentityCandidate(SchemaModel):
     oidc_enabled: TriState
     attacker_control: TriState
     trust_verified: TriState = TriState.UNKNOWN
+    trust_assessment_id: str | None = None
+    audience: str | None = None
+    subject_claims: list[str] = Field(default_factory=list)
+    actual_assume_succeeded: TriState = TriState.UNKNOWN
     evidence_ids: list[str] = Field(default_factory=list)
     confidence: Confidence
     summary: str
+
+
+class OidcAuthenticationMode(StrEnum):
+    GITHUB_OIDC = "github-oidc"
+    STATIC_CREDENTIALS = "static-credentials"
+    WEB_IDENTITY_TOKEN_FILE = "web-identity-token-file"
+    ROLE_CHAINING = "role-chaining"
+    SKIPPED = "skipped"
+    UNKNOWN = "unknown"
+
+
+class OidcClaimCandidate(SchemaModel):
+    trigger_context_id: str
+    variant_group_id: str
+    audience: str
+    subject: str | None = None
+    subject_format: Literal["legacy", "immutable", "custom", "unknown"]
+    complete: TriState
+    missing_evidence: list[str] = Field(default_factory=list)
+
+
+class AwsOidcTrustAssessment(SchemaModel):
+    assessment_id: str
+    workflow_id: str
+    job_id: str
+    step_id: str
+    role_arn: str | None = None
+    provider_arn: str | None = None
+    authentication_mode: OidcAuthenticationMode
+    verdict: TriState
+    audience: str | None = None
+    claim_candidates: list[OidcClaimCandidate] = Field(default_factory=list)
+    matched_statement_ids: list[str] = Field(default_factory=list)
+    missing_evidence: list[str] = Field(default_factory=list)
+    evidence_requirements: list[EvidenceRequirementRef] = Field(default_factory=list)
+    actual_assume_succeeded: TriState = TriState.UNKNOWN
 
 
 class Termination(SchemaModel):
@@ -314,9 +474,7 @@ class WorkingHypothesis(SchemaModel):
 
 class AgentWorkingMemory(SchemaModel):
     revision: int = Field(default=0, ge=0)
-    focus_hypothesis_id: str | None = Field(
-        default=None, pattern=r"^hyp_[0-9a-f]{16}$"
-    )
+    focus_hypothesis_id: str | None = Field(default=None, pattern=r"^hyp_[0-9a-f]{16}$")
     hypotheses: list[WorkingHypothesis] = Field(default_factory=list, max_length=8)
 
 
@@ -336,9 +494,7 @@ class WorkingHypothesisUpsert(SchemaModel):
 class WorkingMemoryPatch(SchemaModel):
     expected_revision: int = Field(ge=0)
     upserts: list[WorkingHypothesisUpsert] = Field(default_factory=list, max_length=3)
-    focus_hypothesis_id: str | None = Field(
-        default=None, pattern=r"^hyp_[0-9a-f]{16}$"
-    )
+    focus_hypothesis_id: str | None = Field(default=None, pattern=r"^hyp_[0-9a-f]{16}$")
     clear_focus: bool = False
 
 
@@ -355,12 +511,14 @@ class AnalysisState(SchemaModel):
     workflows: list[Workflow] = Field(default_factory=list)
     trigger_contexts: list[TriggerExecutionContext] = Field(default_factory=list)
     job_execution_contexts: list[JobExecutionContext] = Field(default_factory=list)
+    condition_evaluations: list[ConditionEvaluation] = Field(default_factory=list)
     evidence: dict[str, Evidence] = Field(default_factory=dict)
     relations: list[Relation] = Field(default_factory=list)
     assessments: list[ControlAssessment] = Field(default_factory=list)
     findings: list[Finding] = Field(default_factory=list)
     paths: list[AttackPath] = Field(default_factory=list)
     identities: list[CloudIdentityCandidate] = Field(default_factory=list)
+    aws_oidc_trust_assessments: list[AwsOidcTrustAssessment] = Field(default_factory=list)
     secret_references: list[SecretReference] = Field(default_factory=list)
     pending_questions: list[str] = Field(default_factory=list)
     inspected_resources: list[str] = Field(default_factory=list)

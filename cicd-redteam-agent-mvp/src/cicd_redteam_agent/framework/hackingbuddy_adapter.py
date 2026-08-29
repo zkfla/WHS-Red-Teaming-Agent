@@ -10,10 +10,21 @@ from hackingBuddyGPT.utils.logging import JsonlLogger
 
 from cicd_redteam_agent.application.objective import compile_objective_goal, objective_hash
 from cicd_redteam_agent.domain.models import AnalysisState, ReportStatus
-from cicd_redteam_agent.framework.auth import ModelProvider, resolve_litellm_credential
+from cicd_redteam_agent.framework.auth import (
+    ModelProvider,
+    resolve_github_observer_token,
+    resolve_litellm_credential,
+)
+from cicd_redteam_agent.framework.aws_resolvers import AwsIamResolver
 from cicd_redteam_agent.framework.capabilities import CapabilityContext, build_capabilities
 from cicd_redteam_agent.framework.cicd_agent import CICDChatAgent
 from cicd_redteam_agent.framework.cicd_usecase import CICDUseCase
+from cicd_redteam_agent.framework.github_resolvers import build_github_resolver_registry
+from cicd_redteam_agent.framework.investigation_runtime import (
+    create_red_team_session,
+    prepare_resume_revalidation,
+    synchronize_analysis_state,
+)
 from cicd_redteam_agent.framework.runtime_support import (
     AgentRuntimeMetrics,
     CheckpointWriter,
@@ -99,6 +110,46 @@ async def _run_agent_analysis_locked(
     runtime_objective_goal_payload = (
         objective_goal_payload if config.objective is not None else None
     )
+    investigation_session = None
+    environment_observer = None
+    if config.observe_github:
+        github_token = resolve_github_observer_token(
+            config.env_file,
+            untrusted_repository_root=boundary.root,
+        )
+        if github_token is None:
+            raise ValueError(
+                "--observe-github requires GH_TOKEN or GITHUB_TOKEN in trusted operator config"
+            )
+        if resume_checkpoint is not None:
+            if resume_checkpoint.investigation_session is None:
+                raise ValueError(
+                    "GitHub observation resume requires a persisted investigation session"
+                )
+            investigation_session = resume_checkpoint.investigation_session.model_copy(deep=True)
+            if investigation_session.github_run_id != config.github_run_id:
+                raise ValueError("checkpoint GitHub workflow run identity does not match config")
+            if investigation_session.github_event_locator != config.github_event_locator:
+                raise ValueError("checkpoint GitHub event provenance locator does not match config")
+            investigation_session.analysis_state = state.model_copy(deep=True)
+            prepare_resume_revalidation(
+                investigation_session,
+                boundary=boundary,
+                profile=config.attacker_profile,
+            )
+            synchronize_analysis_state(state, investigation_session.analysis_state)
+        else:
+            investigation_session = create_red_team_session(
+                state,
+                github_run_id=config.github_run_id,
+                github_event_locator=config.github_event_locator,
+            )
+        environment_observer = build_github_resolver_registry(
+            boundary,
+            token=github_token,
+        )
+        if config.observe_aws:
+            environment_observer.register(AwsIamResolver.from_profile(config.aws_profile))
     if config.provider is ModelProvider.CODEX_CHATGPT:
         from cicd_redteam_agent.framework.codex_llm import CodexChatGPTLLM
 
@@ -177,7 +228,12 @@ async def _run_agent_analysis_locked(
                 "objective": config.objective,
                 "objective_hash": objective_hash(config.objective),
                 "objective_goal": objective_goal_payload,
+                "observe_github": config.observe_github,
+                "observe_aws": config.observe_aws,
+                "aws_profile": config.aws_profile,
+                "github_run_id": config.github_run_id,
             },
+            investigation_session=investigation_session,
         )
         usecase = CICDUseCase(
             agent=agent,
@@ -185,11 +241,14 @@ async def _run_agent_analysis_locked(
             limits=limits,
             checkpoint_writer=checkpoint_writer,
             event_journal=event_journal,
+            investigation_session=investigation_session,
+            environment_observer=environment_observer,
+            attacker_profile=(
+                config.attacker_profile if investigation_session is not None else None
+            ),
         )
         reason = await usecase.run()
-        status = (
-            ReportStatus.COMPLETE if reason == "proposal_validated" else ReportStatus.PARTIAL
-        )
+        status = ReportStatus.COMPLETE if reason == "proposal_validated" else ReportStatus.PARTIAL
         # Avoid JsonlLogger.run_was_success(), whose generic state is "got root".
         logger._finish_run("OK" if status is ReportStatus.COMPLETE else "ERROR", reason)
         event_journal.append(

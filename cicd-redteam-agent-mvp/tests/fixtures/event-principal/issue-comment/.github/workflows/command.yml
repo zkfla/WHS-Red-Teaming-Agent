@@ -1,0 +1,15 @@
+name: issueops-command
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: write
+
+jobs:
+  deploy:
+    if: github.event.comment.user.login == 'maintainer'
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo deploy
