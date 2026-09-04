@@ -48,16 +48,16 @@
 
 - id: G-05
   layer: generic
-  endpoint: "GET /admin"   # REVIEW: Admin API/Page 실제 경로 확인 필요
+  endpoint: "GET /sup3r_s3cr3t_admin"   # 실측 확인: 히든 관리자 패널(OpenAPI/blog에 노출)
   description: Unauthorized Admin Data Access — 일반 사용자가 관리자 전용 데이터를 획득
-  invariant: REVIEW-ADMIN-ACCESS   # REVIEW: INV-2 로 흡수 가능해 보임(권한경계) — 확인 필요
+  invariant: INV-BFLA   # 구현·라이브 검증됨(oracles/privilege.py, is_admin 주입 권한상승)
   severity: CRITICAL
 
 - id: G-06
   layer: generic
-  endpoint: "POST /forgot-password"
+  endpoint: "POST /api/v1/forgot-password"   # 실측 확인: v1 이 debug_info.pin 노출
   description: Password Reset PIN Disclosure — 서버 응답에서 reset PIN 또는 이에 준하는 인증정보 노출
-  invariant: REVIEW-INFO-DISCLOSURE   # REVIEW: 오라클 없음(구 INV-9 exposure 미구현과 유사한 개념)
+  invariant: INV-9   # 구현·라이브 검증됨(oracles/exposure.py, reset_pin_exposed)
   severity: HIGH
 
 - id: G-07
@@ -269,7 +269,7 @@
   layer: finance
   endpoint: "GET /api/virtual-cards"
   description: PAN / CVV Excessive Exposure — 전체 PAN, CVV 등 민감 카드정보가 응답에 노출
-  invariant: REVIEW-SENSITIVE-EXPOSURE   # REVIEW: 구 INV-9(exposure) 개념, 오라클 미구현
+  invariant: INV-9   # 구현·라이브 검증됨(oracles/exposure.py, full_pan_exposed+cvv_exposed)
   severity: CRITICAL
 
 - id: F-17
