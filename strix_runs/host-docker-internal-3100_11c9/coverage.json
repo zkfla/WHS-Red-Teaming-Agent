@@ -1,0 +1,586 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-09-04 15:06:45 UTC",
+  "run_id": "host-docker-internal-3100_11c9",
+  "run_name": "host-docker-internal-3100_11c9",
+  "scope": {
+    "targets": [
+      {
+        "type": "web_application",
+        "details": {
+          "target_url": "http://host.docker.internal:3100"
+        },
+        "original": "http://host.docker.internal:3100"
+      }
+    ],
+    "scan_mode": "deep",
+    "scope_mode": "auto",
+    "diff_scope": {
+      "active": false,
+      "mode": "auto"
+    },
+    "instruction": ""
+  },
+  "summary": {
+    "surfaces_reviewed": 27,
+    "outcomes": {
+      "reported": 12,
+      "no_issue_found": 8,
+      "not_applicable": 1,
+      "needs_follow_up": 6
+    },
+    "findings_filed": 1,
+    "gaps": 14
+  },
+  "machine_observed": {
+    "agents": [
+      {
+        "agent_id": "d0b1c788",
+        "agent_name": "API Security & GraphQL Tester",
+        "status": "stopped",
+        "skills": [
+          "protocols/graphql",
+          "vulnerabilities/information_disclosure"
+        ],
+        "task": "Test API and GraphQL security on http://host.docker.internal:3100. Focus on: (1) CORS vulnerability testing with wildcard origin; (2) GraphQL endpoint introspection and query abuse; (3) Excessive data exposure in API responses; (4) API parameter fuzzing to discover hidden endpoints; (5) HTTP method tampering (GET vs POST vs PUT vs DELETE); (6) Test for missing rate limiting; (7) Test API versioning bypasses if applicable. Examine all API responses for sensitive data exposure. Document all findings.",
+        "is_root": false
+      },
+      {
+        "agent_id": "c392e7f9",
+        "agent_name": "Authentication & Login Security Tester",
+        "status": "stopped",
+        "skills": [
+          "vulnerabilities/authentication_jwt",
+          "vulnerabilities/sql_injection",
+          "vulnerabilities/weak_password_detection"
+        ],
+        "task": "Test authentication and login security on http://host.docker.internal:3100. Focus on: (1) Registration endpoint - attempt with weak passwords, duplicate accounts, SQL injection in fields; (2) Login endpoint - test with common credentials (admin/admin, test/test, etc.), brute force protection, SQL injection; (3) Password reset - enumerate security questions, test if answers are validated, test token reuse/expiration; (4) Session management - analyze cookies, JWT tokens (if any), session fixation, logout effectiveness. Test all input parameters for injection attacks. Document all findings and report any confirmed vulnerabilities.",
+        "is_root": false
+      },
+      {
+        "agent_id": "2d955e3c",
+        "agent_name": "Business Logic & Price Manipulation Tester",
+        "status": "stopped",
+        "skills": [
+          "vulnerabilities/business_logic",
+          "vulnerabilities/race_conditions"
+        ],
+        "task": "Test business logic vulnerabilities on http://host.docker.internal:3100 focusing on: (1) Shopping cart manipulation - test price changes, quantity modifications, negative quantities; (2) Order/payment processing - test checkout with invalid data, bypass validation; (3) Coupon/discount abuse; (4) Race conditions in purchase flow; (5) Workflow bypass - skip checkout steps; (6) Account-level logic - test profile updates, address changes. Test all state-changing operations for logic flaws and authorization gaps. Document all successful manipulations.",
+        "is_root": false
+      },
+      {
+        "agent_id": "9b77f371",
+        "agent_name": "CSRF & Session Security Tester",
+        "status": "stopped",
+        "skills": [
+          "vulnerabilities/csrf",
+          "vulnerabilities/authentication_jwt"
+        ],
+        "task": "Test CSRF and session security on http://host.docker.internal:3100. Focus on: (1) CSRF token validation on state-changing endpoints (login, checkout, profile update); (2) SameSite cookie flag and bypass techniques; (3) Session fixation attacks; (4) Session prediction/hijacking; (5) Test logout effectiveness; (6) Test cookie security attributes (Secure, HttpOnly, Domain, Path). Document all CSRF vulnerabilities with working proof-of-concept.",
+        "is_root": false
+      },
+      {
+        "agent_id": "c37ff0fa",
+        "agent_name": "File Upload & Path Traversal Tester",
+        "status": "stopped",
+        "skills": [
+          "vulnerabilities/insecure_file_uploads",
+          "vulnerabilities/path_traversal_lfi_rfi",
+          "vulnerabilities/xxe"
+        ],
+        "task": "Test file upload and path traversal vulnerabilities on http://host.docker.internal:3100. Focus on: (1) Profile image upload endpoint - test with webshells, polyglot files, path traversal payloads; (2) Test content-type bypass, extension manipulation; (3) Test path traversal in file parameters if any; (4) Test LFI/RFI vulnerabilities; (5) Test XXE if XML processing is used; (6) Check for arbitrary file download. Document all successful uploads/traversals with proof-of-concept.",
+        "is_root": false
+      },
+      {
+        "agent_id": "e569a8c5",
+        "agent_name": "IDOR & Authorization Tester",
+        "status": "completed",
+        "skills": [
+          "vulnerabilities/idor",
+          "vulnerabilities/broken_function_level_authorization"
+        ],
+        "task": "Test authorization and IDOR vulnerabilities on http://host.docker.internal:3100. After obtaining test credentials from authentication testing: (1) Test object-level authorization by attempting to access other users' profiles, orders, and payment methods by changing user ID parameters; (2) Test admin endpoint access from regular user accounts; (3) Test basket/order manipulation across users; (4) Enumerate all API endpoints and test access control on each; (5) Test parameter tampering to change ownership or role. Document successful unauthorized access as IDOR findings.",
+        "is_root": false
+      },
+      {
+        "agent_id": "f9052243",
+        "agent_name": "Reconnaissance Agent",
+        "status": "completed",
+        "skills": [
+          "tooling/agent_browser",
+          "tooling/katana",
+          "reconnaissance/asset_discovery"
+        ],
+        "task": "Perform comprehensive reconnaissance on http://host.docker.internal:3100. Map the complete attack surface including: all pages/endpoints accessible from unauthenticated access, identify authentication mechanisms, enumerate parameters and input fields, discover hidden paths, analyze JavaScript for API endpoints and configuration, identify technology stack and versions, create a complete inventory of the application structure. Document all findings in notes for the threat model establishment.",
+        "is_root": false
+      },
+      {
+        "agent_id": "af3d3f45",
+        "agent_name": "Root Agent",
+        "status": "completed",
+        "skills": [],
+        "task": "\n\nURLs: - http://host.docker.internal:3100",
+        "is_root": true
+      },
+      {
+        "agent_id": "91da777b",
+        "agent_name": "SQL Injection & Injection Tester",
+        "status": "stopped",
+        "skills": [
+          "vulnerabilities/sql_injection",
+          "vulnerabilities/nosql_injection",
+          "vulnerabilities/rce"
+        ],
+        "task": "Test injection vulnerabilities on http://host.docker.internal:3100 focusing on: (1) SQL injection in login, registration, search, feedback, and other input fields; (2) Test with common SQL injection payloads and database-specific techniques (UNION SELECT, time-based blind SQLi, etc.); (3) Test for NoSQL injection if applicable; (4) Test command injection in any file upload or processing endpoints; (5) Test LDAP injection if LDAP is used; (6) Use multiple encoding bypasses to evade any filters. Document all successful injections with proof-of-concept queries.",
+        "is_root": false
+      },
+      {
+        "agent_id": "b45cba78",
+        "agent_name": "XSS & Client-Side Security Tester",
+        "status": "stopped",
+        "skills": [
+          "vulnerabilities/xss",
+          "vulnerabilities/open_redirect"
+        ],
+        "task": "Test XSS and client-side vulnerabilities on http://host.docker.internal:3100. Focus on: (1) Reflected XSS in search, product filters, URL parameters; (2) Stored XSS in feedback, reviews, comments (test payload persistence); (3) DOM-based XSS in JavaScript; (4) Test CSP bypass if CSP headers present; (5) Test with various encodings and payload variations; (6) Test for data exfiltration via XSS; (7) Check for open redirect vulnerabilities. Document all successful XSS with working payloads.",
+        "is_root": false
+      }
+    ],
+    "skills_exercised": [
+      "agent_browser",
+      "asset_discovery",
+      "authentication_jwt",
+      "broken_function_level_authorization",
+      "business_logic",
+      "csrf",
+      "graphql",
+      "idor",
+      "information_disclosure",
+      "insecure_file_uploads",
+      "katana",
+      "nosql_injection",
+      "open_redirect",
+      "path_traversal_lfi_rfi",
+      "race_conditions",
+      "rce",
+      "sql_injection",
+      "weak_password_detection",
+      "xss",
+      "xxe"
+    ],
+    "findings_filed": 1,
+    "source": "runtime"
+  },
+  "completeness": {
+    "complete": false,
+    "scan_status": "completed",
+    "exit_reason": "finished_by_tool",
+    "caveats": [
+      "7 agent(s) did not finish cleanly (API Security & GraphQL Tester, Authentication & Login Security Tester, Business Logic & Price Manipulation Tester, CSRF & Session Security Tester, File Upload & Path Traversal Tester, SQL Injection & Injection Tester, XSS & Client-Side Security Tester); any surface they held is under-covered."
+    ]
+  },
+  "entries": [
+    {
+      "surface": "/rest/admin/application-configuration",
+      "risk_area": "CORS Wildcard Origin + Excessive Data Exposure",
+      "outcome": "reported",
+      "outcome_label": "Finding reported",
+      "evidence": "Endpoint returns Access-Control-Allow-Origin: * to all origins. Returns unauthenticated JSON with 23KB of sensitive application configuration including OAuth credentials, product data, challenge settings. Response status 200, repeatable with CORS origin header set to any domain.",
+      "recorded_by": "API Security & GraphQL Tester",
+      "recorded_at": "2026-09-04 15:04:29 UTC",
+      "updated_at": "",
+      "previous_outcomes": [],
+      "source": "agent_reported"
+    },
+    {
+      "surface": "All API endpoints (wildcard CORS policy)",
+      "risk_area": "CORS Misconfiguration - Wildcard Origin",
+      "outcome": "reported",
+      "outcome_label": "Finding reported",
+      "evidence": "All endpoints /rest/*, /products/search, /admin/* return Access-Control-Allow-Origin: * header. Enables cross-origin requests from any domain. All HTTP methods allowed: GET,HEAD,PUT,PATCH,POST,DELETE. No credentials flag required (ACAC not set). Tested on 40+ endpoints - all return wildcard CORS header.",
+      "recorded_by": "API Security & GraphQL Tester",
+      "recorded_at": "2026-09-04 15:04:29 UTC",
+      "updated_at": "",
+      "previous_outcomes": [],
+      "source": "agent_reported"
+    },
+    {
+      "surface": "/rest/admin/application-configuration, /rest/products/search, /rest/user/whoami",
+      "risk_area": "Missing Rate Limiting",
+      "outcome": "reported",
+      "outcome_label": "Finding reported",
+      "evidence": "Tested 50 rapid sequential requests to /rest/admin/application-configuration. All requests returned HTTP 200 status with average response time 9ms. No HTTP 429 responses, no rate limiting headers, no throttling observed. Same result tested on /rest/products/search and /rest/user/whoami.",
+      "recorded_by": "API Security & GraphQL Tester",
+      "recorded_at": "2026-09-04 15:04:29 UTC",
+      "updated_at": "",
+      "previous_outcomes": [],
+      "source": "agent_reported"
+    },
+    {
+      "surface": "/rest/user/whoami",
+      "risk_area": "Parameter Fuzzing - Sensitive Field Filtering",
+      "outcome": "reported",
+      "outcome_label": "Finding reported",
+      "evidence": "Endpoint accepts arbitrary field parameter: /rest/user/whoami?fields=password,email,role. Returns HTTP 200. No validation or filtering of requested fields observed. Tested with fields=['password','email','role','credit_card'] - all parameter variations accepted.",
+      "recorded_by": "API Security & GraphQL Tester",
+      "recorded_at": "2026-09-04 15:04:29 UTC",
+      "updated_at": "",
+      "previous_outcomes": [],
+      "source": "agent_reported"
+    },
+    {
+      "surface": "HTTP Method Tampering across API",
+      "risk_area": "HTTP Method Tampering",
+      "outcome": "no_issue_found",
+      "outcome_label": "No issue identified",
+      "evidence": "Tested POST, PUT, DELETE, PATCH on read-only endpoints /rest/admin/application-configuration, /rest/user/whoami, /rest/products/search. Unsupported methods returned HTTP 500 or 405. GET and HEAD methods return proper responses. Proper method handling confirmed.",
+      "recorded_by": "API Security & GraphQL Tester",
+      "recorded_at": "2026-09-04 15:04:29 UTC",
+      "updated_at": "",
+      "previous_outcomes": [],
+      "source": "agent_reported"
+    },
+    {
+      "surface": "/rest/languages endpoint",
+      "risk_area": "Hidden API Endpoint Discovery",
+      "outcome": "no_issue_found",
+      "outcome_label": "No issue identified",
+      "evidence": "Discovered /rest/languages returns array of 42 language objects. Endpoint is functional but not exploitable - contains only language code/name pairs, no sensitive data. Tested for injection via language parameter - no vectors found.",
+      "recorded_by": "API Security & GraphQL Tester",
+      "recorded_at": "2026-09-04 15:04:29 UTC",
+      "updated_at": "",
+      "previous_outcomes": [],
+      "source": "agent_reported"
+    },
+    {
+      "surface": "GraphQL endpoints (/graphql, /gql, /query)",
+      "risk_area": "GraphQL Endpoint Security",
+      "outcome": "needs_follow_up",
+      "outcome_label": "Requires further review",
+      "evidence": "Endpoints /graphql, /gql, /query respond with HTTP 200 but return HTML (main application page) not GraphQL responses. POST requests with JSON GraphQL queries also return HTML. GraphQL introspection not accessible via standard endpoints. Requires further investigation of correct GraphQL path or whether GraphQL is properly deployed.",
+      "recorded_by": "API Security & GraphQL Tester",
+      "recorded_at": "2026-09-04 15:04:29 UTC",
+      "updated_at": "",
+      "previous_outcomes": [],
+      "source": "agent_reported"
+    },
+    {
+      "surface": "/api/BasketItems",
+      "risk_area": "IDOR / Object-Level Authorization - Basket Manipulation",
+      "outcome": "reported",
+      "outcome_label": "Finding reported",
+      "evidence": "GET /api/BasketItems returns all basket items for all users (8 items from 3 different baskets). User 25 can access and manipulate basket data belonging to other users.",
+      "recorded_by": "IDOR & Authorization Tester",
+      "recorded_at": "2026-09-04 15:05:29 UTC",
+      "updated_at": "",
+      "previous_outcomes": [],
+      "source": "agent_reported"
+    },
+    {
+      "surface": "/api/BasketItems/{id}",
+      "risk_area": "IDOR / Object-Level Authorization - Basket Item Deletion",
+      "outcome": "reported",
+      "outcome_label": "Finding reported",
+      "evidence": "User 25 successfully deleted BasketItem 1 via DELETE /api/BasketItems/1 (status 200). Item access and deletion not restricted by ownership.",
+      "recorded_by": "IDOR & Authorization Tester",
+      "recorded_at": "2026-09-04 15:05:29 UTC",
+      "updated_at": "",
+      "previous_outcomes": [],
+      "source": "agent_reported"
+    },
+    {
+      "surface": "/api/BasketItems?userId={id}",
+      "risk_area": "IDOR / Parameter-Based Authorization Bypass",
+      "outcome": "reported",
+      "outcome_label": "Finding reported",
+      "evidence": "User 25 accessed User 26 basket items via GET /api/BasketItems?userId=26, returning all items. Server-side does not validate userId parameter against authenticated user.",
+      "recorded_by": "IDOR & Authorization Tester",
+      "recorded_at": "2026-09-04 15:05:29 UTC",
+      "updated_at": "",
+      "previous_outcomes": [],
+      "source": "agent_reported"
+    },
+    {
+      "surface": "/api/Users (enumeration)",
+      "risk_area": "Information Disclosure - User Enumeration",
+      "outcome": "reported",
+      "outcome_label": "Finding reported",
+      "evidence": "Successfully enumerated 26+ user accounts by iterating /api/Users/{id}. Identified admin users (IDs 1, 4, 10), accounting users, and deluxe users. All enumerable via sequential IDs without authentication.",
+      "recorded_by": "IDOR & Authorization Tester",
+      "recorded_at": "2026-09-04 15:05:29 UTC",
+      "updated_at": "",
+      "previous_outcomes": [],
+      "source": "agent_reported"
+    },
+    {
+      "surface": "/api/Orders",
+      "risk_area": "IDOR / Order Access",
+      "outcome": "needs_follow_up",
+      "outcome_label": "Requires further review",
+      "evidence": "Endpoint returns 500 errors. Implementation incomplete or blocked. Could not test for IDOR vulnerability due to lack of functional endpoint.",
+      "recorded_by": "IDOR & Authorization Tester",
+      "recorded_at": "2026-09-04 15:05:29 UTC",
+      "updated_at": "",
+      "previous_outcomes": [],
+      "source": "agent_reported"
+    },
+    {
+      "surface": "/api/SavedPaymentMethod",
+      "risk_area": "IDOR / Sensitive Payment Data Access",
+      "outcome": "needs_follow_up",
+      "outcome_label": "Requires further review",
+      "evidence": "Endpoint returns 500 errors. Could not test for IDOR vulnerability on payment methods. Implementation appears incomplete.",
+      "recorded_by": "IDOR & Authorization Tester",
+      "recorded_at": "2026-09-04 15:05:29 UTC",
+      "updated_at": "",
+      "previous_outcomes": [],
+      "source": "agent_reported"
+    },
+    {
+      "surface": "/api/DeliveryAddress",
+      "risk_area": "IDOR / Sensitive Address Data Access",
+      "outcome": "needs_follow_up",
+      "outcome_label": "Requires further review",
+      "evidence": "Endpoint returns 500 errors. Could not test for IDOR vulnerability on delivery addresses. Endpoint not fully implemented.",
+      "recorded_by": "IDOR & Authorization Tester",
+      "recorded_at": "2026-09-04 15:05:29 UTC",
+      "updated_at": "",
+      "previous_outcomes": [],
+      "source": "agent_reported"
+    },
+    {
+      "surface": "Admin Endpoints (/api/admin*)",
+      "risk_area": "Broken Function-Level Authorization",
+      "outcome": "not_applicable",
+      "outcome_label": "Not applicable",
+      "evidence": "Admin endpoints not implemented (return 500 Unexpected path errors). Cannot test access control on non-existent endpoints.",
+      "recorded_by": "IDOR & Authorization Tester",
+      "recorded_at": "2026-09-04 15:05:29 UTC",
+      "updated_at": "",
+      "previous_outcomes": [],
+      "source": "agent_reported"
+    },
+    {
+      "surface": "POST /file-upload endpoint",
+      "risk_area": "Unrestricted File Upload - Extension Bypass",
+      "outcome": "reported",
+      "outcome_label": "Finding reported",
+      "evidence": "Endpoint accepts PHP, EXE, and other executable extensions without validation. Tested with shell.php, malware.exe - all return 204 status (success). Content-Type spoofing works (image/jpeg MIME with PHP code accepted).",
+      "recorded_by": "File Upload & Path Traversal Tester",
+      "recorded_at": "2026-09-04 15:05:32 UTC",
+      "updated_at": "",
+      "previous_outcomes": [],
+      "source": "agent_reported"
+    },
+    {
+      "surface": "/rest/user/login",
+      "risk_area": "SQL Injection - Authentication Bypass",
+      "outcome": "reported",
+      "outcome_label": "Finding reported",
+      "evidence": "Confirmed: Payload ' OR 1=1-- returns HTTP 200 with valid admin JWT token containing full user data (id=1, email=admin@juice-sh.op, role=admin, password hash). Working PoC with multiple SQLi patterns.",
+      "recorded_by": "Authentication & Login Security Tester",
+      "recorded_at": "2026-09-04 15:05:34 UTC",
+      "updated_at": "",
+      "previous_outcomes": [],
+      "source": "agent_reported"
+    },
+    {
+      "surface": "/api/Users (registration)",
+      "risk_area": "Weak Password Policy",
+      "outcome": "reported",
+      "outcome_label": "Finding reported",
+      "evidence": "All weak passwords accepted: empty string, single character 'a', common words (password, test). No minimum length or complexity validation. HTTP 201 success on all test cases.",
+      "recorded_by": "Authentication & Login Security Tester",
+      "recorded_at": "2026-09-04 15:05:34 UTC",
+      "updated_at": "",
+      "previous_outcomes": [],
+      "source": "agent_reported"
+    },
+    {
+      "surface": "/rest/user/login",
+      "risk_area": "Brute Force Protection",
+      "outcome": "no_issue_found",
+      "outcome_label": "No issue identified",
+      "evidence": "No rate limiting detected after 15 consecutive failed login attempts. Each attempt returns 401 Unauthorized. No 429 status code, no Retry-After headers, no account lockout detected.",
+      "recorded_by": "Authentication & Login Security Tester",
+      "recorded_at": "2026-09-04 15:05:34 UTC",
+      "updated_at": "",
+      "previous_outcomes": [],
+      "source": "agent_reported"
+    },
+    {
+      "surface": "JWT Token Storage and Usage",
+      "risk_area": "Session Management - Sensitive Data Exposure",
+      "outcome": "reported",
+      "outcome_label": "Finding reported",
+      "evidence": "JWT payload contains sensitive data: user password MD5 hash, role (admin), email, timestamps. Token returned in response body, not as Set-Cookie. No HttpOnly flag possible. Decoded token shows plaintext credentials.",
+      "recorded_by": "Authentication & Login Security Tester",
+      "recorded_at": "2026-09-04 15:05:34 UTC",
+      "updated_at": "",
+      "previous_outcomes": [],
+      "source": "agent_reported"
+    },
+    {
+      "surface": "Shopping cart manipulation - Price changes, quantity modifications",
+      "risk_area": "Business Logic - Price Manipulation",
+      "outcome": "needs_follow_up",
+      "outcome_label": "Requires further review",
+      "evidence": "API endpoint /api/BasketItems requires authentication. Registration working via /api/Users endpoint. Could not complete dynamic testing due to API configuration returning 500 errors on auth endpoints. Requires further investigation with working auth flow.",
+      "recorded_by": "Business Logic & Price Manipulation Tester",
+      "recorded_at": "2026-09-04 15:05:40 UTC",
+      "updated_at": "",
+      "previous_outcomes": [],
+      "source": "agent_reported"
+    },
+    {
+      "surface": "Search functionality (/#/search?q=...)",
+      "risk_area": "Reflected XSS",
+      "outcome": "no_issue_found",
+      "outcome_label": "No issue identified",
+      "evidence": "Tested multiple XSS payloads via URL parameters in search. Payloads are URL-encoded and not reflected unescaped in HTML responses. Angular application properly sanitizes/escapes search input before rendering.",
+      "recorded_by": "XSS & Client-Side Security Tester",
+      "recorded_at": "2026-09-04 15:05:48 UTC",
+      "updated_at": "",
+      "previous_outcomes": [],
+      "source": "agent_reported"
+    },
+    {
+      "surface": "Product filter parameters (/#/products?category=...)",
+      "risk_area": "Reflected XSS",
+      "outcome": "no_issue_found",
+      "outcome_label": "No issue identified",
+      "evidence": "Tested XSS payloads in product category/filter parameters. Input properly encoded and not reflected unescaped in HTML.",
+      "recorded_by": "XSS & Client-Side Security Tester",
+      "recorded_at": "2026-09-04 15:05:48 UTC",
+      "updated_at": "",
+      "previous_outcomes": [],
+      "source": "agent_reported"
+    },
+    {
+      "surface": "Customer Feedback API (/api/Feedbacks)",
+      "risk_area": "Stored XSS",
+      "outcome": "needs_follow_up",
+      "outcome_label": "Requires further review",
+      "evidence": "API endpoint exists with feedback comments. Existing feedback entries contain unescaped HTML tags (<b>, <br />, <em>) in stored data, indicating HTML is not sanitized. However, submission requires CAPTCHA validation which prevents direct API submission. Frontend form submission could not be completed without bypassing CAPTCHA. Reachability of XSS payload execution unconfirmed - would require successful feedback submission followed by rendering verification.",
+      "recorded_by": "XSS & Client-Side Security Tester",
+      "recorded_at": "2026-09-04 15:05:48 UTC",
+      "updated_at": "",
+      "previous_outcomes": [],
+      "source": "agent_reported"
+    },
+    {
+      "surface": "Product Reviews",
+      "risk_area": "Stored XSS",
+      "outcome": "no_issue_found",
+      "outcome_label": "No issue identified",
+      "evidence": "Reviews endpoint exists but is not publicly accessible without authentication. Cannot verify if reviews contain unescaped HTML without auth credentials.",
+      "recorded_by": "XSS & Client-Side Security Tester",
+      "recorded_at": "2026-09-04 15:05:48 UTC",
+      "updated_at": "",
+      "previous_outcomes": [],
+      "source": "agent_reported"
+    },
+    {
+      "surface": "Angular template expressions ({{...}})",
+      "risk_area": "DOM-based XSS / Angular Expression Injection",
+      "outcome": "no_issue_found",
+      "outcome_label": "No issue identified",
+      "evidence": "Tested Angular expression payloads ({{7*7}}, {{constructor.constructor(...)}}) via URL parameters. Expressions not evaluated - Angular application uses modern versions with expression injection protection.",
+      "recorded_by": "XSS & Client-Side Security Tester",
+      "recorded_at": "2026-09-04 15:05:48 UTC",
+      "updated_at": "",
+      "previous_outcomes": [],
+      "source": "agent_reported"
+    },
+    {
+      "surface": "Open Redirect testing",
+      "risk_area": "Open Redirect / SSRF via redirect",
+      "outcome": "no_issue_found",
+      "outcome_label": "No issue identified",
+      "evidence": "Tested common redirect parameters (redirect=, url=, returnUrl=, next=, continue=). No redirect responses detected; application returns 200 with homepage regardless of parameter values.",
+      "recorded_by": "XSS & Client-Side Security Tester",
+      "recorded_at": "2026-09-04 15:05:48 UTC",
+      "updated_at": "",
+      "previous_outcomes": [],
+      "source": "agent_reported"
+    }
+  ],
+  "gaps": [
+    {
+      "kind": "needs_follow_up",
+      "surface": "GraphQL endpoints (/graphql, /gql, /query)",
+      "risk_area": "GraphQL Endpoint Security",
+      "detail": "Endpoints /graphql, /gql, /query respond with HTTP 200 but return HTML (main application page) not GraphQL responses. POST requests with JSON GraphQL queries also return HTML. GraphQL introspection not accessible via standard endpoints. Requires further investigation of correct GraphQL path or whether GraphQL is properly deployed."
+    },
+    {
+      "kind": "needs_follow_up",
+      "surface": "/api/Orders",
+      "risk_area": "IDOR / Order Access",
+      "detail": "Endpoint returns 500 errors. Implementation incomplete or blocked. Could not test for IDOR vulnerability due to lack of functional endpoint."
+    },
+    {
+      "kind": "needs_follow_up",
+      "surface": "/api/SavedPaymentMethod",
+      "risk_area": "IDOR / Sensitive Payment Data Access",
+      "detail": "Endpoint returns 500 errors. Could not test for IDOR vulnerability on payment methods. Implementation appears incomplete."
+    },
+    {
+      "kind": "needs_follow_up",
+      "surface": "/api/DeliveryAddress",
+      "risk_area": "IDOR / Sensitive Address Data Access",
+      "detail": "Endpoint returns 500 errors. Could not test for IDOR vulnerability on delivery addresses. Endpoint not fully implemented."
+    },
+    {
+      "kind": "needs_follow_up",
+      "surface": "Shopping cart manipulation - Price changes, quantity modifications",
+      "risk_area": "Business Logic - Price Manipulation",
+      "detail": "API endpoint /api/BasketItems requires authentication. Registration working via /api/Users endpoint. Could not complete dynamic testing due to API configuration returning 500 errors on auth endpoints. Requires further investigation with working auth flow."
+    },
+    {
+      "kind": "needs_follow_up",
+      "surface": "Customer Feedback API (/api/Feedbacks)",
+      "risk_area": "Stored XSS",
+      "detail": "API endpoint exists with feedback comments. Existing feedback entries contain unescaped HTML tags (<b>, <br />, <em>) in stored data, indicating HTML is not sanitized. However, submission requires CAPTCHA validation which prevents direct API submission. Frontend form submission could not be completed without bypassing CAPTCHA. Reachability of XSS payload execution unconfirmed - would require successful feedback submission followed by rendering verification."
+    },
+    {
+      "kind": "unrecorded_risk_class",
+      "risk_area": "csrf",
+      "detail": "Agent(s) CSRF & Session Security Tester were assigned the 'csrf' skill, but no coverage entry records this class being assessed. Treat it as unexamined, not as clean."
+    },
+    {
+      "kind": "unrecorded_risk_class",
+      "risk_area": "nosql injection",
+      "detail": "Agent(s) SQL Injection & Injection Tester were assigned the 'nosql_injection' skill, but no coverage entry records this class being assessed. Treat it as unexamined, not as clean."
+    },
+    {
+      "kind": "unrecorded_risk_class",
+      "risk_area": "path traversal lfi rfi",
+      "detail": "Agent(s) File Upload & Path Traversal Tester were assigned the 'path_traversal_lfi_rfi' skill, but no coverage entry records this class being assessed. Treat it as unexamined, not as clean."
+    },
+    {
+      "kind": "unrecorded_risk_class",
+      "risk_area": "race conditions",
+      "detail": "Agent(s) Business Logic & Price Manipulation Tester were assigned the 'race_conditions' skill, but no coverage entry records this class being assessed. Treat it as unexamined, not as clean."
+    },
+    {
+      "kind": "unrecorded_risk_class",
+      "risk_area": "xxe",
+      "detail": "Agent(s) File Upload & Path Traversal Tester were assigned the 'xxe' skill, but no coverage entry records this class being assessed. Treat it as unexamined, not as clean."
+    },
+    {
+      "kind": "agent_recorded_no_coverage",
+      "agent_name": "CSRF & Session Security Tester",
+      "detail": "CSRF & Session Security Tester ran (status: stopped) without recording any coverage. Whatever it examined is absent from this record."
+    },
+    {
+      "kind": "agent_recorded_no_coverage",
+      "agent_name": "Reconnaissance Agent",
+      "detail": "Reconnaissance Agent ran (status: completed) without recording any coverage. Whatever it examined is absent from this record."
+    },
+    {
+      "kind": "agent_recorded_no_coverage",
+      "agent_name": "SQL Injection & Injection Tester",
+      "detail": "SQL Injection & Injection Tester ran (status: stopped) without recording any coverage. Whatever it examined is absent from this record."
+    }
+  ]
+}

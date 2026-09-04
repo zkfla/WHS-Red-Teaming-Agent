@@ -1,0 +1,81 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-09-04 14:41:10 UTC",
+  "run_id": "host-docker-internal-3100_0207",
+  "run_name": "host-docker-internal-3100_0207",
+  "scope": {
+    "targets": [
+      {
+        "type": "web_application",
+        "details": {
+          "target_url": "http://host.docker.internal:3100"
+        },
+        "original": "http://host.docker.internal:3100"
+      }
+    ],
+    "scan_mode": "deep",
+    "scope_mode": "auto",
+    "diff_scope": {
+      "active": false,
+      "mode": "auto"
+    },
+    "instruction": ""
+  },
+  "summary": {
+    "surfaces_reviewed": 0,
+    "outcomes": {},
+    "findings_filed": 0,
+    "gaps": 1
+  },
+  "machine_observed": {
+    "agents": [
+      {
+        "agent_id": "ff9a779e",
+        "agent_name": "Reconnaissance Agent",
+        "status": "running",
+        "skills": [
+          "tooling/agent_browser",
+          "tooling/httpx",
+          "tooling/katana",
+          "reconnaissance/asset_discovery"
+        ],
+        "task": "Perform comprehensive black-box reconnaissance on http://host.docker.internal:3100 to identify:\n1. Application technology stack and framework\n2. Authentication model and session management\n3. All endpoints, API routes, and parameters\n4. User roles and access levels\n5. Frontend and backend technologies\n6. Third-party services and integrations\n7. Known vulnerabilities in identified technologies\n\nDocument the complete attack surface map and provide a detailed inventory of discovered endpoints and features. This will inform the threat model and guide subsequent vulnerability testing.",
+        "is_root": false
+      },
+      {
+        "agent_id": "e2360de7",
+        "agent_name": "Root Agent",
+        "status": "failed",
+        "skills": [],
+        "task": "\n\nURLs: - http://host.docker.internal:3100",
+        "is_root": true
+      }
+    ],
+    "skills_exercised": [
+      "agent_browser",
+      "asset_discovery",
+      "httpx",
+      "katana"
+    ],
+    "findings_filed": 0,
+    "source": "runtime"
+  },
+  "completeness": {
+    "complete": false,
+    "scan_status": "failed",
+    "exit_reason": "error",
+    "caveats": [
+      "The scan ended with status 'failed' rather than completing, so coverage reflects only the work finished before it stopped.",
+      "1 agent(s) did not finish cleanly (Reconnaissance Agent); any surface they held is under-covered.",
+      "The run terminated via 'error' rather than the root agent finishing, so remaining scope was not reached."
+    ]
+  },
+  "entries": [],
+  "gaps": [
+    {
+      "kind": "agent_recorded_no_coverage",
+      "agent_name": "Reconnaissance Agent",
+      "detail": "Reconnaissance Agent ran (status: running) without recording any coverage. Whatever it examined is absent from this record."
+    }
+  ]
+}

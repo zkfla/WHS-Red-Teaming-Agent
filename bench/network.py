@@ -45,15 +45,22 @@ def create():
     _wait_up()
 
 
-def _wait_up(wait_sec: int = 40):
+def _wait_up(wait_sec: int = 120):
+    """서비스가 실제로 응답할 때까지 기다린다.
+
+    프로세스 이름으로 확인하면 안 된다 — 이 이미지는 i386 바이너리를 qemu로
+    돌려서 `ps`에 죄다 `qemu-i386`으로 뜨고 `pgrep vsftpd`가 안 맞는다.
+    포트 21의 vsFTPd 배너가 실제로 나오는지를 신호로 쓴다. qemu 에뮬레이션이라
+    부팅이 느리므로(수십 초) 넉넉히 잡는다.
+    """
     deadline = time.time() + wait_sec
     while time.time() < deadline:
         r = _run("docker", "exec", TARGET_NAME, "sh", "-c",
-                 "pgrep vsftpd >/dev/null && echo up", check=False)
-        if "up" in r.stdout:
-            time.sleep(2)
+                 "echo | nc -w2 127.0.0.1 21 2>/dev/null", check=False)
+        if "vsFTPd" in r.stdout:
+            time.sleep(3)
             return
-        time.sleep(2)
+        time.sleep(3)
     raise RuntimeError("net-target이 제시간에 뜨지 않았습니다")
 
 

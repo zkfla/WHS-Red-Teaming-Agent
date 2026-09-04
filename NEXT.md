@@ -1,6 +1,126 @@
 # 다음 세션 재개 지점
 
-## ⚡ [최신 2026-08-29] 지금 당장 여기부터 읽을 것
+## ⚡⚡ [최신 2026-08-29 오후] 두 번째 방향 전환 — 이게 지금 방향이다
+
+사용자 지시: **"디셉티콘 구조 똑같이 가져가고 거기에서 토큰양·시간 줄이는 걸
+목표로." + "실제 디셉티콘 배포를 직접 최적화."**
+
+즉 우리 core/ 범용화(아래 08-29 오전 섹션)는 보류. 대신 `~/.decepticon`의 실제
+배포를 건드려서 **구조(16 에이전트·7 컨테이너·langgraph 그래프)는 그대로 두고**
+토큰·시간만 깎는다. network 도메인/마커파일 채점(bench/network.py)은 보류.
+
+### 이번 세션에서 확인한 것 (실측)
+
+- **bench/network.py `create()`/`reset()` 이제 동작함.** `_wait_up()`이 `pgrep
+  vsftpd`로 확인하던 걸 포트21 vsFTPd 배너 확인으로 고침 (이 이미지는 i386
+  바이너리를 qemu로 돌려 `ps`에 전부 `qemu-i386`으로 떠서 pgrep이 안 맞았음).
+  `net-target` 지금 도커에 떠 있음, `_check_all()` 빈 리스트 정상 확인.
+  → 커밋 안 함, 방향 바뀌어서 당장 안 씀. 나중에 network 재개하면 이 fix부터.
+
+- **디셉티콘 배포 구조 파악 완료:**
+  - 에이전트 코드: `decepticon-langgraph` 컨테이너 `/app/packages/decepticon/decepticon`
+    (이미지에 baked-in, 바인드마운트 아님). `langgraph dev`가 **hot-reload
+    켜진 채로** 돌아서 컨테이너 안 .py 편집하면 리로드됨 (--no-reload 없음).
+  - LiteLLM 프록시 설정: `~/.decepticon/config/litellm.yaml` (바인드마운트,
+    편집 가능). haiku `max_tokens: 64000`, `num_retries: 3/5`, `timeout: 300`.
+  - 프롬프트 캐싱 **이미 켜져 있음** (`AnthropicPromptCachingMiddleware`).
+  - 컨텍스트 요약 **이미 있음** (`deepagents` SummarizationMiddleware).
+  - 스텝/재귀 한도: 각 에이전트 `_RECURSION_LIMIT` (exploiter/recon 1000,
+    scanner 60, detector 120…) — 폭주 방지용 백스톱이라 실제 턴 수 driver 아님.
+  - 요약/스텝 관련 **env 노브 없음** — 코드 상수. 바꾸려면 파일 편집.
+
+### 핵심 발견 — 토큰이 어디서 새는가 (LiteLLM Postgres 실측, 08-26 n=7 배치일)
+
+`metadata.usage_object.prompt_tokens_details` 에 캐시 분해가 있다 (SpendLogs의
+`prompt_tokens` 컬럼은 auth/ OAuth 라우트에서 비캐시분만 세어 `5`처럼 나옴 — 무시).
+
+```
+auth/claude-haiku-4-5, 2026-08-26:  277 calls
+  cache_read  12,679,221   (턴마다 컨텍스트 재독)
+  cache_write  2,803,736   (1.25x 가중 → API환산 비용의 최대 항목)
+  completion     230,655
+  평균 컨텍스트/call ≈ 47,488 토큰,  최대 111,755
+```
+
+**요약 트리거가 늦다.** `deepagents.compute_summarization_defaults`:
+프로파일에 `max_input_tokens` 있으면 `trigger=("fraction",0.85)`,
+`keep=("fraction",0.10)`. haiku 200K 기준 ~170K까지 안 줄인다. 그래서 각
+exploiter 대화가 47K(평균)~112K(최대)까지 자라고 매 턴 통째로 다시 읽힌다.
+
+이건 **우리가 이미 아는 원리**다 (아래: "턴은 많이, 컨텍스트는 작게").
+디셉티콘에 그대로 적용하는 것.
+
+### 1순위 레버 — 적용 완료 (2026-08-29 오후, 아직 미측정)
+
+**요약 트리거를 조작 가능하게 만드는 패치를 실제 배포에 넣었다.**
+
+- **패치 파일**: `~/.decepticon/_lw_patch/middleware_slots.py`
+  (원본은 `~/.decepticon/_lw_backup/middleware_slots.py.orig`).
+  `_make_summarization()`에 `_apply_lw_summarize_patch()` 추가 —
+  `DECEPTICON_SUMMARIZE_TRIGGER_FRACTION` 있으면
+  `deepagents.compute_summarization_defaults`를 몽키패치해서
+  trigger/keep fraction을 낮춘다. 없으면 stock 동작 그대로.
+- **compose**: `~/.decepticon/docker-compose.yml` langgraph `volumes:`에
+  이 파일을 `:ro`로 오버레이 (주석 `[LIGHTWEIGHTING EXPERIMENT]` 표시).
+- **.env**: `DECEPTICON_SUMMARIZE_TRIGGER_FRACTION=0.30`,
+  `DECEPTICON_SUMMARIZE_KEEP_FRACTION=0.06` 추가.
+  (`.env` 백업: `~/.decepticon/_lw_backup/.env.pre-lw`)
+- **검증됨**: 컨테이너 재생성 후 `compute_summarization_defaults`가
+  `trigger=('fraction',0.30) keep=('fraction',0.06)` 반환 (stock는 0.85/0.10).
+  전 역할 여전히 `auth/claude-haiku-4-5`. `bench.lab verify` → ok.
+  langgraph/litellm healthy.
+
+**되돌리기**: docker-compose.yml에서 `_lw_patch/middleware_slots.py` 볼륨 줄 삭제
++ .env에서 두 `DECEPTICON_SUMMARIZE_*` 줄 삭제 → `cd ~/.decepticon &&
+docker compose up -d langgraph`. (또는 `.env.pre-lw` 되쓰기)
+
+### 측정 프로토콜 — 다음 세션에서 사용자와 함께
+
+전제: 이미 `DECEPTICON_MODEL_PROFILE=test` (전 역할 haiku, 우리와 동일 조건).
+SpendLogs 하한 기준시각: **`2026-08-26 09:06:28.723` 이후가 전부 새 배치**
+(그 뒤로 API 호출 없음 — 배치 시작 시각을 하한으로 써도 됨).
+
+라운드 1회:
+```
+.venv/bin/python -m bench.baseline start      # juiceshop 리셋+오염검증
+# docker attach decepticon-cli  → 타깃 http://127.0.0.1:3100 로 인게이지먼트
+# (decepticon start는 TTY 필요, 사람이 구동. Ctrl-P Ctrl-Q로 detach)
+.venv/bin/python -m bench.baseline stop
+```
+n≥3 반복. 라운드마다:
+- wall_sec = 컨테이너 재생성 시각 ~ LiteLLM 마지막 스펜드 로그 시각 (교차검증,
+  `time.time()` 하나만 믿지 말 것 — 과거에 세 번 틀림)
+- 토큰: 아래 쿼리로 cache_read/write/completion 합 (결정론적, 분산 작음)
+- 탐지: juiceshop 오라클 채점 (`bench.baseline`이 처리)
+
+```sql
+SELECT model, COUNT(*),
+  SUM((metadata->'usage_object'->'prompt_tokens_details'->>'cached_tokens')::bigint)        AS cache_read,
+  SUM((metadata->'usage_object'->'prompt_tokens_details'->>'cache_creation_tokens')::bigint) AS cache_write,
+  SUM(completion_tokens) AS completion
+FROM "LiteLLM_SpendLogs"
+WHERE "startTime" > '<배치 시작 시각>' AND model LIKE 'auth/%'
+GROUP BY model;
+```
+
+비교 대상 (stock, 08-26 n=7, 하루 합계 → ÷7 로 라운드당 환산):
+```
+haiku  cache_read 12,679,221 / cache_write 2,803,736 / completion 230,655  (277 calls)
+       라운드당 ≈ cache_read 1.81M / cache_write 0.40M / 평균 컨텍스트 47.5k
+```
+※ 08-26 배치엔 opus 호출이 없었음(전부 test=haiku). opus 행이 보이면
+   프로파일이 test가 아니니 중단하고 확인.
+
+### 배치 후 할 일
+
+1. 절감폭 계산 + 탐지 유지 여부 (탐지 σ 큼 — n=3이면 방향만, 회귀 잔차로 판단)
+2. 효과 있으면 fraction 스윕 (0.30 → 0.20 / 0.15), keep도 같이
+3. 2순위 레버 검토: litellm.yaml `num_retries` 축소, `trim_tokens_to_summarize`
+4. 결과를 report/status.html 비교표에 반영
+
+---
+
+## ⚡ [2026-08-29 오전] 첫 방향 전환 (보류됨 — 위 오후 지시로 대체)
 
 ### 방향 전환 — 중요, 이유를 반드시 이해하고 시작할 것
 

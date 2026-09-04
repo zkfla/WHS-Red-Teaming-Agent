@@ -1,0 +1,265 @@
+{
+  "version": "2.1.0",
+  "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+  "runs": [
+    {
+      "tool": {
+        "driver": {
+          "name": "Strix",
+          "informationUri": "https://strix.ai",
+          "rules": [
+            {
+              "id": "CWE-89",
+              "name": "SQL Injection Authentication Bypass via Email Parameter in /rest/user/login",
+              "shortDescription": {
+                "text": "SQL Injection Authentication Bypass via Email Parameter in /rest/user/login"
+              },
+              "fullDescription": {
+                "text": "The login endpoint at `/rest/user/login` is vulnerable to SQL injection through the email parameter. An attacker can bypass authentication using boolean-based SQL injection (`' OR 1=1 --`), allowing login as any user (including admin) without knowing the password."
+              },
+              "defaultConfiguration": {
+                "level": "error"
+              },
+              "help": {
+                "text": "The login endpoint at `/rest/user/login` is vulnerable to SQL injection through the email parameter. An attacker can bypass authentication using boolean-based SQL injection (`' OR 1=1 --`), allowing login as any user (including admin) without knowing the password.\n\nComplete authentication bypass allowing unauthenticated attackers to gain admin access. Attackers can obtain valid JWT tokens for any user account, access all user data (including password hashes), and perform administrative actions without providing valid credentials.\n\n1. Use parameterized queries (prepared statements) for all database operations. Replace string interpolation with query parameters that prevent SQL syntax from being interpreted as part of the query. 2. Implement input validation and sanitization on all user-supplied inputs before using them in database queries. 3. Use an ORM (Object-Relational Mapping) framework that handles parameterization automatically. 4. Apply the principle of least privilege to database user accounts used by the application. 5. Implement rate limiting and account lockout mechanisms on the login endpoint to slow down brute force and injection attacks. 6. Add comprehensive logging and alerting for suspicious login attempts.",
+                "markdown": "The login endpoint at `/rest/user/login` is vulnerable to SQL injection through the email parameter. An attacker can bypass authentication using boolean-based SQL injection (`' OR 1=1 --`), allowing login as any user (including admin) without knowing the password.\n\nComplete authentication bypass allowing unauthenticated attackers to gain admin access. Attackers can obtain valid JWT tokens for any user account, access all user data (including password hashes), and perform administrative actions without providing valid credentials.\n\n1. Use parameterized queries (prepared statements) for all database operations. Replace string interpolation with query parameters that prevent SQL syntax from being interpreted as part of the query. 2. Implement input validation and sanitization on all user-supplied inputs before using them in database queries. 3. Use an ORM (Object-Relational Mapping) framework that handles parameterization automatically. 4. Apply the principle of least privilege to database user accounts used by the application. 5. Implement rate limiting and account lockout mechanisms on the login endpoint to slow down brute force and injection attacks. 6. Add comprehensive logging and alerting for suspicious login attempts."
+              },
+              "properties": {
+                "security-severity": "9.8",
+                "tags": [
+                  "security",
+                  "CWE-89",
+                  "stride:T"
+                ]
+              },
+              "helpUri": "https://cwe.mitre.org/data/definitions/89.html"
+            },
+            {
+              "id": "strix-coverage/sql-injection-search-parameter",
+              "name": "SQL Injection / Search Parameter",
+              "shortDescription": {
+                "text": "Coverage: SQL Injection / Search Parameter"
+              },
+              "fullDescription": {
+                "text": "Coverage of SQL Injection / Search Parameter across the assessed attack surface."
+              },
+              "defaultConfiguration": {
+                "level": "none"
+              },
+              "help": {
+                "text": "Coverage of SQL Injection / Search Parameter across the assessed attack surface.",
+                "markdown": "Coverage of SQL Injection / Search Parameter across the assessed attack surface."
+              },
+              "properties": {
+                "tags": [
+                  "coverage"
+                ]
+              }
+            },
+            {
+              "id": "strix-coverage/jwt-algorithm-confusion-token-forgery",
+              "name": "JWT Algorithm Confusion / Token Forgery",
+              "shortDescription": {
+                "text": "Coverage: JWT Algorithm Confusion / Token Forgery"
+              },
+              "fullDescription": {
+                "text": "Coverage of JWT Algorithm Confusion / Token Forgery across the assessed attack surface."
+              },
+              "defaultConfiguration": {
+                "level": "none"
+              },
+              "help": {
+                "text": "Coverage of JWT Algorithm Confusion / Token Forgery across the assessed attack surface.",
+                "markdown": "Coverage of JWT Algorithm Confusion / Token Forgery across the assessed attack surface."
+              },
+              "properties": {
+                "tags": [
+                  "coverage"
+                ]
+              }
+            }
+          ],
+          "version": "1.6.1"
+        }
+      },
+      "results": [
+        {
+          "ruleId": "CWE-89",
+          "ruleIndex": 0,
+          "level": "error",
+          "message": {
+            "text": "SQL Injection Authentication Bypass via Email Parameter in /rest/user/login\n\nThe login endpoint at `/rest/user/login` is vulnerable to SQL injection through the email parameter. An attacker can bypass authentication using boolean-based SQL injection (`' OR 1=1 --`), allowing login as any user (including admin) without knowing the password."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "SECURITY.md"
+                }
+              }
+            },
+            {
+              "logicalLocations": [
+                {
+                  "fullyQualifiedName": "/rest/user/login",
+                  "kind": "endpoint"
+                }
+              ]
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "a61829a230edd7511efaa6af481a0e5556654bc6bc27fcc968b267f5ed4ddae5"
+          },
+          "properties": {
+            "security-severity": "9.8",
+            "strix_vuln_class_hash": "091274e2ad40f12c26f944cb00be2712c536b9e81137676e98311bc2ccf04d16",
+            "synthetic_location": true,
+            "strix": {
+              "id": "vuln-0001",
+              "severity": "critical",
+              "cvss": 9.8,
+              "timestamp": "2026-09-04 15:24:15 UTC",
+              "target": "http://host.docker.internal:3100",
+              "endpoint": "/rest/user/login",
+              "method": "POST",
+              "cwe": "CWE-89",
+              "impact": "Complete authentication bypass allowing unauthenticated attackers to gain admin access. Attackers can obtain valid JWT tokens for any user account, access all user data (including password hashes), and perform administrative actions without providing valid credentials.",
+              "technical_analysis": "The login endpoint constructs a SQL query using the email parameter without proper parameterization. The vulnerable code appears to construct a query like: `SELECT * FROM users WHERE email = '{email}'` where the email parameter is directly interpolated into the query string. By injecting `' OR 1=1 --`, the query becomes `SELECT * FROM users WHERE email = '' OR 1=1 --'`, which returns the first user record (admin) regardless of the password check. The application then generates a valid JWT token containing full user credentials including password hashes, role, and other sensitive data.",
+              "remediation_steps": "1. Use parameterized queries (prepared statements) for all database operations. Replace string interpolation with query parameters that prevent SQL syntax from being interpreted as part of the query. 2. Implement input validation and sanitization on all user-supplied inputs before using them in database queries. 3. Use an ORM (Object-Relational Mapping) framework that handles parameterization automatically. 4. Apply the principle of least privilege to database user accounts used by the application. 5. Implement rate limiting and account lockout mechanisms on the login endpoint to slow down brute force and injection attacks. 6. Add comprehensive logging and alerting for suspicious login attempts.",
+              "counterevidence": "No parameterized query validation found in the login flow. No Web Application Firewall (WAF) blocking SQL injection patterns. No input validation that would prevent single quotes in email parameters. No rate limiting observed on login endpoint. The vulnerability is consistently reproducible across multiple injection payloads (tested: ' OR 1=1 --, ' OR '1'='1, variations work reliably).",
+              "confidence": "high",
+              "severity_change_conditions": "This is already rated critical as authentication bypass with admin access is confirmed. Severity would remain critical in any deployment. No conditions would lower this rating as the vulnerability is a complete authentication bypass.",
+              "poc": {
+                "description": "1. Send a POST request to /rest/user/login with JSON body containing the SQL injection payload in the email field\n2. Use payload: `' OR 1=1 --` in the email parameter with any password value\n3. The server returns HTTP 200 with a valid JWT token for the admin user\n4. Decode the JWT token to view admin credentials including ID, email, password hash, and role\n5. Use the token in Authorization header to access protected endpoints like /api/users\n6. Successfully retrieve all user records from the database",
+                "script_available": true
+              }
+            }
+          }
+        },
+        {
+          "ruleId": "CWE-89",
+          "ruleIndex": 0,
+          "level": "error",
+          "message": {
+            "text": "Boolean-Based SQL Injection in Product Search Endpoint\n\nThe `/rest/products/search` endpoint is vulnerable to boolean-based SQL injection in the `q` (query) parameter. An attacker can inject SQL conditions to bypass search filters and extract all product data from the database, or potentially access other sensitive data through UNION-based queries."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "SECURITY.md"
+                }
+              }
+            },
+            {
+              "logicalLocations": [
+                {
+                  "fullyQualifiedName": "/rest/products/search",
+                  "kind": "endpoint"
+                }
+              ]
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "29086aa0756bcc40406def84d8e48c8d99d6eecfe57aedd74acaacd79b863866"
+          },
+          "properties": {
+            "security-severity": "7.5",
+            "strix_vuln_class_hash": "091274e2ad40f12c26f944cb00be2712c536b9e81137676e98311bc2ccf04d16",
+            "synthetic_location": true,
+            "strix": {
+              "id": "vuln-0002",
+              "severity": "high",
+              "cvss": 7.5,
+              "timestamp": "2026-09-04 15:24:46 UTC",
+              "target": "http://host.docker.internal:3100",
+              "endpoint": "/rest/products/search",
+              "method": "GET",
+              "cwe": "CWE-89",
+              "impact": "Information disclosure allowing attackers to enumerate all products regardless of search filters. Attackers can extract sensitive product data including pricing, descriptions, and IDs. Combined with UNION-based injection, attackers could potentially extract user credentials, password hashes, and other sensitive database information.",
+              "technical_analysis": "The search endpoint constructs a SQL query using the `q` parameter without proper parameterization. The vulnerable code appears to construct a query like: `SELECT * FROM products WHERE name LIKE '%{q}%' OR description LIKE '%{q}%'` where the search term is directly interpolated. By injecting `' OR '1'='1`, the query becomes `SELECT * FROM products WHERE name LIKE '%' OR '1'='1'%' OR description LIKE '...'`, which returns all products since the condition '1'='1' is always true. This demonstrates boolean-based SQL injection where an attacker can manipulate query conditions without error messages.",
+              "remediation_steps": "1. Use parameterized queries (prepared statements) for all database operations. Replace string interpolation with query parameters that separate SQL code from data values. 2. Implement input validation to ensure search parameters conform to expected format and reject strings containing SQL syntax. 3. Use an ORM framework that handles parameterization automatically and prevents SQL injection. 4. Apply the principle of least privilege to database user accounts. 5. Implement rate limiting on the search endpoint to prevent bulk data extraction. 6. Add comprehensive logging and monitoring for suspicious search patterns and high-volume queries.",
+              "counterevidence": "No input validation observed on the search parameter. No Web Application Firewall (WAF) detected blocking SQL injection patterns. No rate limiting on the search endpoint. No stored procedure or prepared statement usage detected. The vulnerability is consistently exploitable and not dependent on any specific conditions or preconditions.",
+              "confidence": "high",
+              "severity_change_conditions": "Severity would be elevated to critical if attackers could extract user credentials or passwords through UNION-based injection, or if this leads to authentication bypass. Current rating of high is appropriate for information disclosure through boolean-based injection of product data.",
+              "poc": {
+                "description": "1. Send a GET request to /rest/products/search?q=apple (normal search)\n2. Observe that it returns 3 products matching 'apple'\n3. Send a GET request with SQL injection payload: /rest/products/search?q=' OR '1'='1\n4. Observe that it now returns 46 products (all products in database)\n5. This demonstrates that the search filter is bypassed via boolean-based SQL injection\n6. Extract and review all product data including prices and descriptions\n7. The same technique can be extended to extract user data via UNION queries",
+                "script_available": true
+              }
+            }
+          }
+        },
+        {
+          "ruleId": "strix-coverage/sql-injection-search-parameter",
+          "ruleIndex": 1,
+          "kind": "pass",
+          "level": "none",
+          "message": {
+            "text": "SQL Injection / Search Parameter — No issue identified: GET /api/products (q parameter)\n\nTested with SQL injection payloads ' OR '1'='1 and ' OR 1=1 --. The /api/products endpoint returns empty results for injection payloads, suggesting parameterized queries or proper input validation. Unlike /rest/products/search, this endpoint is not vulnerable to SQL injection."
+          },
+          "locations": [
+            {
+              "logicalLocations": [
+                {
+                  "fullyQualifiedName": "GET /api/products (q parameter)"
+                }
+              ]
+            }
+          ],
+          "properties": {
+            "strix": {
+              "coverage_outcome": "no_issue_found",
+              "risk_area": "SQL Injection / Search Parameter",
+              "surface": "GET /api/products (q parameter)",
+              "recorded_by": "SQL Injection & Authentication Specialist",
+              "source": "agent_reported"
+            }
+          }
+        },
+        {
+          "ruleId": "strix-coverage/jwt-algorithm-confusion-token-forgery",
+          "ruleIndex": 2,
+          "kind": "pass",
+          "level": "none",
+          "message": {
+            "text": "JWT Algorithm Confusion / Token Forgery — Ruled out: JWT Token (RS256 algorithm)\n\nJWT tokens use RS256 (RSA Signature) algorithm with proper key binding. Tested for algorithm confusion (RS256 to HS256) which failed - server correctly validates RS256 signature using public key. No 'alg': 'none' acceptance. Token is cryptographically signed and not vulnerable to algorithm confusion attacks. However, tokens are accessible via SQLi vulnerability in login endpoint, so authentication bypass remains the primary issue."
+          },
+          "locations": [
+            {
+              "logicalLocations": [
+                {
+                  "fullyQualifiedName": "JWT Token (RS256 algorithm)"
+                }
+              ]
+            }
+          ],
+          "properties": {
+            "strix": {
+              "coverage_outcome": "ruled_out",
+              "risk_area": "JWT Algorithm Confusion / Token Forgery",
+              "surface": "JWT Token (RS256 algorithm)",
+              "recorded_by": "SQL Injection & Authentication Specialist",
+              "source": "agent_reported"
+            }
+          }
+        }
+      ],
+      "invocations": [
+        {
+          "executionSuccessful": false,
+          "toolExecutionNotifications": [
+            {
+              "level": "warning",
+              "message": {
+                "text": "4 agent(s) did not finish cleanly (Business Logic & Advanced Exploitation Agent, IDOR & Access Control Specialist, XSS & Input Validation Specialist, XXE, SSRF & Data Disclosure Agent); any surface they held is under-covered."
+              }
+            }
+          ]
+        }
+      ],
+      "properties": {
+        "syntheticLocationCount": 2
+      }
+    }
+  ]
+}

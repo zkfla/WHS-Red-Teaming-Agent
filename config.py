@@ -166,6 +166,13 @@ PROFILES = {
         "reporter": RoleConfig("claude-haiku-4-5", "low",  4),
     }, fan_out=["injection", "access", "authn", "exposure", "logic"],
        wave2=RoleConfig("claude-haiku-4-5", "low", 5)),
+    # 동일 예산 실험 — Strix와 같은 $3.00 상한에서 비교한다.
+    # 턴 상한을 40으로 크게 잡아야 '예산'이 실제 제약이 된다. 9턴이면 예산에
+    # 닿기 전에 턴이 먼저 소진돼(실측 $0.36) 동일 조건이 성립하지 않는다.
+    "haiku-budget3": Profile("haiku-budget3", {
+        "exploit":  RoleConfig("claude-haiku-4-5", "low", 40),
+        "reporter": RoleConfig("claude-haiku-4-5", "low",  4),
+    }, fan_out=["injection", "access", "authn", "exposure", "logic"]),
     # 상한선(성능 기준점): 전부 opus + high effort
     "max": Profile("max", {
         "recon":    RoleConfig("claude-opus-5", "high", 15),

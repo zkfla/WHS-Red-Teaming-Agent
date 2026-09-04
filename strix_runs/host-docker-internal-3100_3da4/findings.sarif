@@ -1,0 +1,515 @@
+{
+  "version": "2.1.0",
+  "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+  "runs": [
+    {
+      "tool": {
+        "driver": {
+          "name": "Strix",
+          "informationUri": "https://strix.ai",
+          "rules": [
+            {
+              "id": "CWE-89",
+              "name": "SQL Injection Authentication Bypass in Login Form",
+              "shortDescription": {
+                "text": "SQL Injection Authentication Bypass in Login Form"
+              },
+              "fullDescription": {
+                "text": "The login endpoint is vulnerable to SQL injection in the email parameter, allowing attackers to bypass authentication and log in as any user without knowing their password. The vulnerability exists due to improper input validation or parameterization of the SQL query."
+              },
+              "defaultConfiguration": {
+                "level": "error"
+              },
+              "help": {
+                "text": "The login endpoint is vulnerable to SQL injection in the email parameter, allowing attackers to bypass authentication and log in as any user without knowing their password. The vulnerability exists due to improper input validation or parameterization of the SQL query.\n\nAn attacker can bypass authentication and gain unauthorized access to user accounts, including administrative accounts. This allows complete compromise of the application and access to all user data.\n\nImplement parameterized queries or prepared statements for all database operations. The login query should use parameter binding to separate SQL code from user input. Example: Use query parameters like `SELECT * FROM users WHERE email = ? AND password = ?` and pass email and password as separate parameters to the database driver. Additionally, implement input validation to reject email addresses containing SQL keywords or special characters, and implement rate limiting on failed login attempts to mitigate brute force attacks.",
+                "markdown": "The login endpoint is vulnerable to SQL injection in the email parameter, allowing attackers to bypass authentication and log in as any user without knowing their password. The vulnerability exists due to improper input validation or parameterization of the SQL query.\n\nAn attacker can bypass authentication and gain unauthorized access to user accounts, including administrative accounts. This allows complete compromise of the application and access to all user data.\n\nImplement parameterized queries or prepared statements for all database operations. The login query should use parameter binding to separate SQL code from user input. Example: Use query parameters like `SELECT * FROM users WHERE email = ? AND password = ?` and pass email and password as separate parameters to the database driver. Additionally, implement input validation to reject email addresses containing SQL keywords or special characters, and implement rate limiting on failed login attempts to mitigate brute force attacks."
+              },
+              "properties": {
+                "security-severity": "9.8",
+                "tags": [
+                  "security",
+                  "CWE-89",
+                  "stride:T"
+                ]
+              },
+              "helpUri": "https://cwe.mitre.org/data/definitions/89.html"
+            },
+            {
+              "id": "strix-coverage/jwt-weaknesses",
+              "name": "JWT Weaknesses",
+              "shortDescription": {
+                "text": "Coverage: JWT Weaknesses"
+              },
+              "fullDescription": {
+                "text": "Coverage of JWT Weaknesses across the assessed attack surface."
+              },
+              "defaultConfiguration": {
+                "level": "none"
+              },
+              "help": {
+                "text": "Coverage of JWT Weaknesses across the assessed attack surface.",
+                "markdown": "Coverage of JWT Weaknesses across the assessed attack surface."
+              },
+              "properties": {
+                "tags": [
+                  "coverage"
+                ]
+              }
+            },
+            {
+              "id": "strix-coverage/sql-injection",
+              "name": "SQL Injection",
+              "shortDescription": {
+                "text": "Coverage: SQL Injection"
+              },
+              "fullDescription": {
+                "text": "Coverage of SQL Injection across the assessed attack surface."
+              },
+              "defaultConfiguration": {
+                "level": "none"
+              },
+              "help": {
+                "text": "Coverage of SQL Injection across the assessed attack surface.",
+                "markdown": "Coverage of SQL Injection across the assessed attack surface."
+              },
+              "properties": {
+                "tags": [
+                  "coverage"
+                ]
+              }
+            },
+            {
+              "id": "strix-coverage/information-disclosure-product-enumeration",
+              "name": "Information Disclosure / Product Enumeration",
+              "shortDescription": {
+                "text": "Coverage: Information Disclosure / Product Enumeration"
+              },
+              "fullDescription": {
+                "text": "Coverage of Information Disclosure / Product Enumeration across the assessed attack surface."
+              },
+              "defaultConfiguration": {
+                "level": "none"
+              },
+              "help": {
+                "text": "Coverage of Information Disclosure / Product Enumeration across the assessed attack surface.",
+                "markdown": "Coverage of Information Disclosure / Product Enumeration across the assessed attack surface."
+              },
+              "properties": {
+                "tags": [
+                  "coverage"
+                ]
+              }
+            },
+            {
+              "id": "strix-coverage/information-disclosure",
+              "name": "Information Disclosure",
+              "shortDescription": {
+                "text": "Coverage: Information Disclosure"
+              },
+              "fullDescription": {
+                "text": "Coverage of Information Disclosure across the assessed attack surface."
+              },
+              "defaultConfiguration": {
+                "level": "none"
+              },
+              "help": {
+                "text": "Coverage of Information Disclosure across the assessed attack surface.",
+                "markdown": "Coverage of Information Disclosure across the assessed attack surface."
+              },
+              "properties": {
+                "tags": [
+                  "coverage"
+                ]
+              }
+            },
+            {
+              "id": "strix-coverage/idor-unauthorized-deletion",
+              "name": "IDOR / Unauthorized Deletion",
+              "shortDescription": {
+                "text": "Coverage: IDOR / Unauthorized Deletion"
+              },
+              "fullDescription": {
+                "text": "Coverage of IDOR / Unauthorized Deletion across the assessed attack surface."
+              },
+              "defaultConfiguration": {
+                "level": "none"
+              },
+              "help": {
+                "text": "Coverage of IDOR / Unauthorized Deletion across the assessed attack surface.",
+                "markdown": "Coverage of IDOR / Unauthorized Deletion across the assessed attack surface."
+              },
+              "properties": {
+                "tags": [
+                  "coverage"
+                ]
+              }
+            },
+            {
+              "id": "strix-coverage/user-registration",
+              "name": "User Registration",
+              "shortDescription": {
+                "text": "Coverage: User Registration"
+              },
+              "fullDescription": {
+                "text": "Coverage of User Registration across the assessed attack surface."
+              },
+              "defaultConfiguration": {
+                "level": "none"
+              },
+              "help": {
+                "text": "Coverage of User Registration across the assessed attack surface.",
+                "markdown": "Coverage of User Registration across the assessed attack surface."
+              },
+              "properties": {
+                "tags": [
+                  "coverage"
+                ]
+              }
+            }
+          ],
+          "version": "1.6.1"
+        }
+      },
+      "results": [
+        {
+          "ruleId": "CWE-89",
+          "ruleIndex": 0,
+          "level": "error",
+          "message": {
+            "text": "SQL Injection Authentication Bypass in Login Form\n\nThe login endpoint is vulnerable to SQL injection in the email parameter, allowing attackers to bypass authentication and log in as any user without knowing their password. The vulnerability exists due to improper input validation or parameterization of the SQL query."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "SECURITY.md"
+                }
+              }
+            },
+            {
+              "logicalLocations": [
+                {
+                  "fullyQualifiedName": "/rest/user/login",
+                  "kind": "endpoint"
+                }
+              ]
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "a61829a230edd7511efaa6af481a0e5556654bc6bc27fcc968b267f5ed4ddae5"
+          },
+          "properties": {
+            "security-severity": "9.8",
+            "strix_vuln_class_hash": "091274e2ad40f12c26f944cb00be2712c536b9e81137676e98311bc2ccf04d16",
+            "synthetic_location": true,
+            "strix": {
+              "id": "vuln-0001",
+              "severity": "critical",
+              "cvss": 9.8,
+              "timestamp": "2026-09-04 15:40:23 UTC",
+              "target": "http://host.docker.internal:3100",
+              "endpoint": "/rest/user/login",
+              "method": "POST",
+              "cwe": "CWE-89",
+              "impact": "An attacker can bypass authentication and gain unauthorized access to user accounts, including administrative accounts. This allows complete compromise of the application and access to all user data.",
+              "technical_analysis": "The application constructs a SQL query using unsanitized user input from the email parameter in the login form. The database is likely executing a query similar to: `SELECT * FROM users WHERE email = '[email]' AND password = '[password_hash]'`. By injecting SQL syntax like `' OR 1=1--`, the attacker modifies the query logic to: `SELECT * FROM users WHERE email = '' OR 1=1--' AND password = ...` which evaluates to true for the first user (typically the admin). This returns the first user's record without requiring a valid password.",
+              "remediation_steps": "Implement parameterized queries or prepared statements for all database operations. The login query should use parameter binding to separate SQL code from user input. Example: Use query parameters like `SELECT * FROM users WHERE email = ? AND password = ?` and pass email and password as separate parameters to the database driver. Additionally, implement input validation to reject email addresses containing SQL keywords or special characters, and implement rate limiting on failed login attempts to mitigate brute force attacks.",
+              "counterevidence": "No input validation or parameterized query protection was found. The application accepts and processes SQL syntax in the email parameter without escaping or parameterization. Multiple SQL injection syntaxes were successfully tested and confirmed working. No WAF or query filtering was observed.",
+              "confidence": "high",
+              "severity_change_conditions": "None - this is a critical vulnerability as-is. It allows complete authentication bypass without any prerequisites.",
+              "poc": {
+                "description": "1. Send a POST request to `/rest/user/login` with JSON payload containing `{\"email\": \"' OR 1=1--\", \"password\": \"anything\"}`\n2. The server responds with HTTP 200 and a JWT authentication token\n3. Decode the JWT token to verify successful authentication as the admin user (ID: 1, Email: admin@juice-sh.op, Role: admin)\n4. The JWT token can be used for subsequent API requests to perform actions as an authenticated admin",
+                "script_available": true
+              }
+            }
+          }
+        },
+        {
+          "ruleId": "CWE-89",
+          "ruleIndex": 0,
+          "level": "warning",
+          "message": {
+            "text": "SQL Injection in Product Search Functionality\n\nThe product search endpoint is vulnerable to boolean-based SQL injection in the query parameter. An attacker can inject SQL operators to bypass search filters and retrieve all products in the database, or potentially extract sensitive information."
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "SECURITY.md"
+                }
+              }
+            },
+            {
+              "logicalLocations": [
+                {
+                  "fullyQualifiedName": "/rest/products/search",
+                  "kind": "endpoint"
+                }
+              ]
+            }
+          ],
+          "partialFingerprints": {
+            "primaryLocationLineHash": "29086aa0756bcc40406def84d8e48c8d99d6eecfe57aedd74acaacd79b863866"
+          },
+          "properties": {
+            "security-severity": "5.3",
+            "strix_vuln_class_hash": "091274e2ad40f12c26f944cb00be2712c536b9e81137676e98311bc2ccf04d16",
+            "synthetic_location": true,
+            "strix": {
+              "id": "vuln-0002",
+              "severity": "medium",
+              "cvss": 5.3,
+              "timestamp": "2026-09-04 15:40:42 UTC",
+              "target": "http://host.docker.internal:3100",
+              "endpoint": "/rest/products/search",
+              "method": "GET",
+              "cwe": "CWE-89",
+              "impact": "An attacker can bypass search filters to access all products in the database. In a more severe scenario, this could allow extraction of sensitive data from the database such as user credentials, personal information, or financial records if they are stored in related tables.",
+              "technical_analysis": "The search endpoint constructs a SQL query using unsanitized user input from the query parameter. The application likely executes a query like: `SELECT * FROM products WHERE name LIKE '[query]%'`. By injecting `' OR '1'='1`, the query becomes: `SELECT * FROM products WHERE name LIKE '' OR '1'='1'%'` which always evaluates to true, returning all products in the database. The application returns 46 products when querying with the SQLi payload, versus only search-relevant results for normal queries.",
+              "remediation_steps": "Implement parameterized queries or prepared statements for the search functionality. The query should use parameter binding: `SELECT * FROM products WHERE name LIKE ? OR description LIKE ?` with the search term passed as a parameter. Additionally, implement input validation to escape or reject SQL special characters like single quotes, and consider using a dedicated search engine like Elasticsearch that handles injection safety automatically.",
+              "counterevidence": "No input validation, escaping, or parameterization was found on the search parameter. The application directly incorporates user input into SQL queries. Multiple SQL injection syntaxes were tested and confirmed working (various OR/AND conditions). No database-level protections or WAF was observed.",
+              "confidence": "high",
+              "severity_change_conditions": "Could be rated critical if data extraction (UNION-based SQLi) is achieved to retrieve sensitive data from other tables like users or orders.",
+              "poc": {
+                "description": "1. Make a GET request to `/rest/products/search?q=juice` - observe normal search returns 35 results\n2. Get baseline of total products from `/api/products` - total is 46 products\n3. Make a GET request to `/rest/products/search?q=' OR '1'='1` - the endpoint now returns all 46 products\n4. Verify the SQLi worked by comparing result counts: normal query (35) vs injected query (46)",
+                "script_available": true
+              }
+            }
+          }
+        },
+        {
+          "ruleId": "strix-coverage/jwt-weaknesses",
+          "ruleIndex": 1,
+          "kind": "pass",
+          "level": "none",
+          "message": {
+            "text": "JWT Weaknesses — Ruled out: JWT Token Claims\n\nJWT uses RS256 (asymmetric, appropriate). No alg=none, no HS256, no JWKS header injection observed. Token verification successful on API endpoints. No weaknesses found in JWT implementation itself."
+          },
+          "locations": [
+            {
+              "logicalLocations": [
+                {
+                  "fullyQualifiedName": "JWT Token Claims"
+                }
+              ]
+            }
+          ],
+          "properties": {
+            "strix": {
+              "coverage_outcome": "ruled_out",
+              "risk_area": "JWT Weaknesses",
+              "surface": "JWT Token Claims",
+              "recorded_by": "SQLi + Auth Testing Agent",
+              "source": "agent_reported"
+            }
+          }
+        },
+        {
+          "ruleId": "strix-coverage/sql-injection",
+          "ruleIndex": 2,
+          "kind": "pass",
+          "level": "none",
+          "message": {
+            "text": "SQL Injection — No issue identified: POST /rest/user/register\n\nTested registration endpoint with SQLi payloads in email and username fields. All payloads returned 500 status code without processing. No successful SQLi demonstrated."
+          },
+          "locations": [
+            {
+              "logicalLocations": [
+                {
+                  "fullyQualifiedName": "POST /rest/user/register"
+                }
+              ]
+            }
+          ],
+          "properties": {
+            "strix": {
+              "coverage_outcome": "no_issue_found",
+              "risk_area": "SQL Injection",
+              "surface": "POST /rest/user/register",
+              "recorded_by": "SQLi + Auth Testing Agent",
+              "source": "agent_reported"
+            }
+          }
+        },
+        {
+          "ruleId": "strix-coverage/sql-injection",
+          "ruleIndex": 2,
+          "kind": "pass",
+          "level": "none",
+          "message": {
+            "text": "SQL Injection — No issue identified: POST /rest/user/forgot-password\n\nTested password reset endpoint with SQLi payloads. All requests returned 500 status. No successful exploitation found."
+          },
+          "locations": [
+            {
+              "logicalLocations": [
+                {
+                  "fullyQualifiedName": "POST /rest/user/forgot-password"
+                }
+              ]
+            }
+          ],
+          "properties": {
+            "strix": {
+              "coverage_outcome": "no_issue_found",
+              "risk_area": "SQL Injection",
+              "surface": "POST /rest/user/forgot-password",
+              "recorded_by": "SQLi + Auth Testing Agent",
+              "source": "agent_reported"
+            }
+          }
+        },
+        {
+          "ruleId": "strix-coverage/sql-injection",
+          "ruleIndex": 2,
+          "kind": "pass",
+          "level": "none",
+          "message": {
+            "text": "SQL Injection — No issue identified: GET /api/products, /api/SecurityQuestions\n\nTested API endpoints with SQLi payloads in query parameters. All requests returned 200 status with expected results. No SQL error messages or unexpected behavior observed."
+          },
+          "locations": [
+            {
+              "logicalLocations": [
+                {
+                  "fullyQualifiedName": "GET /api/products, /api/SecurityQuestions"
+                }
+              ]
+            }
+          ],
+          "properties": {
+            "strix": {
+              "coverage_outcome": "no_issue_found",
+              "risk_area": "SQL Injection",
+              "surface": "GET /api/products, /api/SecurityQuestions",
+              "recorded_by": "SQLi + Auth Testing Agent",
+              "source": "agent_reported"
+            }
+          }
+        },
+        {
+          "ruleId": "strix-coverage/information-disclosure-product-enumeration",
+          "ruleIndex": 3,
+          "kind": "pass",
+          "level": "none",
+          "message": {
+            "text": "Information Disclosure / Product Enumeration — No issue identified: GET /api/Products (product enumeration)\n\nPublic product catalog is accessible without authentication. This is expected behavior for e-commerce application. No sensitive information exposed beyond public product data."
+          },
+          "locations": [
+            {
+              "logicalLocations": [
+                {
+                  "fullyQualifiedName": "GET /api/Products (product enumeration)"
+                }
+              ]
+            }
+          ],
+          "properties": {
+            "strix": {
+              "coverage_outcome": "no_issue_found",
+              "risk_area": "Information Disclosure / Product Enumeration",
+              "surface": "GET /api/Products (product enumeration)",
+              "recorded_by": "XSS + IDOR Testing Agent",
+              "source": "agent_reported"
+            }
+          }
+        },
+        {
+          "ruleId": "strix-coverage/information-disclosure",
+          "ruleIndex": 4,
+          "kind": "pass",
+          "level": "none",
+          "message": {
+            "text": "Information Disclosure — No issue identified: GET /rest/products/{id}/reviews (review access)\n\nProduct reviews are public and accessible without authentication. This is expected behavior for e-commerce application."
+          },
+          "locations": [
+            {
+              "logicalLocations": [
+                {
+                  "fullyQualifiedName": "GET /rest/products/{id}/reviews (review access)"
+                }
+              ]
+            }
+          ],
+          "properties": {
+            "strix": {
+              "coverage_outcome": "no_issue_found",
+              "risk_area": "Information Disclosure",
+              "surface": "GET /rest/products/{id}/reviews (review access)",
+              "recorded_by": "XSS + IDOR Testing Agent",
+              "source": "agent_reported"
+            }
+          }
+        },
+        {
+          "ruleId": "strix-coverage/idor-unauthorized-deletion",
+          "ruleIndex": 5,
+          "kind": "pass",
+          "level": "none",
+          "message": {
+            "text": "IDOR / Unauthorized Deletion — Ruled out: DELETE /api/Products/{id}\n\nDELETE requests return 401 Unauthorized, requiring authentication. This endpoint is properly protected."
+          },
+          "locations": [
+            {
+              "logicalLocations": [
+                {
+                  "fullyQualifiedName": "DELETE /api/Products/{id}"
+                }
+              ]
+            }
+          ],
+          "properties": {
+            "strix": {
+              "coverage_outcome": "ruled_out",
+              "risk_area": "IDOR / Unauthorized Deletion",
+              "surface": "DELETE /api/Products/{id}",
+              "recorded_by": "XSS + IDOR Testing Agent",
+              "source": "agent_reported"
+            }
+          }
+        },
+        {
+          "ruleId": "strix-coverage/user-registration",
+          "ruleIndex": 6,
+          "kind": "pass",
+          "level": "none",
+          "message": {
+            "text": "User Registration — No issue identified: POST /api/Users\n\nUser registration endpoint properly accepts unauthenticated requests (expected behavior). No authorization bypass found."
+          },
+          "locations": [
+            {
+              "logicalLocations": [
+                {
+                  "fullyQualifiedName": "POST /api/Users"
+                }
+              ]
+            }
+          ],
+          "properties": {
+            "strix": {
+              "coverage_outcome": "no_issue_found",
+              "risk_area": "User Registration",
+              "surface": "POST /api/Users",
+              "recorded_by": "XSS + IDOR Testing Agent",
+              "source": "agent_reported"
+            }
+          }
+        }
+      ],
+      "invocations": [
+        {
+          "executionSuccessful": false,
+          "toolExecutionNotifications": [
+            {
+              "level": "warning",
+              "message": {
+                "text": "2 agent(s) did not finish cleanly (Business Logic + File Upload Testing Agent, Recon Agent); any surface they held is under-covered."
+              }
+            }
+          ]
+        }
+      ],
+      "properties": {
+        "syntheticLocationCount": 2
+      }
+    }
+  ]
+}
