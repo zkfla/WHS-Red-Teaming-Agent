@@ -109,6 +109,40 @@ def _resolve_read_balance(
     )
 
 
+def _resolve_read_transactions(
+    principal_id: str, target: str, principals: list[Principal], graph: KnowledgeGraph, target_cfg: TargetConfig
+) -> CandidateSkeleton | str:
+    """`target` 계좌의 거래내역을 `/transactions/{account_number}` 로 조회한다.
+
+    read_balance 와 완전히 같은 패턴(그래프 검증 → 실존 계좌만 지목 가능)의
+    또 다른 인스턴스다 — INV-2(권한경계) 오라클을 그대로 재사용하고, 새 오라클을
+    만들지 않는다. 경로는 observation config 에 아직 없어(§ de-hardcoding으로
+    제거됨) 여기서 직접 명시한다 — 나중에 operation_discovery 가 대체할 수 있다.
+    """
+    principal = _find_principal(principal_id, principals)
+    if principal is None:
+        return f"알 수 없는 principal_id: {principal_id!r}"
+
+    account = _parse_account_target(target)
+    if account is None:
+        return f"target 형식이 잘못됨: {target!r} (예: 'account:1234567890')"
+
+    if graph.entitlement_unknown(f"account:{account}"):
+        return f"account:{account} 는 그래프가 모르는 계좌 — observe_graph 나 discover_surface 로 먼저 실존 계좌를 확인하라"
+
+    return CandidateSkeleton(
+        layer="finance",
+        operation="read_transactions",
+        principal_id=principal_id,
+        method="GET",
+        path=f"/transactions/{account}",
+        subject_account=account,
+        watch_accounts=[],
+        needs_baseline=False,
+        hint={"target_account": account},
+    )
+
+
 def _resolve_transfer(
     principal_id: str,
     target: str,
@@ -170,6 +204,7 @@ ResolverFn = Callable[..., "CandidateSkeleton | str"]
 
 _RESOLVERS: dict[str, ResolverFn] = {
     "read_balance": _resolve_read_balance,
+    "read_transactions": _resolve_read_transactions,
     "transfer": _resolve_transfer,
 }
 
