@@ -33,6 +33,7 @@ from finredteam.planning.candidates import resolve_skeleton
 from finredteam.planning.planner import build_candidate
 from finredteam.probing.executor import run as execute
 from finredteam.probing.finance.burst import run_race_candidate, summarize_race
+from finredteam.probing.finance.auth_exposure import run_forgot_password_pin_probe, run_register_password_echo_probe
 from finredteam.probing.finance.card_exposure import run_card_exposure_probe
 from finredteam.probing.finance.card_fund import run_card_fund_manipulation
 from finredteam.probing.finance.charge import run_charge_idempotency_trial
@@ -558,6 +559,37 @@ def test_card_exposure_masked_pan_no_violation():
 
     finding = verify(candidate, result)
     assert finding.verdict != Verdict.VIOLATION
+
+
+def test_register_password_echo_flows_to_inv9_violation():
+    """회원가입 응답이 요청에 보낸 비밀번호를 그대로 echo → INV-9 VIOLATION."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path == "/register":
+            body = json.loads(request.content or b"{}")
+            return httpx.Response(200, json={"status": "success", "debug_data": {"raw_data": body}})
+        return httpx.Response(404, json={})
+
+    session = Session(load_target("vulnbank"), _policy(), _transport=httpx.MockTransport(handler))
+    candidate, result = run_register_password_echo_probe(session, "u1", "Secr3tP@ss!")
+    assert result.exposure_signals == {"password_echoed": True}
+    finding = verify(candidate, result)
+    assert finding.verdict == Verdict.VIOLATION
+    assert finding.invariant == "INV-9"
+
+
+def test_forgot_password_pin_disclosure_flows_to_inv9_violation():
+    """비밀번호 재설정 응답에 PIN 노출 → INV-9 VIOLATION (계정탈취 발판)."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path == "/api/v1/forgot-password":
+            return httpx.Response(200, json={"status": "success", "debug_info": {"pin": "687"}})
+        return httpx.Response(404, json={})
+
+    session = Session(load_target("vulnbank"), _policy(), _transport=httpx.MockTransport(handler))
+    candidate, result = run_forgot_password_pin_probe(session, "u1")
+    assert result.exposure_signals == {"reset_pin_exposed": True}
+    finding = verify(candidate, result)
+    assert finding.verdict == Verdict.VIOLATION
+    assert finding.invariant == "INV-9"
 
 
 # ──────────────────────────────────────────────────────────────────────────

@@ -10,7 +10,17 @@
 from __future__ import annotations
 
 from finredteam.models.finding import CandidateFinding, ExecutionResult
-from finredteam.oracles.base import OracleOutcome, anomaly, is_success_status, passed, unknown, violation
+from finredteam.oracles.base import OracleOutcome, is_success_status, passed, unknown, violation
+
+
+# 신호 이름 → 사람이 읽는 노출 설명. 프로브(probing/finance/*)가 이 이름으로
+# boolean 을 세팅하면 오라클이 그대로 위반 사유로 쓴다.
+_EXPOSURE_LABELS = {
+    "full_pan_exposed": "마스킹 없는 전체 PAN",
+    "cvv_exposed": "카드 CVV",
+    "password_echoed": "요청에 보낸 비밀번호 원문이 응답에 그대로 반환됨",
+    "reset_pin_exposed": "비밀번호 재설정 PIN",
+}
 
 
 def check_inv_9(candidate: CandidateFinding, result: ExecutionResult) -> OracleOutcome:
@@ -21,25 +31,12 @@ def check_inv_9(candidate: CandidateFinding, result: ExecutionResult) -> OracleO
     if not any(is_success_status(code) for code in result.status_codes):
         return passed("INV-9", "성공 응답이 없어 노출이 발생하지 않음")
 
-    pan = signals.get("full_pan_exposed", False)
-    cvv = signals.get("cvv_exposed", False)
-
-    if pan and cvv:
+    exposed = [name for name, present in signals.items() if present]
+    if exposed:
+        labels = [_EXPOSURE_LABELS.get(name, name) for name in exposed]
         return violation(
             "INV-9",
-            "카드정보 과다 노출: 마스킹 없는 전체 PAN 과 CVV 가 응답에 함께 노출됨",
-            evidence={"full_pan_exposed": True, "cvv_exposed": True},
+            "민감정보 노출: " + ", ".join(labels) + " 이(가) 응답에 노출됨",
+            evidence={name: True for name in exposed},
         )
-    if pan:
-        return violation(
-            "INV-9",
-            "카드정보 노출: 마스킹 없는 전체 PAN 이 응답에 노출됨",
-            evidence={"full_pan_exposed": True},
-        )
-    if cvv:
-        return anomaly(
-            "INV-9",
-            "CVV 가 응답에 노출됨 (전체 PAN 은 미확인)",
-            evidence={"cvv_exposed": True},
-        )
-    return passed("INV-9", "마스킹 없는 PAN/CVV 노출 신호 없음")
+    return passed("INV-9", "민감정보 노출 신호 없음")
