@@ -33,6 +33,7 @@ from finredteam.planning.candidates import resolve_skeleton
 from finredteam.planning.planner import build_candidate
 from finredteam.probing.executor import run as execute
 from finredteam.probing.finance.burst import run_race_candidate, summarize_race
+from finredteam.probing.finance.card_fund import run_card_fund_manipulation
 from finredteam.probing.finance.charge import run_charge_idempotency_trial
 from finredteam.probing.session import Session
 from finredteam.oracles import registry
@@ -454,6 +455,68 @@ def test_merchant_charge_replay_flows_to_inv4_violation():
 
     finding = verify(candidate, result)
     assert finding.verdict == Verdict.VIOLATION
+
+
+def _card_fund_mock_session() -> Session:
+    """USD 카드 충전 시 클라이언트 exchange_rate 를 그대로 반영하는 목(실제
+    vuln-bank 의 mass assignment 버그 재현). 계좌 USD 잔액과 카드 USD 잔액을
+    각각 관측 가능하게 한다."""
+    acct = {"balance": Decimal("1000.00")}
+    card = {"balance": Decimal("0.00")}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if request.method == "GET" and path.startswith("/check_balance/"):
+            return httpx.Response(200, json={"balance": str(acct["balance"]), "username": "owner"})
+        if request.method == "GET" and path == "/api/virtual-cards":
+            return httpx.Response(200, json={"cards": [{"id": 1, "balance": float(card["balance"]), "currency": "USD"}]})
+        if request.method == "POST" and path == "/api/virtual-cards/1/fund":
+            body = json.loads(request.content or b"{}")
+            usd = Decimal(str(body["amount"]))
+            rate = Decimal(str(body.get("exchange_rate", "1")))  # ★ 클라이언트 값을 그대로 씀 = 버그
+            acct["balance"] -= usd
+            card["balance"] += usd * rate
+            return httpx.Response(200, json={"status": "success"})
+        return httpx.Response(404, json={"error": "unknown endpoint"})
+
+    return Session(load_target("vulnbank"), _policy(), _transport=httpx.MockTransport(handler))
+
+
+def test_card_fund_exchange_rate_manipulation_flows_to_inv1a_violation():
+    """USD 카드 충전 시 exchange_rate 를 조작 → 계좌에서 usd 만큼 빠지고 카드에
+    usd×rate 만큼 들어옴 → 같은 USD 에서 값 창조 → INV-1A VIOLATION.
+
+    새 오라클 없이 기존 INV-1A(통화별 가치 보존)로 잡힌다 — 계좌·카드 잔액을
+    한 델타로 합쳐 관측하는 게 핵심(run_card_fund_manipulation)."""
+    session = _card_fund_mock_session()
+    owner = Principal(id="attacker_A", username="owner", password="pw", account_number=ATTACKER_ACCT, token="tok")
+
+    candidate, result = run_card_fund_manipulation(
+        session, owner, "1", usd_amount="100.00", exchange_rate="100"
+    )
+    # 계좌 -100, 카드 +10000 (100 × 100) — USD 총합 +9900 창조
+    assert result.delta.balance_delta[ATTACKER_ACCT].amount == Decimal("-100.00")
+    assert result.delta.balance_delta["card:1"].amount == Decimal("10000.00")
+
+    finding = verify(candidate, result)
+    assert finding.verdict == Verdict.VIOLATION
+    assert finding.invariant == "INV-1A"
+
+
+def test_card_fund_normal_rate_is_value_neutral_no_violation():
+    """정상 충전(exchange_rate=1, USD 카드)은 계좌→카드 이동일 뿐이라 USD 총합
+    0 → INV-1A 통과. 거짓양성이 안 나는지 확인(대조군)."""
+    session = _card_fund_mock_session()
+    owner = Principal(id="attacker_A", username="owner", password="pw", account_number=ATTACKER_ACCT, token="tok")
+
+    candidate, result = run_card_fund_manipulation(
+        session, owner, "1", usd_amount="100.00", exchange_rate="1"
+    )
+    assert result.delta.balance_delta[ATTACKER_ACCT].amount == Decimal("-100.00")
+    assert result.delta.balance_delta["card:1"].amount == Decimal("100.00")
+
+    finding = verify(candidate, result)
+    assert finding.verdict != Verdict.VIOLATION  # 값 보존 → 위반 아님
 
 
 # ──────────────────────────────────────────────────────────────────────────
