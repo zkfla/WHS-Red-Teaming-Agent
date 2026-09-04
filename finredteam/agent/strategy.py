@@ -52,6 +52,18 @@ def suggest_nudge(ctx: AgentContextLike) -> str | None:
             "반복하지 말고 이것도 시도해보라."
         )
     if ctx.recent_violations():
+        # ★ 다양화 유도 — read_balance 로 BOLA(INV-2)를 확인하고도 같은 대상만
+        # 반복하느라, 같은 BOLA 클래스가 있는 다른 엔드포인트(거래내역 조회)를
+        # 안 써보고 끝나는 사례가 있었다. 계좌 기반이라 그래프에 이미 있는 계좌로
+        # 바로 지목 가능한(=reachable) operation 만 콕 집어 제안한다.
+        untried = set(ctx.least_tried_operations())
+        reachable_untried = [op for op in ("read_transactions", "api_transactions") if op in untried]
+        if reachable_untried:
+            return (
+                f"힌트: read_balance 로 BOLA(INV-2)를 확인했다면, 같은 계좌를 대상으로 "
+                f"{', '.join(reachable_untried)}(거래내역 조회)에도 같은 권한 경계 취약점이 있을 수 있다 "
+                "— 같은 대상만 반복하지 말고 이 엔드포인트들로 넓혀보라."
+            )
         ops = ", ".join(ctx.successful_operations())
         return f"힌트: 최근 성공한 조합({ops})을 다른 주체/대상으로 더 시도해볼 만하다."
     if ctx.consecutive_failures() >= 2:
