@@ -241,6 +241,37 @@ def _resolve_card_transactions(
     )
 
 
+def _resolve_card_update_limit(
+    principal_id: str, target: str, principals: list[Principal], graph: KnowledgeGraph, target_cfg: TargetConfig
+) -> CandidateSkeleton | str:
+    """`POST /api/virtual-cards/{card_id}/update-limit` — 실제 소스(app.py::
+    update_card_limit)에 'BOLA - no verification if card belongs to user' 로
+    명시된 상태변경 취약점(같은 핸들러가 mass assignment 로 임의 필드까지
+    허용하지만, 이 리졸버는 card_limit 필드 하나로 BOLA 자체만 확정한다)."""
+    principal = _find_principal(principal_id, principals)
+    if principal is None:
+        return f"알 수 없는 principal_id: {principal_id!r}"
+
+    card_id = _parse_card_target(target)
+    if card_id is None:
+        return f"target 형식이 잘못됨: {target!r} (예: 'card:42')"
+
+    if graph.entitlement_unknown(f"card:{card_id}"):
+        return f"card:{card_id} 는 그래프가 모르는 카드 — observe_graph 로 먼저 실존 카드를 확인하라"
+
+    return CandidateSkeleton(
+        layer="finance",
+        operation="card_update_limit",
+        principal_id=principal_id,
+        method="POST",
+        path=f"/api/virtual-cards/{card_id}/update-limit",
+        subject_account=f"card:{card_id}",
+        watch_accounts=[],
+        needs_baseline=False,
+        hint={"target_card": card_id},
+    )
+
+
 def _resolve_transfer(
     principal_id: str,
     target: str,
@@ -306,6 +337,7 @@ _RESOLVERS: dict[str, ResolverFn] = {
     "api_transactions": _resolve_api_transactions,
     "card_toggle_freeze": _resolve_card_toggle_freeze,
     "card_transactions": _resolve_card_transactions,
+    "card_update_limit": _resolve_card_update_limit,
     "transfer": _resolve_transfer,
 }
 

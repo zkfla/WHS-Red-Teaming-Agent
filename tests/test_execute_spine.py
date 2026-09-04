@@ -91,6 +91,9 @@ def _mock_target_session() -> Session:
         if request.method == "GET" and path == "/api/virtual-cards/42/transactions":
             return httpx.Response(200, json={"status": "success", "transactions": []})
 
+        if request.method == "POST" and path == "/api/virtual-cards/42/update-limit":
+            return httpx.Response(200, json={"status": "success", "message": "Card updated successfully"})
+
         if request.method == "POST" and path == "/transfer":
             body = json.loads(request.content or b"{}")
             amount = Decimal(str(body["amount"]))
@@ -346,6 +349,35 @@ def test_bola_card_toggle_freeze_of_unentitled_card_flows_to_inv2_violation():
     assert not isinstance(skeleton, str), skeleton
 
     candidate = build_candidate(skeleton, {}, "", baselines)
+    attacker = principals[0]
+    result = execute(session, target, candidate, attacker, watch_accounts=candidate.watch_accounts)
+    assert all(code < 400 for code in result.status_codes)
+
+    finding = verify(candidate, result, graph)
+    assert finding.verdict == Verdict.VIOLATION
+    assert finding.invariant == "INV-2"
+
+
+def test_bola_card_update_limit_of_unentitled_card_flows_to_inv2_violation():
+    """공격자가 권한 없는 타인 카드의 limit 을 변경 → INV-2 VIOLATION.
+
+    실제 소스(app.py::update_card_limit)에 'BOLA - no verification if card
+    belongs to user'로 명시. 같은 핸들러가 mass assignment(임의 필드 허용)도
+    갖고 있지만, 이 테스트는 BOLA 자체만 card_limit 필드로 확정한다.
+    """
+    session = _mock_target_session()
+    target = session.target
+    principals = _principals()
+    graph = _graph(principals)
+    graph.add_entitlement(
+        Entitlement(principal="victim_V", relation="entitled_own", obj="card:42", source="self_created")
+    )
+    baselines = _seed_baseline()
+
+    skeleton = resolve_skeleton("card_update_limit", "attacker_A", "card:42", principals, graph, target)
+    assert not isinstance(skeleton, str), skeleton
+
+    candidate = build_candidate(skeleton, {"card_limit": "500.00"}, "", baselines)
     attacker = principals[0]
     result = execute(session, target, candidate, attacker, watch_accounts=candidate.watch_accounts)
     assert all(code < 400 for code in result.status_codes)
