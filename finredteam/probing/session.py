@@ -208,6 +208,23 @@ class Session:
         principal = self.register(principal_id, username, password)
         return self.login(principal)
 
+    def create_virtual_card(self, principal: Principal, *, card_limit: str = "1000.00") -> str | None:
+        """가상카드 생성. 카드 관련 BOLA(freeze/transactions/limit) 시험 대상을
+        그래프에 entitled_own(card) 로 등록하려면 먼저 실존하는 카드가 있어야 한다
+        — self_created 근거가 된다(계좌의 register 와 같은 역할). 카드 id 문자열을
+        반환하거나, 실패하면 None(예외를 던지지 않는다 — 호출부가 UNKNOWN 등으로
+        우아하게 처리하게 한다)."""
+        try:
+            ex = self.authed_request(
+                "POST", "/api/virtual-cards/create", principal, json_body={"card_limit": card_limit}
+            )
+        except SessionError:
+            return None
+        if ex.status_code >= 400 or not isinstance(ex.response_body, dict):
+            return None
+        card_id = get_path(ex.response_body, "$.card_details.id")
+        return str(card_id) if card_id is not None else None
+
     def authed_request(
         self,
         method: str,

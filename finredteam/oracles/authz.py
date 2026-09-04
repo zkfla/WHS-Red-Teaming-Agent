@@ -18,7 +18,12 @@ def check_inv_2(candidate: CandidateFinding, result: ExecutionResult, graph: Kno
     if not any(is_success_status(code) for code in result.status_codes):
         return passed("INV-2", "접근이 성공하지 않음 — 권한 경계 정상")
 
-    obj = f"account:{candidate.subject_account}"
+    # subject_account 는 원래 계좌번호만 가정했지만(예: "1234567890" -> "account:1234567890"),
+    # 카드 등 계좌가 아닌 객체의 BOLA 도 같은 오라클로 판정하려면 완전한 그래프 객체 id를
+    # 그대로 받을 수 있어야 한다("card:42" 처럼). 이미 콜론이 있으면 그대로 쓰고, 없으면
+    # 기존처럼 "account:" 를 붙인다 — 계좌 기반 candidate 는 동작이 그대로다.
+    subject = candidate.subject_account
+    obj = subject if ":" in subject else f"account:{subject}"
     if graph.has_entitlement(candidate.principal_id, obj, "read"):
         return passed("INV-2", f"{candidate.principal_id} 는 {obj} 에 entitled_read/own 보유")
 

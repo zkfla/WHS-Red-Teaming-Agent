@@ -82,6 +82,15 @@ def _mock_target_session() -> Session:
                 return httpx.Response(404, json={"error": "no such account"})
             return httpx.Response(200, json={"account_number": acct, "transactions": []})
 
+        if request.method == "POST" and path == "/api/virtual-cards/create":
+            return httpx.Response(200, json={"status": "success", "card_details": {"id": 42}})
+
+        if request.method == "POST" and path == "/api/virtual-cards/42/toggle-freeze":
+            return httpx.Response(200, json={"status": "success", "message": "Card frozen successfully"})
+
+        if request.method == "GET" and path == "/api/virtual-cards/42/transactions":
+            return httpx.Response(200, json={"status": "success", "transactions": []})
+
         if request.method == "POST" and path == "/transfer":
             body = json.loads(request.content or b"{}")
             amount = Decimal(str(body["amount"]))
@@ -304,6 +313,37 @@ def test_bola_api_transactions_of_unentitled_account_flows_to_inv2_violation():
     skeleton = resolve_skeleton("api_transactions", "attacker_A", f"account:{VICTIM_ACCT}", principals, graph, target)
     assert not isinstance(skeleton, str), skeleton
     assert skeleton.path == f"/api/transactions?account_number={VICTIM_ACCT}"
+
+    candidate = build_candidate(skeleton, {}, "", baselines)
+    attacker = principals[0]
+    result = execute(session, target, candidate, attacker, watch_accounts=candidate.watch_accounts)
+    assert all(code < 400 for code in result.status_codes)
+
+    finding = verify(candidate, result, graph)
+    assert finding.verdict == Verdict.VIOLATION
+    assert finding.invariant == "INV-2"
+
+
+def test_bola_card_toggle_freeze_of_unentitled_card_flows_to_inv2_violation():
+    """공격자가 권한 없는 타인 카드의 freeze 상태를 변경 → INV-2 VIOLATION.
+
+    카드는 계좌와 다른 객체 타입("card:42")이지만, INV-2 오라클이 완전한
+    객체 id를 그대로 받아 같은 방식으로 판정한다(§ oracles/authz.py 일반화 검증).
+    실제 소스(app.py::toggle_card_freeze)에 'BOLA - no verification if card
+    belongs to user'로 명시된 상태변경 취약점.
+    """
+    session = _mock_target_session()
+    target = session.target
+    principals = _principals()
+    graph = _graph(principals)
+    # victim_V 가 카드 42 를 소유(entitled_own) — attacker_A 는 권한 없음
+    graph.add_entitlement(
+        Entitlement(principal="victim_V", relation="entitled_own", obj="card:42", source="self_created")
+    )
+    baselines = _seed_baseline()
+
+    skeleton = resolve_skeleton("card_toggle_freeze", "attacker_A", "card:42", principals, graph, target)
+    assert not isinstance(skeleton, str), skeleton
 
     candidate = build_candidate(skeleton, {}, "", baselines)
     attacker = principals[0]

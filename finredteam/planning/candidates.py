@@ -174,6 +174,73 @@ def _resolve_api_transactions(
     )
 
 
+def _parse_card_target(target: str) -> str | None:
+    """"card:42" -> "42". 형식이 다르면 None."""
+    prefix = "card:"
+    return target[len(prefix) :] if target.startswith(prefix) else None
+
+
+def _resolve_card_toggle_freeze(
+    principal_id: str, target: str, principals: list[Principal], graph: KnowledgeGraph, target_cfg: TargetConfig
+) -> CandidateSkeleton | str:
+    """`POST /api/virtual-cards/{card_id}/toggle-freeze` — 실제 소스(app.py::
+    toggle_card_freeze)에 'BOLA - no verification if card belongs to user' 로
+    명시된 상태변경 취약점. read_balance 와 같은 패턴, 다만 대상 객체가 계좌가
+    아니라 카드(`card:{id}`)다 — INV-2 오라클이 완전한 객체 id를 그대로 받아
+    판정한다(§ oracles/authz.py 일반화)."""
+    principal = _find_principal(principal_id, principals)
+    if principal is None:
+        return f"알 수 없는 principal_id: {principal_id!r}"
+
+    card_id = _parse_card_target(target)
+    if card_id is None:
+        return f"target 형식이 잘못됨: {target!r} (예: 'card:42')"
+
+    if graph.entitlement_unknown(f"card:{card_id}"):
+        return f"card:{card_id} 는 그래프가 모르는 카드 — observe_graph 로 먼저 실존 카드를 확인하라"
+
+    return CandidateSkeleton(
+        layer="finance",
+        operation="card_toggle_freeze",
+        principal_id=principal_id,
+        method="POST",
+        path=f"/api/virtual-cards/{card_id}/toggle-freeze",
+        subject_account=f"card:{card_id}",
+        watch_accounts=[],
+        needs_baseline=False,
+        hint={"target_card": card_id},
+    )
+
+
+def _resolve_card_transactions(
+    principal_id: str, target: str, principals: list[Principal], graph: KnowledgeGraph, target_cfg: TargetConfig
+) -> CandidateSkeleton | str:
+    """`GET /api/virtual-cards/{card_id}/transactions` — 실제 소스에 'BOLA - no
+    verification if card belongs to user' 로 명시된 읽기 취약점."""
+    principal = _find_principal(principal_id, principals)
+    if principal is None:
+        return f"알 수 없는 principal_id: {principal_id!r}"
+
+    card_id = _parse_card_target(target)
+    if card_id is None:
+        return f"target 형식이 잘못됨: {target!r} (예: 'card:42')"
+
+    if graph.entitlement_unknown(f"card:{card_id}"):
+        return f"card:{card_id} 는 그래프가 모르는 카드 — observe_graph 로 먼저 실존 카드를 확인하라"
+
+    return CandidateSkeleton(
+        layer="finance",
+        operation="card_transactions",
+        principal_id=principal_id,
+        method="GET",
+        path=f"/api/virtual-cards/{card_id}/transactions",
+        subject_account=f"card:{card_id}",
+        watch_accounts=[],
+        needs_baseline=False,
+        hint={"target_card": card_id},
+    )
+
+
 def _resolve_transfer(
     principal_id: str,
     target: str,
@@ -237,6 +304,8 @@ _RESOLVERS: dict[str, ResolverFn] = {
     "read_balance": _resolve_read_balance,
     "read_transactions": _resolve_read_transactions,
     "api_transactions": _resolve_api_transactions,
+    "card_toggle_freeze": _resolve_card_toggle_freeze,
+    "card_transactions": _resolve_card_transactions,
     "transfer": _resolve_transfer,
 }
 
@@ -272,11 +341,13 @@ def graph_menu(principals: list[Principal], graph: KnowledgeGraph, semantic: Sem
     """`observe_graph` 액션의 Observation — LLM 이 실존하는 대상만 고르도록 메뉴를 준다."""
     entitled = graph.entitled_edges()
     known_accounts = sorted({e["obj"] for e in entitled if e["obj"].startswith("account:")})
+    known_cards = sorted({e["obj"] for e in entitled if e["obj"].startswith("card:")})
     entitled_own = {e["principal"]: e["obj"] for e in entitled if e["relation"] == "entitled_own"}
 
     menu: dict[str, Any] = {
         "principals": [p.id for p in principals],
         "known_accounts": known_accounts,
+        "known_cards": known_cards,
         "entitled_own": entitled_own,
         "entitled_edge_count": len(entitled),
         "observed_edge_count": len(graph.observed_edges()),
