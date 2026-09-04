@@ -76,6 +76,12 @@ def _mock_target_session() -> Session:
                 return httpx.Response(404, json={"error": "no such account"})
             return httpx.Response(200, json={"account_number": acct, "transactions": []})
 
+        if request.method == "GET" and path == "/api/transactions":
+            acct = request.url.params.get("account_number")
+            if acct not in balances:
+                return httpx.Response(404, json={"error": "no such account"})
+            return httpx.Response(200, json={"account_number": acct, "transactions": []})
+
         if request.method == "POST" and path == "/transfer":
             body = json.loads(request.content or b"{}")
             amount = Decimal(str(body["amount"]))
@@ -274,6 +280,30 @@ def test_bola_read_transactions_of_unentitled_account_flows_to_inv2_violation():
     skeleton = resolve_skeleton("read_transactions", "attacker_A", f"account:{VICTIM_ACCT}", principals, graph, target)
     assert not isinstance(skeleton, str), skeleton
     assert skeleton.path == f"/transactions/{VICTIM_ACCT}"
+
+    candidate = build_candidate(skeleton, {}, "", baselines)
+    attacker = principals[0]
+    result = execute(session, target, candidate, attacker, watch_accounts=candidate.watch_accounts)
+    assert all(code < 400 for code in result.status_codes)
+
+    finding = verify(candidate, result, graph)
+    assert finding.verdict == Verdict.VIOLATION
+    assert finding.invariant == "INV-2"
+
+
+def test_bola_api_transactions_of_unentitled_account_flows_to_inv2_violation():
+    """인증된 공격자가 GET /api/transactions?account_number=<victim> 로 타 계좌
+    거래내역을 조회 → INV-2 VIOLATION. 실제 소스(app.py::api_transactions)에
+    "No validation of account_number parameter"로 명시된 취약점."""
+    session = _mock_target_session()
+    target = session.target
+    principals = _principals()
+    graph = _graph(principals)
+    baselines = _seed_baseline()
+
+    skeleton = resolve_skeleton("api_transactions", "attacker_A", f"account:{VICTIM_ACCT}", principals, graph, target)
+    assert not isinstance(skeleton, str), skeleton
+    assert skeleton.path == f"/api/transactions?account_number={VICTIM_ACCT}"
 
     candidate = build_candidate(skeleton, {}, "", baselines)
     attacker = principals[0]

@@ -143,6 +143,37 @@ def _resolve_read_transactions(
     )
 
 
+def _resolve_api_transactions(
+    principal_id: str, target: str, principals: list[Principal], graph: KnowledgeGraph, target_cfg: TargetConfig
+) -> CandidateSkeleton | str:
+    """`GET /api/transactions?account_number={id}` — 인증은 필요하지만(자기 토큰),
+    그 토큰 소유자와 조회 대상 계좌가 같은지는 검증 안 되는 BOLA. read_transactions
+    (경로 파라미터, 비인증)와는 다른 실제 엔드포인트 — 같은 INV-2 오라클로 판정된다.
+    """
+    principal = _find_principal(principal_id, principals)
+    if principal is None:
+        return f"알 수 없는 principal_id: {principal_id!r}"
+
+    account = _parse_account_target(target)
+    if account is None:
+        return f"target 형식이 잘못됨: {target!r} (예: 'account:1234567890')"
+
+    if graph.entitlement_unknown(f"account:{account}"):
+        return f"account:{account} 는 그래프가 모르는 계좌 — observe_graph 나 discover_surface 로 먼저 실존 계좌를 확인하라"
+
+    return CandidateSkeleton(
+        layer="finance",
+        operation="api_transactions",
+        principal_id=principal_id,
+        method="GET",
+        path=f"/api/transactions?account_number={account}",
+        subject_account=account,
+        watch_accounts=[],
+        needs_baseline=False,
+        hint={"target_account": account},
+    )
+
+
 def _resolve_transfer(
     principal_id: str,
     target: str,
@@ -205,6 +236,7 @@ ResolverFn = Callable[..., "CandidateSkeleton | str"]
 _RESOLVERS: dict[str, ResolverFn] = {
     "read_balance": _resolve_read_balance,
     "read_transactions": _resolve_read_transactions,
+    "api_transactions": _resolve_api_transactions,
     "transfer": _resolve_transfer,
 }
 
