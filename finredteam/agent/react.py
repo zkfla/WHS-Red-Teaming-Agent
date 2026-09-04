@@ -39,7 +39,7 @@ from finredteam.memory.summarizer import summarize
 from finredteam.memory.working import WorkingMemory
 from finredteam.models.core import Principal, Verdict
 from finredteam.money import Money
-from finredteam.models.finding import CandidateFinding, Finding
+from finredteam.models.finding import CandidateFinding, ExecutionResult, Finding
 from finredteam.models.knowledge import Fact, Lesson
 from finredteam.oracles import verifier as oracle_verifier
 from finredteam.planning import candidates as candidates_module
@@ -54,10 +54,12 @@ from finredteam.planning.actions import (
     ProposeHypothesisInput,
     ReActStep,
     RecallMemoryInput,
+    RunProbeInput,
     parse_action_input,
 )
 from finredteam.planning.candidates import AttackTemplate, CandidateSkeleton
 from finredteam.probing import executor as executor_module
+from finredteam.probing.finance import auth_exposure, card_exposure, card_fund, privesc
 from finredteam.probing.session import Session, SessionError
 from finredteam.recon import auth_discovery
 from finredteam.recon import entitlement as entitlement_module
@@ -186,6 +188,14 @@ class AgentContext:
         all_ops = set(candidates_module.supported_operations())
         untried = sorted(all_ops - tried)
         return untried or candidates_module.supported_operations()
+
+    def any_probe_run(self) -> bool:
+        """run_probe 로 특수 프로브(노출/권한상승/환율조작)를 한 번이라도 돌렸는가."""
+        probe_ops = {
+            "register_exposure", "forgot_password_exposure", "card_exposure",
+            "mass_assignment_privesc", "card_fund",
+        }
+        return bool(self.episodic.tried_operations() & probe_ops)
 
     def layer_untouched(self, layer: str) -> bool:
         return not any(ep.candidate.layer == layer for ep in self.episodic.all())
@@ -670,6 +680,60 @@ def _handle_execute_experiment(input_: ExecuteExperimentInput, ctx: AgentContext
     return observation + external_side_effect_note
 
 
+def _record_probe_finding(ctx: AgentContext, candidate: CandidateFinding, result: ExecutionResult) -> str:
+    """특수 프로브 결과를 execute_experiment 와 같은 방식으로 판정·기록한다.
+    오라클 전체 집합이 돌고(등록 오라클이 자동 판정), Finding 을 저장·기억에 남긴다."""
+    outcomes = oracle_verifier.run_all_outcomes(candidate, result, ctx.graph)
+    finding = oracle_verifier.verify_from_outcomes(candidate, result, outcomes)
+    ctx.store.append("findings", finding.model_dump(mode="json"))
+    lesson = Lesson(
+        candidate_summary=candidate.id,
+        outcome=finding.verdict.value,
+        insight=finding.reason,
+        operation=candidate.operation,
+    )
+    ctx.episodic.record(candidate, finding, lesson)
+    if finding.verdict == Verdict.VIOLATION:
+        ctx.findings.append(finding)
+    elif finding.verdict in (Verdict.ANOMALY, Verdict.UNKNOWN):
+        ctx.review_queue.append(finding)
+    return f"{finding.invariant or '-'}: {finding.verdict.value} — {finding.reason}"
+
+
+def _handle_run_probe(input_: RunProbeInput, ctx: AgentContext) -> str:
+    """계좌·송금 외 특수 취약점을 전용 프로브로 시험한다 — 셋업(계정/카드 생성)은
+    코드가 자동으로 하고, 판정은 등록된 오라클이 낸다. 실패해도 예외 없이 에러
+    문자열을 Observation 으로 돌려준다(§sad path)."""
+    pairs: list[tuple[CandidateFinding, ExecutionResult]] = []
+    owner = next((p for p in ctx.principals if p.account_number), None)
+
+    if input_.probe == "sensitive_exposure":
+        tag = secrets.token_hex(3)
+        username = f"expo_{tag}"
+        pairs.append(auth_exposure.run_register_password_echo_probe(ctx.session, username, "Rt!pass123"))
+        pairs.append(auth_exposure.run_forgot_password_pin_probe(ctx.session, username))
+        if owner is not None and ctx.session.create_virtual_card(owner) is not None:
+            pairs.append(card_exposure.run_card_exposure_probe(ctx.session, owner))
+
+    elif input_.probe == "privilege_escalation":
+        pairs.append(privesc.run_admin_escalation_probe(ctx.session))
+
+    elif input_.probe == "card_fund":
+        if owner is None:
+            return "card_fund 프로브: 카드 소유자로 쓸 계좌 있는 주체가 없음"
+        card_id = ctx.session.create_virtual_card(owner, card_limit="9999999.00")
+        if card_id is None:
+            return "card_fund 프로브: 카드 생성 실패"
+        pairs.append(
+            card_fund.run_card_fund_manipulation(ctx.session, owner, card_id, usd_amount="100.00", exchange_rate="100")
+        )
+    else:
+        return f"알 수 없는 probe: {input_.probe!r}"
+
+    lines = [_record_probe_finding(ctx, candidate, result) for candidate, result in pairs]
+    return "\n".join(lines) if lines else f"{input_.probe} 프로브가 결과를 만들지 못함"
+
+
 def _dispatch(step: ReActStep, ctx: AgentContext) -> str:
     parsed = parse_action_input(step.action, step.action_input)
     if isinstance(parsed, str):
@@ -720,6 +784,10 @@ def _dispatch(step: ReActStep, ctx: AgentContext) -> str:
     if step.action == "execute_experiment":
         assert isinstance(parsed, ExecuteExperimentInput)
         return _handle_execute_experiment(parsed, ctx)
+
+    if step.action == "run_probe":
+        assert isinstance(parsed, RunProbeInput)
+        return _handle_run_probe(parsed, ctx)
 
     if step.action == "finish":
         assert isinstance(parsed, FinishInput)
