@@ -33,7 +33,9 @@ from finredteam.planning.candidates import resolve_skeleton
 from finredteam.planning.planner import build_candidate
 from finredteam.probing.executor import run as execute
 from finredteam.probing.finance.burst import run_race_candidate, summarize_race
+from finredteam.probing.finance.charge import run_charge_idempotency_trial
 from finredteam.probing.session import Session
+from finredteam.oracles import registry
 from finredteam.oracles.verifier import verify
 from finredteam.targets.loader import load_target
 
@@ -385,6 +387,73 @@ def test_bola_card_update_limit_of_unentitled_card_flows_to_inv2_violation():
     finding = verify(candidate, result, graph)
     assert finding.verdict == Verdict.VIOLATION
     assert finding.invariant == "INV-2"
+
+
+def _charge_mock_session() -> Session:
+    """merchant 등록 + 카드 생성/충전 + 결제(멱등성 없음, 실제 vuln-bank 재현)를
+    흉내내는 가짢 세션. 같은 merchant_order_id 로 결제해도 매번 카드 잔액이
+    차감된다 — 실제 소스(merchant_payments.py) 의 'No idempotency' 버그 그대로."""
+    card = {"id": 1, "card_number": "4111", "cvv": "123", "expiry_date": "12/30", "currency": "USD"}
+    state = {"balance": Decimal("0.00")}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if request.method == "POST" and path == "/api/v1/merchants/register":
+            return httpx.Response(200, json={"token": "mtok"})
+        if request.method == "POST" and path == "/api/virtual-cards/create":
+            return httpx.Response(200, json={"status": "success", "card_details": {**card, "balance": 0}})
+        if request.method == "POST" and path == "/api/virtual-cards/1/fund":
+            body = json.loads(request.content or b"{}")
+            state["balance"] += Decimal(str(body["amount"]))
+            return httpx.Response(200, json={"status": "success"})
+        if request.method == "GET" and path == "/api/virtual-cards":
+            return httpx.Response(200, json={"status": "success", "cards": [{**card, "balance": float(state["balance"])}]})
+        if request.method == "POST" and path == "/api/v1/payments/charge":
+            body = json.loads(request.content or b"{}")
+            amount = Decimal(str(body["amount"]))
+            # ★ merchant_order_id 를 아예 확인하지 않는다 — 멱등성 없음이 이 버그의 핵심.
+            state["balance"] -= amount
+            return httpx.Response(200, json={"status": "success", "payment": {"status": "completed"}})
+        return httpx.Response(404, json={"error": "unknown endpoint"})
+
+    return Session(load_target("vulnbank"), _policy(), _transport=httpx.MockTransport(handler))
+
+
+def test_merchant_charge_replay_flows_to_inv4_violation():
+    """같은 merchant_order_id 로 3번 결제 → 카드 잔액이 3회분 차감(멱등성 없음)
+    → INV-4 VIOLATION. run_charge_idempotency_trial(burst.py 와 같은 급의
+    전용 오케스트레이션)이 관측한 재료로 오라클이 정확히 판정하는지 검증한다."""
+    session = _charge_mock_session()
+    owner = Principal(id="attacker_A", username="cardowner", password="pw", account_number=ATTACKER_ACCT, token="tok")
+    merchant_token = session.register_merchant("Shop", "shop@x.com", "Rt!pass123")
+    assert merchant_token is not None
+
+    card_id = session.create_virtual_card(owner)
+    assert card_id is not None
+    fund_ex = session.authed_request("POST", f"/api/virtual-cards/{card_id}/fund", owner, json_body={"amount": "300.00"})
+    assert fund_ex.status_code == 200
+
+    cards = session.get_own_cards(owner)
+    card = next(c for c in cards if str(c["id"]) == card_id)
+
+    candidate, result = run_charge_idempotency_trial(
+        session, owner, card, merchant_token, order_id="ORDER-1", amount="50.00", repeats=3
+    )
+    assert result.status_codes == [200, 200, 200]
+    assert result.delta.balance_delta[card_id].amount == Decimal("-150.00")  # 3회분 차감 — 위반 증거
+
+    # 여러 오라클이 동시에 걸린다(§ 설계원칙 3) — INV-1A(관측된 계정만으로는 값이
+    # 어디서도 안 늘어서 보존 위반으로도 보임)와 INV-4(멱등성)가 둘 다 독립적으로
+    # VIOLATION을 낸다. verify()는 그중 하나(등록 순서상 먼저인 INV-1A)를 헤드라인
+    # 으로 고르지만, INV-4 도 실제로 걸렸는지 명시적으로 확인한다(실제 라이브
+    # 실행에서도 동일하게 관찰됨).
+    outcomes = registry.run_all(candidate, result)
+    by_invariant = {o.invariant: o for o in outcomes}
+    assert by_invariant["INV-4"].verdict == Verdict.VIOLATION
+    assert "3회 성공" in by_invariant["INV-4"].reason
+
+    finding = verify(candidate, result)
+    assert finding.verdict == Verdict.VIOLATION
 
 
 # ──────────────────────────────────────────────────────────────────────────

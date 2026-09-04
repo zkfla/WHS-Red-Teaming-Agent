@@ -208,6 +208,21 @@ class Session:
         principal = self.register(principal_id, username, password)
         return self.login(principal)
 
+    def register_merchant(self, name: str, email: str, password: str) -> str | None:
+        """가맹점(별도 인증 주체) 등록 — POST /api/v1/merchants/register.
+        일반 user 회원가입과 별개 흐름(§ merchant_payments.py). 성공하면 merchant
+        토큰 문자열을 반환한다(Bearer 로 charge 등에 그대로 쓴다), 실패하면 None."""
+        try:
+            ex = self._request(
+                "POST", "/api/v1/merchants/register", json_body={"name": name, "email": email, "password": password}
+            )
+        except SessionError:
+            return None
+        if ex.status_code >= 400 or not isinstance(ex.response_body, dict):
+            return None
+        token = get_path(ex.response_body, "$.token")
+        return str(token) if token is not None else None
+
     def create_virtual_card(self, principal: Principal, *, card_limit: str = "1000.00") -> str | None:
         """가상카드 생성. 카드 관련 BOLA(freeze/transactions/limit) 시험 대상을
         그래프에 entitled_own(card) 로 등록하려면 먼저 실존하는 카드가 있어야 한다
@@ -224,6 +239,19 @@ class Session:
             return None
         card_id = get_path(ex.response_body, "$.card_details.id")
         return str(card_id) if card_id is not None else None
+
+    def get_own_cards(self, principal: Principal) -> list[dict[str, Any]]:
+        """GET /api/virtual-cards — 본인 카드 목록(원본 카드번호/CVV/잔액 포함).
+        merchant charge 시험은 카드 소유자만 아는 원문 정보가 필요하므로(§ 정상
+        결제 흐름 재현), 본인 카드에 대해서만 쓴다. 실패하면 빈 리스트."""
+        try:
+            ex = self.authed_request("GET", "/api/virtual-cards", principal)
+        except SessionError:
+            return []
+        if ex.status_code >= 400 or not isinstance(ex.response_body, dict):
+            return []
+        cards = ex.response_body.get("cards")
+        return cards if isinstance(cards, list) else []
 
     def authed_request(
         self,
