@@ -526,14 +526,14 @@ def _step_flow_facts(
                 )
             )
         for expression in _expressions(run):
-            if interpreter:
-                relation_type = "untrusted_value_interpreted_as_command"
-                category = "execution"
-            elif output_producer:
+            # GitHub expressions embedded directly in `run` are substituted before the shell
+            # parses the script.  They therefore become shell source even without an explicit
+            # eval/bash -c construct.  Output-producing commands remain transform-only.
+            if output_producer:
                 relation_type = "untrusted_input_reaches_output_producer"
                 category = "transform"
             else:
-                relation_type = "untrusted_input_reaches_execution"
+                relation_type = "untrusted_value_interpreted_as_command"
                 category = "execution"
             relations.append(
                 _relation(
@@ -664,9 +664,10 @@ def _step_flow_facts(
                     )
                 )
         for output_key, output_name in _output_references(run):
+            producer = keyed_steps.get(output_key.lower())
             source = outputs.get((output_key.lower(), output_name.lower()))
-            if source is None and output_key.lower() in keyed_steps:
-                source = _output_node(keyed_steps[output_key.lower()], output_name)
+            if source is None and producer is not None:
+                source = _output_node(producer, output_name)
             if source:
                 relations.append(
                     _relation(
@@ -682,6 +683,43 @@ def _step_flow_facts(
                         verdict=TriState.FALSE if guarded else TriState.TRUE,
                     )
                 )
+                # Direct `${{ steps.x.outputs.y }}` substitution happens before shell parsing.
+                # Model that syntax boundary independently from whether the script also calls eval.
+                relations.append(
+                    _relation(
+                        source,
+                        "output_value_interpolated_into_shell_source",
+                        step.step_id,
+                        step.evidence_ids,
+                        category="execution",
+                        verdict=TriState.FALSE if guarded else TriState.TRUE,
+                    )
+                )
+                # For a PR-triggered workflow, an external action output may depend on attacker
+                # influenced repository/event data, but that provenance and the action's output
+                # escaping are outside the local repository.  Preserve that uncertainty rather
+                # than assuming either attacker control or safety.
+                if (
+                    producer is not None
+                    and producer.uses
+                    and not producer.uses.startswith("./")
+                    and not producer.uses.startswith("docker://")
+                    and set(workflow.triggers) & {"pull_request", "pull_request_target"}
+                ):
+                    relations.append(
+                        _relation(
+                            f"attacker:{profile.value}",
+                            "attacker_may_control_external_action_output",
+                            source,
+                            workflow.evidence_ids + producer.evidence_ids + step.evidence_ids,
+                            category="source",
+                            verdict=TriState.UNKNOWN,
+                            missing_evidence=[
+                                "external action output attacker influence",
+                                "external action output encoding and escaping",
+                            ],
+                        )
+                    )
         controlled_nodes = [_input_node(expression) for expression in _expressions(run)] + [
             _env_node(step, name) for name in step.env if _env_referenced(run, name)
         ]

@@ -14,6 +14,7 @@ from cicd_redteam_agent.domain.models import (
     AttackPath,
     FindingStatus,
     Relation,
+    TriState,
     relation_id_for,
 )
 from cicd_redteam_agent.domain.validator import validate_analysis_proposal
@@ -467,3 +468,95 @@ async def test_gcp_and_azure_oidc_trust_remains_unknown(tmp_path: Path) -> None:
         "fork pull-request OIDC token availability",
         "gcp federated identity trust policy",
     }
+
+
+@pytest.mark.asyncio
+async def test_external_action_output_direct_shell_interpolation_is_bounded_candidate(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "external-output-shell"
+    workflow_dir = repository / ".github" / "workflows"
+    workflow_dir.mkdir(parents=True)
+    (workflow_dir / "pr.yml").write_text(
+        """name: output-shell
+on:
+  pull_request:
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - id: producer
+        uses: vendor/example-action@v1
+      - run: |
+          for item in ${{ steps.producer.outputs.items }}; do
+            echo "$item"
+          done
+""",
+        encoding="utf-8",
+    )
+
+    report, _ = await analyze_repository(
+        repository,
+        AnalysisConfig(output_dir=tmp_path / "external-output-shell-result"),
+    )
+    state = report.state
+    source = next(
+        relation
+        for relation in state.relations
+        if relation.relation_type == "attacker_may_control_external_action_output"
+    )
+    sink = next(
+        relation
+        for relation in state.relations
+        if relation.relation_type == "output_value_interpolated_into_shell_source"
+    )
+    finding = next(
+        finding for finding in state.findings if finding.rule_id == "GHA-01-PR-SHELL-INJECTION"
+    )
+
+    assert source.verdict is TriState.UNKNOWN
+    assert source.target_id == sink.source_id
+    assert sink.verdict is TriState.TRUE
+    assert finding.status is FindingStatus.CANDIDATE
+    assert "external action output attacker influence" in finding.missing_evidence
+    assert "external action output encoding and escaping" in finding.missing_evidence
+    assert "confirmed" not in finding.summary.casefold()
+
+
+@pytest.mark.asyncio
+async def test_external_action_output_via_env_is_not_direct_shell_source_interpolation(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "external-output-env"
+    workflow_dir = repository / ".github" / "workflows"
+    workflow_dir.mkdir(parents=True)
+    (workflow_dir / "pr.yml").write_text(
+        """name: output-env
+on:
+  pull_request:
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - id: producer
+        uses: vendor/example-action@v1
+      - env:
+          ITEMS: ${{ steps.producer.outputs.items }}
+        run: |
+          printf '%s\n' "$ITEMS"
+""",
+        encoding="utf-8",
+    )
+
+    report, _ = await analyze_repository(
+        repository,
+        AnalysisConfig(output_dir=tmp_path / "external-output-env-result"),
+    )
+    assert not any(
+        relation.relation_type == "output_value_interpolated_into_shell_source"
+        for relation in report.state.relations
+    )
+    assert not any(
+        finding.rule_id == "GHA-01-PR-SHELL-INJECTION"
+        for finding in report.state.findings
+    )

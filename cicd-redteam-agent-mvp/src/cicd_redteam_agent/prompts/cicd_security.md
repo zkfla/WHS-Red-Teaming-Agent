@@ -76,6 +76,9 @@ A focused objective may submit one complete candidate. If no grounded
 path exists, submit terminal rejections where required or empty arrays only when the policy says
 `empty_submission_allowed=true`. If submission is rejected, fix the structured errors and retry.
 Only the final `SUBMIT` transition completes the analysis; accepted broad-mode batch commits do not.
+After a broad batch returns `batch_committed=true` and `analysis_complete=false`, do not reuse the
+previous batch's Candidate or Frontier IDs. Call `ListAttackFrontiers` once to obtain the rotated
+current batch before the next `SubmitAnalysis`; the previous tool result is stale for submission.
 
 ## 3. Attack-path construction rules
 
@@ -167,8 +170,11 @@ Pass one JSON-encoded proposal without Markdown. Prefer this compact form:
   `novel_claim_contracts` rule IDs
   (`NOVEL-UNTRUSTED-EXECUTION`, `NOVEL-SECRET-EXPOSURE`, or `NOVEL-CREDENTIAL-ACCESS`) and satisfy
   its required source, mechanism, sink, and status ceiling; arbitrary security rule IDs are rejected.
-- A broad portfolio can include graph frontiers in addition to candidates. Give every selected
-  frontier a terminal `frontier_decisions` entry. `frontier_decisions` accepts `frontier_id`,
+- Broad analysis with canonical Candidates uses Candidate-only decision batches by default; raw
+  repository-wide Frontiers are diagnostic inventory, not implicit decision targets. Mixed
+  Candidate/Frontier batches remain an explicit compatibility path only when the current policy
+  actually selects a Frontier. Give every selected Frontier a terminal `frontier_decisions` entry.
+  `frontier_decisions` accepts `frontier_id`,
   `decision`, optional `confidence`, and optional `analyst_note`. For `ACCEPTED`, include exactly
   one corresponding `path_drafts` entry with the selected frontier's exact `relation_refs`; use
   `REJECTED`, `BLOCKED_EXTERNAL`, or `MERGED` with no path draft when it is not a reportable path.

@@ -13,6 +13,7 @@ from cicd_redteam_agent.domain.investigation_policy import (
     PortfolioEntry,
     decide_investigation_policy,
     score_security_candidate,
+    select_frontier_portfolio,
     select_investigation_portfolio,
 )
 from cicd_redteam_agent.domain.models import (
@@ -283,8 +284,8 @@ async def test_broad_portfolio_requires_terminal_coverage_but_focused_candidate_
     result = build_attack_frontiers(state)
     broad = decide_investigation_policy(result, state)
 
-    assert len(broad.portfolio) == 6
-    assert sum(entry.candidate is not None for entry in broad.portfolio) >= 2
+    assert 1 <= len(broad.portfolio) <= 6
+    assert all(entry.candidate is not None for entry in broad.portfolio)
     assert not broad.candidate_coverage_complete
 
     first_candidate = next(entry.candidate for entry in broad.portfolio if entry.candidate)
@@ -341,17 +342,49 @@ async def test_broad_portfolio_requires_terminal_coverage_but_focused_candidate_
 async def test_mixed_candidate_batch_accepts_frontier_with_exact_path_only(tmp_path: Path) -> None:
     """Mirror the live-model mixed batch contract without legacy Finding prose."""
 
-    state = _reasoning_initial_state(await _analyze_gha07(tmp_path))
+    repository = FIXTURES / "oidc-risk"
+    report, _ = await analyze_repository(
+        repository,
+        AnalysisConfig(output_dir=tmp_path / "mixed-oidc-risk"),
+    )
+    state = _reasoning_initial_state(report.state)
     result = build_attack_frontiers(state)
-    policy = decide_investigation_policy(result, state)
+    automatic = select_investigation_portfolio(result, state, limit=4)
+    assert automatic
+    assert all(entry.candidate is not None for entry in automatic)
+    frontier_entry = next(
+        entry
+        for entry in select_frontier_portfolio(result, state, limit=6)
+        if entry.frontier is not None
+        and entry.frontier.proposal_ready
+        and entry.score.grounding > 0
+    )
+    mixed = tuple(
+        [
+            PortfolioEntry(
+                rank=index,
+                score=entry.score,
+                candidate=entry.candidate,
+            )
+            for index, entry in enumerate(automatic[:3], start=1)
+        ]
+        + [
+            PortfolioEntry(
+                rank=min(4, len(automatic) + 1),
+                score=frontier_entry.score,
+                frontier=frontier_entry.frontier,
+            )
+        ]
+    )
+    policy = decide_investigation_policy(result, state, selected_portfolio=mixed)
     selected_candidates = [entry.candidate for entry in policy.portfolio if entry.candidate]
     selected_frontiers = [entry.frontier for entry in policy.portfolio if entry.frontier]
     assert selected_candidates
-    assert selected_frontiers
+    assert len(selected_frontiers) == 1
     accepted_frontier = selected_frontiers[0]
     context = CapabilityContext(
         state=state,
-        boundary=RepositoryBoundary(GHA07),
+        boundary=RepositoryBoundary(repository),
         investigation_policy=policy,
     )
 
@@ -383,7 +416,7 @@ async def test_mixed_candidate_batch_accepts_frontier_with_exact_path_only(tmp_p
         )
     )
 
-    assert response["accepted"]
+    assert response["accepted"], response["errors"]
     assert response["batch_committed"]
     assert not response["analysis_complete"]
     assert any(path.path_id == "path_mixed_frontier" for path in state.paths)

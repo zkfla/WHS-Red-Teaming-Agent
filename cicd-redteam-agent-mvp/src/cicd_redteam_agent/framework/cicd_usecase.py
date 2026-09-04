@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 
 from cicd_redteam_agent.domain.graph_frontier import (
@@ -177,6 +178,29 @@ class CICDUseCase:
         self._checkpoint("observation_committed")
         return completed
 
+    def _candidate_progress_signature(self) -> tuple[object, ...]:
+        """Track semantic decision progress, not only capability/resource activity."""
+
+        terminal = {"ACCEPTED", "REJECTED", "BLOCKED_EXTERNAL", "MERGED"}
+        roots: dict[str, set[str]] = {}
+        for candidate in self.context.state.candidates:
+            roots.setdefault(candidate.root_cause_key, set()).add(candidate.disposition.value)
+        terminal_roots = tuple(
+            sorted(root for root, dispositions in roots.items() if dispositions & terminal)
+        )
+        return (
+            terminal_roots,
+            len(self.context.state.findings),
+            len(self.context.state.paths),
+            tuple(
+                sorted(
+                    (entry.item_id, entry.disposition.value)
+                    for entry in self.context.state.coverage_ledger
+                    if entry.disposition.value in terminal
+                )
+            ),
+        )
+
     def _runtime_state(self, no_progress_rounds: int) -> InvestigationRuntimeState:
         limit_reached = bool(self.limits.reached())
         tokens_remaining = getattr(self.limits, "tokens_remaining", None)
@@ -218,10 +242,21 @@ class CICDUseCase:
             max_frontiers=DEFAULT_MAX_FRONTIERS,
             max_expansions=DEFAULT_MAX_EXPANSIONS,
         )
-        result = build_attack_frontiers(self.context.state, query)
+        cache_key = json.dumps(
+            {
+                "source_hints": query.source_hints,
+                "mechanism_hints": query.mechanism_hints,
+                "sink_hints": query.sink_hints,
+            },
+            sort_keys=True,
+        )
+        result = self.context.frontier_cache.get(cache_key)
         runtime_metrics = getattr(self.agent, "runtime_metrics", None)
-        if runtime_metrics is not None:
-            runtime_metrics.frontier_searches += 1
+        if result is None:
+            result = build_attack_frontiers(self.context.state, query)
+            self.context.frontier_cache[cache_key] = result
+            if runtime_metrics is not None:
+                runtime_metrics.frontier_searches += 1
         portfolio = select_investigation_portfolio(
             result,
             self.context.state,
@@ -299,6 +334,7 @@ class CICDUseCase:
         known_resources = len(self.context.state.inspected_resources)
         known_call_signatures = len(self.context.state.repeated_calls)
         known_memory_revision = self.context.state.working_memory.revision
+        known_candidate_progress = self._candidate_progress_signature()
         known_knowledge_revision = (
             self.investigation_session.knowledge_state.revision
             if self.investigation_session is not None
@@ -378,6 +414,7 @@ class CICDUseCase:
             current_resources = len(self.context.state.inspected_resources)
             current_call_signatures = len(self.context.state.repeated_calls)
             current_memory_revision = self.context.state.working_memory.revision
+            current_candidate_progress = self._candidate_progress_signature()
             current_knowledge_revision = (
                 self.investigation_session.knowledge_state.revision
                 if self.investigation_session is not None
@@ -387,6 +424,7 @@ class CICDUseCase:
                 current_resources == known_resources
                 and current_call_signatures == known_call_signatures
                 and current_memory_revision == known_memory_revision
+                and current_candidate_progress == known_candidate_progress
                 and current_knowledge_revision == known_knowledge_revision
             ):
                 no_progress += 1
@@ -395,6 +433,7 @@ class CICDUseCase:
                 known_resources = current_resources
                 known_call_signatures = current_call_signatures
                 known_memory_revision = current_memory_revision
+                known_candidate_progress = current_candidate_progress
                 known_knowledge_revision = current_knowledge_revision
             if runtime_metrics is not None:
                 runtime_metrics.no_progress_rounds = no_progress

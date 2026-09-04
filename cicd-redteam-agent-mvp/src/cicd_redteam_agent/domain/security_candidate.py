@@ -87,6 +87,8 @@ _CLAIM_REQUIRED_RELATION_TYPES: dict[str, tuple[str, ...]] = {
     ),
     "GHA-01-PR-SHELL-INJECTION": (
         "untrusted_value_interpreted_as_command",
+        "attacker_may_control_external_action_output",
+        "output_value_interpolated_into_shell_source",
     ),
     "GHA-03-WORKFLOW-RUN-ARTIFACT-EXECUTION": (
         "uploads_artifact",

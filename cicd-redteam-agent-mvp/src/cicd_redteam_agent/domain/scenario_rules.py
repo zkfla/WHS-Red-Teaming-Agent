@@ -138,6 +138,84 @@ def _derive_shell_injection(state: AnalysisState) -> tuple[list[Finding], list[A
                 )
                 findings.append(finding)
                 paths.append(path)
+
+    # Generic external-action output path.  We deliberately do not know or hard-code any action's
+    # output semantics: a PR boundary plus direct shell-source interpolation is a CANDIDATE until
+    # the producer's attacker influence and output escaping are externally established.
+    source_by_output = {
+        relation.target_id: relation
+        for relation in state.relations
+        if relation.relation_type == "attacker_may_control_external_action_output"
+        and relation.verdict is not TriState.FALSE
+    }
+    for sink in state.relations:
+        if (
+            sink.relation_type != "output_value_interpolated_into_shell_source"
+            or sink.verdict is TriState.FALSE
+        ):
+            continue
+        source = source_by_output.get(sink.source_id)
+        if source is None:
+            continue
+        owner = _job_for_step(state, sink.target_id)
+        if owner is None:
+            continue
+        workflow, job = owner
+        step = next((item for item in job.steps if item.step_id == sink.target_id), None)
+        if step is None:
+            continue
+        relations = [source, sink]
+        supported = all(relation.verdict is TriState.TRUE for relation in relations)
+        status = FindingStatus.SUPPORTED if supported else FindingStatus.CANDIDATE
+        missing = sorted(
+            {item for relation in relations for item in relation.missing_evidence}
+        )
+        evidence_ids = sorted(
+            {item for relation in relations for item in relation.evidence_ids}
+        )
+        finding_id = stable_id(
+            "finding",
+            "GHA-01-PR-SHELL-INJECTION",
+            workflow.workflow_id,
+            job.job_id,
+            sink.source_id,
+            sink.target_id,
+        )
+        if any(item.finding_id == finding_id for item in findings):
+            continue
+        findings.append(
+            Finding(
+                finding_id=finding_id,
+                rule_id="GHA-01-PR-SHELL-INJECTION",
+                title="External action output may be interpolated directly into shell source",
+                status=status,
+                evidence_ids=evidence_ids,
+                missing_evidence=missing,
+                confidence=(
+                    Confidence.MEDIUM
+                    if status is FindingStatus.CANDIDATE
+                    else Confidence.HIGH
+                ),
+                summary=(
+                    "A pull-request workflow directly substitutes an external action step output "
+                    "into a run script before shell parsing. Local evidence proves the "
+                    "shell-source "
+                    "interpolation, while attacker influence over that output and the producer's "
+                    "encoding/escaping remain external evidence; exploitability is therefore not "
+                    "assumed."
+                ),
+            )
+        )
+        paths.append(
+            AttackPath(
+                path_id=stable_id("path", finding_id),
+                nodes=[source.source_id, source.target_id, sink.target_id],
+                edges=[_edge_from_relation(source), _edge_from_relation(sink)],
+                status=status,
+                evidence_ids=evidence_ids,
+                missing_evidence=missing,
+            )
+        )
     return findings, paths
 
 
@@ -741,7 +819,14 @@ def _derive_broad_token_permissions(
                 if job.permissions_declared is not None
                 else workflow.permissions
             )
-            if declared != "write-all":
+            contexts = [
+                item for item in state.job_execution_contexts if item.job_id == job.job_id
+            ]
+            effective_write_all = any(
+                context.effective_permissions.default_level is PermissionLevel.WRITE
+                for context in contexts
+            )
+            if declared != "write-all" and not effective_write_all:
                 continue
             controlled_steps = [
                 step
@@ -765,7 +850,12 @@ def _derive_broad_token_permissions(
                 rule_id="GHA-05-BROAD-GITHUB-TOKEN",
                 title="Job grants write-all GITHUB_TOKEN permissions",
                 summary=(
-                    "The job grants every available GITHUB_TOKEN write permission. "
+                    (
+                        "The job explicitly grants every available GITHUB_TOKEN write permission. "
+                        if declared == "write-all"
+                        else "The observed repository default gives the job broad GITHUB_TOKEN "
+                        "write permissions. "
+                    )
                     + (
                         "Repository-controlled execution is also linked to this job."
                         if supported

@@ -295,8 +295,6 @@ class ListAttackFrontiers(Capability):
             for item in result.frontiers
             if include_blocked or item.disposition.value != "BLOCKED"
         ]
-        page = frontiers[offset : offset + limit]
-        next_offset = offset + len(page)
         counts: dict[str, int] = {}
         for item in frontiers:
             counts[item.disposition.value] = counts.get(item.disposition.value, 0) + 1
@@ -326,14 +324,41 @@ class ListAttackFrontiers(Capability):
                 if candidate.root_cause_key == root_cause_key
             )
         }
+        selected_frontier_ids = {
+            entry.frontier.frontier_id
+            for entry in policy.portfolio
+            if entry.frontier is not None
+        }
+        if self.context.state.candidates and not (goal and goal.focused):
+            # In broad candidate-driven analysis, raw repository-wide top frontiers are diagnostics,
+            # not peer decision targets.  Returning stale top rows here caused the model to submit
+            # old frontier IDs after the candidate portfolio rotated.
+            decision_frontiers = [
+                item for item in result.frontiers if item.frontier_id in selected_frontier_ids
+            ]
+            visible_frontiers = decision_frontiers
+        else:
+            visible_frontiers = frontiers
+        visible_page = visible_frontiers[offset : offset + limit]
+        visible_next_offset = offset + len(visible_page)
+
         payload.update(
             {
-                "frontiers": [item.as_dict() for item in page],
-                "total": len(frontiers),
+                "frontiers": [item.as_dict() for item in visible_page],
+                "total": len(visible_frontiers),
                 "counts": counts,
+                "frontier_inventory": {
+                    "discovered_total": len(result.frontiers),
+                    "visible_decision_frontiers": len(visible_frontiers),
+                    "terminal_or_diagnostic_frontiers_hidden": max(
+                        0, len(result.frontiers) - len(visible_frontiers)
+                    ),
+                },
                 "offset": offset,
                 "limit": limit,
-                "next_offset": next_offset if next_offset < len(frontiers) else None,
+                "next_offset": (
+                    visible_next_offset if visible_next_offset < len(visible_frontiers) else None
+                ),
                 "objective_focus": goal.as_dict() if goal else None,
                 "investigation_policy": policy.as_dict(compact=True),
                 # Candidate details are already represented by the current deterministic
@@ -355,8 +380,10 @@ class ListAttackFrontiers(Capability):
                     "Use canonical security_candidates as the primary semantic proposal "
                     "candidates. "
                     "Submit terminal candidate_decisions for every selected candidate in a broad "
-                    "objective. Use proposal_ready COMPLETE frontiers as graph investigation "
-                    "aids. "
+                    "objective. The `frontiers` array contains only current-batch frontier "
+                    "decision "
+                    "targets when canonical candidates exist; repository-wide frontier counts are "
+                    "diagnostic inventory only. "
                     "PARTIAL frontiers are diagnostics only and must never be submitted. BLOCKED "
                     "frontiers are terminal for that execution context and should not be "
                     "repeatedly investigated. UNKNOWN reasons marked EXTERNAL_REQUIRED cannot be "

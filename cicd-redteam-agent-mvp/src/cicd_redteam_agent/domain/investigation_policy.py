@@ -56,7 +56,10 @@ class InvestigationRuntimeState:
             and self.tokens_remaining < self.predicted_next_round_tokens
         ):
             return "insufficient_token_reserve"
-        if self.repeated_calls >= 4 or self.no_progress_rounds >= 4:
+        # Capability-call repetition is diagnostic, not a terminal condition.  A model may
+        # legitimately call the same bounded capability once per rotated root-cause batch.
+        # Only round-level lack of canonical state progress is allowed to stop the run.
+        if self.no_progress_rounds >= 4:
             return "no_progress"
         return None
 
@@ -649,57 +652,55 @@ def select_investigation_portfolio(
             )
         )
 
-    # Once every canonical root-cause instance has a terminal decision, broad-mode coverage is
-    # complete. Frontiers are exploratory supplements to those bounded batches rather than a second
-    # exhaustive universe that would force the model through every graph variant.
-    if state.candidates and not candidate_entries:
-        return ()
-    frontier_entries = list(select_frontier_portfolio(result, state, limit=limit))
-    candidate_relation_sets = [
-        set(candidate.supporting_relation_ids) for candidate in state.candidates
-    ]
-    filtered_frontiers = []
-    relation_by_ref = dict(indexed_relations(state))
-    for entry in frontier_entries:
-        if entry.frontier is None:
-            continue
-        frontier_ids = {
-            relation_by_ref[reference].relation_id
-            for reference in entry.frontier.relation_refs
-            if reference in relation_by_ref
-        }
-        if any(
-            frontier_ids and frontier_ids <= candidate_ids
-            for candidate_ids in candidate_relation_sets
-        ):
-            continue
-        filtered_frontiers.append(entry)
-    remaining = [*candidate_entries, *filtered_frontiers]
-    selected: list[PortfolioEntry] = []
-    while remaining and len(selected) < limit:
-        item = max(
-            remaining,
-            key=lambda entry: (
-                entry.score.total
-                - max(
-                    (_item_overlap(entry, chosen, state) // 2 for chosen in selected),
-                    default=0,
-                ),
-                entry.candidate is not None,
-                entry.item_id,
-            ),
+    # Canonical candidates are the broad-mode decision plane.  Graph frontiers remain available
+    # as bounded investigation aids, but mixing both as peer decision targets caused stale top-page
+    # frontiers to be resubmitted after a candidate batch rotated.  Finish candidate/root-cause
+    # coverage first; frontier-only states still use select_frontier_portfolio below.
+    if state.candidates:
+        if not candidate_entries:
+            return ()
+
+        # Diversity first: take the highest-scoring representative from each root-cause family
+        # before allowing a second root from the same family.  This prevents a large mutable-action
+        # family from crowding out secret/build/execution families while still allowing all mutable
+        # roots to drain once they are the only work left.
+        ordered = sorted(
+            candidate_entries,
+            key=lambda entry: (-entry.score.total, entry.item_id),
         )
-        selected.append(item)
-        remaining = [entry for entry in remaining if entry.item_id != item.item_id]
-    return tuple(
-        PortfolioEntry(
-            rank=index,
-            score=entry.score,
-            frontier=entry.frontier,
-            candidate=entry.candidate,
+        selected: list[PortfolioEntry] = []
+        selected_ids: set[str] = set()
+        seen_families: set[str] = set()
+        for entry in ordered:
+            candidate = entry.candidate
+            if candidate is None:
+                continue
+            family = _candidate_root_cause_family(candidate)
+            if family in seen_families:
+                continue
+            selected.append(entry)
+            selected_ids.add(entry.item_id)
+            seen_families.add(family)
+            if len(selected) >= limit:
+                break
+        if len(selected) < limit:
+            for entry in ordered:
+                if entry.item_id in selected_ids:
+                    continue
+                selected.append(entry)
+                selected_ids.add(entry.item_id)
+                if len(selected) >= limit:
+                    break
+        return tuple(
+            PortfolioEntry(
+                rank=index,
+                score=entry.score,
+                candidate=entry.candidate,
+            )
+            for index, entry in enumerate(selected, start=1)
         )
-        for index, entry in enumerate(selected, start=1)
-    )
+
+    return select_frontier_portfolio(result, state, limit=limit)
 
 
 def decide_investigation_policy(

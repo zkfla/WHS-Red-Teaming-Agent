@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-RELATION_SEMANTICS_VERSION = "1.6"
+RELATION_SEMANTICS_VERSION = "1.7"
 
 
 @dataclass(frozen=True)
@@ -25,6 +25,7 @@ _SOURCE_RELATIONS = {
     "attacker_selects_current_pull_request_head": "pull_request",
     "attacker_selects_event_pull_request_head_sha": "pull_request",
     "may_compromise_mutable_dependency": "external_dependency",
+    "attacker_may_control_external_action_output": "pull_request",
 }
 
 _MECHANISM_RELATIONS = {
@@ -83,6 +84,7 @@ _MECHANISM_RELATIONS = {
     "script_performs_external_network_request": ("package_lifecycle", "network"),
     "script_modifies_workspace_file": ("package_lifecycle", "file_change"),
     "script_spawns_process": ("package_lifecycle", "shell_execution"),
+    "output_value_interpolated_into_shell_source": ("shell_execution",),
 }
 
 _SINK_RELATIONS = {
@@ -90,6 +92,7 @@ _SINK_RELATIONS = {
     "env_value_reaches_execution": "execution",
     "untrusted_input_reaches_execution": "execution",
     "untrusted_value_interpreted_as_command": "execution",
+    "output_value_interpolated_into_shell_source": "execution",
     "untrusted_input_interpreted_by_github_script": "execution",
     "untrusted_input_selects_checkout_revision": "execution",
     "workspace_revision_reaches_execution": "execution",

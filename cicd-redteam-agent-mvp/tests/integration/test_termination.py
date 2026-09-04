@@ -122,14 +122,16 @@ async def test_failed_round_rolls_back_state_submission_and_history(tmp_path: Pa
 
 
 @pytest.mark.asyncio
-async def test_repeated_calls_stop_after_four_rounds(tmp_path: Path) -> None:
+async def test_no_progress_stops_after_four_stagnant_rounds(tmp_path: Path) -> None:
     context = _context(tmp_path)
     limits = StubLimits()
 
     reason = await CICDUseCase(RepeatingAgent(context), context, limits).run()
 
     assert reason == "no_progress"
-    assert limits.rounds == 4
+    # The first bounded call introduces a new inspected-resource signature; only the four
+    # subsequent semantically stagnant rounds count toward the no-progress stop.
+    assert limits.rounds == 5
     assert context.investigation_policy is not None
     assert context.investigation_policy.transition is InvestigationTransition.STOP_PARTIAL
     assert context.investigation_policy.stop_reason == "no_progress"

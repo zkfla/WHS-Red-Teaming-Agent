@@ -20,6 +20,7 @@ from cicd_redteam_agent.domain.investigation_policy import (
 )
 from cicd_redteam_agent.domain.models import (
     AgentWorkingMemory,
+    CandidateDisposition,
     WorkingHypothesis,
     WorkingHypothesisStatus,
 )
@@ -102,7 +103,6 @@ async def test_transition_prefers_observation_then_submit_or_investigation(
             ),
             "insufficient_token_reserve",
         ),
-        (InvestigationRuntimeState(repeated_calls=4), "no_progress"),
         (InvestigationRuntimeState(no_progress_rounds=4), "no_progress"),
     ],
 )
@@ -380,3 +380,37 @@ async def test_submission_gate_rejects_early_and_allows_proven_empty(
 
     assert empty_policy.empty_submission_allowed
     assert accepted["accepted"]
+
+
+@pytest.mark.asyncio
+async def test_repeated_capability_calls_alone_do_not_stop_rotating_candidate_batches(
+    tmp_path: Path,
+) -> None:
+    state = await _analyze("inference-flow/supported", tmp_path)
+    result = build_attack_frontiers(state)
+    policy = decide_investigation_policy(
+        result,
+        state,
+        runtime=InvestigationRuntimeState(repeated_calls=20, no_progress_rounds=0),
+    )
+    assert policy.transition is not InvestigationTransition.STOP_PARTIAL
+
+
+@pytest.mark.asyncio
+async def test_candidate_portfolio_is_candidate_only_and_diversifies_root_families(
+    tmp_path: Path,
+) -> None:
+    state = await _analyze("reasoning-matrix/gha-07/supported", tmp_path)
+    for candidate in state.candidates:
+        candidate.disposition = CandidateDisposition.UNREVIEWED
+    state.coverage_ledger = []
+    result = build_attack_frontiers(state)
+    policy = decide_investigation_policy(result, state)
+    candidates = [entry.candidate for entry in policy.portfolio if entry.candidate is not None]
+
+    assert candidates
+    assert all(entry.frontier is None for entry in policy.portfolio)
+    families = [candidate.root_cause_family for candidate in candidates]
+    # If multiple families are available, each gets one slot before a duplicate family consumes one.
+    available_families = {candidate.root_cause_family for candidate in state.candidates}
+    assert len(set(families)) == min(len(candidates), len(available_families))
