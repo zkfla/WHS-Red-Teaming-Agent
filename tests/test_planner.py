@@ -11,7 +11,7 @@ from decimal import Decimal
 from finredteam.knowledge.baseline import BaselineRecord, BaselineRegistry
 from finredteam.money import Currency, Money
 from finredteam.planning.candidates import CandidateSkeleton
-from finredteam.planning.planner import _expected_delta_for
+from finredteam.planning.planner import _expected_delta_for, build_candidate
 
 USD = Currency(code="USD", minor_unit=2)
 
@@ -147,3 +147,20 @@ def test_expected_delta_remaps_to_a_different_principals_accounts():
     # 원본 baseline 계좌(ATTACKER/VICTIM)가 새 결과에 섞여 들어오면 안 된다.
     assert "ATTACKER" not in exp.deltas
     assert "VICTIM" not in exp.deltas
+
+
+def test_build_candidate_forces_recipient_to_validated_target():
+    """회귀(거짓양성): LLM이 params.to_account에 target과 다른 계좌를 넣어도, 실제
+    요청은 검증·감시된 target 계좌로 강제돼야 한다.
+
+    실측 버그(runs/20260904-165450): watch_accounts는 target(=counterparty)로
+    만드는데 요청은 params.to_account로 나가, 둘이 어긋나면 수신 계좌가 관측되지
+    않아 INV-1A가 '값이 사라졌다'는 거짓 위반을 5건 냈다. 값은 실제로 보존됐다.
+    """
+    baselines = _baselines_with_transfer_10()
+    skeleton = _skeleton()  # hint counterparty_account="VICTIM", watch=[ATTACKER, VICTIM]
+    cand = build_candidate(baselines=baselines, skeleton=skeleton, rationale="",
+                           params={"amount": "1.00", "to_account": "SOMEONE_UNWATCHED"})
+    # 요청은 감시하는 VICTIM으로 강제됨 — 수신 측이 반드시 관측되어 INV-1A 거짓양성이 사라진다
+    assert cand.params["to_account"] == "VICTIM"
+    assert "VICTIM" in cand.watch_accounts

@@ -107,6 +107,17 @@ def build_candidate(
     rationale: str,
     baselines: BaselineRegistry,
 ) -> CandidateFinding:
+    # ★ 수신 계좌를 검증된 target(skeleton.hint.counterparty_account)으로 강제한다.
+    # 리졸버는 `target`(검증·감시하는 계좌)으로 watch_accounts 를 만드는데, 실제
+    # 요청은 `params` 로 나간다 — LLM 이 params 의 to_account 에 target 과 다른 계좌를
+    # 넣으면, 돈은 감시하지 않는 계좌로 가서 수신 측 변화가 관측되지 않고 INV-1A 가
+    # "값이 사라졌다"는 거짓 위반을 낸다(실측: 값은 보존됨). 둘을 일치시켜 막는다.
+    counterparty = skeleton.hint.get("counterparty_account")
+    if counterparty:
+        params = dict(params)
+        recipient_field = skeleton.hint.get("recipient_field") or "to_account"
+        params[recipient_field] = counterparty
+
     expected_delta = _expected_delta_for(skeleton, params, baselines)
     if expected_delta is None and skeleton.needs_baseline:
         expected_delta = ExpectedDelta(
