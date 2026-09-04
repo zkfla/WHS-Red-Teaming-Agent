@@ -83,6 +83,10 @@ class ExecutionResult(BaseModel):
     # 뽑아 여기 담는다. 오라클(oracles/exposure.py)은 이 boolean 만 보고 판정하므로
     # 민감 원문이 오라클/저장소로 새지 않는다(§10, §설계원칙 6).
     exposure_signals: dict[str, bool] = {}
+    # INV-BFLA(권한상승/함수수준 인가) 판정용 파생 신호 — 프로브가 "일반 사용자는
+    # 거부(403)됐는데 mass assignment 로 is_admin 을 주입한 사용자는 관리자 기능에
+    # 접근 성공(200)했는가" 같은 비교 결과를 boolean 으로 담는다.
+    authz_signals: dict[str, bool] = {}
 
 
 class Finding(BaseModel):

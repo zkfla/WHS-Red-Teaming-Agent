@@ -35,6 +35,7 @@ from finredteam.probing.executor import run as execute
 from finredteam.probing.finance.burst import run_race_candidate, summarize_race
 from finredteam.probing.finance.auth_exposure import run_forgot_password_pin_probe, run_register_password_echo_probe
 from finredteam.probing.finance.card_exposure import run_card_exposure_probe
+from finredteam.probing.finance.privesc import run_admin_escalation_probe
 from finredteam.probing.finance.card_fund import run_card_fund_manipulation
 from finredteam.probing.finance.charge import run_charge_idempotency_trial
 from finredteam.probing.session import Session
@@ -590,6 +591,43 @@ def test_forgot_password_pin_disclosure_flows_to_inv9_violation():
     finding = verify(candidate, result)
     assert finding.verdict == Verdict.VIOLATION
     assert finding.invariant == "INV-9"
+
+
+def _privesc_mock_session(admin_panel_checks_flag: bool = True) -> Session:
+    """회원가입 시 is_admin 을 그대로 저장하고, 관리자 패널은 is_admin 계정만
+    200(아니면 403)을 주는 실제 vuln-bank 동작 재현."""
+    users: dict[str, bool] = {}  # token -> is_admin
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if request.method == "POST" and path == "/register":
+            body = json.loads(request.content or b"{}")
+            return httpx.Response(200, json={"status": "success", "debug_data": {"is_admin": bool(body.get("is_admin"))}})
+        if request.method == "POST" and path == "/login":
+            body = json.loads(request.content or b"{}")
+            # 목: username에 'atk'가 들어가면 is_admin 주입된 계정으로 간주
+            is_admin = "atk" in body.get("username", "")
+            tok = f"tok_{'admin' if is_admin else 'user'}_{len(users)}"
+            users[tok] = is_admin
+            return httpx.Response(200, json={"status": "success", "token": tok})
+        if request.method == "GET" and path == "/sup3r_s3cr3t_admin":
+            auth = request.headers.get("Authorization", "")
+            tok = auth.replace("Bearer ", "")
+            return httpx.Response(200 if users.get(tok) else 403, json={})
+        return httpx.Response(404, json={})
+
+    return Session(load_target("vulnbank"), _policy(), _transport=httpx.MockTransport(handler))
+
+
+def test_mass_assignment_admin_escalation_flows_to_bfla_violation():
+    """is_admin=true 주입 가입 → 일반 사용자는 403인 관리자 패널에 200 접근 →
+    INV-BFLA VIOLATION. 정상 사용자(대조군)는 접근 거부됨을 프로브가 함께 확인."""
+    session = _privesc_mock_session()
+    candidate, result = run_admin_escalation_probe(session)
+    assert result.authz_signals == {"privilege_escalation_confirmed": True}
+    finding = verify(candidate, result)
+    assert finding.verdict == Verdict.VIOLATION
+    assert finding.invariant == "INV-BFLA"
 
 
 # ──────────────────────────────────────────────────────────────────────────
