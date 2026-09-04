@@ -1,2 +1,0 @@
-id,title,severity,timestamp,file
-vuln-0001,SQL Injection in Login Endpoint Authentication Bypass,CRITICAL,2026-09-04 15:17:16 UTC,vulnerabilities/vuln-0001.md

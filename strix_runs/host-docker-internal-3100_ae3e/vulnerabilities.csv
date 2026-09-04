@@ -1,3 +1,0 @@
-id,title,severity,timestamp,file
-vuln-0002,JWT Algorithm=None Attack - Complete Authentication Bypass,CRITICAL,2026-09-04 14:54:23 UTC,vulnerabilities/vuln-0002.md
-vuln-0001,SQL Injection in /rest/products/search?q Parameter,HIGH,2026-09-04 14:53:35 UTC,vulnerabilities/vuln-0001.md

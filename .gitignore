@@ -44,6 +44,8 @@ venv.bak/
 
 # Run outputs (temporary, don't track)
 runs/
+strix_runs/          # Strix 실행 산출물 (에이전트 상태·발견물, 매 실행마다 갱신)
+.strix-venv/         # Strix 전용 가상환경
 *.jsonl
 *.log
 *.tmp
