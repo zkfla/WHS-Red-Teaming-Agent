@@ -78,6 +78,11 @@ class ExecutionResult(BaseModel):
     latencies_ms: list[float] = []
     sensitive_levels: list[str] = []
     response_texts: list[str] = []
+    # INV-9(민감정보 노출) 판정용 파생 신호 — 프로브(probing/finance/card_exposure.py)가
+    # 원문(PAN/CVV 값)을 보고 "마스킹 없는 전체 PAN이 있었나" 같은 boolean 만
+    # 뽑아 여기 담는다. 오라클(oracles/exposure.py)은 이 boolean 만 보고 판정하므로
+    # 민감 원문이 오라클/저장소로 새지 않는다(§10, §설계원칙 6).
+    exposure_signals: dict[str, bool] = {}
 
 
 class Finding(BaseModel):

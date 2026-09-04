@@ -33,6 +33,7 @@ from finredteam.planning.candidates import resolve_skeleton
 from finredteam.planning.planner import build_candidate
 from finredteam.probing.executor import run as execute
 from finredteam.probing.finance.burst import run_race_candidate, summarize_race
+from finredteam.probing.finance.card_exposure import run_card_exposure_probe
 from finredteam.probing.finance.card_fund import run_card_fund_manipulation
 from finredteam.probing.finance.charge import run_charge_idempotency_trial
 from finredteam.probing.session import Session
@@ -517,6 +518,46 @@ def test_card_fund_normal_rate_is_value_neutral_no_violation():
 
     finding = verify(candidate, result)
     assert finding.verdict != Verdict.VIOLATION  # 값 보존 → 위반 아님
+
+
+def test_card_exposure_full_pan_and_cvv_flows_to_inv9_violation():
+    """카드 목록 응답에 마스킹 없는 전체 PAN + CVV 가 노출 → INV-9 VIOLATION.
+
+    프로브가 원문에서 boolean(full_pan_exposed/cvv_exposed)만 뽑고, 신규 오라클
+    INV-9 이 그 신호로만 판정한다 — 민감 원문은 오라클로 안 넘어간다."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/api/virtual-cards":
+            return httpx.Response(200, json={"cards": [{
+                "id": 1, "card_number": "4111111111111111", "cvv": "123", "balance": 0.0,
+            }]})
+        return httpx.Response(404, json={})
+
+    session = Session(load_target("vulnbank"), _policy(), _transport=httpx.MockTransport(handler))
+    owner = Principal(id="attacker_A", username="owner", password="pw", account_number=ATTACKER_ACCT, token="tok")
+
+    candidate, result = run_card_exposure_probe(session, owner)
+    assert result.exposure_signals == {"full_pan_exposed": True, "cvv_exposed": True}
+
+    finding = verify(candidate, result)
+    assert finding.verdict == Verdict.VIOLATION
+    assert finding.invariant == "INV-9"
+
+
+def test_card_exposure_masked_pan_no_violation():
+    """마스킹된 PAN(****1111)만 있으면 INV-9 위반 아님 — 거짓양성 방지 대조군."""
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/api/virtual-cards":
+            return httpx.Response(200, json={"cards": [{"id": 1, "card_number": "************1111", "balance": 0.0}]})
+        return httpx.Response(404, json={})
+
+    session = Session(load_target("vulnbank"), _policy(), _transport=httpx.MockTransport(handler))
+    owner = Principal(id="attacker_A", username="owner", password="pw", account_number=ATTACKER_ACCT, token="tok")
+
+    candidate, result = run_card_exposure_probe(session, owner)
+    assert result.exposure_signals == {"full_pan_exposed": False, "cvv_exposed": False}
+
+    finding = verify(candidate, result)
+    assert finding.verdict != Verdict.VIOLATION
 
 
 # ──────────────────────────────────────────────────────────────────────────

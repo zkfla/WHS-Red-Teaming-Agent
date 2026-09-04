@@ -19,19 +19,20 @@ from finredteam.oracles.amount import check_inv_6
 from finredteam.oracles.authz import check_inv_2
 from finredteam.oracles.base import OracleOutcome
 from finredteam.oracles.concurrency import check_inv_1c
+from finredteam.oracles.exposure import check_inv_9
 from finredteam.oracles.idempotency import check_inv_4
 from finredteam.oracles.value import check_inv_1a, check_inv_1b
 
 OracleFn = Callable[[CandidateFinding, ExecutionResult], OracleOutcome]
 GraphOracleFn = Callable[[CandidateFinding, ExecutionResult, KnowledgeGraph], OracleOutcome]
 
-# INV-9(exposure) 는 아직 없다 — 여기 없으면 조용히 빠진다(verifier.py 참고).
 REGISTRY: dict[str, OracleFn] = {
     "INV-1A": check_inv_1a,
     "INV-1B": check_inv_1b,
     "INV-1C": check_inv_1c,
     "INV-4": check_inv_4,
     "INV-6": check_inv_6,
+    "INV-9": check_inv_9,
 }
 
 GRAPH_REGISTRY: dict[str, GraphOracleFn] = {
