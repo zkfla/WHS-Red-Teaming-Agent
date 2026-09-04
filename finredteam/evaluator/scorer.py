@@ -24,7 +24,12 @@ _ID_SEGMENT_RE = re.compile(r"^[0-9]+$|^[0-9]+[A-Za-z0-9_-]*[0-9][A-Za-z0-9_-]*$
 
 def _normalize_path(path: str) -> str:
     """`/check_balance/2344073575` -> `/check_balance/{id}` 처럼 식별자 세그먼트를
-    뭉갠다 — GT 의 `{id}` 표기와 후보 실행 시점의 실제 계좌번호가 항상 다르므로."""
+    뭉갠다 — GT 의 `{id}` 표기와 후보 실행 시점의 실제 계좌번호가 항상 다르므로.
+
+    쿼리 스트링(`?account_number=123`)도 떼어낸다 — 거기 담긴 계좌번호는 경로의
+    `{id}` 세그먼트와 같은 "대상 식별자"일 뿐 취약점의 정체를 가르지 않으므로,
+    GT 의 쿼리 없는 endpoint(`GET /api/transactions`) 와 정상적으로 매칭되게 한다."""
+    path = path.split("?", 1)[0]
     segments = [seg for seg in path.split("/") if seg != ""]
     normalized = ["{id}" if _ID_SEGMENT_RE.match(seg) else seg for seg in segments]
     return "/" + "/".join(normalized)
