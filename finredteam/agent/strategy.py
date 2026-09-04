@@ -64,15 +64,16 @@ def suggest_nudge(ctx: AgentContextLike) -> str | None:
                 f"{', '.join(reachable_untried)}(거래내역 조회)에도 같은 권한 경계 취약점이 있을 수 있다 "
                 "— 같은 대상만 반복하지 말고 이 엔드포인트들로 넓혀보라."
             )
-        # 계좌 BOLA 를 충분히 확인했는데 아직 특수 프로브를 한 번도 안 돌렸으면,
-        # 계좌 조회로는 닿을 수 없는 다른 취약점 클래스(정보노출/권한상승/환율조작)를
-        # run_probe 로 열어보라고 유도한다.
-        if not ctx.any_probe_run():
+        # 계좌 BOLA 를 확인했는데 아직 안 돌린 특수 프로브가 남아 있으면, 남은
+        # 종류를 콕 집어 계속 유도한다(하나만 하고 멈추지 않게). 계좌 조회·송금으로는
+        # 닿을 수 없는 클래스(정보노출/권한상승/환율조작)를 run_probe 로 연다.
+        untried_probes = ctx.untried_probes()
+        if untried_probes:
             return (
-                "힌트: 계좌 권한(BOLA) 취약점은 충분히 확인됐다 — 계좌 조회·송금으로는 닿을 수 없는 "
-                "다른 클래스가 남아 있다. run_probe 로 sensitive_exposure(비밀번호/PIN/카드정보 노출), "
-                "privilege_escalation(회원가입 mass assignment 관리자 권한 상승), card_fund(카드 충전 환율 "
-                "조작)를 시험해보라."
+                "힌트: 계좌 권한(BOLA) 취약점은 확인됐다 — 계좌 조회·송금으로는 닿을 수 없는 클래스가 "
+                f"아직 남아 있다. run_probe 로 아직 안 해본 것들을 마저 시험하라: {', '.join(untried_probes)} "
+                "(sensitive_exposure=비밀번호/PIN/카드정보 노출, privilege_escalation=관리자 권한 상승, "
+                "card_fund=카드 충전 환율 조작). 하나만 하지 말고 남은 것을 다 돌려보라."
             )
         ops = ", ".join(ctx.successful_operations())
         return f"힌트: 최근 성공한 조합({ops})을 다른 주체/대상으로 더 시도해볼 만하다."

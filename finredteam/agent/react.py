@@ -189,13 +189,16 @@ class AgentContext:
         untried = sorted(all_ops - tried)
         return untried or candidates_module.supported_operations()
 
-    def any_probe_run(self) -> bool:
-        """run_probe 로 특수 프로브(노출/권한상승/환율조작)를 한 번이라도 돌렸는가."""
+    def untried_probes(self) -> list[str]:
+        """run_probe 로 아직 한 번도 안 돌린 프로브 종류를 돌려준다 — 하나만 하고
+        멈추지 않게, 남은 종류를 계속 콕 집어 유도하기 위해서다."""
         probe_ops = {
-            "register_exposure", "forgot_password_exposure", "card_exposure",
-            "mass_assignment_privesc", "card_fund",
+            "sensitive_exposure": {"register_exposure", "forgot_password_exposure", "card_exposure"},
+            "privilege_escalation": {"mass_assignment_privesc"},
+            "card_fund": {"card_fund"},
         }
-        return bool(self.episodic.tried_operations() & probe_ops)
+        tried = self.episodic.tried_operations()
+        return [name for name, ops in probe_ops.items() if not (ops & tried)]
 
     def layer_untouched(self, layer: str) -> bool:
         return not any(ep.candidate.layer == layer for ep in self.episodic.all())
