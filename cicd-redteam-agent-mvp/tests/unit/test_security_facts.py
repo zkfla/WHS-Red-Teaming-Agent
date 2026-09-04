@@ -380,6 +380,13 @@ async def test_attack_frontier_capability_paginates_and_exposes_search_limits(
     assert first["relation_semantics_version"]
     assert isinstance(first["search_complete"], bool)
     assert "truncated" in first
+    assert first["security_candidates_included"] is True
+    assert first["candidate_inventory"]["total_candidates"] == len(state.candidates)
+    assert len(first["security_candidates"]) <= 6
+    assert "coverage_summary" in first["investigation_policy"]
+    assert "coverage_ledger" not in first["investigation_policy"]
+    assert second["security_candidates_included"] is False
+    assert second["security_candidates"] == []
 
 
 @pytest.mark.asyncio

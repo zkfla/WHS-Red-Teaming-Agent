@@ -19,10 +19,15 @@ from cicd_redteam_agent.domain.relation_semantics import (
     relation_semantics,
 )
 
-FRONTIER_ENGINE_VERSION = "1.0"
+FRONTIER_ENGINE_VERSION = "1.2"
 DEFAULT_MAX_DEPTH = 10
-DEFAULT_MAX_FRONTIERS = 50
 DEFAULT_MAX_EXPANSIONS = 5_000
+# This is the semantic search-result safety bound, not the model/UI page size.  Capability
+# pagination applies a separate 1..20 page limit after a complete bounded search has finished.
+# Keeping these concerns separate prevents a 50-row presentation cap from making an otherwise
+# complete repository search look semantically truncated.
+DEFAULT_MAX_FRONTIERS = 5_000
+_INTERMEDIATE_SINK_TAGS = {"execution"}
 
 
 class FrontierConnectivity(StrEnum):
@@ -610,6 +615,7 @@ def build_attack_frontiers(
     ] = {}
     while queue and expansions < query.max_expansions:
         path = queue.popleft()
+        intermediate_sink = path.sink_tag in _INTERMEDIATE_SINK_TAGS
         focused_sink_reached = bool(
             path.sink_tag and (not query.sink_hints or path.sink_tag in query.sink_hints)
         )
@@ -619,7 +625,15 @@ def build_attack_frontiers(
             and path.sink_tag not in query.sink_hints
             and adjacency.get(path.nodes[-1])
         )
-        if path.blocked or focused_sink_reached:
+        if path.blocked:
+            frontiers.append(_to_frontier(path, query, adjacency, complete=False))
+            continue
+        if intermediate_sink and not query.sink_hints:
+            # Ordinary attacker-controlled execution is a useful reportable boundary, but it is
+            # not privilege. Keep traversing so a later explicit credential/write relation can
+            # produce a distinct privileged-impact frontier.
+            frontiers.append(_to_frontier(path, query, adjacency, complete=True))
+        elif focused_sink_reached:
             frontiers.append(_to_frontier(path, query, adjacency, complete=focused_sink_reached))
             continue
         if path.sink_tag and not can_continue_past_intermediate_sink:
@@ -686,7 +700,10 @@ def build_attack_frontiers(
                             )
                         )
                     ),
-                    sink_tag=semantics.sink_tag or path.sink_tag,
+                    # A sink describes the current relation endpoint. Do not carry an earlier
+                    # execution sink through unrelated plumbing edges; flow_labels retain that
+                    # execution was reached while traversal continues toward credential sinks.
+                    sink_tag=semantics.sink_tag,
                     trigger_context_id=(
                         trigger_for_job.get(next_job_context_id)
                         if next_job_context_id

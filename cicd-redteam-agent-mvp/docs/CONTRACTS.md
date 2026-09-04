@@ -269,11 +269,59 @@ the status/dependency execution-semantics contract above.
 - A path-level Evidence set must contain every Evidence ID carried by its edges.
 - Static paths cannot be `CONFIRMED`.
 - A `SUPPORTED` Finding requires an Evidence-linked `SUPPORTED` path in the same proposal.
+- Candidate-backed Findings and paths must reference the returned `candidate_id`, exact claim
+  contract and one of its grounded path variants; static candidate ceilings never permit
+  `CONFIRMED`.
+- A broad portfolio batch must account for every selected Candidate and Frontier with a terminal
+  `ACCEPTED`, `REJECTED`, `BLOCKED_EXTERNAL`, or `MERGED` disposition. A successful broad batch
+  commit does not terminate the run: equivalent occurrences sharing the representative's
+  `root_cause_key` receive the same terminal accounting, and the next uncovered root-cause
+  representatives are selected. Final `SUBMIT` requires repository-wide eligible root-cause
+  coverage. A focused complete decision may still finish through the bounded focused policy.
+- Candidate contract summaries are canonical. Forbidden claim language is rejected unless it is
+  explicitly negated as a limitation of the finding; UNKNOWN and missing Evidence are never
+  promoted to SAFE or FALSE.
 - Proposed cloud identities must match an extracted repository/workflow/job/provider/mechanism
   candidate and preserve its Evidence.
 - Duplicate IDs are rejected, including collisions with existing state.
 - A rejected proposal does not mutate state.
-- A successful `submit_analysis` may occur only once.
+- Only the final `SUBMIT` completes the analysis. Broad `INVESTIGATE` batches may be accepted more
+  than once through `decision_submission_allowed=true`; partial batch accounting remains invalid.
+
+## Canonical security candidates
+
+`AnalysisState.candidates` is the shared semantic layer between static extraction and reasoning.
+Each `SecurityCandidate` has a stable ID, a bounded `candidate_kind`, `root_cause_family` and
+`root_cause_key`, optional workflow/job/step/context scope, a `ClaimContract`, a
+`proposal_status_ceiling`, status, supporting/contradicting/guard semantic Relation IDs, Evidence,
+missing Evidence, typed
+`EvidenceRequirementRef` entries and one or more grounded `path_variants`.
+
+`candidate_kind` identifies the vulnerability pattern, `root_cause_family` groups the cause
+family, and `root_cause_key` identifies the concrete cause instance. Mutable-action candidates,
+for example, use the action reference in the key so the same action/ref can be correlated across
+workflows while different refs remain separate. Their semantic grounding comes from real action
+Relations such as `uses_external_action_ref` and `external_code_may_execute_in_step`; structural
+`contains_job`/`contains_step` edges are path topology only. Candidate
+`evidence_requirements` preserves the requirements already attached to those Relations and does
+not synthesize absent provider, provenance, advisory or policy requirements.
+
+The candidate producer reuses the existing deterministic scenario composers, so deterministic and
+reasoning initial states have the same candidate projection. Deterministic mode materializes the
+candidate contract into Findings and candidate-bound AttackPaths. Reasoning mode receives the same
+Candidates through `ListAttackFrontiers`/`GetWorkflowFacts`, investigates or refutes them, and
+submits terminal `CandidateDecisionDraft` entries. `ACCEPTED` selects an exact path variant;
+runtime materializes rule, title, bounded summary, status, Evidence and missing Evidence from the
+candidate rather than trusting model-authored claim text.
+
+`AttackFrontier`, `SecurityCandidate`, `WorkingHypothesis` and `PortfolioEntry` are deliberately
+different layers. Frontiers explore the typed Relation graph, Candidates express semantic
+hypotheses, WorkingMemory records bounded investigation state, and PortfolioEntry schedules either
+kind. A recompute reconciles candidates and coverage ledger entries, preserves terminal decisions,
+marks disappeared candidates `BLOCKED_EXTERNAL`, and reconciles bound WorkingMemory hypotheses.
+Typed novel claims remain possible, but only through the finite `NOVEL-UNTRUSTED-EXECUTION`,
+`NOVEL-SECRET-EXPOSURE`, and `NOVEL-CREDENTIAL-ACCESS` contracts with source, mechanism, sink and
+status-ceiling validation.
 
 ## Termination
 
@@ -317,19 +365,34 @@ execution context. `search_complete`, `truncated`, depth/expansion metadata and 
 limited result from being interpreted as proof that no path exists. Frontier engine and Relation
 semantic-registry versions are returned for reproducibility.
 
-A deterministic investigation-policy layer scores Frontier candidates from readiness, sensitive
-sink impact, Evidence grounding, resolvable information gain, Objective alignment and bounded
-investigation cost. It greedily selects at most six candidates while penalizing Relation, execution
-context and source/mechanism/sink overlap. Runtime budget/progress signals are normalized alongside
-the Frontier state, and the resulting transition is `OBSERVE`, `INVESTIGATE`, `SUBMIT`, or
-`STOP_PARTIAL`. `STOP_PARTIAL` wins when another safe model round is unavailable because a configured
-limit was reached, token reserve is insufficient, or repeated/no-progress thresholds were reached.
-This ranking and transition logic never change a Relation verdict or proposal status.
+A deterministic investigation-policy layer scores Candidates and Frontier rows from readiness,
+sensitive sink impact, Evidence grounding, resolvable information gain, Objective alignment and
+bounded investigation cost. It greedily selects at most six items while penalizing root-cause,
+candidate-kind, Relation, execution-context and source/mechanism/sink overlap. Broad mode schedules
+at most one Candidate representative per uncovered `root_cause_key`; terminal root causes and
+already-terminal Frontier rows are skipped on subsequent batches. Runtime
+budget/progress signals are normalized alongside the graph state, and the resulting transition is
+`OBSERVE`, `INVESTIGATE`, `SUBMIT`, or `STOP_PARTIAL`. A grounded but not-yet-accounted portfolio
+uses `INVESTIGATE` plus `decision_submission_allowed=true` so one complete terminal decision set
+commits that batch and rotates to uncovered root causes. `SUBMIT` is reached only when broad
+root-cause coverage is complete. `STOP_PARTIAL` wins when
+another safe model round is unavailable because a configured limit was reached, token reserve is
+insufficient, or repeated/no-progress thresholds were reached. This ranking and transition logic
+never change a Relation verdict or proposal status.
 
-`SubmitAnalysis` is policy-gated during Agent runs. It rejects submission before `SUBMIT`, rejects
-non-empty paths outside the selected proposal-ready portfolio, and permits an empty proposal only
-when bounded Frontier search is complete with no sufficiently grounded proposal-ready path. The
-ordinary proposal expander and Validator still run after this gate and remain the final authority.
+`SubmitAnalysis` is policy-gated during Agent runs. It rejects submission before `SUBMIT` unless
+`decision_submission_allowed=true`, rejects partial candidate/frontier accounting, rejects non-empty
+paths outside the selected proposal-ready portfolio, and distinguishes an accepted broad batch from
+the final analysis submission. Broad batch acceptance commits dispositions and materialized accepted
+Findings while leaving `context.submitted=false`; the next policy refresh rotates to remaining root
+causes. The final empty proposal is permitted only after broad candidate coverage and bounded graph
+search completeness justify `SUBMIT`. The ordinary proposal expander and Validator still run after
+this gate and remain the final authority.
+
+Relation semantics use `execution` for attacker-controlled code/value execution. `execution` is not
+synonymous with privilege. Write-capable GitHub token, Secret, OIDC and Cloud Identity relations keep
+their own sensitive sink tags, and the validator separately requires explicit TRUE privilege
+evidence before a `SUPPORTED` privileged claim can be materialized.
 
 The Agent can inspect the reusable security fact graph through `ListSecurityFacts` as a fallback.
 Fact categories
@@ -369,6 +432,11 @@ the memory. Only PARTIAL `summary.md` output shows active or blocked investigati
 An upsert may use `supporting_relation_refs` and `contradicting_relation_refs`. The runtime resolves
 them against the same run-local index and derives the exact Relation IDs, Evidence IDs and missing
 Evidence before applying the unchanged working-memory validation rules.
+
+When a hypothesis includes `candidate_id`, the runtime verifies that its supporting and
+contradicting Relations belong to that Candidate. Candidate recompute can move the bound hypothesis
+to `READY_FOR_PROPOSAL`, `BLOCKED`, or `DISCARDED`; a disappeared or rejected Candidate is never
+silently retained as an active investigation claim.
 
 ## Compact analysis proposal
 

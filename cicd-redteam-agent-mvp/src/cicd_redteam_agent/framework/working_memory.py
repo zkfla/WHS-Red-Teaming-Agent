@@ -15,6 +15,8 @@ from cicd_redteam_agent.domain.graph_frontier import (
 from cicd_redteam_agent.domain.models import (
     AgentWorkingMemory,
     AnalysisState,
+    CandidateDisposition,
+    FindingStatus,
     WorkingHypothesis,
     WorkingHypothesisStatus,
     WorkingHypothesisUpsert,
@@ -177,6 +179,7 @@ def reconcile_working_memory(
 
     relation_by_id = {relation.relation_id: relation for relation in state.relations}
     relation_by_ref = dict(indexed_relations(state))
+    candidate_by_id = {candidate.candidate_id: candidate for candidate in state.candidates}
 
     def relation_ids(frontier) -> frozenset[str]:
         return frozenset(
@@ -220,6 +223,26 @@ def reconcile_working_memory(
         status = hypothesis.status
         decision_summary = hypothesis.decision_summary
         clear_next_check = False
+        bound_candidate = (
+            candidate_by_id.get(hypothesis.candidate_id)
+            if hypothesis.candidate_id is not None
+            else None
+        )
+        candidate_missing = hypothesis.candidate_id is not None and bound_candidate is None
+        candidate_blocked = bool(
+            bound_candidate is not None
+            and bound_candidate.disposition is CandidateDisposition.BLOCKED_EXTERNAL
+        )
+        candidate_discarded = bool(
+            bound_candidate is not None
+            and bound_candidate.disposition
+            in {CandidateDisposition.REJECTED, CandidateDisposition.MERGED}
+        )
+        candidate_ready = bool(
+            bound_candidate is not None
+            and bound_candidate.status is not FindingStatus.REJECTED
+            and bound_candidate.path_variants
+        )
         stale_grounding = len(support) != len(original_support)
         hard_contradiction = any(
             relation_by_id[item].verdict.value == "FALSE" for item in support
@@ -245,6 +268,23 @@ def reconcile_working_memory(
             elif stale_grounding or hard_contradiction:
                 status = WorkingHypothesisStatus.DISCARDED
                 decision_summary = "Discarded automatically after canonical semantic recompute."
+                clear_next_check = True
+            elif candidate_missing or candidate_discarded:
+                status = WorkingHypothesisStatus.DISCARDED
+                decision_summary = (
+                    "Discarded automatically because its canonical candidate disappeared "
+                    "or was merged/rejected."
+                )
+                clear_next_check = True
+            elif candidate_blocked:
+                status = WorkingHypothesisStatus.BLOCKED
+                decision_summary = (
+                    "Blocked automatically by the candidate's external evidence state."
+                )
+                clear_next_check = True
+            elif candidate_ready:
+                status = WorkingHypothesisStatus.READY_FOR_PROPOSAL
+                decision_summary = "Canonical SecurityCandidate now supports proposal review."
                 clear_next_check = True
             elif covered_by_ready:
                 status = WorkingHypothesisStatus.READY_FOR_PROPOSAL
@@ -279,10 +319,19 @@ def reconcile_working_memory(
                 ),
                 "missing_evidence": list(
                     dict.fromkeys(
-                        missing
-                        for relation in referenced
-                        if relation.verdict.value == "UNKNOWN"
-                        for missing in relation.missing_evidence
+                        [
+                            *(
+                                bound_candidate.missing_evidence
+                                if bound_candidate is not None
+                                else []
+                            ),
+                            *(
+                                missing
+                                for relation in referenced
+                                if relation.verdict.value == "UNKNOWN"
+                                for missing in relation.missing_evidence
+                            ),
+                        ]
                     )
                 ),
                 "decision_summary": decision_summary,
@@ -344,6 +393,7 @@ def _merge_hypothesis(
         hypothesis_id = _hypothesis_id(repository_id, cleaned.claim)
         return WorkingHypothesis(
             hypothesis_id=hypothesis_id,
+            candidate_id=cleaned.candidate_id,
             claim=cleaned.claim,
             status=cleaned.status or WorkingHypothesisStatus.ACTIVE,
             supporting_relation_ids=cleaned.supporting_relation_ids or [],
@@ -358,6 +408,8 @@ def _merge_hypothesis(
 
     if cleaned.claim and _normalize_claim(cleaned.claim) != _normalize_claim(existing.claim):
         raise ValueError(f"hypothesis claim is immutable: {existing.hypothesis_id}")
+    if cleaned.candidate_id and cleaned.candidate_id != existing.candidate_id:
+        raise ValueError(f"hypothesis candidate binding is immutable: {existing.hypothesis_id}")
     payload = existing.model_dump()
     for field_name in (
         "status",
@@ -370,6 +422,8 @@ def _merge_hypothesis(
         value = getattr(cleaned, field_name)
         if value is not None:
             payload[field_name] = value
+    if cleaned.candidate_id is not None:
+        payload["candidate_id"] = cleaned.candidate_id
     if cleaned.clear_next_check:
         payload["next_check"] = None
     elif cleaned.next_check is not None:
@@ -396,6 +450,26 @@ def _validate_hypothesis(
         errors.append(f"unknown evidence IDs: {sorted(unknown_evidence)}")
     if unknown_relations:
         errors.append(f"unknown relation IDs: {sorted(unknown_relations)}")
+    if hypothesis.candidate_id:
+        candidate = next(
+            (
+                item
+                for item in state.candidates
+                if item.candidate_id == hypothesis.candidate_id
+            ),
+            None,
+        )
+        if candidate is None:
+            errors.append(f"unknown candidate ID: {hypothesis.candidate_id}")
+        else:
+            allowed = set(candidate.supporting_relation_ids) | set(
+                candidate.contradicting_relation_ids
+            )
+            outside = set(relation_ids) - allowed
+            if outside:
+                errors.append(
+                    f"candidate-bound hypothesis references unrelated relations: {sorted(outside)}"
+                )
     false_support = [
         relation_id
         for relation_id in hypothesis.supporting_relation_ids

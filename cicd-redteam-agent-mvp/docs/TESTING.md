@@ -45,6 +45,23 @@
 - matrix graph composition checks the expected SUPPORTED/CANDIDATE/REJECTED outcome without product-side GHA dispatch
 - the unlabeled blind fixture joins fork PR -> local action -> artifact/cache -> privileged workflow -> GitHub Token/OIDC
 - FALSE guard edges are accepted only in REJECTED paths; path-level Evidence must cover every edge
+- canonical `SecurityCandidate` parity holds between deterministic materialization and reasoning
+  initialization, including ID/kind/root/status ceiling/supporting Relation grounding
+- mutable-action candidates are grounded in non-structural action Relations, retain existing
+  Relation `EvidenceRequirementRef` entries, and separate root-cause family from action/ref
+  instance identity
+- candidate-backed ACCEPTED decisions materialize only the bounded claim contract, while forbidden
+  secret-log overclaims are rejected
+- fork PR revision plus repository execution without an explicit write/secret/OIDC relation cannot
+  become a privileged `SUPPORTED` claim
+- broad portfolios require terminal accounting for every selected Candidate/Frontier, commit one
+  root-cause-representative batch at a time, skip terminal root causes on the next batch, and refuse
+  final `SUBMIT` while any eligible root-cause instance remains uncovered; focused candidate
+  decisions keep the bounded one-item behavior
+- ordinary repository/shell/artifact execution produces an `execution` Frontier rather than a
+  `privileged_execution` Frontier; explicit write/OIDC/Secret/Cloud relations remain distinct sinks
+- semantic recompute preserves terminal coverage, marks disappeared Candidates `BLOCKED_EXTERNAL`,
+  and discards stale bound WorkingMemory
 
 ## Agent and failure coverage
 
@@ -89,6 +106,9 @@
 - compact Fact output omits long grounding IDs unless compatibility mode is requested
 - working-memory Relation refs restore exact Evidence and missing Evidence; unknown refs do not mutate state
 - compact drafts derive CANDIDATE from UNKNOWN and REJECTED from FALSE without accepting a model status override
+- P0 pinned GitHub Actions Goat benchmark verifies deterministic/reasoning Candidate parity,
+  diversified multi-batch root-cause coverage through final `SUBMIT`, candidate-backed submission,
+  no silent drops, and ordinary-execution/privilege semantic separation
 - checkpoint replacement is atomic and restores AnalysisState, working memory, limits and runtime metrics
 - observation checkpoints round-trip KnowledgeState, Task attempts and normalized Observations; missing
   sessions, divergent canonical state, invalid Task/Observation bindings and active leases fail closed
@@ -100,6 +120,27 @@
 - resume reuses the same run directory and attempt lineage while preserving cumulative budgets
 - completed runs, Objective hash or compiled-Goal mismatch, commit drift, dirty repositories,
   stale/corrupt journals and concurrent leases are rejected
+
+## P0 pinned Goat benchmark
+
+The repeatable offline harness is `tests/benchmarks/p0_goat_benchmark.py`. It accepts only a clean
+checkout of `https://github.com/step-security/github-actions-goat.git` at commit
+`4da23c8602b4589bacdf7de77240113e02cdb884`, runs no workflow or action, and writes a structured
+`benchmark.json` with workflow/job/step, Evidence/Relation, Candidate, portfolio, disposition,
+Finding/AttackPath and reasoning-smoke metrics.
+
+```powershell
+uv run python tests/benchmarks/p0_goat_benchmark.py `
+  --goat-root output/benchmark-target/github-actions-goat `
+  --output output/p0-goat-benchmark
+```
+
+The reasoning metric is explicitly a provider-free framework smoke: it starts from the same
+Candidate projection, repeatedly commits the real bounded portfolio/coverage batches until every
+eligible root-cause instance is terminal, verifies the final transition reaches `SUBMIT`, and records
+zero external LLM rounds, observations and tokens. It also checks that Goat has ordinary
+`execution` Frontiers and zero legacy `privileged_execution` Frontiers. It is not a live
+provider-accuracy claim.
 
 ## Generic Evidence A-G acceptance coverage
 

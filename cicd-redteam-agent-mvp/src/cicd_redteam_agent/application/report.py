@@ -169,6 +169,7 @@ def _frontier_sink_label(entry: PortfolioEntry) -> str:
         "github_token_write": "write-capable GITHUB_TOKEN",
         "oidc_token": "OIDC token",
         "cloud_identity": "cloud identity",
+        "execution": "attacker-controlled execution",
         "privileged_execution": "privileged execution",
         "secret_exposure": "secret exposure",
     }
@@ -264,6 +265,8 @@ def render_summary(report: AnalysisReport) -> str:
         f"| Workflows / jobs / steps | {len(state.workflows)} / {len(jobs)} / {len(steps)} |",
         f"| Evidence / relations | {len(state.evidence)} / {len(state.relations)} |",
         f"| Findings / attack paths | {len(state.findings)} / {len(state.paths)} |",
+        f"| Security candidates / coverage items | {len(state.candidates)} / "
+        f"{len(state.coverage_ledger)} |",
         f"| Global source-to-credential paths | {len(all_global_paths)} |",
         f"| Cloud identity candidates | {len(state.identities)} |",
         *(
@@ -299,6 +302,9 @@ def render_summary(report: AnalysisReport) -> str:
         f"| Relation verdicts | {_count_table([item.verdict for item in state.relations])} |",
         f"| Finding statuses | {_count_table([item.status for item in state.findings])} |",
         f"| Path statuses | {_count_table([item.status for item in state.paths])} |",
+        f"| Candidate statuses | {_count_table([item.status for item in state.candidates])} |",
+        f"| Candidate dispositions | "
+        f"{_count_table([item.disposition for item in state.candidates])} |",
         "| Attacker-control assessments | "
         f"{_count_table([item.verdict for item in state.assessments])} |",
         "",
@@ -332,9 +338,38 @@ def render_summary(report: AnalysisReport) -> str:
                 ]
             )
 
+    if state.candidates:
+        lines.extend(
+            [
+                "## Security candidates",
+                "",
+                "| ID | Kind | Root-cause family | Root-cause instance | Status | Disposition |",
+                "|---|---|---|---|---|---|",
+                *[
+                    f"| {_code(candidate.candidate_id)} | "
+                    f"{_inline(candidate.candidate_kind)} | "
+                    f"{_inline(candidate.root_cause_family or 'unknown')} | "
+                    f"{_inline(candidate.root_cause_key)} | "
+                    f"{_code(candidate.status)} | {_code(candidate.disposition)} |"
+                    for candidate in state.candidates
+                ],
+                "",
+            ]
+        )
+
     lines.extend(["## Findings", ""])
     if not state.findings:
-        if report.status is ReportStatus.PARTIAL and partial_frontiers:
+        if state.candidates:
+            lines.extend(
+                [
+                    "> No candidate-backed Finding was submitted. The candidate table above "
+                    "records the bounded semantic hypotheses and their coverage state.",
+                    "",
+                    "This does not prove the repository is secure; review candidate dispositions "
+                    "and missing Evidence.",
+                ]
+            )
+        elif report.status is ReportStatus.PARTIAL and partial_frontiers:
             lines.extend(
                 [
                     "> No final Finding was submitted before the partial stop. "

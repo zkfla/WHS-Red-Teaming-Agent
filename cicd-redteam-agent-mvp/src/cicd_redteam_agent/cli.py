@@ -129,6 +129,14 @@ def build_parser() -> argparse.ArgumentParser:
             "event/resource/principal locators and requires --github-run-id --observe-github"
         ),
     )
+    analyze.add_argument(
+        "--runtime-telemetry-file",
+        type=Path,
+        help=(
+            "trusted operator JSONL containing normalized runtime process/network/file telemetry; "
+            "must be outside the analyzed repository and requires reasoning mode"
+        ),
+    )
     resume = subcommands.add_parser(
         "resume", help="resume a reasoning analysis from its last safe checkpoint"
     )
@@ -470,6 +478,9 @@ def main(argv: list[str] | None = None) -> int:
             aws_profile=(args.aws_profile if args.command == "analyze" else None),
             github_run_id=(args.github_run_id if args.command == "analyze" else None),
             github_event_locator=github_event_locator,
+            runtime_telemetry_file=(
+                args.runtime_telemetry_file if args.command == "analyze" else None
+            ),
         )
         if objective is not None and config.resolved_mode is AnalysisMode.DETERMINISTIC:
             raise ValueError("analysis objective requires reasoning mode")

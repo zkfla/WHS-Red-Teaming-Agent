@@ -11,6 +11,7 @@ from cicd_redteam_agent.domain.models import (
     Relation,
     TriState,
 )
+from cicd_redteam_agent.domain.security_candidate import materialize_candidate_decisions
 
 
 class ProposalDraftError(ValueError):
@@ -44,6 +45,17 @@ def expand_analysis_proposal_draft(
     state: AnalysisState, draft: AnalysisProposalDraft
 ) -> AnalysisProposal:
     """Expand short relation references into exact grounded proposal objects."""
+
+    if draft.candidate_decisions:
+        if draft.finding_drafts or draft.path_drafts:
+            raise ProposalDraftError(
+                "candidate_decisions cannot be mixed with legacy finding/path drafts"
+            )
+        try:
+            proposal, _ = materialize_candidate_decisions(state, draft.candidate_decisions)
+        except ValueError as exc:
+            raise ProposalDraftError(str(exc)) from exc
+        return proposal
 
     relation_index = dict(indexed_relations(state))
     paths: list[AttackPath] = []

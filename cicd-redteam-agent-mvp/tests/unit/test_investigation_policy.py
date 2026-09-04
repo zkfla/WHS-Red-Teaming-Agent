@@ -84,7 +84,8 @@ async def test_transition_prefers_observation_then_submit_or_investigation(
     investigating = decide_investigation_policy(incomplete, state)
 
     assert observing.transition is InvestigationTransition.OBSERVE
-    assert submitting.transition is InvestigationTransition.SUBMIT
+    assert submitting.transition is InvestigationTransition.INVESTIGATE
+    assert submitting.decision_submission_allowed
     assert submitting.allowed_relation_ref_paths
     assert investigating.transition is InvestigationTransition.INVESTIGATE
 
@@ -134,7 +135,8 @@ async def test_frontier_capability_exposes_ranked_policy_portfolio(tmp_path: Pat
     payload = json.loads(await ListAttackFrontiers(CapabilityContext(state, boundary))())
 
     policy = payload["investigation_policy"]
-    assert policy["transition"] == "SUBMIT"
+    assert policy["transition"] == "INVESTIGATE"
+    assert policy["decision_submission_allowed"]
     assert policy["portfolio"]
     assert policy["portfolio"][0]["portfolio_rank"] == 1
     assert "candidate_score" in policy["portfolio"][0]

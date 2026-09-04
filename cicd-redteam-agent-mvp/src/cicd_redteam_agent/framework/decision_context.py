@@ -65,7 +65,14 @@ def _count_relations(state: AnalysisState) -> dict[str, int]:
     return dict(sorted(counts.items()))
 
 
-def _current_outputs(state: AnalysisState) -> dict[str, list[dict[str, Any]]]:
+def _current_outputs(state: AnalysisState) -> dict[str, Any]:
+    candidate_status_counts = Counter(candidate.status.value for candidate in state.candidates)
+    candidate_disposition_counts = Counter(
+        candidate.disposition.value for candidate in state.candidates
+    )
+    coverage_disposition_counts = Counter(
+        entry.disposition.value for entry in state.coverage_ledger
+    )
     return {
         "findings": [
             {
@@ -100,6 +107,20 @@ def _current_outputs(state: AnalysisState) -> dict[str, list[dict[str, Any]]]:
             }
             for identity in state.identities[-20:]
         ],
+        # Selected Candidate details live in investigation_policy.portfolio.  Repeating dozens of
+        # repository-wide candidates here on every model round made a paginated Frontier read cost
+        # tens of thousands of tokens without adding information.
+        "security_candidate_summary": {
+            "total": len(state.candidates),
+            "root_cause_instances": len({item.root_cause_key for item in state.candidates}),
+            "by_status": dict(sorted(candidate_status_counts.items())),
+            "by_disposition": dict(sorted(candidate_disposition_counts.items())),
+        },
+        "coverage_summary": {
+            "items": len(state.coverage_ledger),
+            "selected": sum(entry.selected for entry in state.coverage_ledger),
+            "by_disposition": dict(sorted(coverage_disposition_counts.items())),
+        },
     }
 
 
@@ -122,6 +143,8 @@ def build_analysis_state_projection(
             "assessments": len(state.assessments),
             "findings": len(state.findings),
             "attack_paths": len(state.paths),
+            "security_candidates": len(state.candidates),
+            "coverage_items": len(state.coverage_ledger),
             "cloud_identities": len(state.identities),
             "secret_references": len(state.secret_references),
         },

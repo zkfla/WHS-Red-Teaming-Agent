@@ -33,7 +33,15 @@ from cicd_redteam_agent.domain.proposal_draft import (
     expand_analysis_proposal_draft,
     indexed_relations,
 )
-from cicd_redteam_agent.domain.validator import apply_analysis_proposal
+from cicd_redteam_agent.domain.security_candidate import (
+    commit_candidate_decisions,
+    commit_frontier_decisions,
+    materialize_candidate_decisions,
+)
+from cicd_redteam_agent.domain.validator import (
+    apply_analysis_proposal,
+    novel_claim_contracts,
+)
 from cicd_redteam_agent.framework.working_memory import wrap_capabilities_with_memory
 from cicd_redteam_agent.security.redaction import redact
 from cicd_redteam_agent.security.repository_boundary import (
@@ -248,6 +256,18 @@ class ListAttackFrontiers(Capability):
 
         goal = self.context.objective_goal
         sink_hints = goal.sink_hints if goal else ()
+        if "privileged_execution" in sink_hints:
+            sink_hints = tuple(
+                dict.fromkeys(
+                    (
+                        *(item for item in sink_hints if item != "privileged_execution"),
+                        "github_token_write",
+                        "oidc_token",
+                        "cloud_identity",
+                        "secret_exposure",
+                    )
+                )
+            )
         if "cloud_identity" in sink_hints:
             sink_hints = tuple(item for item in sink_hints if item != "oidc_token")
         query = FrontierQuery(
@@ -288,7 +308,24 @@ class ListAttackFrontiers(Capability):
         policy = self.context.investigation_policy or decide_investigation_policy(
             result,
             self.context.state,
+            focused=bool(goal and goal.focused),
         )
+        selected_candidates = [
+            entry.as_dict(compact=True)["candidate"]
+            for entry in policy.portfolio
+            if entry.candidate is not None
+        ]
+        root_cause_keys = {candidate.root_cause_key for candidate in self.context.state.candidates}
+        terminal_root_cause_keys = {
+            root_cause_key
+            for root_cause_key in root_cause_keys
+            if all(
+                candidate.disposition.value
+                in {"ACCEPTED", "REJECTED", "BLOCKED_EXTERNAL", "MERGED"}
+                for candidate in self.context.state.candidates
+                if candidate.root_cause_key == root_cause_key
+            )
+        }
         payload.update(
             {
                 "frontiers": [item.as_dict() for item in page],
@@ -298,9 +335,28 @@ class ListAttackFrontiers(Capability):
                 "limit": limit,
                 "next_offset": next_offset if next_offset < len(frontiers) else None,
                 "objective_focus": goal.as_dict() if goal else None,
-                "investigation_policy": policy.as_dict(),
+                "investigation_policy": policy.as_dict(compact=True),
+                # Candidate details are already represented by the current deterministic
+                # portfolio.  Return them only on the first Frontier page; later pages are graph
+                # pagination, not a reason to resend the repository-wide Candidate universe.
+                "security_candidates": selected_candidates if offset == 0 else [],
+                "security_candidates_included": offset == 0,
+                "candidate_inventory": {
+                    "total_candidates": len(self.context.state.candidates),
+                    "root_cause_instances": len(root_cause_keys),
+                    "terminal_root_cause_instances": len(terminal_root_cause_keys),
+                    "remaining_root_cause_instances": (
+                        len(root_cause_keys) - len(terminal_root_cause_keys)
+                    ),
+                    "selected_candidate_representatives": len(selected_candidates),
+                },
+                "novel_claim_contracts": novel_claim_contracts(),
                 "guidance": (
-                    "Use proposal_ready COMPLETE frontiers as compact proposal candidates. "
+                    "Use canonical security_candidates as the primary semantic proposal "
+                    "candidates. "
+                    "Submit terminal candidate_decisions for every selected candidate in a broad "
+                    "objective. Use proposal_ready COMPLETE frontiers as graph investigation "
+                    "aids. "
                     "PARTIAL frontiers are diagnostics only and must never be submitted. BLOCKED "
                     "frontiers are terminal for that execution context and should not be "
                     "repeatedly investigated. UNKNOWN reasons marked EXTERNAL_REQUIRED cannot be "
@@ -353,6 +409,26 @@ class GetWorkflowFacts(Capability):
             "identities": [
                 item.model_dump(mode="json")
                 for item in self.context.state.identities
+                if item.workflow_id == workflow_id
+            ],
+            "security_candidates": [
+                {
+                        "candidate_id": item.candidate_id,
+                        "candidate_kind": item.candidate_kind.value,
+                        "root_cause_family": item.root_cause_family,
+                        "root_cause_key": item.root_cause_key,
+                    "status": item.status.value,
+                    "proposal_status_ceiling": item.proposal_status_ceiling.value,
+                    "disposition": item.disposition.value,
+                        "supporting_relation_ids": item.supporting_relation_ids,
+                        "evidence_requirements": [
+                            requirement.model_dump(mode="json")
+                            for requirement in item.evidence_requirements
+                        ],
+                        "missing_evidence": item.missing_evidence,
+                    "claim_contract": item.claim_contract.model_dump(mode="json"),
+                }
+                for item in self.context.state.candidates
                 if item.workflow_id == workflow_id
             ],
         }
@@ -450,7 +526,8 @@ class SubmitAnalysis(Capability):
     def describe(self) -> str:
         return (
             "Submit JSON as either a compact AnalysisProposalDraft (preferred) or a full "
-            "AnalysisProposal. Compact top-level keys are schema_version, finding_drafts, and "
+            "AnalysisProposal. Candidate-backed compact top-level keys are schema_version and "
+            "candidate_decisions; legacy compact keys are schema_version, finding_drafts, and "
             "path_drafts. Each path draft has path_id and ordered relation_refs such as R0001; "
             "the runtime derives exact nodes, edges, status, Evidence and missing evidence. "
             "Each finding draft has finding_id, rule_id, title, path_id, confidence, summary. "
@@ -465,7 +542,17 @@ class SubmitAnalysis(Capability):
             "target_id, evidence_ids. Each edge must connect nodes[i] to nodes[i+1], so "
             "len(edges) must equal len(nodes)-1. Include only one continuous chain, not "
             "branching facts, and copy the union of all edge Evidence IDs into the path's "
-            "evidence_ids. Confidence is LOW, MEDIUM, or HIGH."
+            "evidence_ids. Confidence is LOW, MEDIUM, or HIGH. Candidate decisions use "
+            "candidate_id, decision (ACCEPTED, REJECTED, BLOCKED_EXTERNAL, or MERGED), "
+            "optional selected_path_variant, confidence, and optional analyst_note. The runtime "
+            "supplies canonical rule, title, summary, status ceiling, Evidence and missing "
+            "evidence from the candidate contract. Frontier decisions use frontier_id, decision, "
+            "optional confidence, and optional analyst_note. In a mixed candidate/frontier batch, "
+            "an ACCEPTED frontier must be accompanied by exactly one path_draft containing an "
+            "exact allowed relation_refs path for that selected frontier. This is the only "
+            "path_draft allowed alongside candidate_decisions; do not add finding_drafts to a "
+            "candidate-backed mixed batch. REJECTED, BLOCKED_EXTERNAL, and MERGED frontier "
+            "decisions need no path_draft."
         )
 
     async def __call__(self, proposal_json: str) -> str:
@@ -474,9 +561,39 @@ class SubmitAnalysis(Capability):
             raw_proposal = json.loads(proposal_json)
             if not isinstance(raw_proposal, dict):
                 raise ValueError("proposal must be a JSON object")
-            if "finding_drafts" in raw_proposal or "path_drafts" in raw_proposal:
+            candidate_decisions = ()
+            frontier_decisions = ()
+            if (
+                "candidate_decisions" in raw_proposal
+                or "frontier_decisions" in raw_proposal
+                or "finding_drafts" in raw_proposal
+                or "path_drafts" in raw_proposal
+            ):
                 draft = AnalysisProposalDraft.model_validate(raw_proposal)
-                proposal = expand_analysis_proposal_draft(self.context.state, draft)
+                frontier_decisions = tuple(draft.frontier_decisions)
+                if draft.candidate_decisions:
+                    if draft.finding_drafts:
+                        raise ValueError(
+                            "candidate_decisions cannot be mixed with finding_drafts"
+                        )
+                    proposal, candidate_decisions = materialize_candidate_decisions(
+                        self.context.state,
+                        draft.candidate_decisions,
+                    )
+                    if draft.path_drafts:
+                        frontier_draft = draft.model_copy(
+                            update={
+                                "candidate_decisions": [],
+                                "frontier_decisions": [],
+                            }
+                        )
+                        frontier_proposal = expand_analysis_proposal_draft(
+                            self.context.state,
+                            frontier_draft,
+                        )
+                        proposal.paths.extend(frontier_proposal.paths)
+                else:
+                    proposal = expand_analysis_proposal_draft(self.context.state, draft)
             else:
                 proposal = AnalysisProposal.model_validate(raw_proposal)
         except (ProposalDraftError, ValueError) as exc:
@@ -486,25 +603,136 @@ class SubmitAnalysis(Capability):
                 return json.dumps({"accepted": False, "errors": ["analysis_already_submitted"]})
             policy = self.context.investigation_policy
             if policy is not None:
-                policy_errors = self._policy_errors(proposal, policy)
+                policy_errors = self._policy_errors(
+                    proposal,
+                    policy,
+                    candidate_decisions=candidate_decisions,
+                    frontier_decisions=frontier_decisions,
+                )
                 if policy_errors:
                     return json.dumps({"accepted": False, "errors": policy_errors})
             result = apply_analysis_proposal(self.context.state, proposal)
             if result.accepted:
-                self.context.submitted = True
+                if candidate_decisions:
+                    commit_candidate_decisions(self.context.state, candidate_decisions)
+                if frontier_decisions:
+                    commit_frontier_decisions(self.context.state, frontier_decisions)
+                batch_committed = bool(
+                    policy is not None
+                    and policy.transition is InvestigationTransition.INVESTIGATE
+                    and policy.decision_submission_allowed
+                    and not policy.focused
+                    and (candidate_decisions or frontier_decisions)
+                )
+                self.context.submitted = not batch_committed
+                if batch_committed:
+                    return json.dumps(
+                        {
+                            "accepted": True,
+                            "errors": [],
+                            "batch_committed": True,
+                            "analysis_complete": False,
+                        }
+                    )
         return result.model_dump_json()
 
     def _policy_errors(
         self,
         proposal: AnalysisProposal,
         policy: InvestigationPolicy,
+        *,
+        candidate_decisions=(),
+        frontier_decisions=(),
     ) -> list[str]:
-        if policy.transition is not InvestigationTransition.SUBMIT:
+        if (
+            policy.transition is not InvestigationTransition.SUBMIT
+            and not policy.decision_submission_allowed
+        ):
             return [f"submission_transition_not_ready:{policy.transition.value}"]
+        relation_by_ref = dict(indexed_relations(self.context.state))
+        selected_candidates = {
+            entry.candidate.candidate_id
+            for entry in policy.portfolio
+            if entry.candidate is not None
+        }
+        if selected_candidates:
+            decision_ids = {decision.candidate_id for decision in candidate_decisions}
+            if not candidate_decisions:
+                return ["candidate_decisions_required_for_selected_portfolio"]
+            outside = decision_ids - selected_candidates
+            if outside:
+                return [
+                    "candidate_decision_outside_selected_portfolio:"
+                    + ",".join(sorted(outside))
+                ]
+            missing = selected_candidates - decision_ids
+            if missing:
+                return [
+                    "selected_candidate_without_terminal_disposition:"
+                    + ",".join(sorted(missing))
+                ]
+        selected_frontiers = {
+            entry.frontier.frontier_id
+            for entry in policy.portfolio
+            if entry.frontier is not None
+        }
+        # Keep the pre-candidate frontier-only contract compatible for states that contain no
+        # semantic candidates. Candidate-aware portfolios must explicitly account for every
+        # selected graph frontier so broad coverage cannot be silently skipped.
+        if selected_frontiers and (selected_candidates or self.context.state.candidates):
+            frontier_decision_ids = {
+                decision.frontier_id for decision in frontier_decisions
+            }
+            if not frontier_decisions:
+                return ["frontier_decisions_required_for_selected_portfolio"]
+            outside = frontier_decision_ids - selected_frontiers
+            if outside:
+                return [
+                    "frontier_decision_outside_selected_portfolio:"
+                    + ",".join(sorted(outside))
+                ]
+            missing = selected_frontiers - frontier_decision_ids
+            if missing:
+                return [
+                    "selected_frontier_without_terminal_disposition:"
+                    + ",".join(sorted(missing))
+                ]
+            accepted_frontiers = {
+                decision.frontier_id
+                for decision in frontier_decisions
+                if decision.decision.value == "ACCEPTED"
+            }
+            frontier_relation_paths = {
+                entry.frontier.frontier_id: tuple(
+                    relation.relation_id
+                    for reference in entry.frontier.relation_refs
+                    if (relation := relation_by_ref.get(reference)) is not None
+                )
+                for entry in policy.portfolio
+                if entry.frontier is not None
+            }
+            submitted_path_keys = {
+                tuple(edge.relation_id for edge in path.edges)
+                for path in proposal.paths
+            }
+            missing_frontier_paths = {
+                frontier_id
+                for frontier_id in accepted_frontiers
+                if frontier_relation_paths.get(frontier_id) not in submitted_path_keys
+            }
+            if missing_frontier_paths:
+                return [
+                    "accepted_frontier_without_grounded_path:"
+                    + ",".join(sorted(missing_frontier_paths))
+                ]
         if not proposal.paths:
+            if candidate_decisions and all(
+                decision.decision.value != "ACCEPTED"
+                for decision in candidate_decisions
+            ):
+                return []
             return [] if policy.empty_submission_allowed else ["empty_submission_not_allowed"]
 
-        relation_by_ref = dict(indexed_relations(self.context.state))
         allowed = {
             tuple(
                 relation.relation_id
@@ -513,10 +741,24 @@ class SubmitAnalysis(Capability):
             )
             for references in policy.allowed_relation_ref_paths
         }
+        selected_candidate_paths = {
+            (
+                candidate.candidate_id,
+                tuple(edge.relation_id for edge in variant.edges),
+            )
+            for entry in policy.portfolio
+            if entry.candidate is not None
+            for candidate in (entry.candidate,)
+            for variant in candidate.path_variants
+        }
         rejected = [
             path.path_id
             for path in proposal.paths
-            if tuple(edge.relation_id for edge in path.edges) not in allowed
+            if (
+                path.candidate_id,
+                tuple(edge.relation_id for edge in path.edges),
+            ) not in selected_candidate_paths
+            and tuple(edge.relation_id for edge in path.edges) not in allowed
         ]
         if rejected:
             return [f"proposal_path_outside_selected_portfolio:{','.join(sorted(rejected))}"]

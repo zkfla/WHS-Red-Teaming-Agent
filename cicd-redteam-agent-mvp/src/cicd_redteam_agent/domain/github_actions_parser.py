@@ -315,7 +315,7 @@ def parse_workflow(boundary: RepositoryBoundary, relative_path: str) -> Workflow
             evidence[step_ev.evidence_id] = step_ev
             step_evidence_ids = [step_ev.evidence_id]
             field_evidence: dict[str, str] = {}
-            for field_name in ("uses", "run", "with", "env", "if"):
+            for field_name in ("uses", "run", "with", "env", "if", "working-directory"):
                 if raw_step.get(field_name) is None:
                     continue
                 field_line = _mapping_key_line(raw_step, field_name, step_line)
@@ -368,6 +368,11 @@ def parse_workflow(boundary: RepositoryBoundary, relative_path: str) -> Workflow
                 uses=uses,
                 run=run,
                 shell=str(raw_step["shell"]) if raw_step.get("shell") is not None else None,
+                working_directory=(
+                    redact(str(raw_step["working-directory"]))
+                    if raw_step.get("working-directory") is not None
+                    else None
+                ),
                 env=env,
                 **{"with": with_values},
                 references=sorted(set(references)),

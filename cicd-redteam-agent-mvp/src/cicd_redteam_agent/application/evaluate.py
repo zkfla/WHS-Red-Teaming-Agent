@@ -38,6 +38,11 @@ def collect_agent_behavior(report: AnalysisReport) -> dict[str, object]:
     hypothesis_statuses = Counter(
         hypothesis.status.value for hypothesis in state.working_memory.hypotheses
     )
+    candidate_statuses = Counter(candidate.status.value for candidate in state.candidates)
+    candidate_dispositions = Counter(
+        candidate.disposition.value for candidate in state.candidates
+    )
+    selected_coverage = [entry for entry in state.coverage_ledger if entry.selected]
     runtime = report.run_metadata.get("agent_runtime") or {}
     return {
         "status": report.status.value,
@@ -51,9 +56,31 @@ def collect_agent_behavior(report: AnalysisReport) -> dict[str, object]:
         "working_memory_revision": state.working_memory.revision,
         "hypothesis_count": len(state.working_memory.hypotheses),
         "hypothesis_statuses": dict(sorted(hypothesis_statuses.items())),
+        "candidate_count": len(state.candidates),
+        "candidate_statuses": dict(sorted(candidate_statuses.items())),
+        "candidate_dispositions": dict(sorted(candidate_dispositions.items())),
+        "candidate_root_causes": sorted(
+            {candidate.root_cause_key for candidate in state.candidates}
+        ),
+        "candidate_root_cause_families": sorted(
+            {
+                candidate.root_cause_family or candidate.root_cause_key
+                for candidate in state.candidates
+            }
+        ),
+        "coverage_item_count": len(state.coverage_ledger),
+        "selected_coverage_item_count": len(selected_coverage),
+        "unresolved_selected_coverage_count": sum(
+            entry.disposition.value in {"UNREVIEWED", "INVESTIGATING"}
+            for entry in selected_coverage
+        ),
         "model_attempts": int(runtime.get("model_attempts", 0)),
         "model_retries": int(runtime.get("retries", 0)),
         "context_compactions": int(runtime.get("context_compactions", 0)),
+        "frontier_searches": int(runtime.get("frontier_searches", 0)),
+        "investigation_tasks_completed": int(runtime.get("investigation_tasks_completed", 0)),
+        "observations_committed": int(runtime.get("observations_committed", 0)),
+        "semantic_refreshes": int(runtime.get("semantic_refreshes", 0)),
     }
 
 

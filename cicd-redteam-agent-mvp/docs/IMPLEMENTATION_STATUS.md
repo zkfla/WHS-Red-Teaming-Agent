@@ -21,11 +21,13 @@ Event-scoped execution semantics
         ↓
 Fact / Relation / Guard / Evidence extraction
         ↓
-deterministic graph
+canonical SecurityCandidate generation
+        ↓
+Candidate + AttackFrontier portfolio
         ↓
 optional read-only GitHub observation → semantic recompute
         ↓
-optional LLM reasoning
+optional LLM reasoning over the same Candidates
         ↓
 deterministic validator
         ↓
@@ -38,6 +40,9 @@ analysis.json + summary.md + trace.jsonl
 - 확인하지 못한 외부·실행 시점 상태는 `UNKNOWN`으로 유지합니다.
 - `--observe-github`에서는 selected Frontier에 필요한 GitHub repository policy와 선택적 run-time
   상태만 typed Observation으로 관찰하고 execution semantics와 guard를 재계산합니다.
+- deterministic와 reasoning은 동일한 `SecurityCandidate` 집합으로 시작합니다. deterministic는
+  이를 Finding/AttackPath로 materialize하고, reasoning은 Candidate 조사·반증·보강 후
+  candidate-backed decision으로 결과를 materialize합니다.
 - LLM은 Fact를 연결해 제안하고, 최종 판정은 코드 Validator가 수행합니다.
 - Reasoning 분석은 선택적으로 trusted 자연어 Objective를 받아 조사 목표를 좁힐 수 있습니다.
   Objective는 system policy나 Validator를 덮지 못하며 repository/tool 출력과 분리됩니다.
@@ -56,6 +61,8 @@ analysis.json + summary.md + trace.jsonl
 | Artifact 경로 | 완료 | PR 생산 → 특권 workflow 다운로드·실행 → Token |
 | Cache 경로 | 완료 | PR merge-ref cache 오염 경로 + low-trust default-branch cache read-only 정책 구분 |
 | Mutable dependency 경로 | 완료 | 외부 Action·workflow·image·install source를 Candidate로 연결 |
+| Build/package lifecycle side effect | 완료(Node 1차) | package install → repository-local `file:`/`link:` dependency → install lifecycle → literal script의 network/workspace/process side effect를 실행 없이 Relation/Candidate로 연결 |
+| Runtime telemetry ingestion | 완료(collector 제외) | trusted operator JSONL의 normalized network/file/process event를 exact workflow/job/step에 결합하고 Observation → semantic recompute → runtime Candidate로 반영 |
 | OIDC·Cloud Identity | 완료 | action 인증 모드 + GitHub aud/sub + AWS IAM trust의 TRUE/FALSE/UNKNOWN 판정 |
 | Secret 흐름 | 부분 구현 | env, shell, output, file, artifact, 외부 action Fact 추출 |
 | Reusable workflow | 부분 구현 | local caller→callee context와 permission ceiling은 deterministic, 외부 callee 상태는 `UNKNOWN` |
@@ -66,7 +73,9 @@ analysis.json + summary.md + trace.jsonl
 | 자연어 Reasoning Objective | 완료 | 대화형 입력, text/file/explicit stdin, trust boundary, checkpoint/resume 보존 |
 | Objective Goal compilation | 완료 | source/mechanism/sink 힌트, goal-aware Fact 우선순위, verdict 비간섭 |
 | Goal-aware Graph Frontier | 완료 | context-sensitive source→sink 후보, guard 우선 차단, diversity/limit metadata |
-| Deterministic 조사 정책 | 완료 | candidate score, 6개 portfolio, 가설 reconciliation, OBSERVE/INVESTIGATE/SUBMIT/STOP_PARTIAL gate |
+| Canonical SecurityCandidate pipeline | 완료 | 기존 scenario composer 재사용, deterministic/reasoning parity, claim ceiling, root-cause representative Candidate+Frontier portfolio |
+| Deterministic 조사 정책 | 완료 | candidate score, 최대 6개 batch, broad multi-batch root-cause coverage, focused 범위 유지, OBSERVE/INVESTIGATE/SUBMIT/STOP_PARTIAL gate |
+| Execution/privilege 의미론 | 완료 | ordinary attacker-controlled execution은 `execution`; write Token/Secret/OIDC/Cloud 등 explicit sensitive capability와 분리 |
 | Reasoning matrix 평가 | 완료 | 10개 그룹 × 3개 variant의 정확도·시간 표 자동 생성 |
 | GitHub API 관찰 | 부분 구현 | Generic Evidence A-G resolver/transport와 semantic recompute 완료; P0 actor/run/current-permission, P1 event linkage/principal, P2 workflow-run status/jobs/steps를 controlled private fixtures에서 live 검증하고 해당 slices freeze 완료; runner cleanup·historical authorization·Cloud trust는 후속 범위 |
 | `if`·actor/status/dependency 의미론 | 완료(offline 검증) | P4 truth/reachability와 attacker satisfier를 분리하고 `contains/startsWith/endsWith`, event-aware refs, repository/actor/label trust 및 canonical Frontier guard/source를 구현; wildcard `needs.*`, matrix aggregate, historical event-time permission과 exact label revision binding은 근거 없으면 `UNKNOWN` |
@@ -75,6 +84,7 @@ analysis.json + summary.md + trace.jsonl
 | Audit log·Runner 심층 조사 | 부분 구현 | workflow-run job/runner identity는 조회, cleanup·ephemeral 설정과 audit history는 미구현 |
 | Production·Kubernetes 영향 검증 | 미구현 | Token과 Cloud Identity 후보를 최종 sink로 사용 |
 | 실제 공격·배포 실행 | 미구현 | 프로토타입 안전 경계상 의도적으로 제외 |
+| Runtime telemetry collector/instrumentation | 미구현 | 현재는 외부에서 수집·정규화한 trusted telemetry만 입력하며 runner sensor/eBPF/auditd/workflow 실행은 수행하지 않음 |
 
 ## 데모 핵심 시나리오
 
@@ -158,6 +168,20 @@ uv run cicd-agent evaluate tests/fixtures/reasoning-matrix `
 일반 reasoning 분석의 긴 Objective는 `--objective-file`로 전달할 수 있으며 stdin은
 `--objective-file -`를 지정한 경우에만 읽습니다. 분석 대상 저장소 내부 파일은 trusted
 Objective source로 사용할 수 없습니다.
+
+### P0 고정 Goat 벤치마크 (워크플로 실행 없음)
+
+```powershell
+uv run python tests/benchmarks/p0_goat_benchmark.py `
+  --goat-root output/benchmark-target/github-actions-goat `
+  --output output/p0-goat-benchmark
+```
+
+벤치마크는 `step-security/github-actions-goat`의 커밋
+`4da23c8602b4589bacdf7de77240113e02cdb884`와 clean checkout을 확인한 뒤 정적 분석합니다.
+이후 동일 상태에서 reasoning 초기 Candidate parity, root-cause representative multi-batch
+coverage, 최종 `SUBMIT`, candidate-backed 제출과 `execution != privileged_execution` Frontier
+의미론을 외부 LLM 없이 스모크합니다. workflow/action은 실행하지 않습니다.
 
 ## 데모 절차
 

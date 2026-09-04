@@ -14,8 +14,9 @@ from cicd_redteam_agent.application.objective import (
 from cicd_redteam_agent.application.report import write_report
 from cicd_redteam_agent.application.state import create_initial_state
 from cicd_redteam_agent.domain.attack_graph import compose_global_attack_paths
-from cicd_redteam_agent.domain.attacker_control import assess_attacker_control, derive_attack_paths
+from cicd_redteam_agent.domain.attacker_control import assess_attacker_control
 from cicd_redteam_agent.domain.aws_oidc import derive_aws_oidc_trust_assessments
+from cicd_redteam_agent.domain.build_semantics import derive_build_semantics
 from cicd_redteam_agent.domain.evidence_requirement import annotate_external_evidence_requirements
 from cicd_redteam_agent.domain.execution_semantics import derive_execution_semantics
 from cicd_redteam_agent.domain.github_actions_parser import discover_workflows, parse_workflow
@@ -30,7 +31,11 @@ from cicd_redteam_agent.domain.models import (
     TraceMetadata,
 )
 from cicd_redteam_agent.domain.reference_tracer import trace_local_references
-from cicd_redteam_agent.domain.scenario_rules import derive_additional_scenario_results
+from cicd_redteam_agent.domain.security_candidate import (
+    derive_security_candidates,
+    materialize_candidate_results,
+    reconcile_candidate_state,
+)
 from cicd_redteam_agent.domain.security_facts import derive_security_facts
 from cicd_redteam_agent.framework.auth import ModelProvider
 from cicd_redteam_agent.security.redaction import redact
@@ -57,6 +62,7 @@ class AnalysisConfig:
     aws_profile: str | None = None
     github_run_id: int | None = None
     github_event_locator: GitHubEventLocator | None = None
+    runtime_telemetry_file: Path | None = None
 
     def __post_init__(self) -> None:
         if self.objective is not None:
@@ -148,6 +154,11 @@ def _finalize_analysis(
         "observe_aws": config.observe_aws,
         "aws_profile": config.aws_profile,
         "github_run_id": config.github_run_id,
+        "runtime_telemetry_file": (
+            str(config.runtime_telemetry_file)
+            if config.runtime_telemetry_file is not None
+            else None
+        ),
         "github_event_locator": (
             config.github_event_locator.model_dump(mode="json")
             if config.github_event_locator is not None
@@ -187,6 +198,8 @@ async def analyze_repository(
         raise ValueError("--github-run-id requires --observe-github")
     if config.github_event_locator is not None and not config.observe_github:
         raise ValueError("GitHub event provenance requires --observe-github")
+    if config.runtime_telemetry_file is not None and mode is AnalysisMode.DETERMINISTIC:
+        raise ValueError("--runtime-telemetry-file requires reasoning mode")
     if (
         mode is AnalysisMode.REASONING
         and not config.model
@@ -242,6 +255,10 @@ async def analyze_repository(
         state.relations.extend(relations)
         state.evidence.update(reference_evidence)
         warnings.extend(reference_warnings)
+        build_relations, build_evidence, build_warnings = derive_build_semantics(state, boundary)
+        state.relations.extend(build_relations)
+        state.evidence.update(build_evidence)
+        warnings.extend(build_warnings)
         state.assessments = assess_attacker_control(state, config.attacker_profile)
         execution_semantics = derive_execution_semantics(state, config.attacker_profile)
         state.trigger_contexts = execution_semantics.trigger_contexts
@@ -260,11 +277,12 @@ async def analyze_repository(
             }
         )
         state.identities = derive_identity_candidates(state)
+        state.candidates, state.coverage_ledger = reconcile_candidate_state(
+            (),
+            derive_security_candidates(state),
+        )
         if mode is AnalysisMode.DETERMINISTIC:
-            state.findings, state.paths = derive_attack_paths(state)
-            additional_findings, additional_paths = derive_additional_scenario_results(state)
-            state.findings.extend(additional_findings)
-            state.paths.extend(additional_paths)
+            state.findings, state.paths = materialize_candidate_results(state.candidates)
             graph_relations, global_paths = compose_global_attack_paths(
                 state, config.attacker_profile
             )
@@ -371,6 +389,11 @@ async def resume_analysis(
         github_event_locator=(
             GitHubEventLocator.model_validate(saved["github_event_locator"])
             if saved.get("github_event_locator") is not None
+            else None
+        ),
+        runtime_telemetry_file=(
+            Path(str(saved["runtime_telemetry_file"]))
+            if saved.get("runtime_telemetry_file")
             else None
         ),
     )

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-RELATION_SEMANTICS_VERSION = "1.4"
+RELATION_SEMANTICS_VERSION = "1.6"
 
 
 @dataclass(frozen=True)
@@ -77,23 +77,29 @@ _MECHANISM_RELATIONS = {
     "secret_rotation_age_exceeds_policy": ("secret_metadata", "rotation"),
     "audit_window_observed_for_repository": ("audit",),
     "audit_event_observed": ("audit",),
+    "step_runs_package_install": ("package_install",),
+    "package_manifest_declares_local_dependency": ("dependency_resolution",),
+    "dependency_install_executes_lifecycle_script": ("package_lifecycle",),
+    "script_performs_external_network_request": ("package_lifecycle", "network"),
+    "script_modifies_workspace_file": ("package_lifecycle", "file_change"),
+    "script_spawns_process": ("package_lifecycle", "shell_execution"),
 }
 
 _SINK_RELATIONS = {
-    "env_value_interpreted_as_command": "privileged_execution",
-    "env_value_reaches_execution": "privileged_execution",
-    "untrusted_input_reaches_execution": "privileged_execution",
-    "untrusted_value_interpreted_as_command": "privileged_execution",
-    "untrusted_input_interpreted_by_github_script": "privileged_execution",
-    "untrusted_input_selects_checkout_revision": "privileged_execution",
-    "workspace_revision_reaches_execution": "privileged_execution",
-    "artifact_content_reaches_command_argument": "privileged_execution",
-    "artifact_content_reaches_execution": "privileged_execution",
-    "artifact_content_reaches_import": "privileged_execution",
-    "cache_restores_executable_or_dependency_path": "privileged_execution",
-    "repository_file_executes_in": "privileged_execution",
-    "repository_file_imported_or_loaded_by": "privileged_execution",
-    "attacker_code_executes_on_self_hosted_runner": "privileged_execution",
+    "env_value_interpreted_as_command": "execution",
+    "env_value_reaches_execution": "execution",
+    "untrusted_input_reaches_execution": "execution",
+    "untrusted_value_interpreted_as_command": "execution",
+    "untrusted_input_interpreted_by_github_script": "execution",
+    "untrusted_input_selects_checkout_revision": "execution",
+    "workspace_revision_reaches_execution": "execution",
+    "artifact_content_reaches_command_argument": "execution",
+    "artifact_content_reaches_execution": "execution",
+    "artifact_content_reaches_import": "execution",
+    "cache_restores_executable_or_dependency_path": "execution",
+    "repository_file_executes_in": "execution",
+    "repository_file_imported_or_loaded_by": "execution",
+    "attacker_code_executes_on_self_hosted_runner": "execution",
     "secret_may_reach_log": "secret_exposure",
     "secret_passed_to_external_action": "secret_exposure",
     "secret_reaches_external_send": "secret_exposure",
@@ -104,6 +110,11 @@ _SINK_RELATIONS = {
     "oidc_may_assume_cloud_identity": "cloud_identity",
     "static_cloud_credential_may_authenticate_identity": "cloud_identity",
     "executes_with_effective_write_github_token": "github_token_write",
+    "script_performs_external_network_request": "network_egress",
+    "script_modifies_workspace_file": "workspace_mutation",
+    "script_spawns_process": "execution",
+    "runtime_process_made_external_network_call": "network_egress",
+    "runtime_process_modified_workspace_file": "workspace_mutation",
 }
 
 _PLUMBING_RELATIONS = {

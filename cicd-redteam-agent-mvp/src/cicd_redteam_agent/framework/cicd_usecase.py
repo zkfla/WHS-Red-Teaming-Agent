@@ -17,7 +17,7 @@ from cicd_redteam_agent.domain.investigation_policy import (
     InvestigationRuntimeState,
     InvestigationTransition,
     decide_investigation_policy,
-    select_frontier_portfolio,
+    select_investigation_portfolio,
 )
 from cicd_redteam_agent.domain.models import AttackerProfile
 from cicd_redteam_agent.framework.capabilities import CapabilityContext
@@ -197,6 +197,18 @@ class CICDUseCase:
     ) -> InvestigationPolicy:
         goal = self.context.objective_goal
         sink_hints = goal.sink_hints if goal else ()
+        if "privileged_execution" in sink_hints:
+            sink_hints = tuple(
+                dict.fromkeys(
+                    (
+                        *(item for item in sink_hints if item != "privileged_execution"),
+                        "github_token_write",
+                        "oidc_token",
+                        "cloud_identity",
+                        "secret_exposure",
+                    )
+                )
+            )
         if "cloud_identity" in sink_hints:
             sink_hints = tuple(item for item in sink_hints if item != "oidc_token")
         query = FrontierQuery(
@@ -210,7 +222,11 @@ class CICDUseCase:
         runtime_metrics = getattr(self.agent, "runtime_metrics", None)
         if runtime_metrics is not None:
             runtime_metrics.frontier_searches += 1
-        portfolio = select_frontier_portfolio(result, self.context.state)
+        portfolio = select_investigation_portfolio(
+            result,
+            self.context.state,
+            limit=1 if goal and goal.focused else 6,
+        )
         reconciliation = reconcile_working_memory(self.context.state, result)
         planned_task = None
         if (
@@ -238,10 +254,13 @@ class CICDUseCase:
             observation_ready=planned_task is not None,
             runtime=runtime,
             selected_portfolio=portfolio,
+            focused=bool(goal and goal.focused),
         )
         self.context.investigation_policy = policy
         if hasattr(self.agent, "investigation_policy"):
-            self.agent.investigation_policy = policy.as_dict()
+            # The model only needs the current bounded portfolio plus aggregate coverage state.
+            # The canonical policy object on CapabilityContext retains the full ledger.
+            self.agent.investigation_policy = policy.as_dict(compact=True)
         if reconciliation.changed:
             self.context.frontier_cache.clear()
             if self.event_journal is not None:
@@ -262,6 +281,10 @@ class CICDUseCase:
                 payload={
                     "transition": policy.transition.value,
                     "portfolio_size": len(policy.portfolio),
+                    "candidate_coverage_complete": policy.candidate_coverage_complete,
+                    "decision_submission_allowed": policy.decision_submission_allowed,
+                    "search_complete": policy.search_complete,
+                    "truncated": policy.truncated,
                     "empty_submission_allowed": policy.empty_submission_allowed,
                     "stop_reason": policy.stop_reason,
                 },

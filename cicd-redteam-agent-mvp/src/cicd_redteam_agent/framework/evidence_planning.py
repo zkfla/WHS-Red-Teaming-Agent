@@ -198,8 +198,49 @@ def compile_evidence_requirements(
 
     for entry in portfolio:
         frontier = entry.frontier
-        relation_refs = set(frontier.relation_refs)
-        relation_refs.update(guard.relation_ref for guard in frontier.guards)
+        candidate = entry.candidate
+        if frontier is None and candidate is None:
+            continue
+        if frontier is not None:
+            relation_refs = set(frontier.relation_refs)
+            relation_refs.update(guard.relation_ref for guard in frontier.guards)
+            direct_refs = ()
+            item_id = frontier.frontier_id
+        else:
+            assert candidate is not None
+            relation_refs = {
+                reference
+                for reference, relation in relation_by_ref.items()
+                if relation.relation_id
+                in set(candidate.supporting_relation_ids + candidate.contradicting_relation_ids)
+            }
+            direct_refs = tuple(candidate.evidence_requirements)
+            item_id = candidate.candidate_id
+        for direct_ref in direct_refs:
+            if _requirement_resolved(session, direct_ref):
+                continue
+            key = (direct_ref.kind, direct_ref.subject_id, direct_ref.qualifier)
+            merged[key] = EvidenceRequirement(
+                requirement_id=requirement_id_for(
+                    direct_ref.kind,
+                    direct_ref.subject_id,
+                    qualifier=direct_ref.qualifier,
+                ),
+                kind=direct_ref.kind,
+                provider=direct_ref.provider,
+                subject_id=direct_ref.subject_id,
+                qualifier=direct_ref.qualifier,
+                basis_relation_ids=list(candidate.supporting_relation_ids)
+                if candidate is not None
+                else [],
+                frontier_ids=[item_id],
+                priority=1000 - entry.rank * 100 + entry.score.information_gain,
+                reason=f"selected investigation item requires {direct_ref.kind.value}",
+                freshness=EvidenceFreshness(
+                    scope="resume-revalidate",
+                    revalidate_on_resume=True,
+                ),
+            )
         for reference in sorted(relation_refs):
             relation = relation_by_ref.get(reference)
             if relation is None:
@@ -227,9 +268,9 @@ def compile_evidence_requirements(
                     subject_id=ref.subject_id,
                     qualifier=ref.qualifier,
                     basis_relation_ids=basis,
-                    frontier_ids=[frontier.frontier_id],
+                    frontier_ids=[item_id],
                     priority=1000 - entry.rank * 100 + entry.score.information_gain,
-                    reason=f"selected Frontier requires {ref.kind.value}",
+                    reason=f"selected investigation item requires {ref.kind.value}",
                     freshness=EvidenceFreshness(
                         scope="resume-revalidate",
                         revalidate_on_resume=True,
@@ -245,7 +286,7 @@ def compile_evidence_requirements(
                                 set(previous.basis_relation_ids + basis)
                             ),
                             "frontier_ids": sorted(
-                                set(previous.frontier_ids + [frontier.frontier_id])
+                                set(previous.frontier_ids + [item_id])
                             ),
                             "priority": max(previous.priority, requirement.priority),
                         }

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from cicd_redteam_agent.domain.attacker_control import assess_attacker_control
 from cicd_redteam_agent.domain.aws_oidc import derive_aws_oidc_trust_assessments
+from cicd_redteam_agent.domain.build_semantics import derive_build_semantics
 from cicd_redteam_agent.domain.evidence_requirement import (
     annotate_external_evidence_requirements,
     evidence_key,
@@ -37,6 +38,10 @@ from cicd_redteam_agent.domain.models import (
     RepositoryWorkflowPermissionDefault,
 )
 from cicd_redteam_agent.domain.reference_tracer import trace_local_references
+from cicd_redteam_agent.domain.security_candidate import (
+    derive_security_candidates,
+    reconcile_candidate_state,
+)
 from cicd_redteam_agent.domain.security_facts import derive_security_facts
 from cicd_redteam_agent.security.repository_boundary import RepositoryBoundary
 
@@ -223,6 +228,9 @@ def rebuild_semantic_snapshot(
     relations, reference_evidence, _ = trace_local_references(state.workflows, boundary)
     state.relations.extend(relations)
     state.evidence.update(reference_evidence)
+    build_relations, build_evidence, _ = derive_build_semantics(state, boundary)
+    state.relations.extend(build_relations)
+    state.evidence.update(build_evidence)
     state.assessments = assess_attacker_control(state, profile)
 
     execution = derive_execution_semantics(
@@ -277,4 +285,10 @@ def rebuild_semantic_snapshot(
         }
     )
     state.identities = derive_identity_candidates(state)
+    derived_candidates = derive_security_candidates(state)
+    state.candidates, state.coverage_ledger = reconcile_candidate_state(
+        runtime.candidates,
+        derived_candidates,
+        runtime.coverage_ledger,
+    )
     return state

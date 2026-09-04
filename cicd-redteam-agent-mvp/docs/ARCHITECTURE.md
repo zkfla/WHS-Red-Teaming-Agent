@@ -7,14 +7,22 @@ CLI
 -> RepositoryBoundary
 -> GitHub Actions parser
 -> Evidence and local reference extraction
+-> build/package lifecycle semantics
+   -> package install / repository-local dependency / lifecycle script
+   -> bounded network / workspace / process side-effect Relations
 -> attacker-control assessment
 -> event-scoped execution semantics
    -> TriggerExecutionContext / JobExecutionContext
    -> permission lattice / reachability / trust provenance
 -> reusable security fact graph and identity assessment
--> analysis mode split
-   -> deterministic: scenario rules -> global AttackPath composition
-   -> reasoning: hackingBuddyGPT Agent loop
+-> canonical SecurityCandidate derivation
+-> diversified Candidate + AttackFrontier investigation portfolio
+-> optional typed Observation
+   -> GitHub read-only evidence or trusted operator runtime telemetry
+   -> semantic recompute
+-> analysis mode
+   -> deterministic: Candidate -> Finding / AttackPath materialization -> global paths
+   -> reasoning: hackingBuddyGPT Agent loop over the same Candidates
       -> LiteLLM API-key adapter or Codex ChatGPT-login LLM adapter
       -> deterministic proposal validation
 -> analysis.json, summary.md, trace.jsonl
@@ -27,6 +35,14 @@ Agent investigates but cannot override the system policy, trust boundary, Eviden
 Capability limits or deterministic validator. A bounded deterministic compiler derives structured
 source/mechanism/sink hints from the Objective. Those hints affect investigation priority only and
 never create or alter Evidence, Relations, verdicts, guards or final statuses.
+
+`build_semantics` is execution-free. It follows only statically resolvable build/package commands,
+repository-local package dependencies, install lifecycle hooks and literal repository scripts. Its
+network/workspace/process Relations describe reachable build-time side effects, not observed
+exploitation. Optional `RuntimeTelemetryEvidence` is ingested through a bounded resolver from a
+trusted operator path outside the analyzed repository, bound only to a unique workflow/job/step,
+and then fed through the same semantic recompute path. Collection/instrumentation is intentionally
+outside this component.
 
 LiteLLM uses the explicitly resolved provider credential. `CodexChatGPTLLM` implements the same
 hackingBuddyGPT `LLM.get_response` boundary using the official Python SDK and saved ChatGPT login.
@@ -140,11 +156,40 @@ are loaded after analysis and are never visible to the parser, fact extractor, A
 prompt. A separate unlabeled blind fixture combines a fork PR, local action, artifact/cache,
 privileged workflow and GitHub Token/OIDC sinks.
 
-Deterministic and reasoning modes share parsing, Evidence and reusable fact extraction, then diverge
-at conclusion generation. Deterministic mode keeps the legacy scenario rules and global composer for
-fast/reproducible analysis. Reasoning mode does not prepopulate or expose deterministic Findings or
-AttackPaths; the Agent derives them from the fact graph and the validator accepts or rejects the
-proposal.
+Both modes share parsing, Evidence, reusable fact extraction and the canonical
+`derive_security_candidates()` entry point. Deterministic mode materializes those Candidates into
+the legacy scenario Findings/AttackPaths and adds global paths for fast, reproducible output.
+Reasoning mode starts with the same Candidate IDs, kinds, root causes, status ceilings and semantic
+grounding, but keeps Finding/AttackPath materialization empty until the Agent selects a candidate or
+typed novel graph claim. The Agent investigates Candidates, uses Frontier rows for graph
+exploration, and the validator remains the final authority.
+
+## Candidate and investigation boundaries
+
+`SecurityCandidate` is the canonical semantic vulnerability hypothesis. It owns the bounded claim
+contract, proposal status ceiling, candidate kind/root-cause family/root-cause instance identity,
+supporting/contradicting Relations, guards, Evidence, missing Evidence, EvidenceRequirements and
+alternative grounded path variants. Its semantic grounding uses actual typed Relations; structural
+`contains_job`/`contains_step` edges remain path topology only. `AttackFrontier` remains a
+context-sensitive graph-search state; `WorkingHypothesis` remains short LLM investigation memory;
+`PortfolioEntry` is only the scheduling wrapper that can contain either one.
+
+The portfolio is bounded and diversity-aware across root cause, candidate kind, mechanism/sink
+families, execution context and Relation overlap. Broad runs schedule one deterministic
+representative per uncovered `root_cause_key`. A complete terminal decision set may be committed
+while the policy still reports `INVESTIGATE` with `decision_submission_allowed=true`; terminal root
+causes are removed from later batches and the next uncovered representatives are selected. Final
+`SUBMIT` is allowed only after all eligible root-cause instances are terminal. Focused runs retain
+their bounded one-scope behavior. Candidate `ACCEPTED` decisions are materialized from the canonical
+contract, so model prose cannot raise the claim ceiling. Typed novel graph claims remain available
+through a finite source/mechanism/sink contract registry.
+
+Frontier semantics distinguish attacker-controlled `execution` from privilege. Relations such as
+`workspace_revision_reaches_execution`, `repository_file_executes_in` and shell/artifact execution
+terminate an ordinary `execution` frontier but traversal may continue through the same context to an
+explicit sensitive sink such as `github_token_write`, `oidc_token`, `cloud_identity` or
+`secret_exposure`. The graph therefore no longer labels repository execution itself as
+`privileged_execution`.
 
 ## Responsibility boundaries
 

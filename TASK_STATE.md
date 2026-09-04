@@ -150,7 +150,7 @@ AttackPath, CloudIdentityCandidate를 재현 가능하게 생성한다.
   기본 차단하고 명시적 unsafe opt-out/manual fetch는 별도 처리한다. Cache는 `pull_request`의
   merge-ref scope는 read-write로 유지하되 `pull_request_target`, `issue_comment`, `workflow_run`
   default-branch context는 read-only로 모델링한다.
-- semantic-state resume 비호환을 막기 위해 prompt/runtime contract를 현재 1.6으로 올렸다.
+- semantic-state resume 비호환을 막기 위해 prompt/runtime contract를 현재 1.8로 올렸다.
 - `ListAttackFrontiers`를 추가했다. fail-closed Relation semantic registry와 bounded graph traversal이
   trigger/job context, flow label, permission state와 trust provenance를 함께 추적하고, 같은 실행
   context의 hard guard/FALSE Relation을 조기에 `BLOCKED` 처리한다. 단순 trigger→write authority는
@@ -290,9 +290,10 @@ AttackPath, CloudIdentityCandidate를 재현 가능하게 생성한다.
 
 ## Key Decisions
 
-- 공통 Fact/Relation/Guard/Evidence 추출까지는 두 모드가 공유한다. deterministic은 rule 기반
-  결론 생성, reasoning은 fact graph 기반 LLM 경로 추론을 담당하며 서로의 Finding/AttackPath를
-  입력으로 사용하지 않는다.
+- 공통 Fact/Relation/Guard/Evidence 추출과 canonical `SecurityCandidate` 생성까지 두 모드가
+  공유한다. deterministic은 같은 Candidate를 Finding/AttackPath로 materialize하고 reasoning은
+  같은 Candidate와 Frontier를 조사한다. reasoning은 deterministic Finding/AttackPath 자체를
+  최종 결론 입력으로 재사용하지 않고 Candidate claim contract를 authoritative boundary로 사용한다.
 - 현재 `relation_id`의 semantic key는 기존 tuple과 동일하게 유지하고 provenance/scope가 실제로
   필요해질 때 키를 확장한다.
 - compiled Objective Goal은 탐색 우선순위 힌트일 뿐 보안 사실이 아니다. 사용자 Objective가
@@ -382,6 +383,59 @@ AttackPath, CloudIdentityCandidate를 재현 가능하게 생성한다.
   compact Fact/working-memory 적용 후 Luna GHA-01 Candidate 성공 지표
 - `cicd-redteam-agent-mvp/output/compact-facts-luna-rejected/matrix-evaluation/evaluation.json`:
   compact Fact 적용 후 Luna GHA-01 Rejected 성공 지표
+
+## P0 SecurityCandidate grounding supplement (2026-08-29)
+
+- Status: **COMPLETED**. `SecurityCandidate` now separates `candidate_kind`,
+  `root_cause_family`, and concrete `root_cause_key`; mutable-action candidates are grounded in
+  actual action Relations (`uses_external_action_ref`, execution/provenance/advisory Relations)
+  and preserve the Relations' existing `EvidenceRequirementRef` entries. Structural
+  `contains_job`/`contains_step` edges remain path topology only. Deterministic/reasoning parity,
+  full-SHA hard-negative behavior, and same-action/ref versus different-ref identity are covered
+  by the candidate tests.
+- Broad investigation keeps `INVESTIGATE` until every selected Candidate/Frontier has a
+  terminal disposition. A complete terminal decision set can pass the explicit
+  `decision_submission_allowed` gate; incomplete or truncated search cannot bypass it.
+- Pinned offline Goat benchmark passed against
+  `step-security/github-actions-goat@4da23c8602b4589bacdf7de77240113e02cdb884` without
+  executing workflows or Actions: 24 workflows, 26 jobs, 108 steps, 351 Evidence, 1,529
+  Relations, 62 Candidates, 3 candidate kinds, 3 root-cause families, 12 root-cause instances,
+  60 mutable-action Candidates across 10 distinct action/ref instances, 62 Findings, 113
+  AttackPaths; deterministic/reasoning initial Candidate parity passed; mutable Candidates with
+  zero supporting Relations 0; mutable Candidates with zero required Relation types 0; portfolio
+  size 6; silently dropped items 0; candidate-backed submission passed. The provider-free
+  reasoning smoke used 0 model rounds and is not a live provider or real GitHub acceptance run.
+- Validation completed:
+  - `uv run python -m pytest -o addopts="-m 'not live_github'" -ra`: **326 passed, 1 skipped,
+    12 deselected**.
+  - `uv run ruff check .`: passed.
+  - `uv run python -m compileall -q src tests`: passed.
+  - `git diff --check`: passed; Git only reported expected LF/CRLF normalization warnings.
+- Existing dirty/untracked workspace artifacts were preserved. No commit, push, workflow
+  execution, external provider call, or destructive cleanup was performed.
+
+## P0 multi-batch / execution-semantics closure (2026-09-05)
+
+- Status: **COMPLETED (offline/framework)**. Broad reasoning now groups Candidates by concrete
+  `root_cause_key`, schedules one deterministic representative per uncovered root-cause instance,
+  commits complete terminal batches without ending the analysis, and rotates to the next uncovered
+  instances. A representative decision is propagated only to equivalent occurrences with the same
+  root-cause key; non-mutable families use occurrence-specific keys unless a stronger semantic
+  normalizer exists. Final `SUBMIT` requires all eligible root-cause instances to be terminal.
+- Ordinary attacker-controlled execution Relations now use the `execution` sink instead of
+  `privileged_execution`. The Frontier may continue beyond that intermediate boundary toward
+  explicit `github_token_write`, `oidc_token`, `cloud_identity` or `secret_exposure` sinks. The
+  existing claim validator still requires an explicit TRUE privilege Relation for a SUPPORTED
+  privileged claim. Relation semantics version is 1.5 and Frontier engine version is 1.1.
+- `SubmitAnalysis` distinguishes an accepted broad batch (`batch_committed=true`,
+  `analysis_complete=false`) from the final submission. Prompt/runtime contract is 1.8 so older
+  incompatible reasoning checkpoints are not resumed under the new orchestration semantics.
+- Pinned provider-free Goat benchmark at
+  `step-security/github-actions-goat@4da23c8602b4589bacdf7de77240113e02cdb884` now drives real
+  multi-batch rotation through final `SUBMIT`, requires zero uncovered eligible root-cause
+  instances, checks zero silent batch drops, and asserts ordinary execution Frontiers exist while
+  legacy `privileged_execution` Frontiers are absent. This remains a 0-round external-LLM framework
+  smoke, not a Luna/Sol quality benchmark.
 
 ## Updated
 

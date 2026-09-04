@@ -957,6 +957,209 @@ def _derive_artifact_execution(state: AnalysisState) -> tuple[list[Finding], lis
     return findings, paths
 
 
+def _derive_build_side_effect_findings(
+    state: AnalysisState,
+) -> tuple[list[Finding], list[AttackPath]]:
+    """Promote repository-local package lifecycle side effects into bounded CI/CD findings."""
+
+    installs = {
+        relation.target_id: []
+        for relation in state.relations
+        if relation.relation_type == "step_runs_package_install"
+        and relation.verdict is not TriState.FALSE
+    }
+    for relation in state.relations:
+        if (
+            relation.relation_type == "step_runs_package_install"
+            and relation.verdict is not TriState.FALSE
+        ):
+            installs.setdefault(relation.target_id, []).append(relation)
+    local_dependencies: dict[str, list[Relation]] = {}
+    for relation in state.relations:
+        if (
+            relation.relation_type == "package_manifest_declares_local_dependency"
+            and relation.verdict is not TriState.FALSE
+        ):
+            local_dependencies.setdefault(relation.target_id, []).append(relation)
+    lifecycle_by_script: dict[str, list[Relation]] = {}
+    for relation in state.relations:
+        if (
+            relation.relation_type == "dependency_install_executes_lifecycle_script"
+            and relation.verdict is not TriState.FALSE
+        ):
+            lifecycle_by_script.setdefault(relation.target_id, []).append(relation)
+
+    configurations = {
+        "script_performs_external_network_request": (
+            "CICD-BUILD-NETWORK-SIDE-EFFECT",
+            "Package install lifecycle can make an external network request",
+            "A repository-local package dependency is installed by a workflow step and its "
+            "install lifecycle executes repository code containing a literal external network "
+            "request. This proves a statically reachable build-time network side effect; it does "
+            "not prove that sensitive data was sent or that the request occurred in a particular "
+            "workflow run.",
+        ),
+        "script_modifies_workspace_file": (
+            "CICD-BUILD-WORKSPACE-MUTATION",
+            "Package install lifecycle can modify the build workspace",
+            "A repository-local package dependency is installed by a workflow step and its "
+            "install lifecycle executes repository code that writes beneath the build workspace. "
+            "This proves a statically reachable build-time workspace mutation; it does not prove "
+            "which production artifact was affected or that the modification occurred in a "
+            "particular workflow run.",
+        ),
+    }
+    grouped: dict[
+        tuple[str, str, str, str],
+        list[tuple[Relation, Relation, Relation, Relation]],
+    ] = {}
+    for side_effect in state.relations:
+        config = configurations.get(side_effect.relation_type)
+        if config is None or side_effect.verdict is TriState.FALSE:
+            continue
+        for lifecycle in lifecycle_by_script.get(side_effect.source_id, []):
+            for dependency in local_dependencies.get(lifecycle.source_id, []):
+                for install in installs.get(dependency.source_id, []):
+                    key = (
+                        side_effect.relation_type,
+                        lifecycle.source_id,
+                        lifecycle.target_id,
+                        side_effect.target_id,
+                    )
+                    grouped.setdefault(key, []).append(
+                        (install, dependency, lifecycle, side_effect)
+                    )
+
+    findings: list[Finding] = []
+    paths: list[AttackPath] = []
+    for key, chains in sorted(grouped.items()):
+        relation_type = key[0]
+        rule_id, title, summary = configurations[relation_type]
+        all_relations = [relation for chain in chains for relation in chain]
+        supported = all(relation.verdict is TriState.TRUE for relation in all_relations)
+        status = FindingStatus.SUPPORTED if supported else FindingStatus.CANDIDATE
+        evidence_ids = sorted(
+            {evidence_id for relation in all_relations for evidence_id in relation.evidence_ids}
+        )
+        missing = sorted(
+            {item for relation in all_relations for item in relation.missing_evidence}
+        )
+        finding_id = stable_id("finding", rule_id, *key[1:])
+        findings.append(
+            Finding(
+                finding_id=finding_id,
+                rule_id=rule_id,
+                title=title,
+                status=status,
+                evidence_ids=evidence_ids,
+                missing_evidence=missing,
+                confidence=Confidence.HIGH if supported else Confidence.MEDIUM,
+                summary=summary,
+            )
+        )
+        seen_paths: set[tuple[str, ...]] = set()
+        for chain in chains:
+            path_key = tuple(relation.relation_id for relation in chain)
+            if path_key in seen_paths:
+                continue
+            seen_paths.add(path_key)
+            nodes = [chain[0].source_id]
+            nodes.extend(relation.target_id for relation in chain)
+            paths.append(
+                AttackPath(
+                    path_id=stable_id("path", finding_id, chain[0].source_id),
+                    nodes=nodes,
+                    edges=[_edge_from_relation(relation) for relation in chain],
+                    status=status,
+                    evidence_ids=sorted(
+                        {
+                            evidence_id
+                            for relation in chain
+                            for evidence_id in relation.evidence_ids
+                        }
+                    ),
+                    missing_evidence=sorted(
+                        {item for relation in chain for item in relation.missing_evidence}
+                    ),
+                )
+            )
+    return findings, paths
+
+
+def _derive_runtime_side_effect_findings(
+    state: AnalysisState,
+) -> tuple[list[Finding], list[AttackPath]]:
+    """Promote only normalized runtime events that bind to one exact static workflow step."""
+
+    bindings = {
+        relation.target_id: relation
+        for relation in state.relations
+        if relation.relation_type == "runtime_event_exactly_bound_to_step"
+        and relation.verdict is TriState.TRUE
+    }
+    configurations = {
+        "runtime_process_made_external_network_call": (
+            "CICD-RUNTIME-NETWORK-SIDE-EFFECT",
+            "Runtime process made an external network call in a workflow step",
+            "Normalized runtime telemetry was uniquely bound to the workflow step and records an "
+            "external network call from a process in that step. This supports the observed runtime "
+            "network side effect only; it does not prove credential exfiltration, sensitive data "
+            "transfer, or malicious intent.",
+        ),
+        "runtime_process_modified_workspace_file": (
+            "CICD-RUNTIME-WORKSPACE-MUTATION",
+            "Runtime process modified a workspace file in a workflow step",
+            "Normalized runtime telemetry was uniquely bound to the workflow step and records a "
+            "workspace-relative file modification from a process in that step. This supports the "
+            "observed runtime workspace mutation only; it does not prove malicious tampering or "
+            "that a production artifact was compromised.",
+        ),
+    }
+    findings: list[Finding] = []
+    paths: list[AttackPath] = []
+    for side_effect in state.relations:
+        config = configurations.get(side_effect.relation_type)
+        if config is None or side_effect.verdict is not TriState.TRUE:
+            continue
+        binding = bindings.get(side_effect.source_id)
+        if binding is None:
+            continue
+        owner = _job_for_step(state, binding.source_id)
+        if owner is None:
+            continue
+        rule_id, title, summary = config
+        evidence_ids = sorted(set(binding.evidence_ids + side_effect.evidence_ids))
+        finding_id = stable_id(
+            "finding",
+            rule_id,
+            binding.source_id,
+            side_effect.target_id,
+        )
+        findings.append(
+            Finding(
+                finding_id=finding_id,
+                rule_id=rule_id,
+                title=title,
+                status=FindingStatus.SUPPORTED,
+                evidence_ids=evidence_ids,
+                missing_evidence=[],
+                confidence=Confidence.HIGH,
+                summary=summary,
+            )
+        )
+        paths.append(
+            AttackPath(
+                path_id=stable_id("path", finding_id),
+                nodes=[binding.source_id, binding.target_id, side_effect.target_id],
+                edges=[_edge_from_relation(binding), _edge_from_relation(side_effect)],
+                status=FindingStatus.SUPPORTED,
+                evidence_ids=evidence_ids,
+                missing_evidence=[],
+            )
+        )
+    return findings, paths
+
+
 def derive_additional_scenario_results(
     state: AnalysisState,
 ) -> tuple[list[Finding], list[AttackPath]]:
@@ -972,6 +1175,8 @@ def derive_additional_scenario_results(
         _derive_known_action_advisory_findings,
         _derive_stale_secret_metadata_findings,
         _derive_broad_token_permissions,
+        _derive_build_side_effect_findings,
+        _derive_runtime_side_effect_findings,
     ):
         new_findings, new_paths = derive(state)
         findings.extend(new_findings)

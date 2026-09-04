@@ -43,7 +43,8 @@ async def test_frontier_returns_continuous_proposal_ready_path(tmp_path: Path) -
     ready = [item for item in result.frontiers if item.proposal_ready]
 
     assert ready
-    assert any(item.sink_tag == "privileged_execution" for item in ready)
+    assert any(item.sink_tag == "execution" for item in ready)
+    assert all(item.sink_tag != "privileged_execution" for item in ready)
     assert all(item.connectivity is FrontierConnectivity.COMPLETE for item in ready)
     assert any(
         any(value.startswith("workflow_revision_trusted:") for value in item.trust_provenance)
@@ -156,7 +157,7 @@ async def test_unknown_guard_caps_matching_flow_as_candidate(tmp_path: Path) -> 
     guarded = next(
         item
         for item in result.frontiers
-        if item.sink_tag == "privileged_execution" and item.proposal_ready
+        if item.sink_tag == "execution" and item.proposal_ready
     )
 
     assert guarded.proposal_status_ceiling.value == "CANDIDATE"

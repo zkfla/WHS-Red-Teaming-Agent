@@ -19,12 +19,14 @@ from cicd_redteam_agent.framework.aws_resolvers import AwsIamResolver
 from cicd_redteam_agent.framework.capabilities import CapabilityContext, build_capabilities
 from cicd_redteam_agent.framework.cicd_agent import CICDChatAgent
 from cicd_redteam_agent.framework.cicd_usecase import CICDUseCase
+from cicd_redteam_agent.framework.evidence_resolver import ResolverRegistry
 from cicd_redteam_agent.framework.github_resolvers import build_github_resolver_registry
 from cicd_redteam_agent.framework.investigation_runtime import (
     create_red_team_session,
     prepare_resume_revalidation,
     synchronize_analysis_state,
 )
+from cicd_redteam_agent.framework.local_resolvers import LocalRuntimeTelemetryResolver
 from cicd_redteam_agent.framework.runtime_support import (
     AgentRuntimeMetrics,
     CheckpointWriter,
@@ -82,7 +84,17 @@ async def _run_agent_analysis_locked(
 ) -> AgentRunResult:
     trace_dir = config.output_dir.resolve() / ".agent-traces"
     trace_dir.mkdir(parents=True, exist_ok=True)
-    logger = JsonlLogger(console=Console(), log_dir=str(trace_dir), tag="cicd-redteam-agent")
+    logger_console = Console()
+    # Rich expands ``:secret:`` inside canonical node IDs such as
+    # ``credential:secret:<id>`` into U+3299.  Legacy Korean Windows consoles use CP949 and
+    # cannot encode that emoji, so a perfectly valid tool result used to crash while being
+    # displayed.  Disable emoji expansion only; the canonical IDs and JSON trace stay unchanged.
+    logger_console._emoji = False
+    logger = JsonlLogger(
+        console=logger_console,
+        log_dir=str(trace_dir),
+        tag="cicd-redteam-agent",
+    )
     limits = Limits(
         max_rounds=config.max_rounds,
         max_tokens=config.max_tokens,
@@ -111,20 +123,14 @@ async def _run_agent_analysis_locked(
         objective_goal_payload if config.objective is not None else None
     )
     investigation_session = None
-    environment_observer = None
-    if config.observe_github:
-        github_token = resolve_github_observer_token(
-            config.env_file,
-            untrusted_repository_root=boundary.root,
-        )
-        if github_token is None:
-            raise ValueError(
-                "--observe-github requires GH_TOKEN or GITHUB_TOKEN in trusted operator config"
-            )
+    environment_observer: ResolverRegistry | None = None
+    observation_enabled = bool(config.observe_github or config.runtime_telemetry_file is not None)
+    if observation_enabled:
+        environment_observer = ResolverRegistry()
         if resume_checkpoint is not None:
             if resume_checkpoint.investigation_session is None:
                 raise ValueError(
-                    "GitHub observation resume requires a persisted investigation session"
+                    "observation-enabled resume requires a persisted investigation session"
                 )
             investigation_session = resume_checkpoint.investigation_session.model_copy(deep=True)
             if investigation_session.github_run_id != config.github_run_id:
@@ -144,12 +150,30 @@ async def _run_agent_analysis_locked(
                 github_run_id=config.github_run_id,
                 github_event_locator=config.github_event_locator,
             )
+
+    if config.observe_github:
+        github_token = resolve_github_observer_token(
+            config.env_file,
+            untrusted_repository_root=boundary.root,
+        )
+        if github_token is None:
+            raise ValueError(
+                "--observe-github requires GH_TOKEN or GITHUB_TOKEN in trusted operator config"
+            )
         environment_observer = build_github_resolver_registry(
             boundary,
             token=github_token,
         )
         if config.observe_aws:
             environment_observer.register(AwsIamResolver.from_profile(config.aws_profile))
+    if config.runtime_telemetry_file is not None:
+        assert environment_observer is not None
+        environment_observer.register(
+            LocalRuntimeTelemetryResolver(
+                path=config.runtime_telemetry_file,
+                untrusted_repository_root=boundary.root,
+            )
+        )
     if config.provider is ModelProvider.CODEX_CHATGPT:
         from cicd_redteam_agent.framework.codex_llm import CodexChatGPTLLM
 
@@ -230,6 +254,11 @@ async def _run_agent_analysis_locked(
                 "objective_goal": objective_goal_payload,
                 "observe_github": config.observe_github,
                 "observe_aws": config.observe_aws,
+                "runtime_telemetry_file": (
+                    str(config.runtime_telemetry_file)
+                    if config.runtime_telemetry_file is not None
+                    else None
+                ),
                 "aws_profile": config.aws_profile,
                 "github_run_id": config.github_run_id,
             },

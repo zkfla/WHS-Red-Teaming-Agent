@@ -104,7 +104,12 @@ def derive_attack_paths(state: AnalysisState) -> tuple[list[Finding], list[Attac
                     for relation in state.relations
                     if relation.source_id == step.step_id
                     and (
-                        relation.relation_type.startswith("can_use_github_token_")
+                        (
+                            relation.relation_type.startswith("can_use_github_token_")
+                            and relation.relation_type.endswith("_write")
+                            and relation.relation_type
+                            != "can_use_github_token_id-token_write"
+                        )
                         or relation.relation_type == "can_request_oidc_token"
                         or relation.relation_type == "can_access_secret_reference"
                     )

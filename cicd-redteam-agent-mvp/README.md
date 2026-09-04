@@ -18,9 +18,12 @@ semantic state에 반영할 수 있습니다. 모든 결과는 원본 위치를 
 | 기능 | 설명 |
 |---|---|
 | 정적 분석 | GitHub Actions YAML과 로컬 action/script 참조를 실행 없이 추적합니다. |
+| Build/package 실행 의미론 | 정적으로 해석 가능한 package install → repository-local dependency → lifecycle hook → script의 network/workspace/process side effect를 실행 없이 추적합니다. |
 | 공격 경로 구성 | 공격자 입력에서 `GITHUB_TOKEN` 또는 Cloud Identity까지 관계를 연결합니다. |
 | Evidence 기반 판정 | 로컬 근거를 우선하고 확인하지 못한 외부 상태는 `UNKNOWN`으로 보존합니다. |
+| Candidate 중심 조사 | deterministic와 reasoning이 같은 `SecurityCandidate`에서 시작하고, bounded portfolio와 claim contract로 제출 범위를 고정합니다. |
 | 선택적 GitHub 관찰 | `--observe-github`에서 selected Frontier의 policy/runtime evidence만 읽고 semantic state를 재계산합니다. |
+| 선택적 Runtime telemetry | trusted operator JSONL을 `--runtime-telemetry-file`로 받아 exact workflow step에 network/file/process Observation을 결합하고 semantic state를 재계산합니다. |
 | 선택적 LLM 추론 | LiteLLM 또는 ChatGPT 로그인 기반 Codex로 Fact/Relation을 조합합니다. |
 | 안전한 결과 저장 | secret을 redaction하고 구조화 결과, 요약, trace를 분리해 기록합니다. |
 
@@ -33,14 +36,20 @@ Local repository
 Safe parser
       │
       ▼
+Build / package lifecycle semantics
+      │
+      ▼
 Event-scoped execution semantics
       │
       ▼
 Fact / Relation / Guard / Evidence
       │
-      ├── deterministic mode ──▶ scenario rules + attack graph
+      ├── deterministic mode ──▶ SecurityCandidate ──▶ Finding / AttackPath
       │
-      └── reasoning mode ──────▶ optional GitHub read-only observation
+      └── reasoning mode ──────▶ same Candidate portfolio
+                                      │
+                                      ▼
+                                optional GitHub / runtime observation
                                       │
                                       ▼
                                 semantic recompute
@@ -185,6 +194,24 @@ Runtime job은 정적 job key/name과 유일하게 정확히 일치할 때만 �
 identity만 해소하고 cleanup/ephemerality는 계속 `UNKNOWN`이며, 서로 다른 concrete ID만 해당
 run의 cross-job runner-state 경로를 `FALSE`로 닫습니다.
 
+### Trusted runtime telemetry 관찰
+
+Reasoning 분석은 분석 대상 저장소 밖의 trusted operator JSONL을 선택적으로 받아, 이미 수집된
+process/network/workspace-file runtime event를 정확히 하나의 workflow/job/step identity에 결합할 수
+있습니다. 이 기능은 workflow나 script를 실행하거나 telemetry를 직접 수집하지 않습니다.
+
+```powershell
+uv run cicd-agent analyze C:\analysis-targets\project `
+  --output .\output `
+  --mode reasoning `
+  --provider codex-chatgpt `
+  --runtime-telemetry-file C:\trusted\run-telemetry.jsonl
+```
+
+정적 package lifecycle side effect와 runtime Observation은 별도 bounded claim으로 유지됩니다.
+정적 network/write 코드는 실제 전송·변조를 의미하지 않고, runtime network/file event 역시
+credential exfiltration이나 악성 의도를 자동으로 의미하지 않습니다.
+
 AWS GitHub OIDC trust까지 판정하려면 GitHub 관찰에 `--observe-aws`를 함께 추가합니다.
 선택적으로 `--aws-profile <name>`을 지정할 수 있으며 IAM `GetRole`과
 `GetOpenIDConnectProvider`만 read-only로 호출합니다. 정적 trust가 `TRUE`여도 실제 STS
@@ -287,8 +314,26 @@ bounded 후보를 반환합니다. `COMPLETE`이면서 `proposal_ready=true`인 
 다음 전환을 결정합니다. `STOP_PARTIAL`은 round/token/cost/duration 한도, 다음 round token reserve
 부족, 반복 호출·진행 정체를 하나의 policy 입력으로 정규화하며 현재 부분 상태를 보존합니다.
 semantic recompute로 근거가 사라지거나 hard-block된 가설과 동일 Relation 묶음을 반복하는 가설은
-자동 `DISCARDED`됩니다. `SubmitAnalysis`는 `SUBMIT` 상태에서 선택된 portfolio의 정확한 Relation
-경로만 허용하며, 검색이 완결됐고 제출 가능한 경로가 없을 때만 빈 제출을 허용합니다.
+자동 `DISCARDED`됩니다. `SubmitAnalysis`는 `SUBMIT` 상태의 허용 경로 또는
+`decision_submission_allowed=true`인 완전한 terminal decision set만 허용합니다. broad 분석에서
+이 호출은 최종 종료가 아니라 현재 root-cause representative batch를 commit하고 다음 uncovered
+root cause로 portfolio를 회전시킵니다. 모든 eligible root-cause instance가 terminal일 때만 최종
+`SUBMIT`으로 전환하며, 검색이 완결됐고 제출 가능한 경로가 없을 때만 빈 제출을 허용합니다.
+
+`SecurityCandidate`는 Frontier와 다른 계층의 canonical semantic hypothesis입니다. 후보는
+root cause, kind, scope, claim ceiling, supporting/contradicting Relation, Evidence, missing
+Evidence, EvidenceRequirement와 grounded path variant를 함께 보유합니다. broad 분석은 선택된
+Candidate/Frontier 모두에 terminal disposition을 요구하고, 같은 `root_cause_key` occurrence는
+한 representative decision으로 함께 accounting합니다. terminal root cause는 다음 batch에서
+재선택하지 않으며 uncovered root cause가 남으면 `INVESTIGATE`를 유지합니다. 정책이
+`decision_submission_allowed=true`를 표시한 경우에만 현재 batch의 완전한 decision set을 commit할
+수 있습니다.
+`ACCEPTED` 후보는 runtime이 canonical claim contract에서 Finding/AttackPath를 materialize하므로
+모델이 임의의 rule/title/summary나 `CONFIRMED`를 만들어낼 수 없습니다.
+
+Frontier의 ordinary attacker-controlled execution은 `execution` sink로 표현합니다. 이는 그 자체로
+privilege가 아니며 write-capable `GITHUB_TOKEN`, Secret access, OIDC/Cloud Identity 같은 별도
+privileged capability Relation이 이어질 때만 해당 sensitive-impact 경로를 구성합니다.
 
 ## 평가와 개발 검증
 

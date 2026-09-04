@@ -31,6 +31,38 @@ class FindingStatus(StrEnum):
     REJECTED = "REJECTED"
 
 
+class CandidateKind(StrEnum):
+    """Small, stable vocabulary for canonical semantic candidates."""
+
+    UNTRUSTED_PRIVILEGED_EXECUTION = "untrusted-privileged-execution"
+    SHELL_INJECTION = "shell-injection"
+    ARTIFACT_EXECUTION = "artifact-execution"
+    MUTABLE_ACTION = "mutable-action"
+    BROAD_TOKEN_PERMISSION = "broad-token-permission"
+    SECRET_LOG = "secret-log"
+    SELF_HOSTED_PERSISTENCE = "self-hosted-persistence"
+    REVISION_TOCTOU = "revision-toctou"
+    KNOWN_ACTION_ADVISORY = "known-action-advisory"
+    SECRET_ROTATION = "secret-rotation"
+    BUILD_NETWORK_SIDE_EFFECT = "build-network-side-effect"
+    BUILD_WORKSPACE_MUTATION = "build-workspace-mutation"
+    RUNTIME_NETWORK_SIDE_EFFECT = "runtime-network-side-effect"
+    RUNTIME_WORKSPACE_MUTATION = "runtime-workspace-mutation"
+
+
+# Keep both spellings available to callers while retaining one enum vocabulary.
+SecurityCandidateKind = CandidateKind
+
+
+class CandidateDisposition(StrEnum):
+    UNREVIEWED = "UNREVIEWED"
+    INVESTIGATING = "INVESTIGATING"
+    ACCEPTED = "ACCEPTED"
+    REJECTED = "REJECTED"
+    BLOCKED_EXTERNAL = "BLOCKED_EXTERNAL"
+    MERGED = "MERGED"
+
+
 class Confidence(StrEnum):
     LOW = "LOW"
     MEDIUM = "MEDIUM"
@@ -172,6 +204,9 @@ class Step(SchemaModel):
     uses: str | None = None
     run: str | None = None
     shell: str | None = None
+    # Optional for checkpoint compatibility.  The parser now preserves this because package/build
+    # commands resolve manifests and scripts relative to the step execution directory.
+    working_directory: str | None = None
     env: dict[str, str] = Field(default_factory=dict)
     with_: dict[str, Any] = Field(default_factory=dict, alias="with")
     references: list[str] = Field(default_factory=list)
@@ -339,6 +374,7 @@ class Finding(SchemaModel):
     rule_id: str
     title: str
     status: FindingStatus
+    candidate_id: str | None = None
     evidence_ids: list[str] = Field(default_factory=list)
     missing_evidence: list[str] = Field(default_factory=list)
     confidence: Confidence
@@ -372,8 +408,89 @@ class AttackPath(SchemaModel):
     nodes: list[str]
     edges: list[AttackEdge]
     status: FindingStatus
+    candidate_id: str | None = None
     evidence_ids: list[str] = Field(default_factory=list)
     missing_evidence: list[str] = Field(default_factory=list)
+
+
+class ClaimContract(SchemaModel):
+    """Canonical claim boundary used when materializing a candidate proposal."""
+
+    contract_id: str
+    rule_id: str
+    title: str
+    bounded_summary: str
+    proposal_status_ceiling: FindingStatus
+    required_relation_types: list[str] = Field(default_factory=list)
+    required_privileged_relation_types: list[str] = Field(default_factory=list)
+    forbidden_claims: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_static_ceiling(self) -> ClaimContract:
+        if self.proposal_status_ceiling is FindingStatus.CONFIRMED:
+            raise ValueError("static claim contracts cannot permit CONFIRMED")
+        return self
+
+
+class SecurityCandidate(SchemaModel):
+    """Canonical semantic vulnerability hypothesis shared by both analysis modes."""
+
+    candidate_id: str
+    source_finding_id: str | None = None
+    candidate_kind: CandidateKind
+    root_cause_family: str | None = None
+    root_cause_key: str
+    workflow_id: str | None = None
+    job_id: str | None = None
+    step_id: str | None = None
+    context_id: str | None = None
+    claim_contract: ClaimContract
+    proposal_status_ceiling: FindingStatus
+    status: FindingStatus
+    confidence: Confidence = Confidence.MEDIUM
+    disposition: CandidateDisposition = CandidateDisposition.UNREVIEWED
+    disposition_reason: str | None = None
+    supporting_relation_ids: list[str] = Field(default_factory=list, max_length=64)
+    contradicting_relation_ids: list[str] = Field(default_factory=list, max_length=64)
+    guards: list[str] = Field(default_factory=list, max_length=32)
+    evidence_ids: list[str] = Field(default_factory=list, max_length=64)
+    missing_evidence: list[str] = Field(default_factory=list, max_length=32)
+    evidence_requirements: list[EvidenceRequirementRef] = Field(
+        default_factory=list, max_length=32
+    )
+    path_variants: list[AttackPath] = Field(default_factory=list, max_length=16)
+
+    @model_validator(mode="after")
+    def validate_claim_ceiling(self) -> SecurityCandidate:
+        if self.proposal_status_ceiling is FindingStatus.CONFIRMED:
+            raise ValueError("static candidates cannot have CONFIRMED proposal ceiling")
+        if self.claim_contract.proposal_status_ceiling is FindingStatus.CONFIRMED:
+            raise ValueError("candidate claim contract cannot have CONFIRMED ceiling")
+        if self.status is FindingStatus.CONFIRMED:
+            raise ValueError("static candidates cannot be CONFIRMED")
+        if (
+            self.status is FindingStatus.SUPPORTED
+            and self.proposal_status_ceiling is not FindingStatus.SUPPORTED
+        ):
+            raise ValueError("SUPPORTED candidate status exceeds proposal ceiling")
+        return self
+
+
+class CoverageLedgerEntry(SchemaModel):
+    """Terminal accounting for a selected candidate or graph frontier item."""
+
+    item_id: str
+    candidate_id: str | None = None
+    frontier_id: str | None = None
+    disposition: CandidateDisposition = CandidateDisposition.UNREVIEWED
+    selected: bool = True
+    reason: str | None = None
+
+    @model_validator(mode="after")
+    def validate_item_reference(self) -> CoverageLedgerEntry:
+        if bool(self.candidate_id) == bool(self.frontier_id):
+            raise ValueError("coverage item must reference exactly one candidate or frontier")
+        return self
 
 
 class CloudIdentityCandidate(SchemaModel):
@@ -460,6 +577,7 @@ class HypothesisNextCheck(SchemaModel):
 
 class WorkingHypothesis(SchemaModel):
     hypothesis_id: str = Field(pattern=r"^hyp_[0-9a-f]{16}$")
+    candidate_id: str | None = None
     claim: str = Field(min_length=1, max_length=300)
     status: WorkingHypothesisStatus = WorkingHypothesisStatus.ACTIVE
     supporting_relation_ids: list[str] = Field(default_factory=list, max_length=16)
@@ -480,6 +598,7 @@ class AgentWorkingMemory(SchemaModel):
 
 class WorkingHypothesisUpsert(SchemaModel):
     hypothesis_id: str | None = Field(default=None, pattern=r"^hyp_[0-9a-f]{16}$")
+    candidate_id: str | None = None
     claim: str | None = Field(default=None, min_length=1, max_length=300)
     status: WorkingHypothesisStatus | None = None
     supporting_relation_ids: list[str] | None = Field(default=None, max_length=16)
@@ -517,6 +636,8 @@ class AnalysisState(SchemaModel):
     assessments: list[ControlAssessment] = Field(default_factory=list)
     findings: list[Finding] = Field(default_factory=list)
     paths: list[AttackPath] = Field(default_factory=list)
+    candidates: list[SecurityCandidate] = Field(default_factory=list, max_length=256)
+    coverage_ledger: list[CoverageLedgerEntry] = Field(default_factory=list, max_length=256)
     identities: list[CloudIdentityCandidate] = Field(default_factory=list)
     aws_oidc_trust_assessments: list[AwsOidcTrustAssessment] = Field(default_factory=list)
     secret_references: list[SecretReference] = Field(default_factory=list)
@@ -547,7 +668,24 @@ class FindingDraft(SchemaModel):
     summary: str = Field(min_length=1, max_length=1_200)
 
 
+class CandidateDecisionDraft(SchemaModel):
+    candidate_id: str = Field(min_length=1, max_length=200)
+    decision: CandidateDisposition
+    selected_path_variant: str | None = Field(default=None, max_length=200)
+    confidence: Confidence = Confidence.MEDIUM
+    analyst_note: str | None = Field(default=None, max_length=1_200)
+
+
+class FrontierDecisionDraft(SchemaModel):
+    frontier_id: str = Field(min_length=1, max_length=200)
+    decision: CandidateDisposition
+    confidence: Confidence = Confidence.MEDIUM
+    analyst_note: str | None = Field(default=None, max_length=1_200)
+
+
 class AnalysisProposalDraft(SchemaModel):
+    candidate_decisions: list[CandidateDecisionDraft] = Field(default_factory=list, max_length=64)
+    frontier_decisions: list[FrontierDecisionDraft] = Field(default_factory=list, max_length=64)
     finding_drafts: list[FindingDraft] = Field(default_factory=list, max_length=16)
     path_drafts: list[AttackPathDraft] = Field(default_factory=list, max_length=16)
 
