@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 from typing import Callable
@@ -17,11 +18,38 @@ from rich.prompt import Prompt
 
 from finredteam.config import LLMConfig
 
+_CHATGPT_MODEL_FALLBACK = "gpt-5.6-terra"
+
+
+def resolve_chatgpt_model() -> str:
+    """ChatGPT 구독(codex) 기본 모델을 고른다.
+
+    codex 백엔드의 모델 슬러그는 자주 바뀐다(예: gpt-5.4 는 폐기되고 gpt-5.6-* /
+    gpt-5.5 로 교체됨) — 낡은 슬러그를 하드코딩하면 백엔드가 400('model is not
+    supported')으로 거부한다. 그래서 `~/.codex/models_cache.json`(codex login 이
+    최신화하는 목록)에서 현재 노출(list)되고 API 지원되는 모델을 골라 self-heal 한다.
+    캐시가 없거나 형식이 다르면 안전한 폴백으로 돌아간다.
+    """
+    try:
+        cache = json.load(open(os.path.expanduser("~/.codex/models_cache.json")))
+        listed = [
+            m["slug"]
+            for m in cache.get("models", [])
+            if m.get("visibility") == "list" and m.get("supported_in_api") and "mini" not in m.get("slug", "")
+        ]
+        for pref in (_CHATGPT_MODEL_FALLBACK, "gpt-5.5"):  # 선호 모델 우선, 없으면 첫 노출 모델
+            if pref in listed:
+                return pref
+        return listed[0] if listed else _CHATGPT_MODEL_FALLBACK
+    except Exception:
+        return _CHATGPT_MODEL_FALLBACK
+
+
 # provider 별 기본 모델. `--llm-model` 이 없을 때만 쓴다.
 DEFAULT_MODEL = {
     "anthropic": "claude-sonnet-4-6",
     "openai": "gpt-5",
-    "chatgpt_subscription": "gpt-5.4",  # 실측 확인된 모델 슬러그(~/.codex/models_cache.json)
+    "chatgpt_subscription": resolve_chatgpt_model(),  # 캐시 기반 self-heal (슬러그가 자주 바뀜)
 }
 
 
