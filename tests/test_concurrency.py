@@ -57,6 +57,21 @@ def test_inv_1c_passes_when_deduction_matches_successes():
     assert check_inv_1c(cand, _result(cand, before, after, codes)).verdict == Verdict.PASS
 
 
+def test_inv_1c_violation_on_overdraft_even_when_deduction_matches():
+    """GT F-12 플레이버: 가용 잔액이 1건분(100)뿐인데 5건이 성공해 500 을 지출 —
+    차감액 자체는 성공 건수와 정합(actual==expected==500)하지만, 시행 전 잔액을
+    초과했으므로 잔액 검사가 경쟁조건으로 우회된 것이다. actual<expected 검사만
+    으로는 못 잡는 경로를 result.before 로 잡는다."""
+    before = _state({"ATTACKER": "100.00"})   # 딱 1건분
+    after = _state({"ATTACKER": "-400.00"})   # 5건 성공 x 100 = 500 지출 → 음수
+    codes = [200] * 5
+    cand = _candidate()
+    outcome = check_inv_1c(cand, _result(cand, before, after, codes))
+    assert outcome.verdict == Verdict.VIOLATION
+    assert "overdraft" in outcome.reason
+    assert outcome.evidence["available_before"] == "100.00"
+
+
 def test_inv_1c_passes_when_no_success():
     before = _state({"ATTACKER": "1000.00"})
     after = _state({"ATTACKER": "1000.00"})

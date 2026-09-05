@@ -39,6 +39,21 @@ def check_inv_1c(candidate: CandidateFinding, result: ExecutionResult) -> Oracle
         "actual": str(actual.amount),
     }
 
+    # Overdraft/double-spend 플레이버 (GT F-12): 성공 건수가 시행 직전 가용 잔액을
+    # 초과하면, 동시 요청들이 같은 잔액을 읽고 각자 잔액 검사를 통과한 것이다 — 즉
+    # 잔액 검사가 경쟁조건으로 우회됐다. 이 경우 차감액 자체는 성공 건수와 정합할 수
+    # 있어(actual==expected) lost-update 검사로는 안 잡히므로, 시행 전 잔액(result.before)
+    # 으로 별도 판정한다. before 관측이 없으면 이 플레이버는 판정하지 않는다.
+    available = result.before.balances.get(candidate.subject_account) if result.before else None
+    if available is not None and available.currency.code == unit.currency.code:
+        if expected.amount > available.amount + tolerance:
+            return violation(
+                "INV-1C",
+                f"가용 잔액 {available} 로 성공 {n_ok}건 x {unit} = {expected} 지출 — "
+                f"동시 요청이 잔액 검사를 우회(overdraft/double-spend)",
+                evidence={**evidence, "available_before": str(available.amount)},
+            )
+
     if actual.amount < expected.amount - tolerance:
         return violation(
             "INV-1C",

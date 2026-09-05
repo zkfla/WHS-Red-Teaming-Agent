@@ -851,7 +851,10 @@ def _handle_run_probe(input_: RunProbeInput, ctx: AgentContext) -> str:
         # 실행은 이미 candidate.method/path/params 로 이뤄진다 — operation 은 이 시점엔
         # 라벨(넛지 추적)용이라 프로브 종류로 바꿔둔다(untried_probes 매핑과 일치).
         candidate = candidate.model_copy(update={"operation": "race_transfer"})
-        trials = burst.run_race_candidate(
+        # overdraft 셋업(잔액을 1건분만 남기고 동시 발사)으로 시험한다 — 실제
+        # 송금 경쟁조건(GT F-12)의 플레이버다. INV-1C 오라클은 이 셋업에서 overdraft
+        # 를, 채워진 셋업에서는 lost-update 를 각각 잡으므로 상위호환이다.
+        trials = burst.run_overdraft_race_candidate(
             ctx.session, ctx.target, candidate, attacker,
             watch_accounts=[str(attacker.account_number), str(victim.account_number)],
             n_concurrent=5, restorer=victim, trials=RACE_TRIALS,

@@ -255,6 +255,62 @@ def test_concurrent_transfer_flows_through_spine_to_race_violation():
     assert summary["reproduction_rate"] > 0
 
 
+def _overdraft_mock_session() -> Session:
+    """overdraft(잔액 초과 지출) 경쟁조건을 흉내내는 가짜 세션 — 잔액 검사가 아예
+    없어(동시든 아니든) 요청이 무조건 성공한다. 차감 자체는 원자적(actual==expected)
+    이라 lost-update 검사로는 안 잡히고, 시행 전 잔액(result.before)으로만 판정되는
+    overdraft 플레이버(GT F-12)를 결정적으로 검증한다."""
+    balances = {ATTACKER_ACCT: Decimal("1000.00"), VICTIM_ACCT: Decimal("0.00")}
+    lock = threading.Lock()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if request.method == "GET" and path.startswith("/check_balance/"):
+            acct = path.rsplit("/", 1)[-1]
+            if acct not in balances:
+                return httpx.Response(404, json={"error": "no such account"})
+            return httpx.Response(200, json={"balance": str(balances[acct]), "username": f"user_{acct}"})
+        if request.method == "POST" and path == "/transfer":
+            body = json.loads(request.content or b"{}")
+            amount = Decimal(str(body["amount"]))
+            to_acct = str(body["to_account"])
+            with lock:  # ★ 잔액 검사 없음 — 부족해도 무조건 성공(overdraft)
+                balances[ATTACKER_ACCT] -= amount
+                balances[to_acct] += amount
+            return httpx.Response(200, json={"new_balance": str(balances[ATTACKER_ACCT]), "status": "success"})
+        return httpx.Response(404, json={"error": "unknown endpoint"})
+
+    return Session(load_target("vulnbank"), _policy(), _transport=httpx.MockTransport(handler))
+
+
+def test_overdraft_race_flows_to_inv1c_violation():
+    """잔액을 1건분만 남기고 동시 N건을 발사 → 전부 성공해 잔액을 초과 지출 →
+    INV-1C VIOLATION(overdraft). 차감액은 성공 건수와 정합(actual==expected)하지만
+    시행 전 잔액(=1건분)보다 훨씬 많이 나갔다는 걸 result.before 로 잡는다 — GT F-12
+    플레이버로, lost-update 검사만으로는 못 잡는 경로."""
+    from finredteam.probing.finance.burst import run_overdraft_race_candidate
+
+    session = _overdraft_mock_session()
+    target = session.target
+    principals = _principals()
+    graph = _graph(principals)
+    baselines = _seed_baseline()
+
+    skeleton = resolve_skeleton("transfer", "attacker_A", f"account:{VICTIM_ACCT}", principals, graph, target)
+    assert not isinstance(skeleton, str)
+    candidate = build_candidate(skeleton, {"amount": "10.00", "to_account": VICTIM_ACCT, "description": "x"}, "", baselines)
+    assert candidate.unit_amount is not None and candidate.unit_amount.amount == Decimal("10.00")
+
+    trials = run_overdraft_race_candidate(
+        session, target, candidate, principals[0],
+        watch_accounts=[ATTACKER_ACCT, VICTIM_ACCT], n_concurrent=5, restorer=None, trials=1,
+    )
+    summary = summarize_race(trials)
+    assert summary["judged"] == 1
+    assert summary["violations"] == 1  # 가용 10 인데 5건(=50) 지출 성공
+    assert "overdraft" in trials[0].outcome.reason
+
+
 def test_bola_read_of_unentitled_account_flows_to_inv2_violation():
     """공격자가 권한 없는 타 계좌(victim)를 조회 → INV-2 VIOLATION 으로 확정된다.
 

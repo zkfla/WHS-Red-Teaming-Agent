@@ -126,6 +126,71 @@ def run_race_candidate(
     return results
 
 
+def run_overdraft_race_candidate(
+    session: Session,
+    target: TargetConfig,
+    candidate: CandidateFinding,
+    principal: Principal,
+    watch_accounts: list[str],
+    n_concurrent: int,
+    *,
+    restorer: Principal | None = None,
+    trials: int = RACE_TRIALS,
+) -> list[RaceTrial]:
+    """Overdraft/double-spend 플레이버(§7, GT F-12): 잔액을 딱 1건분(unit)만 남기고
+    나머지를 정상 송금으로 비운 뒤, 동시 N 건을 발사한다. 잔액 검사가 원자적이라면
+    1 건만 성공해야 하지만, 경쟁조건이면 여러 건이 같은 잔액을 읽고 통과해 잔액을
+    초과 지출한다 — INV-1C 오라클이 `result.before`(1건분 잔액)와 성공 건수로 판정.
+
+    `run_race_candidate`(lost-update)와 셋업이 정반대다: 저쪽은 모든 요청이 성공할
+    만큼 잔액을 채우고, 이쪽은 1건분만 남긴다. 매 시행 전 restorer 로 잔액을 회복한
+    뒤 다시 1건분으로 비운다(음수 잔액이 된 이전 시행에서 회복)."""
+    assert candidate.unit_amount is not None and candidate.subject_account is not None
+    unit = candidate.unit_amount
+    results: list[RaceTrial] = []
+
+    for trial_no in range(1, trials + 1):
+        if trial_no > 1:
+            time.sleep(RACE_MIN_INTERVAL)
+
+        # 이전 시행에서 음수가 됐을 수 있으므로 넉넉히 회복한 뒤 1건분만 남긴다.
+        if restorer is not None:
+            restore_balance(session, target, restorer, principal, unit * n_concurrent)
+
+        before = observe_many(session, target, watch_accounts, principal_id=principal.id)
+        subject_balance = before.balances.get(candidate.subject_account)
+        if subject_balance is None:
+            results.append(RaceTrial(trial_no, skipped_reason="잔액 관측 실패"))
+            continue
+
+        if subject_balance.amount > unit.amount:  # 초과분을 정상 송금으로 비운다
+            drain = subject_balance - unit
+            try:
+                session.authed_request(
+                    candidate.method, candidate.path, principal,
+                    json_body={**candidate.params, "amount": str(drain.amount)},
+                )
+            except SessionError:
+                results.append(RaceTrial(trial_no, skipped_reason="잔액 조정(drain) 실패 — 시행 스킵"))
+                continue
+            before = observe_many(session, target, watch_accounts, principal_id=principal.id)
+            subject_balance = before.balances.get(candidate.subject_account)
+
+        if subject_balance is None or subject_balance.amount < unit.amount:
+            results.append(RaceTrial(trial_no, skipped_reason="1건분 잔액 확보 실패 — 시행 스킵"))
+            continue
+
+        status_codes = fire_concurrent(session, candidate, principal, n_concurrent)
+        after = observe_many(session, target, watch_accounts, principal_id=principal.id)
+        delta = compute_delta(before, after)
+        result = ExecutionResult(
+            candidate=candidate, status_codes=status_codes, before=before, after=after, delta=delta
+        )
+        results.append(RaceTrial(trial_no, outcome=check_inv_1c(candidate, result)))
+
+    return results
+
+
 def summarize_race(results: list[RaceTrial]) -> dict:
     judged = [r for r in results if r.outcome is not None]
     violations = sum(1 for r in judged if r.outcome.verdict.value == "VIOLATION")
