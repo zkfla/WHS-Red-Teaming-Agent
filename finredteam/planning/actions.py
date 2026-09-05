@@ -42,8 +42,9 @@ ACTION_CATALOG = """\
   전용 프로브로 시험한다. sensitive_exposure=응답에 비밀번호/재설정 PIN/카드 PAN·CVV가
   노출되는지, privilege_escalation=회원가입 mass assignment(is_admin 주입)로 관리자
   권한이 상승되는지, card_fund=카드 충전 시 환율(exchange_rate) 조작으로 가치가
-  창조되는지, sqli_scan=계좌/거래 조회 경로에 boolean-based SQL injection 이 통하는지.
-  판정은 오라클이 자동으로 낸다(INV-9/INV-BFLA/INV-1A/G-SQLI 등).
+  창조되는지, sqli_scan=계좌/거래 조회 경로에 boolean-based SQL injection 이 통하는지,
+  jwt_forge=흔한 약한 시크릿으로 위조한 JWT 를 서버가 수락하는지(토큰 위조).
+  판정은 오라클이 자동으로 낸다(INV-9/INV-BFLA/INV-1A/G-SQLI/G-JWT 등).
 - finish: {"reason": "<왜 그만두는지>"} — 탐색을 종료한다. 예산 한도가 항상 우선한다.
 """
 
@@ -77,7 +78,7 @@ class ExecuteExperimentInput(BaseModel):
 
 
 class RunProbeInput(BaseModel):
-    probe: Literal["sensitive_exposure", "privilege_escalation", "card_fund", "sqli_scan"]
+    probe: Literal["sensitive_exposure", "privilege_escalation", "card_fund", "sqli_scan", "jwt_forge"]
 
 
 class FinishInput(BaseModel):

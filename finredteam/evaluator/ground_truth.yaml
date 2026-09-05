@@ -34,7 +34,7 @@
 
 - id: G-03
   layer: generic
-  endpoint: "POST /login"   # REVIEW: 위조 토큰이 실제로 검증되는 보호 자원 경로로 교체 필요
+  endpoint: "GET /api/virtual-cards"   # 실측: 약한 시크릿으로 위조한 토큰이 보호 자원에 수락됨
   description: Weak JWT / Token Forgery — 변조 또는 위조된 JWT로 보호 자원 접근 성공
   invariant: G-JWT
   severity: CRITICAL

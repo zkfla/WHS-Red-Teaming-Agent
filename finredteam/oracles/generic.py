@@ -51,3 +51,16 @@ def check_jwt_none_alg(accepted_unsigned: bool, alg_header_mutable: bool = False
     if alg_header_mutable:
         return anomaly("G-JWT", "alg 헤더 수정은 가능했으나 서버가 수락하지 않음")
     return passed("G-JWT", "alg 조작이 거부됨")
+
+
+def check_jwt_forgery(accepted: bool, weak_secret_found: str | None = None) -> OracleOutcome:
+    """약한/기본 시크릿으로 HS256 서명한 위조 토큰을 서버가 정상 토큰으로 수락하면
+    위반 — 공격자가 임의 사용자로 토큰을 위조할 수 있다(§ GT G-03 Token Forgery).
+    실제 시크릿 값은 판정 근거에 남기지 않는다(추가 유출 방지)."""
+    if accepted:
+        return violation(
+            "G-JWT",
+            "약한/기본 서명키로 위조한 HS256 토큰을 서버가 수락함 — 임의 사용자 토큰 위조 가능",
+            evidence={"weak_secret_found": bool(weak_secret_found)},
+        )
+    return passed("G-JWT", "흔한 약한 시크릿으로는 토큰 위조가 수락되지 않음")

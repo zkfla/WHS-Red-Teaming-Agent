@@ -14,6 +14,7 @@ import httpx
 from finredteam.engagement.compiler import compile_policy
 from finredteam.engagement.schema import Engagement, EngagementScope, EngagementTarget
 from finredteam.models.core import Verdict
+from finredteam.probing.generic.api import forge_hs256_token, probe_jwt_weak_secret
 from finredteam.probing.generic.web import probe_sqli_boolean
 from finredteam.probing.session import Session
 from finredteam.targets.loader import load_target
@@ -54,4 +55,49 @@ def test_sqli_probe_no_signal_passes():
         return httpx.Response(200, json={"rows": ["A"]})  # 항상 같은 응답
 
     outcome = probe_sqli_boolean(_session(handler), "/check_balance/{value}", "1234567890")
+    assert outcome.verdict != Verdict.VIOLATION
+
+
+def test_jwt_weak_secret_forgery_flags_violation():
+    """서버가 약한 시크릿('secret123')으로 서명된 토큰을 정상으로 받아들이면 → G-JWT VIOLATION.
+    목 서버는 사전에 있는 secret123 으로 검증했을 때만 200 을 준다."""
+    import base64, hashlib, hmac, json
+
+    def _valid(token: str, secret: str) -> bool:
+        try:
+            h, b, sig = token.split(".")
+            expected = base64.urlsafe_b64encode(
+                hmac.new(secret.encode(), f"{h}.{b}".encode(), hashlib.sha256).digest()
+            ).rstrip(b"=").decode()
+            return hmac.compare_digest(sig, expected)
+        except Exception:
+            return False
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        token = request.headers.get("Authorization", "").replace("Bearer ", "")
+        # ★ 취약점: 약한 하드코딩 시크릿으로 검증
+        return httpx.Response(200 if _valid(token, "secret123") else 401, json={})
+
+    outcome = probe_jwt_weak_secret(_session(handler), "/api/virtual-cards", "GET", {"user_id": 1, "is_admin": True})
+    assert outcome.verdict == Verdict.VIOLATION
+    assert outcome.invariant == "G-JWT"
+
+
+def test_jwt_strong_secret_no_forgery():
+    """서버가 사전에 없는 강한 시크릿을 쓰면 위조 실패 → 위반 아님(거짓양성 방지)."""
+    import base64, hashlib, hmac
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        token = request.headers.get("Authorization", "").replace("Bearer ", "")
+        try:
+            h, b, sig = token.split(".")
+            expected = base64.urlsafe_b64encode(
+                hmac.new(b"a-very-strong-unguessable-key-9f3x", f"{h}.{b}".encode(), hashlib.sha256).digest()
+            ).rstrip(b"=").decode()
+            ok = hmac.compare_digest(sig, expected)
+        except Exception:
+            ok = False
+        return httpx.Response(200 if ok else 401, json={})
+
+    outcome = probe_jwt_weak_secret(_session(handler), "/api/virtual-cards", "GET", {"user_id": 1})
     assert outcome.verdict != Verdict.VIOLATION
