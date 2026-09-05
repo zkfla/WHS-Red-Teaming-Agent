@@ -24,7 +24,7 @@ from typing import Any, Callable
 from finredteam.agent import strategy as strategy_module
 from finredteam.agent import termination
 from finredteam.agent.budget import Budget
-from finredteam.config import MAX_PROBES
+from finredteam.config import MAX_PROBES, RACE_TRIALS
 from finredteam.engagement.cleanup import CreatedResource
 from finredteam.engagement.cleanup import run_cleanup as run_cleanup_phase
 from finredteam.engagement.errors import PolicyViolation
@@ -59,7 +59,7 @@ from finredteam.planning.actions import (
 )
 from finredteam.planning.candidates import AttackTemplate, CandidateSkeleton
 from finredteam.probing import executor as executor_module
-from finredteam.probing.finance import auth_exposure, card_exposure, card_fund, charge, privesc
+from finredteam.probing.finance import auth_exposure, burst, card_exposure, card_fund, charge, privesc
 from finredteam.probing.generic import api as generic_api
 from finredteam.probing.generic import web as generic_web
 from finredteam.probing.session import Session, SessionError
@@ -201,6 +201,7 @@ class AgentContext:
             "sqli_scan": {"sqli_check_balance", "sqli_transactions"},
             "jwt_forge": {"jwt_weak_secret"},
             "charge_idempotency": {"merchant_charge"},
+            "race_transfer": {"race_transfer"},
         }
         tried = self.episodic.tried_operations()
         return [name for name, ops in probe_ops.items() if not (ops & tried)]
@@ -736,6 +737,43 @@ def _record_generic_outcome(ctx: AgentContext, operation: str, method: str, path
     return f"{outcome.invariant}: {outcome.verdict.value} — {outcome.reason}"
 
 
+def _record_race_finding(ctx: AgentContext, candidate: CandidateFinding, summary: dict) -> str:
+    """경쟁조건(INV-1C) 반복 시행 결과를 하나의 Finding 으로 종합·기록한다.
+
+    확률적이라 여러 번 시행하고(§7 규칙 1), 판정 가능한 시행 중 한 번이라도 초과
+    인출이 재현되면 VIOLATION(재현율 첨부), 판정 가능한 시행이 하나도 없으면
+    (잔액 회복 실패 등) UNKNOWN, 전부 정상이면 PASS 로 종합한다. INV-1C 는 여러
+    시행을 가로질러 판정하므로 execute_experiment 의 단일 result 경로가 아니라
+    이 전용 종합 경로를 쓴다(burst.py 와 같은 이유)."""
+    violations = summary.get("violations", 0)
+    judged = summary.get("judged", 0)
+    rate = summary.get("reproduction_rate", 0.0)
+    if violations > 0:
+        verdict = Verdict.VIOLATION
+        reason = f"경쟁조건 재현 — 판정 {judged}회 중 {violations}회 초과 인출 확인(재현율 {rate})"
+    elif judged == 0:
+        verdict = Verdict.UNKNOWN
+        reason = f"판정 가능한 시행 없음(스킵 {summary.get('skipped', 0)}회) — 잔액 관측·회복 실패 가능"
+    else:
+        verdict = Verdict.PASS
+        reason = f"{judged}회 시행 모두 잔액 검사가 원자적으로 지켜짐(초과 인출 없음)"
+
+    result = ExecutionResult(candidate=candidate, status_codes=[])
+    finding = Finding(
+        candidate=candidate, result=result, verdict=verdict, invariant="INV-1C", reason=reason
+    )
+    ctx.store.append("findings", finding.model_dump(mode="json"))
+    ctx.episodic.record(
+        candidate, finding,
+        Lesson(candidate_summary=candidate.id, outcome=verdict.value, insight=reason, operation=candidate.operation),
+    )
+    if verdict == Verdict.VIOLATION:
+        ctx.findings.append(finding)
+    elif verdict in (Verdict.ANOMALY, Verdict.UNKNOWN):
+        ctx.review_queue.append(finding)
+    return f"INV-1C: {verdict.value} — {reason}"
+
+
 def _handle_run_probe(input_: RunProbeInput, ctx: AgentContext) -> str:
     """계좌·송금 외 특수 취약점을 전용 프로브로 시험한다 — 셋업(계정/카드 생성)은
     코드가 자동으로 하고, 판정은 등록된 오라클이 낸다. 실패해도 예외 없이 에러
@@ -791,6 +829,34 @@ def _handle_run_probe(input_: RunProbeInput, ctx: AgentContext) -> str:
                 ctx.session, owner, card, merchant_token, order_id=f"ord_{tag}", amount="50.00", repeats=3
             )
         )
+
+    elif input_.probe == "race_transfer":
+        accounted = [p for p in ctx.principals if p.account_number]
+        if len(accounted) < 2:
+            return "race_transfer 프로브: 서로 다른 계좌를 가진 주체가 2명 이상 필요함"
+        attacker, victim = accounted[0], accounted[1]
+        skeleton = candidates_module.resolve_skeleton(
+            "transfer", attacker.id, f"account:{victim.account_number}", ctx.principals, ctx.graph, ctx.target
+        )
+        if isinstance(skeleton, str):
+            return f"race_transfer 프로브: 송금 후보 생성 실패 — {skeleton}"
+        candidate = planner_module.build_candidate(
+            skeleton,
+            {"amount": "10.00", "to_account": victim.account_number, "description": "race-trial"},
+            "",
+            ctx.baselines,
+        )
+        if candidate.unit_amount is None or candidate.subject_account is None:
+            return "race_transfer 프로브: 단위 금액/대상 계좌 미확정 — INV-1C 판정 재료 부족"
+        # 실행은 이미 candidate.method/path/params 로 이뤄진다 — operation 은 이 시점엔
+        # 라벨(넛지 추적)용이라 프로브 종류로 바꿔둔다(untried_probes 매핑과 일치).
+        candidate = candidate.model_copy(update={"operation": "race_transfer"})
+        trials = burst.run_race_candidate(
+            ctx.session, ctx.target, candidate, attacker,
+            watch_accounts=[str(attacker.account_number), str(victim.account_number)],
+            n_concurrent=5, restorer=victim, trials=RACE_TRIALS,
+        )
+        return _record_race_finding(ctx, candidate, burst.summarize_race(trials))
 
     elif input_.probe == "sqli_scan":
         if owner is None or not owner.account_number:
