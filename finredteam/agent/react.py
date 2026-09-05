@@ -59,7 +59,7 @@ from finredteam.planning.actions import (
 )
 from finredteam.planning.candidates import AttackTemplate, CandidateSkeleton
 from finredteam.probing import executor as executor_module
-from finredteam.probing.finance import auth_exposure, card_exposure, card_fund, privesc
+from finredteam.probing.finance import auth_exposure, card_exposure, card_fund, charge, privesc
 from finredteam.probing.generic import api as generic_api
 from finredteam.probing.generic import web as generic_web
 from finredteam.probing.session import Session, SessionError
@@ -200,6 +200,7 @@ class AgentContext:
             "card_fund": {"card_fund"},
             "sqli_scan": {"sqli_check_balance", "sqli_transactions"},
             "jwt_forge": {"jwt_weak_secret"},
+            "charge_idempotency": {"merchant_charge"},
         }
         tried = self.episodic.tried_operations()
         return [name for name, ops in probe_ops.items() if not (ops & tried)]
@@ -761,6 +762,34 @@ def _handle_run_probe(input_: RunProbeInput, ctx: AgentContext) -> str:
             return "card_fund 프로브: 카드 생성 실패"
         pairs.append(
             card_fund.run_card_fund_manipulation(ctx.session, owner, card_id, usd_amount="100.00", exchange_rate="100")
+        )
+
+    elif input_.probe == "charge_idempotency":
+        if owner is None:
+            return "charge_idempotency 프로브: 카드 소유자로 쓸 계좌 있는 주체가 없음"
+        card_id = ctx.session.create_virtual_card(owner, card_limit="9999999.00")
+        if card_id is None:
+            return "charge_idempotency 프로브: 카드 생성 실패"
+        # 반복 결제가 잔액 부족으로 막히면 멱등성 여부를 관측할 수 없으므로, 먼저
+        # 정상 환율(exchange_rate=1)로 카드를 충분히 충전해 시험 조건을 만든다.
+        try:
+            ctx.session.authed_request(
+                "POST", f"/api/virtual-cards/{card_id}/fund", owner,
+                json_body={"amount": "500.00", "exchange_rate": "1"},
+            )
+        except SessionError:
+            return "charge_idempotency 프로브: 카드 충전 실패"
+        card = next((c for c in ctx.session.get_own_cards(owner) if str(c.get("id")) == str(card_id)), None)
+        if card is None:
+            return "charge_idempotency 프로브: 생성한 카드를 조회하지 못함"
+        tag = secrets.token_hex(3)
+        merchant_token = ctx.session.register_merchant(f"m_{tag}", f"m_{tag}@example.com", "Rt!pass123")
+        if merchant_token is None:
+            return "charge_idempotency 프로브: 가맹점 등록 실패"
+        pairs.append(
+            charge.run_charge_idempotency_trial(
+                ctx.session, owner, card, merchant_token, order_id=f"ord_{tag}", amount="50.00", repeats=3
+            )
         )
 
     elif input_.probe == "sqli_scan":

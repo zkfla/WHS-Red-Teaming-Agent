@@ -446,18 +446,21 @@ def test_merchant_charge_replay_flows_to_inv4_violation():
     assert result.status_codes == [200, 200, 200]
     assert result.delta.balance_delta[card_id].amount == Decimal("-150.00")  # 3회분 차감 — 위반 증거
 
-    # 여러 오라클이 동시에 걸린다(§ 설계원칙 3) — INV-1A(관측된 계정만으로는 값이
-    # 어디서도 안 늘어서 보존 위반으로도 보임)와 INV-4(멱등성)가 둘 다 독립적으로
-    # VIOLATION을 낸다. verify()는 그중 하나(등록 순서상 먼저인 INV-1A)를 헤드라인
-    # 으로 고르지만, INV-4 도 실제로 걸렸는지 명시적으로 확인한다(실제 라이브
-    # 실행에서도 동일하게 관찰됨).
+    # 이 실험은 카드→가맹점(관측 안 함)으로 나가는 단방향 결제를 같은 order_id 로
+    # 반복한 것이다. INV-1A(폐쇄계 보존)와 INV-1B(단일 인가분 기준)는 이 경우를
+    # 자기 기준으로는 판정할 수 없어 정직하게 UNKNOWN 으로 defer 하고(각각 open_flow /
+    # 반복 logical_txn_id 신호), 멱등성의 영역인 INV-4 만 VIOLATION 을 낸다.
     outcomes = registry.run_all(candidate, result)
     by_invariant = {o.invariant: o for o in outcomes}
     assert by_invariant["INV-4"].verdict == Verdict.VIOLATION
     assert "3회 성공" in by_invariant["INV-4"].reason
+    assert by_invariant["INV-1A"].verdict == Verdict.UNKNOWN  # 열린 흐름 — 보존 판정 불가
+    assert by_invariant["INV-1B"].verdict == Verdict.UNKNOWN  # 반복 논리거래 — INV-4 에 defer
 
+    # verify()는 유일한 VIOLATION 인 INV-4 를 정확히 헤드라인으로 고른다.
     finding = verify(candidate, result)
     assert finding.verdict == Verdict.VIOLATION
+    assert finding.invariant == "INV-4"
 
 
 def _card_fund_mock_session() -> Session:
