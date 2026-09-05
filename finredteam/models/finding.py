@@ -58,6 +58,9 @@ class CandidateFinding(BaseModel):
     unit_amount: Money | None = None  # 동시성(INV-1C) 시험의 단위 금액
     logical_txn_id: str | None = None  # 멱등성(INV-4) 판정 기준 — 페이로드가 아니라 이 필드 값
     watch_accounts: list[str] = []  # 실행 전/후 관측해야 하는 계좌 (발신·수신 등)
+    open_flow: bool = False  # 관측 집합이 폐쇄계가 아님 — 값이 우리가 관측하지 않는
+    # 외부 정산 상대(예: 가맹점)로 정상적으로 흘러나간다. True 면 INV-1A(가치 보존)는
+    # 한쪽만 봐서는 보존을 판정할 수 없으므로 스스로 UNKNOWN 을 낸다(§신호 부족 시 defer).
     rationale: str = ""  # LLM 이 후보를 왜 골랐는지 — 판정에는 쓰이지 않는, 사람이 읽는 근거
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 

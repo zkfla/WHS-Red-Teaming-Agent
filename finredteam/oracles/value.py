@@ -10,10 +10,15 @@ from decimal import Decimal
 
 from finredteam.models.finding import CandidateFinding, ExecutionResult
 from finredteam.money import Money, tol
-from finredteam.oracles.base import OracleOutcome, passed, unknown, violation
+from finredteam.oracles.base import OracleOutcome, is_success_status, passed, unknown, violation
 
 
 def check_inv_1a(candidate: CandidateFinding, result: ExecutionResult) -> OracleOutcome:
+    if candidate.open_flow:
+        # 값이 우리가 관측하지 않는 외부 정산 상대(예: 가맹점)로 정상적으로 흘러나가는
+        # 열린 흐름 — 한쪽(지불측)만 관측하면 항상 "가치 소멸"처럼 보이므로 보존을
+        # 판정할 수 없다. 신호 부족 → UNKNOWN(다른 오라클, 예: INV-4 가 판정한다).
+        return unknown("INV-1A", "관측 집합이 폐쇄계가 아님 — 외부 정산 상대를 관측하지 않아 보존 판정 불가")
     delta = result.delta
     if delta is None or delta.has_missing():
         return unknown("INV-1A", "잔액 관측 실패 (missing 필드 존재)")
@@ -49,6 +54,14 @@ def check_inv_1b(candidate: CandidateFinding, result: ExecutionResult) -> Oracle
         # ★ §6 — LLM 이 정답지를 쓰지 못하게. llm_inferred 는 힌트일 뿐 판정 근거가 아니다.
         return unknown(
             "INV-1B", f"expected_delta.provenance={exp.provenance!r} — baseline_observed 아니면 판정 불가"
+        )
+
+    # 같은 논리 거래(logical_txn_id)를 여러 번 성공 실행한 경우: expected_delta 는
+    # "1회 인가분"인데, N 번 반복의 인가 총량이 1회분(멱등)인지 N회분인지는 멱등성
+    # 문제라 INV-1B 혼자서는 알 수 없다 — INV-4 에 맡기고 여기선 defer 한다.
+    if candidate.logical_txn_id and sum(1 for c in result.status_codes if is_success_status(c)) > 1:
+        return unknown(
+            "INV-1B", "동일 logical_txn_id 반복 실행 — 인가 총량 판정은 멱등성(INV-4)의 영역"
         )
 
     delta = result.delta

@@ -90,6 +90,8 @@ def run_charge_idempotency_trial(
         path="/api/v1/payments/charge",
         params={"amount": amount, "merchant_order_id": order_id},
         logical_txn_id=order_id,
+        open_flow=True,  # 카드→가맹점(관측 안 함)으로 나가는 정상 단방향 결제 —
+        # INV-1A(보존)는 한쪽만 봐선 판정 불가. 이 프로브의 판정은 INV-4(멱등성)다.
         expected_delta=ExpectedDelta(
             deltas={card_id: -Money.parse(amount, currency)},
             provenance="baseline_observed",
