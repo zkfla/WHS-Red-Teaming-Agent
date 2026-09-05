@@ -60,6 +60,7 @@ from finredteam.planning.actions import (
 from finredteam.planning.candidates import AttackTemplate, CandidateSkeleton
 from finredteam.probing import executor as executor_module
 from finredteam.probing.finance import auth_exposure, card_exposure, card_fund, privesc
+from finredteam.probing.generic import web as generic_web
 from finredteam.probing.session import Session, SessionError
 from finredteam.recon import auth_discovery
 from finredteam.recon import entitlement as entitlement_module
@@ -196,6 +197,7 @@ class AgentContext:
             "sensitive_exposure": {"register_exposure", "forgot_password_exposure", "card_exposure"},
             "privilege_escalation": {"mass_assignment_privesc"},
             "card_fund": {"card_fund"},
+            "sqli_scan": {"sqli_check_balance", "sqli_transactions"},
         }
         tried = self.episodic.tried_operations()
         return [name for name, ops in probe_ops.items() if not (ops & tried)]
@@ -703,6 +705,34 @@ def _record_probe_finding(ctx: AgentContext, candidate: CandidateFinding, result
     return f"{finding.invariant or '-'}: {finding.verdict.value} — {finding.reason}"
 
 
+def _record_generic_outcome(ctx: AgentContext, operation: str, method: str, path: str, outcome) -> str:
+    """Generic 프로브(SQLi/JWT 등)의 OracleOutcome 을 Finding 으로 저장한다.
+
+    Generic 오라클은 registry(INV-*) 가 아니라 프로브가 직접 판정을 낸다 — 그래서
+    run_all 을 거치지 않고 outcome 을 그대로 Finding 으로 감싼다. path 는 채점기가
+    GT 와 맞출 수 있도록 payload 가 아닌 '정상 경로'(예: /check_balance/{계좌})로 남긴다."""
+    candidate = CandidateFinding(
+        id=f"{operation}-{secrets.token_hex(3)}", layer="generic",
+        operation=operation, principal_id="anon", method=method, path=path,
+    )
+    result = ExecutionResult(candidate=candidate, status_codes=[200])
+    finding = Finding(
+        candidate=candidate, result=result, verdict=outcome.verdict,
+        invariant=outcome.invariant, reason=outcome.reason,
+    )
+    ctx.store.append("findings", finding.model_dump(mode="json"))
+    ctx.episodic.record(
+        candidate, finding,
+        Lesson(candidate_summary=candidate.id, outcome=finding.verdict.value,
+               insight=finding.reason, operation=candidate.operation),
+    )
+    if finding.verdict == Verdict.VIOLATION:
+        ctx.findings.append(finding)
+    elif finding.verdict in (Verdict.ANOMALY, Verdict.UNKNOWN):
+        ctx.review_queue.append(finding)
+    return f"{outcome.invariant}: {outcome.verdict.value} — {outcome.reason}"
+
+
 def _handle_run_probe(input_: RunProbeInput, ctx: AgentContext) -> str:
     """계좌·송금 외 특수 취약점을 전용 프로브로 시험한다 — 셋업(계정/카드 생성)은
     코드가 자동으로 하고, 판정은 등록된 오라클이 낸다. 실패해도 예외 없이 에러
@@ -730,6 +760,25 @@ def _handle_run_probe(input_: RunProbeInput, ctx: AgentContext) -> str:
         pairs.append(
             card_fund.run_card_fund_manipulation(ctx.session, owner, card_id, usd_amount="100.00", exchange_rate="100")
         )
+
+    elif input_.probe == "sqli_scan":
+        if owner is None or not owner.account_number:
+            return "sqli_scan: 기준으로 쓸 계좌 있는 주체가 없음"
+        acct = owner.account_number
+        # boolean-based SQLi 프로브는 GET 경로의 {value} 를 payload 로 치환한다.
+        # 기록 path 는 payload 가 아닌 정상 경로로 남겨 GT(G-17/G-02)와 매칭되게 한다.
+        targets = [
+            ("sqli_check_balance", f"/check_balance/{{value}}", f"/check_balance/{acct}"),
+            ("sqli_transactions", f"/transactions/{{value}}", f"/transactions/{acct}"),
+        ]
+        lines = [
+            _record_generic_outcome(
+                ctx, op, "GET", record_path, generic_web.probe_sqli_boolean(ctx.session, template, acct)
+            )
+            for op, template, record_path in targets
+        ]
+        return "\n".join(lines)
+
     else:
         return f"알 수 없는 probe: {input_.probe!r}"
 

@@ -37,12 +37,13 @@ ACTION_CATALOG = """\
 - execute_experiment: {"hypothesis_id": "<propose_hypothesis 가 준 id>"} — 실제로
   요청을 보내고 판정까지 받는다. 어떤 invariant 를 검사할지는 LLM 이 정하지 않는다
   — 관련된 오라클이 자동으로 전부 돈다.
-- run_probe: {"probe": "sensitive_exposure|privilege_escalation|card_fund"} — 계좌 조회·
-  송금 외의 특수 취약점을, 필요한 셋업(계정/카드 생성 등)까지 코드가 자동으로 하는
+- run_probe: {"probe": "sensitive_exposure|privilege_escalation|card_fund|sqli_scan"} — 계좌
+  조회·송금 외의 특수 취약점을, 필요한 셋업(계정/카드 생성 등)까지 코드가 자동으로 하는
   전용 프로브로 시험한다. sensitive_exposure=응답에 비밀번호/재설정 PIN/카드 PAN·CVV가
   노출되는지, privilege_escalation=회원가입 mass assignment(is_admin 주입)로 관리자
   권한이 상승되는지, card_fund=카드 충전 시 환율(exchange_rate) 조작으로 가치가
-  창조되는지. 판정은 오라클이 자동으로 낸다(INV-9/INV-BFLA/INV-1A 등).
+  창조되는지, sqli_scan=계좌/거래 조회 경로에 boolean-based SQL injection 이 통하는지.
+  판정은 오라클이 자동으로 낸다(INV-9/INV-BFLA/INV-1A/G-SQLI 등).
 - finish: {"reason": "<왜 그만두는지>"} — 탐색을 종료한다. 예산 한도가 항상 우선한다.
 """
 
@@ -76,7 +77,7 @@ class ExecuteExperimentInput(BaseModel):
 
 
 class RunProbeInput(BaseModel):
-    probe: Literal["sensitive_exposure", "privilege_escalation", "card_fund"]
+    probe: Literal["sensitive_exposure", "privilege_escalation", "card_fund", "sqli_scan"]
 
 
 class FinishInput(BaseModel):
