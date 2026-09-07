@@ -134,8 +134,11 @@ finredteam/
 │                                  validates operation+target, does NOT pick oracles), planner.py
 │                                  (baseline-derived expected_delta), prompts.py, prioritizer.py
 ├── oracles/                      base, value (INV-1A/1B), amount (INV-6), idempotency (INV-4), concurrency
-│                                  (INV-1C), authz (INV-2, needs graph), generic (SQLi/XSS/BOLA/JWT),
-│                                  registry (★ run_all — full oracle set, no candidate-based narrowing), verifier
+│                                  (INV-1C), authz (INV-2, needs graph), exposure (INV-9), privilege (INV-BFLA),
+│                                  limit (INV-5 — 한도/정책, reads result.policy_signals; probe not wired yet),
+│                                  generic (SQLi/XSS/BOLA/JWT), campaign (★ objective layer — composes findings
+│                                  into adversary objectives OBJ-*, run_all_objectives), registry (★ run_all —
+│                                  full oracle set, no candidate-based narrowing), verifier
 ├── agent/                        budget, phase, strategy (nudges only, no forced batching), termination
 │                                  (Engagement policy_stop always wins over budget/saturation/convergence,
 │                                  which always wins over the LLM's own finish request), react.py (★ main
@@ -150,11 +153,17 @@ vulnbank-target/                  the local target app itself (separate git repo
 
 ### Known gaps (don't assume these exist)
 
-- `resolve_skeleton` only implements `read_balance`/`transfer` operations; there's no
-  auto-generation of idempotency (INV-4) or race-condition (INV-1C) experiment candidates
-  yet, even though those oracles exist.
-- `probing/generic/*` (SQLi, JWT alg=none) is not wired into any ReAct action — only
-  verified via standalone scripts so far.
+- `resolve_skeleton` only implements `read_balance`/`transfer` operations. Idempotency
+  (INV-4) and race (INV-1C) are reachable via dedicated `run_probe` probes
+  (`charge_idempotency`, `race_transfer`), not via auto-generated `execute_experiment`
+  candidates. No probe covers loan/bill/card operations yet.
+- INV-5 (limit/policy, `oracles/limit.py`) is implemented and registered, but no probe
+  fills `result.policy_signals` yet, so it self-returns UNKNOWN on every real run. Its GT
+  items (F-10/F-11/F-17/F-18/F-19/F-21/F-23) are relabeled to INV-5 (coverage ceiling) but
+  are NOT yet findable until a loan/bill/card limit probe is wired (Track B, oracle-first).
+- `probing/generic/*` (SQLi, JWT) IS now wired via `run_probe` probes `sqli_scan` and
+  `jwt_forge` (this supersedes an earlier note that generic probes were unwired). G-XSS /
+  G-BOLA oracles exist but have no dedicated probe yet.
 - `discover_surface` findings land in the graph as facts but are not auto-chained into
   `propose_hypothesis`.
 - `max_concurrency`, `allow_file_upload`, `allow_race_testing` in the Engagement schema

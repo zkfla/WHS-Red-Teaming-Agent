@@ -21,6 +21,7 @@ from finredteam.oracles.base import OracleOutcome
 from finredteam.oracles.concurrency import check_inv_1c
 from finredteam.oracles.exposure import check_inv_9
 from finredteam.oracles.idempotency import check_inv_4
+from finredteam.oracles.limit import check_inv_5
 from finredteam.oracles.privilege import check_bfla
 from finredteam.oracles.value import check_inv_1a, check_inv_1b
 
@@ -32,6 +33,7 @@ REGISTRY: dict[str, OracleFn] = {
     "INV-1B": check_inv_1b,
     "INV-1C": check_inv_1c,
     "INV-4": check_inv_4,
+    "INV-5": check_inv_5,
     "INV-6": check_inv_6,
     "INV-9": check_inv_9,
     "INV-BFLA": check_bfla,

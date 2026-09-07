@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -90,6 +90,10 @@ class ExecutionResult(BaseModel):
     # 거부(403)됐는데 mass assignment 로 is_admin 을 주입한 사용자는 관리자 기능에
     # 접근 성공(200)했는가" 같은 비교 결과를 boolean 으로 담는다.
     authz_signals: dict[str, bool] = {}
+    # INV-5(한도/정책) 판정용 파생 신호 — 프로브(추후 배선)가 정책 경계(min/max/기기
+    # enforced_limit)와 시도 금액·수락 여부·실행후 사용액을 관측해 담는다. 오라클
+    # (oracles/limit.py)은 이 수치만 보고 판정한다(계약은 limit.py docstring 참조).
+    policy_signals: dict[str, Any] = {}
 
 
 class Finding(BaseModel):
