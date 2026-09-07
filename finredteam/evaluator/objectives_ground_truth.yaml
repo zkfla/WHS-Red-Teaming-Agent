@@ -1,0 +1,47 @@
+# objectives_ground_truth.yaml
+#
+# 목표(Objective) 단위 정답 — "이 대상에서 공격자가 실제로 달성 가능한 목표는
+# 무엇인가". invariant 단위 GT(ground_truth.yaml)가 "어떤 취약점이 있나"라면,
+# 이 파일은 그 취약점들을 엮었을 때 "공격자가 무엇을 이룰 수 있나"를 정의한다
+# — red teaming 관점의 정답지.
+#
+# scorer.py::score_objectives 가 이 파일을 읽어 Objective-VVR(목표 달성률)을 낸다:
+# run 의 VIOLATION Finding 들로 oracles/campaign.py::run_all_objectives 를 재실행해
+# 얻은 '달성한 목표'를, 아래 achievable:true 목표들과 대조한다.
+#
+# supported_by 는 이 목표를 성립시키는 invariant-GT 항목 id 들 — 사람이 읽는 근거일
+# 뿐 채점 매칭에는 쓰지 않는다(목표 판정은 오라클이 Finding 으로 직접 한다).
+
+- objective: OBJ-AUTHZ-BYPASS
+  title: 권한 경계 우회 — victim 객체 무단 접근
+  achievable: true
+  supported_by: [F-01, F-02, F-03, F-04, F-05, F-06, F-15, F-20, F-24]
+  note: 다수의 INV-2 BOLA — 인증 없이/타인 토큰으로 victim 객체 접근
+
+- objective: OBJ-FUNDS-EXFIL
+  title: 무단 자금 유출 (victim→attacker)
+  achievable: true
+  supported_by: [F-06, F-07]
+  note: >
+    F-06(victim 계좌를 출금계좌로 사용) / F-07(음수 송금 역방향)로 victim→attacker
+    자금 이동이 성립. 완결 판정은 델타에서 공격자 계좌 증가 + 타 계좌 감소를 함께 관측할 때.
+
+- objective: OBJ-VALUE-FORGE
+  title: 가치 창출(무에서 유) — 공격자 잔액 증식
+  achievable: true
+  supported_by: [F-08, F-12, F-22, F-25]
+  note: >
+    INV-1A(F-08 zero/self/invalid, F-22 invalid recipient) / INV-1C(F-12 race double-spend)
+    / INV-4(F-25 duplicate loan approval) — 대응 출처 감소 없이 가치가 생성/증식.
+
+- objective: OBJ-PRIV-ESC
+  title: 권한 상승 — 관리자/특권 기능 획득
+  achievable: true
+  supported_by: [G-05]
+  note: INV-BFLA — mass assignment(is_admin 주입)로 관리자 기능 접근
+
+- objective: OBJ-PII-EXFIL
+  title: 민감정보 유출 — 카드정보 과다 노출
+  achievable: true
+  supported_by: [F-16, G-06]
+  note: INV-9 — 마스킹 없는 전체 PAN+CVV(F-16) / reset PIN(G-06) 노출

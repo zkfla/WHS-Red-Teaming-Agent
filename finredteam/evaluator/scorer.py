@@ -16,9 +16,13 @@ from pathlib import Path
 
 import yaml
 
+from finredteam.models.core import Principal, Verdict
+from finredteam.models.finding import Finding
+from finredteam.oracles.campaign import run_all_objectives
 from finredteam.storage.db import DB
 
 _DEFAULT_GT_PATH = Path(__file__).resolve().parent / "ground_truth.yaml"
+_DEFAULT_OBJ_GT_PATH = Path(__file__).resolve().parent / "objectives_ground_truth.yaml"
 _ID_SEGMENT_RE = re.compile(r"^[0-9]+$|^[0-9]+[A-Za-z0-9_-]*[0-9][A-Za-z0-9_-]*$")
 
 
@@ -115,15 +119,140 @@ def score(run_dir: Path, ground_truth: list[dict] | None = None) -> ScoreReport:
     )
 
 
+def load_objective_ground_truth(path: Path | None = None) -> list[dict]:
+    raw = yaml.safe_load((path or _DEFAULT_OBJ_GT_PATH).read_text(encoding="utf-8"))
+    return raw or []
+
+
+def _principals_from_manifest(run_dir: Path) -> list[Principal]:
+    """manifest 에 남긴 로스터(id/계좌/role)로 Principal 을 복원한다.
+
+    목표 판정은 principal 의 id 와 account_number 만 쓴다 — username/password 는
+    manifest 에 남기지 않았으므로(비밀 격리) 빈 문자열로 채운다. 로스터가 없는
+    구(舊) run 은 빈 목록을 돌려주고, 그 경우 자금 귀속이 필요한 목표는 오라클이
+    스스로 UNKNOWN 을 낸다(계좌 매핑 불가 → 공격자 계좌 미확정).
+    """
+    manifest_path = run_dir / "manifest.json"
+    if not manifest_path.exists():
+        return []
+    import json
+
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    roster = manifest.get("principals") or []
+    principals: list[Principal] = []
+    for p in roster:
+        principals.append(
+            Principal(
+                id=p["id"],
+                username="",
+                password="",
+                account_number=p.get("account_number"),
+                role=p.get("role", "user"),
+            )
+        )
+    return principals
+
+
+def _findings_from_run(db: DB) -> list[Finding]:
+    """저장된 finding 레코드를 Finding 으로 복원한다 (Money 는 문자열로 직렬화돼 있어
+    round-trip 안전). 스키마가 안 맞는 레코드는 조용히 건너뛴다 — 채점이 한 건의
+    깨진 레코드로 통째 죽지 않게."""
+    findings: list[Finding] = []
+    for record in db.read_all("findings"):
+        try:
+            findings.append(Finding.model_validate(record))
+        except Exception:
+            continue
+    return findings
+
+
+@dataclass
+class ObjectiveScoreReport:
+    """목표(Objective) 단위 채점 결과 — Objective-VVR(목표 달성률).
+
+    achieved/foothold/over_claimed 는 (objective_id, reason) 튜플 목록이다.
+    """
+
+    obj_vvr: tuple[int, int]  # (달성한 achievable 목표 수, 전체 achievable 목표 수)
+    achieved: list[tuple[str, str]]
+    footholds: list[tuple[str, str]]  # ANOMALY — 발판만 확보(체인 미완결)
+    missed: list[str]  # achievable 인데 달성 못 한 목표 id
+    over_claimed: list[tuple[str, str]]  # 달성 판정났으나 GT 에 achievable 로 없는 목표
+
+    def format(self) -> str:
+        matched, total = self.obj_vvr
+        rate = round(matched / total, 2) if total else 0.0
+        ach = ", ".join(o for o, _ in self.achieved) or "-"
+        foot = ", ".join(o for o, _ in self.footholds) or "-"
+        missed = ", ".join(self.missed) or "-"
+        over = ", ".join(o for o, _ in self.over_claimed) or "-"
+        return (
+            f"Objective-VVR {matched}/{total} ({rate}) "
+            f"- Achieved: [{ach}] - Foothold: [{foot}] - Missed: [{missed}] "
+            f"- Over-claimed: [{over}]"
+        )
+
+
+def score_objectives(
+    run_dir: Path, objective_gt: list[dict] | None = None
+) -> ObjectiveScoreReport:
+    """run 의 VIOLATION Finding 들로 목표를 재판정(oracles/campaign)하고 GT 와 대조한다.
+
+    ★ 에이전트를 재실행하지 않는다 — 이미 저장된 Finding 만으로 순수 오라클을 다시
+    돌린다. 그래서 이 채점은 루프/어댑터 설계가 바뀌어도 그대로 동작한다.
+    """
+    db = DB(run_dir)
+    findings = _findings_from_run(db)
+    principals = _principals_from_manifest(run_dir)
+    gt = objective_gt if objective_gt is not None else load_objective_ground_truth()
+
+    outcomes = run_all_objectives(findings, principals)
+    by_id = {o.objective: o for o in outcomes}
+
+    achievable = {g["objective"] for g in gt if g.get("achievable")}
+
+    achieved: list[tuple[str, str]] = []
+    footholds: list[tuple[str, str]] = []
+    over_claimed: list[tuple[str, str]] = []
+    for o in outcomes:
+        if o.verdict == Verdict.VIOLATION:
+            if o.objective in achievable:
+                achieved.append((o.objective, o.reason))
+            else:
+                over_claimed.append((o.objective, o.reason))
+        elif o.verdict == Verdict.ANOMALY:
+            footholds.append((o.objective, o.reason))
+
+    achieved_ids = {o for o, _ in achieved}
+    missed = sorted(a for a in achievable if a not in achieved_ids)
+
+    return ObjectiveScoreReport(
+        obj_vvr=(len(achieved_ids), len(achievable)),
+        achieved=achieved,
+        footholds=footholds,
+        missed=missed,
+        over_claimed=over_claimed,
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="finredteam.evaluator.scorer")
     parser.add_argument("run_dir", type=Path)
     parser.add_argument("--ground-truth", type=Path, default=None)
+    parser.add_argument("--objective-ground-truth", type=Path, default=None)
     args = parser.parse_args(argv if argv is not None else sys.argv[1:])
 
     gt = load_ground_truth(args.ground_truth) if args.ground_truth else None
     report = score(args.run_dir, gt)
     print(report.format())
+
+    obj_gt = (
+        load_objective_ground_truth(args.objective_ground_truth)
+        if args.objective_ground_truth
+        else None
+    )
+    obj_report = score_objectives(args.run_dir, obj_gt)
+    print(obj_report.format())
     return 0
 
 

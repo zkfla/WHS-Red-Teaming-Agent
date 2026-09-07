@@ -1063,6 +1063,7 @@ def run(
         protected_path=protected_path,
     )
     store.record_legacy_bootstrap(ctx.legacy_bootstrap_used)
+    store.record_principals(ctx.principals)  # 목표 채점의 principal→계좌 매핑용 (비밀 제외)
     if ctx.legacy_bootstrap_used:
         logger.warning(
             "Black-box Auth Discovery 실패 — 사람이 작성한 어댑터 설정(LEGACY_BOOTSTRAP)으로 "

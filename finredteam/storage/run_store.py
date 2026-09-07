@@ -84,6 +84,22 @@ class RunStore:
         self.manifest["legacy_bootstrap_used"] = list(used)
         self._write_manifest()
 
+    def record_principals(self, principals: list[Any]) -> None:
+        """이 실행의 principal 로스터를 manifest 에 남긴다 — id/계좌번호/role 만.
+
+        ★ 목표(Objective) 채점(evaluator/scorer.py)이 `principal_id → 계좌번호` 매핑을
+        복원해 '누가 이득을 봤나'(자금 유출 방향)를 판정하려면 이 로스터가 필요하다.
+        Finding 에는 principal_id 만 남고 계좌번호는 없기 때문이다.
+
+        ★ 비밀(password/token/api_key)은 절대 남기지 않는다(§10, storage/evidence 의
+        민감정보 격리 원칙과 같은 이유) — 채점에 필요한 건 계좌 귀속뿐이다.
+        """
+        self.manifest["principals"] = [
+            {"id": p.id, "account_number": p.account_number, "role": p.role}
+            for p in principals
+        ]
+        self._write_manifest()
+
     def record_strategy(self, round_no: int, strategy_name: str) -> None:
         self.manifest["strategy_history"].append({"round": round_no, "strategy": strategy_name})
         self._write_manifest()
