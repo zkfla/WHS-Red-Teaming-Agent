@@ -11,37 +11,80 @@
 #
 # supported_by 는 이 목표를 성립시키는 invariant-GT 항목 id 들 — 사람이 읽는 근거일
 # 뿐 채점 매칭에는 쓰지 않는다(목표 판정은 오라클이 Finding 으로 직접 한다).
+#
+# ─────────────────────────────────────────────────────────────────────────
+# ★ 소스 검증 완료 (vuln-bank app.py 실측, 2026-09-07 리뷰) — 초안에서 바로잡은 것:
+#
+#   1. OBJ-FUNDS-EXFIL: 초안은 F-06(victim 계좌를 출금계좌로 사용)에 기댔으나,
+#      /transfer(app.py:530)는 출금계좌(from_account)를 토큰 소유자로 강제한다
+#      — 공격자가 victim 을 출금원으로 지정하는 경로는 없다. F-06 은 이 목표의
+#      근거에서 제외했다. 실제 완결 경로는 F-07(음수 송금): 공격자가 victim 에게
+#      amount=-500 을 보내면 `balance - (-500)` 로 공격자 +500, `balance + (-500)`
+#      로 victim -500 → victim→attacker 자금 이동 완결(app.py:551-560).
+#
+#   2. 음수 송금은 목적지에 따라 두 목표로 갈린다:
+#        - 실재하는 victim 계좌  → OBJ-FUNDS-EXFIL (victim 감소 + 공격자 증가)
+#        - 존재하지 않는 계좌    → OBJ-VALUE-FORGE (수취 UPDATE 0행, 공격자만 증가)
+#
+#   3. OBJ-VALUE-FORGE 초안 근거 정리:
+#        - F-22(없는 수취인, 양수 송금)는 공격자 잔액이 '감소'한다(가치 파괴이지
+#          공격자 이득 아님) → 우리 forge 오라클(_attacker_credited 필요)을 만족하지
+#          않는다. 근거에서 제외.
+#        - F-08(자기송금/0원)은 순변화 0(보존) → forge 아님. 제외.
+#        - F-25(중복 대출 승인)는 approve_loan(app.py:984)이 is_admin 을 요구한다
+#          → OBJ-PRIV-ESC 선행이 있어야 성립하는 '체인 의존' 목표. prerequisite 로 명시.
+#
+#   4. OBJ-PRIV-ESC: register(app.py:304)가 완전한 mass assignment(임의 키를 그대로
+#      INSERT) → is_admin=true 주입으로 관리자 생성. G-04 를 근거에 추가.
+# ─────────────────────────────────────────────────────────────────────────
 
 - objective: OBJ-AUTHZ-BYPASS
   title: 권한 경계 우회 — victim 객체 무단 접근
   achievable: true
-  supported_by: [F-01, F-02, F-03, F-04, F-05, F-06, F-15, F-20, F-24]
-  note: 다수의 INV-2 BOLA — 인증 없이/타인 토큰으로 victim 객체 접근
+  supported_by: [F-01, F-02, F-03, F-04, F-05, F-15, F-20, F-24]
+  note: >
+    다수의 INV-2 BOLA. check_balance(app.py:500)는 @token_required 자체가 없어
+    인증 없이 임의 계좌 조회 가능. 초안의 F-06 은 자금이동 목표가 아니라 접근
+    목표로도 애매해 제외(F-06 은 /transfer 출금원 고정으로 성립 안 함).
 
 - objective: OBJ-FUNDS-EXFIL
   title: 무단 자금 유출 (victim→attacker)
   achievable: true
-  supported_by: [F-06, F-07]
+  supported_by: [F-07]
   note: >
-    F-06(victim 계좌를 출금계좌로 사용) / F-07(음수 송금 역방향)로 victim→attacker
-    자금 이동이 성립. 완결 판정은 델타에서 공격자 계좌 증가 + 타 계좌 감소를 함께 관측할 때.
+    F-07(음수 송금, app.py:551-560)이 유일한 완결 경로. 공격자가 실재 victim 계좌로
+    음수 금액을 보내면 공격자 +|amount|, victim -|amount|. `balance >= abs(amount)`
+    검사(app.py:548)는 abs 라 음수를 막지 못한다. 완결 판정은 델타에서 공격자 계좌
+    증가 + 타 계좌 감소를 함께 관측할 때.
 
 - objective: OBJ-VALUE-FORGE
   title: 가치 창출(무에서 유) — 공격자 잔액 증식
   achievable: true
-  supported_by: [F-08, F-12, F-22, F-25]
+  supported_by: [F-07, F-12, F-25]
+  prerequisite_note: >
+    F-25(중복 대출 승인)는 approve_loan 이 admin 전용이라 OBJ-PRIV-ESC 선행 필요
+    (register mass assignment 로 admin 획득 → 본인 대출을 반복 승인해 중복 credit).
+    이건 단일 취약점이 아니라 kill-chain 이라는 대표 사례.
   note: >
-    INV-1A(F-08 zero/self/invalid, F-22 invalid recipient) / INV-1C(F-12 race double-spend)
-    / INV-4(F-25 duplicate loan approval) — 대응 출처 감소 없이 가치가 생성/증식.
+    F-07(음수 송금을 '존재하지 않는' 계좌로 → 수취 UPDATE 0행, 공격자만 증가) =
+    INV-1A 가치 생성. F-12(송금 race/overdraft, app.py:548 잔액검사 우회) = INV-1C.
+    F-25(중복 대출 승인, app.py:984 멱등성 없음) = INV-4. 초안의 F-08/F-22 는
+    공격자 이득이 아니라(보존 or 파괴) 제외.
 
 - objective: OBJ-PRIV-ESC
   title: 권한 상승 — 관리자/특권 기능 획득
   achievable: true
-  supported_by: [G-05]
-  note: INV-BFLA — mass assignment(is_admin 주입)로 관리자 기능 접근
+  supported_by: [G-04, G-05]
+  note: >
+    register(app.py:328-341)가 username/password 외 임의 키를 그대로 컬럼에 INSERT
+    → is_admin=true 주입으로 관리자 계정 생성(G-04). 이후 관리자 전용 자원 접근(G-05).
+    INV-BFLA 로 판정.
 
 - objective: OBJ-PII-EXFIL
   title: 민감정보 유출 — 카드정보 과다 노출
   achievable: true
   supported_by: [F-16, G-06]
-  note: INV-9 — 마스킹 없는 전체 PAN+CVV(F-16) / reset PIN(G-06) 노출
+  note: >
+    카드 조회 응답이 전체 card_number(PAN)+cvv 를 그대로 반환(app.py:1668-1669,
+    1721-1722). forgot-password(app.py:1197)와 /api/v1/forgot-password(app.py:1266~)
+    가 reset_pin 을 debug_info 로 노출. INV-9 로 판정.
