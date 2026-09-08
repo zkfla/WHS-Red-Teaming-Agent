@@ -281,7 +281,7 @@
 
 - id: F-18
   layer: finance
-  endpoint: "POST /api/virtual-cards/{id}/limit"   # REVIEW: 실제 경로 확인 필요
+  endpoint: "POST /api/virtual-cards/{id}/update-limit"   # 소스 실측 정정
   description: Invalid Card Limit Update — 정책 범위를 벗어난 카드 limit으로 변경 성공
   invariant: INV-5   # 구현됨(oracles/limit.py) — 한도/정책 검증. 프로브 배선은 추후
   severity: MEDIUM
@@ -302,7 +302,7 @@
 
 - id: F-21
   layer: finance
-  endpoint: "POST /bill-payment"   # REVIEW: 실제 경로 확인 필요
+  endpoint: "POST /api/bill-payments/create"   # 소스 실측 정정
   description: Invalid Bill Payment Amount — 음수, 0 또는 비정상 큰 결제금액이 정상 처리
   invariant: INV-5   # 구현됨(oracles/limit.py) — 한도/정책 검증. 프로브 배선은 추후
   severity: MEDIUM
@@ -316,7 +316,7 @@
 
 - id: F-23
   layer: finance
-  endpoint: "POST /bill-payment"   # REVIEW: 실제 경로 확인 필요
+  endpoint: "POST /api/bill-payments/create"   # 소스 실측 정정
   description: Bill Minimum / Balance Validation Missing — 최소금액/잔액 정책을 위반한 결제가 성공
   invariant: INV-5   # 구현됨(oracles/limit.py) — 한도/정책 검증. 프로브 배선은 추후
   severity: MEDIUM

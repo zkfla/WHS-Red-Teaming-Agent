@@ -59,7 +59,9 @@ from finredteam.planning.actions import (
 )
 from finredteam.planning.candidates import AttackTemplate, CandidateSkeleton
 from finredteam.probing import executor as executor_module
-from finredteam.probing.finance import auth_exposure, burst, card_exposure, card_fund, charge, loan, privesc
+from finredteam.probing.finance import (
+    auth_exposure, bill, burst, card_exposure, card_fund, card_limit as card_limit_probe, charge, loan, privesc,
+)
 from finredteam.probing.generic import api as generic_api
 from finredteam.probing.generic import web as generic_web
 from finredteam.probing.session import Session, SessionError
@@ -203,6 +205,8 @@ class AgentContext:
             "charge_idempotency": {"merchant_charge"},
             "race_transfer": {"race_transfer"},
             "loan_limit": {"request_loan"},
+            "card_limit": {"card_limit_create", "card_limit_update"},
+            "bill_limit": {"bill_payment"},
         }
         tried = self.episodic.tried_operations()
         return [name for name, ops in probe_ops.items() if not (ops & tried)]
@@ -873,6 +877,22 @@ def _handle_run_probe(input_: RunProbeInput, ctx: AgentContext) -> str:
                 ctx.session, owner, amount="100000000.00", max_policy="1000000.00"
             )
         )
+
+    elif input_.probe == "card_limit":
+        if owner is None:
+            return "card_limit 프로브: 카드 소유자로 쓸 계좌 있는 주체가 없음"
+        pairs.append(card_limit_probe.run_card_creation_limit_probe(ctx.session, owner, card_limit="-500.00"))
+        normal_card = ctx.session.create_virtual_card(owner)  # 정상 카드 하나 만들어 한도수정 대상으로
+        if normal_card is not None:
+            pairs.append(card_limit_probe.run_card_update_limit_probe(ctx.session, owner, normal_card, card_limit="-1.00"))
+
+    elif input_.probe == "bill_limit":
+        if owner is None:
+            return "bill_limit 프로브: 결제 주체(계좌 보유)가 없음"
+        biller = bill.discover_biller(ctx.session)
+        if biller is None or biller.get("id") is None:
+            return "bill_limit 프로브: 실존 biller 를 찾지 못함(카테고리/biller 조회 실패)"
+        pairs.append(bill.run_bill_amount_policy_probe(ctx.session, owner, biller=biller, amount="-100.00"))
 
     elif input_.probe == "sqli_scan":
         if owner is None or not owner.account_number:
