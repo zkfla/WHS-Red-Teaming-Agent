@@ -64,6 +64,7 @@ from finredteam.probing.finance import (
 )
 from finredteam.probing.generic import api as generic_api
 from finredteam.probing.generic import web as generic_web
+from finredteam.probing.generic import hygiene as generic_hygiene
 from finredteam.probing.session import Session, SessionError
 from finredteam.recon import auth_discovery
 from finredteam.recon import entitlement as entitlement_module
@@ -207,6 +208,7 @@ class AgentContext:
             "loan_limit": {"request_loan"},
             "card_limit": {"card_limit_create", "card_limit_update"},
             "bill_limit": {"bill_payment"},
+            "web_hygiene": {"cors_reflection", "verbose_error", "user_enumeration"},
         }
         tried = self.episodic.tried_operations()
         return [name for name, ops in probe_ops.items() if not (ops & tried)]
@@ -928,6 +930,20 @@ def _handle_run_probe(input_: RunProbeInput, ctx: AgentContext) -> str:
         payload = {**payload, "is_admin": True}  # 위조 시 권한 승격까지 시도
         outcome = generic_api.probe_jwt_weak_secret(ctx.session, "/api/virtual-cards", "GET", payload)
         return _record_generic_outcome(ctx, "jwt_weak_secret", "GET", "/api/virtual-cards", outcome)
+
+    elif input_.probe == "web_hygiene":
+        lines: list[str] = []
+        lines.append(_record_generic_outcome(
+            ctx, "cors_reflection", "GET", "/check_balance/{id}",
+            generic_hygiene.probe_cors_reflection(ctx.session)))
+        lines.append(_record_generic_outcome(
+            ctx, "verbose_error", "GET", "/check_balance/{id}",
+            generic_hygiene.probe_verbose_error(ctx.session)))
+        if owner is not None:
+            lines.append(_record_generic_outcome(
+                ctx, "user_enumeration", "POST", "/forgot-password",
+                generic_hygiene.probe_user_enumeration(ctx.session, owner.username)))
+        return "\n".join(lines)
 
     else:
         return f"알 수 없는 probe: {input_.probe!r}"

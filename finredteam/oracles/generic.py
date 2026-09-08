@@ -64,3 +64,42 @@ def check_jwt_forgery(accepted: bool, weak_secret_found: str | None = None) -> O
             evidence={"weak_secret_found": bool(weak_secret_found)},
         )
     return passed("G-JWT", "흔한 약한 시크릿으로는 토큰 위조가 수락되지 않음")
+
+
+# ── 웹 위생(Web hygiene) 오라클 — 상태-효과가 아니라 헤더/에러/응답차이 신호로 판정.
+#    Generic Layer 원칙(§15) 그대로: 재현 가능한 강한 신호만 VIOLATION, 애매하면 낮춘다.
+
+
+def check_cors_policy(acao: str | None, origin_sent: str, allow_credentials: bool = False) -> OracleOutcome:
+    """CORS 정책 — 임의 Origin 반사(reflection) 또는 전체 허용(*)을 위반으로 본다 (G-14)."""
+    if not acao:
+        return passed("G-CORS", "Access-Control-Allow-Origin 헤더 없음 — 교차출처 미허용")
+    if acao == origin_sent:
+        cred = " + credentials 허용(치명적)" if allow_credentials else ""
+        return violation(
+            "G-CORS", f"임의 Origin 반사: 보낸 Origin({origin_sent})을 그대로 허용{cred}",
+            evidence={"acao": acao, "origin": origin_sent, "credentials": allow_credentials},
+        )
+    if acao == "*":
+        return violation(
+            "G-CORS", "모든 Origin 허용(Access-Control-Allow-Origin: *) — 금융 API에 부적절",
+            evidence={"acao": "*"},
+        )
+    return passed("G-CORS", f"제한된 Origin만 허용(ACAO={acao})")
+
+
+def check_verbose_error(markers_found: list[str]) -> OracleOutcome:
+    """상세 예외 노출 — 에러 응답에 DB/프레임워크/스택 마커가 있으면 위반 (G-08)."""
+    if markers_found:
+        return violation(
+            "G-INFO", f"에러 응답에 내부 구현 노출 마커: {', '.join(markers_found[:5])}",
+            evidence={"markers": markers_found[:8]},
+        )
+    return passed("G-INFO", "에러 응답에서 내부 구현 노출 신호 없음")
+
+
+def check_user_enumeration(distinguishable: bool, detail: str = "") -> OracleOutcome:
+    """사용자 열거 — 존재/비존재 계정의 응답이 구별되면 위반 (G-18)."""
+    if distinguishable:
+        return violation("G-USERENUM", f"존재/비존재 계정 응답이 구별됨 — {detail}", evidence={"detail": detail})
+    return passed("G-USERENUM", "존재/비존재 계정 응답이 구별되지 않음")

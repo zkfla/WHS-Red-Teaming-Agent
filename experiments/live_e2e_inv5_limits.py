@@ -20,6 +20,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
+        for hk, hv in getattr(self, "_extra_headers", {}).items():
+            self.send_header(hk, hv)
         self.end_headers()
         self.wfile.write(body)
 
@@ -39,6 +41,14 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, {"status": "success", "billers": [
                 {"id": 7, "name": "PowerCo", "account_number": "9990001",
                  "minimum_amount": 50.0, "maximum_amount": 5000.0}]})
+        if p.startswith("/check_balance/"):
+            acct = p.split("/check_balance/", 1)[1]
+            # CORS(app) 무설정 재현: 모든 Origin 허용(ACAO: *)
+            self._extra_headers = {"Access-Control-Allow-Origin": "*"}
+            if "'" in acct or "%27" in acct:  # SQLi 유발 → 상세 예외 노출(str(e)) 재현
+                return self._json(500, {"status": "error",
+                    "message": "psycopg2.errors.SyntaxError: unterminated quoted string at or near \"'\""})
+            return self._json(200, {"status": "success", "username": "u", "balance": 100.0})
         return self._json(404, {"status": "error", "message": "not found"})
 
     def do_POST(self):
@@ -65,6 +75,10 @@ class Handler(BaseHTTPRequestHandler):
         if p == "/api/bill-payments/create":
             return self._json(200, {"status": "success", "message": "Payment processed successfully",
                 "payment_details": {"reference": "BILL1", "amount": data.get("amount")}})
+        if p == "/forgot-password":  # 존재/비존재 계정 응답 구별(user enum)
+            if (data.get("username") or "") == "no_such_user_zzz_000":
+                return self._json(404, {"status": "error", "message": "User not found"})
+            return self._json(200, {"status": "success", "message": "Reset PIN has been sent to your email."})
         return self._json(404, {"status": "error", "message": "not found"})
 
 
@@ -118,6 +132,21 @@ def main():
         if f.verdict.value == "VIOLATION": hits += 1
         print(f"  [{label:18}] {f.invariant} {mark}\n       {f.reason}")
     print(f"\n=== 요약: {hits}/{len(pairs)} 건 INV-5 VIOLATION (실서버 대상 실제 발견) ===")
+
+    # ── 웹 위생(Web hygiene) 프로브도 실소켓으로 ──
+    from finredteam.probing.generic import hygiene
+    print("\n=== 웹 위생 판정 (실제 프로브→소켓→generic 오라클) ===")
+    wh = [
+        ("G-14 CORS", hygiene.probe_cors_reflection(session)),
+        ("G-08 상세에러", hygiene.probe_verbose_error(session)),
+        ("G-18 사용자열거", hygiene.probe_user_enumeration(session, owner.username)),
+    ]
+    wh_hits = 0
+    for label, o in wh:
+        mark = "🔴 VIOLATION" if o.verdict.value == "VIOLATION" else o.verdict.value
+        if o.verdict.value == "VIOLATION": wh_hits += 1
+        print(f"  [{label:16}] {o.invariant} {mark}\n       {o.reason}")
+    print(f"\n=== 요약: {wh_hits}/{len(wh)} 건 웹 위생 VIOLATION ===")
     session.close(); srv.shutdown()
 
 

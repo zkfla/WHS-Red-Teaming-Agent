@@ -71,7 +71,7 @@
   layer: generic
   endpoint: "GET /check_balance/{id}"   # REVIEW: "API 전반" — 대표 엔드포인트 하나로 임시 지정
   description: Verbose Error Disclosure — DB/프레임워크/내부 구조 등의 상세 예외 정보 노출
-  invariant: REVIEW-INFO-DISCLOSURE
+  invariant: G-INFO   # 구현됨(oracles/generic.py) — web_hygiene 프로브
   severity: MEDIUM
 
 - id: G-09
@@ -113,7 +113,7 @@
   layer: generic
   endpoint: "GET /check_balance/{id}"   # REVIEW: "API" 대표 엔드포인트 — 실제 확인 필요
   description: CORS Origin Reflection — 임의 Origin이 허용되거나 Origin reflection 발생
-  invariant: REVIEW-CORS   # REVIEW: 오라클 없음
+  invariant: G-CORS   # 구현됨(oracles/generic.py) — web_hygiene 프로브
   severity: MEDIUM
 
 - id: G-15
@@ -141,7 +141,7 @@
   layer: generic
   endpoint: "POST /forgot-password"
   description: Username Enumeration — 존재/비존재 계정에 따른 응답 차이 확인
-  invariant: REVIEW-USER-ENUM   # REVIEW: 오라클 없음
+  invariant: G-USERENUM   # 구현됨(oracles/generic.py) — web_hygiene 프로브
   severity: LOW
 
 - id: G-19
