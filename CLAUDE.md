@@ -145,8 +145,10 @@ finredteam/
 │                                  which always wins over the LLM's own finish request), react.py (★ main
 │                                  loop + AgentContext + CLEANUP phase), loop.py (compat shim → react.py)
 ├── templates/attacks.yaml        concept-only reference; procedure/payload/endpoint are forbidden here
-└── reporting/, evaluator/        report/transcript/repro/bugbounty; scorer (matches against ground_truth.yaml
-                                   by invariant+endpoint, fully separate process from the agent)
+└── reporting/, evaluator/        report (build() — counts + campaign objectives via run_all_objectives,
+                                   NO VVR; agent-side, GT 안 읽음)/transcript/repro/bugbounty;
+                                   evaluator/scorer (matches ground_truth.yaml by invariant+endpoint +
+                                   score_objectives=Objective-VVR, fully separate process from the agent)
 
 engagements/examples/vulnbank/    pre-approved, committed Engagement for vuln-bank
 vulnbank-target/                  the local target app itself (separate git repo, checked in as a directory)

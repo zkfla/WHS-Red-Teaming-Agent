@@ -164,3 +164,21 @@ def print_report_summary(console: Console, report: dict[str, Any]) -> None:
             sub.add_row(str(name), counts)
         console.print(sub)
     console.print()
+
+    objectives = report.get("objectives") or []
+    if objectives:
+        obj_table = Table(title="달성한 공격 목표 (Objectives — red team view)", show_header=True)
+        obj_table.add_column("objective", style="bold")
+        obj_table.add_column("상태")
+        obj_table.add_column("chain")
+        obj_table.add_column("근거")
+        for o in objectives:
+            achieved = o.get("verdict") == "VIOLATION"
+            status = "[bold red]ACHIEVED[/]" if achieved else "[yellow]FOOTHOLD[/]"
+            obj_table.add_row(
+                o.get("objective", "?"), status,
+                "+".join(o.get("chain") or []) or "-",
+                (o.get("reason") or "")[:70],
+            )
+        console.print(obj_table)
+        console.print()

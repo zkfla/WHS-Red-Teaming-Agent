@@ -9,7 +9,9 @@ from __future__ import annotations
 from collections import Counter
 from typing import Any
 
-from finredteam.models.core import Verdict
+from finredteam.models.core import Principal, Verdict
+from finredteam.models.finding import Finding
+from finredteam.oracles.campaign import run_all_objectives
 from finredteam.storage.db import DB
 
 _LAYERS = ("finance", "generic")
@@ -32,6 +34,30 @@ def build(db: DB, manifest: dict[str, Any]) -> dict[str, Any]:
         if record.get("invariant"):
             by_invariant[record["invariant"]] += 1
 
+    # 목표(Objective) 판정 — campaign 오라클(순수 계층)로 Finding 을 '공격자 목표'로
+    # 조합한다. GT 를 읽지 않으므로 self-scoring(§9) 이 아니다 — 취약점 나열을
+    # red teaming 서사(무엇을 달성했나)로 바꿔 리포트에 싣는다.
+    finding_objs: list[Finding] = []
+    for record in findings:
+        try:
+            finding_objs.append(Finding.model_validate(record))
+        except Exception:
+            continue
+    principals = [
+        Principal(
+            id=p["id"], username="", password="",
+            account_number=p.get("account_number"), role=p.get("role", "user"),
+        )
+        for p in (manifest.get("principals") or [])
+        if p.get("id")
+    ]
+    objectives = [
+        {"objective": o.objective, "title": o.title, "verdict": o.verdict.value,
+         "reason": o.reason, "chain": o.chain}
+        for o in run_all_objectives(finding_objs, principals)
+        if o.verdict in (Verdict.VIOLATION, Verdict.ANOMALY)
+    ]
+
     candidate_count = len(findings)
     verified_count = verdict_counts.get(Verdict.VIOLATION.value, 0)
     yield_ = round(verified_count / candidate_count, 2) if candidate_count else 0.0
@@ -49,6 +75,7 @@ def build(db: DB, manifest: dict[str, Any]) -> dict[str, Any]:
         "by_layer": {layer: dict(counts) for layer, counts in by_layer.items()},
         "by_operation": dict(by_operation),
         "by_invariant": dict(by_invariant),
+        "objectives": objectives,
         "termination_reason": manifest.get("termination_reason"),
         "rounds": manifest.get("round"),
         "strategy_history": manifest.get("strategy_history"),
