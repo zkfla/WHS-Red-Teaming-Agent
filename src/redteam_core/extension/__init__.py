@@ -1,0 +1,43 @@
+from redteam_core.extension.bundle import (
+    BundleKind,
+    BundleManifest,
+    DomainBundle,
+    ExtensionCatalog,
+    compose_bundles,
+)
+from redteam_core.extension.registry import (
+    CandidateDeriverRegistration,
+    DomainStateCodecRegistration,
+    ExperimentExecutorRegistration,
+    FrozenRegistryError,
+    PolicyConstraintEvaluatorRegistration,
+    RelationTypeRegistration,
+    RequirementTypeRegistration,
+    SchemaCategory,
+    SchemaRegistration,
+    TypedRegistry,
+    ValidatorRegistration,
+    fingerprint_source_files,
+    verify_source_fingerprint,
+)
+
+__all__ = [
+    "CandidateDeriverRegistration",
+    "DomainStateCodecRegistration",
+    "ExperimentExecutorRegistration",
+    "BundleManifest",
+    "BundleKind",
+    "DomainBundle",
+    "ExtensionCatalog",
+    "FrozenRegistryError",
+    "PolicyConstraintEvaluatorRegistration",
+    "RelationTypeRegistration",
+    "RequirementTypeRegistration",
+    "SchemaCategory",
+    "SchemaRegistration",
+    "TypedRegistry",
+    "ValidatorRegistration",
+    "compose_bundles",
+    "fingerprint_source_files",
+    "verify_source_fingerprint",
+]
