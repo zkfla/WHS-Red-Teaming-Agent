@@ -1,0 +1,278 @@
+{
+  "schema_version": 1,
+  "source_hash": "e19036b661e15738b8a582acebda156d6ce1946ea515bb92179cba3bb318af10",
+  "harness_hash": "7f405210e60c50fea462395e521085cdb850988f23a55b33d81253b730e3c5ac",
+  "source_integrity": "PASS",
+  "fixture_hash": "61649f57da3141af3b1cd37ae4ae1d9008d42c9768bae09cb981e9ce83965c0e",
+  "config": {
+    "repetitions": 30,
+    "warmup": 5,
+    "legacy_policy": {
+      "max_characters": 1000000,
+      "max_hypotheses": 8,
+      "max_candidates": 500,
+      "max_relations": 5000,
+      "max_requirements": 1000,
+      "max_observations": 1000
+    },
+    "focused_policy": {
+      "max_characters": 1000000,
+      "max_utf8_bytes": 4000000,
+      "max_active_candidates": 16,
+      "max_total_tokens": null,
+      "reserved_output_tokens": 0,
+      "reserved_schema_tokens": 0
+    }
+  },
+  "config_hash": "5e7ce7eb518a118e2473f0666712b4041dc9c2d233d36f2c5c8f70444970717c",
+  "environment": {
+    "python": "3.13.14",
+    "platform": "Windows-11-10.0.26200-SP0"
+  },
+  "fixture": {
+    "name": "focused-active-candidate-with-unrelated-global-relations",
+    "unrelated_relations": 1000,
+    "active_candidates": 1,
+    "required_bundle_status": "COMPLETE"
+  },
+  "token_metric": {
+    "counter": "synthetic_utf8_quad_estimate_not_provider_tokenizer",
+    "legacy_input_tokens": 65614,
+    "focused_input_tokens": 781,
+    "focused_to_legacy_ratio": 0.011902947541683178,
+    "reduction_fraction": 0.9880970524583168,
+    "target_reduction_fraction": 0.2,
+    "target_met": true
+  },
+  "output_bytes": {
+    "legacy": 262456,
+    "focused": 3124
+  },
+  "timing_ns": {
+    "legacy": {
+      "count": 30,
+      "p50": 4626000.0,
+      "p95": 6158300,
+      "minimum": 4393800,
+      "maximum": 7165700,
+      "samples": [
+        4920300,
+        4554900,
+        4577700,
+        4850500,
+        4630800,
+        4428000,
+        4429000,
+        4882700,
+        4549000,
+        4393800,
+        6158300,
+        7165700,
+        4449800,
+        5800100,
+        5022000,
+        4451600,
+        5635300,
+        4548500,
+        4623300,
+        5287300,
+        4628700,
+        4455200,
+        5457600,
+        4630900,
+        4474000,
+        4400100,
+        5194500,
+        4469100,
+        4410700,
+        5210800
+      ],
+      "p95_method": "nearest-rank",
+      "release_sample_count_met": true
+    },
+    "focused": {
+      "count": 30,
+      "p50": 284300.0,
+      "p95": 435300,
+      "minimum": 207700,
+      "maximum": 530800,
+      "samples": [
+        213900,
+        369200,
+        226900,
+        326400,
+        233300,
+        303500,
+        207700,
+        332700,
+        224300,
+        274900,
+        220000,
+        389500,
+        231400,
+        391900,
+        271100,
+        293700,
+        219700,
+        327900,
+        221500,
+        363900,
+        229400,
+        295400,
+        218500,
+        321800,
+        224200,
+        435300,
+        530800,
+        332500,
+        224400,
+        347800
+      ],
+      "p95_method": "nearest-rank",
+      "release_sample_count_met": true
+    },
+    "comparison": {
+      "p50_ratio": 0.06145698227410289,
+      "ci95_low": 0.04879631432093959,
+      "ci95_high": 0.07082379368439241,
+      "seed": 0,
+      "draws": 2000,
+      "sample_pairs": 30,
+      "assessment": "DIRECTION_OBSERVED",
+      "approval": "NOT_A_RELEASE_SPEED_GATE"
+    },
+    "execution_order": [
+      [
+        1,
+        0
+      ],
+      [
+        0,
+        1
+      ],
+      [
+        1,
+        0
+      ],
+      [
+        0,
+        1
+      ],
+      [
+        1,
+        0
+      ],
+      [
+        0,
+        1
+      ],
+      [
+        1,
+        0
+      ],
+      [
+        0,
+        1
+      ],
+      [
+        1,
+        0
+      ],
+      [
+        0,
+        1
+      ],
+      [
+        1,
+        0
+      ],
+      [
+        0,
+        1
+      ],
+      [
+        1,
+        0
+      ],
+      [
+        0,
+        1
+      ],
+      [
+        1,
+        0
+      ],
+      [
+        0,
+        1
+      ],
+      [
+        1,
+        0
+      ],
+      [
+        0,
+        1
+      ],
+      [
+        1,
+        0
+      ],
+      [
+        0,
+        1
+      ],
+      [
+        1,
+        0
+      ],
+      [
+        0,
+        1
+      ],
+      [
+        1,
+        0
+      ],
+      [
+        0,
+        1
+      ],
+      [
+        1,
+        0
+      ],
+      [
+        0,
+        1
+      ],
+      [
+        1,
+        0
+      ],
+      [
+        0,
+        1
+      ],
+      [
+        1,
+        0
+      ],
+      [
+        0,
+        1
+      ]
+    ]
+  },
+  "correctness": {
+    "complete_active_bundles": 1,
+    "incomplete_active_bundles": 0,
+    "required_context_omissions": 0,
+    "raw_payloads_included": false
+  },
+  "memory": "NOT_MEASURED_IN_TIMING_SAMPLES",
+  "separate_python_peak_bytes": {
+    "legacy": 2364618,
+    "focused": 1554516
+  }
+}

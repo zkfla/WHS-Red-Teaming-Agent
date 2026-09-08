@@ -1,5 +1,32 @@
 # Test specification
 
+> The domain-specific scenarios below are historical CI/CD donor tests, not
+> the current Generic Core acceptance criteria. No live target, provider or
+> external CI workflow is exercised by the current offline release procedure.
+
+## Current Generic Core checks
+
+From the `redteam_core` worktree:
+
+```text
+uv sync --dev
+uv run python -m pytest
+uv run ruff check .
+uv run python -m compileall -q src
+uv build
+```
+
+Use the [performance plan](GENERIC_CORE_PERFORMANCE_EVOLUTION_PLAN.md),
+[G9 receipt](GENERIC_CORE_G9_RECEIPT.md) and
+[acceptance audit](GENERIC_CORE_PERFORMANCE_ACCEPTANCE.md) for current regression,
+independent oracle, fault, determinism and benchmark evidence. Performance runners
+must run separately from correctness tests. TIMEOUT/RESOURCE_LIMIT and withheld
+default-enable results are preserved; a fake loop is not live-provider validation.
+The approved offline G9 source is `7293c3e3ca79ba3177f27ee5a52c48c41719e7573996f1325a522b54b9945ce5`;
+see the acceptance audit for the separated full-suite and post-approval hash gates.
+
+## Historical donor test specification
+
 ## Required deterministic coverage
 
 - workflow-free repository and ordinary CI

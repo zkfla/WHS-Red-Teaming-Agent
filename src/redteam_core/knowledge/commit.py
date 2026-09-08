@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from datetime import datetime
 
+from redteam_core.diagnostics.performance import PerformanceStage, performance_span
 from redteam_core.extension.bundle import ExtensionCatalog
 from redteam_core.investigation.requirements import EvidenceRequirement, Observation
+from redteam_core.knowledge.lookup import ObservationLookupMode, index_observations
 from redteam_core.knowledge.recompute import SemanticRecomputer, recompute_relations
 from redteam_core.knowledge.state import (
     CommitResult,
@@ -111,9 +113,7 @@ def _build_slot(
         effective_payload_hash=effective_hash,
         authoritative_payload_hashes=hashes,
         observation_ids=tuple(sorted(item.observation_id for item in fresh)),
-        authoritative_observation_ids=tuple(
-            sorted(item.observation_id for item in authoritative)
-        ),
+        authoritative_observation_ids=tuple(sorted(item.observation_id for item in authoritative)),
         inferred_observation_ids=tuple(sorted(item.observation_id for item in inferred)),
         stale_observation_ids=tuple(sorted(stale_ids)),
     )
@@ -124,12 +124,17 @@ def _recompute_slot(
     session: CoreSession,
     requirement_id: str,
     evaluation_time: datetime,
+    observation_index: dict[str, list[Observation]] | None = None,
 ) -> KnowledgeSlot:
     requirement = session.investigation.requirements[requirement_id]
-    observations = tuple(
-        item
-        for item in session.investigation.observations.values()
-        if item.requirement_id == requirement_id
+    observations = (
+        tuple(observation_index.get(requirement_id, ()))
+        if observation_index is not None
+        else tuple(
+            item
+            for item in session.investigation.observations.values()
+            if item.requirement_id == requirement_id
+        )
     )
     return _build_slot(
         requirement=requirement,
@@ -138,6 +143,9 @@ def _recompute_slot(
     )
 
 
+@performance_span(
+    PerformanceStage.COMMIT, input_items=lambda session, observations, **kwargs: len(observations)
+)
 def apply_observations_atomic(
     session: CoreSession,
     observations: tuple[Observation, ...],
@@ -146,6 +154,7 @@ def apply_observations_atomic(
     evaluation_time: datetime,
     expected_revision: int,
     recomputers: tuple[SemanticRecomputer, ...] = (),
+    lookup_mode: ObservationLookupMode = ObservationLookupMode.FULL_SCAN,
 ) -> CommitResult:
     """Record a batch and commit its semantic effect exactly once.
 
@@ -153,6 +162,7 @@ def apply_observations_atomic(
     affected knowledge slots are recomputed from the complete ledger before one revision bump.
     """
 
+    lookup_mode = ObservationLookupMode(lookup_mode)
     _require_aware(evaluation_time)
     if expected_revision != session.knowledge.revision:
         raise SemanticCommitConflict(
@@ -176,11 +186,17 @@ def apply_observations_atomic(
         affected.add(observation.requirement_id)
 
     semantic_changed = False
+    observation_index = (
+        index_observations(candidate.investigation.observations.values())
+        if lookup_mode is ObservationLookupMode.INDEXED and affected
+        else None
+    )
     for requirement_id in sorted(affected):
         new_slot = _recompute_slot(
             session=candidate,
             requirement_id=requirement_id,
             evaluation_time=evaluation_time,
+            observation_index=observation_index,
         )
         if candidate.knowledge.slots.get(requirement_id) != new_slot:
             candidate.knowledge.slots[requirement_id] = new_slot
@@ -222,6 +238,7 @@ def apply_observation(
     evaluation_time: datetime,
     expected_revision: int,
     recomputers: tuple[SemanticRecomputer, ...] = (),
+    lookup_mode: ObservationLookupMode = ObservationLookupMode.FULL_SCAN,
 ) -> CommitResult:
     return apply_observations_atomic(
         session,
@@ -230,9 +247,14 @@ def apply_observation(
         evaluation_time=evaluation_time,
         expected_revision=expected_revision,
         recomputers=recomputers,
+        lookup_mode=lookup_mode,
     )
 
 
+@performance_span(
+    PerformanceStage.RECOMPUTE,
+    input_items=lambda session, **kwargs: len(session.investigation.observations),
+)
 def refresh_freshness(
     session: CoreSession,
     *,
@@ -240,7 +262,9 @@ def refresh_freshness(
     expected_revision: int,
     catalog: ExtensionCatalog | None = None,
     recomputers: tuple[SemanticRecomputer, ...] = (),
+    lookup_mode: ObservationLookupMode = ObservationLookupMode.FULL_SCAN,
 ) -> CommitResult:
+    lookup_mode = ObservationLookupMode(lookup_mode)
     _require_aware(evaluation_time)
     if expected_revision != session.knowledge.revision:
         raise SemanticCommitConflict(
@@ -248,11 +272,17 @@ def refresh_freshness(
         )
     candidate = session.model_copy(deep=True)
     changed_requirements: list[str] = []
+    observation_index = (
+        index_observations(candidate.investigation.observations.values())
+        if lookup_mode is ObservationLookupMode.INDEXED
+        else None
+    )
     for requirement_id in sorted(candidate.investigation.requirements):
         new_slot = _recompute_slot(
             session=candidate,
             requirement_id=requirement_id,
             evaluation_time=evaluation_time,
+            observation_index=observation_index,
         )
         if candidate.knowledge.slots.get(requirement_id) != new_slot:
             candidate.knowledge.slots[requirement_id] = new_slot

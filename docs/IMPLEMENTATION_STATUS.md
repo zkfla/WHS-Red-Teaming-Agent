@@ -1,5 +1,13 @@
 # 프로토타입 구현 현황
 
+> **이하 내용은 과거 CI/CD donor의 기록이며, 현재 `redteam_core` 구현 현황이 아니다.**
+> 현재 도메인 독립 Core의 후속 작업은
+> [성능·조사 효율 개선 계획](GENERIC_CORE_PERFORMANCE_EVOLUTION_PLAN.md)과
+> [단계별 계획 색인](../PLANS.md), [현재 요구사항 검증표](GENERIC_CORE_PERFORMANCE_ACCEPTANCE.md)를 따른다.
+> G0~G4/G6~G9은 PASSED_OFFLINE이며 G5/C1~C4는 조건 미충족으로 DEFERRED다.
+> 실제 CI/CD 도메인·외부 LLM/provider·live target 적용은 이번 범위에 포함되지 않는다.
+> 아래의 기준일·기능·명령은 과거 donor에 한정하며 현재 기능으로 해석하면 안 된다.
+
 > **현재 상태를 판단하는 기준 문서**
 >
 > 최종 확인일: 2026-08-29 · 대상 버전: `0.1.0`

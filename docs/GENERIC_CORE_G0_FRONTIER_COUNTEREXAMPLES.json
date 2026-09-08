@@ -1,0 +1,319 @@
+{
+  "actual_core_sha256": "53e814dcb5152fa178765201a9afa22c22eab928b3ba3b2101645b738cd1c21c",
+  "baseline": {
+    "approval_receipt": "docs/BATCH_F_IMPLEMENTATION_RECEIPT.md",
+    "approved_core_sha256": "53e814dcb5152fa178765201a9afa22c22eab928b3ba3b2101645b738cd1c21c",
+    "approved_release": "batch-f",
+    "hash_contract": "sorted POSIX relative Python path, NUL, exact file bytes, NUL",
+    "historical_commit": "a01417cb241fc437ce0556ab0d9d5afb0381e8a2",
+    "historical_core_sha256": "53e814dcb5152fa178765201a9afa22c22eab928b3ba3b2101645b738cd1c21c",
+    "schema_version": 1
+  },
+  "cases": [
+    {
+      "actual_reachability": [
+        [
+          "source:one",
+          "z",
+          [],
+          "SUPPORTED"
+        ]
+      ],
+      "case": "source_convergence",
+      "distinct_actual_signatures": 1,
+      "edges": [
+        {
+          "contexts": [],
+          "role": "source",
+          "source": "source:one",
+          "target": "a",
+          "verdict": "TRUE"
+        },
+        {
+          "contexts": [],
+          "role": "source",
+          "source": "source:two",
+          "target": "a",
+          "verdict": "TRUE"
+        },
+        {
+          "contexts": [],
+          "role": "flow",
+          "source": "a",
+          "target": "b",
+          "verdict": "TRUE"
+        },
+        {
+          "contexts": [],
+          "role": "sink",
+          "source": "b",
+          "target": "z",
+          "verdict": "TRUE"
+        }
+      ],
+      "expansions_used": 2,
+      "expected_reachability": [
+        [
+          "source:one",
+          "z",
+          [],
+          "SUPPORTED"
+        ],
+        [
+          "source:two",
+          "z",
+          [],
+          "SUPPORTED"
+        ]
+      ],
+      "gate": "FAILED",
+      "mismatched_orderings": 24,
+      "missing": [
+        [
+          "source:two",
+          "z",
+          [],
+          "SUPPORTED"
+        ]
+      ],
+      "orderings_checked": 24,
+      "search_complete": true,
+      "truncated": false,
+      "unexpected": []
+    },
+    {
+      "actual_reachability": [],
+      "case": "false_shortcut_suppresses_viable_detour",
+      "distinct_actual_signatures": 1,
+      "edges": [
+        {
+          "contexts": [],
+          "role": "source",
+          "source": "s",
+          "target": "a",
+          "verdict": "TRUE"
+        },
+        {
+          "contexts": [],
+          "role": "flow",
+          "source": "a",
+          "target": "b",
+          "verdict": "FALSE"
+        },
+        {
+          "contexts": [],
+          "role": "flow",
+          "source": "a",
+          "target": "c",
+          "verdict": "TRUE"
+        },
+        {
+          "contexts": [],
+          "role": "flow",
+          "source": "c",
+          "target": "b",
+          "verdict": "TRUE"
+        },
+        {
+          "contexts": [],
+          "role": "sink",
+          "source": "b",
+          "target": "z",
+          "verdict": "TRUE"
+        }
+      ],
+      "expansions_used": 2,
+      "expected_reachability": [
+        [
+          "s",
+          "z",
+          [],
+          "SUPPORTED"
+        ]
+      ],
+      "gate": "FAILED",
+      "mismatched_orderings": 120,
+      "missing": [
+        [
+          "s",
+          "z",
+          [],
+          "SUPPORTED"
+        ]
+      ],
+      "orderings_checked": 120,
+      "search_complete": true,
+      "truncated": false,
+      "unexpected": []
+    },
+    {
+      "actual_reachability": [
+        [
+          "source:one",
+          "z",
+          [],
+          "SUPPORTED"
+        ]
+      ],
+      "case": "control_first_source_alone",
+      "distinct_actual_signatures": 1,
+      "edges": [
+        {
+          "contexts": [],
+          "role": "source",
+          "source": "source:one",
+          "target": "a",
+          "verdict": "TRUE"
+        },
+        {
+          "contexts": [],
+          "role": "flow",
+          "source": "a",
+          "target": "b",
+          "verdict": "TRUE"
+        },
+        {
+          "contexts": [],
+          "role": "sink",
+          "source": "b",
+          "target": "z",
+          "verdict": "TRUE"
+        }
+      ],
+      "expansions_used": 2,
+      "expected_reachability": [
+        [
+          "source:one",
+          "z",
+          [],
+          "SUPPORTED"
+        ]
+      ],
+      "gate": "PASSED",
+      "mismatched_orderings": 0,
+      "missing": [],
+      "orderings_checked": 6,
+      "search_complete": true,
+      "truncated": false,
+      "unexpected": []
+    },
+    {
+      "actual_reachability": [
+        [
+          "source:two",
+          "z",
+          [],
+          "SUPPORTED"
+        ]
+      ],
+      "case": "control_second_source_alone",
+      "distinct_actual_signatures": 1,
+      "edges": [
+        {
+          "contexts": [],
+          "role": "source",
+          "source": "source:two",
+          "target": "a",
+          "verdict": "TRUE"
+        },
+        {
+          "contexts": [],
+          "role": "flow",
+          "source": "a",
+          "target": "b",
+          "verdict": "TRUE"
+        },
+        {
+          "contexts": [],
+          "role": "sink",
+          "source": "b",
+          "target": "z",
+          "verdict": "TRUE"
+        }
+      ],
+      "expansions_used": 2,
+      "expected_reachability": [
+        [
+          "source:two",
+          "z",
+          [],
+          "SUPPORTED"
+        ]
+      ],
+      "gate": "PASSED",
+      "mismatched_orderings": 0,
+      "missing": [],
+      "orderings_checked": 6,
+      "search_complete": true,
+      "truncated": false,
+      "unexpected": []
+    },
+    {
+      "actual_reachability": [
+        [
+          "s",
+          "z",
+          [],
+          "SUPPORTED"
+        ]
+      ],
+      "case": "control_without_false_shortcut",
+      "distinct_actual_signatures": 1,
+      "edges": [
+        {
+          "contexts": [],
+          "role": "source",
+          "source": "s",
+          "target": "a",
+          "verdict": "TRUE"
+        },
+        {
+          "contexts": [],
+          "role": "flow",
+          "source": "a",
+          "target": "c",
+          "verdict": "TRUE"
+        },
+        {
+          "contexts": [],
+          "role": "flow",
+          "source": "c",
+          "target": "b",
+          "verdict": "TRUE"
+        },
+        {
+          "contexts": [],
+          "role": "sink",
+          "source": "b",
+          "target": "z",
+          "verdict": "TRUE"
+        }
+      ],
+      "expansions_used": 3,
+      "expected_reachability": [
+        [
+          "s",
+          "z",
+          [],
+          "SUPPORTED"
+        ]
+      ],
+      "gate": "PASSED",
+      "mismatched_orderings": 0,
+      "missing": [],
+      "orderings_checked": 24,
+      "search_complete": true,
+      "truncated": false,
+      "unexpected": []
+    }
+  ],
+  "external_calls": 0,
+  "gate": "FAILED",
+  "purpose": "G0 independent correctness gate, not a performance result",
+  "query": {
+    "max_depth": 8,
+    "max_expansions": 100000,
+    "max_frontiers": 100000
+  },
+  "schema_version": 1
+}

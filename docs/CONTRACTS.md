@@ -1,5 +1,17 @@
 # Public contracts
 
+> The CLI and domain-specific contracts below are historical CI/CD donor records.
+> They are not installed commands or supported concrete adapters in `redteam_core`.
+
+The current package exposes Python APIs through explicit trusted bundle/runtime
+composition. See [current API entry points and rollback](../README.md), the
+[domain-neutral plan](GENERIC_CORE_PERFORMANCE_EVOLUTION_PLAN.md) and
+[requirement-to-evidence audit](GENERIC_CORE_PERFORMANCE_ACCEPTANCE.md).
+Proposal validation, durable budget/history, UNKNOWN and all-applicable validator
+semantics remain authoritative; no live model/provider implementation is bundled.
+
+## Historical donor public contracts
+
 ## CLI
 
 ```text

@@ -1,5 +1,15 @@
 # Agent Runtime Reliability
 
+> Historical CI/CD donor documentation retained from the repository baseline.
+> The descriptions below do **not** describe the domain-independent runtime on
+> `redteam_core`. No CI/CD parser, LiteLLM or Codex provider adapter is included in
+> the current performance-evolution scope. Current contracts and verified status:
+> [active plan](GENERIC_CORE_PERFORMANCE_EVOLUTION_PLAN.md),
+> [G7 runtime receipt](GENERIC_CORE_G7_RECEIPT.md),
+> [current acceptance audit](GENERIC_CORE_PERFORMANCE_ACCEPTANCE.md), and
+> [plan index](../PLANS.md). G7/G8/G9 are provider-free and PASSED_OFFLINE;
+> live-provider and actual domain runtime validation remain outside scope.
+
 The reasoning-mode Agent keeps the CI/CD parser, security fact graph and validator unchanged while
 adding bounded runtime protections:
 

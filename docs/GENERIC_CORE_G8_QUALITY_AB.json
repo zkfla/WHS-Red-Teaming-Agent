@@ -1,0 +1,507 @@
+{
+  "schema_version": 1,
+  "source_hash": "2186f99c16fa93a143fe048a171de47d6afef146934f550ff647c56130b29bc9",
+  "fixture_hash": "a8fdfec652b6b5ea7788bf8a518c400125c4ddc6096744f6ca67e6d394801f87",
+  "python": "3.13.14",
+  "platform": "Windows-11-10.0.26200-SP0",
+  "baseline_contract": "legacy score with common G8 admission and terminal-binding controls",
+  "timing_claim": "single local descriptive sample per case, no statistical speed claim",
+  "real_provider_calls": 0,
+  "request_budgets": [
+    3,
+    6
+  ],
+  "portfolio_limit": 2,
+  "quality_regressions": [
+    {
+      "fixture": "repeated-known-failure",
+      "budget": 3,
+      "metric": "distinct_root_coverage"
+    }
+  ],
+  "default_enable": "WITHHELD_QUALITY_REGRESSION",
+  "results": [
+    {
+      "fixture": "shared-evidence",
+      "arm": "baseline",
+      "request_budget": 3,
+      "status": "PASS",
+      "stop_reason": "NO_ELIGIBLE_ROOT",
+      "correct_root_decisions": 3,
+      "incorrect_root_decisions": 0,
+      "ground_truth_root_count": 4,
+      "unresolved_ground_truth_roots": 0,
+      "distinct_root_coverage": 3,
+      "solved_requirements": 3,
+      "conflicting_requirements": 0,
+      "resolver_calls": 3,
+      "duplicate_calls": 0,
+      "first_valid_outcome_ms": 7989.235600005486,
+      "first_valid_outcome_calls": 3,
+      "elapsed_ms": 9166.751299999305,
+      "outcome_labels": [
+        "PASS",
+        "PASS",
+        "VIOLATION"
+      ],
+      "call_tape": [
+        "long0",
+        "shared",
+        "long1"
+      ],
+      "provider_binding": "core.priority.baseline@1:sha256:baa3112b0ccdd1722ffc7a66cdb30a8db04aec7e161589118283fe9b7265a417"
+    },
+    {
+      "fixture": "shared-evidence",
+      "arm": "utility",
+      "request_budget": 3,
+      "status": "PASS",
+      "stop_reason": "NO_ACTIONABLE_PROGRESS",
+      "correct_root_decisions": 3,
+      "incorrect_root_decisions": 0,
+      "ground_truth_root_count": 4,
+      "unresolved_ground_truth_roots": 0,
+      "distinct_root_coverage": 4,
+      "solved_requirements": 3,
+      "conflicting_requirements": 0,
+      "resolver_calls": 3,
+      "duplicate_calls": 0,
+      "first_valid_outcome_ms": 7922.877999997581,
+      "first_valid_outcome_calls": 3,
+      "elapsed_ms": 9488.972999999532,
+      "outcome_labels": [
+        "PASS",
+        "PASS",
+        "PASS"
+      ],
+      "call_tape": [
+        "shared",
+        "long0",
+        "solo"
+      ],
+      "provider_binding": "core.priority.expected-utility@1:sha256:4df2eb14d6a63e17acec5e19323a4a35e9cbc5fe48450a54a144a9850fbd6bee"
+    },
+    {
+      "fixture": "shared-evidence",
+      "arm": "baseline",
+      "request_budget": 6,
+      "status": "PASS",
+      "stop_reason": "NO_ELIGIBLE_ROOT",
+      "correct_root_decisions": 4,
+      "incorrect_root_decisions": 0,
+      "ground_truth_root_count": 4,
+      "unresolved_ground_truth_roots": 0,
+      "distinct_root_coverage": 4,
+      "solved_requirements": 4,
+      "conflicting_requirements": 0,
+      "resolver_calls": 4,
+      "duplicate_calls": 0,
+      "first_valid_outcome_ms": 8122.469000001729,
+      "first_valid_outcome_calls": 3,
+      "elapsed_ms": 12134.896199997456,
+      "outcome_labels": [
+        "PASS",
+        "PASS",
+        "PASS",
+        "VIOLATION"
+      ],
+      "call_tape": [
+        "long0",
+        "shared",
+        "long1",
+        "solo"
+      ],
+      "provider_binding": "core.priority.baseline@1:sha256:baa3112b0ccdd1722ffc7a66cdb30a8db04aec7e161589118283fe9b7265a417"
+    },
+    {
+      "fixture": "shared-evidence",
+      "arm": "utility",
+      "request_budget": 6,
+      "status": "PASS",
+      "stop_reason": "NO_ELIGIBLE_ROOT",
+      "correct_root_decisions": 4,
+      "incorrect_root_decisions": 0,
+      "ground_truth_root_count": 4,
+      "unresolved_ground_truth_roots": 0,
+      "distinct_root_coverage": 4,
+      "solved_requirements": 4,
+      "conflicting_requirements": 0,
+      "resolver_calls": 4,
+      "duplicate_calls": 0,
+      "first_valid_outcome_ms": 10349.843999996665,
+      "first_valid_outcome_calls": 4,
+      "elapsed_ms": 11779.991900002642,
+      "outcome_labels": [
+        "PASS",
+        "PASS",
+        "PASS",
+        "VIOLATION"
+      ],
+      "call_tape": [
+        "shared",
+        "long0",
+        "solo",
+        "long1"
+      ],
+      "provider_binding": "core.priority.expected-utility@1:sha256:4df2eb14d6a63e17acec5e19323a4a35e9cbc5fe48450a54a144a9850fbd6bee"
+    },
+    {
+      "fixture": "cached-negative",
+      "arm": "utility",
+      "request_budget": 3,
+      "status": "PASS",
+      "stop_reason": "NO_ELIGIBLE_ROOT",
+      "correct_root_decisions": 3,
+      "incorrect_root_decisions": 0,
+      "ground_truth_root_count": 3,
+      "unresolved_ground_truth_roots": 0,
+      "distinct_root_coverage": 3,
+      "solved_requirements": 4,
+      "conflicting_requirements": 0,
+      "resolver_calls": 3,
+      "duplicate_calls": 0,
+      "first_valid_outcome_ms": 5338.134700003138,
+      "first_valid_outcome_calls": 2,
+      "elapsed_ms": 9188.194700000167,
+      "outcome_labels": [
+        "PASS",
+        "VIOLATION",
+        "VIOLATION"
+      ],
+      "call_tape": [
+        "long0",
+        "solo",
+        "long1"
+      ],
+      "provider_binding": "core.priority.expected-utility@1:sha256:4df2eb14d6a63e17acec5e19323a4a35e9cbc5fe48450a54a144a9850fbd6bee"
+    },
+    {
+      "fixture": "cached-negative",
+      "arm": "baseline",
+      "request_budget": 3,
+      "status": "PASS",
+      "stop_reason": "NO_ELIGIBLE_ROOT",
+      "correct_root_decisions": 3,
+      "incorrect_root_decisions": 0,
+      "ground_truth_root_count": 3,
+      "unresolved_ground_truth_roots": 0,
+      "distinct_root_coverage": 3,
+      "solved_requirements": 4,
+      "conflicting_requirements": 0,
+      "resolver_calls": 3,
+      "duplicate_calls": 0,
+      "first_valid_outcome_ms": 7204.038299998501,
+      "first_valid_outcome_calls": 3,
+      "elapsed_ms": 8378.553599999577,
+      "outcome_labels": [
+        "PASS",
+        "VIOLATION",
+        "VIOLATION"
+      ],
+      "call_tape": [
+        "long0",
+        "solo",
+        "long1"
+      ],
+      "provider_binding": "core.priority.baseline@1:sha256:baa3112b0ccdd1722ffc7a66cdb30a8db04aec7e161589118283fe9b7265a417"
+    },
+    {
+      "fixture": "cached-negative",
+      "arm": "utility",
+      "request_budget": 6,
+      "status": "PASS",
+      "stop_reason": "NO_ELIGIBLE_ROOT",
+      "correct_root_decisions": 3,
+      "incorrect_root_decisions": 0,
+      "ground_truth_root_count": 3,
+      "unresolved_ground_truth_roots": 0,
+      "distinct_root_coverage": 3,
+      "solved_requirements": 4,
+      "conflicting_requirements": 0,
+      "resolver_calls": 3,
+      "duplicate_calls": 0,
+      "first_valid_outcome_ms": 5128.010799999174,
+      "first_valid_outcome_calls": 2,
+      "elapsed_ms": 8676.76969999593,
+      "outcome_labels": [
+        "PASS",
+        "VIOLATION",
+        "VIOLATION"
+      ],
+      "call_tape": [
+        "long0",
+        "solo",
+        "long1"
+      ],
+      "provider_binding": "core.priority.expected-utility@1:sha256:4df2eb14d6a63e17acec5e19323a4a35e9cbc5fe48450a54a144a9850fbd6bee"
+    },
+    {
+      "fixture": "cached-negative",
+      "arm": "baseline",
+      "request_budget": 6,
+      "status": "PASS",
+      "stop_reason": "NO_ELIGIBLE_ROOT",
+      "correct_root_decisions": 3,
+      "incorrect_root_decisions": 0,
+      "ground_truth_root_count": 3,
+      "unresolved_ground_truth_roots": 0,
+      "distinct_root_coverage": 3,
+      "solved_requirements": 4,
+      "conflicting_requirements": 0,
+      "resolver_calls": 3,
+      "duplicate_calls": 0,
+      "first_valid_outcome_ms": 7717.504199994437,
+      "first_valid_outcome_calls": 3,
+      "elapsed_ms": 8937.023599995882,
+      "outcome_labels": [
+        "PASS",
+        "VIOLATION",
+        "VIOLATION"
+      ],
+      "call_tape": [
+        "long0",
+        "solo",
+        "long1"
+      ],
+      "provider_binding": "core.priority.baseline@1:sha256:baa3112b0ccdd1722ffc7a66cdb30a8db04aec7e161589118283fe9b7265a417"
+    },
+    {
+      "fixture": "repeated-known-failure",
+      "arm": "baseline",
+      "request_budget": 3,
+      "status": "PASS",
+      "stop_reason": "NO_ELIGIBLE_ROOT",
+      "correct_root_decisions": 3,
+      "incorrect_root_decisions": 0,
+      "ground_truth_root_count": 4,
+      "unresolved_ground_truth_roots": 1,
+      "distinct_root_coverage": 4,
+      "solved_requirements": 3,
+      "conflicting_requirements": 0,
+      "resolver_calls": 3,
+      "duplicate_calls": 0,
+      "first_valid_outcome_ms": 5605.456999997841,
+      "first_valid_outcome_calls": 2,
+      "elapsed_ms": 9926.212899998063,
+      "outcome_labels": [
+        "PASS",
+        "PASS",
+        "VIOLATION"
+      ],
+      "call_tape": [
+        "good0",
+        "good1",
+        "good2"
+      ],
+      "provider_binding": "core.priority.baseline@1:sha256:baa3112b0ccdd1722ffc7a66cdb30a8db04aec7e161589118283fe9b7265a417"
+    },
+    {
+      "fixture": "repeated-known-failure",
+      "arm": "utility",
+      "request_budget": 3,
+      "status": "PASS",
+      "stop_reason": "NO_ELIGIBLE_ROOT",
+      "correct_root_decisions": 3,
+      "incorrect_root_decisions": 0,
+      "ground_truth_root_count": 4,
+      "unresolved_ground_truth_roots": 1,
+      "distinct_root_coverage": 3,
+      "solved_requirements": 3,
+      "conflicting_requirements": 0,
+      "resolver_calls": 3,
+      "duplicate_calls": 0,
+      "first_valid_outcome_ms": 7487.711199995829,
+      "first_valid_outcome_calls": 3,
+      "elapsed_ms": 8594.76839999843,
+      "outcome_labels": [
+        "PASS",
+        "PASS",
+        "VIOLATION"
+      ],
+      "call_tape": [
+        "good2",
+        "good0",
+        "good1"
+      ],
+      "provider_binding": "core.priority.expected-utility@1:sha256:4df2eb14d6a63e17acec5e19323a4a35e9cbc5fe48450a54a144a9850fbd6bee"
+    },
+    {
+      "fixture": "repeated-known-failure",
+      "arm": "baseline",
+      "request_budget": 6,
+      "status": "PASS",
+      "stop_reason": "NO_ELIGIBLE_ROOT",
+      "correct_root_decisions": 3,
+      "incorrect_root_decisions": 0,
+      "ground_truth_root_count": 4,
+      "unresolved_ground_truth_roots": 1,
+      "distinct_root_coverage": 4,
+      "solved_requirements": 3,
+      "conflicting_requirements": 0,
+      "resolver_calls": 4,
+      "duplicate_calls": 0,
+      "first_valid_outcome_ms": 5473.770600001444,
+      "first_valid_outcome_calls": 2,
+      "elapsed_ms": 11670.0045999969,
+      "outcome_labels": [
+        "PASS",
+        "PASS",
+        "VIOLATION"
+      ],
+      "call_tape": [
+        "good0",
+        "good1",
+        "good2",
+        "failure"
+      ],
+      "provider_binding": "core.priority.baseline@1:sha256:baa3112b0ccdd1722ffc7a66cdb30a8db04aec7e161589118283fe9b7265a417"
+    },
+    {
+      "fixture": "repeated-known-failure",
+      "arm": "utility",
+      "request_budget": 6,
+      "status": "PASS",
+      "stop_reason": "NO_ELIGIBLE_ROOT",
+      "correct_root_decisions": 3,
+      "incorrect_root_decisions": 0,
+      "ground_truth_root_count": 4,
+      "unresolved_ground_truth_roots": 1,
+      "distinct_root_coverage": 4,
+      "solved_requirements": 3,
+      "conflicting_requirements": 0,
+      "resolver_calls": 4,
+      "duplicate_calls": 0,
+      "first_valid_outcome_ms": 7185.944500000915,
+      "first_valid_outcome_calls": 3,
+      "elapsed_ms": 10742.879899997206,
+      "outcome_labels": [
+        "PASS",
+        "PASS",
+        "VIOLATION"
+      ],
+      "call_tape": [
+        "good2",
+        "good0",
+        "good1",
+        "failure"
+      ],
+      "provider_binding": "core.priority.expected-utility@1:sha256:4df2eb14d6a63e17acec5e19323a4a35e9cbc5fe48450a54a144a9850fbd6bee"
+    },
+    {
+      "fixture": "conflicting-evidence",
+      "arm": "utility",
+      "request_budget": 3,
+      "status": "PASS",
+      "stop_reason": "NO_ELIGIBLE_ROOT",
+      "correct_root_decisions": 3,
+      "incorrect_root_decisions": 0,
+      "ground_truth_root_count": 3,
+      "unresolved_ground_truth_roots": 0,
+      "distinct_root_coverage": 3,
+      "solved_requirements": 2,
+      "conflicting_requirements": 1,
+      "resolver_calls": 2,
+      "duplicate_calls": 0,
+      "first_valid_outcome_ms": 5101.622300004237,
+      "first_valid_outcome_calls": 2,
+      "elapsed_ms": 6567.647800002305,
+      "outcome_labels": [
+        "PASS",
+        "UNKNOWN_CONFLICT",
+        "VIOLATION"
+      ],
+      "call_tape": [
+        "good",
+        "bad"
+      ],
+      "provider_binding": "core.priority.expected-utility@1:sha256:4df2eb14d6a63e17acec5e19323a4a35e9cbc5fe48450a54a144a9850fbd6bee"
+    },
+    {
+      "fixture": "conflicting-evidence",
+      "arm": "baseline",
+      "request_budget": 3,
+      "status": "PASS",
+      "stop_reason": "NO_ELIGIBLE_ROOT",
+      "correct_root_decisions": 3,
+      "incorrect_root_decisions": 0,
+      "ground_truth_root_count": 3,
+      "unresolved_ground_truth_roots": 0,
+      "distinct_root_coverage": 3,
+      "solved_requirements": 2,
+      "conflicting_requirements": 1,
+      "resolver_calls": 2,
+      "duplicate_calls": 0,
+      "first_valid_outcome_ms": 5420.553600000858,
+      "first_valid_outcome_calls": 2,
+      "elapsed_ms": 6503.323299999465,
+      "outcome_labels": [
+        "PASS",
+        "UNKNOWN_CONFLICT",
+        "VIOLATION"
+      ],
+      "call_tape": [
+        "good",
+        "bad"
+      ],
+      "provider_binding": "core.priority.baseline@1:sha256:baa3112b0ccdd1722ffc7a66cdb30a8db04aec7e161589118283fe9b7265a417"
+    },
+    {
+      "fixture": "conflicting-evidence",
+      "arm": "utility",
+      "request_budget": 6,
+      "status": "PASS",
+      "stop_reason": "NO_ELIGIBLE_ROOT",
+      "correct_root_decisions": 3,
+      "incorrect_root_decisions": 0,
+      "ground_truth_root_count": 3,
+      "unresolved_ground_truth_roots": 0,
+      "distinct_root_coverage": 3,
+      "solved_requirements": 2,
+      "conflicting_requirements": 1,
+      "resolver_calls": 2,
+      "duplicate_calls": 0,
+      "first_valid_outcome_ms": 5104.610099995625,
+      "first_valid_outcome_calls": 2,
+      "elapsed_ms": 6175.216999996337,
+      "outcome_labels": [
+        "PASS",
+        "UNKNOWN_CONFLICT",
+        "VIOLATION"
+      ],
+      "call_tape": [
+        "good",
+        "bad"
+      ],
+      "provider_binding": "core.priority.expected-utility@1:sha256:4df2eb14d6a63e17acec5e19323a4a35e9cbc5fe48450a54a144a9850fbd6bee"
+    },
+    {
+      "fixture": "conflicting-evidence",
+      "arm": "baseline",
+      "request_budget": 6,
+      "status": "PASS",
+      "stop_reason": "NO_ELIGIBLE_ROOT",
+      "correct_root_decisions": 3,
+      "incorrect_root_decisions": 0,
+      "ground_truth_root_count": 3,
+      "unresolved_ground_truth_roots": 0,
+      "distinct_root_coverage": 3,
+      "solved_requirements": 2,
+      "conflicting_requirements": 1,
+      "resolver_calls": 2,
+      "duplicate_calls": 0,
+      "first_valid_outcome_ms": 5423.091199998453,
+      "first_valid_outcome_calls": 2,
+      "elapsed_ms": 6604.679099997156,
+      "outcome_labels": [
+        "PASS",
+        "UNKNOWN_CONFLICT",
+        "VIOLATION"
+      ],
+      "call_tape": [
+        "good",
+        "bad"
+      ],
+      "provider_binding": "core.priority.baseline@1:sha256:baa3112b0ccdd1722ffc7a66cdb30a8db04aec7e161589118283fe9b7265a417"
+    }
+  ]
+}

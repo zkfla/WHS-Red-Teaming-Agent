@@ -51,9 +51,58 @@ not claim those concrete adapters or real exploit capabilities are implemented.
 
 ```text
 uv sync --dev
-uv run pytest
+uv run python -m pytest
 uv run ruff check src tests
 ```
+
+## Domain-neutral performance/runtime follow-up
+
+The separate [performance evolution plan](docs/GENERIC_CORE_PERFORMANCE_EVOLUTION_PLAN.md)
+adds operation-local lookup, bounded Frontier work, durable request accounting,
+passive result receipts/batches, focused evidence context, a provider-neutral step
+loop, and evidence-bound priority history. G0-G4/G6-G9 are **PASSED_OFFLINE**;
+G5 and C1-C4 are conditionally deferred by the plan's untriggered gates.
+See the [requirement audit](docs/GENERIC_CORE_PERFORMANCE_ACCEPTANCE.md) and
+[G9 measurement record](docs/GENERIC_CORE_G9_RECEIPT.md).
+
+Public integration boundaries (explicit trusted composition, no auto-discovery):
+
+| Purpose | Module/API |
+|---|---|
+| Atomic knowledge and freshness | `redteam_core.knowledge.apply_observations_atomic`, `refresh_freshness` |
+| Bounded search | `redteam_core.graph.frontier.FrontierQuery`, `build_attack_frontiers` |
+| Durable passive requests | `redteam_core.runtime.resolver_dispatch.DurableResolverDispatcher` |
+| Bounded batch/single-flight | `redteam_core.runtime.passive_scheduler.PassiveResolutionScheduler` |
+| Focused evidence projection | `redteam_core.reasoning.project_focused_decision_context` |
+| Typed proposals and driver protocol | `redteam_core.models.decision.DecisionProposal`, `redteam_core.runtime.step_loop.DecisionDriver` |
+| Bounded investigation steps | `redteam_core.runtime.step_loop.GenericStepEngine` |
+| Advisory ordering | `redteam_core.investigation.priority.BaselinePriorityProvider`, `ExpectedUtilityPriorityProvider` |
+| Durable selection/host decision binding | `redteam_core.runtime.priority.PriorityCoordinator` |
+
+No real model/provider implementation is bundled. The step engine takes a supplied
+driver and rechecks proposal refs, budget and authority; only test drivers are
+provided here. It uses focused context within this explicitly composed path.
+Legacy APIs remain available. Host terminal decisions do not create Findings or
+replace run-all-applicable validators. Ranking is not an execution permit.
+
+The approved 0.4.1 offline release preserves full-scan lookup, memo off, legacy query
+budget, serial passive scheduling and baseline priority. The provisional memo
+default was withdrawn after a final control fixture's p95 regression. Both legacy
+and v2 support explicit `memoize_sink=True`; `False` remains the rollback.
+Alternative paths are opt-in;
+not every measured optimization qualifies for default enable. In particular,
+the utility provider regressed two fixed-budget coverage fixtures and is withheld.
+
+Runtime/package **0.4.1**, checkpoint schema **4.0**: incompatible older checkpoints
+are rejected, not silently migrated. Do not delete ledgers to reset budget/aging,
+or downgrade a writer onto a newer checkpoint. Rollback uses the current runtime's
+legacy/full-scan/serial/baseline options while retaining durable receipts/history.
+The runtime is single-writer. It is not a sandbox for malicious Python plugins.
+
+Derived Observation indices admit at most 100,000 memberships and 8 MiB of
+membership reference IDs. Overflow uses a complete full scan, never a partial
+index masquerading as complete evidence. These are auxiliary structure caps,
+not limits on canonical ledger size, payload retention, or total process RSS.
 
 See `docs/SOURCE_EXTRACTION_MAP.md`, `docs/SOURCE_CONFORMANCE_MATRIX.md` and
 `docs/SOURCE_BASELINE_RECEIPT.md` for donor traceability. Batch receipts are in

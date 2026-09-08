@@ -66,6 +66,7 @@ from redteam_core.runtime.checkpoint import (
 )
 from redteam_core.runtime.journal import EventJournal
 from redteam_core.validation import ValidatorRuntimeRegistry, run_validation
+from tests.performance.baseline import current_core_hash, release_baseline
 from tests.reference_domains import artifact_runtime as artifact
 from tests.reference_domains import composite
 from tests.reference_domains import request_response as request
@@ -75,7 +76,6 @@ from tests.reference_domains.common import MutableClock
 
 NOW = datetime(2026, 9, 8, 3, 0, tzinfo=UTC)
 ROOT = Path(__file__).resolve().parents[2]
-CORE_FREEZE_SHA = "53e814dcb5152fa178765201a9afa22c22eab928b3ba3b2101645b738cd1c21c"
 
 
 def _runtime_derivers(*items):
@@ -111,21 +111,11 @@ def _runtime_policy_evaluators(*items):
 
 
 def _core_tree_sha() -> str:
-    import hashlib
-
-    root = ROOT / "src" / "redteam_core"
-    digest = hashlib.sha256()
-    for path in sorted(root.rglob("*.py")):
-        relative = path.relative_to(root).as_posix().encode()
-        digest.update(relative)
-        digest.update(b"\0")
-        digest.update(path.read_bytes())
-        digest.update(b"\0")
-    return digest.hexdigest()
+    return current_core_hash()
 
 
 def test_reference_domains_use_the_frozen_core_without_reference_specific_core_edits():
-    assert _core_tree_sha() == CORE_FREEZE_SHA
+    assert _core_tree_sha() == release_baseline()["approved_core_sha256"]
 
 
 def test_static_graph_reference_proves_unknown_guard_context_bridge_frontier_and_coverage():

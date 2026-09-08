@@ -1,0 +1,246 @@
+{
+  "schema_version": 1,
+  "source_hash": "9ce07a002c52d083a9fa72251d5deb25787eb1156aec50a892c1f4339249bcdf",
+  "fixture": {
+    "name": "focused-active-candidate-with-unrelated-global-relations",
+    "unrelated_relations": 1000,
+    "active_candidates": 1,
+    "required_bundle_status": "COMPLETE"
+  },
+  "token_metric": {
+    "counter": "synthetic_utf8_quad_estimate_not_provider_tokenizer",
+    "legacy_input_tokens": 65614,
+    "focused_input_tokens": 771,
+    "focused_to_legacy_ratio": 0.011750541043070077,
+    "reduction_fraction": 0.98824945895693,
+    "target_reduction_fraction": 0.2,
+    "target_met": true
+  },
+  "output_bytes": {
+    "legacy": 262456,
+    "focused": 3082
+  },
+  "timing_ns": {
+    "legacy": {
+      "count": 30,
+      "p50": 11044950.0,
+      "p95": 15959800,
+      "minimum": 10365600,
+      "maximum": 16919500,
+      "samples": [
+        11082600,
+        10408000,
+        11075800,
+        10801900,
+        11172400,
+        12137500,
+        12225100,
+        10877000,
+        10507500,
+        10365600,
+        12470200,
+        13608100,
+        12184200,
+        11132800,
+        10615800,
+        10885700,
+        10550200,
+        10719600,
+        10500100,
+        12050800,
+        11227600,
+        10879000,
+        10586900,
+        13272000,
+        11230300,
+        10831700,
+        16919500,
+        15959800,
+        10981900,
+        11014100
+      ],
+      "p95_method": "nearest-rank",
+      "release_sample_count_met": true
+    },
+    "focused": {
+      "count": 30,
+      "p50": 649700.0,
+      "p95": 823200,
+      "minimum": 361900,
+      "maximum": 1147100,
+      "samples": [
+        573400,
+        743400,
+        520900,
+        773400,
+        567200,
+        647100,
+        1147100,
+        784400,
+        563600,
+        652300,
+        791100,
+        768200,
+        550100,
+        730500,
+        549700,
+        638500,
+        516700,
+        683900,
+        361900,
+        757600,
+        772600,
+        605900,
+        555300,
+        762000,
+        557100,
+        766300,
+        473000,
+        743100,
+        546600,
+        823200
+      ],
+      "p95_method": "nearest-rank",
+      "release_sample_count_met": true
+    },
+    "comparison": {
+      "p50_ratio": 0.058823263120249526,
+      "ci95_low": 0.05104823127900468,
+      "ci95_high": 0.06813992972644156,
+      "seed": 0,
+      "draws": 2000,
+      "sample_pairs": 30,
+      "assessment": "DIRECTION_OBSERVED",
+      "approval": "NOT_A_RELEASE_SPEED_GATE"
+    },
+    "execution_order": [
+      [
+        1,
+        0
+      ],
+      [
+        0,
+        1
+      ],
+      [
+        1,
+        0
+      ],
+      [
+        0,
+        1
+      ],
+      [
+        1,
+        0
+      ],
+      [
+        0,
+        1
+      ],
+      [
+        1,
+        0
+      ],
+      [
+        0,
+        1
+      ],
+      [
+        1,
+        0
+      ],
+      [
+        0,
+        1
+      ],
+      [
+        1,
+        0
+      ],
+      [
+        0,
+        1
+      ],
+      [
+        1,
+        0
+      ],
+      [
+        0,
+        1
+      ],
+      [
+        1,
+        0
+      ],
+      [
+        0,
+        1
+      ],
+      [
+        1,
+        0
+      ],
+      [
+        0,
+        1
+      ],
+      [
+        1,
+        0
+      ],
+      [
+        0,
+        1
+      ],
+      [
+        1,
+        0
+      ],
+      [
+        0,
+        1
+      ],
+      [
+        1,
+        0
+      ],
+      [
+        0,
+        1
+      ],
+      [
+        1,
+        0
+      ],
+      [
+        0,
+        1
+      ],
+      [
+        1,
+        0
+      ],
+      [
+        0,
+        1
+      ],
+      [
+        1,
+        0
+      ],
+      [
+        0,
+        1
+      ]
+    ]
+  },
+  "correctness": {
+    "complete_active_bundles": 1,
+    "incomplete_active_bundles": 0,
+    "required_context_omissions": 0,
+    "raw_payloads_included": false
+  },
+  "memory": "NOT_MEASURED_IN_TIMING_SAMPLES"
+}

@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "historical_commit": "a01417cb241fc437ce0556ab0d9d5afb0381e8a2",
+  "historical_core_sha256": "53e814dcb5152fa178765201a9afa22c22eab928b3ba3b2101645b738cd1c21c",
+  "approved_release": "g9-performance-evolution-tested-offline-defaults-withheld",
+  "approved_core_sha256": "7293c3e3ca79ba3177f27ee5a52c48c41719e7573996f1325a522b54b9945ce5",
+  "approval_receipt": "docs/GENERIC_CORE_G9_RECEIPT.md",
+  "hash_contract": "sorted POSIX relative Python path, NUL, exact file bytes, NUL"
+}

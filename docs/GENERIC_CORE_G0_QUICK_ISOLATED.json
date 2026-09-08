@@ -1,0 +1,349 @@
+{
+  "schema_version": 1,
+  "mode": "quick",
+  "approval": "NOT_EVALUATED",
+  "environment": {
+    "python": "3.13.14 (main, Jun 11 2026, 04:04:46) [MSC v.1944 64 bit (AMD64)]",
+    "executable": "C:\\Users\\qkrgu\\Documents\\GitHub\\WHS-Red-Teaming-Agent-redteam-core\\.venv\\Scripts\\python.exe",
+    "platform": "Windows-11-10.0.26200-SP0"
+  },
+  "core_hash": "706792635a2d5ff6b82ca8fdcf23783a7b36e2f79160705eea99a0a5d44d3d24",
+  "fixture_and_lock_hash": "312adc8bef2ef77950ee153261df27a7fb9b828812a1242be47b5e65ec3e8b5f",
+  "source_after_run": {
+    "core_hash": "706792635a2d5ff6b82ca8fdcf23783a7b36e2f79160705eea99a0a5d44d3d24",
+    "fixture_and_lock_hash": "312adc8bef2ef77950ee153261df27a7fb9b828812a1242be47b5e65ec3e8b5f"
+  },
+  "source_integrity": "PASS",
+  "config": {
+    "repetitions": 5,
+    "warmup": 1,
+    "case_timeout_seconds": 5,
+    "total_timeout_seconds": 60,
+    "memory_limit_bytes": 127906816
+  },
+  "config_hash": "3467c351a8faafffbb1611309b2693b8d32a96e087246bf8b485f09e6d1892ac",
+  "rss_sampling_interval_seconds": 0.01,
+  "memory_limit_kind": "sampled RSS watchdog, not OS hard allocation limit",
+  "cases": [
+    {
+      "case": {
+        "stage": "commit",
+        "size": 100,
+        "cycles": 1
+      },
+      "status": "PASS",
+      "timing_ns": {
+        "count": 5,
+        "p50": 18328500,
+        "p95": 19382800,
+        "minimum": 15358900,
+        "maximum": 19382800,
+        "samples": [
+          18328500,
+          19382800,
+          19017900,
+          16528800,
+          15358900
+        ],
+        "p95_method": "nearest-rank",
+        "release_sample_count_met": false
+      },
+      "python_allocation_peak_bytes": 635993,
+      "semantic_hash": "86f5dde04e05aa1c479c6a24b17a83548d74cea16a6e1fccc13e0b8d1a3382da",
+      "sampled_rss_peak_bytes": 43069440,
+      "wall_seconds": 3.2630274999992253
+    },
+    {
+      "case": {
+        "stage": "commit",
+        "size": 1000,
+        "cycles": 1
+      },
+      "status": "TIMEOUT",
+      "sampled_rss_peak_bytes": 47984640,
+      "wall_seconds": 5.017541899998832
+    },
+    {
+      "case": {
+        "stage": "freshness",
+        "size": 100,
+        "cycles": 1
+      },
+      "status": "PASS",
+      "timing_ns": {
+        "count": 5,
+        "p50": 7089400,
+        "p95": 10202700,
+        "minimum": 5961900,
+        "maximum": 10202700,
+        "samples": [
+          10202700,
+          7089400,
+          7344600,
+          6019400,
+          5961900
+        ],
+        "p95_method": "nearest-rank",
+        "release_sample_count_met": false
+      },
+      "python_allocation_peak_bytes": 701221,
+      "semantic_hash": "86f5dde04e05aa1c479c6a24b17a83548d74cea16a6e1fccc13e0b8d1a3382da",
+      "sampled_rss_peak_bytes": 43831296,
+      "wall_seconds": 1.9408117000002676
+    },
+    {
+      "case": {
+        "stage": "freshness",
+        "size": 1000,
+        "cycles": 1
+      },
+      "status": "TIMEOUT",
+      "sampled_rss_peak_bytes": 51195904,
+      "wall_seconds": 5.016578499999014
+    },
+    {
+      "case": {
+        "stage": "frontier",
+        "size": 100,
+        "cycles": 1
+      },
+      "status": "PASS",
+      "timing_ns": {
+        "count": 5,
+        "p50": 6803600,
+        "p95": 7626700,
+        "minimum": 5892600,
+        "maximum": 7626700,
+        "samples": [
+          6803600,
+          5892600,
+          7626700,
+          6640100,
+          7054900
+        ],
+        "p95_method": "nearest-rank",
+        "release_sample_count_met": false
+      },
+      "python_allocation_peak_bytes": 651938,
+      "semantic_hash": "a2655b75813b57d148a8b6adf6e57e15bc27f87b98a9d4ce8a87b2137b6937f5",
+      "sampled_rss_peak_bytes": 43413504,
+      "wall_seconds": 1.4381145000006654
+    },
+    {
+      "case": {
+        "stage": "frontier",
+        "size": 1000,
+        "cycles": 1
+      },
+      "status": "PASS",
+      "timing_ns": {
+        "count": 5,
+        "p50": 79136100,
+        "p95": 137385700,
+        "minimum": 65683800,
+        "maximum": 137385700,
+        "samples": [
+          137385700,
+          79136100,
+          80810300,
+          65683800,
+          72735900
+        ],
+        "p95_method": "nearest-rank",
+        "release_sample_count_met": false
+      },
+      "python_allocation_peak_bytes": 6430103,
+      "semantic_hash": "adbe352b0aaa7553f17fec9bf763244964b1f827697295a4c66468a056913465",
+      "sampled_rss_peak_bytes": 55824384,
+      "wall_seconds": 3.105915300000561
+    },
+    {
+      "case": {
+        "stage": "context",
+        "size": 100,
+        "cycles": 1
+      },
+      "status": "PASS",
+      "timing_ns": {
+        "count": 5,
+        "p50": 757200,
+        "p95": 3412900,
+        "minimum": 591700,
+        "maximum": 3412900,
+        "samples": [
+          654300,
+          3412900,
+          1052200,
+          591700,
+          757200
+        ],
+        "p95_method": "nearest-rank",
+        "release_sample_count_met": false
+      },
+      "python_allocation_peak_bytes": 383026,
+      "semantic_hash": "8f55c6e9fa6264231f25d28e5bbdfaa4a0a73d6bfdcbb1ae8f74470b5b4b094b",
+      "sampled_rss_peak_bytes": 43257856,
+      "wall_seconds": 1.5557857999992848
+    },
+    {
+      "case": {
+        "stage": "context",
+        "size": 1000,
+        "cycles": 1
+      },
+      "status": "PASS",
+      "timing_ns": {
+        "count": 5,
+        "p50": 9812000,
+        "p95": 13740500,
+        "minimum": 8314400,
+        "maximum": 13740500,
+        "samples": [
+          9653200,
+          13740500,
+          10910400,
+          9812000,
+          8314400
+        ],
+        "p95_method": "nearest-rank",
+        "release_sample_count_met": false
+      },
+      "python_allocation_peak_bytes": 3569847,
+      "semantic_hash": "dcbc16d4139a2cc0f4d24fd2ed71fe7ba6fdda21b95cf1ce09122228cf9750c5",
+      "sampled_rss_peak_bytes": 48627712,
+      "wall_seconds": 4.24853979999898
+    },
+    {
+      "case": {
+        "stage": "checkpoint",
+        "size": 100,
+        "cycles": 1
+      },
+      "status": "PASS",
+      "timing_ns": {
+        "count": 5,
+        "p50": 107229300,
+        "p95": 112181200,
+        "minimum": 86308200,
+        "maximum": 112181200,
+        "samples": [
+          87392300,
+          107229300,
+          112181200,
+          112179600,
+          86308200
+        ],
+        "p95_method": "nearest-rank",
+        "release_sample_count_met": false
+      },
+      "python_allocation_peak_bytes": 1795225,
+      "semantic_hash": "b0233f4d0ecf972ba0753a7de410644ba5f16405248cdc1e8f6e2f8a362d8a7d",
+      "sampled_rss_peak_bytes": 50614272,
+      "wall_seconds": 4.0043719000004785
+    },
+    {
+      "case": {
+        "stage": "checkpoint",
+        "size": 1000,
+        "cycles": 1
+      },
+      "status": "TIMEOUT",
+      "sampled_rss_peak_bytes": 63627264,
+      "wall_seconds": 5.025579600000128
+    },
+    {
+      "case": {
+        "stage": "resolve",
+        "size": 100,
+        "cycles": 1
+      },
+      "status": "PASS",
+      "timing_ns": {
+        "count": 5,
+        "p50": 15020700,
+        "p95": 17413800,
+        "minimum": 12594000,
+        "maximum": 17413800,
+        "samples": [
+          17413800,
+          12813000,
+          12594000,
+          15020700,
+          15272600
+        ],
+        "p95_method": "nearest-rank",
+        "release_sample_count_met": false
+      },
+      "python_allocation_peak_bytes": 474796,
+      "semantic_hash": "7128c9b3453d953407b600eff676704b9ce67ff9e97a0d4714ea061ab1f51c70",
+      "sampled_rss_peak_bytes": 43401216,
+      "wall_seconds": 1.382694800000536
+    },
+    {
+      "case": {
+        "stage": "resolve",
+        "size": 1000,
+        "cycles": 1
+      },
+      "status": "PASS",
+      "timing_ns": {
+        "count": 5,
+        "p50": 194624900,
+        "p95": 234703000,
+        "minimum": 152370400,
+        "maximum": 234703000,
+        "samples": [
+          194624900,
+          152370400,
+          226197600,
+          234703000,
+          183737000
+        ],
+        "p95_method": "nearest-rank",
+        "release_sample_count_met": false
+      },
+      "python_allocation_peak_bytes": 4488432,
+      "semantic_hash": "d55d0c733cdcf452d7b0065071d5db93a7f3179dafcf6288b908b3d72c4f7f35",
+      "sampled_rss_peak_bytes": 53022720,
+      "wall_seconds": 3.7343903000000864
+    },
+    {
+      "case": {
+        "stage": "commit",
+        "size": 100,
+        "cycles": 10
+      },
+      "status": "PASS",
+      "timing_ns": {
+        "count": 5,
+        "p50": 38089300,
+        "p95": 45732100,
+        "minimum": 31106300,
+        "maximum": 45732100,
+        "samples": [
+          45732100,
+          35997300,
+          38089300,
+          31106300,
+          42767700
+        ],
+        "p95_method": "nearest-rank",
+        "release_sample_count_met": false
+      },
+      "python_allocation_peak_bytes": 908753,
+      "semantic_hash": "d7c19f4984e525bf111436435296e06d2cc04f926b5a721bf0943dadce6bdf4b",
+      "sampled_rss_peak_bytes": 44425216,
+      "wall_seconds": 1.9113416000000143
+    },
+    {
+      "case": {
+        "stage": "commit",
+        "size": 100,
+        "cycles": 100
+      },
+      "status": "TIMEOUT",
+      "sampled_rss_peak_bytes": 44056576,
+      "wall_seconds": 5.024681000000783
+    }
+  ]
+}

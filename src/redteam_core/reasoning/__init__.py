@@ -7,6 +7,16 @@ from redteam_core.reasoning.context_projection import (
     compact_history,
     project_decision_context,
 )
+from redteam_core.reasoning.focused_context import (
+    CandidateBundleStatus,
+    ContextBundleStatus,
+    FocusedContextBudgetExceeded,
+    FocusedContextPolicy,
+    FocusedContextRetrieval,
+    FocusedDecisionContext,
+    project_focused_context_retrieval,
+    project_focused_decision_context,
+)
 from redteam_core.reasoning.working_memory import (
     MAX_WORKING_MEMORY_CHARACTERS,
     WorkingMemoryLimitExceeded,
@@ -26,4 +36,12 @@ __all__ = [
     "compact_history",
     "project_decision_context",
     "reconcile_working_memory",
+    "CandidateBundleStatus",
+    "ContextBundleStatus",
+    "FocusedContextBudgetExceeded",
+    "FocusedContextPolicy",
+    "FocusedContextRetrieval",
+    "FocusedDecisionContext",
+    "project_focused_context_retrieval",
+    "project_focused_decision_context",
 ]

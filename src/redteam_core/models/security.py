@@ -221,6 +221,7 @@ class SecurityCandidate(SchemaModel):
     contradicting_relation_ids: list[str] = Field(default_factory=list, max_length=128)
     guard_relation_ids: list[str] = Field(default_factory=list, max_length=64)
     requirement_ids: list[str] = Field(default_factory=list, max_length=64)
+    expectation_ids: list[str] = Field(default_factory=list, max_length=64)
     grounding_refs: list[str] = Field(default_factory=list, max_length=128)
 
     @model_validator(mode="after")

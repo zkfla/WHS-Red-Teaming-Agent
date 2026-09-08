@@ -5,6 +5,7 @@ from typing import Protocol
 
 from pydantic import Field
 
+from redteam_core.diagnostics.performance import PerformanceStage, performance_span
 from redteam_core.knowledge.state import CoreSession
 from redteam_core.models.base import SchemaModel, canonical_json
 from redteam_core.models.reasoning import WorkingHypothesisStatus
@@ -97,7 +98,9 @@ def _candidate_rows(session: CoreSession) -> list[dict[str, object]]:
             "evidence_ids": list(item.evidence_ids),
             "supporting_relation_ids": list(item.supporting_relation_ids),
             "contradicting_relation_ids": list(item.contradicting_relation_ids),
+            "guard_relation_ids": list(item.guard_relation_ids),
             "requirement_ids": list(item.requirement_ids),
+            "expectation_ids": list(item.expectation_ids),
             "grounding_refs": list(item.grounding_refs),
         }
         for item in items
@@ -132,6 +135,7 @@ def _relation_rows(session: CoreSession) -> list[dict[str, object]]:
     ]
 
 
+@performance_span(PerformanceStage.CONTEXT)
 def project_decision_context(
     session: CoreSession,
     *,

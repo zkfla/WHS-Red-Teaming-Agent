@@ -1,0 +1,268 @@
+{
+  "schema_version": 1,
+  "mode": "quick",
+  "approval": "NOT_EVALUATED",
+  "environment": {
+    "python": "3.13.14 (main, Jun 11 2026, 04:04:46) [MSC v.1944 64 bit (AMD64)]",
+    "executable": "C:\\Users\\qkrgu\\Documents\\GitHub\\WHS-Red-Teaming-Agent-redteam-core\\.venv\\Scripts\\python.exe",
+    "platform": "Windows-11-10.0.26200-SP0"
+  },
+  "core_hash": "957244f96871c62bebecca7509353cbe243e260946f364a7145559ad91d70b47",
+  "config": {
+    "repetitions": 5,
+    "warmup": 1,
+    "case_timeout_seconds": 5,
+    "total_timeout_seconds": 60,
+    "memory_limit_bytes": 83850240
+  },
+  "config_hash": "e795088e921b5ba7c9a9b552c4a9c965f5c584e5b944deb8f95036ea773222e4",
+  "fixture_and_lock_hash": "ec891d39a3725f1aca36726681e226aa7c84a96bfca21b052482376a1a8c989b",
+  "rss_sampling_interval_seconds": 0.01,
+  "memory_limit_kind": "sampled RSS watchdog, not OS hard allocation limit",
+  "cases": [
+    {
+      "case": {
+        "stage": "commit",
+        "size": 100,
+        "cycles": 1
+      },
+      "status": "PASS",
+      "timing_ns": {
+        "count": 5,
+        "p50": 10862700,
+        "p95": 15180800,
+        "minimum": 7901200,
+        "maximum": 15180800,
+        "samples": [
+          8384900,
+          7901200,
+          10862700,
+          15180800,
+          13230600
+        ],
+        "p95_method": "nearest-rank",
+        "release_sample_count_met": false
+      },
+      "python_allocation_peak_bytes": 634850,
+      "semantic_hash": "86f5dde04e05aa1c479c6a24b17a83548d74cea16a6e1fccc13e0b8d1a3382da",
+      "sampled_rss_peak_bytes": 43081728,
+      "wall_seconds": 1.6407197999997152
+    },
+    {
+      "case": {
+        "stage": "commit",
+        "size": 1000,
+        "cycles": 1
+      },
+      "status": "PASS",
+      "timing_ns": {
+        "count": 5,
+        "p50": 110324000,
+        "p95": 158919300,
+        "minimum": 105779800,
+        "maximum": 158919300,
+        "samples": [
+          140953400,
+          110324000,
+          158919300,
+          105779800,
+          107549500
+        ],
+        "p95_method": "nearest-rank",
+        "release_sample_count_met": false
+      },
+      "python_allocation_peak_bytes": 6079180,
+      "semantic_hash": "bd2e9b809bfedc8b45b788ffccad643ebe578e09c4c3421d0c28d5d1cd51f0b0",
+      "sampled_rss_peak_bytes": 54611968,
+      "wall_seconds": 4.086572600001091
+    },
+    {
+      "case": {
+        "stage": "freshness",
+        "size": 100,
+        "cycles": 1
+      },
+      "status": "PASS",
+      "timing_ns": {
+        "count": 5,
+        "p50": 5634300,
+        "p95": 7791400,
+        "minimum": 3955400,
+        "maximum": 7791400,
+        "samples": [
+          3955400,
+          7512700,
+          7791400,
+          5634300,
+          4340000
+        ],
+        "p95_method": "nearest-rank",
+        "release_sample_count_met": false
+      },
+      "python_allocation_peak_bytes": 695093,
+      "semantic_hash": "86f5dde04e05aa1c479c6a24b17a83548d74cea16a6e1fccc13e0b8d1a3382da",
+      "sampled_rss_peak_bytes": 43720704,
+      "wall_seconds": 1.4866652000000613
+    },
+    {
+      "case": {
+        "stage": "freshness",
+        "size": 1000,
+        "cycles": 1
+      },
+      "status": "PASS",
+      "timing_ns": {
+        "count": 5,
+        "p50": 75299400,
+        "p95": 86042600,
+        "minimum": 61589700,
+        "maximum": 86042600,
+        "samples": [
+          61589700,
+          78129000,
+          64076600,
+          75299400,
+          86042600
+        ],
+        "p95_method": "nearest-rank",
+        "release_sample_count_met": false
+      },
+      "python_allocation_peak_bytes": 6529009,
+      "semantic_hash": "bd2e9b809bfedc8b45b788ffccad643ebe578e09c4c3421d0c28d5d1cd51f0b0",
+      "sampled_rss_peak_bytes": 57810944,
+      "wall_seconds": 4.706072700000732
+    },
+    {
+      "case": {
+        "stage": "frontier",
+        "size": 100,
+        "cycles": 1
+      },
+      "status": "PASS",
+      "timing_ns": {
+        "count": 5,
+        "p50": 10409200,
+        "p95": 11699900,
+        "minimum": 6516700,
+        "maximum": 11699900,
+        "samples": [
+          11699900,
+          8901500,
+          6516700,
+          10409200,
+          10587500
+        ],
+        "p95_method": "nearest-rank",
+        "release_sample_count_met": false
+      },
+      "python_allocation_peak_bytes": 647943,
+      "semantic_hash": "a2655b75813b57d148a8b6adf6e57e15bc27f87b98a9d4ce8a87b2137b6937f5",
+      "sampled_rss_peak_bytes": 43171840,
+      "wall_seconds": 2.051611299999422
+    },
+    {
+      "case": {
+        "stage": "frontier",
+        "size": 1000,
+        "cycles": 1
+      },
+      "status": "PASS",
+      "timing_ns": {
+        "count": 5,
+        "p50": 112835000,
+        "p95": 121934300,
+        "minimum": 106561400,
+        "maximum": 121934300,
+        "samples": [
+          112835000,
+          106561400,
+          114473800,
+          121934300,
+          109710500
+        ],
+        "p95_method": "nearest-rank",
+        "release_sample_count_met": false
+      },
+      "python_allocation_peak_bytes": 6425103,
+      "semantic_hash": "adbe352b0aaa7553f17fec9bf763244964b1f827697295a4c66468a056913465",
+      "sampled_rss_peak_bytes": 57131008,
+      "wall_seconds": 4.673057599999083
+    },
+    {
+      "case": {
+        "stage": "context",
+        "size": 100,
+        "cycles": 1
+      },
+      "status": "PASS",
+      "timing_ns": {
+        "count": 5,
+        "p50": 892400,
+        "p95": 2033700,
+        "minimum": 747600,
+        "maximum": 2033700,
+        "samples": [
+          861700,
+          1171200,
+          892400,
+          747600,
+          2033700
+        ],
+        "p95_method": "nearest-rank",
+        "release_sample_count_met": false
+      },
+      "python_allocation_peak_bytes": 454967,
+      "semantic_hash": "8f55c6e9fa6264231f25d28e5bbdfaa4a0a73d6bfdcbb1ae8f74470b5b4b094b",
+      "sampled_rss_peak_bytes": 43077632,
+      "wall_seconds": 3.0783030000002327
+    },
+    {
+      "case": {
+        "stage": "context",
+        "size": 1000,
+        "cycles": 1
+      },
+      "status": "TIMEOUT",
+      "sampled_rss_peak_bytes": 50851840,
+      "wall_seconds": 5.027426500000729
+    },
+    {
+      "case": {
+        "stage": "commit",
+        "size": 100,
+        "cycles": 10
+      },
+      "status": "PASS",
+      "timing_ns": {
+        "count": 5,
+        "p50": 98990100,
+        "p95": 117340400,
+        "minimum": 66706200,
+        "maximum": 117340400,
+        "samples": [
+          66706200,
+          98990100,
+          117340400,
+          107928700,
+          90012200
+        ],
+        "p95_method": "nearest-rank",
+        "release_sample_count_met": false
+      },
+      "python_allocation_peak_bytes": 891009,
+      "semantic_hash": "d7c19f4984e525bf111436435296e06d2cc04f926b5a721bf0943dadce6bdf4b",
+      "sampled_rss_peak_bytes": 44204032,
+      "wall_seconds": 3.605677999999898
+    },
+    {
+      "case": {
+        "stage": "commit",
+        "size": 100,
+        "cycles": 100
+      },
+      "status": "TIMEOUT",
+      "sampled_rss_peak_bytes": 43786240,
+      "wall_seconds": 5.026223000000755
+    }
+  ]
+}

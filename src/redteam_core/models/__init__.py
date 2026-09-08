@@ -1,4 +1,5 @@
 from redteam_core.models.base import SchemaModel, TriState, canonical_json, sha256_text, stable_id
+from redteam_core.models.decision import *  # noqa: F403
 from redteam_core.models.domain_state import *  # noqa: F403
 from redteam_core.models.execution import *  # noqa: F403
 from redteam_core.models.provenance import *  # noqa: F403

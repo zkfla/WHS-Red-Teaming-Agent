@@ -14,10 +14,12 @@ from redteam_core.models.base import SchemaModel, canonical_json, sha256_text, s
 from redteam_core.models.execution import ExperimentAttempt, ExperimentDescriptor, ExperimentResult
 from redteam_core.runtime.clock import RuntimeClock
 
-EVENT_SCHEMA_VERSION = "1.0"
+EVENT_SCHEMA_VERSION = "2.0"
 
 
 class RuntimeEventType(StrEnum):
+    OPERATIONAL_DISPATCH_INTENT = "OPERATIONAL_DISPATCH_INTENT"
+    OPERATIONAL_REQUEST_SETTLED = "OPERATIONAL_REQUEST_SETTLED"
     RUN_STARTED = "RUN_STARTED"
     RESUME_STARTED = "RESUME_STARTED"
     CHECKPOINT_WRITTEN = "CHECKPOINT_WRITTEN"

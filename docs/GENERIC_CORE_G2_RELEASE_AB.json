@@ -1,0 +1,987 @@
+{
+  "schema_version": 1,
+  "mode": "release",
+  "approval": "NOT_EVALUATED",
+  "environment": {
+    "python": "3.13.14 (main, Jun 11 2026, 04:04:46) [MSC v.1944 64 bit (AMD64)]",
+    "executable": "C:\\Users\\qkrgu\\Documents\\GitHub\\WHS-Red-Teaming-Agent-redteam-core\\.venv\\Scripts\\python.exe",
+    "platform": "Windows-11-10.0.26200-SP0"
+  },
+  "core_hash": "16bd68260e28d7598f11dfa66944841fdc6632a363fabc6632a27d2fb81f04cb",
+  "fixture_and_lock_hash": "1ddd2ea8e2b02ce03055df2fc06c799e4b66992ce1b78e28a2f0f8044baf08c9",
+  "source_after_run": {
+    "core_hash": "16bd68260e28d7598f11dfa66944841fdc6632a363fabc6632a27d2fb81f04cb",
+    "fixture_and_lock_hash": "1ddd2ea8e2b02ce03055df2fc06c799e4b66992ce1b78e28a2f0f8044baf08c9"
+  },
+  "source_integrity": "PASS",
+  "config": {
+    "repetitions": 30,
+    "warmup": 5,
+    "case_timeout_seconds": 60,
+    "total_timeout_seconds": 900,
+    "memory_limit_bytes": 177654784,
+    "paired": true,
+    "comparison": "g2"
+  },
+  "config_hash": "948cf605598c5fd1d69c956b098444be8f8775e6fd651a4ac000698977474f62",
+  "rss_sampling_interval_seconds": 0.01,
+  "memory_limit_kind": "sampled RSS watchdog, not OS hard allocation limit",
+  "cases": [
+    {
+      "case": {
+        "stage": "frontier",
+        "size": 100,
+        "cycles": 1
+      },
+      "status": "PASS",
+      "paired": {
+        "baseline_ns": {
+          "count": 30,
+          "p50": 9262350.0,
+          "p95": 19131300,
+          "minimum": 5192300,
+          "maximum": 38102300,
+          "samples": [
+            38102300,
+            6860600,
+            10678900,
+            7439700,
+            9802200,
+            9748800,
+            7522000,
+            8851400,
+            10500700,
+            14338600,
+            8234100,
+            9337700,
+            14525200,
+            19131300,
+            9529900,
+            9580600,
+            13421200,
+            9076400,
+            9596500,
+            14059200,
+            9417500,
+            6853600,
+            8548400,
+            6547500,
+            5878400,
+            5602400,
+            5974400,
+            9187000,
+            5192300,
+            6637800
+          ],
+          "p95_method": "nearest-rank",
+          "release_sample_count_met": true
+        },
+        "candidate_ns": {
+          "count": 30,
+          "p50": 8316100.0,
+          "p95": 14992200,
+          "minimum": 5622200,
+          "maximum": 23243600,
+          "samples": [
+            12085700,
+            5626100,
+            5988200,
+            7688800,
+            7136700,
+            8387300,
+            6561100,
+            9428600,
+            8585300,
+            8423600,
+            10464500,
+            11658100,
+            10210000,
+            14992200,
+            23243600,
+            10931500,
+            11009200,
+            10746600,
+            7423300,
+            8244900,
+            8846500,
+            5881600,
+            6667300,
+            10226900,
+            6836700,
+            7095800,
+            8212100,
+            5772400,
+            5622200,
+            7109100
+          ],
+          "p95_method": "nearest-rank",
+          "release_sample_count_met": true
+        },
+        "comparison": {
+          "p50_ratio": 0.8978391013079834,
+          "ci95_low": 0.7814781478147815,
+          "ci95_high": 1.0822786151921813,
+          "seed": 0,
+          "draws": 2000,
+          "sample_pairs": 30,
+          "assessment": "INCONCLUSIVE",
+          "approval": "NOT_EVALUATED"
+        },
+        "execution_order": [
+          [
+            1,
+            0
+          ],
+          [
+            0,
+            1
+          ],
+          [
+            1,
+            0
+          ],
+          [
+            0,
+            1
+          ],
+          [
+            1,
+            0
+          ],
+          [
+            0,
+            1
+          ],
+          [
+            1,
+            0
+          ],
+          [
+            0,
+            1
+          ],
+          [
+            1,
+            0
+          ],
+          [
+            0,
+            1
+          ],
+          [
+            1,
+            0
+          ],
+          [
+            0,
+            1
+          ],
+          [
+            1,
+            0
+          ],
+          [
+            0,
+            1
+          ],
+          [
+            1,
+            0
+          ],
+          [
+            0,
+            1
+          ],
+          [
+            1,
+            0
+          ],
+          [
+            0,
+            1
+          ],
+          [
+            1,
+            0
+          ],
+          [
+            0,
+            1
+          ],
+          [
+            1,
+            0
+          ],
+          [
+            0,
+            1
+          ],
+          [
+            1,
+            0
+          ],
+          [
+            0,
+            1
+          ],
+          [
+            1,
+            0
+          ],
+          [
+            0,
+            1
+          ],
+          [
+            1,
+            0
+          ],
+          [
+            0,
+            1
+          ],
+          [
+            1,
+            0
+          ],
+          [
+            0,
+            1
+          ]
+        ],
+        "semantic_hash": "11eaf0e8685a8eac1476f5764502a3d1ba9c76f25afaeaefca128853bcae4fb2",
+        "memory": "NOT_MEASURED_IN_TIMING_SAMPLES",
+        "separate_memory_samples": {
+          "baseline_python_peak_bytes": 653680,
+          "candidate_python_peak_bytes": 653163,
+          "kind": "fixture plus operation plus verification Python allocations"
+        }
+      },
+      "comparison_kind": "G2_MEMO_OFF_VS_ON",
+      "sampled_rss_peak_bytes": 43626496,
+      "wall_seconds": 2.750778800000262
+    },
+    {
+      "case": {
+        "stage": "frontier",
+        "size": 1000,
+        "cycles": 1
+      },
+      "status": "PASS",
+      "paired": {
+        "baseline_ns": {
+          "count": 30,
+          "p50": 157926950.0,
+          "p95": 251037800,
+          "minimum": 69773900,
+          "maximum": 253335900,
+          "samples": [
+            78751700,
+            69773900,
+            157705800,
+            116148000,
+            97193300,
+            100989000,
+            129517000,
+            158148100,
+            232021300,
+            159594500,
+            253335900,
+            161513100,
+            134064200,
+            166200300,
+            193118900,
+            251037800,
+            197123500,
+            164750100,
+            161021800,
+            167893500,
+            158680300,
+            128426600,
+            140017200,
+            126404100,
+            203287100,
+            174392700,
+            112156700,
+            126241400,
+            120351800,
+            136524800
+          ],
+          "p95_method": "nearest-rank",
+          "release_sample_count_met": true
+        },
+        "candidate_ns": {
+          "count": 30,
+          "p50": 147757900.0,
+          "p95": 223149000,
+          "minimum": 75851400,
+          "maximum": 266101900,
+          "samples": [
+            75851400,
+            84403500,
+            137816100,
+            146665300,
+            136018900,
+            105421800,
+            127269200,
+            150145200,
+            148850500,
+            158665500,
+            223149000,
+            169907300,
+            219676700,
+            154919300,
+            168103700,
+            199451200,
+            214860100,
+            150958900,
+            139744500,
+            152207200,
+            266101900,
+            110803900,
+            135101400,
+            117573200,
+            137410200,
+            133598100,
+            171564500,
+            117173600,
+            131692100,
+            153200700
+          ],
+          "p95_method": "nearest-rank",
+          "release_sample_count_met": true
+        },
+        "comparison": {
+          "p50_ratio": 0.935609153472539,
+          "ci95_low": 0.8678607492898477,
+          "ci95_high": 1.1148685074067128,
+          "seed": 0,
+          "draws": 2000,
+          "sample_pairs": 30,
+          "assessment": "INCONCLUSIVE",
+          "approval": "NOT_EVALUATED"
+        },
+        "execution_order": [
+          [
+            1,
+            0
+          ],
+          [
+            0,
+            1
+          ],
+          [
+            1,
+            0
+          ],
+          [
+            0,
+            1
+          ],
+          [
+            1,
+            0
+          ],
+          [
+            0,
+            1
+          ],
+          [
+            1,
+            0
+          ],
+          [
+            0,
+            1
+          ],
+          [
+            1,
+            0
+          ],
+          [
+            0,
+            1
+          ],
+          [
+            1,
+            0
+          ],
+          [
+            0,
+            1
+          ],
+          [
+            1,
+            0
+          ],
+          [
+            0,
+            1
+          ],
+          [
+            1,
+            0
+          ],
+          [
+            0,
+            1
+          ],
+          [
+            1,
+            0
+          ],
+          [
+            0,
+            1
+          ],
+          [
+            1,
+            0
+          ],
+          [
+            0,
+            1
+          ],
+          [
+            1,
+            0
+          ],
+          [
+            0,
+            1
+          ],
+          [
+            1,
+            0
+          ],
+          [
+            0,
+            1
+          ],
+          [
+            1,
+            0
+          ],
+          [
+            0,
+            1
+          ],
+          [
+            1,
+            0
+          ],
+          [
+            0,
+            1
+          ],
+          [
+            1,
+            0
+          ],
+          [
+            0,
+            1
+          ]
+        ],
+        "semantic_hash": "0c32b6ce629e983f020861ee91e662b4f9d1833c1e6f53f127ea1da9f7352a1f",
+        "memory": "NOT_MEASURED_IN_TIMING_SAMPLES",
+        "separate_memory_samples": {
+          "baseline_python_peak_bytes": 6431398,
+          "candidate_python_peak_bytes": 6431637,
+          "kind": "fixture plus operation plus verification Python allocations"
+        }
+      },
+      "comparison_kind": "G2_MEMO_OFF_VS_ON",
+      "sampled_rss_peak_bytes": 56102912,
+      "wall_seconds": 21.36393649999991
+    },
+    {
+      "case": {
+        "stage": "frontier",
+        "size": 10000,
+        "cycles": 1
+      },
+      "status": "TIMEOUT",
+      "sampled_rss_peak_bytes": 131481600,
+      "wall_seconds": 60.023868199999924
+    },
+    {
+      "case": {
+        "stage": "frontier_partial",
+        "size": 100,
+        "cycles": 1
+      },
+      "status": "PASS",
+      "paired": {
+        "baseline_ns": {
+          "count": 30,
+          "p50": 12784000.0,
+          "p95": 25237900,
+          "minimum": 9084500,
+          "maximum": 37324700,
+          "samples": [
+            15472800,
+            13095900,
+            19167300,
+            14402800,
+            9642500,
+            9792400,
+            11003700,
+            12171600,
+            9957400,
+            10935900,
+            9084500,
+            11986700,
+            25237900,
+            37324700,
+            18981600,
+            12503600,
+            13030700,
+            11689700,
+            13749900,
+            12257700,
+            12612800,
+            12955200,
+            11165700,
+            14233800,
+            13226400,
+            11901400,
+            18716000,
+            9283000,
+            16162200,
+            15438500
+          ],
+          "p95_method": "nearest-rank",
+          "release_sample_count_met": true
+        },
+        "candidate_ns": {
+          "count": 30,
+          "p50": 10525250.0,
+          "p95": 22707800,
+          "minimum": 7279800,
+          "maximum": 33881600,
+          "samples": [
+            8236600,
+            16301700,
+            9153600,
+            11520100,
+            8666100,
+            10412900,
+            9502000,
+            7712900,
+            8958600,
+            7890600,
+            8933600,
+            11220100,
+            22707800,
+            33881600,
+            17267700,
+            9919900,
+            9375000,
+            12162900,
+            12714000,
+            12545900,
+            9185300,
+            10728300,
+            15636900,
+            9470900,
+            10637600,
+            7279800,
+            8773000,
+            15459400,
+            13006600,
+            17355600
+          ],
+          "p95_method": "nearest-rank",
+          "release_sample_count_met": true
+        },
+        "comparison": {
+          "p50_ratio": 0.8233142991239049,
+          "ci95_low": 0.7194548259111176,
+          "ci95_high": 0.9679075100483063,
+          "seed": 0,
+          "draws": 2000,
+          "sample_pairs": 30,
+          "assessment": "DIRECTION_OBSERVED",
+          "approval": "NOT_EVALUATED"
+        },
+        "execution_order": [
+          [
+            1,
+            0
+          ],
+          [
+            0,
+            1
+          ],
+          [
+            1,
+            0
+          ],
+          [
+            0,
+            1
+          ],
+          [
+            1,
+            0
+          ],
+          [
+            0,
+            1
+          ],
+          [
+            1,
+            0
+          ],
+          [
+            0,
+            1
+          ],
+          [
+            1,
+            0
+          ],
+          [
+            0,
+            1
+          ],
+          [
+            1,
+            0
+          ],
+          [
+            0,
+            1
+          ],
+          [
+            1,
+            0
+          ],
+          [
+            0,
+            1
+          ],
+          [
+            1,
+            0
+          ],
+          [
+            0,
+            1
+          ],
+          [
+            1,
+            0
+          ],
+          [
+            0,
+            1
+          ],
+          [
+            1,
+            0
+          ],
+          [
+            0,
+            1
+          ],
+          [
+            1,
+            0
+          ],
+          [
+            0,
+            1
+          ],
+          [
+            1,
+            0
+          ],
+          [
+            0,
+            1
+          ],
+          [
+            1,
+            0
+          ],
+          [
+            0,
+            1
+          ],
+          [
+            1,
+            0
+          ],
+          [
+            0,
+            1
+          ],
+          [
+            1,
+            0
+          ],
+          [
+            0,
+            1
+          ]
+        ],
+        "semantic_hash": "e7972b06f6c17b5b7d5ca378acd1825bba65ceeb511bdee3d7591c124d37e6dc",
+        "memory": "NOT_MEASURED_IN_TIMING_SAMPLES",
+        "separate_memory_samples": {
+          "baseline_python_peak_bytes": 552211,
+          "candidate_python_peak_bytes": 551900,
+          "kind": "fixture plus operation plus verification Python allocations"
+        }
+      },
+      "comparison_kind": "G2_MEMO_OFF_VS_ON",
+      "sampled_rss_peak_bytes": 42975232,
+      "wall_seconds": 4.6479486000007455
+    },
+    {
+      "case": {
+        "stage": "frontier_partial",
+        "size": 1000,
+        "cycles": 1
+      },
+      "status": "PASS",
+      "paired": {
+        "baseline_ns": {
+          "count": 30,
+          "p50": 152873700.0,
+          "p95": 214241500,
+          "minimum": 117716000,
+          "maximum": 298790800,
+          "samples": [
+            155406000,
+            119412700,
+            134776300,
+            131519800,
+            174753700,
+            119885500,
+            132001100,
+            177101400,
+            298790800,
+            166335000,
+            214241500,
+            196570100,
+            119287500,
+            140995300,
+            143413700,
+            189101000,
+            173639800,
+            163999200,
+            157347500,
+            167389900,
+            148005200,
+            135806300,
+            149771700,
+            175985800,
+            146956600,
+            152719400,
+            156031200,
+            153028000,
+            131930500,
+            117716000
+          ],
+          "p95_method": "nearest-rank",
+          "release_sample_count_met": true
+        },
+        "candidate_ns": {
+          "count": 30,
+          "p50": 119007600.0,
+          "p95": 184563200,
+          "minimum": 85563800,
+          "maximum": 738660100,
+          "samples": [
+            94757200,
+            105142900,
+            102739600,
+            90401000,
+            103955000,
+            96161600,
+            86394600,
+            109520500,
+            96269700,
+            184563200,
+            159186600,
+            129736600,
+            182606300,
+            119918800,
+            114093600,
+            158972700,
+            131129300,
+            173237700,
+            149114600,
+            145726000,
+            135287100,
+            85563800,
+            93852400,
+            118096400,
+            738660100,
+            124367200,
+            181807800,
+            100708400,
+            130362500,
+            88864600
+          ],
+          "p95_method": "nearest-rank",
+          "release_sample_count_met": true
+        },
+        "comparison": {
+          "p50_ratio": 0.7784700703914408,
+          "ci95_low": 0.6723983626668153,
+          "ci95_high": 0.8903787640403557,
+          "seed": 0,
+          "draws": 2000,
+          "sample_pairs": 30,
+          "assessment": "DIRECTION_OBSERVED",
+          "approval": "NOT_EVALUATED"
+        },
+        "execution_order": [
+          [
+            1,
+            0
+          ],
+          [
+            0,
+            1
+          ],
+          [
+            1,
+            0
+          ],
+          [
+            0,
+            1
+          ],
+          [
+            1,
+            0
+          ],
+          [
+            0,
+            1
+          ],
+          [
+            1,
+            0
+          ],
+          [
+            0,
+            1
+          ],
+          [
+            1,
+            0
+          ],
+          [
+            0,
+            1
+          ],
+          [
+            1,
+            0
+          ],
+          [
+            0,
+            1
+          ],
+          [
+            1,
+            0
+          ],
+          [
+            0,
+            1
+          ],
+          [
+            1,
+            0
+          ],
+          [
+            0,
+            1
+          ],
+          [
+            1,
+            0
+          ],
+          [
+            0,
+            1
+          ],
+          [
+            1,
+            0
+          ],
+          [
+            0,
+            1
+          ],
+          [
+            1,
+            0
+          ],
+          [
+            0,
+            1
+          ],
+          [
+            1,
+            0
+          ],
+          [
+            0,
+            1
+          ],
+          [
+            1,
+            0
+          ],
+          [
+            0,
+            1
+          ],
+          [
+            1,
+            0
+          ],
+          [
+            0,
+            1
+          ],
+          [
+            1,
+            0
+          ],
+          [
+            0,
+            1
+          ]
+        ],
+        "semantic_hash": "f1d1a2eadbd39cd7b89ee5ab185446507c1426d998b80474fe52c643dfd44870",
+        "memory": "NOT_MEASURED_IN_TIMING_SAMPLES",
+        "separate_memory_samples": {
+          "baseline_python_peak_bytes": 6191446,
+          "candidate_python_peak_bytes": 6191191,
+          "kind": "fixture plus operation plus verification Python allocations"
+        }
+      },
+      "comparison_kind": "G2_MEMO_OFF_VS_ON",
+      "sampled_rss_peak_bytes": 54509568,
+      "wall_seconds": 23.170791200000167
+    },
+    {
+      "case": {
+        "stage": "frontier_partial",
+        "size": 10000,
+        "cycles": 1
+      },
+      "status": "TIMEOUT",
+      "sampled_rss_peak_bytes": 123977728,
+      "wall_seconds": 60.02871589999995
+    }
+  ]
+}

@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "profile": 1,
+  "core_sha256": "b7d5eaa69e9a4c4691dad5ee97f5516aeb059f2562c0825c0c612d13d8d2f5f9",
+  "before": {
+    "working_set_bytes": 49442816,
+    "peak_working_set_bytes": 51449856
+  },
+  "after": {
+    "working_set_bytes": 57982976,
+    "peak_working_set_bytes": 57982976
+  },
+  "elapsed_ms": 13509.3373,
+  "projection": [
+    4,
+    1,
+    4,
+    4
+  ]
+}

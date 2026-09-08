@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Protocol
 
 from pydantic import BaseModel, Field
 
+from redteam_core.diagnostics.performance import PerformanceStage, performance_span
 from redteam_core.extension.bundle import ExtensionCatalog
 from redteam_core.investigation.requirements import (
     EvidenceRequirement,
@@ -17,6 +19,7 @@ from redteam_core.investigation.requirements import (
 from redteam_core.knowledge.recompute import SemanticRecomputer
 from redteam_core.knowledge.state import CommitResult, CoreSession
 from redteam_core.models.base import SchemaModel
+from redteam_core.models.operational_budget import OperationalBudgetState, ReservationStatus
 from redteam_core.models.provenance import Provenance, TrustClass
 from redteam_core.runtime.clock import RuntimeClock
 
@@ -41,9 +44,18 @@ class ResolverOutput:
     payload: BaseModel
     validity: ObservationValidity = field(default_factory=ObservationValidity)
     evidence_ids: tuple[str, ...] = ()
+    actual_tokens: int | None = None
+
+    def __post_init__(self):
+        if self.actual_tokens is not None and (
+            type(self.actual_tokens) is not int or self.actual_tokens < 0
+        ):
+            raise ValueError("actual_tokens must be a nonnegative integer or None")
 
 
 class ResolverDescriptor(SchemaModel):
+    max_tokens_per_call: int | None = Field(default=None, ge=0)
+    max_receipt_bytes_per_call: int = Field(default=1_048_576, ge=4096, le=1_048_576)
     resolver_id: str = Field(min_length=1, max_length=200)
     provider_id: str = Field(min_length=1, max_length=120)
     supported_requirement_type_ids: frozenset[str] = Field(min_length=1)
@@ -67,6 +79,12 @@ class ResolverRuntimeRegistry:
         self._by_id: dict[str, EvidenceResolver] = {}
         self._call_counts: dict[str, int] = {}
         self._frozen = False
+        self._budget_provider: Callable[[], OperationalBudgetState] | None = None
+
+    def bind_operational_budget(self, provider: Callable[[], OperationalBudgetState]) -> None:
+        if self._budget_provider is not None or any(self._call_counts.values()):
+            raise RuntimeError("registry budget already bound or legacy calls already consumed")
+        self._budget_provider = provider
 
     @property
     def frozen(self) -> bool:
@@ -91,12 +109,15 @@ class ResolverRuntimeRegistry:
     def call_count(self, resolver_id: str) -> int:
         if resolver_id not in self._by_id:
             raise KeyError(f"unknown resolver id: {resolver_id}")
+        if self._budget_provider is not None:
+            return sum(
+                row.resolver_id == resolver_id and row.status is not ReservationStatus.RELEASED
+                for row in self._budget_provider().reservations
+            )
         return self._call_counts[resolver_id]
 
     def descriptors(self) -> tuple[ResolverDescriptor, ...]:
-        return tuple(
-            self._by_id[resolver_id].descriptor for resolver_id in sorted(self._by_id)
-        )
+        return tuple(self._by_id[resolver_id].descriptor for resolver_id in sorted(self._by_id))
 
     def _compatible(self, requirement: EvidenceRequirement) -> tuple[EvidenceResolver, ...]:
         return tuple(
@@ -119,7 +140,7 @@ class ResolverRuntimeRegistry:
             resolver
             for resolver in self._compatible(requirement)
             if set(resolver.descriptor.required_permissions) <= set(available_permissions)
-            and self._call_counts[resolver.descriptor.resolver_id] < resolver.descriptor.max_calls
+            and self.call_count(resolver.descriptor.resolver_id) < resolver.descriptor.max_calls
         ]
         eligible.sort(
             key=lambda resolver: (
@@ -167,6 +188,8 @@ class ResolverRuntimeRegistry:
         return eligible[0]
 
     def reserve_call(self, resolver_id: str) -> None:
+        if self._budget_provider is not None:
+            raise RuntimeError("bound registry requires durable resolver dispatch")
         if not self._frozen:
             raise RuntimeError("resolver registry must be frozen before execution")
         resolver = self._by_id.get(resolver_id)
@@ -216,6 +239,7 @@ def _matching_payload_registration(
     return matches[0]
 
 
+@performance_span(PerformanceStage.RESOLVE, input_items=lambda *args, **kwargs: 1)
 async def resolve_to_observation(
     *,
     requirement: EvidenceRequirement,
@@ -230,10 +254,29 @@ async def resolve_to_observation(
     )
     descriptor = resolver.descriptor
     resolver_registry.reserve_call(descriptor.resolver_id)
+    return await _resolve_selected_observation(
+        requirement=requirement, resolver=resolver, catalog=catalog, clock=clock
+    )
+
+
+async def _resolve_selected_observation(
+    *,
+    requirement: EvidenceRequirement,
+    resolver: EvidenceResolver,
+    catalog: ExtensionCatalog,
+    clock: RuntimeClock,
+    before_call: Callable[[], None] | None = None,
+    on_response: Callable[[int | None], None] | None = None,
+) -> Observation:
+    descriptor = resolver.descriptor
+
+    async def invoke():
+        if before_call is not None:
+            before_call()
+        return await resolver.resolve(requirement)
+
     try:
-        resolved = await asyncio.wait_for(
-            resolver.resolve(requirement), timeout=descriptor.timeout_seconds
-        )
+        resolved = await asyncio.wait_for(invoke(), timeout=descriptor.timeout_seconds)
     except TimeoutError as exc:
         raise EvidenceResolutionError(
             ResolutionFailureKind.TIMEOUT,
@@ -253,6 +296,9 @@ async def resolve_to_observation(
             resolver_id=descriptor.resolver_id,
         ) from exc
 
+    # Report transport completion before semantic validation: invalid payloads still cost usage.
+    if on_response is not None:
+        on_response(resolved.actual_tokens if isinstance(resolved, ResolverOutput) else None)
     if not isinstance(resolved, ResolverOutput):
         raise EvidenceResolutionError(
             ResolutionFailureKind.INVALID_PAYLOAD,

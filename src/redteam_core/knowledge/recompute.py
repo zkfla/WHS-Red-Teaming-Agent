@@ -3,7 +3,9 @@ from __future__ import annotations
 import re
 from typing import Protocol
 
+from redteam_core.diagnostics.performance import PerformanceStage, performance_span
 from redteam_core.extension.bundle import ExtensionCatalog
+from redteam_core.knowledge.lookup import ObservationLookupMode
 from redteam_core.knowledge.state import CoreSession, KnowledgeSlotStatus, SemanticState
 from redteam_core.models.provenance import TypedPayloadEnvelope
 from redteam_core.models.security import Relation
@@ -31,14 +33,28 @@ class SemanticRecomputer(Protocol):
 def effective_payload_envelope(
     session: CoreSession,
     requirement_id: str,
+    *,
+    lookup_mode: ObservationLookupMode = ObservationLookupMode.FULL_SCAN,
 ) -> TypedPayloadEnvelope | None:
     """Return a deterministic effective payload only for a consistent knowledge slot."""
 
+    lookup_mode = ObservationLookupMode(lookup_mode)
     slot = session.knowledge.slots.get(requirement_id)
     if slot is None or slot.status is not KnowledgeSlotStatus.CONSISTENT:
         return None
     effective_hash = slot.effective_payload_hash
     if effective_hash is None:
+        return None
+    if lookup_mode is ObservationLookupMode.INDEXED:
+        for observation_id in sorted(slot.authoritative_observation_ids):
+            observation = session.investigation.observations.get(observation_id)
+            if (
+                observation is not None
+                and observation.requirement_id == requirement_id
+                and observation.observation_id == observation_id
+                and observation.payload.content_hash == effective_hash
+            ):
+                return observation.payload
         return None
     matches = sorted(
         (
@@ -53,6 +69,10 @@ def effective_payload_envelope(
     return matches[0].payload if matches else None
 
 
+@performance_span(
+    PerformanceStage.RECOMPUTE,
+    input_items=lambda session, **kwargs: len(session.semantic.relations),
+)
 def recompute_relations(
     session: CoreSession,
     *,

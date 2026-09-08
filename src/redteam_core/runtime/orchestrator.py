@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, field
 
 from redteam_core.extension.bundle import ExtensionCatalog
 from redteam_core.knowledge.state import CoreSession
@@ -39,6 +40,9 @@ class RuntimeOrchestrator:
     checkpoint_store: AtomicCheckpointStore
     budget_limits: RuntimeBudgetLimits
     run_lease: RunLease | None = None
+    _domain_states: tuple[DomainStateEnvelope, ...] | None = field(
+        default=None, init=False, repr=False
+    )
 
     def __post_init__(self) -> None:
         if self.run_lease is None:
@@ -57,6 +61,20 @@ class RuntimeOrchestrator:
         if self.run_lease is not None:
             self.run_lease.release()
 
+    def _current_domain_states(self) -> tuple[DomainStateEnvelope, ...]:
+        if self._domain_states is None:
+            if self.checkpoint_store.path.exists():
+                stored = self.checkpoint_store.load(
+                    catalog=self.catalog,
+                    composition_fingerprint=self.composition_fingerprint,
+                    journal=self.journal,
+                    expected_run_id=self.journal.run_id,
+                )
+                self._domain_states = stored.domain_states
+            else:
+                self._domain_states = ()
+        return self._domain_states
+
     def start(self) -> RuntimeState:
         self._acquire_lease()
         if self.journal.events:
@@ -71,7 +89,7 @@ class RuntimeOrchestrator:
         session: CoreSession,
         runtime_state: RuntimeState,
         *,
-        domain_states: tuple[DomainStateEnvelope, ...] = (),
+        domain_states: tuple[DomainStateEnvelope, ...] | None = None,
     ) -> DurableExperimentEffectObserver:
         self._acquire_lease()
         return DurableExperimentEffectObserver(
@@ -82,7 +100,13 @@ class RuntimeOrchestrator:
             journal=self.journal,
             checkpoint_store=self.checkpoint_store,
             clock=self.clock,
-            domain_states=domain_states,
+            domain_states=domain_states or (),
+            checkpoint_writer=lambda reason: self.checkpoint(
+                session,
+                runtime_state,
+                reason=reason,
+                domain_states=domain_states,
+            ),
         )
 
     def checkpoint(
@@ -91,10 +115,10 @@ class RuntimeOrchestrator:
         runtime_state: RuntimeState,
         *,
         reason: str,
-        domain_states: tuple[DomainStateEnvelope, ...] = (),
+        domain_states: tuple[DomainStateEnvelope, ...] | None = None,
     ) -> CheckpointEnvelope:
         self._acquire_lease()
-        return self.checkpoint_store.write(
+        checkpoint = self.checkpoint_store.write(
             session=session,
             runtime_state=runtime_state,
             catalog=self.catalog,
@@ -102,13 +126,15 @@ class RuntimeOrchestrator:
             journal=self.journal,
             clock=self.clock,
             reason=reason,
-            domain_states=domain_states,
+            domain_states=self._current_domain_states() if domain_states is None else domain_states,
         )
+        self._domain_states = checkpoint.domain_states
+        return checkpoint
 
     def resume(self, *, expected_run_id: str | None = None) -> ResumeResult:
         self._acquire_lease()
         try:
-            return resume_checkpoint(
+            resumed = resume_checkpoint(
                 self.checkpoint_store,
                 catalog=self.catalog,
                 composition_fingerprint=self.composition_fingerprint,
@@ -116,6 +142,8 @@ class RuntimeOrchestrator:
                 clock=self.clock,
                 expected_run_id=expected_run_id,
             )
+            self._domain_states = resumed.domain_states
+            return resumed
         except Exception:
             self.close()
             raise
@@ -151,7 +179,7 @@ class RuntimeOrchestrator:
         *,
         decision: TerminationDecision,
         cleanup_handler: CleanupHandler | None = None,
-        domain_states: tuple[DomainStateEnvelope, ...] = (),
+        domain_states: tuple[DomainStateEnvelope, ...] | None = None,
     ) -> FinalizationResult:
         self._acquire_lease()
         try:
@@ -165,7 +193,9 @@ class RuntimeOrchestrator:
                 checkpoint_store=self.checkpoint_store,
                 clock=self.clock,
                 cleanup_handler=cleanup_handler,
-                domain_states=domain_states,
+                domain_states=self._current_domain_states()
+                if domain_states is None
+                else domain_states,
             )
         finally:
             self.close()
@@ -183,34 +213,32 @@ class DurableExperimentEffectObserver:
     checkpoint_store: AtomicCheckpointStore
     clock: RuntimeClock
     domain_states: tuple[DomainStateEnvelope, ...] = ()
+    checkpoint_writer: Callable[[str], CheckpointEnvelope] | None = None
+
+    def _checkpoint(self, reason: str) -> None:
+        if self.checkpoint_writer is not None:
+            self.checkpoint_writer(reason)
+        else:
+            self.checkpoint_store.write(
+                session=self.session,
+                runtime_state=self.runtime_state,
+                catalog=self.catalog,
+                composition_fingerprint=self.composition_fingerprint,
+                journal=self.journal,
+                clock=self.clock,
+                reason=reason,
+                domain_states=self.domain_states,
+            )
 
     def effect_started(self, *, attempt, descriptor) -> None:
-        self.checkpoint_store.write(
-            session=self.session,
-            runtime_state=self.runtime_state,
-            catalog=self.catalog,
-            composition_fingerprint=self.composition_fingerprint,
-            journal=self.journal,
-            clock=self.clock,
-            reason=f"experiment_effect_started:{attempt.attempt_id}",
-            domain_states=self.domain_states,
-        )
+        self._checkpoint(f"experiment_effect_started:{attempt.attempt_id}")
         JournalExperimentEffectObserver(self.journal).effect_started(
             attempt=attempt,
             descriptor=descriptor,
         )
 
     def effect_terminal(self, *, attempt, result) -> None:
-        self.checkpoint_store.write(
-            session=self.session,
-            runtime_state=self.runtime_state,
-            catalog=self.catalog,
-            composition_fingerprint=self.composition_fingerprint,
-            journal=self.journal,
-            clock=self.clock,
-            reason=f"experiment_effect_terminal:{attempt.attempt_id}",
-            domain_states=self.domain_states,
-        )
+        self._checkpoint(f"experiment_effect_terminal:{attempt.attempt_id}")
         JournalExperimentEffectObserver(self.journal).effect_terminal(
             attempt=attempt,
             result=result,

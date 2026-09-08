@@ -8,6 +8,7 @@ from pathlib import Path
 
 from pydantic import ConfigDict, Field, model_validator
 
+from redteam_core.diagnostics.performance import PerformanceStage, performance_span
 from redteam_core.extension.bundle import ExtensionCatalog
 from redteam_core.investigation.resolution import ResolverDescriptor
 from redteam_core.knowledge.state import CoreSession
@@ -21,6 +22,7 @@ from redteam_core.models.execution import (
     ExperimentAttempt,
     ExperimentAttemptStatus,
 )
+from redteam_core.models.operational_budget import OperationalBudgetState, ReservationStatus
 from redteam_core.models.runtime import (
     RuntimeCompositionFingerprint,
     RuntimeLifecycle,
@@ -29,9 +31,13 @@ from redteam_core.models.runtime import (
 from redteam_core.runtime.clock import RuntimeClock
 from redteam_core.runtime.domain_state import validate_domain_state_envelopes
 from redteam_core.runtime.journal import EventJournal, RuntimeEvent, RuntimeEventType
+from redteam_core.runtime.operational_budget import (
+    recover_reservations,
+    synchronize_operational_usage,
+)
 
-CHECKPOINT_SCHEMA_VERSION = "1.0"
-CORE_RUNTIME_VERSION = "0.1.0"
+CHECKPOINT_SCHEMA_VERSION = "4.0"
+CORE_RUNTIME_VERSION = "0.4.1"
 RESOLVER_ROUTING_POLICY_ID = "core.resolver-routing.trust-desc-cost-asc-id-asc@1"
 
 
@@ -49,7 +55,14 @@ def build_runtime_composition_fingerprint(
     catalog: ExtensionCatalog,
     resolver_descriptors: tuple[ResolverDescriptor, ...] = (),
     priority_provider_ids: tuple[str, ...] = (),
+    decision_driver_hash: str | None = None,
+    semantic_pipeline_hash: str | None = None,
+    context_policy_hash: str | None = None,
+    progress_policy_hash: str | None = None,
 ) -> RuntimeCompositionFingerprint:
+    from redteam_core.models.decision import ProgressPolicy
+    from redteam_core.reasoning.focused_context import FocusedContextPolicy
+
     rows: list[dict[str, object]] = []
     for descriptor in resolver_descriptors:
         dumped = descriptor.model_dump(mode="python")
@@ -57,11 +70,21 @@ def build_runtime_composition_fingerprint(
     rows.sort(key=lambda item: str(item["resolver_id"]))
     resolver_hash = "sha256:" + sha256_text(canonical_json(rows))
     providers = tuple(sorted(set(priority_provider_ids)))
+    context_policy_hash = context_policy_hash or "sha256:" + sha256_text(
+        canonical_json(FocusedContextPolicy().model_dump(mode="json"))
+    )
+    progress_policy_hash = progress_policy_hash or "sha256:" + sha256_text(
+        canonical_json(ProgressPolicy().model_dump(mode="json"))
+    )
     payload = {
         "semantic_manifest_hash": catalog.semantic_manifest_hash,
         "resolver_routing_hash": resolver_hash,
         "routing_policy_id": RESOLVER_ROUTING_POLICY_ID,
         "priority_provider_ids": list(providers),
+        "decision_driver_hash": decision_driver_hash,
+        "semantic_pipeline_hash": semantic_pipeline_hash,
+        "context_policy_hash": context_policy_hash,
+        "progress_policy_hash": progress_policy_hash,
     }
     return RuntimeCompositionFingerprint(
         composition_hash="sha256:" + sha256_text(canonical_json(payload)),
@@ -69,6 +92,10 @@ def build_runtime_composition_fingerprint(
         resolver_routing_hash=resolver_hash,
         routing_policy_id=RESOLVER_ROUTING_POLICY_ID,
         priority_provider_ids=providers,
+        decision_driver_hash=decision_driver_hash,
+        semantic_pipeline_hash=semantic_pipeline_hash,
+        context_policy_hash=context_policy_hash,
+        progress_policy_hash=progress_policy_hash,
     )
 
 
@@ -120,6 +147,33 @@ class CheckpointEnvelope(SchemaModel):
             raise ValueError("unsupported core runtime version")
         if self.run_id != self.runtime_state.run_id:
             raise ValueError("checkpoint run_id does not match runtime state")
+        if any(
+            selection.provider_binding not in self.composition_fingerprint.priority_provider_ids
+            for selection in self.runtime_state.priority.selections
+        ):
+            raise ValueError("checkpoint priority provider is not composition-bound")
+        budget = self.runtime_state.operational_budget
+        committed = set(self.runtime_state.committed_resolution_hashes)
+        for receipt in self.runtime_state.resolution_receipts:
+            if receipt.receipt_hash not in committed:
+                continue
+            if receipt.observation is not None:
+                actual = self.session.investigation.observations.get(
+                    receipt.observation.observation_id
+                )
+                expected = receipt.observation
+            else:
+                actual = self.session.investigation.resolution_failures.get(
+                    receipt.failure.failure_id
+                )
+                expected = receipt.failure
+            if actual != expected:
+                raise ValueError("checkpoint committed receipt lacks canonical result")
+        if (
+            budget is not None
+            and budget.composition_hash != self.composition_fingerprint.composition_hash
+        ):
+            raise ValueError("operational budget composition binding mismatch")
         if self.evaluation_time.tzinfo is None or self.evaluation_time.utcoffset() is None:
             raise ValueError("checkpoint evaluation_time must be timezone-aware")
         if self.journal_sequence == 0 and self.journal_event_hash is not None:
@@ -229,6 +283,7 @@ class AtomicCheckpointStore:
             if temporary_path is not None and temporary_path.exists():
                 temporary_path.unlink(missing_ok=True)
 
+    @performance_span(PerformanceStage.CHECKPOINT)
     def write(
         self,
         *,
@@ -368,9 +423,7 @@ def _uncertain_cleanup_outcome(
             "completed_at": completed_at,
         }
     )
-    terminal_attempt = CleanupAttempt.model_validate(
-        terminal_attempt.model_dump(mode="python")
-    )
+    terminal_attempt = CleanupAttempt.model_validate(terminal_attempt.model_dump(mode="python"))
     detail = "cleanup effect may have started before runtime interruption"
     outcome = CleanupOutcome(
         cleanup_outcome_id=stable_id(
@@ -411,6 +464,60 @@ def resume_checkpoint(
     runtime_state = envelope.runtime_state.model_copy(deep=True)
     evaluation_time = clock.now()
     post_events = journal.events_after(envelope.journal_sequence)
+    budget = runtime_state.operational_budget
+    dispatch_events = [
+        event
+        for event in post_events
+        if event.event_type is RuntimeEventType.OPERATIONAL_DISPATCH_INTENT
+    ]
+    settled_events = [
+        event
+        for event in post_events
+        if event.event_type is RuntimeEventType.OPERATIONAL_REQUEST_SETTLED
+    ]
+    if budget is None and (dispatch_events or settled_events):
+        raise ValueError("dispatch intent exists without operational budget ledger")
+    if budget is not None:
+        rows = {row.attempt_id: row for row in budget.reservations}
+        seen_intents = set()
+        for event in dispatch_events:
+            attempt_id = event.attribute("attempt_id")
+            row = rows.get(attempt_id)
+            if row is None or attempt_id in seen_intents:
+                raise ValueError("unknown or duplicate operational dispatch intent")
+            seen_intents.add(attempt_id)
+            if (
+                event.attribute("composition_hash") != budget.composition_hash
+                or event.attribute("limits_hash") != budget.limits_hash
+                or event.attribute("provider_id") != row.provider_id
+                or event.attribute("resolver_id") != row.resolver_id
+            ):
+                raise ValueError("operational dispatch intent binding mismatch")
+            if row.status not in {ReservationStatus.RESERVED, ReservationStatus.DISPATCHED}:
+                raise ValueError("dispatch intent conflicts with terminal operational reservation")
+            rows[attempt_id] = row.model_copy(update={"status": ReservationStatus.DISPATCHED})
+        for event in settled_events:
+            row = rows.get(event.attribute("attempt_id"))
+            if row is None or row.status in {
+                ReservationStatus.RESERVED,
+                ReservationStatus.RELEASED,
+            }:
+                raise ValueError("settlement without a known operational dispatch")
+            if (
+                event.attribute("composition_hash") != budget.composition_hash
+                or event.attribute("limits_hash") != budget.limits_hash
+                or event.attribute("provider_id") != row.provider_id
+                or event.attribute("resolver_id") != row.resolver_id
+            ):
+                raise ValueError("operational settlement binding mismatch")
+            # Journal markers are not typed result receipts. Do not infer terminal usage/result.
+        projected = OperationalBudgetState.model_validate(
+            {**budget.model_dump(mode="python"), "reservations": tuple(rows.values())}
+        )
+        runtime_state.operational_budget = recover_reservations(
+            projected, expected_revision=projected.revision
+        )
+        runtime_state = synchronize_operational_usage(runtime_state)
 
     experiment_start_events = {
         event.attribute("attempt_id"): event

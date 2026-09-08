@@ -1,5 +1,20 @@
 # Architecture
 
+> The CI/CD pipeline below is retained historical donor documentation, not the
+> architecture of the current domain-independent `redteam_core` package.
+> No GitHub parser, concrete provider or target adapter is included in this scope.
+
+Current generic architecture: bounded acquisition -> canonical Evidence/Observation
+and Knowledge/Relation -> Candidate -> bounded investigation -> all applicable
+validators -> 0..N Findings. Durable request budgets, passive result receipts,
+focused context, typed steps and advisory priority extend that pipeline; none
+replace the effect permit boundary or make LLM text authoritative.
+
+Current contracts and evidence: [plan](GENERIC_CORE_PERFORMANCE_EVOLUTION_PLAN.md),
+[API entry points](../README.md), [acceptance audit](GENERIC_CORE_PERFORMANCE_ACCEPTANCE.md).
+
+## Historical donor architecture
+
 ## Processing pipeline
 
 ```text
