@@ -59,7 +59,7 @@ from finredteam.planning.actions import (
 )
 from finredteam.planning.candidates import AttackTemplate, CandidateSkeleton
 from finredteam.probing import executor as executor_module
-from finredteam.probing.finance import auth_exposure, burst, card_exposure, card_fund, charge, privesc
+from finredteam.probing.finance import auth_exposure, burst, card_exposure, card_fund, charge, loan, privesc
 from finredteam.probing.generic import api as generic_api
 from finredteam.probing.generic import web as generic_web
 from finredteam.probing.session import Session, SessionError
@@ -202,6 +202,7 @@ class AgentContext:
             "jwt_forge": {"jwt_weak_secret"},
             "charge_idempotency": {"merchant_charge"},
             "race_transfer": {"race_transfer"},
+            "loan_limit": {"request_loan"},
         }
         tried = self.episodic.tried_operations()
         return [name for name, ops in probe_ops.items() if not (ops & tried)]
@@ -860,6 +861,18 @@ def _handle_run_probe(input_: RunProbeInput, ctx: AgentContext) -> str:
             n_concurrent=5, restorer=victim, trials=RACE_TRIALS,
         )
         return _record_race_finding(ctx, candidate, burst.summarize_race(trials))
+
+    elif input_.probe == "loan_limit":
+        if owner is None:
+            return "loan_limit 프로브: 대출 요청 주체(계좌 보유)가 없음"
+        # 음수·0(양수성) + 비정상 대형 금액(최대한도 없음, max_policy 는 프로브가 주장하는 도메인 경계)
+        pairs.append(loan.run_loan_amount_policy_probe(ctx.session, owner, amount="-500.00"))
+        pairs.append(loan.run_loan_amount_policy_probe(ctx.session, owner, amount="0.00"))
+        pairs.append(
+            loan.run_loan_amount_policy_probe(
+                ctx.session, owner, amount="100000000.00", max_policy="1000000.00"
+            )
+        )
 
     elif input_.probe == "sqli_scan":
         if owner is None or not owner.account_number:

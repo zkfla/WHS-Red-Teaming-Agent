@@ -123,8 +123,9 @@ finredteam/
 ├── targets/                      loader.py + configs/<name>.yaml — adapter config per target (base_url,
 │                                  register/login endpoints), separate axis from Engagement
 ├── probing/                      session.py (★ policy enforcement + Decimal-safe HTTP — the only place
-│                                  that makes real network calls) + executor; finance/ (state, burst/race);
-│                                  generic/ (SQLi boolean-diff, JWT alg=none — not yet wired to an action)
+│                                  that makes real network calls) + executor; finance/ (state, burst/race,
+│                                  card_fund, charge, loan (INV-5 policy_signals), auth/card_exposure, privesc);
+│                                  generic/ (SQLi boolean-diff, JWT — wired via sqli_scan/jwt_forge probes)
 ├── recon/                        discovery, fingerprint (passive + 1-hop link extraction), entitlement, mapper
 ├── knowledge/                    graph (entitled_* / observed_* split, networkx), baseline (measured
 │                                  ground truth for expected_delta), sensitive, inference
@@ -156,11 +157,12 @@ vulnbank-target/                  the local target app itself (separate git repo
 - `resolve_skeleton` only implements `read_balance`/`transfer` operations. Idempotency
   (INV-4) and race (INV-1C) are reachable via dedicated `run_probe` probes
   (`charge_idempotency`, `race_transfer`), not via auto-generated `execute_experiment`
-  candidates. No probe covers loan/bill/card operations yet.
-- INV-5 (limit/policy, `oracles/limit.py`) is implemented and registered, but no probe
-  fills `result.policy_signals` yet, so it self-returns UNKNOWN on every real run. Its GT
-  items (F-10/F-11/F-17/F-18/F-19/F-21/F-23) are relabeled to INV-5 (coverage ceiling) but
-  are NOT yet findable until a loan/bill/card limit probe is wired (Track B, oracle-first).
+  candidates. Loan is now reachable via the `loan_limit` probe (INV-5); bill/card limit probes are still pending.
+- INV-5 (limit/policy, `oracles/limit.py`) reads `result.policy_signals`, filled by
+  limit probes. The `loan_limit` probe (`probing/finance/loan.py`, wired into `run_probe`)
+  now makes F-10/F-11 findable (negative/zero loan + oversized-with-asserted-max). Card
+  (F-17/18/19) and bill (F-21/F-23) limit probes are still pending — those GT items are
+  relabeled to INV-5 (coverage ceiling) but not yet findable until their probes exist.
 - `probing/generic/*` (SQLi, JWT) IS now wired via `run_probe` probes `sqli_scan` and
   `jwt_forge` (this supersedes an earlier note that generic probes were unwired). G-XSS /
   G-BOLA oracles exist but have no dedicated probe yet.
