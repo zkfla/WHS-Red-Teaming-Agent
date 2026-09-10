@@ -110,3 +110,18 @@ def test_bill_below_server_minimum_flows_to_inv5_violation():
     finding = verify(candidate, result)
     assert finding.verdict == Verdict.VIOLATION and finding.invariant == "INV-5"
     assert "최소" in finding.reason
+
+
+def test_build_bill_race_candidate():
+    # bill overdraft race 후보: amount 가 params 에 있어야 fire_concurrent 가 제대로 쏜다
+    from finredteam.probing.finance.bill import build_bill_race_candidate
+    from finredteam.money import Currency
+    cur = Currency(code="USD", minor_unit=2)
+    c = build_bill_race_candidate({"id": 7, "minimum_amount": 50.0}, OWNER, cur)
+    assert c.path == "/api/bill-payments/create"
+    assert c.params["amount"] == "50.0" and c.params["payment_method"] == "balance"
+    assert str(c.unit_amount.amount) == "50.0"
+    assert c.subject_account == "111" and c.watch_accounts == ["111"]
+    # biller 최소가 낮으면 unit_floor(10) 적용
+    c2 = build_bill_race_candidate({"id": 7, "minimum_amount": 1.0}, OWNER, cur)
+    assert str(c2.unit_amount.amount) == "10.00"

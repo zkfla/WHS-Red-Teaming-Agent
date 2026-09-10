@@ -253,9 +253,9 @@
 
 - id: F-14
   layer: finance
-  endpoint: "POST /bill-payment"   # REVIEW: 실제 경로 확인 필요
+  endpoint: "POST /api/bill-payments/create"   # 소스 실측 정정
   description: Bill Payment Race — 동시 요청으로 중복 결제 또는 잔액 이상 발생
-  invariant: REVIEW-BILL-RACE   # REVIEW: bill payment resolver 없음
+  invariant: INV-1C   # 구현됨 — bill_race 프로브(overdraft TOCTOU)
   severity: HIGH
 
 - id: F-15

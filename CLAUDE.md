@@ -135,7 +135,7 @@ finredteam/
 │                                  register/login endpoints), separate axis from Engagement
 ├── probing/                      session.py (★ policy enforcement + Decimal-safe HTTP — the only place
 │                                  that makes real network calls) + executor; finance/ (state, burst/race,
-│                                  card_fund, charge, loan/card_limit/bill (INV-5 policy_signals), auth/card_exposure, privesc);
+│                                  card_fund, charge, loan/card_limit/bill (INV-5) + bill_race (INV-1C overdraft), auth/card_exposure, privesc);
 │                                  generic/ (SQLi/JWT via sqli_scan/jwt_forge; hygiene.py via web_hygiene; auth_hygiene.py via auth_hygiene — weak-pw/default-cred/rate-limit/CSRF))
 ├── recon/                        discovery, fingerprint (passive + 1-hop link extraction), entitlement, mapper
 ├── knowledge/                    graph (entitled_* / observed_* split, networkx), baseline (measured
@@ -190,7 +190,11 @@ vulnbank-target/                  the local target app itself (separate git repo
   G-04 (mass assignment at /register) now emits an INV-BFLA finding via
   `privesc.run_mass_assignment_register_probe`. Coverage ceiling is 42/45. The only
   permanently-uncovered items are: G-10 (JWT kid — vuln-bank has no kid handling, cannot be
-  honestly probed), F-13/F-14 (loan/bill race — INV-1C oracle exists, race probes pending).
+  honestly probed) and F-13 (loan double-approve — `request_loan` returns no loan_id and
+  `approve_loan` needs one + is admin-gated, so it needs fragile HTML-scraped loan_id + a
+  PRIV-ESC kill-chain; deferred rather than built fragile). F-14 (bill payment overdraft
+  race) IS covered via the `bill_race` probe reusing `burst.run_overdraft_race_candidate`
+  → INV-1C. Coverage ceiling is now 43/45.
 - `discover_surface` findings land in the graph as facts but are not auto-chained into
   `propose_hypothesis`.
 - `max_concurrency`, `allow_file_upload`, `allow_race_testing` in the Engagement schema

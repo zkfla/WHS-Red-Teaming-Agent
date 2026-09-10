@@ -210,6 +210,7 @@ class AgentContext:
             "loan_limit": {"request_loan"},
             "card_limit": {"card_limit_create", "card_limit_update"},
             "bill_limit": {"bill_payment"},
+            "bill_race": {"bill_race"},
             "web_hygiene": {"cors_reflection", "verbose_error", "user_enumeration", "jwt_expiration", "jwt_in_query"},
         }
         tried = self.episodic.tried_operations()
@@ -868,6 +869,22 @@ def _handle_run_probe(input_: RunProbeInput, ctx: AgentContext) -> str:
             ctx.session, ctx.target, candidate, attacker,
             watch_accounts=[str(attacker.account_number), str(victim.account_number)],
             n_concurrent=5, restorer=victim, trials=RACE_TRIALS,
+        )
+        return _record_race_finding(ctx, candidate, burst.summarize_race(trials))
+
+    elif input_.probe == "bill_race":
+        accounted = [p for p in ctx.principals if p.account_number]
+        if len(accounted) < 2:
+            return "bill_race 프로브: 서로 다른 계좌를 가진 주체가 2명 이상 필요함"
+        payer, restorer = accounted[0], accounted[1]
+        biller = bill.discover_biller(ctx.session)
+        if biller is None or biller.get("id") is None:
+            return "bill_race 프로브: 실존 biller 를 찾지 못함"
+        candidate = bill.build_bill_race_candidate(biller, payer, ctx.target.adapter.default_currency)
+        trials = burst.run_overdraft_race_candidate(
+            ctx.session, ctx.target, candidate, payer,
+            watch_accounts=[str(payer.account_number)],
+            n_concurrent=5, restorer=restorer, trials=RACE_TRIALS,
         )
         return _record_race_finding(ctx, candidate, burst.summarize_race(trials))
 

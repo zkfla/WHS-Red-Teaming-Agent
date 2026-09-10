@@ -98,3 +98,31 @@ def run_bill_amount_policy_probe(
         response_texts=[ex.response_text[:200]],
     )
     return candidate, result
+
+
+def build_bill_race_candidate(biller: dict, payer, currency, *, unit_floor: str = "10.00"):
+    """bill 결제 overdraft race 후보를 만든다 — burst.run_overdraft_race_candidate 에 넘겨
+    쓴다(INV-1C). 단위 금액은 biller 최소 이상이어야 결제가 거부되지 않으므로
+    max(biller.min, unit_floor) 로 잡는다. fire_concurrent 가 candidate.params 를 그대로
+    보내므로 amount 를 params 에 포함한다.
+    """
+    from decimal import Decimal
+
+    from finredteam.models.finding import CandidateFinding
+    from finredteam.money import Money
+
+    mn = biller.get("minimum_amount")
+    unit = Decimal(str(mn)) if mn and Decimal(str(mn)) > Decimal(unit_floor) else Decimal(unit_floor)
+    acct = str(payer.account_number)
+    return CandidateFinding(
+        id=f"billrace-{secrets.token_hex(3)}",
+        layer="finance",
+        operation="bill_race",
+        principal_id=payer.id,
+        method="POST",
+        path=_CREATE_PATH,
+        params={"biller_id": biller.get("id"), "amount": str(unit), "payment_method": "balance"},
+        subject_account=acct,
+        unit_amount=Money(amount=unit, currency=currency),
+        watch_accounts=[acct],
+    )

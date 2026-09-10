@@ -83,7 +83,7 @@ class ExecuteExperimentInput(BaseModel):
 class RunProbeInput(BaseModel):
     probe: Literal[
         "sensitive_exposure", "privilege_escalation", "card_fund", "sqli_scan", "jwt_forge",
-        "charge_idempotency", "race_transfer", "loan_limit", "card_limit", "bill_limit", "web_hygiene", "auth_hygiene",
+        "charge_idempotency", "race_transfer", "loan_limit", "card_limit", "bill_limit", "web_hygiene", "auth_hygiene", "bill_race",
     ]
 
 
