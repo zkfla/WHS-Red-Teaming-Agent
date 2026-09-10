@@ -54,3 +54,22 @@ def run_admin_escalation_probe(session) -> tuple[CandidateFinding, ExecutionResu
         authz_signals={"privilege_escalation_confirmed": escalated},
     )
     return candidate, result
+
+
+def run_mass_assignment_register_probe(session) -> tuple[CandidateFinding, ExecutionResult]:
+    """G-04 — 가입 시점 mass assignment 자체를 /register 지점에 기록한다.
+    run_admin_escalation_probe 와 같은 is_admin 주입 확인을 쓰되, Finding 의 endpoint 를
+    주입 지점(POST /register)으로 남겨 채점이 G-04(POST /register)와 매칭되게 한다."""
+    tag = secrets.token_hex(3)
+    control_status = _register_login_access(session, f"ctlr_{tag}", "Rt!pass123", inject_admin=False)
+    attack_status = _register_login_access(session, f"atkr_{tag}", "Rt!pass123", inject_admin=True)
+    escalated = (not is_success_status(control_status)) and is_success_status(attack_status)
+    candidate = CandidateFinding(
+        id=f"massassign-{tag}", layer="generic", operation="mass_assignment_register",
+        principal_id="anon", method="POST", path="/register",
+    )
+    result = ExecutionResult(
+        candidate=candidate, status_codes=[attack_status],
+        authz_signals={"privilege_escalation_confirmed": escalated},
+    )
+    return candidate, result

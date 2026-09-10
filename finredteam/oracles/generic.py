@@ -125,3 +125,40 @@ def check_jwt_in_query(requires_auth: bool, query_accepted: bool) -> OracleOutco
     if query_accepted:
         return violation("G-JWT-QUERY", "보호 엔드포인트가 URL 쿼리(?token=)의 토큰을 인증 수단으로 수락")
     return passed("G-JWT-QUERY", "URL 쿼리 토큰이 인증으로 수락되지 않음")
+
+
+# ── 인증 위생(Auth hygiene) 오라클 — 전부 범용 신호 기반(대상 문자열 없음) ──
+
+
+def check_weak_password_policy(weak_accepted: bool, password: str = "") -> OracleOutcome:
+    """약한 비밀번호 정책 — 지나치게 단순한 비번으로 가입이 수락되면 위반 (G-15)."""
+    if weak_accepted:
+        return violation("G-WEAKPW", f"약한 비밀번호({password!r})로 가입이 수락됨 — 비번 정책 부재")
+    return passed("G-WEAKPW", "약한 비밀번호 가입이 거부됨")
+
+
+def check_default_credentials(login_succeeded: bool, cred_label: str = "") -> OracleOutcome:
+    """기본/약한 크레덴셜 — 흔한 기본 계정으로 로그인 성공하면 위반 (G-16)."""
+    if login_succeeded:
+        return violation("G-DEFAULTCRED", f"기본/약한 크레덴셜로 로그인 성공: {cred_label}")
+    return passed("G-DEFAULTCRED", "시도한 기본 크레덴셜로 로그인 실패")
+
+
+def check_rate_limit(attempts: int, throttled: bool) -> OracleOutcome:
+    """인증 rate limit — N회 반복 인증 시도에도 throttle/lock 신호가 없으면 위반 (G-13)."""
+    if attempts >= 2 and not throttled:
+        return violation("G-RATELIMIT", f"{attempts}회 반복 인증 시도에도 throttle/lockout 없음 — rate limit 부재")
+    if throttled:
+        return passed("G-RATELIMIT", f"{attempts}회 내에 throttle/lockout 관측됨")
+    return unknown("G-RATELIMIT", "시도 횟수 부족으로 판정 불가")
+
+
+def check_csrf(statechange_via_cookie_accepted: bool, samesite_present: bool) -> OracleOutcome:
+    """CSRF — 상태변경이 SameSite 없는 쿠키 인증으로 CSRF 토큰 없이 수락되면 위반 (G-12)."""
+    if statechange_via_cookie_accepted and not samesite_present:
+        return violation(
+            "G-CSRF", "상태변경 요청이 SameSite 없는 쿠키 인증으로 CSRF 토큰 없이 수락됨 — CSRF 가능",
+        )
+    if samesite_present:
+        return passed("G-CSRF", "인증 쿠키에 SameSite 속성 존재 — CSRF 기본 방어 있음")
+    return passed("G-CSRF", "상태변경이 쿠키 인증만으로는 수락되지 않음")

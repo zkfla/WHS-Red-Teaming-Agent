@@ -65,6 +65,7 @@ from finredteam.probing.finance import (
 from finredteam.probing.generic import api as generic_api
 from finredteam.probing.generic import web as generic_web
 from finredteam.probing.generic import hygiene as generic_hygiene
+from finredteam.probing.generic import auth_hygiene as generic_auth_hygiene
 from finredteam.probing.session import Session, SessionError
 from finredteam.recon import auth_discovery
 from finredteam.recon import entitlement as entitlement_module
@@ -199,7 +200,8 @@ class AgentContext:
         멈추지 않게, 남은 종류를 계속 콕 집어 유도하기 위해서다."""
         probe_ops = {
             "sensitive_exposure": {"register_exposure", "forgot_password_exposure", "card_exposure"},
-            "privilege_escalation": {"mass_assignment_privesc"},
+            "privilege_escalation": {"mass_assignment_privesc", "mass_assignment_register"},
+            "auth_hygiene": {"weak_password", "default_credentials", "rate_limit", "csrf_statechange"},
             "card_fund": {"card_fund"},
             "sqli_scan": {"sqli_check_balance", "sqli_transactions"},
             "jwt_forge": {"jwt_weak_secret"},
@@ -798,6 +800,7 @@ def _handle_run_probe(input_: RunProbeInput, ctx: AgentContext) -> str:
 
     elif input_.probe == "privilege_escalation":
         pairs.append(privesc.run_admin_escalation_probe(ctx.session))
+        pairs.append(privesc.run_mass_assignment_register_probe(ctx.session))  # G-04 주입 지점(/register)
 
     elif input_.probe == "card_fund":
         if owner is None:
@@ -950,6 +953,23 @@ def _handle_run_probe(input_: RunProbeInput, ctx: AgentContext) -> str:
             lines.append(_record_generic_outcome(
                 ctx, "jwt_in_query", "GET", "/dashboard",
                 generic_hygiene.probe_jwt_in_query(ctx.session, owner.token)))
+        return "\n".join(lines)
+
+    elif input_.probe == "auth_hygiene":
+        lines = []
+        lines.append(_record_generic_outcome(
+            ctx, "weak_password", "POST", "/register",
+            generic_auth_hygiene.probe_weak_password(ctx.session)))
+        lines.append(_record_generic_outcome(
+            ctx, "default_credentials", "POST", "/login",
+            generic_auth_hygiene.probe_default_credentials(ctx.session)))
+        lines.append(_record_generic_outcome(
+            ctx, "rate_limit", "POST", "/login",
+            generic_auth_hygiene.probe_rate_limit(ctx.session)))
+        if owner is not None:
+            lines.append(_record_generic_outcome(
+                ctx, "csrf_statechange", "POST", "/transfer",
+                generic_auth_hygiene.probe_csrf_statechange(ctx.session, owner)))
         return "\n".join(lines)
 
     else:

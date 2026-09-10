@@ -76,6 +76,17 @@ have caught only one. Do not reintroduce candidate-based oracle filtering.
 `oracles/` is a pure-function layer: it must never import `llm/`, `probing/`, or `storage/`.
 This is enforced by a source-inspection test, `tests/test_oracles.py::test_oracles_are_pure_no_llm_or_network_imports` — keep it that way when adding oracles.
 
+### General-purpose by design (target is a variable, not a constant)
+
+vuln-bank is only the current proving ground — the goal is a **general-purpose** agent. The
+generalization seam is: **oracles are 100% target-agnostic** (pure signal-based judgment — no
+endpoint/payload strings; `check_weak_password_policy(weak_accepted)` not `"/register"`), while
+**probes carry target specifics only as default arguments** (paths, field names, credential
+wordlists parameterized, defaults = vuln-bank convention). Swapping targets is then a config /
+recon change, never an oracle rewrite. When adding detection: put the judgment in an oracle
+(general), keep the "where/how to poke" in a probe (parameterized). Do not bake target strings
+into oracles.
+
 ### Engagement layer — Scope/Rules of Engagement gate everything
 
 The CLI has no `--target`/`--engagement` flags. Running bare `finredteam` always starts (or
@@ -125,7 +136,7 @@ finredteam/
 ├── probing/                      session.py (★ policy enforcement + Decimal-safe HTTP — the only place
 │                                  that makes real network calls) + executor; finance/ (state, burst/race,
 │                                  card_fund, charge, loan/card_limit/bill (INV-5 policy_signals), auth/card_exposure, privesc);
-│                                  generic/ (SQLi/JWT via sqli_scan/jwt_forge; hygiene.py via web_hygiene — CORS/verbose-error/user-enum/jwt-exp/jwt-in-query))
+│                                  generic/ (SQLi/JWT via sqli_scan/jwt_forge; hygiene.py via web_hygiene; auth_hygiene.py via auth_hygiene — weak-pw/default-cred/rate-limit/CSRF))
 ├── recon/                        discovery, fingerprint (passive + 1-hop link extraction), entitlement, mapper
 ├── knowledge/                    graph (entitled_* / observed_* split, networkx), baseline (measured
 │                                  ground truth for expected_delta), sensitive, inference
@@ -137,7 +148,7 @@ finredteam/
 ├── oracles/                      base, value (INV-1A/1B), amount (INV-6), idempotency (INV-4), concurrency
 │                                  (INV-1C), authz (INV-2, needs graph), exposure (INV-9), privilege (INV-BFLA),
 │                                  limit (INV-5 — 한도/정책, reads result.policy_signals; probe not wired yet),
-│                                  generic (SQLi/XSS/BOLA/JWT + web-hygiene: G-CORS/G-INFO/G-USERENUM/G-JWT-EXP/G-JWT-QUERY), campaign (★ objective layer — composes findings
+│                                  generic (SQLi/XSS/BOLA/JWT + web-hygiene: G-CORS/G-INFO/G-USERENUM/G-JWT-EXP/G-JWT-QUERY/G-WEAKPW/G-DEFAULTCRED/G-RATELIMIT/G-CSRF), campaign (★ objective layer — composes findings
 │                                  into adversary objectives OBJ-*, run_all_objectives), registry (★ run_all —
 │                                  full oracle set, no candidate-based narrowing), verifier
 ├── agent/                        budget, phase, strategy (nudges only, no forced batching), termination
@@ -173,11 +184,13 @@ vulnbank-target/                  the local target app itself (separate git repo
   `web_hygiene` (CORS reflection/`*` → G-CORS, verbose-error markers → G-INFO,
   forgot-password existence diff → G-USERENUM). G-XSS/G-BOLA oracles exist but have no
   dedicated probe. `web_hygiene` now also covers G-07 (JWT exp missing → G-JWT-EXP,
-  decode token claims) and G-11 (token accepted via ?token= query → G-JWT-QUERY). Still
-  uncovered (no oracle): G-10 (JWT kid path traversal — DEFERRED: vuln-bank's auth.py has no
-  kid handling, HS256 fixed secret, so no real target behavior to probe), G-12 (CSRF),
-  G-13 (rate limit), G-15/G-16 (weak password / default cred). G-04 (mass assignment) is
-  already caught by INV-BFLA (GT mislabels it).
+  decode token claims) and G-11 (token via ?token= query → G-JWT-QUERY). `auth_hygiene`
+  covers G-15 (weak password → G-WEAKPW), G-16 (default creds → G-DEFAULTCRED), G-13
+  (rate limit → G-RATELIMIT), G-12 (CSRF: state-change via SameSite-less cookie → G-CSRF).
+  G-04 (mass assignment at /register) now emits an INV-BFLA finding via
+  `privesc.run_mass_assignment_register_probe`. Coverage ceiling is 42/45. The only
+  permanently-uncovered items are: G-10 (JWT kid — vuln-bank has no kid handling, cannot be
+  honestly probed), F-13/F-14 (loan/bill race — INV-1C oracle exists, race probes pending).
 - `discover_surface` findings land in the graph as facts but are not auto-chained into
   `propose_hypothesis`.
 - `max_concurrency`, `allow_file_upload`, `allow_race_testing` in the Engagement schema
