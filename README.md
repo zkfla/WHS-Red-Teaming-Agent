@@ -3,8 +3,8 @@
 `instruction.md`의 계약을 구현한다. 하나의 로컬 대상(vuln-bank)에 종속되지
 않도록, 실제 Red Teaming/Bug Bounty처럼 **사람이 먼저 Scope/Rules of
 Engagement를 정의하고 승인해야만 실행되는 Engagement 레이어**(아래 §2)를
-거친다. Black-box 정찰 → 그래프 모델링 → 가설/실험 → 오라클 검증 → Verified
-Finding. 지표(VVR 등)는 `evaluator/`에서만 계산하고 에이전트는 계산하지 않는다.
+거친다. Black-box 정찰 → 그래프 모델링 → 가설/실험 → 오라클 검증 → 목표(Objective)
+판정 → Verified Finding. 지표(VVR 등)는 `evaluator/`에서만 계산하고 에이전트는 계산하지 않는다.
 
 **루프 구조는 ReAct 다.** 원래 `instruction.md` §13 pseudocode 는 코드가
 전략을 배치로 정해 후보를 일괄 나열하는 결정적 파이프라인이었는데, 사용자
@@ -52,8 +52,8 @@ Agent"**로 다시 다듬었다 (아래 §2 참고). 판정은 시종일관 100%
 
 ### 액션 어휘 (`planning/actions.py`)
 
-LLM 이 고를 수 있는 건 이 7개뿐이다 — 자유 텍스트 경로·페이로드를 직접 쓰게
-하지 않는다. **가설(부작용 없음)과 실험(부작용 있음)을 분리했다** —
+LLM 이 고를 수 있는 건 아래 8개뿐이다(`run_probe` 포함) — 자유 텍스트 경로·페이로드를
+직접 쓰게 하지 않는다. **가설(부작용 없음)과 실험(부작용 있음)을 분리했다** —
 `propose_hypothesis`는 그래프 검증만 하고, `execute_experiment`만 실제로
 요청을 보낸다.
 
@@ -65,7 +65,16 @@ LLM 이 고를 수 있는 건 이 7개뿐이다 — 자유 텍스트 경로·페
 | `discover_surface` | `path, method(GET\|HEAD\|OPTIONS)` | 읽기 전용 요청 1회 | 상태코드 + 응답 본문에서 발견된 경로 후보 (MAX_PROBES 상한) |
 | `propose_hypothesis` | `operation, principal_id, target, params` | **없음** — 그래프 검증만 | `hypothesis_id` 또는 검증 실패 사유 |
 | `execute_experiment` | `hypothesis_id` | **실제 요청 실행** | 관련된 오라클 전체의 판정 (VIOLATION/ANOMALY 는 전부, 아니면 PASS 요약) |
+| `run_probe` | `probe`(고정 목록) | **특수 시험 실행**(셋업 자동) | 해당 프로브가 만든 재료에 대한 오라클 판정 |
 | `finish` | `reason` | 없음 | 루프 종료 요청 (예산 한도가 항상 우선) |
+
+`run_probe` 는 계좌·송금으로는 표현되지 않는 특수 시험을 전용 프로브로 돌린다(셋업=
+계정/카드/biller 생성은 코드가 자동). 고정 목록: `sensitive_exposure`(INV-9) ·
+`privilege_escalation`(INV-BFLA) · `card_fund`(INV-1A) · `charge_idempotency`(INV-4) ·
+`race_transfer`/`bill_race`(INV-1C) · `loan_limit`/`card_limit`/`bill_limit`(INV-5) ·
+`sqli_scan`(G-SQLI) · `jwt_forge`(G-JWT) · `web_hygiene`(G-CORS/G-INFO/G-USERENUM/
+G-JWT-EXP/G-JWT-QUERY) · `auth_hygiene`(G-WEAKPW/G-DEFAULTCRED/G-RATELIMIT/G-CSRF).
+판정은 여기서도 **오라클이** 한다 — 프로브는 신호(재료)만 만든다.
 
 `propose_hypothesis`의 `target`은 그래프가 실제로 아는 노드 id
 (`"account:1234567890"`)여야 한다 — `planning/candidates.py::resolve_skeleton`
@@ -96,6 +105,25 @@ INV-6 이 동시에 VIOLATION** 으로 잡혔다(§3 라이브 로그 참고). �
 INV-6 위반은 놓쳤을 것이다. §설계원칙 3("오라클은 실행 전에 선언한다")은
 candidate 단위가 아니라 **시스템 단위**로 지킨다 — 매번 다르게 정할 수
 있는 게 아니라, 애초에 고정된 전체 집합이 돈다.
+
+### 목표(Objective) 판정 — 취약점을 "공격자가 무엇을 달성했나"로 묶는다 ★
+
+개별 불변식 위반(Finding)은 "여기 문이 약하다"까지다. `oracles/campaign.py`는 그 위에서
+한 run 의 Finding 집합을 **공격자 목표**로 조합한다(`run_all_objectives`) — 취약점 나열을
+red teaming 서사로 바꾸는 계층. 오라클과 같은 순수 함수라(정규화된 Finding 만 봄) 대상이
+바뀌어도 재사용된다.
+
+- 목표 5종: `OBJ-FUNDS-EXFIL`(자금 유출: INV-1B 위반 + 공격자 계좌↑ + 타 계좌↓) ·
+  `OBJ-VALUE-FORGE`(무에서 가치 창출) · `OBJ-AUTHZ-BYPASS`(INV-2) · `OBJ-PRIV-ESC`(INV-BFLA) ·
+  `OBJ-PII-EXFIL`(INV-9).
+- 달성 = VIOLATION, **발판(foothold) = ANOMALY**(체인 일부만 성립 — 예: 접근은 됐으나
+  자금 이동은 아직). "공격자 계좌"는 그 실험을 실행한 principal 의 계좌로 본다(authorized
+  시험이라 victim 도 우리 principal 이므로).
+- 리포트(`reporting/report.py`)가 "달성한 공격 목표"로 싣고, 채점(`evaluator/scorer.py::
+  score_objectives`)이 **Objective-VVR**(목표 달성률)을 낸다.
+
+**범용성 원칙**: 오라클·목표는 대상-무관(신호 기반), 프로브는 대상 특유값을 인자 기본값으로만
+둔다 — vuln-bank 는 proving ground 일 뿐이고 손발(프로브)만 갈아끼우면 다른 대상에 쓴다.
 
 ### 능동 Recon — 초기 정찰 이후에도 표면을 넓힌다
 
@@ -235,8 +263,11 @@ finredteam/
 │
 ├── probing/                session(★ Engagement 정책 강제 + Decimal 안전 HTTP — 실제 네트워크로 나가는
 │                          유일한 지점) · executor(실행)
-│   ├── finance/            state(잔액 관측) · burst(F4 동시요청 + 재시행)
-│   └── generic/             web(SQLi boolean-diff) · api(JWT alg=none 위조) · external(인터페이스만)
+│   ├── finance/            state(잔액 관측) · burst(race 동시요청 + overdraft + 재시행) ·
+│   │                          card_fund · charge(멱등성) · loan/card_limit/bill(INV-5) ·
+│   │                          bill_race(INV-1C) · auth_exposure/card_exposure · privesc(INV-BFLA)
+│   └── generic/            web(SQLi) · api(JWT 위조) · hygiene(CORS/verbose-error/user-enum/
+│                          jwt-exp/jwt-query) · auth_hygiene(weak-pw/default-cred/rate-limit/CSRF) · external
 │
 ├── recon/                  discovery · fingerprint(passive + 응답 본문 경로 추출) ·
 │                          entitlement(self_created 등) · mapper(1홉 크롤 포함)
@@ -256,7 +287,8 @@ finredteam/
 │
 ├── planning/
 │   ├── actions.py          ★ ReAct 액션 스키마 (observe_graph/recall_memory/learn_baseline/
-│   │                          discover_surface/propose_hypothesis/execute_experiment/finish)
+│   │                          discover_surface/propose_hypothesis/execute_experiment/finish
+│   │                          + run_probe[특수 프로브 디스패치, 고정 목록])
 │   ├── candidates.py        AttackTemplate 로더(개념 설명용) + resolve_skeleton(operation+target
 │   │                          검증, 오라클 안 정함) + graph_menu(발견된 엔드포인트 포함)
 │   ├── planner.py           baseline 선형 대입(_expected_delta_for) + build_candidate
@@ -264,7 +296,11 @@ finredteam/
 │   └── prioritizer.py       already_tried_and_failed (중복 실험 감지)
 │
 ├── oracles/                 base · value(INV-1A/1B) · amount(INV-6) · idempotency(INV-4)
-│                          · concurrency(INV-1C) · authz(INV-2, graph 필요) · generic(SQLi/XSS/BOLA/JWT)
+│                          · concurrency(INV-1C) · authz(INV-2, graph 필요) · exposure(INV-9)
+│                          · privilege(INV-BFLA) · limit(INV-5, result.policy_signals)
+│                          · generic(SQLi/XSS/BOLA/JWT + 웹·인증 위생 G-CORS/G-INFO/G-USERENUM/
+│                          │   G-JWT-EXP/G-JWT-QUERY/G-WEAKPW/G-DEFAULTCRED/G-RATELIMIT/G-CSRF)
+│                          · campaign(★ 목표 판정 OBJ-*, run_all_objectives — 순수 계층)
 │                          · registry(★ candidate 가 못 줄이는 오라클 전체 집합, INV-2 만
 │                          │   GRAPH_REGISTRY 로 별도 디스패치)
 │                          · verifier(run_all_outcomes 전체 + verify 단일 요약)
@@ -352,11 +388,17 @@ autonomous black-box인지" 참고). 라이브 실측(2026-08-26): vuln-bank 대
   경로(`/dashboard` 등)는 사람이 이 대상을 조사해 적어둔 값이 아니라 흔한
   웹앱 관례 목록(기존 discovery.seed_paths 의 "정상적으로 앱을 쓰면 자연히
   보이는 최소한" 취지와 동일)이다.
-- `resolve_skeleton` 에 `read_balance`/`transfer` 두 operation 만 구현되어
-  있다. 멱등성(INV-4)/경쟁조건(INV-1C) 후보를 `propose_hypothesis` 로
-  자동 생성하는 것은 아직 없다 — 오라클 자체는 있지만 실험 생성기가 없다.
-- Generic Layer(`probing/generic/*`)는 아직 액션에 안 붙어 있다 — 별도
-  스크립트로 직접 호출해서 라이브 검증만 했다.
+- `resolve_skeleton` 에 `read_balance`/`transfer` 두 operation 만 구현되어 있다.
+  멱등성(INV-4)·경쟁조건(INV-1C)·한도(INV-5)·노출(INV-9)·권한상승(INV-BFLA) 등은
+  `execute_experiment` 자동 후보가 아니라 전용 `run_probe` 프로브로 도달한다(위 액션
+  어휘 참고). 단, `discover_surface` 발견 경로를 `propose_hypothesis` 로 자동 연결하는
+  것은 여전히 없다.
+- Generic Layer(`probing/generic/*`)는 이제 `run_probe` 로 배선돼 있다: `sqli_scan`·
+  `jwt_forge`·`web_hygiene`(CORS/verbose-error/user-enum/jwt-exp/jwt-query)·`auth_hygiene`
+  (weak-pw/default-cred/rate-limit/CSRF). G-XSS/G-BOLA 오라클은 있으나 전용 프로브는 아직
+  없다. GT 대비 커버 천장은 **43/45**(Finance 24/25, Generic 19/20) — 남은 G-10(JWT kid)
+  은 대상에 kid 처리가 없고, F-13(loan 중복승인)은 loan_id 미반환+admin 킬체인이라 탐지가
+  불안정해 **정직하게 보류**한다(없는/불확실한 취약점을 찾은 척하지 않는다).
 - `discover_surface` 가 새 경로를 발견해도, 그걸 바로 `propose_hypothesis`
   의 `operation`으로 실험하는 자동 연결은 아직 없다(발견 → 그래프에 사실로
   남음 → 사람이 보거나 다음 설계 확장에서 자동화).
@@ -368,8 +410,8 @@ autonomous black-box인지" 참고). 라이브 실측(2026-08-26): vuln-bank 대
   생략하고 응답하는 경향이 있어 방어적으로 언래핑한다(`_unwrap_items`),
   토큰 자동 갱신은 없어 만료되면 사람이 `codex login` 을 다시 해야 한다.
 - **Engagement 레이어(§2)의 한계**: `max_concurrency`/`allow_file_upload`/
-  `allow_race_testing`은 컴파일은 되지만 대응하는 실행 가능한 액션이 아직
-  없어서(동시 요청을 실제로 보내는 ReAct 액션 자체가 없음) 소비되지 않는다.
+  `allow_race_testing`에 대응하는 동시요청 시험은 `run_probe`(`race_transfer`/`bill_race`)로
+  실제 실행된다. `max_concurrency`/`allow_file_upload`는 컴파일되지만 아직 전용 액션이 없다.
   Stop Condition은 `repeated_5xx`/`request_budget_exceeded`/
   `unexpected_sensitive_data`(CRITICAL 등급 필드 노출, 기본 활성화)/
   `latency_degradation`(baseline 대비 연속 초과, 오탐 위험 때문에 기본
