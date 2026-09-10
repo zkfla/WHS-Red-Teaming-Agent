@@ -125,7 +125,7 @@ finredteam/
 ├── probing/                      session.py (★ policy enforcement + Decimal-safe HTTP — the only place
 │                                  that makes real network calls) + executor; finance/ (state, burst/race,
 │                                  card_fund, charge, loan/card_limit/bill (INV-5 policy_signals), auth/card_exposure, privesc);
-│                                  generic/ (SQLi/JWT via sqli_scan/jwt_forge; hygiene.py via web_hygiene — CORS/verbose-error/user-enum))
+│                                  generic/ (SQLi/JWT via sqli_scan/jwt_forge; hygiene.py via web_hygiene — CORS/verbose-error/user-enum/jwt-exp/jwt-in-query))
 ├── recon/                        discovery, fingerprint (passive + 1-hop link extraction), entitlement, mapper
 ├── knowledge/                    graph (entitled_* / observed_* split, networkx), baseline (measured
 │                                  ground truth for expected_delta), sensitive, inference
@@ -137,7 +137,7 @@ finredteam/
 ├── oracles/                      base, value (INV-1A/1B), amount (INV-6), idempotency (INV-4), concurrency
 │                                  (INV-1C), authz (INV-2, needs graph), exposure (INV-9), privilege (INV-BFLA),
 │                                  limit (INV-5 — 한도/정책, reads result.policy_signals; probe not wired yet),
-│                                  generic (SQLi/XSS/BOLA/JWT + web-hygiene: G-CORS/G-INFO/G-USERENUM), campaign (★ objective layer — composes findings
+│                                  generic (SQLi/XSS/BOLA/JWT + web-hygiene: G-CORS/G-INFO/G-USERENUM/G-JWT-EXP/G-JWT-QUERY), campaign (★ objective layer — composes findings
 │                                  into adversary objectives OBJ-*, run_all_objectives), registry (★ run_all —
 │                                  full oracle set, no candidate-based narrowing), verifier
 ├── agent/                        budget, phase, strategy (nudges only, no forced batching), termination
@@ -172,9 +172,12 @@ vulnbank-target/                  the local target app itself (separate git repo
 - `probing/generic/*` is wired via `run_probe`: `sqli_scan`, `jwt_forge`, and
   `web_hygiene` (CORS reflection/`*` → G-CORS, verbose-error markers → G-INFO,
   forgot-password existence diff → G-USERENUM). G-XSS/G-BOLA oracles exist but have no
-  dedicated probe. Remaining web-hygiene GT still uncovered (no oracle yet): G-07/G-10/G-11
-  (JWT expiration/kid/in-query), G-12 (CSRF), G-13 (rate limit), G-15/G-16 (weak password /
-  default cred). G-04 (mass assignment) is already caught by INV-BFLA (GT mislabels it).
+  dedicated probe. `web_hygiene` now also covers G-07 (JWT exp missing → G-JWT-EXP,
+  decode token claims) and G-11 (token accepted via ?token= query → G-JWT-QUERY). Still
+  uncovered (no oracle): G-10 (JWT kid path traversal — DEFERRED: vuln-bank's auth.py has no
+  kid handling, HS256 fixed secret, so no real target behavior to probe), G-12 (CSRF),
+  G-13 (rate limit), G-15/G-16 (weak password / default cred). G-04 (mass assignment) is
+  already caught by INV-BFLA (GT mislabels it).
 - `discover_surface` findings land in the graph as facts but are not auto-chained into
   `propose_hypothesis`.
 - `max_concurrency`, `allow_file_upload`, `allow_race_testing` in the Engagement schema

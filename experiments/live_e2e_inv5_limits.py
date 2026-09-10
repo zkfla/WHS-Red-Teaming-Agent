@@ -31,7 +31,8 @@ class Handler(BaseHTTPRequestHandler):
         except Exception: return {}
 
     def do_GET(self):
-        p = self.path
+        _raw = self.path
+        p = self.path.split('?', 1)[0]
         if p == "/" or p == "/healthz":
             return self._json(200, {"status": "ok"})
         if p == "/api/bill-categories":  # 인증 불필요(소스 그대로)
@@ -41,6 +42,12 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, {"status": "success", "billers": [
                 {"id": 7, "name": "PowerCo", "account_number": "9990001",
                  "minimum_amount": 50.0, "maximum_amount": 5000.0}]})
+        if p == "/dashboard":  # token_required: 헤더 또는 ?token= 쿼리 수락(취약) 재현
+            has_auth = any(k.lower() == "authorization" for k in self.headers.keys())
+            has_q = "token=" in (self.path.split("?", 1)[1] if "?" in self.path else "")
+            if has_auth or has_q:
+                return self._json(200, {"status": "success", "dashboard": "ok"})
+            return self._json(401, {"error": "Token is missing"})
         if p.startswith("/check_balance/"):
             acct = p.split("/check_balance/", 1)[1]
             # CORS(app) 무설정 재현: 모든 Origin 허용(ACAO: *)
@@ -108,7 +115,12 @@ def main():
     )
     policy = compile_policy(eng)
     session = Session(target, policy)  # ★ 실제 httpx — 소켓으로 나간다
-    owner = Principal(id="attacker_A", username="atk", password="x", account_number="111", token="e2e-token")
+    import base64 as _b64, json as _json
+    def _mkjwt(payload):
+        b = lambda d: _b64.urlsafe_b64encode(_json.dumps(d).encode()).rstrip(b"=").decode()
+        return f"{b({'alg':'HS256','typ':'JWT'})}.{b(payload)}.sig"
+    no_exp_token = _mkjwt({"user_id": 1, "username": "atk"})  # exp 없음 — vuln-bank 재현
+    owner = Principal(id="attacker_A", username="atk", password="x", account_number="111", token=no_exp_token)
 
     print(f"\n=== 실서버 확인: GET http://{HOST}:{PORT}/ ===")
     print("healthz:", session.anonymous_request("GET", "/").status_code, "(실제 소켓 응답)")
@@ -140,6 +152,8 @@ def main():
         ("G-14 CORS", hygiene.probe_cors_reflection(session)),
         ("G-08 상세에러", hygiene.probe_verbose_error(session)),
         ("G-18 사용자열거", hygiene.probe_user_enumeration(session, owner.username)),
+        ("G-07 JWT만료없음", hygiene.probe_jwt_expiration(owner.token)),
+        ("G-11 JWT쿼리토큰", hygiene.probe_jwt_in_query(session, owner.token)),
     ]
     wh_hits = 0
     for label, o in wh:

@@ -208,7 +208,7 @@ class AgentContext:
             "loan_limit": {"request_loan"},
             "card_limit": {"card_limit_create", "card_limit_update"},
             "bill_limit": {"bill_payment"},
-            "web_hygiene": {"cors_reflection", "verbose_error", "user_enumeration"},
+            "web_hygiene": {"cors_reflection", "verbose_error", "user_enumeration", "jwt_expiration", "jwt_in_query"},
         }
         tried = self.episodic.tried_operations()
         return [name for name, ops in probe_ops.items() if not (ops & tried)]
@@ -943,6 +943,13 @@ def _handle_run_probe(input_: RunProbeInput, ctx: AgentContext) -> str:
             lines.append(_record_generic_outcome(
                 ctx, "user_enumeration", "POST", "/forgot-password",
                 generic_hygiene.probe_user_enumeration(ctx.session, owner.username)))
+        if owner is not None and owner.token:
+            lines.append(_record_generic_outcome(
+                ctx, "jwt_expiration", "POST", "/login",
+                generic_hygiene.probe_jwt_expiration(owner.token)))
+            lines.append(_record_generic_outcome(
+                ctx, "jwt_in_query", "GET", "/dashboard",
+                generic_hygiene.probe_jwt_in_query(ctx.session, owner.token)))
         return "\n".join(lines)
 
     else:

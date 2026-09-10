@@ -6,7 +6,7 @@ ANOMALY 비율이 높은 게 이 레이어의 정상적인 한계다 — Finance
 """
 from __future__ import annotations
 
-from finredteam.oracles.base import OracleOutcome, anomaly, passed, violation
+from finredteam.oracles.base import OracleOutcome, anomaly, passed, unknown, violation
 
 _SQL_ERROR_MARKERS = (
     "sql syntax", "psycopg2", "sqlite3.", "postgresql", "you have an error in your sql",
@@ -103,3 +103,25 @@ def check_user_enumeration(distinguishable: bool, detail: str = "") -> OracleOut
     if distinguishable:
         return violation("G-USERENUM", f"존재/비존재 계정 응답이 구별됨 — {detail}", evidence={"detail": detail})
     return passed("G-USERENUM", "존재/비존재 계정 응답이 구별되지 않음")
+
+
+def check_jwt_expiration(decoded: bool, has_exp: bool) -> OracleOutcome:
+    """JWT 만료 — 발급된 토큰에 exp(만료) 클레임이 없으면 위반 (G-07). 영구 유효 토큰."""
+    if not decoded:
+        return unknown("G-JWT-EXP", "토큰 페이로드 디코드 실패 — 만료 클레임 판정 불가")
+    if not has_exp:
+        return violation("G-JWT-EXP", "발급된 JWT에 exp(만료) 클레임 없음 — 토큰이 영구 유효")
+    return passed("G-JWT-EXP", "JWT에 exp(만료) 클레임 존재")
+
+
+def check_jwt_in_query(requires_auth: bool, query_accepted: bool) -> OracleOutcome:
+    """JWT in URL Query — 보호 엔드포인트가 ?token= 쿼리의 토큰을 인증으로 수락하면 위반 (G-11).
+
+    query 로 토큰을 넘기면 URL 로그·Referer·히스토리로 토큰이 유출된다. requires_auth 가
+    거짓이면(엔드포인트가 애초에 인증 불요) query 토큰 판정 자체가 무의미 → UNKNOWN.
+    """
+    if not requires_auth:
+        return unknown("G-JWT-QUERY", "대상 엔드포인트가 토큰 없이도 접근됨 — 쿼리 토큰 판정 불가")
+    if query_accepted:
+        return violation("G-JWT-QUERY", "보호 엔드포인트가 URL 쿼리(?token=)의 토큰을 인증 수단으로 수락")
+    return passed("G-JWT-QUERY", "URL 쿼리 토큰이 인증으로 수락되지 않음")

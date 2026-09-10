@@ -64,7 +64,7 @@
   layer: generic
   endpoint: "POST /login"   # REVIEW: 만료 토큰 검증 대상 경로로 교체 필요
   description: JWT Expiration Missing — 만료되어야 할 토큰이 계속 사용 가능
-  invariant: REVIEW-JWT-EXPIRATION   # REVIEW: 오라클 없음(현재 G-JWT는 alg=none만 검사)
+  invariant: G-JWT-EXP   # 구현됨(oracles/generic.py) — web_hygiene 프로브
   severity: MEDIUM
 
 - id: G-08
@@ -92,7 +92,7 @@
   layer: generic
   endpoint: "GET /dashboard"   # REVIEW: 인증 처리 대표 경로 — 실제 확인 필요
   description: JWT in URL Query — URL query parameter에 포함된 JWT가 인증 수단으로 처리
-  invariant: REVIEW-JWT-IN-QUERY   # REVIEW: 오라클 없음
+  invariant: G-JWT-QUERY   # 구현됨(oracles/generic.py) — web_hygiene 프로브
   severity: MEDIUM
 
 - id: G-12

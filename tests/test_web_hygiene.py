@@ -84,3 +84,42 @@ def test_probe_cors_no_header_passes():
     def handler(request):
         return httpx.Response(200, json={"status": "success"})  # ACAO 없음
     assert hygiene.probe_cors_reflection(_session(handler)).verdict == Verdict.PASS
+
+
+# ── JWT 변형 (G-07 만료없음, G-11 query 토큰) ────────────────────────
+
+def _jwt(payload: dict) -> str:
+    import base64, json
+    def b64(d): return base64.urlsafe_b64encode(json.dumps(d).encode()).rstrip(b"=").decode()
+    return f"{b64({'alg':'HS256','typ':'JWT'})}.{b64(payload)}.sig"
+
+
+def test_jwt_expiration_missing_is_violation():
+    from finredteam.oracles.generic import check_jwt_expiration
+    assert check_jwt_expiration(True, False).verdict == Verdict.VIOLATION
+    assert check_jwt_expiration(True, True).verdict == Verdict.PASS
+    assert check_jwt_expiration(False, False).verdict == Verdict.UNKNOWN
+
+
+def test_jwt_in_query_oracle():
+    from finredteam.oracles.generic import check_jwt_in_query
+    assert check_jwt_in_query(True, True).verdict == Verdict.VIOLATION
+    assert check_jwt_in_query(True, False).verdict == Verdict.PASS
+    assert check_jwt_in_query(False, True).verdict == Verdict.UNKNOWN  # 애초에 보호 안 됨
+
+
+def test_probe_jwt_expiration_flows_to_violation():
+    # exp 없는 토큰 → VIOLATION, exp 있는 토큰 → PASS
+    assert hygiene.probe_jwt_expiration(_jwt({"user_id": 1})).verdict == Verdict.VIOLATION
+    assert hygiene.probe_jwt_expiration(_jwt({"user_id": 1, "exp": 9999999999})).verdict == Verdict.PASS
+
+
+def test_probe_jwt_in_query_flows_to_violation():
+    def handler(request):
+        has_query_token = "token=" in (request.url.query.decode() if isinstance(request.url.query, bytes) else str(request.url.query))
+        has_auth = "authorization" in {k.lower() for k in request.headers}
+        if has_query_token or has_auth:
+            return httpx.Response(200, json={"status": "success"})
+        return httpx.Response(401, json={"error": "Token is missing"})
+    out = hygiene.probe_jwt_in_query(_session(handler), _jwt({"user_id": 1}))
+    assert out.verdict == Verdict.VIOLATION and out.invariant == "G-JWT-QUERY"

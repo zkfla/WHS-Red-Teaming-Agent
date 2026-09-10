@@ -9,6 +9,8 @@ from __future__ import annotations
 from finredteam.oracles.base import OracleOutcome
 from finredteam.oracles.generic import (
     check_cors_policy,
+    check_jwt_expiration,
+    check_jwt_in_query,
     check_user_enumeration,
     check_verbose_error,
 )
@@ -58,3 +60,36 @@ def probe_user_enumeration(
     distinguishable = a.status_code != b.status_code
     detail = f"존재={a.status_code}, 비존재={b.status_code}"
     return check_user_enumeration(distinguishable, detail)
+
+
+def _decode_jwt_payload(token: str) -> dict | None:
+    """JWT 의 payload(가운데 세그먼트)를 서명 검증 없이 base64url 디코드한다.
+    만료 클레임 유무만 보므로 검증은 불필요하고, PyJWT 의존도 피한다."""
+    import base64
+    import json
+
+    try:
+        parts = token.split(".")
+        if len(parts) < 2:
+            return None
+        seg = parts[1]
+        seg += "=" * (-len(seg) % 4)  # base64url 패딩 복원
+        return json.loads(base64.urlsafe_b64decode(seg.encode()))
+    except Exception:
+        return None
+
+
+def probe_jwt_expiration(token: str) -> OracleOutcome:
+    """발급된 토큰을 디코드해 exp(만료) 클레임 유무를 관측."""
+    claims = _decode_jwt_payload(token)
+    return check_jwt_expiration(decoded=claims is not None, has_exp=bool(claims and "exp" in claims))
+
+
+def probe_jwt_in_query(session: Session, token: str, path: str = "/dashboard") -> OracleOutcome:
+    """보호 엔드포인트를 (1) 토큰 없이 (2) ?token= 쿼리로 쳐서, 쿼리 토큰이 인증으로
+    수락되는지 관측한다. (1)이 401/403 이어야 '원래 보호됨'이 확인된다(오탐 방지)."""
+    no_token = session.anonymous_request("GET", path)
+    with_query = session.anonymous_request("GET", f"{path}?token={token}")
+    requires_auth = no_token.status_code in (401, 403)
+    query_accepted = 200 <= with_query.status_code < 300
+    return check_jwt_in_query(requires_auth, query_accepted)
