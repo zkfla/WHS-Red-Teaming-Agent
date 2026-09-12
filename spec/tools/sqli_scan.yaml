@@ -1,0 +1,32 @@
+id: sqli_scan
+version: 1
+layer: generic
+summary: 잔액·거래내역 조회 경로에 boolean-based SQL injection 이 통하는지 본다.
+
+capabilities:
+  required: []                # GET 만. 익명 요청이라 정책 사전검사에서 거의 안 걸린다
+  concurrency: 1
+  max_amount_touched: null
+  request_budget: 6           # 경로 2개 × (참/거짓/에러유도) 3발
+
+effects:
+  creates_resource_types: []
+  mutates_balance: false
+  reversible: true
+  repeatable: true
+
+preconditions:
+  - kind: principal
+    attrs: {has_account: true}   # payload 에 끼워 넣을 정상 계좌번호가 필요하다
+    bind: owner
+
+postconditions: []
+params: {}
+
+# ★ 이 tool 이 건드릴 것으로 선언한 표면 — control plane 이 실행 후 대조한다.
+surface:
+  - {method: GET, path: "/check_balance/{id}", note: "boolean-based payload"}
+  - {method: GET, path: "/transactions/{id}", note: "boolean-based payload"}
+
+failure_modes:
+  - {code: request_failed, expected: true, description: "요청 실패 — 시그니처 판정 불가"}

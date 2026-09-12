@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+build/
+dist/
+*.egg-info/
+.venv/
+venv/
+env/
+
+# 테스트 / 도구
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# 에디터
+.idea/
+.vscode/
+*.swp
+
+# ★ 실행 산출물 — 절대 커밋하지 않는다.
+#   evidence store 에는 응답 원문이 들어간다. 규격이 그래프/리포트로 새는 걸
+#   그렇게 막아놨는데 산출물 디렉터리를 통째로 올리면 의미가 없다.
+evidence/
+runs/
+out/
+*.jsonl
+
+# ★ engagement 승인서 / 대상 자격증명 — 저장소에 들어오면 안 된다
+engagement*.yaml
+engagement*.json
+.env
+.env.*
+secrets/

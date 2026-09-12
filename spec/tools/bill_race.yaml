@@ -1,0 +1,52 @@
+id: bill_race
+version: 1
+layer: finance
+summary: 청구서 결제를 동시에 여러 번 보내 잔액 검사를 우회(초과인출)하는지 본다.
+
+capabilities:
+  required: [state_change, race_testing]
+  concurrency: 5
+  max_amount_touched: "100.00"   # 실제 단위금액은 max(biller.min, 10.00) 으로 런타임 결정.
+                                 # ★ 매니페스트는 정적 상한 선언일 뿐 — 런타임 금액은
+                                 #    execution substrate 가 다시 검사해야 한다.
+  request_budget: 40
+
+effects:
+  creates_resource_types: [bill_payment]
+  mutates_balance: true
+  reversible: true               # restorer 주체가 되돌린다
+  repeatable: true
+
+preconditions:
+  - kind: principal
+    attrs: {has_account: true}
+    count: 2                     # payer + restorer
+    bind: racers
+  - kind: biller
+    attrs: {discovered: true}
+    bind: biller
+
+postconditions: []
+
+params:
+  n_concurrent:
+    type: integer
+    default: 5
+    minimum: 2
+    maximum: 10
+  trials:
+    type: integer
+    default: 3
+    minimum: 1
+    maximum: 5
+
+# ★ 이 tool 이 건드릴 것으로 선언한 표면 — control plane 이 실행 후 대조한다.
+surface:
+  - {method: POST, path: "/api/bill-payments/create", note: "동시 발사 대상"}
+  - {method: POST, path: "/transfer", note: "잔액 복구"}
+  - {method: GET, path: "/check_balance/{id}", note: "잔액 관측"}
+
+failure_modes:
+  - {code: biller_not_found, expected: true, description: "실존 biller 없음"}
+  - {code: target_5xx, expected: false, description: "동시 부하로 대상 불안정"}
+cleanup_impossible_reason: "청구서 결제는 취소 API 가 없다 — 생성된 결제 건은 되돌릴 수 없다"

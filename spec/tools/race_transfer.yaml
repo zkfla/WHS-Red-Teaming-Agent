@@ -1,0 +1,48 @@
+# count>1 케이스 — "서로 다른 계좌를 가진 주체 2명" 전제를 데이터로 표현한다.
+# ★ 이 tool 이 지금 allow_race_testing=false 여도 그냥 도는 구멍의 당사자다.
+id: race_transfer
+version: 1
+layer: finance
+summary: 같은 잔액에 대해 송금을 동시에 여러 번 보내 잔액 검사를 우회하는지 본다.
+
+capabilities:
+  required: [state_change, race_testing]
+  concurrency: 5
+  max_amount_touched: "10.00"
+  request_budget: 40
+
+effects:
+  creates_resource_types: []
+  mutates_balance: true
+  reversible: true      # restorer 주체가 되돌린다
+  repeatable: true
+
+preconditions:
+  - kind: principal
+    attrs: {has_account: true}
+    count: 2            # ★ 이게 지금은 `if len(accounted) < 2: return "..."` 다
+    bind: racers
+
+postconditions: []      # 새 자산을 얻지 않는다 — 불변식 위반만 관측
+
+params:
+  n_concurrent:
+    type: integer
+    default: 5
+    minimum: 2
+    maximum: 10
+  trials:
+    type: integer
+    description: 재현율 측정을 위한 시행 횟수
+    default: 3
+    minimum: 1
+    maximum: 5
+
+# ★ 이 tool 이 건드릴 것으로 선언한 표면 — control plane 이 실행 후 대조한다.
+surface:
+  - {method: POST, path: "/transfer", note: "동시 발사 대상 + 복구"}
+  - {method: GET, path: "/check_balance/{id}", note: "잔액 관측"}
+
+failure_modes:
+  - {code: insufficient_principals, expected: true, description: "주체 부족"}
+  - {code: target_5xx, expected: false, description: "동시 부하로 대상 불안정 — 즉시 중단 검토"}

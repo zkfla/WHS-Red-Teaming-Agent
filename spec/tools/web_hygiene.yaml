@@ -1,0 +1,35 @@
+# 전제조건이 optional 만 있는 케이스 — 항상 frontier 에 올라온다.
+id: web_hygiene
+version: 1
+layer: generic
+summary: CORS 반사, verbose 에러, 사용자 열거, JWT 만료 누락/쿼리 노출을 한 번에 훑는다.
+
+capabilities:
+  required: []          # 읽기만 한다 — 정책 사전검사에서 거의 걸리지 않는다
+  concurrency: 1
+  max_amount_touched: null
+  request_budget: 8
+
+effects:
+  creates_resource_types: []
+  mutates_balance: false
+  reversible: true
+  repeatable: false     # 같은 run 에서 두 번 돌 이유가 없다
+
+preconditions:
+  - kind: principal
+    attrs: {has_token: true}
+    bind: owner
+    optional: true      # ★ 없으면 JWT 관련 검사만 건너뛰고 나머지는 돈다
+
+postconditions: []
+params: {}
+
+# ★ 이 tool 이 건드릴 것으로 선언한 표면 — control plane 이 실행 후 대조한다.
+surface:
+  - {method: GET, path: "/check_balance/{id}", note: "CORS 반사 + verbose 에러"}
+  - {method: POST, path: "/forgot-password", note: "사용자 열거"}
+  - {method: GET, path: "/dashboard", note: "토큰 쿼리 전달"}
+
+failure_modes:
+  - {code: request_failed, expected: true, description: "일부 검사 요청 실패"}

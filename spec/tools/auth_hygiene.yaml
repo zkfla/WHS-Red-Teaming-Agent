@@ -1,0 +1,47 @@
+# ★ bruteforce 를 선언하는 나머지 하나.
+#   probe_default_credentials = 기본 크레덴셜 6쌍 순회
+#   probe_rate_limit         = 같은 계정에 오답 로그인 6회 연속
+#   둘 다 지금은 allow_bruteforce 확인 없이 돌고 있다.
+id: auth_hygiene
+version: 1
+layer: generic
+summary: 약한 비번 수락·기본 크레덴셜·rate limit 부재·CSRF 를 한 번에 훑는다.
+
+capabilities:
+  required: [state_change, account_creation, bruteforce]
+  concurrency: 1
+  max_amount_touched: "1.00"   # CSRF 검사가 자기계좌로 1.00 송금을 시도한다
+  request_budget: 15
+
+effects:
+  creates_resource_types: [user_account]
+  mutates_balance: true
+  reversible: true
+  repeatable: false
+
+preconditions:
+  - kind: principal
+    attrs: {has_account: true}
+    bind: owner
+    optional: true       # 없으면 CSRF 검사만 빠지고 나머지 3개는 돈다
+
+postconditions: []
+
+params:
+  login_attempts:
+    type: integer
+    description: rate limit 확인용 연속 실패 횟수
+    default: 6
+    minimum: 3
+    maximum: 10
+
+# ★ 이 tool 이 건드릴 것으로 선언한 표면 — control plane 이 실행 후 대조한다.
+surface:
+  - {method: POST, path: "/register", note: "약한 비밀번호 수락 여부"}
+  - {method: POST, path: "/login", note: "기본 크레덴셜 + rate limit"}
+  - {method: POST, path: "/transfer", note: "쿠키만으로 상태변경(CSRF)"}
+
+failure_modes:
+  - {code: throttled, expected: true, description: "대상이 정상 throttle — 방어가 있다는 뜻"}
+  - {code: registration_rejected, expected: true, description: "약한 비밀번호 거부 — 정책이 작동 중"}
+cleanup_with: [delete_principal]

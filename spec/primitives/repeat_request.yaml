@@ -1,0 +1,20 @@
+# 멱등성·rate limit 재료. charge_idempotency 와 auth_hygiene 의 rate limit 이 여기로 수렴.
+id: repeat_request
+version: 1
+layer: generic
+summary: 같은 요청을 순차로 N번 반복해 멱등성·throttle 재료를 만든다.
+capabilities: {required: [state_change], concurrency: 1, max_amount_touched: "1000.00", request_budget: 10}
+effects: {creates_resource_types: [], mutates_balance: true, reversible: false, repeatable: true}
+surface_binding: target
+preconditions:
+  - {kind: endpoint, attrs: {reachable: true}, bind: target, from_param: target}
+postconditions: []
+params:
+  target:  {type: string, required: true, binds_to: endpoint}
+  amount:  {type: money, description: 1회분 금액, policy_checked: true}
+  body:    {type: string, description: 매회 동일하게 보낼 바디(논리적 거래 id 포함), sensitive: true}
+  repeats: {type: integer, default: 3, minimum: 2, maximum: 10}
+
+mcp: {expose: true, server: finredteam-web, hide_when_unavailable: true}
+failure_modes:
+  - {code: throttled, expected: true, description: 대상이 정상적으로 throttle — 방어가 있다는 뜻}

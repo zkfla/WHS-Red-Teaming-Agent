@@ -1,0 +1,52 @@
+# 가장 복잡한 케이스 — 셋업 4단계가 전부 react.py 안 if 문에 하드코딩돼 있던 것.
+id: charge_idempotency
+version: 1
+layer: finance
+summary: 같은 merchant_order_id 로 결제를 반복했을 때 카드 잔액이 여러 번 차감되는지 본다.
+
+capabilities:
+  required: [state_change, account_creation]
+  concurrency: 1
+  max_amount_touched: "500.00"   # 셋업 충전 500 + 결제 50×3
+  request_budget: 12
+
+effects:
+  creates_resource_types: [virtual_card, merchant_account]
+  mutates_balance: true
+  reversible: false
+  repeatable: true
+
+preconditions:
+  - kind: principal
+    attrs: {has_account: true}
+    bind: owner
+
+postconditions:
+  - kind: card
+    attrs: {created: true, funded: true}
+  - kind: merchant
+    attrs: {registered: true}
+
+params:
+  repeats:
+    type: integer
+    description: 같은 주문번호로 반복 결제할 횟수
+    default: 3
+    minimum: 2
+    maximum: 5
+  amount:
+    type: money
+    default: "50.00"
+
+# ★ 이 tool 이 건드릴 것으로 선언한 표면 — control plane 이 실행 후 대조한다.
+surface:
+  - {method: POST, path: "/api/virtual-cards/create"}
+  - {method: POST, path: "/api/virtual-cards/{id}/fund", note: "시험 조건용 정상 충전"}
+  - {method: GET, path: "/api/virtual-cards", note: "카드 잔액 관측"}
+  - {method: POST, path: "/api/v1/merchants/register"}
+  - {method: POST, path: "/api/v1/payments/charge", note: "같은 주문번호로 반복"}
+
+failure_modes:
+  - {code: setup_failed, expected: true, description: "카드 충전/가맹점 등록 실패 — 시험 조건 미성립"}
+  - {code: target_5xx, expected: false, description: "대상이 서버 에러 반복"}
+cleanup_with: [delete_card, delete_principal]

@@ -1,0 +1,19 @@
+id: observe_state
+version: 1
+layer: finance
+summary: 계좌·카드 잔액을 읽어 실험 전후 델타의 기준으로 삼는다.
+capabilities: {required: [], concurrency: 1, max_amount_touched: null, request_budget: 2}
+effects: {creates_resource_types: [], mutates_balance: false, reversible: true, repeatable: true}
+surface_binding: target
+preconditions:
+  - {kind: endpoint, attrs: {reachable: true}, bind: target, from_param: target}
+postconditions:
+  - {kind: account, attrs: {balance_known: true}}
+params:
+  target:  {type: string, description: 관측용 endpoint 노드 id, required: true, binds_to: endpoint}
+  subject: {type: string, description: 관측 대상 계좌/카드 식별자, required: true}
+
+mcp: {expose: true, server: finredteam-web, hide_when_unavailable: true,
+      annotations: {readOnlyHint: "true"}}
+failure_modes:
+  - {code: observation_failed, expected: true, description: 잔액을 읽지 못함 — 델타 판정 불가}

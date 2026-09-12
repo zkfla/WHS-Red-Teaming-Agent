@@ -1,0 +1,17 @@
+id: delete_card
+version: 1
+layer: finance
+summary: 시험 중 만든 가상카드를 삭제하거나 동결한다.
+capabilities: {required: [state_change, delete], concurrency: 1, max_amount_touched: null, request_budget: 2}
+effects: {creates_resource_types: [], mutates_balance: false, reversible: false, repeatable: true}
+surface_binding: target
+preconditions:
+  - {kind: endpoint, attrs: {reachable: true}, bind: target, from_param: target}
+  - {kind: card, attrs: {created: true}, bind: card, from_param: card}
+postconditions: []
+params:
+  target: {type: string, required: true, binds_to: endpoint}
+  card:   {type: string, required: true, binds_to: card}
+mcp: {expose: false, server: finredteam-web}
+failure_modes:
+  - {code: delete_unsupported, expected: true, description: 삭제 API 없음 — 동결로 대체 시도}

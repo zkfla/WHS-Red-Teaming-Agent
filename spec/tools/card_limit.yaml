@@ -1,0 +1,39 @@
+id: card_limit
+version: 1
+layer: finance
+summary: 카드 생성/한도수정에 음수 한도를 넣어도 수락되는지 본다.
+
+capabilities:
+  required: [state_change, account_creation]
+  concurrency: 1
+  max_amount_touched: null    # 한도(limit) 를 바꾸지 잔액을 옮기지 않는다
+  request_budget: 4
+
+effects:
+  creates_resource_types: [virtual_card]
+  mutates_balance: false
+  reversible: false
+  repeatable: true
+
+preconditions:
+  - kind: principal
+    attrs: {has_account: true}
+    bind: owner
+
+postconditions:
+  - kind: card
+    attrs: {created: true, limit_known: true}
+
+params:
+  negative_limit:
+    type: money
+    default: "-500.00"
+
+# ★ 이 tool 이 건드릴 것으로 선언한 표면 — control plane 이 실행 후 대조한다.
+surface:
+  - {method: POST, path: "/api/virtual-cards/create", note: "음수 한도로 생성"}
+  - {method: POST, path: "/api/virtual-cards/{id}/update-limit", note: "음수 한도로 수정"}
+
+failure_modes:
+  - {code: card_create_failed, expected: true, description: "카드 생성 실패"}
+cleanup_with: [delete_card]

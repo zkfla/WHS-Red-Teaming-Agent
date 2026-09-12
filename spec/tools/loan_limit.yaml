@@ -1,0 +1,47 @@
+# ★★ 이 파일이 규격의 가장 중요한 발견을 드러낸다.
+#    max_amount_touched 가 1억인데 config.MAX_AMOUNT 는 1000 이다.
+#    → pre-flight 가 이 tool 을 통째로 BLOCK 한다.
+#    지금 코드는 이 금액을 그냥 보낸다(run_probe 경로는 check_amount 를 부르지 않음).
+#    즉 "정책 위반이 아니라 정책 구멍"이었다. 규격이 그걸 드러낸 것이지 만든 게 아니다.
+#    해결 방향은 팀 결정 사항 — spec/README.md "미해결" 참고.
+id: loan_limit
+version: 1
+layer: finance
+summary: 음수·0·초대형 대출 요청이 거부되는지(대출 금액 정책이 있는지) 본다.
+
+capabilities:
+  required: [state_change]
+  concurrency: 1
+  max_amount_touched: "100000000.00"   # ← config.MAX_AMOUNT(1000) 과 충돌. 의도적으로 정직하게 선언
+  request_budget: 3
+
+effects:
+  creates_resource_types: [loan_request]
+  mutates_balance: true
+  reversible: false
+  repeatable: true
+
+preconditions:
+  - kind: principal
+    attrs: {has_account: true}
+    bind: owner
+
+postconditions: []
+
+params:
+  probe_amounts:
+    type: string
+    description: 시험할 금액 목록 (쉼표 구분)
+    default: "-500.00,0.00,100000000.00"
+  asserted_max:
+    type: money
+    description: 프로브가 주장하는 도메인 상한 — 서버 선언값이 아니므로 증거 강도가 낮다
+    default: "1000000.00"
+
+# ★ 이 tool 이 건드릴 것으로 선언한 표면 — control plane 이 실행 후 대조한다.
+surface:
+  - {method: POST, path: "/request_loan", note: "음수·0·초대형 금액"}
+
+failure_modes:
+  - {code: loan_rejected, expected: true, description: "대출 거부 — 정책이 작동 중"}
+cleanup_with: [cancel_loan]

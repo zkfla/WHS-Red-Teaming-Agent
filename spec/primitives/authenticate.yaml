@@ -1,0 +1,20 @@
+id: authenticate
+version: 1
+layer: generic
+summary: 자격증명으로 로그인해 토큰을 얻는다.
+capabilities: {required: [state_change], concurrency: 1, max_amount_touched: null, request_budget: 1}
+effects: {creates_resource_types: [], mutates_balance: false, reversible: true, repeatable: true}
+surface_binding: target
+preconditions:
+  - {kind: endpoint, attrs: {reachable: true}, bind: target, from_param: target}
+postconditions:
+  - {kind: token, attrs: {valid: true}}
+  - {kind: principal, attrs: {authenticated: true}}
+params:
+  target:   {type: string, required: true, binds_to: endpoint}
+  username: {type: string, required: true}
+  password: {type: string, required: true, sensitive: true}
+
+mcp: {expose: true, server: finredteam-web, hide_when_unavailable: true}
+failure_modes:
+  - {code: bad_credentials, expected: true, description: 자격증명 불일치}

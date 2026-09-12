@@ -1,0 +1,38 @@
+# ★ 핵심 원시 동작. 기존 레시피 17개가 하던 일의 대부분이 여기로 수렴한다.
+#
+#   static surface 를 못 적는다 — 어디를 칠지가 실행 시점에 정해지기 때문.
+#   대신 surface_binding 으로 "target 파라미터가 대상을 가리킨다" 고 선언하고,
+#   control plane 이 그 값이 **그래프에 이미 있는 endpoint 노드**인지 확인한다.
+#   → 정찰로 발견한 표면만 칠 수 있다. 임의 경로 생성이 불가능하다.
+id: http_request
+version: 1
+layer: generic
+summary: 이미 발견한 엔드포인트에 임의 메서드·바디로 요청을 보낸다.
+capabilities: {required: [state_change], concurrency: 1, max_amount_touched: "1000.00", request_budget: 3}
+effects: {creates_resource_types: [], mutates_balance: true, reversible: false, repeatable: true}
+surface_binding: target
+preconditions:
+  # ★ from_param 이 핵심이다 — "모델이 target 으로 고른 바로 그 endpoint" 를 묶는다.
+  #   없으면 resolve() 가 reachable 한 아무 endpoint 나 집고, ingest() 가 그걸
+  #   허용 표면으로 써서 스코프 이탈 대조가 통째로 엉뚱한 값으로 돈다.
+  - {kind: endpoint, attrs: {reachable: true}, bind: target, from_param: target}
+  - {kind: principal, attrs: {authenticated: true}, bind: actor, from_param: auth_as, optional: true}
+postconditions: []
+# 어느 엔드포인트를 치느냐에 따라 달라진다 — 미리 못 적으므로 가능한 종류만 선언한다.
+may_produce: [card, merchant, biller, loan, account, token]
+params:
+  target: {type: string, description: 그래프에 실존하는 endpoint 노드 id, required: true, binds_to: endpoint}
+  method: {type: string, enum: [GET, POST, PUT, PATCH, DELETE], default: GET}
+  auth_as: {type: string, description: 어느 주체로 보낼지(principal 노드 id). 비우면 익명, binds_to: principal}
+  # ★ sensitive — 바디에는 자격증명·PII 가 그대로 들어간다. 기록에는 «redacted» 로 남는다.
+  body: {type: json, description: 요청 바디. 필드 이름·값은 에이전트가 정한다, sensitive: true}
+  amount: {type: money, description: 금액 필드가 있으면 여기로 분리해 넣는다, policy_checked: true}
+
+mcp:
+  expose: true
+  server: finredteam-web
+  hide_when_unavailable: true      # frontier 밖이면 MCP 목록에서 뺀다
+failure_modes:
+  - {code: target_unreachable, expected: false, description: 요청 자체가 실패 — 누적되면 중단 검토}
+  - {code: target_5xx,         expected: false, description: 대상이 서버 에러 반복}
+  - {code: auth_expired,       expected: true,  description: 토큰 만료 — 재인증 후 재시도}

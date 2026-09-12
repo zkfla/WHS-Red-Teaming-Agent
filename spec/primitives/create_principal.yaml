@@ -1,0 +1,24 @@
+# 가입. extra_fields 가 mass assignment 시험 지점을 겸한다 —
+# 별도 레시피(privilege_escalation)가 필요 없어진다.
+id: create_principal
+version: 1
+layer: generic
+summary: 새 주체를 가입시킨다. 추가 필드를 끼워 넣을 수 있다.
+capabilities: {required: [state_change, account_creation], concurrency: 1, max_amount_touched: null, request_budget: 2}
+effects: {creates_resource_types: [user_account], mutates_balance: false, reversible: false, repeatable: true}
+surface_binding: target
+preconditions:
+  - {kind: endpoint, attrs: {reachable: true}, bind: target, from_param: target}
+postconditions:
+  - {kind: principal, attrs: {authenticated: false}}
+params:
+  target:       {type: string, required: true, binds_to: endpoint}
+  # ★ 둘 다 sensitive — 예전에는 이 두 값이 Transition.params 에 평문으로 실려
+  #   그대로 evidence store JSONL 로 나갔다. extra_fields 에는 주입용 PII 도 들어간다.
+  password:     {type: string, description: 약한 비밀번호 정책 시험도 이 값으로 한다, default: "Rt!pass123", sensitive: true}
+  extra_fields: {type: json, description: 스키마 밖 필드 주입(JSON). mass assignment 시험 지점, sensitive: true}
+
+mcp: {expose: true, server: finredteam-web, hide_when_unavailable: true}
+failure_modes:
+  - {code: registration_rejected, expected: true, description: 가입 거부 — 정책이 작동 중}
+cleanup_with: [delete_principal]     # ★ 자원을 만들면 되돌릴 tool 을 선언해야 한다

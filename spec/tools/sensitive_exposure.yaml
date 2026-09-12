@@ -1,0 +1,40 @@
+id: sensitive_exposure
+version: 1
+layer: finance
+summary: 응답에 비밀번호·재설정 PIN·카드 PAN/CVV 가 그대로 실려 나오는지 본다.
+
+capabilities:
+  required: [state_change, account_creation]   # /register, /forgot-password, 카드 생성
+  concurrency: 1
+  max_amount_touched: null
+  request_budget: 6
+
+effects:
+  creates_resource_types: [user_account, virtual_card]
+  mutates_balance: false
+  reversible: false
+  repeatable: true
+
+preconditions:
+  - kind: principal
+    attrs: {has_account: true}
+    bind: owner
+    optional: true      # 없으면 카드 노출 검사만 건너뛰고 register/forgot 검사는 돈다
+
+postconditions:
+  - kind: card
+    attrs: {created: true}
+
+params: {}
+
+# ★ 이 tool 이 건드릴 것으로 선언한 표면 — control plane 이 실행 후 대조한다.
+surface:
+  - {method: POST, path: "/register", note: "가입 응답에 비밀번호가 echo 되는지"}
+  - {method: POST, path: "/api/v1/forgot-password", note: "응답에 재설정 PIN 이 실리는지"}
+  - {method: POST, path: "/api/virtual-cards/create"}
+  - {method: GET, path: "/api/virtual-cards", note: "PAN/CVV 노출 확인"}
+
+failure_modes:
+  - {code: registration_rejected, expected: true, description: "가입 거부 — 정책이 작동 중"}
+  - {code: card_create_failed, expected: true, description: "카드 생성 실패 — 노출 검사 일부 불가"}
+cleanup_with: [delete_principal, delete_card]

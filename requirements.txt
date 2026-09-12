@@ -1,0 +1,12 @@
+# spec/ 규격이 쓰는 전부. 프로젝트의 다른 코드를 하나도 import 하지 않는다.
+#
+#   pip install -r requirements.txt
+#
+# Python 3.11+ (CI 에서 3.11 / 3.12 / 3.13 을 돌린다)
+# pydantic 이 `X | Y` 어노테이션을 런타임에 해석하므로 3.10 미만은 안 된다.
+
+pydantic>=2.0,<3
+PyYAML>=6.0
+
+# 개발용
+pytest>=8.0

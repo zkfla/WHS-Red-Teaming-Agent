@@ -1,0 +1,62 @@
+# ★ 내가 처음에 빠뜨렸던 tool. 15개를 세다가 발견했다.
+#
+#   AI 가 고를 수 있는 행동 8개 중 run_probe 계열만 매니페스트로 만들고,
+#   이 경로를 빠뜨렸다. 그런데 이 tool 이 **실제로 돈을 옮기는 송금 요청을 보낸다.**
+#   매니페스트가 없으면 control plane 이 이 경로를 못 막는다 — scope guard 에
+#   구멍이 그대로 남는 셈이다.
+#
+# ★ 다른 tool 과 결정적으로 다른 점: 금액을 AI 가 고른다.
+#   나머지는 매니페스트에 적힌 고정값을 쓰지만 이건 propose_hypothesis 가 넘긴
+#   params.amount 를 그대로 보낸다. 그래서 max_amount_touched 는 "이 tool 이
+#   정책 상한까지 건드릴 수 있다"는 선언일 뿐이고, **실제 방어는 런타임 검사**다.
+#   (현재 코드에서 check_amount 가 불리는 유일한 지점이 이 경로다 — react.py:611)
+id: execute_experiment
+version: 1
+layer: finance
+summary: 그래프가 아는 대상에 대해 잔액조회 또는 송금을 실제로 실행하고 판정까지 받는다.
+
+capabilities:
+  required: [state_change]      # transfer 는 POST. read_balance 만 쓰면 과하지만,
+                                # 한 tool 이 두 operation 을 겸하므로 넓은 쪽으로 선언한다.
+  concurrency: 1
+  max_amount_touched: "1000.00" # = config.MAX_AMOUNT(전역 상한). 정적 상한이 아니라
+                                # "정책이 허용하는 데까지"라는 뜻 — 런타임 재검사 필수.
+  request_budget: 4             # 관측(전) + 요청 + 관측(후)
+
+effects:
+  creates_resource_types: []
+  mutates_balance: true
+  reversible: false
+  repeatable: true
+
+preconditions:
+  - kind: principal
+    attrs: {authenticated: true}
+    bind: actor
+  - kind: account                # propose_hypothesis 의 target 이 되는 계좌 노드
+    bind: subject
+
+postconditions: []               # 새 자산을 얻지 않는다 — observed 관계와 판정만 남긴다
+
+params:
+  operation:
+    type: string
+    description: 실행할 연산
+    enum: [read_balance, transfer]
+    required: true
+  target:
+    type: string
+    description: 그래프에 실존하는 계좌 노드 id
+    required: true
+  amount:
+    type: money
+    description: 송금 금액. 런타임에 policy.check_amount 로 다시 검사된다
+
+# ★ 이 tool 이 건드릴 것으로 선언한 표면 — control plane 이 실행 후 대조한다.
+surface:
+  - {method: GET, path: "/check_balance/{id}", note: "read_balance"}
+  - {method: POST, path: "/transfer", note: "transfer"}
+
+failure_modes:
+  - {code: target_unreachable, expected: false, description: "요청 자체 실패 — 누적되면 중단"}
+  - {code: target_5xx, expected: false, description: "대상이 서버 에러 반복"}

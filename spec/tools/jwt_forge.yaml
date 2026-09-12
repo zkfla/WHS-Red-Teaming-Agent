@@ -1,0 +1,37 @@
+# ★ bruteforce capability 를 선언하는 두 tool 중 하나.
+#   흔한 시크릿 12개를 순회하며 서명을 위조해 서버에 들이민다 —
+#   패스워드 스프레이와 같은 성격이라 정직하게 bruteforce 로 선언했다.
+id: jwt_forge
+version: 1
+layer: generic
+summary: 흔한 약한 시크릿으로 위조한 JWT 를 서버가 수락하는지 본다.
+
+capabilities:
+  required: [bruteforce]
+  concurrency: 1
+  max_amount_touched: null
+  request_budget: 12          # 사전 크기 = 시도 횟수 상한
+
+effects:
+  creates_resource_types: []
+  mutates_balance: false
+  reversible: true
+  repeatable: false
+
+preconditions:
+  - kind: principal
+    attrs: {has_token: true}     # 위조 payload 구조를 정상 토큰에서 베낀다
+    bind: tokened
+
+postconditions:
+  - kind: token
+    attrs: {forged: true}
+
+params: {}
+
+# ★ 이 tool 이 건드릴 것으로 선언한 표면 — control plane 이 실행 후 대조한다.
+surface:
+  - {method: GET, path: "/api/virtual-cards", note: "위조 토큰 수락 여부 확인 대상"}
+
+failure_modes:
+  - {code: no_weak_secret, expected: true, description: "사전에 맞는 시크릿 없음 — 서명키가 강함"}

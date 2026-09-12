@@ -1,0 +1,46 @@
+id: card_fund
+version: 1
+layer: finance
+summary: 카드 충전 시 exchange_rate 조작으로 없던 가치가 만들어지는지 본다.
+
+capabilities:
+  required: [state_change, account_creation]
+  concurrency: 1
+  max_amount_touched: "100.00"
+  request_budget: 4
+
+effects:
+  creates_resource_types: [virtual_card]
+  mutates_balance: true
+  reversible: false
+  repeatable: true
+
+preconditions:
+  - kind: principal
+    attrs: {has_account: true}
+    bind: owner
+
+postconditions:
+  - kind: card
+    attrs: {created: true, funded: true}
+
+params:
+  usd_amount:
+    type: money
+    default: "100.00"
+  exchange_rate:
+    type: string
+    description: 조작할 환율 값
+    default: "100"
+
+# ★ 이 tool 이 건드릴 것으로 선언한 표면 — control plane 이 실행 후 대조한다.
+surface:
+  - {method: POST, path: "/api/virtual-cards/create"}
+  - {method: POST, path: "/api/virtual-cards/{id}/fund", note: "exchange_rate 주입 지점"}
+  - {method: GET, path: "/api/virtual-cards", note: "카드 잔액 관측"}
+  - {method: GET, path: "/check_balance/{id}", note: "계좌 잔액 관측"}
+
+failure_modes:
+  - {code: card_create_failed, expected: true, description: "카드 생성 실패"}
+  - {code: target_5xx, expected: false, description: "대상이 서버 에러 반복"}
+cleanup_with: [delete_card]

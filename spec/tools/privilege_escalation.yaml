@@ -1,0 +1,39 @@
+# 전제조건이 완전히 비어 있는 유일한 finance tool — 익명으로 가입부터 시작한다.
+# 그래서 run 맨 처음부터 frontier 에 올라온다.
+id: privilege_escalation
+version: 1
+layer: finance
+summary: 회원가입에 is_admin 을 주입(mass assignment)해 관리자 권한이 올라가는지 본다.
+
+capabilities:
+  required: [state_change, account_creation]
+  concurrency: 1
+  max_amount_touched: null
+  request_budget: 12          # 계정 4개 × (가입+로그인+관리자패널)
+
+effects:
+  creates_resource_types: [user_account]
+  mutates_balance: false
+  reversible: false
+  repeatable: true
+
+preconditions: []
+
+postconditions:
+  - kind: role
+    attrs: {name: admin}      # ★ 성공하면 admin 역할 노드가 생긴다
+  - kind: principal
+    attrs: {is_admin: true}   #   → admin 을 전제로 하는 tool 이 그때부터 frontier 에 등장
+
+params: {}
+
+# ★ 이 tool 이 건드릴 것으로 선언한 표면 — control plane 이 실행 후 대조한다.
+surface:
+  - {method: POST, path: "/register", note: "is_admin 주입 지점"}
+  - {method: POST, path: "/login"}
+  - {method: GET, path: "/sup3r_s3cr3t_admin", note: "권한 상승 확인 대상"}
+
+failure_modes:
+  - {code: registration_rejected, expected: true, description: "가입 거부"}
+  - {code: admin_panel_missing, expected: true, description: "관리자 경로 없음 — 판정 불가"}
+cleanup_with: [delete_principal]

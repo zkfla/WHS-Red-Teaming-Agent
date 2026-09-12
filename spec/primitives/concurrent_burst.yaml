@@ -1,0 +1,22 @@
+# 경쟁조건 재료. 기존 race_transfer / bill_race 가 이거 하나로 수렴한다.
+id: concurrent_burst
+version: 1
+layer: generic
+summary: 같은 요청을 동시에 N번 발사해 경쟁조건 재료를 만든다.
+capabilities: {required: [state_change, race_testing], concurrency: 10, max_amount_touched: "1000.00", request_budget: 40}
+effects: {creates_resource_types: [], mutates_balance: true, reversible: false, repeatable: true}
+surface_binding: target
+preconditions:
+  - {kind: endpoint, attrs: {reachable: true}, bind: target, from_param: target}
+  - {kind: principal, attrs: {authenticated: true}, bind: actor}
+postconditions: []
+params:
+  target:       {type: string, required: true, binds_to: endpoint}
+  amount:       {type: money, description: 1회분 금액, policy_checked: true}
+  body:         {type: string, description: 동시 발사할 요청 바디, sensitive: true}
+  n_concurrent: {type: integer, default: 5, minimum: 2, maximum: 10}
+  trials:       {type: integer, description: 재현율 측정용 시행 횟수, default: 3, minimum: 1, maximum: 5}
+
+mcp: {expose: true, server: finredteam-web, hide_when_unavailable: true}
+failure_modes:
+  - {code: target_5xx, expected: false, description: 동시 부하로 대상이 불안정 — 즉시 중단 검토}

@@ -1,0 +1,48 @@
+name: spec
+
+# ★ 이 워크플로가 없으면 spec/schema/validate.py 의 23개 검사는 "기억해서 돌리는 것"
+#   이 된다. 4팀이 병렬로 매니페스트를 추가하는 구조에서 그건 곧 안 돌린다는 뜻이다.
+#
+#   검사의 목적은 문법이 아니라 **선언 누락**이다. 작성자가 악의 없이
+#   `from_param` 이나 `sensitive` 를 빼먹으면 정책·스코프·비밀 보호가 조용히
+#   안 걸리기 시작한다 — 사람 리뷰로는 잡히지 않는 종류다.
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  spec:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: 의존성 설치
+        run: pip install -r requirements.txt
+
+      - name: 매니페스트 검사 (23가지)
+        run: PYTHONPATH=. python -m spec.schema.validate spec/tools spec/primitives
+
+      - name: 회귀 시험
+        run: PYTHONPATH=. pytest spec/tests -q
+
+      # 데모는 문서가 아니라 **연기 시험**이다. 규격을 바꾸면 제일 먼저 깨지는 게
+      # 데모라, 이걸 CI 에서 돌리면 "문서가 코드보다 낡는" 상태를 막을 수 있다.
+      - name: 데모 전부 실행
+        run: |
+          for d in spec/demo_*.py; do
+            echo "── $d"
+            PYTHONPATH=. python "$d" > /dev/null
+          done

@@ -1,0 +1,42 @@
+# ★ 기존 프로브 13개에는 없던 tool. 그래프가 "필요하다"고 알려준 것이다.
+#
+#   bill_limit / bill_race 가 biller(discovered) 를 전제로 갖는데, 그 노드를
+#   만들어주는 tool 이 없으면 두 tool 은 영원히 frontier 에 못 올라온다.
+#   지금 코드에서는 bill.discover_biller() 가 각 프로브 안에서 인라인으로 불린다 —
+#   그래서 실패하면 "실존 biller 를 찾지 못함" 한국어 에러가 나올 뿐이고,
+#   같은 조회를 두 프로브가 중복으로 한다.
+#
+#   전제조건을 데이터로 적으면 이런 "빠진 연결고리"가 자동으로 드러난다.
+#   이게 attack graph 를 도입하는 실질적 이득이다.
+id: discover_biller
+version: 1
+layer: finance
+summary: 공개 카테고리 조회로 실존 biller 와 서버가 선언한 금액 경계를 찾는다.
+
+capabilities:
+  required: []          # 인증 불필요한 GET 2발
+  concurrency: 1
+  max_amount_touched: null
+  request_budget: 4
+
+effects:
+  creates_resource_types: []
+  mutates_balance: false
+  reversible: true
+  repeatable: false
+
+preconditions: []
+
+postconditions:
+  - kind: biller
+    attrs: {discovered: true, min_amount_known: true}
+
+params: {}
+
+# ★ 이 tool 이 건드릴 것으로 선언한 표면 — control plane 이 실행 후 대조한다.
+surface:
+  - {method: GET, path: "/api/bill-categories"}
+  - {method: GET, path: "/api/billers/by-category/{id}"}
+
+failure_modes:
+  - {code: biller_not_found, expected: true, description: "카테고리/biller 조회 실패"}

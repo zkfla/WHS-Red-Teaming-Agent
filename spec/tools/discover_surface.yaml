@@ -1,0 +1,58 @@
+# meta tool — 네트워크를 타지만 읽기 전용. 결과가 endpoint 노드로 그래프에 들어간다.
+# ★ 이게 "discover_surface 결과가 propose_hypothesis 로 자동 체이닝 안 되는" 기존
+#   gap(CLAUDE.md Known gaps)을 닫는 지점이다. endpoint 노드가 생기면 그 노드를
+#   precondition 으로 갖는 tool 이 자동으로 frontier 에 올라온다.
+id: discover_surface
+version: 1
+layer: meta
+summary: 아직 모르는 경로를 읽기 전용으로 찔러본다. 존재하면 endpoint 노드가 생긴다.
+
+capabilities:
+  required: []
+  concurrency: 1
+  max_amount_touched: null
+  request_budget: 1
+
+effects:
+  creates_resource_types: []
+  mutates_balance: false
+  reversible: true
+  repeatable: true
+
+preconditions: []
+
+postconditions:
+  - kind: endpoint
+    attrs: {reachable: true}
+
+params:
+  path:
+    type: string
+    description: 찔러볼 경로
+    required: true
+  method:
+    type: string
+    enum: [GET, HEAD, OPTIONS]
+    default: GET
+
+# ★★ 이 tool 은 **정확한** surface 를 선언할 수 없다 — 애초에 "모르는 경로를
+#    찔러보는" tool 이라 건드릴 곳을 미리 적을 수가 없다.
+#
+#    예전에는 그래서 `layer: meta` 로 검사 ⑨ 를 면제받고 `surface: []` 로 뒀는데,
+#    그게 곧 **스코프 대조가 통째로 꺼진 상태**였다(ingest 가 빈 선언을 None 으로
+#    바꿔 넘겨 drift 검사 자체를 건너뛰었다). 하필 "모르는 곳을 친다" 는 이 tool 이
+#    유일한 이탈 벡터인데, 그 하나만 검사 밖에 있었던 셈이다.
+#
+#    이제 `surface_prefixes` 로 **울타리**를 선언한다. 정확한 경로는 못 적어도
+#    "이 범위 안" 은 적을 수 있고, 그건 engagement 승인 범위와 대조 가능하다:
+#      1. StaticPolicy.allowed_path_prefixes 가 울타리를 더 좁힌다 —
+#         승인 범위보다 넓은 울타리를 선언하면 check_manifest 가 tool 전체를 차단
+#      2. 읽기 전용 메서드만 (params.method enum + 검사기 ㉓ 이 이중으로 강제)
+#      3. 만진 경로는 전부 Transition.touched_surfaces 에 남고, 울타리 밖이면
+#         Transition.surface_drift 에 **기록으로** 남는다 (사후 감사 가능)
+surface: []
+surface_prefixes:
+  - {methods: [GET, HEAD, OPTIONS], path_prefix: "/", note: "대상 호스트 전체를 읽기 전용으로만"}
+
+failure_modes:
+  - {code: not_found, expected: true, description: "경로 없음 — 정상적인 탐색 결과"}
