@@ -749,3 +749,168 @@ def test_prompt_view_hides_control_plane_markers():
     blob = str(m.prompt_view())
     for leak in ("policy_checked", "sensitive", "binds_to", "state_change"):
         assert leak not in blob, leak
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  팀 경계 타입 (ports.py) + 한 스텝 정본 배선 (loop.py)
+# ══════════════════════════════════════════════════════════════════════
+
+from spec.schema.loop import StepOutcome, run_step
+from spec.schema.ports import (
+    AgentPort, Executor, ExecutionRequest, OraclePort, ToolCall,
+)
+
+
+class FakeAgent:
+    # ① Agent 대역 — 정해둔 ToolCall 을 순서대로 내놓는다
+    def __init__(self, *calls):
+        self.calls = list(calls)
+        self.seen_tools = []
+
+    def choose(self, observation, tools, *, step):
+        self.seen_tools.append({t["name"] for t in tools})
+        return self.calls.pop(0) if self.calls else None
+
+
+class FakeExecutor:
+    # ③ Capability 대역 — 받은 bindings 를 그대로 기록해둔다(검증용)
+    def __init__(self, surfaces=("POST /transfer",)):
+        self.surfaces = surfaces
+        self.requests = []
+
+    def supports(self, tool_id):
+        return True
+
+    def execute(self, manifest, request):
+        self.requests.append(request)
+        return ProbeResult(
+            tool_id=manifest.id, tool_version=manifest.version,
+            executions=[ExecutionRecord(requests=[
+                RequestRecord(method=s.split(" ")[0], path=s.split(" ", 1)[1],
+                              status_code=200, evidence_ref=f"ev-{i}")
+                for i, s in enumerate(self.surfaces)])])
+
+
+class FakeOracle:
+    # ④ Control Plane 의 판정 대역
+    def __init__(self):
+        self.views = []
+
+    def evaluate(self, result, view, transition):
+        self.views.append(view)
+        return [FindingRecord(
+            finding_id=f"f-{transition.step}", invariant="INV-9", verdict="VIOLATION",
+            transition_id=transition.transition_id,
+            reason="응답에 민감 필드 노출", evidence_refs=result.evidence_refs())]
+
+
+def _wired_graph():
+    g = AttackGraph()
+    g.upsert(Node(node_id="principal:attacker", kind="principal", key="attacker",
+                  attrs={"authenticated": True, "ours": True}))
+    _endpoint(g, "GET", "/balance")          # 미끼
+    _endpoint(g, "POST", "/transfer")
+    return g
+
+
+def test_fakes_satisfy_the_port_protocols():
+    # Protocol 이 runtime_checkable 이라 구현했는지 바로 확인된다.
+    # 각 팀이 자기 클래스에 이 assert 하나만 걸어두면 시그니처가 어긋날 때 바로 터진다.
+    assert isinstance(FakeAgent(), AgentPort)
+    assert isinstance(FakeExecutor(), Executor)
+    assert isinstance(FakeOracle(), OraclePort)
+
+
+def test_run_step_hands_the_same_bindings_to_executor_and_ingest():
+    # ★ 이 규격에서 제일 끊어지기 쉬운 이음매.
+    #   preflight 가 확정한 바인딩이 ③ 실행과 ⑤ ingest 양쪽에 **같은 값**으로
+    #   가야 한다. 갈라지면 "모델이 고른 대상" 과 "스코프 대조 기준" 이 달라진다.
+    g, reg, pol = _wired_graph(), _registry("spec/primitives"), _open_policy()
+    ex, oracle = FakeExecutor(), FakeOracle()
+    agent = FakeAgent(ToolCall(tool_id="http_request", step=1, params={
+        "target": "endpoint:POST /transfer", "method": "POST",
+        "auth_as": "principal:attacker"}))
+
+    out = run_step(step=1, graph=g, registry=reg, policy=pol,
+                   agent=agent, executor=ex, oracle=oracle)
+
+    assert out.ok(), out.problems
+    assert out.status == "succeeded"
+    chosen = ["endpoint:POST /transfer"]
+    assert ex.requests[0].bindings["target"] == chosen          # ③ 이 받은 것
+    t = g.transitions[0]
+    assert t.bindings["target"] == chosen                        # ⑤ 가 대조한 것
+    assert t.surface_drift == []
+    # ④ 는 읽기 전용 뷰만 받는다
+    assert isinstance(oracle.views[0], GraphView)
+    with pytest.raises(AttributeError):
+        oracle.views[0].upsert(Node(node_id="card:1", kind="card", key="1"))
+
+
+def test_run_step_catches_drift_against_the_chosen_target():
+    g, reg, pol = _wired_graph(), _registry("spec/primitives"), _open_policy()
+    ex = FakeExecutor(surfaces=("POST /transfer", "GET /sup3r_s3cr3t_admin"))
+    agent = FakeAgent(ToolCall(tool_id="http_request", step=1, params={
+        "target": "endpoint:POST /transfer", "method": "POST"}))
+
+    out = run_step(step=1, graph=g, registry=reg, policy=pol, agent=agent, executor=ex)
+    assert any("선언 밖 표면" in p for p in out.problems)
+    assert g.transitions[0].surface_drift == ["GET /sup3r_s3cr3t_admin"]
+
+
+def test_run_step_records_policy_block_instead_of_skipping():
+    # 조용히 건너뛰면 리포트가 커버리지를 속인다 — blocked 로 그래프에 남겨야 한다.
+    g, reg = _wired_graph(), _registry("spec/primitives")
+    tight = _open_policy(allow_race_testing=False, max_concurrency=1)
+    agent = FakeAgent(ToolCall(tool_id="concurrent_burst", step=1, params={
+        "target": "endpoint:POST /transfer"}))
+
+    out = run_step(step=1, graph=g, registry=reg, policy=tight,
+                   agent=agent, executor=FakeExecutor())
+    assert out.status == "blocked"
+    assert g.transitions[0].blocked_reason == "RACE_TESTING_FORBIDDEN"
+    assert g.blocked_transitions()
+
+
+def test_run_step_refuses_a_tool_that_was_hidden_from_the_model():
+    # 목록에서 숨겼는데도 골랐다는 건 ① 이 목록 밖을 짐작했다는 뜻이다.
+    g, reg = _wired_graph(), _registry("spec/primitives")
+    tight = _open_policy(allow_bruteforce=False)
+    agent = FakeAgent(ToolCall(tool_id="forge_token", step=1, params={}))
+
+    out = run_step(step=1, graph=g, registry=reg, policy=tight,
+                   agent=agent, executor=FakeExecutor())
+    assert out.status == "blocked"
+    assert "forge_token" not in agent.seen_tools[0]       # 애초에 안 보여줬다
+    assert g.transitions[0].blocked_reason == "BRUTEFORCE_FORBIDDEN"
+
+
+def test_run_step_stops_when_the_agent_is_done():
+    g, reg = _wired_graph(), _registry("spec/primitives")
+    out = run_step(step=1, graph=g, registry=reg, policy=_open_policy(),
+                   agent=FakeAgent(), executor=FakeExecutor())
+    assert out.stopped and not g.transitions
+
+
+def test_agent_rationale_never_becomes_evidence():
+    # ToolCall.rationale 은 모델 문장이다. 판정 근거가 모델 생성물이면
+    # 재현도 검증도 안 된다 — 그래서 기록에 실리는 경로가 없어야 한다.
+    g, reg, pol = _wired_graph(), _registry("spec/primitives"), _open_policy()
+    agent = FakeAgent(ToolCall(
+        tool_id="http_request", step=1,
+        params={"target": "endpoint:POST /transfer", "method": "POST"},
+        rationale="여기가 수상해 보여서 골랐음"))
+    run_step(step=1, graph=g, registry=reg, policy=pol,
+             agent=agent, executor=FakeExecutor(), oracle=FakeOracle())
+    assert "수상해 보여서" not in str(g.to_jsonl_records())
+
+
+def test_run_step_evaluates_the_whole_objective_catalog_every_step():
+    g, reg, pol = _wired_graph(), _registry("spec/primitives"), _open_policy()
+    agent = FakeAgent(ToolCall(tool_id="http_request", step=1, params={
+        "target": "endpoint:POST /transfer", "method": "POST"}))
+    run_step(step=1, graph=g, registry=reg, policy=pol,
+             agent=agent, executor=FakeExecutor(), oracle=FakeOracle())
+    assert len(g.objectives) == len(OBJECTIVE_CATALOG)
+    assert any(o.objective == "OBJ-PII-EXFIL" and o.verdict == "VIOLATION"
+               for o in g.objectives)

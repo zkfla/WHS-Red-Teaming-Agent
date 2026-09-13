@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-from typing import Callable
-
 from spec.schema.attack_graph import (
-    AttackGraph, FindingRecord, Node, Transition,
+    AttackGraph, FindingRecord, GraphView, Node, Transition,
 )
 from spec.schema.policy import PolicyPort, check_manifest
+from spec.schema.ports import OraclePort
 from spec.schema.tool_manifest import ProbeResult, ToolManifest
 
 
@@ -34,7 +33,7 @@ def ingest(
     transition: Transition,
     *,
     findings: list[FindingRecord] | None = None,
-    oracle_runner: Callable[[ProbeResult], list[FindingRecord]] | None = None,
+    oracle: OraclePort | None = None,
 ) -> IngestReport:
     rep = IngestReport()
 
@@ -69,9 +68,11 @@ def ingest(
             )
 
     # ④ 판정 — 오라클이 낸다. 이 함수는 고르지 않는다
+    # ★ 어느 오라클을 돌릴지 여기서 고르지 않는다 — 그 선택권이 생기는 순간
+    #   "이 tool 은 이 불변식만" 이라는 좁힘이 부활한다. 구현체가 전체를 돈다.
     records = list(findings or [])
-    if oracle_runner is not None:
-        records += oracle_runner(result)
+    if oracle is not None:
+        records += oracle.evaluate(result, GraphView(graph), transition)
     for f in records:
         f.transition_id = transition.transition_id
         graph.record_finding(f)

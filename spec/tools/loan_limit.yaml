@@ -3,7 +3,7 @@
 #    → pre-flight 가 이 tool 을 통째로 BLOCK 한다.
 #    지금 코드는 이 금액을 그냥 보낸다(run_probe 경로는 check_amount 를 부르지 않음).
 #    즉 "정책 위반이 아니라 정책 구멍"이었다. 규격이 그걸 드러낸 것이지 만든 게 아니다.
-#    해결 방향은 팀 결정 사항 — spec/README.md "미해결" 참고.
+#    해결 방향은 팀 결정 사항.
 id: loan_limit
 version: 1
 layer: finance
