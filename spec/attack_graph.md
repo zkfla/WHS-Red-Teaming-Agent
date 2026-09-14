@@ -19,7 +19,7 @@ Node(
 )
 ```
 
-### 종류 10개
+### 종류 13개 — 웹과 모바일을 같이 담는다
 
 | kind | 무엇 | 관례 attrs |
 |---|---|---|
@@ -31,8 +31,21 @@ Node(
 | `token` | 인증 토큰 | `valid` `forged` |
 | `role` | 권한 역할 | `name` |
 | `loan` | 대출 건 | `requested` `approved` `credited` |
-| `endpoint` | 발견된 요청 표면 | `method` `reachable` `requires_auth` |
+| `endpoint` | 발견된 **HTTP** 표면 | `method` `reachable` `requires_auth` |
+| `host` | 호스트/도메인 (Asset) | `resolved` `reachable` `in_scope` |
+| `app` | 모바일 앱 패키지 (Asset) | `installed` `launched` `decompiled` |
+| `screen` | 앱 화면 — 모바일의 `endpoint` | `reachable` `requires_auth` |
 | `objective` | **terminal** — 공격자 목표 | `achieved` |
+
+`host` `app` `screen` 은 그림의 **Asset** 계열이다. `endpoint` 가 경로만 담아서
+호스트를 적을 곳이 없었고, 모바일에는 표면에 해당하는 노드가 아예 없었다.
+
+```python
+endpoint_id("POST", "/transfer")            # "endpoint:POST /transfer"
+screen_id("com.bank", "LoginActivity")      # "screen:com.bank/LoginActivity"
+app_id("com.bank")                          # "app:com.bank"
+host_id("API.Bank.COM")                     # "host:api.bank.com"
+```
 
 `principal` 과 `account` 가 따로인 이유: principal 은 행위 주체, account 는 공격 **대상**이다.
 피해자 계좌는 principal 없이도 노드가 되어야 한다.
@@ -278,6 +291,26 @@ g.integrity_report()
 주면 호출부가 무시하는 순간 사라지고, 저장된 기록만 보는 ④ Evidence 는 영영 알 수 없다.
 그래서 `record_transition()` 이 `Transition.surface_drift` 에 남긴다.
 
+### 채널 — 웹과 모바일을 같은 규칙으로
+
+표면 표기가 HTTP 메서드로 고정돼 있으면 모바일 tool(`launch`/`tap`/`intent`)은
+**어디를 건드리는지 적을 방법이 없다.** 그러면 모바일 전체가 대조 밖으로 나간다.
+그래서 채널을 축으로 세웠다. 채널마다 동사만 다르고 규칙은 같다.
+
+| 채널 | 동작 | 읽기 전용 |
+|---|---|---|
+| `http` | GET HEAD OPTIONS POST PUT PATCH DELETE | GET HEAD OPTIONS |
+| `app` | launch tap input swipe intent inspect instrument | inspect |
+| `device` | install uninstall capture proxy shell | capture |
+
+표면 키는 이렇게 생겼다. **`http` 는 기본 채널이라 접두어를 안 붙인다** —
+기존 매니페스트와 기록이 전부 그 표기를 쓰고 있어서다.
+
+```
+"POST /transfer"                      # http
+"app tap com.bank/LoginActivity"      # 모바일
+```
+
 ### 표면 대조의 기준 (`AllowedSurfaces`)
 
 ```python
@@ -297,6 +330,22 @@ t.drift_against(allowed)          # 선언 밖이면 그 목록
   저장→로드→저장 결과가 내용은 같은데 순서가 달라 `round_trip_ok()` 가 거짓이 된다
 - `Transition.params` 는 `ingest()` 가 매니페스트의 `sensitive` 선언대로 치환한 뒤
   기록한다 — 이 줄이 그대로 evidence store 로 나가기 때문이다
+
+### 누가 했고, 누가 승인했나
+
+```python
+Transition(agent_id="mobile",                    # 멀티에이전트에서 누가 한 행동인가
+           status="awaiting_approval",           # 정책이 "애매하다" 고 판정
+           blocked_reason="AMOUNT_NEAR_LIMIT",   # 무엇이 애매한지 — 없으면 기록 거부
+           approved_by="pm@team", approved_at=...)  # 사람 승인 흔적
+```
+
+- `awaiting_approval` 은 허용/거부 2단계로는 "애매한 건 사람에게" 를 표현할 수
+  없어서 넣은 상태다
+- 승인 기록이 **반쪽이면**(누가만 있고 언제가 없으면) 기록이 거부된다.
+  사후 감사에서 "그 시점에 승인된 것" 을 증명할 수 없기 때문이다
+- `integrity_report()` 의 `"승인 대기"` 가 비어 있지 않으면 사람이 안 본 행위가
+  남아 있다는 뜻이다
 
 ## 쓰기 권한
 

@@ -227,9 +227,41 @@ class LoanFacts(BaseModel):
     policy_bounds: list[PolicyBound] = []
 
 
+class HostFacts(BaseModel):
+    # 그림의 Asset(호스트) — endpoint 는 경로만 담아서 호스트를 적을 곳이 없었다.
+    hostname: str
+    ip: Optional[str] = None
+    in_scope: Optional[bool] = None             # 승인 범위 안인가
+    tech_fingerprint: list[str] = []            # 값이 아니라 식별된 이름만
+
+
+class AppFacts(BaseModel):
+    # 그림의 Asset(APK) — 모바일 대상 앱 자체.
+    package: str
+    version_name: Optional[str] = None
+    platform: Literal["android", "ios", "unknown"] = "unknown"
+    # ★ 여기에도 값은 담지 않는다. APK 에서 키를 발견했으면 "발견했다" 만 남기고
+    #   값 자체는 증거 저장소로 간다 — 그래프는 오래 남는다.
+    hardcoded_secret_found: bool = False
+    debuggable: Optional[bool] = None
+    discovered_via: str = ""
+
+
+class ScreenFacts(BaseModel):
+    # 모바일에서 EndpointFacts 에 해당한다. 앱 화면이 곧 요청 표면이다.
+    package: str
+    screen: str                                 # 액티비티/화면 이름
+    requires_auth: Optional[bool] = None
+    observed_actions: list[str] = []            # 실제로 통한 동작 이름만
+    input_fields: list[str] = []                # 필드 **이름**만 (값 저장 금지)
+    sensitivity: Literal["none", "low", "high", "critical"] = "none"
+    discovered_via: str = ""
+
+
 NodeFacts = Union[
     AccountFacts, CardFacts, PrincipalFacts, TokenFacts,
     BillerFacts, EndpointFacts, LoanFacts,
+    HostFacts, AppFacts, ScreenFacts,
 ]
 
 

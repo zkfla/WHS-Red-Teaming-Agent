@@ -597,7 +597,9 @@ def test_registry_refuses_duplicate_ids():
 
 def test_registry_is_the_only_loader():
     reg = _registry()
-    assert len(reg) == 28 and "http_request" in reg
+    # 개수를 박아두지 않는다 — tool 이 늘 때마다 시험이 깨지면 그냥 숫자만 고치게 된다
+    on_disk = sum(len(list(Path(d).glob("*.yaml"))) for d in DIRS)
+    assert len(reg) == on_disk and "http_request" in reg
     assert reg.require("http_request").id == "http_request"
     with pytest.raises(KeyError):
         reg.require("없는_tool")
@@ -914,3 +916,171 @@ def test_run_step_evaluates_the_whole_objective_catalog_every_step():
     assert len(g.objectives) == len(OBJECTIVE_CATALOG)
     assert any(o.objective == "OBJ-PII-EXFIL" and o.verdict == "VIOLATION"
                for o in g.objectives)
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  채널 축 — 웹만 있던 표면 어휘를 모바일까지 넓힌 부분
+# ══════════════════════════════════════════════════════════════════════
+
+from spec.schema.attack_graph import (
+    CHANNEL_ACTIONS, CHANNEL_READ_ONLY, app_id, host_id, screen_id,
+    split_surface_key, surface_key,
+)
+from spec.schema.finance import AppFacts, ScreenFacts
+from spec.schema.tool_manifest import AppActionRecord, SurfaceDecl
+
+
+def _mobile_graph():
+    g = AttackGraph()
+    g.upsert(Node(node_id=app_id("com.bank"), kind="app", key="com.bank",
+                  attrs={"installed": True},
+                  facts=AppFacts(package="com.bank", platform="android")))
+    for scr in ("LoginActivity", "TransferActivity"):
+        nid = screen_id("com.bank", scr)
+        g.upsert(Node(node_id=nid, kind="screen", key=nid.split(":", 1)[1],
+                      attrs={"reachable": True},
+                      facts=ScreenFacts(package="com.bank", screen=scr)))
+    g.upsert(Node(node_id="principal:attacker", kind="principal", key="attacker",
+                  attrs={"authenticated": True, "ours": True}))
+    return g
+
+
+def test_surface_key_keeps_http_unprefixed():
+    # 기존 매니페스트 17개와 테스트가 전부 "POST /transfer" 표기를 쓰고 있다.
+    # http 를 기본 채널로 두고 접두어를 안 붙여야 그게 안 깨진다.
+    assert surface_key("http", "POST", "/transfer") == "POST /transfer"
+    assert surface_key("app", "tap", "com.bank/Login") == "app tap com.bank/Login"
+    assert split_surface_key("POST /transfer") == ("http", "POST", "/transfer")
+    assert split_surface_key("app tap com.bank/Login") == ("app", "tap", "com.bank/Login")
+
+
+def test_channel_vocabulary_is_enforced():
+    # 채널마다 동작 집합이 다르다. 섞이면 대조가 영원히 안 맞는다.
+    assert SurfaceDecl(channel="app", method="tap", path="com.bank/Login")
+    with pytest.raises(ValueError):
+        SurfaceDecl(channel="app", method="POST", path="com.bank/Login")
+    with pytest.raises(ValueError):
+        SurfaceDecl(channel="http", method="tap", path="/transfer")
+
+
+def test_mobile_tool_is_fenced_like_the_web_one():
+    # inspect_apk 는 probe_path 와 같은 규칙이고 채널만 다르다.
+    m = _load("spec/primitives")["inspect_apk"]
+    allowed = m.allowed_surfaces()
+    assert allowed.allows("app inspect com.bank/Login")
+    assert not allowed.allows("app tap com.bank/Login")      # 읽기 전용 울타리
+    assert not allowed.allows("GET /anything")               # 채널이 다르다
+
+
+def test_recon_prefix_read_only_set_is_per_channel():
+    assert CHANNEL_READ_ONLY["app"] == ("inspect",)
+    assert "tap" in CHANNEL_ACTIONS["app"] and "tap" not in CHANNEL_READ_ONLY["app"]
+
+
+def test_mobile_step_runs_end_to_end():
+    # ★ 웹과 **같은 경로**로 돈다 — preflight 가 화면을 확정하고, ingest 가 그걸로 대조한다.
+    reg, pol = _registry("spec/primitives"), _open_policy()
+    m, g = reg.require("app_interact"), _mobile_graph()
+
+    params = {"target": screen_id("com.bank", "TransferActivity"), "action": "tap",
+              "value": "1000000", "amount": "10.00"}
+    bindings, probs = preflight(g, m, params, policy=pol)
+    assert not probs, probs
+    assert bindings["target"] == [screen_id("com.bank", "TransferActivity")]
+
+    res = ProbeResult(tool_id="app_interact", tool_version=1, executions=[ExecutionRecord(
+        app_actions=[AppActionRecord(
+            action="tap", target="com.bank/TransferActivity",
+            evidence_ref="ev-shot-1", observed_fields=["amount", "to_account"])])])
+    t = Transition(transition_id="t1", step=1, tool_id="app_interact", tool_version=1,
+                   status="succeeded", agent_id="mobile", params=params, bindings=bindings)
+    rep = ingest(g, m, res, t)
+
+    assert rep.ok, rep.problems
+    assert t.touched_surfaces == ["app tap com.bank/TransferActivity"]
+    assert t.surface_drift == []
+    assert t.params["value"] == "«redacted»"        # 입력값은 기록에 안 남는다
+
+
+def test_mobile_drift_is_caught_too():
+    reg, g = _registry("spec/primitives"), _mobile_graph()
+    m = reg.require("app_interact")
+    params = {"target": screen_id("com.bank", "LoginActivity"), "action": "tap"}
+    bindings, _ = preflight(g, m, params)
+    res = ProbeResult(tool_id="app_interact", tool_version=1, executions=[ExecutionRecord(
+        app_actions=[
+            AppActionRecord(action="tap", target="com.bank/LoginActivity", evidence_ref="e1"),
+            AppActionRecord(action="intent", target="com.other.app/AdminPanel", evidence_ref="e2")])])
+    t = Transition(transition_id="t", step=1, tool_id="app_interact", tool_version=1,
+                   status="succeeded", params=params, bindings=bindings)
+    probs = ingest(g, m, res, t).problems
+    assert any("선언 밖 표면" in p for p in probs)
+    assert t.surface_drift == ["app intent com.other.app/AdminPanel"]
+
+
+def test_mobile_tool_cannot_touch_an_undiscovered_screen():
+    m, g = _load("spec/primitives")["app_interact"], _mobile_graph()
+    _, probs = preflight(g, m, {"target": screen_id("com.bank", "SecretAdmin")})
+    assert any("그래프에 없는 노드" in p for p in probs)
+
+
+def test_manifest_cannot_mix_web_and_mobile_channels():
+    # 검사기 ㉔ — screen 에 묶였는데 http 표면을 선언하면 대조가 영원히 안 맞는다.
+    from spec.schema.validate import check_manifest_rules
+    m = _load("spec/primitives")["app_interact"].model_copy(deep=True)
+    m.surface = [SurfaceDecl(channel="http", method="POST", path="/transfer")]
+    assert any("모바일 tool 은 app 채널로" in e for e in check_manifest_rules(m))
+
+
+# ── 멀티에이전트 / 사람 승인 ────────────────────────────────────────────
+
+
+def test_agent_identity_is_recorded():
+    # 누가 한 행동인지가 기록에 없으면 멀티에이전트에서 되짚을 수 없다.
+    reg, pol, g = _registry("spec/primitives"), _open_policy(), _wired_graph()
+    agent = FakeAgent(ToolCall(tool_id="http_request", step=1, agent_id="recon",
+                               params={"target": "endpoint:POST /transfer", "method": "POST"}))
+    run_step(step=1, graph=g, registry=reg, policy=pol,
+             agent=agent, executor=FakeExecutor())
+    assert g.transitions[0].agent_id == "recon"
+    assert [t.transition_id for t in g.by_agent("recon")] == ["t-0001"]
+
+
+def test_awaiting_approval_needs_a_reason():
+    # 사람이 뭘 보고 판단하라는 건지가 없으면 승인 요청이 무의미하다.
+    g = AttackGraph()
+    t = Transition(transition_id="t", step=1, tool_id="x", tool_version=1,
+                   status="awaiting_approval")
+    assert any("무엇이 애매한지" in p
+               for p in g.record_transition(t, manifest_surface=AllowedSurfaces()))
+
+
+def test_half_written_approval_is_rejected():
+    # 누가 승인했는지만 있고 언제가 없으면 사후 감사에서 증명이 안 된다.
+    g = AttackGraph()
+    t = Transition(transition_id="t", step=1, tool_id="x", tool_version=1,
+                   approved_by="pm@team")
+    assert any("반쪽" in p for p in g.record_transition(t, manifest_surface=AllowedSurfaces()))
+
+
+def test_pending_approval_blocks_the_report():
+    from datetime import datetime, timezone
+    g = AttackGraph()
+    g.record_transition(
+        Transition(transition_id="t1", step=1, tool_id="x", tool_version=1,
+                   status="awaiting_approval", blocked_reason="AMOUNT_NEAR_LIMIT"),
+        manifest_surface=AllowedSurfaces())
+    assert g.integrity_report()["승인 대기"] == ["t1"]
+
+    g.record_transition(
+        Transition(transition_id="t2", step=2, tool_id="x", tool_version=1,
+                   status="succeeded", approved_by="pm@team",
+                   approved_at=datetime.now(timezone.utc), approval_note="승인함"),
+        manifest_surface=AllowedSurfaces())
+    assert [t.transition_id for t in g.approved_transitions()] == ["t2"]
+
+
+def test_asset_node_ids_are_canonical():
+    assert app_id("com.bank") == "app:com.bank"
+    assert host_id("API.Bank.COM") == "host:api.bank.com"
+    assert screen_id("com.bank", "/LoginActivity") == "screen:com.bank/LoginActivity"

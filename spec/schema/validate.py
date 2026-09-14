@@ -5,12 +5,16 @@ from pathlib import Path
 
 import yaml
 
-from spec.schema.attack_graph import KNOWN_ATTRS, NodeKind
+from spec.schema.attack_graph import CHANNEL_READ_ONLY, KNOWN_ATTRS, NodeKind
 from spec.schema.registry import ToolRegistry
 from spec.schema.tool_manifest import FORBIDDEN_KEYS, ToolManifest
 
-_READ_ONLY = ("GET", "HEAD", "OPTIONS")
+_READ_ONLY = CHANNEL_READ_ONLY["http"]
 _VALID_KINDS = set(getattr(NodeKind, "__args__", ()))
+
+# surface_binding 이 가리킬 수 있는 노드 종류 — 표면을 나타내는 것들.
+# endpoint 는 HTTP 경로, screen 은 앱 화면. 둘 다 "정찰로 발견한 표면" 이다.
+_SURFACE_KINDS = ("endpoint", "screen")
 
 # ㉑ 이런 이름·타입의 파라미터는 값을 기록에 남기면 안 된다.
 #    Transition.params 는 그대로 JSONL 로 나가 evidence store 에 오래 남는다.
@@ -106,18 +110,21 @@ def check_manifest_rules(m: ToolManifest, *, filename: str = "", stem: str | Non
             f"네트워크를 안 타면 offline: true)"
         )
 
-    # ⑩ 잔액을 바꾼다면서 읽기 전용 메서드만 선언
-    if m.effects.mutates_balance and m.surface and all(d.method in _READ_ONLY for d in m.surface):
-        errs.append(f"{n}: 잔액을 바꾼다면서 surface 에 상태변경 메서드가 하나도 없다")
+    # ⑩ 잔액을 바꾼다면서 읽기 전용 동작만 선언 (채널마다 읽기 전용 집합이 다르다)
+    if m.effects.mutates_balance and m.surface and all(
+        d.method in CHANNEL_READ_ONLY[d.channel] for d in m.surface
+    ):
+        errs.append(f"{n}: 잔액을 바꾼다면서 surface 에 상태변경 동작이 하나도 없다")
 
     # ⑪ surface_binding 이 가리키는 파라미터가 실제로 있어야 한다
     if m.surface_binding:
         if m.surface_binding not in m.params:
             errs.append(f"{n}: surface_binding={m.surface_binding!r} 인데 params 에 그 키가 없다")
-        elif m.params[m.surface_binding].binds_to != "endpoint":
+        elif m.params[m.surface_binding].binds_to not in _SURFACE_KINDS:
             errs.append(
-                f"{n}: surface_binding 파라미터는 binds_to: endpoint 여야 한다 "
-                f"(현재 {m.params[m.surface_binding].binds_to!r})"
+                f"{n}: surface_binding 파라미터는 binds_to 가 {list(_SURFACE_KINDS)} "
+                f"중 하나여야 한다 (현재 {m.params[m.surface_binding].binds_to!r}) "
+                f"— 웹은 endpoint, 모바일은 screen"
             )
 
     # ⑫-a may_produce 가 실존하는 노드 종류여야 한다
@@ -181,8 +188,10 @@ def check_manifest_rules(m: ToolManifest, *, filename: str = "", stem: str | Non
                 f"{n}: surface_binding={m.surface_binding!r} 인데 이 파라미터를 "
                 f"from_param 으로 묶은 전제가 없다 — 실행 대상과 대조 기준이 어긋난다"
             )
-        elif any(p.kind != "endpoint" for p in linked):
-            errs.append(f"{n}: surface_binding 과 묶인 전제는 kind: endpoint 여야 한다")
+        elif any(p.kind not in _SURFACE_KINDS for p in linked):
+            errs.append(
+                f"{n}: surface_binding 과 묶인 전제는 kind 가 {list(_SURFACE_KINDS)} "
+                f"중 하나여야 한다")
 
     # ㉑ ★ 자격증명·자유 입력 파라미터는 sensitive 를 선언해야 한다
     for pname, spec in m.params.items():
@@ -192,6 +201,20 @@ def check_manifest_rules(m: ToolManifest, *, filename: str = "", stem: str | Non
                 f"{n}: params.{pname} 는 sensitive: true 여야 한다 "
                 f"— 기록(Transition.params)이 그대로 evidence store 로 나간다"
             )
+
+    # ㉔ ★ 선언한 표면 채널과 바인딩 대상 종류가 어긋나면 안 된다.
+    #    모바일 tool 이 endpoint(HTTP 경로)에 묶여 있으면 대조가 영원히 안 맞는다.
+    if m.surface_binding and m.surface_binding in m.params:
+        want = m.params[m.surface_binding].binds_to
+        channels = {d.channel for d in m.surface} | {p.channel for p in m.surface_prefixes}
+        if want == "screen" and channels and channels != {"app"}:
+            errs.append(
+                f"{n}: screen 에 바인딩하는데 surface 채널이 {sorted(channels)} 다 "
+                f"— 모바일 tool 은 app 채널로 선언해야 한다")
+        if want == "endpoint" and "app" in channels:
+            errs.append(
+                f"{n}: endpoint 에 바인딩하는데 app 채널 표면을 선언했다 "
+                f"— 웹 tool 과 모바일 tool 을 한 매니페스트에 섞지 말 것")
 
     # ㉒ ★ 관계 조건의 related_to 가 실존하는 bind 여야 한다
     for p in m.preconditions:
@@ -216,9 +239,11 @@ def check_manifest_rules(m: ToolManifest, *, filename: str = "", stem: str | Non
                 f"— 접두어는 '모르는 곳을 읽어보는' 정찰 전용 탈출구다"
             )
         for pre in m.surface_prefixes:
-            bad = [x for x in pre.methods if x not in _READ_ONLY]
+            bad = [x for x in pre.methods if x not in CHANNEL_READ_ONLY[pre.channel]]
             if bad:
-                errs.append(f"{n}: surface_prefixes 에 상태변경 메서드 {bad} — 읽기 전용만 허용")
+                errs.append(
+                    f"{n}: surface_prefixes({pre.channel}) 에 상태변경 동작 {bad} "
+                    f"— 읽기 전용만 허용 ({CHANNEL_READ_ONLY[pre.channel]})")
 
     return errs
 
@@ -260,7 +285,10 @@ def check_cross(manifests: dict[str, ToolManifest] | ToolRegistry) -> list[str]:
 
     # ⑱ ★ 전제조건이 요구하는 노드를 **아무 tool 도 만들지 않으면** 그 tool 은
     #    영원히 frontier 에 못 오른다. 부트스트랩으로 생기는 종류는 예외.
-    BOOTSTRAP = {"principal", "account", "endpoint"}
+    # 부트스트랩으로 생기는 종류 — tool 이 만드는 게 아니라 engagement 설정에서 온다.
+    # host/app 도 같다: 대상 도메인과 대상 앱 패키지는 승인서에 적혀 오는 것이지
+    # 에이전트가 발견하는 게 아니다.
+    BOOTSTRAP = {"principal", "account", "endpoint", "host", "app"}
     produced = {p.kind for m in manifests.values() for p in m.postconditions}
     produced |= {k for m in manifests.values() for k in m.may_produce}
     for mid, m in manifests.items():

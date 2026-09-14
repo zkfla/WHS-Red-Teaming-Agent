@@ -32,10 +32,12 @@ effects:
 
 # ━━━ 스코프 — 셋 중 하나는 반드시 있어야 한다 (offline 이 아니면) ━━━
 surface:                         # ① 정적 선언 (칠 곳을 미리 아는 tool)
-  - {method: POST, path: "/transfer"}
+  - {method: POST, path: "/transfer"}                       # channel 기본값 http
+  - {channel: app, method: tap, path: "com.bank/Login"}     # 모바일
 surface_binding: target          # ② 동적 선언 (실행 시점에 정해지는 tool)
 surface_prefixes:                # ③ 울타리 (모르는 곳을 찾는 정찰 tool)
   - {methods: [GET, HEAD, OPTIONS], path_prefix: "/api/"}
+  - {channel: app, methods: [inspect], path_prefix: "com."}
 offline: false                   # true = 네트워크를 안 탄다 → 선언 의무 면제
 
 # ━━━ 그래프 연결 ━━━
@@ -113,6 +115,29 @@ check_manifest(policy, manifest, params)   # 거부 사유 목록. 비면 허용
 
 실행 후 대조도 된다 — 바인딩된 엔드포인트가 곧 그 실행의 허용 표면이므로,
 그 밖을 건드렸으면 `ingest()` 가 잡는다.
+
+### 채널 — 웹과 모바일
+
+`SurfaceDecl` 에 `channel` 이 있다. 채널마다 동작 어휘가 다르고, 검사기가 강제한다.
+
+| 채널 | 동작 | 읽기 전용 |
+|---|---|---|
+| `http` | GET HEAD OPTIONS POST PUT PATCH DELETE | GET HEAD OPTIONS |
+| `app` | launch tap input swipe intent inspect instrument | inspect |
+| `device` | install uninstall capture proxy shell | capture |
+
+`channel: app` 에 `method: POST` 를 적으면 생성이 실패한다. 반대도 마찬가지다.
+
+모바일 tool 은 `endpoint` 가 아니라 **`screen`** 노드에 묶는다
+(`binds_to: screen`). 웹 tool 과 모바일 tool 을 한 매니페스트에 섞으면
+검사기 ㉔ 가 막는다 — 섞이면 대조가 영원히 안 맞는다.
+
+짝이 되는 예시가 `primitives/` 에 있다.
+
+| 웹 | 모바일 | 하는 일 |
+|---|---|---|
+| `probe_path` | `inspect_apk` | 모르는 표면 찾기 (읽기 전용 울타리) |
+| `http_request` | `app_interact` | **발견한** 표면 건드리기 (`surface_binding`) |
 
 ### 정찰 tool — 면제가 아니라 울타리
 
@@ -230,6 +255,8 @@ ProbeResult
   └ executions: [ExecutionRecord]
       ├ requests: [RequestRecord]     method / path / status / evidence_ref
       │                               ★ 응답 본문은 안 담는다. 키 이름만.
+      ├ app_actions: [AppActionRecord] action / target / ok / evidence_ref
+      │                               ★ 모바일. 화면 필드도 이름만.
       ├ value_flow                    잔액 델타
       └ *_signals                     exposure / authz / policy / idempotency / concurrency
 ```
@@ -267,7 +294,7 @@ reg.mcp_tools(available=ready_ids)     # frontier 밖 tool 은 목록에서 뺀�
 dict 에 담아서 **두 파일이 같은 id 를 선언하면 하나가 조용히 사라졌다** —
 교차 검사는 살아남은 쪽만 봤다. `ToolRegistry.add()` 는 중복 id 를 거부한다.
 
-## 검사기 23가지
+## 검사기 24가지
 
 ```bash
 PYTHONPATH=. python -m spec.schema.validate spec/tools spec/primitives
@@ -296,6 +323,7 @@ PYTHONPATH=. python -m spec.schema.validate spec/tools spec/primitives
 | ㉑ | 자격증명·`json` 파라미터에 `sensitive` 미선언 |
 | ㉒ | `distinct_from` / `related_to` 가 없는 bind 를 가리킴 (오타면 제약이 사라진다) |
 | ㉓ | 상태를 바꾸는 tool 이 `surface_prefixes` 로 광범위 선언 |
+| ㉔ | 선언한 표면 채널과 바인딩 대상 종류가 어긋남 (웹/모바일 혼용) |
 
 **교차 참조 ⑮~⑱**
 

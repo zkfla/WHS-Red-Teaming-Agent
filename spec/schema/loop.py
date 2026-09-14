@@ -78,7 +78,7 @@ def run_step(
         t = Transition(
             transition_id=tid, step=step, tool_id=manifest.id,
             tool_version=manifest.version, status="blocked", blocked_reason=reason,
-            params=manifest.redact(call.params),
+            agent_id=call.agent_id, params=manifest.redact(call.params),
         )
         graph.record_transition(t, manifest_surface=manifest.allowed_surfaces())
         return StepOutcome(step=step, tool_id=call.tool_id, transition_id=tid,
@@ -93,7 +93,7 @@ def run_step(
             transition_id=tid, step=step, tool_id=manifest.id,
             tool_version=manifest.version, status="blocked",
             blocked_reason=_rule_of(problems),
-            params=manifest.redact(call.params),
+            agent_id=call.agent_id, params=manifest.redact(call.params),
             requires=list(manifest.preconditions),
         )
         graph.record_transition(t, manifest_surface=manifest.allowed_surfaces())
@@ -115,7 +115,7 @@ def run_step(
         transition_id=tid, step=step, tool_id=manifest.id,
         tool_version=manifest.version,
         status="failed" if result.error else "succeeded",
-        params=dict(call.params), bindings=bindings,
+        agent_id=call.agent_id, params=dict(call.params), bindings=bindings,
         requires=list(manifest.preconditions),
     )
     rep = ingest(graph, manifest, result, t, oracle=oracle)

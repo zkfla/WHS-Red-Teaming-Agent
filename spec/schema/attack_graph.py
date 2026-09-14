@@ -22,8 +22,12 @@ NodeKind = Literal[
     "token",       # 인증 토큰 (정상/위조)
     "role",        # 권한 역할 (admin 등)
     "loan",        # 대출 건 — 중복 승인(INV-4) 판정 대상
-    "endpoint",    # 발견된 경로 — discover_surface 결과가 여기 들어간다
-    "objective",   # ★ terminal. oracles/campaign.py 의 OBJ-* 가 승격된 것
+    "endpoint",    # 발견된 HTTP 경로 — discover_surface 결과가 여기 들어간다
+    # ── Asset 계열 — 그림의 "Asset(호스트, API, APK)" 에 해당 ──────────
+    "host",        # 호스트/도메인. endpoint 는 경로만 담아서 호스트를 못 적었다
+    "app",         # 모바일 앱(패키지). APK 분석 대상
+    "screen",      # 앱 화면/액티비티 — 모바일에서 endpoint 에 해당하는 표면
+    "objective",   # ★ terminal. 목표
 ]
 
 # attrs 관례 키 — 강제는 아니지만 validate.py 가 이 목록 밖의 키에 경고를 낸다.
@@ -41,6 +45,9 @@ KNOWN_ATTRS: dict[str, tuple[str, ...]] = {
     "role":       ("name",),
     "loan":       ("requested", "approved", "credited"),
     "endpoint":   ("method", "reachable", "requires_auth"),
+    "host":       ("resolved", "reachable", "in_scope"),
+    "app":        ("installed", "launched", "decompiled"),
+    "screen":     ("reachable", "requires_auth"),
     "objective":  ("achieved",),
 }
 
@@ -77,6 +84,21 @@ def normalize_path(path: str) -> str:
 def endpoint_id(method: str, path: str) -> str:
     return f"endpoint:{method.upper()} {normalize_path(path)}"
 
+
+# ── 모바일·Asset 쪽 노드 id — endpoint 와 같은 규칙을 채널만 바꿔 적용한다 ──
+def screen_id(package: str, screen: str) -> str:
+    # "screen:com.bank/LoginActivity"
+    # 경로 정규화는 하지 않는다 — 액티비티 이름에는 식별자 세그먼트가 없다.
+    return f"screen:{package}/{screen.lstrip('/')}"
+
+
+def app_id(package: str) -> str:
+    return f"app:{package}"
+
+
+def host_id(hostname: str) -> str:
+    return f"host:{hostname.lower()}"
+
 # attrs 에 절대 들어오면 안 되는 키 / 값 모양 (Node._attrs_carry_no_secrets)
 _SECRET_ATTR_KEYS = frozenset({
     "password", "passwd", "pwd", "secret", "cvv", "cvc", "pan", "card_number",
@@ -84,52 +106,110 @@ _SECRET_ATTR_KEYS = frozenset({
 })
 _PAN_LIKE_ATTR = re.compile(r"^\d{9,}$")
 
+# ── 채널 — ★ 웹만 있던 표면 어휘를 모바일까지 넓힌 축 ────────────────
+#
+#   이 규격의 핵심 안전장치는 "건드릴 곳을 미리 적고 실제와 대조하는 것" 이다.
+#   그런데 표면 표기가 HTTP 메서드로 고정돼 있으면 모바일 tool(launch/tap/intent)은
+#   **어디를 건드리는지 적을 방법이 없다.** 그러면 모바일 전체가 대조 밖으로 나간다
+#   — probe_path 하나가 검사에서 빠져 있던 것과 같은 구멍이 앱 쪽에 통째로 생긴다.
+#
+#   그래서 채널을 축으로 세운다. 채널마다 동사 집합이 다를 뿐, 대조 규칙은 같다.
+Channel = Literal["http", "app", "device"]
+
+CHANNEL_ACTIONS: dict[str, tuple[str, ...]] = {
+    "http":   ("GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH", "DELETE"),
+    "app":    ("launch", "tap", "input", "swipe", "intent", "inspect", "instrument"),
+    "device": ("install", "uninstall", "capture", "proxy", "shell"),
+}
+
+# 상태를 안 바꾸는 동작 — 정찰용 접두어 선언(SurfacePrefix)에 허용되는 것들
+CHANNEL_READ_ONLY: dict[str, tuple[str, ...]] = {
+    "http":   ("GET", "HEAD", "OPTIONS"),
+    "app":    ("inspect",),
+    "device": ("capture",),
+}
+
 HttpMethod = Literal["GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH", "DELETE"]
-_READ_ONLY_METHODS = ("GET", "HEAD", "OPTIONS")
+_READ_ONLY_METHODS = CHANNEL_READ_ONLY["http"]
+
+
+def surface_key(channel: str, action: str, path: str) -> str:
+    """표면 한 개의 정본 표기.
+
+    ★ http 는 접두어를 붙이지 않는다 — 기본 채널이고, 기존 매니페스트 17개와
+      테스트가 전부 "POST /transfer" 표기를 쓰고 있어서다. 다른 채널만 채널명을
+      앞에 붙인다: "app tap com.bank/LoginActivity"
+    """
+    return f"{action} {path}" if channel == "http" else f"{channel} {action} {path}"
+
+
+def split_surface_key(key: str) -> tuple[str, str, str]:
+    """`surface_key()` 의 역방향. (채널, 동작, 경로)."""
+    head, _, rest = key.partition(" ")
+    if head in CHANNEL_ACTIONS and head != "http":
+        action, _, path = rest.partition(" ")
+        return head, action, path
+    return "http", head, rest
 
 
 class SurfacePrefix(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    methods: list[HttpMethod] = ["GET", "HEAD", "OPTIONS"]
-    path_prefix: str                     # "/api/" — 반드시 "/" 로 시작
+    channel: Channel = "http"
+    methods: list[str] = ["GET", "HEAD", "OPTIONS"]
+    path_prefix: str                     # http: "/api/"  ·  app: "com.bank/"
     note: str = ""
 
     @model_validator(mode="after")
     def _prefix_is_bounded(self) -> "SurfacePrefix":
-        if not self.path_prefix.startswith("/"):
-            raise ValueError(f"path_prefix 는 '/' 로 시작해야 한다 ({self.path_prefix!r})")
+        if self.channel == "http" and not self.path_prefix.startswith("/"):
+            raise ValueError(
+                f"http 채널의 path_prefix 는 '/' 로 시작해야 한다 ({self.path_prefix!r})")
+        if not self.path_prefix:
+            raise ValueError("path_prefix 가 비었다 — 울타리가 없는 것과 같다")
+        allowed = CHANNEL_ACTIONS[self.channel]
+        bad = [m for m in self.methods if m not in allowed]
+        if bad:
+            raise ValueError(f"{self.channel} 채널에 없는 동작 {bad} (허용: {allowed})")
         return self
 
-    def allows(self, method: str, path: str) -> bool:
-        return method.upper() in self.methods and path.startswith(self.path_prefix)
+    def allows(self, channel: str, action: str, path: str) -> bool:
+        return (channel == self.channel
+                and action in self.methods
+                and path.startswith(self.path_prefix))
 
 
 class AllowedSurfaces(BaseModel):
-    keys: set[str] = set()               # "POST /transfer" 정확 일치
+    # "POST /transfer" (http) · "app tap com.bank/LoginActivity" (모바일)
+    keys: set[str] = set()
     prefixes: list[SurfacePrefix] = []
 
     def is_empty(self) -> bool:
         return not self.keys and not self.prefixes
 
-    def allows(self, surface_key: str) -> bool:
-        if surface_key in self.keys:
+    def allows(self, key: str) -> bool:
+        if key in self.keys:
             return True
-        method, _, path = surface_key.partition(" ")
-        return any(pre.allows(method, path) for pre in self.prefixes)
+        channel, action, path = split_surface_key(key)
+        return any(pre.allows(channel, action, path) for pre in self.prefixes)
 
     def describe(self) -> str:
         parts = sorted(self.keys)
-        parts += [f"{'/'.join(p.methods)} {p.path_prefix}*" for p in self.prefixes]
+        for p in self.prefixes:
+            head = "" if p.channel == "http" else f"{p.channel} "
+            parts.append(f"{head}{'/'.join(p.methods)} {p.path_prefix}*")
         return ", ".join(parts) or "(선언 없음)"
 
 
 TransitionStatus = Literal[
-    "planned",        # frontier 에 올라왔고 orchestrator 가 고름
-    "blocked",        # ★ control plane 이 정책으로 거부 — 그래도 그래프에 남긴다
+    "planned",            # frontier 에 올라왔고 orchestrator 가 고름
+    # ★ 정책이 "애매하다" 고 판정 — 사람 승인을 기다리는 상태.
+    #   허용/거부 2단계만 있으면 "애매한 건 사람에게" 를 표현할 자리가 없다.
+    "awaiting_approval",
+    "blocked",            # ★ control plane 이 정책으로 거부 — 그래도 그래프에 남긴다
     "succeeded",
-    "failed",         # 실행은 했으나 목적 달성 실패
-    "setup_failed",   # 전제는 맞았는데 런타임 셋업 실패(예: biller 조회 실패)
+    "failed",             # 실행은 했으나 목적 달성 실패
+    "setup_failed",       # 전제는 맞았는데 런타임 셋업 실패
 ]
 
 
@@ -296,9 +376,20 @@ class Transition(BaseModel):
     requires: list[NodePattern] = []
     bindings: dict[str, list[str]] = {}   # bind 이름 → 실제 node_id 들
 
+    # ★ 어느 에이전트가 한 행동인가. 멀티에이전트(Recon / web+api / Mobile ...)에서
+    #   이게 없으면 "이 행동을 누가 했나" 를 기록만 보고 되짚을 수 없다.
+    agent_id: str = ""
+
     status: TransitionStatus = "planned"
-    blocked_reason: str | None = None     # ★ PolicyViolation 의 rule 이름
-                                          #   ("OUT_OF_SCOPE_HOST", "RACE_TESTING_FORBIDDEN" ...)
+    blocked_reason: str | None = None     # ★ PolicyDecision 의 rule 이름
+                                          #   ("OUT_OF_SCOPE_PATH", "RACE_TESTING_FORBIDDEN" ...)
+
+    # ★ 사람 승인 기록 — "애매한 행위" 를 사람이 확인해준 흔적.
+    #   금융권에서는 사후 감사 대상이다. 누가 언제 승인했는지가 남아 있지 않으면
+    #   "이 행동은 승인받은 것" 을 나중에 증명할 수 없다.
+    approved_by: str | None = None
+    approved_at: datetime | None = None
+    approval_note: str = ""
     produced: list[str] = []              # 실제로 생긴 node_id (postcondition 의 실현분)
     finding_ids: list[str] = []
     evidence_refs: list[str] = []
@@ -479,6 +570,16 @@ class AttackGraph(BaseModel):
             )
         if t.status == "blocked" and not t.blocked_reason:
             problems.append(f"{t.transition_id}: blocked 인데 사유가 없다")
+        if t.status == "awaiting_approval" and not t.blocked_reason:
+            problems.append(
+                f"{t.transition_id}: 승인 대기인데 무엇이 애매한지가 없다 "
+                f"— 사람이 뭘 보고 판단하라는 건지 알 수 없다")
+        # ★ 반쪽 승인 기록을 막는다. 누가 승인했는지만 있고 언제가 없으면
+        #   사후 감사에서 "그 시점에 승인된 것" 을 증명할 수 없다.
+        if bool(t.approved_by) != bool(t.approved_at):
+            problems.append(
+                f"{t.transition_id}: 승인 기록이 반쪽이다 "
+                f"(approved_by={t.approved_by!r}, approved_at={t.approved_at!r})")
 
         # ★ manifest_surface 는 **항상** 넘어와야 한다. None 은 "대조 자체를 건너뛴다"
         #   는 뜻이고, 그게 허용되면 선언 없는 tool 이 무엇을 쳐도 통과한다.
@@ -736,6 +837,9 @@ class AttackGraph(BaseModel):
                             for t in self.transitions if t.surface_drift],
             "약한 근거의 관계": [f"{r.src}->{r.dst}" for r in self.relations
                                 if not r.provenance.is_strong],
+            # 승인 대기로 멈춘 채 끝난 것 — 사람이 안 본 행위가 남아 있다는 뜻
+            "승인 대기": [t.transition_id for t in self.transitions
+                        if t.status == "awaiting_approval"],
         }
 
     # ── 금융 사실 조회 ───────────────────────────────────────────────
@@ -929,6 +1033,13 @@ class AttackGraph(BaseModel):
 
     def blocked_transitions(self) -> list[Transition]:
         return [t for t in self.transitions if t.status == "blocked"]
+
+    def approved_transitions(self) -> list[Transition]:
+        # 사람이 승인해준 행위들 — 리포트의 "승인받고 한 것" 목록
+        return [t for t in self.transitions if t.approved_by]
+
+    def by_agent(self, agent_id: str) -> list[Transition]:
+        return [t for t in self.transitions if t.agent_id == agent_id]
 
 
 # ══════════════════════════════════════════════════════════════════════

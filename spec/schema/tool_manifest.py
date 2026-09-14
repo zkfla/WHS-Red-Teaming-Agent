@@ -4,10 +4,11 @@ import json as _json
 from decimal import Decimal
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from spec.schema.attack_graph import (
-    AllowedSurfaces, NodePattern, SurfacePrefix, normalize_path,
+    CHANNEL_ACTIONS, AllowedSurfaces, Channel, NodePattern, SurfacePrefix,
+    normalize_path, surface_key,
 )
 from spec.schema.finance import ValueFlow
 
@@ -64,9 +65,28 @@ class ToolEffects(BaseModel):
 class SurfaceDecl(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    method: Literal["GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH", "DELETE"]
+    # ★ 채널 — 웹만 있던 표면 어휘를 모바일까지 넓힌 축.
+    #   http:   method=POST     path=/transfer
+    #   app:    method=tap      path=com.bank/LoginActivity
+    #   device: method=capture  path=com.bank
+    #
+    #   이게 없으면 모바일 tool(launch/tap/intent)은 "어디를 건드리는지" 를 적을
+    #   방법이 없고, 그러면 선언-실제 대조가 앱 쪽에서 통째로 빠진다.
+    channel: Channel = "http"
+    method: str
     path: str
     note: str = ""
+
+    @model_validator(mode="after")
+    def _action_matches_channel(self) -> "SurfaceDecl":
+        allowed = CHANNEL_ACTIONS[self.channel]
+        if self.method not in allowed:
+            raise ValueError(
+                f"{self.channel} 채널에 없는 동작 {self.method!r} (허용: {allowed})")
+        return self
+
+    def key(self) -> str:
+        return surface_key(self.channel, self.method, self.path)
 
 
 class ParamSpec(BaseModel):
@@ -214,13 +234,20 @@ class ToolManifest(BaseModel):
         return bool(self.surface or self.surface_binding or self.surface_prefixes)
 
     def surface_keys(self) -> set[str]:
-        return {f"{d.method} {d.path}" for d in self.surface}
+        # http 는 "POST /transfer", 그 외는 "app tap com.bank/Login"
+        return {d.key() for d in self.surface}
 
     def allowed_surfaces(self, bound_endpoints: list[str] | None = None) -> AllowedSurfaces:
         keys = set(self.surface_keys())
         for nid in bound_endpoints or []:
+            # endpoint:POST /transfer       → "POST /transfer"        (http)
+            # screen:com.bank/LoginActivity → 그 화면에 허용된 동작들   (app)
             if nid.startswith("endpoint:"):
                 keys.add(nid.split(":", 1)[1])
+            elif nid.startswith("screen:"):
+                target = nid.split(":", 1)[1]
+                for action in CHANNEL_ACTIONS["app"]:
+                    keys.add(surface_key("app", action, target))
         return AllowedSurfaces(keys=keys, prefixes=list(self.surface_prefixes))
 
     def sensitive_params(self) -> set[str]:
@@ -384,9 +411,31 @@ class RequestRecord(BaseModel):
         return f"{self.method} {self.path}"
 
 
+class AppActionRecord(BaseModel):
+    # 모바일에서 RequestRecord 에 해당한다.
+    # ★ RequestRecord 를 그대로 쓸 수 없는 이유: status_code / latency_ms /
+    #   response_field_names 가 전부 HTTP 전제다. 앱 조작에는 그런 게 없고,
+    #   대신 "무엇을 눌렀고 화면이 어떻게 됐나" 가 판정 재료다.
+
+    channel: Channel = "app"
+    action: str                             # launch / tap / input / intent ...
+    target: str                             # "com.bank/LoginActivity"
+    ok: bool = True                         # 동작이 먹혔나
+    evidence_ref: str = ""                  # 스크린샷·트래픽은 증거 저장소에
+    # 화면에 보인 필드 **이름**만. 값 저장 금지 — RequestRecord 와 같은 원칙.
+    observed_fields: list[str] = []
+    sensitivity: Literal["none", "low", "high", "critical"] = "none"
+
+    def surface_key(self) -> str:
+        return surface_key(self.channel, self.action, self.target)
+
+
 class ExecutionRecord(BaseModel):
     label: str = ""                         # 사람이 읽는 시도 이름
     requests: list[RequestRecord] = []
+    # 모바일 조작. 한 시도 안에 HTTP 요청과 섞일 수 있다
+    # (앱을 눌렀더니 백엔드 호출이 나가는 경우)
+    app_actions: list[AppActionRecord] = []
     value_flow: ValueFlow | None = None     # 잔액 델타 (INV-1A/1B/1C)
 
     # 파생 신호 — 프로브가 원문을 보고 **boolean/수치만** 뽑아 담는다.
@@ -398,10 +447,12 @@ class ExecutionRecord(BaseModel):
     concurrency_signals: dict[str, object] = {} # INV-1C (동시 수, 성공 수, 시행 수)
 
     def surfaces(self) -> list[str]:
-        return sorted({r.surface_key() for r in self.requests})
+        return sorted({r.surface_key() for r in self.requests}
+                      | {a.surface_key() for a in self.app_actions})
 
     def all_evidence(self) -> list[str]:
-        return [r.evidence_ref for r in self.requests if r.evidence_ref]
+        return ([r.evidence_ref for r in self.requests if r.evidence_ref]
+                + [a.evidence_ref for a in self.app_actions if a.evidence_ref])
 
     def worst_status(self) -> int:
         return max((r.status_code for r in self.requests), default=0)
@@ -423,4 +474,4 @@ class ProbeResult(BaseModel):
         return [ref for e in self.executions for ref in e.all_evidence()]
 
     def is_empty(self) -> bool:
-        return not any(e.requests for e in self.executions)
+        return not any(e.requests or e.app_actions for e in self.executions)

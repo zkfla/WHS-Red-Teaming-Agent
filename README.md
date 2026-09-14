@@ -25,7 +25,7 @@
 | 팀 | 만들 것 | 받는 것 | 돌려줄 것 | 그래프 |
 |---|---|---|---|---|
 | ① Agent | `AgentPort` | 그래프 요약 + 쓸 수 있는 tool 목록 | `ToolCall` | 읽기만 |
-| ② Orchestration | run 전체 — 루프·예산·중단조건·정리 | — | — | **쓰기 가능** |
+| ② Orchestration | run 전체 — 루프·예산·중단조건·정리·**에이전트 스케줄링** | — | — | **쓰기 가능** |
 | ③ Capability | `Executor` | `ExecutionRequest` | `ProbeResult` | 읽기만 |
 | ④ Control Plane | `PolicyPort`, `OraclePort` | 정책 질의 / 판정 요청 | 허용여부 / 판정결과 | **쓰기 가능** |
 
@@ -51,6 +51,14 @@
 ## 각 팀이 만들 것
 
 ### ① Agent Team
+
+에이전트를 여러 개 둘 거면(Recon / web+api / Mobile / Reporting) **각자 이걸 구현하고
+②가 스케줄링**하면 된다. `ToolCall.agent_id` 에 자기 이름을 넣으면 기록에 남는다.
+
+tool 을 에이전트별로 나누는 축은 매니페스트에 이미 있다 — `mcp.server` 다
+(`finredteam-recon` / `finredteam-web` / `finredteam-mobile` / `finredteam-crypto`).
+Mobile Agent 에게 `http_request` 를 보여주면 엉뚱한 걸 고르니까, 목록을 줄 때
+자기 서버 것만 거르는 게 좋다.
 
 ```python
 from spec.schema.ports import AgentPort, ToolCall
@@ -140,6 +148,26 @@ assert isinstance(MyExecutor(), Executor)
 `request.bindings` 가 곧 "여기만 건드려도 된다" 는 허가증이다. 그 밖을 치면
 결과를 반영할 때 자동으로 잡혀서 기록에 남는다.
 
+**웹과 모바일은 같은 구조다.** 채널만 다르고 규칙은 똑같다.
+
+| 웹 | 모바일 | 하는 일 |
+|---|---|---|
+| `probe_path` | `inspect_apk` | 모르는 표면 찾기 (읽기 전용 울타리 안에서) |
+| `http_request` | `app_interact` | **발견한** 표면 건드리기 |
+| `endpoint` 노드 | `screen` 노드 | 그 표면이 그래프에 있어야 칠 수 있다 |
+| `RequestRecord` | `AppActionRecord` | 결과를 담는 곳 |
+
+모바일 쪽은 웹 걸 그대로 베껴 쓰면 된다. 표면 표기만 이렇게 달라진다.
+
+```
+"POST /transfer"                      # 웹 (기본 채널이라 접두어 없음)
+"app tap com.bank/LoginActivity"      # 모바일
+```
+
+**권장 순서**: 웹 5개(`probe_path` → `create_principal` → `authenticate` →
+`observe_state` → `http_request`) → 모바일 2개 → 나머지 →
+`concurrent_burst`(진짜 동시 발사) / `forge_token`(JWT) 는 제일 나중.
+
 ### ④ Control Plane, Evidence
 
 ```python
@@ -196,14 +224,14 @@ class MyOracle:      # 뭐가 취약점인가 판정
 | `frontier.py` | "지금 쓸 수 있는 tool 이 뭔지" 계산한다 |
 | `ingest.py` | tool 실행 결과를 그래프에 넣는 **유일한 통로** |
 | `loop.py` | 위 전부를 올바른 순서로 이어놓은 것 — `run_step()` |
-| `validate.py` | yaml 검사기. CI 가 알아서 돌린다 |
+| `validate.py` | yaml 검사기 24개. CI 가 알아서 돌린다 |
 
 ### 그 밖에
 
 ```
-spec/primitives/   기본 동작 11개  ← 새 tool 만들 땐 이것들 조합
+spec/primitives/   기본 동작 13개  ← 새 tool 만들 땐 이것들 조합 (웹 11 + 모바일 2)
 spec/tools/        예전에 쓰던 17개 ← 참고용. 대상 주소 목록 겸함
-spec/tests/        시험 76개
+spec/tests/        시험 89개
 spec/demo_*.py     돌려보는 예제 7개
 ```
 

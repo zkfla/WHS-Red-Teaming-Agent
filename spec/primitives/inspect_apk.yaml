@@ -1,0 +1,28 @@
+# 모바일 정찰 — probe_path 의 앱 버전.
+#
+# ★ 정확한 화면을 미리 못 적는다(찾는 게 목적이다). 대신 surface_prefixes 로
+#   울타리를 친다 — 채널이 app 이고 동작이 inspect 인 것만, 이 패키지 아래에서만.
+#   웹의 probe_path 와 완전히 같은 규칙이고 채널만 다르다.
+id: inspect_apk
+version: 1
+layer: generic
+summary: APK 를 정적 분석해 화면·권한·하드코딩된 비밀의 존재를 확인한다.
+capabilities: {required: [], concurrency: 1, max_amount_touched: null, request_budget: 0}
+effects: {creates_resource_types: [], mutates_balance: false, reversible: true, repeatable: true}
+
+surface_prefixes:
+  - {channel: app, methods: [inspect], path_prefix: "com.", note: "대상 패키지 하위만 읽기"}
+
+preconditions:
+  - {kind: app, attrs: {installed: true}, bind: target, from_param: app}
+postconditions:
+  # 발견한 화면이 노드가 된다 — 그래야 app_interact 가 그 화면을 칠 수 있다.
+  - {kind: screen, attrs: {reachable: true}}
+params:
+  app: {type: string, description: 분석할 app 노드 id, required: true, binds_to: app}
+
+mcp: {expose: true, server: finredteam-mobile, hide_when_unavailable: true,
+      annotations: {readOnlyHint: "true"}}
+failure_modes:
+  - {code: apk_unavailable, expected: true, description: APK 를 못 구함 — 정상적인 탐색 결과}
+  - {code: obfuscated,      expected: true, description: 난독화로 분석 불가}

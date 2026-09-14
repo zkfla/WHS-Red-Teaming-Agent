@@ -27,6 +27,9 @@ class ToolCall(BaseModel):
     tool_id: str
     params: dict = {}
     step: int = 0
+    # ★ 멀티에이전트(Recon / web+api / Mobile ...)에서 누가 고른 건지.
+    #   Transition.agent_id 로 그대로 넘어가 기록에 남는다.
+    agent_id: str = ""
 
     # ★ 모델이 만든 문장이다. 리포트의 **서술**에는 써도 되지만
     #   FindingRecord.reason 에는 절대 들어가면 안 된다 —
