@@ -1,0 +1,24 @@
+networks:
+  redteam-net:
+    name: redteam-net
+
+services:
+  mcp-example:
+    build:
+      context: ../docker/mcp-example
+    container_name: redteam-mcp-example
+    networks:
+      - redteam-net
+    ports:
+      - "${MCP_EXAMPLE_PORT:-8765}:8765"
+    environment:
+      MCP_EXAMPLE_PORT: "8765"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8765/health')"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+# TODO(capability-team): add real MCP server services here as they are
+# selected/adapted. Follow the mcp-example naming/health-check pattern:
+# container_name: redteam-mcp-<server-id>, same network, a healthcheck.

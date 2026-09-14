@@ -1,0 +1,34 @@
+# Minimal example Engagement config for the vertical slice.
+# Loaded by redteam.app.bootstrap.load_engagement.
+
+name: "Example Engagement"
+description: "Authorized test engagement used to validate the framework skeleton."
+
+scope:
+  allowed_hosts:
+    - "example.local"
+  allowed_domains: []
+  allowed_networks: []
+  denied_hosts: []
+
+rules_of_engagement:
+  - name: "business-hours-only"
+    description: "Placeholder ROE — not enforced yet, see control/service.py TODO."
+    allowed_time_windows: ["09:00-18:00"]
+    prohibited_techniques: []
+
+execution_budget:
+  max_actions: 5
+  max_tool_calls: 5
+  max_duration_seconds: 300
+
+rate_limit_policy:
+  max_actions_per_minute: 30
+  max_concurrent_actions: 1
+
+approval_policy:
+  require_approval_for: []
+  auto_approve: false
+
+metadata:
+  owner: "pm"
