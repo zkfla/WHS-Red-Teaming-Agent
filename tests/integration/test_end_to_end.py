@@ -3,6 +3,16 @@
 Exercises the Minimal Vertical Slice from instruction.md section 16
 using every real skeleton component except the LLM (FakeLLMClient) and
 the MCP server (ExampleMCPAdapter, simulated in-process).
+
+Two expectations changed with the real re-plan loop (rationale:
+docs/agent/orchestration.md):
+
+1. ``HypothesisCreated``/``AgentFinished`` are now emitted — both were
+   reserved in ``EventType`` and listed as Agent Team's planner work.
+2. Node ids follow ``<type>:<key>``, so the target is
+   ``host:example.local`` rather than ``example.local``.
+
+The assertions are stronger than before, not looser.
 """
 
 from __future__ import annotations
@@ -10,6 +20,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from redteam.app.bootstrap import build_runtime_deps, run_engagement
+from redteam.attack_graph.predicates import attrs_of, facts_of
 from redteam.core.contracts.engagement import (
     ApprovalPolicy,
     Engagement,
@@ -19,7 +30,8 @@ from redteam.core.contracts.engagement import (
 )
 from redteam.core.contracts.events import EventEnvelope, EventType
 from redteam.core.enums import AgentPhase, Verdict
-from redteam.core.ids import EngagementId, GraphNodeId
+from redteam.core.ids import AgentId, EngagementId, GraphNodeId
+from redteam.orchestration.state import TerminationReason
 
 
 def _engagement() -> Engagement:
@@ -47,15 +59,19 @@ async def test_minimal_vertical_slice_end_to_end(tmp_path) -> None:
 
     final_state = await run_engagement(engagement, deps=deps)
 
-    # 13. Run ends in a terminal phase with a recorded verdict.
+    # 13. Run ends in a terminal phase, with a verdict and a named reason.
     assert final_state.phase == AgentPhase.FINISHED
     assert final_state.last_verdict == Verdict.PASS
+    assert final_state.termination_reason == TerminationReason.NO_ACTIONABLE_PLAN
+    assert final_state.actions_executed == 1
+    assert final_state.finished_agents == [AgentId("recon-agent")]
 
     # 3-11. The full chain of events fired, in order, all tagged with
     # the right run/engagement.
     expected_in_order = [
         EventType.RUN_STARTED,
         EventType.AGENT_STARTED,
+        EventType.HYPOTHESIS_CREATED,
         EventType.ACTION_PROPOSED,
         EventType.POLICY_EVALUATED,
         EventType.ACTION_APPROVED,
@@ -63,20 +79,35 @@ async def test_minimal_vertical_slice_end_to_end(tmp_path) -> None:
         EventType.TOOL_EXECUTION_FINISHED,
         EventType.EVIDENCE_CREATED,
         EventType.GRAPH_UPDATED,
+        EventType.AGENT_FINISHED,
         EventType.RUN_FINISHED,
     ]
     assert [e.event_type for e in observed_events] == expected_in_order
     assert all(e.run_id == final_state.run_id for e in observed_events)
     assert all(e.engagement_id == engagement.engagement_id for e in observed_events)
 
+    # 10. Everything from the proposal onwards shares one correlation id,
+    # so the action can be reconstructed from the event log alone.
+    action_id = next(
+        e.payload["action_id"]
+        for e in observed_events
+        if e.event_type == EventType.ACTION_PROPOSED
+    )
+    correlated = [e.event_type for e in observed_events if e.correlation_id == action_id]
+    assert correlated == expected_in_order[2:10]
+
     # 9. Evidence was recorded for the run, correlated to the action.
     evidence = await deps.evidence_store.list_for_run(final_state.run_id)
-    assert len(evidence) == 1
-    assert evidence[0].action_id is not None
+    assert len(evidence) == final_state.actions_executed
+    assert evidence[0].action_id == action_id
     assert evidence[0].invocation_id is not None
     assert evidence[0].engagement_id == engagement.engagement_id
 
-    # 11. Attack Graph was updated with the target.
-    node = await deps.graph_store.get_node(GraphNodeId("example.local"))
+    # 11. Attack Graph was updated with the target, under its stable id.
+    node = await deps.graph_store.get_node(GraphNodeId("host:example.local"))
     assert node is not None
     assert node.type.value == "host"
+    assert attrs_of(node.properties)["reachable"] is True
+    # ...and the attempt is recorded, which is what stops the planner
+    # proposing the same probe again.
+    assert facts_of(node.properties)["attempted_operations"] == ["recon.example/ping"]

@@ -17,7 +17,9 @@ from redteam.core.ports.llm import LLMClient
 from redteam.core.ports.tool_gateway import ToolGateway
 from redteam.event_bus.memory import InMemoryEventBus
 from redteam.llm.fake import FakeLLMClient
+from redteam.orchestration.agents.registry import AgentRegistry, default_registry
 from redteam.orchestration.context import RuntimeDeps
+from redteam.orchestration.settings import OrchestrationSettings
 from tests.fakes.control_plane import FakeControlPlane
 from tests.fakes.evidence_store import FakeEvidenceStore
 from tests.fakes.tool_gateway import DummyToolGateway
@@ -31,6 +33,8 @@ def build_test_application(
     graph_store: AttackGraphStore | None = None,
     evidence_store: EvidenceStore | None = None,
     llm_client: LLMClient | None = None,
+    agents: AgentRegistry | None = None,
+    settings: OrchestrationSettings | None = None,
 ) -> RuntimeDeps:
     return RuntimeDeps(
         control_plane=control_plane or FakeControlPlane(),
@@ -39,4 +43,8 @@ def build_test_application(
         graph_store=graph_store or InMemoryAttackGraphStore(),
         evidence_store=evidence_store or FakeEvidenceStore(),
         llm_client=llm_client or FakeLLMClient(),
+        # `is not None`, not `or`: an intentionally empty AgentRegistry
+        # is falsy and must not be replaced by the default one.
+        agents=agents if agents is not None else default_registry(),
+        settings=settings if settings is not None else OrchestrationSettings(),
     )

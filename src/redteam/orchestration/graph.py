@@ -1,13 +1,26 @@
-"""Builds the LangGraph ``StateGraph`` for a single agent run.
+"""The LangGraph ``StateGraph`` for one agent run. Owned by Agent Team.
 
 ```text
-START -> OBSERVE -> PLAN -> POLICY --ALLOW--> EXECUTE -> VERIFY -> UPDATE -> REPLAN -> END
-                              \\--deny/require_approval--> REPLAN --^
+START -> OBSERVE -> PLAN --proposal--> POLICY --ALLOW--> EXECUTE -> VERIFY --+
+            ^         |                   |                                 |
+            |         |                   \\--deny/approval-needed--> UPDATE <+
+            |         |                                                 |
+            |         \\--no proposal--> REPLAN <------------------------+
+            |                              |
+            \\-------- another turn -------+-- terminal --> END
 ```
 
-Kept intentionally linear/single-pass for this stage (instruction.md
-section 14: "초기 Graph는 아주 단순하게"). ``replan_node`` always ends
-the run today; looping back to ``observe`` is a TODO for Agent Team.
+LangGraph is the workflow runtime and nothing more: it schedules these
+seven functions and persists ``GraphState`` between them. It owns no
+domain model — the Attack Graph and the Evidence Store do, and
+``RuntimeState`` only carries their ids. Replacing LangGraph would mean
+rewriting this file and ``runner.py``; no node, contract or other team's
+module would change.
+
+``build_graph(deps)`` still returns a compiled graph with the same
+signature the skeleton had. Pass ``checkpointer=`` to get per-super-step
+snapshots (see ``checkpointing.py``); ``runner.AgentLoopRunner`` wires
+that plus the recursion limit the loop needs.
 """
 
 from __future__ import annotations
@@ -27,11 +40,18 @@ from redteam.orchestration.nodes import (
     update_node,
     verify_node,
 )
-from redteam.orchestration.router import route_after_policy
+from redteam.orchestration.router import (
+    route_after_observe,
+    route_after_plan,
+    route_after_policy,
+    route_after_replan,
+)
 from redteam.orchestration.state import GraphState
 
+NODE_NAMES = ("observe", "plan", "policy", "execute", "verify", "update", "replan")
 
-def build_graph(deps: RuntimeDeps) -> Any:
+
+def build_graph(deps: RuntimeDeps, *, checkpointer: Any | None = None) -> Any:
     graph = StateGraph(GraphState)
 
     graph.add_node("observe", functools.partial(observe_node, deps=deps))
@@ -43,14 +63,21 @@ def build_graph(deps: RuntimeDeps) -> Any:
     graph.add_node("replan", functools.partial(replan_node, deps=deps))
 
     graph.set_entry_point("observe")
-    graph.add_edge("observe", "plan")
-    graph.add_edge("plan", "policy")
     graph.add_conditional_edges(
-        "policy", route_after_policy, {"execute": "execute", "replan": "replan"}
+        "observe", route_after_observe, {"plan": "plan", "replan": "replan"}
+    )
+    graph.add_conditional_edges(
+        "plan", route_after_plan, {"policy": "policy", "replan": "replan"}
+    )
+    graph.add_conditional_edges(
+        "policy", route_after_policy, {"execute": "execute", "update": "update"}
     )
     graph.add_edge("execute", "verify")
     graph.add_edge("verify", "update")
     graph.add_edge("update", "replan")
-    graph.add_edge("replan", END)
+    graph.add_conditional_edges(
+        "replan", route_after_replan, {"observe": "observe", "end": END}
+    )
 
-    return graph.compile()
+    return graph.compile(checkpointer=checkpointer)
+

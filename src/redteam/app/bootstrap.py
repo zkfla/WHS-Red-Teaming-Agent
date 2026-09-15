@@ -29,6 +29,7 @@ import logging
 from datetime import datetime, timezone
 from pathlib import Path
 
+from redteam.attack_graph.service import AttackGraphService
 from redteam.attack_graph.stores.memory import InMemoryAttackGraphStore
 from redteam.capability.adapters.mcp.example import ExampleMCPAdapter
 from redteam.capability.gateway import MCPToolGateway
@@ -56,7 +57,8 @@ from redteam.event_bus.memory import InMemoryEventBus
 from redteam.evidence.stores.filesystem import FilesystemEvidenceStore
 from redteam.llm.fake import FakeLLMClient
 from redteam.orchestration.context import RuntimeDeps
-from redteam.orchestration.graph import build_graph
+from redteam.orchestration.runner import AgentLoopRunner
+from redteam.orchestration.seed import seed_from_engagement
 from redteam.orchestration.state import RuntimeState
 
 
@@ -186,16 +188,34 @@ async def run_engagement(
     deps: RuntimeDeps | None = None,
     orchestration_config: OrchestrationConfig | None = None,
 ) -> RuntimeState:
-    """Runs the Minimal Vertical Slice (instruction.md section 16) once.
+    """Runs one engagement: OBSERVE -> ... -> REPLAN, looping until a
+    terminal phase (instruction.md section 16, now with real re-planning).
 
-    ``orchestration_config``, when given, sets
-    ``RuntimeState.remaining_budget`` from ``max_steps`` — the one place
-    ``OrchestrationConfig`` currently reaches Orchestration.
-    ``max_retries`` isn't consumed yet (no retry logic exists —
-    TODO(agent-team)).
+    ``orchestration_config``, when given, feeds
+    ``OrchestrationSettings`` (turn ceiling, retry budget) and sets
+    ``RuntimeState.remaining_budget``. The engagement's own
+    ``ExecutionBudget`` is enforced separately and authoritatively by the
+    Control Plane — nothing here can widen it.
+
+    Before the loop starts, the engagement scope is seeded into the
+    Attack Graph (``orchestration.seed``): an empty graph means an empty
+    frontier, so without this the planner would have nothing to choose
+    from on the first turn.
     """
     deps = deps if deps is not None else await build_runtime_deps(engagement)
+    settings = deps.settings
+    if orchestration_config is not None:
+        settings = settings.model_copy(
+            update={
+                "max_steps": orchestration_config.max_steps,
+                "max_retries": orchestration_config.max_retries,
+            }
+        )
     run_id = RunId(new_id("run"))
+
+    await seed_from_engagement(
+        AttackGraphService(deps.graph_store), engagement, run_id=run_id
+    )
 
     await deps.event_bus.publish(
         EventEnvelope(
@@ -209,21 +229,16 @@ async def run_engagement(
         )
     )
 
-    graph = build_graph(deps)
-    initial_state = {
-        "runtime": RuntimeState(
+    runner = AgentLoopRunner(deps, settings=settings)
+    runtime = await runner.run(
+        RuntimeState(
             run_id=run_id,
             engagement_id=engagement.engagement_id,
             phase=AgentPhase.OBSERVE,
-            current_goal="validate architecture wiring end-to-end",
-            remaining_budget=orchestration_config.max_steps if orchestration_config else None,
-        ),
-        "action_proposal": None,
-        "policy_decision": None,
-        "tool_result": None,
-    }
-    final_state = await graph.ainvoke(initial_state)
-    runtime: RuntimeState = final_state["runtime"]
+            current_goal=f"map and probe the declared scope of {engagement.name}",
+            remaining_budget=engagement.execution_budget.max_actions,
+        )
+    )
 
     await deps.event_bus.publish(
         EventEnvelope(
@@ -233,7 +248,12 @@ async def run_engagement(
             engagement_id=engagement.engagement_id,
             source="app.bootstrap",
             timestamp=datetime.now(timezone.utc),
-            payload={"phase": runtime.phase.value},
+            payload={
+                "phase": runtime.phase.value,
+                "termination_reason": runtime.termination_reason,
+                "actions_executed": runtime.actions_executed,
+                "steps": runtime.step_count,
+            },
         )
     )
     return runtime

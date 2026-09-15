@@ -1,0 +1,124 @@
+"""Read-only handle onto the Attack Graph.
+
+Given to components that must not write; writes go through
+``AttackGraphService``. Rationale: ``docs/agent/attack-graph.md``.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+from redteam.attack_graph.integrity import IntegrityReport, check_integrity
+from redteam.attack_graph.observation import (
+    DEFAULT_MAX_PER_TYPE,
+    DEFAULT_MAX_TOTAL,
+    GraphObservation,
+    build_observation,
+)
+from redteam.attack_graph.patterns import NodePattern, ResolveResult, resolve
+from redteam.attack_graph.stores.base import require_listable
+from redteam.core.contracts.graph import GraphEdge, GraphNode
+from redteam.core.enums import GraphEdgeType
+from redteam.core.ids import GraphEdgeId, GraphNodeId
+from redteam.core.ports.attack_graph import AttackGraphStore
+
+_READ_METHODS = frozenset(
+    {
+        "get_node",
+        "get_edge",
+        "neighbors",
+        "query",
+        "list_nodes",
+        "list_edges",
+        "has_edge",
+        "observe",
+        "resolve",
+        "integrity_report",
+        "counts",
+    }
+)
+
+
+class AttackGraphView:
+    """Query-only façade. No ``add_*``/``upsert``/``record_*``."""
+
+    __slots__ = ("_store",)
+
+    def __init__(self, store: AttackGraphStore) -> None:
+        self._store = store
+
+    async def get_node(self, node_id: GraphNodeId) -> GraphNode | None:
+        return await self._store.get_node(node_id)
+
+    async def get_edge(self, edge_id: GraphEdgeId) -> GraphEdge | None:
+        return await self._store.get_edge(edge_id)
+
+    async def neighbors(self, node_id: GraphNodeId) -> list[GraphNode]:
+        return await self._store.neighbors(node_id)
+
+    async def query(self, **filters: Any) -> list[GraphNode]:
+        return await self._store.query(**filters)
+
+    async def list_nodes(self) -> list[GraphNode]:
+        return await require_listable(self._store, "list_nodes").list_nodes()
+
+    async def list_edges(self) -> list[GraphEdge]:
+        return await require_listable(self._store, "list_edges").list_edges()
+
+    async def has_edge(
+        self, source_id: GraphNodeId, target_id: GraphNodeId, edge_type: GraphEdgeType
+    ) -> bool:
+        return any(
+            edge.source_id == source_id
+            and edge.target_id == target_id
+            and edge.type == edge_type
+            for edge in await self.list_edges()
+        )
+
+    async def observe(
+        self,
+        *,
+        step: int = 0,
+        max_per_type: int = DEFAULT_MAX_PER_TYPE,
+        max_total: int = DEFAULT_MAX_TOTAL,
+    ) -> GraphObservation:
+        return build_observation(
+            await self.list_nodes(),
+            step=step,
+            max_per_type=max_per_type,
+            max_total=max_total,
+        )
+
+    async def resolve(
+        self,
+        patterns: list[NodePattern],
+        *,
+        current_step: int = 0,
+        params: dict[str, Any] | None = None,
+        for_frontier: bool = False,
+    ) -> ResolveResult:
+        return resolve(
+            patterns,
+            nodes=await self.list_nodes(),
+            edges=await self.list_edges(),
+            current_step=current_step,
+            params=params,
+            for_frontier=for_frontier,
+        )
+
+    async def integrity_report(self) -> IntegrityReport:
+        return check_integrity(await self.list_nodes(), await self.list_edges())
+
+    async def counts(self) -> dict[str, int]:
+        return {
+            "nodes": len(await self.list_nodes()),
+            "edges": len(await self.list_edges()),
+        }
+
+    def __getattr__(self, name: str) -> Any:
+        raise AttributeError(
+            f"AttackGraphView has no {name!r} — it is read-only. Writes go through "
+            f"redteam.attack_graph.AttackGraphService so identity normalization, "
+            f"merge semantics and the secret guard always run "
+            f"(readable members: {sorted(_READ_METHODS)})"
+        )

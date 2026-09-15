@@ -1,31 +1,16 @@
-"""UPDATE node — records the target as a graph node.
+"""UPDATE — fold the outcome back into the Attack Graph.
 
-Uses ``deps.graph_store`` (a ``core`` port) directly. Orchestration and
-Attack Graph are both owned by Agent Team, so importing
-``redteam.attack_graph.AttackGraphService`` here would also be fine
-per instruction.md section 19 (same-team modules may share internals);
-kept to the port here anyway to keep this node trivially testable with
-just the Protocol.
-
-TODO(agent-team): richer node/edge building (Service/Endpoint discovery,
-Hypothesis -> Finding promotion), node dedup by identity instead of
-overwrite-by-id. Also: ``target_graph_node_id`` returns ``None`` for
-target kinds that don't carry a ``graph_node_id`` yet (Principal/Asset
-targets without one set) — this node currently assumes it's always
-present (true for the hardcoded Fake Recon Agent's ``HostTarget``);
-a real planner needs to either always set it or handle ``None`` here.
+Also runs for blocked actions (reached from POLICY as well as VERIFY):
+nothing executed, but the attempt and the policy verdict are recorded.
 """
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
-
-from redteam.core.contracts.events import EventEnvelope, EventType
-from redteam.core.contracts.graph import GraphNode
-from redteam.core.contracts.target import target_display_name, target_graph_node_id
-from redteam.core.enums import AgentPhase, GraphNodeType
-from redteam.core.ids import EventId, new_id
+from redteam.attack_graph.predicates import Confidence, Provenance
+from redteam.core.contracts.events import EventType
+from redteam.core.enums import AgentPhase
 from redteam.orchestration.context import RuntimeDeps
+from redteam.orchestration.nodes._support import advance, graph_service, publisher_for
 from redteam.orchestration.state import GraphState
 
 
@@ -33,36 +18,65 @@ async def update_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
     runtime = state["runtime"]
     proposal = state["action_proposal"]
     result = state["tool_result"]
-    assert proposal is not None and result is not None
+    decision = state.get("policy_decision")
+    step = state.get("plan_step")
+    assert proposal is not None
 
-    node_id = target_graph_node_id(proposal.target)
-    assert node_id is not None, "Fake Recon Agent's HostTarget always sets graph_node_id"
+    service = graph_service(deps)
+    publisher = publisher_for(state, deps, "orchestration.update")
+    correlation_id = str(proposal.action_id)
+    operation_key = f"{proposal.capability}/{proposal.operation}"
+    blocked = result is None
+    succeeded = result is not None and result.success
 
-    now = datetime.now(timezone.utc)
-    node = GraphNode(
-        id=node_id,
-        type=GraphNodeType.HOST,
-        labels=["observed-by-fake-recon-agent"],
-        properties={
-            "display_name": target_display_name(proposal.target),
-            "last_tool_output": result.output,
+    provenance = Provenance(
+        step=runtime.step_count,
+        source=f"tool:{result.tool_id}" if result is not None else "control-plane",
+        run_id=str(runtime.run_id),
+        confidence=Confidence.MEASURED if succeeded else Confidence.INFERRED,
+    )
+
+    # Only a successful execution may assert a predicate: recording
+    # "reachable" after a failed or blocked probe would make the graph
+    # claim something nobody observed.
+    observed_attrs = dict(step.observed_attrs) if step is not None and succeeded else {}
+    facts: dict[str, object] = {
+        "last_operation": operation_key,
+        "last_operation_succeeded": succeeded,
+    }
+    if blocked:
+        facts["last_operation_blocked"] = True
+        facts["last_block_verdict"] = decision.verdict.value if decision else None
+        facts["last_block_reasons"] = list(decision.reasons) if decision else []
+
+    node = await service.observe_target(
+        proposal.target,
+        attrs=observed_attrs,
+        facts=facts,
+        labels=[f"observed-by:{proposal.agent_id}"],
+        provenance=provenance,
+        step=runtime.step_count,
+    )
+
+    await service.record_attempt(
+        node.id, operation_key, step=runtime.step_count, provenance=provenance
+    )
+
+    updated = await publisher.publish(
+        EventType.GRAPH_UPDATED,
+        {
+            "node_id": str(node.id),
+            "node_type": node.type.value,
+            "action_id": proposal.action_id,
+            "attrs": observed_attrs,
+            "blocked": blocked,
         },
-        created_at=now,
-        updated_at=now,
-    )
-    await deps.graph_store.add_node(node)
-
-    await deps.event_bus.publish(
-        EventEnvelope(
-            event_id=EventId(new_id("evt")),
-            event_type=EventType.GRAPH_UPDATED,
-            run_id=runtime.run_id,
-            engagement_id=runtime.engagement_id,
-            source="orchestration.update",
-            timestamp=datetime.now(timezone.utc),
-            payload={"node_id": node.id},
-        )
+        correlation_id=correlation_id,
+        causation_id=state.get("last_event_id"),
     )
 
-    new_runtime = runtime.model_copy(update={"phase": AgentPhase.REPLAN})
-    return {**state, "runtime": new_runtime}
+    return advance(
+        state,
+        runtime.model_copy(update={"phase": AgentPhase.REPLAN}),
+        last_event_id=updated.event_id,
+    )

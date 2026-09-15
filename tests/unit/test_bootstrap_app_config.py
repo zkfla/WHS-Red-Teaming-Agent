@@ -27,8 +27,16 @@ async def test_build_application_from_app_config_runs_end_to_end(tmp_path) -> No
         engagement, deps=deps, orchestration_config=config.orchestration
     )
     assert final_state.phase == AgentPhase.FINISHED
-    # OrchestrationConfig.max_steps reached RuntimeState.remaining_budget.
-    assert final_state.remaining_budget == config.orchestration.max_steps
+    # OrchestrationConfig now reaches Orchestration as the loop's turn
+    # ceiling (OrchestrationSettings.max_steps), which is what it is
+    # named for; the run finished well inside it.
+    assert 0 < final_state.step_count <= config.orchestration.max_steps
+    # RuntimeState.remaining_budget tracks the engagement's *action*
+    # budget and is decremented per executed action, so it is a real
+    # stop condition rather than a constant copied in at startup.
+    assert final_state.remaining_budget == (
+        config.engagement.execution_budget.max_actions - final_state.actions_executed
+    )
 
 
 async def test_build_application_accepts_fake_overrides_for_every_port(tmp_path) -> None:
