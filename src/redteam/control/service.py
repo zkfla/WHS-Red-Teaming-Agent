@@ -8,8 +8,9 @@ This is a code-based gate: every branch below returns a concrete
 cannot happen by omission. ``context.engagement_id`` selects which
 ``Engagement`` config (scope/budget/ROE/policy) applies.
 
-TODO(control-team): real ROE stage (currently pass-through — no ROE
-rule evaluation implemented yet), per-engagement audit sinks.
+TODO(control-team): ROE stage is now wired but still a pass-through
+skeleton (``redteam.control.roe.check_roe`` — fill in real rule
+evaluation there, track-a), per-engagement durable audit sinks (track-b).
 """
 
 from __future__ import annotations
@@ -21,6 +22,7 @@ from redteam.control.audit import AuditLog
 from redteam.control.budget import BudgetTracker
 from redteam.control.policy import evaluate_policy
 from redteam.control.rate_limit import RateLimiter
+from redteam.control.roe import check_roe
 from redteam.control.scope import check_scope
 from redteam.core.contracts.action import ActionProposal
 from redteam.core.contracts.engagement import Engagement
@@ -60,7 +62,9 @@ class DefaultControlPlane:
         if not scope_ok:
             return self._finalize(proposal, PolicyVerdict.DENY, scope_reasons, ["scope"])
 
-        # ROE stage: pass-through for now — see module docstring TODO.
+        roe_ok, roe_reasons = check_roe(proposal, engagement)
+        if not roe_ok:
+            return self._finalize(proposal, PolicyVerdict.DENY, roe_reasons, ["roe"])
 
         verdict, policy_reasons, matched_rules = evaluate_policy(
             proposal, engagement.approval_policy
