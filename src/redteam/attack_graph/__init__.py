@@ -23,6 +23,7 @@ stores/         AttackGraphStore implementations (in-memory today)
 Docs: ``docs/agent/attack-graph.md``. Contract: ``redteam.core.contracts.graph``.
 """
 
+from redteam.attack_graph.cleanup import CleanupItem, CleanupReport, CleanupStatus
 from redteam.attack_graph.identity import (
     endpoint_node_id,
     host_node_id,
@@ -44,10 +45,26 @@ from redteam.attack_graph.predicates import (
     facts_of,
     merge_properties,
 )
+from redteam.attack_graph.retraction import (
+    DEFAULT_RETRACTION_RULES,
+    PlannedRetraction,
+    RetractionRule,
+    plan_retractions,
+)
 from redteam.attack_graph.service import AttackGraphService, UngroundedFindingError
 from redteam.attack_graph.snapshot import SnapshotError, from_records, to_records
 from redteam.attack_graph.stores.memory import InMemoryAttackGraphStore
+from redteam.attack_graph.traversal import (
+    ChainLink,
+    EvidenceChain,
+    ancestors,
+    descendants,
+    evidence_chain,
+    shortest_path,
+    subgraph_around,
+)
 from redteam.attack_graph.view import AttackGraphView
+from redteam.attack_graph.visualize import render_html, write_html
 
 __all__ = [
     "AttackGraphService",
@@ -60,6 +77,22 @@ __all__ = [
     "resolve",
     "IntegrityReport",
     "check_integrity",
+    "CleanupItem",
+    "CleanupReport",
+    "CleanupStatus",
+    "RetractionRule",
+    "PlannedRetraction",
+    "plan_retractions",
+    "DEFAULT_RETRACTION_RULES",
+    "EvidenceChain",
+    "ChainLink",
+    "evidence_chain",
+    "shortest_path",
+    "descendants",
+    "ancestors",
+    "subgraph_around",
+    "render_html",
+    "write_html",
     "Provenance",
     "Confidence",
     "SensitiveValueError",

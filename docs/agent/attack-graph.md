@@ -143,6 +143,81 @@ record the reader does not understand means a report can go out missing
 evidence with nobody aware of it. Export order is deterministic so
 export -> import -> export is stable.
 
+## Traversal and the evidence chain
+
+`traversal.py` holds pure functions over materialized node/edge lists —
+`walk`, `reachable_from`, `descendants`/`ancestors`, `shortest_path`,
+`subgraph_around`. All are cycle-safe and bounded (`max_depth`,
+`max_nodes`), because a pathological graph must not turn a report into a
+hang.
+
+`evidence_chain(finding)` is the one a report needs. It walks out from a
+Finding over the edges VERIFY and PLAN actually write — `SUPPORTED_BY`
+to the Hypothesis, `TARGETS` to what it was about — and collects the
+`EvidenceId`/`ActionId`/`HypothesisId` stored alongside:
+
+```text
+find_1 [high] finding:find_1+verified --supported_by--> hypothesis:hyp_1
+              --targets--> endpoint:web.local GET /admin+reachable
+              (evidence: ev_42)
+```
+
+That is the difference between a finding a reviewer can retrace and an
+assertion with no history. `service.evidence_chains()` returns every
+chain, worst severity first.
+
+## Withdrawing predicates that went stale
+
+`predicates.apply_retraction` can withdraw a predicate, but something has
+to notice it should be withdrawn. `retraction.py` is that: rules say
+"`reachable` on a Host is only good for N steps", and `plan_retractions`
+turns the current graph into the withdrawals that are due.
+
+`service.sweep_stale_predicates(current_step=...)` applies them;
+`dry_run=True` reports without writing. The OBSERVE node calls it once
+per turn — that call is the only line of this feature living in
+orchestration, and it is marked so the orchestration owner can move it.
+
+Without the sweep, predicates only accumulate: the planner keeps being
+offered steps whose preconditions stopped holding, and burns the budget
+failing against them.
+
+## Cleanup obligations
+
+A test that creates accounts, cards or files and leaves them behind has
+changed the target system and not said so. `cleanup.py` records the
+obligation as state on the node itself (`properties["cleanup"]`), so it
+survives a snapshot round trip:
+
+```python
+await service.register_created_resource(node_id, resource_type="user_account")
+await service.mark_cleaned(node_id, evidence_id="ev_9")   # evidence required
+```
+
+`check_integrity` treats an outstanding item as **blocking** — a report
+must not go out while the run is still holding something. Cleanup status
+only ever moves forward under merge, so a later observation cannot reset
+a cleaned resource back to pending.
+
+The removal itself is an action, so calling it is Orchestration's job;
+the graph only tracks what is owed.
+
+## Rendering
+
+`visualize.py` produces one self-contained HTML file — hand-rolled SVG,
+no plotting library, no CDN, no script tag — so a report artifact opens
+offline. Layout is deterministic (columns by node type, in discovery
+order), so two runs can be compared side by side.
+
+```python
+await service.export_html("out/graph.html", title="Run 1")
+await service.export_html("out/finding.html", around=node_id, radius=2)
+```
+
+Findings are outlined by severity; a resource still awaiting cleanup gets
+a yellow outline. Node keys come from observed hostnames and paths, so
+everything is HTML-escaped on the way in.
+
 ## Write permission
 
 `AttackGraphService` is the write path. `AttackGraphView` is the

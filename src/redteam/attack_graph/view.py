@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from redteam.attack_graph.cleanup import CleanupReport, collect
+from redteam.attack_graph.identity import finding_node_id
 from redteam.attack_graph.integrity import IntegrityReport, check_integrity
 from redteam.attack_graph.observation import (
     DEFAULT_MAX_PER_TYPE,
@@ -17,6 +19,13 @@ from redteam.attack_graph.observation import (
 )
 from redteam.attack_graph.patterns import NodePattern, ResolveResult, resolve
 from redteam.attack_graph.stores.base import require_listable
+from redteam.attack_graph.traversal import (
+    Direction,
+    EvidenceChain,
+    evidence_chain,
+    shortest_path,
+    subgraph_around,
+)
 from redteam.core.contracts.graph import GraphEdge, GraphNode
 from redteam.core.enums import GraphEdgeType
 from redteam.core.ids import GraphEdgeId, GraphNodeId
@@ -35,6 +44,10 @@ _READ_METHODS = frozenset(
         "resolve",
         "integrity_report",
         "counts",
+        "shortest_path",
+        "subgraph_around",
+        "evidence_chain",
+        "cleanup_report",
     }
 )
 
@@ -105,6 +118,38 @@ class AttackGraphView:
             params=params,
             for_frontier=for_frontier,
         )
+
+    async def shortest_path(
+        self,
+        source_id: GraphNodeId,
+        target_id: GraphNodeId,
+        *,
+        direction: Direction = "out",
+    ) -> list[GraphEdge] | None:
+        return shortest_path(
+            source_id, target_id, edges=await self.list_edges(), direction=direction
+        )
+
+    async def subgraph_around(
+        self, node_id: GraphNodeId, *, radius: int = 1, direction: Direction = "any"
+    ) -> tuple[list[GraphNode], list[GraphEdge]]:
+        return subgraph_around(
+            node_id,
+            nodes=await self.list_nodes(),
+            edges=await self.list_edges(),
+            radius=radius,
+            direction=direction,
+        )
+
+    async def evidence_chain(self, finding_id: str) -> EvidenceChain | None:
+        return evidence_chain(
+            finding_node_id(finding_id),
+            nodes=await self.list_nodes(),
+            edges=await self.list_edges(),
+        )
+
+    async def cleanup_report(self) -> CleanupReport:
+        return collect(await self.list_nodes())
 
     async def integrity_report(self) -> IntegrityReport:
         return check_integrity(await self.list_nodes(), await self.list_edges())

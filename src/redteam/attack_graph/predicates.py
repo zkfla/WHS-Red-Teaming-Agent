@@ -20,10 +20,32 @@ PROVENANCE_KEY = "provenance"
 RETRACTIONS_KEY = "retractions"
 FIRST_SEEN_KEY = "first_seen_step"
 LAST_SEEN_KEY = "last_seen_step"
+CLEANUP_KEY = "cleanup"
 
 RESERVED_KEYS = frozenset(
-    {ATTRS_KEY, FACTS_KEY, PROVENANCE_KEY, RETRACTIONS_KEY, FIRST_SEEN_KEY, LAST_SEEN_KEY}
+    {
+        ATTRS_KEY,
+        FACTS_KEY,
+        PROVENANCE_KEY,
+        RETRACTIONS_KEY,
+        FIRST_SEEN_KEY,
+        LAST_SEEN_KEY,
+        CLEANUP_KEY,
+    }
 )
+
+#: Cleanup status values, ordered so a merge can never move backwards.
+CLEANUP_PENDING = "pending"
+CLEANUP_CLEANED = "cleaned"
+CLEANUP_FAILED = "failed"
+CLEANUP_NOT_REQUIRED = "not_required"
+
+_CLEANUP_RANK = {
+    CLEANUP_PENDING: 0,
+    CLEANUP_FAILED: 1,
+    CLEANUP_NOT_REQUIRED: 2,
+    CLEANUP_CLEANED: 3,
+}
 
 #: Key names that must never appear in ``attrs``/``facts``.
 _SECRET_KEYS = frozenset(
@@ -122,6 +144,7 @@ def build_properties(
     attrs: dict[str, Any] | None = None,
     facts: dict[str, Any] | None = None,
     provenance: Provenance | None = None,
+    cleanup: dict[str, Any] | None = None,
     step: int = 0,
     extra: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -134,6 +157,8 @@ def build_properties(
         FIRST_SEEN_KEY: step,
         LAST_SEEN_KEY: step,
     }
+    if cleanup is not None:
+        properties[CLEANUP_KEY] = dict(cleanup)
     for key, value in (extra or {}).items():
         if key in RESERVED_KEYS:
             raise ValueError(f"{key!r} is a reserved property key — pass it via attrs/facts")
@@ -159,6 +184,11 @@ def provenance_of(properties: dict[str, Any]) -> list[dict[str, Any]]:
 def retractions_of(properties: dict[str, Any]) -> list[dict[str, Any]]:
     value = properties.get(RETRACTIONS_KEY)
     return list(value) if isinstance(value, list) else []
+
+
+def cleanup_of(properties: dict[str, Any]) -> dict[str, Any] | None:
+    value = properties.get(CLEANUP_KEY)
+    return dict(value) if isinstance(value, dict) else None
 
 
 def last_seen_step(properties: dict[str, Any]) -> int:
@@ -189,6 +219,25 @@ def _merge_attrs(
         else:
             merged[key] = value
     return merged
+
+
+def _merge_cleanup(
+    existing: dict[str, Any] | None, incoming: dict[str, Any] | None
+) -> dict[str, Any] | None:
+    """Cleanup status only ever moves forward.
+
+    A later observation must not reset a resource that was already
+    cleaned back to "pending" — that would make the run look dirtier than
+    it is, and the opposite mistake (forgetting a real leftover) is the
+    one that matters.
+    """
+    if existing is None:
+        return incoming
+    if incoming is None:
+        return existing
+    old = _CLEANUP_RANK.get(str(existing.get("status")), 0)
+    new = _CLEANUP_RANK.get(str(incoming.get("status")), 0)
+    return {**existing, **incoming} if new >= old else {**incoming, **existing}
 
 
 def _merge_facts(existing: dict[str, Any], incoming: dict[str, Any]) -> dict[str, Any]:
@@ -229,6 +278,10 @@ def merge_properties(existing: dict[str, Any], incoming: dict[str, Any]) -> dict
     retractions = retractions_of(existing)
     retractions.extend(item for item in retractions_of(incoming) if item not in retractions)
     merged[RETRACTIONS_KEY] = retractions
+
+    cleanup = _merge_cleanup(cleanup_of(existing), cleanup_of(incoming))
+    if cleanup is not None:
+        merged[CLEANUP_KEY] = cleanup
 
     merged[FIRST_SEEN_KEY] = min(first_seen_step(existing), first_seen_step(incoming))
     merged[LAST_SEEN_KEY] = max(last_seen_step(existing), last_seen_step(incoming))

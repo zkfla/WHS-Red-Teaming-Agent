@@ -278,3 +278,54 @@ async def test_history_and_replay_need_a_checkpointer() -> None:
         await runner.state_history()
     with pytest.raises(CheckpointingDisabledError):
         await runner.resume_from("nope")
+
+
+# -- report artifacts the graph can produce after a run -------------------
+
+
+async def test_a_finished_run_produces_a_reportable_graph(tmp_path) -> None:
+    target = engagement("a.local", "b.local")
+    deps = await build_runtime_deps(target, evidence_dir=tmp_path)
+
+    final = await run_engagement(target, deps=deps)
+    service = AttackGraphService(deps.graph_store)
+
+    # Nothing outstanding, so a report may go out.
+    report = await service.integrity_report()
+    assert report.blocking == []
+    assert (await service.cleanup_report()).is_clear
+
+    # The graph renders to a self-contained artifact.
+    page = (await service.export_html(tmp_path / "graph.html", title="run")).read_text()
+    assert "host:a.local".rpartition(":")[2] in page
+    assert final.actions_executed == 2
+
+
+async def test_a_leftover_resource_blocks_the_report(tmp_path) -> None:
+    target = engagement("a.local")
+    deps = await build_runtime_deps(target, evidence_dir=tmp_path)
+    await run_engagement(target, deps=deps)
+
+    service = AttackGraphService(deps.graph_store)
+    host = (await service.query(node_type=GraphNodeType.HOST))[0]
+    await service.register_created_resource(host.id, resource_type="user_account", step=1)
+
+    assert (await service.integrity_report()).blocking
+    await service.mark_cleaned(host.id, evidence_id="ev_cleanup")
+    assert (await service.integrity_report()).blocking == []
+
+
+async def test_stale_predicates_are_swept_as_the_loop_runs() -> None:
+    # OBSERVE triggers the sweep each turn; with a tight rule the
+    # reachability predicate written on turn 1 is withdrawn later.
+    deps = build_test_application(
+        settings=OrchestrationSettings(max_steps=6, checkpointing=False)
+    )
+    service = AttackGraphService(deps.graph_store)
+    await run_with(deps, engagement("a.local"))
+
+    node = (await service.query(node_type=GraphNodeType.HOST))[0]
+    assert attrs_of(node.properties)["reachable"] is True
+
+    applied = await service.sweep_stale_predicates(current_step=50)
+    assert [item.attr for item in applied] == ["reachable"]

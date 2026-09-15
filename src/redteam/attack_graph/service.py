@@ -8,8 +8,10 @@ Rationale: ``docs/agent/attack-graph.md``.
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
+from redteam.attack_graph.cleanup import CleanupItem, CleanupReport, CleanupStatus, collect
 from redteam.attack_graph.identity import (
     finding_node_id,
     hypothesis_node_id,
@@ -26,16 +28,29 @@ from redteam.attack_graph.observation import (
 )
 from redteam.attack_graph.patterns import NodePattern, ResolveResult
 from redteam.attack_graph.predicates import (
+    CLEANUP_KEY,
     RESERVED_KEYS,
     Provenance,
     apply_retraction,
     build_properties,
+    cleanup_of,
     facts_of,
     merge_properties,
 )
+from redteam.attack_graph.retraction import PlannedRetraction, RetractionRule, plan_retractions
 from redteam.attack_graph.snapshot import from_records, to_records
 from redteam.attack_graph.stores.base import require_listable
+from redteam.attack_graph.traversal import (
+    Direction,
+    EvidenceChain,
+    ancestors,
+    descendants,
+    evidence_chain,
+    shortest_path,
+    subgraph_around,
+)
 from redteam.attack_graph.view import AttackGraphView
+from redteam.attack_graph.visualize import write_html
 from redteam.core.contracts.graph import Finding, GraphEdge, GraphNode, Hypothesis
 from redteam.core.contracts.target import AnyTarget, target_display_name
 from redteam.core.enums import GraphEdgeType, GraphNodeType
@@ -419,6 +434,222 @@ class AttackGraphService:
         if verified is not None:
             findings = [item for item in findings if item.verified is verified]
         return sorted(findings, key=lambda item: item.finding_id)
+
+    # -- traversal ---------------------------------------------------
+
+    async def shortest_path(
+        self,
+        source_id: GraphNodeId,
+        target_id: GraphNodeId,
+        *,
+        direction: Direction = "out",
+        edge_types: set[GraphEdgeType] | None = None,
+    ) -> list[GraphEdge] | None:
+        """The edges linking two nodes, or ``None`` if they are unlinked."""
+        return shortest_path(
+            source_id,
+            target_id,
+            edges=await self.list_edges(),
+            direction=direction,
+            edge_types=edge_types,
+        )
+
+    async def descendants(
+        self, node_id: GraphNodeId, *, max_depth: int | None = None
+    ) -> list[GraphNode]:
+        """Everything reachable by following edges out of ``node_id``."""
+        reached = descendants(node_id, edges=await self.list_edges(), max_depth=max_depth)
+        return [node for node in await self.list_nodes() if node.id in reached]
+
+    async def ancestors(
+        self, node_id: GraphNodeId, *, max_depth: int | None = None
+    ) -> list[GraphNode]:
+        """Everything that leads to ``node_id``."""
+        reached = ancestors(node_id, edges=await self.list_edges(), max_depth=max_depth)
+        return [node for node in await self.list_nodes() if node.id in reached]
+
+    async def subgraph_around(
+        self, node_id: GraphNodeId, *, radius: int = 1, direction: Direction = "any"
+    ) -> tuple[list[GraphNode], list[GraphEdge]]:
+        """The neighbourhood of a node, for focused reporting or rendering."""
+        return subgraph_around(
+            node_id,
+            nodes=await self.list_nodes(),
+            edges=await self.list_edges(),
+            radius=radius,
+            direction=direction,
+        )
+
+    async def evidence_chain(self, finding_id: str) -> EvidenceChain | None:
+        """How a Finding came to be — hypothesis, target, evidence ids.
+
+        This is what turns a finding from an assertion into something a
+        reviewer can retrace.
+        """
+        return evidence_chain(
+            finding_node_id(finding_id),
+            nodes=await self.list_nodes(),
+            edges=await self.list_edges(),
+        )
+
+    async def evidence_chains(self) -> list[EvidenceChain]:
+        """Every Finding's chain, worst severity first."""
+        nodes = await self.list_nodes()
+        edges = await self.list_edges()
+        chains = [
+            chain
+            for chain in (
+                evidence_chain(node.id, nodes=nodes, edges=edges)
+                for node in nodes
+                if node.type is GraphNodeType.FINDING
+            )
+            if chain is not None
+        ]
+        rank = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
+        return sorted(chains, key=lambda item: (rank.get(item.severity, 9), item.finding_id))
+
+    # -- cleanup -----------------------------------------------------
+
+    async def register_created_resource(
+        self,
+        node_id: GraphNodeId,
+        *,
+        resource_type: str,
+        action_id: str | None = None,
+        step: int = 0,
+        note: str = "",
+    ) -> CleanupItem | None:
+        """Record that this run created something it must remove later."""
+        node = await self._store.get_node(node_id)
+        if node is None:
+            return None
+        item = CleanupItem(
+            node_id=node_id,
+            resource_type=resource_type,
+            status=CleanupStatus.PENDING,
+            created_at_step=step,
+            created_by_action_id=action_id,
+            note=note,
+        )
+        await self._write_cleanup(node, item)
+        return item
+
+    async def mark_cleaned(
+        self, node_id: GraphNodeId, *, evidence_id: str, note: str = ""
+    ) -> CleanupItem | None:
+        """Close out a resource. Evidence is required.
+
+        A claim that something was removed, with nothing behind it, is the
+        same problem as an ungrounded finding.
+        """
+        if not evidence_id:
+            raise ValueError("marking a resource cleaned needs evidence that it happened")
+        return await self._update_cleanup(
+            node_id, status=CleanupStatus.CLEANED, evidence_id=evidence_id, note=note
+        )
+
+    async def mark_cleanup_failed(self, node_id: GraphNodeId, *, note: str) -> CleanupItem | None:
+        return await self._update_cleanup(node_id, status=CleanupStatus.FAILED, note=note)
+
+    async def mark_cleanup_not_required(
+        self, node_id: GraphNodeId, *, note: str
+    ) -> CleanupItem | None:
+        return await self._update_cleanup(
+            node_id, status=CleanupStatus.NOT_REQUIRED, note=note
+        )
+
+    async def cleanup_report(self) -> CleanupReport:
+        return collect(await self.list_nodes())
+
+    async def pending_cleanup(self) -> list[CleanupItem]:
+        return (await self.cleanup_report()).outstanding
+
+    async def _update_cleanup(
+        self,
+        node_id: GraphNodeId,
+        *,
+        status: CleanupStatus,
+        evidence_id: str | None = None,
+        note: str = "",
+    ) -> CleanupItem | None:
+        node = await self._store.get_node(node_id)
+        if node is None:
+            return None
+        existing = cleanup_of(node.properties)
+        if existing is None:
+            return None
+        item = CleanupItem.model_validate({"node_id": node_id, **existing})
+        item = item.model_copy(
+            update={
+                "status": status,
+                "cleanup_evidence_id": evidence_id or item.cleanup_evidence_id,
+                "note": note or item.note,
+            }
+        )
+        await self._write_cleanup(node, item)
+        return item
+
+    async def _write_cleanup(self, node: GraphNode, item: CleanupItem) -> None:
+        payload = item.model_dump(mode="json")
+        payload.pop("node_id", None)
+        await self._store.add_node(
+            node.model_copy(
+                update={
+                    "properties": {**node.properties, CLEANUP_KEY: payload},
+                    "updated_at": _now(),
+                }
+            )
+        )
+
+    # -- retraction sweep --------------------------------------------
+
+    async def sweep_stale_predicates(
+        self,
+        *,
+        current_step: int,
+        rules: list[RetractionRule] | None = None,
+        dry_run: bool = False,
+    ) -> list[PlannedRetraction]:
+        """Withdraw predicates whose observations went stale.
+
+        Call this once per turn. Without it predicates only accumulate and
+        the planner keeps proposing actions whose preconditions stopped
+        holding. ``dry_run`` reports what would be withdrawn without
+        writing.
+        """
+        planned = plan_retractions(
+            await self.list_nodes(), current_step=current_step, rules=rules
+        )
+        if dry_run:
+            return planned
+        applied: list[PlannedRetraction] = []
+        for item in planned:
+            if await self.retract(
+                item.node_id, item.attr, step=current_step, reason=item.reason
+            ):
+                applied.append(item)
+        return applied
+
+    # -- rendering ---------------------------------------------------
+
+    async def export_html(
+        self,
+        path: str | Path,
+        *,
+        title: str = "Attack Graph",
+        around: GraphNodeId | None = None,
+        radius: int = 2,
+    ) -> Path:
+        """Write a self-contained HTML view of the graph.
+
+        ``around`` renders only one node's neighbourhood, which is what a
+        per-finding report wants.
+        """
+        if around is None:
+            nodes, edges = await self.list_nodes(), await self.list_edges()
+        else:
+            nodes, edges = await self.subgraph_around(around, radius=radius)
+        return write_html(nodes, edges, path, title=title)
 
     # -- snapshots ---------------------------------------------------
 

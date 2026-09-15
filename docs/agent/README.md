@@ -47,6 +47,7 @@ pytest tests/unit tests/integration -q
 | Web/API, Mobile, Reporting agents | only the Recon agent ships; add an `AgentSpec` to `agents/registry.py` |
 | Retry on a transient DENY | `max_retries` / `retry_count` exist, nothing consumes them |
 | Durable checkpointer | `InMemorySaver` only; see `orchestration/checkpointing.py` |
-| Cleanup of created resources | no lifecycle for artifacts an action leaves behind |
 | Graph-DB backend | `InMemoryAttackGraphStore` only (deferred, instruction.md §21) |
+| Cleanup execution | the graph tracks what is owed; actually removing a resource is an Orchestration action |
+| Retraction rules | three conservative defaults in `attack_graph/retraction.py`; tune per engagement |
 | Severity scoring | coarse default — see `orchestration/service_status.py` |

@@ -17,12 +17,23 @@ class InMemoryAttackGraphStore:
     def __init__(self) -> None:
         self._nodes: dict[GraphNodeId, GraphNode] = {}
         self._edges: dict[GraphEdgeId, GraphEdge] = {}
+        # Adjacency index: neighbour lookup is per-node and happens on
+        # every planning turn, so scanning every edge each time is the
+        # one hot spot worth indexing.
+        self._out: dict[GraphNodeId, set[GraphEdgeId]] = {}
+        self._in: dict[GraphNodeId, set[GraphEdgeId]] = {}
 
     async def add_node(self, node: GraphNode) -> None:
         self._nodes[node.id] = node
 
     async def add_edge(self, edge: GraphEdge) -> None:
+        previous = self._edges.get(edge.id)
+        if previous is not None:
+            self._out.get(previous.source_id, set()).discard(previous.id)
+            self._in.get(previous.target_id, set()).discard(previous.id)
         self._edges[edge.id] = edge
+        self._out.setdefault(edge.source_id, set()).add(edge.id)
+        self._in.setdefault(edge.target_id, set()).add(edge.id)
 
     async def get_node(self, node_id: GraphNodeId) -> GraphNode | None:
         return self._nodes.get(node_id)
@@ -31,12 +42,25 @@ class InMemoryAttackGraphStore:
         return self._edges.get(edge_id)
 
     async def neighbors(self, node_id: GraphNodeId) -> list[GraphNode]:
+        incident = self._out.get(node_id, set()) | self._in.get(node_id, set())
         neighbor_ids = {
-            edge.target_id if edge.source_id == node_id else edge.source_id
-            for edge in self._edges.values()
-            if node_id in (edge.source_id, edge.target_id)
+            self._edges[edge_id].target_id
+            if self._edges[edge_id].source_id == node_id
+            else self._edges[edge_id].source_id
+            for edge_id in incident
         }
         return [self._nodes[nid] for nid in neighbor_ids if nid in self._nodes]
+
+    async def incident_edges(
+        self, node_id: GraphNodeId, *, direction: str = "any"
+    ) -> list[GraphEdge]:
+        """Edges touching one node, without scanning the whole graph."""
+        edge_ids: set[GraphEdgeId] = set()
+        if direction in ("out", "any"):
+            edge_ids |= self._out.get(node_id, set())
+        if direction in ("in", "any"):
+            edge_ids |= self._in.get(node_id, set())
+        return [self._edges[edge_id] for edge_id in sorted(edge_ids, key=str)]
 
     async def query(self, **filters: Any) -> list[GraphNode]:
         """Keyword filters: ``node_type``, ``label``, ``attrs`` (subset

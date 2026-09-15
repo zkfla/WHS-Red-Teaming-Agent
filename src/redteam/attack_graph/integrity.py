@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field
 
+from redteam.attack_graph.cleanup import collect
 from redteam.attack_graph.identity import is_well_formed, split_node_id
 from redteam.attack_graph.predicates import Confidence, facts_of, provenance_of
 from redteam.core.contracts.graph import GraphEdge, GraphNode
@@ -24,6 +25,7 @@ class IntegrityReport(BaseModel):
     dangling_edges: list[str] = Field(default_factory=list)
     malformed_node_ids: list[str] = Field(default_factory=list)
     unresolved_hypotheses: list[str] = Field(default_factory=list)
+    uncleaned_resources: list[str] = Field(default_factory=list)
 
     @property
     def is_clean(self) -> bool:
@@ -35,6 +37,7 @@ class IntegrityReport(BaseModel):
                 self.dangling_edges,
                 self.malformed_node_ids,
                 self.unresolved_hypotheses,
+                self.uncleaned_resources,
             ]
         )
 
@@ -45,6 +48,9 @@ class IntegrityReport(BaseModel):
             *(f"ungrounded finding: {item}" for item in self.ungrounded_findings),
             *(f"dangling edge: {item}" for item in self.dangling_edges),
             *(f"malformed node id: {item}" for item in self.malformed_node_ids),
+            # A run still holding a resource it created has changed the
+            # target system and not finished saying so.
+            *(f"uncleaned resource: {item}" for item in self.uncleaned_resources),
         ]
 
     def describe(self) -> str:
@@ -89,6 +95,11 @@ def check_integrity(nodes: list[GraphNode], edges: list[GraphEdge]) -> Integrity
                 )
         if node.type == GraphNodeType.HYPOTHESIS and facts.get("status") == "open":
             report.unresolved_hypotheses.append(str(facts.get("hypothesis_id", node_id)))
+
+    for item in collect(nodes).outstanding:
+        report.uncleaned_resources.append(
+            f"{item.node_id} ({item.resource_type}, {item.status.value})"
+        )
 
     for edge in edges:
         missing = [

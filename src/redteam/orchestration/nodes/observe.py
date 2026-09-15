@@ -41,7 +41,15 @@ async def observe_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
         )
         last_event_id = started.event_id
 
-    observation = await graph_service(deps).observe(
+    service = graph_service(deps)
+
+    # Withdraw predicates whose observations went stale before building the
+    # observation, so the planner is not offered steps whose preconditions
+    # stopped holding. Graph-side logic lives in
+    # `attack_graph.retraction`; this is only the per-turn trigger.
+    await service.sweep_stale_predicates(current_step=runtime.step_count + 1)
+
+    observation = await service.observe(
         step=runtime.step_count + 1,
         max_per_type=settings.observation_max_per_type,
         max_total=settings.observation_max_total,
