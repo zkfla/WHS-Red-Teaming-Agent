@@ -46,9 +46,14 @@ def normalize_path(path: str) -> str:
 
 
 def make_node_id(node_type: GraphNodeType, key: str) -> GraphNodeId:
-    """Build ``"<type>:<key>"``. ``key`` must be non-empty."""
-    if not key:
-        raise InvalidNodeIdError(f"empty key for node type {node_type.value!r}")
+    """Build ``"<type>:<key>"``. ``key`` must be non-blank and printable."""
+    if not key or not key.strip():
+        raise InvalidNodeIdError(f"blank key for node type {node_type.value!r}")
+    # Control characters corrupt log lines, the JSONL snapshot, and events.
+    if any(ch < " " or ch == "\x7f" for ch in key):
+        raise InvalidNodeIdError(
+            f"key {key!r} contains a control character — ids must stay greppable"
+        )
     return GraphNodeId(f"{node_type.value}{_SEPARATOR}{key}")
 
 
@@ -76,14 +81,24 @@ def host_node_id(host: str) -> GraphNodeId:
 
 
 def domain_node_id(domain: str) -> GraphNodeId:
-    # Host-shaped identity: "example.local" is one node whether it was
-    # first seen as a host or as a domain.
+    # One node whether first seen as a host or as a domain.
     return make_node_id(GraphNodeType.HOST, domain.strip().lower())
 
 
-def endpoint_node_id(method: str, path: str, host: str | None = None) -> GraphNodeId:
-    prefix = f"{host.strip().lower()} " if host else ""
-    return make_node_id(GraphNodeType.ENDPOINT, f"{prefix}{method.upper()} {normalize_path(path)}")
+def endpoint_node_id(
+    method: str, path: str, host: str | None = None, port: int | None = None
+) -> GraphNodeId:
+    """``"endpoint:a.local:8443 GET /orders/{id}"``. The port is part of the
+    identity — ``:80`` and ``:8443`` are different services."""
+    authority = ""
+    if host:
+        authority = host.strip().lower()
+        if port is not None:
+            authority = f"{authority}:{port}"
+        authority += " "
+    return make_node_id(
+        GraphNodeType.ENDPOINT, f"{authority}{method.upper()} {normalize_path(path)}"
+    )
 
 
 def service_node_id(service_name: str, host: str | None = None) -> GraphNodeId:
@@ -134,7 +149,7 @@ def node_id_for_target(target: AnyTarget) -> GraphNodeId:
     if isinstance(target, UrlTarget):
         return make_node_id(GraphNodeType.ENDPOINT, _url_key(target.url))
     if isinstance(target, EndpointTarget):
-        return endpoint_node_id("ANY", target.path or "/", host=target.host)
+        return endpoint_node_id("ANY", target.path or "/", host=target.host, port=target.port)
     if isinstance(target, ServiceTarget):
         return service_node_id(target.service_name, target.host)
     if isinstance(target, PrincipalTarget):
@@ -164,11 +179,8 @@ def node_type_for_target(target: AnyTarget) -> GraphNodeType:
 
 
 def target_for_node(node_id: GraphNodeId, node_type: GraphNodeType) -> AnyTarget:
-    """Inverse of :func:`node_id_for_target`.
-
-    Returns a concrete, scope-checkable target rather than a
-    ``GraphNodeTarget``, which scope checking cannot match on.
-    """
+    """Inverse of :func:`node_id_for_target`. Returns a concrete,
+    scope-checkable target — scope checking cannot match a ``GraphNodeTarget``."""
     _, key = split_node_id(node_id)
 
     if node_type is GraphNodeType.HOST:
@@ -183,10 +195,16 @@ def target_for_node(node_id: GraphNodeId, node_type: GraphNodeType) -> AnyTarget
             return UrlTarget(url=key, graph_node_id=node_id)
         parts = key.split(" ")
         if len(parts) >= 3:
-            # "<host> <METHOD> /path" — the method is not part of the target.
-            return EndpointTarget(host=parts[0], path=" ".join(parts[2:]), graph_node_id=node_id)
-        # "<METHOD> /path" with no host: nothing for the Control Plane to
-        # scope-check, and saying so beats inventing a host.
+            # "<host>[:<port>] <METHOD> /path" — the method is not part of
+            # the target.
+            authority, port = parts[0], None
+            host, separator, tail = authority.rpartition(":")
+            if separator and tail.isdigit():
+                authority, port = host, int(tail)
+            return EndpointTarget(
+                host=authority, port=port, path=" ".join(parts[2:]), graph_node_id=node_id
+            )
+        # No host: nothing to scope-check, and saying so beats inventing one.
         return UrlTarget(url=parts[-1], graph_node_id=node_id)
     if node_type is GraphNodeType.PRINCIPAL:
         return PrincipalTarget(principal_id=PrincipalId(key), display_name=key)

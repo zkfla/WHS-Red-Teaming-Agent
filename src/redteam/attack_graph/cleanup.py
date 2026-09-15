@@ -1,15 +1,7 @@
-"""Tracking resources a run created, so they get cleaned up.
+"""Resources this run created and still owes a removal for.
 
-A test that creates accounts, cards or files and leaves them behind has
-changed the target system and not said so. The obligation is real, so it
-is recorded as state rather than left to whoever remembers: the item
-lives on the node itself (``properties["cleanup"]``), which means it
-survives a snapshot round trip and shows up in the integrity report.
-
-``check_integrity`` treats an uncleaned resource as blocking — a report
-must not go out while the run is still holding something.
-
-Owned by Agent Team. Rationale: ``docs/agent/attack-graph.md``.
+Stored on the node itself, so it survives a snapshot round trip and shows
+up in the integrity report. Docs: ``docs/agent/attack-graph.md``.
 """
 
 from __future__ import annotations

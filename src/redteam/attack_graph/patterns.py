@@ -1,8 +1,7 @@
 """Preconditions over the Attack Graph: ``NodePattern`` + ``resolve``.
 
 Pure functions over materialized node/edge lists — no store, no I/O.
-
-Owned by Agent Team. Rationale: ``docs/agent/attack-graph.md``.
+Docs: ``docs/agent/attack-graph.md``.
 """
 
 from __future__ import annotations
@@ -16,6 +15,20 @@ from redteam.attack_graph.predicates import attrs_of, is_stale
 from redteam.core.contracts.graph import GraphEdge, GraphNode
 from redteam.core.enums import GraphEdgeType, GraphNodeType
 from redteam.core.ids import GraphNodeId
+
+#: Ceiling on backtracking assignments per ``resolve`` call. The frontier
+#: is recomputed every turn, so an unbounded search is a hang. Exhausting
+#: it reports "could not decide", never "no match".
+MAX_SEARCH_ASSIGNMENTS = 20_000
+
+
+class SearchBudgetExceeded(Exception):
+    """Raised internally when the backtracking budget runs out."""
+
+
+class PatternDefinitionError(ValueError):
+    """An authoring mistake that would resolve to a wrong answer rather
+    than no answer, so it fails loudly."""
 
 
 class NodePattern(BaseModel):
@@ -52,6 +65,10 @@ class NodePattern(BaseModel):
             raise ValueError(f"related_to={self.related_to!r} set but edge_type is missing")
         if self.edge_absent and self.edge_type is None:
             raise ValueError("edge_absent requires edge_type")
+        if self.bind and self.bind in self.distinct_from:
+            raise ValueError(
+                f"{self.bind!r} cannot be distinct from itself — drop it from distinct_from"
+            )
         return self
 
     @property
@@ -66,7 +83,16 @@ class NodePattern(BaseModel):
         if node.type != self.type:
             return False
         node_attrs = attrs_of(node.properties)
-        return all(node_attrs.get(key) == value for key, value in self.attrs.items())
+        return all(
+            _same_value(node_attrs.get(key), value) for key, value in self.attrs.items()
+        )
+
+
+def _same_value(observed: object, wanted: object) -> bool:
+    """Strict equality — ``True`` and ``1`` are not the same predicate."""
+    if isinstance(wanted, bool) != isinstance(observed, bool):
+        return False
+    return observed == wanted
 
 
 class ResolveResult(BaseModel):
@@ -85,6 +111,34 @@ class ResolveResult(BaseModel):
         if len(ids) != 1:
             raise KeyError(f"bind {bind!r} resolved to {len(ids)} nodes, expected exactly 1")
         return ids[0]
+
+
+def validate_patterns(patterns: list[NodePattern]) -> None:
+    """Reject precondition lists that silently resolve to the wrong thing."""
+    seen: set[str] = set()
+    for pattern in patterns:
+        name = pattern.name
+        if name in seen:
+            raise PatternDefinitionError(
+                f"two patterns both resolve to the name {name!r}; give each an explicit "
+                f"`bind` or they overwrite one another"
+            )
+        seen.add(name)
+        if name in pattern.distinct_from:
+            raise PatternDefinitionError(f"{name!r} cannot be distinct from itself")
+
+    for pattern in patterns:
+        for other in pattern.distinct_from:
+            if other not in seen:
+                raise PatternDefinitionError(
+                    f"{pattern.name!r} must be distinct from {other!r}, which is not a "
+                    f"declared bind"
+                )
+        if pattern.related_to and pattern.related_to not in seen:
+            raise PatternDefinitionError(
+                f"{pattern.name!r} relates to {pattern.related_to!r}, which is not a "
+                f"declared bind"
+            )
 
 
 def _wanted_ids(param_value: Any) -> set[str]:
@@ -160,11 +214,12 @@ def resolve(
 ) -> ResolveResult:
     """Bind every pattern to concrete nodes, or explain why it can't.
 
-    ``for_frontier=True`` answers availability and ignores ``from_param``;
+    ``for_frontier=True`` answers availability (ignoring ``from_param``);
     the default answers commitment.
     """
     edges = edges or []
     named = [(pattern.name, pattern) for pattern in patterns]
+    validate_patterns(patterns)
 
     candidates: dict[str, list[GraphNode]] = {}
     active: list[tuple[str, NodePattern]] = []
@@ -197,15 +252,48 @@ def resolve(
                 exclusive[name].add(other)
                 exclusive[other].add(name)
 
+    # If the referenced bind was skipped (unsatisfied `optional`), the
+    # constraint would silently disappear — and with `edge_absent` that is
+    # an authorization boundary check quietly passing.
+    active_names = {name for name, _ in active}
+    surviving: list[tuple[str, NodePattern]] = []
+    for name, pattern in active:
+        if pattern.edge_type is not None and pattern.related_to not in active_names:
+            if not pattern.optional:
+                return ResolveResult(
+                    ok=False,
+                    reason=(
+                        f"precondition not met: {name!r} requires an edge to "
+                        f"{pattern.related_to!r}, which has no candidates"
+                    ),
+                )
+            candidates.pop(name, None)
+            continue
+        surviving.append((name, pattern))
+    active = surviving
+    active_names = {name for name, _ in active}
+    for name in list(exclusive):
+        if name not in active_names:
+            exclusive.pop(name)
+        else:
+            exclusive[name] &= active_names
+
     edge_constraints = [
         (name, pattern.related_to, pattern.edge_type, pattern.edge_absent)
         for name, pattern in active
         if pattern.edge_type is not None
     ]
 
+    # Counting rules this out before backtracking enumerates every
+    # combination to prove the same thing.
+    shortfall = _exclusion_shortfall(active, candidates, exclusive)
+    if shortfall is not None:
+        return ResolveResult(ok=False, reason=shortfall)
+
     # Fewest candidates first: fail fast, search less.
     order = sorted(active, key=lambda item: (len(candidates[item[0]]), item[1].count))
     placed: dict[str, list[GraphNodeId]] = {}
+    budget = [MAX_SEARCH_ASSIGNMENTS]
 
     def edge_ok(
         target_ids: list[GraphNodeId],
@@ -240,6 +328,9 @@ def resolve(
         name, pattern = order[index]
         pool = [node.id for node in candidates[name]]
         for combo in itertools.combinations(pool, pattern.count):
+            budget[0] -= 1
+            if budget[0] <= 0:
+                raise SearchBudgetExceeded
             if not consistent(name, combo):
                 continue
             placed[name] = list(combo)
@@ -248,8 +339,20 @@ def resolve(
             placed.pop(name)
         return False
 
-    if not search(0):
-        counts = {name: len(hits) for name, hits in candidates.items()}
+    counts = {name: len(hits) for name, hits in candidates.items()}
+    try:
+        found = search(0)
+    except SearchBudgetExceeded:
+        return ResolveResult(
+            ok=False,
+            reason=(
+                f"precondition undecided: gave up after {MAX_SEARCH_ASSIGNMENTS} assignments "
+                f"(candidates {counts}). Narrow the patterns — this is not the same as "
+                f"'no match'."
+            ),
+        )
+
+    if not found:
         return ResolveResult(
             ok=False,
             reason=(
@@ -259,3 +362,39 @@ def resolve(
         )
 
     return ResolveResult(ok=True, bindings=placed)
+
+
+def _exclusion_shortfall(
+    active: list[tuple[str, NodePattern]],
+    candidates: dict[str, list[GraphNode]],
+    exclusive: dict[str, set[str]],
+) -> str | None:
+    """Can a group of non-overlapping binds fit at all? A mutually-exclusive
+    group needs ``sum(count)`` distinct candidates between its members."""
+    patterns = dict(active)
+    seen: set[str] = set()
+
+    for name in patterns:
+        if name in seen:
+            continue
+        group = {name}
+        queue = [name]
+        while queue:
+            current = queue.pop()
+            for other in exclusive.get(current, set()):
+                if other not in group and other in patterns:
+                    group.add(other)
+                    queue.append(other)
+        seen |= group
+        if len(group) < 2:
+            continue
+
+        needed = sum(patterns[member].count for member in group)
+        pool = {node.id for member in group for node in candidates[member]}
+        if needed > len(pool):
+            listed = ", ".join(sorted(group))
+            return (
+                f"precondition not met: binds [{listed}] must not overlap and need "
+                f"{needed} distinct nodes, but only {len(pool)} are available"
+            )
+    return None

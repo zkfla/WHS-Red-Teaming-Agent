@@ -1,7 +1,6 @@
-"""In-memory ``AttackGraphStore``.
+"""In-memory ``AttackGraphStore``, with an adjacency index.
 
-Also satisfies ``stores.base.ListableAttackGraphStore``. A graph-DB
-backend goes behind the same Protocol later (instruction.md section 21).
+Also satisfies the optional ``Listable``/``Mutable`` Protocols.
 """
 
 from __future__ import annotations
@@ -17,9 +16,8 @@ class InMemoryAttackGraphStore:
     def __init__(self) -> None:
         self._nodes: dict[GraphNodeId, GraphNode] = {}
         self._edges: dict[GraphEdgeId, GraphEdge] = {}
-        # Adjacency index: neighbour lookup is per-node and happens on
-        # every planning turn, so scanning every edge each time is the
-        # one hot spot worth indexing.
+        # Neighbour lookup runs per node on every planning turn — the one
+        # hot spot worth indexing.
         self._out: dict[GraphNodeId, set[GraphEdgeId]] = {}
         self._in: dict[GraphNodeId, set[GraphEdgeId]] = {}
 
@@ -34,6 +32,26 @@ class InMemoryAttackGraphStore:
         self._edges[edge.id] = edge
         self._out.setdefault(edge.source_id, set()).add(edge.id)
         self._in.setdefault(edge.target_id, set()).add(edge.id)
+
+    async def remove_node(self, node_id: GraphNodeId) -> bool:
+        """Drop a node and every edge touching it."""
+        if node_id not in self._nodes:
+            return False
+        for edge_id in self._out.pop(node_id, set()) | self._in.pop(node_id, set()):
+            edge = self._edges.pop(edge_id, None)
+            if edge is not None:
+                self._out.get(edge.source_id, set()).discard(edge_id)
+                self._in.get(edge.target_id, set()).discard(edge_id)
+        del self._nodes[node_id]
+        return True
+
+    async def remove_edge(self, edge_id: GraphEdgeId) -> bool:
+        edge = self._edges.pop(edge_id, None)
+        if edge is None:
+            return False
+        self._out.get(edge.source_id, set()).discard(edge_id)
+        self._in.get(edge.target_id, set()).discard(edge_id)
+        return True
 
     async def get_node(self, node_id: GraphNodeId) -> GraphNode | None:
         return self._nodes.get(node_id)

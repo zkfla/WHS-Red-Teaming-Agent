@@ -1,26 +1,25 @@
-"""Shared Attack Graph. Owned by Agent Team.
+"""Shared Attack Graph — the Source of Truth for security domain state.
 
-The Source of Truth for security domain state: Host, Service, Endpoint,
-Principal, Credential, Asset, Resource, Hypothesis, Finding — and the
-relations between them. Runtime execution state (loop counters, node
-names, retry counts) belongs in ``orchestration.state.RuntimeState``,
-which references graph nodes by id and never copies them.
-
-Layout:
+Owned by Agent Team. Runtime execution state belongs in
+``orchestration.state.RuntimeState``, which references graph nodes by id.
 
 ```text
-identity.py     stable "<type>:<key>" node ids + path normalization
-predicates.py   how state is written into GraphNode.properties (+ secret guard)
-patterns.py     preconditions: "which nodes could this action run against?"
-observation.py  bounded summary handed to a planner
-integrity.py    "is this graph safe to report from?"
-snapshot.py     append-only JSONL export/import for replay
-view.py         read-only handle for components that must not write
-service.py      the single write path
-stores/         AttackGraphStore implementations (in-memory today)
+identity     stable "<type>:<key>" node ids
+predicates   GraphNode.properties layout, merge rules, secret guard
+patterns     preconditions / frontier
+traversal    reachability, paths, evidence chains
+retraction   which predicates went stale
+cleanup      resources this run must remove
+observation  bounded summary for a planner
+integrity    is this graph safe to report from
+snapshot     append-only JSONL export/import
+visualize    self-contained HTML/SVG render
+view         read-only handle
+service      the single write path
+stores/      AttackGraphStore implementations
 ```
 
-Docs: ``docs/agent/attack-graph.md``. Contract: ``redteam.core.contracts.graph``.
+Docs: ``docs/agent/attack-graph.md``.
 """
 
 from redteam.attack_graph.cleanup import CleanupItem, CleanupReport, CleanupStatus
@@ -51,7 +50,11 @@ from redteam.attack_graph.retraction import (
     RetractionRule,
     plan_retractions,
 )
-from redteam.attack_graph.service import AttackGraphService, UngroundedFindingError
+from redteam.attack_graph.service import (
+    AttackGraphService,
+    NodeTypeConflictError,
+    UngroundedFindingError,
+)
 from redteam.attack_graph.snapshot import SnapshotError, from_records, to_records
 from redteam.attack_graph.stores.memory import InMemoryAttackGraphStore
 from redteam.attack_graph.traversal import (
@@ -97,6 +100,7 @@ __all__ = [
     "Confidence",
     "SensitiveValueError",
     "UngroundedFindingError",
+    "NodeTypeConflictError",
     "SnapshotError",
     "to_records",
     "from_records",

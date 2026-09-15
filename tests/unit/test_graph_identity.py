@@ -107,9 +107,8 @@ def test_every_target_kind_resolves_to_a_node(target, expected_id, expected_type
 
 
 def test_target_for_node_produces_a_scope_checkable_target() -> None:
-    # A planner picks a node; the Control Plane checks a TargetRef. A
-    # GraphNodeTarget has no host-like identity, so scope would deny it
-    # for the wrong reason — host/service/endpoint targets must come back.
+    # A GraphNodeTarget has no host-like identity, so scope would deny it
+    # for the wrong reason.
     host = target_for_node(host_node_id("a.local"), GraphNodeType.HOST)
     assert isinstance(host, HostTarget)
     assert host.host == "a.local"

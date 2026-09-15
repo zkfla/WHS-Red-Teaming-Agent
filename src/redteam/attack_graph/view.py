@@ -1,7 +1,7 @@
 """Read-only handle onto the Attack Graph.
 
 Given to components that must not write; writes go through
-``AttackGraphService``. Rationale: ``docs/agent/attack-graph.md``.
+``AttackGraphService``.
 """
 
 from __future__ import annotations
@@ -12,6 +12,7 @@ from redteam.attack_graph.cleanup import CleanupReport, collect
 from redteam.attack_graph.identity import finding_node_id
 from redteam.attack_graph.integrity import IntegrityReport, check_integrity
 from redteam.attack_graph.observation import (
+    DEFAULT_MAX_ATTEMPTED,
     DEFAULT_MAX_PER_TYPE,
     DEFAULT_MAX_TOTAL,
     GraphObservation,
@@ -94,12 +95,14 @@ class AttackGraphView:
         step: int = 0,
         max_per_type: int = DEFAULT_MAX_PER_TYPE,
         max_total: int = DEFAULT_MAX_TOTAL,
+        max_attempted: int = DEFAULT_MAX_ATTEMPTED,
     ) -> GraphObservation:
         return build_observation(
             await self.list_nodes(),
             step=step,
             max_per_type=max_per_type,
             max_total=max_total,
+            max_attempted=max_attempted,
         )
 
     async def resolve(

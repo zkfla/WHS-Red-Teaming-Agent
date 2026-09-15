@@ -4,15 +4,10 @@ Exercises the Minimal Vertical Slice from instruction.md section 16
 using every real skeleton component except the LLM (FakeLLMClient) and
 the MCP server (ExampleMCPAdapter, simulated in-process).
 
-Two expectations changed with the real re-plan loop (rationale:
-docs/agent/orchestration.md):
-
-1. ``HypothesisCreated``/``AgentFinished`` are now emitted — both were
-   reserved in ``EventType`` and listed as Agent Team's planner work.
-2. Node ids follow ``<type>:<key>``, so the target is
-   ``host:example.local`` rather than ``example.local``.
-
-The assertions are stronger than before, not looser.
+Two expectations changed with the real re-plan loop (see
+docs/agent/orchestration.md): ``HypothesisCreated``/``AgentFinished`` are
+now emitted, and node ids follow ``<type>:<key>``. The assertions below are
+stronger than before, not looser.
 """
 
 from __future__ import annotations

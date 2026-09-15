@@ -1,14 +1,13 @@
 """The re-plan loop end to end: multi-turn, multi-agent, and replayable.
 
-Complements ``test_end_to_end.py`` (one happy-path turn, every real
-component) by exercising what the loop itself adds: iterating until the
-frontier is empty, handing over between agents, stopping for a named
-reason, never reaching the Capability Layer without an ALLOW, and being
-able to rewind to an earlier checkpoint.
+Complements ``test_end_to_end.py`` (one happy-path turn) with what the
+loop itself adds: iteration, agent hand-over, named stop conditions, the
+ALLOW gate, and checkpoint rewind.
 """
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 from typing import cast
 
@@ -17,6 +16,7 @@ import pytest
 from redteam.app.bootstrap import build_runtime_deps, run_engagement
 from redteam.attack_graph.predicates import attrs_of
 from redteam.attack_graph.service import AttackGraphService
+from redteam.attack_graph.stores.memory import InMemoryAttackGraphStore
 from redteam.core.contracts.engagement import (
     ApprovalPolicy,
     Engagement,
@@ -181,8 +181,7 @@ async def test_nothing_reaches_the_capability_layer_without_an_allow(verdict) ->
 
 
 async def test_a_denied_action_still_retires_the_agent_rather_than_spinning() -> None:
-    # The attempt is not recorded (nothing ran), so what ends the run is
-    # the agent having no further steps, not an infinite retry.
+    # What ends the run is the agent running out of steps, not a retry loop.
     deps = build_test_application(
         control_plane=FakeControlPlane(default_verdict=PolicyVerdict.DENY),
         settings=OrchestrationSettings(max_steps=8, checkpointing=False),
@@ -262,9 +261,8 @@ async def test_every_turn_is_checkpointed_and_can_be_replayed() -> None:
     earlier = next(s for s in reversed(history) if s.actions_executed == 1 and s.next_nodes)
     resumed = await runner.resume_from(earlier.checkpoint_id)
 
-    # Rewinding rewinds GraphState only: the Attack Graph kept the
-    # recorded attempts, so the replayed branch finds a smaller frontier
-    # rather than redoing work. Evidence is append-only by design.
+    # Rewinding rewinds GraphState only — the graph kept the attempts, so
+    # the replayed branch finds a smaller frontier. Evidence is append-only.
     assert resumed.phase is AgentPhase.FINISHED
     assert resumed.actions_executed >= earlier.actions_executed
 
@@ -329,3 +327,35 @@ async def test_stale_predicates_are_swept_as_the_loop_runs() -> None:
 
     applied = await service.sweep_stale_predicates(current_step=50)
     assert [item.attr for item in applied] == ["reachable"]
+
+
+class YieldingGraphStore(InMemoryAttackGraphStore):
+    """Awaits between read and write, the way a networked store would — the
+    plain in-memory store never yields, so a run against it hides races."""
+
+    async def get_node(self, node_id):
+        await asyncio.sleep(0)
+        return await super().get_node(node_id)
+
+    async def add_node(self, node) -> None:
+        await asyncio.sleep(0)
+        await super().add_node(node)
+
+
+async def test_a_full_run_is_correct_against_a_store_that_yields() -> None:
+    deps = build_test_application(
+        graph_store=YieldingGraphStore(),
+        settings=OrchestrationSettings(max_steps=20, checkpointing=False),
+    )
+    target = engagement(*[f"h{index}.local" for index in range(5)], max_actions=20)
+
+    final = await run_with(deps, target)
+    service = AttackGraphService(deps.graph_store)
+
+    assert final.actions_executed == 5
+    assert final.termination_reason == TerminationReason.NO_ACTIONABLE_PLAN
+    # Every host got probed exactly once and the graph stays reportable.
+    hosts = await service.query(node_type=GraphNodeType.HOST)
+    assert len(hosts) == 5
+    assert all(attrs_of(node.properties)["reachable"] is True for node in hosts)
+    assert (await service.integrity_report()).blocking == []

@@ -1,16 +1,7 @@
-"""Rendering the Attack Graph as a standalone HTML page.
+"""Rendering the graph as a standalone HTML page.
 
-Hand-rolled SVG with no plotting library and no CDN: the output is one
-self-contained file that opens offline, which is what a report artifact
-has to be. It is also the cheapest way to see that the graph is shaped
-the way you think it is.
-
-Layout is deterministic — nodes are laid out in columns by type, in the
-order an engagement discovers them (Host -> Service -> Endpoint -> ...
--> Hypothesis -> Finding) — so the same graph always renders the same
-way and two runs can be compared side by side.
-
-Owned by Agent Team. Rationale: ``docs/agent/attack-graph.md``.
+Hand-rolled SVG: no plotting library, no CDN, no script tag, so the output
+opens offline. Layout is deterministic, so two runs can be compared.
 """
 
 from __future__ import annotations

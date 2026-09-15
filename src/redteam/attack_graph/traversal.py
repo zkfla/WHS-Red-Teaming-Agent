@@ -1,14 +1,7 @@
-"""Walking the Attack Graph: reachability, paths, and evidence chains.
+"""Walking the graph: reachability, paths, and evidence chains.
 
-Pure functions over materialized node/edge lists, so the caller decides
-what slice to feed in and nothing here touches a store.
-
-``evidence_chain`` is the one a report needs: given a Finding, walk back
-to the Hypothesis it came from and the target it was about, so the claim
-can be read as "we observed X, hypothesised Y, did Z, and here is the
-evidence" rather than as an assertion with no history.
-
-Owned by Agent Team. Rationale: ``docs/agent/attack-graph.md``.
+``evidence_chain`` is the one a report needs — it walks a Finding back to
+the Hypothesis it came from and the target it was about.
 """
 
 from __future__ import annotations
@@ -193,6 +186,8 @@ class EvidenceChain(BaseModel):
     evidence_ids: list[str] = Field(default_factory=list)
     action_ids: list[str] = Field(default_factory=list)
     hypothesis_ids: list[str] = Field(default_factory=list)
+    #: The walk hit its depth limit, so this chain is incomplete.
+    truncated: bool = False
 
     @property
     def is_grounded(self) -> bool:
@@ -201,8 +196,9 @@ class EvidenceChain(BaseModel):
 
     def describe(self) -> str:
         path = "".join(link.describe() for link in self.links)
+        suffix = " …(truncated)" if self.truncated else ""
         return (
-            f"{self.finding_id} [{self.severity}] {path} "
+            f"{self.finding_id} [{self.severity}] {path}{suffix} "
             f"(evidence: {', '.join(self.evidence_ids) or 'none'})"
         )
 
@@ -217,14 +213,10 @@ def evidence_chain(
     *,
     nodes: list[GraphNode],
     edges: list[GraphEdge],
-    max_depth: int = 4,
+    max_depth: int = 8,
 ) -> EvidenceChain | None:
-    """Walk out from a Finding to what supports it.
-
-    Follows the edges VERIFY/PLAN actually write — ``SUPPORTED_BY`` to the
-    Hypothesis, ``TARGETS`` to what it was about — and collects the
-    correlation ids stored alongside them.
-    """
+    """Walk out from a Finding to what supports it, following the edges
+    VERIFY/PLAN write and collecting the correlation ids alongside."""
     by_id = _index(nodes)
     finding_node = by_id.get(finding_node_id)
     if finding_node is None or finding_node.type is not GraphNodeType.FINDING:
@@ -242,9 +234,15 @@ def evidence_chain(
     if action_id:
         chain.action_ids.append(str(action_id))
 
-    for node_id, edge, _depth in walk(
-        finding_node_id, edges=edges, direction="out", max_depth=max_depth
-    ):
+    visited = walk(finding_node_id, edges=edges, direction="out", max_depth=max_depth)
+    reached = {node_id for node_id, _, _ in visited}
+    # An edge leaving the deepest kept node means the walk was cut short.
+    deepest = {node_id for node_id, _, depth in visited if depth == max_depth}
+    chain.truncated = any(
+        edge.source_id in deepest and edge.target_id not in reached for edge in edges
+    )
+
+    for node_id, edge, _depth in visited:
         node = by_id.get(node_id)
         if node is None:
             continue

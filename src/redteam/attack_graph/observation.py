@@ -14,8 +14,12 @@ from redteam.core.ids import GraphNodeId
 
 ATTEMPTED_FACT_KEY = "attempted_operations"
 
+
 DEFAULT_MAX_PER_TYPE = 20
 DEFAULT_MAX_TOTAL = 80
+#: The attempt list needs a ceiling too, or a long run adds one prompt
+#: line per action forever.
+DEFAULT_MAX_ATTEMPTED = 40
 
 
 class GraphObservation(BaseModel):
@@ -23,7 +27,11 @@ class GraphObservation(BaseModel):
 
     step: int = 0
     node_counts: dict[str, int] = Field(default_factory=dict)
+    #: Display only. Never parse ids out of these — a key can contain the
+    #: flag separator (``?q=a+b``). Use :attr:`node_ids_by_type`.
     nodes_by_type: dict[str, list[str]] = Field(default_factory=dict)
+    #: Exact node ids, same order as ``nodes_by_type``.
+    node_ids_by_type: dict[str, list[str]] = Field(default_factory=dict)
     open_hypotheses: list[str] = Field(default_factory=list)
     findings: list[str] = Field(default_factory=list)
     attempted: list[str] = Field(default_factory=list)
@@ -35,9 +43,8 @@ class GraphObservation(BaseModel):
 
     def node_ids(self, node_type: GraphNodeType) -> list[GraphNodeId]:
         """Full ids for one type — the planner's handle back into the graph."""
-        keys = self.nodes_by_type.get(node_type.value, [])
         return [
-            GraphNodeId(f"{node_type.value}:{key.split('+', 1)[0]}") for key in keys
+            GraphNodeId(node_id) for node_id in self.node_ids_by_type.get(node_type.value, [])
         ]
 
     def has_attempted(self, operation_key: str) -> bool:
@@ -59,6 +66,7 @@ def build_observation(
     step: int = 0,
     max_per_type: int = DEFAULT_MAX_PER_TYPE,
     max_total: int = DEFAULT_MAX_TOTAL,
+    max_attempted: int = DEFAULT_MAX_ATTEMPTED,
 ) -> GraphObservation:
     """Compress ``nodes`` into a planner-sized summary, most recently
     observed first."""
@@ -67,21 +75,23 @@ def build_observation(
     )
 
     nodes_by_type: dict[str, list[str]] = {}
+    node_ids_by_type: dict[str, list[str]] = {}
     shown = 0
     truncated = False
     for node in ordered:
         type_name = node.type.value
         bucket = nodes_by_type.setdefault(type_name, [])
+        node_ids_by_type.setdefault(type_name, [])
         if shown >= max_total or len(bucket) >= max_per_type:
             truncated = True
             continue
         bucket.append(_node_label(node))
+        node_ids_by_type[type_name].append(str(node.id))
         shown += 1
 
     node_counts: dict[str, int] = {}
     open_hypotheses: list[str] = []
     findings: list[str] = []
-    attempted: list[str] = []
     for node in nodes:
         node_counts[node.type.value] = node_counts.get(node.type.value, 0) + 1
         facts = facts_of(node.properties)
@@ -97,17 +107,31 @@ def build_observation(
                 f"{facts.get('finding_id', node.id)} [{severity}/{verified}]"
             )
 
-        for entry in facts.get(ATTEMPTED_FACT_KEY, []) or []:
+    # Recency order, then capped: the oldest attempts are the least useful
+    # lines to spend prompt budget on.
+    attempted: list[str] = []
+    attempts_truncated = False
+    for node in ordered:
+        for entry in facts_of(node.properties).get(ATTEMPTED_FACT_KEY, []) or []:
             key = f"{entry}@{node.id}"
-            if key not in attempted:
-                attempted.append(key)
+            if key in attempted:
+                continue
+            if len(attempted) >= max_attempted:
+                attempts_truncated = True
+                break
+            attempted.append(key)
+        if attempts_truncated:
+            break
 
     return GraphObservation(
         step=step,
         node_counts=node_counts,
         nodes_by_type={name: labels for name, labels in nodes_by_type.items() if labels},
+        node_ids_by_type={
+            name: ids for name, ids in node_ids_by_type.items() if ids
+        },
         open_hypotheses=sorted(open_hypotheses),
         findings=sorted(findings),
         attempted=sorted(attempted),
-        truncated=truncated,
+        truncated=truncated or attempts_truncated,
     )

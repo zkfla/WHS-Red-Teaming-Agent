@@ -48,12 +48,14 @@ def from_records(
     nodes: list[GraphNode] = []
     edges: list[GraphEdge] = []
     metadata: dict[str, Any] = {}
+    seen_meta = False
 
     for record in records:
         collection = record.get(COLLECTION_KEY)
         body = {key: value for key, value in record.items() if key != COLLECTION_KEY}
 
         if collection == META_COLLECTION:
+            seen_meta = True
             version = body.pop("schema_version", None)
             if version not in SUPPORTED_SCHEMA_VERSIONS:
                 raise SnapshotError(
@@ -70,6 +72,14 @@ def from_records(
                 f"unknown collection {collection!r} — refusing to drop records this "
                 f"reader does not understand"
             )
+
+    # Without the header there is nothing to version-check against, so a
+    # snapshot written by a newer schema would load silently and wrongly.
+    if records and not seen_meta:
+        raise SnapshotError(
+            f"snapshot has no {META_COLLECTION!r} record, so its schema version cannot "
+            f"be checked"
+        )
 
     return nodes, edges, metadata
 

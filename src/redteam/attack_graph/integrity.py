@@ -1,8 +1,6 @@
 """Structural checks: is this graph safe to report from?
 
 Returns findings; the caller decides whether they block.
-
-Owned by Agent Team. Rationale: ``docs/agent/attack-graph.md``.
 """
 
 from __future__ import annotations
@@ -12,7 +10,7 @@ from pydantic import BaseModel, Field
 from redteam.attack_graph.cleanup import collect
 from redteam.attack_graph.identity import is_well_formed, split_node_id
 from redteam.attack_graph.predicates import Confidence, facts_of, provenance_of
-from redteam.core.contracts.graph import GraphEdge, GraphNode
+from redteam.core.contracts.graph import Finding, GraphEdge, GraphNode, Hypothesis
 from redteam.core.enums import GraphNodeType
 
 
@@ -26,6 +24,9 @@ class IntegrityReport(BaseModel):
     malformed_node_ids: list[str] = Field(default_factory=list)
     unresolved_hypotheses: list[str] = Field(default_factory=list)
     uncleaned_resources: list[str] = Field(default_factory=list)
+    #: Hypothesis/Finding nodes whose contents do not parse. Every listing
+    #: skips them, so an unreported one is a silently missing finding.
+    malformed_records: list[str] = Field(default_factory=list)
 
     @property
     def is_clean(self) -> bool:
@@ -38,6 +39,7 @@ class IntegrityReport(BaseModel):
                 self.malformed_node_ids,
                 self.unresolved_hypotheses,
                 self.uncleaned_resources,
+                self.malformed_records,
             ]
         )
 
@@ -48,9 +50,10 @@ class IntegrityReport(BaseModel):
             *(f"ungrounded finding: {item}" for item in self.ungrounded_findings),
             *(f"dangling edge: {item}" for item in self.dangling_edges),
             *(f"malformed node id: {item}" for item in self.malformed_node_ids),
-            # A run still holding a resource it created has changed the
-            # target system and not finished saying so.
+            # A run still holding what it created has changed the target
+            # system and not finished saying so.
             *(f"uncleaned resource: {item}" for item in self.uncleaned_resources),
+            *(f"unreadable record: {item}" for item in self.malformed_records),
         ]
 
     def describe(self) -> str:
@@ -88,6 +91,14 @@ def check_integrity(nodes: list[GraphNode], edges: list[GraphEdge]) -> Integrity
             report.weakly_grounded_nodes.append(node_id)
 
         facts = facts_of(node.properties)
+        if node.type in (GraphNodeType.HYPOTHESIS, GraphNodeType.FINDING):
+            model = Hypothesis if node.type is GraphNodeType.HYPOTHESIS else Finding
+            try:
+                model.model_validate(facts)
+            except Exception as exc:  # noqa: BLE001 - any parse failure counts
+                first = str(exc).splitlines()[0]
+                report.malformed_records.append(f"{node_id}: {first}")
+
         if node.type == GraphNodeType.FINDING and facts.get("verified") is True:
             if not facts.get("evidence_ids"):
                 report.ungrounded_findings.append(

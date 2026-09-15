@@ -1,15 +1,17 @@
 """The single write path into the Shared Attack Graph.
 
 Identity normalization, non-destructive merge and the secret guard are
-guaranteed to run here. Owned by Agent Team.
-Rationale: ``docs/agent/attack-graph.md``.
+guaranteed to run here. Docs: ``docs/agent/attack-graph.md``.
 """
 
 from __future__ import annotations
 
+import asyncio
+import logging
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
+from weakref import WeakKeyDictionary
 
 from redteam.attack_graph.cleanup import CleanupItem, CleanupReport, CleanupStatus, collect
 from redteam.attack_graph.identity import (
@@ -22,6 +24,7 @@ from redteam.attack_graph.identity import (
 from redteam.attack_graph.integrity import IntegrityReport
 from redteam.attack_graph.observation import (
     ATTEMPTED_FACT_KEY,
+    DEFAULT_MAX_ATTEMPTED,
     DEFAULT_MAX_PER_TYPE,
     DEFAULT_MAX_TOTAL,
     GraphObservation,
@@ -29,6 +32,7 @@ from redteam.attack_graph.observation import (
 from redteam.attack_graph.patterns import NodePattern, ResolveResult
 from redteam.attack_graph.predicates import (
     CLEANUP_KEY,
+    MAX_PROVENANCE_ENTRIES,
     RESERVED_KEYS,
     Provenance,
     apply_retraction,
@@ -39,7 +43,7 @@ from redteam.attack_graph.predicates import (
 )
 from redteam.attack_graph.retraction import PlannedRetraction, RetractionRule, plan_retractions
 from redteam.attack_graph.snapshot import from_records, to_records
-from redteam.attack_graph.stores.base import require_listable
+from redteam.attack_graph.stores.base import require_listable, require_mutable
 from redteam.attack_graph.traversal import (
     Direction,
     EvidenceChain,
@@ -57,6 +61,8 @@ from redteam.core.enums import GraphEdgeType, GraphNodeType
 from redteam.core.ids import GraphEdgeId, GraphNodeId
 from redteam.core.ports.attack_graph import AttackGraphStore
 
+logger = logging.getLogger(__name__)
+
 HYPOTHESIS_OPEN = "open"
 HYPOTHESIS_CONFIRMED = "confirmed"
 HYPOTHESIS_REJECTED = "rejected"
@@ -65,6 +71,28 @@ HYPOTHESIS_INCONCLUSIVE = "inconclusive"
 
 class UngroundedFindingError(ValueError):
     """Raised when a verified Finding is recorded without Evidence."""
+
+
+_Record = TypeVar("_Record", Hypothesis, Finding)
+
+
+def _read(model: type[_Record], node: GraphNode) -> _Record | None:
+    """Parse a Hypothesis/Finding off a node, or ``None`` if it will not.
+
+    One unreadable node must not take a whole listing down with it.
+    ``check_integrity`` reports them as blocking, so they are skipped but
+    never hidden.
+    """
+    try:
+        return model.model_validate(facts_of(node.properties))
+    except Exception as exc:  # noqa: BLE001 - any parse failure is the same problem
+        logger.warning("skipping unreadable %s node %s: %s", model.__name__, node.id, exc)
+        return None
+
+
+class NodeTypeConflictError(ValueError):
+    """Raised when an upsert would change an existing node's type. Silently
+    keeping the old one lets a caller believe a write landed when it did not."""
 
 
 def _edge_id(
@@ -78,12 +106,29 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-class AttackGraphService:
-    """Write path over an ``AttackGraphStore``.
+#: Every write is read-modify-write, so concurrent writers to one node lose
+#: each other's changes once the store actually awaits I/O. Striped so the
+#: table cannot grow with the graph; keyed on the *store* so the service
+#: instances sharing one still serialise.
+_LOCK_STRIPES = 64
+_STORE_LOCKS: WeakKeyDictionary[Any, list[asyncio.Lock]] = WeakKeyDictionary()
 
-    Node/edge operations need only the frozen ``core`` port; enumeration
-    additionally needs ``stores.base.ListableAttackGraphStore``.
-    """
+
+def _node_lock(store: Any, node_id: GraphNodeId) -> asyncio.Lock:
+    try:
+        stripes = _STORE_LOCKS[store]
+    except (KeyError, TypeError):
+        stripes = [asyncio.Lock() for _ in range(_LOCK_STRIPES)]
+        try:
+            _STORE_LOCKS[store] = stripes
+        except TypeError:  # store is not weak-referenceable
+            return stripes[hash(str(node_id)) % _LOCK_STRIPES]
+    return stripes[hash(str(node_id)) % _LOCK_STRIPES]
+
+
+class AttackGraphService:
+    """Write path over an ``AttackGraphStore``. Node/edge operations need
+    only the frozen ``core`` port; enumeration needs ``ListableAttackGraphStore``."""
 
     def __init__(self, store: AttackGraphStore) -> None:
         self._store = store
@@ -116,9 +161,13 @@ class AttackGraphService:
         step: int = 0,
         max_per_type: int = DEFAULT_MAX_PER_TYPE,
         max_total: int = DEFAULT_MAX_TOTAL,
+        max_attempted: int = DEFAULT_MAX_ATTEMPTED,
     ) -> GraphObservation:
         return await self._view.observe(
-            step=step, max_per_type=max_per_type, max_total=max_total
+            step=step,
+            max_per_type=max_per_type,
+            max_total=max_total,
+            max_attempted=max_attempted,
         )
 
     async def resolve(
@@ -152,7 +201,7 @@ class AttackGraphService:
         attrs: dict[str, Any] | None = None,
         facts: dict[str, Any] | None = None,
         provenance: Provenance | None = None,
-        step: int = 0,
+        step: int | None = 0,
     ) -> GraphNode:
         """Add or merge a node. Never destructive.
 
@@ -168,26 +217,40 @@ class AttackGraphService:
             properties, attrs=attrs, facts=facts, provenance=provenance, step=step
         )
 
-        existing = await self._store.get_node(node_id)
-        if existing is None:
-            node = GraphNode(
-                id=node_id,
-                type=node_type,
-                labels=sorted(set(labels or [])),
-                properties=incoming,
-                created_at=_now(),
-                updated_at=_now(),
-            )
-        else:
-            node = existing.model_copy(
-                update={
-                    "labels": sorted(set(existing.labels) | set(labels or [])),
-                    "properties": merge_properties(existing.properties, incoming),
-                    "updated_at": _now(),
-                }
-            )
-        await self._store.add_node(node)
-        return node
+        async with _node_lock(self._store, node_id):
+            existing = await self._store.get_node(node_id)
+            if existing is None:
+                node = GraphNode(
+                    id=node_id,
+                    type=node_type,
+                    labels=sorted(set(labels or [])),
+                    properties=incoming,
+                    created_at=_now(),
+                    updated_at=_now(),
+                )
+            else:
+                if existing.type is not node_type:
+                    raise NodeTypeConflictError(
+                        f"{node_id} is a {existing.type.value} node; refusing to upsert "
+                        f"it as {node_type.value}"
+                    )
+                merged_labels = sorted(set(existing.labels) | set(labels or []))
+                merged_properties = merge_properties(existing.properties, incoming)
+                # A write that changes nothing is not a write.
+                if (
+                    merged_labels == existing.labels
+                    and merged_properties == existing.properties
+                ):
+                    return existing
+                node = existing.model_copy(
+                    update={
+                        "labels": merged_labels,
+                        "properties": merged_properties,
+                        "updated_at": _now(),
+                    }
+                )
+            await self._store.add_node(node)
+            return node
 
     @staticmethod
     def _normalize_properties(
@@ -196,7 +259,7 @@ class AttackGraphService:
         attrs: dict[str, Any] | None,
         facts: dict[str, Any] | None,
         provenance: Provenance | None,
-        step: int,
+        step: int | None,
     ) -> dict[str, Any]:
         raw = dict(properties or {})
         structured = bool(raw) and bool(RESERVED_KEYS & raw.keys())
@@ -226,8 +289,18 @@ class AttackGraphService:
                 *built["provenance"],
             ]
             built["retractions"] = [*raw.get("retractions", []), *built["retractions"]]
-            built["first_seen_step"] = min(raw.get("first_seen_step", step), step)
-            built["last_seen_step"] = max(raw.get("last_seen_step", step), step)
+            recorded_first = raw.get("first_seen_step", 0)
+            recorded_last = raw.get("last_seen_step", 0)
+            if step is None:
+                # No step supplied (a snapshot re-import): the recorded
+                # history stands. Defaulting to 0 would rewrite it.
+                built["first_seen_step"] = recorded_first
+                built["last_seen_step"] = recorded_last
+            else:
+                built["first_seen_step"] = min(recorded_first, step)
+                built["last_seen_step"] = max(recorded_last, step)
+            if CLEANUP_KEY in raw and CLEANUP_KEY not in built:
+                built[CLEANUP_KEY] = raw[CLEANUP_KEY]
         return built
 
     async def observe_target(
@@ -255,16 +328,19 @@ class AttackGraphService:
         self, node_id: GraphNodeId, key: str, *, step: int, reason: str
     ) -> bool:
         """Withdraw a predicate that no longer holds, with a reason."""
-        node = await self._store.get_node(node_id)
-        if node is None:
-            return False
-        properties, changed = apply_retraction(node.properties, key, step=step, reason=reason)
-        if not changed:
-            return False
-        await self._store.add_node(
-            node.model_copy(update={"properties": properties, "updated_at": _now()})
-        )
-        return True
+        async with _node_lock(self._store, node_id):
+            node = await self._store.get_node(node_id)
+            if node is None:
+                return False
+            properties, changed = apply_retraction(
+                node.properties, key, step=step, reason=reason
+            )
+            if not changed:
+                return False
+            await self._store.add_node(
+                node.model_copy(update={"properties": properties, "updated_at": _now()})
+            )
+            return True
 
     async def record_attempt(
         self,
@@ -281,13 +357,13 @@ class AttackGraphService:
         node = await self._store.get_node(node_id)
         if node is None:
             return None
-        attempted = list(facts_of(node.properties).get(ATTEMPTED_FACT_KEY, []) or [])
-        if operation_key not in attempted:
-            attempted.append(operation_key)
+        attempted = facts_of(node.properties).get(ATTEMPTED_FACT_KEY) or []
+        if operation_key in attempted:
+            return node  # nothing to write; the merge is the expensive part
         return await self.upsert_node(
             node.type,
             node_id=node_id,
-            facts={ATTEMPTED_FACT_KEY: attempted},
+            facts={ATTEMPTED_FACT_KEY: [operation_key]},
             provenance=provenance,
             step=step,
         )
@@ -308,10 +384,17 @@ class AttackGraphService:
         existing = await self._store.get_edge(edge_id)
         edge_properties = {**(properties or {})}
         if provenance is not None:
-            edge_properties["provenance"] = [
+            # Same ceiling as nodes: re-linking every turn would otherwise
+            # grow one edge without bound.
+            recorded = [
                 *(existing.properties.get("provenance", []) if existing else []),
                 provenance.model_dump(mode="json"),
             ]
+            edge_properties["provenance"] = (
+                recorded
+                if len(recorded) <= MAX_PROVENANCE_ENTRIES
+                else [recorded[0], *recorded[-(MAX_PROVENANCE_ENTRIES - 1) :]]
+            )
 
         edge = GraphEdge(
             id=edge_id,
@@ -348,9 +431,7 @@ class AttackGraphService:
 
     async def get_hypothesis(self, hypothesis_id: str) -> Hypothesis | None:
         node = await self._store.get_node(hypothesis_node_id(hypothesis_id))
-        if node is None:
-            return None
-        return Hypothesis.model_validate(facts_of(node.properties))
+        return None if node is None else _read(Hypothesis, node)
 
     async def resolve_hypothesis(
         self,
@@ -381,7 +462,7 @@ class AttackGraphService:
 
     async def list_hypotheses(self, *, status: str | None = None) -> list[Hypothesis]:
         nodes = await self._store.query(node_type=GraphNodeType.HYPOTHESIS)
-        hypotheses = [Hypothesis.model_validate(facts_of(node.properties)) for node in nodes]
+        hypotheses = [h for h in (_read(Hypothesis, node) for node in nodes) if h is not None]
         if status is not None:
             hypotheses = [item for item in hypotheses if item.status == status]
         return sorted(hypotheses, key=lambda item: item.hypothesis_id)
@@ -424,13 +505,11 @@ class AttackGraphService:
 
     async def get_finding(self, finding_id: str) -> Finding | None:
         node = await self._store.get_node(finding_node_id(finding_id))
-        if node is None:
-            return None
-        return Finding.model_validate(facts_of(node.properties))
+        return None if node is None else _read(Finding, node)
 
     async def list_findings(self, *, verified: bool | None = None) -> list[Finding]:
         nodes = await self._store.query(node_type=GraphNodeType.FINDING)
-        findings = [Finding.model_validate(facts_of(node.properties)) for node in nodes]
+        findings = [f for f in (_read(Finding, node) for node in nodes) if f is not None]
         if verified is not None:
             findings = [item for item in findings if item.verified is verified]
         return sorted(findings, key=lambda item: item.finding_id)
@@ -481,11 +560,7 @@ class AttackGraphService:
         )
 
     async def evidence_chain(self, finding_id: str) -> EvidenceChain | None:
-        """How a Finding came to be — hypothesis, target, evidence ids.
-
-        This is what turns a finding from an assertion into something a
-        reviewer can retrace.
-        """
+        """How a Finding came to be — hypothesis, target, evidence ids."""
         return evidence_chain(
             finding_node_id(finding_id),
             nodes=await self.list_nodes(),
@@ -518,11 +593,23 @@ class AttackGraphService:
         action_id: str | None = None,
         step: int = 0,
         note: str = "",
+        reopen: bool = False,
     ) -> CleanupItem | None:
-        """Record that this run created something it must remove later."""
+        """Record that this run created something it must remove later.
+
+        A resource that was already cleaned is *not* put back to pending;
+        pass ``reopen=True`` when it genuinely was created again.
+        """
         node = await self._store.get_node(node_id)
         if node is None:
             return None
+
+        existing = cleanup_of(node.properties)
+        if existing is not None and not reopen:
+            current = CleanupItem.model_validate({"node_id": node_id, **existing})
+            if not current.is_outstanding:
+                return current
+
         item = CleanupItem(
             node_id=node_id,
             resource_type=resource_type,
@@ -537,11 +624,8 @@ class AttackGraphService:
     async def mark_cleaned(
         self, node_id: GraphNodeId, *, evidence_id: str, note: str = ""
     ) -> CleanupItem | None:
-        """Close out a resource. Evidence is required.
-
-        A claim that something was removed, with nothing behind it, is the
-        same problem as an ungrounded finding.
-        """
+        """Close out a resource. Evidence is required — an unbacked claim of
+        removal is the same problem as an ungrounded finding."""
         if not evidence_id:
             raise ValueError("marking a resource cleaned needs evidence that it happened")
         return await self._update_cleanup(
@@ -592,14 +676,17 @@ class AttackGraphService:
     async def _write_cleanup(self, node: GraphNode, item: CleanupItem) -> None:
         payload = item.model_dump(mode="json")
         payload.pop("node_id", None)
-        await self._store.add_node(
-            node.model_copy(
-                update={
-                    "properties": {**node.properties, CLEANUP_KEY: payload},
-                    "updated_at": _now(),
-                }
+        async with _node_lock(self._store, node.id):
+            # Re-read inside the lock: the node may have moved on.
+            current = await self._store.get_node(node.id) or node
+            await self._store.add_node(
+                current.model_copy(
+                    update={
+                        "properties": {**current.properties, CLEANUP_KEY: payload},
+                        "updated_at": _now(),
+                    }
+                )
             )
-        )
 
     # -- retraction sweep --------------------------------------------
 
@@ -610,13 +697,8 @@ class AttackGraphService:
         rules: list[RetractionRule] | None = None,
         dry_run: bool = False,
     ) -> list[PlannedRetraction]:
-        """Withdraw predicates whose observations went stale.
-
-        Call this once per turn. Without it predicates only accumulate and
-        the planner keeps proposing actions whose preconditions stopped
-        holding. ``dry_run`` reports what would be withdrawn without
-        writing.
-        """
+        """Withdraw predicates whose observations went stale. Call once per
+        turn; ``dry_run`` reports without writing."""
         planned = plan_retractions(
             await self.list_nodes(), current_step=current_step, rules=rules
         )
@@ -640,11 +722,8 @@ class AttackGraphService:
         around: GraphNodeId | None = None,
         radius: int = 2,
     ) -> Path:
-        """Write a self-contained HTML view of the graph.
-
-        ``around`` renders only one node's neighbourhood, which is what a
-        per-finding report wants.
-        """
+        """Write a self-contained HTML view. ``around`` renders one node's
+        neighbourhood, which is what a per-finding report wants."""
         if around is None:
             nodes, edges = await self.list_nodes(), await self.list_edges()
         else:
@@ -661,10 +740,37 @@ class AttackGraphService:
             await listable.list_nodes(), await listable.list_edges(), metadata=metadata
         )
 
-    async def import_snapshot(self, records: list[dict[str, Any]]) -> dict[str, Any]:
+    async def import_snapshot(
+        self, records: list[dict[str, Any]], *, merge: bool = False
+    ) -> dict[str, Any]:
+        """Load a snapshot back into the store.
+
+        Replaces same-id nodes by default (a restore should reproduce the
+        snapshot exactly); ``merge=True`` folds it into what is already
+        there, for combining two runs.
+        """
         nodes, edges, metadata = from_records(records)
         for node in nodes:
-            await self._store.add_node(node)
+            if merge:
+                await self.upsert_node(
+                    node.type,
+                    node.properties,
+                    node_id=node.id,
+                    labels=list(node.labels),
+                    step=None,
+                )
+            else:
+                await self._store.add_node(node)
         for edge in edges:
             await self._store.add_edge(edge)
         return metadata
+
+    # -- removal -----------------------------------------------------
+
+    async def remove_node(self, node_id: GraphNodeId) -> bool:
+        """Drop a node and its edges — for correcting a mistaken write only.
+        "No longer true" is :meth:`retract`, which keeps the history."""
+        return await require_mutable(self._store, "remove_node").remove_node(node_id)
+
+    async def remove_edge(self, edge_id: GraphEdgeId) -> bool:
+        return await require_mutable(self._store, "remove_edge").remove_edge(edge_id)

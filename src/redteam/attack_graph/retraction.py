@@ -1,18 +1,8 @@
-"""Deciding which predicates no longer hold.
+"""Which predicates went stale and should be withdrawn.
 
-``predicates.apply_retraction`` can withdraw a predicate, but something
-has to notice that it should be withdrawn. That is this module: rules say
-"``reachable`` on a Host is only good for N steps", and ``plan_retractions``
-turns the current graph into the list of withdrawals that are due.
-
-Why it matters: predicates only ever accumulate otherwise, so the planner
-keeps proposing actions whose preconditions stopped being true and burns
-the budget failing.
-
-Nothing here writes — the caller applies the plan, which keeps the rules
-testable without a store and makes the decision visible before it lands.
-
-Owned by Agent Team. Rationale: ``docs/agent/attack-graph.md``.
+Rules in, planned withdrawals out — nothing here writes, so the decision
+is visible before it lands. Without it predicates only accumulate and the
+planner keeps proposing actions whose preconditions stopped holding.
 """
 
 from __future__ import annotations
@@ -51,9 +41,8 @@ class PlannedRetraction(BaseModel):
     reason: str
 
 
-#: Conservative defaults: only predicates that describe a live property of
-#: the target, and only after enough turns that a re-probe is cheap
-#: relative to acting on a stale belief.
+#: Conservative: only live properties of the target, and only once a
+#: re-probe is cheaper than acting on a stale belief.
 DEFAULT_RETRACTION_RULES: tuple[RetractionRule, ...] = (
     RetractionRule(
         attr="reachable",
