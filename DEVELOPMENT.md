@@ -69,7 +69,8 @@ cd deploy/compose
 docker compose up mcp-example
 ```
 
-Currently a placeholder — `ExampleMCPAdapter` simulates the call
-in-process rather than actually talking to this container. See
-`deploy/mcp/README.md` for the container naming/health-check
-conventions to follow when adding a real MCP server.
+The container exposes a harmless `ping` tool at
+`http://localhost:8765/mcp` over MCP Streamable HTTP. The default
+vertical slice still uses `ExampleMCPAdapter` in-process; use
+`WebAPIMCPAdapter` or `ReconMCPAdapter` to exercise the real endpoint.
+See `deploy/mcp/README.md` for registration and deployment conventions.

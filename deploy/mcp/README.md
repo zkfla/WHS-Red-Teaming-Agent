@@ -3,10 +3,10 @@
 Owned by Capability Team.
 
 This stage ships exactly one MCP server: `example-mcp`, a harmless
-dummy used to validate the end-to-end flow (see
-`redteam.capability.adapters.mcp.example.ExampleMCPAdapter`, which
-currently runs in-process and does not actually call this container —
-wire it up for real once the container's transport is decided).
+server used to validate discovery and invocation over MCP Streamable
+HTTP. It exposes a single `ping` tool at `http://localhost:8765/mcp`.
+`ExampleMCPAdapter` remains an in-process test double; real endpoints
+use `WebAPIMCPAdapter` or `ReconMCPAdapter`.
 
 ## Naming conventions
 
@@ -18,18 +18,31 @@ wire it up for real once the container's transport is decided).
 
 ## Health check
 
-Each MCP server container must expose a way for
-`MCPAdapter.health_check()` to determine `ToolHealthStatus` — an HTTP
-health endpoint is the default assumption in
-`deploy/compose/docker-compose.yml`. Adjust per server as needed.
+Each MCP Adapter performs a protocol-level connection health check.
+The Compose healthcheck separately verifies that the container is
+listening so Docker can manage its lifecycle without embedding a
+second application-specific health API.
+
+## Tool identity and registration
+
+Remote tools are exposed as deterministic framework IDs:
+
+```text
+<capability-namespace>.<normalized-remote-tool-name>
+```
+
+Examples: `web.send_http_request`, `recon.probe_http`. Adapter discovery
+returns a complete server snapshot and `MCPToolRegistry.replace_server_tools`
+atomically replaces only that server's tools. A conflicting `ToolId`
+owned by another server is rejected instead of silently overwritten.
 
 ## Adding a new MCP server
 
 1. Add the server's image/build to `deploy/compose/docker-compose.yml`
    (see the `mcp-example` service for the shape).
-2. Implement an `MCPAdapter` for it under
-   `src/redteam/capability/adapters/mcp/`.
-3. Register its `ToolDescriptor`s via `MCPToolRegistry` in
+2. Configure a `WebAPIMCPAdapter`, `ReconMCPAdapter`, or implement an
+   `MCPAdapter` under `src/redteam/capability/adapters/mcp/`.
+3. Discover and register its `ToolDescriptor`s via `MCPToolRegistry` in
    `redteam.app.bootstrap.build_runtime_deps`.
 4. No other code should need to change — that's the point of the
    Adapter pattern (instruction.md section 11).

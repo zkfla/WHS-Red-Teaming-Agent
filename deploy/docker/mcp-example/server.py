@@ -1,29 +1,26 @@
-"""Placeholder entry point for a real example MCP server.
+"""Harmless MCP server used to verify the real Streamable HTTP path."""
 
-TODO(capability-team): implement a minimal MCP server here (stdio or
-HTTP transport) exposing one harmless "ping" tool, matching the
-descriptor currently hardcoded in
-``redteam.capability.adapters.mcp.example.ExampleMCPAdapter``. Until
-this exists, that adapter simulates the call in-process so the rest of
-the framework can be exercised without it.
-"""
-
-import http.server
-import json
 import os
 
+from mcp.server import MCPServer
 
-class Handler(http.server.BaseHTTPRequestHandler):
-    def do_GET(self) -> None:
-        if self.path == "/health":
-            self.send_response(200)
-            self.end_headers()
-            self.wfile.write(json.dumps({"status": "healthy"}).encode())
-            return
-        self.send_response(404)
-        self.end_headers()
+mcp = MCPServer("redteam-example")
+
+
+@mcp.tool()
+def ping(message: str = "ping") -> dict[str, str]:
+    """Echo a harmless message for local Capability integration tests."""
+
+    return {"message": message, "status": "ok"}
+
 
 
 if __name__ == "__main__":
     port = int(os.environ.get("MCP_EXAMPLE_PORT", "8765"))
-    http.server.HTTPServer(("0.0.0.0", port), Handler).serve_forever()
+    mcp.run(
+        transport="streamable-http",
+        host="0.0.0.0",
+        port=port,
+        stateless_http=True,
+        json_response=True,
+    )

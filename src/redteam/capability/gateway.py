@@ -4,21 +4,18 @@ Routes an already-approved ``ToolInvocation`` to the ``MCPAdapter`` that
 owns the target tool's ``server_id``. This is the only class in the
 codebase allowed to call an ``MCPAdapter`` directly.
 
-TODO(capability-team): per-tool timeout enforcement, retries, circuit
-breaking on repeated adapter failures.
+Retries remain deliberately disabled because a generic gateway cannot
+assume that a tool invocation is idempotent.
 """
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 
 from redteam.capability.adapters.mcp.base import MCPAdapter
 from redteam.capability.registry import MCPToolRegistry
 from redteam.core.contracts.tool import ToolError, ToolInvocation, ToolResult
-
-
-class UnknownToolError(Exception):
-    pass
 
 
 class MCPToolGateway:
@@ -56,11 +53,62 @@ class MCPToolGateway:
                 finished_at=datetime.now(timezone.utc),
             )
 
-        result = await adapter.invoke(descriptor, invocation.arguments)
-        return result.model_copy(
-            update={
-                "invocation_id": invocation.invocation_id,
-                "action_id": invocation.action_id,
-                "tool_id": invocation.tool_id,
-            }
+        if invocation.operation != descriptor.tool_name:
+            return self._error_result(
+                invocation,
+                code="operation_mismatch",
+                message=(
+                    f"operation {invocation.operation!r} does not match registered "
+                    f"tool name {descriptor.tool_name!r}"
+                ),
+            )
+
+        try:
+            adapter_result = await asyncio.wait_for(
+                adapter.invoke(descriptor, invocation.arguments),
+                timeout=invocation.timeout_seconds,
+            )
+        except asyncio.TimeoutError:
+            return self._error_result(
+                invocation,
+                code="tool_timeout",
+                message=f"tool exceeded timeout of {invocation.timeout_seconds} seconds",
+                retryable=True,
+            )
+        except Exception as exc:
+            return self._error_result(
+                invocation,
+                code="adapter_error",
+                message=f"adapter execution failed: {type(exc).__name__}",
+            )
+
+        return ToolResult(
+            invocation_id=invocation.invocation_id,
+            action_id=invocation.action_id,
+            tool_id=invocation.tool_id,
+            success=adapter_result.success,
+            output=adapter_result.output,
+            error=adapter_result.error,
+            started_at=adapter_result.started_at,
+            finished_at=adapter_result.finished_at,
+            metadata=adapter_result.metadata,
+        )
+
+    @staticmethod
+    def _error_result(
+        invocation: ToolInvocation,
+        *,
+        code: str,
+        message: str,
+        retryable: bool = False,
+    ) -> ToolResult:
+        occurred_at = datetime.now(timezone.utc)
+        return ToolResult(
+            invocation_id=invocation.invocation_id,
+            action_id=invocation.action_id,
+            tool_id=invocation.tool_id,
+            success=False,
+            error=ToolError(code=code, message=message, retryable=retryable),
+            started_at=occurred_at,
+            finished_at=occurred_at,
         )

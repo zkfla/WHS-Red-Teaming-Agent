@@ -2,14 +2,70 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
+from typing import Any
 
+import pytest
+
+from redteam.capability.adapters.mcp.base import MCPCallResult
 from redteam.capability.adapters.mcp.example import ExampleMCPAdapter
+from redteam.capability.adapters.mcp.naming import build_mcp_tool_id
+from redteam.capability.adapters.mcp.recon import ReconMCPAdapter
+from redteam.capability.adapters.mcp.transport import RemoteCallResult, RemoteTool
+from redteam.capability.adapters.mcp.web_api import WebAPIMCPAdapter
 from redteam.capability.gateway import MCPToolGateway
-from redteam.capability.registry import MCPToolRegistry
-from redteam.core.contracts.tool import ExecutionContext, ToolInvocation
+from redteam.capability.registry import MCPToolRegistry, ToolRegistrationConflictError
+from redteam.core.contracts.tool import ExecutionContext, ToolDescriptor, ToolInvocation
 from redteam.core.enums import ToolHealthStatus
 from redteam.core.ids import ActionId, EngagementId, InvocationId, RunId, ToolId
+
+
+class FakeTransport:
+    def __init__(
+        self,
+        *,
+        tools: list[RemoteTool] | None = None,
+        result: RemoteCallResult | None = None,
+        healthy: bool = True,
+    ) -> None:
+        self.tools = tools or []
+        self.result = result or RemoteCallResult(is_error=False, output={"ok": True})
+        self.healthy = healthy
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+
+    async def list_tools(self) -> list[RemoteTool]:
+        return self.tools
+
+    async def call_tool(
+        self, tool_name: str, arguments: dict[str, Any]
+    ) -> RemoteCallResult:
+        self.calls.append((tool_name, arguments))
+        return self.result
+
+    async def health_check(self) -> bool:
+        return self.healthy
+
+
+def _invocation(
+    *,
+    tool_id: ToolId | None = None,
+    operation: str = "ping",
+    timeout_seconds: float = 30.0,
+) -> ToolInvocation:
+    return ToolInvocation(
+        invocation_id=InvocationId("inv_1"),
+        action_id=ActionId("action_1"),
+        run_id=RunId("run_1"),
+        tool_id=tool_id or ToolId("example.ping"),
+        operation=operation,
+        arguments={"message": "hi"},
+        timeout_seconds=timeout_seconds,
+        execution_context=ExecutionContext(
+            engagement_id=EngagementId("eng_1"), run_id=RunId("run_1")
+        ),
+        created_at=datetime.now(timezone.utc),
+    )
 
 
 async def test_example_adapter_discovers_and_invokes() -> None:
@@ -34,18 +90,7 @@ async def test_gateway_routes_invocation_to_registered_adapter() -> None:
     gateway = MCPToolGateway(registry, {adapter.server_id: adapter})
 
     tool_id = registry.all()[0].tool_id
-    invocation = ToolInvocation(
-        invocation_id=InvocationId("inv_1"),
-        action_id=ActionId("action_1"),
-        run_id=RunId("run_1"),
-        tool_id=tool_id,
-        operation="ping",
-        arguments={"message": "hi"},
-        execution_context=ExecutionContext(
-            engagement_id=EngagementId("eng_1"), run_id=RunId("run_1")
-        ),
-        created_at=datetime.now(timezone.utc),
-    )
+    invocation = _invocation(tool_id=tool_id)
 
     result = await gateway.invoke(invocation)
     assert result.success is True
@@ -55,20 +100,157 @@ async def test_gateway_routes_invocation_to_registered_adapter() -> None:
 
 async def test_gateway_returns_error_for_unknown_tool() -> None:
     gateway = MCPToolGateway(MCPToolRegistry(), {})
-    invocation = ToolInvocation(
-        invocation_id=InvocationId("inv_1"),
-        action_id=ActionId("action_1"),
-        run_id=RunId("run_1"),
-        tool_id=ToolId("does.not.exist"),
-        operation="ping",
-        execution_context=ExecutionContext(
-            engagement_id=EngagementId("eng_1"), run_id=RunId("run_1")
-        ),
-        created_at=datetime.now(timezone.utc),
-    )
+    invocation = _invocation(tool_id=ToolId("does.not.exist"))
 
     result = await gateway.invoke(invocation)
     assert result.success is False
     assert result.action_id == ActionId("action_1")
     assert result.error is not None
     assert result.error.code == "unknown_tool"
+
+
+async def test_web_api_adapter_discovers_and_invokes_independently() -> None:
+    transport = FakeTransport(
+        tools=[
+            RemoteTool(
+                name="Send HTTP Request",
+                description="Send an authorized HTTP request",
+                input_schema={"type": "object"},
+            )
+        ],
+        result=RemoteCallResult(is_error=False, output={"status_code": 200}),
+    )
+    adapter = WebAPIMCPAdapter(
+        server_id="web-server",
+        endpoint="http://mcp.local/mcp",
+        transport=transport,
+    )
+
+    tools = await adapter.discover_tools()
+    assert tools[0].tool_id == ToolId("web.send_http_request")
+    assert tools[0].capability_tags == ["web", "api"]
+    assert tools[0].health_status == ToolHealthStatus.HEALTHY
+
+    result = await adapter.invoke(tools[0], {"url": "http://target.local"})
+    assert result.success is True
+    assert result.output == {"status_code": 200}
+    assert transport.calls == [("Send HTTP Request", {"url": "http://target.local"})]
+
+
+async def test_recon_adapter_has_separate_namespace() -> None:
+    transport = FakeTransport(
+        tools=[RemoteTool(name="Probe HTTP", description="", input_schema={})]
+    )
+    adapter = ReconMCPAdapter(
+        server_id="recon-server",
+        endpoint="http://mcp.local/mcp",
+        transport=transport,
+    )
+
+    tools = await adapter.discover_tools()
+    assert tools[0].tool_id == ToolId("recon.probe_http")
+    assert tools[0].capability_tags == ["recon"]
+
+
+async def test_adapter_normalizes_remote_tool_error() -> None:
+    transport = FakeTransport(
+        tools=[RemoteTool(name="request", description="", input_schema={})],
+        result=RemoteCallResult(is_error=True, output="request rejected"),
+    )
+    adapter = WebAPIMCPAdapter(
+        server_id="web-server",
+        endpoint="http://mcp.local/mcp",
+        transport=transport,
+    )
+    tool = (await adapter.discover_tools())[0]
+
+    result = await adapter.invoke(tool, {})
+    assert result.success is False
+    assert result.error is not None
+    assert result.error.code == "mcp_tool_error"
+    assert result.error.message == "request rejected"
+
+
+def test_tool_id_naming_is_deterministic() -> None:
+    assert build_mcp_tool_id("Web API", "Send  HTTP/Request") == ToolId(
+        "web_api.send_http_request"
+    )
+
+
+def test_registry_rejects_conflicting_tool_ids() -> None:
+    registry = MCPToolRegistry()
+    first = ToolDescriptor(
+        tool_id=ToolId("web.request"),
+        server_id="web-a",
+        tool_name="request",
+    )
+    registry.register(first)
+
+    with pytest.raises(ToolRegistrationConflictError):
+        registry.register(first.model_copy(update={"server_id": "web-b"}))
+
+
+def test_registry_replaces_one_servers_discovery_snapshot_atomically() -> None:
+    registry = MCPToolRegistry()
+    registry.register(
+        ToolDescriptor(
+            tool_id=ToolId("recon.probe"),
+            server_id="recon-server",
+            tool_name="probe",
+        )
+    )
+    registry.register(
+        ToolDescriptor(
+            tool_id=ToolId("web.old"),
+            server_id="web-server",
+            tool_name="old",
+        )
+    )
+    replacement = ToolDescriptor(
+        tool_id=ToolId("web.request"),
+        server_id="web-server",
+        tool_name="request",
+    )
+
+    registry.replace_server_tools("web-server", [replacement])
+
+    assert [tool.tool_id for tool in registry.all()] == [
+        ToolId("recon.probe"),
+        ToolId("web.request"),
+    ]
+    assert registry.get(ToolId("web.old")) is None
+
+
+async def test_gateway_rejects_operation_mismatch() -> None:
+    adapter = ExampleMCPAdapter()
+    registry = MCPToolRegistry()
+    registry.register((await adapter.discover_tools())[0])
+    gateway = MCPToolGateway(registry, {adapter.server_id: adapter})
+
+    result = await gateway.invoke(_invocation(operation="not-ping"))
+
+    assert result.success is False
+    assert result.error is not None
+    assert result.error.code == "operation_mismatch"
+
+
+class SlowAdapter(ExampleMCPAdapter):
+    async def invoke(
+        self, tool: ToolDescriptor, arguments: dict[str, Any]
+    ) -> MCPCallResult:
+        await asyncio.sleep(1)
+        return await super().invoke(tool, arguments)
+
+
+async def test_gateway_enforces_invocation_timeout() -> None:
+    adapter = SlowAdapter()
+    registry = MCPToolRegistry()
+    registry.register((await adapter.discover_tools())[0])
+    gateway = MCPToolGateway(registry, {adapter.server_id: adapter})
+
+    result = await gateway.invoke(_invocation(timeout_seconds=0.001))
+
+    assert result.success is False
+    assert result.error is not None
+    assert result.error.code == "tool_timeout"
+    assert result.error.retryable is True
