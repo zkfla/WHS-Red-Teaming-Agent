@@ -69,7 +69,15 @@ cd deploy/compose
 docker compose up mcp-example
 ```
 
-Currently a placeholder — `ExampleMCPAdapter` simulates the call
-in-process rather than actually talking to this container. See
-`deploy/mcp/README.md` for the container naming/health-check
-conventions to follow when adding a real MCP server.
+The container exposes a harmless `ping` tool at
+`http://localhost:8765/mcp` over MCP Streamable HTTP. The default
+vertical slice still uses `ExampleMCPAdapter` in-process; use
+one of the Web/API, Mobile, Recon, or Analysis adapters to exercise a real
+server.
+See `deploy/mcp/README.md` for registration and deployment conventions.
+
+Configured server IDs in `AppConfig.capability.mcp_servers` are resolved
+from `REDTEAM_MCP_<SERVER_ID>_KIND`, `_TRANSPORT`, and the corresponding
+HTTP `_ENDPOINT` or stdio `_COMMAND`. Bootstrap fails fast when a configured
+server is missing settings, is unreachable, or discovers no tools. Empty
+configuration continues to use the deterministic in-process example.

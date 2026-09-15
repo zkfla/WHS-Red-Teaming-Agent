@@ -173,12 +173,18 @@ Approval) intact; see `src/redteam/control/service.py`.
 
 ## How to Add an MCP Server
 
-1. Implement `MCPAdapter` (`src/redteam/capability/adapters/mcp/base.py`)
-   for it under `src/redteam/capability/adapters/mcp/`.
+1. Choose `WebAPIMCPAdapter`, `MobileMCPAdapter`, `ReconMCPAdapter`, or
+   `AnalysisMCPAdapter`. All four support Streamable HTTP and local stdio;
+   implement `MCPAdapter`
+   (`src/redteam/capability/adapters/mcp/base.py`) for a server needing
+   custom normalization.
 2. Add its container to `deploy/compose/docker-compose.yml` following
    the `mcp-example` naming/health-check pattern (see `deploy/mcp/README.md`).
-3. Register its `ToolDescriptor`s and the adapter instance in
-   `redteam.app.bootstrap.build_runtime_deps`.
+3. Call `discover_tools()`, atomically register the returned snapshot
+   with `MCPToolRegistry.replace_server_tools`. For application startup,
+   add the server ID to `CapabilityConfig.mcp_servers` and configure the
+   the transport-specific `REDTEAM_MCP_<SERVER_ID>_*` variables documented in
+   `deploy/mcp/README.md`.
 
 No other code changes — that's the point of the Adapter pattern.
 

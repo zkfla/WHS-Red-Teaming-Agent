@@ -12,10 +12,12 @@ MCP servers once selected (see docs/adr/0003-mcp-capability.md).
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from typing import Any
 
-from redteam.core.contracts.tool import ToolDescriptor, ToolResult
+from redteam.capability.adapters.mcp.base import MCPCallResult
+from redteam.core.contracts.tool import ToolDescriptor
 from redteam.core.enums import RiskLevel, ToolHealthStatus
-from redteam.core.ids import ActionId, InvocationId, ToolId
+from redteam.core.ids import ToolId
 
 EXAMPLE_TOOL_ID = ToolId("example.ping")
 
@@ -43,12 +45,11 @@ class ExampleMCPAdapter:
             )
         ]
 
-    async def invoke(self, tool: ToolDescriptor, arguments: dict) -> ToolResult:
+    async def invoke(
+        self, tool: ToolDescriptor, arguments: dict[str, Any]
+    ) -> MCPCallResult:
         started_at = datetime.now(timezone.utc)
-        return ToolResult(
-            invocation_id=InvocationId(""),  # overwritten by MCPToolGateway
-            action_id=ActionId(""),  # overwritten by MCPToolGateway
-            tool_id=tool.tool_id,
+        return MCPCallResult(
             success=True,
             output={"echo": arguments, "server_id": self.server_id},
             error=None,
