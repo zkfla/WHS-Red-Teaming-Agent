@@ -48,8 +48,9 @@ REDTEAM_MCP_<SERVER_ID>_RISK_LEVEL=low|medium|high|critical
 REDTEAM_MCP_<SERVER_ID>_TOKEN_ENV_VAR=NAME_OF_SECRET_VARIABLE  # optional
 ```
 
-Hyphens in a server ID become underscores in the environment prefix;
-`web-example` maps to `REDTEAM_MCP_WEB_EXAMPLE_*`. Plain HTTP is accepted
+Server IDs use lowercase kebab-case, and hyphens become underscores in
+the environment prefix; `web-example` maps to
+`REDTEAM_MCP_WEB_EXAMPLE_*`. Plain HTTP is accepted
 for local hosts only. An authorized non-local lab must explicitly set
 `REDTEAM_MCP_<SERVER_ID>_ALLOW_INSECURE_HTTP=true`.
 

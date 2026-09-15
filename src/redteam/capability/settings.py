@@ -9,13 +9,14 @@ from __future__ import annotations
 
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from urllib.parse import urlparse
 
 from redteam.core.enums import RiskLevel
 
-_SAFE_SERVER_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
+_SAFE_SERVER_ID = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+_SAFE_ENVIRONMENT_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _LOCAL_HOSTS = {"127.0.0.1", "::1", "localhost", "host.docker.internal"}
 
 
@@ -34,7 +35,7 @@ class MCPServerSettings:
     kind: MCPServerKind
     endpoint: str
     risk_level: RiskLevel = RiskLevel.LOW
-    bearer_token: str | None = None
+    bearer_token: str | None = field(default=None, repr=False)
 
     @classmethod
     def from_environment(cls, server_id: str) -> MCPServerSettings:
@@ -45,6 +46,10 @@ class MCPServerSettings:
         token_env_var = os.environ.get(f"{prefix}_TOKEN_ENV_VAR")
         token = None
         if token_env_var:
+            if not _SAFE_ENVIRONMENT_NAME.fullmatch(token_env_var):
+                raise MCPConfigurationError(
+                    f"{prefix}_TOKEN_ENV_VAR is not a valid environment variable name"
+                )
             token = os.environ.get(token_env_var)
             if not token:
                 raise MCPConfigurationError(
@@ -81,7 +86,7 @@ class MCPServerSettings:
 def environment_prefix(server_id: str) -> str:
     if not _SAFE_SERVER_ID.fullmatch(server_id):
         raise MCPConfigurationError(
-            "MCP server IDs must contain only letters, digits, underscores, and hyphens"
+            "MCP server IDs must use lowercase kebab-case"
         )
     return f"REDTEAM_MCP_{server_id.upper().replace('-', '_')}"
 
@@ -97,6 +102,10 @@ def _validate_endpoint(endpoint: str, prefix: str) -> None:
     parsed = urlparse(endpoint)
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
         raise MCPConfigurationError(f"{prefix}_ENDPOINT must be an absolute http(s) URL")
+    if parsed.username is not None or parsed.password is not None:
+        raise MCPConfigurationError(
+            f"{prefix}_ENDPOINT must not contain credentials; use TOKEN_ENV_VAR"
+        )
     allow_insecure = os.environ.get(f"{prefix}_ALLOW_INSECURE_HTTP", "false").lower()
     if parsed.scheme == "http" and parsed.hostname not in _LOCAL_HOSTS and allow_insecure != "true":
         raise MCPConfigurationError(

@@ -32,6 +32,7 @@ def test_server_settings_load_endpoint_kind_risk_and_secret_by_indirection(
     assert settings.kind == MCPServerKind.WEB_API
     assert settings.risk_level == RiskLevel.MEDIUM
     assert settings.request_headers() == {"Authorization": "Bearer secret-value"}
+    assert "secret-value" not in repr(settings)
 
 
 def test_remote_plain_http_requires_explicit_lab_opt_in(
@@ -50,6 +51,16 @@ def test_remote_plain_http_requires_explicit_lab_opt_in(
 def test_invalid_server_id_cannot_be_mapped_to_environment() -> None:
     with pytest.raises(MCPConfigurationError):
         environment_prefix("../../secret")
+
+
+def test_endpoint_credentials_are_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(
+        "REDTEAM_MCP_WEB_ENDPOINT", "https://username:password@mcp.example/mcp"
+    )
+    monkeypatch.setenv("REDTEAM_MCP_WEB_KIND", "web_api")
+
+    with pytest.raises(MCPConfigurationError, match="must not contain credentials"):
+        MCPServerSettings.from_environment("web")
 
 
 async def test_empty_server_config_preserves_example_gateway() -> None:
