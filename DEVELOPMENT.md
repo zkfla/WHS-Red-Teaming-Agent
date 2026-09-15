@@ -74,3 +74,9 @@ The container exposes a harmless `ping` tool at
 vertical slice still uses `ExampleMCPAdapter` in-process; use
 `WebAPIMCPAdapter` or `ReconMCPAdapter` to exercise the real endpoint.
 See `deploy/mcp/README.md` for registration and deployment conventions.
+
+Configured server IDs in `AppConfig.capability.mcp_servers` are resolved
+from `REDTEAM_MCP_<SERVER_ID>_KIND` and
+`REDTEAM_MCP_<SERVER_ID>_ENDPOINT`. Bootstrap fails fast when a configured
+server is missing settings, is unreachable, or discovers no tools. Empty
+configuration continues to use the deterministic in-process example.

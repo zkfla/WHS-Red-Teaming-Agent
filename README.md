@@ -180,8 +180,10 @@ Approval) intact; see `src/redteam/control/service.py`.
 2. Add its container to `deploy/compose/docker-compose.yml` following
    the `mcp-example` naming/health-check pattern (see `deploy/mcp/README.md`).
 3. Call `discover_tools()`, atomically register the returned snapshot
-   with `MCPToolRegistry.replace_server_tools`, and wire the adapter in
-   `redteam.app.bootstrap.build_runtime_deps`.
+   with `MCPToolRegistry.replace_server_tools`. For application startup,
+   add the server ID to `CapabilityConfig.mcp_servers` and configure the
+   `REDTEAM_MCP_<SERVER_ID>_*` environment variables documented in
+   `deploy/mcp/README.md`.
 
 No other code changes — that's the point of the Adapter pattern.
 

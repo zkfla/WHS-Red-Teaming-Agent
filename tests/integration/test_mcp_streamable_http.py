@@ -9,17 +9,21 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-from redteam.capability.adapters.mcp.web_api import WebAPIMCPAdapter
-from redteam.capability.gateway import MCPToolGateway
-from redteam.capability.registry import MCPToolRegistry
+import pytest
+
+from redteam.app.bootstrap import build_application
+from redteam.core.config import load_app_config
 from redteam.core.contracts.tool import ExecutionContext, ToolInvocation
-from redteam.core.ids import ActionId, EngagementId, InvocationId, RunId
+from redteam.core.ids import ActionId, EngagementId, InvocationId, RunId, ToolId
 
 
 def _unused_local_port() -> int:
-    with socket.socket() as listener:
-        listener.bind(("127.0.0.1", 0))
-        return int(listener.getsockname()[1])
+    try:
+        with socket.socket() as listener:
+            listener.bind(("127.0.0.1", 0))
+            return int(listener.getsockname()[1])
+    except PermissionError:
+        pytest.skip("sandbox does not permit binding a local integration-test port")
 
 
 async def _wait_for_server(process: asyncio.subprocess.Process, port: int) -> None:
@@ -38,7 +42,10 @@ async def _wait_for_server(process: asyncio.subprocess.Process, port: int) -> No
     raise TimeoutError("MCP example server did not become ready")
 
 
-async def test_real_streamable_http_discovery_and_invocation() -> None:
+async def test_real_streamable_http_discovery_and_invocation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
     repository_root = Path(__file__).parents[2]
     server_path = repository_root / "deploy/docker/mcp-example/server.py"
     port = _unused_local_port()
@@ -55,22 +62,21 @@ async def test_real_streamable_http_discovery_and_invocation() -> None:
 
     try:
         await _wait_for_server(process, port)
-        adapter = WebAPIMCPAdapter(
-            server_id="example-mcp",
-            endpoint=f"http://127.0.0.1:{port}/mcp",
+        monkeypatch.setenv("REDTEAM_MCP_WEB_EXAMPLE_KIND", "web_api")
+        monkeypatch.setenv(
+            "REDTEAM_MCP_WEB_EXAMPLE_ENDPOINT", f"http://127.0.0.1:{port}/mcp"
         )
-        registry = MCPToolRegistry()
-        registry.replace_server_tools(adapter.server_id, await adapter.discover_tools())
-        descriptor = registry.list_by_server(adapter.server_id)[0]
-        gateway = MCPToolGateway(registry, {adapter.server_id: adapter})
+        config = load_app_config(repository_root / "examples/app.yaml")
+        config.capability.mcp_servers = ["web-example"]
+        _, deps = await build_application(config, evidence_dir=tmp_path)
         run_id = RunId("run_mcp_integration")
-        result = await gateway.invoke(
+        result = await deps.tool_gateway.invoke(
             ToolInvocation(
                 invocation_id=InvocationId("inv_mcp_integration"),
                 action_id=ActionId("action_mcp_integration"),
                 run_id=run_id,
-                tool_id=descriptor.tool_id,
-                operation=descriptor.tool_name,
+                tool_id=ToolId("web.ping"),
+                operation="ping",
                 arguments={"message": "hello"},
                 execution_context=ExecutionContext(
                     engagement_id=EngagementId("eng_mcp_integration"),
@@ -83,7 +89,6 @@ async def test_real_streamable_http_discovery_and_invocation() -> None:
         assert result.success is True
         assert result.output == {"message": "hello", "status": "ok"}
         assert result.invocation_id == InvocationId("inv_mcp_integration")
-        assert descriptor.tool_name == "ping"
     finally:
         if process.returncode is None:
             process.terminate()

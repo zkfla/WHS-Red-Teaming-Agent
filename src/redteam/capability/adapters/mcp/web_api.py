@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 from redteam.capability.adapters.mcp.streamable_http import StreamableHTTPMCPAdapter
 from redteam.capability.adapters.mcp.transport import MCPTransport
+from redteam.core.enums import RiskLevel
 
 
 class WebAPIMCPAdapter(StreamableHTTPMCPAdapter):
@@ -12,6 +15,8 @@ class WebAPIMCPAdapter(StreamableHTTPMCPAdapter):
         *,
         server_id: str,
         endpoint: str,
+        risk_level: RiskLevel = RiskLevel.LOW,
+        headers: Mapping[str, str] | None = None,
         transport: MCPTransport | None = None,
     ) -> None:
         super().__init__(
@@ -19,5 +24,7 @@ class WebAPIMCPAdapter(StreamableHTTPMCPAdapter):
             endpoint=endpoint,
             tool_namespace="web",
             capability_tags=("web", "api"),
+            risk_level=risk_level,
+            headers=headers,
             transport=transport,
         )

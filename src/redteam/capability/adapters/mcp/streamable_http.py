@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from typing import Any
 
@@ -26,6 +27,7 @@ class StreamableHTTPMCPAdapter:
         tool_namespace: str,
         capability_tags: tuple[str, ...],
         risk_level: RiskLevel = RiskLevel.LOW,
+        headers: Mapping[str, str] | None = None,
         transport: MCPTransport | None = None,
     ) -> None:
         if not server_id.strip():
@@ -36,7 +38,7 @@ class StreamableHTTPMCPAdapter:
         self._tool_namespace = tool_namespace
         self._capability_tags = capability_tags
         self._risk_level = risk_level
-        self._transport = transport or StreamableHTTPMCPTransport(endpoint)
+        self._transport = transport or StreamableHTTPMCPTransport(endpoint, headers=headers)
 
     async def discover_tools(self) -> list[ToolDescriptor]:
         health = await self.health_check()

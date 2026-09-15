@@ -30,9 +30,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from redteam.attack_graph.stores.memory import InMemoryAttackGraphStore
-from redteam.capability.adapters.mcp.example import ExampleMCPAdapter
-from redteam.capability.gateway import MCPToolGateway
-from redteam.capability.registry import MCPToolRegistry
+from redteam.capability.bootstrap import build_mcp_tool_gateway
 from redteam.control.service import DefaultControlPlane
 from redteam.core.config import (
     AppConfig,
@@ -80,18 +78,9 @@ def _build_llm_client(config: LLMConfig) -> LLMClient:
 
 
 async def _build_default_tool_gateway(config: CapabilityConfig) -> ToolGateway:
-    """The one dummy adapter this stage ships, wrapped in a real gateway.
+    """Build configured MCP servers or the deterministic empty-config default."""
 
-    TODO(capability-team): use ``config.mcp_servers`` to select/instantiate
-    real ``MCPAdapter``s here instead of always defaulting to
-    ``ExampleMCPAdapter`` — the config value already reaches this call
-    site, nothing upstream needs to change once real adapters exist.
-    """
-    registry = MCPToolRegistry()
-    example_adapter = ExampleMCPAdapter()
-    for descriptor in await example_adapter.discover_tools():
-        registry.register(descriptor)
-    return MCPToolGateway(registry, {example_adapter.server_id: example_adapter})
+    return await build_mcp_tool_gateway(config.mcp_servers)
 
 
 async def build_runtime_deps(

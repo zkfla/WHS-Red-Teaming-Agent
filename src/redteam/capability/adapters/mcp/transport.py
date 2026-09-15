@@ -7,6 +7,8 @@ and testable without a live server or external network.
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator, Mapping
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any, Protocol
 from urllib.parse import urlparse
@@ -38,19 +40,19 @@ class MCPTransport(Protocol):
 class StreamableHTTPMCPTransport:
     """Official MCP Python SDK v2 client over Streamable HTTP."""
 
-    def __init__(self, endpoint: str) -> None:
+    def __init__(self, endpoint: str, *, headers: Mapping[str, str] | None = None) -> None:
         parsed = urlparse(endpoint)
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
             raise ValueError("MCP endpoint must be an absolute http(s) URL")
         self._endpoint = endpoint
+        self._headers = dict(headers or {})
 
     async def list_tools(self) -> list[RemoteTool]:
-        Client = _load_mcp_client()
         discovered: list[RemoteTool] = []
         cursor: str | None = None
         seen_cursors: set[str] = set()
 
-        async with Client(self._endpoint) as client:
+        async with self._open_client() as client:
             while True:
                 listing = await client.list_tools(cursor=cursor)
                 discovered.extend(
@@ -74,8 +76,7 @@ class StreamableHTTPMCPTransport:
     async def call_tool(
         self, tool_name: str, arguments: dict[str, Any]
     ) -> RemoteCallResult:
-        Client = _load_mcp_client()
-        async with Client(self._endpoint) as client:
+        async with self._open_client() as client:
             result = await client.call_tool(tool_name, arguments=arguments)
 
         structured = result.structured_content
@@ -98,11 +99,31 @@ class StreamableHTTPMCPTransport:
 
     async def health_check(self) -> bool:
         try:
-            Client = _load_mcp_client()
-            async with Client(self._endpoint):
+            async with self._open_client():
                 return True
         except Exception:
             return False
+
+    @asynccontextmanager
+    async def _open_client(self) -> AsyncIterator[Any]:
+        Client = _load_mcp_client()
+        if not self._headers:
+            async with Client(self._endpoint) as client:
+                yield client
+            return
+
+        try:
+            from httpx2 import AsyncClient
+            from mcp.client.streamable_http import streamable_http_client
+        except ImportError as exc:  # pragma: no cover - optional install guard
+            raise RuntimeError(
+                'MCP support is not installed; run pip install -e "."'
+            ) from exc
+
+        async with AsyncClient(headers=self._headers) as http_client:
+            transport = streamable_http_client(self._endpoint, http_client=http_client)
+            async with Client(transport) as client:
+                yield client
 
 
 def _load_mcp_client() -> type[Any]:
@@ -110,6 +131,6 @@ def _load_mcp_client() -> type[Any]:
         from mcp import Client
     except ImportError as exc:  # pragma: no cover - depends on optional install
         raise RuntimeError(
-            'MCP support is not installed; run pip install -e ".[capability]"'
+            'MCP support is not installed; run pip install -e "."'
         ) from exc
     return Client
