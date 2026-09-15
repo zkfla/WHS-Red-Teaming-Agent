@@ -7,6 +7,7 @@ Capability implementation so the frozen Core config contract need not change.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 from dataclasses import dataclass, field
@@ -26,55 +27,78 @@ class MCPConfigurationError(ValueError):
 
 class MCPServerKind(str, Enum):
     WEB_API = "web_api"
+    MOBILE = "mobile"
     RECON = "recon"
+    ANALYSIS = "analysis"
+
+
+class MCPTransportKind(str, Enum):
+    STREAMABLE_HTTP = "streamable_http"
+    STDIO = "stdio"
 
 
 @dataclass(frozen=True, slots=True)
 class MCPServerSettings:
     server_id: str
     kind: MCPServerKind
-    endpoint: str
+    transport: MCPTransportKind
+    endpoint: str | None = None
+    command: str | None = None
+    args: tuple[str, ...] = ()
     risk_level: RiskLevel = RiskLevel.LOW
     bearer_token: str | None = field(default=None, repr=False)
+    process_environment: dict[str, str] = field(default_factory=dict, repr=False)
 
     @classmethod
     def from_environment(cls, server_id: str) -> MCPServerSettings:
         prefix = environment_prefix(server_id)
-        endpoint = _required_environment_value(f"{prefix}_ENDPOINT")
         kind_value = _required_environment_value(f"{prefix}_KIND")
+        transport_value = os.environ.get(
+            f"{prefix}_TRANSPORT", MCPTransportKind.STREAMABLE_HTTP.value
+        )
         risk_value = os.environ.get(f"{prefix}_RISK_LEVEL", RiskLevel.LOW.value)
-        token_env_var = os.environ.get(f"{prefix}_TOKEN_ENV_VAR")
-        token = None
-        if token_env_var:
-            if not _SAFE_ENVIRONMENT_NAME.fullmatch(token_env_var):
-                raise MCPConfigurationError(
-                    f"{prefix}_TOKEN_ENV_VAR is not a valid environment variable name"
-                )
-            token = os.environ.get(token_env_var)
-            if not token:
-                raise MCPConfigurationError(
-                    f"secret environment variable {token_env_var!r} is not set"
-                )
 
         try:
             kind = MCPServerKind(kind_value)
         except ValueError as exc:
             supported = ", ".join(kind.value for kind in MCPServerKind)
-            raise MCPConfigurationError(
-                f"{prefix}_KIND must be one of: {supported}"
-            ) from exc
+            raise MCPConfigurationError(f"{prefix}_KIND must be one of: {supported}") from exc
+        try:
+            transport = MCPTransportKind(transport_value)
+        except ValueError as exc:
+            supported = ", ".join(transport.value for transport in MCPTransportKind)
+            raise MCPConfigurationError(f"{prefix}_TRANSPORT must be one of: {supported}") from exc
         try:
             risk_level = RiskLevel(risk_value)
         except ValueError as exc:
             raise MCPConfigurationError(f"invalid risk level {risk_value!r}") from exc
 
-        _validate_endpoint(endpoint, prefix)
+        endpoint: str | None = None
+        command: str | None = None
+        args: tuple[str, ...] = ()
+        token: str | None = None
+        process_environment: dict[str, str] = {}
+
+        if transport == MCPTransportKind.STREAMABLE_HTTP:
+            endpoint = _required_environment_value(f"{prefix}_ENDPOINT")
+            _validate_endpoint(endpoint, prefix)
+            token = _load_bearer_token(prefix)
+        else:
+            command = _required_environment_value(f"{prefix}_COMMAND")
+            _validate_command(command, prefix)
+            args = _load_stdio_arguments(prefix)
+            process_environment = _load_process_environment(prefix)
+
         return cls(
             server_id=server_id,
             kind=kind,
+            transport=transport,
             endpoint=endpoint,
+            command=command,
+            args=args,
             risk_level=risk_level,
             bearer_token=token,
+            process_environment=process_environment,
         )
 
     def request_headers(self) -> dict[str, str]:
@@ -85,9 +109,7 @@ class MCPServerSettings:
 
 def environment_prefix(server_id: str) -> str:
     if not _SAFE_SERVER_ID.fullmatch(server_id):
-        raise MCPConfigurationError(
-            "MCP server IDs must use lowercase kebab-case"
-        )
+        raise MCPConfigurationError("MCP server IDs must use lowercase kebab-case")
     return f"REDTEAM_MCP_{server_id.upper().replace('-', '_')}"
 
 
@@ -96,6 +118,56 @@ def _required_environment_value(name: str) -> str:
     if value is None or not value.strip():
         raise MCPConfigurationError(f"required environment variable {name} is not set")
     return value.strip()
+
+
+def _load_bearer_token(prefix: str) -> str | None:
+    token_env_var = os.environ.get(f"{prefix}_TOKEN_ENV_VAR")
+    if not token_env_var:
+        return None
+    if not _SAFE_ENVIRONMENT_NAME.fullmatch(token_env_var):
+        raise MCPConfigurationError(
+            f"{prefix}_TOKEN_ENV_VAR is not a valid environment variable name"
+        )
+    token = os.environ.get(token_env_var)
+    if not token:
+        raise MCPConfigurationError(f"secret environment variable {token_env_var!r} is not set")
+    return token
+
+
+def _load_stdio_arguments(prefix: str) -> tuple[str, ...]:
+    raw_arguments = os.environ.get(f"{prefix}_ARGS_JSON", "[]")
+    try:
+        arguments = json.loads(raw_arguments)
+    except json.JSONDecodeError as exc:
+        raise MCPConfigurationError(f"{prefix}_ARGS_JSON must be a JSON array of strings") from exc
+    if not isinstance(arguments, list) or any(
+        not isinstance(argument, str) or "\x00" in argument for argument in arguments
+    ):
+        raise MCPConfigurationError(
+            f"{prefix}_ARGS_JSON must be a JSON array of strings without NUL bytes"
+        )
+    return tuple(arguments)
+
+
+def _load_process_environment(prefix: str) -> dict[str, str]:
+    raw_names = os.environ.get(f"{prefix}_PASSTHROUGH_ENV", "")
+    names = [name.strip() for name in raw_names.split(",") if name.strip()]
+    environment: dict[str, str] = {}
+    for name in names:
+        if not _SAFE_ENVIRONMENT_NAME.fullmatch(name):
+            raise MCPConfigurationError(
+                f"{prefix}_PASSTHROUGH_ENV contains an invalid environment variable name"
+            )
+        value = os.environ.get(name)
+        if value is None:
+            raise MCPConfigurationError(f"stdio environment variable {name!r} is not set")
+        environment[name] = value
+    return environment
+
+
+def _validate_command(command: str, prefix: str) -> None:
+    if "\x00" in command or "\n" in command or "\r" in command:
+        raise MCPConfigurationError(f"{prefix}_COMMAND must be a single executable name or path")
 
 
 def _validate_endpoint(endpoint: str, prefix: str) -> None:

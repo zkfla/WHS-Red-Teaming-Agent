@@ -8,8 +8,10 @@ from typing import Any
 
 import pytest
 
+from redteam.capability.adapters.mcp.analysis import AnalysisMCPAdapter
 from redteam.capability.adapters.mcp.base import MCPCallResult
 from redteam.capability.adapters.mcp.example import ExampleMCPAdapter
+from redteam.capability.adapters.mcp.mobile import MobileMCPAdapter
 from redteam.capability.adapters.mcp.naming import build_mcp_tool_id
 from redteam.capability.adapters.mcp.recon import ReconMCPAdapter
 from redteam.capability.adapters.mcp.transport import RemoteCallResult, RemoteTool
@@ -37,9 +39,7 @@ class FakeTransport:
     async def list_tools(self) -> list[RemoteTool]:
         return self.tools
 
-    async def call_tool(
-        self, tool_name: str, arguments: dict[str, Any]
-    ) -> RemoteCallResult:
+    async def call_tool(self, tool_name: str, arguments: dict[str, Any]) -> RemoteCallResult:
         self.calls.append((tool_name, arguments))
         return self.result
 
@@ -152,6 +152,41 @@ async def test_recon_adapter_has_separate_namespace() -> None:
     assert tools[0].capability_tags == ["recon"]
 
 
+@pytest.mark.parametrize(
+    ("adapter_type", "server_id", "remote_name", "expected_id", "expected_tags"),
+    [
+        (
+            MobileMCPAdapter,
+            "mobile-server",
+            "Inspect APK",
+            ToolId("mobile.inspect_apk"),
+            ["mobile"],
+        ),
+        (
+            AnalysisMCPAdapter,
+            "analysis-server",
+            "Compare Response",
+            ToolId("analysis.compare_response"),
+            ["analysis"],
+        ),
+    ],
+)
+async def test_mobile_and_analysis_adapters_have_independent_namespaces(
+    adapter_type: type[MobileMCPAdapter] | type[AnalysisMCPAdapter],
+    server_id: str,
+    remote_name: str,
+    expected_id: ToolId,
+    expected_tags: list[str],
+) -> None:
+    transport = FakeTransport(tools=[RemoteTool(name=remote_name, description="", input_schema={})])
+    adapter = adapter_type(server_id=server_id, transport=transport)
+
+    tools = await adapter.discover_tools()
+
+    assert tools[0].tool_id == expected_id
+    assert tools[0].capability_tags == expected_tags
+
+
 async def test_adapter_normalizes_remote_tool_error() -> None:
     transport = FakeTransport(
         tools=[RemoteTool(name="request", description="", input_schema={})],
@@ -172,9 +207,7 @@ async def test_adapter_normalizes_remote_tool_error() -> None:
 
 
 def test_tool_id_naming_is_deterministic() -> None:
-    assert build_mcp_tool_id("Web API", "Send  HTTP/Request") == ToolId(
-        "web_api.send_http_request"
-    )
+    assert build_mcp_tool_id("Web API", "Send  HTTP/Request") == ToolId("web_api.send_http_request")
 
 
 def test_registry_rejects_conflicting_tool_ids() -> None:
@@ -235,9 +268,7 @@ async def test_gateway_rejects_operation_mismatch() -> None:
 
 
 class SlowAdapter(ExampleMCPAdapter):
-    async def invoke(
-        self, tool: ToolDescriptor, arguments: dict[str, Any]
-    ) -> MCPCallResult:
+    async def invoke(self, tool: ToolDescriptor, arguments: dict[str, Any]) -> MCPCallResult:
         await asyncio.sleep(1)
         return await super().invoke(tool, arguments)
 

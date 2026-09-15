@@ -1,4 +1,4 @@
-"""Reusable adapter for MCP servers deployed over Streamable HTTP."""
+"""Reusable capability adapter for MCP servers on supported transports."""
 
 from __future__ import annotations
 
@@ -16,14 +16,14 @@ from redteam.core.contracts.tool import ToolDescriptor, ToolError
 from redteam.core.enums import RiskLevel, ToolHealthStatus
 
 
-class StreamableHTTPMCPAdapter:
+class MCPServerAdapter:
     """Maps one remote MCP server into framework Capability contracts."""
 
     def __init__(
         self,
         *,
         server_id: str,
-        endpoint: str,
+        endpoint: str | None = None,
         tool_namespace: str,
         capability_tags: tuple[str, ...],
         risk_level: RiskLevel = RiskLevel.LOW,
@@ -38,7 +38,11 @@ class StreamableHTTPMCPAdapter:
         self._tool_namespace = tool_namespace
         self._capability_tags = capability_tags
         self._risk_level = risk_level
-        self._transport = transport or StreamableHTTPMCPTransport(endpoint, headers=headers)
+        if transport is None:
+            if endpoint is None:
+                raise ValueError("endpoint is required when transport is not provided")
+            transport = StreamableHTTPMCPTransport(endpoint, headers=headers)
+        self._transport = transport
 
     async def discover_tools(self) -> list[ToolDescriptor]:
         health = await self.health_check()
@@ -57,9 +61,7 @@ class StreamableHTTPMCPAdapter:
             for tool in remote_tools
         ]
 
-    async def invoke(
-        self, tool: ToolDescriptor, arguments: dict[str, Any]
-    ) -> MCPCallResult:
+    async def invoke(self, tool: ToolDescriptor, arguments: dict[str, Any]) -> MCPCallResult:
         if tool.server_id != self.server_id:
             raise ValueError(
                 f"tool belongs to server {tool.server_id}, not adapter {self.server_id}"
@@ -95,3 +97,7 @@ def _safe_error_message(output: dict[str, Any] | str | None) -> str:
     if output is None:
         return "MCP tool reported an error"
     return "MCP tool reported an error; structured details are available in output"
+
+
+# Backward-compatible name for code written before stdio transport support.
+StreamableHTTPMCPAdapter = MCPServerAdapter

@@ -14,13 +14,16 @@ def ping(message: str = "ping") -> dict[str, str]:
     return {"message": message, "status": "ok"}
 
 
-
 if __name__ == "__main__":
-    port = int(os.environ.get("MCP_EXAMPLE_PORT", "8765"))
-    mcp.run(
-        transport="streamable-http",
-        host="0.0.0.0",
-        port=port,
-        stateless_http=True,
-        json_response=True,
-    )
+    transport = os.environ.get("MCP_EXAMPLE_TRANSPORT", "streamable-http")
+    if transport == "stdio":
+        mcp.run(transport="stdio")
+    else:
+        port = int(os.environ.get("MCP_EXAMPLE_PORT", "8765"))
+        mcp.run(
+            transport="streamable-http",
+            host="0.0.0.0",
+            port=port,
+            stateless_http=True,
+            json_response=True,
+        )
