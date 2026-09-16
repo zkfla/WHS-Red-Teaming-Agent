@@ -2,9 +2,27 @@
 
 - 제안: Control 팀 (ROE 담당) - 김도윤
 - 대상 영역: **Naming Convention (PM 담당, instruction.md:137)**
-- 상태: PM 검토 요청
+- 상태: ✅ **확정** (PM, `origin/dev d4b6887` — `docs/contracts/actions.md` "Action Naming Convention")
 - 관련: [PLAN.md](../PLAN.md) §3(ROE), `docs/contracts/actions.md`,
   Capability 팀 작업 (origin/dev `f6308bf`, PR #2)
+
+---
+
+## ✅ 확정된 결정 (PM)
+
+A안 기반 + 수정으로 확정. 아래가 최종 규칙 (`docs/contracts/actions.md`):
+
+- `capability` = namespace(`recon`/`web`/`mobile`/`analysis`), lowercase, operation 미포함.
+  → `denied/allowed_capabilities`와 **exact match**.
+- `operation` = tool과 독립적인 canonical action name, `lower_snake_case`.
+  MCP `tool_name`과 같을 필요 없음.
+- **Canonical Action Key = `<capability>.<operation>`** (예: `recon.port_scan`).
+  → `denied/allowed_operations`는 이 **키와 exact match**. (우리 초안의 "operation=tool_name"에서 변경됨)
+- **prefix/wildcard 매칭 없음.** 전체 차단은 `denied_capabilities: ["web"]`,
+  개별 차단은 `denied_operations: ["web.file_upload"]`.
+
+**Control 반영 완료:** `control/roe.py`가 canonical action key(`<capability>.<operation>`)로
+operation을 exact match하도록 수정, prefix 매칭 미도입. 테스트 갱신·통과.
 
 ---
 

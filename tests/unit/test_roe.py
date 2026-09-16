@@ -1,9 +1,9 @@
 """ROE stage tests (control-team, track-a).
 
-Covers the implemented rules — denied/allowed capabilities and
-operations — both as a unit (``check_roe``) and through the full
-``DefaultControlPlane`` pipeline. Add cases here as the remaining ROE
-fields (time windows, availability impact, prohibited techniques) land.
+Uses the PM-confirmed naming convention (docs/contracts/actions.md):
+``capability`` is a namespace (recon/web/mobile/analysis); operation
+policy is matched against the canonical action key
+``<capability>.<operation>``. No prefix/wildcard matching.
 """
 
 from __future__ import annotations
@@ -41,7 +41,7 @@ def _engagement(roe: list[RuleOfEngagement] | None = None) -> Engagement:
 
 
 def _proposal(
-    *, capability: str = "recon.example", operation: str = "ping", host: str = "good.local"
+    *, capability: str = "recon", operation: str = "port_scan", host: str = "good.local"
 ) -> ActionProposal:
     return ActionProposal(
         action_id=ActionId("action_roe"),
@@ -66,56 +66,67 @@ def test_no_rules_allows() -> None:
 
 
 def test_action_not_touched_by_rules_allows() -> None:
-    roe = [RuleOfEngagement(name="no-ddos", denied_operations=["ddos"])]
-    ok, reasons = check_roe(_proposal(operation="ping"), _engagement(roe))
+    roe = [RuleOfEngagement(name="no-uploads", denied_operations=["web.file_upload"])]
+    ok, reasons = check_roe(_proposal(capability="recon", operation="port_scan"), _engagement(roe))
     assert ok is True
     assert reasons == []
 
 
-def test_denied_operation_is_denied() -> None:
-    roe = [RuleOfEngagement(name="no-ddos", denied_operations=["ddos"])]
-    ok, reasons = check_roe(_proposal(operation="ddos"), _engagement(roe))
+def test_denied_operation_matches_canonical_action_key() -> None:
+    # denied_operations holds the "<capability>.<operation>" key.
+    roe = [RuleOfEngagement(name="no-portscan", denied_operations=["recon.port_scan"])]
+    ok, reasons = check_roe(_proposal(capability="recon", operation="port_scan"), _engagement(roe))
     assert ok is False
-    assert "ddos" in reasons[0]
-    assert "no-ddos" in reasons[0]
+    assert "recon.port_scan" in reasons[0]
+    assert "no-portscan" in reasons[0]
+
+
+def test_bare_operation_name_does_not_match() -> None:
+    # "port_scan" (no capability prefix) must NOT match — the key is
+    # "recon.port_scan". Guards against regressing to bare-operation match.
+    roe = [RuleOfEngagement(name="wrong", denied_operations=["port_scan"])]
+    ok, _ = check_roe(_proposal(capability="recon", operation="port_scan"), _engagement(roe))
+    assert ok is True
 
 
 def test_denied_capability_is_denied() -> None:
-    roe = [RuleOfEngagement(name="no-destructive", denied_capabilities=["exploit.destructive"])]
-    ok, reasons = check_roe(_proposal(capability="exploit.destructive"), _engagement(roe))
+    roe = [RuleOfEngagement(name="no-mobile", denied_capabilities=["mobile"])]
+    proposal = _proposal(capability="mobile", operation="app_launch")
+    ok, reasons = check_roe(proposal, _engagement(roe))
     assert ok is False
-    assert "exploit.destructive" in reasons[0]
+    assert "mobile" in reasons[0]
 
 
-def test_allow_list_is_restrictive_when_configured() -> None:
-    roe = [RuleOfEngagement(name="recon-only", allowed_capabilities=["recon.example"])]
-    # In the allow-list -> passes.
-    ok, _ = check_roe(_proposal(capability="recon.example"), _engagement(roe))
-    assert ok is True
-    # Not in the allow-list -> denied by default.
-    ok, reasons = check_roe(_proposal(capability="exploit.other"), _engagement(roe))
+def test_capability_allow_list_is_restrictive() -> None:
+    roe = [RuleOfEngagement(name="recon-only", allowed_capabilities=["recon"])]
+    assert check_roe(_proposal(capability="recon"), _engagement(roe))[0] is True
+    ok, reasons = check_roe(_proposal(capability="web", operation="http_request"), _engagement(roe))
     assert ok is False
     assert "allowed-capability" in reasons[0]
 
 
-def test_allowed_operation_list_is_restrictive() -> None:
-    roe = [RuleOfEngagement(name="ops", allowed_operations=["ping", "scan"])]
-    assert check_roe(_proposal(operation="scan"), _engagement(roe))[0] is True
-    ok, reasons = check_roe(_proposal(operation="delete"), _engagement(roe))
+def test_operation_allow_list_matches_canonical_key() -> None:
+    roe = [
+        RuleOfEngagement(
+            name="ops",
+            allowed_operations=["recon.port_scan", "recon.service_discovery"],
+        )
+    ]
+    assert check_roe(_proposal(operation="service_discovery"), _engagement(roe))[0] is True
+    ok, reasons = check_roe(_proposal(operation="file_upload"), _engagement(roe))
     assert ok is False
-    assert "allowed-operation" in reasons[0]
+    assert "recon.file_upload" in reasons[0]
 
 
 def test_deny_wins_over_allow_list() -> None:
     roe = [
         RuleOfEngagement(
             name="mixed",
-            allowed_operations=["ping"],
-            denied_operations=["ping"],
+            allowed_operations=["recon.port_scan"],
+            denied_operations=["recon.port_scan"],
         )
     ]
-    # Denied even though it's also in the allow-list.
-    ok, reasons = check_roe(_proposal(operation="ping"), _engagement(roe))
+    ok, reasons = check_roe(_proposal(operation="port_scan"), _engagement(roe))
     assert ok is False
     assert "denied by ROE rule" in reasons[0]
 
@@ -144,12 +155,13 @@ async def test_control_plane_denies_out_of_scope_before_roe() -> None:
 
 
 async def test_control_plane_denies_roe_violation() -> None:
-    engagement = _engagement([RuleOfEngagement(name="no-ddos", denied_operations=["ddos"])])
+    roe = [RuleOfEngagement(name="no-portscan", denied_operations=["recon.port_scan"])]
+    engagement = _engagement(roe)
     plane = DefaultControlPlane({engagement.engagement_id: engagement})
     decision = await plane.evaluate(
-        _proposal(operation="ddos"),
+        _proposal(capability="recon", operation="port_scan"),
         ControlContext(engagement_id=engagement.engagement_id),
     )
     assert decision.verdict == PolicyVerdict.DENY
     assert "roe" in decision.matched_rules
-    assert any("ddos" in r for r in decision.reasons)
+    assert any("recon.port_scan" in r for r in decision.reasons)
