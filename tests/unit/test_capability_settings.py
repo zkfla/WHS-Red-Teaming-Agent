@@ -39,6 +39,28 @@ def test_server_settings_load_endpoint_kind_risk_and_secret_by_indirection(
     assert "secret-value" not in repr(settings)
 
 
+def test_server_settings_load_canonical_tool_operation_bindings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("REDTEAM_MCP_WEB_ENDPOINT", "http://localhost:8765/mcp")
+    monkeypatch.setenv("REDTEAM_MCP_WEB_KIND", "web_api")
+    monkeypatch.setenv(
+        "REDTEAM_MCP_WEB_ALLOWED_TOOLS_JSON",
+        '["http_request","operator_status"]',
+    )
+    monkeypatch.setenv(
+        "REDTEAM_MCP_WEB_TOOL_OPERATIONS_JSON",
+        '{"http_request":["http_request","response_analysis"],"operator_status":[]}',
+    )
+
+    settings = MCPServerSettings.from_environment("web")
+
+    assert settings.tool_operations == {
+        "http_request": ("http_request", "response_analysis"),
+        "operator_status": (),
+    }
+
+
 def test_remote_plain_http_requires_explicit_lab_opt_in(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -139,3 +161,38 @@ def test_invalid_tool_allowlist_rejected(monkeypatch: pytest.MonkeyPatch, value:
     monkeypatch.setenv("REDTEAM_MCP_BROWSER_ALLOWED_TOOLS_JSON", value)
     with pytest.raises(MCPConfigurationError, match="ALLOWED_TOOLS_JSON"):
         MCPServerSettings.from_environment("browser")
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "[]",
+        "{}",
+        '{"request":"http_request"}',
+        '{"request":["HTTP_REQUEST"]}',
+        '{"request":["http_request","http_request"]}',
+        "not-json",
+    ],
+)
+def test_invalid_tool_operation_bindings_rejected(
+    monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    monkeypatch.setenv("REDTEAM_MCP_WEB_KIND", "web_api")
+    monkeypatch.setenv("REDTEAM_MCP_WEB_ENDPOINT", "http://localhost:8931/mcp")
+    monkeypatch.setenv("REDTEAM_MCP_WEB_TOOL_OPERATIONS_JSON", value)
+    with pytest.raises(MCPConfigurationError, match="TOOL_OPERATIONS_JSON"):
+        MCPServerSettings.from_environment("web")
+
+
+def test_tool_operation_binding_keys_must_match_tool_allowlist(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("REDTEAM_MCP_WEB_KIND", "web_api")
+    monkeypatch.setenv("REDTEAM_MCP_WEB_ENDPOINT", "http://localhost:8931/mcp")
+    monkeypatch.setenv("REDTEAM_MCP_WEB_ALLOWED_TOOLS_JSON", '["http_request"]')
+    monkeypatch.setenv(
+        "REDTEAM_MCP_WEB_TOOL_OPERATIONS_JSON",
+        '{"different_tool":["http_request"]}',
+    )
+    with pytest.raises(MCPConfigurationError, match="keys must exactly match"):
+        MCPServerSettings.from_environment("web")

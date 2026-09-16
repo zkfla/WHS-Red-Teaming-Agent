@@ -11,6 +11,7 @@ assume that a tool invocation is idempotent.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Collection, Mapping
 from datetime import datetime, timezone
 
 from redteam.capability.adapters.mcp.base import MCPAdapter
@@ -19,9 +20,22 @@ from redteam.core.contracts.tool import ToolError, ToolInvocation, ToolResult
 
 
 class MCPToolGateway:
-    def __init__(self, registry: MCPToolRegistry, adapters: dict[str, MCPAdapter]) -> None:
+    def __init__(
+        self,
+        registry: MCPToolRegistry,
+        adapters: dict[str, MCPAdapter],
+        operation_bindings: Mapping[str, Collection[str]] | None = None,
+    ) -> None:
         self._registry = registry
         self._adapters = adapters
+        self._operation_bindings = (
+            {
+                str(tool_id): frozenset(operations)
+                for tool_id, operations in operation_bindings.items()
+            }
+            if operation_bindings is not None
+            else None
+        )
 
     async def invoke(self, invocation: ToolInvocation) -> ToolResult:
         descriptor = self._registry.get(invocation.tool_id)
@@ -53,13 +67,18 @@ class MCPToolGateway:
                 finished_at=datetime.now(timezone.utc),
             )
 
-        if invocation.operation != descriptor.tool_name:
+        allowed_operations = (
+            self._operation_bindings.get(str(invocation.tool_id), frozenset())
+            if self._operation_bindings is not None
+            else frozenset((descriptor.tool_name,))
+        )
+        if invocation.operation not in allowed_operations:
             return self._error_result(
                 invocation,
-                code="operation_mismatch",
+                code="operation_not_allowed_for_tool",
                 message=(
-                    f"operation {invocation.operation!r} does not match registered "
-                    f"tool name {descriptor.tool_name!r}"
+                    f"tool {invocation.tool_id} is not registered for canonical operation "
+                    f"{invocation.operation!r}"
                 ),
             )
 

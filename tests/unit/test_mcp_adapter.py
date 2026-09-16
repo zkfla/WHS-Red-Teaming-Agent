@@ -258,17 +258,50 @@ def test_registry_replaces_one_servers_discovery_snapshot_atomically() -> None:
     assert registry.get(ToolId("web.old")) is None
 
 
-async def test_gateway_rejects_operation_mismatch() -> None:
-    adapter = ExampleMCPAdapter()
+async def test_gateway_routes_tool_when_intent_differs_from_remote_tool_name() -> None:
+    backend = FakeTransport(tools=[RemoteTool("http_request", "", {})])
+    adapter = WebAPIMCPAdapter(server_id="http", transport=backend)
     registry = MCPToolRegistry()
-    registry.register((await adapter.discover_tools())[0])
-    gateway = MCPToolGateway(registry, {adapter.server_id: adapter})
+    registry.replace_server_tools("http", await adapter.discover_tools())
+    gateway = MCPToolGateway(
+        registry,
+        {adapter.server_id: adapter},
+        {"web.http_request": ("http_request", "response_analysis")},
+    )
 
-    result = await gateway.invoke(_invocation(operation="not-ping"))
+    result = await gateway.invoke(
+        _invocation(
+            tool_id=ToolId("web.http_request"),
+            operation="response_analysis",
+        )
+    )
+
+    assert result.success is True
+    assert backend.calls == [("http_request", {"message": "hi"})]
+
+
+async def test_gateway_blocks_tool_substitution_outside_operation_binding() -> None:
+    backend = FakeTransport(tools=[RemoteTool("proxy_mutate_json", "", {})])
+    adapter = WebAPIMCPAdapter(server_id="proxy", transport=backend)
+    registry = MCPToolRegistry()
+    registry.replace_server_tools("proxy", await adapter.discover_tools())
+    gateway = MCPToolGateway(
+        registry,
+        {adapter.server_id: adapter},
+        {"web.proxy_mutate_json": ("parameter_fuzz",)},
+    )
+
+    result = await gateway.invoke(
+        _invocation(
+            tool_id=ToolId("web.proxy_mutate_json"),
+            operation="response_analysis",
+        )
+    )
 
     assert result.success is False
     assert result.error is not None
-    assert result.error.code == "operation_mismatch"
+    assert result.error.code == "operation_not_allowed_for_tool"
+    assert backend.calls == []
 
 
 class SlowAdapter(ExampleMCPAdapter):

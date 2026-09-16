@@ -1,4 +1,4 @@
-"""Mechanical conversions between Core Contracts (instruction.md section 23).
+"""Mechanical conversions between Core Contracts.
 
 No policy/business logic lives here — only the "given A, produce B"
 transforms every team would otherwise duplicate:
@@ -6,11 +6,10 @@ transforms every team would otherwise duplicate:
     ActionProposal + PolicyDecision -> ToolInvocation
     ToolResult                      -> EvidenceRecord
 
-``build_tool_invocation`` also enforces the one rule instruction.md
-section 24 calls out explicitly: a non-ALLOW ``PolicyDecision`` can
-never become a ``ToolInvocation``. That's a mechanical guard (reject on
-a field value), not a policy decision, so it belongs here rather than
-in ``redteam.control``.
+``build_tool_invocation`` also enforces that a non-ALLOW
+``PolicyDecision`` can never become a ``ToolInvocation``. That's a
+mechanical guard (reject on a field value), not a policy decision, so it
+belongs here rather than in ``redteam.control``.
 """
 
 from __future__ import annotations

@@ -13,13 +13,9 @@ engagement:
     auto_approve: false
     require_approval_for:
       - web:http_request
-      - web:http_compare_sessions
-      - web:proxy_replay_flow
-      - web:proxy_mutate_json
-      - web:proxy_compare_sessions
-      - web:browser_navigate
-      - web:browser_click
-      - web:browser_fill_form
+      - web:auth_attempt
+      - web:parameter_fuzz
+      - web:response_analysis
       - recon:port_scan
 capability:
   mcp_servers: [web-http, web-proxy, web-browser, recon-passive, recon-active]

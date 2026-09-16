@@ -160,7 +160,9 @@ python -m redteam.capability.servers recon-active --policy /absolute/path/policy
 - OpenAPI의 `$ref`/servers, OIDC의 endpoints는 자동 방문하지 않는다. 발견 경로가
   자동으로 승인 범위에 추가되지 않으며 출력은 비신뢰 대상 데이터로 다룬다.
 - `ALLOWED_TOOLS_JSON`으로 공식 서버의 도구도 선택 등록하며 직접 호출도 제한한다.
-  upstream 이름 변경은 시작 실패로 알린다. 임의 코드 실행·파일 업로드는 미등록이다.
+  `TOOL_OPERATIONS_JSON`은 각 원격 Tool 이름에 실행 가능한 canonical operation을
+  연결한다. 빈 배열인 운영 도구는 Agent 실행을 막고, 매핑 누락·upstream 이름 변경은
+  시작 실패로 알린다. 임의 코드 실행·파일 업로드는 미등록이다.
 - Proxy catalog와 connector 입력은 4 MiB/기본 500개 flow로 제한하며 query·fragment·범위 밖 origin/path/
   method를 가져오지 않는다. multipart/form body는 지원하지 않으며, 실행 중 파일 갱신은
   명시적인 `proxy_reload_capture` 호출로만 반영한다. 캡처 파일은 합성·비식별 테스트
@@ -174,9 +176,31 @@ python -m redteam.capability.servers recon-active --policy /absolute/path/policy
 ## Control / Agent 팀 연결 사항
 
 `risk_level=high`는 metadata이며 현재 Control Plane은 이것만으로 승인 요청을 하지
-않는다. `app.yaml`의 `capability:operation` 승인 규칙을 실제 정책에 포함해야 한다.
+않는다. `app.yaml`의 승인 목록은 ToolId 목록이 아니라 의미 기반 operation 목록이다.
+현재 Control의 `ApprovalPolicy` matcher가 사용하는 legacy 표기인
+`capability:operation`을 따르며, ROE의 canonical action key는 PM 계약대로
+`capability.operation`을 사용한다. 두 형식을 섞거나 ToolId를 승인 규칙에 넣으면 안 된다.
 현 승인 서비스는 사람 승인 해결 흐름이 미완성이므로 Active를 production에서 켜지 않는다.
 `active_enabled=true`는 운영자 on/off 스위치이지 승인 토큰이 아니다.
+
+Agent/Orchestration은 먼저 의미 기반 ActionProposal을 만들고 Control의 ALLOW 이후에
+실행 ToolId를 선택한다. 아래는 현재 금융 랩 도구의 권장 연결이며, 하나의 operation에
+복수 ToolId가 올 수 있다. Gateway는 ToolId로 실제 원격 도구를 찾으며
+`ActionProposal.operation == remote tool_name`을 요구하지 않는다.
+
+| canonical action key | 선택 가능한 ToolId | 비고 |
+|---|---|---|
+| `web.http_request` | `web.http_request`, `web.proxy_replay_flow`, `web.browser_navigate` | 승인된 API/캡처/UI 경로 중 문맥에 맞게 선택 |
+| `web.auth_attempt` | `web.browser_fill_form`, `web.browser_click` | 로그인·추가 인증 절차에 한정; 일반 click은 Agent가 더 정확한 operation을 제안해야 함 |
+| `web.parameter_fuzz` | `web.proxy_mutate_json` | 허용된 JSON 최상위 필드만 변경 |
+| `web.response_analysis` | `web.http_compare_sessions`, `web.proxy_compare_sessions`, `web.browser_snapshot` | 결과 차이는 관찰이며 취약점 확정이 아님 |
+| `recon.service_discovery` | `recon.dns_resolve`, `recon.http_probe`, `recon.tls_inspect` | 동일 intent를 서로 다른 관찰 도구가 수행 |
+| `recon.endpoint_discovery` | `recon.openapi_inventory`, `recon.oidc_inventory` | 문서에 노출된 endpoint만 수집 |
+| `recon.port_scan` | `recon.port_scan` | 이름이 같아도 action key와 ToolId는 별도 값 |
+
+`web.session_list`, `web.proxy_reload_capture`, `web.browser_close`,
+`recon.active_status`는 운영·상태 관리용이다. Agent의 자율 공격 행동으로 제안하지 않고
+운영자 워크플로 또는 명시적으로 합의한 별도 operation 계약에서만 사용한다.
 
 현재 서버는 engagement ID를 전달받지 않는다. policy/credential/browser 인스턴스를
 하나의 engagement에 전용 배치하고, Control 팀은 proposal의 실제 target과

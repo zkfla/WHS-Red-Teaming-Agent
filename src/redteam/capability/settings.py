@@ -18,6 +18,7 @@ from redteam.core.enums import RiskLevel
 
 _SAFE_SERVER_ID = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 _SAFE_ENVIRONMENT_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_CANONICAL_OPERATION = re.compile(r"^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$")
 _LOCAL_HOSTS = {"127.0.0.1", "::1", "localhost", "host.docker.internal"}
 
 
@@ -49,6 +50,7 @@ class MCPServerSettings:
     bearer_token: str | None = field(default=None, repr=False)
     process_environment: dict[str, str] = field(default_factory=dict, repr=False)
     allowed_tools: tuple[str, ...] | None = None
+    tool_operations: dict[str, tuple[str, ...]] | None = None
 
     @classmethod
     def from_environment(cls, server_id: str) -> MCPServerSettings:
@@ -90,6 +92,17 @@ class MCPServerSettings:
             args = _load_stdio_arguments(prefix)
             process_environment = _load_process_environment(prefix)
 
+        allowed_tools = _load_allowed_tools(prefix)
+        tool_operations = _load_tool_operations(prefix)
+        if allowed_tools is not None and tool_operations is not None:
+            allowed_names = set(allowed_tools)
+            binding_names = set(tool_operations)
+            if binding_names != allowed_names:
+                raise MCPConfigurationError(
+                    f"{prefix}_TOOL_OPERATIONS_JSON keys must exactly match "
+                    f"{prefix}_ALLOWED_TOOLS_JSON"
+                )
+
         return cls(
             server_id=server_id,
             kind=kind,
@@ -100,7 +113,8 @@ class MCPServerSettings:
             risk_level=risk_level,
             bearer_token=token,
             process_environment=process_environment,
-            allowed_tools=_load_allowed_tools(prefix),
+            allowed_tools=allowed_tools,
+            tool_operations=tool_operations,
         )
 
     def request_headers(self) -> dict[str, str]:
@@ -166,6 +180,40 @@ def _load_allowed_tools(prefix: str) -> tuple[str, ...] | None:
     ):
         raise MCPConfigurationError("ALLOWED_TOOLS_JSON must contain unique non-empty tool names")
     return tuple(names)
+
+
+def _load_tool_operations(prefix: str) -> dict[str, tuple[str, ...]] | None:
+    value = os.environ.get(f"{prefix}_TOOL_OPERATIONS_JSON")
+    if value is None:
+        return None
+    try:
+        raw_bindings = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise MCPConfigurationError("TOOL_OPERATIONS_JSON must be a JSON object") from exc
+    if not isinstance(raw_bindings, dict) or not raw_bindings:
+        raise MCPConfigurationError("TOOL_OPERATIONS_JSON must be a non-empty JSON object")
+
+    bindings: dict[str, tuple[str, ...]] = {}
+    for tool_name, operations in raw_bindings.items():
+        if not isinstance(tool_name, str) or not tool_name.strip():
+            raise MCPConfigurationError(
+                "TOOL_OPERATIONS_JSON keys must be non-empty remote tool names"
+            )
+        if (
+            not isinstance(operations, list)
+            or any(
+                not isinstance(operation, str)
+                or not _CANONICAL_OPERATION.fullmatch(operation)
+                for operation in operations
+            )
+            or len(operations) != len(set(operations))
+        ):
+            raise MCPConfigurationError(
+                "TOOL_OPERATIONS_JSON values must be arrays of unique lower_snake_case "
+                "operations"
+            )
+        bindings[tool_name] = tuple(operations)
+    return bindings
 
 
 def _load_process_environment(prefix: str) -> dict[str, str]:

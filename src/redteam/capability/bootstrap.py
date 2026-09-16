@@ -63,6 +63,7 @@ async def _build_gateway(
 
     registry = MCPToolRegistry()
     adapters: dict[str, MCPAdapter] = {}
+    operation_bindings: dict[str, tuple[str, ...]] = {}
     for server_id in server_ids:
         settings = MCPServerSettings.from_environment(server_id)
         transport = _create_transport(settings)
@@ -72,10 +73,24 @@ async def _build_gateway(
         descriptors = await adapter.discover_tools()
         if not descriptors:
             raise MCPConfigurationError(f"MCP server {server_id!r} discovered no tools")
+        if settings.tool_operations is not None:
+            discovered_names = {descriptor.tool_name for descriptor in descriptors}
+            configured_names = set(settings.tool_operations)
+            if discovered_names != configured_names:
+                raise MCPConfigurationError(
+                    f"MCP server {server_id!r} operation bindings do not match discovered tools"
+                )
         registry.replace_server_tools(server_id, descriptors)
+        for descriptor in descriptors:
+            operations = (
+                settings.tool_operations[descriptor.tool_name]
+                if settings.tool_operations is not None
+                else (descriptor.tool_name,)
+            )
+            operation_bindings[str(descriptor.tool_id)] = operations
         adapters[server_id] = adapter
 
-    return MCPToolGateway(registry, adapters)
+    return MCPToolGateway(registry, adapters, operation_bindings)
 
 
 def _create_adapter(settings: MCPServerSettings, transport: MCPTransport) -> MCPAdapter:
