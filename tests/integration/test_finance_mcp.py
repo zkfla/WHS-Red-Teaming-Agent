@@ -77,6 +77,64 @@ async def test_real_stdio_roles_discover_and_reject_unconfigured_target(
     assert result.is_error is True
 
 
+async def test_real_stdio_proxy_role_discovers_neutral_tools(
+    policy: ServerPolicy,
+    tmp_path: Path,
+) -> None:
+    config = policy.model_dump()
+    config["targets"]["bank"]["replayable_paths"] = ["/account"]
+    config["proxy_replay_enabled"] = True
+    policy_path = tmp_path / "policy.json"
+    policy_path.write_text(ServerPolicy.model_validate(config).model_dump_json())
+    capture_path = tmp_path / "capture.har"
+    capture_path.write_text(
+        json.dumps(
+            {
+                "log": {
+                    "entries": [
+                        {
+                            "request": {
+                                "method": "GET",
+                                "url": "http://127.0.0.1:8080/account",
+                                "headers": [],
+                            },
+                            "response": {
+                                "status": 200,
+                                "headers": [],
+                                "content": {"text": "synthetic"},
+                            },
+                        }
+                    ]
+                }
+            }
+        )
+    )
+    transport = StdioMCPTransport(
+        sys.executable,
+        args=[
+            "-m",
+            "redteam.capability.servers",
+            "web-proxy",
+            "--policy",
+            str(policy_path),
+            "--capture-path",
+            str(capture_path),
+        ],
+    )
+
+    tools = await transport.list_tools()
+    assert {tool.name for tool in tools} == {
+        "proxy_status",
+        "proxy_list_flows",
+        "proxy_get_flow",
+        "proxy_replay_flow",
+        "proxy_mutate_json",
+        "proxy_compare_sessions",
+    }
+    result = await transport.call_tool("proxy_get_flow", {"flow_ref": "not-configured"})
+    assert result.is_error is True
+
+
 async def test_two_principal_comparison_is_observation_not_finding(
     policy: ServerPolicy,
     monkeypatch: pytest.MonkeyPatch,

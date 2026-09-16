@@ -20,6 +20,7 @@ async def main() -> None:
     async with open_mcp_tool_gateway(
         [
             "web-http",
+            "web-proxy",
             "web-browser",
             "recon-passive",
             "recon-active",
@@ -83,6 +84,43 @@ async def exercise(gateway: MCPToolGateway) -> None:
         },
         error=True,
     )
+    proxy_status = await call("web.proxy_status", {})
+    assert proxy_status["provider"] == "har-v1" and proxy_status["flow_count"] == 2
+    assert proxy_status["ignored_out_of_scope_flows"] == 1
+    flows = (await call("web.proxy_list_flows", {"target_ref": "bank-lab"}))["flows"]
+    read_flow = next(flow for flow in flows if flow["method"] == "GET")
+    write_flow = next(flow for flow in flows if flow["method"] == "POST")
+    detail = await call("web.proxy_get_flow", {"flow_ref": read_flow["flow_ref"]})
+    assert "discarded-capture-token" not in str(detail)
+    replay = await call(
+        "web.proxy_replay_flow",
+        {"flow_ref": read_flow["flow_ref"], "session_ref": "alice"},
+    )
+    assert replay["status_code"] == 200 and replay["body_omitted"]
+    proxy_comparison = await call(
+        "web.proxy_compare_sessions",
+        {
+            "flow_ref": read_flow["flow_ref"],
+            "first_session_ref": "alice",
+            "second_session_ref": "bob",
+        },
+    )
+    assert proxy_comparison["first"]["status_code"] == 200
+    assert proxy_comparison["second"]["status_code"] == 403
+    mutation = await call(
+        "web.proxy_mutate_json",
+        {
+            "flow_ref": write_flow["flow_ref"],
+            "session_ref": "alice",
+            "mutations": {"amount": 100001},
+        },
+    )
+    assert mutation["status_code"] == 200 and mutation["mutated_fields"] == ["amount"], mutation
+    await call(
+        "web.proxy_mutate_json",
+        {"flow_ref": write_flow["flow_ref"], "mutations": {"admin": True}},
+        error=True,
+    )
     for name, arguments in (
         ("dns_resolve", {"target_ref": "bank-lab"}),
         ("http_probe", {"target_ref": "bank-lab", "path": "/health"}),
@@ -95,16 +133,24 @@ async def exercise(gateway: MCPToolGateway) -> None:
     await call("web.browser_navigate", {"url": "http://mock-bank:8080"})
     snapshot = await call("web.browser_snapshot", {})
     assert "Synthetic bank" in str(snapshot), "browser state lost between invocations"
-    await call("web.browser_fill_form", {"fields": [
-        {"target": "#alias", "name": "Test alias", "type": "textbox", "value": "Synthetic Alice"},
-    ]})
+    await call(
+        "web.browser_fill_form",
+        {
+            "fields": [
+                {
+                    "target": "#alias",
+                    "name": "Test alias",
+                    "type": "textbox",
+                    "value": "Synthetic Alice",
+                },
+            ]
+        },
+    )
     await call("web.browser_click", {"target": "#confirm"})
     assert "Synthetic Alice" in str(await call("web.browser_snapshot", {}))
     await call("web.browser_run_code_unsafe", {}, error=True)
     await call("web.browser_close", {})
-    print(
-        "PASS: all four MCP servers; actor isolation; scope/method/tool denial; browser continuity"
-    )
+    print("PASS: five MCP servers; proxy replay; actor isolation; scope denial; browser continuity")
 
 
 if __name__ == "__main__":

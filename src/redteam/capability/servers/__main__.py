@@ -2,21 +2,27 @@
 
 import argparse
 
-from redteam.capability.servers import active, recon, web_http
+from redteam.capability.servers import active, proxy, recon, web_http
 from redteam.capability.servers.config import ServerPolicy
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("role", choices=["web-http", "recon-passive", "recon-active"])
+    parser.add_argument("role", choices=["web-http", "web-proxy", "recon-passive", "recon-active"])
     parser.add_argument("--policy", required=True)
+    parser.add_argument("--capture-path")
     parser.add_argument("--transport", choices=["stdio", "streamable-http"], default="stdio")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     args = parser.parse_args()
     policy = ServerPolicy.load(args.policy)
-    factory = {"web-http": web_http, "recon-passive": recon, "recon-active": active}[args.role]
-    server = factory.create_server(policy)
+    if args.role == "web-proxy":
+        if not args.capture_path:
+            parser.error("web-proxy requires --capture-path")
+        server = proxy.create_server(policy, args.capture_path)
+    else:
+        factory = {"web-http": web_http, "recon-passive": recon, "recon-active": active}[args.role]
+        server = factory.create_server(policy)
     if args.transport == "stdio":
         server.run(transport="stdio")
     else:

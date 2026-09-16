@@ -45,6 +45,16 @@ services:
       LAB_ALICE_TOKEN: synthetic-alice
       LAB_BOB_TOKEN: synthetic-bob
 
+  web-proxy:
+    <<: *worker
+    command: [web-proxy, --policy, /app/policy.json, --capture-path, /app/captures.har, --transport, streamable-http, --host, 0.0.0.0]
+    environment:
+      LAB_ALICE_TOKEN: synthetic-alice
+      LAB_BOB_TOKEN: synthetic-bob
+    volumes:
+      - ../mcp/finance/policy.json:/app/policy.json:ro
+      - ../mcp/finance/captures.har:/app/captures.har:ro
+
   web-browser:
     build:
       context: ../docker/finance-browser
@@ -104,6 +114,8 @@ services:
       disable: true
     depends_on:
       web-http:
+        condition: service_healthy
+      web-proxy:
         condition: service_healthy
       web-browser:
         condition: service_healthy

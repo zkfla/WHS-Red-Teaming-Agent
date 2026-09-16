@@ -84,6 +84,18 @@ async def test_write_method_disabled_by_default(policy: ServerPolicy) -> None:
         await request(policy, "bank", "/account", method="POST")
 
 
+async def test_path_specific_method_does_not_enable_writes_elsewhere(
+    policy: ServerPolicy,
+) -> None:
+    config = policy.model_dump()
+    config["targets"]["bank"]["allowed_paths"].append("/validate")
+    config["targets"]["bank"]["allowed_path_methods"] = {"/validate": ["POST"]}
+    scoped = ServerPolicy.model_validate(config)
+
+    with pytest.raises(ToolInputError, match="method is not enabled"):
+        await request(scoped, "bank", "/account", method="POST")
+
+
 async def test_cross_target_session_denied_before_dns(policy: ServerPolicy) -> None:
     config = policy.model_dump()
     config["targets"]["other"] = {"origin": "https://other.test", "allowed_paths": ["/account"]}

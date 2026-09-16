@@ -124,7 +124,8 @@ async def request(
     if profile is None:
         raise ToolInputError("unknown target_ref")
     validate_path(profile, path)
-    if method not in profile.allowed_methods:
+    allowed_methods = profile.allowed_path_methods.get(path, profile.allowed_methods)
+    if method not in allowed_methods:
         raise ToolInputError("HTTP method is not enabled for this target")
     if json_body is not None and method in {"GET", "HEAD", "OPTIONS"}:
         raise ToolInputError("body is not allowed for read requests")

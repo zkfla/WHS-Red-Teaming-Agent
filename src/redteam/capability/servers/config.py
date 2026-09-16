@@ -23,6 +23,9 @@ class TargetProfile(BaseModel):
     origin: str
     allowed_paths: list[str] = Field(min_length=1)
     allowed_methods: list[HTTPMethod] = Field(default_factory=read_methods)
+    allowed_path_methods: dict[str, list[HTTPMethod]] = Field(default_factory=dict)
+    replayable_paths: list[str] = Field(default_factory=list)
+    mutable_json_fields: dict[str, list[str]] = Field(default_factory=dict)
 
     @field_validator("origin")
     @classmethod
@@ -51,6 +54,27 @@ class TargetProfile(BaseModel):
                 raise ValueError("ambiguous path")
         return values
 
+    @model_validator(mode="after")
+    def proxy_paths_are_explicitly_scoped(self) -> TargetProfile:
+        allowed = set(self.allowed_paths)
+        if set(self.allowed_path_methods) - allowed:
+            raise ValueError("allowed_path_methods keys must be allowed paths")
+        if set(self.replayable_paths) - allowed:
+            raise ValueError("replayable_paths must be allowed paths")
+        if set(self.mutable_json_fields) - set(self.replayable_paths):
+            raise ValueError("mutable_json_fields keys must be replayable paths")
+        for methods in self.allowed_path_methods.values():
+            if not methods or len(methods) != len(set(methods)):
+                raise ValueError("path method lists must be non-empty and unique")
+        for fields in self.mutable_json_fields.values():
+            if (
+                not fields
+                or len(fields) != len(set(fields))
+                or any(not field or len(field) > 100 for field in fields)
+            ):
+                raise ValueError("mutable JSON field lists must be non-empty and unique")
+        return self
+
 
 class SessionProfile(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -70,6 +94,8 @@ class ServerPolicy(BaseModel):
     timeout_seconds: float = Field(default=5, gt=0, le=15)
     active_enabled: bool = False
     active_ports: list[int] = Field(default_factory=lambda: [80, 443], max_length=16)
+    proxy_replay_enabled: bool = False
+    proxy_max_flows: int = Field(default=500, ge=1, le=1000)
 
     @field_validator("allowed_networks")
     @classmethod
