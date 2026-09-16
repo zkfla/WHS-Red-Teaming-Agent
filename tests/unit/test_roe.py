@@ -8,7 +8,7 @@ policy is matched against the canonical action key
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from redteam.control.roe import check_roe
 from redteam.control.service import DefaultControlPlane
@@ -129,6 +129,61 @@ def test_deny_wins_over_allow_list() -> None:
     ok, reasons = check_roe(_proposal(operation="port_scan"), _engagement(roe))
     assert ok is False
     assert "denied by ROE rule" in reasons[0]
+
+
+# --- unit: time windows (injected clock) ------------------------------
+
+_NOON = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
+
+
+def test_start_at_in_future_is_denied() -> None:
+    roe = [RuleOfEngagement(name="not-started", start_at=_NOON + timedelta(hours=1))]
+    ok, reasons = check_roe(_proposal(), _engagement(roe), now=_NOON)
+    assert ok is False
+    assert "has not started" in reasons[0]
+
+
+def test_end_at_in_past_is_denied() -> None:
+    roe = [RuleOfEngagement(name="ended", end_at=_NOON - timedelta(hours=1))]
+    ok, reasons = check_roe(_proposal(), _engagement(roe), now=_NOON)
+    assert ok is False
+    assert "has ended" in reasons[0]
+
+
+def test_within_start_end_allows() -> None:
+    roe = [
+        RuleOfEngagement(
+            name="active",
+            start_at=_NOON - timedelta(hours=1),
+            end_at=_NOON + timedelta(hours=1),
+        )
+    ]
+    assert check_roe(_proposal(), _engagement(roe), now=_NOON)[0] is True
+
+
+def test_time_window_inside_allows() -> None:
+    roe = [RuleOfEngagement(name="business-hours", allowed_time_windows=["09:00-18:00"])]
+    assert check_roe(_proposal(), _engagement(roe), now=_NOON)[0] is True
+
+
+def test_time_window_outside_is_denied() -> None:
+    roe = [RuleOfEngagement(name="business-hours", allowed_time_windows=["09:00-11:00"])]
+    ok, reasons = check_roe(_proposal(), _engagement(roe), now=_NOON)
+    assert ok is False
+    assert "time" in reasons[0]
+
+
+def test_overnight_window() -> None:
+    roe = [RuleOfEngagement(name="night", allowed_time_windows=["22:00-04:00"])]
+    late = datetime(2026, 1, 1, 23, 0, tzinfo=timezone.utc)
+    assert check_roe(_proposal(), _engagement(roe), now=late)[0] is True
+    assert check_roe(_proposal(), _engagement(roe), now=_NOON)[0] is False
+
+
+def test_malformed_window_denies_when_only_window() -> None:
+    roe = [RuleOfEngagement(name="typo", allowed_time_windows=["not-a-time"])]
+    ok, _ = check_roe(_proposal(), _engagement(roe), now=_NOON)
+    assert ok is False
 
 
 # --- pipeline: DefaultControlPlane ------------------------------------
