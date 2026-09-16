@@ -26,6 +26,7 @@ from redteam.control.policy import evaluate_policy
 from redteam.control.rate_limit import RateLimiter
 from redteam.control.roe import check_roe
 from redteam.control.scope import check_scope
+from redteam.control.severity import Severity, to_tag
 from redteam.core.contracts.action import ActionProposal
 from redteam.core.contracts.engagement import Engagement
 from redteam.core.contracts.policy import Approval, ControlContext, PolicyDecision
@@ -67,42 +68,53 @@ class DefaultControlPlane:
         engagement_id = context.engagement_id
         engagement = self._engagements[engagement_id]
 
-        scope_ok, scope_reasons = check_scope(proposal, engagement.scope)
+        scope_ok, scope_reasons, scope_severity = check_scope(proposal, engagement.scope)
         if not scope_ok:
-            return await self._finalize(proposal, PolicyVerdict.DENY, scope_reasons, ["scope"])
+            return await self._finalize(
+                proposal, PolicyVerdict.DENY, scope_reasons, ["scope"], severity=scope_severity
+            )
 
-        roe_ok, roe_reasons = check_roe(proposal, engagement)
+        roe_ok, roe_reasons, roe_severity = check_roe(proposal, engagement)
         if not roe_ok:
-            return await self._finalize(proposal, PolicyVerdict.DENY, roe_reasons, ["roe"])
+            return await self._finalize(
+                proposal, PolicyVerdict.DENY, roe_reasons, ["roe"], severity=roe_severity
+            )
 
         verdict, policy_reasons, matched_rules = evaluate_policy(
             proposal, engagement.approval_policy
         )
         if verdict == PolicyVerdict.DENY:
-            return await self._finalize(proposal, verdict, policy_reasons, matched_rules)
+            # A policy deny rejects this class of action — switch goals.
+            return await self._finalize(
+                proposal, verdict, policy_reasons, matched_rules, severity=Severity.REPLAN_GOAL
+            )
 
         rate_limiter = self._rate_limiters.setdefault(
             engagement_id, RateLimiter(engagement.rate_limit_policy)
         )
         if not rate_limiter.allow():
+            # Transient — retry a (later) action; don't end the run.
             return await self._finalize(
                 proposal,
                 PolicyVerdict.DENY,
                 ["rate limit exceeded"],
                 ["rate_limit"],
                 rate_limit_remaining=rate_limiter.remaining,
+                severity=Severity.BLOCK_ACTION,
             )
 
         budget = self._budgets.setdefault(
             engagement_id, BudgetTracker(engagement.execution_budget)
         )
         if not budget.has_capacity():
+            # No capacity left for any further action — end the run.
             return await self._finalize(
                 proposal,
                 PolicyVerdict.DENY,
                 ["execution budget exhausted"],
                 ["budget"],
                 budget_remaining=budget.remaining,
+                severity=Severity.ABORT_RUN,
             )
 
         requires_approval = verdict == PolicyVerdict.REQUIRE_APPROVAL
@@ -160,7 +172,12 @@ class DefaultControlPlane:
         *,
         rate_limit_remaining: int | None = None,
         budget_remaining: int | None = None,
+        severity: Severity | None = None,
     ) -> PolicyDecision:
+        # Carry the denial severity as a matched_rules tag (PolicyDecision
+        # has no severity field yet — see redteam.control.severity).
+        if severity is not None:
+            matched_rules = [*matched_rules, to_tag(severity)]
         decision = PolicyDecision(
             action_id=proposal.action_id,
             verdict=verdict,

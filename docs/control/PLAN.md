@@ -137,11 +137,16 @@ DENY할 때 **왜 막혔는지에 따라 에이전트의 다음 행동이 달라
 | 이 목표(능력) 자체가 ROE 금지 | 목표 통째로 포기 → 전환 | REPLAN |
 | 절대 금지 행위(DDoS 등) | 즉시 전체 중단 | Run 종료 |
 
-**표현 방법 2가지:**
-- **방법 A (규격 변경 없음, 권장 시작점):** `PolicyDecision.reasons`/`matched_rules`에 심각도 표시(예: `"roe:hard_violation"`) → Agent 라우터가 보고 판단.
-- **방법 B (PM Issue 필요):** `PolicyVerdict`에 `ABORT` 추가 또는 `severity` 필드 추가. 더 깔끔하지만 공통 규격 변경.
+**✅ 구현 완료 (방법 A — 규격 변경 없음):** `redteam.control.severity`
+- `Severity` = `BLOCK_ACTION`(다른 행동) / `REPLAN_GOAL`(다른 목표) / `ABORT_RUN`(세션 종료)
+- Control이 DENY 시 `PolicyDecision.matched_rules`에 `"severity:<level>"` 태그를 실어 보냄.
+  Agent 라우터는 `severity_from_matched_rules(decision.matched_rules)`로 읽어 라우팅.
+- 스테이지별 매핑: scope→BLOCK / roe(능력)→REPLAN / roe(작업)→BLOCK / roe(시간)→ABORT /
+  policy→REPLAN / rate_limit→BLOCK / budget→ABORT.
 
-지금 스켈레톤 상태: DENY/REQUIRE_APPROVAL 모두 REPLAN → replan_node가 한 바퀴 후 무조건 종료 (아직 3단계 구분 없음).
+**남은 것 (Control 범위 밖):**
+- Agent 팀(orchestration `router`/`replan`)이 이 태그를 **실제 라우팅에 반영** (현재는 DENY 모두 REPLAN 후 종료).
+- (선택) **방법 B**: `PolicyDecision.severity` 1급 필드 승격 → PM Issue. 지금은 태그 규약으로 충분.
 
 ---
 

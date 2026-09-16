@@ -25,6 +25,7 @@ from __future__ import annotations
 import ipaddress
 from urllib.parse import urlsplit
 
+from redteam.control.severity import Severity
 from redteam.core.contracts.action import ActionProposal
 from redteam.core.contracts.engagement import EngagementScope
 from redteam.core.contracts.target import (
@@ -102,22 +103,43 @@ def _matches_network(candidate: str, networks: list[str]) -> bool:
     return False
 
 
-def check_scope(action: ActionProposal, scope: EngagementScope) -> tuple[bool, list[str]]:
+def check_scope(
+    action: ActionProposal, scope: EngagementScope
+) -> tuple[bool, list[str], Severity | None]:
+    """Returns ``(allowed, reasons, severity)``. Every scope denial is
+    ``BLOCK_ACTION``: the agent should try a different (in-scope) target,
+    not abandon the goal or the whole run."""
     hosts = _target_hosts(action.target)
     if not hosts:
-        return False, [f"target kind '{action.target.kind}' has no scope-checkable host identity"]
+        return (
+            False,
+            [f"target kind '{action.target.kind}' has no scope-checkable host identity"],
+            Severity.BLOCK_ACTION,
+        )
 
     # Deny lists win outright.
     for host in hosts:
         if _matches_host(host, scope.denied_hosts):
-            return False, [f"target '{host}' is explicitly denied (denied_hosts)"]
+            return (
+                False,
+                [f"target '{host}' is explicitly denied (denied_hosts)"],
+                Severity.BLOCK_ACTION,
+            )
         if _matches_domain(host, scope.denied_domains):
-            return False, [f"target '{host}' is explicitly denied (denied_domains)"]
+            return (
+                False,
+                [f"target '{host}' is explicitly denied (denied_domains)"],
+                Severity.BLOCK_ACTION,
+            )
 
     if not (scope.allowed_hosts or scope.allowed_domains or scope.allowed_networks):
         # No explicit allow-list configured: default-deny is safer for a
         # red-team framework than default-allow.
-        return False, ["engagement scope has no allowed_hosts/domains/networks configured"]
+        return (
+            False,
+            ["engagement scope has no allowed_hosts/domains/networks configured"],
+            Severity.BLOCK_ACTION,
+        )
 
     for host in hosts:
         if (
@@ -125,6 +147,6 @@ def check_scope(action: ActionProposal, scope: EngagementScope) -> tuple[bool, l
             or _matches_domain(host, scope.allowed_domains)
             or _matches_network(host, scope.allowed_networks)
         ):
-            return True, []
+            return True, [], None
 
-    return False, [f"target {hosts} is not within engagement scope"]
+    return False, [f"target {hosts} is not within engagement scope"], Severity.BLOCK_ACTION

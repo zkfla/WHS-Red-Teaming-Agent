@@ -4,6 +4,9 @@ Uses the PM-confirmed naming convention (docs/contracts/actions.md):
 ``capability`` is a namespace (recon/web/mobile/analysis); operation
 policy is matched against the canonical action key
 ``<capability>.<operation>``. No prefix/wildcard matching.
+
+``check_roe`` returns ``(allowed, reasons, severity)`` — see
+``redteam.control.severity`` for how each denial maps to a severity.
 """
 
 from __future__ import annotations
@@ -12,6 +15,7 @@ from datetime import datetime, timedelta, timezone
 
 from redteam.control.roe import check_roe
 from redteam.control.service import DefaultControlPlane
+from redteam.control.severity import Severity
 from redteam.core.contracts.action import ActionProposal
 from redteam.core.contracts.engagement import (
     ApprovalPolicy,
@@ -60,14 +64,17 @@ def _proposal(
 
 
 def test_no_rules_allows() -> None:
-    ok, reasons = check_roe(_proposal(), _engagement())
+    ok, reasons, severity = check_roe(_proposal(), _engagement())
     assert ok is True
     assert reasons == []
+    assert severity is None
 
 
 def test_action_not_touched_by_rules_allows() -> None:
     roe = [RuleOfEngagement(name="no-uploads", denied_operations=["web.file_upload"])]
-    ok, reasons = check_roe(_proposal(capability="recon", operation="port_scan"), _engagement(roe))
+    ok, reasons, _ = check_roe(
+        _proposal(capability="recon", operation="port_scan"), _engagement(roe)
+    )
     assert ok is True
     assert reasons == []
 
@@ -75,34 +82,41 @@ def test_action_not_touched_by_rules_allows() -> None:
 def test_denied_operation_matches_canonical_action_key() -> None:
     # denied_operations holds the "<capability>.<operation>" key.
     roe = [RuleOfEngagement(name="no-portscan", denied_operations=["recon.port_scan"])]
-    ok, reasons = check_roe(_proposal(capability="recon", operation="port_scan"), _engagement(roe))
+    ok, reasons, severity = check_roe(
+        _proposal(capability="recon", operation="port_scan"), _engagement(roe)
+    )
     assert ok is False
     assert "recon.port_scan" in reasons[0]
     assert "no-portscan" in reasons[0]
+    assert severity is Severity.BLOCK_ACTION
 
 
 def test_bare_operation_name_does_not_match() -> None:
     # "port_scan" (no capability prefix) must NOT match — the key is
     # "recon.port_scan". Guards against regressing to bare-operation match.
     roe = [RuleOfEngagement(name="wrong", denied_operations=["port_scan"])]
-    ok, _ = check_roe(_proposal(capability="recon", operation="port_scan"), _engagement(roe))
+    ok, _, _ = check_roe(_proposal(capability="recon", operation="port_scan"), _engagement(roe))
     assert ok is True
 
 
 def test_denied_capability_is_denied() -> None:
     roe = [RuleOfEngagement(name="no-mobile", denied_capabilities=["mobile"])]
     proposal = _proposal(capability="mobile", operation="app_launch")
-    ok, reasons = check_roe(proposal, _engagement(roe))
+    ok, reasons, severity = check_roe(proposal, _engagement(roe))
     assert ok is False
     assert "mobile" in reasons[0]
+    assert severity is Severity.REPLAN_GOAL
 
 
 def test_capability_allow_list_is_restrictive() -> None:
     roe = [RuleOfEngagement(name="recon-only", allowed_capabilities=["recon"])]
     assert check_roe(_proposal(capability="recon"), _engagement(roe))[0] is True
-    ok, reasons = check_roe(_proposal(capability="web", operation="http_request"), _engagement(roe))
+    ok, reasons, severity = check_roe(
+        _proposal(capability="web", operation="http_request"), _engagement(roe)
+    )
     assert ok is False
     assert "allowed-capability" in reasons[0]
+    assert severity is Severity.REPLAN_GOAL
 
 
 def test_operation_allow_list_matches_canonical_key() -> None:
@@ -113,9 +127,10 @@ def test_operation_allow_list_matches_canonical_key() -> None:
         )
     ]
     assert check_roe(_proposal(operation="service_discovery"), _engagement(roe))[0] is True
-    ok, reasons = check_roe(_proposal(operation="file_upload"), _engagement(roe))
+    ok, reasons, severity = check_roe(_proposal(operation="file_upload"), _engagement(roe))
     assert ok is False
     assert "recon.file_upload" in reasons[0]
+    assert severity is Severity.BLOCK_ACTION
 
 
 def test_deny_wins_over_allow_list() -> None:
@@ -126,7 +141,7 @@ def test_deny_wins_over_allow_list() -> None:
             denied_operations=["recon.port_scan"],
         )
     ]
-    ok, reasons = check_roe(_proposal(operation="port_scan"), _engagement(roe))
+    ok, reasons, _ = check_roe(_proposal(operation="port_scan"), _engagement(roe))
     assert ok is False
     assert "denied by ROE rule" in reasons[0]
 
@@ -138,16 +153,18 @@ _NOON = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
 
 def test_start_at_in_future_is_denied() -> None:
     roe = [RuleOfEngagement(name="not-started", start_at=_NOON + timedelta(hours=1))]
-    ok, reasons = check_roe(_proposal(), _engagement(roe), now=_NOON)
+    ok, reasons, severity = check_roe(_proposal(), _engagement(roe), now=_NOON)
     assert ok is False
     assert "has not started" in reasons[0]
+    assert severity is Severity.ABORT_RUN
 
 
 def test_end_at_in_past_is_denied() -> None:
     roe = [RuleOfEngagement(name="ended", end_at=_NOON - timedelta(hours=1))]
-    ok, reasons = check_roe(_proposal(), _engagement(roe), now=_NOON)
+    ok, reasons, severity = check_roe(_proposal(), _engagement(roe), now=_NOON)
     assert ok is False
     assert "has ended" in reasons[0]
+    assert severity is Severity.ABORT_RUN
 
 
 def test_within_start_end_allows() -> None:
@@ -168,9 +185,10 @@ def test_time_window_inside_allows() -> None:
 
 def test_time_window_outside_is_denied() -> None:
     roe = [RuleOfEngagement(name="business-hours", allowed_time_windows=["09:00-11:00"])]
-    ok, reasons = check_roe(_proposal(), _engagement(roe), now=_NOON)
+    ok, reasons, severity = check_roe(_proposal(), _engagement(roe), now=_NOON)
     assert ok is False
     assert "time" in reasons[0]
+    assert severity is Severity.ABORT_RUN
 
 
 def test_overnight_window() -> None:
@@ -182,7 +200,7 @@ def test_overnight_window() -> None:
 
 def test_malformed_window_denies_when_only_window() -> None:
     roe = [RuleOfEngagement(name="typo", allowed_time_windows=["not-a-time"])]
-    ok, _ = check_roe(_proposal(), _engagement(roe), now=_NOON)
+    ok, _, _ = check_roe(_proposal(), _engagement(roe), now=_NOON)
     assert ok is False
 
 
