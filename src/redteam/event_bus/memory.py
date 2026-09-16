@@ -49,6 +49,12 @@ class InMemoryEventBus:
 
     # -- introspection (in-memory backend only; not part of the port) --
 
+    def subscription_count(self, event_type: str | None = None) -> int:
+        """Number of registered handlers, including duplicate registrations."""
+        if event_type is not None:
+            return len(self._handlers.get(event_type, []))
+        return sum(len(handlers) for handlers in self._handlers.values())
+
     def history(self, *, event_type: str | None = None) -> list[EventEnvelope]:
         """Recently published events, oldest first. Debugging/tests only."""
         if event_type is None:

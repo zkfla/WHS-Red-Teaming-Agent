@@ -122,6 +122,71 @@ async def test_synchronous_failure_still_waits_for_concurrent_handlers() -> None
     assert bus.handler_failures == 1
 
 
+async def test_handlers_start_concurrently_and_publish_waits_for_all() -> None:
+    bus = InMemoryEventBus()
+    started = asyncio.Event()
+    release = asyncio.Event()
+    started_count = 0
+    completed: list[str] = []
+    published = event("RunStarted")
+
+    async def slow(name: str, _event: EventEnvelope) -> None:
+        nonlocal started_count
+        started_count += 1
+        if started_count == 2:
+            started.set()
+        await release.wait()
+        completed.append(name)
+
+    await bus.subscribe("RunStarted", lambda evt: slow("first", evt))
+    await bus.subscribe("RunStarted", lambda evt: slow("second", evt))
+
+    publishing = asyncio.create_task(bus.publish(published))
+    try:
+        await asyncio.wait_for(started.wait(), timeout=1)
+        assert bus.history() == [published]
+        assert not publishing.done()
+        assert completed == []
+    finally:
+        release.set()
+        await asyncio.wait_for(publishing, timeout=1)
+
+    assert sorted(completed) == ["first", "second"]
+
+
+async def test_cancelled_handler_is_isolated_and_other_handlers_complete() -> None:
+    bus = InMemoryEventBus()
+    completed: list[str] = []
+
+    async def cancelled(_event: EventEnvelope) -> None:
+        raise asyncio.CancelledError()
+
+    async def collect(_event: EventEnvelope) -> None:
+        completed.append("collect")
+
+    await bus.subscribe("RunStarted", cancelled)
+    await bus.subscribe("RunStarted", collect)
+    await bus.publish(event("RunStarted"))
+
+    assert completed == ["collect"]
+    assert bus.handler_failures == 1
+
+
+async def test_subscription_count_preserves_duplicate_and_wildcard_registrations() -> None:
+    bus = InMemoryEventBus()
+
+    async def handler(_event: EventEnvelope) -> None:
+        return None
+
+    await bus.subscribe("RunStarted", handler)
+    await bus.subscribe("RunStarted", handler)
+    await bus.subscribe("*", handler)
+
+    assert bus.subscription_count("RunStarted") == 2
+    assert bus.subscription_count("*") == 1
+    assert bus.subscription_count() == 3
+
+
 async def test_history_preserves_publication_order() -> None:
     bus = InMemoryEventBus()
     for name in ("RunStarted", "ActionProposed", "RunFinished"):

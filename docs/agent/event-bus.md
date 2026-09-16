@@ -54,6 +54,16 @@ asking another component to *do* something stays a direct call through a
 Subscriptions are not deduplicated: repeated registrations and registering the
 same handler for both an event type and `"*"` each cause a separate invocation.
 
+`InMemoryEventBus.subscription_count()` is a backend-only debugging and test
+convenience. It reports registrations, so duplicate handlers are counted
+separately; it is not part of the backend-independent `EventBus` port.
+
+History is appended before handler execution and is returned oldest first.
+Handlers for one publication start concurrently, and `publish()` waits for all
+of them to finish. This backend has no retry, acknowledgement, durable
+storage, or replay. Its history is a bounded in-memory debugging buffer; the
+Evidence Store remains the durable record.
+
 ## What orchestration emits today
 
 Happy path, one turn, in order:
