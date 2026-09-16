@@ -27,9 +27,9 @@ from redteam.control.roe import check_roe
 from redteam.control.scope import check_scope
 from redteam.core.contracts.action import ActionProposal
 from redteam.core.contracts.engagement import Engagement
-from redteam.core.contracts.policy import ControlContext, PolicyDecision
-from redteam.core.enums import PolicyVerdict
-from redteam.core.ids import EngagementId
+from redteam.core.contracts.policy import Approval, ControlContext, PolicyDecision
+from redteam.core.enums import ApprovalStatus, PolicyVerdict
+from redteam.core.ids import ApprovalId, EngagementId
 
 
 class DefaultControlPlane:
@@ -54,6 +54,12 @@ class DefaultControlPlane:
         self._rate_limiters: dict[EngagementId, RateLimiter] = {}
         self._budgets: dict[EngagementId, BudgetTracker] = {}
         self._approvals = ApprovalService()
+        # Remembers which ActionProposal a pending Approval belongs to, so
+        # resolve_approval() can record an APPROVAL_RESOLVED audit entry
+        # correlated back to run_id/engagement_id/action_id. Popped once
+        # resolved -- not a durable store itself, just enough bookkeeping
+        # to bridge evaluate() and resolve_approval().
+        self._pending_proposals: dict[ApprovalId, ActionProposal] = {}
 
     async def evaluate(self, proposal: ActionProposal, context: ControlContext) -> PolicyDecision:
         engagement_id = context.engagement_id
@@ -61,23 +67,23 @@ class DefaultControlPlane:
 
         scope_ok, scope_reasons = check_scope(proposal, engagement.scope)
         if not scope_ok:
-            return self._finalize(proposal, PolicyVerdict.DENY, scope_reasons, ["scope"])
+            return await self._finalize(proposal, PolicyVerdict.DENY, scope_reasons, ["scope"])
 
         roe_ok, roe_reasons = check_roe(proposal, engagement)
         if not roe_ok:
-            return self._finalize(proposal, PolicyVerdict.DENY, roe_reasons, ["roe"])
+            return await self._finalize(proposal, PolicyVerdict.DENY, roe_reasons, ["roe"])
 
         verdict, policy_reasons, matched_rules = evaluate_policy(
             proposal, engagement.approval_policy
         )
         if verdict == PolicyVerdict.DENY:
-            return self._finalize(proposal, verdict, policy_reasons, matched_rules)
+            return await self._finalize(proposal, verdict, policy_reasons, matched_rules)
 
         rate_limiter = self._rate_limiters.setdefault(
             engagement_id, RateLimiter(engagement.rate_limit_policy)
         )
         if not rate_limiter.allow():
-            return self._finalize(
+            return await self._finalize(
                 proposal,
                 PolicyVerdict.DENY,
                 ["rate limit exceeded"],
@@ -89,7 +95,7 @@ class DefaultControlPlane:
             engagement_id, BudgetTracker(engagement.execution_budget)
         )
         if not budget.has_capacity():
-            return self._finalize(
+            return await self._finalize(
                 proposal,
                 PolicyVerdict.DENY,
                 ["execution budget exhausted"],
@@ -100,6 +106,7 @@ class DefaultControlPlane:
         requires_approval = verdict == PolicyVerdict.REQUIRE_APPROVAL
         if requires_approval and not engagement.approval_policy.auto_approve:
             approval = await self._approvals.request(proposal.action_id)
+            self._pending_proposals[approval.approval_id] = proposal
             decision = PolicyDecision(
                 action_id=proposal.action_id,
                 verdict=PolicyVerdict.REQUIRE_APPROVAL,
@@ -110,11 +117,11 @@ class DefaultControlPlane:
                 budget_remaining=budget.remaining,
                 evaluated_at=datetime.now(timezone.utc),
             )
-            self._audit.record(proposal, decision)
+            await self._audit.record(proposal, decision)
             return decision
 
         budget.consume()
-        return self._finalize(
+        return await self._finalize(
             proposal,
             PolicyVerdict.ALLOW,
             policy_reasons or ["allowed"],
@@ -123,7 +130,26 @@ class DefaultControlPlane:
             budget_remaining=budget.remaining,
         )
 
-    def _finalize(
+    async def resolve_approval(
+        self, approval_id: ApprovalId, status: ApprovalStatus, resolved_by: str
+    ) -> Approval:
+        """Record a human's decision on a pending Approval.
+
+        Not part of the ``ControlPlane`` Protocol (that only requires
+        ``evaluate``) -- a ``DefaultControlPlane``-specific extension,
+        called by whatever notification channel (CLI/Slack/webhook)
+        surfaces the pending approval to a human. Also records an
+        APPROVAL_RESOLVED audit entry, closing the gap where a
+        REQUIRE_APPROVAL verdict was audited but the eventual human
+        decision was not.
+        """
+        approval = await self._approvals.resolve(approval_id, status, resolved_by)
+        proposal = self._pending_proposals.pop(approval_id, None)
+        if proposal is not None:
+            await self._audit.record_approval_resolution(proposal, approval)
+        return approval
+
+    async def _finalize(
         self,
         proposal: ActionProposal,
         verdict: PolicyVerdict,
@@ -142,5 +168,5 @@ class DefaultControlPlane:
             budget_remaining=budget_remaining,
             evaluated_at=datetime.now(timezone.utc),
         )
-        self._audit.record(proposal, decision)
+        await self._audit.record(proposal, decision)
         return decision

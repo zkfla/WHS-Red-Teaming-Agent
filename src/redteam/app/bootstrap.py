@@ -33,7 +33,9 @@ from redteam.attack_graph.stores.memory import InMemoryAttackGraphStore
 from redteam.capability.adapters.mcp.example import ExampleMCPAdapter
 from redteam.capability.gateway import MCPToolGateway
 from redteam.capability.registry import MCPToolRegistry
+from redteam.control.audit import AuditLog
 from redteam.control.service import DefaultControlPlane
+from redteam.control.stores.filesystem import FilesystemAuditStore
 from redteam.core.config import (
     AppConfig,
     CapabilityConfig,
@@ -95,15 +97,20 @@ async def _build_default_tool_gateway(config: CapabilityConfig) -> ToolGateway:
 
 
 async def build_runtime_deps(
-    engagement: Engagement, evidence_dir: str | Path = "data/evidence"
+    engagement: Engagement,
+    evidence_dir: str | Path = "data/evidence",
+    audit_dir: str | Path = "data/audit",
 ) -> RuntimeDeps:
     """Wire in-memory/dummy backends for every port, from an ``Engagement`` alone.
 
     TODO(each-team): swap in your real backend here once it's ready —
     e.g. Capability Team adds real ``MCPAdapter``s to
-    ``_build_default_tool_gateway``, Control Team can inject a
-    persistent audit sink, Agent Team can swap
-    ``InMemoryAttackGraphStore`` for a real one.
+    ``_build_default_tool_gateway``, Agent Team can swap
+    ``InMemoryAttackGraphStore`` for a real one. Control Team's
+    persistent audit sink is wired below (``FilesystemAuditStore``) —
+    like ``evidence_dir``, ``audit_dir`` is a plain function parameter
+    rather than an ``AppConfig``/``LoggingConfig`` field, since it isn't
+    part of the frozen Contract v0.1 set and doesn't need to be.
 
     Prefer ``build_application`` over this function when you have a
     full ``AppConfig`` available — it reads the LLM/Capability/Logging
@@ -113,7 +120,10 @@ async def build_runtime_deps(
     graph_store = InMemoryAttackGraphStore()
     evidence_store = FilesystemEvidenceStore(evidence_dir)
     tool_gateway = await _build_default_tool_gateway(CapabilityConfig())
-    control_plane = DefaultControlPlane({engagement.engagement_id: engagement})
+    audit_log = AuditLog(FilesystemAuditStore(audit_dir))
+    control_plane = DefaultControlPlane(
+        {engagement.engagement_id: engagement}, audit_log=audit_log
+    )
     llm_client = FakeLLMClient()
 
     return RuntimeDeps(
@@ -136,6 +146,7 @@ async def build_application(
     attack_graph: AttackGraphStore | None = None,
     llm: LLMClient | None = None,
     evidence_dir: str | Path = "data/evidence",
+    audit_dir: str | Path = "data/audit",
 ) -> tuple[Engagement, RuntimeDeps]:
     """``AppConfig``-aware composition root. Every dependency is overridable.
 
@@ -162,7 +173,8 @@ async def build_application(
     engagement = config.engagement.to_engagement(engagement_id=EngagementId(new_id("eng")))
 
     resolved_control_plane = control_plane or DefaultControlPlane(
-        {engagement.engagement_id: engagement}
+        {engagement.engagement_id: engagement},
+        audit_log=AuditLog(FilesystemAuditStore(audit_dir)),
     )
     resolved_tool_gateway = tool_gateway or await _build_default_tool_gateway(config.capability)
     resolved_evidence_store = evidence_store or FilesystemEvidenceStore(evidence_dir)
