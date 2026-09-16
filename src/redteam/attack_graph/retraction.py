@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field
 
-from redteam.attack_graph.predicates import attrs_of, is_stale, last_seen_step
+from redteam.attack_graph.predicates import attr_age, attrs_of
 from redteam.core.contracts.graph import GraphNode
 from redteam.core.enums import GraphNodeType
 from redteam.core.ids import GraphNodeId
@@ -30,7 +30,7 @@ class RetractionRule(BaseModel):
         return self.attr in attrs_of(node.properties)
 
     def describe(self, node: GraphNode, current_step: int) -> str:
-        age = current_step - last_seen_step(node.properties)
+        age = attr_age(node.properties, self.attr, current_step)
         base = self.reason or f"{self.attr!r} was last observed {age} steps ago"
         return f"{base} (limit {self.max_age_steps})"
 
@@ -78,7 +78,10 @@ def plan_retractions(
         for rule in active:
             if not rule.applies_to(node):
                 continue
-            if not is_stale(node.properties, current_step, max_age=rule.max_age_steps):
+            # Age the predicate itself. Node-level freshness moves whenever
+            # anything is written — an unrelated note or attempt log would
+            # renew a belief nobody re-checked.
+            if attr_age(node.properties, rule.attr, current_step) <= rule.max_age_steps:
                 continue
             planned.append(
                 PlannedRetraction(

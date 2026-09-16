@@ -65,7 +65,9 @@ def walk(
     order: list[tuple[GraphNodeId, GraphEdge | None, int]] = [(start, None, 0)]
     queue: deque[tuple[GraphNodeId, int]] = deque([(start, 0)])
 
-    while queue and len(seen) < max_nodes:
+    while queue:
+        if len(order) >= max_nodes:
+            break
         node_id, depth = queue.popleft()
         if max_depth is not None and depth >= max_depth:
             continue
@@ -74,6 +76,10 @@ def walk(
                 continue
             if other in seen:
                 continue
+            # Checked per neighbour, not per dequeue: one node with a
+            # thousand neighbours otherwise returns all thousand.
+            if len(order) >= max_nodes:
+                return order
             seen.add(other)
             order.append((other, edge, depth + 1))
             queue.append((other, depth + 1))
@@ -170,6 +176,11 @@ class ChainLink(BaseModel):
     label: str
     via: GraphEdgeType | None = None
     step: int = 0
+    #: What this hop was reached from. Without it a chain reads as one
+    #: line, so a Finding pointing at two separate things is described as
+    #: a path through both — a route that does not exist in the graph.
+    parent_id: GraphNodeId | None = None
+    depth: int = 0
 
     def describe(self) -> str:
         arrow = f" --{self.via.value}--> " if self.via else ""
@@ -194,9 +205,35 @@ class EvidenceChain(BaseModel):
         """A verified finding with no evidence cannot be reported."""
         return bool(self.evidence_ids) if self.verified else True
 
+    @property
+    def branches(self) -> list[list[ChainLink]]:
+        """Each root-to-leaf path, so a fork is not flattened into a line."""
+        children: dict[GraphNodeId | None, list[ChainLink]] = {}
+        for link in self.links:
+            children.setdefault(link.parent_id, []).append(link)
+
+        roots = [link for link in self.links if link.parent_id is None]
+        paths: list[list[ChainLink]] = []
+
+        def walk_down(link: ChainLink, prefix: list[ChainLink]) -> None:
+            trail = [*prefix, link]
+            kids = children.get(link.node_id, [])
+            if not kids:
+                paths.append(trail)
+                return
+            for kid in kids:
+                walk_down(kid, trail)
+
+        for root in roots:
+            walk_down(root, [])
+        return paths
+
     def describe(self) -> str:
-        path = "".join(link.describe() for link in self.links)
         suffix = " …(truncated)" if self.truncated else ""
+        rendered = [
+            "".join(link.describe() for link in branch) for branch in self.branches
+        ]
+        path = " | ".join(rendered) if rendered else ""
         return (
             f"{self.finding_id} [{self.severity}] {path}{suffix} "
             f"(evidence: {', '.join(self.evidence_ids) or 'none'})"
@@ -242,7 +279,7 @@ def evidence_chain(
         edge.source_id in deepest and edge.target_id not in reached for edge in edges
     )
 
-    for node_id, edge, _depth in visited:
+    for node_id, edge, depth in visited:
         node = by_id.get(node_id)
         if node is None:
             continue
@@ -253,6 +290,8 @@ def evidence_chain(
                 label=_label(node),
                 via=edge.type if edge is not None else None,
                 step=last_seen_step(node.properties),
+                parent_id=edge.source_id if edge is not None else None,
+                depth=depth,
             )
         )
         if node.type is GraphNodeType.HYPOTHESIS:

@@ -178,9 +178,26 @@ def node_type_for_target(target: AnyTarget) -> GraphNodeType:
     raise TypeError(f"unknown target kind: {target!r}")  # pragma: no cover
 
 
-def target_for_node(node_id: GraphNodeId, node_type: GraphNodeType) -> AnyTarget:
+#: Fact key holding the literal path/URL as observed, before
+#: :func:`normalize_path` collapsed its identifier segments.
+OBSERVED_TARGET_FACT = "observed_target"
+
+
+def target_for_node(
+    node_id: GraphNodeId,
+    node_type: GraphNodeType,
+    *,
+    observed: str | None = None,
+) -> AnyTarget:
     """Inverse of :func:`node_id_for_target`. Returns a concrete,
-    scope-checkable target — scope checking cannot match a ``GraphNodeTarget``."""
+    scope-checkable target — scope checking cannot match a ``GraphNodeTarget``.
+
+    Node ids normalise identifier segments (``/orders/8831`` ->
+    ``/orders/{id}``) so one endpoint stays one node. That template is an
+    identity, not an address: acting on it would request ``/orders/{id}``
+    literally. Pass ``observed`` — the concrete path/URL the node was seen
+    at — to target the real thing.
+    """
     _, key = split_node_id(node_id)
 
     if node_type is GraphNodeType.HOST:
@@ -192,7 +209,7 @@ def target_for_node(node_id: GraphNodeId, node_type: GraphNodeType) -> AnyTarget
         return ServiceTarget(service_name=key, graph_node_id=node_id)
     if node_type is GraphNodeType.ENDPOINT:
         if "://" in key:
-            return UrlTarget(url=key, graph_node_id=node_id)
+            return UrlTarget(url=observed or key, graph_node_id=node_id)
         parts = key.split(" ")
         if len(parts) >= 3:
             # "<host>[:<port>] <METHOD> /path" — the method is not part of
@@ -202,10 +219,13 @@ def target_for_node(node_id: GraphNodeId, node_type: GraphNodeType) -> AnyTarget
             if separator and tail.isdigit():
                 authority, port = host, int(tail)
             return EndpointTarget(
-                host=authority, port=port, path=" ".join(parts[2:]), graph_node_id=node_id
+                host=authority,
+                port=port,
+                path=observed or " ".join(parts[2:]),
+                graph_node_id=node_id,
             )
         # No host: nothing to scope-check, and saying so beats inventing one.
-        return UrlTarget(url=parts[-1], graph_node_id=node_id)
+        return UrlTarget(url=observed or parts[-1], graph_node_id=node_id)
     if node_type is GraphNodeType.PRINCIPAL:
         return PrincipalTarget(principal_id=PrincipalId(key), display_name=key)
     if node_type is GraphNodeType.ASSET:

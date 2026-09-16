@@ -12,6 +12,7 @@ from redteam.attack_graph.cleanup import CleanupReport, collect
 from redteam.attack_graph.identity import finding_node_id
 from redteam.attack_graph.integrity import IntegrityReport, check_integrity
 from redteam.attack_graph.observation import (
+    ATTEMPTED_FACT_KEY,
     DEFAULT_MAX_ATTEMPTED,
     DEFAULT_MAX_PER_TYPE,
     DEFAULT_MAX_TOTAL,
@@ -19,6 +20,7 @@ from redteam.attack_graph.observation import (
     build_observation,
 )
 from redteam.attack_graph.patterns import NodePattern, ResolveResult, resolve
+from redteam.attack_graph.predicates import facts_of
 from redteam.attack_graph.stores.base import require_listable
 from redteam.attack_graph.traversal import (
     Direction,
@@ -41,6 +43,7 @@ _READ_METHODS = frozenset(
         "list_nodes",
         "list_edges",
         "has_edge",
+        "has_attempted",
         "observe",
         "resolve",
         "integrity_report",
@@ -78,6 +81,18 @@ class AttackGraphView:
 
     async def list_edges(self) -> list[GraphEdge]:
         return await require_listable(self._store, "list_edges").list_edges()
+
+    async def has_attempted(self, node_id: GraphNodeId, operation_key: str) -> bool:
+        """Was ``operation_key`` already tried against this node?
+
+        Authoritative, unlike ``GraphObservation.attempted``, which is
+        capped for prompt size — deciding *whether to act* from the capped
+        list re-runs whatever fell off the end.
+        """
+        node = await self._store.get_node(node_id)
+        if node is None:
+            return False
+        return operation_key in (facts_of(node.properties).get(ATTEMPTED_FACT_KEY) or [])
 
     async def has_edge(
         self, source_id: GraphNodeId, target_id: GraphNodeId, edge_type: GraphEdgeType

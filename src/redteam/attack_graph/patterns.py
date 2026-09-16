@@ -11,7 +11,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field, model_validator
 
-from redteam.attack_graph.predicates import attrs_of, is_stale
+from redteam.attack_graph.predicates import attr_age, attrs_of
 from redteam.core.contracts.graph import GraphEdge, GraphNode
 from redteam.core.enums import GraphEdgeType, GraphNodeType
 from redteam.core.ids import GraphNodeId
@@ -178,11 +178,18 @@ def _candidates(
             )
 
     if pattern.max_age_steps > 0:
-        fresh = [
-            node
-            for node in hits
-            if not is_stale(node.properties, current_step, max_age=pattern.max_age_steps)
-        ]
+        # Age the predicates this pattern actually asks about, not the node
+        # as a whole; otherwise any unrelated write refreshes them. With no
+        # attrs to name, node freshness is all there is to go on.
+        watched: list[str] = list(pattern.attrs) or [""]
+
+        def fresh_enough(node: GraphNode) -> bool:
+            return all(
+                attr_age(node.properties, key, current_step) <= pattern.max_age_steps
+                for key in watched
+            )
+
+        fresh = [node for node in hits if fresh_enough(node)]
         if hits and not fresh:
             why = f"last observation is older than {pattern.max_age_steps} steps — re-observe first"
         hits = fresh
@@ -190,17 +197,19 @@ def _candidates(
     return hits, why
 
 
-def _edge_exists(
+def _linked_targets(
     edges: list[GraphEdge],
     source_ids: list[GraphNodeId],
     target_ids: list[GraphNodeId],
     edge_type: GraphEdgeType,
-) -> bool:
+) -> set[GraphNodeId]:
+    """Which of ``target_ids`` any of ``source_ids`` reaches by this edge."""
     sources, targets = set(source_ids), set(target_ids)
-    return any(
-        edge.type == edge_type and edge.source_id in sources and edge.target_id in targets
+    return {
+        edge.target_id
         for edge in edges
-    )
+        if edge.type == edge_type and edge.source_id in sources and edge.target_id in targets
+    }
 
 
 def resolve(
@@ -255,22 +264,31 @@ def resolve(
     # If the referenced bind was skipped (unsatisfied `optional`), the
     # constraint would silently disappear — and with `edge_absent` that is
     # an authorization boundary check quietly passing.
-    active_names = {name for name, _ in active}
-    surviving: list[tuple[str, NodePattern]] = []
-    for name, pattern in active:
-        if pattern.edge_type is not None and pattern.related_to not in active_names:
-            if not pattern.optional:
-                return ResolveResult(
-                    ok=False,
-                    reason=(
-                        f"precondition not met: {name!r} requires an edge to "
-                        f"{pattern.related_to!r}, which has no candidates"
-                    ),
-                )
-            candidates.pop(name, None)
-            continue
-        surviving.append((name, pattern))
-    active = surviving
+    # Dropping a bind can orphan another that referenced it, which can
+    # orphan a third — so repeat until nothing more falls out. A single
+    # pass leaves a required edge constraint pointing at a bind that is no
+    # longer there, and the constraint then never runs at all.
+    while True:
+        active_names = {name for name, _ in active}
+        surviving: list[tuple[str, NodePattern]] = []
+        dropped = False
+        for name, pattern in active:
+            if pattern.edge_type is not None and pattern.related_to not in active_names:
+                if not pattern.optional:
+                    return ResolveResult(
+                        ok=False,
+                        reason=(
+                            f"precondition not met: {name!r} requires an edge to "
+                            f"{pattern.related_to!r}, which has no candidates"
+                        ),
+                    )
+                candidates.pop(name, None)
+                dropped = True
+                continue
+            surviving.append((name, pattern))
+        active = surviving
+        if not dropped:
+            break
     active_names = {name for name, _ in active}
     for name in list(exclusive):
         if name not in active_names:
@@ -301,8 +319,14 @@ def resolve(
         edge_type: GraphEdgeType,
         absent: bool,
     ) -> bool:
-        found = _edge_exists(edges, source_ids, target_ids, edge_type)
-        return (not found) if absent else found
+        linked = _linked_targets(edges, source_ids, target_ids, edge_type)
+        if absent:
+            return not linked
+        # Every node bound to this pattern must carry the relation, not
+        # just one of them: with ``count=2``, "owns these two assets" has
+        # to mean both, or the precondition is satisfied by a node the
+        # principal has no claim on at all.
+        return len(linked) == len(set(target_ids))
 
     def consistent(name: str, chosen: tuple[GraphNodeId, ...]) -> bool:
         taken = {
@@ -369,32 +393,54 @@ def _exclusion_shortfall(
     candidates: dict[str, list[GraphNode]],
     exclusive: dict[str, set[str]],
 ) -> str | None:
-    """Can a group of non-overlapping binds fit at all? A mutually-exclusive
-    group needs ``sum(count)`` distinct candidates between its members."""
+    """Can a set of mutually-exclusive binds fit at all?
+
+    The counting argument only holds for a **clique** — binds that are
+    pairwise exclusive. Exclusion is not transitive: ``A≠B`` and ``B≠C``
+    leave ``A=C`` perfectly legal, so treating a connected component as one
+    group rejects assignments that exist.
+    """
     patterns = dict(active)
-    seen: set[str] = set()
 
-    for name in patterns:
-        if name in seen:
-            continue
-        group = {name}
-        queue = [name]
-        while queue:
-            current = queue.pop()
-            for other in exclusive.get(current, set()):
-                if other not in group and other in patterns:
-                    group.add(other)
-                    queue.append(other)
-        seen |= group
-        if len(group) < 2:
-            continue
+    def excluded(left: str, right: str) -> bool:
+        return right in exclusive.get(left, set())
 
+    def shortfall_for(group: set[str]) -> str | None:
         needed = sum(patterns[member].count for member in group)
         pool = {node.id for member in group for node in candidates[member]}
-        if needed > len(pool):
-            listed = ", ".join(sorted(group))
-            return (
-                f"precondition not met: binds [{listed}] must not overlap and need "
-                f"{needed} distinct nodes, but only {len(pool)} are available"
-            )
+        if needed <= len(pool):
+            return None
+        listed = ", ".join(sorted(group))
+        return (
+            f"precondition not met: binds [{listed}] must not overlap and need "
+            f"{needed} distinct nodes, but only {len(pool)} are available"
+        )
+
+    names = [name for name, _ in active]
+
+    # Pairs first: cheap, and every pair is a clique of size two.
+    for index, left in enumerate(names):
+        for right in names[index + 1 :]:
+            if excluded(left, right):
+                found = shortfall_for({left, right})
+                if found is not None:
+                    return found
+
+    # Then grow each pair greedily into a larger clique. Exclusion graphs
+    # here have a handful of binds, so this stays cheap; it only ever adds
+    # a node that excludes every member already in the clique.
+    for index, left in enumerate(names):
+        for right in names[index + 1 :]:
+            if not excluded(left, right):
+                continue
+            clique = {left, right}
+            for other in names:
+                if other in clique:
+                    continue
+                if all(excluded(other, member) for member in clique):
+                    clique.add(other)
+            if len(clique) > 2:
+                found = shortfall_for(clique)
+                if found is not None:
+                    return found
     return None

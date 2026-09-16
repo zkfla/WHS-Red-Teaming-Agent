@@ -15,6 +15,7 @@ from weakref import WeakKeyDictionary
 
 from redteam.attack_graph.cleanup import CleanupItem, CleanupReport, CleanupStatus, collect
 from redteam.attack_graph.identity import (
+    OBSERVED_TARGET_FACT,
     finding_node_id,
     hypothesis_node_id,
     make_node_id,
@@ -40,6 +41,7 @@ from redteam.attack_graph.predicates import (
     cleanup_of,
     facts_of,
     merge_properties,
+    validate_properties,
 )
 from redteam.attack_graph.retraction import PlannedRetraction, RetractionRule, plan_retractions
 from redteam.attack_graph.snapshot import from_records, to_records
@@ -185,6 +187,10 @@ class AttackGraphService:
             for_frontier=for_frontier,
         )
 
+    async def has_attempted(self, node_id: GraphNodeId, operation_key: str) -> bool:
+        """Was ``operation_key`` already tried against this node? Authoritative."""
+        return await self._view.has_attempted(node_id, operation_key)
+
     async def integrity_report(self) -> IntegrityReport:
         return await self._view.integrity_report()
 
@@ -282,6 +288,9 @@ class AttackGraphService:
             step=step,
             extra=extra,
         )
+        # `extra` covers custom keys the caller passed explicitly; a
+        # structured properties dict can carry its own, so scan the result.
+        validate_properties(built)
         if structured:
             # Preserve an already-recorded history rather than resetting it.
             built["provenance"] = [
@@ -314,11 +323,21 @@ class AttackGraphService:
         step: int = 0,
     ) -> GraphNode:
         """Record an ``ActionProposal.target`` as a node, id derived consistently."""
+        observed: dict[str, Any] = {}
+        literal = getattr(target, "url", None) or getattr(target, "path", None)
+        if literal:
+            # The id normalises identifier segments; keep the address that
+            # was actually reached so a later action can use it.
+            observed[OBSERVED_TARGET_FACT] = literal
         return await self.upsert_node(
             node_type_for_target(target),
             node_id=node_id_for_target(target),
             attrs=attrs,
-            facts={"display_name": target_display_name(target), **(facts or {})},
+            facts={
+                "display_name": target_display_name(target),
+                **observed,
+                **(facts or {}),
+            },
             labels=labels,
             provenance=provenance,
             step=step,
@@ -382,7 +401,7 @@ class AttackGraphService:
         """Connect two nodes. The same relation twice stays one edge."""
         edge_id = _edge_id(edge_type, source_id, target_id)
         existing = await self._store.get_edge(edge_id)
-        edge_properties = {**(properties or {})}
+        edge_properties = validate_properties({**(properties or {})})
         if provenance is not None:
             # Same ceiling as nodes: re-linking every turn would otherwise
             # grow one edge without bound.
@@ -750,6 +769,12 @@ class AttackGraphService:
         there, for combining two runs.
         """
         nodes, edges, metadata = from_records(records)
+        # A snapshot is an external file. Importing without the guard makes
+        # "write it to a file, read it back" the way around every check.
+        for node in nodes:
+            validate_properties(node.properties)
+        for edge in edges:
+            validate_properties(edge.properties)
         for node in nodes:
             if merge:
                 await self.upsert_node(

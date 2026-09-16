@@ -6,11 +6,14 @@ plus the guard that keeps secrets out. Docs: ``docs/agent/attack-graph.md``.
 
 from __future__ import annotations
 
+import logging
 import re
 from enum import Enum
 from typing import Any
 
 from pydantic import BaseModel, Field
+
+logger = logging.getLogger(__name__)
 
 ATTRS_KEY = "attrs"
 FACTS_KEY = "facts"
@@ -19,6 +22,11 @@ RETRACTIONS_KEY = "retractions"
 FIRST_SEEN_KEY = "first_seen_step"
 LAST_SEEN_KEY = "last_seen_step"
 CLEANUP_KEY = "cleanup"
+#: Step at which each predicate was last asserted. Node-level
+#: ``last_seen_step`` moves whenever *anything* about the node is written,
+#: so using it to age a predicate means an unrelated note or attempt log
+#: silently renews a belief nobody re-checked.
+ATTRS_SEEN_KEY = "attrs_observed_at"
 
 RESERVED_KEYS = frozenset(
     {
@@ -29,6 +37,7 @@ RESERVED_KEYS = frozenset(
         FIRST_SEEN_KEY,
         LAST_SEEN_KEY,
         CLEANUP_KEY,
+        ATTRS_SEEN_KEY,
     }
 )
 
@@ -76,6 +85,10 @@ _SECRET_KEY_PATTERN = re.compile(
 )
 _NON_WORD = re.compile(r"[^a-z0-9]+")
 
+#: How far to walk into nested values looking for secrets. Anything deeper
+#: is refused rather than stored unscanned.
+_MAX_SCAN_DEPTH = 6
+
 #: PAN/account-number shaped, as a string or an integer.
 _LONG_DIGIT_RUN = re.compile(r"^\d{9,}$")
 _PAN_MIN_DIGITS = 9
@@ -84,10 +97,17 @@ _PAN_MIN_DIGITS = 9
 #: kept so "who first saw this" survives.
 MAX_PROVENANCE_ENTRIES = 20
 
-#: Items kept in a list-valued fact. Rewriting facts is O(size), so an
-#: unbounded list makes a long run quadratic. Newest kept; the Evidence
-#: Store holds the complete record.
+#: Items kept in a *capped* list-valued fact. Rewriting facts is O(size),
+#: so an unbounded log makes a long run quadratic. Newest kept.
 MAX_FACT_LIST_ITEMS = 200
+
+#: Nothing is truncated. A fact list is either a link something depends on
+#: (``evidence_ids``) or a record something is decided from
+#: (``attempted_operations`` — dropping the oldest re-runs work already
+#: done). Past this many items a single list is a bug signal, not a
+#: capacity problem, so it is reported rather than silently trimmed.
+CAPPED_LIST_FACTS: frozenset[str] = frozenset()
+WARN_FACT_LIST_ITEMS = 5_000
 
 #: A pattern can never ask for "".
 _BLANK_KEY = re.compile(r"^\s*$")
@@ -140,7 +160,28 @@ def _looks_like_pan(value: Any) -> bool:
     return False
 
 
-def _reject_secret(container: str, key: str, value: Any) -> None:
+def _scan_nested(container: str, path: str, value: Any, depth: int = 0) -> None:
+    """Walk into dicts/lists — a secret one level down is still a secret."""
+    if depth > _MAX_SCAN_DEPTH:
+        raise SensitiveValueError(
+            f"{container}[{path}] nests deeper than {_MAX_SCAN_DEPTH}; it cannot be "
+            f"scanned for secrets, so it must not be stored"
+        )
+    if isinstance(value, dict):
+        for inner_key, inner in value.items():
+            _reject_secret(container, str(inner_key), inner, path=f"{path}.{inner_key}")
+            _scan_nested(container, f"{path}.{inner_key}", inner, depth + 1)
+    elif isinstance(value, (list, tuple, set)):
+        for index, inner in enumerate(value):
+            if _looks_like_pan(inner):
+                raise SensitiveValueError(
+                    f"{container}[{path}[{index}]] looks like a PAN/account number"
+                )
+            _scan_nested(container, f"{path}[{index}]", inner, depth + 1)
+
+
+def _reject_secret(container: str, key: str, value: Any, path: str | None = None) -> None:
+    path = path or key
     if _BLANK_KEY.match(key):
         raise ValueError(f"{container} has a blank key — nothing can ever match it")
     if any(ch < " " or ch == "\x7f" for ch in key):
@@ -150,12 +191,12 @@ def _reject_secret(container: str, key: str, value: Any) -> None:
         )
     if _looks_secret(key):
         raise SensitiveValueError(
-            f"{container}[{key!r}] is a secret-shaped key — the Attack Graph stores "
+            f"{container}[{path!r}] is a secret-shaped key — the Attack Graph stores "
             f"references and predicates, never credentials"
         )
     if _looks_like_pan(value):
         raise SensitiveValueError(
-            f"{container}[{key!r}] looks like a PAN/account number — store a reference instead"
+            f"{container}[{path!r}] looks like a PAN/account number — store a reference instead"
         )
 
 
@@ -176,7 +217,34 @@ def validate_attrs(attrs: dict[str, Any]) -> dict[str, AttrValue]:
 def validate_facts(facts: dict[str, Any]) -> dict[str, Any]:
     for key, value in facts.items():
         _reject_secret(FACTS_KEY, key, value)
+        # Facts hold arbitrary observed values, so a credential can arrive
+        # nested inside one (``metadata: {"password": ...}``) and used to
+        # sail straight through into snapshots and the rendered report.
+        _scan_nested(FACTS_KEY, key, value)
     return dict(facts)
+
+
+def validate_properties(properties: dict[str, Any]) -> dict[str, Any]:
+    """Scan a whole ``properties`` mapping, whatever route it arrived by.
+
+    ``validate_attrs``/``validate_facts`` only cover what goes through
+    ``build_properties``. Custom top-level keys, edge properties and
+    imported snapshots reach the store without passing either.
+    """
+    for key, value in properties.items():
+        if key in (PROVENANCE_KEY, RETRACTIONS_KEY, ATTRS_SEEN_KEY):
+            continue  # code-generated bookkeeping, not observed values
+        if key == ATTRS_KEY and isinstance(value, dict):
+            validate_attrs(value)
+            continue
+        if key == FACTS_KEY and isinstance(value, dict):
+            validate_facts(value)
+            continue
+        if key in (FIRST_SEEN_KEY, LAST_SEEN_KEY, CLEANUP_KEY):
+            continue
+        _reject_secret("properties", key, value)
+        _scan_nested("properties", key, value)
+    return properties
 
 
 def build_properties(
@@ -194,8 +262,10 @@ def build_properties(
     is a real first turn.
     """
     recorded_step = 0 if step is None else step
+    validated_attrs = validate_attrs(attrs or {})
     properties: dict[str, Any] = {
-        ATTRS_KEY: validate_attrs(attrs or {}),
+        ATTRS_KEY: validated_attrs,
+        ATTRS_SEEN_KEY: {key: recorded_step for key in validated_attrs},
         FACTS_KEY: validate_facts(facts or {}),
         PROVENANCE_KEY: [provenance.model_dump(mode="json")] if provenance else [],
         RETRACTIONS_KEY: [],
@@ -208,6 +278,7 @@ def build_properties(
         if key in RESERVED_KEYS:
             raise ValueError(f"{key!r} is a reserved property key — pass it via attrs/facts")
         _reject_secret("properties", key, value)
+        _scan_nested("properties", key, value)
         properties[key] = value
     return properties
 
@@ -230,6 +301,20 @@ def provenance_of(properties: dict[str, Any]) -> list[dict[str, Any]]:
 def retractions_of(properties: dict[str, Any]) -> list[dict[str, Any]]:
     value = properties.get(RETRACTIONS_KEY)
     return list(value) if isinstance(value, list) else []
+
+
+def attrs_observed_at(properties: dict[str, Any]) -> dict[str, int]:
+    """Step each predicate was last asserted at."""
+    value = properties.get(ATTRS_SEEN_KEY)
+    if not isinstance(value, dict):
+        return {}
+    return {str(k): v for k, v in value.items() if isinstance(v, int)}
+
+
+def attr_age(properties: dict[str, Any], key: str, current_step: int) -> int:
+    """Turns since ``key`` was last asserted (node age if never recorded)."""
+    seen = attrs_observed_at(properties).get(key)
+    return current_step - (last_seen_step(properties) if seen is None else seen)
 
 
 def cleanup_of(properties: dict[str, Any]) -> dict[str, Any] | None:
@@ -269,9 +354,21 @@ def _merge_attrs(
     *,
     retracted_at: dict[str, int] | None = None,
     incoming_step: int = 0,
+    seen_at: dict[str, int] | None = None,
 ) -> dict[str, AttrValue]:
     merged = dict(existing)
     blocked = retracted_at or {}
+    observed = seen_at or {}
+
+    # A retraction arriving from the other side must actually withdraw the
+    # predicate, not merely refuse to re-add it. Merging a snapshot that
+    # records "reachable was withdrawn at step 5" into a graph still
+    # holding reachable=True has to take it down.
+    for key, retracted_step in blocked.items():
+        # Compare against when *this predicate* was last asserted, not when
+        # anything about the node was last touched.
+        if key in merged and key not in incoming and observed.get(key, 0) <= retracted_step:
+            merged.pop(key)
     for key, value in incoming.items():
         # A withdrawn predicate must not come back from an *older*
         # observation (a stale snapshot import). A newer one still restores
@@ -329,7 +426,16 @@ def _merge_facts(existing: dict[str, Any], incoming: dict[str, Any]) -> dict[str
             continue  # an unobserved field never erases an observed one
         current = merged.get(key)
         if isinstance(current, list) and isinstance(value, list):
-            merged[key] = _union(current, value, limit=MAX_FACT_LIST_ITEMS)
+            limit = MAX_FACT_LIST_ITEMS if key in CAPPED_LIST_FACTS else None
+            joined = _union(current, value, limit=limit)
+            if len(joined) > WARN_FACT_LIST_ITEMS:
+                logger.warning(
+                    "fact list %r has %d items — kept in full, but this is far past "
+                    "anything a run should produce",
+                    key,
+                    len(joined),
+                )
+            merged[key] = joined
         else:
             merged[key] = value
     return merged
@@ -353,12 +459,23 @@ def merge_properties(existing: dict[str, Any], incoming: dict[str, Any]) -> dict
     retractions = _union(retractions_of(existing), retractions_of(incoming))
     merged[RETRACTIONS_KEY] = retractions
 
+    existing_seen = attrs_observed_at(existing) or dict.fromkeys(
+        attrs_of(existing), last_seen_step(existing)
+    )
+    incoming_seen = attrs_observed_at(incoming) or dict.fromkeys(
+        attrs_of(incoming), last_seen_step(incoming)
+    )
     merged[ATTRS_KEY] = _merge_attrs(
         attrs_of(existing),
         attrs_of(incoming),
         retracted_at=_retracted_at(retractions),
         incoming_step=last_seen_step(incoming),
+        seen_at=existing_seen,
     )
+    merged[ATTRS_SEEN_KEY] = {
+        key: max(existing_seen.get(key, 0), incoming_seen.get(key, 0))
+        for key in merged[ATTRS_KEY]
+    }
     merged[FACTS_KEY] = _merge_facts(facts_of(existing), facts_of(incoming))
     merged[PROVENANCE_KEY] = _cap_provenance(
         _union(provenance_of(existing), provenance_of(incoming))
@@ -398,9 +515,13 @@ def apply_retraction(
     retractions = retractions_of(properties)
     retractions.append({"step": step, "key": key, "reason": reason})
 
+    seen = attrs_observed_at(properties)
+    seen.pop(key, None)
+
     updated = dict(properties)
     updated[ATTRS_KEY] = attrs
     updated[RETRACTIONS_KEY] = retractions
+    updated[ATTRS_SEEN_KEY] = seen
     return updated, True
 
 
