@@ -8,9 +8,10 @@ This is a code-based gate: every branch below returns a concrete
 cannot happen by omission. ``context.engagement_id`` selects which
 ``Engagement`` config (scope/budget/ROE/policy) applies.
 
-TODO(control-team): ROE stage is now wired but still a pass-through
-skeleton (``redteam.control.roe.check_roe`` — fill in real rule
-evaluation there, track-a), per-engagement durable audit sinks (track-b).
+TODO(control-team): ROE stage now enforces capability/operation
+allow/deny lists (``redteam.control.roe``); still TODO there — time
+windows, availability impact, prohibited techniques (track-a).
+Per-engagement durable audit sinks (track-b).
 """
 
 from __future__ import annotations
