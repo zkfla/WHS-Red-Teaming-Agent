@@ -64,6 +64,7 @@ async def _build_gateway(
     registry = MCPToolRegistry()
     adapters: dict[str, MCPAdapter] = {}
     operation_bindings: dict[str, tuple[str, ...]] = {}
+    server_concurrency: dict[str, int] = {}
     for server_id in server_ids:
         settings = MCPServerSettings.from_environment(server_id)
         transport = _create_transport(settings)
@@ -89,8 +90,14 @@ async def _build_gateway(
             )
             operation_bindings[str(descriptor.tool_id)] = operations
         adapters[server_id] = adapter
+        server_concurrency[server_id] = settings.max_concurrency
 
-    return MCPToolGateway(registry, adapters, operation_bindings)
+    return MCPToolGateway(
+        registry,
+        adapters,
+        operation_bindings,
+        server_concurrency=server_concurrency,
+    )
 
 
 def _create_adapter(settings: MCPServerSettings, transport: MCPTransport) -> MCPAdapter:

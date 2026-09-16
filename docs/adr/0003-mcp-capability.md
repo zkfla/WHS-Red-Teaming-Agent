@@ -60,5 +60,9 @@ they enter the Registry.
   binding, preventing a caller from obtaining approval for one intent and
   substituting a different execution mechanism. An empty binding reserves a
   tool for operator-only lifecycle work.
+- The Gateway applies a per-server concurrency semaphore and includes queue
+  wait time in the invocation timeout. A tool discovered from an unhealthy
+  server is rejected before transport invocation; there is still no automatic
+  retry because tool calls cannot be assumed idempotent.
 - `deploy/mcp/finance` provides local Web/API and Recon MCP services plus a
   persistent browser connection example for the synthetic financial lab.

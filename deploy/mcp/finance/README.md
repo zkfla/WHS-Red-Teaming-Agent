@@ -154,7 +154,9 @@ python -m redteam.capability.servers recon-active --policy /absolute/path/policy
 - 기본 허용 method는 GET/HEAD/OPTIONS이며 금융권의 일부 GET도 부작용이 있을 수
   있으므로 운영자가 정확한 path를 검토해야 한다. 쓰기 method는 별도 설정 사항이다.
 - timeout·응답 byte 제한, 압축 응답 거부, 한 프로세스 내 네트워크 동작 직렬화.
-  stdio 프로세스 사이의 전역 요청량/동시성 Budget은 Control Plane/실행 환경 책임이다.
+  Gateway는 `MAX_CONCURRENCY`로 MCP 서버별 동시 호출을 다시 제한하며 대기시간도
+  invocation timeout에 포함한다. 비정상 상태로 발견된 서버는 실제 호출 전에 차단한다.
+  engagement 전체 요청량/Budget은 Control Plane 책임이다.
 - 계정 자격증명은 `bearer_env`로 조회하고 각 session_ref는 한 target_ref에 묶인다.
   토큰 자동 발급/갱신, 원본 증거 암호화 저장, 범용 개인정보 마스킹은 구현하지 않았다.
 - OpenAPI의 `$ref`/servers, OIDC의 endpoints는 자동 방문하지 않는다. 발견 경로가

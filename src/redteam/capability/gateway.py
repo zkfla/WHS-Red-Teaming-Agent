@@ -13,10 +13,12 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Collection, Mapping
 from datetime import datetime, timezone
+from typing import Any
 
-from redteam.capability.adapters.mcp.base import MCPAdapter
+from redteam.capability.adapters.mcp.base import MCPAdapter, MCPCallResult
 from redteam.capability.registry import MCPToolRegistry
-from redteam.core.contracts.tool import ToolError, ToolInvocation, ToolResult
+from redteam.core.contracts.tool import ToolDescriptor, ToolError, ToolInvocation, ToolResult
+from redteam.core.enums import ToolHealthStatus
 
 
 class MCPToolGateway:
@@ -25,6 +27,8 @@ class MCPToolGateway:
         registry: MCPToolRegistry,
         adapters: dict[str, MCPAdapter],
         operation_bindings: Mapping[str, Collection[str]] | None = None,
+        *,
+        server_concurrency: Mapping[str, int] | None = None,
     ) -> None:
         self._registry = registry
         self._adapters = adapters
@@ -36,6 +40,17 @@ class MCPToolGateway:
             if operation_bindings is not None
             else None
         )
+        concurrency = server_concurrency or {}
+        unknown_servers = set(concurrency) - set(adapters)
+        if unknown_servers:
+            names = ", ".join(sorted(unknown_servers))
+            raise ValueError(f"concurrency configured for unknown MCP servers: {names}")
+        if any(limit < 1 for limit in concurrency.values()):
+            raise ValueError("MCP server concurrency must be at least 1")
+        self._server_semaphores = {
+            server_id: asyncio.Semaphore(concurrency.get(server_id, 1))
+            for server_id in adapters
+        }
 
     async def invoke(self, invocation: ToolInvocation) -> ToolResult:
         descriptor = self._registry.get(invocation.tool_id)
@@ -92,16 +107,32 @@ class MCPToolGateway:
                 metadata={"dry_run": True},
             )
 
+        if descriptor.health_status == ToolHealthStatus.UNHEALTHY:
+            return self._error_result(
+                invocation,
+                code="tool_unhealthy",
+                message=f"tool {invocation.tool_id} belongs to an unhealthy MCP server",
+                retryable=True,
+            )
+
         try:
             adapter_result = await asyncio.wait_for(
-                adapter.invoke(descriptor, invocation.arguments),
+                _invoke_with_limit(
+                    adapter,
+                    descriptor,
+                    invocation.arguments,
+                    self._server_semaphores[descriptor.server_id],
+                ),
                 timeout=invocation.timeout_seconds,
             )
         except asyncio.TimeoutError:
             return self._error_result(
                 invocation,
                 code="tool_timeout",
-                message=f"tool exceeded timeout of {invocation.timeout_seconds} seconds",
+                message=(
+                    "tool queue and execution exceeded timeout of "
+                    f"{invocation.timeout_seconds} seconds"
+                ),
                 retryable=True,
             )
         except Exception as exc:
@@ -141,3 +172,13 @@ class MCPToolGateway:
             started_at=occurred_at,
             finished_at=occurred_at,
         )
+
+
+async def _invoke_with_limit(
+    adapter: MCPAdapter,
+    descriptor: ToolDescriptor,
+    arguments: dict[str, Any],
+    semaphore: asyncio.Semaphore,
+) -> MCPCallResult:
+    async with semaphore:
+        return await adapter.invoke(descriptor, arguments)

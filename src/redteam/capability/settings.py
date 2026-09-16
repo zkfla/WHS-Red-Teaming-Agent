@@ -51,6 +51,7 @@ class MCPServerSettings:
     process_environment: dict[str, str] = field(default_factory=dict, repr=False)
     allowed_tools: tuple[str, ...] | None = None
     tool_operations: dict[str, tuple[str, ...]] | None = None
+    max_concurrency: int = 1
 
     @classmethod
     def from_environment(cls, server_id: str) -> MCPServerSettings:
@@ -94,6 +95,7 @@ class MCPServerSettings:
 
         allowed_tools = _load_allowed_tools(prefix)
         tool_operations = _load_tool_operations(prefix)
+        max_concurrency = _load_max_concurrency(prefix)
         if allowed_tools is not None and tool_operations is not None:
             allowed_names = set(allowed_tools)
             binding_names = set(tool_operations)
@@ -115,6 +117,7 @@ class MCPServerSettings:
             process_environment=process_environment,
             allowed_tools=allowed_tools,
             tool_operations=tool_operations,
+            max_concurrency=max_concurrency,
         )
 
     def request_headers(self) -> dict[str, str]:
@@ -214,6 +217,17 @@ def _load_tool_operations(prefix: str) -> dict[str, tuple[str, ...]] | None:
             )
         bindings[tool_name] = tuple(operations)
     return bindings
+
+
+def _load_max_concurrency(prefix: str) -> int:
+    value = os.environ.get(f"{prefix}_MAX_CONCURRENCY", "1")
+    try:
+        limit = int(value)
+    except ValueError as exc:
+        raise MCPConfigurationError(f"{prefix}_MAX_CONCURRENCY must be an integer") from exc
+    if not 1 <= limit <= 32:
+        raise MCPConfigurationError(f"{prefix}_MAX_CONCURRENCY must be between 1 and 32")
+    return limit
 
 
 def _load_process_environment(prefix: str) -> dict[str, str]:
