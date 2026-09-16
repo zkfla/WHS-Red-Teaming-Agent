@@ -32,8 +32,12 @@ class InMemoryEventBus:
         handlers = [*self._handlers.get(event.event_type, []), *self._handlers.get(WILDCARD, [])]
         if not handlers:
             return
+
+        async def invoke(handler: EventHandler) -> None:
+            await handler(event)
+
         results = await asyncio.gather(
-            *(handler(event) for handler in handlers), return_exceptions=True
+            *(invoke(handler) for handler in handlers), return_exceptions=True
         )
         for result in results:
             if isinstance(result, BaseException):

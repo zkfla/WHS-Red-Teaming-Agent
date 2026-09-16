@@ -43,13 +43,16 @@ asking another component to *do* something stays a direct call through a
   tests depend on this.
 - **Isolation** — a handler that raises is logged and counted
   (`handler_failures`); it cannot stop the other handlers or fail the
-  publisher. A broken subscriber must not be able to abort a run.
+  publisher. This includes synchronous exceptions when calling a handler,
+  before it returns an awaitable. A broken subscriber must not be able to abort a run.
 - **Bounded history** — `history()`, `event_types()`,
   `correlated(id)` for debugging and assertions. This is a ring buffer,
   **not** durable storage; the Evidence Store keeps the record that
   matters. It is also in-memory-backend-only, not part of the port.
 
 `"*"` subscribes to everything (see `app.cli`).
+Subscriptions are not deduplicated: repeated registrations and registering the
+same handler for both an event type and `"*"` each cause a separate invocation.
 
 ## What orchestration emits today
 

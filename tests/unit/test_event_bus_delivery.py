@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
+from typing import NoReturn
 
 from redteam.core.contracts.events import EventEnvelope
 from redteam.core.ids import EngagementId, EventId, RunId
@@ -27,6 +29,7 @@ async def test_a_failing_handler_cannot_break_the_others_or_the_publisher() -> N
     delivered: list[str] = []
 
     async def boom(_event: EventEnvelope) -> None:
+        await asyncio.sleep(0)
         raise RuntimeError("subscriber exploded")
 
     async def collect(evt: EventEnvelope) -> None:
@@ -37,6 +40,85 @@ async def test_a_failing_handler_cannot_break_the_others_or_the_publisher() -> N
     await bus.publish(event("RunStarted"))
 
     assert delivered == ["RunStarted"]
+    assert bus.handler_failures == 1
+
+
+async def test_synchronous_handler_failure_is_isolated() -> None:
+    bus = InMemoryEventBus()
+    delivered: list[str] = []
+
+    def boom(_event: EventEnvelope) -> NoReturn:
+        raise RuntimeError("subscriber call exploded")
+
+    async def collect(evt: EventEnvelope) -> None:
+        delivered.append(evt.event_type)
+
+    await bus.subscribe("RunStarted", boom)
+    await bus.subscribe("RunStarted", collect)
+    await bus.publish(event("RunStarted"))
+
+    assert delivered == ["RunStarted"]
+    assert bus.handler_failures == 1
+
+
+async def test_synchronous_failures_preserve_duplicate_and_wildcard_delivery() -> None:
+    bus = InMemoryEventBus()
+    failed: list[str] = []
+    delivered: list[str] = []
+
+    def boom(evt: EventEnvelope) -> NoReturn:
+        failed.append(evt.event_type)
+        raise RuntimeError("subscriber call exploded")
+
+    async def collect(evt: EventEnvelope) -> None:
+        delivered.append(evt.event_type)
+
+    await bus.subscribe("RunStarted", boom)
+    await bus.subscribe("RunStarted", boom)
+    await bus.subscribe("*", boom)
+    await bus.subscribe("RunStarted", collect)
+    await bus.subscribe("*", collect)
+    await bus.publish(event("RunStarted"))
+
+    assert failed == ["RunStarted"] * 3
+    assert delivered == ["RunStarted"] * 2
+    assert bus.handler_failures == 3
+
+
+async def test_synchronous_failure_still_waits_for_concurrent_handlers() -> None:
+    bus = InMemoryEventBus()
+    started = asyncio.Event()
+    release = asyncio.Event()
+    completed: list[str] = []
+    published = event("RunStarted")
+
+    def boom(_event: EventEnvelope) -> NoReturn:
+        raise RuntimeError("subscriber call exploded")
+
+    async def slow(_event: EventEnvelope) -> None:
+        assert bus.history() == [published]
+        started.set()
+        await release.wait()
+        completed.append("slow")
+
+    async def peer(_event: EventEnvelope) -> None:
+        await started.wait()
+        completed.append("peer")
+
+    await bus.subscribe("RunStarted", boom)
+    await bus.subscribe("RunStarted", slow)
+    await bus.subscribe("RunStarted", peer)
+    publishing = asyncio.create_task(bus.publish(published))
+    try:
+        await asyncio.wait_for(started.wait(), timeout=1)
+        await asyncio.sleep(0)
+        assert not publishing.done()
+        assert completed == ["peer"]
+    finally:
+        release.set()
+        await asyncio.wait_for(publishing, timeout=1)
+
+    assert completed == ["peer", "slow"]
     assert bus.handler_failures == 1
 
 
