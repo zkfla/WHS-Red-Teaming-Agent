@@ -33,9 +33,10 @@ from redteam.attack_graph.stores.memory import InMemoryAttackGraphStore
 from redteam.capability.adapters.mcp.example import ExampleMCPAdapter
 from redteam.capability.gateway import MCPToolGateway
 from redteam.capability.registry import MCPToolRegistry
+from redteam.control.approval import ApprovalService
 from redteam.control.audit import AuditLog
 from redteam.control.service import DefaultControlPlane
-from redteam.control.stores.filesystem import FilesystemAuditStore
+from redteam.control.stores.filesystem import FilesystemApprovalStore, FilesystemAuditStore
 from redteam.core.config import (
     AppConfig,
     CapabilityConfig,
@@ -100,6 +101,7 @@ async def build_runtime_deps(
     engagement: Engagement,
     evidence_dir: str | Path = "data/evidence",
     audit_dir: str | Path = "data/audit",
+    approval_dir: str | Path = "data/approvals",
 ) -> RuntimeDeps:
     """Wire in-memory/dummy backends for every port, from an ``Engagement`` alone.
 
@@ -121,8 +123,9 @@ async def build_runtime_deps(
     evidence_store = FilesystemEvidenceStore(evidence_dir)
     tool_gateway = await _build_default_tool_gateway(CapabilityConfig())
     audit_log = AuditLog(FilesystemAuditStore(audit_dir))
+    approvals = ApprovalService(FilesystemApprovalStore(approval_dir))
     control_plane = DefaultControlPlane(
-        {engagement.engagement_id: engagement}, audit_log=audit_log
+        {engagement.engagement_id: engagement}, audit_log=audit_log, approvals=approvals
     )
     llm_client = FakeLLMClient()
 
@@ -147,6 +150,7 @@ async def build_application(
     llm: LLMClient | None = None,
     evidence_dir: str | Path = "data/evidence",
     audit_dir: str | Path = "data/audit",
+    approval_dir: str | Path = "data/approvals",
 ) -> tuple[Engagement, RuntimeDeps]:
     """``AppConfig``-aware composition root. Every dependency is overridable.
 
@@ -175,6 +179,7 @@ async def build_application(
     resolved_control_plane = control_plane or DefaultControlPlane(
         {engagement.engagement_id: engagement},
         audit_log=AuditLog(FilesystemAuditStore(audit_dir)),
+        approvals=ApprovalService(FilesystemApprovalStore(approval_dir)),
     )
     resolved_tool_gateway = tool_gateway or await _build_default_tool_gateway(config.capability)
     resolved_evidence_store = evidence_store or FilesystemEvidenceStore(evidence_dir)

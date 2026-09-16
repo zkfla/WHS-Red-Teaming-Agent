@@ -48,12 +48,13 @@ class DefaultControlPlane:
         self,
         engagements: dict[EngagementId, Engagement],
         audit_log: AuditLog | None = None,
+        approvals: ApprovalService | None = None,
     ) -> None:
         self._engagements = engagements
         self._audit = audit_log or AuditLog()
         self._rate_limiters: dict[EngagementId, RateLimiter] = {}
         self._budgets: dict[EngagementId, BudgetTracker] = {}
-        self._approvals = ApprovalService()
+        self._approvals = approvals or ApprovalService()
         # Remembers which ActionProposal a pending Approval belongs to, so
         # resolve_approval() can record an APPROVAL_RESOLVED audit entry
         # correlated back to run_id/engagement_id/action_id. Popped once

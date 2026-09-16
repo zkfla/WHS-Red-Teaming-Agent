@@ -43,6 +43,11 @@ python -m redteam.app.cli run examples/engagement.yaml
 # or:
 python examples/minimal_run.py
 
+# Inspect/resolve pending Approvals (human-in-the-loop, independent of
+# a `run` in progress -- operates on the persisted ApprovalStore)
+python -m redteam.app.cli approvals list
+python -m redteam.app.cli approvals resolve <approval_id> approved --by <name>
+
 # Tests
 pytest -q
 

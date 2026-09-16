@@ -19,12 +19,19 @@ from redteam.core.contracts.engagement import (
     ExecutionBudget,
     RateLimitPolicy,
 )
+from redteam.core.contracts.policy import ControlContext, PolicyDecision
 from redteam.core.contracts.target import HostTarget
 from redteam.core.enums import ApprovalStatus, PolicyVerdict
 from redteam.core.ids import ActionId, AgentId, EngagementId, RunId
 
 
 def _proposal(capability: str, operation: str) -> ActionProposal:
+    """Builds an ActionProposal using only canonical capability/operation
+    values (docs/contracts/actions.md): capability is one of the fixed
+    namespaces (recon/web/mobile/analysis), operation is one of the
+    registered canonical action names. Callers in this file must stick
+    to that vocabulary rather than inventing new strings.
+    """
     return ActionProposal(
         action_id=ActionId("action_1"),
         run_id=RunId("run_1"),
@@ -65,9 +72,7 @@ async def test_filesystem_audit_store_persists_across_instances(tmp_path: Path) 
     at the same directory sees entries written by a previous one."""
     store_a = FilesystemAuditStore(tmp_path)
     log_a = AuditLog(store_a)
-    proposal = _proposal("recon.example", "ping")
-
-    from redteam.core.contracts.policy import PolicyDecision
+    proposal = _proposal("recon", "port_scan")
 
     decision = PolicyDecision(
         action_id=proposal.action_id,
@@ -91,21 +96,29 @@ async def test_filesystem_audit_store_persists_across_instances(tmp_path: Path) 
 async def test_control_plane_records_approval_resolution() -> None:
     """Closes the traceability gap: resolving a pending Approval must
     produce an APPROVAL_RESOLVED audit entry correlated back to the
-    original action, not just the REQUIRE_APPROVAL decision."""
-    engagement = _engagement(require_approval_for=["fund.transfer:execute"])
+    original action, not just the REQUIRE_APPROVAL decision.
+
+    Uses "web:auth_attempt" (colon) for ApprovalPolicy.require_approval_for
+    -- that field is matched by control.policy.evaluate_policy's own
+    "capability:operation" key, which is a separate convention from
+    ROE's "capability.operation" (dot) canonical action key.
+    """
+    engagement = _engagement(require_approval_for=["web:auth_attempt"])
     audit_log = AuditLog()  # in-memory is enough for this test
-    control_plane = DefaultControlPlane({engagement.engagement_id: engagement}, audit_log=audit_log)
+    control_plane = DefaultControlPlane(
+        {engagement.engagement_id: engagement}, audit_log=audit_log
+    )
 
-    proposal = _proposal("fund.transfer", "execute")
-    from redteam.core.contracts.policy import ControlContext
-
+    proposal = _proposal("web", "auth_attempt")
     decision = await control_plane.evaluate(
         proposal, ControlContext(engagement_id=engagement.engagement_id)
     )
     assert decision.verdict == PolicyVerdict.REQUIRE_APPROVAL
     assert decision.approval_id is not None
 
-    await control_plane.resolve_approval(decision.approval_id, ApprovalStatus.APPROVED, "operator")
+    await control_plane.resolve_approval(
+        decision.approval_id, ApprovalStatus.APPROVED, "operator"
+    )
 
     entries = await audit_log.entries_for_action(proposal.action_id)
     entry_types = [e.entry_type.value for e in entries]

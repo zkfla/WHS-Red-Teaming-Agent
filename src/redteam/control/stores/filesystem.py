@@ -1,18 +1,25 @@
-"""Filesystem-backed ``AuditStore``.
+"""Filesystem-backed ``AuditStore``/``ApprovalStore``.
 
-Append-only, one JSONL file per run (``<root>/<run_id>.jsonl``) --
-mirrors ``redteam.evidence.stores.filesystem.FilesystemEvidenceStore``'s
-shape and guarantees. Kept as a separate class rather than reusing
-``FilesystemEvidenceStore`` directly: ``AuditEntry`` and
-``EvidenceRecord`` are different domain concerns (one Control-team-
-internal, one a frozen core contract) and collapsing them into one
+``FilesystemAuditStore``: append-only, one JSONL file per run
+(``<root>/<run_id>.jsonl``).
+
+``FilesystemApprovalStore``: one JSON file per approval
+(``<root>/<approval_id>.json``), overwritten in place -- an Approval is
+a single mutable record (PENDING -> APPROVED/REJECTED/EXPIRED), not a
+log, so it doesn't fit the append-only shape.
+
+Both mirror ``redteam.evidence.stores.filesystem.FilesystemEvidenceStore``'s
+guarantees but are kept as separate classes: ``AuditEntry``/``Approval``
+and ``EvidenceRecord`` are different domain concerns (two Control-team-
+internal, one a frozen core contract), and collapsing them into one
 class would create exactly the kind of accidental coupling the
-dependency rules are meant to avoid, even though the on-disk shape
-happens to be identical today.
+dependency rules are meant to avoid, even where the on-disk shape
+happens to look similar today.
 
-TODO(control-team): ``list_for_action`` scans every run file, same
-known limitation as ``FilesystemEvidenceStore`` -- add an index if/when
-this becomes a bottleneck. No retention policy yet either.
+TODO(control-team): ``list_for_action``/``list_pending`` scan every
+file in ``root`` -- same known limitation as
+``FilesystemEvidenceStore``; add an index if/when this becomes a
+bottleneck. No retention policy on the audit side yet either.
 """
 
 from __future__ import annotations
@@ -20,7 +27,9 @@ from __future__ import annotations
 from pathlib import Path
 
 from redteam.control.audit import AuditEntry
-from redteam.core.ids import ActionId, RunId
+from redteam.core.contracts.policy import Approval
+from redteam.core.enums import ApprovalStatus
+from redteam.core.ids import ActionId, ApprovalId, RunId
 
 
 class FilesystemAuditStore:
@@ -56,3 +65,32 @@ class FilesystemAuditStore:
                 if entry.action_id == action_id:
                     results.append(entry)
         return results
+
+
+class FilesystemApprovalStore:
+    def __init__(self, root_dir: str | Path) -> None:
+        self._root = Path(root_dir)
+        self._root.mkdir(parents=True, exist_ok=True)
+
+    def _path_for(self, approval_id: ApprovalId) -> Path:
+        return self._root / f"{approval_id}.json"
+
+    async def save(self, approval: Approval) -> None:
+        self._path_for(approval.approval_id).write_text(
+            approval.model_dump_json(), encoding="utf-8"
+        )
+
+    async def get(self, approval_id: ApprovalId) -> Approval | None:
+        path = self._path_for(approval_id)
+        if not path.exists():
+            return None
+        return Approval.model_validate_json(path.read_text(encoding="utf-8"))
+
+    async def list_pending(self) -> list[Approval]:
+        results = []
+        for path in self._root.glob("*.json"):
+            approval = Approval.model_validate_json(path.read_text(encoding="utf-8"))
+            if approval.status == ApprovalStatus.PENDING:
+                results.append(approval)
+        return results
+
