@@ -78,6 +78,113 @@ REDTEAM_MCP_<SERVER_ID>_PASSTHROUGH_ENV=ANDROID_SERIAL,ANDROID_HOME
 
 `TRANSPORT` defaults to `streamable_http` for existing configurations.
 
+## Mobile capability (candidate: mobile-next/mobile-mcp)
+
+**Not finalized.** `mobile-next/mobile-mcp` (https://github.com/mobile-next/mobile-mcp)
+is being evaluated, not adopted — `MobileMCPAdapter` only knows the generic
+`MCPServerAdapter`/`MCPTransport` shapes, so swapping it for a different
+mobile MCP server later means changing `.env.example`/`examples/app.yaml`
+only, no Adapter code.
+
+Canonical operations this capability binds today (see
+`docs/contracts/actions.md`): `app_launch`, `device_shell`,
+`response_analysis`. `runtime_instrumentation` is a canonical operation
+this capability does **not** yet implement — see "Known gaps" below.
+
+| canonical operation | mobile-next/mobile-mcp remote tool | notes |
+|---|---|---|
+| `app_launch` | `mobile_launch_app` | starts an app by package/bundle name |
+| `response_analysis` | `mobile_get_device_logs`, `mobile_list_crashes`, `mobile_get_crash` | observing device logs/crash output after an action; observation only |
+| `device_shell` | *(not provided upstream)* | filled by the in-repo fallback below |
+
+Bind only these remote tool names via `REDTEAM_MCP_<SERVER_ID>_ALLOWED_TOOLS_JSON`
++ `_TOOL_OPERATIONS_JSON` — see `.env.example` for the exact values. UI
+automation tools the upstream server also exposes (`mobile_click_on_screen_at_coordinates`,
+`mobile_swipe_on_screen`, `mobile_take_screenshot`, `mobile_install_app`,
+`mobile_terminate_app`, ...) are real remote tools `discover_tools()` will
+surface, but they are **not** bound to any canonical operation in this PR —
+tap/swipe/screenshot-style interaction is not yet a canonical operation.
+Propose one via Issue (docs/contracts/actions.md's process) before wiring
+any of them up.
+
+mobile-next/mobile-mcp supports both transports: stdio (its default,
+`npx -y @mobilenext/mobile-mcp@latest`, run directly on a host with
+ADB/Xcode tooling already set up) and Streamable HTTP (`--listen <port>`,
+containerized via `deploy/docker/mobile-next-mcp` + the `mobile-next-mcp`
+compose service, profile `mobile`, `network_mode: host` since it needs to
+reach adb/simulators on the host). Either way it needs a real,
+operator-authorized device or emulator — there is no lab/dummy mode.
+
+### Local fallback: `redteam.capability.servers.mobile` (server ID example: `mobile-local`)
+
+Implements only `device_shell`, the one canonical operation neither
+mobile-next/mobile-mcp nor any other candidate currently covers: one fixed,
+allowlisted ADB diagnostic (`getprop`, `pm_list_packages`,
+`dumpsys_battery`, `logcat_recent`) against an operator-registered device
+serial — not a general remote-shell primitive. Policy shape:
+
+```json
+{"devices": {"pixel": {"serial": "emulator-5554"}}, "allowed_commands": ["getprop"]}
+```
+
+Run it the same way as any stdio MCP server:
+
+```sh
+python -m redteam.capability.servers.mobile --policy /absolute/path/mobile-policy.json
+```
+
+### Known gaps
+
+- `runtime_instrumentation` (e.g. Frida-style hooking of a running process)
+  is not implemented anywhere in this capability. It is a fundamentally
+  different class of tool than a bounded diagnostic command — building it
+  in-repo would mean writing new attack tooling rather than wrapping an
+  existing one (instruction.md section 21). Needs a dedicated MCP
+  adapter/Issue once the team picks a real instrumentation MCP server.
+
+## Analysis capability (candidate: apktool-mcp-server)
+
+**Not finalized.** `apktool-mcp-server` (https://github.com/zinja-coder/apktool-mcp-server)
+is being evaluated, not adopted — same swap guarantee as above via
+`AnalysisMCPAdapter`.
+
+Canonical operation this capability binds today: `static_analysis`.
+
+| canonical operation | apktool-mcp-server remote tool | notes |
+|---|---|---|
+| `static_analysis` | `decode_apk`, `get_manifest`, `get_apktool_yml`, `list_smali_directories`, `list_smali_files`, `get_smali_file`, `list_resources`, `get_resource_file`, `search_in_file` | decompiled-code-level read/analyze tools only |
+
+`build_apk`, `modify_smali_file`, `modify_resource_file`, and
+`clean_project` are **deliberately excluded** from
+`REDTEAM_MCP_<SERVER_ID>_ALLOWED_TOOLS_JSON` (see `.env.example`) — this PR
+only wires up inspection, per instruction.md section 21 (no build/modify
+capability without a separate, explicit decision).
+
+apktool-mcp-server only speaks MCP stdio upstream (`uv run
+apktool_mcp_server.py`; no HTTP mode documented). Containerized via
+`deploy/docker/apktool-mcp` + the `apktool-mcp` compose service (profile
+`tools`); since it's stdio, that image is built once and invoked per-call
+(`docker compose run --rm -i apktool-mcp`), not started with `docker
+compose up`.
+
+### Local fallback: `redteam.capability.servers.analysis` (server ID example: `analysis-local`)
+
+A dependency-free complement to apktool-mcp-server: reads an
+operator-registered `.apk` file's zip container directly (stdlib
+`zipfile`) — entry listing, a SHA-256 digest per entry, and a bounded
+fixed-string search — without needing apktool/Java installed. It does not
+decompile smali or parse binary `AndroidManifest.xml`; that stays apktool's
+job. Useful standalone, or while apktool-mcp-server isn't wired up yet.
+Policy shape:
+
+```json
+{"apks": {"sample": {"path": "/absolute/path/app.apk"}}}
+```
+
+```sh
+python -m redteam.capability.servers.analysis --policy /absolute/path/analysis-policy.json
+```
+
 ## Adding a new MCP server
 
 1. Add the server's image/build to `deploy/compose/docker-compose.yml`
