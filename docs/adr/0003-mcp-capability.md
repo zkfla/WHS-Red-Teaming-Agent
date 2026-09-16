@@ -60,6 +60,10 @@ they enter the Registry.
   binding, preventing a caller from obtaining approval for one intent and
   substituting a different execution mechanism. An empty binding reserves a
   tool for operator-only lifecycle work.
+- `MCPToolCatalog` returns healthy, namespace-matched candidates for a
+  canonical action but deliberately does not choose one. Exposing that query
+  to Orchestration requires the frozen Core Port change described in
+  `docs/proposals/tool-selection-port.md`.
 - The Gateway applies a per-server concurrency semaphore and includes queue
   wait time in the invocation timeout. A tool discovered from an unhealthy
   server is rejected before transport invocation; there is still no automatic

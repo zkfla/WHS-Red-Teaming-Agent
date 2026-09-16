@@ -278,6 +278,9 @@ async def test_gateway_routes_tool_when_intent_differs_from_remote_tool_name() -
 
     assert result.success is True
     assert backend.calls == [("http_request", {"message": "hi"})]
+    assert [
+        tool.tool_id for tool in gateway.list_tools_for_action("web", "response_analysis")
+    ] == [ToolId("web.http_request")]
 
 
 async def test_gateway_blocks_tool_substitution_outside_operation_binding() -> None:

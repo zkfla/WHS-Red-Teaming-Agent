@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from redteam.capability.adapters.mcp.base import MCPAdapter, MCPCallResult
+from redteam.capability.catalog import MCPToolCatalog
 from redteam.capability.registry import MCPToolRegistry
 from redteam.core.contracts.tool import ToolDescriptor, ToolError, ToolInvocation, ToolResult
 from redteam.core.enums import ToolHealthStatus
@@ -32,14 +33,7 @@ class MCPToolGateway:
     ) -> None:
         self._registry = registry
         self._adapters = adapters
-        self._operation_bindings = (
-            {
-                str(tool_id): frozenset(operations)
-                for tool_id, operations in operation_bindings.items()
-            }
-            if operation_bindings is not None
-            else None
-        )
+        self._catalog = MCPToolCatalog(registry, operation_bindings)
         concurrency = server_concurrency or {}
         unknown_servers = set(concurrency) - set(adapters)
         if unknown_servers:
@@ -82,12 +76,7 @@ class MCPToolGateway:
                 finished_at=datetime.now(timezone.utc),
             )
 
-        allowed_operations = (
-            self._operation_bindings.get(str(invocation.tool_id), frozenset())
-            if self._operation_bindings is not None
-            else frozenset((descriptor.tool_name,))
-        )
-        if invocation.operation not in allowed_operations:
+        if not self._catalog.supports(invocation.tool_id, invocation.operation):
             return self._error_result(
                 invocation,
                 code="operation_not_allowed_for_tool",
@@ -152,6 +141,21 @@ class MCPToolGateway:
             started_at=adapter_result.started_at,
             finished_at=adapter_result.finished_at,
             metadata=adapter_result.metadata,
+        )
+
+    def list_tools_for_action(
+        self,
+        capability: str,
+        operation: str,
+        *,
+        include_unhealthy: bool = False,
+    ) -> list[ToolDescriptor]:
+        """Return eligible Registry candidates without applying selection policy."""
+
+        return self._catalog.list_tools_for_action(
+            capability,
+            operation,
+            include_unhealthy=include_unhealthy,
         )
 
     @staticmethod
