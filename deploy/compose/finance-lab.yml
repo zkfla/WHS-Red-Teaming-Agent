@@ -1,0 +1,120 @@
+name: redteam-finance-lab
+
+x-worker: &worker
+  build:
+    context: ../..
+    dockerfile: deploy/docker/finance-tools/Dockerfile
+    target: base
+  read_only: true
+  tmpfs: [/tmp]
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  networks: [lab]
+  volumes:
+    - ../mcp/finance/policy.json:/app/policy.json:ro
+  depends_on:
+    mock-bank:
+      condition: service_healthy
+  healthcheck:
+    test: [CMD, python, -c, "import socket; socket.create_connection(('127.0.0.1',8000),2).close()"]
+    interval: 5s
+    timeout: 3s
+    retries: 15
+
+services:
+  mock-bank:
+    image: python:3.11-slim
+    user: "10001:10001"
+    command: [python, /app/server.py]
+    volumes:
+      - ../docker/finance-mock/server.py:/app/server.py:ro
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    networks: [lab]
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health')"]
+      interval: 3s
+      timeout: 3s
+      retries: 15
+
+  web-http:
+    <<: *worker
+    command: [web-http, --policy, /app/policy.json, --transport, streamable-http, --host, 0.0.0.0]
+    environment:
+      LAB_ALICE_TOKEN: synthetic-alice
+      LAB_BOB_TOKEN: synthetic-bob
+
+  web-browser:
+    build:
+      context: ../docker/finance-browser
+    init: true
+    command:
+      - --headless
+      - --browser
+      - chromium
+      - --no-sandbox
+      - --isolated
+      - --block-service-workers
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8931"
+      - --allowed-origins
+      - http://mock-bank:8080
+      - --allowed-hosts
+      - web-browser:8931,localhost:8931,127.0.0.1:8931
+    networks: [lab]
+    read_only: true
+    tmpfs: [/tmp, /home/node/.cache, /home/node/.config]
+    working_dir: /tmp
+    entrypoint: [/app/node_modules/.bin/playwright-mcp]
+    shm_size: 256mb
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    depends_on:
+      mock-bank:
+        condition: service_healthy
+    healthcheck:
+      test: [CMD, node, -e, "const s=require('net').connect(8931,'127.0.0.1',()=>{s.end();process.exit(0)});s.on('error',()=>process.exit(1));"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  recon-passive:
+    <<: *worker
+    command: [recon-passive, --policy, /app/policy.json, --transport, streamable-http, --host, 0.0.0.0]
+
+  recon-active:
+    <<: *worker
+    build:
+      context: ../..
+      dockerfile: deploy/docker/finance-tools/Dockerfile
+      target: active
+    command: [recon-active, --policy, /app/policy.json, --transport, streamable-http, --host, 0.0.0.0]
+
+  smoke:
+    <<: *worker
+    profiles: [test]
+    entrypoint: [python, /app/finance_mcp_smoke.py]
+    env_file: ../mcp/finance/framework.env.example
+    volumes:
+      - ../../examples/finance_mcp_smoke.py:/app/finance_mcp_smoke.py:ro
+    healthcheck:
+      disable: true
+    depends_on:
+      web-http:
+        condition: service_healthy
+      web-browser:
+        condition: service_healthy
+      recon-passive:
+        condition: service_healthy
+      recon-active:
+        condition: service_healthy
+
+networks:
+  lab:
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.30.50.0/24

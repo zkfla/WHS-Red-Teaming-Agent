@@ -63,6 +63,16 @@ class MCPToolGateway:
                 ),
             )
 
+        if invocation.execution_context.dry_run:
+            occurred_at = datetime.now(timezone.utc)
+            return ToolResult(
+                invocation_id=invocation.invocation_id, action_id=invocation.action_id,
+                tool_id=invocation.tool_id, success=True,
+                output={"dry_run": True, "executed": False},
+                started_at=occurred_at, finished_at=occurred_at,
+                metadata={"dry_run": True},
+            )
+
         try:
             adapter_result = await asyncio.wait_for(
                 adapter.invoke(descriptor, invocation.arguments),

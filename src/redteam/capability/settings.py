@@ -48,6 +48,7 @@ class MCPServerSettings:
     risk_level: RiskLevel = RiskLevel.LOW
     bearer_token: str | None = field(default=None, repr=False)
     process_environment: dict[str, str] = field(default_factory=dict, repr=False)
+    allowed_tools: tuple[str, ...] | None = None
 
     @classmethod
     def from_environment(cls, server_id: str) -> MCPServerSettings:
@@ -99,6 +100,7 @@ class MCPServerSettings:
             risk_level=risk_level,
             bearer_token=token,
             process_environment=process_environment,
+            allowed_tools=_load_allowed_tools(prefix),
         )
 
     def request_headers(self) -> dict[str, str]:
@@ -147,6 +149,23 @@ def _load_stdio_arguments(prefix: str) -> tuple[str, ...]:
             f"{prefix}_ARGS_JSON must be a JSON array of strings without NUL bytes"
         )
     return tuple(arguments)
+
+
+def _load_allowed_tools(prefix: str) -> tuple[str, ...] | None:
+    value = os.environ.get(f"{prefix}_ALLOWED_TOOLS_JSON")
+    if value is None:
+        return None
+    try:
+        names = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise MCPConfigurationError("ALLOWED_TOOLS_JSON must be a JSON array") from exc
+    if (
+        not isinstance(names, list) or not names
+        or any(not isinstance(name, str) or not name.strip() for name in names)
+        or len(names) != len(set(names))
+    ):
+        raise MCPConfigurationError("ALLOWED_TOOLS_JSON must contain unique non-empty tool names")
+    return tuple(names)
 
 
 def _load_process_environment(prefix: str) -> dict[str, str]:

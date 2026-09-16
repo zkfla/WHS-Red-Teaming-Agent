@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
+from contextlib import AsyncExitStack, asynccontextmanager
+
 from redteam.capability.adapters.mcp.analysis import AnalysisMCPAdapter
 from redteam.capability.adapters.mcp.base import MCPAdapter
 from redteam.capability.adapters.mcp.example import ExampleMCPAdapter
 from redteam.capability.adapters.mcp.mobile import MobileMCPAdapter
 from redteam.capability.adapters.mcp.recon import ReconMCPAdapter
 from redteam.capability.adapters.mcp.transport import (
+    AllowlistedMCPTransport,
     MCPTransport,
     StdioMCPTransport,
     StreamableHTTPMCPTransport,
@@ -30,6 +34,24 @@ async def build_mcp_tool_gateway(server_ids: list[str]) -> MCPToolGateway:
     used by the repository's minimal vertical slice.
     """
 
+    return await _build_gateway(server_ids)
+
+
+@asynccontextmanager
+async def open_mcp_tool_gateway(server_ids: list[str]) -> AsyncIterator[MCPToolGateway]:
+    """Engagement-scoped connections, required for stateful browser operations.
+
+    The orchestration owner must enter/exit in the same task and finish all
+    invocation tasks before exiting. Never share this scope across engagements.
+    Partial startup failures close previously opened connections as well.
+    """
+    async with AsyncExitStack() as stack:
+        yield await _build_gateway(server_ids, stack)
+
+
+async def _build_gateway(
+    server_ids: list[str], stack: AsyncExitStack | None = None,
+) -> MCPToolGateway:
     if not server_ids:
         example = ExampleMCPAdapter()
         registry = MCPToolRegistry()
@@ -43,7 +65,10 @@ async def build_mcp_tool_gateway(server_ids: list[str]) -> MCPToolGateway:
     adapters: dict[str, MCPAdapter] = {}
     for server_id in server_ids:
         settings = MCPServerSettings.from_environment(server_id)
-        adapter = _create_adapter(settings)
+        transport = _create_transport(settings)
+        if stack is not None:
+            await stack.enter_async_context(transport.session())
+        adapter = _create_adapter(settings, transport)
         descriptors = await adapter.discover_tools()
         if not descriptors:
             raise MCPConfigurationError(f"MCP server {server_id!r} discovered no tools")
@@ -53,8 +78,9 @@ async def build_mcp_tool_gateway(server_ids: list[str]) -> MCPToolGateway:
     return MCPToolGateway(registry, adapters)
 
 
-def _create_adapter(settings: MCPServerSettings) -> MCPAdapter:
-    transport = _create_transport(settings)
+def _create_adapter(settings: MCPServerSettings, transport: MCPTransport) -> MCPAdapter:
+    if settings.allowed_tools is not None:
+        transport = AllowlistedMCPTransport(transport, settings.allowed_tools)
     if settings.kind == MCPServerKind.WEB_API:
         return WebAPIMCPAdapter(
             server_id=settings.server_id,
@@ -82,7 +108,9 @@ def _create_adapter(settings: MCPServerSettings) -> MCPAdapter:
     raise MCPConfigurationError(f"unsupported MCP server kind: {settings.kind}")
 
 
-def _create_transport(settings: MCPServerSettings) -> MCPTransport:
+def _create_transport(
+    settings: MCPServerSettings,
+) -> StreamableHTTPMCPTransport | StdioMCPTransport:
     if settings.transport == MCPTransportKind.STREAMABLE_HTTP:
         if settings.endpoint is None:
             raise MCPConfigurationError("Streamable HTTP MCP endpoint is missing")

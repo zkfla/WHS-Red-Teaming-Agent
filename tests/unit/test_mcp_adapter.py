@@ -14,7 +14,11 @@ from redteam.capability.adapters.mcp.example import ExampleMCPAdapter
 from redteam.capability.adapters.mcp.mobile import MobileMCPAdapter
 from redteam.capability.adapters.mcp.naming import build_mcp_tool_id
 from redteam.capability.adapters.mcp.recon import ReconMCPAdapter
-from redteam.capability.adapters.mcp.transport import RemoteCallResult, RemoteTool
+from redteam.capability.adapters.mcp.transport import (
+    AllowlistedMCPTransport,
+    RemoteCallResult,
+    RemoteTool,
+)
 from redteam.capability.adapters.mcp.web_api import WebAPIMCPAdapter
 from redteam.capability.gateway import MCPToolGateway
 from redteam.capability.registry import MCPToolRegistry, ToolRegistrationConflictError
@@ -285,3 +289,32 @@ async def test_gateway_enforces_invocation_timeout() -> None:
     assert result.error is not None
     assert result.error.code == "tool_timeout"
     assert result.error.retryable is True
+
+
+async def test_allowlist_hides_and_blocks_unsafe_remote_tools() -> None:
+    backend = FakeTransport(tools=[
+        RemoteTool("browser_snapshot", "", {}), RemoteTool("browser_run_code_unsafe", "", {}),
+    ])
+    filtered = AllowlistedMCPTransport(backend, ("browser_snapshot",))
+    assert [tool.name for tool in await filtered.list_tools()] == ["browser_snapshot"]
+    with pytest.raises(ValueError, match="not enabled"):
+        await filtered.call_tool("browser_run_code_unsafe", {})
+    assert backend.calls == []
+
+
+async def test_allowlist_fails_on_upstream_tool_drift() -> None:
+    filtered = AllowlistedMCPTransport(FakeTransport(), ("browser_snapshot",))
+    with pytest.raises(ValueError, match="does not match"):
+        await filtered.list_tools()
+
+
+async def test_dry_run_does_not_invoke_transport() -> None:
+    transport = FakeTransport(tools=[RemoteTool("http_request", "", {})])
+    adapter = WebAPIMCPAdapter(server_id="http", transport=transport)
+    registry = MCPToolRegistry()
+    registry.replace_server_tools("http", await adapter.discover_tools())
+    invocation = _invocation(tool_id=ToolId("web.http_request"), operation="http_request")
+    invocation.execution_context.dry_run = True
+    result = await MCPToolGateway(registry, {"http": adapter}).invoke(invocation)
+    assert result.success and result.output == {"dry_run": True, "executed": False}
+    assert transport.calls == []

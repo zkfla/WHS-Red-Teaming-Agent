@@ -2,6 +2,10 @@
 
 Owned by Capability Team.
 
+For the runnable four-service financial lab, tool inventory and exact limitations,
+see [finance/README.md](finance/README.md). It uses a separate Compose file and
+synthetic bank; the default example stack below remains the minimal smoke target.
+
 This stage ships exactly one MCP server: `example-mcp`, a harmless
 server used to validate discovery and invocation over MCP Streamable
 HTTP. It exposes a single `ping` tool at `http://localhost:8765/mcp`.

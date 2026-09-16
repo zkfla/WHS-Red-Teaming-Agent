@@ -130,3 +130,12 @@ async def test_empty_server_config_preserves_example_gateway() -> None:
 async def test_duplicate_server_ids_fail_before_discovery() -> None:
     with pytest.raises(MCPConfigurationError, match="duplicates"):
         await build_mcp_tool_gateway(["web", "web"])
+
+
+@pytest.mark.parametrize("value", ['[]', '{}', '[null]', '["a","a"]', 'not-json'])
+def test_invalid_tool_allowlist_rejected(monkeypatch: pytest.MonkeyPatch, value: str) -> None:
+    monkeypatch.setenv("REDTEAM_MCP_BROWSER_KIND", "web_api")
+    monkeypatch.setenv("REDTEAM_MCP_BROWSER_ENDPOINT", "http://localhost:8931/mcp")
+    monkeypatch.setenv("REDTEAM_MCP_BROWSER_ALLOWED_TOOLS_JSON", value)
+    with pytest.raises(MCPConfigurationError, match="ALLOWED_TOOLS_JSON"):
+        MCPServerSettings.from_environment("browser")
