@@ -71,7 +71,7 @@ async def test_real_stdio_process_lists_and_searches_registered_apk(
 
     listing = await transport.call_tool("apk_file_listing", {"apk_ref": "sample"})
     assert listing.is_error is False
-    assert listing.output is not None
+    assert isinstance(listing.output, dict)
     names = {entry["name"] for entry in listing.output["entries"]}
     assert names == {"AndroidManifest.xml", "res/values/strings.xml"}
 
@@ -84,7 +84,7 @@ async def test_real_stdio_process_lists_and_searches_registered_apk(
         },
     )
     assert search.is_error is False
-    assert search.output is not None
+    assert isinstance(search.output, dict)
     assert search.output["match_count"] == 1
 
 
@@ -132,7 +132,7 @@ async def test_static_analysis_tools_bound_to_canonical_operation_through_full_b
         )
     )
     assert result.success is True
-    assert result.output is not None
+    assert isinstance(result.output, dict)
     assert {entry["name"] for entry in result.output["entries"]} == {
         "AndroidManifest.xml",
         "res/values/strings.xml",
