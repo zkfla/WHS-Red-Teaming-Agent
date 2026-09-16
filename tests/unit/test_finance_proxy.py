@@ -234,3 +234,26 @@ async def test_replay_switch_blocks_before_network(
     async with Client(proxy.create_server(disabled, str(capture_path))) as client:
         result = await client.call_tool("proxy_replay_flow", {"flow_ref": read_ref})
     assert result.is_error is True
+
+
+async def test_operator_capture_reload_replaces_catalog_without_target_traffic(
+    policy: ServerPolicy,
+    capture_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fail(*args: Any, **kwargs: Any) -> None:
+        pytest.fail("capture reload must not call the target")
+
+    monkeypatch.setattr(proxy, "request", fail)
+    async with Client(proxy.create_server(policy, str(capture_path))) as client:
+        document = json.loads(capture_path.read_text(encoding="utf-8"))
+        document["log"]["entries"] = document["log"]["entries"][:1]
+        capture_path.write_text(json.dumps(document), encoding="utf-8")
+        reloaded = await client.call_tool("proxy_reload_capture", {})
+        listed = await client.call_tool("proxy_list_flows", {})
+
+    assert reloaded.structured_content is not None
+    assert reloaded.structured_content["reloaded"] is True
+    assert reloaded.structured_content["flow_count"] == 1
+    assert listed.structured_content is not None
+    assert len(listed.structured_content["flows"]) == 1

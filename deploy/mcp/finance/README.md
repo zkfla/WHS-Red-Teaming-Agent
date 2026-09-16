@@ -10,7 +10,7 @@ Compose의 다섯 MCP 서비스와 합성 금융 API 한 개를 사용한다.
 | MCP 서비스 | 기반 | 실제 등록 도구 | 금융 테스트에서의 용도 |
 |---|---|---|---|
 | web-http | HTTPX를 감싼 소형 MCP façade | `web.session_list`, `web.http_request`, `web.http_compare_sessions` | 테스트 계정별 인증 API 호출, 응답 차이 관찰, 재전송 없는 단일 요청 |
-| web-proxy | 제품 중립 HAR 1.2 façade | `web.proxy_status`, `web.proxy_list_flows`, `web.proxy_get_flow`, `web.proxy_replay_flow`, `web.proxy_mutate_json`, `web.proxy_compare_sessions` | ZAP/Burp에서 수집한 승인 범위 요청을 공통 목록으로 조회하고 제한적으로 재실행·비교 |
+| web-proxy | 제품 중립 HAR 1.2 façade | `web.proxy_status`, `web.proxy_list_flows`, `web.proxy_get_flow`, `web.proxy_reload_capture`, `web.proxy_replay_flow`, `web.proxy_mutate_json`, `web.proxy_compare_sessions` | ZAP/Burp에서 수집한 승인 범위 요청을 공통 목록으로 조회하고 제한적으로 재실행·비교 |
 | web-browser | 공식 Microsoft Playwright MCP 0.0.81 | `web.browser_navigate`, `web.browser_snapshot`, `web.browser_click`, `web.browser_fill_form`, `web.browser_close` | 로그인·추가 인증·동적 UI의 후속 연결 기반 |
 | recon-passive | Python DNS/TLS 및 HTTPX façade | `recon.dns_resolve`, `recon.http_probe`, `recon.tls_inspect`, `recon.openapi_inventory`, `recon.oidc_inventory` | 승인 호스트 해석, TLS 검증, API 목록 및 OAuth/OIDC 메타데이터 수집 |
 | recon-active | 고정 인자의 Nmap façade | `recon.active_status`, `recon.port_scan` | 한 IP의 운영자 지정 포트 최대 16개 TCP connect 점검; 기본 비활성 |
@@ -19,10 +19,10 @@ Compose의 다섯 MCP 서비스와 합성 금융 API 한 개를 사용한다.
 발생시키므로 순수 passive OSINT 또는 자동 허가를 의미하지 않는다.
 Nmap/httpx CLI/ZAP은 그 자체가 이 프로젝트의 MCP 서버가 아니다. 기존 기능을 MCP로
 노출하는 wrapper와 공식 MCP 배포판을 구분한다. `web-proxy`는 ZAP이나 Burp 프로세스를
-직접 제어하지 않고 제품별 connector가 만든 HAR 1.2 파일을 시작 시 한 번 읽는다.
-ZAP은 API의 HAR 형식을 사용할 수 있고, Burp는 팀이 선택한 공식 MCP 또는 별도
-export 변환기를 통해 같은 계약으로 연결한다. 자체 exploit이나 스캐너 엔진은
-구현하지 않는다.
+직접 제어하지 않고 제품별 connector가 만든 HAR 1.2 파일을 읽는다. ZAP은 Import/Export
+add-on의 `exportHar` API, Burp는 `Save items`가 만든 XML을 connector가 같은 계약으로
+변환한다. 교체된 파일은 `proxy_reload_capture`로 다시 읽는다. 자체 exploit이나
+스캐너 엔진은 구현하지 않는다.
 
 ## 기존 계획을 조정한 이유
 
@@ -51,6 +51,44 @@ docker compose -f deploy/compose/finance-lab.yml up --build -d --wait
 docker compose -f deploy/compose/finance-lab.yml run --build --rm smoke
 docker compose -f deploy/compose/finance-lab.yml down
 ```
+
+## ZAP/Burp 캡처 연결
+
+connector는 운영자가 실행하며 Agent가 임의 URL이나 API key를 전달하지 않는다.
+ZAP API key는 명령줄에 쓰지 않고 환경변수 이름만 지정한다. ZAP Import/Export add-on이
+설치되어 있어야 한다.
+
+```sh
+export ZAP_API_KEY='operator-managed-secret'
+python -m redteam.capability.connectors.proxy_capture \
+  --policy deploy/mcp/finance/policy.json \
+  --target-ref bank-lab \
+  --output /private/capture/catalog.har \
+  zap --api-url http://127.0.0.1:8080 --api-key-env ZAP_API_KEY
+```
+
+Burp에서는 승인 대상 항목을 선택해 `Save items` XML로 저장한 뒤 변환한다. 이 과정은
+요청을 전송하지 않는다.
+
+```sh
+python -m redteam.capability.connectors.proxy_capture \
+  --policy deploy/mcp/finance/policy.json \
+  --target-ref bank-lab \
+  --output /private/capture/catalog.har \
+  burp --input /private/burp/selected-items.xml
+```
+
+두 connector 모두 허용 origin/path/method 및 JSON body 규격에 맞는 flow만 보존하고,
+Authorization·Cookie·Proxy-Authorization·Set-Cookie 값은 출력 catalog에서 제거한다.
+out-of-scope, query 포함 요청, 지원하지 않는 form/multipart/binary body는 제외한다.
+catalog에는 재실행용 JSON body와 응답 body가 남을 수 있으므로 실데이터가 아닌 테스트
+데이터만 사용하고 접근권한·보존기간을 별도로 관리한다. 새 파일은 권한 `0600`으로
+만들며 기존 파일 교체 시 기존 권한을 유지한다.
+
+실행 중 교체는 connector가 Proxy MCP와 같은 파일시스템의 catalog를 원자적으로 바꾼
+후 `web.proxy_reload_capture`를 한 번 호출한다. Compose 예제는 원자적 교체가 보이도록
+finance 디렉터리를 읽기 전용 마운트한다. 별도 호스트 배포에서는 private volume을
+connector와 Proxy MCP가 공유해야 한다.
 
 Python 예제는 다섯 서비스의 등록/호출을 확인하는 **운영자 실행 연결 테스트**이다.
 실제 Agent는 `ActionProposal → Control Plane → build_tool_invocation → ToolGateway`
@@ -123,9 +161,10 @@ python -m redteam.capability.servers recon-active --policy /absolute/path/policy
   자동으로 승인 범위에 추가되지 않으며 출력은 비신뢰 대상 데이터로 다룬다.
 - `ALLOWED_TOOLS_JSON`으로 공식 서버의 도구도 선택 등록하며 직접 호출도 제한한다.
   upstream 이름 변경은 시작 실패로 알린다. 임의 코드 실행·파일 업로드는 미등록이다.
-- Proxy catalog는 4 MiB/기본 500개 flow로 제한하며 query·fragment·범위 밖 origin/path/
-  method를 가져오지 않는다. 현재는 실행 중 파일 갱신과 multipart/form body를 지원하지
-  않는다. 캡처 파일은 합성·비식별 테스트 데이터로 만들고 read-only로 마운트한다.
+- Proxy catalog와 connector 입력은 4 MiB/기본 500개 flow로 제한하며 query·fragment·범위 밖 origin/path/
+  method를 가져오지 않는다. multipart/form body는 지원하지 않으며, 실행 중 파일 갱신은
+  명시적인 `proxy_reload_capture` 호출로만 반영한다. 캡처 파일은 합성·비식별 테스트
+  데이터로 만들고 Proxy MCP에는 read-only로 마운트한다.
 - `proxy_replay_enabled` 기본값은 false다. 재실행을 켜도 `replayable_paths`에 없는 요청,
   path별 허용 method가 아닌 요청, `mutable_json_fields` 밖의 변경은 거부한다. 자동 retry,
   redirect 추적, captured credential 재사용은 없다. 쓰기 method는 등록된 `session_ref`가
@@ -152,8 +191,8 @@ TLS는 검증된 한 번의 handshake이며 전체 프로토콜/암호군 스캐
 
 ## 후속 후보 (아직 연결되지 않음)
 
-1. ZAP connector: 승인된 Context의 HAR를 원자적으로 export하고 catalog를 재시작/교체.
-2. Burp connector: 팀 Burp 환경이 정해지면 공식 MCP 또는 승인된 export 변환기를 선택.
+1. ZAP 증분 동기화: engagement별 cursor와 승인 Context 매핑이 정해진 뒤 polling 추가.
+2. Burp 실시간 연결: 팀 Burp edition과 공식 MCP 사용 여부가 정해지면 saved-items 변환과 역할 중복 검토.
 3. Nuclei: 검토된 template ID·버전과 요청 수 상한을 확정한 후 별도 승인 작업으로 연결.
 4. 거래 재전송/멱등성/경쟁 상태: 합성 계좌·거래 한도·정합성 oracle·복구 계약이 있는 후속 PR.
 

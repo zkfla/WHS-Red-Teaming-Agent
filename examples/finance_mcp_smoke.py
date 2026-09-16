@@ -87,6 +87,8 @@ async def exercise(gateway: MCPToolGateway) -> None:
     proxy_status = await call("web.proxy_status", {})
     assert proxy_status["provider"] == "har-v1" and proxy_status["flow_count"] == 2
     assert proxy_status["ignored_out_of_scope_flows"] == 1
+    reloaded = await call("web.proxy_reload_capture", {})
+    assert reloaded["reloaded"] and reloaded["flow_count"] == 2
     flows = (await call("web.proxy_list_flows", {"target_ref": "bank-lab"}))["flows"]
     read_flow = next(flow for flow in flows if flow["method"] == "GET")
     write_flow = next(flow for flow in flows if flow["method"] == "POST")

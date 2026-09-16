@@ -47,13 +47,13 @@ services:
 
   web-proxy:
     <<: *worker
-    command: [web-proxy, --policy, /app/policy.json, --capture-path, /app/captures.har, --transport, streamable-http, --host, 0.0.0.0]
+    command: [web-proxy, --policy, /app/finance/policy.json, --capture-path, /app/finance/captures.har, --transport, streamable-http, --host, 0.0.0.0]
     environment:
       LAB_ALICE_TOKEN: synthetic-alice
       LAB_BOB_TOKEN: synthetic-bob
     volumes:
-      - ../mcp/finance/policy.json:/app/policy.json:ro
-      - ../mcp/finance/captures.har:/app/captures.har:ro
+      # Directory mount makes an operator's atomic capture replacement visible in-container.
+      - ../mcp/finance:/app/finance:ro
 
   web-browser:
     build:

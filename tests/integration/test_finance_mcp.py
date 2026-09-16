@@ -127,6 +127,7 @@ async def test_real_stdio_proxy_role_discovers_neutral_tools(
         "proxy_status",
         "proxy_list_flows",
         "proxy_get_flow",
+        "proxy_reload_capture",
         "proxy_replay_flow",
         "proxy_mutate_json",
         "proxy_compare_sessions",

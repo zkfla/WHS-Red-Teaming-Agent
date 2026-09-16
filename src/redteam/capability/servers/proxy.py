@@ -18,8 +18,12 @@ from redteam.capability.servers.config import ServerPolicy
 from redteam.capability.servers.network import CapturedResponse, ToolInputError, request
 
 _READ_METHODS = {"GET", "HEAD", "OPTIONS"}
-_MAX_CAPTURE_BYTES = 4 * 1024 * 1024
+MAX_CAPTURE_BYTES = 4 * 1024 * 1024
 _MAX_REQUEST_BODY_BYTES = 65536
+
+
+class _UnsupportedRequestBody(Exception):
+    """A well-formed capture body that this bounded replay service does not support."""
 
 
 @dataclass(frozen=True)
@@ -71,11 +75,18 @@ class HarCaptureBackend:
         capture_path = Path(path)
         try:
             raw_document = capture_path.read_bytes()
-            if len(raw_document) > _MAX_CAPTURE_BYTES:
+        except OSError as exc:
+            raise ToolInputError("invalid proxy capture catalog") from exc
+        return cls.from_bytes(raw_document, policy)
+
+    @classmethod
+    def from_bytes(cls, raw_document: bytes, policy: ServerPolicy) -> HarCaptureBackend:
+        try:
+            if len(raw_document) > MAX_CAPTURE_BYTES:
                 raise ToolInputError("proxy capture exceeds configured file limit")
             document = json.loads(raw_document)
             entries = document["log"]["entries"]
-        except (OSError, UnicodeError, json.JSONDecodeError, KeyError, TypeError) as exc:
+        except (UnicodeError, json.JSONDecodeError, KeyError, TypeError) as exc:
             raise ToolInputError("invalid proxy capture catalog") from exc
         if not isinstance(entries, list):
             raise ToolInputError("invalid proxy capture entries")
@@ -124,7 +135,10 @@ def _parse_har_entry(entry: Any, index: int, policy: ServerPolicy) -> ProxyFlow 
     if path not in profile.allowed_paths or method not in allowed_methods:
         return None
 
-    request_json = _request_json(request_item.get("postData"))
+    try:
+        request_json = _request_json(request_item.get("postData"))
+    except _UnsupportedRequestBody:
+        return None
     response = _captured_response(response_item, policy.max_response_bytes)
     digest_input = f"{index}\0{target_ref}\0{method}\0{path}".encode()
     flow_ref = f"flow_{hashlib.sha256(digest_input).hexdigest()[:16]}"
@@ -146,8 +160,10 @@ def _request_json(post_data: Any) -> dict[str, Any] | None:
         raise ToolInputError("invalid captured request body")
     mime_type = str(post_data.get("mimeType", "")).split(";", 1)[0].strip().lower()
     text = post_data.get("text")
-    if mime_type != "application/json" or not isinstance(text, str):
-        raise ToolInputError("only JSON proxy request bodies are supported")
+    if not isinstance(text, str):
+        raise ToolInputError("invalid captured request body")
+    if mime_type != "application/json":
+        raise _UnsupportedRequestBody
     if len(text.encode()) > _MAX_REQUEST_BODY_BYTES:
         raise ToolInputError("captured request body exceeds limit")
     try:
@@ -231,6 +247,20 @@ def create_server(policy: ServerPolicy, capture_path: str) -> MCPServer:
     def proxy_get_flow(flow_ref: str) -> dict[str, Any]:
         """Return one redacted capture summary. Header values and bodies remain omitted."""
         return backend.get_flow(flow_ref).summary()
+
+    @server.tool()
+    async def proxy_reload_capture() -> dict[str, Any]:
+        """Atomically reload the operator-owned capture file; never contacts a target."""
+        nonlocal backend
+        replacement = HarCaptureBackend.load(capture_path, policy)
+        async with execution_lock:
+            backend = replacement
+        return {
+            "provider": backend.provider,
+            "flow_count": len(backend.list_flows()),
+            "ignored_out_of_scope_flows": backend.ignored_flow_count,
+            "reloaded": True,
+        }
 
     @server.tool()
     async def proxy_replay_flow(flow_ref: str, session_ref: str | None = None) -> dict[str, Any]:
