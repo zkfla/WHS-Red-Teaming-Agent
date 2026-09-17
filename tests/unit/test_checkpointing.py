@@ -5,7 +5,11 @@ from __future__ import annotations
 from redteam.attack_graph.observation import GraphObservation
 from redteam.core.enums import AgentPhase, Verdict
 from redteam.core.ids import AgentId, EngagementId, RunId
-from redteam.orchestration.checkpointing import build_checkpointer, state_type_allowlist
+from redteam.orchestration.checkpointing import (
+    build_checkpointer,
+    open_checkpointer,
+    state_type_allowlist,
+)
 from redteam.orchestration.state import RuntimeState, initial_graph_state
 
 REQUIRED = [
@@ -30,9 +34,7 @@ def test_the_allowlist_stays_inside_agent_team_and_core_packages() -> None:
     # Nothing from control/capability/evidence belongs in workflow state,
     # and reaching into them from here would cross a team boundary.
     forbidden = ("redteam.control", "redteam.capability", "redteam.evidence")
-    assert not [
-        module for module, _ in state_type_allowlist() if module.startswith(forbidden)
-    ]
+    assert not [module for module, _ in state_type_allowlist() if module.startswith(forbidden)]
 
 
 def test_a_round_tripped_runtime_state_keeps_its_type_and_values() -> None:
@@ -66,3 +68,24 @@ def test_a_round_tripped_runtime_state_keeps_its_type_and_values() -> None:
 
 def test_checkpointing_can_be_turned_off() -> None:
     assert build_checkpointer(enabled=False) is None
+
+
+async def test_sqlite_checkpointer_survives_reopen(tmp_path) -> None:
+    path = tmp_path / "checkpoints.sqlite3"
+    config = {"configurable": {"thread_id": "thread-1", "checkpoint_ns": ""}}
+    checkpoint = {
+        "v": 4,
+        "ts": "2026-01-01T00:00:00+00:00",
+        "id": "00000000-0000-0000-0000-000000000001",
+        "channel_values": {},
+        "channel_versions": {},
+        "versions_seen": {},
+        "updated_channels": None,
+    }
+    async with open_checkpointer(backend="sqlite", path=str(path)) as saver:
+        await saver.aput(config, checkpoint, {}, {})
+    async with open_checkpointer(backend="sqlite", path=str(path)) as saver:
+        restored = await saver.aget(config)
+
+    assert restored is not None
+    assert restored["id"] == checkpoint["id"]

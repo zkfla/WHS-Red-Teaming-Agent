@@ -33,6 +33,7 @@ from redteam.core.ids import (
 from redteam.event_bus.memory import InMemoryEventBus
 from redteam.orchestration.agents import AgentRegistry, AgentSpec, HypothesisDraft, PlanStep
 from redteam.orchestration.agents.registry import RECON_AGENT
+from redteam.orchestration.candidates.compiler import CandidateCompiler
 from redteam.orchestration.expectations import Expectation
 from redteam.orchestration.nodes import (
     execute_node,
@@ -56,6 +57,7 @@ from redteam.orchestration.state import (
     TerminationReason,
     initial_graph_state,
 )
+from redteam.orchestration.work.models import WorkItem, WorkStatus
 from tests.fakes import DummyToolGateway, FakeControlPlane, build_test_application
 
 NOW = datetime.now(timezone.utc)
@@ -164,6 +166,14 @@ async def test_observe_routes_to_replan_when_no_agent_is_left() -> None:
     assert route_after_observe(state) == "replan"
 
 
+async def test_observe_distinguishes_inactive_agents_from_an_empty_registry() -> None:
+    d = deps()  # Built-in agents exist, but an empty graph activates none.
+    state = await observe_node(initial_graph_state(runtime()), deps=d)
+
+    assert state["runtime"].phase is AgentPhase.REPLAN
+    assert state["runtime"].termination_reason == TerminationReason.NO_ACTIONABLE_PLAN
+
+
 # -- PLAN -----------------------------------------------------------------
 
 
@@ -221,6 +231,41 @@ async def test_plan_without_a_hypothesis_still_proposes() -> None:
     proposed = state["action_proposal"]
     assert proposed is not None and proposed.hypothesis_id is None
     assert EventType.HYPOTHESIS_CREATED not in d.event_bus.event_types()
+
+
+async def test_plan_reacquires_a_previously_pending_candidate() -> None:
+    d = deps()
+    service = await seeded(d, "a.local")
+    observed = await observe_node(initial_graph_state(runtime()), deps=d)
+    observation = observed["observation"]
+    assert observation is not None
+    compiled = await CandidateCompiler().compile_playbook(
+        RECON_AGENT,
+        service.view(),
+        observation,
+        step=1,
+    )
+    candidate = compiled[0]
+    await d.work_store.add(
+        WorkItem(
+            work_id="work_pending_from_prior_tick",
+            run_id=RUN,
+            candidate_key=candidate.candidate_key,
+            agent_id=RECON_AGENT.agent_id,
+            graph_revision=1,
+            target_node_ids=candidate.draft.target_node_ids,
+            hypothesis_id=HypothesisId("hyp_pending_from_prior_tick"),
+            priority=candidate.priority,
+            created_at=NOW,
+            updated_at=NOW,
+        )
+    )
+
+    planned = await plan_node(observed, deps=d)
+
+    assert planned["current_work_id"] == "work_pending_from_prior_tick"
+    restored = await d.work_store.get("work_pending_from_prior_tick")
+    assert restored is not None and restored.status is WorkStatus.LEASED
 
 
 # -- POLICY ---------------------------------------------------------------
@@ -308,6 +353,26 @@ async def test_execute_counts_consecutive_failures() -> None:
 
     assert result["runtime"].consecutive_failures == 2
     assert EventType.TOOL_EXECUTION_FAILED in d.event_bus.event_types()
+
+
+async def test_execute_does_not_invoke_tool_after_lease_is_lost() -> None:
+    gateway = DummyToolGateway()
+    d = deps(tool_gateway=gateway)
+    state = state_with(
+        runtime(remaining_budget=3),
+        action_proposal=proposal(),
+        current_work_id="missing-work",
+    )
+    state = await policy_node(state, deps=d)
+    state = merged(state, plan_step=RECON_AGENT.playbook[0])
+
+    result = await execute_node(state, deps=d)
+
+    assert gateway.invocations == []
+    tool = result["tool_result"]
+    assert tool is not None and tool.success is False
+    assert tool.error is not None and tool.error.code == "lease_lost_before_execution"
+    assert tool.metadata["orchestration_exception"] is True
 
 
 # -- VERIFY ---------------------------------------------------------------

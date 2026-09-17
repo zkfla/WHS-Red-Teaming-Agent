@@ -18,6 +18,7 @@ from redteam.attack_graph.patterns import NodePattern, resolve
 from redteam.attack_graph.predicates import is_stale
 from redteam.attack_graph.view import AttackGraphView
 from redteam.core.contracts.target import AnyTarget, TargetRef
+from redteam.core.enums import RiskLevel
 from redteam.core.ids import AgentId, EngagementId, RunId, ToolId
 from redteam.core.ports.llm import LLMClient
 from redteam.orchestration.expectations import Expectation
@@ -34,6 +35,8 @@ class HypothesisDraft(BaseModel):
     confidence: float = Field(default=0.3, ge=0.0, le=1.0)
     #: Confirming this hypothesis means a security violation, not just a fact.
     violation_if_confirmed: bool = False
+    #: Optional domain-provider impact assessment, declared before execution.
+    severity: RiskLevel | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -117,6 +120,13 @@ class AgentSpec(BaseModel):
     system_prompt: str = ""
     #: Stop offering this agent after this many executed actions.
     max_actions: int | None = Field(default=None, ge=1)
+
+    @model_validator(mode="after")
+    def _step_ids_are_unique(self) -> AgentSpec:
+        step_ids = [step.step_id for step in self.playbook]
+        if len(step_ids) != len(set(step_ids)):
+            raise ValueError(f"agent {self.agent_id!r} has duplicate step_id values")
+        return self
 
 
 @dataclass(frozen=True)

@@ -102,8 +102,14 @@ FindingCreated         orchestration.verify    (VIOLATION only)
 FindingVerified        orchestration.verify    (VIOLATION only)
 GraphUpdated           orchestration.update
 AgentFinished          orchestration.replan    (once per retired agent)
+ReportProjected        orchestration.reporting
 RunFinished            app.bootstrap
 ```
+
+Agent-Team-local extensible event names additionally include
+`CandidatePruned`, `AgentProviderFailed`, and `ReportProjected`. They remain
+plain `EventEnvelope.event_type` strings rather than modifying PM's frozen
+`core.contracts.events.EventType` vocabulary.
 
 `HypothesisCreated`, `AgentFinished`, `FindingCreated` and
 `FindingVerified` were reserved in `EventType` but listed as "not

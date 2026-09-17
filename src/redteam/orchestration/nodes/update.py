@@ -6,12 +6,15 @@ nothing executed, but the attempt and the policy verdict are recorded.
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 from redteam.attack_graph.predicates import Confidence, Provenance
 from redteam.core.contracts.events import EventType
 from redteam.core.enums import AgentPhase
 from redteam.orchestration.context import RuntimeDeps
 from redteam.orchestration.nodes._support import advance, graph_service, publisher_for
 from redteam.orchestration.state import GraphState
+from redteam.orchestration.work.models import WorkStatus
 
 
 async def update_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
@@ -27,7 +30,23 @@ async def update_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
     correlation_id = str(proposal.action_id)
     operation_key = f"{proposal.capability}/{proposal.operation}"
     blocked = result is None
-    succeeded = result is not None and result.success
+    tool_succeeded = result is not None and result.success
+    verification_exception = (
+        result.metadata.get("verification_exception") if result is not None else None
+    )
+    verification_failed = bool(verification_exception)
+    succeeded = tool_succeeded and not verification_failed
+
+    # PLAN records the hypothesis before the policy gate so the question is
+    # auditable. A blocked action never reaches VERIFY, therefore UPDATE must
+    # close it explicitly or reporting remains permanently blocked by a fake
+    # "open" hypothesis that was never tested.
+    if blocked and proposal.hypothesis_id is not None:
+        await service.resolve_hypothesis(
+            str(proposal.hypothesis_id),
+            status="inconclusive",
+            step=runtime.step_count,
+        )
 
     provenance = Provenance(
         step=runtime.step_count,
@@ -43,7 +62,10 @@ async def update_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
     facts: dict[str, object] = {
         "last_operation": operation_key,
         "last_operation_succeeded": succeeded,
+        "last_tool_succeeded": tool_succeeded,
     }
+    if verification_failed:
+        facts["last_verification_failed"] = True
     if blocked:
         facts["last_operation_blocked"] = True
         facts["last_block_verdict"] = decision.verdict.value if decision else None
@@ -75,8 +97,31 @@ async def update_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
         causation_id=state.get("last_event_id"),
     )
 
+    work_id = state.get("current_work_id")
+    if work_id is not None:
+        if blocked:
+            work_status = WorkStatus.BLOCKED
+            reason = decision.verdict.value if decision is not None else "blocked"
+        elif succeeded:
+            work_status = WorkStatus.SUCCEEDED
+            reason = None
+        else:
+            work_status = WorkStatus.FAILED
+            if verification_failed:
+                reason = f"verification_exception:{verification_exception}"
+            else:
+                reason = result.error.code if result is not None and result.error else "tool_failed"
+        await deps.work_store.complete(
+            work_id,
+            owner=str(runtime.run_id),
+            status=work_status,
+            now=datetime.now(timezone.utc),
+            reason=reason,
+        )
+
     return advance(
         state,
         runtime.model_copy(update={"phase": AgentPhase.REPLAN}),
         last_event_id=updated.event_id,
+        current_work_id=None,
     )

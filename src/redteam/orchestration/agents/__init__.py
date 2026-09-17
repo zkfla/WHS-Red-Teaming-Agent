@@ -20,10 +20,24 @@ from redteam.orchestration.agents.base import (
     PlanStep,
     available_steps,
 )
+from redteam.orchestration.agents.builtin import MOBILE_AGENT, WEB_API_AGENT
+from redteam.orchestration.agents.definition import (
+    ActivationRule,
+    AgentDefinition,
+    ContextProfile,
+    builtin_agent_definitions,
+)
 from redteam.orchestration.agents.planners import (
     LLMPlanner,
     PlaybookPlanner,
     build_planner,
+)
+from redteam.orchestration.agents.providers import (
+    CandidateProvider,
+    CandidateProviderRegistry,
+    DuplicateProviderError,
+    PlaybookCandidateProvider,
+    default_provider_registry,
 )
 from redteam.orchestration.agents.registry import (
     RECON_AGENT,
@@ -32,6 +46,7 @@ from redteam.orchestration.agents.registry import (
     DuplicateAgentError,
     default_registry,
 )
+from redteam.orchestration.agents.result import AgentResult, FollowupHint
 
 __all__ = [
     "AgentSpec",
@@ -49,4 +64,17 @@ __all__ = [
     "PlaybookPlanner",
     "LLMPlanner",
     "build_planner",
+    "ActivationRule",
+    "AgentDefinition",
+    "ContextProfile",
+    "builtin_agent_definitions",
+    "AgentResult",
+    "FollowupHint",
+    "WEB_API_AGENT",
+    "MOBILE_AGENT",
+    "CandidateProvider",
+    "CandidateProviderRegistry",
+    "DuplicateProviderError",
+    "PlaybookCandidateProvider",
+    "default_provider_registry",
 ]

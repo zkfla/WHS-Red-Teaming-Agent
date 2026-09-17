@@ -12,8 +12,8 @@ from redteam.core.contracts.graph import Finding
 from redteam.core.convert import tool_result_to_evidence
 from redteam.core.enums import AgentPhase, Verdict
 from redteam.core.ids import new_id
+from redteam.orchestration.analysis import VerificationAssessment, VerificationRequest
 from redteam.orchestration.context import RuntimeDeps
-from redteam.orchestration.expectations import verdict_for
 from redteam.orchestration.nodes._support import advance, graph_service, publisher_for
 from redteam.orchestration.service_status import (
     HYPOTHESIS_STATUS_BY_VERDICT,
@@ -40,6 +40,17 @@ async def verify_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
         hypothesis_id=proposal.hypothesis_id,
         summary=proposal.expected_observation,
     )
+    evidence = evidence.model_copy(
+        update={
+            "metadata": {
+                **evidence.metadata,
+                "target_node_id": str(node_id_for_target(proposal.target)),
+                "agent_id": str(proposal.agent_id),
+                "capability": proposal.capability,
+                "operation": proposal.operation,
+            }
+        }
+    )
     await deps.evidence_store.append(evidence)
 
     created = await publisher.publish(
@@ -56,7 +67,33 @@ async def verify_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
     last_event_id = created.event_id
 
     expectation = step.expectation if step is not None else None
-    verdict, reason = verdict_for(expectation, result)
+    verification_failed = False
+    try:
+        assessment = await deps.verifier.verify(
+            VerificationRequest(
+                proposal=proposal,
+                result=result,
+                expectation=expectation,
+                source_refs=[str(evidence.evidence_id), str(result.invocation_id)],
+            )
+        )
+    except Exception as exc:  # noqa: BLE001 - preserve evidence and close work safely
+        verification_failed = True
+        result = result.model_copy(
+            update={
+                "metadata": {
+                    **result.metadata,
+                    "verification_exception": type(exc).__name__,
+                }
+            }
+        )
+        assessment = VerificationAssessment(
+            verdict=Verdict.UNKNOWN,
+            reason="analysis verifier failed before reaching a verdict",
+            reviewer_id=f"analysis:error:{type(exc).__name__}",
+            source_refs=[str(evidence.evidence_id), str(result.invocation_id)],
+        )
+    verdict, reason = assessment.verdict, assessment.reason
 
     provenance = Provenance(
         step=runtime.step_count,
@@ -67,9 +104,12 @@ async def verify_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
     )
 
     if proposal.hypothesis_id is not None:
+        hypothesis_status = HYPOTHESIS_STATUS_BY_VERDICT[verdict]
+        if result.metadata.get("orchestration_exception") or verification_failed:
+            hypothesis_status = "inconclusive"
         await service.resolve_hypothesis(
             str(proposal.hypothesis_id),
-            status=HYPOTHESIS_STATUS_BY_VERDICT[verdict],
+            status=hypothesis_status,
             step=runtime.step_count,
         )
 
@@ -86,6 +126,8 @@ async def verify_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                 "agent_id": str(proposal.agent_id),
                 "hypothesis_id": str(proposal.hypothesis_id) if proposal.hypothesis_id else None,
                 "target": str(node_id_for_target(proposal.target)),
+                "reviewer_id": assessment.reviewer_id,
+                "verification_source_refs": assessment.source_refs,
             },
         )
         await service.record_finding(
@@ -115,6 +157,17 @@ async def verify_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
 
     return advance(
         state,
-        runtime.model_copy(update={"phase": AgentPhase.UPDATE, "last_verdict": verdict}),
+        runtime.model_copy(
+            update={
+                "phase": AgentPhase.UPDATE,
+                "last_verdict": verdict,
+                "consecutive_failures": (
+                    runtime.consecutive_failures + 1
+                    if verification_failed
+                    else runtime.consecutive_failures
+                ),
+            }
+        ),
         last_event_id=last_event_id,
+        tool_result=result,
     )

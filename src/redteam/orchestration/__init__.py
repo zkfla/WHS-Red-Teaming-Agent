@@ -24,7 +24,11 @@ Docs: ``docs/agent/orchestration.md``.
 
 from redteam.orchestration.context import RuntimeDeps
 from redteam.orchestration.graph import build_graph
-from redteam.orchestration.runner import AgentLoopRunner, CheckpointSnapshot
+from redteam.orchestration.runner import (
+    AgentLoopRunner,
+    CheckpointSnapshot,
+    ReconciliationResult,
+)
 from redteam.orchestration.seed import seed_from_engagement
 from redteam.orchestration.settings import OrchestrationSettings
 from redteam.orchestration.state import (
@@ -38,6 +42,7 @@ __all__ = [
     "build_graph",
     "AgentLoopRunner",
     "CheckpointSnapshot",
+    "ReconciliationResult",
     "GraphState",
     "RuntimeState",
     "RuntimeDeps",

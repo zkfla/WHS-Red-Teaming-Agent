@@ -13,6 +13,7 @@ from __future__ import annotations
 import importlib
 import inspect
 import pkgutil
+from contextlib import asynccontextmanager
 from enum import Enum
 from functools import lru_cache
 from typing import Any
@@ -44,18 +45,60 @@ def state_type_allowlist() -> tuple[tuple[str, str], ...]:
     return tuple(sorted(found))
 
 
+def _serializer() -> Any:
+    from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
+
+    return JsonPlusSerializer(allowed_msgpack_modules=list(state_type_allowlist()))
+
+
 def build_checkpointer(*, enabled: bool = True) -> Any | None:
     """An in-memory saver, or ``None`` when checkpointing is off.
 
-    TODO(agent-team): swap in a durable saver once runs must outlive the
-    process; nothing outside this function changes.
+    Durable runs use :func:`open_checkpointer` with the SQLite backend.
     """
     if not enabled:
         return None
 
     from langgraph.checkpoint.memory import InMemorySaver
-    from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 
-    return InMemorySaver(
-        serde=JsonPlusSerializer(allowed_msgpack_modules=list(state_type_allowlist()))
-    )
+    return InMemorySaver(serde=_serializer())
+
+
+@asynccontextmanager
+async def open_checkpointer(
+    *, enabled: bool = True, backend: str = "memory", path: str | None = None
+):
+    """Open a checkpointer with explicit lifecycle ownership.
+
+    SQLite's async saver owns a live connection, so callers must keep this
+    context open for history/replay and close it when the runner is done.
+    """
+
+    if not enabled:
+        yield None
+        return
+    if backend == "memory":
+        yield build_checkpointer(enabled=True)
+        return
+    if backend != "sqlite":
+        raise ValueError(f"unsupported checkpoint backend: {backend!r}")
+    if not path:
+        raise ValueError("sqlite checkpoint backend needs a path")
+
+    from pathlib import Path
+
+    try:
+        import aiosqlite
+        from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+    except ImportError as exc:  # pragma: no cover - optional-extra failure path
+        raise RuntimeError(
+            'SQLite checkpointing requires pip install -e ".[orchestration]"'
+        ) from exc
+
+    resolved = Path(path)
+    resolved.parent.mkdir(parents=True, exist_ok=True)
+    connection = await aiosqlite.connect(resolved)
+    try:
+        yield AsyncSqliteSaver(connection, serde=_serializer())
+    finally:
+        await connection.close()

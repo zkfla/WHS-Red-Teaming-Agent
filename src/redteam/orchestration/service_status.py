@@ -26,13 +26,14 @@ HYPOTHESIS_STATUS_BY_VERDICT: dict[Verdict, str] = {
 
 
 def severity_for(step: PlanStep | None) -> str:
-    """Severity for a finding produced by ``step``. Deliberately coarse.
+    """Severity declared pre-execution by the domain provider, with fallback.
 
-    TODO(agent-team): derive from target criticality + capability risk
-    once a ``ToolCatalog`` port exposes ``ToolDescriptor.risk_level``
-    (Contract Change Proposal in ``docs/agent/orchestration.md``).
+    Tool operational risk is intentionally not used: how dangerous a tool is
+    to run is a different axis from the impact of the finding it confirms.
     """
     if step is not None and step.hypothesis is not None:
+        if step.hypothesis.severity is not None:
+            return step.hypothesis.severity.value
         if step.hypothesis.violation_if_confirmed:
             return RiskLevel.HIGH.value
     return RiskLevel.MEDIUM.value

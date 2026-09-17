@@ -6,6 +6,8 @@ only translate it, which keeps the ALLOW gate to one readable expression.
 
 from __future__ import annotations
 
+from langgraph.types import Send
+
 from redteam.core.enums import AgentPhase
 from redteam.orchestration.state import GraphState
 
@@ -23,8 +25,15 @@ def route_after_observe(state: GraphState) -> str:
     return REPLAN if state["runtime"].phase == AgentPhase.REPLAN else PLAN
 
 
-def route_after_plan(state: GraphState) -> str:
-    """No proposal (empty frontier / planner declined) skips straight to REPLAN."""
+def route_after_plan(state: GraphState) -> str | list[Send]:
+    """Route one proposal normally or map a bounded batch to workers."""
+    dispatch_items = state.get("dispatch_items", [])
+    if len(dispatch_items) > 1:
+        runtime = state["runtime"]
+        return [
+            Send("worker", {"runtime": runtime, "dispatch_item": item})
+            for item in dispatch_items
+        ]
     return POLICY if state.get("action_proposal") is not None else REPLAN
 
 

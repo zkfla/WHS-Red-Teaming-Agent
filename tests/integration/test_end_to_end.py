@@ -26,6 +26,7 @@ from redteam.core.contracts.engagement import (
 from redteam.core.contracts.events import EventEnvelope, EventType
 from redteam.core.enums import AgentPhase, Verdict
 from redteam.core.ids import AgentId, EngagementId, GraphNodeId
+from redteam.orchestration.events import REPORT_PROJECTED
 from redteam.orchestration.state import TerminationReason
 
 
@@ -75,6 +76,7 @@ async def test_minimal_vertical_slice_end_to_end(tmp_path) -> None:
         EventType.EVIDENCE_CREATED,
         EventType.GRAPH_UPDATED,
         EventType.AGENT_FINISHED,
+        REPORT_PROJECTED,
         EventType.RUN_FINISHED,
     ]
     assert [e.event_type for e in observed_events] == expected_in_order

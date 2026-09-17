@@ -57,9 +57,15 @@ from redteam.event_bus.memory import InMemoryEventBus
 from redteam.evidence.stores.filesystem import FilesystemEvidenceStore
 from redteam.llm.fake import FakeLLMClient
 from redteam.orchestration.context import RuntimeDeps
+from redteam.orchestration.events import REPORT_PROJECTED
+from redteam.orchestration.reporting import ReportingAgent
 from redteam.orchestration.runner import AgentLoopRunner
 from redteam.orchestration.seed import seed_from_engagement
+from redteam.orchestration.settings import OrchestrationSettings
 from redteam.orchestration.state import RuntimeState
+from redteam.orchestration.work.memory import InMemoryWorkStore
+from redteam.orchestration.work.sqlite import SQLiteWorkStore
+from redteam.orchestration.work.store import WorkStore
 
 
 def load_engagement(path: str | Path) -> Engagement:
@@ -81,7 +87,9 @@ def _build_llm_client(config: LLMConfig) -> LLMClient:
     return FakeLLMClient()
 
 
-async def _build_default_tool_gateway(config: CapabilityConfig) -> ToolGateway:
+async def _build_default_capability(
+    config: CapabilityConfig,
+) -> tuple[ToolGateway, MCPToolRegistry]:
     """The one dummy adapter this stage ships, wrapped in a real gateway.
 
     TODO(capability-team): use ``config.mcp_servers`` to select/instantiate
@@ -93,11 +101,20 @@ async def _build_default_tool_gateway(config: CapabilityConfig) -> ToolGateway:
     example_adapter = ExampleMCPAdapter()
     for descriptor in await example_adapter.discover_tools():
         registry.register(descriptor)
-    return MCPToolGateway(registry, {example_adapter.server_id: example_adapter})
+    return MCPToolGateway(registry, {example_adapter.server_id: example_adapter}), registry
+
+
+async def _build_default_tool_gateway(config: CapabilityConfig) -> ToolGateway:
+    """Compatibility helper retained for callers that only need the gateway."""
+    gateway, _ = await _build_default_capability(config)
+    return gateway
 
 
 async def build_runtime_deps(
-    engagement: Engagement, evidence_dir: str | Path = "data/evidence"
+    engagement: Engagement,
+    evidence_dir: str | Path = "data/evidence",
+    *,
+    orchestration_settings: OrchestrationSettings | None = None,
 ) -> RuntimeDeps:
     """Wire in-memory/dummy backends for every port, from an ``Engagement`` alone.
 
@@ -114,9 +131,10 @@ async def build_runtime_deps(
     event_bus = InMemoryEventBus()
     graph_store = InMemoryAttackGraphStore()
     evidence_store = FilesystemEvidenceStore(evidence_dir)
-    tool_gateway = await _build_default_tool_gateway(CapabilityConfig())
+    tool_gateway, tool_catalog = await _build_default_capability(CapabilityConfig())
     control_plane = DefaultControlPlane({engagement.engagement_id: engagement})
     llm_client = FakeLLMClient()
+    settings = orchestration_settings or OrchestrationSettings()
 
     return RuntimeDeps(
         control_plane=control_plane,
@@ -125,7 +143,16 @@ async def build_runtime_deps(
         graph_store=graph_store,
         evidence_store=evidence_store,
         llm_client=llm_client,
+        tool_catalog=tool_catalog,
+        work_store=_build_work_store(settings),
+        settings=settings,
     )
+
+
+def _build_work_store(settings: OrchestrationSettings) -> WorkStore:
+    if settings.work_backend == "sqlite":
+        return SQLiteWorkStore(settings.work_path)
+    return InMemoryWorkStore()
 
 
 async def build_application(
@@ -138,6 +165,7 @@ async def build_application(
     attack_graph: AttackGraphStore | None = None,
     llm: LLMClient | None = None,
     evidence_dir: str | Path = "data/evidence",
+    orchestration_settings: OrchestrationSettings | None = None,
 ) -> tuple[Engagement, RuntimeDeps]:
     """``AppConfig``-aware composition root. Every dependency is overridable.
 
@@ -149,9 +177,9 @@ async def build_application(
     - ``config.llm`` -> ``_build_llm_client`` (``FakeLLMClient`` unless
       ``provider: "litellm"``).
     - ``config.capability`` -> ``_build_default_tool_gateway``.
-    - ``config.orchestration`` -> not consumed here; pass it to
-      ``run_engagement(..., orchestration_config=config.orchestration)``
-      so ``RuntimeState.remaining_budget`` reflects ``max_steps``.
+    - ``config.orchestration`` -> ``OrchestrationSettings.from_config``;
+      an explicit ``orchestration_settings`` may additionally select durable
+      checkpoint/work-ledger backends and bounded parallelism.
     - ``config.logging`` -> ``logging.basicConfig`` below.
 
     Passing an explicit keyword (e.g. ``control_plane=FakeControlPlane()``)
@@ -166,11 +194,20 @@ async def build_application(
     resolved_control_plane = control_plane or DefaultControlPlane(
         {engagement.engagement_id: engagement}
     )
-    resolved_tool_gateway = tool_gateway or await _build_default_tool_gateway(config.capability)
+    resolved_tool_catalog = None
+    if tool_gateway is None:
+        resolved_tool_gateway, resolved_tool_catalog = await _build_default_capability(
+            config.capability
+        )
+    else:
+        resolved_tool_gateway = tool_gateway
     resolved_evidence_store = evidence_store or FilesystemEvidenceStore(evidence_dir)
     resolved_event_bus = event_bus or InMemoryEventBus()
     resolved_attack_graph = attack_graph or InMemoryAttackGraphStore()
     resolved_llm = llm or _build_llm_client(config.llm)
+    resolved_settings = orchestration_settings or OrchestrationSettings.from_config(
+        config.orchestration
+    )
 
     deps = RuntimeDeps(
         control_plane=resolved_control_plane,
@@ -179,6 +216,9 @@ async def build_application(
         graph_store=resolved_attack_graph,
         evidence_store=resolved_evidence_store,
         llm_client=resolved_llm,
+        tool_catalog=resolved_tool_catalog,
+        work_store=_build_work_store(resolved_settings),
+        settings=resolved_settings,
     )
     return engagement, deps
 
@@ -213,9 +253,7 @@ async def run_engagement(
         )
     run_id = RunId(new_id("run"))
 
-    await seed_from_engagement(
-        AttackGraphService(deps.graph_store), engagement, run_id=run_id
-    )
+    await seed_from_engagement(AttackGraphService(deps.graph_store), engagement, run_id=run_id)
 
     await deps.event_bus.publish(
         EventEnvelope(
@@ -230,13 +268,42 @@ async def run_engagement(
     )
 
     runner = AgentLoopRunner(deps, settings=settings)
-    runtime = await runner.run(
-        RuntimeState(
+    try:
+        runtime = await runner.run(
+            RuntimeState(
+                run_id=run_id,
+                engagement_id=engagement.engagement_id,
+                phase=AgentPhase.OBSERVE,
+                current_goal=f"map and probe the declared scope of {engagement.name}",
+                remaining_budget=engagement.execution_budget.max_actions,
+            )
+        )
+    finally:
+        await runner.aclose()
+
+    report = await ReportingAgent().project(
+        runtime,
+        graph=AttackGraphService(deps.graph_store),
+        evidence_store=deps.evidence_store,
+        work_store=deps.work_store,
+    )
+    await deps.event_bus.publish(
+        EventEnvelope(
+            event_id=EventId(new_id("evt")),
+            event_type=REPORT_PROJECTED,
             run_id=run_id,
             engagement_id=engagement.engagement_id,
-            phase=AgentPhase.OBSERVE,
-            current_goal=f"map and probe the declared scope of {engagement.name}",
-            remaining_budget=engagement.execution_budget.max_actions,
+            source="orchestration.reporting",
+            timestamp=datetime.now(timezone.utc),
+            payload={
+                "ready_for_release": report.ready_for_release,
+                "finding_count": report.finding_count,
+                "evidence_count": report.evidence_count,
+                "integrity_blockers": report.integrity_blockers,
+                "unresolved_hypotheses": report.unresolved_hypotheses,
+                "outstanding_cleanup": report.outstanding_cleanup,
+                "effectiveness": report.effectiveness.model_dump(mode="json"),
+            },
         )
     )
 

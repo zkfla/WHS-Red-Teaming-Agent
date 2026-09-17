@@ -32,6 +32,7 @@ from langgraph.graph import END, StateGraph
 
 from redteam.orchestration.context import RuntimeDeps
 from redteam.orchestration.nodes import (
+    aggregate_node,
     execute_node,
     observe_node,
     plan_node,
@@ -39,6 +40,7 @@ from redteam.orchestration.nodes import (
     replan_node,
     update_node,
     verify_node,
+    worker_node,
 )
 from redteam.orchestration.router import (
     route_after_observe,
@@ -48,7 +50,17 @@ from redteam.orchestration.router import (
 )
 from redteam.orchestration.state import GraphState
 
-NODE_NAMES = ("observe", "plan", "policy", "execute", "verify", "update", "replan")
+NODE_NAMES = (
+    "observe",
+    "plan",
+    "policy",
+    "execute",
+    "verify",
+    "update",
+    "worker",
+    "aggregate",
+    "replan",
+)
 
 
 def build_graph(deps: RuntimeDeps, *, checkpointer: Any | None = None) -> Any:
@@ -60,6 +72,8 @@ def build_graph(deps: RuntimeDeps, *, checkpointer: Any | None = None) -> Any:
     graph.add_node("execute", functools.partial(execute_node, deps=deps))
     graph.add_node("verify", functools.partial(verify_node, deps=deps))
     graph.add_node("update", functools.partial(update_node, deps=deps))
+    graph.add_node("worker", functools.partial(worker_node, deps=deps))
+    graph.add_node("aggregate", functools.partial(aggregate_node, deps=deps))
     graph.add_node("replan", functools.partial(replan_node, deps=deps))
 
     graph.set_entry_point("observe")
@@ -75,9 +89,10 @@ def build_graph(deps: RuntimeDeps, *, checkpointer: Any | None = None) -> Any:
     graph.add_edge("execute", "verify")
     graph.add_edge("verify", "update")
     graph.add_edge("update", "replan")
+    graph.add_edge("worker", "aggregate")
+    graph.add_edge("aggregate", "replan")
     graph.add_conditional_edges(
         "replan", route_after_replan, {"observe": "observe", "end": END}
     )
 
     return graph.compile(checkpointer=checkpointer)
-

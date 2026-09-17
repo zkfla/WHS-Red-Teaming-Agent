@@ -6,8 +6,10 @@ routes away rather than waiting.
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 from redteam.core.contracts.events import EventType
-from redteam.core.contracts.policy import ControlContext
+from redteam.core.contracts.policy import ControlContext, PolicyDecision
 from redteam.core.enums import AgentPhase, PolicyVerdict
 from redteam.orchestration.context import RuntimeDeps
 from redteam.orchestration.nodes._support import advance, publisher_for
@@ -33,7 +35,16 @@ async def policy_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
         agent_id=runtime.current_agent,
         correlation_id=correlation_id,
     )
-    decision = await deps.control_plane.evaluate(proposal, context)
+    try:
+        decision = await deps.control_plane.evaluate(proposal, context)
+    except Exception as exc:  # noqa: BLE001 - policy failures must fail closed
+        decision = PolicyDecision(
+            action_id=proposal.action_id,
+            verdict=PolicyVerdict.DENY,
+            reasons=["control plane evaluation failed"],
+            matched_rules=[f"control_error:{type(exc).__name__}"],
+            evaluated_at=datetime.now(timezone.utc),
+        )
 
     evaluated = await publisher.publish(
         EventType.POLICY_EVALUATED,

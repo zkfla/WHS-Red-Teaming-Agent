@@ -68,13 +68,16 @@ class LLMPlanner:
                 system=context.agent.system_prompt or DEFAULT_SYSTEM_PROMPT,
             )
         except Exception as exc:  # noqa: BLE001 - a planner must not abort the run
-            logger.warning("LLM planning call failed: %s", exc)
-            return await self._fall_back(f"llm call failed: {exc}", context)
+            # Provider messages may contain prompt fragments, target data or
+            # credentials. Keep only the exception class in logs/runtime.
+            error_type = type(exc).__name__
+            logger.warning("LLM planning call failed (%s)", error_type)
+            return await self._fall_back(f"llm call failed: {error_type}", context)
 
         step_id = str(choice.get("step_id", "")) if isinstance(choice, dict) else ""
         if step_id not in by_id:
             return await self._fall_back(
-                f"llm returned step_id {step_id!r}, which was not offered", context
+                "llm returned a step_id which was not offered", context
             )
 
         self.last_fallback_reason = None
@@ -107,6 +110,14 @@ class LLMPlanner:
         if observation.attempted:
             lines.append("Already attempted (do not repeat):")
             lines.extend(f"  - {item}" for item in observation.attempted)
+        evidence_excerpts = context.metadata.get("evidence_excerpts", [])
+        if evidence_excerpts:
+            lines.append("Target-linked evidence excerpts:")
+            for item in evidence_excerpts:
+                lines.append(
+                    "  - evidence_id={evidence_id} target={target_node_id} "
+                    "source={source_id} summary={summary}".format(**item)
+                )
 
         lines.append("")
         lines.append("Available steps:")
