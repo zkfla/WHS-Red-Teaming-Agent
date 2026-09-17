@@ -48,7 +48,9 @@ async def test_pins_ip_preserves_sni_and_host_and_does_not_leak_token(
         assert req.extensions["sni_hostname"] == "bank.test"
         assert req.headers["Authorization"] == "Bearer credential-must-not-appear"
         return httpx.Response(
-            200, headers={"Set-Cookie": "s=secret"}, json={"token": "secret", "account": "123456"}
+            200,
+            headers=[("Set-Cookie", "s=secret; HttpOnly"), ("Set-Cookie", "t=secret2; Secure")],
+            json={"token": "secret", "account": "123456"},
         )
 
     response = await request(
@@ -58,6 +60,7 @@ async def test_pins_ip_preserves_sni_and_host_and_does_not_leak_token(
     assert len(calls) == 1
     assert "secret" not in summary and "123456" not in summary
     assert response.summary()["body_omitted"] is True
+    assert response.set_cookie_headers == ("s=secret; HttpOnly", "t=secret2; Secure")
 
 
 @pytest.mark.parametrize("address", ["169.254.169.254", "127.0.0.1", "192.0.3.1", "0.0.0.0"])

@@ -11,6 +11,7 @@ from typing import Any
 from mcp.server import MCPServer
 
 from redteam.capability.servers.config import ServerPolicy
+from redteam.capability.servers.inspection import html_observations
 from redteam.capability.servers.network import ToolInputError, request, resolve_target
 
 
@@ -164,6 +165,27 @@ def create_server(policy: ServerPolicy) -> MCPServer:
             "source_untrusted": True,
             "endpoints_followed": False,
             "verdict": "observation_only",
+        }
+
+    @server.tool()
+    async def html_inventory(target_ref: str, path: str) -> dict[str, Any]:
+        """One approved GET: list static same-origin link/form/script paths, never follow them.
+
+        Query/fragment values and form contents are omitted. Discovered paths are candidates,
+        not newly authorized targets. Does not identify financial product versions.
+        """
+        async with execution_lock:
+            response = await request(policy, target_ref, path)
+        media_type = response.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+        if response.status != 200 or media_type != "text/html":
+            raise ToolInputError("HTML inventory requires HTTP 200 and text/html")
+        return {
+            "target_ref": target_ref,
+            **html_observations(
+                response.body, policy.targets[target_ref], path, response.headers["content-type"],
+            ),
+            "source_sha256": hashlib.sha256(response.body).hexdigest(),
+            "request_count": 1,
         }
 
     return server

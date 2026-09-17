@@ -8,7 +8,7 @@ import ipaddress
 import json
 import os
 import socket
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -89,6 +89,8 @@ class CapturedResponse:
     status: int
     headers: dict[str, str]
     body: bytes
+    # Preserve individual fields: joining Set-Cookie breaks Expires and cookie boundaries.
+    set_cookie_headers: tuple[str, ...] = field(default=(), repr=False)
 
     def summary(self) -> dict[str, Any]:
         # No raw response, header values, URL query or token is returned to the model.
@@ -163,7 +165,10 @@ async def request(
                         if len(body) > policy.max_response_bytes:
                             raise ToolInputError("response exceeds configured byte limit")
                     return CapturedResponse(
-                        response.status_code, dict(response.headers), bytes(body)
+                        response.status_code,
+                        dict(response.headers),
+                        bytes(body),
+                        tuple(response.headers.get_list("set-cookie")),
                     )
     except (httpx.HTTPError, OSError, asyncio.TimeoutError, TimeoutError) as exc:
         raise ToolInputError("target HTTP request failed") from exc

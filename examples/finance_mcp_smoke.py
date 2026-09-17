@@ -70,6 +70,27 @@ async def exercise(gateway: MCPToolGateway) -> None:
         },
     )
     assert response["status_code"] == 200 and response["body_omitted"]
+    posture = await call(
+        "web.http_security_posture", "response_analysis",
+        {"target_ref": "bank-lab", "path": "/api/accounts/alice", "session_ref": "alice"},
+    )
+    assert posture["cache_control_no_store"] and posture["content_type_nosniff"]
+    assert posture["set_cookie_header_count"] == 2
+    assert posture["cookies"][0]["http_only"] and posture["cookies"][0]["secure"]
+    assert "synthetic-cookie" not in str(posture)
+    anonymous = await call(
+        "web.http_compare_anonymous", "response_analysis",
+        {"target_ref": "bank-lab", "path": "/api/accounts/alice", "session_ref": "alice"},
+    )
+    assert anonymous["anonymous"]["status_code"] == 403
+    assert anonymous["authenticated"]["status_code"] == 200
+    assert anonymous["request_count"] == 2
+    inventory = await call(
+        "recon.html_inventory", "endpoint_discovery", {"target_ref": "bank-lab", "path": "/"},
+    )
+    assert inventory["references_followed"] is False
+    assert any(item["path"] == "/assets/test-sdk.js" for item in inventory["references"])
+    assert "synthetic-secret" not in str(inventory)
     comparison = await call(
         "web.http_compare_sessions",
         "response_analysis",
@@ -191,7 +212,10 @@ async def exercise(gateway: MCPToolGateway) -> None:
         await call("web.browser_snapshot", "response_analysis", {})
     )
     await call("web.browser_run_code_unsafe", "runtime_instrumentation", {}, error=True)
-    print("PASS: five MCP servers; proxy replay; actor isolation; scope denial; browser continuity")
+    print(
+        "PASS: five MCP servers; proxy replay; actor isolation; scope denial; browser continuity; "
+        "security posture; anonymous comparison; HTML inventory"
+    )
 
 
 if __name__ == "__main__":

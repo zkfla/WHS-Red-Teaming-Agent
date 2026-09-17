@@ -12,6 +12,8 @@ class Handler(BaseHTTPRequestHandler):
             content_type = "text/html; charset=utf-8"
             body = (
                 b"<html><title>Finance MCP lab</title><h1>Synthetic bank</h1>"
+                b'<a href="/api/accounts/alice?trace=synthetic-secret">Account</a>'
+                b'<script src="/assets/test-sdk.js"></script>'
                 b'<label>Test alias<input id="alias"></label>'
                 b'<button id="confirm" onclick="document.getElementById(\'result\').textContent='
                 b"document.getElementById('alias').value\">Preview alias</button>"
@@ -51,6 +53,10 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header(
+            "Set-Cookie", "lab_session=synthetic-cookie; Path=/; Secure; HttpOnly; SameSite=Lax"
+        )
+        self.send_header("Set-Cookie", "lab_preference=synthetic-pref; Path=/; SameSite=Strict")
         self.end_headers()
         self.wfile.write(body)
 
