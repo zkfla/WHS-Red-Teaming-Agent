@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import timezone
+
 from redteam.core.contracts.events import EventType
 from redteam.core.ids import EngagementId, RunId
 from redteam.event_bus.memory import InMemoryEventBus
@@ -30,6 +32,66 @@ async def test_correlation_defaults_to_the_run() -> None:
     assert event.correlation_id == str(RUN)
 
 
+async def test_custom_default_correlation_override_does_not_mutate_default() -> None:
+    bus = InMemoryEventBus()
+    pub = EventPublisher(
+        bus,
+        run_id=RUN,
+        engagement_id=ENGAGEMENT,
+        source="test",
+        correlation_id="workflow-1",
+    )
+
+    overridden = await pub.publish(EventType.ACTION_PROPOSED, correlation_id="action-1")
+    restored = await pub.publish(EventType.RUN_FINISHED)
+
+    assert overridden.correlation_id == "action-1"
+    assert restored.correlation_id == "workflow-1"
+
+
+async def test_for_source_preserves_bus_run_engagement_and_default_correlation() -> None:
+    bus = InMemoryEventBus()
+    original = EventPublisher(
+        bus,
+        run_id=RUN,
+        engagement_id=ENGAGEMENT,
+        source="original",
+        correlation_id="workflow-1",
+    )
+
+    derived = original.for_source("derived")
+    event = await derived.publish(EventType.EVIDENCE_CREATED)
+
+    assert derived.source == "derived"
+    assert original.source == "original"
+    assert event.source == "derived"
+    assert event.run_id == RUN
+    assert event.engagement_id == ENGAGEMENT
+    assert event.correlation_id == "workflow-1"
+    assert bus.history() == [event]
+
+
+async def test_each_published_event_gets_a_new_id_and_utc_timestamp() -> None:
+    bus = InMemoryEventBus()
+    pub = publisher(bus)
+
+    first = await pub.publish(EventType.ACTION_PROPOSED)
+    second = await pub.publish(EventType.ACTION_PROPOSED)
+
+    assert first.event_id != second.event_id
+    assert first.timestamp.tzinfo == timezone.utc
+    assert second.timestamp.tzinfo == timezone.utc
+
+
+def test_payload_is_copied_at_build_time() -> None:
+    payload = {"capability": "recon", "operation": "port_scan"}
+    event = publisher(InMemoryEventBus()).build(EventType.ACTION_PROPOSED, payload)
+
+    payload["operation"] = "changed_after_build"
+
+    assert event.payload == {"capability": "recon", "operation": "port_scan"}
+
+
 async def test_a_chain_of_events_stays_walkable() -> None:
     bus = InMemoryEventBus()
     pub = publisher(bus)
@@ -44,6 +106,39 @@ async def test_a_chain_of_events_stays_walkable() -> None:
         EventType.ACTION_PROPOSED,
         EventType.POLICY_EVALUATED,
     ]
+
+
+async def test_fan_out_children_keep_correlation_and_share_parent_causation() -> None:
+    bus = InMemoryEventBus()
+    pub = publisher(bus)
+    parent = await pub.publish(EventType.ACTION_PROPOSED, correlation_id="action-1")
+
+    first = await pub.publish(
+        EventType.POLICY_EVALUATED,
+        correlation_id="action-1",
+        causation_id=parent.event_id,
+    )
+    second = await pub.publish(
+        EventType.ACTION_APPROVED,
+        correlation_id="action-1",
+        causation_id=parent.event_id,
+    )
+
+    assert first.correlation_id == second.correlation_id == parent.correlation_id
+    assert first.causation_id == second.causation_id == parent.event_id
+
+
+async def test_publishers_for_different_runs_do_not_share_default_correlation() -> None:
+    bus = InMemoryEventBus()
+    first = await publisher(bus).publish(EventType.RUN_STARTED)
+    second = await EventPublisher(
+        bus,
+        run_id=RunId("run_2"),
+        engagement_id=ENGAGEMENT,
+        source="test",
+    ).publish(EventType.RUN_STARTED)
+
+    assert first.correlation_id != second.correlation_id
 
 
 async def test_for_source_keeps_the_run_and_changes_only_the_source() -> None:

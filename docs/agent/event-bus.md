@@ -34,6 +34,26 @@ Commands are not events. This publishes facts that already happened;
 asking another component to *do* something stays a direct call through a
 `core` port.
 
+## Event identity rules
+
+- `event_id` is generated for every envelope and is unique per event.
+- `correlation_id` identifies the run or logical action trail. Lifecycle
+  events use the run correlation; events from `ActionProposed` through
+  `GraphUpdated` use the action correlation.
+- `causation_id` is the direct parent event's `event_id`, or `None` for a
+  root event. It is never a run id or an action id.
+- A fan-out keeps the parent's correlation and gives each child the same
+  direct-parent causation id. A multi-hop chain updates causation to the
+  immediately preceding event while retaining correlation.
+- The publisher copies payload mappings and never translates
+  `capability`, `operation`, `action_key`, or `tool_id`. Action naming follows
+  `docs/contracts/actions.md`; intent and execution identifiers remain
+  separate.
+
+The Event Bus owns these rules as tests and verification guidance. Producer
+nodes own the state needed to supply the parent event id. Known producer gaps
+are tracked below rather than patched from this module.
+
 ## Delivery guarantees
 
 `InMemoryEventBus`:
@@ -96,6 +116,23 @@ otherwise — they need updating.**
 A blocked action (DENY / REQUIRE_APPROVAL) still emits `GraphUpdated`:
 nothing ran, but the graph records that the action was not taken and
 why. See [orchestration.md](orchestration.md).
+
+## Producer integration notes
+
+The current vertical slice exposes three producer-side follow-ups:
+
+1. `app.bootstrap.run_engagement` creates `RunStarted` and `RunFinished`
+   directly, without setting their lifecycle correlation or terminal
+   causation context.
+2. The first `orchestration.observe` `AgentStarted` event has no parent id,
+   because the `RunStarted` id is not seeded into `GraphState["last_event_id"]`.
+3. The default Recon playbook still uses the legacy `recon.example/ping`
+   operation key and `recon.example` capability. Orchestration/Control owners
+   must migrate it to the canonical action naming in
+   `docs/contracts/actions.md`; Event Bus preserves the supplied values.
+
+These are covered by the Event Bus integration diagnostics as expected
+failures until the Producer owners implement the corresponding changes.
 
 ## Swapping the backend
 
