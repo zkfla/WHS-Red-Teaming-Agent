@@ -16,6 +16,7 @@ import anyio
 import httpx
 
 from redteam.capability.servers.config import ServerPolicy, TargetProfile
+from redteam.capability.servers.session_state import cookie_header
 
 
 class ToolInputError(ValueError):
@@ -71,13 +72,16 @@ def validate_path(profile: TargetProfile, path: str) -> None:
 
 
 def session_header(
-    policy: ServerPolicy, target_ref: str, session_ref: str | None
+    policy: ServerPolicy, target_ref: str, session_ref: str | None, path: str = "/"
 ) -> dict[str, str]:
     if session_ref is None:
         return {}
     session = policy.sessions.get(session_ref)
     if session is None or session.target_ref != target_ref:
         raise ToolInputError("session_ref is not bound to this target")
+    if session.storage_state_path:
+        return {"Cookie": cookie_header(session, policy.targets[target_ref].origin, path)}
+    assert session.bearer_env is not None
     token = os.environ.get(session.bearer_env)
     if not token or any(c in token for c in "\r\n\x00"):
         raise ToolInputError("session credential unavailable")
@@ -120,6 +124,8 @@ async def request(
     method: str = "GET",
     session_ref: str | None = None,
     json_body: dict[str, Any] | None = None,
+    query: dict[str, str] | None = None,
+    request_headers: dict[str, str] | None = None,
     transport: httpx.AsyncBaseTransport | None = None,
 ) -> CapturedResponse:
     profile = policy.targets.get(target_ref)
@@ -134,7 +140,22 @@ async def request(
     content = None if json_body is None else json.dumps(json_body).encode()
     if content is not None and len(content) > 65536:
         raise ToolInputError("request body exceeds limit")
-    headers = session_header(policy, target_ref, session_ref)
+    query = query or {}
+    request_headers = request_headers or {}
+    if len(query) > 20 or any(
+        key not in profile.allowed_query_keys.get(path, [])
+        or len(value) > 1024 or any(ord(c) < 32 for c in value)
+        for key, value in query.items()
+    ):
+        raise ToolInputError("query outside configured allowlist or size limit")
+    headers = {key.lower(): value for key, value in request_headers.items()}
+    if len(headers) != len(request_headers) or len(headers) > 20 or any(
+        key not in profile.allowed_request_headers or len(value) > 1024
+        or any(ord(c) < 32 or ord(c) > 126 for c in value)
+        for key, value in headers.items()
+    ):
+        raise ToolInputError("request headers outside configured allowlist or size limit")
+    headers.update(session_header(policy, target_ref, session_ref, path))
     target = await resolve_target(policy, target_ref)
     host = f"[{target.host}]" if ":" in target.host else target.host
     headers.update({"Host": f"{host}:{target.port}", "Accept-Encoding": "identity"})
@@ -155,6 +176,7 @@ async def request(
                     url,
                     headers=headers,
                     content=content,
+                    params=query,
                     extensions={"sni_hostname": target.host},
                 ) as response:
                     if response.headers.get("content-encoding", "identity").lower() != "identity":

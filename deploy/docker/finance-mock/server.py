@@ -2,6 +2,7 @@
 
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlsplit
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -19,7 +20,7 @@ class Handler(BaseHTTPRequestHandler):
                 b"document.getElementById('alias').value\">Preview alias</button>"
                 b'<p id="result"></p></html>'
             )
-        elif self.path == "/health":
+        elif urlsplit(self.path).path == "/health":
             body = b'{"status":"ok"}'
         elif self.path == "/api/accounts/alice":
             if self.headers.get("Authorization") == "Bearer synthetic-alice":

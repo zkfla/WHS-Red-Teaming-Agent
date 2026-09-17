@@ -37,6 +37,8 @@ def create_server(policy: ServerPolicy) -> MCPServer:
         method: str = "GET",
         session_ref: str | None = None,
         json_body: dict[str, Any] | None = None,
+        query: dict[str, str] | None = None,
+        request_headers: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         """Send one scoped request. No automatic redirects/retries; return body digest only.
 
@@ -51,6 +53,8 @@ def create_server(policy: ServerPolicy) -> MCPServer:
                 method=method,
                 session_ref=session_ref,
                 json_body=json_body,
+                query=query,
+                request_headers=request_headers,
             )
         return {"target_ref": target_ref, "session_ref": session_ref, **response.summary()}
 
@@ -116,7 +120,7 @@ def create_server(policy: ServerPolicy) -> MCPServer:
         # Validate the named credential before either request, including the anonymous one.
         if session_ref not in policy.sessions:
             raise ToolInputError("registered session_ref is required")
-        session_header(policy, target_ref, session_ref)
+        session_header(policy, target_ref, session_ref, path)
         async with execution_lock:
             anonymous = await request(policy, target_ref, path)
             authenticated = await request(policy, target_ref, path, session_ref=session_ref)
