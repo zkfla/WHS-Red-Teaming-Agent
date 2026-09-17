@@ -107,4 +107,4 @@ async def test_minimal_vertical_slice_end_to_end(tmp_path) -> None:
     assert attrs_of(node.properties)["reachable"] is True
     # ...and the attempt is recorded, which is what stops the planner
     # proposing the same probe again.
-    assert facts_of(node.properties)["attempted_operations"] == ["recon.example/ping"]
+    assert facts_of(node.properties)["attempted_operations"] == ["recon.service_discovery"]

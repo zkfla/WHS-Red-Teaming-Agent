@@ -8,9 +8,9 @@ from pydantic import BaseModel, Field
 
 from redteam.attack_graph.service import AttackGraphService
 from redteam.core.enums import AgentPhase
-from redteam.core.ids import EvidenceId, FindingId, RunId
+from redteam.core.ids import ApprovalId, EvidenceId, FindingId, RunId
 from redteam.core.ports.evidence_store import EvidenceStore
-from redteam.orchestration.state import RuntimeState
+from redteam.orchestration.state import RuntimeState, TerminationReason
 from redteam.orchestration.work.store import WorkStore
 
 
@@ -33,6 +33,7 @@ class TerminalReportProjection(BaseModel):
     run_id: RunId
     phase: AgentPhase
     termination_reason: str | None
+    pending_approval_id: ApprovalId | None = None
     ready_for_release: bool
     actions_executed: int
     finding_count: int
@@ -106,8 +107,10 @@ class ReportingAgent:
             run_id=runtime.run_id,
             phase=runtime.phase,
             termination_reason=runtime.termination_reason,
+            pending_approval_id=runtime.pending_approval_id,
             ready_for_release=(
                 runtime.phase is AgentPhase.FINISHED
+                and runtime.termination_reason == TerminationReason.NO_ACTIONABLE_PLAN
                 and not integrity.blocking
                 and not integrity.unresolved_hypotheses
                 and cleanup.is_clear

@@ -21,6 +21,10 @@ from redteam.core.contracts.target import AnyTarget, TargetRef
 from redteam.core.enums import RiskLevel
 from redteam.core.ids import AgentId, EngagementId, RunId, ToolId
 from redteam.core.ports.llm import LLMClient
+from redteam.orchestration.action_naming import (
+    canonical_action_key,
+    tool_matches_action_namespace,
+)
 from redteam.orchestration.expectations import Expectation
 
 #: Cap on concrete steps produced from one playbook entry per turn, so a
@@ -70,6 +74,12 @@ class PlanStep(BaseModel):
 
     @model_validator(mode="after")
     def _has_exactly_one_target_source(self) -> PlanStep:
+        canonical_action_key(self.capability, self.operation)
+        if not tool_matches_action_namespace(self.tool_id, self.capability):
+            raise ValueError(
+                f"step {self.step_id!r} binds tool {self.tool_id!r} outside "
+                f"capability namespace {self.capability!r}"
+            )
         if (self.target is None) == (not self.target_bind):
             raise ValueError(
                 f"step {self.step_id!r} must set exactly one of target / target_bind"
@@ -92,8 +102,8 @@ class PlanStep(BaseModel):
 
     @property
     def operation_key(self) -> str:
-        """``"recon.example/ping"`` — how an attempt is recorded in the graph."""
-        return f"{self.capability}/{self.operation}"
+        """Canonical ROE/action key recorded in the graph."""
+        return canonical_action_key(self.capability, self.operation)
 
     def resolved_target(self) -> AnyTarget:
         if self.target is None:  # pragma: no cover - guarded by the validator

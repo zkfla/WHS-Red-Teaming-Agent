@@ -108,14 +108,14 @@ async def test_attempts_accumulate_on_the_target_node() -> None:
     svc = service()
     node = await svc.upsert_node(GraphNodeType.HOST, key="a.local")
 
-    await svc.record_attempt(node.id, "recon.example/ping", step=1)
-    await svc.record_attempt(node.id, "recon.example/ping", step=2)
-    await svc.record_attempt(node.id, "recon.example/banner", step=3)
+    await svc.record_attempt(node.id, "recon.service_discovery", step=1)
+    await svc.record_attempt(node.id, "recon.service_discovery", step=2)
+    await svc.record_attempt(node.id, "recon.endpoint_discovery", step=3)
 
     refreshed = await node_at(svc, node.id)
     assert facts_of(refreshed.properties)["attempted_operations"] == [
-        "recon.example/ping",
-        "recon.example/banner",
+        "recon.service_discovery",
+        "recon.endpoint_discovery",
     ]
 
 

@@ -13,7 +13,11 @@ from datetime import datetime, timedelta, timezone
 from redteam.core.contracts.events import EventType
 from redteam.core.contracts.tool import ToolError, ToolResult
 from redteam.core.convert import build_tool_invocation
-from redteam.core.enums import AgentPhase
+from redteam.core.enums import AgentPhase, ToolHealthStatus
+from redteam.orchestration.action_naming import (
+    canonical_action_key,
+    tool_matches_action_namespace,
+)
 from redteam.orchestration.context import RuntimeDeps
 from redteam.orchestration.nodes._support import advance, publisher_for
 from redteam.orchestration.state import GraphState
@@ -90,6 +94,22 @@ async def execute_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
     lease_lost = asyncio.Event()
     heartbeat_task: asyncio.Task[None] | None = None
     lease_ready = True
+    try:
+        canonical_action_key(proposal.capability, proposal.operation)
+        binding_ready = bool(
+            step.capability == proposal.capability
+            and step.operation == proposal.operation
+            and tool_matches_action_namespace(step.tool_id, proposal.capability)
+        )
+    except ValueError:
+        binding_ready = False
+    if binding_ready and deps.tool_catalog is not None:
+        descriptor = deps.tool_catalog.get(step.tool_id)
+        binding_ready = bool(
+            descriptor is not None
+            and proposal.capability in descriptor.capability_tags
+            and descriptor.health_status is not ToolHealthStatus.UNHEALTHY
+        )
     if work_id is not None:
         try:
             lease_ready = (
@@ -105,6 +125,8 @@ async def execute_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             lease_ready = False
 
     try:
+        if not binding_ready:
+            raise RuntimeError("tool binding is no longer valid for the approved action")
         if not lease_ready:
             raise RuntimeError("work lease was lost before tool execution")
         if work_id is not None:
@@ -121,11 +143,15 @@ async def execute_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
         result = await deps.tool_gateway.invoke(invocation)
     except Exception as exc:  # noqa: BLE001 - normalize adapter/transport failure
         now = datetime.now(timezone.utc)
-        error_code = (
-            "lease_lost_before_execution"
-            if not lease_ready
-            else f"gateway_exception:{type(exc).__name__}"
-        )
+        if not binding_ready:
+            error_code = "tool_binding_invalid"
+            error_message = "approved action has no valid healthy tool binding"
+        elif not lease_ready:
+            error_code = "lease_lost_before_execution"
+            error_message = "work lease was unavailable before tool execution"
+        else:
+            error_code = f"gateway_exception:{type(exc).__name__}"
+            error_message = "tool gateway raised an exception"
         result = ToolResult(
             invocation_id=invocation.invocation_id,
             action_id=invocation.action_id,
@@ -134,11 +160,7 @@ async def execute_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             error=ToolError(
                 code=error_code,
                 # Exception text may contain target output or secrets.
-                message=(
-                    "work lease was unavailable before tool execution"
-                    if not lease_ready
-                    else "tool gateway raised an exception"
-                ),
+                message=error_message,
             ),
             started_at=now,
             finished_at=now,

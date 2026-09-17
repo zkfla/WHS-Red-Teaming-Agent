@@ -7,7 +7,7 @@ from langgraph.types import Overwrite
 from redteam.core.enums import AgentPhase
 from redteam.orchestration.context import RuntimeDeps
 from redteam.orchestration.nodes._support import advance
-from redteam.orchestration.state import GraphState
+from redteam.orchestration.state import GraphState, TerminationReason
 
 
 async def aggregate_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
@@ -48,6 +48,9 @@ async def aggregate_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
     last_with_event = next(
         (item for item in reversed(outcomes) if item.last_event_id is not None), None
     )
+    pending_approval = next(
+        (item for item in outcomes if item.approval_id is not None), None
+    )
 
     return advance(
         state,
@@ -62,7 +65,17 @@ async def aggregate_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                     last_with_verdict.verdict if last_with_verdict else runtime.last_verdict
                 ),
                 "pending_action_id": None,
+                "pending_approval_id": (
+                    pending_approval.approval_id
+                    if pending_approval is not None
+                    else runtime.pending_approval_id
+                ),
                 "active_hypothesis_id": None,
+                "termination_reason": (
+                    TerminationReason.APPROVAL_PENDING
+                    if pending_approval is not None
+                    else runtime.termination_reason
+                ),
             }
         ),
         last_event_id=last_with_event.last_event_id if last_with_event else None,

@@ -25,6 +25,7 @@ Two entry points build a ``RuntimeDeps``:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
@@ -56,13 +57,19 @@ from redteam.core.ports.tool_gateway import ToolGateway
 from redteam.event_bus.memory import InMemoryEventBus
 from redteam.evidence.stores.filesystem import FilesystemEvidenceStore
 from redteam.llm.fake import FakeLLMClient
+from redteam.orchestration.agents.providers import (
+    CandidateProviderRegistry,
+    default_provider_registry,
+)
+from redteam.orchestration.agents.registry import AgentRegistry, default_registry
+from redteam.orchestration.candidates.catalog import ToolCatalog
 from redteam.orchestration.context import RuntimeDeps
 from redteam.orchestration.events import REPORT_PROJECTED
 from redteam.orchestration.reporting import ReportingAgent
 from redteam.orchestration.runner import AgentLoopRunner
 from redteam.orchestration.seed import seed_from_engagement
 from redteam.orchestration.settings import OrchestrationSettings
-from redteam.orchestration.state import RuntimeState
+from redteam.orchestration.state import RuntimeState, TerminationReason
 from redteam.orchestration.work.memory import InMemoryWorkStore
 from redteam.orchestration.work.sqlite import SQLiteWorkStore
 from redteam.orchestration.work.store import WorkStore
@@ -115,6 +122,9 @@ async def build_runtime_deps(
     evidence_dir: str | Path = "data/evidence",
     *,
     orchestration_settings: OrchestrationSettings | None = None,
+    agents: AgentRegistry | None = None,
+    candidate_providers: CandidateProviderRegistry | None = None,
+    tool_catalog: ToolCatalog | None = None,
 ) -> RuntimeDeps:
     """Wire in-memory/dummy backends for every port, from an ``Engagement`` alone.
 
@@ -131,7 +141,7 @@ async def build_runtime_deps(
     event_bus = InMemoryEventBus()
     graph_store = InMemoryAttackGraphStore()
     evidence_store = FilesystemEvidenceStore(evidence_dir)
-    tool_gateway, tool_catalog = await _build_default_capability(CapabilityConfig())
+    tool_gateway, discovered_catalog = await _build_default_capability(CapabilityConfig())
     control_plane = DefaultControlPlane({engagement.engagement_id: engagement})
     llm_client = FakeLLMClient()
     settings = orchestration_settings or OrchestrationSettings()
@@ -143,7 +153,13 @@ async def build_runtime_deps(
         graph_store=graph_store,
         evidence_store=evidence_store,
         llm_client=llm_client,
-        tool_catalog=tool_catalog,
+        agents=agents if agents is not None else default_registry(),
+        candidate_providers=(
+            candidate_providers
+            if candidate_providers is not None
+            else default_provider_registry()
+        ),
+        tool_catalog=(tool_catalog if tool_catalog is not None else discovered_catalog),
         work_store=_build_work_store(settings),
         settings=settings,
     )
@@ -166,6 +182,9 @@ async def build_application(
     llm: LLMClient | None = None,
     evidence_dir: str | Path = "data/evidence",
     orchestration_settings: OrchestrationSettings | None = None,
+    agents: AgentRegistry | None = None,
+    candidate_providers: CandidateProviderRegistry | None = None,
+    tool_catalog: ToolCatalog | None = None,
 ) -> tuple[Engagement, RuntimeDeps]:
     """``AppConfig``-aware composition root. Every dependency is overridable.
 
@@ -194,7 +213,7 @@ async def build_application(
     resolved_control_plane = control_plane or DefaultControlPlane(
         {engagement.engagement_id: engagement}
     )
-    resolved_tool_catalog = None
+    resolved_tool_catalog = tool_catalog
     if tool_gateway is None:
         resolved_tool_gateway, resolved_tool_catalog = await _build_default_capability(
             config.capability
@@ -216,11 +235,71 @@ async def build_application(
         graph_store=resolved_attack_graph,
         evidence_store=resolved_evidence_store,
         llm_client=resolved_llm,
+        agents=agents if agents is not None else default_registry(),
+        candidate_providers=(
+            candidate_providers
+            if candidate_providers is not None
+            else default_provider_registry()
+        ),
         tool_catalog=resolved_tool_catalog,
         work_store=_build_work_store(resolved_settings),
         settings=resolved_settings,
     )
     return engagement, deps
+
+
+async def _publish_terminal_artifacts(
+    runtime: RuntimeState,
+    deps: RuntimeDeps,
+    *,
+    error_type: str | None = None,
+) -> None:
+    """Project and publish a report for every terminal outcome."""
+
+    report = await ReportingAgent().project(
+        runtime,
+        graph=AttackGraphService(deps.graph_store),
+        evidence_store=deps.evidence_store,
+        work_store=deps.work_store,
+    )
+    await deps.event_bus.publish(
+        EventEnvelope(
+            event_id=EventId(new_id("evt")),
+            event_type=REPORT_PROJECTED,
+            run_id=runtime.run_id,
+            engagement_id=runtime.engagement_id,
+            source="orchestration.reporting",
+            timestamp=datetime.now(timezone.utc),
+            payload={
+                "ready_for_release": report.ready_for_release,
+                "finding_count": report.finding_count,
+                "evidence_count": report.evidence_count,
+                "integrity_blockers": report.integrity_blockers,
+                "unresolved_hypotheses": report.unresolved_hypotheses,
+                "outstanding_cleanup": report.outstanding_cleanup,
+                "pending_approval_id": report.pending_approval_id,
+                "effectiveness": report.effectiveness.model_dump(mode="json"),
+            },
+        )
+    )
+    await deps.event_bus.publish(
+        EventEnvelope(
+            event_id=EventId(new_id("evt")),
+            event_type=EventType.RUN_FINISHED,
+            run_id=runtime.run_id,
+            engagement_id=runtime.engagement_id,
+            source="app.bootstrap",
+            timestamp=datetime.now(timezone.utc),
+            payload={
+                "phase": runtime.phase.value,
+                "termination_reason": runtime.termination_reason,
+                "pending_approval_id": runtime.pending_approval_id,
+                "actions_executed": runtime.actions_executed,
+                "steps": runtime.step_count,
+                "error_type": error_type,
+            },
+        )
+    )
 
 
 async def run_engagement(
@@ -267,60 +346,44 @@ async def run_engagement(
         )
     )
 
+    initial_runtime = RuntimeState(
+        run_id=run_id,
+        engagement_id=engagement.engagement_id,
+        phase=AgentPhase.OBSERVE,
+        current_goal=f"map and probe the declared scope of {engagement.name}",
+        remaining_budget=engagement.execution_budget.max_actions,
+    )
     runner = AgentLoopRunner(deps, settings=settings)
     try:
-        runtime = await runner.run(
-            RuntimeState(
-                run_id=run_id,
-                engagement_id=engagement.engagement_id,
-                phase=AgentPhase.OBSERVE,
-                current_goal=f"map and probe the declared scope of {engagement.name}",
-                remaining_budget=engagement.execution_budget.max_actions,
+        try:
+            runtime = await runner.run(initial_runtime)
+        except BaseException as exc:
+            recovered_runtime = runner.failure_runtime or initial_runtime
+            failed_runtime = recovered_runtime.model_copy(
+                update={
+                    "phase": AgentPhase.FAILED,
+                    "termination_reason": (
+                        TerminationReason.USER_INTERRUPTED
+                        if isinstance(exc, asyncio.CancelledError)
+                        else TerminationReason.EXECUTION_ERROR
+                    ),
+                }
             )
-        )
+            # Preserve the original exception even if reporting infrastructure
+            # is also degraded.  Canonical graph/evidence/ledger stores still
+            # provide the partial projection whenever this succeeds.
+            try:
+                await asyncio.shield(
+                    _publish_terminal_artifacts(
+                        failed_runtime,
+                        deps,
+                        error_type=type(exc).__name__,
+                    )
+                )
+            except Exception:  # noqa: BLE001 - never mask the run failure
+                pass
+            raise
+        await _publish_terminal_artifacts(runtime, deps)
+        return runtime
     finally:
         await runner.aclose()
-
-    report = await ReportingAgent().project(
-        runtime,
-        graph=AttackGraphService(deps.graph_store),
-        evidence_store=deps.evidence_store,
-        work_store=deps.work_store,
-    )
-    await deps.event_bus.publish(
-        EventEnvelope(
-            event_id=EventId(new_id("evt")),
-            event_type=REPORT_PROJECTED,
-            run_id=run_id,
-            engagement_id=engagement.engagement_id,
-            source="orchestration.reporting",
-            timestamp=datetime.now(timezone.utc),
-            payload={
-                "ready_for_release": report.ready_for_release,
-                "finding_count": report.finding_count,
-                "evidence_count": report.evidence_count,
-                "integrity_blockers": report.integrity_blockers,
-                "unresolved_hypotheses": report.unresolved_hypotheses,
-                "outstanding_cleanup": report.outstanding_cleanup,
-                "effectiveness": report.effectiveness.model_dump(mode="json"),
-            },
-        )
-    )
-
-    await deps.event_bus.publish(
-        EventEnvelope(
-            event_id=EventId(new_id("evt")),
-            event_type=EventType.RUN_FINISHED,
-            run_id=run_id,
-            engagement_id=engagement.engagement_id,
-            source="app.bootstrap",
-            timestamp=datetime.now(timezone.utc),
-            payload={
-                "phase": runtime.phase.value,
-                "termination_reason": runtime.termination_reason,
-                "actions_executed": runtime.actions_executed,
-                "steps": runtime.step_count,
-            },
-        )
-    )
-    return runtime

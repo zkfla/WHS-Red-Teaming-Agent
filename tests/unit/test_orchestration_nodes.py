@@ -110,8 +110,8 @@ def proposal(hypothesis_id: HypothesisId | None = None, host: str = "a.local") -
         run_id=RUN,
         engagement_id=ENGAGEMENT,
         agent_id=AgentId("recon-agent"),
-        capability="recon.example",
-        operation="ping",
+        capability="recon",
+        operation="service_discovery",
         target=HostTarget(host=host),
         reason="probe",
         hypothesis_id=hypothesis_id,
@@ -126,7 +126,7 @@ def tool_result(
     return ToolResult(
         invocation_id=InvocationId("inv_1"),
         action_id=ActionId("action_1"),
-        tool_id=ToolId("example.ping"),
+        tool_id=ToolId("recon.ping"),
         success=success,
         output=output if output is not None else {"echo": {"message": "hi"}},
         error=None if success else ToolError(code="timeout", message="no answer"),
@@ -184,7 +184,7 @@ async def test_plan_states_a_hypothesis_before_it_acts() -> None:
 
     action = state["action_proposal"]
     assert action is not None
-    assert action.capability == "recon.example"
+    assert action.capability == "recon"
     assert isinstance(action.target, HostTarget)
     assert action.target.host == "a.local"
     assert state["runtime"].phase is AgentPhase.POLICY
@@ -218,9 +218,9 @@ async def test_plan_produces_nothing_when_the_frontier_is_empty() -> None:
 async def test_plan_without_a_hypothesis_still_proposes() -> None:
     step = PlanStep(
         step_id="bare",
-        capability="recon.example",
-        operation="ping",
-        tool_id=ToolId("example.ping"),
+        capability="recon",
+        operation="service_discovery",
+        tool_id=ToolId("recon.ping"),
         target=HostTarget(host="a.local"),
         reason="no hypothesis on this one",
     )
@@ -312,7 +312,7 @@ async def test_a_blocked_action_is_recorded_without_asserting_anything() -> None
     assert facts["last_operation_blocked"] is True
     assert facts["last_block_verdict"] == "deny"
     # Recorded as attempted, so the planner does not re-propose it forever.
-    assert facts["attempted_operations"] == ["recon.example/ping"]
+    assert facts["attempted_operations"] == ["recon.service_discovery"]
     assert d.event_bus.history(event_type=EventType.GRAPH_UPDATED)[0].payload["blocked"] is True
 
 
@@ -336,7 +336,7 @@ async def test_execute_uses_the_tool_the_chosen_step_declared() -> None:
 
     result = await execute_node(state, deps=d)
 
-    assert gateway.invocations[0].tool_id == ToolId("example.ping")
+    assert gateway.invocations[0].tool_id == ToolId("recon.ping")
     assert result["runtime"].actions_executed == 1
     assert result["runtime"].remaining_budget == 2
     assert result["runtime"].consecutive_failures == 0
@@ -373,6 +373,24 @@ async def test_execute_does_not_invoke_tool_after_lease_is_lost() -> None:
     assert tool is not None and tool.success is False
     assert tool.error is not None and tool.error.code == "lease_lost_before_execution"
     assert tool.metadata["orchestration_exception"] is True
+
+
+async def test_execute_rejects_a_tool_binding_for_a_different_approved_intent() -> None:
+    gateway = DummyToolGateway()
+    d = deps(tool_gateway=gateway)
+    state = state_with(runtime(), action_proposal=proposal())
+    state = await policy_node(state, deps=d)
+    mismatched = RECON_AGENT.playbook[0].model_copy(
+        update={"operation": "endpoint_discovery"}
+    )
+    state = merged(state, plan_step=mismatched)
+
+    result = await execute_node(state, deps=d)
+
+    assert gateway.invocations == []
+    tool = result["tool_result"]
+    assert tool is not None and tool.success is False
+    assert tool.error is not None and tool.error.code == "tool_binding_invalid"
 
 
 # -- VERIFY ---------------------------------------------------------------
@@ -419,9 +437,9 @@ async def test_a_failed_execution_leaves_the_hypothesis_open() -> None:
 async def test_a_violation_produces_a_verified_finding_backed_by_evidence() -> None:
     step = PlanStep(
         step_id="authz",
-        capability="web.probe",
-        operation="get",
-        tool_id=ToolId("example.ping"),
+        capability="web",
+        operation="http_request",
+        tool_id=ToolId("web.http_client"),
         target=HostTarget(host="a.local"),
         reason="unauthenticated read must not succeed",
         hypothesis=HypothesisDraft(description="anonymous read works", violation_if_confirmed=True),
@@ -477,7 +495,7 @@ async def test_update_writes_predicates_and_records_the_attempt() -> None:
 
     node = await node_at(service, "host:a.local")
     assert attrs_of(node.properties) == {"reachable": True, "probed": True}
-    assert facts_of(node.properties)["attempted_operations"] == ["recon.example/ping"]
+    assert facts_of(node.properties)["attempted_operations"] == ["recon.service_discovery"]
     # The payload itself stays in Evidence, not in long-lived graph state.
     assert "echo" not in facts_of(node.properties)
     assert result["runtime"].phase is AgentPhase.REPLAN
@@ -499,7 +517,7 @@ async def test_update_does_not_assert_predicates_after_a_failed_tool_call() -> N
     node = await node_at(service, "host:a.local")
     assert attrs_of(node.properties) == {}
     # The attempt is still recorded, so it is not proposed again.
-    assert facts_of(node.properties)["attempted_operations"] == ["recon.example/ping"]
+    assert facts_of(node.properties)["attempted_operations"] == ["recon.service_discovery"]
 
 
 # -- REPLAN ---------------------------------------------------------------

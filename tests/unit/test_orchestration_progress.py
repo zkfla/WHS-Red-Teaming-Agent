@@ -8,7 +8,7 @@ def test_fingerprint_ignores_turn_and_attempt_bookkeeping() -> None:
         step=1,
         node_counts={"host": 1},
         nodes_by_type={"host": ["a.local"]},
-        attempted=["recon/ping@host:a.local"],
+        attempted=["recon.service_discovery@host:a.local"],
     )
     second = first.model_copy(
         update={"step": 99, "attempted": ["different/bookkeeping@host:a.local"]}

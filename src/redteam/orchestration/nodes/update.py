@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from redteam.attack_graph.predicates import Confidence, Provenance
 from redteam.core.contracts.events import EventType
 from redteam.core.enums import AgentPhase
+from redteam.orchestration.action_naming import canonical_action_key
 from redteam.orchestration.context import RuntimeDeps
 from redteam.orchestration.nodes._support import advance, graph_service, publisher_for
 from redteam.orchestration.state import GraphState
@@ -28,7 +29,7 @@ async def update_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
     service = graph_service(deps)
     publisher = publisher_for(state, deps, "orchestration.update")
     correlation_id = str(proposal.action_id)
-    operation_key = f"{proposal.capability}/{proposal.operation}"
+    operation_key = canonical_action_key(proposal.capability, proposal.operation)
     blocked = result is None
     tool_succeeded = result is not None and result.success
     verification_exception = (

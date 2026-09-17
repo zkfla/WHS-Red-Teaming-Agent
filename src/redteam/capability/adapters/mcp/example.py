@@ -17,7 +17,7 @@ from redteam.core.contracts.tool import ToolDescriptor, ToolResult
 from redteam.core.enums import RiskLevel, ToolHealthStatus
 from redteam.core.ids import ActionId, InvocationId, ToolId
 
-EXAMPLE_TOOL_ID = ToolId("example.ping")
+EXAMPLE_TOOL_ID = ToolId("recon.ping")
 
 
 class ExampleMCPAdapter:
@@ -37,7 +37,7 @@ class ExampleMCPAdapter:
                 tool_name="ping",
                 description="Harmless example tool: echoes arguments back.",
                 input_schema={"type": "object", "properties": {"message": {"type": "string"}}},
-                capability_tags=["recon.example"],
+                capability_tags=["recon"],
                 risk_level=RiskLevel.LOW,
                 health_status=ToolHealthStatus.HEALTHY,
             )

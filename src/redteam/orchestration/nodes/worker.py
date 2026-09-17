@@ -75,6 +75,7 @@ async def worker_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             executed=result is not None,
             succeeded=result.success if result is not None else None,
             policy_verdict=decision.verdict if decision is not None else None,
+            approval_id=decision.approval_id if decision is not None else None,
             verdict=local["runtime"].last_verdict,
             last_event_id=local.get("last_event_id"),
         )
@@ -107,6 +108,7 @@ async def worker_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             executed=attempted,
             succeeded=result.success if result is not None else False if attempted else None,
             policy_verdict=decision.verdict if decision is not None else None,
+            approval_id=decision.approval_id if decision is not None else None,
             verdict=local["runtime"].last_verdict,
             last_event_id=local.get("last_event_id"),
             # Checkpoint only the class. Exception text may contain tool output,

@@ -39,7 +39,7 @@ async def test_gateway_routes_invocation_to_registered_adapter() -> None:
         action_id=ActionId("action_1"),
         run_id=RunId("run_1"),
         tool_id=tool_id,
-        operation="ping",
+        operation="service_discovery",
         arguments={"message": "hi"},
         execution_context=ExecutionContext(
             engagement_id=EngagementId("eng_1"), run_id=RunId("run_1")
@@ -60,7 +60,7 @@ async def test_gateway_returns_error_for_unknown_tool() -> None:
         action_id=ActionId("action_1"),
         run_id=RunId("run_1"),
         tool_id=ToolId("does.not.exist"),
-        operation="ping",
+        operation="service_discovery",
         execution_context=ExecutionContext(
             engagement_id=EngagementId("eng_1"), run_id=RunId("run_1")
         ),

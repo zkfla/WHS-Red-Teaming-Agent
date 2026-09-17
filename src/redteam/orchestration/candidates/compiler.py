@@ -15,6 +15,10 @@ from redteam.attack_graph.view import AttackGraphView
 from redteam.core.contracts.tool import ToolDescriptor
 from redteam.core.enums import RiskLevel, ToolHealthStatus
 from redteam.core.ids import ToolId
+from redteam.orchestration.action_naming import (
+    canonical_action_key,
+    tool_matches_action_namespace,
+)
 from redteam.orchestration.agents.base import AgentSpec
 from redteam.orchestration.agents.providers import PlaybookCandidateProvider
 from redteam.orchestration.candidates.catalog import ToolCatalog
@@ -59,6 +63,7 @@ class CandidateCompiler:
         for draft in drafts:
             plan_step = draft.plan_step
             try:
+                canonical_action_key(plan_step.capability, plan_step.operation)
                 execution_target_id = node_id_for_target(plan_step.resolved_target())
             except ValueError:
                 # Providers must emit concrete executable steps, never an
@@ -95,6 +100,8 @@ class CandidateCompiler:
         )
 
     def _resolve_tool(self, preferred: ToolId, capability: str) -> ToolDescriptor | None:
+        if not tool_matches_action_namespace(preferred, capability):
+            return None
         if self._catalog is None:
             return ToolDescriptor(
                 tool_id=preferred,
@@ -105,35 +112,14 @@ class CandidateCompiler:
                 health_status=ToolHealthStatus.UNKNOWN,
             )
 
+        # A capability tag says only what family a tool belongs to.  It is not
+        # an intent-to-tool binding.  Falling back to an arbitrary tool with
+        # the same tag could execute a different operation than Control
+        # approved, so only the explicitly configured binding is accepted.
         exact = self._catalog.get(preferred)
-        if exact is not None and capability in exact.capability_tags:
-            return exact
-        tools = [
-            tool
-            for tool in self._catalog.list_by_capability(capability)
-            if tool.health_status is not ToolHealthStatus.UNHEALTHY
-        ]
-        if not tools:
+        if exact is None or capability not in exact.capability_tags:
             return None
-        health_rank = {
-            ToolHealthStatus.HEALTHY: 0,
-            ToolHealthStatus.UNKNOWN: 1,
-            ToolHealthStatus.UNHEALTHY: 2,
-        }
-        risk_rank = {
-            RiskLevel.LOW: 0,
-            RiskLevel.MEDIUM: 1,
-            RiskLevel.HIGH: 2,
-            RiskLevel.CRITICAL: 3,
-        }
-        return min(
-            tools,
-            key=lambda tool: (
-                health_rank[tool.health_status],
-                risk_rank[tool.risk_level],
-                str(tool.tool_id),
-            ),
-        )
+        return exact
 
     @staticmethod
     def _arguments_match_schema(arguments: dict, schema: dict) -> bool:

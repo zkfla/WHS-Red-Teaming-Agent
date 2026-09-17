@@ -208,14 +208,14 @@ RECON_AGENT = AgentSpec(
     agent_id=RECON_AGENT_ID,
     name="Recon Agent",
     description="Confirms which in-scope hosts respond, one probe per host.",
-    capabilities=["recon.example"],
+    capabilities=["recon"],
     planner_kind="llm",
     playbook=[
         PlanStep(
             step_id="probe-host",
-            capability="recon.example",
-            operation="ping",
-            tool_id=ToolId("example.ping"),
+            capability="recon",
+            operation="service_discovery",
+            tool_id=ToolId("recon.ping"),
             target_bind="host",
             preconditions=[
                 NodePattern(

@@ -125,17 +125,13 @@ why. See [orchestration.md](orchestration.md).
 
 ## Producer integration notes
 
-The current vertical slice exposes three producer-side follow-ups:
+The current vertical slice exposes two producer-side follow-ups:
 
 1. `app.bootstrap.run_engagement` creates `RunStarted` and `RunFinished`
    directly, without setting their lifecycle correlation or terminal
    causation context.
 2. The first `orchestration.observe` `AgentStarted` event has no parent id,
    because the `RunStarted` id is not seeded into `GraphState["last_event_id"]`.
-3. The default Recon playbook still uses the legacy `recon.example/ping`
-   operation key and `recon.example` capability. Orchestration/Control owners
-   must migrate it to the canonical action naming in
-   `docs/contracts/actions.md`; Event Bus preserves the supplied values.
 
 These are covered by the Event Bus integration diagnostics as expected
 failures until the Producer owners implement the corresponding changes.

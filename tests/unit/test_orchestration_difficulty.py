@@ -27,7 +27,7 @@ def candidate() -> ExecutableCandidate:
         candidate_key="cand_same",
         draft=draft,
         tool={
-            "tool_id": "example.ping",
+            "tool_id": "recon.ping",
             "server_id": "example",
             "tool_name": "ping",
             "risk_level": RiskLevel.LOW,

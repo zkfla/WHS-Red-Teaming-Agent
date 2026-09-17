@@ -17,7 +17,15 @@ from redteam.core.contracts.action import ActionProposal
 from redteam.core.contracts.policy import PolicyDecision
 from redteam.core.contracts.tool import ToolResult
 from redteam.core.enums import AgentPhase, Verdict
-from redteam.core.ids import ActionId, AgentId, EngagementId, EventId, HypothesisId, RunId
+from redteam.core.ids import (
+    ActionId,
+    AgentId,
+    ApprovalId,
+    EngagementId,
+    EventId,
+    HypothesisId,
+    RunId,
+)
 from redteam.orchestration.agents.base import PlanStep
 from redteam.orchestration.dispatch import (
     DispatchItem,
@@ -38,6 +46,9 @@ class TerminationReason:
     UNRESOLVED_HYPOTHESES = "unresolved_hypotheses"
     CLEANUP_REQUIRED = "cleanup_required"
     NO_AGENTS = "no_agents_registered"
+    APPROVAL_PENDING = "approval_pending"
+    USER_INTERRUPTED = "user_interrupted"
+    EXECUTION_ERROR = "execution_error"
 
 
 class RuntimeState(BaseModel):
@@ -51,6 +62,7 @@ class RuntimeState(BaseModel):
 
     active_hypothesis_id: HypothesisId | None = None
     pending_action_id: ActionId | None = None
+    pending_approval_id: ApprovalId | None = None
 
     retry_count: int = 0
     step_count: int = 0

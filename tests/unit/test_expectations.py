@@ -23,7 +23,7 @@ def result(
     return ToolResult(
         invocation_id=InvocationId("inv_1"),
         action_id=ActionId("action_1"),
-        tool_id=ToolId("example.ping"),
+        tool_id=ToolId("recon.ping"),
         success=success,
         output=output,
         error=None if success else ToolError(code=error_code, message="failed"),

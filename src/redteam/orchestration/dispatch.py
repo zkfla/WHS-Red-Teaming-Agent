@@ -6,7 +6,7 @@ from pydantic import BaseModel
 
 from redteam.core.contracts.action import ActionProposal
 from redteam.core.enums import PolicyVerdict, Verdict
-from redteam.core.ids import EventId
+from redteam.core.ids import ApprovalId, EventId
 from redteam.orchestration.agents.base import PlanStep
 
 
@@ -27,6 +27,7 @@ class WorkerOutcome(BaseModel):
     executed: bool = False
     succeeded: bool | None = None
     policy_verdict: PolicyVerdict | None = None
+    approval_id: ApprovalId | None = None
     verdict: Verdict | None = None
     last_event_id: EventId | None = None
     error: str | None = None

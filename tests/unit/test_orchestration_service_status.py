@@ -8,9 +8,9 @@ from redteam.orchestration.service_status import severity_for
 def step(hypothesis: HypothesisDraft) -> PlanStep:
     return PlanStep(
         step_id="test",
-        capability="test",
-        operation="test",
-        tool_id=ToolId("test.tool"),
+        capability="analysis",
+        operation="response_analysis",
+        tool_id=ToolId("analysis.test"),
         target=HostTarget(host="a.local"),
         reason="test",
         hypothesis=hypothesis,

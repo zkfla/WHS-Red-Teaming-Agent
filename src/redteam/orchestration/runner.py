@@ -18,7 +18,12 @@ from redteam.orchestration.context import RuntimeDeps
 from redteam.orchestration.graph import build_graph
 from redteam.orchestration.progress import observation_fingerprint
 from redteam.orchestration.settings import OrchestrationSettings
-from redteam.orchestration.state import GraphState, RuntimeState, initial_graph_state
+from redteam.orchestration.state import (
+    GraphState,
+    RuntimeState,
+    TerminationReason,
+    initial_graph_state,
+)
 from redteam.orchestration.wakeup import EventWakeup, WakeupBatch
 
 
@@ -91,6 +96,9 @@ class AgentLoopRunner:
         self._bound_run_id: str | None = None
         self._wakeup: EventWakeup | None = None
         self._wakeup_run_id: str | None = None
+        self._active_graph_task: asyncio.Task[GraphState] | None = None
+        self._stop_requested = False
+        self._failure_runtime: RuntimeState | None = None
 
     @property
     def settings(self) -> OrchestrationSettings:
@@ -99,6 +107,12 @@ class AgentLoopRunner:
     @property
     def checkpointing_enabled(self) -> bool:
         return self._settings.checkpointing
+
+    @property
+    def failure_runtime(self) -> RuntimeState | None:
+        """Best durable runtime recovered after the last failed invocation."""
+
+        return self._failure_runtime
 
     def config(self, *, checkpoint_id: str | None = None) -> dict[str, Any]:
         configurable: dict[str, Any] = {}
@@ -117,25 +131,93 @@ class AgentLoopRunner:
         if self._bound_run_id is not None and self._bound_run_id != run_key:
             raise ValueError("one AgentLoopRunner may execute only one run")
         self._bound_run_id = run_key
+        self._failure_runtime = None
         await self._ensure_graph()
         self._thread_id = self._thread_id or str(runtime.run_id)
         assert self._graph is not None
         try:
-            final: GraphState = await self._graph.ainvoke(
-                initial_graph_state(runtime), config=self.config()
+            self._active_graph_task = asyncio.create_task(
+                self._graph.ainvoke(initial_graph_state(runtime), config=self.config())
             )
-        except BaseException as exc:
-            reason = f"runner_error:{type(exc).__name__}"
-            cleanup = self._abandon_active_work(runtime, reason=reason)
-            try:
-                await asyncio.wait_for(
-                    asyncio.shield(cleanup),
-                    timeout=self._settings.drain_timeout_seconds,
+            final: GraphState = await self._active_graph_task
+        except asyncio.CancelledError:
+            latest = await self._latest_runtime(runtime)
+            reason = TerminationReason.USER_INTERRUPTED
+            await self._cleanup_after_failure(latest, reason=reason)
+            if self._stop_requested:
+                return latest.model_copy(
+                    update={
+                        "phase": AgentPhase.FINISHED,
+                        "termination_reason": TerminationReason.USER_INTERRUPTED,
+                        "pending_action_id": None,
+                        "active_hypothesis_id": None,
+                    }
                 )
-            except Exception:  # noqa: BLE001 - preserve the original run failure
-                pass
+            self._failure_runtime = latest.model_copy(
+                update={
+                    "phase": AgentPhase.FAILED,
+                    "termination_reason": TerminationReason.USER_INTERRUPTED,
+                    "pending_action_id": None,
+                    "active_hypothesis_id": None,
+                }
+            )
             raise
+        except BaseException as exc:
+            latest = await self._latest_runtime(runtime)
+            reason = f"runner_error:{type(exc).__name__}"
+            await self._cleanup_after_failure(latest, reason=reason)
+            self._failure_runtime = latest.model_copy(
+                update={
+                    "phase": AgentPhase.FAILED,
+                    "termination_reason": TerminationReason.EXECUTION_ERROR,
+                    "pending_action_id": None,
+                    "active_hypothesis_id": None,
+                }
+            )
+            raise
+        finally:
+            self._active_graph_task = None
+            self._stop_requested = False
         return final["runtime"]
+
+    def request_stop(self) -> bool:
+        """Gracefully classify and stop the currently running graph invocation.
+
+        Returns ``False`` when no run is active.  The caller should await the
+        existing ``run()`` task; it returns a terminal ``USER_INTERRUPTED``
+        runtime after active leases and hypotheses are closed.
+        """
+
+        task = self._active_graph_task
+        if task is None or task.done():
+            return False
+        self._stop_requested = True
+        task.cancel()
+        return True
+
+    async def _cleanup_after_failure(
+        self, runtime: RuntimeState, *, reason: str
+    ) -> None:
+        cleanup = self._abandon_active_work(runtime, reason=reason)
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(cleanup),
+                timeout=self._settings.drain_timeout_seconds,
+            )
+        except Exception:  # noqa: BLE001 - preserve the original run failure
+            pass
+
+    async def _latest_runtime(self, fallback: RuntimeState) -> RuntimeState:
+        """Recover the last completed super-step without masking a failure."""
+
+        if self._graph is None or self._checkpointer is None:
+            return fallback
+        try:
+            snapshot = await self._graph.aget_state(self.config())
+            candidate = snapshot.values.get("runtime") if snapshot.values else None
+            return candidate if isinstance(candidate, RuntimeState) else fallback
+        except Exception:  # noqa: BLE001 - recovery is best effort
+            return fallback
 
     async def _abandon_active_work(
         self,

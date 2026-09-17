@@ -41,7 +41,8 @@ same action every turn.
 
 **Every exit names itself.** `RuntimeState.termination_reason` is one of
 `TerminationReason`: `no_actionable_plan`, `max_steps_reached`,
-`budget_exhausted`, `consecutive_failures`, `no_agents_registered`.
+`budget_exhausted`, `consecutive_failures`, `no_agents_registered`,
+`approval_pending`, `user_interrupted`, `execution_error`.
 "The run ended" and "the run ran out of budget after two turns" lead to
 very different reports.
 
@@ -63,7 +64,7 @@ A `PlanStep` either names a fixed `target`, or binds one from the graph:
 ```python
 PlanStep(
     step_id="probe-host",
-    capability="recon.example", operation="ping", tool_id=ToolId("example.ping"),
+    capability="recon", operation="service_discovery", tool_id=ToolId("recon.ping"),
     target_bind="host",
     preconditions=[NodePattern(type=GraphNodeType.HOST, attrs={"in_scope": True}, bind="host")],
     hypothesis=HypothesisDraft(description="The host is reachable from the harness."),
@@ -85,8 +86,9 @@ restore and is shared across agents.
    `orchestration/agents/registry.py` (or your own module).
 2. Add it to the registry — order is the scheduling policy; each agent
    runs until it has nothing left to propose, then hands over.
-3. Wire a non-default registry through `RuntimeDeps(agents=...)` in
-   `app.bootstrap` if it should not be the shipped default.
+3. Wire a non-default registry/provider set through the `agents=` and
+   `candidate_providers=` bootstrap arguments if it should not be the shipped
+   default.
 
 No contract change is needed for any of this.
 
@@ -354,7 +356,9 @@ wake-up to an actual canonical-store re-read and graph run. It revives only
 quiescent/reconcilable reasons; budget exhaustion, max-step and repeated-failure
 hard stops remain terminal. Repeated hosting of that tick is deployment work.
 
-`REQUIRE_APPROVAL` remains recorded as blocked/inconclusive. The shared
+`REQUIRE_APPROVAL` is recorded as blocked/inconclusive and terminates the
+current run as `approval_pending`, retaining the approval id for reporting.
+The shared
 `ControlPlane` port can evaluate proposals but cannot retrieve or consume a
 resolved approval, so trusting an `ActionApproved` event alone would bypass the
 mandatory gate. Approval resume waits for that Control-owned contract.
@@ -440,17 +444,21 @@ Capability `MCPToolRegistry` already satisfies. Bootstrap injects that live
 registry through `RuntimeDeps`, so discovery/health changes are visible on the
 next compile rather than copied into a static per-run descriptor list.
 
-`CandidateCompiler` first accepts the provider's preferred `tool_id`, then may
-bind another healthy descriptor advertising the same capability. The resolved
-id remains inside the executable candidate/`PlanStep` used to build the
-`ToolInvocation`; the AI sees only offered candidates and cannot invent an
-adapter or server name.
+`CandidateCompiler` accepts only the provider's explicit preferred `tool_id`
+when that exact descriptor belongs to the canonical capability namespace.
+A capability tag alone is not an intent-to-tool binding, so the compiler never
+substitutes an arbitrary healthy tool advertising the same tag. After ALLOW,
+EXECUTE revalidates action/step equality, namespace, catalog membership and
+health before building the `ToolInvocation`; the AI sees only offered
+candidates and cannot invent an adapter or server name.
 
 The remaining PM/Capability decision is whether this structural subset becomes
 a shared Core port and whether descriptor version, supported operation and
 target-kind constraints are added to `ToolDescriptor`. Until then,
 orchestration validates the complete available input schema, capability tag
 and health but cannot infer descriptor fields the shared contract does not
-carry. `ToolDescriptor.risk_level` is operational safety input for scheduling;
+carry. The proposed action-aware shared port is tracked in
+`docs/proposals/tool-selection-port.md`. `ToolDescriptor.risk_level` is
+operational safety input for scheduling;
 finding severity comes from the pre-execution hypothesis/domain provider, not
 from the tool used to test it.

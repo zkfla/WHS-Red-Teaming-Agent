@@ -26,6 +26,7 @@ from redteam.core.contracts.engagement import (
     RateLimitPolicy,
 )
 from redteam.core.contracts.events import EventEnvelope, EventType
+from redteam.core.contracts.policy import ControlContext, PolicyDecision
 from redteam.core.contracts.target import HostTarget
 from redteam.core.contracts.tool import ToolDescriptor
 from redteam.core.enums import (
@@ -37,6 +38,7 @@ from redteam.core.enums import (
 )
 from redteam.core.ids import (
     AgentId,
+    ApprovalId,
     EngagementId,
     EventId,
     GraphNodeId,
@@ -149,6 +151,94 @@ async def test_a_denied_host_is_never_seeded_and_never_probed(tmp_path) -> None:
     assert {str(n.id) for n in await service.query(node_type=GraphNodeType.HOST)} == {
         "host:a.local"
     }
+
+
+async def test_pending_approval_has_its_own_terminal_reason_and_partial_report() -> None:
+    class ApprovalControl:
+        async def evaluate(
+            self, proposal, context: ControlContext
+        ) -> PolicyDecision:
+            del context
+            return PolicyDecision(
+                action_id=proposal.action_id,
+                verdict=PolicyVerdict.REQUIRE_APPROVAL,
+                reasons=["human approval required"],
+                approval_id=ApprovalId("appr_test"),
+                evaluated_at=datetime.now(timezone.utc),
+            )
+
+    target = engagement("a.local")
+    gateway = DummyToolGateway()
+    deps = build_test_application(control_plane=ApprovalControl(), tool_gateway=gateway)
+
+    final = await run_engagement(target, deps=deps)
+
+    assert final.phase is AgentPhase.FINISHED
+    assert final.termination_reason == TerminationReason.APPROVAL_PENDING
+    assert final.pending_approval_id == ApprovalId("appr_test")
+    assert gateway.invocations == []
+    projected = bus(deps).history(event_type=REPORT_PROJECTED)
+    assert projected[0].payload["ready_for_release"] is False
+    assert projected[0].payload["pending_approval_id"] == "appr_test"
+
+
+async def test_runner_request_stop_returns_a_named_terminal_runtime() -> None:
+    class BlockingGateway:
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+
+        async def invoke(self, invocation):
+            del invocation
+            self.started.set()
+            await asyncio.Event().wait()
+
+    target = engagement("a.local")
+    gateway = BlockingGateway()
+    deps = build_test_application(tool_gateway=gateway)
+    await seed_from_engagement(AttackGraphService(deps.graph_store), target)
+    runner = AgentLoopRunner(deps, settings=deps.settings)
+    task = asyncio.create_task(
+        runner.run(
+            RuntimeState(
+                run_id=RunId("run_stop"),
+                engagement_id=target.engagement_id,
+                remaining_budget=target.execution_budget.max_actions,
+            )
+        )
+    )
+    await asyncio.wait_for(gateway.started.wait(), timeout=1)
+
+    assert runner.request_stop() is True
+    final = await asyncio.wait_for(task, timeout=1)
+
+    assert final.phase is AgentPhase.FINISHED
+    assert final.termination_reason == TerminationReason.USER_INTERRUPTED
+    assert all(
+        item.status is WorkStatus.FAILED
+        for item in await deps.work_store.list_items(run_id=RunId("run_stop"))
+    )
+
+
+async def test_unexpected_run_failure_still_publishes_a_partial_report(
+    monkeypatch,
+) -> None:
+    async def fail_run(self, runtime):
+        del self, runtime
+        raise RuntimeError("sensitive failure detail")
+
+    monkeypatch.setattr(AgentLoopRunner, "run", fail_run)
+    target = engagement("a.local")
+    deps = build_test_application()
+
+    with pytest.raises(RuntimeError, match="sensitive failure detail"):
+        await run_engagement(target, deps=deps)
+
+    projected = bus(deps).history(event_type=REPORT_PROJECTED)
+    finished = bus(deps).history(event_type=EventType.RUN_FINISHED)
+    assert len(projected) == 1
+    assert projected[0].payload["ready_for_release"] is False
+    assert finished[-1].payload["termination_reason"] == TerminationReason.EXECUTION_ERROR
+    assert finished[-1].payload["error_type"] == "RuntimeError"
 
 
 async def test_findings_stay_empty_and_the_graph_stays_reportable(tmp_path) -> None:
@@ -356,9 +446,9 @@ async def test_agents_run_in_order_and_share_one_graph() -> None:
         playbook=[
             PlanStep(
                 step_id="re-probe",
-                capability="recon.followup",
-                operation="ping",
-                tool_id=ToolId("example.ping"),
+                capability="recon",
+                operation="endpoint_discovery",
+                tool_id=ToolId("recon.ping"),
                 target_bind="host",
                 preconditions=[
                     # Only offered for hosts the recon agent already
@@ -388,8 +478,8 @@ async def test_agents_run_in_order_and_share_one_graph() -> None:
 async def test_default_web_agent_activates_when_target_and_catalog_tool_exist() -> None:
     catalog = MCPToolRegistry()
     for tool_id, capability in (
-        ("example.ping", "recon.example"),
-        ("web.http.inspect", "web.http.inspect"),
+        ("recon.ping", "recon"),
+        ("web.http_inspect", "web"),
     ):
         catalog.register(
             ToolDescriptor(
@@ -418,8 +508,8 @@ async def test_default_web_agent_activates_when_target_and_catalog_tool_exist() 
 async def test_round_robin_prevents_recon_from_consuming_all_specialist_budget() -> None:
     catalog = MCPToolRegistry()
     for tool_id, capability in (
-        ("example.ping", "recon.example"),
-        ("web.http.inspect", "web.http.inspect"),
+        ("recon.ping", "recon"),
+        ("web.http_inspect", "web"),
     ):
         catalog.register(
             ToolDescriptor(
@@ -447,7 +537,10 @@ async def test_round_robin_prevents_recon_from_consuming_all_specialist_budget()
     )
 
     assert final.actions_executed == 2
-    assert {item.operation for item in gateway.invocations} == {"ping", "inspect"}
+    assert {item.operation for item in gateway.invocations} == {
+        "service_discovery",
+        "http_request",
+    }
 
 
 async def test_custom_provider_adds_an_agent_without_editing_the_central_graph() -> None:
@@ -459,9 +552,9 @@ async def test_custom_provider_adds_an_agent_without_editing_the_central_graph()
             del view, observation, step
             plan_step = PlanStep(
                 step_id="plugin-probe",
-                capability="plugin.probe",
-                operation="ping",
-                tool_id=ToolId("plugin.ping"),
+                capability="recon",
+                operation="service_discovery",
+                tool_id=ToolId("recon.ping"),
                 target=HostTarget(host="a.local"),
                 reason="candidate came from a registered provider",
             )
@@ -1030,11 +1123,11 @@ async def test_long_running_tool_renews_its_work_lease() -> None:
 async def test_per_target_concurrency_serializes_distinct_actions_on_one_target() -> None:
     first = RECON_AGENT.playbook[0].model_copy(
         deep=True,
-        update={"step_id": "first-probe", "operation": "first"},
+        update={"step_id": "first-probe", "operation": "port_scan"},
     )
     second = RECON_AGENT.playbook[0].model_copy(
         deep=True,
-        update={"step_id": "second-probe", "operation": "second"},
+        update={"step_id": "second-probe", "operation": "endpoint_discovery"},
     )
     specialist = AgentSpec(
         agent_id=AgentId("same-target-agent"),

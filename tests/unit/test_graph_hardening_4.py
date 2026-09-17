@@ -142,17 +142,17 @@ async def test_attempts_are_answered_from_the_graph_not_the_capped_summary() -> 
             GraphNodeType.HOST, key=f"h{index:02d}.local", attrs={"in_scope": True}, step=1
         )
         ids.append(created.id)
-        await svc.record_attempt(created.id, "recon.example/ping", step=2)
+        await svc.record_attempt(created.id, "recon.service_discovery", step=2)
 
     observation = await svc.observe(step=3)
     from_summary = sum(
-        1 for node_id in ids if observation.has_attempted(f"recon.example/ping@{node_id}")
+        1 for node_id in ids if observation.has_attempted(f"recon.service_discovery@{node_id}")
     )
     assert from_summary < len(ids)  # the cap bites
 
     for node_id in ids:
-        assert await svc.has_attempted(node_id, "recon.example/ping") is True
-    assert await svc.has_attempted(ids[0], "recon.example/other") is False
+        assert await svc.has_attempted(node_id, "recon.service_discovery") is True
+    assert await svc.has_attempted(ids[0], "recon.port_scan") is False
     assert await svc.has_attempted(GraphNodeId("host:ghost"), "x/y") is False
 
 

@@ -36,9 +36,9 @@ HOST_PATTERN = NodePattern(type=GraphNodeType.HOST, attrs={"in_scope": True}, bi
 def probe_step(step_id: str = "probe", repeatable: bool = False) -> PlanStep:
     return PlanStep(
         step_id=step_id,
-        capability="recon.example",
-        operation="ping",
-        tool_id=ToolId("example.ping"),
+        capability="recon",
+        operation="service_discovery",
+        tool_id=ToolId("recon.ping"),
         target_bind="host",
         preconditions=[HOST_PATTERN.model_copy(deep=True)],
         reason="probe the host",
@@ -98,17 +98,17 @@ def test_a_step_needs_exactly_one_target_source() -> None:
     with pytest.raises(ValidationError, match="exactly one"):
         PlanStep(
             step_id="s",
-            capability="c",
-            operation="o",
-            tool_id=ToolId("t"),
+            capability="recon",
+            operation="service_discovery",
+            tool_id=ToolId("recon.ping"),
             reason="r",
         )
     with pytest.raises(ValidationError, match="exactly one"):
         PlanStep(
             step_id="s",
-            capability="c",
-            operation="o",
-            tool_id=ToolId("t"),
+            capability="recon",
+            operation="service_discovery",
+            tool_id=ToolId("recon.ping"),
             reason="r",
             target=HostTarget(host="a.local"),
             target_bind="host",
@@ -120,9 +120,9 @@ def test_target_bind_must_name_a_declared_precondition() -> None:
     with pytest.raises(ValidationError, match="no precondition uses that bind"):
         PlanStep(
             step_id="s",
-            capability="c",
-            operation="o",
-            tool_id=ToolId("t"),
+            capability="recon",
+            operation="service_discovery",
+            tool_id=ToolId("recon.ping"),
             reason="r",
             target_bind="nope",
             preconditions=[HOST_PATTERN.model_copy(deep=True)],
@@ -154,7 +154,7 @@ async def test_an_attempted_step_is_not_offered_again() -> None:
     # it is derived from the graph rather than a conversation buffer.
     service = await seeded_service("a.local", "b.local")
     await service.record_attempt(
-        (await service.query(node_type=GraphNodeType.HOST))[0].id, "recon.example/ping", step=1
+        (await service.query(node_type=GraphNodeType.HOST))[0].id, "recon.service_discovery", step=1
     )
     observation = await service.observe(step=2)
 
@@ -165,7 +165,7 @@ async def test_an_attempted_step_is_not_offered_again() -> None:
 async def test_a_repeatable_step_is_always_offered() -> None:
     service = await seeded_service("a.local")
     node = (await service.query(node_type=GraphNodeType.HOST))[0]
-    await service.record_attempt(node.id, "recon.example/ping", step=1)
+    await service.record_attempt(node.id, "recon.service_discovery", step=1)
     observation = await service.observe(step=2)
 
     candidates = await available_steps(
@@ -185,9 +185,9 @@ async def test_nodes_that_fail_the_precondition_are_not_offered() -> None:
 async def test_a_fixed_target_step_respects_its_preconditions() -> None:
     step = PlanStep(
         step_id="fixed",
-        capability="recon.example",
-        operation="ping",
-        tool_id=ToolId("example.ping"),
+        capability="recon",
+        operation="service_discovery",
+        tool_id=ToolId("recon.ping"),
         target=HostTarget(host="a.local"),
         preconditions=[NodePattern(type=GraphNodeType.CREDENTIAL, bind="cred")],
         reason="needs a credential first",
@@ -527,7 +527,7 @@ async def test_an_llm_failure_falls_back_instead_of_aborting_the_run() -> None:
 async def test_the_prompt_shows_only_available_steps_and_prior_attempts() -> None:
     service = await seeded_service("a.local")
     node = (await service.query(node_type=GraphNodeType.HOST))[0]
-    await service.record_attempt(node.id, "recon.example/banner", step=1)
+    await service.record_attempt(node.id, "recon.endpoint_discovery", step=1)
     observation = await service.observe(step=2)
     agent = spec(probe_step("first"), planner_kind="llm")
     candidates = await available_steps(agent, service.view(), observation, step=2)
@@ -536,7 +536,7 @@ async def test_the_prompt_shows_only_available_steps_and_prior_attempts() -> Non
 
     assert "step_id=first" in rendered
     assert "Already attempted (do not repeat)" in rendered
-    assert "recon.example/banner@host:a.local" in rendered
+    assert "recon.endpoint_discovery@host:a.local" in rendered
 
 
 def test_planner_kind_selects_the_implementation() -> None:

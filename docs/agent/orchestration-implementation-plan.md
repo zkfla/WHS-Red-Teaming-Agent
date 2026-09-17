@@ -217,17 +217,20 @@ class AgentResult(BaseModel):
 
 1. Registry에서 현재 graph delta에 활성화되는 `AgentDefinition`만 찾는다.
 2. 각 agent/provider가 자신의 도메인 playbook/template을 Attack Graph에 resolve하여 `CandidateDraft`를 낸다. Compiler 자체는 금융·모바일·웹 업무 의미를 해석하지 않는다.
-3. `capability + operation + target kind + input schema`로 Tool Catalog를 조회한다.
-4. schema가 맞고 health가 실행 가능한 `ToolDescriptor`만 남긴다. 정책 허용 여부의 최종 판단은 이후 모든 `ActionProposal`에 대해 Control Plane이 수행한다.
+3. canonical `capability + operation`과 provider가 명시한 preferred ToolId의
+   namespace가 일치하는지 검사한다.
+4. 현재 structural Tool Catalog에서는 exact ToolId descriptor만 조회해 capability
+   tag, schema, health를 검증한다. tag만 같은 다른 Tool로 대체하지 않는다.
+   정책 허용 여부의 최종 판단은 이후 모든 `ActionProposal`에 대해 Control Plane이 수행한다.
 5. target과 schema를 채워 `ExecutableCandidate`를 만든다.
 6. canonical `candidate_key`로 이미 성공·실패·진행 중인 동일 작업을 제거한다.
 7. hard constraint를 통과한 후보만 scorer와 LLM에 제공한다.
 
-AI는 Adapter 종류, MCP server 이름, 등록 과정을 모른다. AI가 보는 것은 `candidate_id`, capability, operation, target, 예상 정보가치, 비용, 위험, schema 요약이다. 실제 `tool_id`는 compiler가 Tool Catalog 결과에서 결합하고 worker context에 보관한다.
+AI는 Adapter 종류, MCP server 이름, 등록 과정을 모른다. AI가 보는 것은 `candidate_id`, capability, operation, target, 예상 정보가치, 비용, 위험, schema 요약이다. preferred ToolId binding은 worker context 내부에만 보관하고, ALLOW 뒤 EXECUTE에서 action/step/namespace/catalog/health를 다시 검증한 뒤 최종 사용한다.
 
-현재 frozen `ActionProposal`에는 `tool_id`가 없고 `PlanStep`에만 존재한다. 1차 구현은 현재처럼 내부 `ExecutableCandidate/PlanStep.tool_id`를 `execute_node`까지 전달해서 계약 변경 없이 간다. PM과 계약이 확정되어 `ActionProposal.tool_id`가 필수가 되면 그때 Contract Change Proposal 하나로 승격한다. 그 전에는 오케스트레이션이 외부 core contract를 선제 변경하지 않는다.
+확정 계약상 `ActionProposal`에는 `tool_id`를 넣지 않는다. 현재 구현은 내부 `ExecutableCandidate/PlanStep.tool_id`를 explicit preferred binding으로 `execute_node`까지 전달한다. 여러 Tool 중 action-aware 선택은 `docs/proposals/tool-selection-port.md`의 Core Port가 PM 승인된 뒤 이 seam에서 교체한다. 그 전에는 오케스트레이션이 외부 core contract를 선제 변경하거나 `<capability>.<operation>`을 ToolId로 추측하지 않는다.
 
-도구 선택 정책은 기본적으로 결정론적이다.
+제안된 action-aware port 승인 뒤의 도구 선택 정책도 결정론적으로 유지한다.
 
 ```text
 healthy > degraded > unknown
@@ -626,7 +629,9 @@ run을 canonical store 기준으로 실제 재실행하되 budget/max-step/failu
 
 승인 재개는 아직 연결하지 않는다. 현재 ControlPlane port에는 resolved approval을
 조회·소비해 새 `ALLOW` 결정을 얻는 계약이 없으므로 `ActionApproved` event만 믿고
-실행하면 정책 gate 우회가 된다. Control 팀 계약 전에는 blocked/inconclusive로 남긴다.
+실행하면 정책 gate 우회가 된다. 현재 run은 `approval_pending`으로 종료하고 approval
+ID와 blocked/inconclusive 결과를 partial report에 남긴다. Control 팀 계약 전에는
+이를 임의로 재개하지 않는다.
 
 공유 Attack Graph node에는 engagement/run namespace가 없으므로 integrity/cleanup은
 store 전체 기준이다. 기본 app처럼 engagement별 store를 쓰지 않고 multi-tenant graph를
@@ -713,10 +718,14 @@ store 전체 기준이다. 기본 app처럼 engagement별 store를 쓰지 않고
 1. Tool Catalog read port
    - capability/operation/target kind/schema/health로 조회
    - 안정적인 `tool_id`와 descriptor version 제공
+   - Capability 팀 제안은 `docs/proposals/tool-selection-port.md`에 보존되어 있으며
+     PM 승인 전까지 frozen Core Port는 변경하지 않는다.
 2. Adapter `discover_tools()` 결과의 정규화 규칙
    - Adapter 종류와 server 내부 이름은 AI에 노출하지 않음
 3. `tool_id`를 `ActionProposal`에 넣을지 내부 candidate에 둘지
-   - 현재 계약 호환 구현은 내부 candidate 방식
+   - PM 확정: `ActionProposal`에는 canonical intent만 둔다.
+   - 현재 호환 구현은 내부 candidate의 explicit preferred binding을 사용하고,
+     capability tag 기반 임의 fallback을 금지하며 ALLOW 뒤 실행 직전에 재검증한다.
 4. Attack Graph revision/delta 조회 방식
    - 없다면 Agent Team 내부 monotonic revision wrapper로 시작하고 계약 변경은 제안서로 분리
 5. finding supersedes와 verification stage를 기존 metadata로 둘지 core contract로 승격할지
@@ -726,19 +735,40 @@ store 전체 기준이다. 기본 app처럼 engagement별 store를 쓰지 않고
 
 1~5는 외부 팀/PM 합의 사항이고, 6은 Agent Team 내부 계약이다. 그 밖의 scheduler, agent lifecycle, context projection, Control Plane이 허용한 예산 안의 내부 배분, concurrency는 Agent Team 내부에서 진행한다.
 
+PM Action Naming Convention 반영 상태:
+
+- `capability`: `recon`, `web`, `mobile`, `analysis`
+- `operation`: canonical tool-independent intent
+- graph/ROE action key: `<capability>.<operation>`
+- ToolId: `<namespace>.<remote_tool_name>`인 별도 실행 식별자
+- 기본 실행 mapping: `recon.service_discovery`, `web.http_request`,
+  `mobile.static_analysis`
+
+Control 팀의 현재 `dev-control` 구현은 operation 단독 비교를 사용하므로
+canonical action key 비교로 수정해야 한다. 추적 문서는
+`docs/control/issues/0001-capability-operation-naming.md`다.
+
 ## 16. 완료 정의
 
-- 기본 5개 agent가 Registry plugin으로 등록되고 중앙 router에 역할별 조건문이 없다.
-- 새 agent 추가에 필요한 수정이 새 agent module + bootstrap registration으로 제한된다.
-- 금융 같은 새 도메인 pack을 추가해도 `graph.py`, `router.py`, `scheduler.py`, `WorkItem` schema가 바뀌지 않는다.
-- LLM은 catalog/compiler가 제공하지 않은 tool/target/candidate를 실행할 수 없다.
-- 독립 작업은 병렬, 충돌 작업은 직렬이며 모든 action은 정책 gate를 통과한다.
-- 프로세스 재시작 후 checkpoint와 lease를 reconcile해 이어갈 수 있다.
-- 관련 graph delta가 생긴 agent만 재활성화된다.
-- 같은 무진전 작업이 무한 반복되지 않는다.
-- verified/inconclusive/refuted가 구분되고 report는 evidence ID로 추적된다.
-- 정상 수렴, 예산 종료, 승인 대기, 사용자 중단, 실패 종료가 서로 구분된다.
-- 어떤 종료에서도 partial report를 만들 수 있다.
+- [x] 기본 5개 agent가 Registry plugin으로 등록되고 중앙 router에 역할별 조건문이 없다.
+- [x] 새 agent 추가에 필요한 수정이 새 agent module + bootstrap registration으로 제한된다.
+- [x] 금융 같은 새 도메인 pack을 추가해도 `graph.py`, `router.py`, `scheduler.py`, `WorkItem` schema가 바뀌지 않는다.
+- [x] LLM은 catalog/compiler가 제공하지 않은 tool/target/candidate를 실행할 수 없다.
+- [x] 독립 작업은 병렬, 충돌 작업은 직렬이며 모든 action은 정책 gate를 통과한다.
+- [x] 프로세스 재시작 후 checkpoint와 lease를 reconcile해 이어갈 수 있다.
+- [x] 관련 graph delta가 생긴 agent만 재활성화된다.
+- [x] 같은 무진전 작업이 무한 반복되지 않는다.
+- [x] verified/inconclusive/refuted가 구분되고 report는 evidence ID로 추적된다.
+- [x] 정상 수렴, 예산 종료, 승인 대기, 사용자 중단, 실패 종료가 서로 구분된다.
+- [x] 어떤 종료에서도 partial report를 만들 수 있다.
+
+구현 완료 정의는 11/11 충족한다. 다만 아래는 오케스트레이션 내부 완료와
+별개인 외부 통합 항목이다.
+
+- 승인 해소 후 안전한 재개: resolved approval을 ALLOW로 재평가하는 Control Port 필요
+- action-aware 동적 Tool 선택: PM의 Tool Catalog Core Port 승인 필요
+- multi-tenant shared graph 격리: Attack Graph tenancy 계약 필요
+- 상시 reconciliation loop: 배포 계층 daemon/worker host 필요
 
 ## 17. 블라인드 자기평가와 보정 기록
 

@@ -17,15 +17,15 @@ from redteam.orchestration.candidates.compiler import CandidateCompiler, candida
 from redteam.orchestration.candidates.models import PrioritySignals
 
 
-def agent(tool_id: str = "example.ping") -> AgentSpec:
+def agent(tool_id: str = "recon.ping") -> AgentSpec:
     return AgentSpec(
         agent_id=AgentId("recon"),
         name="recon",
         playbook=[
             PlanStep(
                 step_id="probe",
-                capability="recon.example",
-                operation="ping",
+                capability="recon",
+                operation="service_discovery",
                 tool_id=ToolId(tool_id),
                 target_bind="host",
                 preconditions=[
@@ -64,37 +64,36 @@ async def test_compiler_creates_stable_candidates_per_target() -> None:
     assert all(item.draft.signals.source_refs for item in first)
 
 
-async def test_catalog_rejects_unhealthy_tool_and_binds_a_healthy_alternative() -> None:
+async def test_catalog_does_not_substitute_an_unbound_tool_with_the_same_tag() -> None:
     service = await graph()
     observation = await service.observe(step=1)
     registry = MCPToolRegistry()
     registry.register(
         ToolDescriptor(
-            tool_id=ToolId("bad.ping"),
+            tool_id=ToolId("recon.unhealthy"),
             server_id="bad",
             tool_name="ping",
-            capability_tags=["recon.example"],
+            capability_tags=["recon"],
             risk_level=RiskLevel.LOW,
             health_status=ToolHealthStatus.UNHEALTHY,
         )
     )
     registry.register(
         ToolDescriptor(
-            tool_id=ToolId("good.ping"),
+            tool_id=ToolId("recon.alternative"),
             server_id="good",
             tool_name="ping",
-            capability_tags=["recon.example"],
+            capability_tags=["recon"],
             risk_level=RiskLevel.LOW,
             health_status=ToolHealthStatus.HEALTHY,
         )
     )
 
     candidates = await CandidateCompiler(registry).compile_playbook(
-        agent("missing.ping"), service.view(), observation, step=1
+        agent("recon.missing"), service.view(), observation, step=1
     )
 
-    assert candidates
-    assert {str(item.tool.tool_id) for item in candidates} == {"good.ping"}
+    assert candidates == []
 
 
 async def test_required_tool_schema_fields_are_hard_constraints() -> None:
@@ -103,10 +102,10 @@ async def test_required_tool_schema_fields_are_hard_constraints() -> None:
     registry = MCPToolRegistry()
     registry.register(
         ToolDescriptor(
-            tool_id=ToolId("example.ping"),
+            tool_id=ToolId("recon.ping"),
             server_id="example",
             tool_name="ping",
-            capability_tags=["recon.example"],
+            capability_tags=["recon"],
             input_schema={"type": "object", "required": ["message"]},
             health_status=ToolHealthStatus.HEALTHY,
         )
@@ -123,10 +122,10 @@ async def test_full_json_schema_rejects_wrong_argument_types() -> None:
     registry = MCPToolRegistry()
     registry.register(
         ToolDescriptor(
-            tool_id=ToolId("example.ping"),
+            tool_id=ToolId("recon.ping"),
             server_id="example",
             tool_name="ping",
-            capability_tags=["recon.example"],
+            capability_tags=["recon"],
             input_schema={
                 "type": "object",
                 "properties": {"message": {"type": "integer", "minimum": 1}},
@@ -149,10 +148,10 @@ async def test_invalid_tool_schema_is_rejected_as_an_unusable_contract() -> None
     registry = MCPToolRegistry()
     registry.register(
         ToolDescriptor(
-            tool_id=ToolId("example.ping"),
+            tool_id=ToolId("recon.ping"),
             server_id="example",
             tool_name="ping",
-            capability_tags=["recon.example"],
+            capability_tags=["recon"],
             input_schema={"type": "definitely-not-a-json-schema-type"},
             health_status=ToolHealthStatus.HEALTHY,
         )

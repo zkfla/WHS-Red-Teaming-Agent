@@ -13,7 +13,7 @@ from redteam.core.contracts.policy import ControlContext, PolicyDecision
 from redteam.core.enums import AgentPhase, PolicyVerdict
 from redteam.orchestration.context import RuntimeDeps
 from redteam.orchestration.nodes._support import advance, publisher_for
-from redteam.orchestration.state import GraphState
+from redteam.orchestration.state import GraphState, TerminationReason
 
 _OUTCOME = {
     PolicyVerdict.ALLOW: (EventType.ACTION_APPROVED, AgentPhase.EXECUTE),
@@ -70,9 +70,18 @@ async def policy_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
         causation_id=evaluated.event_id,
     )
 
+    runtime_update: dict[str, object] = {"phase": next_phase}
+    if decision.verdict is PolicyVerdict.REQUIRE_APPROVAL:
+        runtime_update.update(
+            {
+                "termination_reason": TerminationReason.APPROVAL_PENDING,
+                "pending_approval_id": decision.approval_id,
+            }
+        )
+
     return advance(
         state,
-        runtime.model_copy(update={"phase": next_phase}),
+        runtime.model_copy(update=runtime_update),
         last_event_id=outcome.event_id,
         policy_decision=decision,
     )
