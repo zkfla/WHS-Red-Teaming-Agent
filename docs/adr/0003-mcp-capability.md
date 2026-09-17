@@ -68,5 +68,8 @@ they enter the Registry.
   wait time in the invocation timeout. A tool discovered from an unhealthy
   server is rejected before transport invocation; there is still no automatic
   retry because tool calls cannot be assumed idempotent.
+- Per-server output limits stop oversized or unexpectedly verbose MCP results
+  before they cross into Orchestration/Evidence. Oversized results are omitted
+  as an explicit error instead of being silently truncated.
 - `deploy/mcp/finance` provides local Web/API and Recon MCP services plus a
   persistent browser connection example for the synthetic financial lab.

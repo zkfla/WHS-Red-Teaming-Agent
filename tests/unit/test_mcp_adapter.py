@@ -384,6 +384,38 @@ def test_gateway_rejects_concurrency_for_unknown_server() -> None:
         MCPToolGateway(MCPToolRegistry(), {}, server_concurrency={"typo": 1})
 
 
+async def test_gateway_omits_output_above_server_byte_limit() -> None:
+    backend = FakeTransport(
+        tools=[RemoteTool("http_request", "", {})],
+        result=RemoteCallResult(is_error=False, output={"body": "가" * 100}),
+    )
+    adapter = WebAPIMCPAdapter(server_id="http", transport=backend)
+    registry = MCPToolRegistry()
+    registry.replace_server_tools("http", await adapter.discover_tools())
+    gateway = MCPToolGateway(
+        registry,
+        {adapter.server_id: adapter},
+        server_output_limits={adapter.server_id: 128},
+    )
+
+    result = await gateway.invoke(
+        _invocation(tool_id=ToolId("web.http_request"), operation="http_request")
+    )
+
+    assert result.success is False
+    assert result.output is None
+    assert result.error is not None
+    assert result.error.code == "tool_output_too_large"
+    assert result.error.retryable is False
+    assert result.metadata["output_omitted"] is True
+    assert result.metadata["output_bytes"] > result.metadata["max_output_bytes"]
+
+
+def test_gateway_rejects_output_limit_for_unknown_server() -> None:
+    with pytest.raises(ValueError, match="unknown MCP servers"):
+        MCPToolGateway(MCPToolRegistry(), {}, server_output_limits={"typo": 1024})
+
+
 async def test_allowlist_hides_and_blocks_unsafe_remote_tools() -> None:
     backend = FakeTransport(tools=[
         RemoteTool("browser_snapshot", "", {}), RemoteTool("browser_run_code_unsafe", "", {}),

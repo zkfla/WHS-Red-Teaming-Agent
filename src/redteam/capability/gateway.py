@@ -11,6 +11,7 @@ assume that a tool invocation is idempotent.
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Collection, Mapping
 from datetime import datetime, timezone
 from typing import Any
@@ -30,6 +31,7 @@ class MCPToolGateway:
         operation_bindings: Mapping[str, Collection[str]] | None = None,
         *,
         server_concurrency: Mapping[str, int] | None = None,
+        server_output_limits: Mapping[str, int] | None = None,
     ) -> None:
         self._registry = registry
         self._adapters = adapters
@@ -44,6 +46,16 @@ class MCPToolGateway:
         self._server_semaphores = {
             server_id: asyncio.Semaphore(concurrency.get(server_id, 1))
             for server_id in adapters
+        }
+        output_limits = server_output_limits or {}
+        unknown_output_servers = set(output_limits) - set(adapters)
+        if unknown_output_servers:
+            names = ", ".join(sorted(unknown_output_servers))
+            raise ValueError(f"output limit configured for unknown MCP servers: {names}")
+        if any(limit < 1 for limit in output_limits.values()):
+            raise ValueError("MCP server output limit must be at least 1 byte")
+        self._server_output_limits = {
+            server_id: output_limits.get(server_id, 1_048_576) for server_id in adapters
         }
 
     async def invoke(self, invocation: ToolInvocation) -> ToolResult:
@@ -131,6 +143,29 @@ class MCPToolGateway:
                 message=f"adapter execution failed: {type(exc).__name__}",
             )
 
+        output_bytes = _serialized_output_size(adapter_result.output)
+        max_output_bytes = self._server_output_limits[descriptor.server_id]
+        if output_bytes > max_output_bytes:
+            return ToolResult(
+                invocation_id=invocation.invocation_id,
+                action_id=invocation.action_id,
+                tool_id=invocation.tool_id,
+                success=False,
+                output=None,
+                error=ToolError(
+                    code="tool_output_too_large",
+                    message="tool output exceeded the configured byte limit and was omitted",
+                    retryable=False,
+                ),
+                started_at=adapter_result.started_at,
+                finished_at=adapter_result.finished_at,
+                metadata={
+                    "output_omitted": True,
+                    "output_bytes": output_bytes,
+                    "max_output_bytes": max_output_bytes,
+                },
+            )
+
         return ToolResult(
             invocation_id=invocation.invocation_id,
             action_id=invocation.action_id,
@@ -186,3 +221,18 @@ async def _invoke_with_limit(
 ) -> MCPCallResult:
     async with semaphore:
         return await adapter.invoke(descriptor, arguments)
+
+
+def _serialized_output_size(output: dict[str, Any] | str | None) -> int:
+    if output is None:
+        return 0
+    if isinstance(output, str):
+        return len(output.encode("utf-8"))
+    serialized = json.dumps(
+        output,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+        default=str,
+    )
+    return len(serialized.encode("utf-8"))

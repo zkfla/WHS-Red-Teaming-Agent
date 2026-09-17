@@ -28,6 +28,7 @@ def test_server_settings_load_endpoint_kind_risk_and_secret_by_indirection(
     monkeypatch.setenv("REDTEAM_MCP_WEB_EXAMPLE_KIND", "web_api")
     monkeypatch.setenv("REDTEAM_MCP_WEB_EXAMPLE_RISK_LEVEL", "medium")
     monkeypatch.setenv("REDTEAM_MCP_WEB_EXAMPLE_MAX_CONCURRENCY", "3")
+    monkeypatch.setenv("REDTEAM_MCP_WEB_EXAMPLE_MAX_OUTPUT_BYTES", "262144")
     monkeypatch.setenv("REDTEAM_MCP_WEB_EXAMPLE_TOKEN_ENV_VAR", "TEST_MCP_TOKEN")
     monkeypatch.setenv("TEST_MCP_TOKEN", "secret-value")
 
@@ -37,6 +38,7 @@ def test_server_settings_load_endpoint_kind_risk_and_secret_by_indirection(
     assert settings.transport == MCPTransportKind.STREAMABLE_HTTP
     assert settings.risk_level == RiskLevel.MEDIUM
     assert settings.max_concurrency == 3
+    assert settings.max_output_bytes == 262144
     assert settings.request_headers() == {"Authorization": "Bearer secret-value"}
     assert "secret-value" not in repr(settings)
 
@@ -90,6 +92,18 @@ def test_invalid_server_concurrency_rejected(
     monkeypatch.setenv("REDTEAM_MCP_WEB_MAX_CONCURRENCY", value)
 
     with pytest.raises(MCPConfigurationError, match="MAX_CONCURRENCY"):
+        MCPServerSettings.from_environment("web")
+
+
+@pytest.mark.parametrize("value", ["0", "1023", "16777217", "1.5", "many"])
+def test_invalid_server_output_limit_rejected(
+    monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    monkeypatch.setenv("REDTEAM_MCP_WEB_KIND", "web_api")
+    monkeypatch.setenv("REDTEAM_MCP_WEB_ENDPOINT", "http://localhost:8765/mcp")
+    monkeypatch.setenv("REDTEAM_MCP_WEB_MAX_OUTPUT_BYTES", value)
+
+    with pytest.raises(MCPConfigurationError, match="MAX_OUTPUT_BYTES"):
         MCPServerSettings.from_environment("web")
 
 

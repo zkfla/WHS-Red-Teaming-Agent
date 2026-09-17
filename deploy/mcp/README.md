@@ -51,6 +51,8 @@ REDTEAM_MCP_<SERVER_ID>_KIND=web_api|mobile|recon|analysis
 REDTEAM_MCP_<SERVER_ID>_TRANSPORT=streamable_http
 REDTEAM_MCP_<SERVER_ID>_ENDPOINT=https://mcp.example/mcp
 REDTEAM_MCP_<SERVER_ID>_RISK_LEVEL=low|medium|high|critical
+REDTEAM_MCP_<SERVER_ID>_MAX_CONCURRENCY=1
+REDTEAM_MCP_<SERVER_ID>_MAX_OUTPUT_BYTES=1048576
 REDTEAM_MCP_<SERVER_ID>_TOKEN_ENV_VAR=NAME_OF_SECRET_VARIABLE  # optional
 ```
 
@@ -63,6 +65,12 @@ for local hosts only. An authorized non-local lab must explicitly set
 The token setting contains the *name* of a secret environment variable,
 not a token. The Adapter sends that value as a Bearer token without
 placing it in AppConfig, tool metadata, or results.
+
+`MAX_OUTPUT_BYTES` limits the UTF-8/compact-JSON size allowed to cross the
+Gateway boundary. Oversized MCP output is omitted and returned as
+`tool_output_too_large`; it is never partially truncated into a misleading
+result. The default is 1 MiB and the allowed configuration range is 1 KiB to
+16 MiB.
 
 For a local MCP process, use argv-based stdio configuration. No shell is
 invoked, arguments must be a JSON string array, and only explicitly named
