@@ -1,6 +1,8 @@
 """``python -m redteam.app.cli run examples/engagement.yaml``
 ``python -m redteam.app.cli approvals list``
 ``python -m redteam.app.cli approvals resolve <approval_id> approved --by <name>``
+``python -m redteam.app.cli evidence verify --run <run_id>``
+``python -m redteam.app.cli evidence purge --days <n>``
 
 ``run`` prints every published event, then the final ``RuntimeState``.
 
@@ -17,6 +19,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import math
 import os
 
 from redteam.app.bootstrap import build_runtime_deps, load_engagement, run_engagement
@@ -24,7 +27,8 @@ from redteam.control.approval import ApprovalService
 from redteam.control.stores.filesystem import FilesystemApprovalStore
 from redteam.core.contracts.events import EventEnvelope
 from redteam.core.enums import ApprovalStatus
-from redteam.core.ids import ApprovalId
+from redteam.core.ids import ApprovalId, RunId
+from redteam.evidence.stores.filesystem import FilesystemEvidenceStore
 
 
 async def _print_event(event: EventEnvelope) -> None:
@@ -66,6 +70,28 @@ async def _approvals_resolve(
     print(f"{updated.approval_id} -> {updated.status.value} (by {updated.resolved_by})")
 
 
+async def _evidence_verify(evidence_dir: str, run_id: str) -> None:
+    store = FilesystemEvidenceStore(evidence_dir)
+    tampered = await store.verify_run_integrity(RunId(run_id))
+    if not tampered:
+        print(f"run {run_id}: OK, no tampering detected")
+    else:
+        print(f"run {run_id}: {len(tampered)} record(s) changed since they were written:")
+        for evidence_id in tampered:
+            print(f"  {evidence_id}")
+
+
+async def _evidence_purge(evidence_dir: str, days: float) -> None:
+    store = FilesystemEvidenceStore(evidence_dir)
+    purged = await store.purge_older_than(days)
+    if not purged:
+        print("Nothing to purge.")
+        return
+    print(f"Purged {len(purged)} run(s):")
+    for run_id in purged:
+        print(f"  {run_id}")
+
+
 def main() -> None:
     logging.basicConfig(level=os.environ.get("REDTEAM_LOG_LEVEL", "INFO"))
 
@@ -91,6 +117,19 @@ def main() -> None:
     resolve_parser.add_argument("--by", required=True, dest="resolved_by")
     resolve_parser.add_argument("--dir", default="data/approvals", dest="approval_dir")
 
+    evidence_parser = subparsers.add_parser(
+        "evidence", help="Verify integrity / apply retention on the persisted Evidence Store"
+    )
+    evidence_sub = evidence_parser.add_subparsers(dest="evidence_command", required=True)
+
+    verify_parser = evidence_sub.add_parser("verify", help="Check a run's evidence for tampering")
+    verify_parser.add_argument("--run", required=True, dest="run_id")
+    verify_parser.add_argument("--dir", default="data/evidence", dest="evidence_dir")
+
+    purge_parser = evidence_sub.add_parser("purge", help="Delete runs past the retention window")
+    purge_parser.add_argument("--days", required=True, type=float)
+    purge_parser.add_argument("--dir", default="data/evidence", dest="evidence_dir")
+
     args = parser.parse_args()
     if args.command == "run":
         asyncio.run(_run(args.engagement_path))
@@ -103,6 +142,13 @@ def main() -> None:
                     args.approval_dir, args.approval_id, args.status, args.resolved_by
                 )
             )
+    elif args.command == "evidence":
+        if args.evidence_command == "verify":
+            asyncio.run(_evidence_verify(args.evidence_dir, args.run_id))
+        elif args.evidence_command == "purge":
+            if not math.isfinite(args.days) or args.days < 0:
+                parser.error("evidence purge --days must be finite and non-negative")
+            asyncio.run(_evidence_purge(args.evidence_dir, args.days))
 
 
 if __name__ == "__main__":

@@ -24,12 +24,17 @@
 
 **담당 파일:** `control/service.py`(파이프라인), `scope.py`, `roe.py`, `policy.py`, `budget.py`, `rate_limit.py`
 
+**통합 배선:** `app/bootstrap.py`
+
 **작업 순서 (쉬운 것 → 어려운 것):**
 1. **ROE 규칙 채우기** `roe.py` ← 시작점 (뼈대는 이미 있음)
 2. Scope 업그레이드 `scope.py` — 글자 비교 → 진짜 IP 대역(CIDR) 계산 + 도메인 서픽스 + 전 target 종류
 3. Policy 강화 `policy.py` — "무조건 거절" deny 규칙 추가
 4. Budget 세분화 `budget.py` — 횟수 + 시간 + 도구호출 제한
 5. RateLimit 개선 `rate_limit.py` — sliding window
+6. Blocked Action Evidence 연결 `control/service.py`, `app/bootstrap.py`
+   — `DENY`/`REQUIRE_APPROVAL` 결정 시 Track B의 EvidenceService 호출
+   — Control과 Orchestration이 동일한 Evidence Store를 사용하도록 배선
 
 ### 🅱️ Track B — Governance, Audit & Evidence (기록·승인·증거)
 > 판단이 내려진 "다음"과 "결과 저장"을 담당
@@ -40,12 +45,27 @@
 - **Audit(감사기록)** `audit.py` — 지금 메모리에만 있음 → 파일 등 durable 저장
 - **Approval(승인)** `approval.py` — 지금 요청만 됨 → 승인/거절/만료 + 사람 개입(CLI) 경로
 - **Evidence 저장소** `evidence/stores/*` — 조회 빠르게(인덱스/DB), digest 검증, 보관정책(retention)
-- **EvidenceService** — 차단된 시도도 증거로 남기기 등
+- **EvidenceService** — `DENY`/`REQUIRE_APPROVAL`로 실행되지 않은 Action도 Evidence로 저장
+  - `record_blocked_action(proposal, decision)` 구현 및 단위 테스트
+  - 상세 규격: `docs/control/blocked-action-evidence.md`
+  - 재평가·재실행 시 중복 Evidence 방지는 후속 TODO
 
 > ⚠️ **이벤트 발행은 우리 일이 아님!** `POLICY_EVALUATED/ACTION_APPROVED/ACTION_DENIED` 등은 이미 Agent 팀의 orchestration이 발행한다 (`orchestration/nodes/policy.py`). Control이 또 발행하면 이벤트가 중복돼 통합 테스트가 깨진다. → Control은 이벤트를 발행하지 않는다.
 
 ### 🤝 두 사람이 안 부딪히는 이유
 이벤트 발행이 빠지면서 **`service.py`는 Track A 전용**이 됨. Track B는 audit/approval을 `__init__` 주입으로 갈아끼우고, evidence는 별도 폴더라 **두 사람이 같은 파일을 동시에 건드릴 일이 없다.**
+
+### 🤝 Blocked Action Evidence 협업 지점
+
+| 담당 | 작업 |
+|---|---|
+| Track B | `EvidenceService.record_blocked_action()` 구현, 테스트, 스펙 문서 관리 |
+| Track A | `DefaultControlPlane`의 `DENY`·`REQUIRE_APPROVAL` 경로에 메서드 연결 |
+| Track A | Evidence 기록 실패 시 로그를 남기고 기존 `PolicyDecision` 반환 |
+| Track A | Bootstrap에서 Control과 Orchestration이 동일한 `EvidenceStore`를 사용하도록 구성 |
+
+Track B는 `evidence/service.py`를 담당하고, Track A는 `control/service.py`와
+`app/bootstrap.py`를 담당한다. 새 Event나 Core Contract는 추가하지 않는다.
 
 ---
 
@@ -63,6 +83,27 @@ PolicyDecision  (ALLOW / DENY / REQUIRE_APPROVAL + 이유)
 
 - **ALLOW만** ToolInvocation(실제 도구 실행 명령)으로 변환된다.
 - 이건 `core/convert.build_tool_invocation()`이 기계적으로 강제한다 (ALLOW 아니면 예외). → **DENY난 요청은 물리적으로 공격 도구에 도달 불가.**
+
+정책 결정 이후의 기록 흐름은 다음과 같다.
+
+```text
+PolicyDecision 생성
+   │
+   ▼
+Audit 기록
+   │
+   ▼
+DENY / REQUIRE_APPROVAL이면 Evidence 기록 시도
+   │
+   ▼
+PolicyDecision 반환
+```
+
+Evidence 기록은 정책 판단 이후의 부가 작업이다. 저장에 실패하더라도 이미
+생성된 `PolicyDecision`의 verdict를 변경하거나 반환을 막지 않는다.
+
+`ALLOW`된 Action의 실행 결과는 기존과 같이 Orchestration의 `verify_node`에서
+Evidence로 기록한다.
 
 ---
 
@@ -106,6 +147,7 @@ DENY할 때 **왜 막혔는지에 따라 에이전트의 다음 행동이 달라
 - `tests/unit/test_roe.py` 추가 (4개, DefaultControlPlane 파이프라인 첫 테스트 포함).
 - 전체 61 tests pass, ruff/mypy clean, 기존 동작 불변.
 
+
 ---
 
 ## 5. PM Issue 후보 (지금은 전부 "대안=변경없음"으로 진행 가능, Contract v0.1 유지)
@@ -144,5 +186,6 @@ DENY할 때 **왜 막혔는지에 따라 에이전트의 다음 행동이 달라
 ## 7. 작업 방식
 
 - **채팅 = 작업실(자유), 파일 = 확정본(공유).** 정해진 결론은 이 문서에 반영.
+- `PLAN.md`에는 담당 범위와 진행 상태를 기록하고, 함수 시그니처·필드 매핑·검증 및 실패 처리 규칙은 기능별 스펙 문서에 기록한다.
 - 공통 규격(`core/**`)은 직접 수정 금지 → PM Issue.
 - 새 기능엔 테스트 작성. 작업 후 `pytest -q` 전체 통과 확인.

@@ -93,6 +93,39 @@ async def test_filesystem_audit_store_persists_across_instances(tmp_path: Path) 
     assert entries[0].action_summary["arguments"]["session_token"] == "***REDACTED***"
 
 
+async def test_audit_redacts_policy_reasons_and_proposal_text_on_disk(tmp_path: Path) -> None:
+    log = AuditLog(FilesystemAuditStore(tmp_path))
+    proposal = _proposal("recon", "port_scan").model_copy(
+        update={
+            "reason": "Authorization: Bearer proposal-secret",
+            "arguments": {"note": "session_id=argument-secret"},
+        }
+    )
+    decision = PolicyDecision(
+        action_id=proposal.action_id,
+        verdict=PolicyVerdict.DENY,
+        reasons=["Cookie: sid=reason-secret", "api_key=another-secret"],
+        matched_rules=["rule: token=rule-secret"],
+        evaluated_at=datetime.now(timezone.utc),
+    )
+
+    await log.record(proposal, decision)
+
+    stored_text = (tmp_path / "run_1.jsonl").read_text(encoding="utf-8")
+    for secret in (
+        "proposal-secret",
+        "argument-secret",
+        "reason-secret",
+        "another-secret",
+        "rule-secret",
+    ):
+        assert secret not in stored_text
+    stored = (await log.entries_for_run(proposal.run_id))[0]
+    assert stored.decision is not None
+    assert stored.decision.reasons == ["Cookie: ***REDACTED***", "api_key=***REDACTED***"]
+    assert decision.reasons == ["Cookie: sid=reason-secret", "api_key=another-secret"]
+
+
 async def test_control_plane_records_approval_resolution() -> None:
     """Closes the traceability gap: resolving a pending Approval must
     produce an APPROVAL_RESOLVED audit entry correlated back to the

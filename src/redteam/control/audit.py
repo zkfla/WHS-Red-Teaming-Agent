@@ -44,21 +44,41 @@ class AuditEntryType(str, Enum):
 
 
 _SENSITIVE_KEY_PATTERN = re.compile(
-    r"(token|password|passwd|secret|credential|account|card|ssn|api[_-]?key|auth)",
+    r"(token|password|passwd|secret|credential|account|card|ssn|api[_-]?key|auth|"
+    r"session|csrf|cookie)",
     re.IGNORECASE,
 )
+_SENSITIVE_TEXT_VALUE_PATTERN = re.compile(
+    r"\b(api[_-]?key|access[_-]?token|refresh[_-]?token|session(?:[_-]?(?:id|token))?|"
+    r"csrf(?:[_-]?token)?|token|password|passwd|secret|credential|account|card|ssn|"
+    r"authorization|auth)(\s*[:=]\s*)(\"[^\"]*\"|'[^']*'|[^\s,;]+)",
+    re.IGNORECASE,
+)
+_SENSITIVE_HEADER_PATTERN = re.compile(
+    r"\b(set-cookie|cookie|authorization)(\s*:\s*)[^\r\n]*",
+    re.IGNORECASE,
+)
+
+
+def redact_sensitive_text(value: str) -> str:
+    """Redact credential headers and common key/value secrets in free text."""
+    value = _SENSITIVE_HEADER_PATTERN.sub(
+        lambda match: f"{match.group(1)}{match.group(2)}***REDACTED***",
+        value,
+    )
+    return _SENSITIVE_TEXT_VALUE_PATTERN.sub(
+        lambda match: f"{match.group(1)}{match.group(2)}***REDACTED***",
+        value,
+    )
 
 
 def redact_arguments(value: Any) -> Any:
     """Best-effort redaction of likely-sensitive values before persisting.
 
     This is a safety net, not a substitute for not collecting sensitive
-    data in the first place: it only catches values under an
-    obviously-named key (token/password/account/card/...). Anything
-    else -- including a real account number or session token sitting
-    under an unrelated-looking key -- passes through unredacted. Recurses
-    into nested dicts and lists so an ``ActionProposal.arguments`` blob
-    of arbitrary shape is covered.
+    data in the first place: it catches obviously-named keys and common
+    credential patterns in text, but cannot identify arbitrary secrets
+    or personal data. It recurses into nested dicts and lists.
     """
     if isinstance(value, dict):
         return {
@@ -67,6 +87,8 @@ def redact_arguments(value: Any) -> Any:
         }
     if isinstance(value, list):
         return [redact_arguments(item) for item in value]
+    if isinstance(value, str):
+        return redact_sensitive_text(value)
     return value
 
 
@@ -143,7 +165,14 @@ class AuditLog:
             engagement_id=action.engagement_id,
             action_id=action.action_id,
             action_summary=redact_arguments(action.model_dump(mode="json")),
-            decision=decision,
+            decision=decision.model_copy(
+                update={
+                    "reasons": [redact_sensitive_text(reason) for reason in decision.reasons],
+                    "matched_rules": [
+                        redact_sensitive_text(rule) for rule in decision.matched_rules
+                    ],
+                }
+            ),
             created_at=datetime.now(timezone.utc),
         )
         await self._store.append(entry)

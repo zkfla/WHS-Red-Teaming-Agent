@@ -48,6 +48,12 @@ python examples/minimal_run.py
 python -m redteam.app.cli approvals list
 python -m redteam.app.cli approvals resolve <approval_id> approved --by <name>
 
+# Verify a run's evidence hasn't been tampered with since it was written,
+# or purge runs past the retention window (both operate on the
+# persisted EvidenceStore directly, not through EvidenceService)
+python -m redteam.app.cli evidence verify --run <run_id>
+python -m redteam.app.cli evidence purge --days 90
+
 # Tests
 pytest -q
 
