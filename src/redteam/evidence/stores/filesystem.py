@@ -12,9 +12,9 @@ list_for_action), this concrete class adds three things -- deliberately
 
 - An index (``_index.jsonl``: evidence_id/action_id/run_id/line_sha256)
   so ``get``/``list_for_action`` no longer scan every run file.
-- ``verify_run_integrity``: recomputes each stored line's SHA-256 and
-  compares against what the index recorded at write time, to catch
-  file corruption/tampering *after* the fact. This is a different
+- ``verify_run_integrity``: compares indexed record IDs and line hashes
+  against the run file, detecting changed, missing, and unindexed
+  records. This is a different
   check from ``EvidenceRecord.digest`` (a PM-defined hash of the
   original ``ToolResult``, computed in ``core.convert`` before the
   record ever reaches this store) -- that field can't be re-verified
@@ -118,28 +118,42 @@ class FilesystemEvidenceStore:
         return results
 
     async def verify_run_integrity(self, run_id: RunId) -> list[EvidenceId]:
-        """Returns the ``evidence_id``s of any record in ``run_id`` whose
-        current on-disk line hash no longer matches what the index
-        recorded when it was written -- i.e. the file changed after the
-        fact. An empty list means the run's evidence file is intact.
+        """Return IDs for changed, missing, duplicate, or unindexed records.
+
+        The index and run file are compared in both directions. An empty
+        result means they agree; it does not authenticate the index itself.
         """
-        path = self._path_for_run(run_id)
-        if not path.exists():
-            return []
         expected = {
             entry["evidence_id"]: entry["line_hash"]
             for entry in self._read_index()
             if entry["run_id"] == run_id
         }
-        tampered: list[EvidenceId] = []
+        path = self._path_for_run(run_id)
+        if not path.exists():
+            return [EvidenceId(evidence_id) for evidence_id in expected]
+
+        problems: list[EvidenceId] = []
+        seen: set[EvidenceId] = set()
         for line in path.read_text(encoding="utf-8").splitlines():
             if not line.strip():
                 continue
             record = EvidenceRecord.model_validate_json(line)
-            expected_hash = expected.get(record.evidence_id)
-            if expected_hash is not None and expected_hash != _line_hash(line):
-                tampered.append(record.evidence_id)
-        return tampered
+            evidence_id = record.evidence_id
+            if (
+                evidence_id in seen
+                or evidence_id not in expected
+                or record.run_id != run_id
+                or expected[evidence_id] != _line_hash(line)
+            ) and evidence_id not in problems:
+                problems.append(evidence_id)
+            seen.add(evidence_id)
+
+        problems.extend(
+            EvidenceId(evidence_id)
+            for evidence_id in expected
+            if evidence_id not in seen
+        )
+        return problems
 
     async def purge_older_than(self, days: float) -> list[RunId]:
         """Deletes whole run files (by file mtime) past the retention

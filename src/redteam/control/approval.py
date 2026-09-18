@@ -11,23 +11,15 @@ not a stream of immutable facts).
 
 TODO(control-team): human-in-the-loop notification channel beyond the
 CLI (``redteam.app.cli`` ``approvals list``/``approvals resolve``) --
-e.g. Slack/webhook. Also: resolving a pending Approval from a separate
-CLI invocation than the one that saw the original REQUIRE_APPROVAL
-updates the Approval record correctly, but does not (and currently
-cannot) produce an APPROVAL_RESOLVED audit entry -- that still requires
-going through ``DefaultControlPlane.resolve_approval`` in the *same*
-process that holds the ``ActionProposal`` in
-``_pending_proposals``. Closing that gap needs either persisting
-run_id/engagement_id on Approval itself (a core contract change) or a
-lookup path from action_id back to run_id/engagement_id (e.g. via
-Audit's own POLICY_DECISION entry for that action) -- left as a
-follow-up rather than done here, since it's moot until Agent Team's
-replan loop can actually pause a run for a pending approval in the
-first place (today ``replan_node`` ends the run regardless).
+e.g. Slack/webhook. The CLI recovers run and engagement context from
+the durable policy-decision Audit entry when recording a resolution.
+The Agent Team's replan loop still ends a run instead of pausing for
+pending approval.
 """
 
 from __future__ import annotations
 
+import math
 from datetime import datetime, timezone
 from typing import Protocol
 
@@ -84,6 +76,10 @@ class ApprovalService:
         approval = await self._store.get(approval_id)
         if approval is None:
             raise KeyError(f"no such approval: {approval_id}")
+        if approval.status != ApprovalStatus.PENDING:
+            raise ValueError(f"approval is already {approval.status.value}: {approval_id}")
+        if status not in {ApprovalStatus.APPROVED, ApprovalStatus.REJECTED}:
+            raise ValueError("resolve status must be approved or rejected")
         updated = approval.model_copy(
             update={
                 "status": status,
@@ -103,11 +99,12 @@ class ApprovalService:
     async def sweep_expired(self, ttl_seconds: float) -> list[Approval]:
         """Mark PENDING approvals older than ``ttl_seconds`` as EXPIRED.
 
-        Not called automatically anywhere yet -- run it periodically
-        (a cron-style job, or a CLI command) or before relying on
-        ``list_pending()`` if stale approvals matter for the caller.
+        Run ``redteam approvals expire --ttl-seconds N`` periodically
+        to apply the configured operational retention window.
         Returns the approvals that were just expired.
         """
+        if not math.isfinite(ttl_seconds) or ttl_seconds < 0:
+            raise ValueError("approval TTL must be finite and non-negative")
         now = datetime.now(timezone.utc)
         expired: list[Approval] = []
         for approval in await self._store.list_pending():

@@ -39,7 +39,7 @@
 ### 🅱️ Track B — Governance, Audit & Evidence (기록·승인·증거)
 > 판단이 내려진 "다음"과 "결과 저장"을 담당
 
-**담당 파일:** `control/approval.py`, `control/audit.py`, `evidence/service.py`, `evidence/stores/*`
+**담당 파일:** `control/approval.py`, `control/audit.py`, `evidence/service.py`, `evidence/stores/*`와 해당 운영 CLI
 
 **작업:**
 - **Audit(감사기록)** `audit.py` — 지금 메모리에만 있음 → 파일 등 durable 저장
@@ -47,8 +47,13 @@
 - **Evidence 저장소** `evidence/stores/*` — 조회 빠르게(인덱스/DB), digest 검증, 보관정책(retention)
 - **EvidenceService** — `DENY`/`REQUIRE_APPROVAL`로 실행되지 않은 Action도 Evidence로 저장
   - `record_blocked_action(proposal, decision)` 구현 및 단위 테스트
-  - 상세 규격: `docs/control/blocked-action-evidence.md`
   - 재평가·재실행 시 중복 Evidence 방지는 후속 TODO
+
+승인·Audit와 Evidence 저장소의 동작·제약은
+[`governance-and-evidence-store.md`](./governance-and-evidence-store.md),
+차단 Action Evidence의 필드 규격은
+[`blocked-action-evidence.md`](./blocked-action-evidence.md)를 따른다.
+
 
 > ⚠️ **이벤트 발행은 우리 일이 아님!** `POLICY_EVALUATED/ACTION_APPROVED/ACTION_DENIED` 등은 이미 Agent 팀의 orchestration이 발행한다 (`orchestration/nodes/policy.py`). Control이 또 발행하면 이벤트가 중복돼 통합 테스트가 깨진다. → Control은 이벤트를 발행하지 않는다.
 
@@ -145,7 +150,7 @@ DENY할 때 **왜 막혔는지에 따라 에이전트의 다음 행동이 달라
 - `control/roe.py` 생성: `check_roe(action, engagement) -> (bool, list[str])` (현재 pass-through 껍데기).
 - `DefaultControlPlane.evaluate()`에서 Scope 다음 · Policy 앞에 ROE 단계로 연결 (DENY 시 `matched_rules=["roe"]`).
 - `tests/unit/test_roe.py` 추가 (4개, DefaultControlPlane 파이프라인 첫 테스트 포함).
-- 전체 61 tests pass, ruff/mypy clean, 기존 동작 불변.
+- M0 당시 전체 61 tests pass, ruff/mypy clean, 기존 동작 불변.
 
 
 ---
@@ -158,6 +163,7 @@ DENY할 때 **왜 막혔는지에 따라 에이전트의 다음 행동이 달라
 | `ControlPlane` 포트에 `resolve_approval` | 오케스트레이션이 승인 해소 | control 모듈 내부 + CLI로 해소 |
 | `ActionProposal.risk_level` | risk 기반 정책 | Config 매핑으로 risk 유도 (권장) |
 | `EvidenceStore` 포트에 조회 메서드 | hypothesis별 조회 등 | concrete store에만 추가 |
+| `EvidenceRecord.digest` 원본 재검증 규격 | 원본 payload 보존·검증이 필요할 때 | 현재는 저장 JSONL 줄의 해시만 인덱스와 대조. 원본 보존 방식은 PM과 결정 |
 
 ---
 

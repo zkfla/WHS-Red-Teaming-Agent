@@ -47,8 +47,10 @@ python examples/minimal_run.py
 # a `run` in progress -- operates on the persisted ApprovalStore)
 python -m redteam.app.cli approvals list
 python -m redteam.app.cli approvals resolve <approval_id> approved --by <name>
+# Run periodically to expire pending requests older than one hour
+python -m redteam.app.cli approvals expire --ttl-seconds 3600
 
-# Verify a run's evidence hasn't been tampered with since it was written,
+# Compare a run's evidence file with its index (changed/missing/extra records),
 # or purge runs past the retention window (both operate on the
 # persisted EvidenceStore directly, not through EvidenceService)
 python -m redteam.app.cli evidence verify --run <run_id>

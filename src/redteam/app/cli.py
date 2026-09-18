@@ -1,17 +1,14 @@
 """``python -m redteam.app.cli run examples/engagement.yaml``
 ``python -m redteam.app.cli approvals list``
 ``python -m redteam.app.cli approvals resolve <approval_id> approved --by <name>``
+``python -m redteam.app.cli approvals expire --ttl-seconds <n>``
 ``python -m redteam.app.cli evidence verify --run <run_id>``
 ``python -m redteam.app.cli evidence purge --days <n>``
 
 ``run`` prints every published event, then the final ``RuntimeState``.
 
-``approvals`` operates directly on the persisted ``ApprovalStore``
-(default: ``data/approvals``) -- it does not need a ``run`` to be in
-progress. Resolving here updates the Approval record on disk, but does
-not (yet) produce an APPROVAL_RESOLVED audit entry when the approval
-was requested by a *different* process than the one resolving it --
-see the TODO in ``redteam.control.approval`` for why.
+``approvals resolve`` recovers the original run and engagement from the
+persisted policy-decision Audit entry before updating the Approval.
 """
 
 from __future__ import annotations
@@ -24,7 +21,8 @@ import os
 
 from redteam.app.bootstrap import build_runtime_deps, load_engagement, run_engagement
 from redteam.control.approval import ApprovalService
-from redteam.control.stores.filesystem import FilesystemApprovalStore
+from redteam.control.audit import AuditLog
+from redteam.control.stores.filesystem import FilesystemApprovalStore, FilesystemAuditStore
 from redteam.core.contracts.events import EventEnvelope
 from redteam.core.enums import ApprovalStatus
 from redteam.core.ids import ApprovalId, RunId
@@ -61,24 +59,42 @@ async def _approvals_list(approval_dir: str) -> None:
 
 
 async def _approvals_resolve(
-    approval_dir: str, approval_id: str, status: str, resolved_by: str
+    approval_dir: str, approval_id: str, status: str, resolved_by: str, audit_dir: str
 ) -> None:
     service = ApprovalService(FilesystemApprovalStore(approval_dir))
+    approval = await service.get(ApprovalId(approval_id))
+    if approval is None:
+        raise KeyError(f"no such approval: {approval_id}")
+    audit = AuditLog(FilesystemAuditStore(audit_dir))
+    request = await audit.find_approval_request(approval.action_id, approval.approval_id)
+    if request is None:
+        raise LookupError(f"no policy decision audit entry for approval: {approval_id}")
     updated = await service.resolve(
         ApprovalId(approval_id), ApprovalStatus(status), resolved_by
     )
+    await audit.record_approval_resolution_from_request(request, updated)
     print(f"{updated.approval_id} -> {updated.status.value} (by {updated.resolved_by})")
 
 
-async def _evidence_verify(evidence_dir: str, run_id: str) -> None:
+async def _approvals_expire(approval_dir: str, ttl_seconds: float) -> None:
+    service = ApprovalService(FilesystemApprovalStore(approval_dir))
+    expired = await service.sweep_expired(ttl_seconds)
+    print(f"Expired {len(expired)} approval(s).")
+    for approval in expired:
+        print(f"  {approval.approval_id}  action={approval.action_id}")
+
+
+async def _evidence_verify(evidence_dir: str, run_id: str) -> bool:
     store = FilesystemEvidenceStore(evidence_dir)
     tampered = await store.verify_run_integrity(RunId(run_id))
     if not tampered:
         print(f"run {run_id}: OK, no tampering detected")
+        return True
     else:
-        print(f"run {run_id}: {len(tampered)} record(s) changed since they were written:")
+        print(f"run {run_id}: {len(tampered)} record(s) changed, missing, or unindexed:")
         for evidence_id in tampered:
             print(f"  {evidence_id}")
+        return False
 
 
 async def _evidence_purge(evidence_dir: str, days: float) -> None:
@@ -116,6 +132,11 @@ def main() -> None:
     resolve_parser.add_argument("status", choices=["approved", "rejected"])
     resolve_parser.add_argument("--by", required=True, dest="resolved_by")
     resolve_parser.add_argument("--dir", default="data/approvals", dest="approval_dir")
+    resolve_parser.add_argument("--audit-dir", default="data/audit")
+
+    expire_parser = approvals_sub.add_parser("expire", help="Expire pending approvals past a TTL")
+    expire_parser.add_argument("--ttl-seconds", required=True, type=float)
+    expire_parser.add_argument("--dir", default="data/approvals", dest="approval_dir")
 
     evidence_parser = subparsers.add_parser(
         "evidence", help="Verify integrity / apply retention on the persisted Evidence Store"
@@ -139,12 +160,18 @@ def main() -> None:
         elif args.approvals_command == "resolve":
             asyncio.run(
                 _approvals_resolve(
-                    args.approval_dir, args.approval_id, args.status, args.resolved_by
+                    args.approval_dir, args.approval_id, args.status, args.resolved_by,
+                    args.audit_dir,
                 )
             )
+        elif args.approvals_command == "expire":
+            if not math.isfinite(args.ttl_seconds) or args.ttl_seconds < 0:
+                parser.error("approvals expire --ttl-seconds must be finite and non-negative")
+            asyncio.run(_approvals_expire(args.approval_dir, args.ttl_seconds))
     elif args.command == "evidence":
         if args.evidence_command == "verify":
-            asyncio.run(_evidence_verify(args.evidence_dir, args.run_id))
+            if not asyncio.run(_evidence_verify(args.evidence_dir, args.run_id)):
+                raise SystemExit(1)
         elif args.evidence_command == "purge":
             if not math.isfinite(args.days) or args.days < 0:
                 parser.error("evidence purge --days must be finite and non-negative")

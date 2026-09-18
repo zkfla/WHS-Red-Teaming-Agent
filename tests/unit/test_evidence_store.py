@@ -5,6 +5,8 @@ beyond what already existed (append/list_for_run).
 
 from __future__ import annotations
 
+import subprocess
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -216,6 +218,71 @@ async def test_verify_run_integrity_detects_tampering(tmp_path: Path) -> None:
 
     tampered_ids = await store.verify_run_integrity(RunId("run_1"))
     assert tampered_ids == [evidence.evidence_id]
+
+
+async def test_verify_run_integrity_detects_deleted_record_and_file(tmp_path: Path) -> None:
+    store = FilesystemEvidenceStore(tmp_path)
+    service = EvidenceService(store)
+    proposal = _proposal()
+    decision = PolicyDecision(
+        action_id=proposal.action_id,
+        verdict=PolicyVerdict.DENY,
+        evaluated_at=datetime.now(timezone.utc),
+    )
+    first = await service.record_blocked_action(proposal, decision)
+    second = await service.record_blocked_action(proposal, decision)
+    run_file = tmp_path / "run_1.jsonl"
+    lines = run_file.read_text(encoding="utf-8").splitlines()
+
+    run_file.write_text(lines[1] + "\n", encoding="utf-8")
+    assert await store.verify_run_integrity(proposal.run_id) == [first.evidence_id]
+
+    run_file.unlink()
+    assert await store.verify_run_integrity(proposal.run_id) == [
+        first.evidence_id, second.evidence_id
+    ]
+
+
+async def test_verify_run_integrity_detects_unindexed_record(tmp_path: Path) -> None:
+    store = FilesystemEvidenceStore(tmp_path)
+    service = EvidenceService(store)
+    proposal = _proposal()
+    decision = PolicyDecision(
+        action_id=proposal.action_id,
+        verdict=PolicyVerdict.DENY,
+        evaluated_at=datetime.now(timezone.utc),
+    )
+    evidence = await service.record_blocked_action(proposal, decision)
+    run_file = tmp_path / "run_1.jsonl"
+    with run_file.open("a", encoding="utf-8") as fh:
+        fh.write(evidence.model_copy(update={"evidence_id": "ev_unindexed"}).model_dump_json())
+        fh.write("\n")
+
+    assert await store.verify_run_integrity(proposal.run_id) == ["ev_unindexed"]
+
+
+async def test_cli_verify_fails_when_run_file_is_missing(tmp_path: Path) -> None:
+    store = FilesystemEvidenceStore(tmp_path)
+    proposal = _proposal()
+    await EvidenceService(store).record_blocked_action(
+        proposal,
+        PolicyDecision(
+            action_id=proposal.action_id,
+            verdict=PolicyVerdict.DENY,
+            evaluated_at=datetime.now(timezone.utc),
+        ),
+    )
+    (tmp_path / "run_1.jsonl").unlink()
+
+    result = subprocess.run(
+        [
+            sys.executable, "-m", "redteam.app.cli", "evidence", "verify",
+            "--run", "run_1", "--dir", str(tmp_path),
+        ],
+        capture_output=True, text=True, check=False,
+    )
+    assert result.returncode == 1
+    assert "missing" in result.stdout
 
 
 async def test_purge_older_than_removes_old_runs_only(tmp_path: Path) -> None:

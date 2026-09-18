@@ -4,8 +4,12 @@ expiry sweeping moves stale PENDING approvals to EXPIRED.
 
 from __future__ import annotations
 
+import subprocess
+import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+import pytest
 
 from redteam.control.approval import ApprovalService, InMemoryApprovalStore
 from redteam.control.stores.filesystem import FilesystemApprovalStore
@@ -64,3 +68,74 @@ async def test_sweep_expired_marks_old_pending_approvals() -> None:
     refreshed = await service.get(approval.approval_id)
     assert refreshed is not None
     assert refreshed.status == ApprovalStatus.EXPIRED
+
+
+@pytest.mark.parametrize("first_status", [ApprovalStatus.APPROVED, ApprovalStatus.REJECTED])
+async def test_resolved_approval_cannot_be_processed_again(first_status: ApprovalStatus) -> None:
+    service = ApprovalService()
+    approval = await service.request(ActionId("action_1"))
+    first = await service.resolve(approval.approval_id, first_status, "operator_one")
+
+    with pytest.raises(ValueError, match="already"):
+        await service.resolve(approval.approval_id, ApprovalStatus.APPROVED, "operator_two")
+
+    assert await service.get(approval.approval_id) == first
+
+
+async def test_expired_approval_cannot_be_resolved() -> None:
+    store = InMemoryApprovalStore()
+    service = ApprovalService(store)
+    approval = await service.request(ActionId("action_1"))
+    await store.save(
+        approval.model_copy(
+            update={"requested_at": datetime.now(timezone.utc) - timedelta(seconds=120)}
+        )
+    )
+    await service.sweep_expired(60)
+
+    with pytest.raises(ValueError, match="already expired"):
+        await service.resolve(approval.approval_id, ApprovalStatus.APPROVED, "operator")
+
+
+async def test_resolve_rejects_nonterminal_status() -> None:
+    service = ApprovalService()
+    approval = await service.request(ActionId("action_1"))
+
+    with pytest.raises(ValueError, match="must be approved or rejected"):
+        await service.resolve(approval.approval_id, ApprovalStatus.PENDING, "operator")
+
+    assert (await service.get(approval.approval_id)).status == ApprovalStatus.PENDING
+
+
+@pytest.mark.parametrize("ttl", [-1, float("nan"), float("inf")])
+async def test_sweep_rejects_invalid_ttl(ttl: float) -> None:
+    service = ApprovalService()
+    approval = await service.request(ActionId("action_1"))
+    with pytest.raises(ValueError, match="finite and non-negative"):
+        await service.sweep_expired(ttl)
+    assert (await service.get(approval.approval_id)).status == ApprovalStatus.PENDING
+
+
+async def test_cli_expire_updates_persisted_approvals(tmp_path: Path) -> None:
+    store = FilesystemApprovalStore(tmp_path)
+    service = ApprovalService(store)
+    old = await service.request(ActionId("action_old"))
+    recent = await service.request(ActionId("action_recent"))
+    await store.save(
+        old.model_copy(
+            update={"requested_at": datetime.now(timezone.utc) - timedelta(seconds=120)}
+        )
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable, "-m", "redteam.app.cli", "approvals", "expire",
+            "--ttl-seconds", "60", "--dir", str(tmp_path),
+        ],
+        capture_output=True, text=True, check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "Expired 1 approval(s)" in result.stdout
+    restarted = ApprovalService(FilesystemApprovalStore(tmp_path))
+    assert (await restarted.get(old.approval_id)).status == ApprovalStatus.EXPIRED
+    assert (await restarted.get(recent.approval_id)).status == ApprovalStatus.PENDING

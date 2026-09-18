@@ -33,7 +33,8 @@ from pydantic import BaseModel, Field
 
 from redteam.core.contracts.action import ActionProposal
 from redteam.core.contracts.policy import Approval, PolicyDecision
-from redteam.core.ids import ActionId, EngagementId, RunId, new_id
+from redteam.core.enums import PolicyVerdict
+from redteam.core.ids import ActionId, ApprovalId, EngagementId, RunId, new_id
 
 AuditId = NewType("AuditId", str)
 
@@ -180,12 +181,50 @@ class AuditLog:
     async def record_approval_resolution(
         self, action: ActionProposal, approval: Approval
     ) -> None:
+        await self._append_resolution(
+            action.run_id, action.engagement_id, action.action_id, approval
+        )
+
+    async def find_approval_request(
+        self, action_id: ActionId, approval_id: ApprovalId
+    ) -> AuditEntry | None:
+        """Recover the original request context from durable policy audit."""
+        for entry in await self._store.list_for_action(action_id):
+            if (
+                entry.entry_type == AuditEntryType.POLICY_DECISION
+                and entry.decision is not None
+                and entry.decision.verdict == PolicyVerdict.REQUIRE_APPROVAL
+                and entry.decision.approval_id == approval_id
+            ):
+                return entry
+        return None
+
+    async def record_approval_resolution_from_request(
+        self, request: AuditEntry, approval: Approval
+    ) -> None:
+        """Record a resolution using context recovered after a process restart."""
+        if request.action_id != approval.action_id:
+            raise ValueError("approval action_id does not match audit request")
+        if (
+            request.entry_type != AuditEntryType.POLICY_DECISION
+            or request.decision is None
+            or request.decision.verdict != PolicyVerdict.REQUIRE_APPROVAL
+            or request.decision.approval_id != approval.approval_id
+        ):
+            raise ValueError("approval_id does not match audit request")
+        await self._append_resolution(
+            request.run_id, request.engagement_id, request.action_id, approval
+        )
+
+    async def _append_resolution(
+        self, run_id: RunId, engagement_id: EngagementId, action_id: ActionId, approval: Approval
+    ) -> None:
         entry = AuditEntry(
             audit_id=AuditId(new_id("audit")),
             entry_type=AuditEntryType.APPROVAL_RESOLVED,
-            run_id=action.run_id,
-            engagement_id=action.engagement_id,
-            action_id=action.action_id,
+            run_id=run_id,
+            engagement_id=engagement_id,
+            action_id=action_id,
             approval=approval,
             created_at=datetime.now(timezone.utc),
         )

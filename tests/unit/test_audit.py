@@ -5,12 +5,17 @@ sensitive-looking argument values verbatim.
 
 from __future__ import annotations
 
+import subprocess
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+import pytest
+
+from redteam.control.approval import ApprovalService
 from redteam.control.audit import AuditLog, redact_arguments
 from redteam.control.service import DefaultControlPlane
-from redteam.control.stores.filesystem import FilesystemAuditStore
+from redteam.control.stores.filesystem import FilesystemApprovalStore, FilesystemAuditStore
 from redteam.core.contracts.action import ActionProposal
 from redteam.core.contracts.engagement import (
     ApprovalPolicy,
@@ -161,3 +166,70 @@ async def test_control_plane_records_approval_resolution() -> None:
     resolved_entry = next(e for e in entries if e.entry_type.value == "approval_resolved")
     assert resolved_entry.approval is not None
     assert resolved_entry.approval.status == ApprovalStatus.APPROVED
+
+
+@pytest.mark.parametrize("status", ["approved", "rejected"])
+async def test_cli_resolution_records_audit_after_restart(tmp_path: Path, status: str) -> None:
+    approval_dir = tmp_path / "approvals"
+    audit_dir = tmp_path / "audit"
+    approvals = ApprovalService(FilesystemApprovalStore(approval_dir))
+    approval = await approvals.request(ActionId("action_1"))
+    proposal = _proposal("web", "auth_attempt")
+    await AuditLog(FilesystemAuditStore(audit_dir)).record(
+        proposal,
+        PolicyDecision(
+            action_id=proposal.action_id,
+            verdict=PolicyVerdict.REQUIRE_APPROVAL,
+            approval_id=approval.approval_id,
+            evaluated_at=datetime.now(timezone.utc),
+        ),
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable, "-m", "redteam.app.cli", "approvals", "resolve",
+            str(approval.approval_id), status, "--by", "operator",
+            "--dir", str(approval_dir), "--audit-dir", str(audit_dir),
+        ],
+        capture_output=True, text=True, check=False,
+    )
+    assert result.returncode == 0, result.stderr
+
+    entries = await AuditLog(FilesystemAuditStore(audit_dir)).entries_for_run(proposal.run_id)
+    assert len(entries) == 2
+    resolved = entries[1]
+    assert resolved.entry_type.value == "approval_resolved"
+    assert resolved.engagement_id == proposal.engagement_id
+    assert resolved.action_id == proposal.action_id
+    assert resolved.approval is not None
+    assert resolved.approval.approval_id == approval.approval_id
+    assert resolved.approval.status == ApprovalStatus(status)
+
+    repeated = subprocess.run(result.args, capture_output=True, text=True, check=False)
+    assert repeated.returncode != 0
+    entries_after_retry = await AuditLog(FilesystemAuditStore(audit_dir)).entries_for_run(
+        proposal.run_id
+    )
+    assert len(entries_after_retry) == 2
+
+
+async def test_cli_does_not_resolve_without_policy_audit(tmp_path: Path) -> None:
+    approval_dir = tmp_path / "approvals"
+    approval = await ApprovalService(FilesystemApprovalStore(approval_dir)).request(
+        ActionId("action_1")
+    )
+
+    result = subprocess.run(
+        [
+            sys.executable, "-m", "redteam.app.cli", "approvals", "resolve",
+            str(approval.approval_id), "approved", "--by", "operator",
+            "--dir", str(approval_dir), "--audit-dir", str(tmp_path / "audit"),
+        ],
+        capture_output=True, text=True, check=False,
+    )
+    assert result.returncode != 0
+    stored = await ApprovalService(FilesystemApprovalStore(approval_dir)).get(
+        approval.approval_id
+    )
+    assert stored is not None
+    assert stored.status == ApprovalStatus.PENDING
