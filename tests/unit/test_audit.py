@@ -136,12 +136,12 @@ async def test_control_plane_records_approval_resolution() -> None:
     produce an APPROVAL_RESOLVED audit entry correlated back to the
     original action, not just the REQUIRE_APPROVAL decision.
 
-    Uses "web:auth_attempt" (colon) for ApprovalPolicy.require_approval_for
-    -- that field is matched by control.policy.evaluate_policy's own
-    "capability:operation" key, which is a separate convention from
-    ROE's "capability.operation" (dot) canonical action key.
+    Uses "web.auth_attempt" for ApprovalPolicy.require_approval_for --
+    control.policy.evaluate_policy matches it against the same
+    "<capability>.<operation>" canonical action key used by ROE (unified
+    on the dot form per docs/contracts/actions.md).
     """
-    engagement = _engagement(require_approval_for=["web:auth_attempt"])
+    engagement = _engagement(require_approval_for=["web.auth_attempt"])
     audit_log = AuditLog()  # in-memory is enough for this test
     control_plane = DefaultControlPlane(
         {engagement.engagement_id: engagement}, audit_log=audit_log
