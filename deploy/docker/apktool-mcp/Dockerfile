@@ -9,7 +9,7 @@
 # this candidate.
 FROM python:3.11-slim
 ARG APKTOOL_VERSION=2.9.3
-ARG APKTOOL_MCP_SERVER_REF=main
+ARG APKTOOL_MCP_SERVER_REF=master
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         default-jre-headless \
@@ -25,13 +25,20 @@ RUN curl -fsSL -o /usr/local/bin/apktool \
 
 RUN pip install --no-cache-dir uv
 
+# uv provisions its own interpreter under $UV_PYTHON_INSTALL_DIR when no
+# system Python satisfies pyproject.toml's requirement. Left at its default
+# (under /root), the non-root `mcp` user below can't traverse into /root to
+# reach it at runtime ("Permission denied" resolving .venv/bin/python) --
+# redirect it to a world-traversable path instead.
+ENV UV_PYTHON_INSTALL_DIR=/opt/uv-python
+
 WORKDIR /app
 RUN git clone --depth 1 --branch "${APKTOOL_MCP_SERVER_REF}" \
         https://github.com/zinja-coder/apktool-mcp-server.git server \
     && cd server && uv sync --no-dev || uv pip install -r requirements.txt || true
 
 RUN useradd --create-home --uid 10001 mcp \
-    && chown -R mcp:mcp /app
+    && chown -R mcp:mcp /app /opt/uv-python
 USER mcp
 WORKDIR /app/server
 VOLUME ["/work"]

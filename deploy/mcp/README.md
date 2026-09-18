@@ -160,7 +160,7 @@ Canonical operation this capability binds today: `static_analysis`.
 
 | canonical operation | apktool-mcp-server remote tool | notes |
 |---|---|---|
-| `static_analysis` | `decode_apk`, `get_manifest`, `get_apktool_yml`, `list_smali_directories`, `list_smali_files`, `get_smali_file`, `list_resources`, `get_resource_file`, `search_in_file` | decompiled-code-level read/analyze tools only |
+| `static_analysis` | `decode_apk`, `get_manifest`, `get_apktool_yml`, `list_smali_directories`, `list_smali_files`, `get_smali_file`, `list_resources`, `get_resource_file`, `search_in_files` | decompiled-code-level read/analyze tools only |
 
 `build_apk`, `modify_smali_file`, `modify_resource_file`, and
 `clean_project` are **deliberately excluded** from
