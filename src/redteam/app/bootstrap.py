@@ -56,6 +56,7 @@ from redteam.core.ports.evidence_store import EvidenceStore
 from redteam.core.ports.llm import LLMClient
 from redteam.core.ports.tool_gateway import ToolGateway
 from redteam.event_bus.memory import InMemoryEventBus
+from redteam.evidence.service import EvidenceService
 from redteam.evidence.stores.filesystem import FilesystemEvidenceStore
 from redteam.llm.fake import FakeLLMClient
 from redteam.orchestration.context import RuntimeDeps
@@ -125,7 +126,12 @@ async def build_runtime_deps(
     audit_log = AuditLog(FilesystemAuditStore(audit_dir))
     approvals = ApprovalService(FilesystemApprovalStore(approval_dir))
     control_plane = DefaultControlPlane(
-        {engagement.engagement_id: engagement}, audit_log=audit_log, approvals=approvals
+        {engagement.engagement_id: engagement},
+        audit_log=audit_log,
+        approvals=approvals,
+        # Same evidence_store the Orchestration side writes to, so blocked
+        # attempts and executed results land in one place.
+        evidence_service=EvidenceService(evidence_store),
     )
     llm_client = FakeLLMClient()
 
@@ -176,13 +182,16 @@ async def build_application(
 
     engagement = config.engagement.to_engagement(engagement_id=EngagementId(new_id("eng")))
 
+    # Build the evidence store first so both the Control Plane (blocked
+    # actions) and Orchestration (executed results) share one store.
+    resolved_evidence_store = evidence_store or FilesystemEvidenceStore(evidence_dir)
     resolved_control_plane = control_plane or DefaultControlPlane(
         {engagement.engagement_id: engagement},
         audit_log=AuditLog(FilesystemAuditStore(audit_dir)),
         approvals=ApprovalService(FilesystemApprovalStore(approval_dir)),
+        evidence_service=EvidenceService(resolved_evidence_store),
     )
     resolved_tool_gateway = tool_gateway or await _build_default_tool_gateway(config.capability)
-    resolved_evidence_store = evidence_store or FilesystemEvidenceStore(evidence_dir)
     resolved_event_bus = event_bus or InMemoryEventBus()
     resolved_attack_graph = attack_graph or InMemoryAttackGraphStore()
     resolved_llm = llm or _build_llm_client(config.llm)

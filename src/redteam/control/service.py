@@ -17,6 +17,7 @@ sinks (track-b).
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timezone
 
 from redteam.control.approval import ApprovalService
@@ -32,6 +33,9 @@ from redteam.core.contracts.engagement import Engagement
 from redteam.core.contracts.policy import Approval, ControlContext, PolicyDecision
 from redteam.core.enums import ApprovalStatus, PolicyVerdict
 from redteam.core.ids import ApprovalId, EngagementId
+from redteam.evidence.service import EvidenceService
+
+logger = logging.getLogger(__name__)
 
 
 class DefaultControlPlane:
@@ -51,12 +55,18 @@ class DefaultControlPlane:
         engagements: dict[EngagementId, Engagement],
         audit_log: AuditLog | None = None,
         approvals: ApprovalService | None = None,
+        evidence_service: EvidenceService | None = None,
     ) -> None:
         self._engagements = engagements
         self._audit = audit_log or AuditLog()
         self._rate_limiters: dict[EngagementId, RateLimiter] = {}
         self._budgets: dict[EngagementId, BudgetTracker] = {}
         self._approvals = approvals or ApprovalService()
+        # Optional (Track B's EvidenceService): when present, DENY /
+        # REQUIRE_APPROVAL decisions are also recorded as Evidence so the
+        # final report includes blocked attempts, not just executed ones.
+        # See docs/control/blocked-action-evidence.md.
+        self._evidence_service = evidence_service
         # Remembers which ActionProposal a pending Approval belongs to, so
         # resolve_approval() can record an APPROVAL_RESOLVED audit entry
         # correlated back to run_id/engagement_id/action_id. Popped once
@@ -132,6 +142,7 @@ class DefaultControlPlane:
                 evaluated_at=datetime.now(timezone.utc),
             )
             await self._audit.record(proposal, decision)
+            await self._record_blocked_action(proposal, decision)
             return decision
 
         budget.consume()
@@ -188,4 +199,28 @@ class DefaultControlPlane:
             evaluated_at=datetime.now(timezone.utc),
         )
         await self._audit.record(proposal, decision)
+        await self._record_blocked_action(proposal, decision)
         return decision
+
+    async def _record_blocked_action(
+        self, proposal: ActionProposal, decision: PolicyDecision
+    ) -> None:
+        """Best-effort Evidence record for a non-executed (DENY /
+        REQUIRE_APPROVAL) decision. Never lets an Evidence failure change
+        the verdict or block the return — see
+        docs/control/blocked-action-evidence.md §10.2.
+        """
+        if self._evidence_service is None:
+            return
+        if decision.verdict not in (PolicyVerdict.DENY, PolicyVerdict.REQUIRE_APPROVAL):
+            return
+        try:
+            await self._evidence_service.record_blocked_action(proposal, decision)
+        except Exception:
+            logger.exception(
+                "Failed to record blocked action evidence",
+                extra={
+                    "action_id": str(proposal.action_id),
+                    "verdict": decision.verdict.value,
+                },
+            )
