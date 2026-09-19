@@ -31,7 +31,10 @@ from pathlib import Path
 
 from redteam.attack_graph.stores.memory import InMemoryAttackGraphStore
 from redteam.capability.bootstrap import build_mcp_tool_gateway
+from redteam.control.approval import ApprovalService
+from redteam.control.audit import AuditLog
 from redteam.control.service import DefaultControlPlane
+from redteam.control.stores.filesystem import FilesystemApprovalStore, FilesystemAuditStore
 from redteam.core.config import (
     AppConfig,
     CapabilityConfig,
@@ -51,6 +54,7 @@ from redteam.core.ports.evidence_store import EvidenceStore
 from redteam.core.ports.llm import LLMClient
 from redteam.core.ports.tool_gateway import ToolGateway
 from redteam.event_bus.memory import InMemoryEventBus
+from redteam.evidence.service import EvidenceService
 from redteam.evidence.stores.filesystem import FilesystemEvidenceStore
 from redteam.llm.fake import FakeLLMClient
 from redteam.orchestration.context import RuntimeDeps
@@ -84,15 +88,21 @@ async def _build_default_tool_gateway(config: CapabilityConfig) -> ToolGateway:
 
 
 async def build_runtime_deps(
-    engagement: Engagement, evidence_dir: str | Path = "data/evidence"
+    engagement: Engagement,
+    evidence_dir: str | Path = "data/evidence",
+    audit_dir: str | Path = "data/audit",
+    approval_dir: str | Path = "data/approvals",
 ) -> RuntimeDeps:
     """Wire in-memory/dummy backends for every port, from an ``Engagement`` alone.
 
     TODO(each-team): swap in your real backend here once it's ready —
     e.g. Capability Team adds real ``MCPAdapter``s to
-    ``_build_default_tool_gateway``, Control Team can inject a
-    persistent audit sink, Agent Team can swap
-    ``InMemoryAttackGraphStore`` for a real one.
+    ``_build_default_tool_gateway``, Agent Team can swap
+    ``InMemoryAttackGraphStore`` for a real one. Control Team's
+    persistent audit sink is wired below (``FilesystemAuditStore``) —
+    like ``evidence_dir``, ``audit_dir`` is a plain function parameter
+    rather than an ``AppConfig``/``LoggingConfig`` field, since it isn't
+    part of the frozen Contract v0.1 set and doesn't need to be.
 
     Prefer ``build_application`` over this function when you have a
     full ``AppConfig`` available — it reads the LLM/Capability/Logging
@@ -102,7 +112,16 @@ async def build_runtime_deps(
     graph_store = InMemoryAttackGraphStore()
     evidence_store = FilesystemEvidenceStore(evidence_dir)
     tool_gateway = await _build_default_tool_gateway(CapabilityConfig())
-    control_plane = DefaultControlPlane({engagement.engagement_id: engagement})
+    audit_log = AuditLog(FilesystemAuditStore(audit_dir))
+    approvals = ApprovalService(FilesystemApprovalStore(approval_dir))
+    control_plane = DefaultControlPlane(
+        {engagement.engagement_id: engagement},
+        audit_log=audit_log,
+        approvals=approvals,
+        # Same evidence_store the Orchestration side writes to, so blocked
+        # attempts and executed results land in one place.
+        evidence_service=EvidenceService(evidence_store),
+    )
     llm_client = FakeLLMClient()
 
     return RuntimeDeps(
@@ -125,6 +144,8 @@ async def build_application(
     attack_graph: AttackGraphStore | None = None,
     llm: LLMClient | None = None,
     evidence_dir: str | Path = "data/evidence",
+    audit_dir: str | Path = "data/audit",
+    approval_dir: str | Path = "data/approvals",
 ) -> tuple[Engagement, RuntimeDeps]:
     """``AppConfig``-aware composition root. Every dependency is overridable.
 
@@ -150,11 +171,16 @@ async def build_application(
 
     engagement = config.engagement.to_engagement(engagement_id=EngagementId(new_id("eng")))
 
+    # Build the evidence store first so both the Control Plane (blocked
+    # actions) and Orchestration (executed results) share one store.
+    resolved_evidence_store = evidence_store or FilesystemEvidenceStore(evidence_dir)
     resolved_control_plane = control_plane or DefaultControlPlane(
-        {engagement.engagement_id: engagement}
+        {engagement.engagement_id: engagement},
+        audit_log=AuditLog(FilesystemAuditStore(audit_dir)),
+        approvals=ApprovalService(FilesystemApprovalStore(approval_dir)),
+        evidence_service=EvidenceService(resolved_evidence_store),
     )
     resolved_tool_gateway = tool_gateway or await _build_default_tool_gateway(config.capability)
-    resolved_evidence_store = evidence_store or FilesystemEvidenceStore(evidence_dir)
     resolved_event_bus = event_bus or InMemoryEventBus()
     resolved_attack_graph = attack_graph or InMemoryAttackGraphStore()
     resolved_llm = llm or _build_llm_client(config.llm)

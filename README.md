@@ -43,6 +43,19 @@ python -m redteam.app.cli run examples/engagement.yaml
 # or:
 python examples/minimal_run.py
 
+# Inspect/resolve pending Approvals (human-in-the-loop, independent of
+# a `run` in progress -- operates on the persisted ApprovalStore)
+python -m redteam.app.cli approvals list
+python -m redteam.app.cli approvals resolve <approval_id> approved --by <name>
+# Run periodically to expire pending requests older than one hour
+python -m redteam.app.cli approvals expire --ttl-seconds 3600
+
+# Compare a run's evidence file with its index (changed/missing/extra records),
+# or purge runs past the retention window (both operate on the
+# persisted EvidenceStore directly, not through EvidenceService)
+python -m redteam.app.cli evidence verify --run <run_id>
+python -m redteam.app.cli evidence purge --days 90
+
 # Tests
 pytest -q
 
