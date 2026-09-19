@@ -104,7 +104,9 @@ async def test_resolve_rejects_nonterminal_status() -> None:
     with pytest.raises(ValueError, match="must be approved or rejected"):
         await service.resolve(approval.approval_id, ApprovalStatus.PENDING, "operator")
 
-    assert (await service.get(approval.approval_id)).status == ApprovalStatus.PENDING
+    pending = await service.get(approval.approval_id)
+    assert pending is not None
+    assert pending.status == ApprovalStatus.PENDING
 
 
 @pytest.mark.parametrize("ttl", [-1, float("nan"), float("inf")])
@@ -113,7 +115,9 @@ async def test_sweep_rejects_invalid_ttl(ttl: float) -> None:
     approval = await service.request(ActionId("action_1"))
     with pytest.raises(ValueError, match="finite and non-negative"):
         await service.sweep_expired(ttl)
-    assert (await service.get(approval.approval_id)).status == ApprovalStatus.PENDING
+    pending = await service.get(approval.approval_id)
+    assert pending is not None
+    assert pending.status == ApprovalStatus.PENDING
 
 
 async def test_cli_expire_updates_persisted_approvals(tmp_path: Path) -> None:
@@ -137,5 +141,8 @@ async def test_cli_expire_updates_persisted_approvals(tmp_path: Path) -> None:
     assert result.returncode == 0, result.stderr
     assert "Expired 1 approval(s)" in result.stdout
     restarted = ApprovalService(FilesystemApprovalStore(tmp_path))
-    assert (await restarted.get(old.approval_id)).status == ApprovalStatus.EXPIRED
-    assert (await restarted.get(recent.approval_id)).status == ApprovalStatus.PENDING
+    expired = await restarted.get(old.approval_id)
+    pending = await restarted.get(recent.approval_id)
+    assert expired is not None and pending is not None
+    assert expired.status == ApprovalStatus.EXPIRED
+    assert pending.status == ApprovalStatus.PENDING

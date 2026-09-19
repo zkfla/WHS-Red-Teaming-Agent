@@ -8,8 +8,8 @@ Proposed by Capability Team. PM review required before any `core` file changes.
 
 `ActionProposal.operation` is a canonical intent and is deliberately separate
 from the selected MCP `ToolId`. Orchestration currently has access only to
-`ToolGateway.invoke()` and therefore hardcodes `example.ping`; it cannot query
-the Capability Registry through an approved Core Port.
+`ToolGateway.invoke()` and therefore hardcodes a preferred tool binding; it
+cannot query the Capability Registry through an approved Core Port.
 
 Importing `redteam.capability` from Orchestration would violate the repository's
 dependency rules. Guessing a ToolId from `<capability>.<operation>` would also
@@ -54,9 +54,9 @@ read-only query through the existing dependency boundary.
 
 - PM/Core: approve and add the Protocol method.
 - Capability: concrete implementation is ready.
-- Agent/Orchestration: replace `example.ping` with candidate lookup and an
-  explicit selection strategy; handle an empty candidate list without calling
-  `invoke()`.
+- Agent/Orchestration: replace the preferred static binding with candidate
+  lookup and an explicit selection strategy; handle an empty candidate list
+  without calling `invoke()`.
 - Tests/fakes: add a deterministic `list_tools_for_action()` implementation.
 - Control: no change; ActionProposal is evaluated before execution as today.
 

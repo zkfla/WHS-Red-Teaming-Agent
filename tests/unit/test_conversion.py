@@ -30,8 +30,8 @@ def _proposal() -> ActionProposal:
         run_id=RunId("run_1"),
         engagement_id=EngagementId("eng_1"),
         agent_id=AgentId("agent_1"),
-        capability="recon.example",
-        operation="ping",
+        capability="recon",
+        operation="service_discovery",
         target=HostTarget(host="a.local"),
         reason="test",
         created_at=datetime.now(timezone.utc),
@@ -50,11 +50,11 @@ def test_build_tool_invocation_from_allow_decision() -> None:
     proposal = _proposal()
     decision = _decision(PolicyVerdict.ALLOW)
 
-    invocation = build_tool_invocation(proposal, decision, tool_id=ToolId("example.ping"))
+    invocation = build_tool_invocation(proposal, decision, tool_id=ToolId("recon.ping"))
 
     assert invocation.action_id == proposal.action_id
     assert invocation.run_id == proposal.run_id
-    assert invocation.tool_id == ToolId("example.ping")
+    assert invocation.tool_id == ToolId("recon.ping")
     assert invocation.execution_context.engagement_id == proposal.engagement_id
     assert invocation.execution_context.agent_id == proposal.agent_id
 
@@ -65,7 +65,7 @@ def test_build_tool_invocation_refuses_non_allow_decision(verdict: PolicyVerdict
     decision = _decision(verdict)
 
     with pytest.raises(NonAllowDecisionError):
-        build_tool_invocation(proposal, decision, tool_id=ToolId("example.ping"))
+        build_tool_invocation(proposal, decision, tool_id=ToolId("recon.ping"))
 
 
 def test_build_tool_invocation_refuses_mismatched_action_id() -> None:
@@ -73,14 +73,14 @@ def test_build_tool_invocation_refuses_mismatched_action_id() -> None:
     decision = _decision(PolicyVerdict.ALLOW, action_id=ActionId("some_other_action"))
 
     with pytest.raises(ValueError):
-        build_tool_invocation(proposal, decision, tool_id=ToolId("example.ping"))
+        build_tool_invocation(proposal, decision, tool_id=ToolId("recon.ping"))
 
 
 def test_tool_result_to_evidence_keeps_correlation() -> None:
     result = ToolResult(
         invocation_id=InvocationId("inv_1"),
         action_id=ActionId("action_1"),
-        tool_id=ToolId("example.ping"),
+        tool_id=ToolId("recon.ping"),
         success=True,
         output={"ok": True},
         started_at=datetime.now(timezone.utc),

@@ -12,11 +12,11 @@ engagement:
   approval_policy:
     auto_approve: false
     require_approval_for:
-      - web:http_request
-      - web:auth_attempt
-      - web:parameter_fuzz
-      - web:response_analysis
-      - recon:port_scan
+      - web.http_request
+      - web.auth_attempt
+      - web.parameter_fuzz
+      - web.response_analysis
+      - recon.port_scan
 capability:
   mcp_servers: [web-http, web-proxy, web-browser, recon-passive, recon-active]
 llm:

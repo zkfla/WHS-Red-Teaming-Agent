@@ -163,8 +163,8 @@ async def test_empty_server_config_preserves_example_gateway() -> None:
             invocation_id=InvocationId("inv_default_gateway"),
             action_id=ActionId("action_default_gateway"),
             run_id=run_id,
-            tool_id=ToolId("example.ping"),
-            operation="ping",
+            tool_id=ToolId("recon.ping"),
+            operation="service_discovery",
             arguments={"message": "ready"},
             execution_context=ExecutionContext(
                 engagement_id=EngagementId("eng_default_gateway"),

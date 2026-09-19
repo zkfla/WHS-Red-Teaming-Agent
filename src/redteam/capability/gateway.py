@@ -21,6 +21,7 @@ from redteam.capability.catalog import MCPToolCatalog
 from redteam.capability.registry import MCPToolRegistry
 from redteam.core.contracts.tool import ToolDescriptor, ToolError, ToolInvocation, ToolResult
 from redteam.core.enums import ToolHealthStatus
+from redteam.core.ids import ToolId
 
 
 class MCPToolGateway:
@@ -57,6 +58,13 @@ class MCPToolGateway:
         self._server_output_limits = {
             server_id: output_limits.get(server_id, 1_048_576) for server_id in adapters
         }
+
+    def get(self, tool_id: ToolId) -> ToolDescriptor | None:
+        """Expose a defensive catalog snapshot to the application composition root."""
+        return self._registry.get(tool_id)
+
+    def list_by_capability(self, capability_tag: str) -> list[ToolDescriptor]:
+        return self._registry.list_by_capability(capability_tag)
 
     async def invoke(self, invocation: ToolInvocation) -> ToolResult:
         descriptor = self._registry.get(invocation.tool_id)

@@ -7,6 +7,7 @@ requires-python = ">=3.10"
 license = { text = "Proprietary" }
 dependencies = [
     "pydantic>=2.6",
+    "jsonschema>=4.20,<5.0",
     "langgraph>=0.2",
     "mcp>=2,<3",
     "pyyaml>=6.0",
@@ -15,16 +16,25 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# LiteLLM currently requires Python 3.11+ (uses typing.NotRequired).
-# Kept optional so the base install works on the team's current 3.10
-# environments; install this extra once you're on 3.11+ to use
-# redteam.llm.litellm.LiteLLMClient for real.
+orchestration = [
+    "langgraph>=1.2,<2.0",
+    "langchain>=1.4,<2.0",
+    "langchain-litellm>=0.7,<1.0",
+    "langchain-mcp-adapters>=0.3,<1.0",
+    "langgraph-checkpoint-sqlite>=3.1,<4.0",
+    "aiosqlite>=0.22,<1.0",
+]
+# Direct LiteLLM adapter support. The orchestration extra also installs
+# LiteLLM transitively through langchain-litellm.
 llm = [
     "litellm>=1.50",
 ]
 dev = [
+    "langgraph-checkpoint-sqlite>=3.1,<4.0",
+    "aiosqlite>=0.22,<1.0",
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
+    "hypothesis>=6.168",
     "ruff>=0.6",
     "mypy>=1.10",
 ]

@@ -56,7 +56,10 @@ async def _build_gateway(
         example = ExampleMCPAdapter()
         registry = MCPToolRegistry()
         registry.replace_server_tools(example.server_id, await example.discover_tools())
-        return MCPToolGateway(registry, {example.server_id: example})
+        return MCPToolGateway(
+            registry, {example.server_id: example},
+            {str(tool.tool_id): ("service_discovery",) for tool in registry.all()},
+        )
 
     if len(server_ids) != len(set(server_ids)):
         raise MCPConfigurationError("CapabilityConfig.mcp_servers contains duplicates")

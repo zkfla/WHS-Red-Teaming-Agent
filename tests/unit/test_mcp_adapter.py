@@ -61,7 +61,7 @@ def _invocation(
         invocation_id=InvocationId("inv_1"),
         action_id=ActionId("action_1"),
         run_id=RunId("run_1"),
-        tool_id=tool_id or ToolId("example.ping"),
+        tool_id=tool_id or ToolId("recon.ping"),
         operation=operation,
         arguments={"message": "hi"},
         timeout_seconds=timeout_seconds,
