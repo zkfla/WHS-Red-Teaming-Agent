@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+from redteam.capability.adapters.mcp.transport import StdioMCPTransport
 from redteam.capability.bootstrap import build_mcp_tool_gateway
 from redteam.core.contracts.tool import ExecutionContext, ToolInvocation
 from redteam.core.ids import ActionId, EngagementId, InvocationId, RunId, ToolId
@@ -59,3 +60,21 @@ async def test_all_adapter_kinds_support_real_stdio_discovery_and_invocation(
 
     assert result.success is True
     assert result.output == {"message": "stdio-ready", "status": "ok"}
+
+
+async def test_scoped_stdio_survives_multiple_child_task_calls() -> None:
+    import asyncio
+
+    server = Path(__file__).parents[2] / "deploy/docker/mcp-example/server.py"
+    transport = StdioMCPTransport(
+        sys.executable, args=[str(server)], env={"MCP_EXAMPLE_TRANSPORT": "stdio"},
+    )
+    async with transport.session():
+        assert await transport.health_check()
+        assert (await transport.list_tools())[0].name == "ping"
+        for message in ("first", "second"):
+            result = await asyncio.wait_for(
+                transport.call_tool("ping", {"message": message}), timeout=5,
+            )
+            assert result.output == {"message": message, "status": "ok"}
+    assert not await transport.health_check()

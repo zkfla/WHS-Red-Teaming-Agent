@@ -35,8 +35,62 @@ class MCPTransport(Protocol):
     async def health_check(self) -> bool: ...
 
 
+class AllowlistedMCPTransport:
+    """Only expose and invoke the operator-selected remote tool names."""
+
+    def __init__(self, transport: MCPTransport, allowed_tools: tuple[str, ...]) -> None:
+        self._transport = transport
+        self._allowed = frozenset(allowed_tools)
+
+    async def list_tools(self) -> list[RemoteTool]:
+        tools = await self._transport.list_tools()
+        if self._allowed - {tool.name for tool in tools}:
+            raise ValueError("configured tool allowlist does not match the server catalog")
+        return [tool for tool in tools if tool.name in self._allowed]
+
+    async def call_tool(self, tool_name: str, arguments: dict[str, Any]) -> RemoteCallResult:
+        if tool_name not in self._allowed:
+            raise ValueError("tool is not enabled by the operator")
+        return await self._transport.call_tool(tool_name, arguments)
+
+    async def health_check(self) -> bool:
+        return await self._transport.health_check()
+
+
 class _SDKMCPTransport:
     """Shared MCP SDK result mapping for concrete connection transports."""
+
+    _session_client: Any = None
+    _session_ended = False
+
+    @asynccontextmanager
+    async def session(self) -> AsyncIterator[None]:
+        """Keep one client alive within its owning task's explicit lifecycle.
+
+        Enter/exit in the same task (SDK task groups require this). Child tasks
+        may call tools, but must finish before the session exits. No reconnect
+        or automatic replay is performed after a failure.
+        """
+        if self._session_client is not None:
+            raise RuntimeError("MCP session is already open")
+        async with self._connect_client() as client:
+            self._session_ended = False
+            self._session_client = client
+            try:
+                yield
+            finally:
+                self._session_client = None
+                self._session_ended = True
+
+    @asynccontextmanager
+    async def _open_client(self) -> AsyncIterator[Any]:
+        if self._session_client is not None:
+            yield self._session_client
+        elif self._session_ended:
+            raise RuntimeError("MCP session scope has ended")
+        else:
+            async with self._connect_client() as client:
+                yield client
 
     async def list_tools(self) -> list[RemoteTool]:
         discovered: list[RemoteTool] = []
@@ -91,7 +145,7 @@ class _SDKMCPTransport:
         except Exception:
             return False
 
-    def _open_client(self) -> Any:
+    def _connect_client(self) -> Any:
         raise NotImplementedError
 
 
@@ -106,7 +160,7 @@ class StreamableHTTPMCPTransport(_SDKMCPTransport):
         self._headers = dict(headers or {})
 
     @asynccontextmanager
-    async def _open_client(self) -> AsyncIterator[Any]:
+    async def _connect_client(self) -> AsyncIterator[Any]:
         Client = _load_mcp_client()
         if not self._headers:
             async with Client(self._endpoint) as client:
@@ -148,7 +202,7 @@ class StdioMCPTransport(_SDKMCPTransport):
         self._env = dict(env or {})
 
     @asynccontextmanager
-    async def _open_client(self) -> AsyncIterator[Any]:
+    async def _connect_client(self) -> AsyncIterator[Any]:
         Client = _load_mcp_client()
         try:
             from mcp import StdioServerParameters

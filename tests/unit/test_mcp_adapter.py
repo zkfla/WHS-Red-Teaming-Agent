@@ -14,7 +14,11 @@ from redteam.capability.adapters.mcp.example import ExampleMCPAdapter
 from redteam.capability.adapters.mcp.mobile import MobileMCPAdapter
 from redteam.capability.adapters.mcp.naming import build_mcp_tool_id
 from redteam.capability.adapters.mcp.recon import ReconMCPAdapter
-from redteam.capability.adapters.mcp.transport import RemoteCallResult, RemoteTool
+from redteam.capability.adapters.mcp.transport import (
+    AllowlistedMCPTransport,
+    RemoteCallResult,
+    RemoteTool,
+)
 from redteam.capability.adapters.mcp.web_api import WebAPIMCPAdapter
 from redteam.capability.gateway import MCPToolGateway
 from redteam.capability.registry import MCPToolRegistry, ToolRegistrationConflictError
@@ -254,17 +258,53 @@ def test_registry_replaces_one_servers_discovery_snapshot_atomically() -> None:
     assert registry.get(ToolId("web.old")) is None
 
 
-async def test_gateway_rejects_operation_mismatch() -> None:
-    adapter = ExampleMCPAdapter()
+async def test_gateway_routes_tool_when_intent_differs_from_remote_tool_name() -> None:
+    backend = FakeTransport(tools=[RemoteTool("http_request", "", {})])
+    adapter = WebAPIMCPAdapter(server_id="http", transport=backend)
     registry = MCPToolRegistry()
-    registry.register((await adapter.discover_tools())[0])
-    gateway = MCPToolGateway(registry, {adapter.server_id: adapter})
+    registry.replace_server_tools("http", await adapter.discover_tools())
+    gateway = MCPToolGateway(
+        registry,
+        {adapter.server_id: adapter},
+        {"web.http_request": ("http_request", "response_analysis")},
+    )
 
-    result = await gateway.invoke(_invocation(operation="not-ping"))
+    result = await gateway.invoke(
+        _invocation(
+            tool_id=ToolId("web.http_request"),
+            operation="response_analysis",
+        )
+    )
+
+    assert result.success is True
+    assert backend.calls == [("http_request", {"message": "hi"})]
+    assert [
+        tool.tool_id for tool in gateway.list_tools_for_action("web", "response_analysis")
+    ] == [ToolId("web.http_request")]
+
+
+async def test_gateway_blocks_tool_substitution_outside_operation_binding() -> None:
+    backend = FakeTransport(tools=[RemoteTool("proxy_mutate_json", "", {})])
+    adapter = WebAPIMCPAdapter(server_id="proxy", transport=backend)
+    registry = MCPToolRegistry()
+    registry.replace_server_tools("proxy", await adapter.discover_tools())
+    gateway = MCPToolGateway(
+        registry,
+        {adapter.server_id: adapter},
+        {"web.proxy_mutate_json": ("parameter_fuzz",)},
+    )
+
+    result = await gateway.invoke(
+        _invocation(
+            tool_id=ToolId("web.proxy_mutate_json"),
+            operation="response_analysis",
+        )
+    )
 
     assert result.success is False
     assert result.error is not None
-    assert result.error.code == "operation_mismatch"
+    assert result.error.code == "operation_not_allowed_for_tool"
+    assert backend.calls == []
 
 
 class SlowAdapter(ExampleMCPAdapter):
@@ -285,3 +325,121 @@ async def test_gateway_enforces_invocation_timeout() -> None:
     assert result.error is not None
     assert result.error.code == "tool_timeout"
     assert result.error.retryable is True
+
+
+async def test_gateway_blocks_unhealthy_server_before_transport_call() -> None:
+    backend = FakeTransport(tools=[RemoteTool("http_request", "", {})], healthy=False)
+    adapter = WebAPIMCPAdapter(server_id="http", transport=backend)
+    registry = MCPToolRegistry()
+    registry.replace_server_tools("http", await adapter.discover_tools())
+    gateway = MCPToolGateway(registry, {adapter.server_id: adapter})
+
+    result = await gateway.invoke(
+        _invocation(tool_id=ToolId("web.http_request"), operation="http_request")
+    )
+
+    assert result.success is False
+    assert result.error is not None
+    assert result.error.code == "tool_unhealthy"
+    assert result.error.retryable is True
+    assert backend.calls == []
+
+
+class ConcurrentAdapter(ExampleMCPAdapter):
+    def __init__(self) -> None:
+        self.active = 0
+        self.peak = 0
+
+    async def invoke(self, tool: ToolDescriptor, arguments: dict[str, Any]) -> MCPCallResult:
+        self.active += 1
+        self.peak = max(self.peak, self.active)
+        try:
+            await asyncio.sleep(0.01)
+            return await super().invoke(tool, arguments)
+        finally:
+            self.active -= 1
+
+
+async def test_gateway_limits_concurrency_per_mcp_server() -> None:
+    adapter = ConcurrentAdapter()
+    registry = MCPToolRegistry()
+    registry.replace_server_tools(adapter.server_id, await adapter.discover_tools())
+    gateway = MCPToolGateway(
+        registry,
+        {adapter.server_id: adapter},
+        server_concurrency={adapter.server_id: 1},
+    )
+
+    first, second = await asyncio.gather(
+        gateway.invoke(_invocation()),
+        gateway.invoke(_invocation()),
+    )
+
+    assert first.success and second.success
+    assert adapter.peak == 1
+
+
+def test_gateway_rejects_concurrency_for_unknown_server() -> None:
+    with pytest.raises(ValueError, match="unknown MCP servers"):
+        MCPToolGateway(MCPToolRegistry(), {}, server_concurrency={"typo": 1})
+
+
+async def test_gateway_omits_output_above_server_byte_limit() -> None:
+    backend = FakeTransport(
+        tools=[RemoteTool("http_request", "", {})],
+        result=RemoteCallResult(is_error=False, output={"body": "가" * 100}),
+    )
+    adapter = WebAPIMCPAdapter(server_id="http", transport=backend)
+    registry = MCPToolRegistry()
+    registry.replace_server_tools("http", await adapter.discover_tools())
+    gateway = MCPToolGateway(
+        registry,
+        {adapter.server_id: adapter},
+        server_output_limits={adapter.server_id: 128},
+    )
+
+    result = await gateway.invoke(
+        _invocation(tool_id=ToolId("web.http_request"), operation="http_request")
+    )
+
+    assert result.success is False
+    assert result.output is None
+    assert result.error is not None
+    assert result.error.code == "tool_output_too_large"
+    assert result.error.retryable is False
+    assert result.metadata["output_omitted"] is True
+    assert result.metadata["output_bytes"] > result.metadata["max_output_bytes"]
+
+
+def test_gateway_rejects_output_limit_for_unknown_server() -> None:
+    with pytest.raises(ValueError, match="unknown MCP servers"):
+        MCPToolGateway(MCPToolRegistry(), {}, server_output_limits={"typo": 1024})
+
+
+async def test_allowlist_hides_and_blocks_unsafe_remote_tools() -> None:
+    backend = FakeTransport(tools=[
+        RemoteTool("browser_snapshot", "", {}), RemoteTool("browser_run_code_unsafe", "", {}),
+    ])
+    filtered = AllowlistedMCPTransport(backend, ("browser_snapshot",))
+    assert [tool.name for tool in await filtered.list_tools()] == ["browser_snapshot"]
+    with pytest.raises(ValueError, match="not enabled"):
+        await filtered.call_tool("browser_run_code_unsafe", {})
+    assert backend.calls == []
+
+
+async def test_allowlist_fails_on_upstream_tool_drift() -> None:
+    filtered = AllowlistedMCPTransport(FakeTransport(), ("browser_snapshot",))
+    with pytest.raises(ValueError, match="does not match"):
+        await filtered.list_tools()
+
+
+async def test_dry_run_does_not_invoke_transport() -> None:
+    transport = FakeTransport(tools=[RemoteTool("http_request", "", {})])
+    adapter = WebAPIMCPAdapter(server_id="http", transport=transport)
+    registry = MCPToolRegistry()
+    registry.replace_server_tools("http", await adapter.discover_tools())
+    invocation = _invocation(tool_id=ToolId("web.http_request"), operation="http_request")
+    invocation.execution_context.dry_run = True
+    result = await MCPToolGateway(registry, {"http": adapter}).invoke(invocation)
+    assert result.success and result.output == {"dry_run": True, "executed": False}
+    assert transport.calls == []

@@ -27,6 +27,8 @@ def test_server_settings_load_endpoint_kind_risk_and_secret_by_indirection(
     monkeypatch.setenv("REDTEAM_MCP_WEB_EXAMPLE_ENDPOINT", "http://127.0.0.1:8765/mcp")
     monkeypatch.setenv("REDTEAM_MCP_WEB_EXAMPLE_KIND", "web_api")
     monkeypatch.setenv("REDTEAM_MCP_WEB_EXAMPLE_RISK_LEVEL", "medium")
+    monkeypatch.setenv("REDTEAM_MCP_WEB_EXAMPLE_MAX_CONCURRENCY", "3")
+    monkeypatch.setenv("REDTEAM_MCP_WEB_EXAMPLE_MAX_OUTPUT_BYTES", "262144")
     monkeypatch.setenv("REDTEAM_MCP_WEB_EXAMPLE_TOKEN_ENV_VAR", "TEST_MCP_TOKEN")
     monkeypatch.setenv("TEST_MCP_TOKEN", "secret-value")
 
@@ -35,8 +37,32 @@ def test_server_settings_load_endpoint_kind_risk_and_secret_by_indirection(
     assert settings.kind == MCPServerKind.WEB_API
     assert settings.transport == MCPTransportKind.STREAMABLE_HTTP
     assert settings.risk_level == RiskLevel.MEDIUM
+    assert settings.max_concurrency == 3
+    assert settings.max_output_bytes == 262144
     assert settings.request_headers() == {"Authorization": "Bearer secret-value"}
     assert "secret-value" not in repr(settings)
+
+
+def test_server_settings_load_canonical_tool_operation_bindings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("REDTEAM_MCP_WEB_ENDPOINT", "http://localhost:8765/mcp")
+    monkeypatch.setenv("REDTEAM_MCP_WEB_KIND", "web_api")
+    monkeypatch.setenv(
+        "REDTEAM_MCP_WEB_ALLOWED_TOOLS_JSON",
+        '["http_request","operator_status"]',
+    )
+    monkeypatch.setenv(
+        "REDTEAM_MCP_WEB_TOOL_OPERATIONS_JSON",
+        '{"http_request":["http_request","response_analysis"],"operator_status":[]}',
+    )
+
+    settings = MCPServerSettings.from_environment("web")
+
+    assert settings.tool_operations == {
+        "http_request": ("http_request", "response_analysis"),
+        "operator_status": (),
+    }
 
 
 def test_remote_plain_http_requires_explicit_lab_opt_in(
@@ -55,6 +81,30 @@ def test_remote_plain_http_requires_explicit_lab_opt_in(
 def test_invalid_server_id_cannot_be_mapped_to_environment() -> None:
     with pytest.raises(MCPConfigurationError):
         environment_prefix("../../secret")
+
+
+@pytest.mark.parametrize("value", ["0", "33", "1.5", "many"])
+def test_invalid_server_concurrency_rejected(
+    monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    monkeypatch.setenv("REDTEAM_MCP_WEB_KIND", "web_api")
+    monkeypatch.setenv("REDTEAM_MCP_WEB_ENDPOINT", "http://localhost:8765/mcp")
+    monkeypatch.setenv("REDTEAM_MCP_WEB_MAX_CONCURRENCY", value)
+
+    with pytest.raises(MCPConfigurationError, match="MAX_CONCURRENCY"):
+        MCPServerSettings.from_environment("web")
+
+
+@pytest.mark.parametrize("value", ["0", "1023", "16777217", "1.5", "many"])
+def test_invalid_server_output_limit_rejected(
+    monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    monkeypatch.setenv("REDTEAM_MCP_WEB_KIND", "web_api")
+    monkeypatch.setenv("REDTEAM_MCP_WEB_ENDPOINT", "http://localhost:8765/mcp")
+    monkeypatch.setenv("REDTEAM_MCP_WEB_MAX_OUTPUT_BYTES", value)
+
+    with pytest.raises(MCPConfigurationError, match="MAX_OUTPUT_BYTES"):
+        MCPServerSettings.from_environment("web")
 
 
 def test_endpoint_credentials_are_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -130,3 +180,47 @@ async def test_empty_server_config_preserves_example_gateway() -> None:
 async def test_duplicate_server_ids_fail_before_discovery() -> None:
     with pytest.raises(MCPConfigurationError, match="duplicates"):
         await build_mcp_tool_gateway(["web", "web"])
+
+
+@pytest.mark.parametrize("value", ['[]', '{}', '[null]', '["a","a"]', 'not-json'])
+def test_invalid_tool_allowlist_rejected(monkeypatch: pytest.MonkeyPatch, value: str) -> None:
+    monkeypatch.setenv("REDTEAM_MCP_BROWSER_KIND", "web_api")
+    monkeypatch.setenv("REDTEAM_MCP_BROWSER_ENDPOINT", "http://localhost:8931/mcp")
+    monkeypatch.setenv("REDTEAM_MCP_BROWSER_ALLOWED_TOOLS_JSON", value)
+    with pytest.raises(MCPConfigurationError, match="ALLOWED_TOOLS_JSON"):
+        MCPServerSettings.from_environment("browser")
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "[]",
+        "{}",
+        '{"request":"http_request"}',
+        '{"request":["HTTP_REQUEST"]}',
+        '{"request":["http_request","http_request"]}',
+        "not-json",
+    ],
+)
+def test_invalid_tool_operation_bindings_rejected(
+    monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    monkeypatch.setenv("REDTEAM_MCP_WEB_KIND", "web_api")
+    monkeypatch.setenv("REDTEAM_MCP_WEB_ENDPOINT", "http://localhost:8931/mcp")
+    monkeypatch.setenv("REDTEAM_MCP_WEB_TOOL_OPERATIONS_JSON", value)
+    with pytest.raises(MCPConfigurationError, match="TOOL_OPERATIONS_JSON"):
+        MCPServerSettings.from_environment("web")
+
+
+def test_tool_operation_binding_keys_must_match_tool_allowlist(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("REDTEAM_MCP_WEB_KIND", "web_api")
+    monkeypatch.setenv("REDTEAM_MCP_WEB_ENDPOINT", "http://localhost:8931/mcp")
+    monkeypatch.setenv("REDTEAM_MCP_WEB_ALLOWED_TOOLS_JSON", '["http_request"]')
+    monkeypatch.setenv(
+        "REDTEAM_MCP_WEB_TOOL_OPERATIONS_JSON",
+        '{"different_tool":["http_request"]}',
+    )
+    with pytest.raises(MCPConfigurationError, match="keys must exactly match"):
+        MCPServerSettings.from_environment("web")
