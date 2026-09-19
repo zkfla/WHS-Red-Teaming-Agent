@@ -25,13 +25,18 @@ Two entry points build a ``RuntimeDeps``:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
 
+from redteam.attack_graph.service import AttackGraphService
 from redteam.attack_graph.stores.memory import InMemoryAttackGraphStore
 from redteam.capability.bootstrap import build_mcp_tool_gateway
+from redteam.control.approval import ApprovalService
+from redteam.control.audit import AuditLog
 from redteam.control.service import DefaultControlPlane
+from redteam.control.stores.filesystem import FilesystemApprovalStore, FilesystemAuditStore
 from redteam.core.config import (
     AppConfig,
     CapabilityConfig,
@@ -51,11 +56,25 @@ from redteam.core.ports.evidence_store import EvidenceStore
 from redteam.core.ports.llm import LLMClient
 from redteam.core.ports.tool_gateway import ToolGateway
 from redteam.event_bus.memory import InMemoryEventBus
+from redteam.evidence.service import EvidenceService
 from redteam.evidence.stores.filesystem import FilesystemEvidenceStore
 from redteam.llm.fake import FakeLLMClient
+from redteam.orchestration.agents.providers import (
+    CandidateProviderRegistry,
+    default_provider_registry,
+)
+from redteam.orchestration.agents.registry import AgentRegistry, default_registry
+from redteam.orchestration.candidates.catalog import ToolCatalog
 from redteam.orchestration.context import RuntimeDeps
-from redteam.orchestration.graph import build_graph
-from redteam.orchestration.state import RuntimeState
+from redteam.orchestration.events import REPORT_PROJECTED
+from redteam.orchestration.reporting import ReportingAgent
+from redteam.orchestration.runner import AgentLoopRunner
+from redteam.orchestration.seed import seed_from_engagement
+from redteam.orchestration.settings import OrchestrationSettings
+from redteam.orchestration.state import RuntimeState, TerminationReason
+from redteam.orchestration.work.memory import InMemoryWorkStore
+from redteam.orchestration.work.sqlite import SQLiteWorkStore
+from redteam.orchestration.work.store import WorkStore
 
 
 def load_engagement(path: str | Path) -> Engagement:
@@ -77,22 +96,41 @@ def _build_llm_client(config: LLMConfig) -> LLMClient:
     return FakeLLMClient()
 
 
-async def _build_default_tool_gateway(config: CapabilityConfig) -> ToolGateway:
-    """Build configured MCP servers or the deterministic empty-config default."""
+async def _build_default_capability(
+    config: CapabilityConfig,
+) -> tuple[ToolGateway, ToolCatalog]:
+    """Build one configured gateway and expose its read-only tool catalog."""
+    gateway = await build_mcp_tool_gateway(config.mcp_servers)
+    return gateway, gateway
 
-    return await build_mcp_tool_gateway(config.mcp_servers)
+
+async def _build_default_tool_gateway(config: CapabilityConfig) -> ToolGateway:
+    """Compatibility helper for callers that only need execution."""
+    gateway, _ = await _build_default_capability(config)
+    return gateway
 
 
 async def build_runtime_deps(
-    engagement: Engagement, evidence_dir: str | Path = "data/evidence"
+    engagement: Engagement,
+    evidence_dir: str | Path = "data/evidence",
+    audit_dir: str | Path = "data/audit",
+    approval_dir: str | Path = "data/approvals",
+    *,
+    orchestration_settings: OrchestrationSettings | None = None,
+    agents: AgentRegistry | None = None,
+    candidate_providers: CandidateProviderRegistry | None = None,
+    tool_catalog: ToolCatalog | None = None,
 ) -> RuntimeDeps:
     """Wire in-memory/dummy backends for every port, from an ``Engagement`` alone.
 
     TODO(each-team): swap in your real backend here once it's ready —
     e.g. Capability Team adds real ``MCPAdapter``s to
-    ``_build_default_tool_gateway``, Control Team can inject a
-    persistent audit sink, Agent Team can swap
-    ``InMemoryAttackGraphStore`` for a real one.
+    ``_build_default_tool_gateway``, Agent Team can swap
+    ``InMemoryAttackGraphStore`` for a real one. Control Team's
+    persistent audit sink is wired below (``FilesystemAuditStore``) —
+    like ``evidence_dir``, ``audit_dir`` is a plain function parameter
+    rather than an ``AppConfig``/``LoggingConfig`` field, since it isn't
+    part of the frozen Contract v0.1 set and doesn't need to be.
 
     Prefer ``build_application`` over this function when you have a
     full ``AppConfig`` available — it reads the LLM/Capability/Logging
@@ -101,9 +139,19 @@ async def build_runtime_deps(
     event_bus = InMemoryEventBus()
     graph_store = InMemoryAttackGraphStore()
     evidence_store = FilesystemEvidenceStore(evidence_dir)
-    tool_gateway = await _build_default_tool_gateway(CapabilityConfig())
-    control_plane = DefaultControlPlane({engagement.engagement_id: engagement})
+    tool_gateway, discovered_catalog = await _build_default_capability(CapabilityConfig())
+    audit_log = AuditLog(FilesystemAuditStore(audit_dir))
+    approvals = ApprovalService(FilesystemApprovalStore(approval_dir))
+    control_plane = DefaultControlPlane(
+        {engagement.engagement_id: engagement},
+        audit_log=audit_log,
+        approvals=approvals,
+        # Same evidence_store the Orchestration side writes to, so blocked
+        # attempts and executed results land in one place.
+        evidence_service=EvidenceService(evidence_store),
+    )
     llm_client = FakeLLMClient()
+    settings = orchestration_settings or OrchestrationSettings()
 
     return RuntimeDeps(
         control_plane=control_plane,
@@ -112,7 +160,22 @@ async def build_runtime_deps(
         graph_store=graph_store,
         evidence_store=evidence_store,
         llm_client=llm_client,
+        agents=agents if agents is not None else default_registry(),
+        candidate_providers=(
+            candidate_providers
+            if candidate_providers is not None
+            else default_provider_registry()
+        ),
+        tool_catalog=(tool_catalog if tool_catalog is not None else discovered_catalog),
+        work_store=_build_work_store(settings),
+        settings=settings,
     )
+
+
+def _build_work_store(settings: OrchestrationSettings) -> WorkStore:
+    if settings.work_backend == "sqlite":
+        return SQLiteWorkStore(settings.work_path)
+    return InMemoryWorkStore()
 
 
 async def build_application(
@@ -125,6 +188,12 @@ async def build_application(
     attack_graph: AttackGraphStore | None = None,
     llm: LLMClient | None = None,
     evidence_dir: str | Path = "data/evidence",
+    audit_dir: str | Path = "data/audit",
+    approval_dir: str | Path = "data/approvals",
+    orchestration_settings: OrchestrationSettings | None = None,
+    agents: AgentRegistry | None = None,
+    candidate_providers: CandidateProviderRegistry | None = None,
+    tool_catalog: ToolCatalog | None = None,
 ) -> tuple[Engagement, RuntimeDeps]:
     """``AppConfig``-aware composition root. Every dependency is overridable.
 
@@ -136,9 +205,9 @@ async def build_application(
     - ``config.llm`` -> ``_build_llm_client`` (``FakeLLMClient`` unless
       ``provider: "litellm"``).
     - ``config.capability`` -> ``_build_default_tool_gateway``.
-    - ``config.orchestration`` -> not consumed here; pass it to
-      ``run_engagement(..., orchestration_config=config.orchestration)``
-      so ``RuntimeState.remaining_budget`` reflects ``max_steps``.
+    - ``config.orchestration`` -> ``OrchestrationSettings.from_config``;
+      an explicit ``orchestration_settings`` may additionally select durable
+      checkpoint/work-ledger backends and bounded parallelism.
     - ``config.logging`` -> ``logging.basicConfig`` below.
 
     Passing an explicit keyword (e.g. ``control_plane=FakeControlPlane()``)
@@ -150,14 +219,30 @@ async def build_application(
 
     engagement = config.engagement.to_engagement(engagement_id=EngagementId(new_id("eng")))
 
-    resolved_control_plane = control_plane or DefaultControlPlane(
-        {engagement.engagement_id: engagement}
-    )
-    resolved_tool_gateway = tool_gateway or await _build_default_tool_gateway(config.capability)
+    # Build the evidence store first so both the Control Plane (blocked
+    # actions) and Orchestration (executed results) share one store.
     resolved_evidence_store = evidence_store or FilesystemEvidenceStore(evidence_dir)
+    resolved_control_plane = control_plane or DefaultControlPlane(
+        {engagement.engagement_id: engagement},
+        audit_log=AuditLog(FilesystemAuditStore(audit_dir)),
+        approvals=ApprovalService(FilesystemApprovalStore(approval_dir)),
+        evidence_service=EvidenceService(resolved_evidence_store),
+    )
+    resolved_tool_catalog = tool_catalog
+    if tool_gateway is None:
+        resolved_tool_gateway, discovered_catalog = await _build_default_capability(
+            config.capability
+        )
+        if resolved_tool_catalog is None:
+            resolved_tool_catalog = discovered_catalog
+    else:
+        resolved_tool_gateway = tool_gateway
     resolved_event_bus = event_bus or InMemoryEventBus()
     resolved_attack_graph = attack_graph or InMemoryAttackGraphStore()
     resolved_llm = llm or _build_llm_client(config.llm)
+    resolved_settings = orchestration_settings or OrchestrationSettings.from_config(
+        config.orchestration
+    )
 
     deps = RuntimeDeps(
         control_plane=resolved_control_plane,
@@ -166,8 +251,71 @@ async def build_application(
         graph_store=resolved_attack_graph,
         evidence_store=resolved_evidence_store,
         llm_client=resolved_llm,
+        agents=agents if agents is not None else default_registry(),
+        candidate_providers=(
+            candidate_providers
+            if candidate_providers is not None
+            else default_provider_registry()
+        ),
+        tool_catalog=resolved_tool_catalog,
+        work_store=_build_work_store(resolved_settings),
+        settings=resolved_settings,
     )
     return engagement, deps
+
+
+async def _publish_terminal_artifacts(
+    runtime: RuntimeState,
+    deps: RuntimeDeps,
+    *,
+    error_type: str | None = None,
+) -> None:
+    """Project and publish a report for every terminal outcome."""
+
+    report = await ReportingAgent().project(
+        runtime,
+        graph=AttackGraphService(deps.graph_store),
+        evidence_store=deps.evidence_store,
+        work_store=deps.work_store,
+    )
+    await deps.event_bus.publish(
+        EventEnvelope(
+            event_id=EventId(new_id("evt")),
+            event_type=REPORT_PROJECTED,
+            run_id=runtime.run_id,
+            engagement_id=runtime.engagement_id,
+            source="orchestration.reporting",
+            timestamp=datetime.now(timezone.utc),
+            payload={
+                "ready_for_release": report.ready_for_release,
+                "finding_count": report.finding_count,
+                "evidence_count": report.evidence_count,
+                "integrity_blockers": report.integrity_blockers,
+                "unresolved_hypotheses": report.unresolved_hypotheses,
+                "outstanding_cleanup": report.outstanding_cleanup,
+                "pending_approval_id": report.pending_approval_id,
+                "effectiveness": report.effectiveness.model_dump(mode="json"),
+            },
+        )
+    )
+    await deps.event_bus.publish(
+        EventEnvelope(
+            event_id=EventId(new_id("evt")),
+            event_type=EventType.RUN_FINISHED,
+            run_id=runtime.run_id,
+            engagement_id=runtime.engagement_id,
+            source="app.bootstrap",
+            timestamp=datetime.now(timezone.utc),
+            payload={
+                "phase": runtime.phase.value,
+                "termination_reason": runtime.termination_reason,
+                "pending_approval_id": runtime.pending_approval_id,
+                "actions_executed": runtime.actions_executed,
+                "steps": runtime.step_count,
+                "error_type": error_type,
+            },
+        )
+    )
 
 
 async def run_engagement(
@@ -175,16 +323,32 @@ async def run_engagement(
     deps: RuntimeDeps | None = None,
     orchestration_config: OrchestrationConfig | None = None,
 ) -> RuntimeState:
-    """Runs the Minimal Vertical Slice (instruction.md section 16) once.
+    """Runs one engagement: OBSERVE -> ... -> REPLAN, looping until a
+    terminal phase (instruction.md section 16, now with real re-planning).
 
-    ``orchestration_config``, when given, sets
-    ``RuntimeState.remaining_budget`` from ``max_steps`` — the one place
-    ``OrchestrationConfig`` currently reaches Orchestration.
-    ``max_retries`` isn't consumed yet (no retry logic exists —
-    TODO(agent-team)).
+    ``orchestration_config``, when given, feeds
+    ``OrchestrationSettings`` (turn ceiling, retry budget) and sets
+    ``RuntimeState.remaining_budget``. The engagement's own
+    ``ExecutionBudget`` is enforced separately and authoritatively by the
+    Control Plane — nothing here can widen it.
+
+    Before the loop starts, the engagement scope is seeded into the
+    Attack Graph (``orchestration.seed``): an empty graph means an empty
+    frontier, so without this the planner would have nothing to choose
+    from on the first turn.
     """
     deps = deps if deps is not None else await build_runtime_deps(engagement)
+    settings = deps.settings
+    if orchestration_config is not None:
+        settings = settings.model_copy(
+            update={
+                "max_steps": orchestration_config.max_steps,
+                "max_retries": orchestration_config.max_retries,
+            }
+        )
     run_id = RunId(new_id("run"))
+
+    await seed_from_engagement(AttackGraphService(deps.graph_store), engagement, run_id=run_id)
 
     await deps.event_bus.publish(
         EventEnvelope(
@@ -198,31 +362,44 @@ async def run_engagement(
         )
     )
 
-    graph = build_graph(deps)
-    initial_state = {
-        "runtime": RuntimeState(
-            run_id=run_id,
-            engagement_id=engagement.engagement_id,
-            phase=AgentPhase.OBSERVE,
-            current_goal="validate architecture wiring end-to-end",
-            remaining_budget=orchestration_config.max_steps if orchestration_config else None,
-        ),
-        "action_proposal": None,
-        "policy_decision": None,
-        "tool_result": None,
-    }
-    final_state = await graph.ainvoke(initial_state)
-    runtime: RuntimeState = final_state["runtime"]
-
-    await deps.event_bus.publish(
-        EventEnvelope(
-            event_id=EventId(new_id("evt")),
-            event_type=EventType.RUN_FINISHED,
-            run_id=run_id,
-            engagement_id=engagement.engagement_id,
-            source="app.bootstrap",
-            timestamp=datetime.now(timezone.utc),
-            payload={"phase": runtime.phase.value},
-        )
+    initial_runtime = RuntimeState(
+        run_id=run_id,
+        engagement_id=engagement.engagement_id,
+        phase=AgentPhase.OBSERVE,
+        current_goal=f"map and probe the declared scope of {engagement.name}",
+        remaining_budget=engagement.execution_budget.max_actions,
     )
-    return runtime
+    runner = AgentLoopRunner(deps, settings=settings)
+    try:
+        try:
+            runtime = await runner.run(initial_runtime)
+        except BaseException as exc:
+            recovered_runtime = runner.failure_runtime or initial_runtime
+            failed_runtime = recovered_runtime.model_copy(
+                update={
+                    "phase": AgentPhase.FAILED,
+                    "termination_reason": (
+                        TerminationReason.USER_INTERRUPTED
+                        if isinstance(exc, asyncio.CancelledError)
+                        else TerminationReason.EXECUTION_ERROR
+                    ),
+                }
+            )
+            # Preserve the original exception even if reporting infrastructure
+            # is also degraded.  Canonical graph/evidence/ledger stores still
+            # provide the partial projection whenever this succeeds.
+            try:
+                await asyncio.shield(
+                    _publish_terminal_artifacts(
+                        failed_runtime,
+                        deps,
+                        error_type=type(exc).__name__,
+                    )
+                )
+            except Exception:  # noqa: BLE001 - never mask the run failure
+                pass
+            raise
+        await _publish_terminal_artifacts(runtime, deps)
+        return runtime
+    finally:
+        await runner.aclose()
