@@ -236,7 +236,12 @@ class PolicyDecision(BaseModel):
 ```text
 ActionProposal
   -> Scope Check       (redteam.control.scope.check_scope)
-  -> ROE Check          (pass-through stub — TODO)
+  -> ROE Check          (redteam.control.roe.check_roe — real: exact
+                          denied/allowed_operations match, `availability_impact_allowed`
+                          enforced against the agent-declared `ActionProposal.availability_impact`,
+                          `prohibited_techniques` fails the whole run closed
+                          with `UnsupportedRoePolicyError` rather than being
+                          silently ignored — no technique taxonomy exists yet)
   -> Policy Engine      (redteam.control.policy.evaluate_policy)
   -> Rate Limit         (redteam.control.rate_limit.RateLimiter)
   -> Budget             (redteam.control.budget.BudgetTracker)

@@ -810,6 +810,78 @@ canonical action key 비교로 수정해야 한다. 추적 문서는
 - reconciliation host의 CLI 진입점은 만들지 않았다 — 이번 작업 지시에
   "CLI 구현은 범위 아님"이 명시됨.
 
+### 16.1 2026-09-21 상태 갱신 — Recon→Web 파이프라인 배선 완료, 콘텐츠 gap 발견
+
+**이번에 구현된 것:**
+
+- **Tool Result → Attack Graph Mutation** (`orchestration/observations/`):
+  `ResultMapperRegistry`가 `tool_id`별로 정확히 등록된 mapper만 실행 —
+  `update.py`엔 `if tool_id == ...` 없음. `recon.http_probe` mapper가
+  실제 HTTP 응답을 읽어 HOST 속성 갱신에 더해 SERVICE/ENDPOINT 노드와
+  `HOSTS`/`EXPOSES` edge(기존 `GraphEdgeType` 재사용, 신규 문자열 없음)를
+  생성한다. Port는 그 tool의 output에 원래 없어서 의도적으로 안 채움.
+- **`WEB_API_AGENT` 실행 가능화** (`agents/base.py`,
+  `agents/builtin.py`): 기존 `$target_ref` placeholder 인프라를
+  `$path`까지 일반화(`_PLACEHOLDER_RESOLVERS` dict). `EndpointTarget`에
+  없는 필드를 요구하면 `PlanStep.bound_to()`가 `None`을 반환해 후보
+  자체를 만들지 않는다(추측 금지). 결과: SERVICE/ENDPOINT가 생기면
+  `WEB_API_AGENT`가 activation → 실제 `target_ref`/`path` resolve →
+  진짜 `web.http_request` 호출까지 end-to-end로 이어짐(VulnBank
+  실측 확인, `run.actions_executed`가 recon 1건에서 멈추지 않음).
+- **`AgentNoExecutableCandidates` 이벤트** (`orchestration/events.py`,
+  `nodes/plan.py`): agent가 activation은 됐는데 draft가 있어도 전부
+  compile에서 버려지면(tool 없음/schema 불일치) 기본 로그(verbose
+  아니어도)에 경고 노출 — 이전엔 조용히 묻혔음.
+
+**이번에 고치지 않고 남긴, 새로 확인한 콘텐츠 gap** (배선 문제가 아니라
+"에이전트가 실제로 뭘 할 수 있는가"의 문제 — 별도 작업 필요):
+
+1. **빌트인 playbook이 구조적으로 Violation/Finding을 만들 수 없다.**
+   `Verdict.VIOLATION`은 `Expectation.violation_if_met=True`일 때만
+   나오는데(`orchestration/expectations.py`), `RECON_AGENT`/
+   `WEB_API_AGENT`/`MOBILE_AGENT`의 어떤 step도 `violation_if_met`/
+   `anomaly_if_unmet`을 설정하지 않는다. `WEB_API_AGENT`의 두 step은
+   `expectation` 필드 자체가 없어 `verdict_for()`가 항상 `PASS`를
+   반환한다 — 응답이 401/500/시크릿노출이어도 마찬가지. 10장이
+   서술하는 "candidate finding"/"finding 상태 변화" 산출 경로가
+   현재 코드엔 전혀 없다.
+2. **10.4의 `AnalysisAgent`, 10.5의 `ReportingAgent`는 스케줄링
+   가능한 실체가 아니다.** `definition.py`에 정의는 있고
+   `default_provider_registry()`엔 `"reporting"` provider_id조차
+   없는데, `registry.py`의 `default_registry()`가 실제로 등록하는
+   `AgentSpec`은 `[RECON_AGENT, WEB_API_AGENT, MOBILE_AGENT]`뿐이라
+   `AgentRegistry.next_agent()`가 이 둘을 절대 뽑지 못한다. 실제
+   Analysis는 `verify.py`가 `deps.verifier`를 매 액션마다 직접
+   호출하는 별도 경로(`DeterministicAnalysisVerifier` = `verdict_for()`
+   재호출 래퍼, 독립 재검증 로직 없음)로 동작 — 10.4가 서술하는
+   "원 실행 agent와 문맥 분리" 같은 설계는 미구현.
+3. **`docs/contracts/actions.md`의 canonical operation 12개 중 3개만
+   실제 playbook에서 쓰인다** (`service_discovery`/`http_request`/
+   `static_analysis`). `capability/servers/`에 이미 동작하는
+   `active.py`(nmap), `proxy.py`(HAR replay), `nuclei.py`, `zap.py`,
+   `recon.py`의 `openapi_inventory`/`oidc_inventory`/`tls_inspect`,
+   `mobile.py`의 `device_shell` 전부 이걸 호출하는 playbook step이
+   없어 연결 불가능한 상태 — 6장의 "Tool Catalog에서 후보를 resolve"
+   설계 자체는 맞게 동작하지만, 애초에 그 앞단(provider draft)이
+   이 도구들을 제안한 적이 없다.
+4. **Playbook은 전부 1회성·비분기.** `PlanStep.repeatable` 기본
+   `False`, 빌트인 step 어느 것도 안 바꿈. 결과 내용(예:
+   `status_code=401`)을 보고 다른 operation(`auth_attempt`)을
+   후속 제안하는 메커니즘 자체가 없다 — 11장의 "관련 delta가 생긴
+   agent만 재활성화"는 *다른 agent*를 깨우는 것뿐이고, *같은 agent*가
+   방금 본 결과로 다음 수를 두는 경로는 없다.
+5. **`planner_kind="llm"`이어도 LLM은 고정 목록에서 고르기만 한다**
+   (`agents/planners.py`: "Do not invent steps, tools, or targets").
+   7.4장이 서술하는 "coverage gap 발견 시 LLM 개입"/`FollowupHint`
+   경로는 미구현 — 지금은 매 turn 정적 playbook이 만든 후보 중
+   순서만 LLM이 고르는 정도.
+
+즉 이번 작업은 "파이프라인 배선"(그래프 뮤테이션, activation, argument
+resolution) 문제였고, 위 1~5는 "에이전트 콘텐츠"(뭘 발견할 수 있는가,
+확장 가능한가) 문제로 범주가 다르다. 1번이 가장 심각함 — 나머지를 전부
+고쳐도 Finding이 안 나오면 이 프로젝트가 실질적으로 "보안 테스트
+결과"를 낼 방법이 없다.
+
 ## 17. 블라인드 자기평가와 보정 기록
 
 ### 17.1 평가 방식

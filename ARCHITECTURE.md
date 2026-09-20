@@ -224,7 +224,6 @@ ports without standing up the real thing — see
 repo/
 ├── README.md
 ├── ARCHITECTURE.md
-├── CONTRIBUTING.md
 ├── DEVELOPMENT.md
 ├── instruction.md
 ├── pyproject.toml

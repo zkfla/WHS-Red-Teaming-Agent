@@ -23,7 +23,16 @@ depends on. Two implementations:
 
 - `redteam.llm.fake.FakeLLMClient` — deterministic, no network, used
   by default in the current stub flow and in tests.
-- `redteam.llm.litellm.LiteLLMClient` — wraps `litellm.acompletion`.
+- `redteam.llm.litellm.LiteLLMClient` — wraps `litellm.acompletion` for
+  every provider except the `chatgpt/<model>` subscription path (ChatGPT
+  Plus/Pro via OAuth device flow, no API key), which calls
+  `litellm.aresponses()` directly instead — verified directly that
+  bridging that provider through `acompletion()` is unreliable for a
+  short, non-agentic prompt (see the module docstring on
+  `redteam.llm.litellm` for the exact failure and why). Provider
+  identity is resolved via litellm's own `litellm.get_llm_provider(model)`,
+  not a hand-maintained `"chatgpt/"` prefix check, so a future litellm
+  provider rename doesn't silently misroute.
 
 ## Compatibility caveat (superseded)
 
@@ -54,3 +63,14 @@ shouldn't force on everyone:
   anything at this stage.
 - `requires-python` (3.10) is unrelated to this ADR now — nothing here
   blocks on a Python version bump.
+- litellm caches a persistent async HTTP client per provider for
+  connection reuse (`litellm.in_memory_llm_clients_cache`); a short-lived
+  `redteam` CLI process (one `asyncio.run()`, then exit) can otherwise hit
+  a noisy-but-harmless `Fatal error on SSL transport ... Event loop is
+  closed` at shutdown, since litellm's own `atexit` cleanup closes those
+  clients on a *new* event loop created after the original one is already
+  gone. `redteam.app.cli.__init__._dispatch` explicitly calls
+  `litellm.close_litellm_async_clients()` on the still-live loop right
+  after the command handler returns (only if `"litellm"` is already in
+  `sys.modules`, so this never forces the import for `FakeLLMClient`-only
+  installs) — verified directly that this removes the traceback.
