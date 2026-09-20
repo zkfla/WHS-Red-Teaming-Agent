@@ -85,7 +85,7 @@ async def update_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
         node.id, operation_key, step=runtime.step_count, provenance=provenance
     )
 
-    updated = await publisher.publish(
+    last_event = await publisher.publish(
         EventType.GRAPH_UPDATED,
         {
             "node_id": str(node.id),
@@ -97,6 +97,49 @@ async def update_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
         correlation_id=correlation_id,
         causation_id=state.get("last_event_id"),
     )
+
+    # Tool Result -> Attack Graph Mutation (SERVICE/ENDPOINT discovery, if
+    # a mapper is registered for this tool_id): purely additive, never
+    # replaces the static `observed_attrs` write above, and never raises
+    # -- `ResultMapperRegistry.map_result` degrades to "nothing new" for
+    # an unmapped tool_id, a failed/blocked action, or malformed output.
+    if succeeded and result is not None and step is not None:
+        mutation = deps.result_mappers.map_result(
+            tool_id=result.tool_id,
+            target=proposal.target,
+            arguments=step.arguments,
+            result=result,
+        )
+        for node_mutation in mutation.nodes:
+            discovered = await service.upsert_node(
+                node_mutation.node_type,
+                node_id=node_mutation.node_id,
+                attrs=node_mutation.attrs,
+                facts=node_mutation.facts,
+                labels=node_mutation.labels,
+                provenance=provenance,
+                step=runtime.step_count,
+            )
+            last_event = await publisher.publish(
+                EventType.GRAPH_UPDATED,
+                {
+                    "node_id": str(discovered.id),
+                    "node_type": discovered.type.value,
+                    "action_id": proposal.action_id,
+                    "attrs": node_mutation.attrs,
+                    "blocked": False,
+                },
+                correlation_id=correlation_id,
+                causation_id=last_event.event_id,
+            )
+        for edge_mutation in mutation.edges:
+            await service.link(
+                edge_mutation.edge_type,
+                edge_mutation.source_id,
+                edge_mutation.target_id,
+                edge_mutation.properties,
+                provenance=provenance,
+            )
 
     work_id = state.get("current_work_id")
     if work_id is not None:
@@ -123,6 +166,6 @@ async def update_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
     return advance(
         state,
         runtime.model_copy(update={"phase": AgentPhase.REPLAN}),
-        last_event_id=updated.event_id,
+        last_event_id=last_event.event_id,
         current_work_id=None,
     )

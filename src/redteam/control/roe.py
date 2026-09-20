@@ -19,14 +19,27 @@ Implemented (control-team, track-a):
   - allowed capabilities / operations  -> restrictive allow-list
   - time windows: ``start_at`` / ``end_at`` (absolute) and
     ``allowed_time_windows`` (time-of-day, restrictive when configured)
+  - ``availability_impact_allowed`` — enforced against the agent-declared
+    ``ActionProposal.availability_impact`` signal (added for this; see its
+    docstring). This is real, agent-declared intent, never inferred from
+    ``operation``'s name.
+  - ``max_parallel_actions`` — enforced against ``in_flight_actions``, a
+    live concurrency count the caller (``DefaultControlPlane.evaluate``)
+    supplies via ``ControlContext.metadata["in_flight_actions"]``
+    (Orchestration owns the Work Ledger this comes from; Control never
+    imports it). A rule that configures this limit without the caller
+    supplying the signal fails **closed**, not open — see
+    ``_check_max_parallel_actions``.
 
-BLOCKED — needs a signal not present in ``ActionProposal`` (candidate
-for a follow-up PM/contract decision, do NOT fake it):
-  - ``availability_impact_allowed`` — no "does this action impact
-    availability?" flag on the proposal.
-  - ``prohibited_techniques`` — no "technique" identity on the proposal.
-  - ``max_parallel_actions`` — needs in-flight action count (coordinate
-    with rate_limit/budget stages).
+Still genuinely unsupported (do NOT fake it):
+  - ``prohibited_techniques`` — no technique taxonomy/identity exists
+    anywhere in this codebase yet (not on ``ActionProposal``, not on
+    ``ToolDescriptor``). Guessing a "technique" from ``operation``'s name
+    (e.g. ``auth_attempt`` -> ``brute_force``) would be exactly the kind
+    of silent, wrong inference this stage must not do. A rule that
+    configures this field is therefore rejected explicitly — see
+    ``_check_prohibited_techniques`` — rather than silently ignored
+    (fail-open) or asked to guess (fabricated).
 """
 
 from __future__ import annotations
@@ -35,7 +48,7 @@ from datetime import datetime, time, timezone
 
 from redteam.control.severity import Severity
 from redteam.core.contracts.action import ActionProposal
-from redteam.core.contracts.engagement import Engagement
+from redteam.core.contracts.engagement import Engagement, RuleOfEngagement
 
 
 def _as_utc(dt: datetime) -> datetime:
@@ -61,33 +74,59 @@ def _time_in_window(now_t: time, start: time, end: time) -> bool:
     return now_t >= start or now_t <= end
 
 
+class UnsupportedRoePolicyError(ValueError):
+    """A configured ROE field has no enforcement path yet.
+
+    Raised (never silently swallowed into an ALLOW) so an operator who
+    configures ``prohibited_techniques`` gets a loud, explicit failure
+    instead of a false sense of safety. See the module docstring.
+    """
+
+
 def check_roe(
     action: ActionProposal,
     engagement: Engagement,
     *,
     now: datetime | None = None,
+    in_flight_actions: int | None = None,
 ) -> tuple[bool, list[str], Severity | None]:
     """Evaluate the proposal against the engagement's Rules of Engagement.
 
     Returns ``(allowed, reasons, severity)``. ``now`` (default: current
     UTC time) is the clock the time-window rules are evaluated against —
-    injectable for tests. Capabilities match on the ``capability``
-    namespace; operations match on the ``<capability>.<operation>``
-    canonical action key. Deny-lists are absolute; allow-lists
-    (capabilities/operations/time-windows) are restrictive only when
-    configured.
+    injectable for tests. ``in_flight_actions`` is the number of *other*
+    actions for this run currently leased/running, supplied by the caller
+    (Orchestration owns that count) — required only when a rule sets
+    ``max_parallel_actions``; see ``_check_max_parallel_actions``.
+    Capabilities match on the ``capability`` namespace; operations match
+    on the ``<capability>.<operation>`` canonical action key. Deny-lists
+    are absolute; allow-lists (capabilities/operations/time-windows) are
+    restrictive only when configured.
 
     Severity hints (see ``redteam.control.severity``):
       - a whole capability being off-limits -> ``REPLAN_GOAL``
       - a single operation being off-limits -> ``BLOCK_ACTION``
       - outside the allowed time window      -> ``ABORT_RUN`` (no action
         will pass until the clock changes)
+      - too many actions already in flight   -> ``BLOCK_ACTION`` (transient)
+
+    Raises ``UnsupportedRoePolicyError`` if any rule sets
+    ``prohibited_techniques`` — see the module docstring.
     """
     rules = engagement.rules_of_engagement
     if not rules:
         # No ROE configured — nothing to enforce at this stage. Scope
         # (the previous stage) already provides target default-deny.
         return True, [], None
+
+    for rule in rules:
+        if rule.prohibited_techniques:
+            raise UnsupportedRoePolicyError(
+                f"ROE rule '{rule.name}' sets prohibited_techniques="
+                f"{rule.prohibited_techniques!r}, but no technique taxonomy or "
+                f"signal exists on ActionProposal yet — this cannot be enforced "
+                f"safely. Remove this field from the rule until support exists."
+            )
 
     now = now or datetime.now(timezone.utc)
     action_key = f"{action.capability}.{action.operation}"
@@ -112,6 +151,17 @@ def check_roe(
                 f"(ended {_as_utc(rule.end_at).isoformat()})"
             )
             return False, [reason], Severity.ABORT_RUN
+        if not rule.availability_impact_allowed and action.availability_impact:
+            reason = (
+                f"action declares availability_impact=True, but ROE rule "
+                f"'{rule.name}' has availability_impact_allowed=False"
+            )
+            return False, [reason], Severity.BLOCK_ACTION
+        if rule.max_parallel_actions is not None:
+            ok, parallel_reason = _check_max_parallel_actions(rule, in_flight_actions)
+            if not ok:
+                assert parallel_reason is not None
+                return False, [parallel_reason], Severity.BLOCK_ACTION
 
     # 2. Time-of-day windows are restrictive when configured: if any rule
     #    lists windows, ``now`` must fall inside at least one.
@@ -137,3 +187,29 @@ def check_roe(
         return False, [reason], Severity.BLOCK_ACTION
 
     return True, [], None
+
+
+def _check_max_parallel_actions(
+    rule: RuleOfEngagement, in_flight_actions: int | None
+) -> tuple[bool, str | None]:
+    """``max_parallel_actions`` is a runtime concurrency limit, not
+    something derivable from ``ActionProposal`` alone — the caller must
+    supply the current in-flight count. A rule that configures this limit
+    without that signal fails **closed**: silently treating it as
+    unlimited (fail-open) would defeat the operator's explicit intent.
+    """
+    if in_flight_actions is None:
+        return False, (
+            f"ROE rule '{rule.name}' sets max_parallel_actions="
+            f"{rule.max_parallel_actions}, but no in-flight-action count was "
+            f"supplied to check_roe() — failing closed rather than silently "
+            f"treating the limit as unenforced"
+        )
+    assert rule.max_parallel_actions is not None
+    if in_flight_actions >= rule.max_parallel_actions:
+        return False, (
+            f"{in_flight_actions} action(s) already in flight for this run "
+            f">= ROE rule '{rule.name}' max_parallel_actions="
+            f"{rule.max_parallel_actions}"
+        )
+    return True, None

@@ -14,12 +14,11 @@ from redteam.attack_graph.observation import GraphObservation
 from redteam.attack_graph.view import AttackGraphView
 from redteam.core.contracts.tool import ToolDescriptor
 from redteam.core.enums import RiskLevel, ToolHealthStatus
-from redteam.core.ids import ToolId
 from redteam.orchestration.action_naming import (
     canonical_action_key,
     tool_matches_action_namespace,
 )
-from redteam.orchestration.agents.base import AgentSpec
+from redteam.orchestration.agents.base import AgentSpec, PlanStep
 from redteam.orchestration.agents.providers import PlaybookCandidateProvider
 from redteam.orchestration.candidates.catalog import ToolCatalog
 from redteam.orchestration.candidates.models import (
@@ -27,6 +26,7 @@ from redteam.orchestration.candidates.models import (
     ExecutableCandidate,
 )
 from redteam.orchestration.candidates.scoring import score_candidate
+from redteam.orchestration.candidates.tool_selection import select_tool
 
 
 @lru_cache(maxsize=256)
@@ -73,7 +73,7 @@ class CandidateCompiler:
                 # Context, work/conflict accounting and evidence routing must
                 # describe the same target that Policy and ToolGateway receive.
                 continue
-            tool = self._resolve_tool(plan_step.tool_id, plan_step.capability)
+            tool = self._resolve_tool(plan_step)
             if tool is None or tool.health_status is ToolHealthStatus.UNHEALTHY:
                 continue
             if not self._arguments_match_schema(plan_step.arguments, tool.input_schema):
@@ -99,10 +99,18 @@ class CandidateCompiler:
             key=lambda item: (-item.priority.total, item.candidate_key),
         )
 
-    def _resolve_tool(self, preferred: ToolId, capability: str) -> ToolDescriptor | None:
+    def _resolve_tool(self, plan_step: PlanStep) -> ToolDescriptor | None:
+        preferred, capability, operation = (
+            plan_step.tool_id,
+            plan_step.capability,
+            plan_step.operation,
+        )
         if not tool_matches_action_namespace(preferred, capability):
             return None
         if self._catalog is None:
+            # No live Registry wired (legacy/minimal-vertical-slice path,
+            # e.g. the in-process ExampleMCPAdapter): nothing to select
+            # from, so the provider's declared binding is the only option.
             return ToolDescriptor(
                 tool_id=preferred,
                 server_id="legacy-playbook",
@@ -112,14 +120,15 @@ class CandidateCompiler:
                 health_status=ToolHealthStatus.UNKNOWN,
             )
 
-        # A capability tag says only what family a tool belongs to.  It is not
-        # an intent-to-tool binding.  Falling back to an arbitrary tool with
-        # the same tag could execute a different operation than Control
-        # approved, so only the explicitly configured binding is accepted.
-        exact = self._catalog.get(preferred)
-        if exact is None or capability not in exact.capability_tags:
-            return None
-        return exact
+        # Action-aware selection: never pin to the provider's declared
+        # ``tool_id``. Ask the live Registry which tools are actually
+        # eligible for this canonical action, and pick deterministically —
+        # see ``tool_selection.select_tool``. A tool that disappeared,
+        # went unhealthy, or was never bound to this operation is simply
+        # not offered; that is not distinguished from "no candidate" here
+        # because no ``ActionProposal`` is produced for either case (Policy
+        # never sees a proposal this step could not have executed).
+        return select_tool(self._catalog.list_tools_for_action(capability, operation))
 
     @staticmethod
     def _arguments_match_schema(arguments: dict, schema: dict) -> bool:

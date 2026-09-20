@@ -8,11 +8,12 @@ This is a code-based gate: every branch below returns a concrete
 cannot happen by omission. ``context.engagement_id`` selects which
 ``Engagement`` config (scope/budget/ROE/policy) applies.
 
-TODO(control-team): ROE stage enforces capability/operation allow/deny
-lists and time windows (``redteam.control.roe``); still blocked there —
-availability impact, prohibited techniques, max_parallel (need signals
-absent from ActionProposal, track-a). Per-engagement durable audit
-sinks (track-b).
+ROE (``redteam.control.roe``) enforces capability/operation allow/deny
+lists, time windows, availability impact, and max_parallel_actions
+(the last via ``context.metadata["in_flight_actions"]`` — Orchestration
+supplies it; Control never imports the Work Ledger). ``prohibited_techniques``
+has no enforcement path yet and fails the run closed rather than being
+silently ignored — see ``roe.UnsupportedRoePolicyError``.
 """
 
 from __future__ import annotations
@@ -25,7 +26,7 @@ from redteam.control.audit import AuditLog
 from redteam.control.budget import BudgetTracker
 from redteam.control.policy import evaluate_policy
 from redteam.control.rate_limit import RateLimiter
-from redteam.control.roe import check_roe
+from redteam.control.roe import UnsupportedRoePolicyError, check_roe
 from redteam.control.scope import check_scope
 from redteam.control.severity import Severity, to_tag
 from redteam.core.contracts.action import ActionProposal
@@ -68,11 +69,17 @@ class DefaultControlPlane:
         # See docs/control/blocked-action-evidence.md.
         self._evidence_service = evidence_service
         # Remembers which ActionProposal a pending Approval belongs to, so
-        # resolve_approval() can record an APPROVAL_RESOLVED audit entry
-        # correlated back to run_id/engagement_id/action_id. Popped once
-        # resolved -- not a durable store itself, just enough bookkeeping
-        # to bridge evaluate() and resolve_approval().
+        # resolve_approval() can record an APPROVAL_RESOLVED audit entry,
+        # and approval_outcome() can re-evaluate rate-limit/budget against
+        # the original proposal once a human resolves it. In-memory only
+        # -- not a durable store -- so this does not survive a process
+        # restart; see approval_outcome()'s "stale approval" handling.
+        # Popped by approval_outcome() once consumed.
         self._pending_proposals: dict[ApprovalId, ActionProposal] = {}
+        # Cached so approval_outcome() is idempotent: a second call after
+        # the first resolved one returns the same PolicyDecision instead
+        # of re-consuming rate-limit/budget capacity.
+        self._resolved_outcomes: dict[ApprovalId, PolicyDecision] = {}
 
     async def evaluate(self, proposal: ActionProposal, context: ControlContext) -> PolicyDecision:
         engagement_id = context.engagement_id
@@ -84,7 +91,19 @@ class DefaultControlPlane:
                 proposal, PolicyVerdict.DENY, scope_reasons, ["scope"], severity=scope_severity
             )
 
-        roe_ok, roe_reasons, roe_severity = check_roe(proposal, engagement)
+        in_flight = context.metadata.get("in_flight_actions")
+        try:
+            roe_ok, roe_reasons, roe_severity = check_roe(
+                proposal, engagement, in_flight_actions=in_flight
+            )
+        except UnsupportedRoePolicyError as exc:
+            # A configured-but-unenforceable ROE field: fail the whole run
+            # closed rather than let it silently pass (see roe.py). Every
+            # further action against this Engagement would hit the same
+            # rule, so ABORT_RUN — not just this one action.
+            return await self._finalize(
+                proposal, PolicyVerdict.DENY, [str(exc)], ["roe"], severity=Severity.ABORT_RUN
+            )
         if not roe_ok:
             return await self._finalize(
                 proposal, PolicyVerdict.DENY, roe_reasons, ["roe"], severity=roe_severity
@@ -160,19 +179,120 @@ class DefaultControlPlane:
     ) -> Approval:
         """Record a human's decision on a pending Approval.
 
-        Not part of the ``ControlPlane`` Protocol (that only requires
-        ``evaluate``) -- a ``DefaultControlPlane``-specific extension,
-        called by whatever notification channel (CLI/Slack/webhook)
-        surfaces the pending approval to a human. Also records an
-        APPROVAL_RESOLVED audit entry, closing the gap where a
-        REQUIRE_APPROVAL verdict was audited but the eventual human
-        decision was not.
+        Not part of the ``ControlPlane`` Protocol -- a
+        ``DefaultControlPlane``-specific extension, called by whatever
+        notification channel (CLI/Slack/webhook) surfaces the pending
+        approval to a human. Also records an APPROVAL_RESOLVED audit
+        entry, closing the gap where a REQUIRE_APPROVAL verdict was
+        audited but the eventual human decision was not.
+
+        Only marks the human decision -- it does not re-evaluate rate
+        limit/budget or build the final ``PolicyDecision``; call
+        ``approval_outcome`` (the Protocol method Orchestration's resume
+        path uses) for that, once. Deliberately keeps ``_pending_proposals``
+        intact here (unlike before) so ``approval_outcome`` can still
+        reach it afterwards.
         """
         approval = await self._approvals.resolve(approval_id, status, resolved_by)
-        proposal = self._pending_proposals.pop(approval_id, None)
+        proposal = self._pending_proposals.get(approval_id)
         if proposal is not None:
             await self._audit.record_approval_resolution(proposal, approval)
         return approval
+
+    async def approval_outcome(self, approval_id: ApprovalId) -> PolicyDecision | None:
+        cached = self._resolved_outcomes.get(approval_id)
+        if cached is not None:
+            return cached
+
+        approval = await self._approvals.get(approval_id)
+        if approval is None or approval.status == ApprovalStatus.PENDING:
+            return None
+        action_id = approval.action_id
+
+        if approval.status != ApprovalStatus.APPROVED:
+            # REJECTED or EXPIRED: a terminal DENY, never left dangling.
+            decision = PolicyDecision(
+                action_id=action_id,
+                verdict=PolicyVerdict.DENY,
+                reasons=[f"approval {approval_id} was {approval.status.value}, not approved"],
+                matched_rules=["approval", to_tag(Severity.REPLAN_GOAL)],
+                approval_id=approval_id,
+                evaluated_at=datetime.now(timezone.utc),
+            )
+            self._resolved_outcomes[approval_id] = decision
+            return decision
+
+        proposal = self._pending_proposals.pop(approval_id, None)
+        if proposal is None:
+            # This ControlPlane instance never held (or already consumed)
+            # the original proposal -- most likely a process restart, since
+            # _pending_proposals is in-memory only. Never guess the intent
+            # back from a redacted Audit snapshot: fail closed, explicitly.
+            decision = PolicyDecision(
+                action_id=action_id,
+                verdict=PolicyVerdict.DENY,
+                reasons=[
+                    f"stale approval {approval_id}: original ActionProposal is no longer "
+                    f"held (process restart or already consumed) -- cannot safely resume"
+                ],
+                matched_rules=["approval", "stale", to_tag(Severity.ABORT_RUN)],
+                approval_id=approval_id,
+                evaluated_at=datetime.now(timezone.utc),
+            )
+            self._resolved_outcomes[approval_id] = decision
+            return decision
+
+        # Only rate limit and budget can change between the original
+        # REQUIRE_APPROVAL and this resolution -- Scope/ROE/Policy already
+        # evaluated deterministically against this same immutable proposal
+        # and engagement config. Re-running them here would also risk
+        # re-triggering REQUIRE_APPROVAL and minting a second Approval for
+        # the same action.
+        engagement = self._engagements[proposal.engagement_id]
+        rate_limiter = self._rate_limiters.setdefault(
+            proposal.engagement_id, RateLimiter(engagement.rate_limit_policy)
+        )
+        if not rate_limiter.allow():
+            decision = await self._finalize(
+                proposal,
+                PolicyVerdict.DENY,
+                [f"approval {approval_id} was approved, but rate limit is exceeded now"],
+                ["approval", "rate_limit"],
+                rate_limit_remaining=rate_limiter.remaining,
+                severity=Severity.BLOCK_ACTION,
+                approval_id=approval_id,
+            )
+            self._resolved_outcomes[approval_id] = decision
+            return decision
+
+        budget = self._budgets.setdefault(
+            proposal.engagement_id, BudgetTracker(engagement.execution_budget)
+        )
+        if not budget.has_capacity():
+            decision = await self._finalize(
+                proposal,
+                PolicyVerdict.DENY,
+                [f"approval {approval_id} was approved, but execution budget is exhausted now"],
+                ["approval", "budget"],
+                budget_remaining=budget.remaining,
+                severity=Severity.ABORT_RUN,
+                approval_id=approval_id,
+            )
+            self._resolved_outcomes[approval_id] = decision
+            return decision
+
+        budget.consume()
+        decision = await self._finalize(
+            proposal,
+            PolicyVerdict.ALLOW,
+            [f"approval {approval_id} approved by {approval.resolved_by}"],
+            ["approval"],
+            rate_limit_remaining=rate_limiter.remaining,
+            budget_remaining=budget.remaining,
+            approval_id=approval_id,
+        )
+        self._resolved_outcomes[approval_id] = decision
+        return decision
 
     async def _finalize(
         self,
@@ -184,6 +304,7 @@ class DefaultControlPlane:
         rate_limit_remaining: int | None = None,
         budget_remaining: int | None = None,
         severity: Severity | None = None,
+        approval_id: ApprovalId | None = None,
     ) -> PolicyDecision:
         # Carry the denial severity as a matched_rules tag (PolicyDecision
         # has no severity field yet — see redteam.control.severity).
@@ -194,6 +315,7 @@ class DefaultControlPlane:
             verdict=verdict,
             reasons=reasons,
             matched_rules=matched_rules,
+            approval_id=approval_id,
             rate_limit_remaining=rate_limit_remaining,
             budget_remaining=budget_remaining,
             evaluated_at=datetime.now(timezone.utc),

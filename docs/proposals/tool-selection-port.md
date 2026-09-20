@@ -2,7 +2,21 @@
 
 ## Status
 
-Proposed by Capability Team. PM review required before any `core` file changes.
+✅ **Implemented.** `ToolGateway.list_tools_for_action(capability, operation)`
+is live on `redteam.core.ports.tool_gateway.ToolGateway` (mirrored on the
+Agent-owned `redteam.orchestration.candidates.catalog.ToolCatalog` for the
+seam that actually consumes it). `redteam.orchestration.candidates.tool_selection.select_tool`
+is the deterministic priority (healthy > unknown, then lower risk_level,
+then stable `tool_id` lexical order — historical failure rate is not a
+tier: no per-tool failure signal exists anywhere in this codebase yet, and
+this proposal explicitly said not to fake one). Wired into
+`CandidateCompiler._resolve_tool`, replacing the old exact-preferred-tool_id
+lookup — Orchestration no longer pins a hardcoded `ToolId`; it asks the
+live Registry which tools are eligible and picks among them. `MCPToolGateway`
+and the `DummyToolGateway`/`FakeControlPlane` test fakes were updated in
+the same change, per the compatibility note below.
+
+Originally proposed by Capability Team; PM review completed.
 
 ## Problem
 

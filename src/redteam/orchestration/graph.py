@@ -2,13 +2,19 @@
 
 ```text
 START -> OBSERVE -> PLAN --proposal--> POLICY --ALLOW--> EXECUTE -> VERIFY --+
-            ^         |                   |                                 |
-            |         |                   \\--deny/approval-needed--> UPDATE <+
-            |         |                                                 |
-            |         \\--no proposal--> REPLAN <------------------------+
-            |                              |
-            \\-------- another turn -------+-- terminal --> END
+  |         ^         |                   |                                 |
+  |         |         |                   \\--deny/approval-needed--> UPDATE <+
+  |         |         |                                                 |
+  |         |         \\--no proposal--> REPLAN <------------------------+
+  |         |                              |
+  |         \\-------- another turn -------+-- terminal --> END
+  |
+  \\-- resumed APPROVAL_PENDING run (AgentLoopRunner.reconcile_once,
+       runtime.phase already POLICY) -----> POLICY
 ```
+
+The resume edge (``_route_entry``) is the only conditional START: every
+fresh run always enters at OBSERVE.
 
 LangGraph is the workflow runtime and nothing more: it schedules these
 seven functions and persists ``GraphState`` between them. It owns no
@@ -28,8 +34,9 @@ from __future__ import annotations
 import functools
 from typing import Any
 
-from langgraph.graph import END, StateGraph
+from langgraph.graph import END, START, StateGraph
 
+from redteam.core.enums import AgentPhase
 from redteam.orchestration.context import RuntimeDeps
 from redteam.orchestration.nodes import (
     aggregate_node,
@@ -63,6 +70,19 @@ NODE_NAMES = (
 )
 
 
+def _route_entry(state: GraphState) -> str:
+    """Normal runs always start at OBSERVE. The one exception:
+    ``AgentLoopRunner.reconcile_once`` seeds a resumed APPROVAL_PENDING
+    run with ``runtime.phase == POLICY`` and the original ``action_proposal``
+    already in state (``orchestration.state.resume_graph_state``) — that
+    invocation must re-enter directly at POLICY, never re-derive a fresh
+    proposal through OBSERVE/PLAN.
+    """
+    if state["runtime"].phase == AgentPhase.POLICY and state.get("action_proposal") is not None:
+        return "policy"
+    return "observe"
+
+
 def build_graph(deps: RuntimeDeps, *, checkpointer: Any | None = None) -> Any:
     graph = StateGraph(GraphState)
 
@@ -76,7 +96,9 @@ def build_graph(deps: RuntimeDeps, *, checkpointer: Any | None = None) -> Any:
     graph.add_node("aggregate", functools.partial(aggregate_node, deps=deps))
     graph.add_node("replan", functools.partial(replan_node, deps=deps))
 
-    graph.set_entry_point("observe")
+    graph.add_conditional_edges(
+        START, _route_entry, {"observe": "observe", "policy": "policy"}
+    )
     graph.add_conditional_edges(
         "observe", route_after_observe, {"plan": "plan", "replan": "replan"}
     )

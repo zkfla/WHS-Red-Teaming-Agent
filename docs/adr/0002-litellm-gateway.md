@@ -2,7 +2,11 @@
 
 ## Status
 
-Accepted, with a known compatibility caveat.
+Accepted. The Python-version compatibility caveat below no longer
+applies — current `litellm` releases install and import fine on this
+project's 3.10+ floor (verified directly: `pip install -e ".[llm]"` then
+`import litellm` on 3.10.4). Kept as an optional extra regardless, for
+its dependency footprint (see "Compatibility caveat" below, updated).
 
 ## Context
 
@@ -21,28 +25,32 @@ depends on. Two implementations:
   by default in the current stub flow and in tests.
 - `redteam.llm.litellm.LiteLLMClient` — wraps `litellm.acompletion`.
 
-## Compatibility caveat
+## Compatibility caveat (superseded)
 
-`litellm` (as of this writing) requires Python 3.11+
-(`typing.NotRequired`, used internally) and fails to import on the
-3.10.4 that's actually available in local dev right now. To avoid
-breaking the base install:
+An earlier `litellm` release genuinely required Python 3.11+
+(`typing.NotRequired`, used internally) and failed to import on the
+3.10.4 available in local dev at the time. That is no longer true:
+current releases satisfying this project's `litellm>=1.50` pin install
+and import fine on 3.10 (verified directly, not assumed). `litellm`
+stays an optional dependency regardless — not to work around a Python
+version, but because it pulls a large transitive dependency footprint
+(`boto3`, `openai`, `tiktoken`, `tokenizers`, ...) the base install
+shouldn't force on everyone:
 
 - `litellm` is an optional dependency (`pip install -e ".[llm]"`), not
   a hard requirement.
 - `redteam.llm.litellm` imports `litellm` lazily, inside each method
   body — the module itself, and everything that imports
-  `LLMClient`/`FakeLLMClient`, stays importable on 3.10.
+  `LLMClient`/`FakeLLMClient`, stays importable without it.
 
 ## Consequences
 
 - Nothing outside `redteam.llm` needs to change when/if the team moves
   to a different LLM gateway (or drops LiteLLM) — implement
   `LLMClient` and rewire `redteam.app.bootstrap`.
-- Until the team is on Python 3.11+, `LiteLLMClient` can be
-  constructed but its methods will raise `ImportError` when actually
-  called. Tests and the current vertical slice use `FakeLLMClient`, so
-  this doesn't block anything at this stage.
-- Revisit once the team standardizes on 3.11+: bump
-  `pyproject.toml`'s `requires-python`, fold `llm` back into the base
-  dependency set if desired.
+- Without the `llm` extra installed, `LiteLLMClient` can be constructed
+  but its methods raise `ImportError` when actually called. Tests and
+  the default vertical slice use `FakeLLMClient`, so this doesn't block
+  anything at this stage.
+- `requires-python` (3.10) is unrelated to this ADR now — nothing here
+  blocks on a Python version bump.

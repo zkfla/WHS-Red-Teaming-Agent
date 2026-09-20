@@ -2,6 +2,14 @@
 
 Makes no judgement of its own, including on REQUIRE_APPROVAL, which
 routes away rather than waiting.
+
+Resume exception: when ``runtime.pending_approval_id`` is already set and
+matches this exact proposal (``AgentLoopRunner.reconcile_once`` seeded
+this turn that way — see ``orchestration.state.resume_graph_state``),
+this node must never ask Control for a *fresh* judgement — that would
+mint a second Approval for an action a human already resolved. It asks
+for the resolved *outcome* instead (``ControlPlane.approval_outcome``),
+which itself never bypasses Control (see its docstring).
 """
 
 from __future__ import annotations
@@ -14,6 +22,7 @@ from redteam.core.enums import AgentPhase, PolicyVerdict
 from redteam.orchestration.context import RuntimeDeps
 from redteam.orchestration.nodes._support import advance, publisher_for
 from redteam.orchestration.state import GraphState, TerminationReason
+from redteam.orchestration.work.models import WorkStatus
 
 _OUTCOME = {
     PolicyVerdict.ALLOW: (EventType.ACTION_APPROVED, AgentPhase.EXECUTE),
@@ -30,21 +39,72 @@ async def policy_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
     correlation_id = str(proposal.action_id)
     publisher = publisher_for(state, deps, "orchestration.policy")
 
-    context = ControlContext(
-        engagement_id=runtime.engagement_id,
-        agent_id=runtime.current_agent,
-        correlation_id=correlation_id,
-    )
-    try:
-        decision = await deps.control_plane.evaluate(proposal, context)
-    except Exception as exc:  # noqa: BLE001 - policy failures must fail closed
-        decision = PolicyDecision(
-            action_id=proposal.action_id,
-            verdict=PolicyVerdict.DENY,
-            reasons=["control plane evaluation failed"],
-            matched_rules=[f"control_error:{type(exc).__name__}"],
-            evaluated_at=datetime.now(timezone.utc),
+    # Live concurrency signal for ROE's max_parallel_actions (control/roe.py
+    # cannot compute this itself: the Work Ledger is Orchestration's, not
+    # Control's, to import). "Other" actions already leased/running for
+    # this run, excluding the one currently being evaluated.
+    current_work_id = state.get("current_work_id")
+    in_flight = 0
+    for status in (WorkStatus.LEASED, WorkStatus.RUNNING):
+        in_flight += len(
+            [
+                item
+                for item in await deps.work_store.list_items(
+                    status=status, run_id=runtime.run_id
+                )
+                if item.work_id != current_work_id
+            ]
         )
+
+    resuming_approval = (
+        runtime.pending_approval_id is not None
+        and runtime.pending_action_id == proposal.action_id
+    )
+    if resuming_approval:
+        assert runtime.pending_approval_id is not None
+        resume_error: str | None
+        try:
+            resolved = await deps.control_plane.approval_outcome(runtime.pending_approval_id)
+        except Exception as exc:  # noqa: BLE001 - policy failures must fail closed
+            resolved = None
+            resume_error = type(exc).__name__
+        else:
+            resume_error = None
+        if resolved is not None:
+            decision = resolved
+        else:
+            # Still pending (or the outcome lookup itself failed) --
+            # never fabricate an ALLOW. Re-publish the same
+            # REQUIRE_APPROVAL shape; the run ends up back at
+            # APPROVAL_PENDING exactly as before this resume attempt.
+            decision = PolicyDecision(
+                action_id=proposal.action_id,
+                verdict=PolicyVerdict.REQUIRE_APPROVAL,
+                reasons=(
+                    ["approval still pending"]
+                    if resume_error is None
+                    else [f"approval outcome lookup failed: {resume_error}"]
+                ),
+                approval_id=runtime.pending_approval_id,
+                evaluated_at=datetime.now(timezone.utc),
+            )
+    else:
+        context = ControlContext(
+            engagement_id=runtime.engagement_id,
+            agent_id=runtime.current_agent,
+            correlation_id=correlation_id,
+            metadata={"in_flight_actions": in_flight},
+        )
+        try:
+            decision = await deps.control_plane.evaluate(proposal, context)
+        except Exception as exc:  # noqa: BLE001 - policy failures must fail closed
+            decision = PolicyDecision(
+                action_id=proposal.action_id,
+                verdict=PolicyVerdict.DENY,
+                reasons=["control plane evaluation failed"],
+                matched_rules=[f"control_error:{type(exc).__name__}"],
+                evaluated_at=datetime.now(timezone.utc),
+            )
 
     evaluated = await publisher.publish(
         EventType.POLICY_EVALUATED,
@@ -78,6 +138,11 @@ async def policy_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                 "pending_approval_id": decision.approval_id,
             }
         )
+    elif resuming_approval:
+        # The approval cycle is fully resolved now (ALLOW or DENY) --
+        # clear the markers so a later, unrelated action is never
+        # mistaken for a resume of this one.
+        runtime_update.update({"pending_approval_id": None, "pending_action_id": None})
 
     return advance(
         state,

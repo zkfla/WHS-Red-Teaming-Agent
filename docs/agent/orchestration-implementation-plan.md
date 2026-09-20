@@ -606,9 +606,12 @@ and (coverage obligations satisfied or every gap has an explicit blocked reason)
 Analysis는 독립 `AnalysisVerifier` 포트와 기본 deterministic reviewer로 VERIFY에
 연결했고, Reporting은 terminal canonical-state projection으로 연결했다. Web/Mobile은
 해당 graph target과 capability tag를 가진 ToolDescriptor가 동시에 있을 때만 실행된다.
-단, 현재 Control scope checker는 `AssetTarget` identity를 허용 범위와 대조하지 못해
-기본 Control Plane에서 Mobile action을 DENY한다. 이는 오케스트레이션이 우회하지 않고
-Control/PM의 Asset scope 계약 확정을 기다리는 명시적 cross-team blocker다.
+~~단, 현재 Control scope checker는 AssetTarget identity를 허용 범위와 대조하지
+못해 기본 Control Plane에서 Mobile action을 DENY한다.~~ **해결됨**:
+`EngagementScope.allowed_assets`/`denied_assets` (canonical `asset_id` exact
+match, host 계열과 별도 규칙 — `redteam.control.scope._check_asset_scope`)로
+Mobile action도 이제 명시적으로 ALLOW 가능하다. Scope 밖 asset은 여전히
+fail-closed DENY.
 
 ### Phase 9 — Event Bus wake-up과 관측성 (reconciliation tick 구현, daemon host 남음)
 
@@ -762,13 +765,50 @@ canonical action key 비교로 수정해야 한다. 추적 문서는
 - [x] 정상 수렴, 예산 종료, 승인 대기, 사용자 중단, 실패 종료가 서로 구분된다.
 - [x] 어떤 종료에서도 partial report를 만들 수 있다.
 
-구현 완료 정의는 11/11 충족한다. 다만 아래는 오케스트레이션 내부 완료와
-별개인 외부 통합 항목이다.
+구현 완료 정의는 11/11 충족한다. 아래 네 항목은 "외부 팀/PM 합의가 먼저
+필요하다"는 이유로 미룬 것이었는데, 이번 Live Integration Gap 작업에서
+전부 구현되었다 — 상태만 갱신한다.
 
-- 승인 해소 후 안전한 재개: resolved approval을 ALLOW로 재평가하는 Control Port 필요
-- action-aware 동적 Tool 선택: PM의 Tool Catalog Core Port 승인 필요
-- multi-tenant shared graph 격리: Attack Graph tenancy 계약 필요
-- 상시 reconciliation loop: 배포 계층 daemon/worker host 필요
+- [x] **승인 해소 후 안전한 재개** — `ControlPlane.approval_outcome(approval_id)`
+  (Core Port, read-only)가 resolved approval을 rate-limit/budget만
+  재평가해 ALLOW/DENY로 돌려준다 (Scope/ROE/Policy는 같은 불변 proposal에
+  이미 한 번 결정론적으로 적용됐으므로 재실행하지 않는다 — 재실행하면
+  REQUIRE_APPROVAL을 다시 발급해 버린다). `orchestration.nodes.replan`이
+  APPROVAL_PENDING 종료 시에만 `action_proposal`/`plan_step`을 체크포인트에
+  보존하고, `orchestration.graph`의 조건부 START edge가 그 상태를
+  OBSERVE/PLAN을 건너뛰고 POLICY로 바로 재진입시킨다
+  (`orchestration.state.resume_graph_state`). `policy_node`는
+  `runtime.pending_approval_id`가 이 proposal과 일치하면 `evaluate()` 대신
+  `approval_outcome()`을 호출해 두 번째 Approval이 생기지 않게 한다. 재개된
+  실행은 원래 WorkItem lease를 재사용하지 않는 단발성 실행이다(의도적
+  단순화 — 아래 참고).
+- [x] **action-aware 동적 Tool 선택** — `docs/proposals/tool-selection-port.md`
+  참고. `ToolGateway.list_tools_for_action` Core Port 추가, PM 승인 완료.
+- [x] **multi-tenant shared graph 격리** — `attack_graph.stores.namespaced.EngagementScopedAttackGraphStore`.
+  `AttackGraphStore` Core Port 시그니처는 그대로 두고, id를 스토어
+  경계에서만 네임스페이스 처리하는 decorator. `app.bootstrap`이 기본으로
+  감싸서 배선한다.
+- [x] **상시 reconciliation loop** — `AgentLoopRunner.reconcile_once()`
+  자체는 이미 있었다(event wake-up + periodic fallback). 이번에 추가된
+  것은 그걸 반복 호출하는 최소 host 루프
+  (`orchestration.reconciliation.run_reconciliation_loop`) — daemon
+  프레임워크가 아니라 평범한 `asyncio` 코루틴이며, 이를 구동할 프로세스
+  자체(및 CLI 진입점)는 여전히 배포/애플리케이션 계층의 몫으로 남는다.
+
+의도적으로 남겨둔 단순화 (다음 이터레이션 후보, 지금 fake로 채우지 않음):
+
+- 재개된 실행은 Work Ledger lease를 재사용하지 않는다 — 원래 WorkItem은
+  REQUIRE_APPROVAL 시점에 `BLOCKED`로 이미 종료 처리되고, 재개 실행은
+  `current_work_id=None`으로 렛저 밖에서 한 번만 도는 단발 실행이다.
+  reporting의 work-ratio 지표가 이 건을 "실행됨"이 아니라 "blocked"로
+  셀 수 있다는 게 유일한 부작용이며, 정확성/안전성 문제는 아니다.
+  `AgentLoopRunner._resume_pending_approval`에 근거와 함께 적어 두었다.
+- `approval_outcome`의 `_pending_proposals`는 프로세스 메모리에만
+  있다 — 프로세스 재시작 후에는 "stale approval"로 fail-closed DENY
+  된다(추측 재구성 금지). 진짜 durable resume(재시작을 넘는)은 이번
+  범위 밖이다.
+- reconciliation host의 CLI 진입점은 만들지 않았다 — 이번 작업 지시에
+  "CLI 구현은 범위 아님"이 명시됨.
 
 ## 17. 블라인드 자기평가와 보정 기록
 

@@ -13,7 +13,12 @@ from redteam.attack_graph.observation import GraphObservation
 from redteam.attack_graph.patterns import NodePattern
 from redteam.core.enums import AgentPhase, GraphNodeType
 from redteam.core.ids import AgentId, ToolId
-from redteam.orchestration.agents.base import AgentSpec, HypothesisDraft, PlanStep
+from redteam.orchestration.agents.base import (
+    TARGET_REF_PLACEHOLDER,
+    AgentSpec,
+    HypothesisDraft,
+    PlanStep,
+)
 from redteam.orchestration.agents.builtin import MOBILE_AGENT, WEB_API_AGENT
 from redteam.orchestration.agents.definition import (
     AgentDefinition,
@@ -201,9 +206,19 @@ class AgentRegistry:
 
 RECON_AGENT_ID = AgentId("recon-agent")
 
-#: Probes each in-scope host with the harmless example MCP tool. Its
-#: target comes from the graph, not a hardcoded hostname, so adding a
-#: host to the engagement YAML is enough to make it probe that host too.
+#: Probes each in-scope host. Its target comes from the graph, not a
+#: hardcoded hostname, so adding a host to the engagement YAML is enough
+#: to make it probe that host too. ``target_ref`` (via
+#: ``PlanStep.bound_to``'s ``TARGET_REF_PLACEHOLDER`` substitution) is
+#: the bound host's own address, so this one static step works both
+#: against the harmless in-process ``ExampleMCPAdapter`` (zero MCP
+#: servers configured -- its permissive ``ping`` schema accepts any
+#: arguments and just echoes them) and against a real, configured
+#: ``recon`` MCP server whose tool is keyed by that same address (e.g.
+#: ``recon.http_probe(target_ref, path)`` -- see
+#: ``deploy/mcp/README.md``/``.env.example``). Action-aware Tool
+#: Selection (``orchestration.candidates.tool_selection``) decides which
+#: concrete tool actually runs; this step never pins one.
 RECON_AGENT = AgentSpec(
     agent_id=RECON_AGENT_ID,
     name="Recon Agent",
@@ -215,7 +230,7 @@ RECON_AGENT = AgentSpec(
             step_id="probe-host",
             capability="recon",
             operation="service_discovery",
-            tool_id=ToolId("recon.ping"),
+            tool_id=ToolId("recon.probe"),
             target_bind="host",
             preconditions=[
                 NodePattern(
@@ -224,17 +239,20 @@ RECON_AGENT = AgentSpec(
                     bind="host",
                 )
             ],
-            arguments={"message": "reachability probe"},
+            arguments={
+                "target_ref": TARGET_REF_PLACEHOLDER,
+                "path": "/",
+                "message": "reachability probe",
+            },
             reason="Confirm the host answers before anything else is planned against it.",
-            expected_observation="the tool echoes the probe message back",
+            expected_observation="the probe tool completes without a transport/tool error",
             hypothesis=HypothesisDraft(
                 description="The host is reachable from the test harness.",
                 confidence=0.4,
             ),
             expectation=Expectation(
-                kind="output_field_present",
-                field="echo",
-                description="the example tool echoes its arguments back",
+                kind="tool_succeeded",
+                description="the probe tool ran and returned a result for this host",
             ),
             observed_attrs={"reachable": True, "probed": True},
         )

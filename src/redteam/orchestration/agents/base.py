@@ -31,6 +31,45 @@ from redteam.orchestration.expectations import Expectation
 #: graph with thousands of discovered nodes cannot blow up a prompt.
 MAX_CANDIDATES_PER_STEP = 25
 
+#: ``PlanStep.arguments`` values that ``bound_to`` replaces with a real
+#: field off the bound target — lets one static playbook entry call a
+#: real tool whose required arguments vary per discovered node, without
+#: a specific host/service/path baked into the playbook. Deliberately
+#: not a general template engine: this is the exact, small set of
+#: fields real tools in this codebase need resolved from graph context
+#: today (``docs/contracts/actions.md``'s canonical ``http_request``
+#: shape). Add to this dict only when a real tool needs another one.
+TARGET_REF_PLACEHOLDER = "$target_ref"
+PATH_PLACEHOLDER = "$path"
+
+
+def _target_ref_value(target: AnyTarget) -> str | None:
+    for attribute in ("host", "domain", "service_name", "url"):
+        value = getattr(target, attribute, None)
+        if isinstance(value, str) and value:
+            return value
+    return str(target)
+
+
+def _path_value(target: AnyTarget) -> str | None:
+    """Only ``EndpointTarget`` carries a path — a ``ServiceTarget``/
+    ``HostTarget`` genuinely has none, and this returns ``None`` rather
+    than inventing ``"/"``: the caller drops that candidate instead of
+    proposing an unresolved or guessed path."""
+    value = getattr(target, "path", None)
+    return value if isinstance(value, str) and value else None
+
+
+#: Resolver per placeholder. ``_target_ref_value`` falls back to
+#: ``str(target)`` so it never fails (every target kind has *some*
+#: string identity); ``_path_value`` can genuinely return ``None`` when
+#: the bound target has no path, which ``bound_to`` treats as "this
+#: candidate cannot be resolved from what's known" rather than a guess.
+_PLACEHOLDER_RESOLVERS: dict[str, Any] = {
+    TARGET_REF_PLACEHOLDER: _target_ref_value,
+    PATH_PLACEHOLDER: _path_value,
+}
+
 
 class HypothesisDraft(BaseModel):
     """The security question a step is asking, stated before it runs."""
@@ -110,9 +149,35 @@ class PlanStep(BaseModel):
             raise ValueError(f"step {self.step_id!r} has no concrete target yet")
         return self.target
 
-    def bound_to(self, target: AnyTarget) -> PlanStep:
-        """A concrete copy of this step, pinned to one target."""
-        return self.model_copy(update={"target": target, "target_bind": ""})
+    def bound_to(self, target: AnyTarget) -> PlanStep | None:
+        """A concrete copy of this step, pinned to one target, with every
+        placeholder in :data:`_PLACEHOLDER_RESOLVERS` resolved from that
+        target's real fields — lets a static playbook argument stay in
+        sync with whichever concrete node it gets bound to, instead of a
+        deployment-specific value (or a guessed one, e.g. a fixed path)
+        baked into the playbook itself.
+
+        Returns ``None`` when a placeholder this step actually uses
+        cannot be resolved from ``target`` (e.g. ``$path`` against a
+        ``ServiceTarget``, which has no path) — the caller
+        (:func:`available_steps`) drops that candidate rather than
+        proposing one with a dangling ``"$path"`` string, which would
+        either fail tool-schema validation or, worse, reach a real tool
+        as a literal argument value.
+        """
+        arguments: dict[str, Any] = {}
+        for key, value in self.arguments.items():
+            resolver = _PLACEHOLDER_RESOLVERS.get(value) if isinstance(value, str) else None
+            if resolver is None:
+                arguments[key] = value
+                continue
+            resolved = resolver(target)
+            if resolved is None:
+                return None
+            arguments[key] = resolved
+        return self.model_copy(
+            update={"target": target, "target_bind": "", "arguments": arguments}
+        )
 
 
 class AgentSpec(BaseModel):
@@ -218,7 +283,13 @@ async def available_steps(
             )
             if not result.ok:
                 continue
-            candidates.append(entry.bound_to(target_for_node(node.id, node.type)))
+            bound = entry.bound_to(target_for_node(node.id, node.type))
+            if bound is None:
+                # A placeholder this step needs could not be resolved
+                # from this particular node (section 7: never guess) --
+                # skip it, do not count it against this turn's offer cap.
+                continue
+            candidates.append(bound)
             offered += 1
 
     return candidates
