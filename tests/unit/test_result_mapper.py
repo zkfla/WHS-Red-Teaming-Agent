@@ -296,7 +296,18 @@ def test_web_mapper_preserves_only_normalized_response_metadata() -> None:
         "realm_present": True,
     }
     assert endpoint.facts["cookie_metadata"]["cookies"][0]["name"] == "sid"
-    assert "value" not in str(endpoint.facts["cookie_metadata"])
+    # Assert the intent directly instead of substring-matching the rendered
+    # dict: the mapper's own "values_omitted": True flag legitimately contains
+    # the characters "value", so a naive containment check fails on a payload
+    # that is in fact safe. These two are strictly stronger -- the raw value
+    # string must be absent, and no cookie entry may carry a value key at all.
+    cookie_metadata = endpoint.facts["cookie_metadata"]
+    assert "must-not-be-copied" not in str(cookie_metadata)
+    assert cookie_metadata["values_omitted"] is True
+    assert cookie_metadata["cookies"]
+    for entry in cookie_metadata["cookies"]:
+        assert "value" not in entry
+        assert "values" not in entry
 
 
 @pytest.mark.parametrize('status', [True, 0, 600, '200', None])

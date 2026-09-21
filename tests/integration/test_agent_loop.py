@@ -223,8 +223,11 @@ async def test_runner_request_stop_returns_a_named_terminal_runtime() -> None:
 async def test_unexpected_run_failure_still_publishes_a_partial_report(
     monkeypatch,
 ) -> None:
-    async def fail_run(self, runtime):
-        del self, runtime
+    # Must mirror AgentLoopRunner.run's real signature, otherwise the
+    # monkeypatch fails with a TypeError before the failure path under test
+    # is ever reached.
+    async def fail_run(self, runtime, *, initial_event_id=None):
+        del self, runtime, initial_event_id
         raise RuntimeError("sensitive failure detail")
 
     monkeypatch.setattr(AgentLoopRunner, "run", fail_run)
