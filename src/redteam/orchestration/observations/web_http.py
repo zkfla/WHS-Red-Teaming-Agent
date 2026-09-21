@@ -534,6 +534,9 @@ def map_web_http_request(
     observation = http_observation(arguments, result)
     if isinstance(observation, dict):
         observation["body_sha256"] = f"sha256:{digest.lower()}"
+        for metadata_key in ("redirect_metadata", "auth_challenge", "cookie_metadata"):
+            if metadata_key in observation:
+                facts[metadata_key] = observation[metadata_key]
     facts["security_headers_present"] = dict(headers)
     endpoint_id = endpoint_node_id(method, path, host=host, port=port)
     nodes = [

@@ -221,6 +221,35 @@ async def test_a_redirect_status_produces_no_location_derived_candidate() -> Non
         assert NEVER_OBSERVED_KEYS.isdisjoint(draft.plan_step.arguments)
 
 
+async def test_an_observed_redirect_path_produces_a_bounded_followup() -> None:
+    observation = http_observation(302)
+    observation["redirect_metadata"] = {
+        "detected": True,
+        "location_path": "/login",
+        "query_omitted": False,
+        "fragment_omitted": False,
+    }
+    service = await endpoint_graph(observations=[observation], sessions=[session("alice")])
+
+    batch = await propose(service)
+
+    redirects = followups(batch, step_prefix="redirect-followup:")
+    assert len(redirects) == 1
+    assert redirects[0].plan_step.arguments["path"] == "/login"
+    assert redirects[0].plan_step.arguments["method"] == "GET"
+    assert redirects[0].plan_step.hypothesis is not None
+
+
+async def test_redirect_followup_requires_a_catalog_bound_http_operation() -> None:
+    observation = http_observation(302)
+    observation["redirect_metadata"] = {"detected": True, "location_path": "/login"}
+    service = await endpoint_graph(observations=[observation])
+
+    batch = await propose(service, operations=(("web", "other_operation"),), verified=True)
+
+    assert not followups(batch, step_prefix="redirect-followup:")
+
+
 async def test_header_and_cookie_values_are_never_materialized() -> None:
     service = await endpoint_graph(
         observations=[http_observation(401)],

@@ -39,17 +39,16 @@ GraphUpdated
 FindingCreated        FindingVerified
 ```
 
-**Current status**: every event above is real and emitted in a normal
-run, including `AgentFinished` (`orchestration.nodes.replan`) and
-`HypothesisCreated` (`orchestration.nodes.plan`, whenever a step
-declares a `HypothesisDraft` — every built-in playbook step does).
-`FindingCreated`/`FindingVerified` are the one pair that still never
-fires: `orchestration.nodes.verify` only publishes a `Finding` when a
-step's `Expectation` reaches `Verdict.VIOLATION`
-(`violation_if_met=True`), and no built-in playbook step sets that —
-see `docs/agent/orchestration-implementation-plan.md` section 16.1,
-finding 1. The vocabulary itself is fixed by PM either way, so nothing
-needs inventing once a playbook actually sets one.
+**Current status**: every event above is emitted by the corresponding
+runtime path when its condition is met, including `AgentFinished`,
+`HypothesisCreated`, and evidence-gated `FindingCreated`/`FindingVerified`.
+The latter still requires a verified violation with evidence and a
+confirmed hypothesis; observation-only results do not emit a Finding.
+Agent-owned lifecycle extensions such as `CandidateRejected`,
+`GraphMutationApplied`, `ResultMapperFailed`, `HypothesisResolved`, and
+`ReplanTriggered` are documented in `docs/agent/event-bus.md` and remain
+plain `EventEnvelope.event_type` strings so the frozen Core vocabulary is
+not changed.
 
 ## Subscribing
 

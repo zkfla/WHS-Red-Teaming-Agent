@@ -1,14 +1,6 @@
-"""Event identity checks across the real orchestration vertical slice.
-
-The producer-gap checks are intentionally marked xfail until orchestration and
-bootstrap owners thread the initial/terminal lifecycle context through state.
-They keep the required identity rules visible without changing producer code
-from the Event Bus team.
-"""
+"""Event identity checks across the real orchestration vertical slice."""
 
 from __future__ import annotations
-
-import pytest
 
 from redteam.app.bootstrap import build_runtime_deps, run_engagement
 from redteam.core.contracts.events import EventEnvelope, EventType
@@ -79,10 +71,6 @@ async def test_replan_triggered_keeps_run_identity_and_cites_its_cause(tmp_path)
         ), "the cited cause must not appear after the effect"
 
 
-@pytest.mark.xfail(
-    strict=False,
-    reason="bootstrap must seed RunStarted event identity into orchestration state",
-)
 async def test_agent_started_cites_run_started_as_causation(tmp_path) -> None:
     events, _run_id = await _run_with_events(tmp_path)
     run_started = next(event for event in events if event.event_type == EventType.RUN_STARTED)
@@ -93,10 +81,6 @@ async def test_agent_started_cites_run_started_as_causation(tmp_path) -> None:
     assert agent_started.causation_id == run_started.event_id
 
 
-@pytest.mark.xfail(
-    strict=False,
-    reason="bootstrap must publish RunFinished with the terminal event context",
-)
 async def test_run_finished_cites_the_last_event_and_keeps_run_correlation(tmp_path) -> None:
     events, run_id = await _run_with_events(tmp_path)
     run_started = next(event for event in events if event.event_type == EventType.RUN_STARTED)

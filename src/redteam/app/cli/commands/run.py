@@ -51,6 +51,12 @@ from redteam.orchestration.events import (
     AGENT_NO_EXECUTABLE_CANDIDATES,
     AUTHENTICATION_CHECK_DEFERRED,
     AUTHENTICATION_CHECKED,
+    CANDIDATE_GENERATED,
+    CANDIDATE_REJECTED,
+    GRAPH_MUTATION_APPLIED,
+    HYPOTHESIS_RESOLVED,
+    REPLAN_TRIGGERED,
+    RESULT_MAPPER_FAILED,
 )
 from redteam.orchestration.runner import AgentLoopRunner
 from redteam.orchestration.settings import OrchestrationSettings
@@ -80,6 +86,12 @@ _RENDERED_EVENTS = frozenset(
         # agent silently producing zero executable candidates is visible
         # by default, not only under --verbose (section 10).
         AGENT_NO_EXECUTABLE_CANDIDATES,
+        CANDIDATE_GENERATED,
+        CANDIDATE_REJECTED,
+        GRAPH_MUTATION_APPLIED,
+        HYPOTHESIS_RESOLVED,
+        REPLAN_TRIGGERED,
+        RESULT_MAPPER_FAILED,
         AUTHENTICATION_CHECK_DEFERRED,
         AUTHENTICATION_CHECKED,
     }
@@ -116,6 +128,41 @@ def _render_event(event: EventEnvelope, *, json_mode: bool) -> None:
         print(json.dumps(mask_secrets(event.model_dump(mode="json")), separators=(",", ":")))
         return
     if event.event_type not in _RENDERED_EVENTS:
+        return
+    if event.event_type == CANDIDATE_REJECTED:
+        payload = event.payload
+        field = f" field={payload['field']}" if payload.get("field") else ""
+        print(
+            "candidate rejected: "
+            f"operation={payload.get('operation', 'unknown')} "
+            f"reason={payload.get('reason', 'unknown')}{field}"
+        )
+        return
+    if event.event_type == RESULT_MAPPER_FAILED:
+        payload = event.payload
+        print(
+            "result mapper failed: "
+            f"operation={payload.get('operation', 'unknown')} "
+            f"mapper={payload.get('mapper', 'unknown')} "
+            f"reason={payload.get('reason', 'unknown')}"
+        )
+        return
+    if event.event_type == AGENT_NO_EXECUTABLE_CANDIDATES:
+        payload = event.payload
+        print(
+            "no executable candidates: "
+            f"offered={payload.get('drafts_offered', 0)} "
+            f"rejected={len(payload.get('rejections', []) or [])}"
+        )
+        for item in (payload.get("rejections", []) or [])[:3]:
+            if not isinstance(item, dict):
+                continue
+            field = f"({item['field']})" if item.get("field") else ""
+            print(
+                "  - "
+                f"{item.get('operation', 'unknown')}: "
+                f"{item.get('reason', 'unknown')}{field}"
+            )
         return
     fields = " ".join(f"{k}={v}" for k, v in mask_secrets(event.payload).items() if v is not None)
     print(f"[{event.event_type}] {fields}")

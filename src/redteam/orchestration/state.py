@@ -117,7 +117,9 @@ class GraphState(TypedDict, total=False):
     last_event_id: EventId | None
 
 
-def initial_graph_state(runtime: RuntimeState) -> GraphState:
+def initial_graph_state(
+    runtime: RuntimeState, *, last_event_id: EventId | None = None
+) -> GraphState:
     """A ``GraphState`` with every transient field explicitly empty."""
     return {
         "runtime": runtime,
@@ -130,7 +132,7 @@ def initial_graph_state(runtime: RuntimeState) -> GraphState:
         "current_work_id": None,
         "dispatch_items": [],
         "worker_outcomes": {},
-        "last_event_id": None,
+        "last_event_id": last_event_id,
     }
 
 

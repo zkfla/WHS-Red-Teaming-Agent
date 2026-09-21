@@ -247,6 +247,58 @@ def test_web_mapper_models_a_session_reference_and_observed_access() -> None:
     }
 
 
+def test_web_mapper_preserves_only_normalized_response_metadata() -> None:
+    from redteam.orchestration.observations.web_http import map_web_http_request
+
+    mutation = map_web_http_request(
+        target=EndpointTarget(host="a.local", path="/private"),
+        arguments={"target_ref": "x", "path": "/private", "method": "GET"},
+        result=_result(
+            tool_id="web.http_request",
+            output={
+                **_GOOD_OUTPUT,
+                "redirect_metadata": {
+                    "detected": True,
+                    "location_path": "/login",
+                    "query_omitted": True,
+                    "fragment_omitted": False,
+                },
+                "auth_challenge": {
+                    "present": True,
+                    "scheme": "basic",
+                    "realm_present": True,
+                },
+                "cookie_metadata": {
+                    "present": True,
+                    "cookies": [
+                        {
+                            "name": "sid",
+                            "secure": True,
+                            "http_only": True,
+                            "same_site": "lax",
+                            "domain_present": False,
+                            "path_present": True,
+                            "persistent": False,
+                            "value": "must-not-be-copied",
+                        }
+                    ],
+                    "values_omitted": True,
+                },
+            },
+        ),
+    )
+
+    endpoint = next(node for node in mutation.nodes if node.node_type is GraphNodeType.ENDPOINT)
+    assert endpoint.facts["redirect_metadata"]["location_path"] == "/login"
+    assert endpoint.facts["auth_challenge"] == {
+        "present": True,
+        "scheme": "basic",
+        "realm_present": True,
+    }
+    assert endpoint.facts["cookie_metadata"]["cookies"][0]["name"] == "sid"
+    assert "value" not in str(endpoint.facts["cookie_metadata"])
+
+
 @pytest.mark.parametrize('status', [True, 0, 600, '200', None])
 def test_web_mapper_rejects_invalid_status(status) -> None:
     from redteam.orchestration.observations.web_http import map_web_http_request

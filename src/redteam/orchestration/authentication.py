@@ -47,6 +47,75 @@ def request_key(method: str, path: str, session_ref: str | None) -> str:
     return hashlib.sha256(encoded).hexdigest()[:24]
 
 
+def _safe_response_metadata(output: dict[str, Any]) -> dict[str, Any]:
+    """Copy only already-normalized response metadata into an observation.
+
+    The current web capability intentionally does not expose response headers.
+    This seam accepts safe metadata if a compatible ToolResult producer supplies
+    it later, without ever copying raw headers, cookie values, or credentials.
+    """
+
+    metadata: dict[str, Any] = {}
+    redirect = output.get("redirect_metadata")
+    if isinstance(redirect, dict) and redirect.get("detected") is True:
+        location = redirect.get("location_path")
+        if (
+            isinstance(location, str)
+            and location.startswith("/")
+            and len(location) <= 512
+            and not any(ord(char) < 32 for char in location)
+            and "\\" not in location
+        ):
+            metadata["redirect_metadata"] = {
+                "detected": True,
+                "location_path": location,
+                "query_omitted": redirect.get("query_omitted") is True,
+                "fragment_omitted": redirect.get("fragment_omitted") is True,
+            }
+        else:
+            metadata["redirect_metadata"] = {"detected": True}
+
+    challenge = output.get("auth_challenge")
+    if isinstance(challenge, dict) and challenge.get("present") is True:
+        scheme = challenge.get("scheme")
+        metadata["auth_challenge"] = {
+            "present": True,
+            "scheme": scheme if isinstance(scheme, str) and len(scheme) <= 32 else "unknown",
+            "realm_present": challenge.get("realm_present") is True,
+        }
+
+    cookies = output.get("cookie_metadata")
+    if isinstance(cookies, dict) and cookies.get("present") is True:
+        safe_cookies: list[dict[str, Any]] = []
+        raw_cookies = cookies.get("cookies", [])
+        if not isinstance(raw_cookies, list):
+            raw_cookies = []
+        for item in raw_cookies[:50]:
+            if not isinstance(item, dict):
+                continue
+            name = item.get("name")
+            safe_cookies.append(
+                {
+                    "name": name if isinstance(name, str) and len(name) <= 128 else "unknown",
+                    "secure": item.get("secure") is True,
+                    "http_only": item.get("http_only") is True,
+                    "same_site": item.get("same_site")
+                    if item.get("same_site") in {"strict", "lax", "none", "unspecified", "invalid"}
+                    else "unspecified",
+                    "domain_present": item.get("domain_present") is True,
+                    "path_present": item.get("path_present") is True,
+                    "persistent": item.get("persistent") is True,
+                }
+            )
+        metadata["cookie_metadata"] = {
+            "present": True,
+            "cookies": safe_cookies,
+            "truncated": cookies.get("truncated") is True,
+            "values_omitted": True,
+        }
+    return metadata
+
+
 def http_observation(arguments: dict[str, Any], result: ToolResult) -> dict[str, Any] | None:
     if str(result.tool_id) != "web.http_request" or not result.success:
         return None
@@ -82,6 +151,7 @@ def http_observation(arguments: dict[str, Any], result: ToolResult) -> dict[str,
         # leaving the Capability Layer.
         "redirect": output.get("redirect") is True,
         "body_sha256": digest if isinstance(digest, str) else None,
+        **_safe_response_metadata(output),
     }
 
 

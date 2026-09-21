@@ -162,16 +162,10 @@ why. See [orchestration.md](orchestration.md).
 
 ## Producer integration notes
 
-The current vertical slice exposes two producer-side follow-ups:
-
-1. `app.bootstrap.run_engagement` creates `RunStarted` and `RunFinished`
-   directly, without setting their lifecycle correlation or terminal
-   causation context.
-2. The first `orchestration.observe` `AgentStarted` event has no parent id,
-   because the `RunStarted` id is not seeded into `GraphState["last_event_id"]`.
-
-These are covered by the Event Bus integration diagnostics as expected
-failures until the Producer owners implement the corresponding changes.
+The bootstrap producer seeds the `RunStarted` event id into the initial graph
+state, so the first `AgentStarted` event cites it as causation and shares the
+run correlation. Terminal projection similarly publishes `ReportProjected`
+from the last orchestration event and publishes `RunFinished` as its child.
 
 ## Swapping the backend
 

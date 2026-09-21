@@ -18,7 +18,7 @@ vulnerability, so no candidate and no finding is derived from it.
 
 from __future__ import annotations
 
-from redteam.attack_graph.identity import host_node_id
+from redteam.attack_graph.identity import endpoint_node_id, host_node_id
 from redteam.attack_graph.observation import GraphObservation
 from redteam.attack_graph.predicates import facts_of
 from redteam.attack_graph.view import AttackGraphView
@@ -159,9 +159,118 @@ class WebCandidateProvider:
                     diagnostics=diagnostics,
                 )
             )
+            candidates.extend(
+                self._redirect_followups(
+                    context=context,
+                    spec=spec,
+                    node=node,
+                    facts=facts,
+                    host=host,
+                    host_facts=host_facts,
+                    latest=latest,
+                )
+            )
         return CandidateBatch(
             candidates=candidates, diagnostics=diagnostics, drops=drops
         )
+
+    def _redirect_followups(
+        self,
+        *,
+        context: GraphCandidateContext | None,
+        node: GraphNode,
+        facts: dict,
+        host: str,
+        host_facts: dict,
+        latest: dict[str, dict],
+        spec: AgentSpec,
+    ) -> list[CandidateDraft]:
+        """Probe an observed same-origin redirect path once.
+
+        The redirect target is only used when a ToolResult producer has
+        already supplied a normalized path. A bare 3xx never creates a
+        guessed login candidate, and query/fragment values are intentionally
+        omitted by the metadata contract.
+        """
+
+        if context is not None and not context.can_execute("web", _HTTP_REQUEST_OPERATION):
+            return []
+        drafts: list[CandidateDraft] = []
+        for item in latest.values():
+            metadata = item.get("redirect_metadata")
+            if not isinstance(metadata, dict) or metadata.get("detected") is not True:
+                continue
+            location = metadata.get("location_path")
+            if (
+                not isinstance(location, str)
+                or not location.startswith("/")
+                or location == item.get("path")
+                or len(location) > 512
+                or "\\" in location
+                or any(ord(char) < 32 for char in location)
+                or not item.get("evidence_id")
+            ):
+                continue
+            session_ref = item.get("session_ref")
+            if session_ref is not None and not any(
+                entry.session_ref == session_ref for entry in self._sessions_for_host(host_facts)
+            ):
+                continue
+            key = request_key("GET", location, session_ref)
+            if key in latest:
+                continue
+            arguments = {
+                "target_ref": host_facts.get("target_ref", host),
+                "path": location,
+                "method": "GET",
+            }
+            if isinstance(session_ref, str):
+                arguments["session_ref"] = session_ref
+            redirect_node_id = endpoint_node_id(
+                "GET", location, host=host, port=facts.get("port")
+            )
+            drafts.append(
+                CandidateDraft(
+                    agent_id=spec.agent_id,
+                    plan_step=PlanStep(
+                        step_id=f"redirect-followup:{node.id}:{key}",
+                        capability="web",
+                        operation=_HTTP_REQUEST_OPERATION,
+                        tool_id=WEB_HTTP_REQUEST,
+                        compatible_tool_ids=[WEB_HTTP_REQUEST],
+                        assessment_kind="observation",
+                        target=EndpointTarget(
+                            host=host,
+                            path=location,
+                            port=facts.get("port"),
+                            graph_node_id=node.id,
+                        ),
+                        arguments=arguments,
+                        reason="Probe an observed redirect target on the same host",
+                        hypothesis=HypothesisDraft(
+                            description=(
+                                f"The observed redirect from {item['path']} leads to "
+                                f"{location}"
+                            ),
+                            metadata={
+                                "kind": "redirect_followup",
+                                "source_evidence_id": item["evidence_id"],
+                            },
+                        ),
+                    ),
+                    target_node_ids=[redirect_node_id],
+                    conflict_keys=[f"target:{redirect_node_id}"],
+                    signals=PrioritySignals(source_refs=[f"evidence:{item['evidence_id']}"]),
+                )
+            )
+        return drafts
+
+    @staticmethod
+    def _sessions_for_host(host_facts: dict) -> list[AuthSession]:
+        return [
+            AuthSession.model_validate(item)
+            for item in host_facts.get("auth_session_config", {}).get("sessions", [])
+        ]
 
     def _authentication_followups(
         self,
