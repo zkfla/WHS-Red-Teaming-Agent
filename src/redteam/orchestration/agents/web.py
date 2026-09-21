@@ -22,6 +22,7 @@ from redteam.attack_graph.identity import host_node_id
 from redteam.attack_graph.observation import GraphObservation
 from redteam.attack_graph.predicates import facts_of
 from redteam.attack_graph.view import AttackGraphView
+from redteam.core.contracts.graph import GraphNode
 from redteam.core.contracts.target import EndpointTarget
 from redteam.core.enums import GraphNodeType
 from redteam.core.ids import EvidenceId, ToolId
@@ -29,6 +30,7 @@ from redteam.orchestration.agents.base import AgentSpec, HypothesisDraft, PlanSt
 from redteam.orchestration.agents.providers import (
     CandidateBatch,
     CandidateDiagnostic,
+    DraftDrop,
     GraphCandidateContext,
     PlaybookCandidateProvider,
 )
@@ -93,7 +95,13 @@ class WebCandidateProvider:
         step: int,
         context: GraphCandidateContext | None,
     ) -> CandidateBatch:
-        candidates = await PlaybookCandidateProvider().propose(spec, view, observation, step=step)
+        playbook = PlaybookCandidateProvider()
+        drops: list[DraftDrop] = []
+        if context is not None:
+            inherited = await playbook.propose_graph(spec, context)
+            candidates, drops = inherited.candidates, inherited.drops
+        else:
+            candidates = await playbook.propose(spec, view, observation, step=step)
         diagnostics: list[CandidateDiagnostic] = []
         for node in await view.list_nodes():
             if node.type is not GraphNodeType.ENDPOINT:
@@ -114,32 +122,51 @@ class WebCandidateProvider:
                 if item.get("kind") != "http_response":
                     continue
                 latest[request_key(item["method"], item["path"], item.get("session_ref"))] = item
-            shared = {
-                "node": node,
-                "facts": facts,
-                "host": host,
-                "host_facts": host_facts,
-                "sessions": sessions,
-                "latest": latest,
-                "spec": spec,
-            }
             candidates.extend(
-                self._authentication_followups(diagnostics=diagnostics, **shared)
-            )
-            candidates.extend(
-                self._session_baseline_followups(
-                    context=context, diagnostics=diagnostics, **shared
+                self._authentication_followups(
+                    spec=spec,
+                    node=node,
+                    facts=facts,
+                    host=host,
+                    host_facts=host_facts,
+                    sessions=sessions,
+                    latest=latest,
+                    diagnostics=diagnostics,
                 )
             )
             candidates.extend(
-                self._authorization_followups(diagnostics=diagnostics, **shared)
+                self._session_baseline_followups(
+                    context=context,
+                    spec=spec,
+                    node=node,
+                    facts=facts,
+                    host=host,
+                    host_facts=host_facts,
+                    sessions=sessions,
+                    latest=latest,
+                    diagnostics=diagnostics,
+                )
             )
-        return CandidateBatch(candidates=candidates, diagnostics=diagnostics)
+            candidates.extend(
+                self._authorization_followups(
+                    spec=spec,
+                    node=node,
+                    facts=facts,
+                    host=host,
+                    host_facts=host_facts,
+                    sessions=sessions,
+                    latest=latest,
+                    diagnostics=diagnostics,
+                )
+            )
+        return CandidateBatch(
+            candidates=candidates, diagnostics=diagnostics, drops=drops
+        )
 
     def _authentication_followups(
         self,
         *,
-        node: object,
+        node: GraphNode,
         facts: dict,
         host: str,
         host_facts: dict,
@@ -156,7 +183,10 @@ class WebCandidateProvider:
 
         drafts: list[CandidateDraft] = []
         for item in latest.values():
-            if item.get("session_ref") is not None or item["status_code"] != _UNAUTHENTICATED_STATUS:
+            if (
+                item.get("session_ref") is not None
+                or item["status_code"] != _UNAUTHENTICATED_STATUS
+            ):
                 continue
             if item["method"] != "GET" or not item.get("evidence_id"):
                 continue
@@ -189,7 +219,7 @@ class WebCandidateProvider:
         self,
         *,
         context: GraphCandidateContext | None,
-        node: object,
+        node: GraphNode,
         facts: dict,
         host: str,
         host_facts: dict,
@@ -320,7 +350,7 @@ class WebCandidateProvider:
     def _authorization_followups(
         self,
         *,
-        node: object,
+        node: GraphNode,
         facts: dict,
         host: str,
         host_facts: dict,
@@ -421,7 +451,7 @@ class WebCandidateProvider:
         self,
         *,
         spec: AgentSpec,
-        node: object,
+        node: GraphNode,
         facts: dict,
         host: str,
         host_facts: dict,

@@ -29,6 +29,7 @@ from redteam.core.ids import AgentId, EngagementId, GraphNodeId
 from redteam.orchestration.events import (
     CANDIDATE_GENERATED,
     HYPOTHESIS_RESOLVED,
+    REPLAN_TRIGGERED,
     REPORT_PROJECTED,
 )
 from redteam.orchestration.state import TerminationReason
@@ -82,6 +83,7 @@ async def test_minimal_vertical_slice_end_to_end(tmp_path) -> None:
         HYPOTHESIS_RESOLVED,
         EventType.GRAPH_UPDATED,
         EventType.AGENT_FINISHED,
+        REPLAN_TRIGGERED,
         REPORT_PROJECTED,
         EventType.RUN_FINISHED,
     ]

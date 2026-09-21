@@ -433,7 +433,61 @@ async def test_compiler_reports_when_no_tool_serves_the_action() -> None:
 
     _, rejections = compiler.compile_drafts_with_rejections(drafts)
 
-    assert rejections and rejections[0].reason == "no_tool_for_action"
+    # An empty catalog has nothing in the namespace at all, which is a
+    # missing capability rather than a missing operation binding.
+    assert rejections and rejections[0].reason == "capability_unavailable"
+
+
+async def test_compiler_distinguishes_an_unbound_operation_from_a_missing_capability() -> None:
+    from redteam.orchestration.agents.providers import PlaybookCandidateProvider
+
+    service = await graph()
+    observation = await service.observe(step=1)
+    registry = MCPToolRegistry()
+    registry.register(
+        ToolDescriptor(
+            tool_id=ToolId("recon.ping"),
+            server_id="test",
+            tool_name="ping",
+            capability_tags=["recon"],
+            health_status=ToolHealthStatus.HEALTHY,
+        )
+    )
+    # The capability exists, but this catalog binds the tool to a different
+    # canonical operation.
+    compiler = CandidateCompiler(catalog_for(registry, operation="port_scan"))
+    drafts = await PlaybookCandidateProvider().propose(
+        agent(), service.view(), observation, step=1
+    )
+
+    _, rejections = compiler.compile_drafts_with_rejections(drafts)
+
+    assert rejections and rejections[0].reason == "operation_unsupported"
+
+
+async def test_compiler_reports_an_unhealthy_only_tool_set_as_such() -> None:
+    from redteam.orchestration.agents.providers import PlaybookCandidateProvider
+
+    service = await graph()
+    observation = await service.observe(step=1)
+    registry = MCPToolRegistry()
+    registry.register(
+        ToolDescriptor(
+            tool_id=ToolId("recon.ping"),
+            server_id="test",
+            tool_name="ping",
+            capability_tags=["recon"],
+            health_status=ToolHealthStatus.UNHEALTHY,
+        )
+    )
+    compiler = CandidateCompiler(catalog_for(registry))
+    drafts = await PlaybookCandidateProvider().propose(
+        agent(), service.view(), observation, step=1
+    )
+
+    _, rejections = compiler.compile_drafts_with_rejections(drafts)
+
+    assert rejections and rejections[0].reason == "tool_unhealthy"
 
 
 async def test_incompatible_first_tool_does_not_hide_a_valid_alternative() -> None:

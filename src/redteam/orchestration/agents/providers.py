@@ -29,6 +29,23 @@ class CandidateDiagnostic:
 class CandidateBatch:
     candidates: list[CandidateDraft]
     diagnostics: list[CandidateDiagnostic] = field(default_factory=list)
+    drops: list[DraftDrop] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class DraftDrop:
+    """A playbook entry that matched real graph context but produced no draft.
+
+    Distinct from CandidateRejection: there is no CandidateDraft to reject
+    because a graph-derived argument could not be resolved at all. Reported
+    through the same CandidateRejected event so the drop is observable
+    rather than silent.
+    """
+
+    step_id: str
+    target_node_id: str
+    reason: str
+    field: str = ""
 
 @dataclass(frozen=True)
 class GraphCandidateContext:
@@ -134,10 +151,32 @@ class PlaybookCandidateProvider:
         *,
         step: int,
     ) -> list[CandidateDraft]:
+        return (await self._propose(spec, view, observation, step=step)).candidates
+
+    async def propose_graph(
+        self, spec: AgentSpec, context: GraphCandidateContext
+    ) -> CandidateBatch:
+        """Default graph-aware seam while retaining playbook semantics."""
+
+        return await self._propose(
+            spec, context.view, context.observation, step=context.step
+        )
+
+    async def _propose(
+        self,
+        spec: AgentSpec,
+        view: AttackGraphView,
+        observation: GraphObservation,
+        *,
+        step: int,
+    ) -> CandidateBatch:
         from redteam.orchestration.candidates.models import CandidateDraft, PrioritySignals
 
+        drops: list[tuple[str, str, str]] = []
         drafts: list[CandidateDraft] = []
-        for plan_step in await available_steps(spec, view, observation, step=step):
+        for plan_step in await available_steps(
+            spec, view, observation, step=step, drops=drops
+        ):
             target_id = node_id_for_target(plan_step.resolved_target())
             drafts.append(
                 CandidateDraft(
@@ -148,15 +187,17 @@ class PlaybookCandidateProvider:
                     signals=PrioritySignals(source_refs=[f"graph:{target_id}"]),
                 )
             )
-        return drafts
-
-    async def propose_graph(
-        self, spec: AgentSpec, context: GraphCandidateContext
-    ) -> list[CandidateDraft]:
-        """Default graph-aware seam while retaining playbook semantics."""
-
-        return await self.propose(
-            spec, context.view, context.observation, step=context.step
+        return CandidateBatch(
+            candidates=drafts,
+            drops=[
+                DraftDrop(
+                    step_id=step_id,
+                    target_node_id=target_node_id,
+                    reason="graph_prerequisite_missing",
+                    field=field,
+                )
+                for step_id, target_node_id, field in drops
+            ],
         )
 
 
@@ -193,7 +234,15 @@ def default_provider_registry() -> CandidateProviderRegistry:
     from redteam.orchestration.agents.web import WebCandidateProvider
 
     playbook = PlaybookCandidateProvider()
+    # Every AgentDefinition declares a provider_id, so every declared id must
+    # resolve even when the role is a non-schedulable seam (Analysis is the
+    # verifier, Reporting the terminal projector): a registry that cannot
+    # resolve a declared id turns "flip schedulable to True later" into an
+    # AgentProviderFailed crash instead of a working role.
     return CandidateProviderRegistry(
-        [(f"playbook:{role}", playbook) for role in ("recon", "mobile", "analysis")]
+        [
+            (f"playbook:{role}", playbook)
+            for role in ("recon", "mobile", "analysis", "reporting")
+        ]
         + [("playbook:web_api", WebCandidateProvider())]
     )

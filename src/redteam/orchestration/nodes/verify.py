@@ -6,8 +6,8 @@ verified ``Finding`` carrying the ``EvidenceId`` behind it.
 from __future__ import annotations
 
 from redteam.attack_graph.identity import hypothesis_node_id, node_id_for_target
-from redteam.attack_graph.service import HYPOTHESIS_INCONCLUSIVE, HYPOTHESIS_OPEN
 from redteam.attack_graph.predicates import Confidence, Provenance
+from redteam.attack_graph.service import HYPOTHESIS_INCONCLUSIVE, HYPOTHESIS_OPEN
 from redteam.core.contracts.events import EventType
 from redteam.core.convert import tool_result_to_evidence
 from redteam.core.enums import AgentPhase, GraphEdgeType, GraphNodeType, Verdict
@@ -237,6 +237,11 @@ async def verify_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             )
             last_event_id = settled.event_id
 
+    existing_claims = {
+        str(item.metadata["claim_key"])
+        for item in await service.list_findings()
+        if item.metadata.get("claim_key")
+    }
     decision = FindingPromoter().promote(
         PromotionRequest(
             verdict=verdict,
@@ -256,10 +261,11 @@ async def verify_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             reviewer_id=assessment.reviewer_id,
             source_refs=list(assessment.source_refs),
             severity=severity_for(step),
-        )
+        ),
+        existing_claims=existing_claims,
     )
-    if decision.promoted:
-        finding = decision.finding
+    finding = decision.finding
+    if finding is not None:
         await service.record_finding(
             finding,
             hypothesis_id=str(proposal.hypothesis_id) if proposal.hypothesis_id else None,

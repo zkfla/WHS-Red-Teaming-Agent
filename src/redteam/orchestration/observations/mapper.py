@@ -14,7 +14,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, TypeGuard
 
 from redteam.core.contracts.target import AnyTarget
 from redteam.core.contracts.tool import ToolResult
@@ -57,6 +57,17 @@ class GraphMutation:
 
     nodes: list[NodeMutation] = field(default_factory=list)
     edges: list[EdgeMutation] = field(default_factory=list)
+
+
+def is_http_status(value: Any) -> TypeGuard[int]:
+    """A real HTTP status code.
+
+    Uses type(value) is int rather than isinstance, because True is an int
+    subclass: a boolean where a status belongs means the tool output is not
+    shaped the way the mapper was written for.
+    """
+
+    return type(value) is int and 100 <= value <= 599
 
 
 #: A mapper only ever reads its inputs; it must not raise for
@@ -111,9 +122,13 @@ class ResultMapperRegistry:
 
 def default_result_mapper_registry() -> ResultMapperRegistry:
     from redteam.orchestration.observations.recon_http import map_recon_http_probe
-    from redteam.orchestration.observations.web_http import map_web_http_request
+    from redteam.orchestration.observations.web_http import (
+        map_web_compare_anonymous,
+        map_web_http_request,
+    )
 
     registry = ResultMapperRegistry()
     registry.register("recon.http_probe", map_recon_http_probe)
     registry.register("web.http_request", map_web_http_request)
+    registry.register("web.http_compare_anonymous", map_web_compare_anonymous)
     return registry

@@ -21,6 +21,9 @@ Rationale: docs/agent/orchestration.md (section 10).
 
 from __future__ import annotations
 
+import hashlib
+import json
+from collections.abc import Collection
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -70,7 +73,30 @@ class FindingPromoter:
     #: at the honest minimum: at least one *linked* record.
     minimum_evidence: int = 1
 
-    def promote(self, request: PromotionRequest) -> PromotionDecision:
+    def claim_key(self, request: PromotionRequest) -> str:
+        """Stable identity of the claim, independent of the evidence gathered.
+
+        Two runs that confirm the same hypothesis on the same target through
+        the same action are one claim, so the second must not become a second
+        Finding. Evidence ids are deliberately excluded: they differ per
+        execution and are not part of what is being asserted.
+        """
+
+        payload = {
+            "capability": request.capability,
+            "operation": request.operation,
+            "target_node_id": request.target_node_id,
+            "hypothesis_id": request.hypothesis_id or "",
+        }
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+        return "finding_claim_" + hashlib.sha256(encoded).hexdigest()[:24]
+
+    def promote(
+        self,
+        request: PromotionRequest,
+        *,
+        existing_claims: Collection[str] = (),
+    ) -> PromotionDecision:
         if request.verdict is not Verdict.VIOLATION:
             return PromotionDecision(None, "verdict_is_not_a_violation")
         evidence_ids = sorted({str(item) for item in request.evidence_ids if item})
@@ -82,6 +108,9 @@ class FindingPromoter:
             return PromotionDecision(None, "no_hypothesis_under_test")
         if request.hypothesis_status != HYPOTHESIS_CONFIRMED:
             return PromotionDecision(None, "hypothesis_not_confirmed")
+        claim_key = self.claim_key(request)
+        if claim_key in set(existing_claims):
+            return PromotionDecision(None, "duplicate_finding")
         return PromotionDecision(
             Finding(
                 finding_id=new_id("find"),
@@ -99,6 +128,7 @@ class FindingPromoter:
                     "reviewer_id": request.reviewer_id,
                     "verification_source_refs": list(request.source_refs),
                     "assessment_kind": request.assessment_kind,
+                    "claim_key": claim_key,
                     **request.extra_metadata,
                 },
             )

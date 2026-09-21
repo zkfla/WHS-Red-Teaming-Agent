@@ -91,6 +91,7 @@ Happy path, one turn, in order:
 ```text
 RunStarted             app.bootstrap
 AgentStarted           orchestration.observe   (once per agent)
+CandidateGenerated     orchestration.plan      (once per compiled frontier)
 HypothesisCreated      orchestration.plan      (when the step states one)
 ActionProposed         orchestration.plan
 PolicyEvaluated        orchestration.policy
@@ -98,18 +99,54 @@ ActionApproved         orchestration.policy    (or ActionDenied / ApprovalRequir
 ToolExecutionStarted   orchestration.execute
 ToolExecutionFinished  orchestration.execute   (or ToolExecutionFailed)
 EvidenceCreated        orchestration.verify
+HypothesisResolved     orchestration.verify    (whenever one is actually closed)
 FindingCreated         orchestration.verify    (VIOLATION only)
 FindingVerified        orchestration.verify    (VIOLATION only)
 GraphUpdated           orchestration.update
 AgentFinished          orchestration.replan    (once per retired agent)
+ReplanTriggered        orchestration.replan    (decisions only, see below)
 ReportProjected        orchestration.reporting
 RunFinished            app.bootstrap
 ```
 
 Agent-Team-local extensible event names additionally include
-`CandidatePruned`, `AgentProviderFailed`, and `ReportProjected`. They remain
+`CandidatePruned`, `CandidateRejected`, `AgentNoExecutableCandidates`,
+`AgentProviderFailed`, `GraphMutationApplied`, `ResultMapperFailed`,
+`ReplanTriggered`, `HypothesisResolved`, and `ReportProjected`. They remain
 plain `EventEnvelope.event_type` strings rather than modifying PM's frozen
 `core.contracts.events.EventType` vocabulary.
+
+### Details for the newer Agent-owned events
+
+`CandidateRejected` carries `candidate_key`, `capability`, `operation`,
+`tool_id`, `reason` and `field`. The reason vocabulary is stable:
+`missing_required_argument`, `schema_mismatch`, `target_mismatch`,
+`non_json_arguments`, `duplicate_candidate`, `capability_unavailable`,
+`operation_unsupported`, `tool_unhealthy`, `unresolved_target` and
+`graph_prerequisite_missing`. The last one has no draft at all -- a playbook
+step whose graph-derived argument cannot be resolved -- so it is reported with
+an empty `candidate_key` rather than being dropped silently. Diagnostic
+generation never re-raises on malformed arguments: a non-JSON candidate is
+reported with a deterministic `cand_invalid_` key derived from stable identity
+fields and argument *type* names, never from the offending value.
+
+`HypothesisResolved` is published when a hypothesis is genuinely closed and
+carries `status`, `reason`, `verdict` and `action_id`. It follows
+the Evidence and any `ObservationRecorded` on the same action correlation. A
+hypothesis stays open only while a real follow-up verification can still run
+(a repeatable step); otherwise it closes inconclusive, with `reason` set to
+`"no_follow_up_verification_available"`, instead of parking the run on a question
+nothing will ask again.
+
+`ReplanTriggered` is published only for an actual decision: a terminal
+outcome, or a reactivation caused by changed planning inputs. Taking another
+loop turn is not a decision and stays silent. It carries `outcome`
+(`continue` / `terminate` / `wait_for_approval`), `reason`
+(`graph_changed`, `hypothesis_updated`, `new_candidate_available`,
+`action_failed`, `no_progress`, `budget_limit`, `max_steps`,
+`no_executable_candidate`, `terminal_condition`), the retiring `agent_id`,
+the `next_agent_id` and the step. It is a run-level event, so unlike the
+action chain it does not share the action correlation id.
 
 `HypothesisCreated`, `AgentFinished`, `FindingCreated` and
 `FindingVerified` were reserved in `EventType` but listed as "not

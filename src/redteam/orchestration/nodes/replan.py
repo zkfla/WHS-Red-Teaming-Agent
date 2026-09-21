@@ -6,8 +6,36 @@ from redteam.core.contracts.events import EventType
 from redteam.core.enums import AgentPhase
 from redteam.orchestration.context import RuntimeDeps
 from redteam.orchestration.convergence import evaluate_convergence
+from redteam.orchestration.events import REPLAN_TRIGGERED
 from redteam.orchestration.nodes._support import advance, graph_service, publisher_for
 from redteam.orchestration.state import GraphState, RuntimeState, TerminationReason
+
+#: Why a replan happened, in the Event Bus vocabulary rather than the run's
+#: exit contract (TerminationReason). Only the reasons that actually imply a
+#: *decision* have an entry; "we simply took another turn" is not one.
+_REPLAN_REASON_BY_TERMINATION = {
+    TerminationReason.MAX_STEPS_REACHED: "max_steps",
+    TerminationReason.BUDGET_EXHAUSTED: "budget_limit",
+    TerminationReason.CONSECUTIVE_FAILURES: "action_failed",
+    TerminationReason.STALLED: "no_progress",
+}
+
+
+def _replan_reason(
+    *, termination: str | None, reactivated: bool, switched: bool
+) -> str:
+    """Name the replan, or return "" when nothing meaningful happened."""
+
+    if termination is not None:
+        mapped = _REPLAN_REASON_BY_TERMINATION.get(termination)
+        if mapped is not None:
+            return mapped
+        return "terminal_condition"
+    if reactivated:
+        return "graph_changed"
+    if switched:
+        return "new_candidate_available"
+    return ""
 
 
 def _hard_stop(runtime: RuntimeState, deps: RuntimeDeps) -> str | None:
@@ -97,7 +125,47 @@ async def replan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
         if convergence.terminal:
             reason = convergence.reason
 
+    # Was a previously retired agent handed work again because *its own*
+    # planning inputs changed? That -- not merely taking another turn -- is
+    # what makes this a replan worth an event. The cursor was written from
+    # the role-scoped, content-sensitive revision fingerprint, so an
+    # unrelated node elsewhere cannot trigger it.
+    reactivated = False
+    observation = state.get("observation")
+    if next_agent is not None and observation is not None:
+        cursor = revision_cursors.get(str(next_agent.agent_id))
+        reactivated = (
+            next_agent.agent_id in finished_agents
+            and cursor is not None
+            and cursor
+            != deps.agents.revision_fingerprint(next_agent.agent_id, observation)
+        )
+    switched = (
+        next_agent is not None
+        and agent_id is not None
+        and next_agent.agent_id != agent_id
+    )
+    event_reason = _replan_reason(
+        termination=reason, reactivated=reactivated, switched=switched
+    )
+
     if reason is not None:
+        triggered = await publisher.publish(
+            REPLAN_TRIGGERED,
+            {
+                "outcome": (
+                    "wait_for_approval"
+                    if reason == TerminationReason.APPROVAL_PENDING
+                    else "terminate"
+                ),
+                "reason": event_reason,
+                "agent_id": agent_id,
+                "next_agent_id": None,
+                "step": runtime.step_count,
+            },
+            causation_id=last_event_id,
+        )
+        last_event_id = triggered.event_id
         # APPROVAL_PENDING is not a dead end: AgentLoopRunner.reconcile_once
         # resumes it directly at POLICY once a human resolves the Approval
         # (see orchestration.state.resume_graph_state), and needs this exact
@@ -133,6 +201,20 @@ async def replan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             current_work_id=None,
             dispatch_items=[],
         )
+
+    if reactivated:
+        triggered = await publisher.publish(
+            REPLAN_TRIGGERED,
+            {
+                "outcome": "continue",
+                "reason": event_reason or "graph_changed",
+                "agent_id": agent_id,
+                "next_agent_id": next_agent.agent_id if next_agent is not None else None,
+                "step": runtime.step_count,
+            },
+            causation_id=last_event_id,
+        )
+        last_event_id = triggered.event_id
 
     return advance(
         state,

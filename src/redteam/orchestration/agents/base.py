@@ -170,6 +170,8 @@ class PlanStep(BaseModel):
         either fail tool-schema validation or, worse, reach a real tool
         as a literal argument value.
         """
+        if self.unresolved_placeholder(target, target_ref=target_ref) is not None:
+            return None
         arguments: dict[str, Any] = {}
         for key, value in self.arguments.items():
             resolver = _PLACEHOLDER_RESOLVERS.get(value) if isinstance(value, str) else None
@@ -179,12 +181,31 @@ class PlanStep(BaseModel):
             resolved = (
                 target_ref if value == TARGET_REF_PLACEHOLDER and target_ref else resolver(target)
             )
-            if resolved is None:
-                return None
             arguments[key] = resolved
         return self.model_copy(
             update={"target": target, "target_bind": "", "arguments": arguments}
         )
+
+    def unresolved_placeholder(
+        self, target: AnyTarget, *, target_ref: str | None = None
+    ) -> str | None:
+        """The first argument key whose placeholder this target cannot fill.
+
+        The reason a step is dropped used to be invisible: no draft existed,
+        so no rejection could be reported. Naming the offending key lets the
+        drop surface as a real graph_prerequisite_missing rejection instead
+        of vanishing.
+        """
+
+        for key, value in self.arguments.items():
+            resolver = _PLACEHOLDER_RESOLVERS.get(value) if isinstance(value, str) else None
+            if resolver is None:
+                continue
+            if value == TARGET_REF_PLACEHOLDER and target_ref:
+                continue
+            if resolver(target) is None:
+                return key
+        return None
 
 
 class AgentSpec(BaseModel):
@@ -248,9 +269,15 @@ async def available_steps(
     *,
     step: int = 0,
     limit: int = MAX_CANDIDATES_PER_STEP,
+    drops: list[tuple[str, str, str]] | None = None,
 ) -> list[PlanStep]:
     """The frontier: playbook entries whose preconditions resolve and
-    that have not already been attempted against that target."""
+    that have not already been attempted against that target.
+
+    A step whose bound target satisfies every precondition but cannot fill a
+    placeholder argument is reported into drops as (step_id, node_id, field).
+    It produces no draft, so without that record it would leave no trace.
+    """
     nodes = await view.list_nodes()
     edges = await view.list_edges()
     candidates: list[PlanStep] = []
@@ -301,6 +328,14 @@ async def available_steps(
                 # A placeholder this step needs could not be resolved
                 # from this particular node (section 7: never guess) --
                 # skip it, do not count it against this turn's offer cap.
+                if drops is not None:
+                    drops.append(
+                        (
+                            entry.step_id,
+                            str(node.id),
+                            entry.unresolved_placeholder(target, target_ref=target_ref) or "",
+                        )
+                    )
                 continue
             candidates.append(bound)
             offered += 1

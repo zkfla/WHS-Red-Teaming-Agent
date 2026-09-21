@@ -68,6 +68,7 @@ def http_observation(arguments: dict[str, Any], result: ToolResult) -> dict[str,
         or (session_ref is not None and not isinstance(session_ref, str))
     ):
         return None
+    digest = output.get("body_sha256")
     return {
         "kind": "http_response",
         "context_key": request_key(method, path, session_ref),
@@ -76,6 +77,11 @@ def http_observation(arguments: dict[str, Any], result: ToolResult) -> dict[str,
         "target_ref": target_ref,
         "session_ref": session_ref,
         "status_code": status,
+        # Both come straight out of CapturedResponse.summary; recording them
+        # lets a later comparison ask "same body?" without the body ever
+        # leaving the Capability Layer.
+        "redirect": output.get("redirect") is True,
+        "body_sha256": digest if isinstance(digest, str) else None,
     }
 
 

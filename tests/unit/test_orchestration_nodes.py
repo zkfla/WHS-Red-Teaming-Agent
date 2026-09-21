@@ -35,12 +35,15 @@ from redteam.event_bus.memory import InMemoryEventBus
 from redteam.orchestration.agents import AgentRegistry, AgentSpec, HypothesisDraft, PlanStep
 from redteam.orchestration.agents.registry import RECON_AGENT
 from redteam.orchestration.candidates.compiler import CandidateCompiler
-from redteam.orchestration.expectations import Expectation
 from redteam.orchestration.events import (
     CANDIDATE_GENERATED,
+    CANDIDATE_REJECTED,
     GRAPH_MUTATION_APPLIED,
     HYPOTHESIS_RESOLVED,
+    OBSERVATION_RECORDED,
+    REPLAN_TRIGGERED,
 )
+from redteam.orchestration.expectations import Expectation
 from redteam.orchestration.nodes import (
     execute_node,
     observe_node,
@@ -792,3 +795,129 @@ async def test_every_hard_stop_names_itself(state_kwargs, settings, expected) ->
 
     assert result["runtime"].phase is AgentPhase.FINISHED
     assert result["runtime"].termination_reason == expected
+
+
+# -- P0-4 / P1-1 / P1-3: the feedback seams, reached through the nodes -------
+
+
+def observation_step(**overrides) -> PlanStep:
+    values: dict[str, Any] = {
+        "step_id": "inspect",
+        "capability": "web",
+        "operation": "http_request",
+        "tool_id": ToolId("web.http_client"),
+        "target": HostTarget(host="a.local"),
+        "reason": "record what the endpoint answers",
+        "assessment_kind": "observation",
+        "expectation": Expectation(
+            kind="output_field_equals",
+            field="status",
+            value=200,
+            violation_if_met=True,
+        ),
+    }
+    values.update(overrides)
+    return PlanStep(**values)
+
+
+async def test_an_observation_only_step_never_becomes_a_finding() -> None:
+    # Even an expectation that would be a violation cannot promote an
+    # observation: assessment_kind=observation means no security claim was
+    # under test in the first place.
+    d = deps()
+    service = AttackGraphService(d.graph_store)
+    await service.record_hypothesis(Hypothesis(hypothesis_id="hyp_1", description="reachable"))
+    state = state_with(
+        runtime(),
+        action_proposal=proposal(hypothesis_id=HypothesisId("hyp_1")),
+        tool_result=tool_result(output={"status": 200}),
+        plan_step=observation_step(),
+    )
+
+    result = await verify_node(state, deps=d)
+
+    assert result["runtime"].last_verdict is Verdict.UNKNOWN
+    assert await service.list_findings(verified=True) == []
+    assert OBSERVATION_RECORDED in d.event_bus.event_types()
+    assert EventType.FINDING_CREATED not in d.event_bus.event_types()
+
+
+async def test_a_violation_with_no_hypothesis_under_test_is_refused_observably() -> None:
+    d = deps()
+    state = state_with(
+        runtime(),
+        action_proposal=proposal(),  # no hypothesis was stated before acting
+        tool_result=tool_result(output={"status": 200}),
+        plan_step=observation_step(assessment_kind="security_check"),
+    )
+
+    result = await verify_node(state, deps=d)
+
+    assert result["runtime"].last_verdict is Verdict.UNKNOWN
+    assert d.event_bus.history(event_type=EventType.FINDING_CREATED) == []
+    assert (
+        d.event_bus.history(event_type=OBSERVATION_RECORDED)[-1].payload[
+            "finding_promotion_refused"
+        ]
+        == "no_hypothesis_under_test"
+    )
+
+
+async def test_plan_reports_a_step_that_cannot_fill_its_graph_arguments() -> None:
+    # The web playbook can inspect a SERVICE, but a ServiceTarget has no path
+    # and $path must never be guessed. Previously that step simply vanished;
+    # now the drop names itself.
+    d = deps()
+    service = await seeded(d, "a.local")
+    await service.upsert_node(
+        GraphNodeType.SERVICE,
+        key="a.local/http",
+        attrs={"responded": True},
+        facts={"scheme": "http", "host": "a.local"},
+    )
+    state = await observe_node(
+        initial_graph_state(runtime(current_agent=AgentId("web-api-agent"))), deps=d
+    )
+
+    await plan_node(state, deps=d)
+
+    rejected = d.event_bus.history(event_type=CANDIDATE_REJECTED)
+    assert [(item.payload["reason"], item.payload["field"]) for item in rejected] == [
+        ("graph_prerequisite_missing", "path")
+    ]
+    assert rejected[0].payload["operation"] == "inspect-http-service"
+
+
+async def test_replan_names_a_terminal_decision() -> None:
+    d = deps()
+    state = initial_graph_state(runtime(step_count=1, current_agent=RECON_AGENT.agent_id))
+
+    await replan_node(state, deps=d)
+
+    triggered = d.event_bus.history(event_type=REPLAN_TRIGGERED)
+    assert len(triggered) == 1
+    assert triggered[0].payload["outcome"] == "terminate"
+    assert triggered[0].payload["reason"] == "terminal_condition"
+
+
+async def test_replan_stays_silent_when_it_is_only_taking_another_turn() -> None:
+    # "We took a turn" is not a replanning event; publishing one per step would
+    # bury the decisions that actually matter.
+    d = deps()
+    state = state_with(runtime(step_count=1), action_proposal=proposal())
+
+    await replan_node(state, deps=d)
+
+    assert d.event_bus.history(event_type=REPLAN_TRIGGERED) == []
+
+
+async def test_replan_maps_a_hard_stop_to_its_own_reason() -> None:
+    d = deps(settings=OrchestrationSettings(max_steps=4))
+    state = state_with(
+        runtime(step_count=4, current_agent=RECON_AGENT.agent_id), action_proposal=proposal()
+    )
+
+    await replan_node(state, deps=d)
+
+    triggered = d.event_bus.history(event_type=REPLAN_TRIGGERED)
+    assert [item.payload["reason"] for item in triggered] == ["max_steps"]

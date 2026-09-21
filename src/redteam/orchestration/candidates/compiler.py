@@ -188,12 +188,33 @@ class CandidateCompiler:
 
         action_tools = self._catalog.list_tools_for_action(capability, operation)
         if not action_tools:
-            return None, ("no_tool_for_action", "")
-        healthy = [
+            # "Nothing in this namespace at all" and "the namespace exists
+            # but no tool is bound to this intent" are different operator
+            # problems: the first is a missing capability, the second an
+            # unsupported operation. Collapsing them into one reason hides
+            # which configuration is actually missing.
+            capability_tools = self._catalog.list_by_capability(capability)
+            if not capability_tools:
+                return None, ("capability_unavailable", "")
+            # list_tools_for_action hides unhealthy tools, so an
+            # all-unhealthy namespace presents as "nothing serves this
+            # action". Reporting that as an unsupported operation would send
+            # the operator looking for a binding that is already there.
+            if all(
+                tool.health_status is ToolHealthStatus.UNHEALTHY
+                for tool in capability_tools
+            ):
+                return None, ("tool_unhealthy", "")
+            return None, ("operation_unsupported", "")
+        usable = [
             tool
             for tool in action_tools
             if tool.health_status is not ToolHealthStatus.UNHEALTHY
-            and (not plan_step.compatible_tool_ids or tool.tool_id in plan_step.compatible_tool_ids)
+        ]
+        healthy = [
+            tool
+            for tool in usable
+            if not plan_step.compatible_tool_ids or tool.tool_id in plan_step.compatible_tool_ids
         ]
         if not healthy:
             return None, ("no_healthy_compatible_tool", "")
@@ -205,7 +226,7 @@ class CandidateCompiler:
         if not schema_ok:
             reason, field = self._schema_rejection(
                 plan_step.arguments, healthy[0].input_schema
-            ) or ("argument_schema_mismatch", "")
+            ) or ("schema_mismatch", "")
             return None, (reason, field)
         return select_tool(schema_ok), None
 
@@ -228,7 +249,7 @@ class CandidateCompiler:
             required = error.validator_value if isinstance(error.validator_value, list) else []
             missing = next((name for name in required if name not in (arguments or {})), "")
             return ("missing_required_argument", str(missing))
-        return ("argument_schema_mismatch", ".".join(str(part) for part in error.absolute_path))
+        return ("schema_mismatch", ".".join(str(part) for part in error.absolute_path))
 
     @staticmethod
     def _arguments_match_schema(arguments: dict, schema: dict) -> bool:

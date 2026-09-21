@@ -17,14 +17,16 @@ from redteam.core.contracts.graph import Hypothesis
 from redteam.core.contracts.target import target_display_name
 from redteam.core.enums import AgentPhase
 from redteam.core.ids import ActionId, HypothesisId, new_id
-from redteam.orchestration.agents.base import PlanningContext
+from redteam.orchestration.agents.base import AgentSpec, PlanningContext
 from redteam.orchestration.agents.planners import build_planner
 from redteam.orchestration.agents.providers import (
     CandidateBatch,
     CandidateDiagnostic,
+    DraftDrop,
     GraphCandidateContext,
     planning_fingerprint,
 )
+from redteam.orchestration.candidates.catalog import ToolCatalog
 from redteam.orchestration.candidates.compiler import CandidateCompiler, CandidateRejection
 from redteam.orchestration.context import RuntimeDeps
 from redteam.orchestration.context_projection import (
@@ -67,7 +69,7 @@ def _declared_operations(agent: AgentSpec, provider: object) -> list[tuple[str, 
 
 
 def _available_operations(
-    catalog: object | None, declared: list[tuple[str, str]]
+    catalog: ToolCatalog | None, declared: list[tuple[str, str]]
 ) -> tuple[tuple[tuple[str, str], ...], bool]:
     """Which declared actions the live Tool Catalog can actually execute.
 
@@ -127,6 +129,7 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
     drafts = None
     diagnostics: list[CandidateDiagnostic] = []
     rejections: list[CandidateRejection] = []
+    drops: list[DraftDrop] = []
     planning_digest = ""
     try:
         if definition is None:
@@ -167,6 +170,7 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             )
             if isinstance(offered, CandidateBatch):
                 drafts, diagnostics = offered.candidates, offered.diagnostics
+                drops = offered.drops
             else:
                 drafts = offered
             compiled, rejections = compiler.compile_drafts_with_rejections(drafts)
@@ -201,6 +205,26 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
         )
     publisher = publisher_for(state, deps, "orchestration.plan")
     last_event_id = state.get("last_event_id")
+    for drop in drops:
+        # A playbook entry that matched real graph context but could not be
+        # turned into a draft (an argument the bound target cannot supply)
+        # never reaches the compiler, so it has no CandidateRejection. Report
+        # it through the same event instead of dropping it silently.
+        dropped = await publisher.publish(
+            CANDIDATE_REJECTED,
+            {
+                "agent_id": agent.agent_id,
+                "target_node_id": drop.target_node_id,
+                "capability": "",
+                "operation": drop.step_id,
+                "tool_id": "",
+                "reason": drop.reason,
+                "field": drop.field,
+                "candidate_key": "",
+            },
+            causation_id=last_event_id,
+        )
+        last_event_id = dropped.event_id
     for rejection in rejections:
         rejected = await publisher.publish(
             CANDIDATE_REJECTED,
