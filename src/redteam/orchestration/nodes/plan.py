@@ -23,6 +23,7 @@ from redteam.orchestration.agents.providers import (
     CandidateBatch,
     CandidateDiagnostic,
     GraphCandidateContext,
+    planning_fingerprint,
 )
 from redteam.orchestration.candidates.compiler import CandidateCompiler, CandidateRejection
 from redteam.orchestration.context import RuntimeDeps
@@ -48,6 +49,48 @@ from redteam.orchestration.nodes._support import advance, graph_service, publish
 from redteam.orchestration.scheduler import WorkScheduler
 from redteam.orchestration.state import GraphState
 from redteam.orchestration.work.models import TERMINAL_STATUSES, WorkStatus
+
+
+def _declared_operations(agent: AgentSpec, provider: object) -> list[tuple[str, str]]:
+    """Every (capability, operation) pair this agent could ever propose.
+
+    The static playbook is the baseline. A provider that can go beyond it
+    declares the extras on its declared_operations attribute -- so the
+    runtime, not the provider, is the one that checks them against the
+    live Tool Catalog.
+    """
+
+    pairs = {(str(step.capability), str(step.operation)) for step in agent.playbook}
+    for capability, operation in getattr(provider, "declared_operations", ()) or ():
+        pairs.add((str(capability), str(operation)))
+    return sorted(pairs)
+
+
+def _available_operations(
+    catalog: object | None, declared: list[tuple[str, str]]
+) -> tuple[tuple[tuple[str, str], ...], bool]:
+    """Which declared actions the live Tool Catalog can actually execute.
+
+    Returns (pairs, verified). With no catalog wired in, executability is
+    unverifiable and the provider's declared ToolId binding remains the
+    only evidence available, so verified is False and callers keep the
+    existing permissive behaviour instead of silently disabling every
+    tool-specific candidate.
+    """
+
+    if catalog is None:
+        return (), False
+    available: list[tuple[str, str]] = []
+    for capability, operation in declared:
+        try:
+            tools = catalog.list_tools_for_action(capability, operation)
+        except ValueError:
+            # Noncanonical capability/operation can never be executed; the
+            # compiler reports it rather than the planner guessing.
+            continue
+        if tools:
+            available.append((capability, operation))
+    return tuple(available), True
 
 
 async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
@@ -84,6 +127,7 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
     drafts = None
     diagnostics: list[CandidateDiagnostic] = []
     rejections: list[CandidateRejection] = []
+    planning_digest = ""
     try:
         if definition is None:
             compiled = await compiler.compile_playbook(
@@ -94,6 +138,14 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                 raise LookupError(
                     f"candidate provider {definition.provider_id!r} is not registered"
                 )
+            available_operations, operations_verified = _available_operations(
+                deps.tool_catalog, _declared_operations(agent, provider)
+            )
+            planning_digest = planning_fingerprint(
+                observation=observation,
+                available_operations=available_operations,
+                prior_candidate_keys=terminal_keys,
+            )
             context = GraphCandidateContext(
                 view=service.view(),
                 observation=observation,
@@ -101,6 +153,9 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                 available_capabilities=tuple(str(item) for item in agent.capabilities),
                 open_hypotheses=tuple(observation.open_hypotheses),
                 prior_candidate_keys=frozenset(terminal_keys),
+                available_operations=available_operations,
+                operations_verified=operations_verified,
+                planning_fingerprint=planning_digest,
             )
             graph_propose = getattr(provider, "propose_graph", None)
             offered = (

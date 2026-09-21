@@ -6,12 +6,11 @@ verified ``Finding`` carrying the ``EvidenceId`` behind it.
 from __future__ import annotations
 
 from redteam.attack_graph.identity import hypothesis_node_id, node_id_for_target
+from redteam.attack_graph.service import HYPOTHESIS_INCONCLUSIVE, HYPOTHESIS_OPEN
 from redteam.attack_graph.predicates import Confidence, Provenance
 from redteam.core.contracts.events import EventType
-from redteam.core.contracts.graph import Finding
 from redteam.core.convert import tool_result_to_evidence
 from redteam.core.enums import AgentPhase, GraphEdgeType, GraphNodeType, Verdict
-from redteam.core.ids import new_id
 from redteam.orchestration.analysis import VerificationAssessment, VerificationRequest
 from redteam.orchestration.authentication import (
     ACCESS_CONTROL_VIOLATION,
@@ -19,13 +18,30 @@ from redteam.orchestration.authentication import (
     http_observation,
 )
 from redteam.orchestration.context import RuntimeDeps
-from redteam.orchestration.events import AUTHENTICATION_CHECKED, OBSERVATION_RECORDED
+from redteam.orchestration.events import (
+    AUTHENTICATION_CHECKED,
+    HYPOTHESIS_RESOLVED,
+    OBSERVATION_RECORDED,
+)
+from redteam.orchestration.findings import FindingPromoter, PromotionRequest
 from redteam.orchestration.nodes._support import advance, graph_service, publisher_for
 from redteam.orchestration.service_status import (
     HYPOTHESIS_STATUS_BY_VERDICT,
     severity_for,
 )
 from redteam.orchestration.state import GraphState
+
+
+def _follow_up_possible(step: object | None) -> bool:
+    """Whether a further verification of this question can still run.
+
+    The Work Ledger permanently dedups a candidate once it is terminal
+    unless its step is repeatable, so a non-repeatable step genuinely has
+    no follow-up available -- leaving its hypothesis open would park the run
+    on a question nothing will ever ask again.
+    """
+
+    return bool(getattr(step, "repeatable", False))
 
 
 async def verify_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
@@ -186,6 +202,8 @@ async def verify_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
         )
         last_event_id = observed.event_id
 
+    hypothesis_status = ""
+    resolution_reason = ""
     if proposal.hypothesis_id is not None:
         hypothesis_status = HYPOTHESIS_STATUS_BY_VERDICT[verdict]
         if (
@@ -196,34 +214,52 @@ async def verify_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             hypothesis_status = "inconclusive"
         if auth_assessment is not None:
             hypothesis_status = auth_assessment.hypothesis_status
-        await service.resolve_hypothesis(
+        if hypothesis_status == HYPOTHESIS_OPEN and not _follow_up_possible(step):
+            hypothesis_status = HYPOTHESIS_INCONCLUSIVE
+            resolution_reason = "no_follow_up_verification_available"
+        resolved = await service.resolve_hypothesis(
             str(proposal.hypothesis_id),
             status=hypothesis_status,
             step=runtime.step_count,
         )
+        if resolved is not None:
+            settled = await publisher.publish(
+                HYPOTHESIS_RESOLVED,
+                {
+                    "hypothesis_id": str(proposal.hypothesis_id),
+                    "status": hypothesis_status,
+                    "reason": resolution_reason or reason,
+                    "verdict": verdict.value,
+                    "action_id": proposal.action_id,
+                },
+                correlation_id=correlation_id,
+                causation_id=last_event_id,
+            )
+            last_event_id = settled.event_id
 
-    if verdict is Verdict.VIOLATION:
-        finding = Finding(
-            finding_id=new_id("find"),
-            title=f"{proposal.capability}/{proposal.operation} confirmed a violation",
-            description=reason,
-            severity=severity_for(step),
-            verified=True,
+    decision = FindingPromoter().promote(
+        PromotionRequest(
+            verdict=verdict,
+            reason=reason,
             evidence_ids=(
                 list(auth_assessment.evidence_ids)
                 if auth_assessment is not None
                 else [str(evidence.evidence_id)]
             ),
-            metadata={
-                "action_id": str(proposal.action_id),
-                "agent_id": str(proposal.agent_id),
-                "hypothesis_id": str(proposal.hypothesis_id) if proposal.hypothesis_id else None,
-                "target": str(node_id_for_target(proposal.target)),
-                "reviewer_id": assessment.reviewer_id,
-                "verification_source_refs": assessment.source_refs,
-                "assessment_kind": "security_check",
-            },
+            hypothesis_id=str(proposal.hypothesis_id) if proposal.hypothesis_id else None,
+            hypothesis_status=hypothesis_status,
+            target_node_id=str(node_id_for_target(proposal.target)),
+            capability=proposal.capability,
+            operation=proposal.operation,
+            agent_id=str(proposal.agent_id),
+            action_id=str(proposal.action_id),
+            reviewer_id=assessment.reviewer_id,
+            source_refs=list(assessment.source_refs),
+            severity=severity_for(step),
         )
+    )
+    if decision.promoted:
+        finding = decision.finding
         await service.record_finding(
             finding,
             hypothesis_id=str(proposal.hypothesis_id) if proposal.hypothesis_id else None,
@@ -248,6 +284,27 @@ async def verify_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             causation_id=finding_created.event_id,
         )
         last_event_id = finding_verified.event_id
+    elif verdict is Verdict.VIOLATION:
+        # A reviewer claimed a violation that could not be grounded. The
+        # honest verdict is "no verdict", not "violation with no finding":
+        # recording it through the existing observation event keeps one
+        # event vocabulary while making the refusal traceable.
+        verdict = Verdict.UNKNOWN
+        reason = f"violation was not promoted to a Finding: {decision.refused_reason}"
+        refused = await publisher.publish(
+            OBSERVATION_RECORDED,
+            {
+                "evidence_id": evidence.evidence_id,
+                "action_id": proposal.action_id,
+                "target_node_id": str(node_id_for_target(proposal.target)),
+                "assessment_kind": "observation",
+                "tool_success": result.success,
+                "finding_promotion_refused": decision.refused_reason,
+            },
+            correlation_id=correlation_id,
+            causation_id=last_event_id,
+        )
+        last_event_id = refused.event_id
 
     return advance(
         state,

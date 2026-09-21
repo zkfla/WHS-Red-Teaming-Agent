@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Protocol
@@ -30,7 +32,16 @@ class CandidateBatch:
 
 @dataclass(frozen=True)
 class GraphCandidateContext:
-    """Bounded read-only context for graph-driven candidate providers."""
+    """Bounded read-only context for graph-driven candidate providers.
+
+    Everything a provider may plan from is named here explicitly: the
+    current graph view, the role-scoped observation, unresolved
+    hypotheses, already-attempted operations, prior candidate identities,
+    and -- when the runtime has a live Tool Catalog -- which
+    (capability, operation) pairs are actually executable right now.
+    A provider that needs a fact not in this context should have that
+    fact added here rather than reach around the seam.
+    """
 
     view: AttackGraphView
     observation: GraphObservation
@@ -38,6 +49,62 @@ class GraphCandidateContext:
     available_capabilities: tuple[str, ...] = ()
     open_hypotheses: tuple[str, ...] = ()
     prior_candidate_keys: frozenset[str] = frozenset()
+    #: (capability, operation) pairs with at least one healthy tool bound to
+    #: them in the live catalog. Only meaningful together with
+    #: operations_verified.
+    available_operations: tuple[tuple[str, str], ...] = ()
+    #: True when available_operations was actually derived from a live Tool
+    #: Catalog. False means "unknown", not "none": with no catalog wired in,
+    #: the provider's declared ToolId binding is the only evidence of
+    #: executability that exists (the same rule the compiler already
+    #: documents), so callers keep the legacy permissive behaviour.
+    operations_verified: bool = False
+    #: Digest of the meaningful planning inputs (content-sensitive, excludes
+    #: the global graph revision counter). Recorded so a replan can say *what*
+    #: changed instead of only that a counter moved.
+    planning_fingerprint: str = ""
+
+    def can_execute(self, capability: str, operation: str) -> bool:
+        """Whether a candidate for this action could actually be executed.
+
+        The provider uses this to avoid offering a tool-specific candidate
+        whose canonical operation is not bound to any real tool -- the
+        catalog, not a guess, decides. The compiler is still the authority
+        that enforces it; this only keeps unusable drafts out of the queue.
+        """
+
+        if not self.operations_verified:
+            return True
+        return (capability, operation) in self.available_operations
+
+
+def planning_fingerprint(
+    *,
+    observation: GraphObservation,
+    available_operations: Iterable[tuple[str, str]] = (),
+    prior_candidate_keys: Iterable[str] = (),
+) -> str:
+    """Stable digest of what a planning turn could actually have planned from.
+
+    Deliberately content-sensitive (content_digests) and deliberately
+    independent of the graph revision counter: an unrelated node added
+    elsewhere must not change this, and a changed fact on a node the role
+    already knows must.
+    """
+
+    payload = {
+        "nodes_by_type": observation.nodes_by_type,
+        "node_counts": observation.node_counts,
+        "content_digests": observation.content_digests,
+        "observation_context_counts": observation.observation_context_counts,
+        "open_hypotheses": observation.open_hypotheses,
+        "findings": observation.findings,
+        "attempted": observation.attempted,
+        "available_operations": sorted([list(item) for item in available_operations]),
+        "prior_candidate_keys": sorted(prior_candidate_keys),
+    }
+    encoded = json.dumps(payload, sort_keys=True, default=str, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()[:24]
 
 class GraphCandidateProvider(Protocol):
     async def propose_graph(

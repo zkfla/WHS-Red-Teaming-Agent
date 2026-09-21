@@ -10,6 +10,7 @@ import pytest
 from redteam.attack_graph.predicates import attrs_of, facts_of
 from redteam.attack_graph.service import (
     HYPOTHESIS_CONFIRMED,
+    HYPOTHESIS_INCONCLUSIVE,
     HYPOTHESIS_OPEN,
     HYPOTHESIS_REJECTED,
     AttackGraphService,
@@ -35,6 +36,11 @@ from redteam.orchestration.agents import AgentRegistry, AgentSpec, HypothesisDra
 from redteam.orchestration.agents.registry import RECON_AGENT
 from redteam.orchestration.candidates.compiler import CandidateCompiler
 from redteam.orchestration.expectations import Expectation
+from redteam.orchestration.events import (
+    CANDIDATE_GENERATED,
+    GRAPH_MUTATION_APPLIED,
+    HYPOTHESIS_RESOLVED,
+)
 from redteam.orchestration.nodes import (
     execute_node,
     observe_node,
@@ -201,8 +207,11 @@ async def test_plan_states_a_hypothesis_before_it_acts() -> None:
     assert route_after_plan(state) == "policy"
 
     types = d.event_bus.event_types()
+    # CandidateGenerated is published for the compiled frontier before the
+    # hypothesis/action pair, so it belongs in the same ordered assertion.
     assert types == [
         EventType.AGENT_STARTED,
+        CANDIDATE_GENERATED,
         EventType.HYPOTHESIS_CREATED,
         EventType.ACTION_PROPOSED,
     ]
@@ -440,10 +449,19 @@ async def test_verify_records_evidence_then_reaches_a_verdict() -> None:
     assert d.evidence_store.records[0].action_id == ActionId("action_1")
     assert result["runtime"].last_verdict is Verdict.PASS
     assert await hypothesis_status(service, "hyp_1") == HYPOTHESIS_REJECTED
-    assert d.event_bus.event_types() == [EventType.EVIDENCE_CREATED]
+    assert d.event_bus.event_types() == [EventType.EVIDENCE_CREATED, HYPOTHESIS_RESOLVED]
+    assert (
+        d.event_bus.history(event_type=HYPOTHESIS_RESOLVED)[0].payload["status"]
+        == HYPOTHESIS_REJECTED
+    )
 
 
-async def test_a_failed_execution_leaves_the_hypothesis_open() -> None:
+async def test_a_failed_execution_without_a_follow_up_closes_the_hypothesis() -> None:
+    # R7: an open hypothesis must correspond to a verification that can still
+    # run. A non-repeatable step is permanently deduplicated by the Work
+    # Ledger once terminal, so there is no follow-up left to ask -- the
+    # question closes inconclusive with a traceable reason instead of
+    # parking the run on something nothing will ask again.
     d = deps()
     service = AttackGraphService(d.graph_store)
     await service.record_hypothesis(Hypothesis(hypothesis_id="hyp_1", description="reachable"))
@@ -457,7 +475,33 @@ async def test_a_failed_execution_leaves_the_hypothesis_open() -> None:
     result = await verify_node(state, deps=d)
 
     assert result["runtime"].last_verdict is Verdict.UNKNOWN
+    assert await hypothesis_status(service, "hyp_1") == HYPOTHESIS_INCONCLUSIVE
+    assert (
+        d.event_bus.history(event_type=HYPOTHESIS_RESOLVED)[0].payload["reason"]
+        == "no_follow_up_verification_available"
+    )
+
+
+async def test_a_failed_execution_keeps_a_repeatable_hypothesis_open() -> None:
+    # The complementary half of R7: when a real follow-up verification can
+    # still run, the question stays open rather than being closed early.
+    d = deps()
+    service = AttackGraphService(d.graph_store)
+    await service.record_hypothesis(Hypothesis(hypothesis_id="hyp_1", description="reachable"))
+    state = state_with(
+        runtime(),
+        action_proposal=proposal(hypothesis_id=HypothesisId("hyp_1")),
+        tool_result=tool_result(success=False),
+        plan_step=RECON_AGENT.playbook[0].model_copy(update={"repeatable": True}),
+    )
+
+    await verify_node(state, deps=d)
+
     assert await hypothesis_status(service, "hyp_1") == HYPOTHESIS_OPEN
+    assert (
+        d.event_bus.history(event_type=HYPOTHESIS_RESOLVED)[0].payload["status"]
+        == HYPOTHESIS_OPEN
+    )
 
 
 async def test_a_violation_produces_a_verified_finding_backed_by_evidence() -> None:
@@ -497,6 +541,7 @@ async def test_a_violation_produces_a_verified_finding_backed_by_evidence() -> N
     assert await hypothesis_status(service, "hyp_1") == HYPOTHESIS_CONFIRMED
     assert d.event_bus.event_types() == [
         EventType.EVIDENCE_CREATED,
+        HYPOTHESIS_RESOLVED,
         EventType.FINDING_CREATED,
         EventType.FINDING_VERIFIED,
     ]
@@ -590,8 +635,11 @@ async def test_update_discovers_service_and_endpoint_from_a_successful_http_prob
 
     # Case E: the pre-existing single-event assertion's *sibling* still
     # holds -- the host-attrs write happens exactly as before, this is
-    # additive (three more GRAPH_UPDATED events, one per discovered node).
-    assert d.event_bus.event_types() == [EventType.GRAPH_UPDATED] * 3
+    # additive: three more GRAPH_UPDATED events (one per discovered node)
+    # plus the GraphMutationApplied summary for that batch.
+    assert d.event_bus.event_types() == [EventType.GRAPH_UPDATED] * 3 + [
+        GRAPH_MUTATION_APPLIED
+    ]
 
 
 async def test_update_processing_the_same_probe_result_twice_does_not_duplicate_nodes() -> None:

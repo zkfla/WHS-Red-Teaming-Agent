@@ -5,14 +5,68 @@ Owned by Agent Team. Rationale: ``docs/agent/attack-graph.md``.
 
 from __future__ import annotations
 
+import hashlib
+import json
+
 from pydantic import BaseModel, Field
 
-from redteam.attack_graph.predicates import facts_of, last_seen_step, predicate_flags
+from redteam.attack_graph.predicates import (
+    attrs_of,
+    facts_of,
+    last_seen_step,
+    predicate_flags,
+)
 from redteam.core.contracts.graph import GraphNode
 from redteam.core.enums import GraphNodeType
 from redteam.core.ids import GraphNodeId
 
 ATTEMPTED_FACT_KEY = "attempted_operations"
+
+
+#: Fact/attribute keys a planner or candidate provider actually plans from.
+#: A node's *identity* alone is not enough to decide whether a role has
+#: something new to do -- an endpoint that was 401 anonymously and is now
+#: 403 for the same session has the same id, the same context key and the
+#: same counts, yet is a genuinely different planning input. This list is
+#: a deliberate allow-list rather than "hash everything": volatile
+#: bookkeeping (last observed step, accumulated evidence ids, the attempt
+#: log, provenance) changes on every turn and would make every role look
+#: reactivatable for no informational reason.
+PLANNING_CONTENT_KEYS = (
+    "observations",
+    "path",
+    "method",
+    "host",
+    "port",
+    "scheme",
+    "service_name",
+    "target_ref",
+    "in_scope",
+    "authenticated",
+    "auth_session_config",
+    "path_parameters",
+    "status_code",
+    "redirect",
+    "object_scoped",
+    "web_inspected",
+    "responded",
+    "reachable",
+    "probed",
+    "assessment_kind",
+)
+
+
+def _planning_content(node: GraphNode) -> str:
+    """Digest of one node's planning-relevant content, stable across bookkeeping."""
+
+    facts = facts_of(node.properties)
+    attrs = attrs_of(node.properties)
+    payload = {
+        "facts": {key: facts[key] for key in PLANNING_CONTENT_KEYS if key in facts},
+        "attrs": {key: attrs[key] for key in PLANNING_CONTENT_KEYS if key in attrs},
+    }
+    encoded = json.dumps(payload, sort_keys=True, default=str, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()[:16]
 
 
 DEFAULT_MAX_PER_TYPE = 20
@@ -37,6 +91,11 @@ class GraphObservation(BaseModel):
     attempted: list[str] = Field(default_factory=list)
     truncated: bool = False
     observation_context_counts: dict[str, int] = Field(default_factory=dict)
+    #: Per node type, a digest over every node's PLANNING_CONTENT_KEYS
+    #: content. Lets a role-scoped revision fingerprint notice a *changed fact*
+    #: (a status code, a new observation, a security-header flag, a newly
+    #: registered session) instead of only a changed node identity.
+    content_digests: dict[str, str] = Field(default_factory=dict)
 
     @property
     def is_empty(self) -> bool:
@@ -93,8 +152,15 @@ def build_observation(
     node_counts: dict[str, int] = {}
     open_hypotheses: list[str] = []
     findings: list[str] = []
+    content: dict[str, list[str]] = {}
     for node in nodes:
         node_counts[node.type.value] = node_counts.get(node.type.value, 0) + 1
+        # Over *all* nodes, not the truncated display bucket: truncation is a
+        # prompt-size decision and must not hide a content change from the
+        # reactivation fingerprint.
+        content.setdefault(node.type.value, []).append(
+            f"{node.id}={_planning_content(node)}"
+        )
         facts = facts_of(node.properties)
 
         if node.type == GraphNodeType.HYPOTHESIS and facts.get("status") == "open":
@@ -142,4 +208,8 @@ def build_observation(
         attempted=sorted(attempted),
         truncated=truncated or attempts_truncated,
         observation_context_counts={kind: len(keys) for kind, keys in contexts.items()},
+        content_digests={
+            name: hashlib.sha256("\n".join(sorted(items)).encode()).hexdigest()[:16]
+            for name, items in content.items()
+        },
     )

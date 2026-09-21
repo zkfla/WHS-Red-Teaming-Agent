@@ -54,6 +54,15 @@ def observation_fingerprint(
         },
         "open_hypotheses": observation.open_hypotheses if include_hypotheses else [],
         "findings": observation.findings if include_findings else [],
+        # Content, not just identity: a role must be woken by a changed fact
+        # on a node it already knows (endpoint 401 -> 403, a newly observed
+        # response, a newly registered session) -- those leave node ids and
+        # counts untouched.
+        "content_digests": {
+            name: digest
+            for name, digest in observation.content_digests.items()
+            if relevant(name)
+        },
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(encoded).hexdigest()[:24]
