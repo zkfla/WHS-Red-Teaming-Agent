@@ -10,7 +10,7 @@ from __future__ import annotations
 from pydantic import BaseModel, Field, model_validator
 
 from redteam.attack_graph.observation import GraphObservation
-from redteam.core.enums import AgentPhase, GraphNodeType
+from redteam.core.enums import AgentPhase, GraphEdgeType, GraphNodeType
 from redteam.core.ids import AgentId
 
 
@@ -59,6 +59,9 @@ class ContextProfile(BaseModel):
     max_tokens: int = Field(default=8_000, ge=256)
     neighbor_depth: int = Field(default=1, ge=0, le=5)
     include_node_types: list[GraphNodeType] = Field(default_factory=list)
+    #: Relation types this role plans from. Empty means the role does not
+    #: subscribe to relation deltas at all and must not be woken by them.
+    include_edge_types: list[GraphEdgeType] = Field(default_factory=list)
     include_hypotheses: bool = True
     include_findings: bool = True
     include_attempted: bool = True
@@ -140,8 +143,19 @@ def builtin_agent_definitions() -> list[AgentDefinition]:
                     GraphNodeType.ENDPOINT,
                     GraphNodeType.PRINCIPAL,
                     GraphNodeType.CREDENTIAL,
+                    # What a principal can reach is a first-class part of the
+                    # web/api surface: an access relation appearing between
+                    # nodes the role already knows is new work.
+                    GraphNodeType.RESOURCE,
                     GraphNodeType.HYPOTHESIS,
                     GraphNodeType.FINDING,
+                ],
+                include_edge_types=[
+                    GraphEdgeType.CAN_ACCESS,
+                    GraphEdgeType.OWNS,
+                    GraphEdgeType.AUTHENTICATES_TO,
+                    GraphEdgeType.OBSERVED,
+                    GraphEdgeType.EXPOSES,
                 ],
             ),
             max_concurrency=4,

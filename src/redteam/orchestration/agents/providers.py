@@ -113,6 +113,8 @@ def planning_fingerprint(
         "nodes_by_type": observation.nodes_by_type,
         "node_counts": observation.node_counts,
         "content_digests": observation.content_digests,
+        "edge_counts": observation.edge_counts,
+        "relation_digests": observation.relation_digests,
         "observation_context_counts": observation.observation_context_counts,
         "open_hypotheses": observation.open_hypotheses,
         "findings": observation.findings,

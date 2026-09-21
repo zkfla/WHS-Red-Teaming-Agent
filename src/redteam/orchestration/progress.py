@@ -7,17 +7,25 @@ import json
 from collections.abc import Iterable
 
 from redteam.attack_graph.observation import GraphObservation
-from redteam.core.enums import GraphNodeType
+from redteam.core.enums import GraphEdgeType, GraphNodeType
 
 
 def observation_fingerprint(
     observation: GraphObservation,
     *,
     include_node_types: Iterable[GraphNodeType | str] | None = None,
+    include_edge_types: Iterable[GraphEdgeType | str] = (),
     include_hypotheses: bool = True,
     include_findings: bool = True,
 ) -> str:
-    """Hash meaningful graph state, optionally scoped to one agent role."""
+    """Hash meaningful graph state, optionally scoped to one agent role.
+
+    include_edge_types is empty by default: a role that does not subscribe to
+    relations must not be woken by an edge it never planned from. A role that
+    does subscribe is woken by an edge-only change -- a new CAN_ACCESS
+    between nodes it already knew -- which leaves every node id and node
+    digest identical.
+    """
 
     # Closed per-attempt hypotheses accumulate as audit records. Counting them
     # as progress lets a repeatable action manufacture novelty forever; active
@@ -36,6 +44,11 @@ def observation_fingerprint(
 
     def relevant(name: str) -> bool:
         return name not in ignored_types and (included is None or name in included)
+
+    subscribed_edges = {
+        item.value if isinstance(item, GraphEdgeType) else str(item)
+        for item in include_edge_types
+    }
 
     payload = {
         "observation_context_counts": {
@@ -62,6 +75,16 @@ def observation_fingerprint(
             name: digest
             for name, digest in observation.content_digests.items()
             if relevant(name)
+        },
+        "edge_counts": {
+            name: count
+            for name, count in observation.edge_counts.items()
+            if name in subscribed_edges
+        },
+        "relation_digests": {
+            name: digest
+            for name, digest in observation.relation_digests.items()
+            if name in subscribed_edges
         },
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()

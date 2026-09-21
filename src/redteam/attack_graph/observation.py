@@ -16,7 +16,7 @@ from redteam.attack_graph.predicates import (
     last_seen_step,
     predicate_flags,
 )
-from redteam.core.contracts.graph import GraphNode
+from redteam.core.contracts.graph import GraphEdge, GraphNode
 from redteam.core.enums import GraphNodeType
 from redteam.core.ids import GraphNodeId
 
@@ -56,6 +56,27 @@ PLANNING_CONTENT_KEYS = (
     "assessment_kind",
 )
 
+#: Edge property keys that are volatile bookkeeping rather than relation
+#: content. A relation digest exists so a *meaningful* access change wakes a
+#: role -- a new CAN_ACCESS, a changed outcome. Including provenance, step
+#: counters or timestamps would instead make every edge look changed on every
+#: turn and wake every subscribed role for no informational reason.
+VOLATILE_RELATION_KEYS = frozenset(
+    {
+        "provenance",
+        "step",
+        "first_seen_step",
+        "last_seen_step",
+        "created_at",
+        "updated_at",
+        "timestamp",
+        "run_id",
+        "evidence_id",
+        "evidence_ids",
+        "retractions",
+    }
+)
+
 
 def _planning_content(node: GraphNode) -> str:
     """Digest of one node's planning-relevant content, stable across bookkeeping."""
@@ -65,6 +86,29 @@ def _planning_content(node: GraphNode) -> str:
     payload = {
         "facts": {key: facts[key] for key in PLANNING_CONTENT_KEYS if key in facts},
         "attrs": {key: attrs[key] for key in PLANNING_CONTENT_KEYS if key in attrs},
+    }
+    encoded = json.dumps(payload, sort_keys=True, default=str, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()[:16]
+
+
+def _relation_content(edge: GraphEdge) -> str:
+    """Digest of one edge's stable relation content.
+
+    The endpoints and the non-volatile properties are included; the edge id
+    and its creation time are not, so re-materialising an identical relation
+    does not read as a change.
+    """
+
+    properties = edge.properties if isinstance(edge.properties, dict) else {}
+    stable = {
+        str(key): properties[key]
+        for key in sorted(properties, key=str)
+        if str(key) not in VOLATILE_RELATION_KEYS
+    }
+    payload = {
+        "source": str(edge.source_id),
+        "target": str(edge.target_id),
+        "properties": stable,
     }
     encoded = json.dumps(payload, sort_keys=True, default=str, separators=(",", ":")).encode()
     return hashlib.sha256(encoded).hexdigest()[:16]
@@ -97,6 +141,13 @@ class GraphObservation(BaseModel):
     #: (a status code, a new observation, a security-header flag, a newly
     #: registered session) instead of only a changed node identity.
     content_digests: dict[str, str] = Field(default_factory=dict)
+    #: How many edges of each type the graph holds right now.
+    edge_counts: dict[str, int] = Field(default_factory=dict)
+    #: Per edge type, a digest over every edge's stable relation content.
+    #: Lets a role notice an edge-only change -- a CAN_ACCESS appearing
+    #: between principals and resources the graph already knew about -- which
+    #: leaves every node id and every node digest untouched.
+    relation_digests: dict[str, str] = Field(default_factory=dict)
 
     @property
     def is_empty(self) -> bool:
@@ -124,6 +175,7 @@ def _node_label(node: GraphNode) -> str:
 def build_observation(
     nodes: list[GraphNode],
     *,
+    edges: list[GraphEdge] | None = None,
     step: int = 0,
     max_per_type: int = DEFAULT_MAX_PER_TYPE,
     max_total: int = DEFAULT_MAX_TOTAL,
@@ -197,6 +249,13 @@ def build_observation(
             if isinstance(item, dict) and isinstance(item.get("context_key"), str):
                 contexts.setdefault(node.type.value, set()).add((str(node.id), item["context_key"]))
 
+    edge_counts: dict[str, int] = {}
+    relations: dict[str, list[str]] = {}
+    for edge in edges or []:
+        type_name = edge.type.value
+        edge_counts[type_name] = edge_counts.get(type_name, 0) + 1
+        relations.setdefault(type_name, []).append(_relation_content(edge))
+
     return GraphObservation(
         step=step,
         node_counts=node_counts,
@@ -212,5 +271,10 @@ def build_observation(
         content_digests={
             name: hashlib.sha256("\n".join(sorted(items)).encode()).hexdigest()[:16]
             for name, items in content.items()
+        },
+        edge_counts=edge_counts,
+        relation_digests={
+            name: hashlib.sha256("\n".join(sorted(items)).encode()).hexdigest()[:16]
+            for name, items in relations.items()
         },
     )

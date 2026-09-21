@@ -134,6 +134,7 @@ class AgentRegistry:
         return observation_fingerprint(
             observation,
             include_node_types=profile.include_node_types or None,
+            include_edge_types=profile.include_edge_types,
             include_hypotheses=profile.include_hypotheses,
             include_findings=profile.include_findings,
         )

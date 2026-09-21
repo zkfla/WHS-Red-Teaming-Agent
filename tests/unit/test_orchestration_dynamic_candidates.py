@@ -119,7 +119,9 @@ async def test_an_unrelated_node_type_does_not_change_the_role_fingerprint() -> 
     before = await graph_with(observations=[http_observation(401)])
     after = await graph_with(
         observations=[http_observation(401)],
-        extra_nodes=[(GraphNodeType.RESOURCE, "orders/1")],
+        # ASSET, not RESOURCE: RESOURCE is deliberately inside the web/api
+        # profile now that access relations are part of its fingerprint.
+        extra_nodes=[(GraphNodeType.ASSET, "com.example.app")],
     )
 
     first = registry.revision_fingerprint(
@@ -129,7 +131,7 @@ async def test_an_unrelated_node_type_does_not_change_the_role_fingerprint() -> 
         AgentId("web-api-agent"), await after.observe(step=2)
     )
 
-    assert first == second, "RESOURCE is outside the web role's context profile"
+    assert first == second, "ASSET is outside the web role's context profile"
 
 
 async def test_the_observation_carries_planning_content_digests() -> None:
