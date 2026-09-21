@@ -375,7 +375,12 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             limit=evidence_limit,
         )
 
-    planner = build_planner(agent.planner_kind, deps.llm_client)
+    planner = build_planner(
+        agent.planner_kind,
+        deps.llm_client,
+        score_margin=deps.settings.planner_score_margin,
+        top_k=deps.settings.planner_rerank_top_k,
+    )
     step = await planner.plan(
         PlanningContext(
             agent=agent,
@@ -393,6 +398,13 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                 "projected_nodes": sum(planning_observation.node_counts.values()),
                 "source_nodes": sum(observation.node_counts.values()),
                 "evidence_excerpts": [item.model_dump(mode="json") for item in evidence_excerpts],
+                # The same totals the compiler ranked by, so a hybrid planner
+                # can tell "clear winner" from "genuinely ambiguous" without
+                # scoring anything itself.
+                "candidate_scores": {
+                    candidate.plan_step.step_id: candidate.priority.total
+                    for candidate in compiled
+                },
             },
         )
     )
