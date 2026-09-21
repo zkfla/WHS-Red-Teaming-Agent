@@ -8,9 +8,9 @@ tell any of these apart -- which is exactly the gap this closes.
 from __future__ import annotations
 
 from redteam.attack_graph.identity import (
-    make_node_id,
     endpoint_node_id,
     host_node_id,
+    make_node_id,
     principal_node_id,
 )
 from redteam.attack_graph.service import AttackGraphService

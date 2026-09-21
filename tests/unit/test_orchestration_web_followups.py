@@ -110,6 +110,7 @@ def test_the_provider_declares_the_operations_it_may_use() -> None:
     assert WebCandidateProvider.declared_operations == (
         ("web", "http_request"),
         ("web", "auth_attempt"),
+        ("web", "response_analysis"),
     )
 
 
@@ -216,7 +217,24 @@ async def test_a_redirect_status_produces_no_location_derived_candidate() -> Non
 
     batch = await propose(service)
 
-    assert len(batch.candidates) == 1, "only the playbook inspection step remains"
+    # The playbook inspection step, plus the posture observation a real 302
+    # response justifies -- and nothing derived from an unseen Location.
+    playbook_steps = sorted(
+        item.plan_step.step_id
+        for item in batch.candidates
+        if ":" not in item.plan_step.step_id
+    )
+    assert playbook_steps == ["inspect-http-endpoint"]
+    assert [
+        item.plan_step.step_id
+        for item in batch.candidates
+        if item.plan_step.step_id.startswith("security-posture:")
+    ]
+    assert not [
+        item
+        for item in batch.candidates
+        if "location" in str(item.plan_step.arguments).lower()
+    ]
     for draft in batch.candidates:
         assert NEVER_OBSERVED_KEYS.isdisjoint(draft.plan_step.arguments)
 

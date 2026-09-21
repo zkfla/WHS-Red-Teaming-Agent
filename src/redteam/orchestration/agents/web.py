@@ -39,11 +39,19 @@ from redteam.orchestration.candidates.models import CandidateDraft, PrioritySign
 
 WEB_HTTP_REQUEST = ToolId("web.http_request")
 WEB_COMPARE_ANONYMOUS = ToolId("web.http_compare_anonymous")
+#: Both of these only measure and record; the mappers label what they write
+#: with verdict observation_only and the provider never promotes them.
+WEB_COMPARE_SESSIONS = ToolId("web.http_compare_sessions")
+WEB_SECURITY_POSTURE = ToolId("web.http_security_posture")
 
 _HTTP_REQUEST_OPERATION = "http_request"
 #: docs/contracts/actions.md requires a tool-independent intent. Comparing
 #: anonymous against registered-session access is an authentication check.
 _AUTH_ATTEMPT_OPERATION = "auth_attempt"
+#: Comparing two responses, and reading a response's header/cookie flags,
+#: are both analysis of an already-observed exchange rather than a new
+#: request intent of their own.
+_RESPONSE_ANALYSIS_OPERATION = "response_analysis"
 
 #: HTTP status semantics, from RFC 9110. Deriving these from an *observed*
 #: status code is reading the protocol definition of a measured value, not
@@ -61,6 +69,7 @@ class WebCandidateProvider:
     declared_operations = (
         ("web", _HTTP_REQUEST_OPERATION),
         ("web", _AUTH_ATTEMPT_OPERATION),
+        ("web", _RESPONSE_ANALYSIS_OPERATION),
     )
 
     async def propose(
@@ -161,6 +170,29 @@ class WebCandidateProvider:
             )
             candidates.extend(
                 self._redirect_followups(
+                    context=context,
+                    spec=spec,
+                    node=node,
+                    facts=facts,
+                    host=host,
+                    host_facts=host_facts,
+                    latest=latest,
+                )
+            )
+            candidates.extend(
+                self._session_comparison_followups(
+                    context=context,
+                    spec=spec,
+                    node=node,
+                    facts=facts,
+                    host=host,
+                    host_facts=host_facts,
+                    sessions=sessions,
+                    latest=latest,
+                )
+            )
+            candidates.extend(
+                self._posture_followups(
                     context=context,
                     spec=spec,
                     node=node,
@@ -611,3 +643,214 @@ class WebCandidateProvider:
             conflict_keys=[f"target:{node.id}"],
             signals=PrioritySignals(source_refs=[f"evidence:{baseline['evidence_id']}"]),
         )
+
+    def _session_comparison_followups(
+        self,
+        *,
+        context: GraphCandidateContext | None,
+        spec: AgentSpec,
+        node: GraphNode,
+        facts: dict,
+        host: str,
+        host_facts: dict,
+        sessions: list[AuthSession],
+        latest: dict[str, dict],
+    ) -> list[CandidateDraft]:
+        """Two identities that both answered this path -> compare them.
+
+        The pair comes from observations, never from the registered session
+        list: only identities that actually produced a response for this
+        exact path are eligible. "Two sessions are configured" is not
+        evidence that measuring them would tell us anything.
+
+        The cross-check runs the other way too: an observed session_ref that
+        the operator never registered is not an operator-managed identity,
+        so it can never be half of the pair either. (Whether the two refs are
+        genuinely distinct *principals* is not knowable here -- AuthSession
+        carries no principal -- and remains the Capability tool's own check.)
+        """
+
+        if context is None or not context.can_execute(
+            "web", _RESPONSE_ANALYSIS_OPERATION
+        ):
+            return []
+        registered = {item.session_ref: set(item.paths) for item in sessions}
+        observed: dict[str, set[str]] = {}
+        evidences: dict[str, str] = {}
+        for item in latest.values():
+            session_ref = item.get("session_ref")
+            path = item.get("path")
+            evidence_id = item.get("evidence_id")
+            if not isinstance(session_ref, str) or not session_ref:
+                continue
+            if not isinstance(path, str) or not path.startswith("/"):
+                continue
+            if not evidence_id:
+                continue
+            # Operator-managed only: registered, and registered for *this*
+            # path. An arbitrary ref seen in a response is not an identity we
+            # are allowed to treat as a test principal.
+            if session_ref not in registered or path not in registered[session_ref]:
+                continue
+            observed.setdefault(path, set()).add(session_ref)
+            evidences.setdefault(path, str(evidence_id))
+
+        drafts: list[CandidateDraft] = []
+        for path in sorted(observed):
+            refs = sorted(observed[path])
+            if len(refs) < 2:
+                continue
+            first, second = refs[0], refs[1]
+            if _already_compared(facts, first, second):
+                continue
+            drafts.append(
+                CandidateDraft(
+                    agent_id=spec.agent_id,
+                    plan_step=PlanStep(
+                        step_id=f"compare-sessions:{node.id}:{first}:{second}",
+                        capability="web",
+                        operation=_RESPONSE_ANALYSIS_OPERATION,
+                        tool_id=WEB_COMPARE_SESSIONS,
+                        compatible_tool_ids=[WEB_COMPARE_SESSIONS],
+                        assessment_kind="observation",
+                        target=EndpointTarget(
+                            host=host,
+                            path=path,
+                            port=facts.get("port"),
+                            graph_node_id=node.id,
+                        ),
+                        arguments={
+                            "target_ref": host_facts.get("target_ref", host),
+                            "path": path,
+                            "first_session_ref": first,
+                            "second_session_ref": second,
+                        },
+                        reason=(
+                            "Two operator-managed identities both answered this path, so "
+                            "their statuses and bodies can be compared directly"
+                        ),
+                        hypothesis=HypothesisDraft(
+                            description=(
+                                f"{path} answers differently for {first} and {second}"
+                            ),
+                            metadata={
+                                "kind": "session_comparison",
+                                "first_session_ref": first,
+                                "second_session_ref": second,
+                            },
+                        ),
+                    ),
+                    target_node_ids=[node.id],
+                    conflict_keys=[f"target:{node.id}"],
+                    signals=PrioritySignals(
+                        expected_information_gain=0.7,
+                        evidence_gap_reduction=0.6,
+                        expected_cost=0.4,
+                        source_refs=[f"evidence:{evidences[path]}"],
+                    ),
+                )
+            )
+        return drafts
+
+    def _posture_followups(
+        self,
+        *,
+        context: GraphCandidateContext | None,
+        spec: AgentSpec,
+        node: GraphNode,
+        facts: dict,
+        host: str,
+        host_facts: dict,
+        latest: dict[str, dict],
+    ) -> list[CandidateDraft]:
+        """Header and cookie-flag posture, once a real response exists.
+
+        Skipped when this endpoint already has an anonymous posture
+        observation: the tool would return the same flags again.
+        """
+
+        if context is None or not context.can_execute(
+            "web", _RESPONSE_ANALYSIS_OPERATION
+        ):
+            return []
+        if not latest:
+            return []
+        if _posture_observed(facts):
+            return []
+        first = sorted(latest.values(), key=lambda item: str(item.get("context_key")))[0]
+        path = first.get("path")
+        if not isinstance(path, str) or not path.startswith("/"):
+            return []
+        evidence_id = first.get("evidence_id")
+        if not evidence_id:
+            return []
+        return [
+            CandidateDraft(
+                agent_id=spec.agent_id,
+                plan_step=PlanStep(
+                    step_id=f"security-posture:{node.id}",
+                    capability="web",
+                    operation=_RESPONSE_ANALYSIS_OPERATION,
+                    tool_id=WEB_SECURITY_POSTURE,
+                    compatible_tool_ids=[WEB_SECURITY_POSTURE],
+                    assessment_kind="observation",
+                    target=EndpointTarget(
+                        host=host,
+                        path=path,
+                        port=facts.get("port"),
+                        graph_node_id=node.id,
+                    ),
+                    arguments={
+                        "target_ref": host_facts.get("target_ref", host),
+                        "path": path,
+                    },
+                    reason=(
+                        "This endpoint answered a real request, so its security-header "
+                        "and cookie-flag posture can be recorded without guessing any value"
+                    ),
+                    hypothesis=HypothesisDraft(
+                        description=(
+                            f"{path} presents a header and cookie posture worth recording"
+                        ),
+                        confidence=0.3,
+                        metadata={"kind": "security_posture"},
+                    ),
+                ),
+                target_node_ids=[node.id],
+                conflict_keys=[f"target:{node.id}"],
+                signals=PrioritySignals(
+                    expected_information_gain=0.4,
+                    expected_cost=0.2,
+                    source_refs=[f"evidence:{evidence_id}"],
+                ),
+            )
+        ]
+
+
+def _already_compared(facts: dict, first: str, second: str) -> bool:
+    """Did this exact pair already produce a comparison for this endpoint?
+
+    Read from the Mapper's own recorded fields rather than recomputing its
+    context key, so the two cannot drift apart.
+    """
+
+    wanted = {first, second}
+    for item in facts.get("observations", []) or []:
+        if not isinstance(item, dict):
+            continue
+        if item.get("kind") != "http_session_comparison":
+            continue
+        if {item.get("first_session_ref"), item.get("second_session_ref")} == wanted:
+            return True
+    return False
+
+
+def _posture_observed(facts: dict) -> bool:
+    """Is there already an anonymous posture observation for this endpoint?"""
+
+    for item in facts.get("observations", []) or []:
+        if not isinstance(item, dict):
+            continue
+        if item.get("kind") == "http_security_posture" and item.get("session_ref") is None:
+            return True
+    return False
