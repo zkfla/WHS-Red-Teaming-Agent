@@ -132,6 +132,25 @@ class CandidateCompiler:
     @staticmethod
     def _reject(draft: CandidateDraft, reason: str, *, field: str = "") -> CandidateRejection:
         step = draft.plan_step
+        try:
+            diagnostic_key = candidate_key(draft)
+        except (TypeError, ValueError):
+            # A malformed/non-JSON candidate still needs an observable rejection,
+            # but its invalid argument value must not escape into an event payload.
+            # Hash only stable non-secret identity fields and argument *types*.
+            safe_payload = {
+                "agent_id": str(draft.agent_id),
+                "capability": step.capability,
+                "operation": step.operation,
+                "target_node_ids": sorted(map(str, draft.target_node_ids)),
+                "prerequisite_ids": sorted(draft.prerequisite_ids),
+                "argument_types": {
+                    str(key): type(value).__name__
+                    for key, value in sorted(step.arguments.items(), key=lambda item: str(item[0]))
+                },
+            }
+            encoded = json.dumps(safe_payload, sort_keys=True, separators=(",", ":")).encode()
+            diagnostic_key = "cand_invalid_" + hashlib.sha256(encoded).hexdigest()[:16]
         return CandidateRejection(
             target_node_id=str(draft.target_node_ids[0]) if draft.target_node_ids else "",
             capability=step.capability,
@@ -139,7 +158,7 @@ class CandidateCompiler:
             tool_id=str(step.tool_id),
             reason=reason,
             field=field,
-            candidate_key=candidate_key(draft),
+            candidate_key=diagnostic_key,
         )
 
     def _resolve_tool_with_reason(

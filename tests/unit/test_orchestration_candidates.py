@@ -315,6 +315,8 @@ async def test_invalid_tool_schema_is_rejected_as_an_unusable_contract() -> None
 
 
 async def test_non_json_tool_arguments_are_rejected_even_by_a_permissive_schema() -> None:
+    from redteam.orchestration.agents.providers import PlaybookCandidateProvider
+
     service = await graph()
     observation = await service.observe(step=1)
     invalid = agent().model_copy(deep=True)
@@ -323,6 +325,13 @@ async def test_non_json_tool_arguments_are_rejected_even_by_a_permissive_schema(
     assert not await CandidateCompiler().compile_playbook(
         invalid, service.view(), observation, step=1
     )
+
+    drafts = await PlaybookCandidateProvider().propose(
+        invalid, service.view(), observation, step=1
+    )
+    _, rejections = CandidateCompiler().compile_drafts_with_rejections(drafts)
+    assert rejections[0].reason == "non_json_arguments"
+    assert rejections[0].candidate_key.startswith("cand_invalid_")
 
 
 async def test_candidate_key_excludes_score_and_graph_revision() -> None:

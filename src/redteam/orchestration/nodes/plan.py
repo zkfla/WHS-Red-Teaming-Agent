@@ -185,7 +185,7 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                     {
                         str(node_id)
                         for item in compiled
-                        for node_id in item.target_node_ids
+                        for node_id in item.draft.target_node_ids
                     }
                 ),
             },
@@ -212,6 +212,9 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                         "reason": item.reason,
                         "field": item.field,
                     }
+                    for item in rejections
+                ],
+            },
             causation_id=last_event_id,
         )
         last_event_id = no_candidates.event_id
