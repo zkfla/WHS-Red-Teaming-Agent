@@ -19,7 +19,11 @@ from redteam.core.enums import AgentPhase
 from redteam.core.ids import ActionId, HypothesisId, new_id
 from redteam.orchestration.agents.base import PlanningContext
 from redteam.orchestration.agents.planners import build_planner
-from redteam.orchestration.agents.providers import CandidateBatch, CandidateDiagnostic
+from redteam.orchestration.agents.providers import (
+    CandidateBatch,
+    CandidateDiagnostic,
+    GraphCandidateContext,
+)
 from redteam.orchestration.candidates.compiler import CandidateCompiler, CandidateRejection
 from redteam.orchestration.context import RuntimeDeps
 from redteam.orchestration.context_projection import (
@@ -36,6 +40,7 @@ from redteam.orchestration.events import (
     AGENT_NO_EXECUTABLE_CANDIDATES,
     AGENT_PROVIDER_FAILED,
     AUTHENTICATION_CHECK_DEFERRED,
+    CANDIDATE_GENERATED,
     CANDIDATE_PRUNED,
     CANDIDATE_REJECTED,
 )
@@ -69,6 +74,8 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
     service = graph_service(deps)
     now = datetime.now(timezone.utc)
     await deps.work_store.reclaim_expired(now=now)
+    history = await deps.work_store.list_items(run_id=runtime.run_id)
+    terminal_keys = {item.candidate_key for item in history if item.status in TERMINAL_STATUSES}
     compiler = CandidateCompiler(deps.tool_catalog)
     definition = deps.agents.definition(agent.agent_id)
     provider = (
@@ -87,8 +94,21 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                 raise LookupError(
                     f"candidate provider {definition.provider_id!r} is not registered"
                 )
-            offered = await provider.propose(
-                agent, service.view(), observation, step=runtime.step_count
+            context = GraphCandidateContext(
+                view=service.view(),
+                observation=observation,
+                step=runtime.step_count,
+                available_capabilities=tuple(str(item) for item in agent.capabilities),
+                open_hypotheses=tuple(observation.open_hypotheses),
+                prior_candidate_keys=frozenset(terminal_keys),
+            )
+            graph_propose = getattr(provider, "propose_graph", None)
+            offered = (
+                await graph_propose(agent, context)
+                if callable(graph_propose)
+                else await provider.propose(
+                    agent, context.view, context.observation, step=context.step
+                )
             )
             if isinstance(offered, CandidateBatch):
                 drafts, diagnostics = offered.candidates, offered.diagnostics
@@ -137,6 +157,7 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                 "tool_id": rejection.tool_id,
                 "reason": rejection.reason,
                 "field": rejection.field,
+                "candidate_key": rejection.candidate_key,
             },
             causation_id=last_event_id,
         )
@@ -153,6 +174,25 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             causation_id=last_event_id,
         )
         last_event_id = deferred.event_id
+    if compiled:
+        generated = await publisher.publish(
+            CANDIDATE_GENERATED,
+            {
+                "agent_id": agent.agent_id,
+                "candidate_count": len(compiled),
+                "candidate_keys": [item.candidate_key for item in compiled],
+                "target_node_ids": sorted(
+                    {
+                        str(node_id)
+                        for item in compiled
+                        for node_id in item.target_node_ids
+                    }
+                ),
+            },
+            causation_id=last_event_id,
+        )
+        last_event_id = generated.event_id
+
     if drafts and not compiled:
         # The agent was activated (its playbook precondition genuinely
         # matched something) and had at least one draft to try, but every
@@ -162,12 +202,19 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
         # to do" (drafts empty), which stays silent as before.
         no_candidates = await publisher.publish(
             AGENT_NO_EXECUTABLE_CANDIDATES,
-            {"agent_id": agent.agent_id, "drafts_offered": len(drafts)},
+            {
+                "agent_id": agent.agent_id,
+                "drafts_offered": len(drafts),
+                "rejections": [
+                    {
+                        "candidate_key": item.candidate_key,
+                        "operation": item.operation,
+                        "reason": item.reason,
+                        "field": item.field,
+                    }
             causation_id=last_event_id,
         )
         last_event_id = no_candidates.event_id
-    history = await deps.work_store.list_items(run_id=runtime.run_id)
-    terminal_keys = {item.candidate_key for item in history if item.status in TERMINAL_STATUSES}
     compiled = [
         candidate
         for candidate in compiled

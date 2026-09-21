@@ -32,6 +32,13 @@ class NodeMutation:
     facts: dict[str, Any] = field(default_factory=dict)
     labels: list[str] = field(default_factory=list)
     observations: list[dict[str, Any]] = field(default_factory=list)
+@dataclass(frozen=True)
+class MapperFailure:
+    tool_id: str
+    mapper: str
+    reason: str
+
+
 
 
 @dataclass(frozen=True)
@@ -67,6 +74,11 @@ class ResultMapperRegistry:
 
     def __init__(self) -> None:
         self._mappers: dict[str, ResultMapperFn] = {}
+        self._last_failure: MapperFailure | None = None
+
+    @property
+    def last_failure(self) -> MapperFailure | None:
+        return self._last_failure
 
     def register(self, tool_id: str, mapper: ResultMapperFn) -> None:
         if tool_id in self._mappers:
@@ -81,12 +93,18 @@ class ResultMapperRegistry:
         arguments: dict[str, Any],
         result: ToolResult,
     ) -> GraphMutation:
+        self._last_failure = None
         mapper = self._mappers.get(str(tool_id))
         if mapper is None:
             return GraphMutation()
         try:
             return mapper(target=target, arguments=arguments, result=result)
-        except Exception:  # noqa: BLE001 - a mapper bug must not fail the whole run
+        except Exception as exc:  # noqa: BLE001 - mapper failure is observable, not fatal
+            self._last_failure = MapperFailure(
+                tool_id=str(tool_id),
+                mapper=getattr(mapper, "__name__", type(mapper).__name__),
+                reason=type(exc).__name__,
+            )
             logger.warning("result mapper for %s raised; ignoring", tool_id, exc_info=True)
             return GraphMutation()
 

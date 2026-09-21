@@ -13,6 +13,7 @@ from redteam.core.contracts.events import EventType
 from redteam.core.enums import AgentPhase
 from redteam.orchestration.action_naming import canonical_action_key
 from redteam.orchestration.context import RuntimeDeps
+from redteam.orchestration.events import GRAPH_MUTATION_APPLIED, RESULT_MAPPER_FAILED
 from redteam.orchestration.nodes._support import advance, graph_service, publisher_for
 from redteam.orchestration.state import GraphState
 from redteam.orchestration.work.models import WorkStatus
@@ -116,6 +117,23 @@ async def update_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             arguments=proposal.arguments,
             result=result,
         )
+        mapper_failure = deps.result_mappers.last_failure
+        if mapper_failure is not None:
+            failed_event = await publisher.publish(
+                RESULT_MAPPER_FAILED,
+                {
+                    "operation": proposal.operation,
+                    "tool_id": mapper_failure.tool_id,
+                    "mapper": mapper_failure.mapper,
+                    "reason": mapper_failure.reason,
+                    "action_id": str(proposal.action_id),
+                    "invocation_id": str(result.invocation_id),
+                },
+                correlation_id=correlation_id,
+                causation_id=last_event.event_id,
+            )
+            last_event = failed_event
+
         for node_mutation in mutation.nodes:
             observed_facts = dict(node_mutation.facts)
             if node_mutation.observations and provenance.evidence_id:
@@ -153,6 +171,19 @@ async def update_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                 edge_mutation.target_id,
                 edge_mutation.properties,
                 provenance=provenance,
+            )
+
+        if mutation.nodes or mutation.edges:
+            last_event = await publisher.publish(
+                GRAPH_MUTATION_APPLIED,
+                {
+                    "action_id": str(proposal.action_id),
+                    "tool_id": str(result.tool_id),
+                    "nodes": len(mutation.nodes),
+                    "edges": len(mutation.edges),
+                },
+                correlation_id=correlation_id,
+                causation_id=last_event.event_id,
             )
 
     work_id = state.get("current_work_id")

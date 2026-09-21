@@ -28,6 +28,22 @@ class CandidateBatch:
     candidates: list[CandidateDraft]
     diagnostics: list[CandidateDiagnostic] = field(default_factory=list)
 
+@dataclass(frozen=True)
+class GraphCandidateContext:
+    """Bounded read-only context for graph-driven candidate providers."""
+
+    view: AttackGraphView
+    observation: GraphObservation
+    step: int
+    available_capabilities: tuple[str, ...] = ()
+    open_hypotheses: tuple[str, ...] = ()
+    prior_candidate_keys: frozenset[str] = frozenset()
+
+class GraphCandidateProvider(Protocol):
+    async def propose_graph(
+        self, spec: AgentSpec, context: GraphCandidateContext
+    ) -> list[CandidateDraft] | CandidateBatch: ...
+
 
 class CandidateProvider(Protocol):
     async def propose(
@@ -66,6 +82,15 @@ class PlaybookCandidateProvider:
                 )
             )
         return drafts
+
+    async def propose_graph(
+        self, spec: AgentSpec, context: GraphCandidateContext
+    ) -> list[CandidateDraft]:
+        """Default graph-aware seam while retaining playbook semantics."""
+
+        return await self.propose(
+            spec, context.view, context.observation, step=context.step
+        )
 
 
 class DuplicateProviderError(ValueError):

@@ -47,6 +47,7 @@ class CandidateRejection:
     tool_id: str
     reason: str
     field: str = ""
+    candidate_key: str = ""
 
 
 class CandidateCompiler:
@@ -112,7 +113,7 @@ class CandidateCompiler:
             return None, self._reject(draft, reason, field=field)
         key = candidate_key(draft)
         if key in seen:
-            return None, None
+            return None, self._reject(draft, "duplicate_candidate")
         seen.add(key)
         return (
             ExecutableCandidate(
@@ -138,6 +139,7 @@ class CandidateCompiler:
             tool_id=str(step.tool_id),
             reason=reason,
             field=field,
+            candidate_key=candidate_key(draft),
         )
 
     def _resolve_tool_with_reason(
@@ -235,6 +237,7 @@ def candidate_key(draft: CandidateDraft) -> str:
         "operation": draft.plan_step.operation,
         "arguments": draft.plan_step.arguments,
         "target_node_ids": sorted(map(str, draft.target_node_ids)),
+        "prerequisite_ids": sorted(draft.prerequisite_ids),
         "hypothesis": hypothesis.description if hypothesis else None,
         "prerequisite_fingerprint": draft.prerequisite_fingerprint,
     }

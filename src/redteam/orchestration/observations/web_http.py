@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 from redteam.attack_graph.identity import endpoint_node_id, path_parameters
 from redteam.core.contracts.target import AnyTarget
