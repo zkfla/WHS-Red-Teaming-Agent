@@ -47,7 +47,11 @@ from redteam.core.config import AppConfig
 from redteam.core.contracts.events import EventEnvelope, EventType
 from redteam.core.ports.event_bus import EventHandler
 from redteam.orchestration.context import RuntimeDeps
-from redteam.orchestration.events import AGENT_NO_EXECUTABLE_CANDIDATES
+from redteam.orchestration.events import (
+    AGENT_NO_EXECUTABLE_CANDIDATES,
+    AUTHENTICATION_CHECK_DEFERRED,
+    AUTHENTICATION_CHECKED,
+)
 from redteam.orchestration.runner import AgentLoopRunner
 from redteam.orchestration.settings import OrchestrationSettings
 from redteam.orchestration.state import RuntimeState, TerminationReason
@@ -76,6 +80,8 @@ _RENDERED_EVENTS = frozenset(
         # agent silently producing zero executable candidates is visible
         # by default, not only under --verbose (section 10).
         AGENT_NO_EXECUTABLE_CANDIDATES,
+        AUTHENTICATION_CHECK_DEFERRED,
+        AUTHENTICATION_CHECKED,
     }
 )
 

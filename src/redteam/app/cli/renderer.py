@@ -25,7 +25,11 @@ from rich.text import Text
 from redteam.app.cli import theme
 from redteam.app.cli._shared import mask_secrets
 from redteam.core.contracts.events import EventEnvelope, EventType
-from redteam.orchestration.events import AGENT_NO_EXECUTABLE_CANDIDATES
+from redteam.orchestration.events import (
+    AGENT_NO_EXECUTABLE_CANDIDATES,
+    AUTHENTICATION_CHECK_DEFERRED,
+    AUTHENTICATION_CHECKED,
+)
 
 # Events worth a line in the default (human-readable) stream. Same
 # filtering intent as `commands.run._RENDERED_EVENTS`, kept separate
@@ -44,6 +48,8 @@ _RENDERED_EVENTS = frozenset(
         EventType.FINDING_CREATED,
         EventType.FINDING_VERIFIED,
         AGENT_NO_EXECUTABLE_CANDIDATES,
+        AUTHENTICATION_CHECK_DEFERRED,
+        AUTHENTICATION_CHECKED,
     }
 )
 
@@ -177,6 +183,15 @@ class RichEventRenderer:
             title = str(payload.get("title") or payload.get("summary") or "New finding")
             return Text(f"[{timestamp}] ", style=theme.MUTED) + Text(
                 f"{theme.ICON_WARNING} Finding: {title}", style=theme.WARNING
+            )
+
+        if event.event_type == AUTHENTICATION_CHECK_DEFERRED:
+            return Text(f"[{timestamp}] Authentication check deferred: ") + Text(
+                str(payload.get("reason", "unavailable")), style=theme.WARNING
+            )
+        if event.event_type == AUTHENTICATION_CHECKED:
+            return Text(f"[{timestamp}] Authentication observation: ") + Text(
+                str(payload.get("outcome", "inconclusive")), style=theme.MUTED
             )
 
         if event.event_type == AGENT_NO_EXECUTABLE_CANDIDATES:

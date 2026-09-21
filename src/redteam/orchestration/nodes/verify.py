@@ -5,15 +5,21 @@ verified ``Finding`` carrying the ``EvidenceId`` behind it.
 
 from __future__ import annotations
 
-from redteam.attack_graph.identity import node_id_for_target
+from redteam.attack_graph.identity import hypothesis_node_id, node_id_for_target
 from redteam.attack_graph.predicates import Confidence, Provenance
 from redteam.core.contracts.events import EventType
 from redteam.core.contracts.graph import Finding
 from redteam.core.convert import tool_result_to_evidence
-from redteam.core.enums import AgentPhase, Verdict
+from redteam.core.enums import AgentPhase, GraphEdgeType, GraphNodeType, Verdict
 from redteam.core.ids import new_id
 from redteam.orchestration.analysis import VerificationAssessment, VerificationRequest
+from redteam.orchestration.authentication import (
+    ACCESS_CONTROL_VIOLATION,
+    assess_authentication,
+    http_observation,
+)
 from redteam.orchestration.context import RuntimeDeps
+from redteam.orchestration.events import AUTHENTICATION_CHECKED, OBSERVATION_RECORDED
 from redteam.orchestration.nodes._support import advance, graph_service, publisher_for
 from redteam.orchestration.service_status import (
     HYPOTHESIS_STATUS_BY_VERDICT,
@@ -51,6 +57,9 @@ async def verify_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             }
         }
     )
+    response_observation = http_observation(proposal.arguments, result)
+    if response_observation is not None:
+        evidence.metadata["http_observation"] = response_observation
     await deps.evidence_store.append(evidence)
 
     created = await publisher.publish(
@@ -103,10 +112,90 @@ async def verify_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
         confidence=Confidence.MEASURED,
     )
 
+    auth_assessment = None
+    if step is not None and step.authentication_check is not None:
+        auth_assessment = await assess_authentication(
+            step.authentication_check, proposal, result, evidence, deps.evidence_store,
+        )
+        is_violation = auth_assessment.outcome == ACCESS_CONTROL_VIOLATION
+        comparison = {
+            **auth_assessment.model_dump(),
+            "session_ref": step.authentication_check.session_ref,
+            "path": proposal.arguments.get("path"),
+            "expected_access": step.authentication_check.expected_access,
+        }
+        await service.observe_target(
+            proposal.target, facts={"authentication_checks": [comparison]},
+            provenance=provenance, step=runtime.step_count,
+        )
+        if proposal.hypothesis_id is not None:
+            await service.upsert_node(
+                GraphNodeType.HYPOTHESIS,
+                node_id=hypothesis_node_id(str(proposal.hypothesis_id)),
+                facts={"evidence_ids": auth_assessment.evidence_ids,
+                       "authentication_outcome": auth_assessment.outcome},
+                provenance=provenance, step=runtime.step_count,
+            )
+        if auth_assessment.outcome in {"session_access_observed", ACCESS_CONTROL_VIOLATION}:
+            principal = await service.upsert_node(
+                GraphNodeType.PRINCIPAL,
+                key=f"session:{step.authentication_check.session_ref}",
+                attrs={"authenticated": True},
+                provenance=provenance, step=runtime.step_count,
+            )
+            await service.link(
+                GraphEdgeType.CAN_ACCESS,
+                principal.id,
+                node_id_for_target(proposal.target),
+                properties={
+                    "outcome": auth_assessment.outcome,
+                    "expected_access": step.authentication_check.expected_access,
+                },
+                provenance=provenance,
+            )
+        compared = await publisher.publish(
+            AUTHENTICATION_CHECKED,
+            {**comparison, "action_id": proposal.action_id,
+             "hypothesis_id": proposal.hypothesis_id,
+             "assessment_kind": "security_check" if is_violation else "observation"},
+            correlation_id=correlation_id, causation_id=last_event_id,
+        )
+        last_event_id = compared.event_id
+        if is_violation:
+            verdict = Verdict.VIOLATION
+            reason = (
+                "registered session reached an operator-declared deny path "
+                f"(status {auth_assessment.session_status}); access-control "
+                "violation confirmed against the anonymous 401 baseline"
+            )
+
+    if step is not None and step.authentication_check is not None:
+        observation_only = verdict is not Verdict.VIOLATION
+    else:
+        observation_only = step is not None and step.assessment_kind == "observation"
+    if observation_only:
+        verdict = Verdict.UNKNOWN
+        reason = "response recorded as an observation; no security claim was verified"
+        observed = await publisher.publish(
+            OBSERVATION_RECORDED,
+            {"evidence_id": evidence.evidence_id, "action_id": proposal.action_id,
+             "target_node_id": str(node_id_for_target(proposal.target)),
+             "assessment_kind": "observation", "tool_success": result.success},
+            correlation_id=correlation_id,
+            causation_id=last_event_id,
+        )
+        last_event_id = observed.event_id
+
     if proposal.hypothesis_id is not None:
         hypothesis_status = HYPOTHESIS_STATUS_BY_VERDICT[verdict]
-        if result.metadata.get("orchestration_exception") or verification_failed:
+        if (
+            observation_only
+            or result.metadata.get("orchestration_exception")
+            or verification_failed
+        ):
             hypothesis_status = "inconclusive"
+        if auth_assessment is not None:
+            hypothesis_status = auth_assessment.hypothesis_status
         await service.resolve_hypothesis(
             str(proposal.hypothesis_id),
             status=hypothesis_status,
@@ -120,7 +209,11 @@ async def verify_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             description=reason,
             severity=severity_for(step),
             verified=True,
-            evidence_ids=[str(evidence.evidence_id)],
+            evidence_ids=(
+                list(auth_assessment.evidence_ids)
+                if auth_assessment is not None
+                else [str(evidence.evidence_id)]
+            ),
             metadata={
                 "action_id": str(proposal.action_id),
                 "agent_id": str(proposal.agent_id),
@@ -128,6 +221,7 @@ async def verify_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                 "target": str(node_id_for_target(proposal.target)),
                 "reviewer_id": assessment.reviewer_id,
                 "verification_source_refs": assessment.source_refs,
+                "assessment_kind": "security_check",
             },
         )
         await service.record_finding(
@@ -170,4 +264,5 @@ async def verify_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
         ),
         last_event_id=last_event_id,
         tool_result=result,
+        result_evidence_id=evidence.evidence_id,
     )

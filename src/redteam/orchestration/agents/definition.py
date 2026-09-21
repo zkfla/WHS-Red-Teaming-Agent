@@ -72,6 +72,9 @@ class AgentDefinition(BaseModel):
     name: str
     description: str = ""
     contract_version: str = "1"
+    #: ``False`` marks a seam role (Analysis=verifier, Reporting=projector)
+    #: that has no executable ``AgentSpec`` and is never scheduled.
+    schedulable: bool = True
     activation_rules: list[ActivationRule] = Field(default_factory=list)
     capabilities: list[str] = Field(default_factory=list)
     provider_id: str
@@ -92,7 +95,8 @@ def builtin_agent_definitions() -> list[AgentDefinition]:
 
     Recon, Web/API and Mobile have executable specs/providers. Analysis is the
     verifier seam and Reporting is the terminal read-only projector, so neither
-    consumes ordinary action-loop turns.
+    consumes ordinary action-loop turns — both carry ``schedulable=False`` to
+    say so in the model, matching the fact that they have no ``AgentSpec``.
     """
 
     return [
@@ -168,6 +172,7 @@ def builtin_agent_definitions() -> list[AgentDefinition]:
             role="analysis",
             name="Analysis Agent",
             description="Independently validates evidence and hypotheses.",
+            schedulable=False,
             activation_rules=[
                 ActivationRule(requires_open_hypothesis=True),
                 ActivationRule(requires_finding=True),
@@ -191,6 +196,7 @@ def builtin_agent_definitions() -> list[AgentDefinition]:
             role="reporting",
             name="Reporting Agent",
             description="Creates a read-only projection after drain/termination.",
+            schedulable=False,
             activation_rules=[ActivationRule(phases=[AgentPhase.FINISHED, AgentPhase.FAILED])],
             capabilities=["reporting"],
             provider_id="playbook:reporting",

@@ -89,9 +89,9 @@ async def test_recon_discovery_unlocks_a_real_web_http_request_call() -> None:
         health_status=ToolHealthStatus.HEALTHY,
     )
     web_tool = ToolDescriptor(
-        tool_id=ToolId("web.http_inspect"),
+        tool_id=ToolId("web.http_request"),
         server_id="test",
-        tool_name="http_inspect",
+        tool_name="http_request",
         input_schema=_REAL_WEB_HTTP_REQUEST_SCHEMA,
         capability_tags=["web", "api"],
         risk_level=RiskLevel.LOW,
@@ -109,7 +109,7 @@ async def test_recon_discovery_unlocks_a_real_web_http_request_call() -> None:
     web_invocations = [
         invocation
         for invocation in gateway.invocations
-        if str(invocation.tool_id) == "web.http_inspect"
+        if str(invocation.tool_id) == "web.http_request"
     ]
     assert web_invocations, "Web/API Agent never called a real web.http_request-shaped tool"
 

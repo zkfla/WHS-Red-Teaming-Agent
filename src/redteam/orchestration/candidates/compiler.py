@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import dataclass
 from functools import lru_cache
 
 from jsonschema import Draft202012Validator
@@ -36,6 +37,18 @@ def _compiled_validator(schema_blob: str) -> Draft202012Validator:
     return Draft202012Validator(schema)
 
 
+@dataclass(frozen=True)
+class CandidateRejection:
+    """Why one draft did not compile; ``field`` names the offending argument."""
+
+    target_node_id: str
+    capability: str
+    operation: str
+    tool_id: str
+    reason: str
+    field: str = ""
+
+
 class CandidateCompiler:
     """Compiles hard-constrained candidates; it does not own domain meaning."""
 
@@ -57,78 +70,144 @@ class CandidateCompiler:
 
     def compile_drafts(self, drafts: list[CandidateDraft]) -> list[ExecutableCandidate]:
         """Apply generic catalog/schema/health constraints to provider drafts."""
+        return self.compile_drafts_with_rejections(drafts)[0]
 
+    def compile_drafts_with_rejections(
+        self, drafts: list[CandidateDraft]
+    ) -> tuple[list[ExecutableCandidate], list[CandidateRejection]]:
+        """Like :meth:`compile_drafts`, but also returns why each dropped draft
+        was dropped (dedup drops are not reported)."""
         candidates: list[ExecutableCandidate] = []
+        rejections: list[CandidateRejection] = []
         seen: set[str] = set()
         for draft in drafts:
-            plan_step = draft.plan_step
-            try:
-                canonical_action_key(plan_step.capability, plan_step.operation)
-                execution_target_id = node_id_for_target(plan_step.resolved_target())
-            except ValueError:
-                # Providers must emit concrete executable steps, never an
-                # unresolved bind that could fail after a lease is acquired.
-                continue
-            if execution_target_id not in draft.target_node_ids:
-                # Context, work/conflict accounting and evidence routing must
-                # describe the same target that Policy and ToolGateway receive.
-                continue
-            tool = self._resolve_tool(plan_step)
-            if tool is None or tool.health_status is ToolHealthStatus.UNHEALTHY:
-                continue
-            if not self._arguments_match_schema(plan_step.arguments, tool.input_schema):
-                continue
-            key = candidate_key(draft)
-            if key in seen:
-                continue
-            seen.add(key)
-            candidates.append(
-                ExecutableCandidate(
-                    candidate_key=key,
-                    draft=draft,
-                    tool=tool,
-                    priority=score_candidate(
-                        draft,
-                        risk_level=tool.risk_level,
-                        health_status=tool.health_status,
-                    ),
-                )
-            )
-        return sorted(
-            candidates,
-            key=lambda item: (-item.priority.total, item.candidate_key),
+            candidate, rejection = self._evaluate_draft(draft, seen)
+            if candidate is not None:
+                candidates.append(candidate)
+            elif rejection is not None:
+                rejections.append(rejection)
+        return (
+            sorted(candidates, key=lambda item: (-item.priority.total, item.candidate_key)),
+            rejections,
         )
 
-    def _resolve_tool(self, plan_step: PlanStep) -> ToolDescriptor | None:
+    def _evaluate_draft(
+        self, draft: CandidateDraft, seen: set[str]
+    ) -> tuple[ExecutableCandidate | None, CandidateRejection | None]:
+        plan_step = draft.plan_step
+        try:
+            json.dumps(plan_step.arguments, sort_keys=True, allow_nan=False)
+        except (TypeError, ValueError):
+            return None, self._reject(draft, "non_json_arguments")
+        try:
+            canonical_action_key(plan_step.capability, plan_step.operation)
+            execution_target_id = node_id_for_target(plan_step.resolved_target())
+        except ValueError:
+            return None, self._reject(draft, "unresolved_target")
+        if execution_target_id not in draft.target_node_ids:
+            return None, self._reject(draft, "target_mismatch")
+        tool, tool_rejection = self._resolve_tool_with_reason(plan_step)
+        if tool is None:
+            reason, field = tool_rejection or ("no_compatible_tool", "")
+            return None, self._reject(draft, reason, field=field)
+        key = candidate_key(draft)
+        if key in seen:
+            return None, None
+        seen.add(key)
+        return (
+            ExecutableCandidate(
+                candidate_key=key,
+                draft=draft,
+                tool=tool,
+                priority=score_candidate(
+                    draft,
+                    risk_level=tool.risk_level,
+                    health_status=tool.health_status,
+                ),
+            ),
+            None,
+        )
+
+    @staticmethod
+    def _reject(draft: CandidateDraft, reason: str, *, field: str = "") -> CandidateRejection:
+        step = draft.plan_step
+        return CandidateRejection(
+            target_node_id=str(draft.target_node_ids[0]) if draft.target_node_ids else "",
+            capability=step.capability,
+            operation=step.operation,
+            tool_id=str(step.tool_id),
+            reason=reason,
+            field=field,
+        )
+
+    def _resolve_tool_with_reason(
+        self, plan_step: PlanStep
+    ) -> tuple[ToolDescriptor | None, tuple[str, str] | None]:
+        """The tool to run, or ``(None, (reason, field))`` explaining why none was usable."""
         preferred, capability, operation = (
             plan_step.tool_id,
             plan_step.capability,
             plan_step.operation,
         )
         if not tool_matches_action_namespace(preferred, capability):
-            return None
+            return None, ("tool_outside_capability_namespace", "")
         if self._catalog is None:
-            # No live Registry wired (legacy/minimal-vertical-slice path,
-            # e.g. the in-process ExampleMCPAdapter): nothing to select
-            # from, so the provider's declared binding is the only option.
-            return ToolDescriptor(
-                tool_id=preferred,
-                server_id="legacy-playbook",
-                tool_name=str(preferred).rpartition(".")[2] or str(preferred),
-                capability_tags=[capability],
-                risk_level=RiskLevel.LOW,
-                health_status=ToolHealthStatus.UNKNOWN,
+            # No live Registry: the provider's declared binding is the only option.
+            return (
+                ToolDescriptor(
+                    tool_id=preferred,
+                    server_id="legacy-playbook",
+                    tool_name=str(preferred).rpartition(".")[2] or str(preferred),
+                    capability_tags=[capability],
+                    risk_level=RiskLevel.LOW,
+                    health_status=ToolHealthStatus.UNKNOWN,
+                ),
+                None,
             )
 
-        # Action-aware selection: never pin to the provider's declared
-        # ``tool_id``. Ask the live Registry which tools are actually
-        # eligible for this canonical action, and pick deterministically —
-        # see ``tool_selection.select_tool``. A tool that disappeared,
-        # went unhealthy, or was never bound to this operation is simply
-        # not offered; that is not distinguished from "no candidate" here
-        # because no ``ActionProposal`` is produced for either case (Policy
-        # never sees a proposal this step could not have executed).
-        return select_tool(self._catalog.list_tools_for_action(capability, operation))
+        action_tools = self._catalog.list_tools_for_action(capability, operation)
+        if not action_tools:
+            return None, ("no_tool_for_action", "")
+        healthy = [
+            tool
+            for tool in action_tools
+            if tool.health_status is not ToolHealthStatus.UNHEALTHY
+            and (not plan_step.compatible_tool_ids or tool.tool_id in plan_step.compatible_tool_ids)
+        ]
+        if not healthy:
+            return None, ("no_healthy_compatible_tool", "")
+        schema_ok = [
+            tool
+            for tool in healthy
+            if self._arguments_match_schema(plan_step.arguments, tool.input_schema)
+        ]
+        if not schema_ok:
+            reason, field = self._schema_rejection(
+                plan_step.arguments, healthy[0].input_schema
+            ) or ("argument_schema_mismatch", "")
+            return None, (reason, field)
+        return select_tool(schema_ok), None
+
+    @staticmethod
+    def _schema_rejection(arguments: dict, schema: dict) -> tuple[str, str] | None:
+        """The first reason ``arguments`` fail ``schema`` as ``(reason, field)``, or ``None``."""
+        if not isinstance(schema, dict):
+            return ("no_input_schema", "")
+        try:
+            json.dumps(arguments, sort_keys=True, separators=(",", ":"))
+            schema_blob = json.dumps(schema, sort_keys=True, separators=(",", ":"))
+            validator = _compiled_validator(schema_blob)
+        except (SchemaError, TypeError, ValueError):
+            return ("invalid_tool_schema", "")
+        errors = sorted(validator.iter_errors(arguments), key=lambda e: list(e.absolute_path))
+        if not errors:
+            return None
+        error = errors[0]
+        if error.validator == "required":
+            required = error.validator_value if isinstance(error.validator_value, list) else []
+            missing = next((name for name in required if name not in (arguments or {})), "")
+            return ("missing_required_argument", str(missing))
+        return ("argument_schema_mismatch", ".".join(str(part) for part in error.absolute_path))
 
     @staticmethod
     def _arguments_match_schema(arguments: dict, schema: dict) -> bool:

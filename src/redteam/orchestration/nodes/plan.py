@@ -19,7 +19,8 @@ from redteam.core.enums import AgentPhase
 from redteam.core.ids import ActionId, HypothesisId, new_id
 from redteam.orchestration.agents.base import PlanningContext
 from redteam.orchestration.agents.planners import build_planner
-from redteam.orchestration.candidates.compiler import CandidateCompiler
+from redteam.orchestration.agents.providers import CandidateBatch, CandidateDiagnostic
+from redteam.orchestration.candidates.compiler import CandidateCompiler, CandidateRejection
 from redteam.orchestration.context import RuntimeDeps
 from redteam.orchestration.context_projection import (
     ContextProjector,
@@ -34,7 +35,9 @@ from redteam.orchestration.dispatch import DispatchItem
 from redteam.orchestration.events import (
     AGENT_NO_EXECUTABLE_CANDIDATES,
     AGENT_PROVIDER_FAILED,
+    AUTHENTICATION_CHECK_DEFERRED,
     CANDIDATE_PRUNED,
+    CANDIDATE_REJECTED,
 )
 from redteam.orchestration.nodes._support import advance, graph_service, publisher_for
 from redteam.orchestration.scheduler import WorkScheduler
@@ -69,11 +72,11 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
     compiler = CandidateCompiler(deps.tool_catalog)
     definition = deps.agents.definition(agent.agent_id)
     provider = (
-        deps.candidate_providers.get(definition.provider_id)
-        if definition is not None
-        else None
+        deps.candidate_providers.get(definition.provider_id) if definition is not None else None
     )
     drafts = None
+    diagnostics: list[CandidateDiagnostic] = []
+    rejections: list[CandidateRejection] = []
     try:
         if definition is None:
             compiled = await compiler.compile_playbook(
@@ -84,10 +87,24 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                 raise LookupError(
                     f"candidate provider {definition.provider_id!r} is not registered"
                 )
-            drafts = await provider.propose(
+            offered = await provider.propose(
                 agent, service.view(), observation, step=runtime.step_count
             )
-            compiled = compiler.compile_drafts(drafts)
+            if isinstance(offered, CandidateBatch):
+                drafts, diagnostics = offered.candidates, offered.diagnostics
+            else:
+                drafts = offered
+            compiled, rejections = compiler.compile_drafts_with_rejections(drafts)
+            for draft in drafts:
+                check = draft.plan_step.authentication_check
+                if check is not None and not any(item.draft == draft for item in compiled):
+                    diagnostics.append(
+                        CandidateDiagnostic(
+                            target_node_id=draft.target_node_ids[0],
+                            reason="no_compatible_authentication_tool",
+                            evidence_id=str(check.baseline_evidence_id),
+                        )
+                    )
     except Exception as exc:  # noqa: BLE001 - isolate one extension from other roles
         failed = await publisher_for(state, deps, "orchestration.plan").publish(
             AGENT_PROVIDER_FAILED,
@@ -109,6 +126,33 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
         )
     publisher = publisher_for(state, deps, "orchestration.plan")
     last_event_id = state.get("last_event_id")
+    for rejection in rejections:
+        rejected = await publisher.publish(
+            CANDIDATE_REJECTED,
+            {
+                "agent_id": agent.agent_id,
+                "target_node_id": rejection.target_node_id,
+                "capability": rejection.capability,
+                "operation": rejection.operation,
+                "tool_id": rejection.tool_id,
+                "reason": rejection.reason,
+                "field": rejection.field,
+            },
+            causation_id=last_event_id,
+        )
+        last_event_id = rejected.event_id
+    for diagnostic in diagnostics:
+        deferred = await publisher.publish(
+            AUTHENTICATION_CHECK_DEFERRED,
+            {
+                "agent_id": agent.agent_id,
+                "target_node_id": diagnostic.target_node_id,
+                "reason": diagnostic.reason,
+                "evidence_id": diagnostic.evidence_id,
+            },
+            causation_id=last_event_id,
+        )
+        last_event_id = deferred.event_id
     if drafts and not compiled:
         # The agent was activated (its playbook precondition genuinely
         # matched something) and had at least one draft to try, but every
@@ -123,14 +167,11 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
         )
         last_event_id = no_candidates.event_id
     history = await deps.work_store.list_items(run_id=runtime.run_id)
-    terminal_keys = {
-        item.candidate_key for item in history if item.status in TERMINAL_STATUSES
-    }
+    terminal_keys = {item.candidate_key for item in history if item.status in TERMINAL_STATUSES}
     compiled = [
         candidate
         for candidate in compiled
-        if candidate.plan_step.repeatable
-        or candidate.candidate_key not in terminal_keys
+        if candidate.plan_step.repeatable or candidate.candidate_key not in terminal_keys
     ]
     source_nodes = max(sum(observation.node_counts.values()), 1)
     if definition is None:
@@ -180,15 +221,11 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
         # Bound only after dedup and pruning, otherwise already-terminal or
         # pruned high-ranked candidates could hide untouched lower candidates.
         compiled = compiled[: definition.context_profile.max_candidates]
-        planning_observation = await ContextProjector(
-            service, deps.context_cache
-        ).project(
+        planning_observation = await ContextProjector(service, deps.context_cache).project(
             definition.context_profile,
             step=runtime.step_count,
             target_node_ids=[
-                node_id
-                for candidate in compiled
-                for node_id in candidate.draft.target_node_ids
+                node_id for candidate in compiled for node_id in candidate.draft.target_node_ids
             ],
             fallback=observation,
             revision=runtime.step_count,
@@ -204,9 +241,7 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
         evidence_excerpts = project_evidence_excerpts(
             await deps.evidence_store.list_for_run(runtime.run_id),
             target_node_ids=[
-                node_id
-                for candidate in compiled
-                for node_id in candidate.draft.target_node_ids
+                node_id for candidate in compiled for node_id in candidate.draft.target_node_ids
             ],
             limit=evidence_limit,
         )
@@ -228,9 +263,7 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                 ),
                 "projected_nodes": sum(planning_observation.node_counts.values()),
                 "source_nodes": sum(observation.node_counts.values()),
-                "evidence_excerpts": [
-                    item.model_dump(mode="json") for item in evidence_excerpts
-                ],
+                "evidence_excerpts": [item.model_dump(mode="json") for item in evidence_excerpts],
             },
         )
     )
@@ -374,9 +407,7 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                     "step_id": candidate_step.step_id,
                     "target": target_display_name(target),
                     "target_node_id": str(target_node_id),
-                    "violation_if_confirmed": (
-                        candidate_step.hypothesis.violation_if_confirmed
-                    ),
+                    "violation_if_confirmed": (candidate_step.hypothesis.violation_if_confirmed),
                     "severity": (
                         candidate_step.hypothesis.severity.value
                         if candidate_step.hypothesis.severity is not None

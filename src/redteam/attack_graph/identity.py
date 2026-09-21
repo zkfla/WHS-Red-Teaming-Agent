@@ -45,6 +45,18 @@ def normalize_path(path: str) -> str:
     return "/" + "/".join(normalized)
 
 
+def path_parameters(path: str) -> list[str]:
+    """Object-identifier positions a path templates over, named after the
+    collection: ``/orders/8831/items/42`` -> ``["orders_id", "items_id"]``."""
+    segments = [s for s in normalize_path(path).split("/") if s]
+    params: list[str] = []
+    for index, segment in enumerate(segments):
+        if segment == "{id}":
+            collection = segments[index - 1] if index > 0 else "root"
+            params.append(f"{collection}_id")
+    return params
+
+
 def make_node_id(node_type: GraphNodeType, key: str) -> GraphNodeId:
     """Build ``"<type>:<key>"``. ``key`` must be non-blank and printable."""
     if not key or not key.strip():

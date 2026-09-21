@@ -13,6 +13,7 @@ from redteam.attack_graph.identity import (
     node_id_for_target,
     node_type_for_target,
     normalize_path,
+    path_parameters,
     split_node_id,
     target_for_node,
 )
@@ -135,3 +136,12 @@ def test_target_for_node_round_trips_the_node_id() -> None:
         (make_node_id(GraphNodeType.ASSET, "db-1"), GraphNodeType.ASSET),
     ]:
         assert node_id_for_target(target_for_node(node_id, node_type)) == node_id
+
+
+def test_path_parameters_names_object_identifier_positions() -> None:
+    # #2: the endpoint's Parameters -- the object-identifier positions the
+    # path templates over, named after the collection they identify.
+    assert path_parameters("/orders/8831") == ["orders_id"]
+    assert path_parameters("/orders/8831/items/42") == ["orders_id", "items_id"]
+    assert path_parameters("/login") == []
+    assert path_parameters("/") == []

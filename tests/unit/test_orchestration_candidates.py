@@ -372,3 +372,74 @@ def test_custom_priority_signals_require_provenance() -> None:
         source_refs=[" graph:host:a.local ", "graph:host:a.local"],
     )
     assert signals.source_refs == ["graph:host:a.local"]
+
+
+async def test_compiler_reports_a_field_level_rejection_reason() -> None:
+    # PM #5: an empty frontier must be explainable. A tool that requires
+    # `path`, an action step that never supplies it -> the compiler names
+    # the concrete reason and the offending field instead of dropping it
+    # silently.
+    from redteam.orchestration.agents.providers import PlaybookCandidateProvider
+
+    service = await graph()
+    observation = await service.observe(step=1)
+    registry = MCPToolRegistry()
+    registry.register(
+        ToolDescriptor(
+            tool_id=ToolId("recon.ping"),
+            server_id="test",
+            tool_name="ping",
+            capability_tags=["recon"],
+            input_schema={
+                "type": "object",
+                "required": ["path"],
+                "properties": {"path": {"type": "string"}},
+            },
+        )
+    )
+    compiler = CandidateCompiler(catalog_for(registry))
+    drafts = await PlaybookCandidateProvider().propose(
+        agent(), service.view(), observation, step=1
+    )
+
+    candidates, rejections = compiler.compile_drafts_with_rejections(drafts)
+
+    assert candidates == []
+    assert rejections, "a dropped draft must be reported, not silently discarded"
+    rejection = rejections[0]
+    assert rejection.reason == "missing_required_argument"
+    assert rejection.field == "path"
+    assert rejection.operation == "service_discovery"
+
+
+async def test_compiler_reports_when_no_tool_serves_the_action() -> None:
+    from redteam.orchestration.agents.providers import PlaybookCandidateProvider
+
+    service = await graph()
+    observation = await service.observe(step=1)
+    compiler = CandidateCompiler(catalog_for(MCPToolRegistry()))  # empty catalog
+    drafts = await PlaybookCandidateProvider().propose(
+        agent(), service.view(), observation, step=1
+    )
+
+    _, rejections = compiler.compile_drafts_with_rejections(drafts)
+
+    assert rejections and rejections[0].reason == "no_tool_for_action"
+
+
+async def test_incompatible_first_tool_does_not_hide_a_valid_alternative() -> None:
+    service = await graph()
+    registry = MCPToolRegistry()
+    for name, schema in [
+        ('a_requires_url', {'type': 'object', 'required': ['url']}),
+        ('z_compatible', {'type': 'object'}),
+    ]:
+        registry.register(ToolDescriptor(
+            tool_id=ToolId(f'recon.{name}'), server_id='test', tool_name=name,
+            capability_tags=['recon'], input_schema=schema,
+        ))
+    candidates = await CandidateCompiler(catalog_for(registry)).compile_playbook(
+        agent(), service.view(), await service.observe(), step=0,
+    )
+    assert len(candidates) == 2
+    assert {candidate.tool.tool_id for candidate in candidates} == {'recon.z_compatible'}

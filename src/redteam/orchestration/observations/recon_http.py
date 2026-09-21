@@ -76,6 +76,7 @@ def map_recon_http_probe(
     endpoint_facts: dict[str, Any] = {
         "host": host,
         "path": path,
+        "observed_target": path,
         "method": _METHOD,
         "scheme": _SCHEME,
     }

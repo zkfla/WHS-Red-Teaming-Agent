@@ -36,6 +36,7 @@ class GraphObservation(BaseModel):
     findings: list[str] = Field(default_factory=list)
     attempted: list[str] = Field(default_factory=list)
     truncated: bool = False
+    observation_context_counts: dict[str, int] = Field(default_factory=dict)
 
     @property
     def is_empty(self) -> bool:
@@ -123,6 +124,12 @@ def build_observation(
         if attempts_truncated:
             break
 
+    contexts: dict[str, set[tuple[str, str]]] = {}
+    for node in nodes:
+        for item in facts_of(node.properties).get("observations", []):
+            if isinstance(item, dict) and isinstance(item.get("context_key"), str):
+                contexts.setdefault(node.type.value, set()).add((str(node.id), item["context_key"]))
+
     return GraphObservation(
         step=step,
         node_counts=node_counts,
@@ -134,4 +141,5 @@ def build_observation(
         findings=sorted(findings),
         attempted=sorted(attempted),
         truncated=truncated or attempts_truncated,
+        observation_context_counts={kind: len(keys) for kind, keys in contexts.items()},
     )

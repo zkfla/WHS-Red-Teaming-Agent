@@ -91,5 +91,6 @@ async def observe_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
         action_proposal=None,
         policy_decision=None,
         tool_result=None,
+        result_evidence_id=None,
         current_work_id=None,
     )

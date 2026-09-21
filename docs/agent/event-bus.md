@@ -144,3 +144,15 @@ and wire it in `redteam.app.bootstrap`. Nothing else changes —
 `history()`/`correlated()` are conveniences of the in-memory backend;
 code that needs a durable trail should read the Evidence Store, not the
 bus.
+
+`ObservationRecorded` is an Agent-owned event for observation-only steps after
+Evidence storage. It carries `action_id`, `evidence_id`, `target_node_id`,
+`assessment_kind="observation"` and `tool_success`, using the action correlation
+and preceding event as causation. It does not imply `FindingVerified` or a
+security PASS and contains no raw response or credential.
+
+`AuthenticationCheckDeferred` records the target, baseline Evidence ID and a
+missing-session/tool reason. `AuthenticationChecked` records the comparison
+outcome, hypothesis status, Evidence IDs and HTTP statuses, plus the configured
+session reference. Both are Agent-owned events rendered by the CLI. Neither
+event asserts a vulnerability or carries session credentials.

@@ -38,6 +38,10 @@ def observation_fingerprint(
         return name not in ignored_types and (included is None or name in included)
 
     payload = {
+        "observation_context_counts": {
+            name: count for name, count in observation.observation_context_counts.items()
+            if relevant(name)
+        },
         "node_counts": {
             name: count
             for name, count in observation.node_counts.items()

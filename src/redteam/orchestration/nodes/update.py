@@ -53,6 +53,10 @@ async def update_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
         step=runtime.step_count,
         source=f"tool:{result.tool_id}" if result is not None else "control-plane",
         run_id=str(runtime.run_id),
+        evidence_id=(
+            str(state["result_evidence_id"])
+            if result is not None and state.get("result_evidence_id") else None
+        ),
         confidence=Confidence.MEASURED if succeeded else Confidence.INFERRED,
     )
 
@@ -65,6 +69,8 @@ async def update_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
         "last_operation_succeeded": succeeded,
         "last_tool_succeeded": tool_succeeded,
     }
+    if provenance.evidence_id:
+        facts["evidence_ids"] = [provenance.evidence_id]
     if verification_failed:
         facts["last_verification_failed"] = True
     if blocked:
@@ -107,15 +113,23 @@ async def update_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
         mutation = deps.result_mappers.map_result(
             tool_id=result.tool_id,
             target=proposal.target,
-            arguments=step.arguments,
+            arguments=proposal.arguments,
             result=result,
         )
         for node_mutation in mutation.nodes:
+            observed_facts = dict(node_mutation.facts)
+            if node_mutation.observations and provenance.evidence_id:
+                observed_facts["observations"] = [
+                    {**item, "evidence_id": provenance.evidence_id}
+                    for item in node_mutation.observations
+                ]
             discovered = await service.upsert_node(
                 node_mutation.node_type,
                 node_id=node_mutation.node_id,
                 attrs=node_mutation.attrs,
-                facts=node_mutation.facts,
+                facts={**observed_facts, **(
+                    {"evidence_ids": [provenance.evidence_id]} if provenance.evidence_id else {}
+                )},
                 labels=node_mutation.labels,
                 provenance=provenance,
                 step=runtime.step_count,

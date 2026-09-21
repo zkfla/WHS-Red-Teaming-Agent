@@ -23,6 +23,7 @@ from redteam.core.ids import (
     ApprovalId,
     EngagementId,
     EventId,
+    EvidenceId,
     HypothesisId,
     RunId,
 )
@@ -102,6 +103,7 @@ class GraphState(TypedDict, total=False):
     action_proposal: ActionProposal | None
     policy_decision: PolicyDecision | None
     tool_result: ToolResult | None
+    result_evidence_id: EvidenceId | None
     #: Internal WorkLedger reference for the in-flight proposal.
     current_work_id: str | None
     #: A batch exists only when ``max_actions_per_turn`` admits fan-out.
@@ -124,6 +126,7 @@ def initial_graph_state(runtime: RuntimeState) -> GraphState:
         "action_proposal": None,
         "policy_decision": None,
         "tool_result": None,
+        "result_evidence_id": None,
         "current_work_id": None,
         "dispatch_items": [],
         "worker_outcomes": {},
@@ -156,6 +159,7 @@ def resume_graph_state(
         "action_proposal": action_proposal,
         "policy_decision": None,
         "tool_result": None,
+        "result_evidence_id": None,
         "current_work_id": None,
         "dispatch_items": [],
         "worker_outcomes": {},

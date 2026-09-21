@@ -3,15 +3,30 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Protocol
 
 from redteam.attack_graph.identity import node_id_for_target
 from redteam.attack_graph.observation import GraphObservation
 from redteam.attack_graph.view import AttackGraphView
+from redteam.core.ids import GraphNodeId
 from redteam.orchestration.agents.base import AgentSpec, available_steps
 
 if TYPE_CHECKING:
     from redteam.orchestration.candidates.models import CandidateDraft
+
+
+@dataclass(frozen=True)
+class CandidateDiagnostic:
+    target_node_id: GraphNodeId
+    reason: str
+    evidence_id: str
+
+
+@dataclass(frozen=True)
+class CandidateBatch:
+    candidates: list[CandidateDraft]
+    diagnostics: list[CandidateDiagnostic] = field(default_factory=list)
 
 
 class CandidateProvider(Protocol):
@@ -22,7 +37,7 @@ class CandidateProvider(Protocol):
         observation: GraphObservation,
         *,
         step: int,
-    ) -> list[CandidateDraft]: ...
+    ) -> list[CandidateDraft] | CandidateBatch: ...
 
 
 class PlaybookCandidateProvider:
@@ -83,7 +98,10 @@ class CandidateProviderRegistry:
 
 
 def default_provider_registry() -> CandidateProviderRegistry:
+    from redteam.orchestration.agents.web import WebCandidateProvider
+
     playbook = PlaybookCandidateProvider()
     return CandidateProviderRegistry(
-        [(f"playbook:{role}", playbook) for role in ("recon", "web_api", "mobile", "analysis")]
+        [(f"playbook:{role}", playbook) for role in ("recon", "mobile", "analysis")]
+        + [("playbook:web_api", WebCandidateProvider())]
     )

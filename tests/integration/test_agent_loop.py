@@ -480,7 +480,7 @@ async def test_default_web_agent_activates_when_target_and_catalog_tool_exist() 
     registry = MCPToolRegistry()
     for tool_id, capability in (
         ("recon.ping", "recon"),
-        ("web.http_inspect", "web"),
+        ("web.http_request", "web"),
     ):
         registry.register(
             ToolDescriptor(
@@ -492,7 +492,7 @@ async def test_default_web_agent_activates_when_target_and_catalog_tool_exist() 
             )
         )
     catalog = MCPToolGateway(
-        registry, {}, {"recon.ping": ["service_discovery"], "web.http_inspect": ["http_request"]}
+        registry, {}, {"recon.ping": ["service_discovery"], "web.http_request": ["http_request"]}
     )
     deps = build_test_application(
         tool_catalog=catalog,
@@ -513,7 +513,7 @@ async def test_round_robin_prevents_recon_from_consuming_all_specialist_budget()
     registry = MCPToolRegistry()
     for tool_id, capability in (
         ("recon.ping", "recon"),
-        ("web.http_inspect", "web"),
+        ("web.http_request", "web"),
     ):
         registry.register(
             ToolDescriptor(
@@ -525,7 +525,7 @@ async def test_round_robin_prevents_recon_from_consuming_all_specialist_budget()
             )
         )
     catalog = MCPToolGateway(
-        registry, {}, {"recon.ping": ["service_discovery"], "web.http_inspect": ["http_request"]}
+        registry, {}, {"recon.ping": ["service_discovery"], "web.http_request": ["http_request"]}
     )
     gateway = DummyToolGateway()
     deps = build_test_application(

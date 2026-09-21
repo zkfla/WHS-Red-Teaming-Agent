@@ -462,3 +462,79 @@ carry. The proposed action-aware shared port is tracked in
 operational safety input for scheduling;
 finding severity comes from the pre-execution hypothesis/domain provider, not
 from the tool used to test it.
+
+### HTTP integration and observation classification
+
+The built-in HTTP playbooks declare `compatible_tool_ids` for the response
+contracts they understand. CandidateCompiler filters the live operation catalog
+by those bindings, health and input schema **before** ranking. A browser tool
+requiring `url` therefore cannot hide an executable HTTP request requiring
+`target_ref` and `path`. DNS resolution is not a substitute for an HTTP response.
+New tool contracts need an appropriate playbook/provider and result mapper.
+
+An operator can map a scope hostname to an MCP policy key without changing the
+host checked by Control:
+
+```yaml
+engagement:
+  scope:
+    allowed_hosts: [mock-bank]
+  metadata:
+    target_refs:
+      mock-bank: bank-lab
+```
+
+The mapping is validated and seeded on the Host node; bound Endpoint requests
+reuse it. When omitted, the existing convention that the policy key equals the
+hostname remains. The bundled finance AppConfig includes this mapping. Target
+refs identify configured targets, not credentials or authorization grants.
+
+Web inspection has `assessment_kind="observation"`. HTTP status and header
+presence are stored as graph facts with Evidence IDs. `ObservationRecorded`
+links the action and evidence; its verdict is UNKNOWN because no security claim
+was tested. Even a verifier returning VIOLATION cannot promote this observation
+to a Finding. Missing HSTS by itself is not a verified vulnerability.
+
+Security-check steps retain the existing explicit expectation/verifier path:
+VIOLATION produces a verified Finding with stored Evidence IDs and
+`metadata.assessment_kind="security_check"`.
+
+### Authentication follow-ups
+
+The Web candidate provider turns an anonymous GET 401 observation into a
+hypothesis and a session-bound GET candidate for the same concrete path. Only
+operator-registered session references for that host and exact path are eligible:
+
+```yaml
+engagement:
+  metadata:
+    auth_sessions:
+      mock-bank:
+        - session_ref: alice
+          paths: [/api/accounts/alice]
+          expected_access: allow
+```
+
+The same session reference must exist in the Capability adapter's session
+configuration. This metadata contains no passwords, cookies or tokens and does
+not grant permission: candidates still pass compilation and Control evaluation.
+Without an eligible session or compatible tool, `AuthenticationCheckDeferred`
+records the reason. Completed comparisons emit `AuthenticationChecked`; both
+events appear in CLI output.
+
+The comparison verifies the anonymous baseline Evidence against the same
+engagement, target, method and path, and links baseline and follow-up Evidence.
+A 2xx response records session access, 401 records an unaccepted session, and
+403 records denied access. Other responses remain inconclusive. With
+`expected_access: deny`, a 2xx response is marked `authorization_review_required`.
+None of these status-only observations creates a Finding: confirming unauthorized
+access still requires a domain-specific content/ownership verification rule.
+Each path/session context is tried once in the current work ledger; distinct
+session observations count as progress without treating repeated evidence for
+the same context as new progress.
+
+The default Web mapper is registered under the executed `web.http_request`
+identifier. It uses the invocation's method/path and target port, and preserves
+the concrete path separately from its normalized graph ID. VERIFY passes only
+the Evidence ID to UPDATE; target and discovered nodes plus discovered edges
+carry that provenance. The ID is cleared between sequential/parallel actions.

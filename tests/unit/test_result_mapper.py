@@ -133,3 +133,26 @@ def test_registry_refuses_a_duplicate_registration() -> None:
     registry.register("recon.custom", map_recon_http_probe)
     with pytest.raises(ValueError, match="already registered"):
         registry.register("recon.custom", map_recon_http_probe)
+
+
+def test_web_mapper_uses_executed_method_path_and_port() -> None:
+    from redteam.orchestration.observations.web_http import map_web_http_request
+
+    mutation = map_web_http_request(
+        target=EndpointTarget(host='a.local', port=8443, path='/old'),
+        arguments={'path': '/actual', 'method': 'POST'},
+        result=_result(tool_id='web.http_request', output=_GOOD_OUTPUT),
+    )
+    node = mutation.nodes[0]
+    assert str(node.node_id) == 'endpoint:a.local:8443 POST /actual'
+    assert node.facts['observed_target'] == '/actual'
+
+
+@pytest.mark.parametrize('status', [True, 0, 600, '200', None])
+def test_web_mapper_rejects_invalid_status(status) -> None:
+    from redteam.orchestration.observations.web_http import map_web_http_request
+
+    assert map_web_http_request(
+        target=EndpointTarget(host='a.local', path='/'), arguments={'path': '/'},
+        result=_result(output={'status_code': status}),
+    ) == GraphMutation()

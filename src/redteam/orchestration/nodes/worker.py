@@ -35,6 +35,7 @@ async def worker_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
         "action_proposal": item.proposal,
         "policy_decision": None,
         "tool_result": None,
+        "result_evidence_id": None,
         "current_work_id": item.work_id,
         "dispatch_items": [],
         "worker_outcomes": {},

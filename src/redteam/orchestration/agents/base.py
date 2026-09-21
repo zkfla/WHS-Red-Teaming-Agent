@@ -8,14 +8,14 @@ that was never declared. Rationale: ``docs/agent/orchestration.md``.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 from pydantic import BaseModel, Field, model_validator
 
-from redteam.attack_graph.identity import node_id_for_target, target_for_node
+from redteam.attack_graph.identity import host_node_id, node_id_for_target, target_for_node
 from redteam.attack_graph.observation import GraphObservation
 from redteam.attack_graph.patterns import NodePattern, resolve
-from redteam.attack_graph.predicates import is_stale
+from redteam.attack_graph.predicates import facts_of, is_stale
 from redteam.attack_graph.view import AttackGraphView
 from redteam.core.contracts.target import AnyTarget, TargetRef
 from redteam.core.enums import RiskLevel
@@ -25,6 +25,7 @@ from redteam.orchestration.action_naming import (
     canonical_action_key,
     tool_matches_action_namespace,
 )
+from redteam.orchestration.authentication import AuthenticationCheck
 from redteam.orchestration.expectations import Expectation
 
 #: Cap on concrete steps produced from one playbook entry per turn, so a
@@ -90,6 +91,10 @@ class PlanStep(BaseModel):
     capability: str
     operation: str
     tool_id: ToolId
+    # Tool result contracts understood by this playbook; empty permits any compatible input.
+    compatible_tool_ids: list[ToolId] = Field(default_factory=list)
+    assessment_kind: Literal["observation", "security_check"] = "security_check"
+    authentication_check: AuthenticationCheck | None = None
 
     #: Either a fixed target...
     target: TargetRef | None = None
@@ -149,7 +154,7 @@ class PlanStep(BaseModel):
             raise ValueError(f"step {self.step_id!r} has no concrete target yet")
         return self.target
 
-    def bound_to(self, target: AnyTarget) -> PlanStep | None:
+    def bound_to(self, target: AnyTarget, *, target_ref: str | None = None) -> PlanStep | None:
         """A concrete copy of this step, pinned to one target, with every
         placeholder in :data:`_PLACEHOLDER_RESOLVERS` resolved from that
         target's real fields — lets a static playbook argument stay in
@@ -171,7 +176,9 @@ class PlanStep(BaseModel):
             if resolver is None:
                 arguments[key] = value
                 continue
-            resolved = resolver(target)
+            resolved = (
+                target_ref if value == TARGET_REF_PLACEHOLDER and target_ref else resolver(target)
+            )
             if resolved is None:
                 return None
             arguments[key] = resolved
@@ -283,7 +290,13 @@ async def available_steps(
             )
             if not result.ok:
                 continue
-            bound = entry.bound_to(target_for_node(node.id, node.type))
+            target = target_for_node(
+                node.id, node.type, observed=facts_of(node.properties).get("observed_target")
+            )
+            host = getattr(target, "host", None)
+            host_node = await view.get_node(host_node_id(host)) if host else None
+            target_ref = facts_of(host_node.properties).get("target_ref") if host_node else None
+            bound = entry.bound_to(target, target_ref=target_ref)
             if bound is None:
                 # A placeholder this step needs could not be resolved
                 # from this particular node (section 7: never guess) --

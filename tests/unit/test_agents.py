@@ -454,6 +454,14 @@ def test_the_default_registry_ships_executable_specialists() -> None:
         AgentId("analysis-agent"),
         AgentId("reporting-agent"),
     ]
+    # Architecture invariant: exactly the schedulable roles have executable
+    # specs. Analysis/Reporting are seams (verifier/projector), so they are
+    # defined roles but carry no spec -- this guards against the drift PM
+    # flagged (a definition that looks schedulable but was never wired).
+    schedulable = [d.agent_id for d in registry.definitions() if d.schedulable]
+    assert schedulable == registry.agent_ids
+    seams = [d.agent_id for d in registry.definitions() if not d.schedulable]
+    assert seams == [AgentId("analysis-agent"), AgentId("reporting-agent")]
 
 
 # -- planners -------------------------------------------------------------

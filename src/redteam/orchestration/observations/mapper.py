@@ -31,6 +31,7 @@ class NodeMutation:
     attrs: dict[str, Any] = field(default_factory=dict)
     facts: dict[str, Any] = field(default_factory=dict)
     labels: list[str] = field(default_factory=list)
+    observations: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -92,7 +93,9 @@ class ResultMapperRegistry:
 
 def default_result_mapper_registry() -> ResultMapperRegistry:
     from redteam.orchestration.observations.recon_http import map_recon_http_probe
+    from redteam.orchestration.observations.web_http import map_web_http_request
 
     registry = ResultMapperRegistry()
     registry.register("recon.http_probe", map_recon_http_probe)
+    registry.register("web.http_request", map_web_http_request)
     return registry
