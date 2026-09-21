@@ -398,14 +398,19 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                 "projected_nodes": sum(planning_observation.node_counts.values()),
                 "source_nodes": sum(observation.node_counts.values()),
                 "evidence_excerpts": [item.model_dump(mode="json") for item in evidence_excerpts],
-                # The same totals the compiler ranked by, so a hybrid planner
-                # can tell "clear winner" from "genuinely ambiguous" without
-                # scoring anything itself.
+                # One playbook step bound to several targets keeps the same
+                # PlanStep.step_id, so step_id is NOT a unique identity here.
+                # The compiler's candidate_key is, and these two are aligned
+                # with the candidates list handed to the planner: a hybrid
+                # planner orders and shortlists by option key, then maps the
+                # chosen key back to the PlanStep it came from. The PlanStep /
+                # PM action contract is untouched.
+                "candidate_keys": [candidate.candidate_key for candidate in compiled],
                 "candidate_scores": {
-                    candidate.plan_step.step_id: candidate.priority.total
+                    candidate.candidate_key: candidate.priority.total
                     for candidate in compiled
                 },
-            },
+                },
         )
     )
 
