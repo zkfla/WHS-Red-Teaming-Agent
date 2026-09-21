@@ -22,19 +22,24 @@
 ### 🅰️ Track A — Policy & Enforcement Pipeline (판단)
 > "이 요청이 관문을 통과하는가"를 판단하는 로직
 
-**담당 파일:** `control/service.py`(파이프라인), `scope.py`, `roe.py`, `policy.py`, `budget.py`, `rate_limit.py`
+**담당 파일:** `control/service.py`(파이프라인), `scope.py`, `roe.py`, `policy.py`, `risk.py`, `severity.py`, `budget.py`, `rate_limit.py`
 
 **통합 배선:** `app/bootstrap.py`
 
-**작업 순서 (쉬운 것 → 어려운 것):**
-1. **ROE 규칙 채우기** `roe.py` ← 시작점 (뼈대는 이미 있음)
-2. Scope 업그레이드 `scope.py` — 글자 비교 → 진짜 IP 대역(CIDR) 계산 + 도메인 서픽스 + 전 target 종류
-3. Policy 강화 `policy.py` — "무조건 거절" deny 규칙 추가
-4. Budget 세분화 `budget.py` — 횟수 + 시간 + 도구호출 제한
-5. RateLimit 개선 `rate_limit.py` — sliding window
-6. Blocked Action Evidence 연결 `control/service.py`, `app/bootstrap.py`
-   — `DENY`/`REQUIRE_APPROVAL` 결정 시 Track B의 EvidenceService 호출
-   — Control과 Orchestration이 동일한 Evidence Store를 사용하도록 배선
+**작업 목록과 상태:**
+
+| # | 작업 | 상태 |
+|---|---|---|
+| 1 | ROE 규칙 — 능력/작업 allow·deny(canonical action key), 시간대, 가용성, 동시 실행 제한 (`roe.py`) | ✅ 완료 |
+| 2 | Scope — CIDR 대역 + 도메인 서픽스 + host 외 target 종류 (`scope.py`) | ✅ 완료 |
+| 3 | Policy — 승인 게이트(capability / action key 매칭). 거절은 ROE 담당이라 Policy는 deny 하지 않음 (`policy.py`) | ✅ 완료 |
+| 4 | Budget — 횟수 + 도구호출 + 경과시간 (`budget.py`) | ✅ 완료 |
+| 5 | RateLimit — sliding window (`rate_limit.py`) | ✅ 완료 |
+| 6 | Blocked Action Evidence 연결 (`service.py`, `bootstrap.py`) — `DENY`/`REQUIRE_APPROVAL`을 Track B `EvidenceService`로 기록, 동일 Evidence Store 공유 | ✅ 완료 |
+| 7 | 거절 심각도 태그 (`severity.py`) | ✅ 완료 (소비는 Agent 팀, §3 참고) |
+| 8 | **Risk 기반 승인** — Tool Registry `risk_level` 조회 (`risk.py`, `policy.py`) — §2.1 참고 | ✅ 완료 (임계값은 임시 기본값, §5 참고) |
+| 9 | Action 유형 무관 게이트 통과 검증 (`test_gate_universality.py`) | ✅ 완료 |
+| 10 | Finding → Evidence → Action → Invocation 추적 체인 검증 (PM 문제 4) | ⏳ 후속 |
 
 ### 🅱️ Track B — Governance, Audit & Evidence (기록·승인·증거)
 > 판단이 내려진 "다음"과 "결과 저장"을 담당
@@ -88,6 +93,34 @@ PolicyDecision  (ALLOW / DENY / REQUIRE_APPROVAL + 이유)
 
 - **ALLOW만** ToolInvocation(실제 도구 실행 명령)으로 변환된다.
 - 이건 `core/convert.build_tool_invocation()`이 기계적으로 강제한다 (ALLOW 아니면 예외). → **DENY난 요청은 물리적으로 공격 도구에 도달 불가.**
+
+Control Plane 우회 방지는 세 겹으로 검증한다.
+
+| 계층 | 테스트 | 보장 |
+|---|---|---|
+| 구조 | `test_control_plane_bypass` | Orchestration은 Control/Capability 구현을 import할 수 없다 |
+| 기계 | `test_conversion` | non-ALLOW `PolicyDecision`은 `ToolInvocation`이 될 수 없다 |
+| 동작 | `test_gate_universality` | auth / scanner / replay / active probe / mobile / 처음 보는 유형까지 모두 `evaluate()`를 거친다 |
+
+### 2.1 Risk 기반 승인 (Policy 단계)
+
+위험도가 높은 Action은 `require_approval_for` 목록에 없어도 사람 승인을 요구한다.
+**위험도 값은 Control에 하드코딩하지 않고 Capability Tool Registry(`ToolDescriptor.risk_level`)를 단일 출처로 쓴다.**
+
+```text
+ActionProposal(capability, operation)
+   │
+   ▼  RegistryRiskResolver   (control/risk.py)
+ToolGateway.list_tools_for_action()   ← read-only 조회, 실행 없음
+   │
+   ▼  후보 도구 중 최고 risk_level  (승인 후 어떤 후보가 선택될지 모르므로 보수적으로)
+임계값 이상이면 REQUIRE_APPROVAL   (matched_rules: "risk:<level>")
+```
+
+- 등록된 도구가 없으면 risk 판단은 건너뛰고 기존 동작 그대로다.
+- **조회가 예외를 던지면 fail-closed** — 로그를 남기고 `REQUIRE_APPROVAL` (`matched_rules: "risk:unresolved"`). 위험도를 알 수 없는 Action이 승인 없이 통과하지 않게 하고, 게이트가 크래시하지도 않게 한다.
+- 이미 dev에 있는 `ToolGateway.list_tools_for_action`과 `RiskLevel`만 사용하므로 **Core Contract 변경은 없다.**
+- 임계값은 코드의 임시 기본값(`DEFAULT_APPROVAL_RISK_THRESHOLD = HIGH`)이다. Engagement별 설정은 §5 참고.
 
 정책 결정 이후의 기록 흐름은 다음과 같다.
 
@@ -145,30 +178,39 @@ DENY할 때 **왜 막혔는지에 따라 에이전트의 다음 행동이 달라
   policy→REPLAN / rate_limit→BLOCK / budget→ABORT.
 
 **남은 것 (Control 범위 밖):**
-- Agent 팀(orchestration `router`/`replan`)이 이 태그를 **실제 라우팅에 반영** (현재는 DENY 모두 REPLAN 후 종료).
+- Agent 팀(orchestration `router`/`replan`)이 이 태그를 **실제 라우팅에 반영**해야 한다. 현재 `orchestration/`에는 `severity_from_matched_rules` 사용처가 없어서, 태그는 붙어 있지만 아직 소비되지 않는다.
 - (선택) **방법 B**: `PolicyDecision.severity` 1급 필드 승격 → PM Issue. 지금은 태그 규약으로 충분.
 
 ---
 
-## 4. 이미 완료 (M0 — 뼈대/seam)
+## 4. 진행 현황 (2026-09-22 기준)
 
-- `control/roe.py` 생성: `check_roe(action, engagement) -> (bool, list[str])` (현재 pass-through 껍데기).
-- `DefaultControlPlane.evaluate()`에서 Scope 다음 · Policy 앞에 ROE 단계로 연결 (DENY 시 `matched_rules=["roe"]`).
-- `tests/unit/test_roe.py` 추가 (4개, DefaultControlPlane 파이프라인 첫 테스트 포함).
-- M0 당시 전체 61 tests pass, ruff/mypy clean, 기존 동작 불변.
+- 게이트 6단계(Scope → ROE → Policy → RateLimit → Budget → Approval)가 모두 실제 로직으로 동작한다.
+- 차단된 시도(`DENY`/`REQUIRE_APPROVAL`)도 Evidence로 기록된다 (Track B `record_blocked_action` + Track A 배선).
+- Risk 기반 승인은 Tool Registry의 `risk_level`을 읽어 동작한다 (§2.1).
+- 검증: `pytest -q` 910 passed, `ruff`·`mypy` 통과.
+
+**아직 열려 있는 것**
+- 승인 임계값의 Engagement별 설정 (§5).
+- Raw Evidence 저장 구조 — `ArtifactStore` 포트와 `ToolResult` artifact 참조 (§5).
+- Audit 추적 체인 검증 (§1 작업 #10).
+- ROE `prohibited_techniques`: 기법 분류 체계가 없어서, 설정되면 조용히 무시하지 않고 명시적으로 실패한다 (`UnsupportedRoePolicyError`).
 
 
 ---
 
-## 5. PM Issue 후보 (지금은 전부 "대안=변경없음"으로 진행 가능, Contract v0.1 유지)
+## 5. PM Issue 후보 (Contract v0.1은 유지하고, 필요한 것만 Issue로 올린다)
 
-| 항목 | 필요할 때 | 대안 (변경 없음) |
+| 항목 | 필요할 때 | 대안 (변경 없음) / 상태 |
 |---|---|---|
+| **`ApprovalPolicy`에 risk 승인 임계값 필드** | Engagement마다 "어느 risk부터 승인"을 다르게 하고 싶을 때 | 지금은 코드의 임시 기본값 `HIGH`. **설계 논의 필요** (Passive/Active/Intrusive ↔ `RiskLevel` 매핑, 후보 도구가 여러 개일 때 기준) |
+| **`ArtifactStore` 포트 + `ToolResult`의 artifact 참조 필드** | Raw Evidence(HTTP 응답, HAR 등 관측 원본)를 별도 저장하고 `artifact_ref`/`digest`로 연결할 때 | 임시로 `ToolResult.metadata`에 참조를 담을 수 있음. 저장 책임은 원본이 생기는 Capability 쪽을 제안 |
 | `PolicyVerdict`에 `ABORT`/`severity` | 심각도로 Run 종료 구분 | reasons/matched_rules 규약 사용 (권장) |
 | `ControlPlane` 포트에 `resolve_approval` | 오케스트레이션이 승인 해소 | control 모듈 내부 + CLI로 해소 |
-| `ActionProposal.risk_level` | risk 기반 정책 | Config 매핑으로 risk 유도 (권장) |
 | `EvidenceStore` 포트에 조회 메서드 | hypothesis별 조회 등 | concrete store에만 추가 |
 | `EvidenceRecord.digest` 원본 재검증 규격 | 원본 payload 보존·검증이 필요할 때 | 현재는 저장 JSONL 줄의 해시만 인덱스와 대조. 원본 보존 방식은 PM과 결정 |
+
+**해결됨:** `ActionProposal.risk_level` 추가 요청은 필요 없어졌다. dev에 추가된 read-only `ToolGateway.list_tools_for_action`으로 Registry의 `risk_level`을 Contract 변경 없이 읽을 수 있다 (§2.1).
 
 ---
 
