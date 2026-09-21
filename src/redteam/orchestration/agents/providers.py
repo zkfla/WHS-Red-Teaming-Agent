@@ -231,6 +231,7 @@ class CandidateProviderRegistry:
 
 
 def default_provider_registry() -> CandidateProviderRegistry:
+    from redteam.orchestration.agents.recon import ReconCandidateProvider
     from redteam.orchestration.agents.web import WebCandidateProvider
 
     playbook = PlaybookCandidateProvider()
@@ -241,8 +242,11 @@ def default_provider_registry() -> CandidateProviderRegistry:
     # AgentProviderFailed crash instead of a working role.
     return CandidateProviderRegistry(
         [
-            (f"playbook:{role}", playbook)
-            for role in ("recon", "mobile", "analysis", "reporting")
+            ("playbook:recon", ReconCandidateProvider()),
+            ("playbook:web_api", WebCandidateProvider()),
         ]
-        + [("playbook:web_api", WebCandidateProvider())]
+        + [
+            (f"playbook:{role}", playbook)
+            for role in ("mobile", "analysis", "reporting")
+        ]
     )
