@@ -9,10 +9,22 @@ exists".
 
 from __future__ import annotations
 
-from redteam.attack_graph.identity import endpoint_node_id, host_node_id, service_node_id
+from datetime import datetime, timezone
+
+from redteam.attack_graph.identity import (
+    endpoint_node_id,
+    host_node_id,
+    node_id_for_target,
+    service_node_id,
+)
 from redteam.attack_graph.service import AttackGraphService
 from redteam.attack_graph.stores.memory import InMemoryAttackGraphStore
-from redteam.core.enums import GraphNodeType
+from redteam.capability.gateway import MCPToolGateway
+from redteam.capability.registry import MCPToolRegistry
+from redteam.core.contracts.target import HostTarget
+from redteam.core.contracts.tool import ToolDescriptor
+from redteam.core.enums import GraphNodeType, RiskLevel, ToolHealthStatus
+from redteam.core.ids import ToolId
 from redteam.orchestration.agents.providers import GraphCandidateContext
 from redteam.orchestration.agents.recon import (
     RECON_HTML_INVENTORY,
@@ -23,9 +35,47 @@ from redteam.orchestration.agents.recon import (
     ReconCandidateProvider,
 )
 from redteam.orchestration.agents.registry import RECON_AGENT
+from redteam.orchestration.candidates.compiler import CandidateCompiler
 
 HOST = "a.local"
 TARGET_REF = "lab"
+
+#: Each recon tool bound to the canonical operation its candidate declares.
+_RECON_TOOLS = (
+    ("recon.http_probe", "service_discovery"),
+    ("recon.html_inventory", "endpoint_discovery"),
+    ("recon.openapi_inventory", "endpoint_discovery"),
+    ("recon.oidc_inventory", "endpoint_discovery"),
+    ("recon.tls_inspect", "service_discovery"),
+)
+
+
+def recon_catalog() -> MCPToolGateway:
+    """A real, operation-aware ToolCatalog over the recon tools."""
+
+    registry = MCPToolRegistry()
+    for tool_id, _operation in _RECON_TOOLS:
+        registry.register(
+            ToolDescriptor(
+                tool_id=ToolId(tool_id),
+                server_id="test",
+                tool_name=tool_id.split(".")[1],
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "target_ref": {"type": "string"},
+                        "path": {"type": "string"},
+                    },
+                    "required": ["target_ref"],
+                },
+                capability_tags=["recon"],
+                risk_level=RiskLevel.LOW,
+                health_status=ToolHealthStatus.HEALTHY,
+            )
+        )
+    return MCPToolGateway(
+        registry, {}, {tool_id: [operation] for tool_id, operation in _RECON_TOOLS}
+    )
 
 
 async def graph(
@@ -350,6 +400,14 @@ async def test_an_observed_https_service_justifies_a_tls_inspection() -> None:
     assert len(drafts) == 1
     assert drafts[0].plan_step.tool_id == RECON_TLS_INSPECT
     assert drafts[0].plan_step.arguments == {"target_ref": TARGET_REF}
+    # Execution target and graph target are the same node; the SERVICE that
+    # justified the candidate is carried as provenance instead.
+    assert [str(item) for item in drafts[0].target_node_ids] == [str(host_node_id(HOST))]
+    hypothesis = drafts[0].plan_step.hypothesis
+    assert hypothesis is not None
+    assert hypothesis.metadata["source_node_id"] == str(
+        service_node_id("https", host=HOST)
+    )
 
 
 async def test_a_scheme_fact_is_also_enough_for_a_tls_inspection() -> None:
@@ -374,6 +432,138 @@ async def test_an_already_verified_tls_service_is_not_inspected_again() -> None:
     batch = await propose(service_graph)
 
     assert not by_prefix(batch, "tls-inspect:")
+
+
+# -- every generated draft must survive the compiler -----------------------
+
+
+def test_the_tls_mapper_only_maps_a_host_scoped_target() -> None:
+    # Verified against the real Mapper, because it is the reason this
+    # candidate cannot be ServiceTarget-scoped: recon.tls_inspect handshakes
+    # the target's *origin* and the Mapper requires a HostTarget, silently
+    # returning nothing for anything else. A ServiceTarget would compile fine
+    # and then never map a result -- a dead end, not an alignment fix.
+    from redteam.core.contracts.target import ServiceTarget
+    from redteam.core.contracts.tool import ToolResult
+    from redteam.core.ids import InvocationId
+    from redteam.orchestration.observations.recon_network import map_recon_tls_inspect
+
+    output = {
+        "target_ref": TARGET_REF,
+        "verified": True,
+        "protocol": "TLSv1.3",
+        "cipher": "TLS_AES_256_GCM_SHA384",
+        "certificate_sha256": "a" * 64,
+    }
+    # The handshake publishes the result under the host's "tls" SERVICE, so
+    # the SERVICE node is an output of this tool, not its execution target.
+    result = ToolResult(
+        invocation_id=InvocationId("inv_tls"),
+        action_id="action_tls",
+        tool_id=ToolId("recon.tls_inspect"),
+        success=True,
+        output=output,
+        started_at=datetime.now(timezone.utc),
+        finished_at=datetime.now(timezone.utc),
+    )
+    arguments = {"target_ref": TARGET_REF}
+
+    host_scoped = map_recon_tls_inspect(
+        target=HostTarget(host=HOST), arguments=arguments, result=result
+    )
+    service_scoped = map_recon_tls_inspect(
+        target=ServiceTarget(service_name="tls", host=HOST),
+        arguments=arguments,
+        result=result,
+    )
+
+    assert [node.node_type for node in host_scoped.nodes] == [GraphNodeType.SERVICE]
+    assert str(host_scoped.nodes[0].node_id) == str(service_node_id("tls", host=HOST))
+    observation = host_scoped.nodes[0].observations[0]
+    assert observation["kind"] == "tls_handshake"
+    assert observation["verified"] is True
+    # Nothing at all for a service-scoped target: the result is dropped.
+    assert service_scoped.nodes == []
+
+
+async def test_generated_inventory_and_tls_drafts_compile_cleanly() -> None:
+    # The regression this guards: these drafts used to name an ENDPOINT or
+    # SERVICE node in target_node_ids while carrying a HostTarget execution
+    # target, so the compiler correctly refused every one of them as
+    # target_mismatch and nothing was ever executable.
+    service_graph = await graph(
+        service=("https", {"application_protocol": "https"}, {"responded": True}),
+        endpoints=[
+            ("/home", {"target_ref": TARGET_REF}, {"status_code": 200}),
+            ("/api/openapi.json", {"target_ref": TARGET_REF}, {"status_code": 200}),
+            (
+                "/.well-known/openid-configuration",
+                {"target_ref": TARGET_REF},
+                {"status_code": 200},
+            ),
+        ],
+        host_facts=PROBE_RETIRED,
+    )
+    batch = await propose(service_graph)
+
+    compiled, rejections = CandidateCompiler(
+        recon_catalog()
+    ).compile_drafts_with_rejections(batch.candidates)
+
+    assert [item.reason for item in rejections if item.reason == "target_mismatch"] == []
+    assert {
+        RECON_HTML_INVENTORY,
+        RECON_OPENAPI_INVENTORY,
+        RECON_OIDC_INVENTORY,
+        RECON_TLS_INSPECT,
+    } <= {item.plan_step.tool_id for item in compiled}
+    # And the invariant itself: whatever executes must be a node the draft
+    # actually named.
+    for item in compiled:
+        target_node = node_id_for_target(item.plan_step.resolved_target())
+        assert target_node in item.draft.target_node_ids
+
+
+async def test_the_bootstrap_draft_compiles_cleanly() -> None:
+    service_graph = await graph(service=HTTP_SERVICE, host_facts=PROBE_RETIRED)
+    batch = await propose(service_graph)
+
+    compiled, rejections = CandidateCompiler(
+        recon_catalog()
+    ).compile_drafts_with_rejections(batch.candidates)
+
+    assert [item.reason for item in rejections] == []
+    assert {item.plan_step.tool_id for item in compiled} >= {RECON_HTTP_PROBE}
+
+
+async def test_an_inventory_draft_pointing_at_the_host_is_still_rejected() -> None:
+    # The compiler invariant is unchanged and must stay enforced: an
+    # EndpointTarget's own node is what an inventory option executes against,
+    # so substituting a HOST target is a real mismatch, not a technicality.
+    service_graph = await graph(
+        service=HTTP_SERVICE,
+        endpoints=[("/home", {"target_ref": TARGET_REF}, {"status_code": 200})],
+        host_facts=PROBE_RETIRED,
+    )
+    batch = await propose(service_graph)
+    mismatched = [
+        draft.model_copy(
+            update={
+                "plan_step": draft.plan_step.model_copy(
+                    update={"target": HostTarget(host=HOST)}
+                )
+            }
+        )
+        for draft in batch.candidates
+        if draft.plan_step.tool_id == RECON_HTML_INVENTORY
+    ]
+
+    assert mismatched, "the html inventory draft must exist for this graph"
+    _, rejections = CandidateCompiler(
+        recon_catalog()
+    ).compile_drafts_with_rejections(mismatched)
+
+    assert [item.reason for item in rejections] == ["target_mismatch"]
 
 
 async def test_without_an_observed_tls_fact_no_tls_inspection_is_offered() -> None:

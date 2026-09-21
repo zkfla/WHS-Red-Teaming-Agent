@@ -60,7 +60,7 @@ from redteam.attack_graph.observation import GraphObservation
 from redteam.attack_graph.predicates import attrs_of, facts_of
 from redteam.attack_graph.view import AttackGraphView
 from redteam.core.contracts.graph import GraphNode
-from redteam.core.contracts.target import HostTarget
+from redteam.core.contracts.target import EndpointTarget, HostTarget
 from redteam.core.enums import GraphNodeType
 from redteam.core.ids import ToolId
 from redteam.orchestration.agents.base import AgentSpec, HypothesisDraft, PlanStep
@@ -369,6 +369,7 @@ class ReconCandidateProvider:
                     path=path,
                     tool_id=RECON_HTML_INVENTORY,
                     step_prefix="html-inventory",
+                    port=facts.get("port"),
                     reason=(
                         "The endpoint answered successfully, so its own links and forms "
                         "are a real surface to enumerate"
@@ -392,6 +393,7 @@ class ReconCandidateProvider:
                     path=path,
                     tool_id=RECON_OPENAPI_INVENTORY,
                     step_prefix="openapi-inventory",
+                    port=facts.get("port"),
                     reason=(
                         "This observed path names an API description document, so its "
                         "declared operations are worth reading"
@@ -415,6 +417,7 @@ class ReconCandidateProvider:
                     path=path,
                     tool_id=RECON_OIDC_INVENTORY,
                     step_prefix="oidc-inventory",
+                    port=facts.get("port"),
                     reason=(
                         "This observed path names an OIDC discovery document, so its "
                         "declared capabilities are worth reading"
@@ -448,6 +451,7 @@ class ReconCandidateProvider:
         path: str,
         tool_id: ToolId,
         step_prefix: str,
+        port: int | None,
         reason: str,
         question: str,
         signals: PrioritySignals,
@@ -463,7 +467,17 @@ class ReconCandidateProvider:
                 # Listing is an observation step: it may find new paths, and it
                 # must not be able to claim a vulnerability by itself.
                 assessment_kind="observation",
-                target=HostTarget(host=host),
+                # The option actually runs against the endpoint that was
+                # observed, so the execution target must resolve to that
+                # endpoint node -- the same node target_node_ids names. A
+                # HostTarget here would resolve to the HOST and the compiler
+                # would (correctly) reject the draft as target_mismatch.
+                target=EndpointTarget(
+                    host=host,
+                    path=path,
+                    port=port,
+                    graph_node_id=node.id,
+                ),
                 arguments={"target_ref": target_ref, "path": path},
                 reason=reason,
                 hypothesis=HypothesisDraft(
@@ -499,6 +513,14 @@ class ReconCandidateProvider:
             "recon", _SERVICE_DISCOVERY_OPERATION
         ):
             return None
+        # tls_inspect handshakes the target's origin, so the execution target
+        # is the HOST: its Mapper requires a HostTarget and publishes the
+        # result under the host's "tls" SERVICE. The SERVICE node that
+        # justified this candidate is carried as provenance, not as the
+        # execution target -- naming it in target_node_ids would resolve to a
+        # different node than the target and the compiler would reject the
+        # draft as target_mismatch.
+        host_id = host_node_id(host)
         return CandidateDraft(
             agent_id=spec.agent_id,
             plan_step=PlanStep(
@@ -508,7 +530,7 @@ class ReconCandidateProvider:
                 tool_id=RECON_TLS_INSPECT,
                 compatible_tool_ids=[RECON_TLS_INSPECT],
                 assessment_kind="observation",
-                target=HostTarget(host=host),
+                target=HostTarget(host=host, graph_node_id=host_id),
                 arguments={"target_ref": target_ref},
                 reason=(
                     "This service was observed over HTTPS, so its negotiated protocol, "
@@ -517,11 +539,14 @@ class ReconCandidateProvider:
                 hypothesis=HypothesisDraft(
                     description=f"{host} presents a verifiable TLS configuration",
                     confidence=0.4,
-                    metadata={"kind": "transport_security"},
+                    metadata={
+                        "kind": "transport_security",
+                        "source_node_id": str(node.id),
+                    },
                 ),
             ),
-            target_node_ids=[node.id],
-            conflict_keys=[f"target:{node.id}"],
+            target_node_ids=[host_id],
+            conflict_keys=[f"target:{host_id}"],
             signals=PrioritySignals(
                 expected_information_gain=0.3,
                 expected_cost=0.2,

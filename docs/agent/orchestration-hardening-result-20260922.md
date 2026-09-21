@@ -17,6 +17,7 @@
 | `a84d87e` | H3 — evidence-first session comparison / posture |
 | `e9b139d` | H4 — observed-fact signals + hybrid planner |
 | `d745b9b` | H4 correction — unique candidate_key 옵션 identity + rerank context 복원 |
+| H1 correction | final review — target_mismatch blocker 수정(§3.1). SHA는 관리 스레드에 반환 |
 | 본 문서 commit | 결과 문서 (HEAD) |
 
 ## 2. H0 — baseline 정렬과 고정
@@ -79,12 +80,65 @@ worktree는 이전 task의 detached `84247a8`에 있었고 그 HEAD는 `6a69445`
 
 ### H1 테스트
 
-- `tests/unit/test_orchestration_recon_provider.py` (21): bootstrap 양성/음성
+- `tests/unit/test_orchestration_recon_provider.py` (25): bootstrap 양성/음성
   (endpoint 존재, HOST 부재, 비HTTP 서비스, 포트만, TLS 서비스명만, target_ref 부재,
   catalog 불가, playbook probe와 중복 금지, probe retired 후 takeover), inventory
-  양성/음성(200 vs 401 vs 무응답, 표준 경로 미생성), TLS 양성/음성.
+  양성/음성(200 vs 401 vs 무응답, 표준 경로 미생성), TLS 양성/음성,
+  그리고 **생성된 draft를 실제 `CandidateCompiler` 에 통과시키는 회귀 테스트**
+  (§3.1 참고).
 - `tests/integration/test_recon_service_bootstrap.py` (2): **SERVICE-only →
   recon.http_probe → ENDPOINT → Web/API 실행** 전 구간, 그리고 복구 후 재실행 없음.
+
+### 3.1 H1 correction — target_mismatch blocker (final review)
+
+**발견**: `_inventory_draft` 는 `HostTarget(host=host)` 를 실행 target으로
+쓰면서 `target_node_ids` 에는 ENDPOINT 노드를, `_tls_draft` 는 HostTarget을
+쓰면서 SERVICE 노드를 넣었다. `node_id_for_target` 는 HostTarget을 HOST로
+해석하므로 `CandidateCompiler` 의
+`execution_target_id not in draft.target_node_ids` 검사에 걸려
+**inventory/TLS draft가 전부 `target_mismatch` 로 버려졌다.** 단위 테스트가
+provider 출력만 보고 compile 단계를 지나지 않은 것이 구멍이었다.
+
+**수정** (compiler 불변조건도 Core/Capability 계약도 건드리지 않았다):
+
+- **inventory** (html/openapi/oidc): 실행 target을
+  `EndpointTarget(host, path, port, graph_node_id=node.id)` 로 바꿨다. 관측된
+  endpoint 노드가 곧 실행 대상이고 `target_node_ids=[node.id]` 와 정확히 일치한다.
+  Mapper도 이 target에서 `host`/`port` 를 읽고
+  `node_id_for_target(target)` 를 발견 edge의 출발점으로 쓰므로 의미가 더
+  정확해졌다(이전에는 HOST가 출발점이었다).
+- **TLS**: 실행 target을 `HostTarget(host, graph_node_id=host_id)`,
+  `target_node_ids=[host_id]` 로 맞췄다. SERVICE 노드는 target이 아니라
+  provenance로 남긴다 — `hypothesis.metadata["source_node_id"]` 와
+  `step_id` 가 후보를 정당화한 SERVICE를 가리킨다.
+
+**ServiceTarget 안 (검토 후 채택하지 않음)**: 관리 제안대로 검증했으나
+`recon.tls_inspect` 의 Mapper인 `map_recon_tls_inspect` 는
+`_host_context` 에서 `isinstance(target, HostTarget)` 를 **하드 요구**한다.
+ServiceTarget을 주면 `GraphMutation()` 를 반환해 결과가 **조용히 버려진다** —
+compiler는 통과하지만 아무것도 매핑되지 않는 dead end다. 게다가 이 도구는
+`resolve_target(policy, target_ref)` 로 origin에 handshake하고 결과를
+`service:<host>/tls` 노드로 *출력*하므로, SERVICE 노드는 실행 대상이 아니라
+산출물이다. 따라서 HostTarget + HOST 노드 정렬이 (a) 컴파일되고 (b) 실제로 매핑되는
+유일한 조합이다. 이 판단은 `test_the_tls_mapper_only_maps_a_host_scoped_target`
+로 고정했다(HostTarget → SERVICE 노드 + `tls_handshake` 관측,
+ServiceTarget → 빈 mutation).
+
+**회귀 테스트** (이 버그를 잡지 못하던 구멍을 메운다):
+
+- `test_generated_inventory_and_tls_drafts_compile_cleanly`: 한 그래프에서
+  html/openapi/oidc/TLS draft를 실제 `CandidateCompiler` 로 컴파일해
+  `target_mismatch` 0건을 확인하고, 네 도구가 모두 executable이 됨을 단언한다.
+  추가로 컴파일된 모든 후보에 대해
+  `node_id_for_target(plan_step.resolved_target()) in draft.target_node_ids`
+  불변식을 직접 검사한다.
+- `test_the_bootstrap_draft_compiles_cleanly`: bootstrap draft도 동일하게
+  compile 통과, rejection 0건.
+- `test_an_inventory_draft_pointing_at_the_host_is_still_rejected`: HOST target을
+  끼워 넣으면 **여전히** `target_mismatch` 다 — compiler 불변조건은 약화되지
+  않았음을 고정한다.
+- `test_an_observed_https_service_justifies_a_tls_inspection` 에 실행 target ==
+  graph target, SERVICE provenance 보존 단언을 추가.
 
 ## 4. H2 — Relation-aware observation / role 재활성화
 
@@ -197,16 +251,16 @@ no client, 후보 없음, **동일 step_id 두 target → 점수대로 정확히
 
 | 게이트 | 결과 |
 |---|---|
-| G1 H1 targeted + Recon→Endpoint→Web 통합 | 21 + 2 passed |
+| G1 H1 targeted(compile 회귀 포함) + Recon→Endpoint→Web 통합 | 25 + 2 passed |
 | G2 H2 edge 양성/음성 fingerprint·재활성화 | 10 passed |
 | G3 H3 targeted(근거 없음 음성 포함) | 13 passed |
 | G4 H4 deterministic/margin/rerank/fallback | 21 passed |
-| G5 `python -m pytest tests -q` | **1079 passed, 13 failed, 3 skipped** |
+| G5 `python -m pytest tests -q` | **1083 passed, 13 failed, 3 skipped** |
 | G6 `ruff check src tests examples` | **All checks passed!** |
 | G7 diff 리뷰 | §11 |
 
 baseline `6a69445`: 1010 passed / 15 failed(환경 13 + baseline 결함 2).
-최종: 1079 passed / 13 failed. **남은 13건은 전부 기존 환경 문제**이며 이번 변경
+최종: 1083 passed / 13 failed. **남은 13건은 전부 기존 환경 문제**이며 이번 변경
 파일과 무관하다:
 
 - 12건 `OSError [WinError 1314]` — Windows 심볼릭 링크 권한 없음
