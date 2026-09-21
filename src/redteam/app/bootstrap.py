@@ -42,6 +42,7 @@ from redteam.attack_graph.stores.namespaced import EngagementScopedAttackGraphSt
 from redteam.capability.bootstrap import build_mcp_tool_gateway
 from redteam.control.approval import ApprovalService
 from redteam.control.audit import AuditLog
+from redteam.control.risk import RegistryRiskResolver
 from redteam.control.service import DefaultControlPlane
 from redteam.control.stores.filesystem import FilesystemApprovalStore, FilesystemAuditStore
 from redteam.core.config import (
@@ -163,6 +164,8 @@ async def build_runtime_deps(
         # Same evidence_store the Orchestration side writes to, so blocked
         # attempts and executed results land in one place.
         evidence_service=EvidenceService(evidence_store),
+        # Risk-tiered approval reads tool risk_level from the Registry.
+        risk_resolver=RegistryRiskResolver(tool_gateway),
     )
     llm_client = FakeLLMClient()
     settings = orchestration_settings or OrchestrationSettings()
@@ -236,12 +239,8 @@ async def build_application(
     # Build the evidence store first so both the Control Plane (blocked
     # actions) and Orchestration (executed results) share one store.
     resolved_evidence_store = evidence_store or FilesystemEvidenceStore(evidence_dir)
-    resolved_control_plane = control_plane or DefaultControlPlane(
-        {engagement.engagement_id: engagement},
-        audit_log=AuditLog(FilesystemAuditStore(audit_dir)),
-        approvals=ApprovalService(FilesystemApprovalStore(approval_dir)),
-        evidence_service=EvidenceService(resolved_evidence_store),
-    )
+    # Resolve the tool gateway before the Control Plane so the latter can
+    # read tool risk_level from the Registry for risk-tiered approval.
     resolved_tool_catalog = tool_catalog
     if tool_gateway is None:
         resolved_tool_gateway, discovered_catalog = await _build_default_capability(
@@ -251,6 +250,13 @@ async def build_application(
             resolved_tool_catalog = discovered_catalog
     else:
         resolved_tool_gateway = tool_gateway
+    resolved_control_plane = control_plane or DefaultControlPlane(
+        {engagement.engagement_id: engagement},
+        audit_log=AuditLog(FilesystemAuditStore(audit_dir)),
+        approvals=ApprovalService(FilesystemApprovalStore(approval_dir)),
+        evidence_service=EvidenceService(resolved_evidence_store),
+        risk_resolver=RegistryRiskResolver(resolved_tool_gateway),
+    )
     resolved_event_bus = event_bus or InMemoryEventBus()
     resolved_attack_graph = attack_graph or EngagementScopedAttackGraphStore(
         InMemoryAttackGraphStore(), engagement_id=engagement.engagement_id

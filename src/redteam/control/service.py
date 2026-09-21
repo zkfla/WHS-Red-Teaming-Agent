@@ -26,6 +26,7 @@ from redteam.control.audit import AuditLog
 from redteam.control.budget import BudgetTracker
 from redteam.control.policy import evaluate_policy
 from redteam.control.rate_limit import RateLimiter
+from redteam.control.risk import DEFAULT_APPROVAL_RISK_THRESHOLD, RiskResolver
 from redteam.control.roe import UnsupportedRoePolicyError, check_roe
 from redteam.control.scope import check_scope
 from redteam.control.severity import Severity, to_tag
@@ -57,12 +58,17 @@ class DefaultControlPlane:
         audit_log: AuditLog | None = None,
         approvals: ApprovalService | None = None,
         evidence_service: EvidenceService | None = None,
+        risk_resolver: RiskResolver | None = None,
     ) -> None:
         self._engagements = engagements
         self._audit = audit_log or AuditLog()
         self._rate_limiters: dict[EngagementId, RateLimiter] = {}
         self._budgets: dict[EngagementId, BudgetTracker] = {}
         self._approvals = approvals or ApprovalService()
+        # Optional risk-tiered approval: resolves an action's risk from the
+        # Capability Tool Registry (source of truth) so higher-risk actions
+        # require human approval. None = no risk-based gating (unchanged).
+        self._risk_resolver = risk_resolver
         # Optional (Track B's EvidenceService): when present, DENY /
         # REQUIRE_APPROVAL decisions are also recorded as Evidence so the
         # final report includes blocked attempts, not just executed ones.
@@ -109,8 +115,16 @@ class DefaultControlPlane:
                 proposal, PolicyVerdict.DENY, roe_reasons, ["roe"], severity=roe_severity
             )
 
+        risk = (
+            self._risk_resolver.resolve(proposal.capability, proposal.operation)
+            if self._risk_resolver is not None
+            else None
+        )
         verdict, policy_reasons, matched_rules = evaluate_policy(
-            proposal, engagement.approval_policy
+            proposal,
+            engagement.approval_policy,
+            risk=risk,
+            risk_threshold=DEFAULT_APPROVAL_RISK_THRESHOLD,
         )
         if verdict == PolicyVerdict.DENY:
             # A policy deny rejects this class of action — switch goals.
