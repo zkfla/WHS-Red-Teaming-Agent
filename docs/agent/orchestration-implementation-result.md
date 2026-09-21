@@ -15,7 +15,7 @@
 | 회귀 baseline 확정 | `7e49b1e` | 관리 체크아웃의 3개 dirty fix 이관 |
 | 실행 protocol 기록 | `bd2a3be` | 구현 전 protocol 커밋 (프로젝트 규칙) |
 | 코드 변경 1 | `058c9aa` | graph-driven 후보 생성 + Web multi-step + evidence-gated Finding 승격 |
-| 최종 결과 commit | `833b051` | 본 문서를 포함한 최종 커밋 (부모 `bd2a3be` protocol) |
+| 최종 결과 commit | 본 문서를 포함한 HEAD | SHA는 실행 담당이 관리 스레드에 반환한다. 그 앞선 커밋은 `bd2a3be`(protocol) / `058c9aa`(코드) / `7e49b1e`(baseline)로 고정이다 |
 
 이관은 blob 해시 일치로 검증했다: `compiler.py` `86d5df4`,
 `plan.py` `14b85f1`, `test_orchestration_candidates.py` `3dcf8f6`
