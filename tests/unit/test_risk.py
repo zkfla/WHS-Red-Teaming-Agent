@@ -159,5 +159,25 @@ async def test_pipeline_no_resolver_allows() -> None:
     assert decision.verdict == PolicyVerdict.ALLOW
 
 
+class _ExplodingResolver:
+    def resolve(self, capability: str, operation: str) -> RiskLevel | None:
+        raise RuntimeError("registry unavailable")
+
+
+async def test_pipeline_risk_resolution_failure_is_fail_closed() -> None:
+    # A crashing risk source must NOT crash the gate, and must fail closed
+    # (require a human) rather than let a possibly-risky action through.
+    engagement = _engagement()
+    plane = DefaultControlPlane(
+        {engagement.engagement_id: engagement}, risk_resolver=_ExplodingResolver()
+    )
+    decision = await plane.evaluate(
+        _proposal(), ControlContext(engagement_id=engagement.engagement_id)
+    )
+    assert decision.verdict == PolicyVerdict.REQUIRE_APPROVAL
+    assert "risk:unresolved" in decision.matched_rules
+    assert decision.approval_id is not None
+
+
 def test_default_threshold_is_high() -> None:
     assert DEFAULT_APPROVAL_RISK_THRESHOLD is RiskLevel.HIGH
