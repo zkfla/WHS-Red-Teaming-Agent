@@ -22,9 +22,9 @@ from redteam.attack_graph.stores.memory import InMemoryAttackGraphStore
 from redteam.capability.gateway import MCPToolGateway
 from redteam.capability.registry import MCPToolRegistry
 from redteam.core.contracts.target import HostTarget
-from redteam.core.contracts.tool import ToolDescriptor
+from redteam.core.contracts.tool import ToolDescriptor, ToolResult
 from redteam.core.enums import GraphNodeType, RiskLevel, ToolHealthStatus
-from redteam.core.ids import ToolId
+from redteam.core.ids import InvocationId, ToolId
 from redteam.orchestration.agents.providers import GraphCandidateContext
 from redteam.orchestration.agents.recon import (
     RECON_HTML_INVENTORY,
@@ -36,6 +36,8 @@ from redteam.orchestration.agents.recon import (
 )
 from redteam.orchestration.agents.registry import RECON_AGENT
 from redteam.orchestration.candidates.compiler import CandidateCompiler
+from redteam.orchestration.observations import default_result_mapper_registry
+from tests.unit.test_result_mapper_inventory import _html_output, _openapi_output
 
 HOST = "a.local"
 TARGET_REF = "lab"
@@ -435,6 +437,87 @@ async def test_an_already_verified_tls_service_is_not_inspected_again() -> None:
 
 
 # -- every generated draft must survive the compiler -----------------------
+
+
+def _oidc_output() -> dict:
+    """The real recon.oidc_inventory output shape."""
+
+    return {
+        "capabilities": {
+            "response_types_supported": ["code"],
+            "grant_types_supported": ["authorization_code"],
+            "code_challenge_methods_supported": ["S256"],
+            "token_endpoint_auth_methods_supported": ["client_secret_basic"],
+        },
+        "endpoints_present": {
+            "authorization_endpoint": True,
+            "token_endpoint": True,
+            "jwks_uri": True,
+            "revocation_endpoint": False,
+        },
+        "source_untrusted": True,
+        "endpoints_followed": False,
+        "verdict": "observation_only",
+    }
+
+
+def _tool_result(tool_id: str, output: dict) -> ToolResult:
+    return ToolResult(
+        invocation_id=InvocationId("inv_inventory"),
+        action_id="action_inventory",
+        tool_id=ToolId(tool_id),
+        success=True,
+        # The fixture's own target_ref must not win: the Mapper requires the
+        # output to agree with the argument actually sent.
+        output={**output, "target_ref": TARGET_REF},
+        started_at=datetime.now(timezone.utc),
+        finished_at=datetime.now(timezone.utc),
+    )
+
+
+async def test_every_inventory_draft_actually_maps_a_successful_result() -> None:
+    # The second half of the same class of bug: a draft that compiles but
+    # whose Mapper silently returns nothing for the target kind it carries is
+    # still a dead end. html/openapi map through _common_context (host/port
+    # off any target), while oidc_inventory maps through _host_context, which
+    # requires a HostTarget -- verified directly, which is why OIDC is the one
+    # inventory candidate executed against the HOST.
+    cases = (
+        (RECON_HTML_INVENTORY, "/home", _html_output()),
+        (RECON_OPENAPI_INVENTORY, "/api/openapi.json", _openapi_output()),
+        (RECON_OIDC_INVENTORY, "/.well-known/openid-configuration", _oidc_output()),
+    )
+
+    for tool_id, path, output in cases:
+        assert path.startswith("/")
+        service_graph = await graph(
+            service=HTTP_SERVICE,
+            endpoints=[(path, {"target_ref": TARGET_REF}, {"status_code": 200})],
+            host_facts=PROBE_RETIRED,
+        )
+        batch = await propose(service_graph)
+        drafts = [item for item in batch.candidates if item.plan_step.tool_id == tool_id]
+        assert len(drafts) == 1, tool_id
+
+        compiled, rejections = CandidateCompiler(
+            recon_catalog()
+        ).compile_drafts_with_rejections(drafts)
+        assert [item.reason for item in rejections] == [], tool_id
+        candidate = compiled[0]
+
+        mutation = default_result_mapper_registry().map_result(
+            tool_id=ToolId(tool_id),
+            target=candidate.plan_step.resolved_target(),
+            arguments=candidate.plan_step.arguments,
+            result=_tool_result(tool_id, output),
+        )
+
+        assert mutation.nodes, f"{tool_id} compiled but mapped to nothing"
+        # Each of these discovers endpoints; openapi additionally materializes
+        # a RESOURCE template, so this is "at least one endpoint", not "only".
+        assert any(
+            node.node_type is GraphNodeType.ENDPOINT for node in mutation.nodes
+        ), tool_id
 
 
 def test_the_tls_mapper_only_maps_a_host_scoped_target() -> None:

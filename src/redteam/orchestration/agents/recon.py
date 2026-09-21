@@ -55,12 +55,12 @@ from __future__ import annotations
 
 from typing import Any
 
-from redteam.attack_graph.identity import host_node_id
+from redteam.attack_graph.identity import host_node_id, node_id_for_target
 from redteam.attack_graph.observation import GraphObservation
 from redteam.attack_graph.predicates import attrs_of, facts_of
 from redteam.attack_graph.view import AttackGraphView
 from redteam.core.contracts.graph import GraphNode
-from redteam.core.contracts.target import EndpointTarget, HostTarget
+from redteam.core.contracts.target import AnyTarget, EndpointTarget, HostTarget
 from redteam.core.enums import GraphNodeType
 from redteam.core.ids import ToolId
 from redteam.orchestration.agents.base import AgentSpec, HypothesisDraft, PlanStep
@@ -357,6 +357,23 @@ class ReconCandidateProvider:
         ):
             return []
 
+        # html_inventory and openapi_inventory map through _common_context,
+        # which reads host/port off any target that has them and uses
+        # node_id_for_target(target) as the source of the discovery edge -- so
+        # an EndpointTarget is both correct and more precise (the edge starts
+        # at the endpoint that was inspected).
+        endpoint_target = EndpointTarget(
+            host=host,
+            path=path,
+            port=facts.get("port"),
+            graph_node_id=node.id,
+        )
+        # oidc_inventory maps through _host_context, which requires a
+        # HostTarget and otherwise returns nothing at all -- verified directly
+        # against the Mapper. Its execution target is therefore the HOST, and
+        # the observed ENDPOINT travels as provenance instead.
+        host_target = HostTarget(host=host, graph_node_id=host_node_id(host))
+
         drafts: list[CandidateDraft] = []
         statuses = _observed_statuses(facts, attrs)
         if _HTML_INVENTORY_STATUS in statuses:
@@ -364,12 +381,11 @@ class ReconCandidateProvider:
                 self._inventory_draft(
                     spec=spec,
                     node=node,
-                    host=host,
+                    target=endpoint_target,
                     target_ref=target_ref,
                     path=path,
                     tool_id=RECON_HTML_INVENTORY,
                     step_prefix="html-inventory",
-                    port=facts.get("port"),
                     reason=(
                         "The endpoint answered successfully, so its own links and forms "
                         "are a real surface to enumerate"
@@ -388,12 +404,11 @@ class ReconCandidateProvider:
                 self._inventory_draft(
                     spec=spec,
                     node=node,
-                    host=host,
+                    target=endpoint_target,
                     target_ref=target_ref,
                     path=path,
                     tool_id=RECON_OPENAPI_INVENTORY,
                     step_prefix="openapi-inventory",
-                    port=facts.get("port"),
                     reason=(
                         "This observed path names an API description document, so its "
                         "declared operations are worth reading"
@@ -412,12 +427,11 @@ class ReconCandidateProvider:
                 self._inventory_draft(
                     spec=spec,
                     node=node,
-                    host=host,
+                    target=host_target,
                     target_ref=target_ref,
                     path=path,
                     tool_id=RECON_OIDC_INVENTORY,
                     step_prefix="oidc-inventory",
-                    port=facts.get("port"),
                     reason=(
                         "This observed path names an OIDC discovery document, so its "
                         "declared capabilities are worth reading"
@@ -446,16 +460,20 @@ class ReconCandidateProvider:
         *,
         spec: AgentSpec,
         node: GraphNode,
-        host: str,
+        target: AnyTarget,
         target_ref: str,
         path: str,
         tool_id: ToolId,
         step_prefix: str,
-        port: int | None,
         reason: str,
         question: str,
         signals: PrioritySignals,
     ) -> CandidateDraft:
+        # Derived from the execution target rather than hand-paired with it,
+        # so an execution target and a graph target can never disagree again:
+        # CandidateCompiler rejects exactly this discrepancy as
+        # target_mismatch.
+        target_node_id = node_id_for_target(target)
         return CandidateDraft(
             agent_id=spec.agent_id,
             plan_step=PlanStep(
@@ -467,27 +485,22 @@ class ReconCandidateProvider:
                 # Listing is an observation step: it may find new paths, and it
                 # must not be able to claim a vulnerability by itself.
                 assessment_kind="observation",
-                # The option actually runs against the endpoint that was
-                # observed, so the execution target must resolve to that
-                # endpoint node -- the same node target_node_ids names. A
-                # HostTarget here would resolve to the HOST and the compiler
-                # would (correctly) reject the draft as target_mismatch.
-                target=EndpointTarget(
-                    host=host,
-                    path=path,
-                    port=port,
-                    graph_node_id=node.id,
-                ),
+                target=target,
                 arguments={"target_ref": target_ref, "path": path},
                 reason=reason,
                 hypothesis=HypothesisDraft(
                     description=question,
                     confidence=0.3,
-                    metadata={"kind": "surface_discovery", "source_node_id": str(node.id)},
+                    metadata={
+                        "kind": "surface_discovery",
+                        # The observed endpoint that justified this option.
+                        "source_node_id": str(node.id),
+                        "source_path": path,
+                    },
                 ),
             ),
-            target_node_ids=[node.id],
-            conflict_keys=[f"target:{node.id}"],
+            target_node_ids=[target_node_id],
+            conflict_keys=[f"target:{target_node_id}"],
             signals=signals,
         )
 

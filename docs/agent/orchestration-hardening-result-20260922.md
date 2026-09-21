@@ -18,6 +18,7 @@
 | `e9b139d` | H4 — observed-fact signals + hybrid planner |
 | `d745b9b` | H4 correction — unique candidate_key 옵션 identity + rerank context 복원 |
 | H1 correction | final review — target_mismatch blocker 수정(§3.1). SHA는 관리 스레드에 반환 |
+| H1 correction 2 | second final review — OIDC mapping dead end 수정(§3.2). SHA는 관리 스레드에 반환 |
 | 본 문서 commit | 결과 문서 (HEAD) |
 
 ## 2. H0 — baseline 정렬과 고정
@@ -80,7 +81,7 @@ worktree는 이전 task의 detached `84247a8`에 있었고 그 HEAD는 `6a69445`
 
 ### H1 테스트
 
-- `tests/unit/test_orchestration_recon_provider.py` (25): bootstrap 양성/음성
+- `tests/unit/test_orchestration_recon_provider.py` (26): bootstrap 양성/음성
   (endpoint 존재, HOST 부재, 비HTTP 서비스, 포트만, TLS 서비스명만, target_ref 부재,
   catalog 불가, playbook probe와 중복 금지, probe retired 후 takeover), inventory
   양성/음성(200 vs 401 vs 무응답, 표준 경로 미생성), TLS 양성/음성,
@@ -139,6 +140,46 @@ ServiceTarget → 빈 mutation).
   않았음을 고정한다.
 - `test_an_observed_https_service_justifies_a_tls_inspection` 에 실행 target ==
   graph target, SERVICE provenance 보존 단언을 추가.
+
+### 3.2 H1 correction 2 — OIDC mapping dead end (second final review)
+
+**발견**: §3.1에서 inventory 실행 target을 `EndpointTarget` 으로 바꾼 것은
+html/openapi에는 맞았지만 OIDC에는 dead end를 만들었다. `map_recon_oidc_inventory`
+는 `_host_context` 를 호출하고 그 안에서 `isinstance(target, HostTarget)` 를
+하드 요구한다. 그래서 OIDC 후보는 compiler를 통과하지만 mapper가
+`GraphMutation()` 를 돌려주어 **아무것도 그래프에 남지 않았다.**
+compile만 검사하고 mapper 실행까지 가지 않은 것이 §3.1과 같은 형태의 두 번째 구멍이다.
+
+**수정** (수정 범위는 orchestration provider 하나, Mapper/Core 계약 무변경):
+
+- **html / openapi**: `EndpointTarget` 유지. 두 Mapper는 공통으로
+  `_common_context` 를 쓰며 `getattr(target, "host")`,
+  `getattr(target, "port")`, `node_id_for_target(target)` 만 읽는다 —
+  HostTarget 요구가 없음을 실제 소스로 확인했다. EndpointTarget이라 발견 edge의
+  출발점이 그 endpoint가 되는 편이 오히려 정확하다.
+- **OIDC**: 실행 target을 `HostTarget(host, graph_node_id=host_id)`,
+  `target_node_ids=[host_id]` 로 두었다. 관측된 ENDPOINT 노드와 path는
+  provenance로 보존한다 — `hypothesis.metadata["source_node_id"]`(관측 endpoint)
+  와 `source_path`, 그리고 `step_id` 가 그 endpoint를 가리킨다.
+  conflict key도 실행 target을 따라 `target:host:<host>` 가 된다.
+
+**구조적 재발 방지**: `_inventory_draft` 가 `target_node_ids` 와
+`conflict_keys` 를 손으로 짝지어 넘기지 않고
+`node_id_for_target(target)` 에서 **도출**한다. 실행 target과 graph target이
+어긋나는 상태 자체가 표현 불가능해졌다(compiler의 `target_mismatch` 는 그대로
+유지되며, 어긋난 draft를 억지로 넣으면 여전히 거부된다).
+
+**회귀 테스트**:
+
+- `test_every_inventory_draft_actually_maps_a_successful_result`: html/openapi/oidc
+  각각에 대해 (1) 실제 `CandidateCompiler` 컴파일, (2) **실제
+  `default_result_mapper_registry()` 로 성공 ToolResult 매핑**,
+  (3) non-empty mutation + 최소 하나의 ENDPOINT 노드 생성을 단언한다. openapi는
+  RESOURCE template도 만들므로 "최소 하나" 기준이다.
+- `test_the_tls_mapper_only_maps_a_host_scoped_target` 는 §3.1에서 추가한
+  HostTarget 하드 요구 검증으로 그대로 유지한다.
+- `test_an_inventory_draft_pointing_at_the_host_is_still_rejected` 로 negative
+  `target_mismatch` 불변조건도 유지한다.
 
 ## 4. H2 — Relation-aware observation / role 재활성화
 
@@ -251,16 +292,17 @@ no client, 후보 없음, **동일 step_id 두 target → 점수대로 정확히
 
 | 게이트 | 결과 |
 |---|---|
-| G1 H1 targeted(compile 회귀 포함) + Recon→Endpoint→Web 통합 | 25 + 2 passed |
+| G1 H1 targeted(compile + mapper 회귀 포함) + Recon→Endpoint→Web 통합 | 26 + 2 passed |
 | G2 H2 edge 양성/음성 fingerprint·재활성화 | 10 passed |
 | G3 H3 targeted(근거 없음 음성 포함) | 13 passed |
 | G4 H4 deterministic/margin/rerank/fallback | 21 passed |
-| G5 `python -m pytest tests -q` | **1083 passed, 13 failed, 3 skipped** |
+| G1~G4 합계(H1~H4 targeted 전체 + mapper 회귀 포함) | **186 passed** |
+| G5 `python -m pytest tests -q` | **1084 passed, 13 failed, 3 skipped** |
 | G6 `ruff check src tests examples` | **All checks passed!** |
 | G7 diff 리뷰 | §11 |
 
 baseline `6a69445`: 1010 passed / 15 failed(환경 13 + baseline 결함 2).
-최종: 1083 passed / 13 failed. **남은 13건은 전부 기존 환경 문제**이며 이번 변경
+최종: 1084 passed / 13 failed. **남은 13건은 전부 기존 환경 문제**이며 이번 변경
 파일과 무관하다:
 
 - 12건 `OSError [WinError 1314]` — Windows 심볼릭 링크 권한 없음
