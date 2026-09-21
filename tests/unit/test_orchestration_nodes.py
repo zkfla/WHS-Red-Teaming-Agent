@@ -20,11 +20,12 @@ from redteam.core.contracts.events import EventType
 from redteam.core.contracts.graph import Hypothesis
 from redteam.core.contracts.target import HostTarget
 from redteam.core.contracts.tool import ToolError, ToolResult
-from redteam.core.enums import AgentPhase, GraphNodeType, PolicyVerdict, Verdict
+from redteam.core.enums import AgentPhase, GraphEdgeType, GraphNodeType, PolicyVerdict, Verdict
 from redteam.core.ids import (
     ActionId,
     AgentId,
     EngagementId,
+    EvidenceId,
     GraphNodeId,
     HypothesisId,
     InvocationId,
@@ -601,7 +602,7 @@ _HTTP_PROBE_OUTPUT = {
     "target_ref": "a.local",
     "status_code": 200,
     "body_bytes": 42,
-    "body_sha256": "deadbeef",
+    "body_sha256": "a" * 64,
     "redirect": False,
     "security_headers_present": {"strict-transport-security": False},
     "body_omitted": True,
@@ -625,7 +626,7 @@ async def test_update_discovers_service_and_endpoint_from_a_successful_http_prob
 
     service_node = await node_at(service, "service:a.local/http")
     assert attrs_of(service_node.properties) == {"responded": True}
-    assert facts_of(service_node.properties)["scheme"] == "http"
+    assert facts_of(service_node.properties)["application_protocol"] == "http"
 
     endpoint_node = await node_at(service, "endpoint:a.local GET /")
     assert attrs_of(endpoint_node.properties) == {"status_code": 200, "redirect": False}
@@ -698,6 +699,133 @@ async def test_update_ignores_malformed_probe_output_without_crashing() -> None:
 
     nodes = await service.list_nodes()
     assert all(n.type is GraphNodeType.HOST for n in nodes)
+
+
+_HTML_INVENTORY_OUTPUT = {
+    "target_ref": "bank",
+    "references": [
+        {
+            "kind": "a",
+            "path": "/accounts/123",
+            "method": "GET",
+            "query_omitted": False,
+            "fragment_omitted": False,
+            "path_allowlisted": True,
+        }
+    ],
+    "reference_limit": 200,
+    "references_truncated": False,
+    "omitted_references": 0,
+    "base_element_present": False,
+    "decoding_replacements": False,
+    "references_followed": False,
+    "javascript_executed": False,
+    "source_untrusted": True,
+    "verdict": "observation_only",
+    "source_sha256": "a" * 64,
+    "request_count": 1,
+}
+
+
+async def test_inventory_update_merges_nodes_and_keeps_evidence_backed_history() -> None:
+    d = deps()
+    graph = AttackGraphService(d.graph_store)
+    first_proposal = proposal().model_copy(
+        update={"arguments": {"target_ref": "bank", "path": "/"}}
+    )
+    first = state_with(
+        runtime(step_count=1),
+        action_proposal=first_proposal,
+        tool_result=tool_result(
+            output=_HTML_INVENTORY_OUTPUT,
+            tool_id="recon.html_inventory",
+        ),
+        result_evidence_id=EvidenceId("ev_html_1"),
+        plan_step=RECON_AGENT.playbook[0],
+    )
+    await update_node(first, deps=d)
+
+    second_proposal = proposal().model_copy(
+        update={"arguments": {"target_ref": "bank", "path": "/index"}}
+    )
+    second = merged(
+        first,
+        runtime=runtime(step_count=2),
+        action_proposal=second_proposal,
+        result_evidence_id=EvidenceId("ev_html_2"),
+    )
+    await update_node(second, deps=d)
+
+    endpoint = await node_at(graph, "endpoint:a.local GET /accounts/{id}")
+    endpoint_facts = facts_of(endpoint.properties)
+    assert endpoint_facts["evidence_ids"] == ["ev_html_1", "ev_html_2"]
+    assert {item["source_path"] for item in endpoint_facts["observations"]} == {
+        "/",
+        "/index",
+    }
+    assert {item["evidence_id"] for item in endpoint_facts["observations"]} == {
+        "ev_html_1",
+        "ev_html_2",
+    }
+    endpoints = [
+        node for node in await graph.list_nodes() if node.type is GraphNodeType.ENDPOINT
+    ]
+    assert len(endpoints) == 1
+    observed_edges = [
+        edge for edge in await graph.list_edges() if edge.type is GraphEdgeType.OBSERVED
+    ]
+    assert len(observed_edges) == 1
+
+
+async def test_proxy_update_attaches_evidence_to_each_captured_flow_observation() -> None:
+    d = deps()
+    graph = AttackGraphService(d.graph_store)
+    flow_ref = "flow_0123456789abcdef"
+    proxy_proposal = proposal().model_copy(
+        update={"arguments": {"target_ref": "bank", "limit": 10}}
+    )
+    proxy_output = {
+        "flows": [
+            {
+                "flow_ref": flow_ref,
+                "target_ref": "bank",
+                "method": "GET",
+                "path": "/accounts/123",
+                "request_json_fields": [],
+                "request_body_omitted": False,
+                "captured_response": {
+                    "status_code": 200,
+                    "body_bytes": 17,
+                    "body_sha256": "a" * 64,
+                    "redirect": False,
+                    "security_headers_present": {
+                        "strict-transport-security": True,
+                        "content-security-policy": False,
+                        "x-content-type-options": True,
+                        "cache-control": False,
+                    },
+                    "body_omitted": True,
+                },
+            }
+        ],
+        "may_be_truncated": False,
+    }
+    state = state_with(
+        runtime(step_count=1),
+        action_proposal=proxy_proposal,
+        tool_result=tool_result(output=proxy_output, tool_id="web.proxy_list_flows"),
+        result_evidence_id=EvidenceId("ev_proxy_1"),
+        plan_step=RECON_AGENT.playbook[0],
+    )
+
+    await update_node(state, deps=d)
+
+    endpoint = await node_at(graph, "endpoint:a.local GET /accounts/{id}")
+    endpoint_facts = facts_of(endpoint.properties)
+    assert endpoint_facts["evidence_ids"] == ["ev_proxy_1"]
+    assert endpoint_facts["observations"][0]["evidence_id"] == "ev_proxy_1"
+    assert endpoint_facts["observations"][0]["captured_response"]["status_code"] == 200
+    assert all(node.type is not GraphNodeType.FINDING for node in await graph.list_nodes())
 
 
 async def test_discovered_service_and_endpoint_activate_the_web_api_agent() -> None:

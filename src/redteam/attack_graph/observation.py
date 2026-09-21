@@ -39,6 +39,7 @@ PLANNING_CONTENT_KEYS = (
     "host",
     "port",
     "scheme",
+    "application_protocol",
     "service_name",
     "target_ref",
     "in_scope",

@@ -5,7 +5,12 @@ verified ``Finding`` carrying the ``EvidenceId`` behind it.
 
 from __future__ import annotations
 
-from redteam.attack_graph.identity import hypothesis_node_id, node_id_for_target
+from redteam.attack_graph.identity import (
+    hypothesis_node_id,
+    node_id_for_target,
+    session_credential_node_id,
+    session_principal_node_id,
+)
 from redteam.attack_graph.predicates import Confidence, Provenance
 from redteam.attack_graph.service import HYPOTHESIS_INCONCLUSIVE, HYPOTHESIS_OPEN
 from redteam.core.contracts.events import EventType
@@ -153,11 +158,35 @@ async def verify_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                 provenance=provenance, step=runtime.step_count,
             )
         if auth_assessment.outcome in {"session_access_observed", ACCESS_CONTROL_VIOLATION}:
+            target_ref = str(
+                proposal.arguments.get("target_ref") or node_id_for_target(proposal.target)
+            )
+            session_ref = step.authentication_check.session_ref
             principal = await service.upsert_node(
                 GraphNodeType.PRINCIPAL,
-                key=f"session:{step.authentication_check.session_ref}",
-                attrs={"authenticated": True},
+                node_id=session_principal_node_id(target_ref, session_ref),
+                attrs={"authenticated": True, "operator_managed_session": True},
+                facts={"target_ref": target_ref, "session_refs": [session_ref]},
                 provenance=provenance, step=runtime.step_count,
+            )
+            credential = await service.upsert_node(
+                GraphNodeType.CREDENTIAL,
+                node_id=session_credential_node_id(target_ref, session_ref),
+                attrs={"reference_only": True},
+                facts={
+                    "target_ref": target_ref,
+                    "session_ref": session_ref,
+                    "credential_kind": "session_reference",
+                },
+                provenance=provenance,
+                step=runtime.step_count,
+            )
+            await service.link(
+                GraphEdgeType.RELATED_TO,
+                credential.id,
+                principal.id,
+                properties={"relation": "session_for"},
+                provenance=provenance,
             )
             await service.link(
                 GraphEdgeType.CAN_ACCESS,

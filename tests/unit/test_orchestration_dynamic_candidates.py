@@ -192,8 +192,8 @@ async def test_a_step_that_cannot_fill_its_graph_argument_is_reported_as_a_drop(
 def comparison_result(**overrides) -> ToolResult:
     output = {
         "target_ref": HOST,
-        "anonymous": {"status_code": 401, "body_sha256": "aa", "redirect": False},
-        "authenticated": {"status_code": 200, "body_sha256": "bb", "redirect": False},
+        "anonymous": {"status_code": 401, "body_sha256": "a" * 64, "redirect": False},
+        "authenticated": {"status_code": 200, "body_sha256": "b" * 64, "redirect": False},
         "same_status": False,
         "same_body": False,
         "verdict": "observation_only",
@@ -222,7 +222,7 @@ def test_the_comparison_mapper_is_registered_for_its_own_tool_id() -> None:
     )
 
     assert registry.last_failure is None
-    assert len(mutation.nodes) == 1
+    assert len(mutation.nodes) == 3
 
 
 def test_the_comparison_mapper_records_what_the_tool_actually_measured() -> None:
@@ -257,6 +257,8 @@ def test_the_comparison_mapper_ignores_malformed_output() -> None:
         comparison_result(authenticated={}),
         comparison_result(anonymous={"status_code": True}),
         comparison_result(anonymous={"status_code": 999}),
+        comparison_result(target_ref="different-target"),
+        comparison_result(same_status=True),
         comparison_result(),
     ]
 

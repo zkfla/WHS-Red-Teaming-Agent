@@ -43,7 +43,7 @@ _HTTP_PROBE_OUTPUT = {
     "target_ref": "a.local",
     "status_code": 200,
     "body_bytes": 10,
-    "body_sha256": "deadbeef",
+    "body_sha256": "a" * 64,
     "redirect": False,
     "security_headers_present": {"strict-transport-security": False},
     "body_omitted": True,

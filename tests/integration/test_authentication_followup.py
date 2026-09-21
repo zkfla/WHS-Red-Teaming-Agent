@@ -68,7 +68,27 @@ class SessionGateway(DummyToolGateway):
             status = self.status
             if invocation.tool_id == "web.http_request" and self.disable_after_anonymous:
                 self._tools = [t for t in self._tools if t.tool_id != "web.http_request"]
-        return result.model_copy(update={"output": {"status_code": status}})
+        target_ref = invocation.arguments.get("target_ref")
+        session_ref = invocation.arguments.get("session_ref")
+        return result.model_copy(
+            update={
+                "output": {
+                    "target_ref": target_ref,
+                    "session_ref": session_ref,
+                    "status_code": status,
+                    "body_bytes": 0,
+                    "body_sha256": ("b" if session_ref else "a") * 64,
+                    "redirect": 300 <= status < 400,
+                    "security_headers_present": {
+                        "strict-transport-security": False,
+                        "content-security-policy": False,
+                        "x-content-type-options": False,
+                        "cache-control": False,
+                    },
+                    "body_omitted": True,
+                }
+            }
+        )
 
 
 class SessionGate(FakeControlPlane):
@@ -225,7 +245,11 @@ async def test_each_session_is_checked_once_and_preserves_anonymous_evidence():
     assert final.termination_reason == "no_actionable_plan"
     graph = AttackGraphService(deps.graph_store)
     endpoints = [n for n in await graph.list_nodes() if n.type.value == "endpoint"]
-    observations = facts_of(endpoints[0].properties)["observations"]
+    observations = [
+        item
+        for item in facts_of(endpoints[0].properties)["observations"]
+        if item["kind"] == "http_response"
+    ]
     assert len(observations) == 6
     assert observations[0]["status_code"] == 401 and observations[0]["session_ref"] is None
     assert len({o["session_ref"] for o in observations[1:]}) == 5

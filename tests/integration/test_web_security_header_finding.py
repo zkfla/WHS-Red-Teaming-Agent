@@ -37,7 +37,18 @@ class ChangingResponses(DummyToolGateway):
     async def invoke(self, invocation):
         result = await super().invoke(invocation)
         is_web = invocation.tool_id == "web.http_request"
-        output = {"status_code": self.status if is_web else 200, "redirect": False}
+        status = self.status if is_web else 200
+        output = {
+            "target_ref": invocation.arguments["target_ref"],
+            "status_code": status,
+            "body_bytes": 0,
+            "body_sha256": "a" * 64,
+            "redirect": 300 <= status < 400,
+            "security_headers_present": {},
+            "body_omitted": True,
+        }
+        if is_web:
+            output["session_ref"] = invocation.arguments.get("session_ref")
         if self.header is not None:
             output["security_headers_present"] = {"strict-transport-security": self.header}
         return result.model_copy(update={"output": output})
