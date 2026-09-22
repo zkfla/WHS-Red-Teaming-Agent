@@ -160,10 +160,10 @@ class FilesystemEvidenceStore:
         window, and drops their entries from the index. Returns the
         ``run_id``s that were purged. Index entries for other, still-
         live runs are preserved by rewriting the index file without
-        the purged runs' entries. ``days`` must be finite and non-negative.
+        the purged runs' entries. ``days`` must be finite and positive.
         """
-        if not math.isfinite(days) or days < 0:
-            raise ValueError("retention days must be a finite, non-negative number")
+        if not math.isfinite(days) or days <= 0:
+            raise ValueError("retention days must be a finite, positive number")
         cutoff = datetime.now(timezone.utc) - timedelta(days=days)
         purged: list[RunId] = []
         for path in self._root.glob("*.jsonl"):

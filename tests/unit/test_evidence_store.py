@@ -320,7 +320,7 @@ async def test_purge_older_than_removes_old_runs_only(tmp_path: Path) -> None:
     assert remaining_for_action_1 == []
 
 
-@pytest.mark.parametrize("days", [-1, float("nan"), float("inf")])
+@pytest.mark.parametrize("days", [0, -1, float("nan"), float("inf")])
 async def test_purge_rejects_invalid_retention_without_deleting(
     tmp_path: Path, days: float
 ) -> None:

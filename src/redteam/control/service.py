@@ -26,13 +26,14 @@ from redteam.control.audit import AuditLog
 from redteam.control.budget import BudgetTracker
 from redteam.control.policy import evaluate_policy
 from redteam.control.rate_limit import RateLimiter
+from redteam.control.risk import DEFAULT_APPROVAL_RISK_THRESHOLD, RiskResolver
 from redteam.control.roe import UnsupportedRoePolicyError, check_roe
 from redteam.control.scope import check_scope
 from redteam.control.severity import Severity, to_tag
 from redteam.core.contracts.action import ActionProposal
 from redteam.core.contracts.engagement import Engagement
 from redteam.core.contracts.policy import Approval, ControlContext, PolicyDecision
-from redteam.core.enums import ApprovalStatus, PolicyVerdict
+from redteam.core.enums import ApprovalStatus, PolicyVerdict, RiskLevel
 from redteam.core.ids import ApprovalId, EngagementId
 from redteam.evidence.service import EvidenceService
 
@@ -57,12 +58,17 @@ class DefaultControlPlane:
         audit_log: AuditLog | None = None,
         approvals: ApprovalService | None = None,
         evidence_service: EvidenceService | None = None,
+        risk_resolver: RiskResolver | None = None,
     ) -> None:
         self._engagements = engagements
         self._audit = audit_log or AuditLog()
         self._rate_limiters: dict[EngagementId, RateLimiter] = {}
         self._budgets: dict[EngagementId, BudgetTracker] = {}
         self._approvals = approvals or ApprovalService()
+        # Optional risk-tiered approval: resolves an action's risk from the
+        # Capability Tool Registry (source of truth) so higher-risk actions
+        # require human approval. None = no risk-based gating (unchanged).
+        self._risk_resolver = risk_resolver
         # Optional (Track B's EvidenceService): when present, DENY /
         # REQUIRE_APPROVAL decisions are also recorded as Evidence so the
         # final report includes blocked attempts, not just executed ones.
@@ -109,9 +115,20 @@ class DefaultControlPlane:
                 proposal, PolicyVerdict.DENY, roe_reasons, ["roe"], severity=roe_severity
             )
 
+        risk, risk_unresolved = self._resolve_risk(proposal)
         verdict, policy_reasons, matched_rules = evaluate_policy(
-            proposal, engagement.approval_policy
+            proposal,
+            engagement.approval_policy,
+            risk=risk,
+            risk_threshold=DEFAULT_APPROVAL_RISK_THRESHOLD,
         )
+        if risk_unresolved and verdict == PolicyVerdict.ALLOW:
+            # Fail-closed: risk-tiered approval exists precisely to catch
+            # risky actions, so when the risk lookup errors we require a
+            # human rather than let a possibly-risky action through.
+            verdict = PolicyVerdict.REQUIRE_APPROVAL
+            policy_reasons = ["tool risk_level could not be resolved — requiring approval"]
+            matched_rules = ["risk:unresolved"]
         if verdict == PolicyVerdict.DENY:
             # A policy deny rejects this class of action — switch goals.
             return await self._finalize(
@@ -323,6 +340,30 @@ class DefaultControlPlane:
         await self._audit.record(proposal, decision)
         await self._record_blocked_action(proposal, decision)
         return decision
+
+    def _resolve_risk(self, proposal: ActionProposal) -> tuple[RiskLevel | None, bool]:
+        """Resolve an action's risk from the Registry, fail-closed.
+
+        Returns ``(risk, unresolved)``. ``unresolved`` is True only when
+        the resolver *raised* — never for the normal "no eligible tool"
+        case (which returns ``risk=None, unresolved=False``). A crashing
+        risk lookup must not crash the gate, and must not silently let a
+        possibly-risky action skip risk-tiered approval.
+        """
+        if self._risk_resolver is None:
+            return None, False
+        try:
+            return self._risk_resolver.resolve(proposal.capability, proposal.operation), False
+        except Exception:  # noqa: BLE001 - a broken risk source must not crash the gate
+            logger.exception(
+                "risk resolution failed; requiring approval (fail-closed)",
+                extra={
+                    "action_id": str(proposal.action_id),
+                    "capability": proposal.capability,
+                    "operation": proposal.operation,
+                },
+            )
+            return None, True
 
     async def _record_blocked_action(
         self, proposal: ActionProposal, decision: PolicyDecision
