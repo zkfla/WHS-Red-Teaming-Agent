@@ -5,6 +5,9 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from contextlib import AsyncExitStack, asynccontextmanager
 
+from jsonschema import Draft202012Validator
+from jsonschema.exceptions import SchemaError
+
 from redteam.capability.adapters.mcp.analysis import AnalysisMCPAdapter
 from redteam.capability.adapters.mcp.base import MCPAdapter
 from redteam.capability.adapters.mcp.example import ExampleMCPAdapter
@@ -85,14 +88,22 @@ async def _build_gateway(
                 raise MCPConfigurationError(
                     f"MCP server {server_id!r} operation bindings do not match discovered tools"
                 )
-        registry.replace_server_tools(server_id, descriptors)
         for descriptor in descriptors:
+            _validate_discovered_schema(descriptor.tool_name, descriptor.input_schema)
+            if descriptor.output_schema:
+                _validate_discovered_schema(descriptor.tool_name, descriptor.output_schema)
             operations = (
                 settings.tool_operations[descriptor.tool_name]
                 if settings.tool_operations is not None
                 else (descriptor.tool_name,)
             )
+            # The operation binding is part of the Registry snapshot exposed
+            # to Agent/Orchestration; it must not remain only in a private
+            # Gateway map.
+            descriptor.operations = list(operations)
+            descriptor.target_types = _default_target_types(settings.kind, descriptor.tool_name)
             operation_bindings[str(descriptor.tool_id)] = operations
+        registry.replace_server_tools(server_id, descriptors)
         adapters[server_id] = adapter
         server_concurrency[server_id] = settings.max_concurrency
         server_output_limits[server_id] = settings.max_output_bytes
@@ -104,6 +115,33 @@ async def _build_gateway(
         server_concurrency=server_concurrency,
         server_output_limits=server_output_limits,
     )
+
+
+def _default_target_types(kind: MCPServerKind, tool_name: str) -> list[str]:
+    """Conservative target hints for discovery metadata.
+
+    Server-specific policy may narrow these later; these defaults never add
+    an execution target and are used only to filter Agent candidates.
+    """
+    if kind == MCPServerKind.MOBILE:
+        return ["device", "asset"]
+    if kind == MCPServerKind.ANALYSIS:
+        return ["asset", "endpoint", "observation"]
+    if kind == MCPServerKind.WEB_API:
+        return ["host", "service", "endpoint"]
+    if kind == MCPServerKind.RECON:
+        return ["host", "service", "endpoint"]
+    return []
+
+
+def _validate_discovered_schema(tool_name: str, schema: dict[str, object]) -> None:
+    """Fail closed when an MCP advertises malformed JSON Schema."""
+    try:
+        Draft202012Validator.check_schema(schema)
+    except SchemaError as exc:
+        raise MCPConfigurationError(
+            f"MCP tool {tool_name!r} advertised an invalid JSON schema"
+        ) from exc
 
 
 def _create_adapter(settings: MCPServerSettings, transport: MCPTransport) -> MCPAdapter:

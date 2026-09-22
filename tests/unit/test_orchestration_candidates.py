@@ -8,6 +8,7 @@ from pydantic import ValidationError
 from redteam.attack_graph.patterns import NodePattern
 from redteam.attack_graph.service import AttackGraphService
 from redteam.attack_graph.stores.memory import InMemoryAttackGraphStore
+from redteam.capability.catalog import MCPToolCatalog
 from redteam.capability.registry import MCPToolRegistry
 from redteam.core.contracts.tool import ToolDescriptor
 from redteam.core.enums import GraphNodeType, RiskLevel, ToolHealthStatus
@@ -94,6 +95,41 @@ async def test_catalog_does_not_substitute_an_unbound_tool_with_the_same_tag() -
     )
 
     assert candidates == []
+
+
+async def test_compiler_discovers_tool_by_action_when_preferred_binding_is_absent() -> None:
+    service = await graph()
+    observation = await service.observe(step=1)
+    registry = MCPToolRegistry()
+    registry.register(
+        ToolDescriptor(
+            tool_id=ToolId("recon.http_probe"),
+            server_id="recon-passive",
+            tool_name="http_probe",
+            capability_tags=["recon"],
+            operations=["service_discovery"],
+            target_types=["host"],
+            input_schema={
+                "type": "object",
+                "properties": {"target_ref": {"type": "string"}},
+                "required": ["target_ref"],
+            },
+            health_status=ToolHealthStatus.HEALTHY,
+        )
+    )
+    catalog = MCPToolCatalog(registry)
+
+    candidates = await CandidateCompiler(catalog).compile_playbook(
+        agent("recon.missing"), service.view(), observation, step=1
+    )
+
+    assert {candidate.tool.tool_id for candidate in candidates} == {
+        ToolId("recon.http_probe")
+    }
+    assert {candidate.plan_step.arguments["target_ref"] for candidate in candidates} == {
+        "a.local",
+        "b.local",
+    }
 
 
 async def test_required_tool_schema_fields_are_hard_constraints() -> None:

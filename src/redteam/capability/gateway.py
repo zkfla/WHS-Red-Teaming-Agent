@@ -16,6 +16,9 @@ from collections.abc import Collection, Mapping
 from datetime import datetime, timezone
 from typing import Any
 
+from jsonschema import Draft202012Validator
+from jsonschema.exceptions import SchemaError, ValidationError
+
 from redteam.capability.adapters.mcp.base import MCPAdapter, MCPCallResult
 from redteam.capability.catalog import MCPToolCatalog
 from redteam.capability.registry import MCPToolRegistry
@@ -173,6 +176,16 @@ class MCPToolGateway:
                     "max_output_bytes": max_output_bytes,
                 },
             )
+
+        if descriptor.output_schema:
+            try:
+                Draft202012Validator(descriptor.output_schema).validate(adapter_result.output)
+            except (SchemaError, ValidationError, TypeError):
+                return self._error_result(
+                    invocation,
+                    code="tool_output_schema_mismatch",
+                    message="MCP output did not match the registered output schema",
+                )
 
         return ToolResult(
             invocation_id=invocation.invocation_id,
