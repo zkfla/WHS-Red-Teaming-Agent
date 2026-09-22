@@ -409,17 +409,57 @@ AgentNoExecutableCandidates")은 payload 확장까지 반영됐지만, **발행 
 - `test_a_provider_with_nothing_to_say_stays_silent` — 빈 batch 를 낸 provider 는
   이벤트를 만들지 않음(기존 동작 보존)
 
-### 10.4 최종 검증 (이번 기준, exact)
+### 10.4 최종 검증 (이번 기준, exact — 재현 명령 포함)
 
-깨끗한 temp venv(`mcp 2.2.0`) + `sys.path` 로 현재 체크아웃 `src` 를
-명시적으로 사용했다(`PYTHONPATH=src`).
+아래 명령을 그대로 **재실행**해 수치를 재확인했다. 최초 기록과 재실행 결과가 일치한다.
 
-| 명령 | 결과 |
-|---|---|
-| `python -m pytest tests -q` | **1092 passed, 13 failed, 3 skipped** |
-| targeted + H1~H4 회귀 14개 파일 | **221 passed** |
-| `ruff check src tests examples` | **All checks passed!** |
-| `python -m compileall -q src` | exit 0 |
+환경:
+
+- python: `%TEMP%\whs-orch-venv2\Scripts\python.exe` (임시 venv, `mcp 2.2.0`)
+- import 경로는 `PYTHONPATH=src` 로 현재 체크아웃을 강제한다. 확인:
+  `python -c "import redteam,os; print(os.path.normcase(redteam.__file__))"`
+  → `...\4261\WHS-Red-Teaming-Agent\src\redteam\__init__.py`
+
+#### (1) targeted + H1~H4 회귀 — 14개 파일, **221 passed**
+
+```powershell
+$env:PYTHONPATH='src'
+& "$env:TEMP\whs-orch-venv2\Scripts\python.exe" -m pytest tests/unit/test_orchestration_nodes.py tests/integration/test_authentication_followup.py tests/unit/test_cli_renderer.py tests/integration/test_event_identity.py tests/unit/test_orchestration_convergence.py tests/unit/test_orchestration_web_followups.py tests/unit/test_orchestration_web_analysis_followups.py tests/unit/test_orchestration_recon_provider.py tests/integration/test_recon_service_bootstrap.py tests/unit/test_orchestration_relation_reactivation.py tests/unit/test_orchestration_hybrid_planner.py tests/unit/test_orchestration_dynamic_candidates.py tests/unit/test_orchestration_findings.py tests/unit/test_agents.py -q --no-header -p no:cacheprovider
+```
+
+위 14개 파일(순서 포함, 실행한 그대로):
+
+1. `tests/unit/test_orchestration_nodes.py`
+2. `tests/integration/test_authentication_followup.py`
+3. `tests/unit/test_cli_renderer.py`
+4. `tests/integration/test_event_identity.py`
+5. `tests/unit/test_orchestration_convergence.py`
+6. `tests/unit/test_orchestration_web_followups.py`
+7. `tests/unit/test_orchestration_web_analysis_followups.py`
+8. `tests/unit/test_orchestration_recon_provider.py`
+9. `tests/integration/test_recon_service_bootstrap.py`
+10. `tests/unit/test_orchestration_relation_reactivation.py`
+11. `tests/unit/test_orchestration_hybrid_planner.py`
+12. `tests/unit/test_orchestration_dynamic_candidates.py`
+13. `tests/unit/test_orchestration_findings.py`
+14. `tests/unit/test_agents.py`
+
+#### (2) 전체 스위트 — **1092 passed, 13 failed, 3 skipped**
+
+```powershell
+$env:PYTHONPATH='src'
+& "$env:TEMP\whs-orch-venv2\Scripts\python.exe" -m pytest tests -q --no-header -p no:cacheprovider
+```
+
+#### (3) Ruff / compileall
+
+```powershell
+& "$env:TEMP\whs-orch-venv2\Scripts\ruff.exe" check src tests examples
+& "$env:TEMP\whs-orch-venv2\Scripts\python.exe" -m compileall -q src
+```
+
+재실행 대조(2026-09-22): (1) `221 passed`, (2) `1092 passed / 13 failed / 3 skipped`,
+(3) ruff `All checks passed!` / compileall `exit 0` — 최초 기록과 동일하다.
 
 남은 13건은 이 머신의 기존 환경 실패 그대로다: Windows 심볼릭 링크 권한 없음
 (`WinError 1314`) 12건 + cp949 콘솔 인코딩 1건(`validate.py`). 이번 변경과
