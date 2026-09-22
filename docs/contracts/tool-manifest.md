@@ -39,3 +39,26 @@ Recon 결과는 관찰된 값만 구조화한다. HTTP probe는 가능한 경우
 `scheme`, `protocol`, `service`, `status`, `status_code`, `url`을 반환하며,
 확인하지 못한 제품명·버전·서비스는 추측하지 않는다. Port scan도 실제로 실행한
 주소와 포트 상태만 반환한다.
+
+## 후보 선택과 Graph 반영
+
+후보마다 target type 확인 → 구조적 인자 바인딩 → input schema 검증을 먼저
+수행한 뒤, 실행 가능한 후보 사이에서 기존 건강 상태·위험도·ToolId 순위를 적용한다.
+첫 후보의 필수 인자가 없더라도 다른 실행 가능한 후보가 있으면 사용할 수 있다.
+운영자가 명시한 인자를 삭제하거나 자격증명을 추측하여 맞추지 않는다.
+
+- `recon.http_probe`: 실제 port를 서비스/endpoint 식별자에 포함하고 HTTPS 정보를
+  보존한다. 숫자 경로를 정규화하더라도 `observed_target`에 원래 요청 경로를 남긴다.
+- `recon.dns_resolve`: 기존 host에 관찰한 IP 목록만 기록한다. HTTP 연결 성공이나
+  해당 IP의 scope 승인을 의미하지 않는다.
+- `recon.openapi_inventory`, `recon.html_inventory`: 기존 host의
+  `operations_candidates`/`references_candidates`에 문서에서 발견한 경로를 기록한다.
+  미방문 경로를 응답이 확인된 endpoint로 만들거나 자동 승인하지 않는다.
+- `recon.port_scan`: 완료된 스캔의 포트 상태를 기록하고 열린 TCP 포트만 service로
+  연결한다. 포트 번호로 HTTP/HTTPS 또는 제품명을 추측하지 않는다.
+
+이 변경은 기본 playbook의 operation 목록을 늘리지 않는다. DNS/TLS/HTTP가 모두
+`service_discovery`로 등록된 설정에서는 schema 적합성만으로 HTTP probe 목적을
+구별할 수 없으며, DNS 결과 자체도 Web Agent를 활성화하지 않는다. 금융 기본 설정의
+host(`mock-bank`)와 policy target_ref(`bank-lab`)를 연결하는 명시적 매핑, 브라우저의
+engagement 단위 지속 연결, 신규 operation별 provider는 별도 통합 작업이 남아 있다.

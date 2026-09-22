@@ -14,27 +14,22 @@ only place this tool's ``output`` dict is built)::
         "body_omitted": True,
     }
 
-That server deliberately never returns the resolved host/port/scheme
-back to the model ("No raw response, header values, URL query or token
-is returned" -- see ``network.py``): only ``status_code`` and the
-security-header booleans are real, observed facts about the target this
-mapper can use. ``host``/``path`` are not guessed from that output --
-they come from the ``ActionProposal.target`` actually probed and the
-``path`` argument actually sent, both already known to the framework
-independently of the tool's response. ``scheme="GET"``/``method="GET"``
-are not read from anywhere either -- they are what *this specific tool*
-always does (a plain HTTP GET, per its own implementation), the same
-kind of tool-identity fact ``ResultMapperRegistry`` already keys on.
-Port is not encoded anywhere: this tool's output never reveals it, so
-claiming one would be exactly the invented-field this mapper must not
-do (see the module docstring on ``orchestration.observations``).
+Current responses also carry host/port/scheme. Preserve observed ports in
+node identity and HTTPS in facts; legacy responses may omit those fields.
+The path comes from the actual request, and GET is fixed by this tool.
+Missing port/scheme values are never filled from conventional defaults.
 """
 
 from __future__ import annotations
 
 from typing import Any
 
-from redteam.attack_graph.identity import endpoint_node_id, host_node_id, service_node_id
+from redteam.attack_graph.identity import (
+    OBSERVED_TARGET_FACT,
+    endpoint_node_id,
+    node_id_for_target,
+    service_node_id,
+)
 from redteam.core.contracts.target import AnyTarget, HostTarget
 from redteam.core.contracts.tool import ToolResult
 from redteam.core.enums import GraphEdgeType, GraphNodeType
@@ -60,9 +55,17 @@ def map_recon_http_probe(
     host = target.host
     if not host:
         return GraphMutation()
+    if "host" in result.output and result.output["host"] != host:
+        return GraphMutation()
+    port = result.output.get("port")
+    if port is not None and (type(port) is not int or not 1 <= port <= 65535):
+        return GraphMutation()
+    scheme = result.output.get("scheme")
+    if scheme is not None and scheme not in ("http", "https"):
+        return GraphMutation()
 
     status_code = result.output.get("status_code")
-    if not isinstance(status_code, int):
+    if type(status_code) is not int or not 100 <= status_code <= 599:
         # Incomplete/malformed output: no confirmed response, so no
         # service/endpoint claim -- only the pre-existing HOST attrs
         # (reachable/probed, from PlanStep.observed_attrs) still apply.
@@ -77,20 +80,28 @@ def map_recon_http_probe(
         "host": host,
         "path": path,
         "method": _METHOD,
-        "scheme": _SCHEME,
+        OBSERVED_TARGET_FACT: path,
     }
+    service_facts: dict[str, Any] = {"host": host}
+    for name, value in (("port", port), ("scheme", scheme)):
+        if value is not None:
+            endpoint_facts[name] = value
+            service_facts[name] = value
     if isinstance(security_headers, dict):
         endpoint_facts["security_headers_present"] = dict(security_headers)
 
-    host_id = host_node_id(host)
-    service_id = service_node_id(_SCHEME, host=host)
-    endpoint_id = endpoint_node_id(_METHOD, path, host=host)
+    host_id = node_id_for_target(target)
+    service_name = scheme or _SCHEME
+    if port is not None:
+        service_name = f"{service_name}:{port}"
+    service_id = service_node_id(service_name, host=host)
+    endpoint_id = endpoint_node_id(_METHOD, path, host=host, port=port)
 
     service_node = NodeMutation(
         node_type=GraphNodeType.SERVICE,
         node_id=service_id,
         attrs={"responded": True},
-        facts={"host": host, "scheme": _SCHEME, "display_name": f"{host} {_SCHEME}"},
+        facts={**service_facts, "display_name": f"{host} {service_name}"},
         labels=["discovered-by:recon.http_probe"],
     )
     endpoint_node = NodeMutation(

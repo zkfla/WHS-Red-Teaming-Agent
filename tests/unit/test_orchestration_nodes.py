@@ -577,7 +577,7 @@ async def test_update_discovers_service_and_endpoint_from_a_successful_http_prob
 
     service_node = await node_at(service, "service:a.local/http")
     assert attrs_of(service_node.properties) == {"responded": True}
-    assert facts_of(service_node.properties)["scheme"] == "http"
+    assert "scheme" not in facts_of(service_node.properties)  # legacy output omits scheme
 
     endpoint_node = await node_at(service, "endpoint:a.local GET /")
     assert attrs_of(endpoint_node.properties) == {"status_code": 200, "redirect": False}

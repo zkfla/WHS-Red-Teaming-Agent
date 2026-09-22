@@ -92,7 +92,10 @@ class ResultMapperRegistry:
 
 def default_result_mapper_registry() -> ResultMapperRegistry:
     from redteam.orchestration.observations.recon_http import map_recon_http_probe
+    from redteam.orchestration.observations.recon_inventory import map_recon_inventory
 
     registry = ResultMapperRegistry()
     registry.register("recon.http_probe", map_recon_http_probe)
+    for tool in ("dns_resolve", "openapi_inventory", "html_inventory", "port_scan"):
+        registry.register(f"recon.{tool}", map_recon_inventory)
     return registry

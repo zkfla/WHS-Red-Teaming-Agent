@@ -145,8 +145,17 @@ class CandidateCompiler:
         candidates = [
             candidate
             for candidate in self._catalog.list_tools_for_action(capability, operation)
-            if not candidate.target_types
-            or plan_step.resolved_target().kind in candidate.target_types
+            if candidate.health_status is not ToolHealthStatus.UNHEALTHY
+            and (
+                not candidate.target_types
+                or plan_step.resolved_target().kind in candidate.target_types
+            )
+            and self._arguments_match_schema(
+                self._bind_target_arguments(
+                    plan_step.arguments, plan_step.resolved_target(), candidate
+                ),
+                candidate.input_schema,
+            )
         ]
         return select_tool(candidates)
 

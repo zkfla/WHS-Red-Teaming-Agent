@@ -268,6 +268,31 @@ async def test_required_tool_schema_fields_are_hard_constraints() -> None:
     )
 
 
+async def test_incompatible_first_tool_does_not_hide_executable_alternative() -> None:
+    service = await graph()
+    observation = await service.observe(step=1)
+    registry = MCPToolRegistry()
+    for name, required in (("a_url_tool", "url"), ("z_host_tool", "target_ref")):
+        registry.register(ToolDescriptor(
+            tool_id=ToolId(f"recon.{name}"), server_id="test", tool_name=name,
+            input_schema={
+                "type": "object", "properties": {required: {"type": "string"}},
+                "required": [required], "additionalProperties": False,
+            },
+            capability_tags=["recon"], health_status=ToolHealthStatus.HEALTHY,
+        ))
+    spec = agent()
+    candidates = await CandidateCompiler(catalog_for(registry)).compile_playbook(
+        spec, service.view(), observation, step=1
+    )
+    assert len(candidates) == 2
+    assert all(c.tool.tool_id == "recon.z_host_tool" for c in candidates)
+    assert {c.draft.plan_step.arguments["target_ref"] for c in candidates} == {
+        "a.local", "b.local",
+    }
+    assert spec.playbook[0].arguments == {}
+
+
 async def test_full_json_schema_rejects_wrong_argument_types() -> None:
     service = await graph()
     observation = await service.observe(step=1)
