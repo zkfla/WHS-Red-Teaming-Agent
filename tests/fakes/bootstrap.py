@@ -14,6 +14,7 @@ from redteam.core.ports.control_plane import ControlPlane
 from redteam.core.ports.event_bus import EventBus
 from redteam.core.ports.evidence_store import EvidenceStore
 from redteam.core.ports.llm import LLMClient
+from redteam.core.ports.tool_catalog import ToolCatalog
 from redteam.core.ports.tool_gateway import ToolGateway
 from redteam.event_bus.memory import InMemoryEventBus
 from redteam.llm.fake import FakeLLMClient
@@ -23,7 +24,6 @@ from redteam.orchestration.agents.providers import (
 )
 from redteam.orchestration.agents.registry import AgentRegistry, default_registry
 from redteam.orchestration.analysis import AnalysisVerifier, DeterministicAnalysisVerifier
-from redteam.orchestration.candidates.catalog import ToolCatalog
 from redteam.orchestration.context import RuntimeDeps
 from redteam.orchestration.settings import OrchestrationSettings
 from tests.fakes.control_plane import FakeControlPlane

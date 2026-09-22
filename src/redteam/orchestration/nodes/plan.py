@@ -28,6 +28,7 @@ from redteam.orchestration.agents.providers import (
 )
 from redteam.orchestration.candidates.catalog import ToolCatalog
 from redteam.orchestration.candidates.compiler import CandidateCompiler, CandidateRejection
+from redteam.orchestration.candidates.models import CandidateDraft
 from redteam.orchestration.context import RuntimeDeps
 from redteam.orchestration.context_projection import (
     ContextProjector,
@@ -126,7 +127,7 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
     provider = (
         deps.candidate_providers.get(definition.provider_id) if definition is not None else None
     )
-    drafts = None
+    drafts: list[CandidateDraft] = []
     diagnostics: list[CandidateDiagnostic] = []
     rejections: list[CandidateRejection] = []
     drops: list[DraftDrop] = []

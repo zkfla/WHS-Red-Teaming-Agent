@@ -195,7 +195,7 @@ class DefaultControlPlane:
         )
 
     async def resolve_approval(
-        self, approval_id: ApprovalId, status: ApprovalStatus, resolved_by: str
+        self, approval_id: ApprovalId | str, status: ApprovalStatus, resolved_by: str
     ) -> Approval:
         """Record a human's decision on a pending Approval.
 
@@ -213,18 +213,20 @@ class DefaultControlPlane:
         intact here (unlike before) so ``approval_outcome`` can still
         reach it afterwards.
         """
-        approval = await self._approvals.resolve(approval_id, status, resolved_by)
-        proposal = self._pending_proposals.get(approval_id)
+        normalized_id = ApprovalId(str(approval_id))
+        approval = await self._approvals.resolve(normalized_id, status, resolved_by)
+        proposal = self._pending_proposals.get(normalized_id)
         if proposal is not None:
             await self._audit.record_approval_resolution(proposal, approval)
         return approval
 
-    async def approval_outcome(self, approval_id: ApprovalId) -> PolicyDecision | None:
-        cached = self._resolved_outcomes.get(approval_id)
+    async def approval_outcome(self, approval_id: ApprovalId | str) -> PolicyDecision | None:
+        normalized_id = ApprovalId(str(approval_id))
+        cached = self._resolved_outcomes.get(normalized_id)
         if cached is not None:
             return cached
 
-        approval = await self._approvals.get(approval_id)
+        approval = await self._approvals.get(normalized_id)
         if approval is None or approval.status == ApprovalStatus.PENDING:
             return None
         action_id = approval.action_id
@@ -236,13 +238,13 @@ class DefaultControlPlane:
                 verdict=PolicyVerdict.DENY,
                 reasons=[f"approval {approval_id} was {approval.status.value}, not approved"],
                 matched_rules=["approval", to_tag(Severity.REPLAN_GOAL)],
-                approval_id=approval_id,
+                approval_id=normalized_id,
                 evaluated_at=datetime.now(timezone.utc),
             )
-            self._resolved_outcomes[approval_id] = decision
+            self._resolved_outcomes[normalized_id] = decision
             return decision
 
-        proposal = self._pending_proposals.pop(approval_id, None)
+        proposal = self._pending_proposals.pop(normalized_id, None)
         if proposal is None:
             # This ControlPlane instance never held (or already consumed)
             # the original proposal -- most likely a process restart, since
@@ -256,10 +258,10 @@ class DefaultControlPlane:
                     f"held (process restart or already consumed) -- cannot safely resume"
                 ],
                 matched_rules=["approval", "stale", to_tag(Severity.ABORT_RUN)],
-                approval_id=approval_id,
+                approval_id=normalized_id,
                 evaluated_at=datetime.now(timezone.utc),
             )
-            self._resolved_outcomes[approval_id] = decision
+            self._resolved_outcomes[normalized_id] = decision
             return decision
 
         # Only rate limit and budget can change between the original
@@ -280,9 +282,9 @@ class DefaultControlPlane:
                 ["approval", "rate_limit"],
                 rate_limit_remaining=rate_limiter.remaining,
                 severity=Severity.BLOCK_ACTION,
-                approval_id=approval_id,
+                approval_id=normalized_id,
             )
-            self._resolved_outcomes[approval_id] = decision
+            self._resolved_outcomes[normalized_id] = decision
             return decision
 
         budget = self._budgets.setdefault(
@@ -296,9 +298,9 @@ class DefaultControlPlane:
                 ["approval", "budget"],
                 budget_remaining=budget.remaining,
                 severity=Severity.ABORT_RUN,
-                approval_id=approval_id,
+                approval_id=normalized_id,
             )
-            self._resolved_outcomes[approval_id] = decision
+            self._resolved_outcomes[normalized_id] = decision
             return decision
 
         budget.consume()
@@ -309,9 +311,9 @@ class DefaultControlPlane:
             ["approval"],
             rate_limit_remaining=rate_limiter.remaining,
             budget_remaining=budget.remaining,
-            approval_id=approval_id,
+            approval_id=normalized_id,
         )
-        self._resolved_outcomes[approval_id] = decision
+        self._resolved_outcomes[normalized_id] = decision
         return decision
 
     async def _finalize(

@@ -57,6 +57,7 @@ class MCPServerAdapter:
                 tool_name=tool.name,
                 description=tool.description,
                 input_schema=tool.input_schema,
+                output_schema=tool.output_schema,
                 capability_tags=list(self._capability_tags),
                 risk_level=self._risk_level,
                 health_status=health,

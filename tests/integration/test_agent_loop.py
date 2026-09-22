@@ -168,6 +168,10 @@ async def test_pending_approval_has_its_own_terminal_reason_and_partial_report()
                 evaluated_at=datetime.now(timezone.utc),
             )
 
+        async def approval_outcome(self, approval_id):
+            del approval_id
+            return None
+
     target = engagement("a.local")
     gateway = DummyToolGateway()
     deps = build_test_application(control_plane=ApprovalControl(), tool_gateway=gateway)
@@ -412,6 +416,10 @@ async def test_control_plane_exception_fails_closed_and_releases_the_lease() -> 
         async def evaluate(self, proposal, context):
             del proposal, context
             raise RuntimeError("sensitive policy backend detail")
+
+        async def approval_outcome(self, approval_id):
+            del approval_id
+            return None
 
     gateway = DummyToolGateway()
     deps = build_test_application(

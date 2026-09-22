@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator, Mapping, Sequence
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Protocol
 from urllib.parse import urlparse
 
@@ -19,7 +19,7 @@ class RemoteTool:
     name: str
     description: str
     input_schema: dict[str, Any]
-    output_schema: dict[str, Any] | None = None
+    output_schema: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -106,11 +106,7 @@ class _SDKMCPTransport:
                         name=tool.name,
                         description=tool.description or "",
                         input_schema=dict(tool.input_schema),
-                        output_schema=(
-                            dict(tool.output_schema)
-                            if getattr(tool, "output_schema", None) is not None
-                            else None
-                        ),
+                        output_schema=dict(getattr(tool, "output_schema", None) or {}),
                     )
                     for tool in listing.tools
                 )

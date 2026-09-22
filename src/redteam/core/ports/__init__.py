@@ -10,6 +10,7 @@ from redteam.core.ports.control_plane import ControlPlane
 from redteam.core.ports.event_bus import EventBus, EventHandler
 from redteam.core.ports.evidence_store import EvidenceStore
 from redteam.core.ports.llm import LLMClient
+from redteam.core.ports.tool_catalog import ToolCatalog
 from redteam.core.ports.tool_gateway import ToolGateway
 
 __all__ = [
@@ -20,4 +21,5 @@ __all__ = [
     "EventHandler",
     "LLMClient",
     "ToolGateway",
+    "ToolCatalog",
 ]

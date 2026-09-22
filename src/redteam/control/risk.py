@@ -5,7 +5,7 @@ PM direction (problem 3): approval should tighten with the tool's risk
 Capability Tool Registry** (``ToolDescriptor.risk_level``) — Control must
 NOT keep a hardcoded/duplicated risk table that would drift out of sync.
 
-The read-only ``ToolGateway.list_tools_for_action(capability, operation)``
+The read-only ``ToolCatalog.list_tools_for_action(capability, operation)``
 port (see ``docs/proposals/tool-selection-port.md``) exposes exactly this
 metadata to Control without importing the Capability package and without
 executing anything. This module reads that snapshot and reduces the
@@ -23,7 +23,7 @@ from __future__ import annotations
 from typing import Protocol
 
 from redteam.core.enums import RiskLevel
-from redteam.core.ports.tool_gateway import ToolGateway
+from redteam.core.ports.tool_catalog import ToolCatalog
 
 # Total order over the risk ladder so we can compare "at or above".
 _RISK_ORDER: dict[RiskLevel, int] = {
@@ -59,11 +59,11 @@ class RegistryRiskResolver:
     nothing to say and approval falls through to the normal path.
     """
 
-    def __init__(self, tool_gateway: ToolGateway) -> None:
-        self._gateway = tool_gateway
+    def __init__(self, tool_catalog: ToolCatalog) -> None:
+        self._catalog = tool_catalog
 
     def resolve(self, capability: str, operation: str) -> RiskLevel | None:
-        tools = self._gateway.list_tools_for_action(capability, operation)
+        tools = self._catalog.list_tools_for_action(capability, operation)
         levels = [tool.risk_level for tool in tools]
         if not levels:
             return None

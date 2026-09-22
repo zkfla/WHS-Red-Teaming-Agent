@@ -22,9 +22,33 @@ class ToolDescriptor(BaseModel):
     tool_name: str
     description: str = ""
     input_schema: dict[str, Any] = Field(default_factory=dict)
+    # Metadata discovered from the MCP server plus operator-approved bindings.
+    # ``input_schema`` remains the source of truth for required/optional
+    # arguments; the convenience properties below only present that schema in
+    # a form that Agent/Registry code can consume safely.
+    output_schema: dict[str, Any] = Field(default_factory=dict)
+    operations: list[str] = Field(default_factory=list)
+    target_types: list[str] = Field(default_factory=list)
     capability_tags: list[str] = Field(default_factory=list)
     risk_level: RiskLevel = RiskLevel.LOW
     health_status: ToolHealthStatus = ToolHealthStatus.UNKNOWN
+
+    @property
+    def required_arguments(self) -> tuple[str, ...]:
+        required = self.input_schema.get("required", [])
+        if not isinstance(required, list):
+            return ()
+        return tuple(name for name in required if isinstance(name, str))
+
+    @property
+    def optional_arguments(self) -> tuple[str, ...]:
+        properties = self.input_schema.get("properties", {})
+        if not isinstance(properties, dict):
+            return ()
+        required = set(self.required_arguments)
+        return tuple(
+            name for name in properties if isinstance(name, str) and name not in required
+        )
 
 
 class ExecutionContext(BaseModel):

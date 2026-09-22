@@ -95,7 +95,9 @@ async def test_run_command_calls_build_application_not_build_runtime_deps(
 
     assert exit_code == 0
     build_application_mock.assert_awaited_once()
-    called_config = build_application_mock.await_args.args[0]
+    call = build_application_mock.await_args
+    assert call is not None
+    called_config = call.args[0]
     assert called_config.engagement.name == "Wiring Test"
 
 
@@ -143,7 +145,9 @@ capability:
     )
     await run_command.run(args)
 
-    called_config = build_application_mock.await_args.args[0]
+    call = build_application_mock.await_args
+    assert call is not None
+    called_config = call.args[0]
     assert called_config.llm.provider == "litellm"
     assert called_config.llm.default_model == "gpt-4o-mini"
     assert called_config.capability.mcp_servers == ["web-example"]

@@ -86,6 +86,51 @@ async def test_example_adapter_discovers_and_invokes() -> None:
     assert await adapter.health_check() == ToolHealthStatus.HEALTHY
 
 
+async def test_adapter_preserves_remote_output_schema_in_registry_metadata() -> None:
+    transport = FakeTransport(
+        tools=[
+            RemoteTool(
+                name="http_probe",
+                description="probe",
+                input_schema={
+                    "type": "object",
+                    "properties": {"target_ref": {"type": "string"}},
+                    "required": ["target_ref"],
+                },
+                output_schema={
+                    "type": "object",
+                    "properties": {"status_code": {"type": "integer"}},
+                    "required": ["status_code"],
+                },
+            )
+        ]
+    )
+    tools = await ReconMCPAdapter(
+        server_id="recon", transport=transport
+    ).discover_tools()
+
+    descriptor = tools[0]
+    assert descriptor.required_arguments == ("target_ref",)
+    assert descriptor.optional_arguments == ()
+    assert descriptor.output_schema["required"] == ["status_code"]
+
+
+async def test_gateway_rejects_output_that_breaks_registered_schema() -> None:
+    adapter = ExampleMCPAdapter()
+    registry = MCPToolRegistry()
+    descriptor = (await adapter.discover_tools())[0].model_copy(
+        update={"output_schema": {"type": "string"}}
+    )
+    registry.register(descriptor)
+    result = await MCPToolGateway(registry, {adapter.server_id: adapter}).invoke(
+        _invocation(operation="service_discovery")
+    )
+
+    assert result.success is False
+    assert result.error is not None
+    assert result.error.code == "tool_output_schema_mismatch"
+
+
 async def test_gateway_routes_invocation_to_registered_adapter() -> None:
     adapter = ExampleMCPAdapter()
     registry = MCPToolRegistry()

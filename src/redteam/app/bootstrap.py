@@ -62,6 +62,7 @@ from redteam.core.ports.control_plane import ControlPlane
 from redteam.core.ports.event_bus import EventBus
 from redteam.core.ports.evidence_store import EvidenceStore
 from redteam.core.ports.llm import LLMClient
+from redteam.core.ports.tool_catalog import ToolCatalog
 from redteam.core.ports.tool_gateway import ToolGateway
 from redteam.event_bus.memory import InMemoryEventBus
 from redteam.evidence.service import EvidenceService
@@ -72,7 +73,6 @@ from redteam.orchestration.agents.providers import (
     default_provider_registry,
 )
 from redteam.orchestration.agents.registry import AgentRegistry, default_registry
-from redteam.orchestration.candidates.catalog import ToolCatalog
 from redteam.orchestration.context import RuntimeDeps
 from redteam.orchestration.events import REPORT_PROJECTED
 from redteam.orchestration.reporting import ReportingAgent
@@ -165,7 +165,7 @@ async def build_runtime_deps(
         # attempts and executed results land in one place.
         evidence_service=EvidenceService(evidence_store),
         # Risk-tiered approval reads tool risk_level from the Registry.
-        risk_resolver=RegistryRiskResolver(tool_gateway),
+        risk_resolver=RegistryRiskResolver(discovered_catalog),
     )
     llm_client = FakeLLMClient()
     settings = orchestration_settings or OrchestrationSettings()
@@ -255,7 +255,11 @@ async def build_application(
         audit_log=AuditLog(FilesystemAuditStore(audit_dir)),
         approvals=ApprovalService(FilesystemApprovalStore(approval_dir)),
         evidence_service=EvidenceService(resolved_evidence_store),
-        risk_resolver=RegistryRiskResolver(resolved_tool_gateway),
+        risk_resolver=(
+            RegistryRiskResolver(resolved_tool_catalog)
+            if resolved_tool_catalog is not None
+            else None
+        ),
     )
     resolved_event_bus = event_bus or InMemoryEventBus()
     resolved_attack_graph = attack_graph or EngagementScopedAttackGraphStore(

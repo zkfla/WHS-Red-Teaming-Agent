@@ -74,7 +74,8 @@ def _engagement(*hosts: str) -> Engagement:
     )
 
 
-async def test_recon_discovery_unlocks_a_real_web_http_request_call() -> None:
+@pytest.mark.parametrize("with_browser", [False, True])
+async def test_recon_discovery_unlocks_a_real_web_http_request_call(with_browser: bool) -> None:
     recon_tool = ToolDescriptor(
         tool_id=ToolId("recon.http_probe"),
         server_id="test",
@@ -97,7 +98,16 @@ async def test_recon_discovery_unlocks_a_real_web_http_request_call() -> None:
         risk_level=RiskLevel.LOW,
         health_status=ToolHealthStatus.HEALTHY,
     )
-    gateway = DummyToolGateway(output=_HTTP_PROBE_OUTPUT, tools=[recon_tool, web_tool])
+    tools = [recon_tool, web_tool]
+    if with_browser:
+        tools.append(ToolDescriptor(
+            tool_id=ToolId("web.browser_navigate"), server_id="browser",
+            tool_name="browser_navigate", capability_tags=["web"],
+            input_schema={"type": "object", "properties": {"url": {"type": "string"}},
+                          "required": ["url"]},
+            risk_level=RiskLevel.LOW, health_status=ToolHealthStatus.HEALTHY,
+        ))
+    gateway = DummyToolGateway(output=_HTTP_PROBE_OUTPUT, tools=tools)
     deps = build_test_application(
         tool_gateway=gateway,
         tool_catalog=gateway,

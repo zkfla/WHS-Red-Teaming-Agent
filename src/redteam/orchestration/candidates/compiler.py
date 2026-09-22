@@ -13,6 +13,15 @@ from jsonschema.exceptions import SchemaError, ValidationError
 from redteam.attack_graph.identity import node_id_for_target
 from redteam.attack_graph.observation import GraphObservation
 from redteam.attack_graph.view import AttackGraphView
+from redteam.core.contracts.target import (
+    AnyTarget,
+    AssetTarget,
+    DomainTarget,
+    EndpointTarget,
+    HostTarget,
+    ServiceTarget,
+    UrlTarget,
+)
 from redteam.core.contracts.tool import ToolDescriptor
 from redteam.core.enums import RiskLevel, ToolHealthStatus
 from redteam.orchestration.action_naming import (
@@ -111,17 +120,22 @@ class CandidateCompiler:
         if tool is None:
             reason, field = tool_rejection or ("no_compatible_tool", "")
             return None, self._reject(draft, reason, field=field)
-        key = candidate_key(draft)
+        bound_arguments = self._bind_target_arguments(
+            plan_step.arguments, plan_step.resolved_target(), tool
+        )
+        bound_step = plan_step.model_copy(update={"arguments": bound_arguments})
+        bound_draft = draft.model_copy(update={"plan_step": bound_step})
+        key = candidate_key(bound_draft)
         if key in seen:
-            return None, self._reject(draft, "duplicate_candidate")
+            return None, self._reject(bound_draft, "duplicate_candidate")
         seen.add(key)
         return (
             ExecutableCandidate(
                 candidate_key=key,
-                draft=draft,
+                draft=bound_draft,
                 tool=tool,
                 priority=score_candidate(
-                    draft,
+                    bound_draft,
                     risk_level=tool.risk_level,
                     health_status=tool.health_status,
                 ),
@@ -210,7 +224,13 @@ class CandidateCompiler:
             tool
             for tool in action_tools
             if tool.health_status is not ToolHealthStatus.UNHEALTHY
+            and (
+                not tool.target_types
+                or plan_step.resolved_target().kind in tool.target_types
+            )
         ]
+        if not usable:
+            return None, ("target_type_mismatch", "")
         healthy = [
             tool
             for tool in usable
@@ -221,14 +241,66 @@ class CandidateCompiler:
         schema_ok = [
             tool
             for tool in healthy
-            if self._arguments_match_schema(plan_step.arguments, tool.input_schema)
+            if self._arguments_match_schema(
+                self._bind_target_arguments(
+                    plan_step.arguments, plan_step.resolved_target(), tool
+                ),
+                tool.input_schema,
+            )
         ]
         if not schema_ok:
+            bound_arguments = self._bind_target_arguments(
+                plan_step.arguments, plan_step.resolved_target(), healthy[0]
+            )
             reason, field = self._schema_rejection(
-                plan_step.arguments, healthy[0].input_schema
+                bound_arguments, healthy[0].input_schema
             ) or ("schema_mismatch", "")
             return None, (reason, field)
         return select_tool(schema_ok), None
+
+    @staticmethod
+    def _bind_target_arguments(
+        arguments: dict,
+        target: AnyTarget,
+        tool: ToolDescriptor,
+    ) -> dict:
+        """Fill schema-declared identity fields from the selected target."""
+
+        values = dict(arguments)
+        target_values: dict[str, object] = {}
+        if isinstance(target, HostTarget):
+            target_values.update(host=target.host, target_ref=target.host)
+        elif isinstance(target, DomainTarget):
+            target_values.update(host=target.domain, target_ref=target.domain)
+        elif isinstance(target, UrlTarget):
+            target_values.update(url=target.url, target_ref=target.url)
+        elif isinstance(target, EndpointTarget):
+            target_values.update(
+                host=target.host,
+                target_ref=target.host,
+                port=target.port,
+                path=target.path,
+            )
+        elif isinstance(target, ServiceTarget):
+            target_values.update(
+                service=target.service_name,
+                target_ref=target.host or target.service_name,
+                host=target.host,
+            )
+        elif isinstance(target, AssetTarget):
+            target_values.update(
+                asset_ref=str(target.asset_id),
+                apk_ref=str(target.asset_id),
+                artifact_ref=str(target.asset_id),
+            )
+
+        properties = tool.input_schema.get("properties", {})
+        if not isinstance(properties, dict):
+            return values
+        for name, value in target_values.items():
+            if name in properties and value is not None and name not in values:
+                values[name] = value
+        return values
 
     @staticmethod
     def _schema_rejection(arguments: dict, schema: dict) -> tuple[str, str] | None:

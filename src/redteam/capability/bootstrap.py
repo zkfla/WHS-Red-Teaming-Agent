@@ -19,6 +19,7 @@ from redteam.capability.adapters.mcp.transport import (
 )
 from redteam.capability.adapters.mcp.web_api import WebAPIMCPAdapter
 from redteam.capability.gateway import MCPToolGateway
+from redteam.capability.manifest import validate_tool_manifest
 from redteam.capability.mobile_analysis_manifest import (
     MOBILE_ANALYSIS_TOOLS,
     validate_configured_discovery,
@@ -60,7 +61,10 @@ async def _build_gateway(
     if not server_ids:
         example = ExampleMCPAdapter()
         registry = MCPToolRegistry()
-        registry.replace_server_tools(example.server_id, await example.discover_tools())
+        example_descriptors = await example.discover_tools()
+        for descriptor in example_descriptors:
+            validate_tool_manifest(descriptor)
+        registry.replace_server_tools(example.server_id, example_descriptors)
         return MCPToolGateway(
             registry, {example.server_id: example},
             {str(tool.tool_id): ("service_discovery",) for tool in registry.all()},
@@ -93,12 +97,28 @@ async def _build_gateway(
                     f"MCP server {server_id!r} operation bindings do not match discovered tools"
                 )
         server_bindings: dict[str, tuple[str, ...]] = {}
+        selected_specs = {
+            spec.tool_id: spec for spec in MOBILE_ANALYSIS_TOOLS.get(server_id, ())
+        }
         for descriptor in descriptors:
             operations = (
                 settings.tool_operations[descriptor.tool_name]
                 if settings.tool_operations is not None
                 else (descriptor.tool_name,)
             )
+            # The operation binding is part of the Registry snapshot exposed
+            # to Agent/Orchestration; it must not remain only in a private
+            # Gateway map.
+            descriptor.operations = list(operations)
+            selected_spec = selected_specs.get(str(descriptor.tool_id))
+            descriptor.target_types = (
+                [selected_spec.target_type]
+                if selected_spec is not None
+                else _default_target_types(settings.kind)
+            )
+            # Validate after operator bindings are copied into the descriptor:
+            # this is the exact manifest exposed to Agent/Orchestration.
+            validate_tool_manifest(descriptor)
             operation_bindings[str(descriptor.tool_id)] = operations
             server_bindings[str(descriptor.tool_id)] = operations
             if isinstance(adapter, MCPServerAdapter):
@@ -135,6 +155,23 @@ async def _build_gateway(
         output_schemas=output_schemas,
         target_types=target_types,
     )
+
+
+def _default_target_types(kind: MCPServerKind) -> list[str]:
+    """Conservative target hints for discovery metadata.
+
+    Server-specific policy may narrow these later; these defaults never add
+    an execution target and are used only to filter Agent candidates.
+    """
+    if kind == MCPServerKind.MOBILE:
+        return ["device", "asset"]
+    if kind == MCPServerKind.ANALYSIS:
+        return ["asset", "endpoint", "observation"]
+    if kind == MCPServerKind.WEB_API:
+        return ["host", "service", "endpoint"]
+    if kind == MCPServerKind.RECON:
+        return ["host", "service", "endpoint"]
+    return []
 
 
 def _create_adapter(settings: MCPServerSettings, transport: MCPTransport) -> MCPAdapter:

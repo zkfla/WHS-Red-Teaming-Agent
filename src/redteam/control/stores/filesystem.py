@@ -80,8 +80,8 @@ class FilesystemApprovalStore:
             approval.model_dump_json(), encoding="utf-8"
         )
 
-    async def get(self, approval_id: ApprovalId) -> Approval | None:
-        path = self._path_for(approval_id)
+    async def get(self, approval_id: ApprovalId | str) -> Approval | None:
+        path = self._path_for(ApprovalId(str(approval_id)))
         if not path.exists():
             return None
         return Approval.model_validate_json(path.read_text(encoding="utf-8"))
@@ -93,4 +93,3 @@ class FilesystemApprovalStore:
             if approval.status == ApprovalStatus.PENDING:
                 results.append(approval)
         return results
-

@@ -99,6 +99,12 @@ class MCPToolCatalog:
             return False
         return operation in self._operations_for(descriptor)
 
+    def get(self, tool_id: ToolId) -> ToolDescriptor | None:
+        return self._registry.get(tool_id)
+
+    def list_by_capability(self, capability_tag: str) -> list[ToolDescriptor]:
+        return self._registry.list_by_capability(capability_tag)
+
     def list_tools_for_action(
         self,
         capability: str,
@@ -179,7 +185,7 @@ class MCPToolCatalog:
 
     def _operations_for(self, descriptor: ToolDescriptor) -> frozenset[str]:
         if self._operation_bindings is None:
-            return frozenset((descriptor.tool_name,))
+            return frozenset((*descriptor.operations, descriptor.tool_name))
         return self._operation_bindings.get(descriptor.tool_id, frozenset())
 
 

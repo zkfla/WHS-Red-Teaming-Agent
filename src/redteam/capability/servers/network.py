@@ -95,11 +95,19 @@ class CapturedResponse:
     body: bytes
     # Preserve individual fields: joining Set-Cookie breaks Expires and cookie boundaries.
     set_cookie_headers: tuple[str, ...] = field(default=(), repr=False)
+    # Populated by the live request path when the target metadata is known.
+    # Optional keeps fixture responses honest: absent values are not guessed.
+    host: str | None = None
+    port: int | None = None
+    scheme: str | None = None
+    protocol: str | None = None
+    url: str | None = None
 
     def summary(self) -> dict[str, Any]:
         # No raw response, header values, URL query or token is returned to the model.
-        return {
+        summary = {
             "status_code": self.status,
+            "status": self.status,
             "body_bytes": len(self.body),
             "body_sha256": hashlib.sha256(self.body).hexdigest(),
             "redirect": 300 <= self.status < 400,
@@ -114,6 +122,17 @@ class CapturedResponse:
             },
             "body_omitted": True,
         }
+        for key, value in (
+            ("host", self.host),
+            ("port", self.port),
+            ("scheme", self.scheme),
+            ("protocol", self.protocol),
+            ("service", "http" if self.scheme in {"http", "https"} else None),
+            ("url", self.url),
+        ):
+            if value is not None:
+                summary[key] = value
+        return summary
 
 
 async def request(
@@ -191,6 +210,11 @@ async def request(
                         dict(response.headers),
                         bytes(body),
                         tuple(response.headers.get_list("set-cookie")),
+                        host=target.host,
+                        port=target.port,
+                        scheme=url.scheme,
+                        protocol=response.http_version,
+                        url=profile.origin + path,
                     )
     except (httpx.HTTPError, OSError, asyncio.TimeoutError, TimeoutError) as exc:
         raise ToolInputError("target HTTP request failed") from exc
