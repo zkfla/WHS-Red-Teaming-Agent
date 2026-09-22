@@ -1,14 +1,14 @@
-"""In-memory MCP Tool Registry. Owned by Capability Team."""
+"""MCP Tool Registry. Owned by Capability Team.
+
+Tracks which ``ToolDescriptor``s exist and which MCP server (adapter)
+serves each one. In-memory for now; TODO(capability-team): persist +
+periodic health re-checks.
+"""
 
 from __future__ import annotations
 
 from redteam.core.contracts.tool import ToolDescriptor
-from redteam.core.enums import ToolHealthStatus
 from redteam.core.ids import ToolId
-
-
-class ToolRegistrationConflictError(ValueError):
-    """Raised instead of silently overwriting a ToolId owned by another tool."""
 
 
 class MCPToolRegistry:
@@ -16,68 +16,13 @@ class MCPToolRegistry:
         self._tools: dict[ToolId, ToolDescriptor] = {}
 
     def register(self, descriptor: ToolDescriptor) -> None:
-        current = self._tools.get(descriptor.tool_id)
-        if current is not None and current != descriptor:
-            raise ToolRegistrationConflictError(
-                f"tool id {descriptor.tool_id} is already registered by {current.server_id}"
-            )
-        self._tools[descriptor.tool_id] = descriptor.model_copy(deep=True)
+        self._tools[descriptor.tool_id] = descriptor
 
     def get(self, tool_id: ToolId) -> ToolDescriptor | None:
-        descriptor = self._tools.get(tool_id)
-        return descriptor.model_copy(deep=True) if descriptor is not None else None
+        return self._tools.get(tool_id)
 
     def list_by_capability(self, capability_tag: str) -> list[ToolDescriptor]:
-        return [
-            tool.model_copy(deep=True)
-            for tool in self._sorted_tools()
-            if capability_tag in tool.capability_tags
-        ]
-
-    def list_by_server(self, server_id: str) -> list[ToolDescriptor]:
-        return [
-            tool.model_copy(deep=True)
-            for tool in self._sorted_tools()
-            if tool.server_id == server_id
-        ]
+        return [t for t in self._tools.values() if capability_tag in t.capability_tags]
 
     def all(self) -> list[ToolDescriptor]:
-        return [tool.model_copy(deep=True) for tool in self._sorted_tools()]
-
-    def replace_server_tools(
-        self, server_id: str, descriptors: list[ToolDescriptor]
-    ) -> None:
-        """Atomically replace the discovery snapshot for one MCP server."""
-
-        replacements: dict[ToolId, ToolDescriptor] = {}
-        for descriptor in descriptors:
-            if descriptor.server_id != server_id:
-                raise ValueError(
-                    f"descriptor {descriptor.tool_id} belongs to {descriptor.server_id}, "
-                    f"expected {server_id}"
-                )
-            if descriptor.tool_id in replacements:
-                raise ToolRegistrationConflictError(
-                    f"duplicate tool id {descriptor.tool_id} in discovery result"
-                )
-            existing = self._tools.get(descriptor.tool_id)
-            if existing is not None and existing.server_id != server_id:
-                raise ToolRegistrationConflictError(
-                    f"tool id {descriptor.tool_id} is already registered by {existing.server_id}"
-                )
-            replacements[descriptor.tool_id] = descriptor.model_copy(deep=True)
-
-        retained = {
-            tool_id: descriptor
-            for tool_id, descriptor in self._tools.items()
-            if descriptor.server_id != server_id
-        }
-        self._tools = {**retained, **replacements}
-
-    def update_server_health(self, server_id: str, status: ToolHealthStatus) -> None:
-        for tool_id, descriptor in tuple(self._tools.items()):
-            if descriptor.server_id == server_id:
-                self._tools[tool_id] = descriptor.model_copy(update={"health_status": status})
-
-    def _sorted_tools(self) -> list[ToolDescriptor]:
-        return sorted(self._tools.values(), key=lambda descriptor: str(descriptor.tool_id))
+        return list(self._tools.values())

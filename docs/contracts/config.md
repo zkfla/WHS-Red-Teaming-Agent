@@ -29,17 +29,13 @@ class AppConfig(BaseModel):
     logging: LoggingConfig
 ```
 
-See `examples/app.yaml` for the full shape. **Current status**: fully
-wired, via a second, `AppConfig`-aware entry point —
-`redteam.app.bootstrap.build_application(config, ...)` — that reads
-every section (`LLMConfig.provider` -> `LiteLLMClient`/`FakeLLMClient`,
-`CapabilityConfig.mcp_servers` -> real MCP server wiring,
-`LoggingConfig` -> `logging.basicConfig`) and is what the CLI (`redteam
-run`, and the interactive `redteam` entrypoint) always uses. The
-original `build_runtime_deps(engagement, ...)` — `Engagement`-only, no
-`AppConfig` — is kept as-is for callers that only have a bare
-`Engagement` (`examples/minimal_run.py`, most unit/integration tests),
-not the CLI.
+See `examples/app.yaml` for the full shape. **Not yet wired into
+`redteam.app.bootstrap.build_runtime_deps`** — that function still only
+takes an `Engagement` (see its TODO(pm) comment). Read
+`LLMConfig`/`OrchestrationConfig`/`CapabilityConfig` there once a team
+actually needs one of those sections to change bootstrap behavior
+(e.g. choosing `LiteLLMClient` over `FakeLLMClient` based on
+`LLMConfig.provider`).
 
 ## Secrets
 

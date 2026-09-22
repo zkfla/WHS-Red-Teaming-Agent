@@ -12,14 +12,12 @@ MCP servers once selected (see docs/adr/0003-mcp-capability.md).
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Any
 
-from redteam.capability.adapters.mcp.base import MCPCallResult
-from redteam.core.contracts.tool import ToolDescriptor
+from redteam.core.contracts.tool import ToolDescriptor, ToolResult
 from redteam.core.enums import RiskLevel, ToolHealthStatus
-from redteam.core.ids import ToolId
+from redteam.core.ids import ActionId, InvocationId, ToolId
 
-EXAMPLE_TOOL_ID = ToolId("recon.ping")
+EXAMPLE_TOOL_ID = ToolId("example.ping")
 
 
 class ExampleMCPAdapter:
@@ -39,17 +37,18 @@ class ExampleMCPAdapter:
                 tool_name="ping",
                 description="Harmless example tool: echoes arguments back.",
                 input_schema={"type": "object", "properties": {"message": {"type": "string"}}},
-                capability_tags=["recon"],
+                capability_tags=["recon.example"],
                 risk_level=RiskLevel.LOW,
                 health_status=ToolHealthStatus.HEALTHY,
             )
         ]
 
-    async def invoke(
-        self, tool: ToolDescriptor, arguments: dict[str, Any]
-    ) -> MCPCallResult:
+    async def invoke(self, tool: ToolDescriptor, arguments: dict) -> ToolResult:
         started_at = datetime.now(timezone.utc)
-        return MCPCallResult(
+        return ToolResult(
+            invocation_id=InvocationId(""),  # overwritten by MCPToolGateway
+            action_id=ActionId(""),  # overwritten by MCPToolGateway
+            tool_id=tool.tool_id,
             success=True,
             output={"echo": arguments, "server_id": self.server_id},
             error=None,

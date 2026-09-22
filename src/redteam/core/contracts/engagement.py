@@ -24,15 +24,6 @@ class EngagementScope(BaseModel):
     denied_hosts: list[str] = Field(default_factory=list)
     denied_domains: list[str] = Field(default_factory=list)
 
-    # Mobile artifacts (`AssetTarget.asset_id`) have no host identity, so
-    # they cannot match allowed_hosts/domains/networks above — they are
-    # scoped separately, by the same canonical identifier the rest of the
-    # framework already uses for an asset (`core.contracts.target.AssetTarget.asset_id`,
-    # e.g. an Android package id or an operator-assigned APK/IPA
-    # reference). Exact match only — see `redteam.control.scope`.
-    allowed_assets: list[str] = Field(default_factory=list)
-    denied_assets: list[str] = Field(default_factory=list)
-
 
 class RuleOfEngagement(BaseModel):
     name: str
