@@ -27,6 +27,7 @@ import argparse
 import asyncio
 import json
 from pathlib import Path
+from typing import Any
 
 from mcp.server import MCPServer
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -86,15 +87,6 @@ class MobileDiagnosticsPolicy(BaseModel):
         return cls.model_validate(json.loads(Path(path).read_text(encoding="utf-8")))
 
 
-class DeviceShellOutput(BaseModel):
-    """Fields returned by the bounded ADB diagnostic MCP tool."""
-
-    device_ref: str
-    command: str
-    output: str
-    truncated: bool
-
-
 async def _run_adb(argv: list[str], timeout: float) -> str:
     """Spawn one bounded, non-shell ADB command and return decoded stdout."""
     try:
@@ -123,7 +115,7 @@ def create_server(policy: MobileDiagnosticsPolicy) -> MCPServer:
     execution_lock = asyncio.Lock()
 
     @server.tool()
-    async def device_shell(device_ref: str, command: str) -> DeviceShellOutput:
+    async def device_shell(device_ref: str, command: str) -> dict[str, Any]:
         """Run one allowlisted, read-only ADB diagnostic against a configured device.
 
         Not a general remote-shell primitive: ``command`` selects a fixed,
@@ -145,12 +137,12 @@ def create_server(policy: MobileDiagnosticsPolicy) -> MCPServer:
         ]
         async with execution_lock:
             output = await _run_adb(argv, policy.timeout_seconds)
-        return DeviceShellOutput(
-            device_ref=device_ref,
-            command=command,
-            output=output[:_MAX_OUTPUT_BYTES],
-            truncated=len(output) > _MAX_OUTPUT_BYTES,
-        )
+        return {
+            "device_ref": device_ref,
+            "command": command,
+            "output": output[:_MAX_OUTPUT_BYTES],
+            "truncated": len(output) > _MAX_OUTPUT_BYTES,
+        }
 
     return server
 

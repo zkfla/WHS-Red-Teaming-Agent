@@ -17,7 +17,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from redteam.capability.adapters.mcp.base import MCPAdapter, MCPCallResult
-from redteam.capability.catalog import MCPToolCatalog, ToolCandidateMetadata
+from redteam.capability.catalog import MCPToolCatalog
 from redteam.capability.registry import MCPToolRegistry
 from redteam.core.contracts.tool import ToolDescriptor, ToolError, ToolInvocation, ToolResult
 from redteam.core.enums import ToolHealthStatus
@@ -33,17 +33,10 @@ class MCPToolGateway:
         *,
         server_concurrency: Mapping[str, int] | None = None,
         server_output_limits: Mapping[str, int] | None = None,
-        output_schemas: Mapping[str, dict[str, Any] | None] | None = None,
-        target_types: Mapping[str, str | None] | None = None,
     ) -> None:
         self._registry = registry
         self._adapters = adapters
-        self._catalog = MCPToolCatalog(
-            registry,
-            operation_bindings,
-            output_schemas=output_schemas,
-            target_types=target_types,
-        )
+        self._catalog = MCPToolCatalog(registry, operation_bindings)
         concurrency = server_concurrency or {}
         unknown_servers = set(concurrency) - set(adapters)
         if unknown_servers:
@@ -208,21 +201,6 @@ class MCPToolGateway:
         """Return eligible Registry candidates without applying selection policy."""
 
         return self._catalog.list_tools_for_action(
-            capability,
-            operation,
-            include_unhealthy=include_unhealthy,
-        )
-
-    def list_candidate_metadata(
-        self,
-        capability: str | None = None,
-        operation: str | None = None,
-        *,
-        include_unhealthy: bool = False,
-    ) -> list[ToolCandidateMetadata]:
-        """Describe registered candidates without selecting or invoking them."""
-
-        return self._catalog.list_candidate_metadata(
             capability,
             operation,
             include_unhealthy=include_unhealthy,
