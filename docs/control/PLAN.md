@@ -197,12 +197,12 @@ DENY할 때 **왜 막혔는지에 따라 에이전트의 다음 행동이 달라
 - 게이트 6단계(Scope → ROE → Policy → RateLimit → Budget → Approval)가 모두 실제 로직으로 동작한다.
 - 차단된 시도(`DENY`/`REQUIRE_APPROVAL`)도 Evidence로 기록된다 (Track B `record_blocked_action` + Track A 배선).
 - Risk 기반 승인은 Tool Registry의 `risk_level`을 읽어 동작한다 (§2.1).
-- 검증: `pytest -q` 910 passed, `ruff`·`mypy` 통과.
+- 검증: `pytest -q` 929 passed, 2 skipped, 2 xfailed; `ruff check src tests examples`·`mypy src/redteam` 통과.
 
 **아직 열려 있는 것**
 - 승인 임계값의 Engagement별 설정 (§5).
-- Raw Evidence 저장 구조 — `ArtifactStore` 포트와 `ToolResult` artifact 참조 (§5).
-- Audit 추적 체인 검증 (§1 작업 #10).
+- Raw Evidence 공통 연결 — 공통 Artifact 포트, 저장 결과 Contract, ToolResult 전달 규격, 실제 Tool 실행 및 Finding/Reporter 연결 (§5). Track B 내부 `ArtifactBackend`는 완료.
+- Audit → 실행 Tool·Invocation·생성 Evidence 연결 및 검증 (§1 Track B 작업 #9).
 - ROE `prohibited_techniques`: 기법 분류 체계가 없어서, 설정되면 조용히 무시하지 않고 명시적으로 실패한다 (`UnsupportedRoePolicyError`).
 
 
@@ -213,12 +213,11 @@ DENY할 때 **왜 막혔는지에 따라 에이전트의 다음 행동이 달라
 | 항목 | 필요할 때 | 대안 (변경 없음) / 상태 |
 |---|---|---|
 | **`ApprovalPolicy`에 risk 승인 임계값 필드** | Engagement마다 "어느 risk부터 승인"을 다르게 하고 싶을 때 | 지금은 코드의 임시 기본값 `HIGH`. **설계 논의 필요** (Passive/Active/Intrusive ↔ `RiskLevel` 매핑, 후보 도구가 여러 개일 때 기준) |
-| **`ArtifactStore` 포트 + `ToolResult`의 artifact 참조 필드** | Raw Evidence(HTTP 응답, HAR 등 관측 원본)를 별도 저장하고 `artifact_ref`/`digest`로 연결할 때 | 임시로 `ToolResult.metadata`에 참조를 담을 수 있음. 저장 책임은 원본이 생기는 Capability 쪽을 제안 |
+| **공통 Artifact 포트·저장 결과 Contract·ToolResult 전달 규격** | Raw Evidence를 실제 Tool 실행 및 Evidence에 연결할 때 | Track B 내부 `ArtifactBackend`는 완료. 저장 요청 책임과 실제 실행 연결은 PM 및 Capability/Orchestration 협의 대기 |
 | `PolicyVerdict`에 `ABORT`/`severity` | 심각도로 Run 종료 구분 | reasons/matched_rules 규약 사용 (권장) |
 | `ControlPlane` 포트에 `resolve_approval` | 오케스트레이션이 승인 해소 | control 모듈 내부 + CLI로 해소 |
 | `EvidenceStore` 포트에 조회 메서드 | hypothesis별 조회 등 | concrete store에만 추가 |
 | `EvidenceRecord.digest` 원본 재검증 규격 | 원본 payload 보존·검증이 필요할 때 | 현재는 저장 JSONL 줄의 해시만 인덱스와 대조. 원본 보존 방식은 PM과 결정 |
-| 공통 Artifact 포트/전달 규격 | Capability·Orchestration 실행 연결 시 | Track B 내부 Backend만 구현하고 실제 실행에는 미연결 |
 | Evidence Target 저장 규격 | Finding의 Target 연결 검증 시 | 공통 Target dict만 비교하고 표시 문자열은 검증 불가 처리 |
 
 **해결됨:** `ActionProposal.risk_level` 추가 요청은 필요 없어졌다. dev에 추가된 read-only `ToolGateway.list_tools_for_action`으로 Registry의 `risk_level`을 Contract 변경 없이 읽을 수 있다 (§2.1).
