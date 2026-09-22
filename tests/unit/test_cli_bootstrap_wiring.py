@@ -1,0 +1,183 @@
+"""CLI `run` must use the canonical `build_application()` path, never a
+CLI-only shortcut — the whole point of this task. These tests patch
+`build_application` itself and assert it (not `build_runtime_deps`) is
+what `commands.run` actually calls, with the configured LLM/MCP settings
+flowing through untouched.
+"""
+
+from __future__ import annotations
+
+import argparse
+from datetime import datetime, timezone
+from pathlib import Path
+from unittest.mock import AsyncMock
+
+import pytest
+
+from redteam.app.cli.commands import run as run_command
+from redteam.core.contracts.engagement import (
+    ApprovalPolicy,
+    Engagement,
+    EngagementScope,
+    ExecutionBudget,
+    RateLimitPolicy,
+)
+from redteam.core.enums import AgentPhase
+from redteam.core.ids import EngagementId, RunId
+from redteam.orchestration.state import RuntimeState
+from tests.fakes import build_test_application
+
+
+def _engagement_yaml(tmp_path: Path) -> Path:
+    path = tmp_path / "engagement.yaml"
+    path.write_text(
+        """
+name: "Wiring Test"
+scope:
+  allowed_hosts: ["a.local"]
+execution_budget:
+  max_actions: 1
+rate_limit_policy:
+  max_actions_per_minute: 10
+approval_policy:
+  require_approval_for: []
+""",
+        encoding="utf-8",
+    )
+    return path
+
+
+def _finished_runtime() -> RuntimeState:
+    return RuntimeState(
+        run_id=RunId("run_wiring"),
+        engagement_id=EngagementId("eng_wiring"),
+        phase=AgentPhase.FINISHED,
+        termination_reason="no_actionable_plan",
+        actions_executed=0,
+    )
+
+
+async def test_run_command_calls_build_application_not_build_runtime_deps(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engagement_path = _engagement_yaml(tmp_path)
+    engagement = Engagement(
+        engagement_id=EngagementId("eng_wiring"),
+        name="Wiring Test",
+        scope=EngagementScope(allowed_hosts=["a.local"]),
+        execution_budget=ExecutionBudget(max_actions=1),
+        rate_limit_policy=RateLimitPolicy(max_actions_per_minute=10),
+        approval_policy=ApprovalPolicy(),
+        created_at=datetime.now(timezone.utc),
+    )
+    deps = build_test_application()
+
+    build_application_mock = AsyncMock(return_value=(engagement, deps))
+    monkeypatch.setattr(run_command, "build_application", build_application_mock)
+    monkeypatch.setattr(
+        run_command,
+        "run_engagement",
+        AsyncMock(return_value=_finished_runtime()),
+    )
+    # commands.run doesn't even import build_runtime_deps -- the CLI-only
+    # dependency graph this task's section 1 explicitly disallows.
+    assert not hasattr(run_command, "build_runtime_deps")
+
+    args = argparse.Namespace(
+        engagement_path=str(engagement_path),
+        config_path=None,
+        non_interactive=True,
+        max_steps=None,
+        log_level=None,
+        json=False,
+    )
+    exit_code = await run_command.run(args)
+
+    assert exit_code == 0
+    build_application_mock.assert_awaited_once()
+    called_config = build_application_mock.await_args.args[0]
+    assert called_config.engagement.name == "Wiring Test"
+
+
+async def test_run_command_propagates_configured_llm_and_mcp_settings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A `--config app.yaml` with real llm/capability sections must reach
+    `build_application` unchanged -- not silently dropped/defaulted."""
+    engagement_path = _engagement_yaml(tmp_path)
+    app_config_path = tmp_path / "app.yaml"
+    app_config_path.write_text(
+        """
+llm:
+  provider: "litellm"
+  default_model: "gpt-4o-mini"
+capability:
+  mcp_servers: ["web-example"]
+""",
+        encoding="utf-8",
+    )
+
+    engagement = Engagement(
+        engagement_id=EngagementId("eng_wiring"),
+        name="Wiring Test",
+        scope=EngagementScope(allowed_hosts=["a.local"]),
+        execution_budget=ExecutionBudget(max_actions=1),
+        rate_limit_policy=RateLimitPolicy(max_actions_per_minute=10),
+        approval_policy=ApprovalPolicy(),
+        created_at=datetime.now(timezone.utc),
+    )
+    deps = build_test_application()
+    build_application_mock = AsyncMock(return_value=(engagement, deps))
+    monkeypatch.setattr(run_command, "build_application", build_application_mock)
+    monkeypatch.setattr(
+        run_command, "run_engagement", AsyncMock(return_value=_finished_runtime())
+    )
+
+    args = argparse.Namespace(
+        engagement_path=str(engagement_path),
+        config_path=str(app_config_path),
+        non_interactive=True,
+        max_steps=None,
+        log_level=None,
+        json=False,
+    )
+    await run_command.run(args)
+
+    called_config = build_application_mock.await_args.args[0]
+    assert called_config.llm.provider == "litellm"
+    assert called_config.llm.default_model == "gpt-4o-mini"
+    assert called_config.capability.mcp_servers == ["web-example"]
+
+
+async def test_run_command_fails_fast_on_bad_mcp_configuration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A configured-but-unreachable MCP server id must abort the run
+    (exit 2) -- never silently fall back to the ExampleMCPAdapter."""
+    from redteam.capability.settings import MCPConfigurationError
+
+    engagement_path = _engagement_yaml(tmp_path)
+    app_config_path = tmp_path / "app.yaml"
+    app_config_path.write_text('capability:\n  mcp_servers: ["broken-server"]\n', encoding="utf-8")
+
+    monkeypatch.setattr(
+        run_command,
+        "build_application",
+        AsyncMock(
+            side_effect=MCPConfigurationError(
+                "required environment variable REDTEAM_MCP_BROKEN_SERVER_KIND is not set"
+            )
+        ),
+    )
+
+    args = argparse.Namespace(
+        engagement_path=str(engagement_path),
+        config_path=str(app_config_path),
+        non_interactive=True,
+        max_steps=None,
+        log_level=None,
+        json=False,
+    )
+    exit_code = await run_command.run(args)
+
+    assert exit_code == 2  # EXIT_CONFIG_ERROR

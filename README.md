@@ -3,15 +3,26 @@
 ## Project Goal
 
 A multi-agent framework for **authorized security testing** engagements.
-This repository is currently a **skeleton**, not a finished product: the
-goal of this stage is a shared Repository structure, Core Schema,
-Interfaces, and dependency boundaries so 7 developers across 3 teams
-(Agent, Control, Capability) plus PM can build in parallel without
-breaking each other. See `instruction.md` for the full brief and
-`ARCHITECTURE.md` for the architecture decisions behind this layout.
+This repository started as a **skeleton** (shared Repository structure,
+Core Schema, Interfaces, and dependency boundaries so 7 developers
+across 3 teams — Agent, Control, Capability — plus PM could build in
+parallel without breaking each other) and has since grown real
+Capability-layer implementations on top of that skeleton. See
+`instruction.md` for the full brief and `ARCHITECTURE.md` for the
+architecture decisions behind this layout.
 
-No real exploit logic, payload databases, or attack-tool MCP servers
-are implemented at this stage.
+Capability tools today (`src/redteam/capability/servers/`) are
+policy-bounded wrappers around real tools — `nmap` (narrow TCP-connect
+port scan, no scripts, disabled by default), a live ZAP daemon (passive
+HAR capture only), `nuclei` (`-passive` mode, two fixed local checks, no
+arbitrary templates/DSL) — plus self-contained scoped HTTP/recon/proxy
+tools with no external binary. No payload databases, no general
+exploit/attack-technique library, and no unbounded tool invocation —
+every tool call is allowlisted per target/method/path by an
+operator-owned policy file and gated by the Control Plane before it can
+run at all. See `deploy/mcp/README.md` for the exact tool inventory and
+what's still a "candidate, not finalized" external MCP server (Mobile,
+Analysis) versus what's real and wired up (Web/API, Recon).
 
 ## Architecture
 
@@ -36,12 +47,19 @@ framework library. See `docs/architecture/overview.md` and
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -e ".[dev]"
+pip install -e ".[dev]"          # dev tooling + everything below except a real LLM provider
+pip install -e ".[dev,agent]"    # ...add `agent` for a real LLM provider too (one command)
 
-# Run the Minimal Vertical Slice end to end
-python -m redteam.app.cli run examples/engagement.yaml
-# or:
-python examples/minimal_run.py
+redteam                               # interactive: natural-language setup -> Preflight -> run
+# -- or the explicit/scripted path --
+redteam init                         # writes ./engagement.yaml
+redteam validate engagement.yaml     # schema/ROE/capability checks, no target touched
+redteam tools health                 # per-MCP-server health
+redteam tools list                   # every registered ToolDescriptor
+redteam run engagement.yaml          # the Minimal Vertical Slice end to end
+redteam status <run-id>
+redteam findings list <run-id>
+redteam report generate <run-id>
 
 # Tests
 pytest -q
@@ -51,9 +69,18 @@ ruff check src tests examples
 mypy src/redteam
 ```
 
-`LiteLLMClient` (`redteam.llm.litellm`) needs Python 3.11+ and the
-optional `llm` extra (`pip install -e ".[llm]"`) — the base install and
-everything else works on 3.10+, using `FakeLLMClient` by default.
+`redteam` is the installed console script (`pyproject.toml`
+`[project.scripts]`); `python -m redteam.app.cli ...` works identically.
+See "CLI" below for the full command reference, including
+`--config app.yaml` (real LLM provider + real MCP servers) and the
+Approval workflow (`redteam approvals approve/deny`).
+
+`LiteLLMClient` (`redteam.llm.litellm`) needs the optional `llm` extra
+(`pip install -e ".[llm]"`) to use a real LLM provider — it installs and
+imports fine on this project's 3.10+ floor (verified directly; an older
+`litellm` release once needed 3.11+, current ones don't). The base
+install and everything else works on 3.10+ using `FakeLLMClient` by
+default without it.
 
 ## Repository Structure
 
@@ -173,12 +200,18 @@ Approval) intact; see `src/redteam/control/service.py`.
 
 ## How to Add an MCP Server
 
-1. Implement `MCPAdapter` (`src/redteam/capability/adapters/mcp/base.py`)
-   for it under `src/redteam/capability/adapters/mcp/`.
+1. Choose `WebAPIMCPAdapter`, `MobileMCPAdapter`, `ReconMCPAdapter`, or
+   `AnalysisMCPAdapter`. All four support Streamable HTTP and local stdio;
+   implement `MCPAdapter`
+   (`src/redteam/capability/adapters/mcp/base.py`) for a server needing
+   custom normalization.
 2. Add its container to `deploy/compose/docker-compose.yml` following
    the `mcp-example` naming/health-check pattern (see `deploy/mcp/README.md`).
-3. Register its `ToolDescriptor`s and the adapter instance in
-   `redteam.app.bootstrap.build_runtime_deps`.
+3. Call `discover_tools()`, atomically register the returned snapshot
+   with `MCPToolRegistry.replace_server_tools`. For application startup,
+   add the server ID to `CapabilityConfig.mcp_servers` and configure the
+   the transport-specific `REDTEAM_MCP_<SERVER_ID>_*` variables documented in
+   `deploy/mcp/README.md`.
 
 No other code changes — that's the point of the Adapter pattern.
 
@@ -190,3 +223,157 @@ pytest tests/unit -q         # unit
 pytest tests/contract -q     # Pydantic schema/contract tests
 pytest tests/integration -q  # end-to-end vertical slice
 ```
+
+## CLI
+
+`redteam` (`src/redteam/app/cli/`) is a thin interface: argument parsing,
+one call into `redteam.app.bootstrap`/`redteam.control`/`redteam.capability`,
+then rendering + exit code. No ROE/Scope/Tool-selection/Approval decision
+is made in this package — `redteam run` is the only command that reaches
+the domain layer, and it always goes through the canonical
+`app.bootstrap.build_application(AppConfig)` path (real configured LLM
+provider, real configured MCP servers, real Control Plane) — never a
+CLI-only shortcut. Every other command reads durable state directly
+(Approval/Audit/Evidence stores, or the persisted terminal report — see
+`redteam.app.report_store`).
+
+### Interactive setup (`redteam`, no subcommand)
+
+```bash
+redteam
+```
+
+No YAML, no flags: this reads `engagement.yaml`/`app.yaml` from the
+current directory if they exist (offering `Start`/`Edit`/`New`/`Quit`),
+or starts a natural-language setup ("어떤 대상을 테스트하려고 하나요?")
+if they don't. `Edit` re-opens the same conversation on the existing
+config and patches only what you ask to change — it never regenerates
+scope/ROE from scratch. Either way you land on a Preflight screen
+(target/scope/focus/budget, enforced ROE vs. documented-only notes,
+LLM/config/scope/MCP status) before anything executes, and `Enter`
+there hands off to the *exact same* `build_application`/`run_engagement`
+path `redteam run` uses below — nothing is re-implemented for this mode.
+
+The natural-language layer is `redteam.intake` (the **Engagement Intake
+Assistant**), a distinct role from the Orchestrator:
+
+```text
+Intake Assistant  = prepares an Engagement (collect/structure/validate)
+Orchestrator      = executes one (plan/act/verify) -- unchanged by this
+```
+
+It reuses the same `LLMClient`/LiteLLM wiring as everything else (a
+different system prompt, not a new provider), and it never produces raw
+YAML itself — the model only ever returns a structured, temporary
+`EngagementDraft`; code (`redteam.intake.serializer`) converts a
+*complete* draft into the real `EngagementConfig`/`RuleOfEngagement`
+models and serializes those. Scope is never widened beyond what a draft
+explicitly states (the merge is field-level replace-or-keep, not an
+LLM-driven union), and a restriction that doesn't map onto a real
+enforced field (`denied_capabilities`/`denied_operations`/
+`availability_impact_allowed`) is recorded as a plainly-labeled
+"documented only, not enforced" note rather than silently trusted.
+Secrets (API keys) are collected by the CLI directly (`getpass`, stored
+in `.env`) — the Intake Assistant's schema has no field that could carry
+one, by construction.
+
+`--verbose` shows internal ids/metadata (`action_id`, `candidate_key`,
+`priority_components`, ...) alongside each human-readable event line;
+the default view hides them. This mode is purely additive: every
+`redteam run ...` invocation below is completely unchanged and remains
+the automation/CI-safe, non-interactive entrypoint.
+
+### Config
+
+```bash
+redteam run engagement.yaml                    # AppConfig = engagement only, FakeLLMClient, no MCP servers
+redteam run engagement.yaml --config app.yaml   # AppConfig = engagement + app.yaml's llm/orchestration/capability/logging
+```
+
+`app.yaml` is the `AppConfig` shape (`examples/app.yaml`) minus its own
+`engagement:` key — the positional `engagement.yaml` is always
+authoritative for scope/ROE, so there is exactly one place to look for
+it. `LLM_API_KEY`/MCP secrets still come from the process environment
+(`.env.example`) — this CLI does not parse `.env` itself, matching the
+"copy to `.env` and source it before running" convention that file
+already documents. Using `llm.provider: litellm` needs the `agent`
+extra installed (`pip install -e ".[agent]"`) — see Quick Start.
+
+An empty (or omitted) `capability.mcp_servers` is not an error: `run`,
+`tools list` and `tools health` all fall back to the in-process
+`ExampleMCPAdapter` and print an explicit `WARNING` to stderr every time
+they do — development/test only, never a silent difference from a real
+MCP-backed run. A *configured but broken* MCP server (bad/missing
+`REDTEAM_MCP_<ID>_*` env vars) fails the command instead
+(`MCPConfigurationError`, exit 2) — see `redteam validate` to catch this
+before `run`.
+
+### Commands
+
+```bash
+redteam [--verbose]                               # interactive setup/Preflight/run -- see above
+redteam init [--output engagement.yaml]          # write a starter Engagement config (from examples/engagement.yaml)
+redteam validate engagement.yaml [--config app.yaml] [--json]
+                                                   # schema/scope/ROE/capability checks -- never touches a target
+redteam run engagement.yaml [--config app.yaml] [--non-interactive] [--max-steps N] [--json]
+redteam status <run-id> [--json]                  # from the persisted terminal report; "unknown" if still running elsewhere
+redteam roe show engagement.yaml [--json]
+redteam tools list [--config app.yaml engagement.yaml] [--json]
+redteam tools health [--config app.yaml engagement.yaml] [--json]
+redteam approvals list [--run <run-id>] [--json]
+redteam approvals approve <approval-id> [--by <name>]
+redteam approvals deny <approval-id> [--by <name>]
+redteam approvals resolve <approval-id> approved|rejected --by <name>   # lower-level; approve/deny wrap this
+redteam approvals expire --ttl-seconds <n>
+redteam findings list <run-id> [--json]
+redteam report generate <run-id> [--format md|json] [--output-dir reports]
+redteam evidence verify --run <run-id>            # pre-existing, kept as-is
+redteam evidence purge --days <n>                 # pre-existing, kept as-is
+```
+
+### `--non-interactive` and the Approval workflow
+
+A `REQUIRE_APPROVAL` decision never auto-approves, `--non-interactive` or
+not. The difference is what happens next:
+
+- **default (interactive):** `run` prints the pending Approval, then
+  polls (`AgentLoopRunner.reconcile_once`, the same reconciliation
+  primitive a host loop would use) until a human resolves it from
+  another terminal, then resumes **the same Run** — no new Run, no new
+  Action, `RunId`/`ActionId`/`ApprovalId` all unchanged. Ctrl+C stops
+  watching (exit 130) without losing the pending Approval; there is no
+  `resume` command in this v1 to reconnect afterwards — keep the
+  interactive `run` alive, or check back with `redteam status`.
+- **`--non-interactive`:** stops at `APPROVAL_PENDING` immediately and
+  exits 0 (a correct policy outcome, not a CLI failure — see Exit codes
+  below). `redteam approvals approve/deny` still resolves the Approval
+  durably, but nothing resumes that specific Run afterward in v1.
+
+```bash
+redteam approvals approve appr_abc123
+# Approval: appr_abc123
+# Run: run_xyz
+# Action: web.file_upload
+# Target: {...}
+# Reason: ...
+# appr_abc123 -> approved (by yuyechan)
+```
+
+### Exit codes
+
+```text
+0 = success (including a correct ROE/Scope DENY, or a still-pending Approval)
+1 = a run/command genuinely failed (crash, unreachable MCP mid-run, etc.)
+2 = configuration/argument error (bad YAML, unknown ROE operation, bad MCP config, bad CLI args)
+130 = interrupted (Ctrl+C)
+```
+
+### `--json`
+
+Every command supports `--json` where it produces structured output.
+`redteam run --json` streams JSON Lines (one compact object per event,
+matching this project's own `.jsonl` evidence/audit file convention) —
+every other `--json` command prints one JSON document. Logs and warnings
+always go to stderr, so stdout stays parseable either way. Known-secret
+key names (tokens, API keys, passwords, ...) are redacted in every
+output mode, matching `redteam.control.audit.redact_arguments`.
