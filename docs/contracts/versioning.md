@@ -57,7 +57,7 @@ A Contract Change Proposal should say, at minimum:
 
 Do not bundle a contract change into a PR that also contains your
 team's feature work — split it so PM can review the contract change in
-isolation.
+isolation (see `CONTRIBUTING.md`).
 
 ## Precedent from this pass
 

@@ -12,13 +12,10 @@ scope:
   denied_hosts: []
 
 rules_of_engagement:
-  # ROE is now enforced by redteam.control.roe. This prototype rule sets
-  # no restrictions so the vertical slice runs at any time / timezone.
-  # To exercise enforcement, add denied_capabilities/denied_operations
-  # (canonical "<capability>.<operation>" keys), allowed_* lists, or
-  # start_at/end_at/allowed_time_windows — see docs/contracts/actions.md.
-  - name: "prototype-open"
-    description: "No restrictions; keeps the demo green regardless of clock."
+  - name: "business-hours-only"
+    description: "Placeholder ROE — not enforced yet, see control/service.py TODO."
+    allowed_time_windows: ["09:00-18:00"]
+    prohibited_techniques: []
 
 execution_budget:
   max_actions: 5

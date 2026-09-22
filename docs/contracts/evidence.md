@@ -36,10 +36,8 @@ class EvidenceRecord(BaseModel):
 (`<root>/<run_id>.jsonl`) and only ever appends via `EvidenceStore.append`
 — no in-place rewrite. `digest` is a SHA-256 of the source payload
 (`redteam.core.convert.digest_payload`), so downstream consumers can
-verify a record wasn't altered after the fact. Verification itself is
-real, not a TODO: `FilesystemEvidenceStore.verify_run_integrity` recomputes
-every record's digest and flags changed/missing/unindexed ones, exposed
-as `redteam evidence verify --run <run-id>`.
+verify a record wasn't altered after the fact (verification itself is a
+TODO).
 
 ## Producing evidence from a ToolResult
 

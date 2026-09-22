@@ -39,16 +39,14 @@ GraphUpdated
 FindingCreated        FindingVerified
 ```
 
-**Current status**: every event above is emitted by the corresponding
-runtime path when its condition is met, including `AgentFinished`,
-`HypothesisCreated`, and evidence-gated `FindingCreated`/`FindingVerified`.
-The latter still requires a verified violation with evidence and a
-confirmed hypothesis; observation-only results do not emit a Finding.
-Agent-owned lifecycle extensions such as `CandidateRejected`,
-`GraphMutationApplied`, `ResultMapperFailed`, `HypothesisResolved`, and
-`ReplanTriggered` are documented in `docs/agent/event-bus.md` and remain
-plain `EventEnvelope.event_type` strings so the frozen Core vocabulary is
-not changed.
+Only `RunStarted`, `AgentStarted`, `ActionProposed`, `PolicyEvaluated`,
+`ActionApproved`/`ActionDenied`/`ApprovalRequired`,
+`ToolExecutionStarted`/`ToolExecutionFinished`/`ToolExecutionFailed`,
+`EvidenceCreated`, `GraphUpdated`, and `RunFinished` are emitted by the
+current stub flow. `AgentFinished`, `HypothesisCreated`,
+`FindingCreated`, `FindingVerified` aren't yet (no real agent-lifecycle/
+hypothesis/finding logic) — reserved for Agent Team's planner work; the
+vocabulary is fixed by PM so there's nothing to invent when that lands.
 
 ## Subscribing
 

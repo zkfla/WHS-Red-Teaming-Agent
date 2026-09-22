@@ -45,15 +45,8 @@ class GraphEdge(BaseModel):
 Fields are `id`/`type` (not `node_id`/`node_type` or
 `edge_id`/`edge_type`) — matches instruction.md section 16 exactly.
 `Hypothesis` and `Finding` are separate lightweight models (also under
-`redteam.core.contracts.graph`). **Current status**: `Hypothesis` nodes
-are real and produced in every run that proposes a step with a
-`HypothesisDraft` (`AttackGraphService.record_hypothesis`, called from
-`orchestration.nodes.plan`) — every built-in playbook step does.
-`Finding` nodes are still never produced: that requires a step's
-`Expectation` to reach `Verdict.VIOLATION`, which no built-in playbook
-step's `Expectation` is configured to do — see
-`docs/agent/orchestration-implementation-plan.md` section 16.1, finding
-1, not a missing code path.
+`redteam.core.contracts.graph`) — reserved for Agent Team's planner
+work; not yet produced by the stub flow.
 
 ## Store Protocol
 
