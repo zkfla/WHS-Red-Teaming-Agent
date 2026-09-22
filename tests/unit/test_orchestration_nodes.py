@@ -10,6 +10,7 @@ import pytest
 from redteam.attack_graph.predicates import attrs_of, facts_of
 from redteam.attack_graph.service import (
     HYPOTHESIS_CONFIRMED,
+    HYPOTHESIS_INCONCLUSIVE,
     HYPOTHESIS_OPEN,
     HYPOTHESIS_REJECTED,
     AttackGraphService,
@@ -19,11 +20,12 @@ from redteam.core.contracts.events import EventType
 from redteam.core.contracts.graph import Hypothesis
 from redteam.core.contracts.target import HostTarget
 from redteam.core.contracts.tool import ToolError, ToolResult
-from redteam.core.enums import AgentPhase, GraphNodeType, PolicyVerdict, Verdict
+from redteam.core.enums import AgentPhase, GraphEdgeType, GraphNodeType, PolicyVerdict, Verdict
 from redteam.core.ids import (
     ActionId,
     AgentId,
     EngagementId,
+    EvidenceId,
     GraphNodeId,
     HypothesisId,
     InvocationId,
@@ -34,6 +36,14 @@ from redteam.event_bus.memory import InMemoryEventBus
 from redteam.orchestration.agents import AgentRegistry, AgentSpec, HypothesisDraft, PlanStep
 from redteam.orchestration.agents.registry import RECON_AGENT
 from redteam.orchestration.candidates.compiler import CandidateCompiler
+from redteam.orchestration.events import (
+    CANDIDATE_GENERATED,
+    CANDIDATE_REJECTED,
+    GRAPH_MUTATION_APPLIED,
+    HYPOTHESIS_RESOLVED,
+    OBSERVATION_RECORDED,
+    REPLAN_TRIGGERED,
+)
 from redteam.orchestration.expectations import Expectation
 from redteam.orchestration.nodes import (
     execute_node,
@@ -201,8 +211,11 @@ async def test_plan_states_a_hypothesis_before_it_acts() -> None:
     assert route_after_plan(state) == "policy"
 
     types = d.event_bus.event_types()
+    # CandidateGenerated is published for the compiled frontier before the
+    # hypothesis/action pair, so it belongs in the same ordered assertion.
     assert types == [
         EventType.AGENT_STARTED,
+        CANDIDATE_GENERATED,
         EventType.HYPOTHESIS_CREATED,
         EventType.ACTION_PROPOSED,
     ]
@@ -239,6 +252,36 @@ async def test_plan_warns_when_an_activated_agent_gets_zero_executable_candidate
 
     assert state["action_proposal"] is None
     assert AGENT_NO_EXECUTABLE_CANDIDATES in d.event_bus.event_types()
+    summary = d.event_bus.history(event_type=AGENT_NO_EXECUTABLE_CANDIDATES)[0].payload
+    assert summary["total_drafts"] >= 1
+    assert summary["rejected_count"] >= 1
+    assert summary["rejection_reason_summary"]["capability_unavailable"] >= 1
+
+
+async def test_plan_reports_a_prior_terminal_candidate_once_per_planning_turn() -> None:
+    d = deps()
+    await seeded(d, "a.local")
+    observed = await observe_node(initial_graph_state(runtime()), deps=d)
+    planned = await plan_node(observed, deps=d)
+    work_id = planned["current_work_id"]
+    assert work_id is not None
+    assert await d.work_store.complete(
+        work_id,
+        owner=str(RUN),
+        status=WorkStatus.SUCCEEDED,
+        now=datetime.now(timezone.utc),
+    )
+
+    again = await plan_node(observed, deps=d)
+
+    assert again["action_proposal"] is None
+    prior = [
+        event
+        for event in d.event_bus.history(event_type=CANDIDATE_REJECTED)
+        if event.payload["reason"] == "prior_terminal_execution"
+    ]
+    assert len(prior) == 1
+    assert prior[0].payload["candidate_key"]
 
 
 async def test_plan_without_a_hypothesis_still_proposes() -> None:
@@ -440,10 +483,19 @@ async def test_verify_records_evidence_then_reaches_a_verdict() -> None:
     assert d.evidence_store.records[0].action_id == ActionId("action_1")
     assert result["runtime"].last_verdict is Verdict.PASS
     assert await hypothesis_status(service, "hyp_1") == HYPOTHESIS_REJECTED
-    assert d.event_bus.event_types() == [EventType.EVIDENCE_CREATED]
+    assert d.event_bus.event_types() == [EventType.EVIDENCE_CREATED, HYPOTHESIS_RESOLVED]
+    assert (
+        d.event_bus.history(event_type=HYPOTHESIS_RESOLVED)[0].payload["status"]
+        == HYPOTHESIS_REJECTED
+    )
 
 
-async def test_a_failed_execution_leaves_the_hypothesis_open() -> None:
+async def test_a_failed_execution_without_a_follow_up_closes_the_hypothesis() -> None:
+    # R7: an open hypothesis must correspond to a verification that can still
+    # run. A non-repeatable step is permanently deduplicated by the Work
+    # Ledger once terminal, so there is no follow-up left to ask -- the
+    # question closes inconclusive with a traceable reason instead of
+    # parking the run on something nothing will ask again.
     d = deps()
     service = AttackGraphService(d.graph_store)
     await service.record_hypothesis(Hypothesis(hypothesis_id="hyp_1", description="reachable"))
@@ -457,7 +509,33 @@ async def test_a_failed_execution_leaves_the_hypothesis_open() -> None:
     result = await verify_node(state, deps=d)
 
     assert result["runtime"].last_verdict is Verdict.UNKNOWN
+    assert await hypothesis_status(service, "hyp_1") == HYPOTHESIS_INCONCLUSIVE
+    assert (
+        d.event_bus.history(event_type=HYPOTHESIS_RESOLVED)[0].payload["reason"]
+        == "no_follow_up_verification_available"
+    )
+
+
+async def test_a_failed_execution_keeps_a_repeatable_hypothesis_open() -> None:
+    # The complementary half of R7: when a real follow-up verification can
+    # still run, the question stays open rather than being closed early.
+    d = deps()
+    service = AttackGraphService(d.graph_store)
+    await service.record_hypothesis(Hypothesis(hypothesis_id="hyp_1", description="reachable"))
+    state = state_with(
+        runtime(),
+        action_proposal=proposal(hypothesis_id=HypothesisId("hyp_1")),
+        tool_result=tool_result(success=False),
+        plan_step=RECON_AGENT.playbook[0].model_copy(update={"repeatable": True}),
+    )
+
+    await verify_node(state, deps=d)
+
     assert await hypothesis_status(service, "hyp_1") == HYPOTHESIS_OPEN
+    assert (
+        d.event_bus.history(event_type=HYPOTHESIS_RESOLVED)[0].payload["status"]
+        == HYPOTHESIS_OPEN
+    )
 
 
 async def test_a_violation_produces_a_verified_finding_backed_by_evidence() -> None:
@@ -497,6 +575,7 @@ async def test_a_violation_produces_a_verified_finding_backed_by_evidence() -> N
     assert await hypothesis_status(service, "hyp_1") == HYPOTHESIS_CONFIRMED
     assert d.event_bus.event_types() == [
         EventType.EVIDENCE_CREATED,
+        HYPOTHESIS_RESOLVED,
         EventType.FINDING_CREATED,
         EventType.FINDING_VERIFIED,
     ]
@@ -553,7 +632,7 @@ _HTTP_PROBE_OUTPUT = {
     "target_ref": "a.local",
     "status_code": 200,
     "body_bytes": 42,
-    "body_sha256": "deadbeef",
+    "body_sha256": "a" * 64,
     "redirect": False,
     "security_headers_present": {"strict-transport-security": False},
     "body_omitted": True,
@@ -577,7 +656,7 @@ async def test_update_discovers_service_and_endpoint_from_a_successful_http_prob
 
     service_node = await node_at(service, "service:a.local/http")
     assert attrs_of(service_node.properties) == {"responded": True}
-    assert facts_of(service_node.properties)["scheme"] == "http"
+    assert facts_of(service_node.properties)["application_protocol"] == "http"
 
     endpoint_node = await node_at(service, "endpoint:a.local GET /")
     assert attrs_of(endpoint_node.properties) == {"status_code": 200, "redirect": False}
@@ -590,8 +669,11 @@ async def test_update_discovers_service_and_endpoint_from_a_successful_http_prob
 
     # Case E: the pre-existing single-event assertion's *sibling* still
     # holds -- the host-attrs write happens exactly as before, this is
-    # additive (three more GRAPH_UPDATED events, one per discovered node).
-    assert d.event_bus.event_types() == [EventType.GRAPH_UPDATED] * 3
+    # additive: three more GRAPH_UPDATED events (one per discovered node)
+    # plus the GraphMutationApplied summary for that batch.
+    assert d.event_bus.event_types() == [EventType.GRAPH_UPDATED] * 3 + [
+        GRAPH_MUTATION_APPLIED
+    ]
 
 
 async def test_update_processing_the_same_probe_result_twice_does_not_duplicate_nodes() -> None:
@@ -647,6 +729,133 @@ async def test_update_ignores_malformed_probe_output_without_crashing() -> None:
 
     nodes = await service.list_nodes()
     assert all(n.type is GraphNodeType.HOST for n in nodes)
+
+
+_HTML_INVENTORY_OUTPUT = {
+    "target_ref": "bank",
+    "references": [
+        {
+            "kind": "a",
+            "path": "/accounts/123",
+            "method": "GET",
+            "query_omitted": False,
+            "fragment_omitted": False,
+            "path_allowlisted": True,
+        }
+    ],
+    "reference_limit": 200,
+    "references_truncated": False,
+    "omitted_references": 0,
+    "base_element_present": False,
+    "decoding_replacements": False,
+    "references_followed": False,
+    "javascript_executed": False,
+    "source_untrusted": True,
+    "verdict": "observation_only",
+    "source_sha256": "a" * 64,
+    "request_count": 1,
+}
+
+
+async def test_inventory_update_merges_nodes_and_keeps_evidence_backed_history() -> None:
+    d = deps()
+    graph = AttackGraphService(d.graph_store)
+    first_proposal = proposal().model_copy(
+        update={"arguments": {"target_ref": "bank", "path": "/"}}
+    )
+    first = state_with(
+        runtime(step_count=1),
+        action_proposal=first_proposal,
+        tool_result=tool_result(
+            output=_HTML_INVENTORY_OUTPUT,
+            tool_id="recon.html_inventory",
+        ),
+        result_evidence_id=EvidenceId("ev_html_1"),
+        plan_step=RECON_AGENT.playbook[0],
+    )
+    await update_node(first, deps=d)
+
+    second_proposal = proposal().model_copy(
+        update={"arguments": {"target_ref": "bank", "path": "/index"}}
+    )
+    second = merged(
+        first,
+        runtime=runtime(step_count=2),
+        action_proposal=second_proposal,
+        result_evidence_id=EvidenceId("ev_html_2"),
+    )
+    await update_node(second, deps=d)
+
+    endpoint = await node_at(graph, "endpoint:a.local GET /accounts/{id}")
+    endpoint_facts = facts_of(endpoint.properties)
+    assert endpoint_facts["evidence_ids"] == ["ev_html_1", "ev_html_2"]
+    assert {item["source_path"] for item in endpoint_facts["observations"]} == {
+        "/",
+        "/index",
+    }
+    assert {item["evidence_id"] for item in endpoint_facts["observations"]} == {
+        "ev_html_1",
+        "ev_html_2",
+    }
+    endpoints = [
+        node for node in await graph.list_nodes() if node.type is GraphNodeType.ENDPOINT
+    ]
+    assert len(endpoints) == 1
+    observed_edges = [
+        edge for edge in await graph.list_edges() if edge.type is GraphEdgeType.OBSERVED
+    ]
+    assert len(observed_edges) == 1
+
+
+async def test_proxy_update_attaches_evidence_to_each_captured_flow_observation() -> None:
+    d = deps()
+    graph = AttackGraphService(d.graph_store)
+    flow_ref = "flow_0123456789abcdef"
+    proxy_proposal = proposal().model_copy(
+        update={"arguments": {"target_ref": "bank", "limit": 10}}
+    )
+    proxy_output = {
+        "flows": [
+            {
+                "flow_ref": flow_ref,
+                "target_ref": "bank",
+                "method": "GET",
+                "path": "/accounts/123",
+                "request_json_fields": [],
+                "request_body_omitted": False,
+                "captured_response": {
+                    "status_code": 200,
+                    "body_bytes": 17,
+                    "body_sha256": "a" * 64,
+                    "redirect": False,
+                    "security_headers_present": {
+                        "strict-transport-security": True,
+                        "content-security-policy": False,
+                        "x-content-type-options": True,
+                        "cache-control": False,
+                    },
+                    "body_omitted": True,
+                },
+            }
+        ],
+        "may_be_truncated": False,
+    }
+    state = state_with(
+        runtime(step_count=1),
+        action_proposal=proxy_proposal,
+        tool_result=tool_result(output=proxy_output, tool_id="web.proxy_list_flows"),
+        result_evidence_id=EvidenceId("ev_proxy_1"),
+        plan_step=RECON_AGENT.playbook[0],
+    )
+
+    await update_node(state, deps=d)
+
+    endpoint = await node_at(graph, "endpoint:a.local GET /accounts/{id}")
+    endpoint_facts = facts_of(endpoint.properties)
+    assert endpoint_facts["evidence_ids"] == ["ev_proxy_1"]
+    assert endpoint_facts["observations"][0]["evidence_id"] == "ev_proxy_1"
+    assert endpoint_facts["observations"][0]["captured_response"]["status_code"] == 200
+    assert all(node.type is not GraphNodeType.FINDING for node in await graph.list_nodes())
 
 
 async def test_discovered_service_and_endpoint_activate_the_web_api_agent() -> None:
@@ -744,3 +953,251 @@ async def test_every_hard_stop_names_itself(state_kwargs, settings, expected) ->
 
     assert result["runtime"].phase is AgentPhase.FINISHED
     assert result["runtime"].termination_reason == expected
+
+
+# -- P0-4 / P1-1 / P1-3: the feedback seams, reached through the nodes -------
+
+
+def observation_step(**overrides) -> PlanStep:
+    values: dict[str, Any] = {
+        "step_id": "inspect",
+        "capability": "web",
+        "operation": "http_request",
+        "tool_id": ToolId("web.http_client"),
+        "target": HostTarget(host="a.local"),
+        "reason": "record what the endpoint answers",
+        "assessment_kind": "observation",
+        "expectation": Expectation(
+            kind="output_field_equals",
+            field="status",
+            value=200,
+            violation_if_met=True,
+        ),
+    }
+    values.update(overrides)
+    return PlanStep(**values)
+
+
+async def test_an_observation_only_step_never_becomes_a_finding() -> None:
+    # Even an expectation that would be a violation cannot promote an
+    # observation: assessment_kind=observation means no security claim was
+    # under test in the first place.
+    d = deps()
+    service = AttackGraphService(d.graph_store)
+    await service.record_hypothesis(Hypothesis(hypothesis_id="hyp_1", description="reachable"))
+    state = state_with(
+        runtime(),
+        action_proposal=proposal(hypothesis_id=HypothesisId("hyp_1")),
+        tool_result=tool_result(output={"status": 200}),
+        plan_step=observation_step(),
+    )
+
+    result = await verify_node(state, deps=d)
+
+    assert result["runtime"].last_verdict is Verdict.UNKNOWN
+    assert await service.list_findings(verified=True) == []
+    assert OBSERVATION_RECORDED in d.event_bus.event_types()
+    assert EventType.FINDING_CREATED not in d.event_bus.event_types()
+
+
+async def test_a_violation_with_no_hypothesis_under_test_is_refused_observably() -> None:
+    d = deps()
+    state = state_with(
+        runtime(),
+        action_proposal=proposal(),  # no hypothesis was stated before acting
+        tool_result=tool_result(output={"status": 200}),
+        plan_step=observation_step(assessment_kind="security_check"),
+    )
+
+    result = await verify_node(state, deps=d)
+
+    assert result["runtime"].last_verdict is Verdict.UNKNOWN
+    assert d.event_bus.history(event_type=EventType.FINDING_CREATED) == []
+    assert (
+        d.event_bus.history(event_type=OBSERVATION_RECORDED)[-1].payload[
+            "finding_promotion_refused"
+        ]
+        == "no_hypothesis_under_test"
+    )
+
+
+async def test_plan_reports_a_step_that_cannot_fill_its_graph_arguments() -> None:
+    # The web playbook can inspect a SERVICE, but a ServiceTarget has no path
+    # and $path must never be guessed. Previously that step simply vanished;
+    # now the drop names itself.
+    d = deps()
+    service = await seeded(d, "a.local")
+    await service.upsert_node(
+        GraphNodeType.SERVICE,
+        key="a.local/http",
+        attrs={"responded": True},
+        facts={"scheme": "http", "host": "a.local"},
+    )
+    state = await observe_node(
+        initial_graph_state(runtime(current_agent=AgentId("web-api-agent"))), deps=d
+    )
+
+    await plan_node(state, deps=d)
+
+    rejected = d.event_bus.history(event_type=CANDIDATE_REJECTED)
+    assert [(item.payload["reason"], item.payload["field"]) for item in rejected] == [
+        ("graph_prerequisite_missing", "path")
+    ]
+    assert rejected[0].payload["operation"] == "inspect-http-service"
+
+
+class _ProviderStub:
+    """A candidate provider that returns exactly the batch it was given."""
+
+    declared_operations: tuple[tuple[str, str], ...] = ()
+
+    def __init__(self, batch) -> None:
+        self._batch = batch
+
+    async def propose_graph(self, spec, context):
+        return self._batch
+
+
+def _providers_with_web(replacement):
+    from redteam.orchestration.agents.providers import (
+        CandidateProviderRegistry,
+        PlaybookCandidateProvider,
+    )
+
+    return CandidateProviderRegistry(
+        [
+            ("playbook:recon", PlaybookCandidateProvider()),
+            ("playbook:web_api", replacement),
+            ("playbook:mobile", PlaybookCandidateProvider()),
+        ]
+    )
+
+
+async def test_a_drop_only_frontier_is_reported_as_no_executable_candidates() -> None:
+    # The web playbook matched a real SERVICE but cannot fill its path, so it
+    # produced a drop and no draft at all. Nothing executable came out, and
+    # the reason must not stay silent just because drafts happened to be 0.
+    from redteam.orchestration.events import AGENT_NO_EXECUTABLE_CANDIDATES
+
+    d = deps()
+    service = await seeded(d, "a.local")
+    await service.upsert_node(
+        GraphNodeType.SERVICE,
+        key="a.local/http",
+        attrs={"responded": True},
+        facts={"scheme": "http", "host": "a.local"},
+    )
+    state = await observe_node(
+        initial_graph_state(runtime(current_agent=AgentId("web-api-agent"))), deps=d
+    )
+
+    await plan_node(state, deps=d)
+
+    summary = d.event_bus.history(event_type=AGENT_NO_EXECUTABLE_CANDIDATES)[0].payload
+    assert summary["total_drafts"] == 0
+    assert summary["drafts_offered"] == 0
+    assert summary["dropped_count"] >= 1
+    assert summary["rejected_count"] == summary["dropped_count"]
+    assert summary["rejection_reason_summary"]["graph_prerequisite_missing"] >= 1
+
+
+async def test_a_diagnostic_only_provider_is_reported_as_no_executable_candidates() -> None:
+    from redteam.core.ids import GraphNodeId
+    from redteam.orchestration.agents.providers import (
+        CandidateBatch,
+        CandidateDiagnostic,
+    )
+    from redteam.orchestration.events import AGENT_NO_EXECUTABLE_CANDIDATES
+
+    batch = CandidateBatch(
+        candidates=[],
+        diagnostics=[
+            CandidateDiagnostic(
+                target_node_id=GraphNodeId("endpoint:a.local GET /"),
+                reason="no_registered_session_for_path",
+                evidence_id="ev_diag",
+            )
+        ],
+    )
+    d = deps(candidate_providers=_providers_with_web(_ProviderStub(batch)))
+    service = await seeded(d, "a.local")
+    await service.upsert_node(
+        GraphNodeType.SERVICE,
+        key="a.local/http",
+        attrs={"responded": True},
+        facts={"scheme": "http", "host": "a.local"},
+    )
+    state = await observe_node(
+        initial_graph_state(runtime(current_agent=AgentId("web-api-agent"))), deps=d
+    )
+
+    await plan_node(state, deps=d)
+
+    summary = d.event_bus.history(event_type=AGENT_NO_EXECUTABLE_CANDIDATES)[0].payload
+    assert summary["total_drafts"] == 0
+    assert summary["dropped_count"] == 0
+    assert summary["provider_diagnostic_count"] == 1
+    assert summary["provider_diagnostic_summary"]["no_registered_session_for_path"] == 1
+    assert summary["rejected_count"] == 0
+
+
+async def test_a_provider_with_nothing_to_say_stays_silent() -> None:
+    # "Nothing to do" is genuinely different from "something was considered
+    # and none of it was executable", and must not start emitting events.
+    from redteam.orchestration.agents.providers import CandidateBatch
+    from redteam.orchestration.events import AGENT_NO_EXECUTABLE_CANDIDATES
+
+    d = deps(
+        candidate_providers=_providers_with_web(
+            _ProviderStub(CandidateBatch(candidates=[]))
+        )
+    )
+    service = await seeded(d, "a.local")
+    await service.upsert_node(
+        GraphNodeType.SERVICE,
+        key="a.local/http",
+        attrs={"responded": True},
+        facts={"scheme": "http", "host": "a.local"},
+    )
+    state = await observe_node(
+        initial_graph_state(runtime(current_agent=AgentId("web-api-agent"))), deps=d
+    )
+
+    await plan_node(state, deps=d)
+
+    assert d.event_bus.history(event_type=AGENT_NO_EXECUTABLE_CANDIDATES) == []
+
+
+async def test_replan_names_a_terminal_decision() -> None:
+    d = deps()
+    state = initial_graph_state(runtime(step_count=1, current_agent=RECON_AGENT.agent_id))
+
+    await replan_node(state, deps=d)
+
+    triggered = d.event_bus.history(event_type=REPLAN_TRIGGERED)
+    assert len(triggered) == 1
+    assert triggered[0].payload["outcome"] == "terminate"
+    assert triggered[0].payload["reason"] == "terminal_condition"
+
+
+async def test_replan_stays_silent_when_it_is_only_taking_another_turn() -> None:
+    # "We took a turn" is not a replanning event; publishing one per step would
+    # bury the decisions that actually matter.
+    d = deps()
+    state = state_with(runtime(step_count=1), action_proposal=proposal())
+
+    await replan_node(state, deps=d)
+
+    assert d.event_bus.history(event_type=REPLAN_TRIGGERED) == []
+
+
+async def test_replan_maps_a_hard_stop_to_its_own_reason() -> None:
+    d = deps(settings=OrchestrationSettings(max_steps=4))
+    state = state_with(
+        runtime(step_count=4, current_agent=RECON_AGENT.agent_id), action_proposal=proposal()
+    )
+
+    await replan_node(state, deps=d)
+
+    triggered = d.event_bus.history(event_type=REPLAN_TRIGGERED)
+    assert [item.payload["reason"] for item in triggered] == ["max_steps"]

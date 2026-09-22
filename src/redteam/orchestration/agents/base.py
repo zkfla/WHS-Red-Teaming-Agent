@@ -8,23 +8,24 @@ that was never declared. Rationale: ``docs/agent/orchestration.md``.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 from pydantic import BaseModel, Field, model_validator
 
-from redteam.attack_graph.identity import node_id_for_target, target_for_node
+from redteam.attack_graph.identity import host_node_id, node_id_for_target, target_for_node
 from redteam.attack_graph.observation import GraphObservation
 from redteam.attack_graph.patterns import NodePattern, resolve
-from redteam.attack_graph.predicates import is_stale
+from redteam.attack_graph.predicates import facts_of, is_stale
 from redteam.attack_graph.view import AttackGraphView
 from redteam.core.contracts.target import AnyTarget, TargetRef
 from redteam.core.enums import RiskLevel
-from redteam.core.ids import AgentId, EngagementId, RunId, ToolId
+from redteam.core.ids import AgentId, EngagementId, HypothesisId, RunId, ToolId
 from redteam.core.ports.llm import LLMClient
 from redteam.orchestration.action_naming import (
     canonical_action_key,
     tool_matches_action_namespace,
 )
+from redteam.orchestration.authentication import AuthenticationCheck
 from redteam.orchestration.expectations import Expectation
 
 #: Cap on concrete steps produced from one playbook entry per turn, so a
@@ -87,9 +88,16 @@ class PlanStep(BaseModel):
     """One thing an agent may propose, with its preconditions and its test."""
 
     step_id: str
+    #: Runtime-assigned safe identity for cross-event lookup. Providers leave
+    #: it blank; PLAN fills it only after compilation.
+    candidate_key: str = ""
     capability: str
     operation: str
     tool_id: ToolId
+    # Tool result contracts understood by this playbook; empty permits any compatible input.
+    compatible_tool_ids: list[ToolId] = Field(default_factory=list)
+    assessment_kind: Literal["observation", "security_check"] = "security_check"
+    authentication_check: AuthenticationCheck | None = None
 
     #: Either a fixed target...
     target: TargetRef | None = None
@@ -103,6 +111,10 @@ class PlanStep(BaseModel):
     expected_observation: str | None = None
 
     hypothesis: HypothesisDraft | None = None
+    #: Reuse a question that an earlier observation stated before this
+    #: targeted validation was planned. Agent-internal only: the Core action
+    #: contract already carries the resulting hypothesis_id.
+    existing_hypothesis_id: HypothesisId | None = None
     expectation: Expectation | None = None
 
     #: Predicates to write onto the target node when the step succeeds.
@@ -149,7 +161,7 @@ class PlanStep(BaseModel):
             raise ValueError(f"step {self.step_id!r} has no concrete target yet")
         return self.target
 
-    def bound_to(self, target: AnyTarget) -> PlanStep | None:
+    def bound_to(self, target: AnyTarget, *, target_ref: str | None = None) -> PlanStep | None:
         """A concrete copy of this step, pinned to one target, with every
         placeholder in :data:`_PLACEHOLDER_RESOLVERS` resolved from that
         target's real fields — lets a static playbook argument stay in
@@ -165,19 +177,42 @@ class PlanStep(BaseModel):
         either fail tool-schema validation or, worse, reach a real tool
         as a literal argument value.
         """
+        if self.unresolved_placeholder(target, target_ref=target_ref) is not None:
+            return None
         arguments: dict[str, Any] = {}
         for key, value in self.arguments.items():
             resolver = _PLACEHOLDER_RESOLVERS.get(value) if isinstance(value, str) else None
             if resolver is None:
                 arguments[key] = value
                 continue
-            resolved = resolver(target)
-            if resolved is None:
-                return None
+            resolved = (
+                target_ref if value == TARGET_REF_PLACEHOLDER and target_ref else resolver(target)
+            )
             arguments[key] = resolved
         return self.model_copy(
             update={"target": target, "target_bind": "", "arguments": arguments}
         )
+
+    def unresolved_placeholder(
+        self, target: AnyTarget, *, target_ref: str | None = None
+    ) -> str | None:
+        """The first argument key whose placeholder this target cannot fill.
+
+        The reason a step is dropped used to be invisible: no draft existed,
+        so no rejection could be reported. Naming the offending key lets the
+        drop surface as a real graph_prerequisite_missing rejection instead
+        of vanishing.
+        """
+
+        for key, value in self.arguments.items():
+            resolver = _PLACEHOLDER_RESOLVERS.get(value) if isinstance(value, str) else None
+            if resolver is None:
+                continue
+            if value == TARGET_REF_PLACEHOLDER and target_ref:
+                continue
+            if resolver(target) is None:
+                return key
+        return None
 
 
 class AgentSpec(BaseModel):
@@ -241,9 +276,15 @@ async def available_steps(
     *,
     step: int = 0,
     limit: int = MAX_CANDIDATES_PER_STEP,
+    drops: list[tuple[str, str, str]] | None = None,
 ) -> list[PlanStep]:
     """The frontier: playbook entries whose preconditions resolve and
-    that have not already been attempted against that target."""
+    that have not already been attempted against that target.
+
+    A step whose bound target satisfies every precondition but cannot fill a
+    placeholder argument is reported into drops as (step_id, node_id, field).
+    It produces no draft, so without that record it would leave no trace.
+    """
     nodes = await view.list_nodes()
     edges = await view.list_edges()
     candidates: list[PlanStep] = []
@@ -283,11 +324,25 @@ async def available_steps(
             )
             if not result.ok:
                 continue
-            bound = entry.bound_to(target_for_node(node.id, node.type))
+            target = target_for_node(
+                node.id, node.type, observed=facts_of(node.properties).get("observed_target")
+            )
+            host = getattr(target, "host", None)
+            host_node = await view.get_node(host_node_id(host)) if host else None
+            target_ref = facts_of(host_node.properties).get("target_ref") if host_node else None
+            bound = entry.bound_to(target, target_ref=target_ref)
             if bound is None:
                 # A placeholder this step needs could not be resolved
                 # from this particular node (section 7: never guess) --
                 # skip it, do not count it against this turn's offer cap.
+                if drops is not None:
+                    drops.append(
+                        (
+                            entry.step_id,
+                            str(node.id),
+                            entry.unresolved_placeholder(target, target_ref=target_ref) or "",
+                        )
+                    )
                 continue
             candidates.append(bound)
             offered += 1

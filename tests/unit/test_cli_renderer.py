@@ -140,3 +140,51 @@ async def test_agent_no_executable_candidates_renders_by_default_not_only_verbos
     output = buffer.getvalue()
     assert "Web API Agent" in output
     assert "no executable" in output
+
+
+async def test_candidate_rejection_renders_safe_diagnostics() -> None:
+    from redteam.orchestration.events import CANDIDATE_REJECTED
+
+    console, buffer = _console()
+    renderer = RichEventRenderer(console, verbose=False)
+
+    await renderer(
+        _event(
+            CANDIDATE_REJECTED,
+            {
+                "operation": "web.http_request",
+                "reason": "missing_required_argument",
+                "field": "path",
+                "candidate_key": "cand_internal",
+            },
+        )
+    )
+
+    output = buffer.getvalue()
+    assert "Candidate rejected" in output
+    assert "web.http_request: missing_required_argument (path)" in output
+    assert "cand_internal" not in output
+
+
+async def test_result_mapper_failure_renders_without_internal_payload() -> None:
+    from redteam.orchestration.events import RESULT_MAPPER_FAILED
+
+    console, buffer = _console()
+    renderer = RichEventRenderer(console, verbose=False)
+
+    await renderer(
+        _event(
+            RESULT_MAPPER_FAILED,
+            {
+                "operation": "web.http_request",
+                "mapper": "map_web_http_request",
+                "reason": "invalid_result_shape",
+                "traceback": "secret traceback",
+            },
+        )
+    )
+
+    output = buffer.getvalue()
+    assert "Result mapper failed" in output
+    assert "invalid_result_shape" in output
+    assert "secret traceback" not in output

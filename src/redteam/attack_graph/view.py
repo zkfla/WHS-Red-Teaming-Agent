@@ -114,6 +114,7 @@ class AttackGraphView:
     ) -> GraphObservation:
         return build_observation(
             await self.list_nodes(),
+            edges=await self.list_edges(),
             step=step,
             max_per_type=max_per_type,
             max_total=max_total,

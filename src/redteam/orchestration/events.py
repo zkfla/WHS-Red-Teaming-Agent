@@ -1,8 +1,18 @@
 """Agent-Team event names that are not part of the frozen Core vocabulary."""
 
 CANDIDATE_PRUNED = "CandidatePruned"
+#: A provider's draft did not compile; payload carries the reason and field.
+CANDIDATE_REJECTED = "CandidateRejected"
+CANDIDATE_GENERATED = "CandidateGenerated"
 AGENT_PROVIDER_FAILED = "AgentProviderFailed"
 REPORT_PROJECTED = "ReportProjected"
+OBSERVATION_RECORDED = "ObservationRecorded"
+GRAPH_MUTATION_APPLIED = "GraphMutationApplied"
+HYPOTHESIS_RESOLVED = "HypothesisResolved"
+RESULT_MAPPER_FAILED = "ResultMapperFailed"
+REPLAN_TRIGGERED = "ReplanTriggered"
+AUTHENTICATION_CHECK_DEFERRED = "AuthenticationCheckDeferred"
+AUTHENTICATION_CHECKED = "AuthenticationChecked"
 #: An agent activated (a provider offered at least one draft step -- the
 #: preconditions in its playbook genuinely matched something in the
 #: graph) but every draft was dropped during candidate compilation

@@ -134,6 +134,7 @@ class AgentRegistry:
         return observation_fingerprint(
             observation,
             include_node_types=profile.include_node_types or None,
+            include_edge_types=profile.include_edge_types,
             include_hypotheses=profile.include_hypotheses,
             include_findings=profile.include_findings,
         )
@@ -206,19 +207,9 @@ class AgentRegistry:
 
 RECON_AGENT_ID = AgentId("recon-agent")
 
-#: Probes each in-scope host. Its target comes from the graph, not a
-#: hardcoded hostname, so adding a host to the engagement YAML is enough
-#: to make it probe that host too. ``target_ref`` (via
-#: ``PlanStep.bound_to``'s ``TARGET_REF_PLACEHOLDER`` substitution) is
-#: the bound host's own address, so this one static step works both
-#: against the harmless in-process ``ExampleMCPAdapter`` (zero MCP
-#: servers configured -- its permissive ``ping`` schema accepts any
-#: arguments and just echoes them) and against a real, configured
-#: ``recon`` MCP server whose tool is keyed by that same address (e.g.
-#: ``recon.http_probe(target_ref, path)`` -- see
-#: ``deploy/mcp/README.md``/``.env.example``). Action-aware Tool
-#: Selection (``orchestration.candidates.tool_selection``) decides which
-#: concrete tool actually runs; this step never pins one.
+#: The HTTP-probe playbook supports the HTTP result contract and the
+#: in-process demonstration tool. DNS/TLS discovery needs its own provider
+#: and result mapper; sharing an operation name does not make it equivalent.
 RECON_AGENT = AgentSpec(
     agent_id=RECON_AGENT_ID,
     name="Recon Agent",
@@ -231,6 +222,7 @@ RECON_AGENT = AgentSpec(
             capability="recon",
             operation="service_discovery",
             tool_id=ToolId("recon.probe"),
+            compatible_tool_ids=[ToolId("recon.http_probe"), ToolId("recon.ping")],
             target_bind="host",
             preconditions=[
                 NodePattern(
@@ -242,7 +234,6 @@ RECON_AGENT = AgentSpec(
             arguments={
                 "target_ref": TARGET_REF_PLACEHOLDER,
                 "path": "/",
-                "message": "reachability probe",
             },
             reason="Confirm the host answers before anything else is planned against it.",
             expected_observation="the probe tool completes without a transport/tool error",

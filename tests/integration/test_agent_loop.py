@@ -223,8 +223,11 @@ async def test_runner_request_stop_returns_a_named_terminal_runtime() -> None:
 async def test_unexpected_run_failure_still_publishes_a_partial_report(
     monkeypatch,
 ) -> None:
-    async def fail_run(self, runtime):
-        del self, runtime
+    # Must mirror AgentLoopRunner.run's real signature, otherwise the
+    # monkeypatch fails with a TypeError before the failure path under test
+    # is ever reached.
+    async def fail_run(self, runtime, *, initial_event_id=None):
+        del self, runtime, initial_event_id
         raise RuntimeError("sensitive failure detail")
 
     monkeypatch.setattr(AgentLoopRunner, "run", fail_run)
@@ -480,7 +483,7 @@ async def test_default_web_agent_activates_when_target_and_catalog_tool_exist() 
     registry = MCPToolRegistry()
     for tool_id, capability in (
         ("recon.ping", "recon"),
-        ("web.http_inspect", "web"),
+        ("web.http_request", "web"),
     ):
         registry.register(
             ToolDescriptor(
@@ -492,7 +495,7 @@ async def test_default_web_agent_activates_when_target_and_catalog_tool_exist() 
             )
         )
     catalog = MCPToolGateway(
-        registry, {}, {"recon.ping": ["service_discovery"], "web.http_inspect": ["http_request"]}
+        registry, {}, {"recon.ping": ["service_discovery"], "web.http_request": ["http_request"]}
     )
     deps = build_test_application(
         tool_catalog=catalog,
@@ -513,7 +516,7 @@ async def test_round_robin_prevents_recon_from_consuming_all_specialist_budget()
     registry = MCPToolRegistry()
     for tool_id, capability in (
         ("recon.ping", "recon"),
-        ("web.http_inspect", "web"),
+        ("web.http_request", "web"),
     ):
         registry.register(
             ToolDescriptor(
@@ -525,7 +528,7 @@ async def test_round_robin_prevents_recon_from_consuming_all_specialist_budget()
             )
         )
     catalog = MCPToolGateway(
-        registry, {}, {"recon.ping": ["service_discovery"], "web.http_inspect": ["http_request"]}
+        registry, {}, {"recon.ping": ["service_discovery"], "web.http_request": ["http_request"]}
     )
     gateway = DummyToolGateway()
     deps = build_test_application(

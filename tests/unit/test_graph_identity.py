@@ -6,13 +6,16 @@ import pytest
 
 from redteam.attack_graph.identity import (
     InvalidNodeIdError,
+    api_resource_node_id,
     endpoint_node_id,
+    flow_resource_node_id,
     host_node_id,
     is_well_formed,
     make_node_id,
     node_id_for_target,
     node_type_for_target,
     normalize_path,
+    path_parameters,
     split_node_id,
     target_for_node,
 )
@@ -47,6 +50,24 @@ def test_same_endpoint_with_different_ids_is_one_node() -> None:
     # Without this, every request against an id-bearing URL would mint a
     # new node and the graph would never converge.
     assert endpoint_node_id("get", "/orders/1") == endpoint_node_id("GET", "/orders/999")
+
+
+def test_api_resources_are_normalized_but_remain_port_scoped() -> None:
+    assert api_resource_node_id("A.Local", "/orders/1", 443) == api_resource_node_id(
+        "a.local", "/orders/999", 443
+    )
+    assert api_resource_node_id("a.local", "/orders/1", 443) != api_resource_node_id(
+        "a.local", "/orders/1", 8443
+    )
+
+
+def test_flow_resources_escape_the_target_scope_before_joining_the_reference() -> None:
+    assert flow_resource_node_id("bank/api", "flow_0123456789abcdef") == GraphNodeId(
+        "resource:bank%2Fapi/flow:flow_0123456789abcdef"
+    )
+    assert flow_resource_node_id("bank/api", "flow_0123456789abcdef") != (
+        flow_resource_node_id("bank", "api/flow_0123456789abcdef")
+    )
 
 
 def test_host_ids_are_case_insensitive() -> None:
@@ -135,3 +156,12 @@ def test_target_for_node_round_trips_the_node_id() -> None:
         (make_node_id(GraphNodeType.ASSET, "db-1"), GraphNodeType.ASSET),
     ]:
         assert node_id_for_target(target_for_node(node_id, node_type)) == node_id
+
+
+def test_path_parameters_names_object_identifier_positions() -> None:
+    # #2: the endpoint's Parameters -- the object-identifier positions the
+    # path templates over, named after the collection they identify.
+    assert path_parameters("/orders/8831") == ["orders_id"]
+    assert path_parameters("/orders/8831/items/42") == ["orders_id", "items_id"]
+    assert path_parameters("/login") == []
+    assert path_parameters("/") == []

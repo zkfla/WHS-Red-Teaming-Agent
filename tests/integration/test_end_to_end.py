@@ -26,7 +26,12 @@ from redteam.core.contracts.engagement import (
 from redteam.core.contracts.events import EventEnvelope, EventType
 from redteam.core.enums import AgentPhase, Verdict
 from redteam.core.ids import AgentId, EngagementId, GraphNodeId
-from redteam.orchestration.events import REPORT_PROJECTED
+from redteam.orchestration.events import (
+    CANDIDATE_GENERATED,
+    HYPOTHESIS_RESOLVED,
+    REPLAN_TRIGGERED,
+    REPORT_PROJECTED,
+)
 from redteam.orchestration.state import TerminationReason
 
 
@@ -67,6 +72,7 @@ async def test_minimal_vertical_slice_end_to_end(tmp_path) -> None:
     expected_in_order = [
         EventType.RUN_STARTED,
         EventType.AGENT_STARTED,
+        CANDIDATE_GENERATED,
         EventType.HYPOTHESIS_CREATED,
         EventType.ACTION_PROPOSED,
         EventType.POLICY_EVALUATED,
@@ -74,8 +80,10 @@ async def test_minimal_vertical_slice_end_to_end(tmp_path) -> None:
         EventType.TOOL_EXECUTION_STARTED,
         EventType.TOOL_EXECUTION_FINISHED,
         EventType.EVIDENCE_CREATED,
+        HYPOTHESIS_RESOLVED,
         EventType.GRAPH_UPDATED,
         EventType.AGENT_FINISHED,
+        REPLAN_TRIGGERED,
         REPORT_PROJECTED,
         EventType.RUN_FINISHED,
     ]
@@ -91,7 +99,10 @@ async def test_minimal_vertical_slice_end_to_end(tmp_path) -> None:
         if e.event_type == EventType.ACTION_PROPOSED
     )
     correlated = [e.event_type for e in observed_events if e.correlation_id == action_id]
-    assert correlated == expected_in_order[2:10]
+    # From the hypothesis the action was raised for through the update that
+    # settled it -- CandidateGenerated is not part of this action's chain
+    # (it summarises the whole compiled frontier, before a step is chosen).
+    assert correlated == expected_in_order[3:12]
 
     # 9. Evidence was recorded for the run, correlated to the action.
     evidence = await deps.evidence_store.list_for_run(final_state.run_id)

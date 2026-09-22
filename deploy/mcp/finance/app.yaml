@@ -2,6 +2,9 @@ engagement:
   name: Synthetic financial MCP integration lab
   scope:
     allowed_hosts: [mock-bank]
+  metadata:
+    target_refs:
+      mock-bank: bank-lab
   execution_budget:
     max_actions: 30
     max_tool_calls: 30

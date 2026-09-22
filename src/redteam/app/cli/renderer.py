@@ -25,7 +25,17 @@ from rich.text import Text
 from redteam.app.cli import theme
 from redteam.app.cli._shared import mask_secrets
 from redteam.core.contracts.events import EventEnvelope, EventType
-from redteam.orchestration.events import AGENT_NO_EXECUTABLE_CANDIDATES
+from redteam.orchestration.events import (
+    AGENT_NO_EXECUTABLE_CANDIDATES,
+    AUTHENTICATION_CHECK_DEFERRED,
+    AUTHENTICATION_CHECKED,
+    CANDIDATE_GENERATED,
+    CANDIDATE_REJECTED,
+    GRAPH_MUTATION_APPLIED,
+    HYPOTHESIS_RESOLVED,
+    REPLAN_TRIGGERED,
+    RESULT_MAPPER_FAILED,
+)
 
 # Events worth a line in the default (human-readable) stream. Same
 # filtering intent as `commands.run._RENDERED_EVENTS`, kept separate
@@ -44,6 +54,14 @@ _RENDERED_EVENTS = frozenset(
         EventType.FINDING_CREATED,
         EventType.FINDING_VERIFIED,
         AGENT_NO_EXECUTABLE_CANDIDATES,
+        CANDIDATE_GENERATED,
+        CANDIDATE_REJECTED,
+        GRAPH_MUTATION_APPLIED,
+        HYPOTHESIS_RESOLVED,
+        REPLAN_TRIGGERED,
+        RESULT_MAPPER_FAILED,
+        AUTHENTICATION_CHECK_DEFERRED,
+        AUTHENTICATION_CHECKED,
     }
 )
 
@@ -72,6 +90,14 @@ def _operation_phrase(operation: str, target: Any) -> str:
     fallback = "Testing " + operation.replace("_", " ") + " on {target}"
     template = _OPERATION_PHRASES.get(operation, fallback)
     return template.format(target=target)
+
+
+def _rejection_text(item: dict[str, Any]) -> str:
+    operation = str(item.get("operation") or "unknown")
+    reason = str(item.get("reason") or "unknown")
+    field = item.get("field")
+    suffix = f" ({field})" if field else ""
+    return f"{operation}: {reason}{suffix}"
 
 
 class RichEventRenderer:
@@ -173,21 +199,80 @@ class RichEventRenderer:
                 style=theme.MUTED,
             )
 
+        if event.event_type == CANDIDATE_REJECTED:
+            return Text(f"[{timestamp}] ", style=theme.MUTED) + Text(
+                f"{theme.ICON_WARNING} Candidate rejected: "
+                f"{_rejection_text(payload)}",
+                style=theme.WARNING,
+            )
+
+        if event.event_type == CANDIDATE_GENERATED:
+            return Text(f"[{timestamp}] ", style=theme.MUTED) + Text(
+                f"{theme.ICON_TRANSITION} Candidates generated: "
+                f"{payload.get('candidate_count', 0)}",
+                style=theme.MUTED,
+            )
+
+        if event.event_type == GRAPH_MUTATION_APPLIED:
+            return Text(f"[{timestamp}] ", style=theme.MUTED) + Text(
+                f"{theme.ICON_TRANSITION} Graph mutation applied: "
+                f"{payload.get('nodes', 0)} node(s), {payload.get('edges', 0)} edge(s)",
+                style=theme.MUTED,
+            )
+
+        if event.event_type == HYPOTHESIS_RESOLVED:
+            return Text(f"[{timestamp}] ", style=theme.MUTED) + Text(
+                f"Hypothesis resolved: {payload.get('status', 'unknown')}",
+                style=theme.MUTED,
+            )
+
+        if event.event_type == REPLAN_TRIGGERED:
+            return Text(f"[{timestamp}] ", style=theme.MUTED) + Text(
+                f"Replan: {payload.get('outcome', 'unknown')} "
+                f"({payload.get('reason', 'unknown')})",
+                style=theme.MUTED,
+            )
+
+        if event.event_type == RESULT_MAPPER_FAILED:
+            return Text(f"[{timestamp}] ", style=theme.MUTED) + Text(
+                f"{theme.ICON_WARNING} Result mapper failed: "
+                f"{payload.get('operation', 'unknown')} / "
+                f"{payload.get('mapper', 'unknown')} "
+                f"({payload.get('reason', 'unknown')})",
+                style=theme.WARNING,
+            )
+
         if event.event_type in (EventType.FINDING_CREATED, EventType.FINDING_VERIFIED):
             title = str(payload.get("title") or payload.get("summary") or "New finding")
             return Text(f"[{timestamp}] ", style=theme.MUTED) + Text(
                 f"{theme.ICON_WARNING} Finding: {title}", style=theme.WARNING
             )
 
+        if event.event_type == AUTHENTICATION_CHECK_DEFERRED:
+            return Text(f"[{timestamp}] Authentication check deferred: ") + Text(
+                str(payload.get("reason", "unavailable")), style=theme.WARNING
+            )
+        if event.event_type == AUTHENTICATION_CHECKED:
+            return Text(f"[{timestamp}] Authentication observation: ") + Text(
+                str(payload.get("outcome", "inconclusive")), style=theme.MUTED
+            )
+
         if event.event_type == AGENT_NO_EXECUTABLE_CANDIDATES:
             agent = _agent_label(str(payload.get("agent_id", "agent")))
             drafts = payload.get("drafts_offered", 0)
-            return Text(f"[{timestamp}] ", style=theme.MUTED) + Text(
+            summary = Text(
                 f"{theme.ICON_WARNING} {agent}: activated, but produced no executable "
                 f"candidate ({drafts} draft step(s) had no matching/healthy tool or "
                 f"could not be resolved from what's known so far)",
                 style=theme.WARNING,
             )
+            rejections = payload.get("rejections", [])
+            if not isinstance(rejections, list):
+                rejections = []
+            for item in rejections[:3]:
+                if isinstance(item, dict):
+                    summary.append(f"\n  - {_rejection_text(item)}", style=theme.MUTED)
+            return Text(f"[{timestamp}] ", style=theme.MUTED) + summary
 
         return None
 

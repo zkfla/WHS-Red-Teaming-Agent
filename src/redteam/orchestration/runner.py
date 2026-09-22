@@ -13,6 +13,7 @@ from pydantic import BaseModel, Field
 
 from redteam.attack_graph.service import AttackGraphService
 from redteam.core.enums import AgentPhase
+from redteam.core.ids import EventId
 from redteam.orchestration.checkpointing import build_checkpointer, open_checkpointer
 from redteam.orchestration.context import RuntimeDeps
 from redteam.orchestration.graph import build_graph
@@ -107,6 +108,7 @@ class AgentLoopRunner:
         self._active_graph_task: asyncio.Task[GraphState] | None = None
         self._stop_requested = False
         self._failure_runtime: RuntimeState | None = None
+        self._last_event_id: EventId | None = None
 
     @property
     def settings(self) -> OrchestrationSettings:
@@ -122,6 +124,12 @@ class AgentLoopRunner:
 
         return self._failure_runtime
 
+    @property
+    def last_event_id(self) -> EventId | None:
+        """Last event emitted by the graph, for terminal lifecycle causation."""
+
+        return self._last_event_id
+
     def config(self, *, checkpoint_id: str | None = None) -> dict[str, Any]:
         configurable: dict[str, Any] = {}
         if self._checkpointer is not None:
@@ -133,9 +141,13 @@ class AgentLoopRunner:
             "recursion_limit": self._settings.effective_recursion_limit,
         }
 
-    async def run(self, runtime: RuntimeState) -> RuntimeState:
+    async def run(
+        self, runtime: RuntimeState, *, initial_event_id: EventId | None = None
+    ) -> RuntimeState:
         """Run the OBSERVE..REPLAN loop until a terminal phase."""
-        return await self._run_state(runtime, initial_graph_state(runtime))
+        return await self._run_state(
+            runtime, initial_graph_state(runtime, last_event_id=initial_event_id)
+        )
 
     async def _run_state(self, runtime: RuntimeState, graph_state: GraphState) -> RuntimeState:
         """Shared invocation path for a fresh run and an approval resume
@@ -156,6 +168,7 @@ class AgentLoopRunner:
                 self._graph.ainvoke(graph_state, config=self.config())
             )
             final: GraphState = await self._active_graph_task
+            self._last_event_id = final.get("last_event_id")
         except asyncio.CancelledError:
             latest = await self._latest_runtime(runtime)
             reason = TerminationReason.USER_INTERRUPTED

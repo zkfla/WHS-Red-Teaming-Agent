@@ -10,7 +10,7 @@ from __future__ import annotations
 from pydantic import BaseModel, Field, model_validator
 
 from redteam.attack_graph.observation import GraphObservation
-from redteam.core.enums import AgentPhase, GraphNodeType
+from redteam.core.enums import AgentPhase, GraphEdgeType, GraphNodeType
 from redteam.core.ids import AgentId
 
 
@@ -59,6 +59,9 @@ class ContextProfile(BaseModel):
     max_tokens: int = Field(default=8_000, ge=256)
     neighbor_depth: int = Field(default=1, ge=0, le=5)
     include_node_types: list[GraphNodeType] = Field(default_factory=list)
+    #: Relation types this role plans from. Empty means the role does not
+    #: subscribe to relation deltas at all and must not be woken by them.
+    include_edge_types: list[GraphEdgeType] = Field(default_factory=list)
     include_hypotheses: bool = True
     include_findings: bool = True
     include_attempted: bool = True
@@ -72,6 +75,9 @@ class AgentDefinition(BaseModel):
     name: str
     description: str = ""
     contract_version: str = "1"
+    #: ``False`` marks a seam role (Analysis=verifier, Reporting=projector)
+    #: that has no executable ``AgentSpec`` and is never scheduled.
+    schedulable: bool = True
     activation_rules: list[ActivationRule] = Field(default_factory=list)
     capabilities: list[str] = Field(default_factory=list)
     provider_id: str
@@ -92,7 +98,8 @@ def builtin_agent_definitions() -> list[AgentDefinition]:
 
     Recon, Web/API and Mobile have executable specs/providers. Analysis is the
     verifier seam and Reporting is the terminal read-only projector, so neither
-    consumes ordinary action-loop turns.
+    consumes ordinary action-loop turns — both carry ``schedulable=False`` to
+    say so in the model, matching the fact that they have no ``AgentSpec``.
     """
 
     return [
@@ -136,8 +143,19 @@ def builtin_agent_definitions() -> list[AgentDefinition]:
                     GraphNodeType.ENDPOINT,
                     GraphNodeType.PRINCIPAL,
                     GraphNodeType.CREDENTIAL,
+                    # What a principal can reach is a first-class part of the
+                    # web/api surface: an access relation appearing between
+                    # nodes the role already knows is new work.
+                    GraphNodeType.RESOURCE,
                     GraphNodeType.HYPOTHESIS,
                     GraphNodeType.FINDING,
+                ],
+                include_edge_types=[
+                    GraphEdgeType.CAN_ACCESS,
+                    GraphEdgeType.OWNS,
+                    GraphEdgeType.AUTHENTICATES_TO,
+                    GraphEdgeType.OBSERVED,
+                    GraphEdgeType.EXPOSES,
                 ],
             ),
             max_concurrency=4,
@@ -168,6 +186,7 @@ def builtin_agent_definitions() -> list[AgentDefinition]:
             role="analysis",
             name="Analysis Agent",
             description="Independently validates evidence and hypotheses.",
+            schedulable=False,
             activation_rules=[
                 ActivationRule(requires_open_hypothesis=True),
                 ActivationRule(requires_finding=True),
@@ -191,6 +210,7 @@ def builtin_agent_definitions() -> list[AgentDefinition]:
             role="reporting",
             name="Reporting Agent",
             description="Creates a read-only projection after drain/termination.",
+            schedulable=False,
             activation_rules=[ActivationRule(phases=[AgentPhase.FINISHED, AgentPhase.FAILED])],
             capabilities=["reporting"],
             provider_id="playbook:reporting",

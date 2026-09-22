@@ -17,9 +17,17 @@ from redteam.core.contracts.graph import Hypothesis
 from redteam.core.contracts.target import target_display_name
 from redteam.core.enums import AgentPhase
 from redteam.core.ids import ActionId, HypothesisId, new_id
-from redteam.orchestration.agents.base import PlanningContext
+from redteam.orchestration.agents.base import AgentSpec, PlanningContext
 from redteam.orchestration.agents.planners import build_planner
-from redteam.orchestration.candidates.compiler import CandidateCompiler
+from redteam.orchestration.agents.providers import (
+    CandidateBatch,
+    CandidateDiagnostic,
+    DraftDrop,
+    GraphCandidateContext,
+    planning_fingerprint,
+)
+from redteam.orchestration.candidates.catalog import ToolCatalog
+from redteam.orchestration.candidates.compiler import CandidateCompiler, CandidateRejection
 from redteam.orchestration.context import RuntimeDeps
 from redteam.orchestration.context_projection import (
     ContextProjector,
@@ -34,12 +42,57 @@ from redteam.orchestration.dispatch import DispatchItem
 from redteam.orchestration.events import (
     AGENT_NO_EXECUTABLE_CANDIDATES,
     AGENT_PROVIDER_FAILED,
+    AUTHENTICATION_CHECK_DEFERRED,
+    CANDIDATE_GENERATED,
     CANDIDATE_PRUNED,
+    CANDIDATE_REJECTED,
 )
 from redteam.orchestration.nodes._support import advance, graph_service, publisher_for
 from redteam.orchestration.scheduler import WorkScheduler
 from redteam.orchestration.state import GraphState
 from redteam.orchestration.work.models import TERMINAL_STATUSES, WorkStatus
+
+
+def _declared_operations(agent: AgentSpec, provider: object) -> list[tuple[str, str]]:
+    """Every (capability, operation) pair this agent could ever propose.
+
+    The static playbook is the baseline. A provider that can go beyond it
+    declares the extras on its declared_operations attribute -- so the
+    runtime, not the provider, is the one that checks them against the
+    live Tool Catalog.
+    """
+
+    pairs = {(str(step.capability), str(step.operation)) for step in agent.playbook}
+    for capability, operation in getattr(provider, "declared_operations", ()) or ():
+        pairs.add((str(capability), str(operation)))
+    return sorted(pairs)
+
+
+def _available_operations(
+    catalog: ToolCatalog | None, declared: list[tuple[str, str]]
+) -> tuple[tuple[tuple[str, str], ...], bool]:
+    """Which declared actions the live Tool Catalog can actually execute.
+
+    Returns (pairs, verified). With no catalog wired in, executability is
+    unverifiable and the provider's declared ToolId binding remains the
+    only evidence available, so verified is False and callers keep the
+    existing permissive behaviour instead of silently disabling every
+    tool-specific candidate.
+    """
+
+    if catalog is None:
+        return (), False
+    available: list[tuple[str, str]] = []
+    for capability, operation in declared:
+        try:
+            tools = catalog.list_tools_for_action(capability, operation)
+        except ValueError:
+            # Noncanonical capability/operation can never be executed; the
+            # compiler reports it rather than the planner guessing.
+            continue
+        if tools:
+            available.append((capability, operation))
+    return tuple(available), True
 
 
 async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
@@ -66,14 +119,18 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
     service = graph_service(deps)
     now = datetime.now(timezone.utc)
     await deps.work_store.reclaim_expired(now=now)
+    history = await deps.work_store.list_items(run_id=runtime.run_id)
+    terminal_keys = {item.candidate_key for item in history if item.status in TERMINAL_STATUSES}
     compiler = CandidateCompiler(deps.tool_catalog)
     definition = deps.agents.definition(agent.agent_id)
     provider = (
-        deps.candidate_providers.get(definition.provider_id)
-        if definition is not None
-        else None
+        deps.candidate_providers.get(definition.provider_id) if definition is not None else None
     )
     drafts = None
+    diagnostics: list[CandidateDiagnostic] = []
+    rejections: list[CandidateRejection] = []
+    drops: list[DraftDrop] = []
+    planning_digest = ""
     try:
         if definition is None:
             compiled = await compiler.compile_playbook(
@@ -84,10 +141,49 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                 raise LookupError(
                     f"candidate provider {definition.provider_id!r} is not registered"
                 )
-            drafts = await provider.propose(
-                agent, service.view(), observation, step=runtime.step_count
+            available_operations, operations_verified = _available_operations(
+                deps.tool_catalog, _declared_operations(agent, provider)
             )
-            compiled = compiler.compile_drafts(drafts)
+            planning_digest = planning_fingerprint(
+                observation=observation,
+                available_operations=available_operations,
+                prior_candidate_keys=terminal_keys,
+            )
+            context = GraphCandidateContext(
+                view=service.view(),
+                observation=observation,
+                step=runtime.step_count,
+                available_capabilities=tuple(str(item) for item in agent.capabilities),
+                open_hypotheses=tuple(observation.open_hypotheses),
+                prior_candidate_keys=frozenset(terminal_keys),
+                available_operations=available_operations,
+                operations_verified=operations_verified,
+                planning_fingerprint=planning_digest,
+            )
+            graph_propose = getattr(provider, "propose_graph", None)
+            offered = (
+                await graph_propose(agent, context)
+                if callable(graph_propose)
+                else await provider.propose(
+                    agent, context.view, context.observation, step=context.step
+                )
+            )
+            if isinstance(offered, CandidateBatch):
+                drafts, diagnostics = offered.candidates, offered.diagnostics
+                drops = offered.drops
+            else:
+                drafts = offered
+            compiled, rejections = compiler.compile_drafts_with_rejections(drafts)
+            for draft in drafts:
+                check = draft.plan_step.authentication_check
+                if check is not None and not any(item.draft == draft for item in compiled):
+                    diagnostics.append(
+                        CandidateDiagnostic(
+                            target_node_id=draft.target_node_ids[0],
+                            reason="no_compatible_authentication_tool",
+                            evidence_id=str(check.baseline_evidence_id),
+                        )
+                    )
     except Exception as exc:  # noqa: BLE001 - isolate one extension from other roles
         failed = await publisher_for(state, deps, "orchestration.plan").publish(
             AGENT_PROVIDER_FAILED,
@@ -109,29 +205,165 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
         )
     publisher = publisher_for(state, deps, "orchestration.plan")
     last_event_id = state.get("last_event_id")
-    if drafts and not compiled:
-        # The agent was activated (its playbook precondition genuinely
-        # matched something) and had at least one draft to try, but every
-        # one was dropped during compilation -- no matching/healthy tool,
-        # or a required graph-context field could not be resolved
-        # (`PlanStep.bound_to` returning `None`). Distinct from "nothing
-        # to do" (drafts empty), which stays silent as before.
+    for drop in drops:
+        # A playbook entry that matched real graph context but could not be
+        # turned into a draft (an argument the bound target cannot supply)
+        # never reaches the compiler, so it has no CandidateRejection. Report
+        # it through the same event instead of dropping it silently.
+        dropped = await publisher.publish(
+            CANDIDATE_REJECTED,
+            {
+                "agent_id": agent.agent_id,
+                "target_node_id": drop.target_node_id,
+                "capability": "",
+                "operation": drop.step_id,
+                "tool_id": "",
+                "reason": drop.reason,
+                "field": drop.field,
+                "candidate_key": "",
+            },
+            causation_id=last_event_id,
+        )
+        last_event_id = dropped.event_id
+    for rejection in rejections:
+        rejected = await publisher.publish(
+            CANDIDATE_REJECTED,
+            {
+                "agent_id": agent.agent_id,
+                "target_node_id": rejection.target_node_id,
+                "capability": rejection.capability,
+                "operation": rejection.operation,
+                "tool_id": rejection.tool_id,
+                "reason": rejection.reason,
+                "field": rejection.field,
+                "candidate_key": rejection.candidate_key,
+            },
+            causation_id=last_event_id,
+        )
+        last_event_id = rejected.event_id
+    for diagnostic in diagnostics:
+        deferred = await publisher.publish(
+            AUTHENTICATION_CHECK_DEFERRED,
+            {
+                "agent_id": agent.agent_id,
+                "target_node_id": diagnostic.target_node_id,
+                "reason": diagnostic.reason,
+                "evidence_id": diagnostic.evidence_id,
+            },
+            causation_id=last_event_id,
+        )
+        last_event_id = deferred.event_id
+    terminal_rejections: list[CandidateRejection] = []
+    retained = []
+    for candidate in compiled:
+        if candidate.plan_step.repeatable or candidate.candidate_key not in terminal_keys:
+            retained.append(candidate)
+            continue
+        rejection = CandidateRejection(
+            target_node_id=(
+                str(candidate.draft.target_node_ids[0])
+                if candidate.draft.target_node_ids
+                else ""
+            ),
+            capability=candidate.plan_step.capability,
+            operation=candidate.plan_step.operation,
+            tool_id=str(candidate.tool.tool_id),
+            reason="prior_terminal_execution",
+            candidate_key=candidate.candidate_key,
+        )
+        terminal_rejections.append(rejection)
+        rejected = await publisher.publish(
+            CANDIDATE_REJECTED,
+            {
+                "agent_id": agent.agent_id,
+                "target_node_id": rejection.target_node_id,
+                "capability": rejection.capability,
+                "operation": rejection.operation,
+                "tool_id": rejection.tool_id,
+                "reason": rejection.reason,
+                "field": "",
+                "candidate_key": rejection.candidate_key,
+            },
+            causation_id=last_event_id,
+        )
+        last_event_id = rejected.event_id
+    compiled = retained
+    if compiled:
+        generated = await publisher.publish(
+            CANDIDATE_GENERATED,
+            {
+                "agent_id": agent.agent_id,
+                "candidate_count": len(compiled),
+                "candidate_keys": [item.candidate_key for item in compiled],
+                "hypothesis_ids": sorted(
+                    {
+                        str(item.plan_step.existing_hypothesis_id)
+                        for item in compiled
+                        if item.plan_step.existing_hypothesis_id is not None
+                    }
+                ),
+                "target_node_ids": sorted(
+                    {
+                        str(node_id)
+                        for item in compiled
+                        for node_id in item.draft.target_node_ids
+                    }
+                ),
+            },
+            causation_id=last_event_id,
+        )
+        last_event_id = generated.event_id
+
+    if not compiled and (drafts or drops or diagnostics):
+        # The agent was activated and its provider produced *something*:
+        # drafts to try, a step that matched graph context but could not
+        # produce a draft at all (a drop), or a provider diagnostic. None of
+        # it reached the executable frontier, so the reason it produced
+        # nothing is worth saying out loud.
+        #
+        # Distinct from "nothing to do" at all -- no drafts, no drops and no
+        # diagnostics -- which stays silent exactly as before.
+        #
+        # The counts are reported per source so none of them has to be read
+        # as a total: total_drafts counts CandidateDrafts only (a drop is not
+        # a draft), dropped_count counts steps that produced no draft, and
+        # rejected_count is the compiler/terminal/drop rejection total.
+        # Provider diagnostics are deliberately NOT part of rejected_count:
+        # they are counted separately as provider_diagnostic_count, because a
+        # diagnostic explains why nothing was offered rather than rejecting
+        # something that was.
         no_candidates = await publisher.publish(
             AGENT_NO_EXECUTABLE_CANDIDATES,
-            {"agent_id": agent.agent_id, "drafts_offered": len(drafts)},
+            {
+                "agent_id": agent.agent_id,
+                "drafts_offered": len(drafts),
+                "total_drafts": len(drafts),
+                "dropped_count": len(drops),
+                "rejected_count": len(rejections) + len(terminal_rejections) + len(drops),
+                "provider_diagnostic_count": len(diagnostics),
+                "rejections": [
+                    {
+                        "candidate_key": item.candidate_key,
+                        "operation": item.operation,
+                        "reason": item.reason,
+                        "field": item.field,
+                    }
+                    for item in [*rejections, *terminal_rejections]
+                ],
+                "rejection_reason_summary": dict(
+                    Counter(
+                        [item.reason for item in rejections]
+                        + [item.reason for item in terminal_rejections]
+                        + [item.reason for item in drops]
+                    )
+                ),
+                "provider_diagnostic_summary": dict(
+                    Counter(item.reason for item in diagnostics)
+                ),
+            },
             causation_id=last_event_id,
         )
         last_event_id = no_candidates.event_id
-    history = await deps.work_store.list_items(run_id=runtime.run_id)
-    terminal_keys = {
-        item.candidate_key for item in history if item.status in TERMINAL_STATUSES
-    }
-    compiled = [
-        candidate
-        for candidate in compiled
-        if candidate.plan_step.repeatable
-        or candidate.candidate_key not in terminal_keys
-    ]
     source_nodes = max(sum(observation.node_counts.values()), 1)
     if definition is None:
         context_load = 1.0
@@ -180,15 +412,11 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
         # Bound only after dedup and pruning, otherwise already-terminal or
         # pruned high-ranked candidates could hide untouched lower candidates.
         compiled = compiled[: definition.context_profile.max_candidates]
-        planning_observation = await ContextProjector(
-            service, deps.context_cache
-        ).project(
+        planning_observation = await ContextProjector(service, deps.context_cache).project(
             definition.context_profile,
             step=runtime.step_count,
             target_node_ids=[
-                node_id
-                for candidate in compiled
-                for node_id in candidate.draft.target_node_ids
+                node_id for candidate in compiled for node_id in candidate.draft.target_node_ids
             ],
             fallback=observation,
             revision=runtime.step_count,
@@ -204,14 +432,17 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
         evidence_excerpts = project_evidence_excerpts(
             await deps.evidence_store.list_for_run(runtime.run_id),
             target_node_ids=[
-                node_id
-                for candidate in compiled
-                for node_id in candidate.draft.target_node_ids
+                node_id for candidate in compiled for node_id in candidate.draft.target_node_ids
             ],
             limit=evidence_limit,
         )
 
-    planner = build_planner(agent.planner_kind, deps.llm_client)
+    planner = build_planner(
+        agent.planner_kind,
+        deps.llm_client,
+        score_margin=deps.settings.planner_score_margin,
+        top_k=deps.settings.planner_rerank_top_k,
+    )
     step = await planner.plan(
         PlanningContext(
             agent=agent,
@@ -228,10 +459,20 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                 ),
                 "projected_nodes": sum(planning_observation.node_counts.values()),
                 "source_nodes": sum(observation.node_counts.values()),
-                "evidence_excerpts": [
-                    item.model_dump(mode="json") for item in evidence_excerpts
-                ],
-            },
+                "evidence_excerpts": [item.model_dump(mode="json") for item in evidence_excerpts],
+                # One playbook step bound to several targets keeps the same
+                # PlanStep.step_id, so step_id is NOT a unique identity here.
+                # The compiler's candidate_key is, and these two are aligned
+                # with the candidates list handed to the planner: a hybrid
+                # planner orders and shortlists by option key, then maps the
+                # chosen key back to the PlanStep it came from. The PlanStep /
+                # PM action contract is untouched.
+                "candidate_keys": [candidate.candidate_key for candidate in compiled],
+                "candidate_scores": {
+                    candidate.candidate_key: candidate.priority.total
+                    for candidate in compiled
+                },
+                },
         )
     )
 
@@ -356,13 +597,28 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
 
     dispatch_items: list[DispatchItem] = []
     for candidate, work in leased:
-        candidate_step = candidate.plan_step
+        candidate_step = candidate.plan_step.model_copy(
+            update={"candidate_key": candidate.candidate_key}
+        )
         target = candidate_step.resolved_target()
         target_node_id = node_id_for_target(target)
         action_id = ActionId(new_id("action"))
 
         hypothesis_id: HypothesisId | None = None
-        if candidate_step.hypothesis is not None:
+        if candidate_step.existing_hypothesis_id is not None:
+            assert work.hypothesis_id == candidate_step.existing_hypothesis_id
+            existing = await service.get_hypothesis(str(work.hypothesis_id))
+            if existing is None:
+                await deps.work_store.complete(
+                    work.work_id,
+                    owner=str(runtime.run_id),
+                    status=WorkStatus.BLOCKED,
+                    now=now,
+                    reason="referenced_hypothesis_missing",
+                )
+                continue
+            hypothesis_id = work.hypothesis_id
+        elif candidate_step.hypothesis is not None:
             assert work.hypothesis_id is not None
             hypothesis = Hypothesis(
                 hypothesis_id=str(work.hypothesis_id),
@@ -374,9 +630,7 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                     "step_id": candidate_step.step_id,
                     "target": target_display_name(target),
                     "target_node_id": str(target_node_id),
-                    "violation_if_confirmed": (
-                        candidate_step.hypothesis.violation_if_confirmed
-                    ),
+                    "violation_if_confirmed": (candidate_step.hypothesis.violation_if_confirmed),
                     "severity": (
                         candidate_step.hypothesis.severity.value
                         if candidate_step.hypothesis.severity is not None
@@ -437,6 +691,7 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                 "target": target_display_name(target),
                 "step_id": candidate_step.step_id,
                 "candidate_key": candidate.candidate_key,
+                "hypothesis_id": hypothesis_id,
                 "work_id": work.work_id,
                 "priority": candidate.priority.total,
                 "priority_components": candidate.priority.components,
@@ -459,6 +714,17 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                 proposal=proposal,
                 last_event_id=proposed.event_id,
             )
+        )
+
+    if not dispatch_items:
+        return advance(
+            state,
+            runtime.model_copy(update={"phase": AgentPhase.REPLAN}),
+            plan_step=None,
+            action_proposal=None,
+            current_work_id=None,
+            dispatch_items=[],
+            last_event_id=last_event_id,
         )
 
     first = dispatch_items[0]

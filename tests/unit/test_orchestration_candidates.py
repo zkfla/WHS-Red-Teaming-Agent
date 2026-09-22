@@ -315,6 +315,8 @@ async def test_invalid_tool_schema_is_rejected_as_an_unusable_contract() -> None
 
 
 async def test_non_json_tool_arguments_are_rejected_even_by_a_permissive_schema() -> None:
+    from redteam.orchestration.agents.providers import PlaybookCandidateProvider
+
     service = await graph()
     observation = await service.observe(step=1)
     invalid = agent().model_copy(deep=True)
@@ -323,6 +325,13 @@ async def test_non_json_tool_arguments_are_rejected_even_by_a_permissive_schema(
     assert not await CandidateCompiler().compile_playbook(
         invalid, service.view(), observation, step=1
     )
+
+    drafts = await PlaybookCandidateProvider().propose(
+        invalid, service.view(), observation, step=1
+    )
+    _, rejections = CandidateCompiler().compile_drafts_with_rejections(drafts)
+    assert rejections[0].reason == "non_json_arguments"
+    assert rejections[0].candidate_key.startswith("cand_invalid_")
 
 
 async def test_candidate_key_excludes_score_and_graph_revision() -> None:
@@ -372,3 +381,128 @@ def test_custom_priority_signals_require_provenance() -> None:
         source_refs=[" graph:host:a.local ", "graph:host:a.local"],
     )
     assert signals.source_refs == ["graph:host:a.local"]
+
+
+async def test_compiler_reports_a_field_level_rejection_reason() -> None:
+    # PM #5: an empty frontier must be explainable. A tool that requires
+    # `path`, an action step that never supplies it -> the compiler names
+    # the concrete reason and the offending field instead of dropping it
+    # silently.
+    from redteam.orchestration.agents.providers import PlaybookCandidateProvider
+
+    service = await graph()
+    observation = await service.observe(step=1)
+    registry = MCPToolRegistry()
+    registry.register(
+        ToolDescriptor(
+            tool_id=ToolId("recon.ping"),
+            server_id="test",
+            tool_name="ping",
+            capability_tags=["recon"],
+            input_schema={
+                "type": "object",
+                "required": ["path"],
+                "properties": {"path": {"type": "string"}},
+            },
+        )
+    )
+    compiler = CandidateCompiler(catalog_for(registry))
+    drafts = await PlaybookCandidateProvider().propose(
+        agent(), service.view(), observation, step=1
+    )
+
+    candidates, rejections = compiler.compile_drafts_with_rejections(drafts)
+
+    assert candidates == []
+    assert rejections, "a dropped draft must be reported, not silently discarded"
+    rejection = rejections[0]
+    assert rejection.reason == "missing_required_argument"
+    assert rejection.field == "path"
+    assert rejection.operation == "service_discovery"
+
+
+async def test_compiler_reports_when_no_tool_serves_the_action() -> None:
+    from redteam.orchestration.agents.providers import PlaybookCandidateProvider
+
+    service = await graph()
+    observation = await service.observe(step=1)
+    compiler = CandidateCompiler(catalog_for(MCPToolRegistry()))  # empty catalog
+    drafts = await PlaybookCandidateProvider().propose(
+        agent(), service.view(), observation, step=1
+    )
+
+    _, rejections = compiler.compile_drafts_with_rejections(drafts)
+
+    # An empty catalog has nothing in the namespace at all, which is a
+    # missing capability rather than a missing operation binding.
+    assert rejections and rejections[0].reason == "capability_unavailable"
+
+
+async def test_compiler_distinguishes_an_unbound_operation_from_a_missing_capability() -> None:
+    from redteam.orchestration.agents.providers import PlaybookCandidateProvider
+
+    service = await graph()
+    observation = await service.observe(step=1)
+    registry = MCPToolRegistry()
+    registry.register(
+        ToolDescriptor(
+            tool_id=ToolId("recon.ping"),
+            server_id="test",
+            tool_name="ping",
+            capability_tags=["recon"],
+            health_status=ToolHealthStatus.HEALTHY,
+        )
+    )
+    # The capability exists, but this catalog binds the tool to a different
+    # canonical operation.
+    compiler = CandidateCompiler(catalog_for(registry, operation="port_scan"))
+    drafts = await PlaybookCandidateProvider().propose(
+        agent(), service.view(), observation, step=1
+    )
+
+    _, rejections = compiler.compile_drafts_with_rejections(drafts)
+
+    assert rejections and rejections[0].reason == "operation_unsupported"
+
+
+async def test_compiler_reports_an_unhealthy_only_tool_set_as_such() -> None:
+    from redteam.orchestration.agents.providers import PlaybookCandidateProvider
+
+    service = await graph()
+    observation = await service.observe(step=1)
+    registry = MCPToolRegistry()
+    registry.register(
+        ToolDescriptor(
+            tool_id=ToolId("recon.ping"),
+            server_id="test",
+            tool_name="ping",
+            capability_tags=["recon"],
+            health_status=ToolHealthStatus.UNHEALTHY,
+        )
+    )
+    compiler = CandidateCompiler(catalog_for(registry))
+    drafts = await PlaybookCandidateProvider().propose(
+        agent(), service.view(), observation, step=1
+    )
+
+    _, rejections = compiler.compile_drafts_with_rejections(drafts)
+
+    assert rejections and rejections[0].reason == "tool_unhealthy"
+
+
+async def test_incompatible_first_tool_does_not_hide_a_valid_alternative() -> None:
+    service = await graph()
+    registry = MCPToolRegistry()
+    for name, schema in [
+        ('a_requires_url', {'type': 'object', 'required': ['url']}),
+        ('z_compatible', {'type': 'object'}),
+    ]:
+        registry.register(ToolDescriptor(
+            tool_id=ToolId(f'recon.{name}'), server_id='test', tool_name=name,
+            capability_tags=['recon'], input_schema=schema,
+        ))
+    candidates = await CandidateCompiler(catalog_for(registry)).compile_playbook(
+        agent(), service.view(), await service.observe(), step=0,
+    )
+    assert len(candidates) == 2
+    assert {candidate.tool.tool_id for candidate in candidates} == {'recon.z_compatible'}

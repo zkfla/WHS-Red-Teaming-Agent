@@ -23,6 +23,7 @@ from redteam.core.ids import (
     ApprovalId,
     EngagementId,
     EventId,
+    EvidenceId,
     HypothesisId,
     RunId,
 )
@@ -102,6 +103,7 @@ class GraphState(TypedDict, total=False):
     action_proposal: ActionProposal | None
     policy_decision: PolicyDecision | None
     tool_result: ToolResult | None
+    result_evidence_id: EvidenceId | None
     #: Internal WorkLedger reference for the in-flight proposal.
     current_work_id: str | None
     #: A batch exists only when ``max_actions_per_turn`` admits fan-out.
@@ -115,7 +117,9 @@ class GraphState(TypedDict, total=False):
     last_event_id: EventId | None
 
 
-def initial_graph_state(runtime: RuntimeState) -> GraphState:
+def initial_graph_state(
+    runtime: RuntimeState, *, last_event_id: EventId | None = None
+) -> GraphState:
     """A ``GraphState`` with every transient field explicitly empty."""
     return {
         "runtime": runtime,
@@ -124,10 +128,11 @@ def initial_graph_state(runtime: RuntimeState) -> GraphState:
         "action_proposal": None,
         "policy_decision": None,
         "tool_result": None,
+        "result_evidence_id": None,
         "current_work_id": None,
         "dispatch_items": [],
         "worker_outcomes": {},
-        "last_event_id": None,
+        "last_event_id": last_event_id,
     }
 
 
@@ -156,6 +161,7 @@ def resume_graph_state(
         "action_proposal": action_proposal,
         "policy_decision": None,
         "tool_result": None,
+        "result_evidence_id": None,
         "current_work_id": None,
         "dispatch_items": [],
         "worker_outcomes": {},

@@ -6,6 +6,7 @@ Owned by Agent Team. Rationale: ``docs/agent/attack-graph.md``.
 from __future__ import annotations
 
 import re
+from urllib.parse import quote
 
 from redteam.core.contracts.target import (
     AnyTarget,
@@ -43,6 +44,18 @@ def normalize_path(path: str) -> str:
     segments = [s for s in path.split("/") if s]
     normalized = ["{id}" if _ID_SEGMENT.match(s) else s for s in segments]
     return "/" + "/".join(normalized)
+
+
+def path_parameters(path: str) -> list[str]:
+    """Object-identifier positions a path templates over, named after the
+    collection: ``/orders/8831/items/42`` -> ``["orders_id", "items_id"]``."""
+    segments = [s for s in normalize_path(path).split("/") if s]
+    params: list[str] = []
+    for index, segment in enumerate(segments):
+        if segment == "{id}":
+            collection = segments[index - 1] if index > 0 else "root"
+            params.append(f"{collection}_id")
+    return params
 
 
 def make_node_id(node_type: GraphNodeType, key: str) -> GraphNodeId:
@@ -110,9 +123,49 @@ def principal_node_id(principal: str) -> GraphNodeId:
     return make_node_id(GraphNodeType.PRINCIPAL, principal)
 
 
+def session_principal_node_id(target_ref: str, session_ref: str) -> GraphNodeId:
+    """A session identity scoped to the configured target it belongs to.
+
+    Session names such as ``alice`` are commonly reused by separate MCP
+    targets.  A global ``principal:session:alice`` id would merge unrelated
+    identities and invent cross-target access relationships.
+    """
+
+    return principal_node_id(f"{target_ref}/session:{session_ref}")
+
+
 def credential_node_id(credential_ref: str) -> GraphNodeId:
     """``credential_ref`` is a *reference*, never the secret itself."""
     return make_node_id(GraphNodeType.CREDENTIAL, credential_ref)
+
+
+def session_credential_node_id(target_ref: str, session_ref: str) -> GraphNodeId:
+    """Stable id for an operator-managed session reference, never its secret."""
+
+    return credential_node_id(f"{target_ref}/session:{session_ref}")
+
+
+def api_resource_node_id(
+    host: str, path: str, port: int | None = None
+) -> GraphNodeId:
+    """Identity of an API resource template independent of its HTTP methods."""
+
+    authority = host.strip().lower()
+    if port is not None:
+        authority = f"{authority}:{port}"
+    return make_node_id(
+        GraphNodeType.RESOURCE,
+        f"{authority} {normalize_path(path)}",
+    )
+
+
+def flow_resource_node_id(scope: str, flow_ref: str) -> GraphNodeId:
+    """A captured HTTP flow scoped to its configured target or target node."""
+
+    return make_node_id(
+        GraphNodeType.RESOURCE,
+        f"{quote(scope, safe='')}/flow:{quote(flow_ref, safe='')}",
+    )
 
 
 def asset_node_id(asset: str) -> GraphNodeId:

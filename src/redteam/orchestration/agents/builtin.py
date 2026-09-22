@@ -11,16 +11,8 @@ from redteam.orchestration.agents.base import (
     PlanStep,
 )
 
-#: Real ``web.http_request`` schema (`redteam.capability.servers.web_http`)
-#: requires exactly ``target_ref``/``path`` -- verified directly against
-#: its MCP-declared ``input_schema``, not assumed. ``target_ref`` is the
-#: bound target's host (same semantics as ``RECON_AGENT``'s own
-#: ``$target_ref`` usage -- a policy target key, not a graph node id);
-#: ``path`` comes from the ``EndpointTarget`` a matched ENDPOINT node
-#: resolves to. A ``ServiceTarget`` (the other precondition below) has
-#: no path, so `$path` resolves to ``None`` for it and `PlanStep.bound_to`
-#: drops that candidate -- an honest "not enough context yet", not a
-#: guessed ``"/"``.
+#: Target refs resolve from operator metadata; paths come from graph context.
+#: A ServiceTarget without a concrete path does not produce an HTTP request.
 _WEB_HTTP_REQUEST_ARGUMENTS = {"target_ref": TARGET_REF_PLACEHOLDER, "path": PATH_PLACEHOLDER}
 
 WEB_API_AGENT = AgentSpec(
@@ -34,14 +26,20 @@ WEB_API_AGENT = AgentSpec(
             step_id="inspect-http-endpoint",
             capability="web",
             operation="http_request",
-            tool_id=ToolId("web.http_inspect"),
+            tool_id=ToolId("web.http_request"),
+            compatible_tool_ids=[ToolId("web.http_request")],
+            assessment_kind="observation",
             target_bind="endpoint",
             preconditions=[NodePattern(type=GraphNodeType.ENDPOINT, bind="endpoint")],
             arguments=dict(_WEB_HTTP_REQUEST_ARGUMENTS),
             reason="Inspect a discovered endpoint before proposing deeper tests.",
             hypothesis=HypothesisDraft(
-                description="The endpoint exposes behavior that can be analyzed safely.",
-                confidence=0.3,
+                description=(
+                    "This endpoint's access-control behavior may require targeted "
+                    "validation against an explicit operator policy."
+                ),
+                confidence=0.2,
+                metadata={"kind": "web_access_validation"},
             ),
             observed_attrs={"web_inspected": True},
         ),
@@ -49,7 +47,9 @@ WEB_API_AGENT = AgentSpec(
             step_id="inspect-http-service",
             capability="web",
             operation="http_request",
-            tool_id=ToolId("web.http_inspect"),
+            tool_id=ToolId("web.http_request"),
+            compatible_tool_ids=[ToolId("web.http_request")],
+            assessment_kind="observation",
             target_bind="service",
             preconditions=[NodePattern(type=GraphNodeType.SERVICE, bind="service")],
             # `$path` never resolves against a ServiceTarget (see module

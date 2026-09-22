@@ -291,6 +291,7 @@ async def _publish_terminal_artifacts(
     deps: RuntimeDeps,
     *,
     error_type: str | None = None,
+    causation_id: str | None = None,
 ) -> None:
     """Project and publish a report for every terminal outcome."""
 
@@ -307,44 +308,46 @@ async def _publish_terminal_artifacts(
         save_terminal_report(report)
     except OSError:
         logger.exception("Failed to persist terminal report for run %s", runtime.run_id)
-    await deps.event_bus.publish(
-        EventEnvelope(
-            event_id=EventId(new_id("evt")),
-            event_type=REPORT_PROJECTED,
-            run_id=runtime.run_id,
-            engagement_id=runtime.engagement_id,
-            source="orchestration.reporting",
-            timestamp=datetime.now(timezone.utc),
-            payload={
-                "ready_for_release": report.ready_for_release,
-                "finding_count": report.finding_count,
-                "evidence_count": report.evidence_count,
-                "integrity_blockers": report.integrity_blockers,
-                "unresolved_hypotheses": report.unresolved_hypotheses,
-                "outstanding_cleanup": report.outstanding_cleanup,
-                "pending_approval_id": report.pending_approval_id,
-                "effectiveness": report.effectiveness.model_dump(mode="json"),
-            },
-        )
+    report_event = EventEnvelope(
+        event_id=EventId(new_id("evt")),
+        event_type=REPORT_PROJECTED,
+        run_id=runtime.run_id,
+        engagement_id=runtime.engagement_id,
+        source="orchestration.reporting",
+        timestamp=datetime.now(timezone.utc),
+        correlation_id=str(runtime.run_id),
+        causation_id=causation_id,
+        payload={
+            "ready_for_release": report.ready_for_release,
+            "finding_count": report.finding_count,
+            "evidence_count": report.evidence_count,
+            "integrity_blockers": report.integrity_blockers,
+            "unresolved_hypotheses": report.unresolved_hypotheses,
+            "outstanding_cleanup": report.outstanding_cleanup,
+            "pending_approval_id": report.pending_approval_id,
+            "effectiveness": report.effectiveness.model_dump(mode="json"),
+        },
     )
-    await deps.event_bus.publish(
-        EventEnvelope(
-            event_id=EventId(new_id("evt")),
-            event_type=EventType.RUN_FINISHED,
-            run_id=runtime.run_id,
-            engagement_id=runtime.engagement_id,
-            source="app.bootstrap",
-            timestamp=datetime.now(timezone.utc),
-            payload={
-                "phase": runtime.phase.value,
-                "termination_reason": runtime.termination_reason,
-                "pending_approval_id": runtime.pending_approval_id,
-                "actions_executed": runtime.actions_executed,
-                "steps": runtime.step_count,
-                "error_type": error_type,
-            },
-        )
+    await deps.event_bus.publish(report_event)
+    run_finished = EventEnvelope(
+        event_id=EventId(new_id("evt")),
+        event_type=EventType.RUN_FINISHED,
+        run_id=runtime.run_id,
+        engagement_id=runtime.engagement_id,
+        source="app.bootstrap",
+        timestamp=datetime.now(timezone.utc),
+        correlation_id=str(runtime.run_id),
+        causation_id=report_event.event_id,
+        payload={
+            "phase": runtime.phase.value,
+            "termination_reason": runtime.termination_reason,
+            "pending_approval_id": runtime.pending_approval_id,
+            "actions_executed": runtime.actions_executed,
+            "steps": runtime.step_count,
+            "error_type": error_type,
+        },
     )
+    await deps.event_bus.publish(run_finished)
 
 
 async def run_engagement(
@@ -379,17 +382,17 @@ async def run_engagement(
 
     await seed_from_engagement(AttackGraphService(deps.graph_store), engagement, run_id=run_id)
 
-    await deps.event_bus.publish(
-        EventEnvelope(
-            event_id=EventId(new_id("evt")),
-            event_type=EventType.RUN_STARTED,
-            run_id=run_id,
-            engagement_id=engagement.engagement_id,
-            source="app.bootstrap",
-            timestamp=datetime.now(timezone.utc),
-            payload={"engagement_id": engagement.engagement_id},
-        )
+    run_started = EventEnvelope(
+        event_id=EventId(new_id("evt")),
+        event_type=EventType.RUN_STARTED,
+        run_id=run_id,
+        engagement_id=engagement.engagement_id,
+        source="app.bootstrap",
+        timestamp=datetime.now(timezone.utc),
+        correlation_id=str(run_id),
+        payload={"engagement_id": engagement.engagement_id},
     )
+    await deps.event_bus.publish(run_started)
 
     initial_runtime = RuntimeState(
         run_id=run_id,
@@ -401,7 +404,7 @@ async def run_engagement(
     runner = AgentLoopRunner(deps, settings=settings)
     try:
         try:
-            runtime = await runner.run(initial_runtime)
+            runtime = await runner.run(initial_runtime, initial_event_id=run_started.event_id)
         except BaseException as exc:
             recovered_runtime = runner.failure_runtime or initial_runtime
             failed_runtime = recovered_runtime.model_copy(
@@ -423,12 +426,17 @@ async def run_engagement(
                         failed_runtime,
                         deps,
                         error_type=type(exc).__name__,
+                        causation_id=str(runner.last_event_id) if runner.last_event_id else None,
                     )
                 )
             except Exception:  # noqa: BLE001 - never mask the run failure
                 pass
             raise
-        await _publish_terminal_artifacts(runtime, deps)
+        await _publish_terminal_artifacts(
+            runtime,
+            deps,
+            causation_id=str(runner.last_event_id) if runner.last_event_id else None,
+        )
         return runtime
     finally:
         await runner.aclose()

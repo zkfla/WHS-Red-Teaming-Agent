@@ -83,6 +83,69 @@ The tool's output payload is deliberately *not* written to the graph.
 The graph holds predicates and references; the payload is Evidence,
 already stored by VERIFY and reachable by `EvidenceId`.
 
+## Tool result mappers
+
+`orchestration.observations.ResultMapperRegistry` converts a successful,
+known `ToolResult` into bounded node and edge mutations. UPDATE only asks
+the registry for a mapper and applies its mutations; it has no tool-specific
+`if/elif` ladder. Unknown tools and malformed outputs add no graph facts.
+
+The current inventory and web mappings are:
+
+| Tool | Graph result |
+|---|---|
+| `recon.dns_resolve` | Resolved-address observation on the scoped Host |
+| `recon.http_probe` | Host → Service → Endpoint reachability |
+| `recon.tls_inspect` | Host → verified TLS Service and certificate digest reference |
+| `recon.port_scan` | Full bounded scan observation plus Services for open TCP ports |
+| `recon.html_inventory` | Same-origin Endpoint candidates and their source page |
+| `recon.openapi_inventory` | Endpoint operations → shared Resource templates |
+| `recon.oidc_inventory` | OIDC capability/presence observation without following advertised URLs |
+| `web.http_request` | One measured Endpoint response |
+| `web.http_compare_anonymous` | Anonymous/session comparison observation |
+| `web.http_compare_sessions` | Target-scoped Principals and observed `CAN_ACCESS` edges |
+| `web.http_security_posture` | Fixed header/cookie flags, without names or values |
+| `web.proxy_list_flows` | Scoped captured Flow Resources plus normalized Endpoints |
+| `web.proxy_get_flow` | One redacted Flow Resource; no Endpoint host is guessed |
+| `web.proxy_replay_flow` | Replay observation and session access to the captured Flow |
+| `web.proxy_mutate_json` | Mutated field names and response summary; mutation values are omitted |
+| `web.proxy_compare_sessions` | Two-session comparison retained as an observation |
+| `web.zap_capture_snapshot` | Untrusted, first-page-only ZAP Flow observations |
+| `web.nuclei_response_check` | Allowlisted passive match retained as an observation, never a Finding |
+
+HTML and OpenAPI discoveries do not extend engagement scope. OpenAPI
+endpoints are marked `scope_unverified`; Control and Capability still decide
+whether a later request is allowed. Session and credential-reference ids
+include `target_ref`, so two targets that both call a session `alice` cannot
+be merged into one Principal. Credential nodes contain only the configured
+reference name, never a token or cookie. Every stored observation receives
+the Evidence ID that UPDATE already recorded, and repeated observations merge
+into history under the deterministic node id.
+
+Captured responses retain status, byte count, body digest, fixed security-header
+presence flags, and omission markers. They never retain response bodies, header
+values, cookies, query strings, or JSON mutation values. A proxy Flow id is scoped
+to its configured target reference so equal flow references from separate targets
+cannot merge. `proxy_get_flow` cannot prove which host in the Attack Graph owns its
+returned `target_ref`, so it records a Flow Resource without inventing an Endpoint
+relationship. The target-bound list and ZAP tools carry an explicit `target_ref` and
+may safely materialize Endpoints.
+
+Nuclei runs here are passive response checks. A positive match is still only an
+Observation. Hypothesis creation, a separate validation action, Evidence review,
+and Finding creation remain the validation pipeline's responsibility.
+
+Operational metadata tools such as `web.session_list`, `web.proxy_status`,
+`web.proxy_reload_capture`, and `recon.active_status` intentionally have no graph
+mapper. They describe configured runtime state rather than a fact observed about
+an engagement target.
+
+Before UPDATE writes anything, the registry validates the complete mutation:
+node-id/type agreement, secret-safe attributes/facts/observations, edge
+properties, and edge endpoints supplied by either the mutation or its action
+target. A malformed mapper batch is rejected as a whole and reported through
+`ResultMapperFailed`, preventing a half-written graph.
+
 ## Preconditions (`NodePattern` / `resolve`)
 
 `resolve(patterns, nodes=..., edges=...)` answers "does the graph

@@ -39,27 +39,24 @@ description — run `redteam run examples/engagement.yaml` (or bare
 ```text
 RunStarted
 AgentStarted
+CandidateGenerated
 ActionProposed
 PolicyEvaluated
 ActionApproved
 ToolExecutionStarted
 ToolExecutionFinished
 EvidenceCreated
+HypothesisResolved
+FindingCreated / FindingVerified (when evidence-gated violation is confirmed)
 GraphUpdated
+ReplanTriggered (for a replan decision)
+ReportProjected
 RunFinished
 ```
 
-Verified by `tests/integration/test_end_to_end.py` for this exact
-sequence. **Current status**: `HypothesisCreated` *does* fire in a real
-run today — every built-in playbook step declares a `HypothesisDraft`
-(`orchestration/agents/{registry,builtin}.py`), and `plan_node` publishes
-it whenever one is set. `FindingCreated`/`FindingVerified` still never
-fire, for a now-precisely-known reason (not just "TODO"): reaching
-`Verdict.VIOLATION` requires a step's `Expectation` to set
-`violation_if_met=True` (or `anomaly_if_unmet=True`), and no built-in
-playbook step sets either — see `docs/agent/orchestration-implementation-plan.md`
-section 16.1, finding 1, for the full detail and why it's the most
-significant remaining gap in this project.
+The exact sequence varies by provider, policy result, mapper output, and
+whether a hypothesis reaches a confirmed violation. The action chain keeps
+its action correlation; `ReplanTriggered` is a run-level decision event.
 
 ## `Verdict` vs `ToolResult.success` — two different axes
 

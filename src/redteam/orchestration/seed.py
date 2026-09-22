@@ -12,6 +12,7 @@ from redteam.core.contracts.engagement import Engagement
 from redteam.core.contracts.graph import GraphNode
 from redteam.core.enums import GraphNodeType
 from redteam.core.ids import RunId
+from redteam.orchestration.authentication import AuthSession
 
 SCOPE_LABEL = "engagement-scope"
 
@@ -34,6 +35,27 @@ async def seed_from_engagement(
         if value and value.lower() not in denied
     ]
 
+    target_refs = engagement.metadata.get("target_refs", {})
+    if not isinstance(target_refs, dict) or any(
+        not isinstance(host, str) or not host.strip()
+        or not isinstance(ref, str) or not ref.strip()
+        for host, ref in target_refs.items()
+    ):
+        raise ValueError(
+            "engagement.metadata.target_refs must map hosts to non-empty MCP target refs"
+        )
+    target_refs = {host.strip().lower(): ref for host, ref in target_refs.items()}
+    raw_sessions = engagement.metadata.get("auth_sessions", {})
+    if not isinstance(raw_sessions, dict) or any(
+        not isinstance(host, str) or not isinstance(items, list)
+        for host, items in raw_sessions.items()
+    ):
+        raise ValueError("engagement.metadata.auth_sessions must map hosts to session lists")
+    auth_sessions = {
+        host.strip().lower(): [AuthSession.model_validate(item).model_dump() for item in items]
+        for host, items in raw_sessions.items()
+    }
+
     provenance = Provenance(
         step=step,
         source=f"engagement:{engagement.engagement_id}",
@@ -50,6 +72,8 @@ async def seed_from_engagement(
                 GraphNodeType.HOST,
                 key=value,
                 attrs={"in_scope": True},
+                facts={"target_ref": target_refs.get(value, value),
+                       "auth_session_config": {"sessions": auth_sessions.get(value, [])}},
                 labels=[SCOPE_LABEL],
                 provenance=provenance,
                 step=step,

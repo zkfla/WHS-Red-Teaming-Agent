@@ -21,28 +21,31 @@ security-header booleans are real, observed facts about the target this
 mapper can use. ``host``/``path`` are not guessed from that output --
 they come from the ``ActionProposal.target`` actually probed and the
 ``path`` argument actually sent, both already known to the framework
-independently of the tool's response. ``scheme="GET"``/``method="GET"``
-are not read from anywhere either -- they are what *this specific tool*
-always does (a plain HTTP GET, per its own implementation), the same
-kind of tool-identity fact ``ResultMapperRegistry`` already keys on.
-Port is not encoded anywhere: this tool's output never reveals it, so
-claiming one would be exactly the invented-field this mapper must not
-do (see the module docstring on ``orchestration.observations``).
+independently of the tool's response. GET and the HTTP application
+protocol are fixed by this specific tool. The URL scheme and port are
+not returned, so the mapper does not claim either one.
 """
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from redteam.attack_graph.identity import endpoint_node_id, host_node_id, service_node_id
 from redteam.core.contracts.target import AnyTarget, HostTarget
 from redteam.core.contracts.tool import ToolResult
 from redteam.core.enums import GraphEdgeType, GraphNodeType
-from redteam.orchestration.observations.mapper import EdgeMutation, GraphMutation, NodeMutation
+from redteam.orchestration.authentication import request_key
+from redteam.orchestration.observations.mapper import (
+    EdgeMutation,
+    GraphMutation,
+    NodeMutation,
+    is_http_status,
+)
 
-#: What this tool always speaks -- not inferred from the response.
-_SCHEME = "http"
+_APPLICATION_PROTOCOL = "http"
 _METHOD = "GET"
+_HEX_64 = re.compile(r"^[0-9a-fA-F]{64}$")
 
 
 def map_recon_http_probe(
@@ -61,36 +64,76 @@ def map_recon_http_probe(
     if not host:
         return GraphMutation()
 
-    status_code = result.output.get("status_code")
-    if not isinstance(status_code, int):
+    output = result.output
+    status_code = output.get("status_code")
+    target_ref = arguments.get("target_ref")
+    output_target_ref = output.get("target_ref")
+    redirect = output.get("redirect")
+    security_headers = output.get("security_headers_present")
+    digest = output.get("body_sha256")
+    if (
+        not is_http_status(status_code)
+        or not isinstance(output_target_ref, str)
+        or not output_target_ref
+        or (target_ref is not None and target_ref != output_target_ref)
+        or type(redirect) is not bool
+        or redirect != (300 <= status_code < 400)
+        or not isinstance(security_headers, dict)
+        or any(type(value) is not bool for value in security_headers.values())
+        or set(security_headers)
+        - {
+            "strict-transport-security",
+            "content-security-policy",
+            "x-content-type-options",
+            "cache-control",
+        }
+        or not isinstance(digest, str)
+        or _HEX_64.fullmatch(digest) is None
+        or output.get("body_omitted") is not True
+        or type(output.get("body_bytes")) is not int
+        or output["body_bytes"] < 0
+    ):
         # Incomplete/malformed output: no confirmed response, so no
         # service/endpoint claim -- only the pre-existing HOST attrs
         # (reachable/probed, from PlanStep.observed_attrs) still apply.
         return GraphMutation()
 
-    path = arguments.get("path")
-    if not isinstance(path, str) or not path:
+    path = arguments.get("path", "/")
+    if path is None:
         path = "/"
+    if (
+        not isinstance(path, str)
+        or not path.startswith("/")
+        or len(path) > 512
+        or any(ord(char) < 32 or char in "?#%\\" for char in path)
+        or "//" in path
+        or any(part in {".", ".."} for part in path.split("/"))
+    ):
+        return GraphMutation()
 
-    security_headers = result.output.get("security_headers_present")
     endpoint_facts: dict[str, Any] = {
         "host": host,
         "path": path,
+        "observed_target": path,
         "method": _METHOD,
-        "scheme": _SCHEME,
+        "target_ref": output_target_ref,
+        "security_headers_present": dict(security_headers),
     }
-    if isinstance(security_headers, dict):
-        endpoint_facts["security_headers_present"] = dict(security_headers)
 
     host_id = host_node_id(host)
-    service_id = service_node_id(_SCHEME, host=host)
+    service_id = service_node_id(_APPLICATION_PROTOCOL, host=host)
     endpoint_id = endpoint_node_id(_METHOD, path, host=host)
 
     service_node = NodeMutation(
         node_type=GraphNodeType.SERVICE,
         node_id=service_id,
         attrs={"responded": True},
-        facts={"host": host, "scheme": _SCHEME, "display_name": f"{host} {_SCHEME}"},
+        facts={
+            "host": host,
+            "application_protocol": _APPLICATION_PROTOCOL,
+            "display_name": f"{host} {_APPLICATION_PROTOCOL}",
+            "target_ref": output_target_ref,
+        },
         labels=["discovered-by:recon.http_probe"],
     )
     endpoint_node = NodeMutation(
@@ -98,10 +141,23 @@ def map_recon_http_probe(
         node_id=endpoint_id,
         attrs={
             "status_code": status_code,
-            "redirect": bool(result.output.get("redirect", False)),
+            "redirect": redirect,
         },
         facts=endpoint_facts,
         labels=["discovered-by:recon.http_probe"],
+        observations=[
+            {
+                "kind": "http_probe",
+                "context_key": request_key(_METHOD, path, None),
+                "method": _METHOD,
+                "path": path,
+                "target_ref": output_target_ref,
+                "status_code": status_code,
+                "redirect": redirect,
+                "security_headers_present": dict(security_headers),
+                "body_sha256": f"sha256:{digest.lower()}",
+            }
+        ],
     )
 
     return GraphMutation(
