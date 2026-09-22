@@ -26,7 +26,7 @@ from redteam.core.contracts.engagement import (
 )
 from redteam.core.contracts.policy import ControlContext
 from redteam.core.contracts.target import HostTarget
-from redteam.core.contracts.tool import ToolDescriptor
+from redteam.core.contracts.tool import ToolDescriptor, ToolInvocation, ToolResult
 from redteam.core.enums import PolicyVerdict, RiskLevel
 from redteam.core.ids import ActionId, AgentId, EngagementId, RunId, ToolId
 
@@ -56,11 +56,18 @@ def _tool(risk: RiskLevel) -> ToolDescriptor:
 
 
 class _FakeGateway:
+    """Minimal ``ToolGateway`` double — only ``list_tools_for_action`` is
+    exercised by these tests, but ``invoke`` must exist (even unused) to
+    structurally satisfy the Protocol under mypy."""
+
     def __init__(self, tools: list[ToolDescriptor]) -> None:
         self._tools = tools
 
     def list_tools_for_action(self, capability: str, operation: str) -> list[ToolDescriptor]:
         return self._tools
+
+    async def invoke(self, invocation: ToolInvocation) -> ToolResult:
+        raise NotImplementedError("not exercised by risk resolver tests")
 
 
 class _FixedRiskResolver:
