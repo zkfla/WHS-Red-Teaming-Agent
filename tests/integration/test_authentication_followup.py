@@ -165,6 +165,9 @@ async def test_401_creates_exactly_one_gated_session_check(status, outcome):
     events = deps.event_bus.history(event_type=AUTHENTICATION_CHECKED)
     assert len(events) == 1
     assert events[0].payload["outcome"] == outcome
+    # An ordinary probe declares assessment_kind="observation", so the event
+    # must keep saying observation no matter what the comparison found.
+    assert events[0].payload["assessment_kind"] == "observation"
     refs = events[0].payload["evidence_ids"]
     assert len(refs) == 2
     evidence = await deps.evidence_store.list_for_run(final.run_id)
@@ -228,6 +231,14 @@ async def test_denied_session_200_is_a_confirmed_access_control_finding():
         deps.event_bus.history(event_type=AUTHENTICATION_CHECKED)[0].payload["outcome"]
         == "access_control_violation"
     )
+    # The step declared a security check; the violation is the outcome, not
+    # the label.
+    assert (
+        deps.event_bus.history(event_type=AUTHENTICATION_CHECKED)[0].payload[
+            "assessment_kind"
+        ]
+        == "security_check"
+    )
     findings = await AttackGraphService(deps.graph_store).list_findings(verified=True)
     assert len(findings) == 1
     finding = findings[0]
@@ -265,6 +276,14 @@ async def test_denied_session_that_remains_denied_rejects_the_same_hypothesis():
         authenticated=403,
         sessions=[{"session_ref": "bob", "paths": ["/"], "expected_access": "deny"}],
     )
+
+    # Regression: the deny expectation was *enforced*, so the verdict is PASS
+    # -- but the step was still an explicit security check. Deriving this
+    # label from is_violation mislabelled it "observation", which misreports
+    # what was under test.
+    checked = deps.event_bus.history(event_type=AUTHENTICATION_CHECKED)
+    assert checked and checked[-1].payload["outcome"] == "access_denied"
+    assert checked[-1].payload["assessment_kind"] == "security_check"
 
     graph = AttackGraphService(deps.graph_store)
     hypotheses = [

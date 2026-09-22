@@ -314,20 +314,30 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
         )
         last_event_id = generated.event_id
 
-    if drafts and not compiled:
-        # The agent was activated (its playbook precondition genuinely
-        # matched something) and had at least one draft to try, but every
-        # one was dropped during compilation -- no matching/healthy tool,
-        # or a required graph-context field could not be resolved
-        # (`PlanStep.bound_to` returning `None`). Distinct from "nothing
-        # to do" (drafts empty), which stays silent as before.
+    if not compiled and (drafts or drops or diagnostics):
+        # The agent was activated and its provider produced *something*:
+        # drafts to try, a step that matched graph context but could not
+        # produce a draft at all (a drop), or a provider diagnostic. None of
+        # it reached the executable frontier, so the reason it produced
+        # nothing is worth saying out loud.
+        #
+        # Distinct from "nothing to do" at all -- no drafts, no drops and no
+        # diagnostics -- which stays silent exactly as before.
+        #
+        # The counts are reported per source so none of them has to be read
+        # as a total: total_drafts counts CandidateDrafts only (a drop is not
+        # a draft), dropped_count counts steps that produced no draft,
+        # provider_diagnostic_count counts provider-reported reasons, and
+        # rejected_count is the union of everything non-executable.
         no_candidates = await publisher.publish(
             AGENT_NO_EXECUTABLE_CANDIDATES,
             {
                 "agent_id": agent.agent_id,
                 "drafts_offered": len(drafts),
                 "total_drafts": len(drafts),
+                "dropped_count": len(drops),
                 "rejected_count": len(rejections) + len(terminal_rejections) + len(drops),
+                "provider_diagnostic_count": len(diagnostics),
                 "rejections": [
                     {
                         "candidate_key": item.candidate_key,

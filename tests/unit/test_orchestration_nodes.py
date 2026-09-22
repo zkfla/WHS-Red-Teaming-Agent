@@ -1046,6 +1046,128 @@ async def test_plan_reports_a_step_that_cannot_fill_its_graph_arguments() -> Non
     assert rejected[0].payload["operation"] == "inspect-http-service"
 
 
+class _ProviderStub:
+    """A candidate provider that returns exactly the batch it was given."""
+
+    declared_operations: tuple[tuple[str, str], ...] = ()
+
+    def __init__(self, batch) -> None:
+        self._batch = batch
+
+    async def propose_graph(self, spec, context):
+        return self._batch
+
+
+def _providers_with_web(replacement):
+    from redteam.orchestration.agents.providers import (
+        CandidateProviderRegistry,
+        PlaybookCandidateProvider,
+    )
+
+    return CandidateProviderRegistry(
+        [
+            ("playbook:recon", PlaybookCandidateProvider()),
+            ("playbook:web_api", replacement),
+            ("playbook:mobile", PlaybookCandidateProvider()),
+        ]
+    )
+
+
+async def test_a_drop_only_frontier_is_reported_as_no_executable_candidates() -> None:
+    # The web playbook matched a real SERVICE but cannot fill its path, so it
+    # produced a drop and no draft at all. Nothing executable came out, and
+    # the reason must not stay silent just because drafts happened to be 0.
+    from redteam.orchestration.events import AGENT_NO_EXECUTABLE_CANDIDATES
+
+    d = deps()
+    service = await seeded(d, "a.local")
+    await service.upsert_node(
+        GraphNodeType.SERVICE,
+        key="a.local/http",
+        attrs={"responded": True},
+        facts={"scheme": "http", "host": "a.local"},
+    )
+    state = await observe_node(
+        initial_graph_state(runtime(current_agent=AgentId("web-api-agent"))), deps=d
+    )
+
+    await plan_node(state, deps=d)
+
+    summary = d.event_bus.history(event_type=AGENT_NO_EXECUTABLE_CANDIDATES)[0].payload
+    assert summary["total_drafts"] == 0
+    assert summary["drafts_offered"] == 0
+    assert summary["dropped_count"] >= 1
+    assert summary["rejected_count"] == summary["dropped_count"]
+    assert summary["rejection_reason_summary"]["graph_prerequisite_missing"] >= 1
+
+
+async def test_a_diagnostic_only_provider_is_reported_as_no_executable_candidates() -> None:
+    from redteam.core.ids import GraphNodeId
+    from redteam.orchestration.agents.providers import (
+        CandidateBatch,
+        CandidateDiagnostic,
+    )
+    from redteam.orchestration.events import AGENT_NO_EXECUTABLE_CANDIDATES
+
+    batch = CandidateBatch(
+        candidates=[],
+        diagnostics=[
+            CandidateDiagnostic(
+                target_node_id=GraphNodeId("endpoint:a.local GET /"),
+                reason="no_registered_session_for_path",
+                evidence_id="ev_diag",
+            )
+        ],
+    )
+    d = deps(candidate_providers=_providers_with_web(_ProviderStub(batch)))
+    service = await seeded(d, "a.local")
+    await service.upsert_node(
+        GraphNodeType.SERVICE,
+        key="a.local/http",
+        attrs={"responded": True},
+        facts={"scheme": "http", "host": "a.local"},
+    )
+    state = await observe_node(
+        initial_graph_state(runtime(current_agent=AgentId("web-api-agent"))), deps=d
+    )
+
+    await plan_node(state, deps=d)
+
+    summary = d.event_bus.history(event_type=AGENT_NO_EXECUTABLE_CANDIDATES)[0].payload
+    assert summary["total_drafts"] == 0
+    assert summary["dropped_count"] == 0
+    assert summary["provider_diagnostic_count"] == 1
+    assert summary["provider_diagnostic_summary"]["no_registered_session_for_path"] == 1
+    assert summary["rejected_count"] == 0
+
+
+async def test_a_provider_with_nothing_to_say_stays_silent() -> None:
+    # "Nothing to do" is genuinely different from "something was considered
+    # and none of it was executable", and must not start emitting events.
+    from redteam.orchestration.agents.providers import CandidateBatch
+    from redteam.orchestration.events import AGENT_NO_EXECUTABLE_CANDIDATES
+
+    d = deps(
+        candidate_providers=_providers_with_web(
+            _ProviderStub(CandidateBatch(candidates=[]))
+        )
+    )
+    service = await seeded(d, "a.local")
+    await service.upsert_node(
+        GraphNodeType.SERVICE,
+        key="a.local/http",
+        attrs={"responded": True},
+        facts={"scheme": "http", "host": "a.local"},
+    )
+    state = await observe_node(
+        initial_graph_state(runtime(current_agent=AgentId("web-api-agent"))), deps=d
+    )
+
+    await plan_node(state, deps=d)
+
+    assert d.event_bus.history(event_type=AGENT_NO_EXECUTABLE_CANDIDATES) == []
+
+
 async def test_replan_names_a_terminal_decision() -> None:
     d = deps()
     state = initial_graph_state(runtime(step_count=1, current_agent=RECON_AGENT.agent_id))

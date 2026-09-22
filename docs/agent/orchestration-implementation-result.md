@@ -321,3 +321,110 @@ PM action naming(`capability` + canonical `operation` = intent,
 `ToolId` = 실행 수단)도 그대로다.
 `attack_graph/observation.py`는 "Owned by Agent Team"으로 명시된 Agent 소유
 모델이라 수정 범위에 포함되며, 기존 필드는 전부 하위 호환(기본값)으로 유지했다.
+
+## 10. 2026-09-22 follow-up — `3c27b7b` 이후 (ORCH-PULL-FIX-20260922)
+
+> **기준 분리**: 이 절은 §1~§9와 기준이 다르다. 위 절의 수치
+> (baseline 919 passed / 16 failed, 최종 967 passed / 13 failed)는
+> ORCH-AGENT-FEEDBACK-20260921 사이클 시점의 기록이며 **덮어쓰지 않았다.**
+> 아래는 그 이후 `dev-orchestration`이 전진한 상태를 별도 기준으로 기록한다.
+
+### 10.1 커밋 사슬
+
+| commit | 내용 |
+|---|---|
+| `64ecfc6` | 이전 사이클의 마지막 실행 커밋 |
+| `af27274` | 관리: orchestration feedback protocol 기록 |
+| `3c27b7b` | 관리: targeted web validation lifecycle — existing-hypothesis 재사용, deny-policy `security_check` 후보, FindingPromoter의 `assessment_kind` 요구, 진단 요약, 이벤트 linking id |
+| 본 절 commit | ORCH-PULL-FIX-20260922 — 아래 2건 마감 |
+
+정렬은 `git merge --ff-only 3c27b7b` (fast-forward). `64ecfc6` 이 이미
+`3c27b7b` 의 조상이었으므로 reset/clean 은 필요하지 않았고 사용하지도 않았다.
+
+### 10.2 마감 1 — `AUTHENTICATION_CHECKED` 의 `assessment_kind` 가 결과에서 파생되던 문제
+
+관리 protocol 5번("Require `assessment_kind=security_check` inside
+FindingPromoter and pass the real PlanStep value from VERIFY")은 promoter 쪽은
+반영됐지만(`verify.py` 의 `PromotionRequest`), **이벤트 payload**는 아직
+결과에서 라벨을 만들고 있었다:
+
+`"assessment_kind": "security_check" if is_violation else "observation"`
+
+그래서 operator가 `expected_access=deny` 로 선언한 세션의 접근이 **차단된**
+경우(`outcome=access_denied` → `Verdict.PASS`, `is_violation` False)
+그 이벤트가 `observation` 으로 오표기됐다. "무엇을 테스트했는가"가 아니라
+"결과가 어땠는가"를 라벨로 쓴 것이다.
+
+수정: `step.assessment_kind` 를 그대로 싣는다. `security_check` step은
+결과와 무관하게 `security_check` 로 남고, `assessment_kind=observation` 인
+일반 probe는 계속 `observation` 이다.
+
+회귀 근거:
+
+- `test_denied_session_that_remains_denied_rejects_the_same_hypothesis` 에
+  `assessment_kind == "security_check"` 단언 추가 — **수정 전 코드였다면
+  `observation` 이 나와 실패한다.** (deny 정책이 집행된 PASS 경로)
+- `test_denied_session_200_is_a_confirmed_access_control_finding`(위반 경로)에도
+  같은 단언을 추가해 양방향을 고정.
+- `test_401_creates_exactly_one_gated_session_check`(일반 관측)에는
+  `"observation"` 단언을 추가해 회귀 방향을 막았다.
+
+### 10.3 마감 2 — `AGENT_NO_EXECUTABLE_CANDIDATES` 가 `drafts == 0` 에서 침묵하던 문제
+
+관리 protocol 6번("include compiler, provider, and prerequisite summaries in
+AgentNoExecutableCandidates")은 payload 확장까지 반영됐지만, **발행 조건**이 아직
+`if drafts and not compiled:` 였다. 그래서 provider가
+
+- 그래프 문맥은 맞았지만 인자를 못 채운 step(drop)만 냈거나,
+- 진단만 냈거나,
+
+하는 경우 `drafts` 가 비어 있어 아무 이벤트도 남지 않았다. 즉 "시도할 게 있었다"는
+사실이 조용히 사라졌다.
+
+수정: `if not compiled and (drafts or drops or diagnostics):` — provider가
+*무언가* 를 냈는데 실행 가능한 후보가 없으면 발행한다. drafts·drops·diagnostics 가
+**전부 없으면** 기존과 동일하게 침묵한다("할 일이 없음").
+
+집계도 출처별로 분리해 하나의 숫자로 오독되지 않게 했다:
+
+- `total_drafts`/`drafts_offered` — `CandidateDraft` 수만(drop은 draft 가 아니다)
+- `dropped_count`(신규) — draft 를 만들지 못한 step 수
+- `provider_diagnostic_count`(신규) — provider가 보고한 진단 수
+- `rejected_count` — 위 셋과 compile rejection 의 합집합(비실행 결과 총계)
+- `rejection_reason_summary` / `provider_diagnostic_summary` — 사유별 내역
+
+회귀 근거(신규 3건, `tests/unit/test_orchestration_nodes.py`):
+
+- `test_a_drop_only_frontier_is_reported_as_no_executable_candidates` —
+  `total_drafts == 0`, `dropped_count >= 1`,
+  `rejected_count == dropped_count`,
+  `rejection_reason_summary["graph_prerequisite_missing"] >= 1`
+- `test_a_diagnostic_only_provider_is_reported_as_no_executable_candidates` —
+  진단만 낸 stub provider 로 `provider_diagnostic_count == 1`,
+  `rejected_count == 0`
+- `test_a_provider_with_nothing_to_say_stays_silent` — 빈 batch 를 낸 provider 는
+  이벤트를 만들지 않음(기존 동작 보존)
+
+### 10.4 최종 검증 (이번 기준, exact)
+
+깨끗한 temp venv(`mcp 2.2.0`) + `sys.path` 로 현재 체크아웃 `src` 를
+명시적으로 사용했다(`PYTHONPATH=src`).
+
+| 명령 | 결과 |
+|---|---|
+| `python -m pytest tests -q` | **1092 passed, 13 failed, 3 skipped** |
+| targeted + H1~H4 회귀 14개 파일 | **221 passed** |
+| `ruff check src tests examples` | **All checks passed!** |
+| `python -m compileall -q src` | exit 0 |
+
+남은 13건은 이 머신의 기존 환경 실패 그대로다: Windows 심볼릭 링크 권한 없음
+(`WinError 1314`) 12건 + cp949 콘솔 인코딩 1건(`validate.py`). 이번 변경과
+무관하며 새로 생긴 실패는 0건이다.
+
+### 10.5 남은 제약
+
+- 관리 protocol 이 기록한 외부 의존 2건은 그대로다: redirect `Location`,
+  `WWW-Authenticate` scheme/realm, 상세 `Set-Cookie` 메타데이터는 현재
+  `ToolResult` 계약이 보장하지 않으므로 추론하지 않는다. 비인증 Web 보안 정책
+  입력도 아직 없다.
+- 위 두 계약이 Capability/Core 쪽에서 확정되면 mapper/provider 규칙 추가로 확장한다.

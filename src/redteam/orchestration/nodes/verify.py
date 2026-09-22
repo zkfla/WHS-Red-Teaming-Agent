@@ -204,7 +204,12 @@ async def verify_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             AUTHENTICATION_CHECKED,
             {**comparison, "action_id": proposal.action_id,
              "hypothesis_id": proposal.hypothesis_id,
-             "assessment_kind": "security_check" if is_violation else "observation"},
+             # The step's own declaration, not the outcome. A security_check
+             # whose deny expectation was *enforced* is still a security
+             # check -- labelling it "observation" would misreport what was
+             # under test, and the label is what downstream consumers use to
+             # decide whether a conclusion was claimed at all.
+             "assessment_kind": step.assessment_kind},
             correlation_id=correlation_id, causation_id=last_event_id,
         )
         last_event_id = compared.event_id
