@@ -189,7 +189,7 @@ class MCPToolGateway:
                 },
             )
 
-        if descriptor.output_schema:
+        if descriptor.output_schema is not None:
             try:
                 Draft202012Validator(descriptor.output_schema).validate(adapter_result.output)
             except (SchemaError, ValidationError, TypeError):

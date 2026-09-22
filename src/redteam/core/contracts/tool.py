@@ -26,7 +26,7 @@ class ToolDescriptor(BaseModel):
     # ``input_schema`` remains the source of truth for required/optional
     # arguments; the convenience properties below only present that schema in
     # a form that Agent/Registry code can consume safely.
-    output_schema: dict[str, Any] = Field(default_factory=dict)
+    output_schema: dict[str, Any] | None = None
     operations: list[str] = Field(default_factory=list)
     target_types: list[str] = Field(default_factory=list)
     capability_tags: list[str] = Field(default_factory=list)

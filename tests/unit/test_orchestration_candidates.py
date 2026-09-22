@@ -293,6 +293,39 @@ async def test_incompatible_first_tool_does_not_hide_executable_alternative() ->
     assert spec.playbook[0].arguments == {}
 
 
+async def test_target_type_mismatch_only_removes_the_incompatible_tool() -> None:
+    service = await graph()
+    observation = await service.observe(step=1)
+    registry = MCPToolRegistry()
+    for name, target_types in (
+        ("a_endpoint_only", ["endpoint"]),
+        ("z_host", ["host"]),
+    ):
+        registry.register(
+            ToolDescriptor(
+                tool_id=ToolId(f"recon.{name}"),
+                server_id="test",
+                tool_name=name,
+                input_schema={
+                    "type": "object",
+                    "properties": {"target_ref": {"type": "string"}},
+                    "required": ["target_ref"],
+                    "additionalProperties": False,
+                },
+                target_types=target_types,
+                capability_tags=["recon"],
+                health_status=ToolHealthStatus.HEALTHY,
+            )
+        )
+
+    candidates = await CandidateCompiler(catalog_for(registry)).compile_playbook(
+        agent(), service.view(), observation, step=1
+    )
+
+    assert len(candidates) == 2
+    assert {candidate.tool.tool_id for candidate in candidates} == {"recon.z_host"}
+
+
 async def test_full_json_schema_rejects_wrong_argument_types() -> None:
     service = await graph()
     observation = await service.observe(step=1)

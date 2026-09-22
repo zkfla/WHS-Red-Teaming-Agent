@@ -51,7 +51,7 @@ def validate_tool_manifest(descriptor: ToolDescriptor) -> None:
     prefix = f"MCP tool {tool_name!r}"
     _validate_identity(descriptor, prefix)
     _validate_schema(descriptor.input_schema, f"{prefix} input schema")
-    if descriptor.output_schema:
+    if descriptor.output_schema is not None:
         _validate_schema(descriptor.output_schema, f"{prefix} output schema")
     _validate_required_arguments(descriptor.input_schema, prefix)
     _validate_operations(descriptor.operations, prefix)

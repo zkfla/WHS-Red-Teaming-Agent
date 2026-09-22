@@ -115,6 +115,39 @@ async def test_adapter_preserves_remote_output_schema_in_registry_metadata() -> 
     assert descriptor.output_schema["required"] == ["status_code"]
 
 
+async def test_adapter_preserves_absent_output_schema_as_none() -> None:
+    transport = FakeTransport(
+        tools=[
+            RemoteTool(
+                name="http_probe",
+                description="probe",
+                input_schema={"type": "object"},
+            )
+        ]
+    )
+    descriptor = (
+        await ReconMCPAdapter(server_id="recon", transport=transport).discover_tools()
+    )[0]
+
+    assert descriptor.output_schema is None
+
+
+async def test_gateway_skips_output_validation_when_schema_is_absent() -> None:
+    adapter = ExampleMCPAdapter()
+    registry = MCPToolRegistry()
+    descriptor = (await adapter.discover_tools())[0].model_copy(
+        update={"output_schema": None}
+    )
+    registry.register(descriptor)
+
+    result = await MCPToolGateway(registry, {adapter.server_id: adapter}).invoke(
+        _invocation(operation="service_discovery")
+    )
+
+    assert result.success is True
+    assert result.output == {"echo": {"message": "hi"}, "server_id": "example-mcp"}
+
+
 async def test_gateway_rejects_output_that_breaks_registered_schema() -> None:
     adapter = ExampleMCPAdapter()
     registry = MCPToolRegistry()

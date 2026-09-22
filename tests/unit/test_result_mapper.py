@@ -107,6 +107,31 @@ def test_never_invents_a_port_because_the_tool_output_never_carries_one() -> Non
     assert ":80" not in str(service.node_id)
 
 
+def test_probe_preserves_observed_https_port_and_original_path() -> None:
+    mutation = map_recon_http_probe(
+        target=HostTarget(host="a.local"),
+        arguments={"target_ref": "x", "path": "/accounts/1234"},
+        result=_result(
+            output={
+                **_GOOD_OUTPUT,
+                "host": "a.local",
+                "port": 8443,
+                "scheme": "https",
+            }
+        ),
+    )
+
+    service = next(node for node in mutation.nodes if node.node_type is GraphNodeType.SERVICE)
+    endpoint = next(node for node in mutation.nodes if node.node_type is GraphNodeType.ENDPOINT)
+    assert service.facts["port"] == 8443
+    assert service.facts["scheme"] == "https"
+    assert endpoint.facts["port"] == 8443
+    assert endpoint.facts["scheme"] == "https"
+    assert endpoint.facts["observed_target"] == "/accounts/1234"
+    assert ":8443" in str(endpoint.node_id)
+    assert str(endpoint.node_id).endswith("/accounts/{id}")
+
+
 def test_probe_rejects_a_result_for_a_different_target_ref() -> None:
     assert map_recon_http_probe(
         target=HostTarget(host="a.local"),
