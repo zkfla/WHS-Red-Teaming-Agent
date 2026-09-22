@@ -19,7 +19,7 @@ from redteam.attack_graph.predicates import facts_of, is_stale
 from redteam.attack_graph.view import AttackGraphView
 from redteam.core.contracts.target import AnyTarget, TargetRef
 from redteam.core.enums import RiskLevel
-from redteam.core.ids import AgentId, EngagementId, RunId, ToolId
+from redteam.core.ids import AgentId, EngagementId, HypothesisId, RunId, ToolId
 from redteam.core.ports.llm import LLMClient
 from redteam.orchestration.action_naming import (
     canonical_action_key,
@@ -88,6 +88,9 @@ class PlanStep(BaseModel):
     """One thing an agent may propose, with its preconditions and its test."""
 
     step_id: str
+    #: Runtime-assigned safe identity for cross-event lookup. Providers leave
+    #: it blank; PLAN fills it only after compilation.
+    candidate_key: str = ""
     capability: str
     operation: str
     tool_id: ToolId
@@ -108,6 +111,10 @@ class PlanStep(BaseModel):
     expected_observation: str | None = None
 
     hypothesis: HypothesisDraft | None = None
+    #: Reuse a question that an earlier observation stated before this
+    #: targeted validation was planned. Agent-internal only: the Core action
+    #: contract already carries the resulting hypothesis_id.
+    existing_hypothesis_id: HypothesisId | None = None
     expectation: Expectation | None = None
 
     #: Predicates to write onto the target node when the step succeeds.

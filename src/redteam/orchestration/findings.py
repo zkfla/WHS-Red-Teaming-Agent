@@ -50,7 +50,7 @@ class PromotionRequest:
     reviewer_id: str = ""
     source_refs: list[str] = field(default_factory=list)
     severity: str = "info"
-    assessment_kind: str = "security_check"
+    assessment_kind: str = "observation"
     extra_metadata: dict[str, Any] = field(default_factory=dict)
 
 
@@ -97,6 +97,8 @@ class FindingPromoter:
         *,
         existing_claims: Collection[str] = (),
     ) -> PromotionDecision:
+        if request.assessment_kind != "security_check":
+            return PromotionDecision(None, "assessment_is_not_a_security_check")
         if request.verdict is not Verdict.VIOLATION:
             return PromotionDecision(None, "verdict_is_not_a_violation")
         evidence_ids = sorted({str(item) for item in request.evidence_ids if item})

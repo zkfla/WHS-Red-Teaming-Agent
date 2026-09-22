@@ -252,6 +252,36 @@ async def test_plan_warns_when_an_activated_agent_gets_zero_executable_candidate
 
     assert state["action_proposal"] is None
     assert AGENT_NO_EXECUTABLE_CANDIDATES in d.event_bus.event_types()
+    summary = d.event_bus.history(event_type=AGENT_NO_EXECUTABLE_CANDIDATES)[0].payload
+    assert summary["total_drafts"] >= 1
+    assert summary["rejected_count"] >= 1
+    assert summary["rejection_reason_summary"]["capability_unavailable"] >= 1
+
+
+async def test_plan_reports_a_prior_terminal_candidate_once_per_planning_turn() -> None:
+    d = deps()
+    await seeded(d, "a.local")
+    observed = await observe_node(initial_graph_state(runtime()), deps=d)
+    planned = await plan_node(observed, deps=d)
+    work_id = planned["current_work_id"]
+    assert work_id is not None
+    assert await d.work_store.complete(
+        work_id,
+        owner=str(RUN),
+        status=WorkStatus.SUCCEEDED,
+        now=datetime.now(timezone.utc),
+    )
+
+    again = await plan_node(observed, deps=d)
+
+    assert again["action_proposal"] is None
+    prior = [
+        event
+        for event in d.event_bus.history(event_type=CANDIDATE_REJECTED)
+        if event.payload["reason"] == "prior_terminal_execution"
+    ]
+    assert len(prior) == 1
+    assert prior[0].payload["candidate_key"]
 
 
 async def test_plan_without_a_hypothesis_still_proposes() -> None:

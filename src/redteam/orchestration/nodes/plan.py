@@ -253,6 +253,41 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             causation_id=last_event_id,
         )
         last_event_id = deferred.event_id
+    terminal_rejections: list[CandidateRejection] = []
+    retained = []
+    for candidate in compiled:
+        if candidate.plan_step.repeatable or candidate.candidate_key not in terminal_keys:
+            retained.append(candidate)
+            continue
+        rejection = CandidateRejection(
+            target_node_id=(
+                str(candidate.draft.target_node_ids[0])
+                if candidate.draft.target_node_ids
+                else ""
+            ),
+            capability=candidate.plan_step.capability,
+            operation=candidate.plan_step.operation,
+            tool_id=str(candidate.tool.tool_id),
+            reason="prior_terminal_execution",
+            candidate_key=candidate.candidate_key,
+        )
+        terminal_rejections.append(rejection)
+        rejected = await publisher.publish(
+            CANDIDATE_REJECTED,
+            {
+                "agent_id": agent.agent_id,
+                "target_node_id": rejection.target_node_id,
+                "capability": rejection.capability,
+                "operation": rejection.operation,
+                "tool_id": rejection.tool_id,
+                "reason": rejection.reason,
+                "field": "",
+                "candidate_key": rejection.candidate_key,
+            },
+            causation_id=last_event_id,
+        )
+        last_event_id = rejected.event_id
+    compiled = retained
     if compiled:
         generated = await publisher.publish(
             CANDIDATE_GENERATED,
@@ -260,6 +295,13 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                 "agent_id": agent.agent_id,
                 "candidate_count": len(compiled),
                 "candidate_keys": [item.candidate_key for item in compiled],
+                "hypothesis_ids": sorted(
+                    {
+                        str(item.plan_step.existing_hypothesis_id)
+                        for item in compiled
+                        if item.plan_step.existing_hypothesis_id is not None
+                    }
+                ),
                 "target_node_ids": sorted(
                     {
                         str(node_id)
@@ -284,6 +326,8 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             {
                 "agent_id": agent.agent_id,
                 "drafts_offered": len(drafts),
+                "total_drafts": len(drafts),
+                "rejected_count": len(rejections) + len(terminal_rejections) + len(drops),
                 "rejections": [
                     {
                         "candidate_key": item.candidate_key,
@@ -291,17 +335,22 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                         "reason": item.reason,
                         "field": item.field,
                     }
-                    for item in rejections
+                    for item in [*rejections, *terminal_rejections]
                 ],
+                "rejection_reason_summary": dict(
+                    Counter(
+                        [item.reason for item in rejections]
+                        + [item.reason for item in terminal_rejections]
+                        + [item.reason for item in drops]
+                    )
+                ),
+                "provider_diagnostic_summary": dict(
+                    Counter(item.reason for item in diagnostics)
+                ),
             },
             causation_id=last_event_id,
         )
         last_event_id = no_candidates.event_id
-    compiled = [
-        candidate
-        for candidate in compiled
-        if candidate.plan_step.repeatable or candidate.candidate_key not in terminal_keys
-    ]
     source_nodes = max(sum(observation.node_counts.values()), 1)
     if definition is None:
         context_load = 1.0
@@ -535,13 +584,28 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
 
     dispatch_items: list[DispatchItem] = []
     for candidate, work in leased:
-        candidate_step = candidate.plan_step
+        candidate_step = candidate.plan_step.model_copy(
+            update={"candidate_key": candidate.candidate_key}
+        )
         target = candidate_step.resolved_target()
         target_node_id = node_id_for_target(target)
         action_id = ActionId(new_id("action"))
 
         hypothesis_id: HypothesisId | None = None
-        if candidate_step.hypothesis is not None:
+        if candidate_step.existing_hypothesis_id is not None:
+            assert work.hypothesis_id == candidate_step.existing_hypothesis_id
+            existing = await service.get_hypothesis(str(work.hypothesis_id))
+            if existing is None:
+                await deps.work_store.complete(
+                    work.work_id,
+                    owner=str(runtime.run_id),
+                    status=WorkStatus.BLOCKED,
+                    now=now,
+                    reason="referenced_hypothesis_missing",
+                )
+                continue
+            hypothesis_id = work.hypothesis_id
+        elif candidate_step.hypothesis is not None:
             assert work.hypothesis_id is not None
             hypothesis = Hypothesis(
                 hypothesis_id=str(work.hypothesis_id),
@@ -614,6 +678,7 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                 "target": target_display_name(target),
                 "step_id": candidate_step.step_id,
                 "candidate_key": candidate.candidate_key,
+                "hypothesis_id": hypothesis_id,
                 "work_id": work.work_id,
                 "priority": candidate.priority.total,
                 "priority_components": candidate.priority.components,
@@ -636,6 +701,17 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                 proposal=proposal,
                 last_event_id=proposed.event_id,
             )
+        )
+
+    if not dispatch_items:
+        return advance(
+            state,
+            runtime.model_copy(update={"phase": AgentPhase.REPLAN}),
+            plan_step=None,
+            action_proposal=None,
+            current_work_id=None,
+            dispatch_items=[],
+            last_event_id=last_event_id,
         )
 
     first = dispatch_items[0]

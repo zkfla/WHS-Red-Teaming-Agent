@@ -33,6 +33,14 @@ WEB_API_AGENT = AgentSpec(
             preconditions=[NodePattern(type=GraphNodeType.ENDPOINT, bind="endpoint")],
             arguments=dict(_WEB_HTTP_REQUEST_ARGUMENTS),
             reason="Inspect a discovered endpoint before proposing deeper tests.",
+            hypothesis=HypothesisDraft(
+                description=(
+                    "This endpoint's access-control behavior may require targeted "
+                    "validation against an explicit operator policy."
+                ),
+                confidence=0.2,
+                metadata={"kind": "web_access_validation"},
+            ),
             observed_attrs={"web_inspected": True},
         ),
         PlanStep(

@@ -75,6 +75,7 @@ async def verify_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                 "agent_id": str(proposal.agent_id),
                 "capability": proposal.capability,
                 "operation": proposal.operation,
+                "candidate_key": step.candidate_key if step is not None else "",
             }
         }
     )
@@ -90,6 +91,7 @@ async def verify_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             "action_id": proposal.action_id,
             "invocation_id": evidence.invocation_id,
             "hypothesis_id": proposal.hypothesis_id,
+            "candidate_key": step.candidate_key if step is not None else "",
         },
         correlation_id=correlation_id,
         causation_id=state.get("last_event_id"),
@@ -213,11 +215,16 @@ async def verify_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                 f"(status {auth_assessment.session_status}); access-control "
                 "violation confirmed against the anonymous 401 baseline"
             )
+        elif (
+            step is not None
+            and step.assessment_kind == "security_check"
+            and step.authentication_check.expected_access == "deny"
+            and auth_assessment.outcome in {"session_not_accepted", "access_denied"}
+        ):
+            verdict = Verdict.PASS
+            reason = "the operator-declared deny expectation was enforced"
 
-    if step is not None and step.authentication_check is not None:
-        observation_only = verdict is not Verdict.VIOLATION
-    else:
-        observation_only = step is not None and step.assessment_kind == "observation"
+    observation_only = step is not None and step.assessment_kind == "observation"
     if observation_only:
         verdict = Verdict.UNKNOWN
         reason = "response recorded as an observation; no security claim was verified"
@@ -260,6 +267,7 @@ async def verify_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                     "reason": resolution_reason or reason,
                     "verdict": verdict.value,
                     "action_id": proposal.action_id,
+                    "candidate_key": step.candidate_key if step is not None else "",
                 },
                 correlation_id=correlation_id,
                 causation_id=last_event_id,
@@ -290,6 +298,7 @@ async def verify_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             reviewer_id=assessment.reviewer_id,
             source_refs=list(assessment.source_refs),
             severity=severity_for(step),
+            assessment_kind=(step.assessment_kind if step is not None else "observation"),
         ),
         existing_claims=existing_claims,
     )
@@ -308,6 +317,9 @@ async def verify_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                 "finding_id": finding.finding_id,
                 "severity": finding.severity,
                 "evidence_ids": finding.evidence_ids,
+                "hypothesis_id": proposal.hypothesis_id,
+                "action_id": proposal.action_id,
+                "candidate_key": step.candidate_key if step is not None else "",
             },
             correlation_id=correlation_id,
             causation_id=last_event_id,

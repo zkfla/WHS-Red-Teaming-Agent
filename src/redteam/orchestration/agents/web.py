@@ -20,12 +20,12 @@ from __future__ import annotations
 
 from redteam.attack_graph.identity import endpoint_node_id, host_node_id
 from redteam.attack_graph.observation import GraphObservation
-from redteam.attack_graph.predicates import facts_of
+from redteam.attack_graph.predicates import attrs_of, facts_of
 from redteam.attack_graph.view import AttackGraphView
 from redteam.core.contracts.graph import GraphNode
 from redteam.core.contracts.target import EndpointTarget
 from redteam.core.enums import GraphNodeType
-from redteam.core.ids import EvidenceId, ToolId
+from redteam.core.ids import EvidenceId, HypothesisId, ToolId
 from redteam.orchestration.agents.base import AgentSpec, HypothesisDraft, PlanStep
 from redteam.orchestration.agents.providers import (
     CandidateBatch,
@@ -112,7 +112,9 @@ class WebCandidateProvider:
         else:
             candidates = await playbook.propose(spec, view, observation, step=step)
         diagnostics: list[CandidateDiagnostic] = []
-        for node in await view.list_nodes():
+        nodes = await view.list_nodes()
+        validation_hypotheses = _access_validation_hypotheses(nodes)
+        for node in nodes:
             if node.type is not GraphNodeType.ENDPOINT:
                 continue
             facts = facts_of(node.properties)
@@ -140,6 +142,7 @@ class WebCandidateProvider:
                     host_facts=host_facts,
                     sessions=sessions,
                     latest=latest,
+                    validation_hypothesis_id=validation_hypotheses.get(str(node.id)),
                     diagnostics=diagnostics,
                 )
             )
@@ -313,6 +316,7 @@ class WebCandidateProvider:
         host_facts: dict,
         sessions: list[AuthSession],
         latest: dict[str, dict],
+        validation_hypothesis_id: HypothesisId | None,
         spec: AgentSpec,
         diagnostics: list[CandidateDiagnostic],
     ) -> list[CandidateDraft]:
@@ -343,6 +347,15 @@ class WebCandidateProvider:
             for session in eligible:
                 if request_key("GET", item["path"], session.session_ref) in latest:
                     continue
+                if session.expected_access == "deny" and validation_hypothesis_id is None:
+                    diagnostics.append(
+                        CandidateDiagnostic(
+                            target_node_id=node.id,
+                            reason="missing_access_validation_hypothesis",
+                            evidence_id=item["evidence_id"],
+                        )
+                    )
+                    continue
                 drafts.append(
                     self._session_candidate(
                         spec=spec,
@@ -352,6 +365,11 @@ class WebCandidateProvider:
                         host_facts=host_facts,
                         session=session,
                         baseline=item,
+                        validation_hypothesis_id=(
+                            validation_hypothesis_id
+                            if session.expected_access == "deny"
+                            else None
+                        ),
                     )
                 )
         return drafts
@@ -598,6 +616,7 @@ class WebCandidateProvider:
         host_facts: dict,
         session: AuthSession,
         baseline: dict,
+        validation_hypothesis_id: HypothesisId | None = None,
     ) -> CandidateDraft:
         key = request_key("GET", baseline["path"], session.session_ref)
         return CandidateDraft(
@@ -608,7 +627,9 @@ class WebCandidateProvider:
                 operation=_HTTP_REQUEST_OPERATION,
                 tool_id=WEB_HTTP_REQUEST,
                 compatible_tool_ids=[WEB_HTTP_REQUEST],
-                assessment_kind="observation",
+                assessment_kind=(
+                    "security_check" if validation_hypothesis_id is not None else "observation"
+                ),
                 authentication_check=AuthenticationCheck(
                     baseline_evidence_id=EvidenceId(baseline["evidence_id"]),
                     session_ref=session.session_ref,
@@ -638,6 +659,7 @@ class WebCandidateProvider:
                         "baseline_evidence_id": baseline["evidence_id"],
                     },
                 ),
+                existing_hypothesis_id=validation_hypothesis_id,
             ),
             target_node_ids=[node.id],
             conflict_keys=[f"target:{node.id}"],
@@ -854,3 +876,32 @@ def _posture_observed(facts: dict) -> bool:
         if item.get("kind") == "http_security_posture" and item.get("session_ref") is None:
             return True
     return False
+
+
+def _access_validation_hypotheses(nodes: list[GraphNode]) -> dict[str, HypothesisId]:
+    """Return reusable observation questions keyed by endpoint node id.
+
+    ``inconclusive`` means the observation did not decide the question. It is
+    therefore eligible for one bounded, catalog-backed validation; confirmed
+    and rejected hypotheses are deliberately ignored.
+    """
+
+    found: dict[str, HypothesisId] = {}
+    for node in nodes:
+        if node.type is not GraphNodeType.HYPOTHESIS:
+            continue
+        hypothesis = facts_of(node.properties)
+        metadata = hypothesis.get("metadata")
+        target_node_id = metadata.get("target_node_id") if isinstance(metadata, dict) else None
+        hypothesis_id = hypothesis.get("hypothesis_id")
+        if (
+            attrs_of(node.properties).get("status") == "inconclusive"
+            and isinstance(metadata, dict)
+            and metadata.get("kind") == "web_access_validation"
+            and isinstance(target_node_id, str)
+            and target_node_id
+            and isinstance(hypothesis_id, str)
+            and hypothesis_id
+        ):
+            found.setdefault(target_node_id, HypothesisId(hypothesis_id))
+    return found

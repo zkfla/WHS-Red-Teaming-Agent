@@ -36,9 +36,12 @@ class WorkScheduler:
                 graph_revision=graph_revision,
                 target_node_ids=draft.target_node_ids,
                 hypothesis_id=(
-                    HypothesisId(new_id("hyp"))
-                    if draft.plan_step.hypothesis is not None
-                    else None
+                    draft.plan_step.existing_hypothesis_id
+                    or (
+                        HypothesisId(new_id("hyp"))
+                        if draft.plan_step.hypothesis is not None
+                        else None
+                    )
                 ),
                 prerequisite_ids=draft.prerequisite_ids,
                 conflict_keys=draft.conflict_keys,

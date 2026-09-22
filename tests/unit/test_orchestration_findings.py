@@ -31,6 +31,7 @@ def request(**overrides) -> PromotionRequest:
         "action_id": "action_1",
         "reviewer_id": "analysis:deterministic-expectation-v1",
         "severity": "high",
+        "assessment_kind": "security_check",
     }
     values.update(overrides)
     return PromotionRequest(**values)
@@ -87,6 +88,13 @@ def test_a_non_violation_verdict_is_never_promoted() -> None:
         decision = FindingPromoter().promote(request(verdict=verdict))
         assert not decision.promoted
         assert decision.refused_reason == "verdict_is_not_a_violation"
+
+
+def test_an_observation_assessment_can_never_be_promoted() -> None:
+    decision = FindingPromoter().promote(request(assessment_kind="observation"))
+
+    assert not decision.promoted
+    assert decision.refused_reason == "assessment_is_not_a_security_check"
 
 
 def test_the_same_claim_is_not_promoted_twice() -> None:

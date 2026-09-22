@@ -12,6 +12,7 @@ from __future__ import annotations
 from redteam.attack_graph.identity import endpoint_node_id
 from redteam.attack_graph.service import AttackGraphService
 from redteam.attack_graph.stores.memory import InMemoryAttackGraphStore
+from redteam.core.contracts.graph import Hypothesis
 from redteam.core.enums import GraphNodeType
 from redteam.orchestration.agents.builtin import WEB_API_AGENT
 from redteam.orchestration.agents.providers import GraphCandidateContext
@@ -127,6 +128,49 @@ async def test_anonymous_401_with_a_registered_session_probes_with_that_session(
     assert probes[0].plan_step.arguments["session_ref"] == "alice"
     assert probes[0].plan_step.authentication_check is not None
     assert str(probes[0].target_node_ids[0]) == str(endpoint_node_id("GET", PATH, host=HOST))
+
+
+async def test_explicit_deny_reuses_an_inconclusive_validation_hypothesis() -> None:
+    service = await endpoint_graph(
+        observations=[http_observation(401)],
+        sessions=[session("alice", expected_access="deny")],
+    )
+    endpoint_id = endpoint_node_id("GET", PATH, host=HOST)
+    await service.record_hypothesis(
+        Hypothesis(
+            hypothesis_id="hyp_access_1",
+            description="access behavior requires explicit-policy validation",
+            status="inconclusive",
+            metadata={
+                "kind": "web_access_validation",
+                "target_node_id": str(endpoint_id),
+            },
+        ),
+        about=endpoint_id,
+    )
+
+    batch = await propose(service)
+
+    probes = followups(batch, step_prefix="auth-check:")
+    assert len(probes) == 1
+    step = probes[0].plan_step
+    assert step.assessment_kind == "security_check"
+    assert str(step.existing_hypothesis_id) == "hyp_access_1"
+    assert step.hypothesis is not None and step.hypothesis.violation_if_confirmed
+
+
+async def test_explicit_deny_without_a_preexisting_hypothesis_is_deferred() -> None:
+    service = await endpoint_graph(
+        observations=[http_observation(401)],
+        sessions=[session("alice", expected_access="deny")],
+    )
+
+    batch = await propose(service)
+
+    assert not followups(batch, step_prefix="auth-check:")
+    assert [item.reason for item in batch.diagnostics] == [
+        "missing_access_validation_hypothesis"
+    ]
 
 
 async def test_anonymous_and_session_candidates_are_distinct_identities() -> None:

@@ -237,18 +237,14 @@ def default_provider_registry() -> CandidateProviderRegistry:
     from redteam.orchestration.agents.web import WebCandidateProvider
 
     playbook = PlaybookCandidateProvider()
-    # Every AgentDefinition declares a provider_id, so every declared id must
-    # resolve even when the role is a non-schedulable seam (Analysis is the
-    # verifier, Reporting the terminal projector): a registry that cannot
-    # resolve a declared id turns "flip schedulable to True later" into an
-    # AgentProviderFailed crash instead of a working role.
-    return CandidateProviderRegistry(
-        [
-            ("playbook:recon", ReconCandidateProvider()),
-            ("playbook:web_api", WebCandidateProvider()),
-        ]
-        + [
+
+    providers: list[tuple[str, CandidateProvider]] = [
+        ("playbook:recon", ReconCandidateProvider()),
+        ("playbook:web_api", WebCandidateProvider()),
+        *[
             (f"playbook:{role}", playbook)
             for role in ("mobile", "analysis", "reporting")
-        ]
-    )
+        ],
+    ]
+
+    return CandidateProviderRegistry(providers)

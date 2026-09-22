@@ -221,7 +221,7 @@ async def test_denied_session_200_is_a_confirmed_access_control_finding():
     # policy violation corroborated by two evidence records (anonymous 401
     # baseline + this session's 200), so -- unlike an ambiguous status-only
     # signal -- it IS promoted to a verified Finding.
-    _, deps, _, _ = await exercise(
+    final, deps, _, _ = await exercise(
         sessions=[{"session_ref": "bob", "paths": ["/"], "expected_access": "deny"}]
     )
     assert (
@@ -235,6 +235,45 @@ async def test_denied_session_200_is_a_confirmed_access_control_finding():
     assert finding.severity == "high"
     # Corroborated by the baseline 401 and the session's 200.
     assert len(finding.evidence_ids) == 2
+    graph = AttackGraphService(deps.graph_store)
+    hypotheses = [
+        item
+        for item in await graph.list_hypotheses()
+        if item.metadata.get("kind") == "web_access_validation"
+    ]
+    assert len(hypotheses) == 1
+    hypothesis = hypotheses[0]
+    assert hypothesis.status == "confirmed"
+    assert finding.metadata["hypothesis_id"] == hypothesis.hypothesis_id
+    evidence = await deps.evidence_store.list_for_run(final.run_id)
+    validation = [item for item in evidence if item.hypothesis_id == hypothesis.hypothesis_id]
+    assert len(validation) == 2
+    action_events = deps.event_bus.history(event_type="ActionProposed")
+    validation_actions = [
+        item
+        for item in action_events
+        if item.payload.get("hypothesis_id") == hypothesis.hypothesis_id
+    ]
+    assert len(validation_actions) == 2  # initial observation plus targeted validation
+    assert len({item.payload["hypothesis_id"] for item in validation_actions}) == 1
+    finding_event = deps.event_bus.history(event_type="FindingCreated")[0]
+    assert finding_event.payload["hypothesis_id"] == hypothesis.hypothesis_id
+
+
+async def test_denied_session_that_remains_denied_rejects_the_same_hypothesis():
+    _, deps, _, _ = await exercise(
+        authenticated=403,
+        sessions=[{"session_ref": "bob", "paths": ["/"], "expected_access": "deny"}],
+    )
+
+    graph = AttackGraphService(deps.graph_store)
+    hypotheses = [
+        item
+        for item in await graph.list_hypotheses()
+        if item.metadata.get("kind") == "web_access_validation"
+    ]
+    assert len(hypotheses) == 1 and hypotheses[0].status == "rejected"
+    assert await graph.list_findings() == []
 
 
 async def test_each_session_is_checked_once_and_preserves_anonymous_evidence():

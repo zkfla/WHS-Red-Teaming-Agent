@@ -279,6 +279,7 @@ def candidate_key(draft: CandidateDraft) -> str:
         "target_node_ids": sorted(map(str, draft.target_node_ids)),
         "prerequisite_ids": sorted(draft.prerequisite_ids),
         "hypothesis": hypothesis.description if hypothesis else None,
+        "existing_hypothesis_id": str(draft.plan_step.existing_hypothesis_id or ""),
         "prerequisite_fingerprint": draft.prerequisite_fingerprint,
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
