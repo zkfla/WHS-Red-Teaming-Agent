@@ -107,6 +107,99 @@ def test_candidate_metadata_includes_every_registered_capability() -> None:
     }
 
 
+def test_multiple_candidates_for_one_operation_keep_individual_metadata() -> None:
+    """``analysis.static_analysis`` with two apktool-shaped tools plus a
+    local-fallback tool: each candidate must stay separately inspectable
+    (own ``tool_id``/schema/risk), never collapsed or deduplicated just
+    because they share a canonical operation."""
+
+    registry = MCPToolRegistry()
+    registry.register(
+        ToolDescriptor(
+            tool_id=ToolId("analysis.decode_apk"),
+            server_id="apktool",
+            tool_name="decode_apk",
+            input_schema={
+                "type": "object",
+                "properties": {"apk_path": {"type": "string"}},
+                "required": ["apk_path"],
+            },
+            capability_tags=["analysis"],
+            risk_level=RiskLevel.LOW,
+            health_status=ToolHealthStatus.HEALTHY,
+        )
+    )
+    registry.register(
+        ToolDescriptor(
+            tool_id=ToolId("analysis.get_manifest"),
+            server_id="apktool",
+            tool_name="get_manifest",
+            input_schema={
+                "type": "object",
+                "properties": {"project_dir": {"type": "string"}},
+                "required": ["project_dir"],
+            },
+            capability_tags=["analysis"],
+            risk_level=RiskLevel.LOW,
+            health_status=ToolHealthStatus.HEALTHY,
+        )
+    )
+    registry.register(
+        ToolDescriptor(
+            tool_id=ToolId("analysis.apk_file_listing"),
+            server_id="analysis-local",
+            tool_name="apk_file_listing",
+            input_schema={
+                "type": "object",
+                "properties": {"apk_ref": {"type": "string"}},
+                "required": ["apk_ref"],
+            },
+            capability_tags=["analysis"],
+            risk_level=RiskLevel.LOW,
+            health_status=ToolHealthStatus.HEALTHY,
+        )
+    )
+    gateway = MCPToolGateway(
+        registry,
+        adapters={},
+        operation_bindings={
+            "analysis.decode_apk": ("static_analysis",),
+            "analysis.get_manifest": ("static_analysis",),
+            "analysis.apk_file_listing": ("static_analysis",),
+        },
+        output_schemas={
+            "analysis.apk_file_listing": {
+                "type": "object", "properties": {"entries": {"type": "array"}}
+            }
+        },
+        target_types={
+            "analysis.decode_apk": "asset",
+            "analysis.get_manifest": "asset",
+            "analysis.apk_file_listing": "asset",
+        },
+    )
+
+    candidates = gateway.list_candidate_metadata("analysis", "static_analysis")
+
+    assert len(candidates) == 3
+    by_tool_id = {str(c.tool_id): c for c in candidates}
+    assert set(by_tool_id) == {
+        "analysis.decode_apk",
+        "analysis.get_manifest",
+        "analysis.apk_file_listing",
+    }
+    assert by_tool_id["analysis.decode_apk"].required_arguments == ("apk_path",)
+    assert by_tool_id["analysis.get_manifest"].required_arguments == ("project_dir",)
+    assert by_tool_id["analysis.apk_file_listing"].required_arguments == ("apk_ref",)
+    # Only the local-fallback tool has a known output schema -- the apktool
+    # candidates correctly stay None (never guessed) alongside it.
+    assert by_tool_id["analysis.decode_apk"].output_schema is None
+    assert by_tool_id["analysis.get_manifest"].output_schema is None
+    assert by_tool_id["analysis.apk_file_listing"].output_schema == {
+        "type": "object", "properties": {"entries": {"type": "array"}}
+    }
+
+
 async def test_adapter_keeps_discovered_output_schema() -> None:
     class Transport:
         async def health_check(self) -> bool:

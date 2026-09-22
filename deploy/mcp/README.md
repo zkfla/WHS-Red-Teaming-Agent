@@ -233,6 +233,118 @@ Policy shape:
 python -m redteam.capability.servers.analysis --policy /absolute/path/analysis-policy.json
 ```
 
+## Local fallback vs. external MCP: not a transparent substitute
+
+`mobile-local`/`analysis-local` exist so the capability works without the
+external candidate installed, but they are **not** functionally
+interchangeable with mobile-next/apktool-mcp-server for the same canonical
+operation, even though Action-aware Tool Selection
+(`orchestration.candidates.tool_selection.select_tool`) can pick either one:
+
+- `analysis-local`'s `static_analysis` tools read the APK's zip container
+  only (`zipfile`, no decompilation) — `apktool-mcp-server`'s decode
+  smali/`AndroidManifest.xml` at the decompiled-code level. Same canonical
+  operation, materially different depth of analysis; see each server's own
+  module docstring (`capability/servers/analysis.py`).
+- `mobile-local`'s `device_shell` is not a fallback for anything
+  mobile-next exposes — mobile-next has no shell-style primitive at all
+  (see the operation table above). It fills a gap, it does not substitute
+  an existing one.
+- If both `apktool` and `analysis-local` are configured for the same
+  engagement, both bind `analysis.static_analysis` with the same
+  (`healthy`, `LOW` risk) tier today, so `select_tool`'s final tie-break —
+  stable `tool_id` lexical order — decides between them. `analysis.apk_*`
+  (analysis-local) sorts before `analysis.decode_apk`/`analysis.get_*`
+  (apktool) alphabetically, so the *shallower* zip-level tool would win
+  every time a candidate is actually picked, not the decompiling one. This
+  is Orchestration-owned selection logic (out of scope here to change) —
+  documented so an operator configuring both together understands the
+  consequence, rather than assuming "more candidates" means "the best one
+  gets used."
+
+Only treat two candidates as a genuine transparent fallback of each other
+when their input contract, output shape, and risk classification all
+match — not just their canonical operation name.
+
+## Risk level rationale (mobile/analysis)
+
+No new risk taxonomy — this project's single `RiskLevel` (LOW/MEDIUM/HIGH/
+CRITICAL, `core.enums.RiskLevel`) stays the only axis. Current assignments
+in `mobile_analysis_manifest.py`, and why:
+
+- **`static_analysis`, all candidates (apktool, analysis-local) — `LOW`.**
+  Read-only file/zip parsing against an operator-registered local artifact;
+  no device or network interaction.
+- **`device_shell` (mobile-local) — `LOW`.** A fixed four-command allowlist
+  (`getprop`, `pm_list_packages`, `dumpsys_battery`, `logcat_recent`), all
+  read-only diagnostics with capped output (`capability/servers/mobile.py`)
+  — no device state is ever mutated, and the command set cannot grow at
+  runtime.
+- **`app_launch` (mobile-next) — `MEDIUM`.** Starts a real process on a
+  real device — the one operation in this set that mutates device state.
+- **`response_analysis` (mobile-next: device logs/crash retrieval) —
+  `MEDIUM`, not `LOW`.** Also read-only, but deliberately rated above
+  `device_shell`: the upstream server, not this project, decides what a
+  log/crash dump contains, with no fixed allowlist or output cap on this
+  project's side — broader, less-bounded read access than the four fixed
+  diagnostics above.
+
+One adapter-level `REDTEAM_MCP_<SERVER_ID>_RISK_LEVEL` applies uniformly to
+every tool discovered from that server (`MCPServerAdapter.discover_tools`,
+`capability/adapters/mcp/streamable_http.py`) — the manifest's per-tool
+`risk_level` is what `validate_configured_discovery` checks that value
+against at startup, not a per-tool override. This is why every
+mobile-next tool in the manifest carries the same `MEDIUM` and every
+apktool tool carries the same `LOW`: a single env var per server can only
+express one tier, so today's manifest keeps every tool on one server at a
+uniform tier by construction. If a future candidate server mixes tiers
+across its own tools, per-tool risk would need to move from the manifest
+into something the adapter can read per remote tool name — not attempted
+here (no new enum, no Contract change; scope stays this PR's four
+candidate servers).
+
+## Mobile/analysis status (2026-09-22)
+
+"A tool is registered" and "an Agent can actually use it today" are not
+the same claim — kept separate below.
+
+**Implemented:**
+
+- mobile-next discovery (`app_launch`, `response_analysis` x3)
+- apktool discovery (`static_analysis` x9)
+- `mobile-local`/`analysis-local` fallbacks (`device_shell`,
+  `static_analysis` x3)
+- manifest ↔ MCP discovery conformance validation
+  (`validate_configured_discovery`, fails registration on drift)
+- candidate metadata (`MCPToolGateway.list_candidate_metadata()`) —
+  per-candidate, never collapsed when several tools share an operation
+- direct Gateway invocation (`MCPToolGateway.invoke`)
+- structured output schemas for the two local-fallback servers
+- external MCP `outputSchema` preservation where advertised, `None`
+  where not (never inferred)
+
+**Validated (real execution, not just registration):**
+
+- apktool MCP direct call (`decode_apk` then `get_manifest`)
+- `MCPToolGateway.invoke("analysis.get_manifest")` through the full
+  transport/adapter/gateway stack
+- `InsecureBankv2.apk` manifest extraction (`com.android.insecurebankv2`)
+  via that path
+
+**Not yet validated:**
+
+- `mobile.app_launch` real execution — no online emulator/device in this
+  environment (`tests/integration/test_mobile_mcp.py` has an opt-in real
+  test ready; needs a device, not new test code)
+- Agent -> Control -> Capability full E2E for mobile/analysis (see the
+  Integration Issue in
+  `docs/capability/issues/0001-tool-candidate-metadata-contract.md`)
+- MobSF Docker integration (excluded from this work's scope)
+- Structured interpretation of external MCP tool output that has no
+  advertised `outputSchema` — documented as available metadata only, no
+  Result Mapper implemented (that decision belongs with Agent
+  Team/Observation, not Capability alone)
+
 ## Adding a new MCP server
 
 1. Add the server's image/build to `deploy/compose/docker-compose.yml`
