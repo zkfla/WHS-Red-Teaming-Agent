@@ -14,6 +14,7 @@ from typing import Protocol
 
 from redteam.core.contracts.action import ActionProposal
 from redteam.core.contracts.policy import ControlContext, PolicyDecision
+from redteam.core.ids import ApprovalId
 
 
 class ControlPlane(Protocol):
@@ -22,3 +23,20 @@ class ControlPlane(Protocol):
         proposal: ActionProposal,
         context: ControlContext,
     ) -> PolicyDecision: ...
+
+    async def approval_outcome(self, approval_id: ApprovalId) -> PolicyDecision | None:
+        """The final decision for a proposal that previously got
+        ``REQUIRE_APPROVAL``, once a human has resolved it — or ``None``
+        while still pending.
+
+        Never creates a new Approval and never re-runs Scope/ROE/Policy
+        (those already ran once, deterministically, against the same
+        immutable proposal and engagement config): only the pipeline
+        stages whose outcome can change between the original evaluation
+        and resolution (rate limit, budget) are re-checked, so a resolved
+        Approval cannot bypass either. A rejected or expired Approval
+        resolves to a ``DENY`` here, never left dangling. Idempotent:
+        calling this again after the first resolved call returns the
+        same decision rather than re-consuming budget.
+        """
+        ...

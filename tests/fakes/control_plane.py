@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from redteam.core.contracts.action import ActionProposal
 from redteam.core.contracts.policy import ControlContext, PolicyDecision
 from redteam.core.enums import PolicyVerdict
-from redteam.core.ids import ActionId
+from redteam.core.ids import ActionId, ApprovalId
 
 
 class FakeControlPlane:
@@ -19,6 +19,11 @@ class FakeControlPlane:
     per-action override via ``verdict_by_action_id``. No scope/policy/
     rate-limit/budget logic — for tests of code that just needs *some*
     ``PolicyDecision`` back, not a correctly-evaluated one.
+
+    ``approval_outcome`` returns a canned decision set via
+    ``resolve_approval`` (test setup), or ``None`` (still pending) if
+    never set — real budget/rate-limit re-evaluation belongs to
+    ``DefaultControlPlane``, not this fake.
     """
 
     def __init__(
@@ -29,6 +34,7 @@ class FakeControlPlane:
         self.default_verdict = default_verdict
         self.verdict_by_action_id = verdict_by_action_id or {}
         self.evaluated: list[ActionProposal] = []
+        self._resolved: dict[ApprovalId, PolicyDecision] = {}
 
     async def evaluate(self, proposal: ActionProposal, context: ControlContext) -> PolicyDecision:
         self.evaluated.append(proposal)
@@ -38,5 +44,15 @@ class FakeControlPlane:
             verdict=verdict,
             reasons=["FakeControlPlane"],
             matched_rules=[],
+            approval_id=ApprovalId(f"appr_{proposal.action_id}")
+            if verdict == PolicyVerdict.REQUIRE_APPROVAL
+            else None,
             evaluated_at=datetime.now(timezone.utc),
         )
+
+    def resolve_approval(self, approval_id: ApprovalId, decision: PolicyDecision) -> None:
+        """Test setup helper: make ``approval_outcome`` return ``decision``."""
+        self._resolved[approval_id] = decision
+
+    async def approval_outcome(self, approval_id: ApprovalId) -> PolicyDecision | None:
+        return self._resolved.get(approval_id)

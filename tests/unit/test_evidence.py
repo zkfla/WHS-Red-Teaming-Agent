@@ -21,7 +21,7 @@ async def test_record_tool_result_persists_evidence(tmp_path: Path) -> None:
     result = ToolResult(
         invocation_id=InvocationId("inv_1"),
         action_id=ActionId("action_1"),
-        tool_id=ToolId("example.ping"),
+        tool_id=ToolId("recon.ping"),
         success=True,
         output={"echo": {"message": "hi"}},
         started_at=datetime.now(timezone.utc),

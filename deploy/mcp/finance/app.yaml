@@ -1,0 +1,28 @@
+engagement:
+  name: Synthetic financial MCP integration lab
+  scope:
+    allowed_hosts: [mock-bank]
+  metadata:
+    target_refs:
+      mock-bank: bank-lab
+  execution_budget:
+    max_actions: 30
+    max_tool_calls: 30
+    max_duration_seconds: 300
+  rate_limit_policy:
+    max_actions_per_minute: 10
+    max_concurrent_actions: 1
+  approval_policy:
+    auto_approve: false
+    require_approval_for:
+      - web.http_request
+      - web.auth_attempt
+      - web.parameter_fuzz
+      - web.response_analysis
+      - recon.port_scan
+capability:
+  mcp_servers: [web-http, web-proxy, web-browser, recon-passive, recon-active]
+llm:
+  provider: fake
+logging:
+  level: WARNING

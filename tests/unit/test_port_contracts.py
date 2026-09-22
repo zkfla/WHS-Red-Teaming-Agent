@@ -37,8 +37,8 @@ async def test_fake_control_plane_satisfies_protocol() -> None:
         run_id=RunId("run_1"),
         engagement_id=EngagementId("eng_1"),
         agent_id=AgentId("agent_1"),
-        capability="recon.example",
-        operation="ping",
+        capability="recon",
+        operation="service_discovery",
         target=HostTarget(host="a.local"),
         reason="test",
         created_at=datetime.now(timezone.utc),
@@ -55,8 +55,8 @@ async def test_dummy_tool_gateway_satisfies_protocol() -> None:
         invocation_id=InvocationId("inv_1"),
         action_id=ActionId("action_1"),
         run_id=RunId("run_1"),
-        tool_id=ToolId("example.ping"),
-        operation="ping",
+        tool_id=ToolId("recon.ping"),
+        operation="service_discovery",
         execution_context=ExecutionContext(
             engagement_id=EngagementId("eng_1"), run_id=RunId("run_1")
         ),

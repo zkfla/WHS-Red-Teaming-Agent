@@ -42,6 +42,8 @@ class ToolInvocation(BaseModel):
     action_id: ActionId
     run_id: RunId
     tool_id: ToolId
+    # Canonical, tool-independent intent copied from ActionProposal.operation.
+    # The actual MCP remote tool name is resolved from tool_id via ToolDescriptor.
     operation: str
     arguments: dict[str, Any] = Field(default_factory=dict)
     timeout_seconds: float = 30.0
