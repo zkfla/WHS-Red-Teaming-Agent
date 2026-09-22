@@ -390,7 +390,11 @@ AgentNoExecutableCandidates")은 payload 확장까지 반영됐지만, **발행 
 - `total_drafts`/`drafts_offered` — `CandidateDraft` 수만(drop은 draft 가 아니다)
 - `dropped_count`(신규) — draft 를 만들지 못한 step 수
 - `provider_diagnostic_count`(신규) — provider가 보고한 진단 수
-- `rejected_count` — 위 셋과 compile rejection 의 합집합(비실행 결과 총계)
+- `rejected_count` — **compiler rejection + terminal-prior rejection + drop 의 총계**
+  (`len(rejections) + len(terminal_rejections) + len(drops)`).
+  provider diagnostics 는 **포함되지 않는다** — 진단은 "무엇이 거부됐다"가 아니라
+  "왜 아무것도 못 냈는가"를 설명하므로 `provider_diagnostic_count` 로 별도 집계한다.
+  그래서 diagnostic-only 프런티어에서 `rejected_count == 0` 인 것이 정상이다.
 - `rejection_reason_summary` / `provider_diagnostic_summary` — 사유별 내역
 
 회귀 근거(신규 3건, `tests/unit/test_orchestration_nodes.py`):

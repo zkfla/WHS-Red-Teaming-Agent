@@ -326,9 +326,12 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
         #
         # The counts are reported per source so none of them has to be read
         # as a total: total_drafts counts CandidateDrafts only (a drop is not
-        # a draft), dropped_count counts steps that produced no draft,
-        # provider_diagnostic_count counts provider-reported reasons, and
-        # rejected_count is the union of everything non-executable.
+        # a draft), dropped_count counts steps that produced no draft, and
+        # rejected_count is the compiler/terminal/drop rejection total.
+        # Provider diagnostics are deliberately NOT part of rejected_count:
+        # they are counted separately as provider_diagnostic_count, because a
+        # diagnostic explains why nothing was offered rather than rejecting
+        # something that was.
         no_candidates = await publisher.publish(
             AGENT_NO_EXECUTABLE_CANDIDATES,
             {
