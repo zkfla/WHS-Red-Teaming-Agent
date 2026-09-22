@@ -16,10 +16,15 @@ Capability Registry는 MCP discovery 결과를 다음 메타데이터 묶음으�
 
 `required_arguments`와 `optional_arguments`를 별도 설정 파일에 반복해서 쓰지
 않는다. 실제 MCP `input_schema`의 `required`와 `properties`가 원본이다. 시작 시
-input/output schema가 유효한 JSON Schema인지 검사하고, 실행 후 output이 등록된
-schema를 만족하지 않으면 결과를 실패로 기록한다.
+input/output schema가 유효한 JSON Schema인지 검사하고, required 인자가 properties에
+실제로 존재하는지도 확인한다. `operations`는 중복 없는 lower_snake_case여야 하고,
+`target_types`는 Core가 이해하는 Graph target 종류만 허용한다. 검증에 실패한
+discovery 결과는 Registry에 등록하지 않는다. 실행 후 output이 등록된 schema를
+만족하지 않으면 결과를 실패로 기록한다.
 
-Agent는 특정 MCP 서버나 구현체를 import하지 않는다.
+Agent는 특정 MCP 서버나 구현체를 import하지 않는다. Agent가 사용하는
+`redteam.core.ports.tool_catalog.ToolCatalog`가 유일한 조회 계약이며,
+`redteam.orchestration.candidates.catalog.ToolCatalog`는 호환용 재-export일 뿐이다.
 
 ```text
 Agent → core ToolCatalog Port → Capability Registry → ToolGateway → MCP Adapter

@@ -5,9 +5,6 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from contextlib import AsyncExitStack, asynccontextmanager
 
-from jsonschema import Draft202012Validator
-from jsonschema.exceptions import SchemaError
-
 from redteam.capability.adapters.mcp.analysis import AnalysisMCPAdapter
 from redteam.capability.adapters.mcp.base import MCPAdapter
 from redteam.capability.adapters.mcp.example import ExampleMCPAdapter
@@ -21,6 +18,7 @@ from redteam.capability.adapters.mcp.transport import (
 )
 from redteam.capability.adapters.mcp.web_api import WebAPIMCPAdapter
 from redteam.capability.gateway import MCPToolGateway
+from redteam.capability.manifest import validate_tool_manifest
 from redteam.capability.registry import MCPToolRegistry
 from redteam.capability.settings import (
     MCPConfigurationError,
@@ -58,7 +56,10 @@ async def _build_gateway(
     if not server_ids:
         example = ExampleMCPAdapter()
         registry = MCPToolRegistry()
-        registry.replace_server_tools(example.server_id, await example.discover_tools())
+        example_descriptors = await example.discover_tools()
+        for descriptor in example_descriptors:
+            validate_tool_manifest(descriptor)
+        registry.replace_server_tools(example.server_id, example_descriptors)
         return MCPToolGateway(
             registry, {example.server_id: example},
             {str(tool.tool_id): ("service_discovery",) for tool in registry.all()},
@@ -89,9 +90,6 @@ async def _build_gateway(
                     f"MCP server {server_id!r} operation bindings do not match discovered tools"
                 )
         for descriptor in descriptors:
-            _validate_discovered_schema(descriptor.tool_name, descriptor.input_schema)
-            if descriptor.output_schema:
-                _validate_discovered_schema(descriptor.tool_name, descriptor.output_schema)
             operations = (
                 settings.tool_operations[descriptor.tool_name]
                 if settings.tool_operations is not None
@@ -102,6 +100,9 @@ async def _build_gateway(
             # Gateway map.
             descriptor.operations = list(operations)
             descriptor.target_types = _default_target_types(settings.kind, descriptor.tool_name)
+            # Validate after operator bindings are copied into the descriptor:
+            # this is the exact manifest exposed to Agent/Orchestration.
+            validate_tool_manifest(descriptor)
             operation_bindings[str(descriptor.tool_id)] = operations
         registry.replace_server_tools(server_id, descriptors)
         adapters[server_id] = adapter
@@ -132,16 +133,6 @@ def _default_target_types(kind: MCPServerKind, tool_name: str) -> list[str]:
     if kind == MCPServerKind.RECON:
         return ["host", "service", "endpoint"]
     return []
-
-
-def _validate_discovered_schema(tool_name: str, schema: dict[str, object]) -> None:
-    """Fail closed when an MCP advertises malformed JSON Schema."""
-    try:
-        Draft202012Validator.check_schema(schema)
-    except SchemaError as exc:
-        raise MCPConfigurationError(
-            f"MCP tool {tool_name!r} advertised an invalid JSON schema"
-        ) from exc
 
 
 def _create_adapter(settings: MCPServerSettings, transport: MCPTransport) -> MCPAdapter:
