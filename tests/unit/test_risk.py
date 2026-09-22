@@ -171,9 +171,10 @@ class _ExplodingResolver:
         raise RuntimeError("registry unavailable")
 
 
-async def test_pipeline_risk_resolution_failure_is_fail_closed() -> None:
-    # A crashing risk source must NOT crash the gate, and must fail closed
-    # (require a human) rather than let a possibly-risky action through.
+async def test_pipeline_risk_resolution_failure_escalates_to_manual_approval() -> None:
+    # A crashing risk source must NOT crash the gate, and must escalate to
+    # a human (REQUIRE_APPROVAL, not a fail-closed DENY) rather than let a
+    # possibly-risky action through on an unresolved risk.
     engagement = _engagement()
     plane = DefaultControlPlane(
         {engagement.engagement_id: engagement}, risk_resolver=_ExplodingResolver()

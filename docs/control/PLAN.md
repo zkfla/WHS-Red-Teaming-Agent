@@ -127,7 +127,7 @@ ToolGateway.list_tools_for_action()   ← read-only 조회, 실행 없음
 ```
 
 - 등록된 도구가 없으면 risk 판단은 건너뛰고 기존 동작 그대로다.
-- **조회가 예외를 던지면 fail-closed** — 로그를 남기고 `REQUIRE_APPROVAL` (`matched_rules: "risk:unresolved"`). 위험도를 알 수 없는 Action이 승인 없이 통과하지 않게 하고, 게이트가 크래시하지도 않게 한다.
+- **조회가 예외를 던지면 사람에게 넘긴다 (manual escalation)** — 로그를 남기고 `REQUIRE_APPROVAL` (`matched_rules: "risk:unresolved"`). 엄밀히는 fail-closed(DENY와 동급)가 아니다: 사람이 승인하면 실행은 계속 가능하다. 위험도를 알 수 없는 Action이 *승인 없이* 통과하지 않게 하는 것이 목적이며, 게이트가 크래시하지도 않게 한다. 진짜 fail-closed(승인으로도 못 뚫는 DENY) 예시는 ROE `prohibited_techniques`가 설정됐을 때의 `UnsupportedRoePolicyError`다 (§4, `control/roe.py`).
 - 이미 dev에 있는 `ToolGateway.list_tools_for_action`과 `RiskLevel`만 사용하므로 **Core Contract 변경은 없다.**
 - 임계값은 코드의 임시 기본값(`DEFAULT_APPROVAL_RISK_THRESHOLD = HIGH`)이다. Engagement별 설정은 §5 참고.
 
@@ -212,8 +212,10 @@ DENY할 때 **왜 막혔는지에 따라 에이전트의 다음 행동이 달라
 
 | 항목 | 필요할 때 | 대안 (변경 없음) / 상태 |
 |---|---|---|
-| **`ApprovalPolicy`에 risk 승인 임계값 필드** | Engagement마다 "어느 risk부터 승인"을 다르게 하고 싶을 때 | 지금은 코드의 임시 기본값 `HIGH`. **설계 논의 필요** (Passive/Active/Intrusive ↔ `RiskLevel` 매핑, 후보 도구가 여러 개일 때 기준) |
-| **공통 Artifact 포트·저장 결과 Contract·ToolResult 전달 규격** | Raw Evidence를 실제 Tool 실행 및 Evidence에 연결할 때 | Track B 내부 `ArtifactBackend`는 완료. 저장 요청 책임과 실제 실행 연결은 PM 및 Capability/Orchestration 협의 대기 |
+| **`ApprovalPolicy`에 risk 승인 임계값 필드** | Engagement마다 "어느 risk부터 승인"을 다르게 하고 싶을 때 | 지금은 코드의 임시 global 기본값 `HIGH` (`control/risk.py:DEFAULT_APPROVAL_RISK_THRESHOLD`). **설계 논의 필요**: (1) 이 threshold를 `ApprovalPolicy` Contract 필드로 둘지, (2) 지금처럼 global 기본값으로 유지할지, (3) 그 둘을 병행해 Engagement가 override 안 하면 global 기본값을 쓰게 할지. 참고로만: 개념적으로 passive/active/intrusive 같은 등급을 논의하더라도 `RiskLevel`(LOW/MEDIUM/HIGH/CRITICAL) 하나를 단일 기준으로 유지하고 새 enum은 만들지 않는다. |
+| **`ArtifactStore`/`ArtifactBackend` 공통 Port 추가** | Capability가 만든 Raw Artifact를 팀 경계 너머로 저장 요청할 표준 인터페이스가 필요할 때 | Track B 내부 `ArtifactBackend`(`redteam.evidence.artifacts`)는 완료했지만 Track B 내부 타입일 뿐 공통 Core Port가 아니다. Capability/Orchestration이 호출할 수 있는 공통 Port로 승격할지는 PM 결정 대기. |
+| **`ToolResult`에 artifact reference/digest 전달 방식** | Tool 실행이 만든 Raw Artifact(HTTP 응답/HAR/stdout/screenshot)를 `ToolResult`를 통해 Control까지 흘려보내야 할 때 | 지금은 `ToolResult`에 그런 필드가 없다. `output` 전체를 Raw Evidence로 간주하지 않는다 — Raw Artifact는 Tool 실행에서 실제 관측한 원본 데이터만을 가리키는 더 좁은 개념. |
+| **`EvidenceRecord` ↔ Artifact lineage 정의** | Finding/Reporter가 검증된 결과의 원본 Artifact까지 추적해야 할 때 | 지금은 `EvidenceRecord`에 Artifact 참조 필드가 없다. `redteam.evidence.validation.EvidenceLinkValidator`는 이미 있는 Evidence 문맥(engagement/run/action/invocation/hypothesis/target)만 검증하며, Artifact lineage는 다루지 않는다. |
 | `PolicyVerdict`에 `ABORT`/`severity` | 심각도로 Run 종료 구분 | reasons/matched_rules 규약 사용 (권장) |
 | `ControlPlane` 포트에 `resolve_approval` | 오케스트레이션이 승인 해소 | control 모듈 내부 + CLI로 해소 |
 | `EvidenceStore` 포트에 조회 메서드 | hypothesis별 조회 등 | concrete store에만 추가 |

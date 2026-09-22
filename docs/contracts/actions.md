@@ -242,7 +242,16 @@ ActionProposal
                           `prohibited_techniques` fails the whole run closed
                           with `UnsupportedRoePolicyError` rather than being
                           silently ignored — no technique taxonomy exists yet)
-  -> Policy Engine      (redteam.control.policy.evaluate_policy)
+  -> Policy Engine      (redteam.control.policy.evaluate_policy — also
+                          risk-tiered: an action whose Tool Registry
+                          `risk_level` meets a threshold requires approval
+                          regardless of `require_approval_for`, via the
+                          read-only `ToolGateway.list_tools_for_action`
+                          port; see `redteam.control.risk` and
+                          `docs/control/PLAN.md` section 2.1. A Registry
+                          lookup failure also requires approval — manual
+                          escalation, not a fail-closed DENY, since a
+                          human can still allow it)
   -> Rate Limit         (redteam.control.rate_limit.RateLimiter)
   -> Budget             (redteam.control.budget.BudgetTracker)
   -> Approval           (redteam.control.approval.ApprovalService, only if REQUIRE_APPROVAL and not auto_approve)

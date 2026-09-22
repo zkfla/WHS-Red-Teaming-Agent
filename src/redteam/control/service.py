@@ -123,9 +123,12 @@ class DefaultControlPlane:
             risk_threshold=DEFAULT_APPROVAL_RISK_THRESHOLD,
         )
         if risk_unresolved and verdict == PolicyVerdict.ALLOW:
-            # Fail-closed: risk-tiered approval exists precisely to catch
-            # risky actions, so when the risk lookup errors we require a
-            # human rather than let a possibly-risky action through.
+            # Manual escalation, not a fail-closed DENY: risk-tiered
+            # approval exists precisely to catch risky actions, so when
+            # the risk lookup errors we escalate to a human rather than
+            # let a possibly-risky action through on an unresolved risk.
+            # A human can still approve it -- this stage only refuses to
+            # decide ALLOW on its own when it doesn't know the risk.
             verdict = PolicyVerdict.REQUIRE_APPROVAL
             policy_reasons = ["tool risk_level could not be resolved — requiring approval"]
             matched_rules = ["risk:unresolved"]
@@ -342,13 +345,18 @@ class DefaultControlPlane:
         return decision
 
     def _resolve_risk(self, proposal: ActionProposal) -> tuple[RiskLevel | None, bool]:
-        """Resolve an action's risk from the Registry, fail-closed.
+        """Resolve an action's risk from the Registry.
 
         Returns ``(risk, unresolved)``. ``unresolved`` is True only when
         the resolver *raised* — never for the normal "no eligible tool"
         case (which returns ``risk=None, unresolved=False``). A crashing
         risk lookup must not crash the gate, and must not silently let a
-        possibly-risky action skip risk-tiered approval.
+        possibly-risky action skip risk-tiered approval — so an
+        unresolved risk escalates to ``REQUIRE_APPROVAL`` (manual
+        escalation: a human can still allow it). This is deliberately
+        *not* the same guarantee as a fail-closed ``DENY`` — see the ROE
+        ``UnsupportedRoePolicyError`` path above for what an actual
+        fail-closed refusal looks like in this file.
         """
         if self._risk_resolver is None:
             return None, False
@@ -356,7 +364,7 @@ class DefaultControlPlane:
             return self._risk_resolver.resolve(proposal.capability, proposal.operation), False
         except Exception:  # noqa: BLE001 - a broken risk source must not crash the gate
             logger.exception(
-                "risk resolution failed; requiring approval (fail-closed)",
+                "risk resolution failed; escalating to manual approval (risk unresolved)",
                 extra={
                     "action_id": str(proposal.action_id),
                     "capability": proposal.capability,
