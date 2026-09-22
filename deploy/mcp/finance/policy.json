@@ -1,0 +1,29 @@
+{
+  "targets": {
+    "bank-lab": {
+      "origin": "http://mock-bank:8080",
+      "allowed_paths": ["/", "/health", "/api/accounts/alice", "/api/beneficiaries/validate", "/openapi.json", "/.well-known/openid-configuration"],
+      "allowed_methods": ["GET", "HEAD", "OPTIONS"],
+      "allowed_query_keys": {"/health": ["probe"]},
+      "allowed_request_headers": ["x-test-case"],
+      "allowed_path_methods": {
+        "/api/beneficiaries/validate": ["POST"]
+      },
+      "replayable_paths": ["/api/accounts/alice", "/api/beneficiaries/validate"],
+      "mutable_json_fields": {
+        "/api/beneficiaries/validate": ["account_alias", "amount"]
+      }
+    }
+  },
+  "allowed_networks": ["172.30.50.0/24"],
+  "sessions": {
+    "alice": {"target_ref": "bank-lab", "principal_ref": "test-alice", "bearer_env": "LAB_ALICE_TOKEN"},
+    "bob": {"target_ref": "bank-lab", "principal_ref": "test-bob", "bearer_env": "LAB_BOB_TOKEN"}
+  },
+  "active_enabled": false,
+  "active_ports": [8080],
+  "proxy_replay_enabled": true,
+  "proxy_max_flows": 50,
+  "timeout_seconds": 5,
+  "max_response_bytes": 262144
+}

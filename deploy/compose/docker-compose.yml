@@ -1,0 +1,79 @@
+networks:
+  redteam-net:
+    name: redteam-net
+
+services:
+  mcp-example:
+    build:
+      context: ../docker/mcp-example
+    container_name: redteam-mcp-example
+    networks:
+      - redteam-net
+    ports:
+      - "${MCP_EXAMPLE_PORT:-8765}:8765"
+    environment:
+      MCP_EXAMPLE_PORT: "8765"
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; socket.create_connection(('127.0.0.1', 8765), 2).close()"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+  # Mobile capability candidate (NOT finalized — see deploy/mcp/README.md
+  # "Mobile capability"). mobile-next/mobile-mcp needs to reach adb/Xcode
+  # simulators on the host, so it runs with host networking instead of
+  # `redteam-net`; only start it with `--profile mobile` on a host that
+  # already has an authorized device/emulator reachable via `adb devices`.
+  mobile-next-mcp:
+    profiles: ["mobile"]
+    build:
+      context: ../docker/mobile-next-mcp
+    container_name: redteam-mcp-mobile-next
+    network_mode: host
+    environment:
+      MOBILE_NEXT_MCP_PORT: "${MOBILE_NEXT_MCP_PORT:-3000}"
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('net').connect(process.env.MOBILE_NEXT_MCP_PORT||3000,'127.0.0.1').on('connect',s=>{}).on('error',()=>process.exit(1))"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+  # Analysis capability candidate (NOT finalized — see deploy/mcp/README.md
+  # "Analysis capability"). apktool-mcp-server only speaks MCP stdio (no
+  # HTTP mode upstream), so this image is built but not started by
+  # `docker compose up`; invoke it per-call with
+  # `docker compose run --rm -i apktool-mcp` (matches a stdio
+  # REDTEAM_MCP_<ID>_COMMAND=docker ... invocation from the framework).
+  apktool-mcp:
+    profiles: ["tools"]
+    build:
+      context: ../docker/apktool-mcp
+    container_name: redteam-mcp-apktool
+    networks:
+      - redteam-net
+    volumes:
+      - ${APKTOOL_MCP_WORKDIR:-./apktool-workdir}:/work
+    stdin_open: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+# TODO(capability-team): mobile-next-mcp/apktool-mcp are candidates, not a
+# finalized choice (see deploy/mcp/README.md). Swapping either for a
+# different MCP server means changing only this file, .env.example, and
+# examples/app.yaml — no Adapter/code change required.

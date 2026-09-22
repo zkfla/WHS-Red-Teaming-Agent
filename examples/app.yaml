@@ -1,0 +1,59 @@
+# Example full AppConfig (instruction.md section 19).
+#
+# `examples/engagement.yaml` (the flat Engagement shape) is what
+# `redteam.app.bootstrap.load_engagement` and the CLI actually use today.
+# This file demonstrates the fuller AppConfig shape
+# (redteam.core.config.AppConfig / load_app_config) that wraps an
+# engagement alongside LLM/Orchestration/Capability/Logging config —
+# see bootstrap.py's TODO(pm) for wiring it in once a team needs those
+# other sections read.
+
+engagement:
+  name: "Example Engagement"
+  description: "Authorized test engagement used to validate the framework skeleton."
+
+  scope:
+    allowed_hosts:
+      - "example.local"
+
+  rules_of_engagement:
+    - name: "business-hours-only"
+      description: "Placeholder ROE — not enforced yet, see control/service.py TODO."
+      allowed_time_windows: ["09:00-18:00"]
+
+  execution_budget:
+    max_actions: 5
+    max_tool_calls: 5
+    max_duration_seconds: 300
+
+  rate_limit_policy:
+    max_actions_per_minute: 30
+    max_concurrent_actions: 1
+
+  approval_policy:
+    require_approval_for: []
+    auto_approve: false
+
+  metadata:
+    owner: "pm"
+
+llm:
+  provider: "fake"
+  default_model: "gpt-4o-mini"
+  api_key_env_var: "LLM_API_KEY"
+
+orchestration:
+  max_retries: 3
+  max_steps: 50
+
+capability:
+  # Candidate mobile/analysis MCP servers ("mobile-next", "apktool", and the
+  # in-repo fallbacks "mobile-local"/"analysis-local") are documented in
+  # .env.example and deploy/mcp/README.md but not enabled by default here —
+  # neither upstream tool is finalized yet and neither binary is assumed
+  # installed. Add a server ID below once its REDTEAM_MCP_<ID>_* variables
+  # are set; no code change is needed either way (Adapter pattern).
+  mcp_servers: []
+
+logging:
+  level: "INFO"
