@@ -116,7 +116,7 @@ Propose one via Issue (docs/contracts/actions.md's process) before wiring
 any of them up.
 
 mobile-next/mobile-mcp supports both transports: stdio (its default,
-`npx -y @mobilenext/mobile-mcp@1.0.4`, run directly on a host with
+`npx -y @mobilenext/mobile-mcp@latest`, run directly on a host with
 ADB/Xcode tooling already set up) and Streamable HTTP (`--listen <port>`,
 containerized via `deploy/docker/mobile-next-mcp` + the `mobile-next-mcp`
 compose service, profile `mobile`, `network_mode: host` since it needs to
@@ -174,46 +174,6 @@ apktool_mcp_server.py`; no HTTP mode documented). Containerized via
 `tools`); since it's stdio, that image is built once and invoked per-call
 (`docker compose run --rm -i apktool-mcp`), not started with `docker
 compose up`.
-
-### Mobile/analysis discovery conformance
-
-`redteam.capability.mobile_analysis_manifest` records the selected candidate
-tools' ToolId, canonical operation, required/optional arguments, asset target
-kind, risk level and advertised output schema where one exists. The candidate
-versions used to check those argument lists are `@mobilenext/mobile-mcp@1.0.4`
-and apktool-mcp-server commit `12bb33134af905923a0a58643dcc35fd694ad6f6`.
-Update the manifest and pin together whenever a candidate changes.
-
-The in-repo `mobile-local` and `analysis-local` MCP servers advertise specific
-Pydantic output schemas. The external mobile-next and apktool candidates do
-not advertise output schemas for the selected tools; the manifest leaves those
-unknown instead of claiming a shape. The Capability transport preserves an
-advertised output schema, and `MCPToolGateway.list_candidate_metadata()`
-projects every registered MCP tool and canonical operation into candidate
-metadata: ToolId, capability, operation, required/optional arguments, target
-kind when known, risk level, and output schema when available. Missing schema
-fields remain `None`; they are not inferred. For explicitly configured
-mobile-next, apktool, mobile-local, and analysis-local candidates, bootstrap
-checks the manifest against discovery before registration and fails on drift.
-The Core `ToolDescriptor` and `ToolGateway` Port still do not expose this
-candidate view, so Agent use needs a PM-reviewed Contract change.
-
-`tests/unit/test_mobile_analysis_manifest.py` checks the local servers' real
-MCP discovery on every run. To check an installed external candidate, set
-`REDTEAM_TEST_MOBILE_NEXT_COMMAND` and `REDTEAM_TEST_MOBILE_NEXT_ARGS_JSON`,
-or `REDTEAM_TEST_APKTOOL_COMMAND` and `REDTEAM_TEST_APKTOOL_ARGS_JSON`, then
-run that test file. The external check only lists tools; it does not contact a
-device or analyze an APK.
-
-For an apktool result smoke test, call `decode_apk` on a permitted test APK,
-then `get_manifest` with the returned project directory. Leave resource
-decoding enabled (`no_res=false`); with `no_res=true`, the manifest remains
-binary and `get_manifest` cannot parse it as text. On Windows, some
-`apktool.bat` distributions pause for input at exit. Use a noninteractive
-apktool launcher on `PATH` or the Docker image before interpreting an MCP
-timeout as a server failure. A local direct MCP smoke on InsecureBankv2.apk
-confirmed both calls on apktool 2.9.3. It did not exercise Agent selection or
-the Core `ToolGateway` Port.
 
 ### Local fallback: `redteam.capability.servers.analysis` (server ID example: `analysis-local`)
 

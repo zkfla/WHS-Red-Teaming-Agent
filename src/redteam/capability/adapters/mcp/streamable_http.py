@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from copy import deepcopy
 from datetime import datetime, timezone
 from typing import Any
 
@@ -15,7 +14,6 @@ from redteam.capability.adapters.mcp.transport import (
 )
 from redteam.core.contracts.tool import ToolDescriptor, ToolError
 from redteam.core.enums import RiskLevel, ToolHealthStatus
-from redteam.core.ids import ToolId
 
 
 class MCPServerAdapter:
@@ -45,12 +43,11 @@ class MCPServerAdapter:
                 raise ValueError("endpoint is required when transport is not provided")
             transport = StreamableHTTPMCPTransport(endpoint, headers=headers)
         self._transport = transport
-        self._discovered_output_schemas: dict[ToolId, dict[str, Any]] = {}
 
     async def discover_tools(self) -> list[ToolDescriptor]:
         health = await self.health_check()
         remote_tools = await self._transport.list_tools()
-        descriptors = [
+        return [
             ToolDescriptor(
                 tool_id=build_mcp_tool_id(self._tool_namespace, tool.name),
                 server_id=self.server_id,
@@ -63,17 +60,6 @@ class MCPServerAdapter:
             )
             for tool in remote_tools
         ]
-        self._discovered_output_schemas = {
-            descriptor.tool_id: deepcopy(remote_tool.output_schema)
-            for descriptor, remote_tool in zip(descriptors, remote_tools, strict=True)
-            if remote_tool.output_schema is not None
-        }
-        return descriptors
-
-    def output_schema_for_tool(self, tool_id: ToolId) -> dict[str, Any] | None:
-        """Return a discovered MCP output schema without changing the Core contract."""
-        schema = self._discovered_output_schemas.get(tool_id)
-        return deepcopy(schema) if schema is not None else None
 
     async def invoke(self, tool: ToolDescriptor, arguments: dict[str, Any]) -> MCPCallResult:
         if tool.server_id != self.server_id:
