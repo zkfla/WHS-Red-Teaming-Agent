@@ -27,7 +27,6 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from redteam.control.audit import redact_arguments, redact_sensitive_text
 from redteam.core.contracts.action import ActionProposal
 from redteam.core.contracts.evidence import EvidenceRecord
 from redteam.core.contracts.policy import PolicyDecision
@@ -67,6 +66,10 @@ class EvidenceService:
         decision: PolicyDecision,
     ) -> EvidenceRecord:
         """Record a non-executed DENY/REQUIRE_APPROVAL action as Evidence."""
+        # Import lazily to avoid making ``redteam.evidence.service`` depend on
+        # eager package initialization in ``redteam.control.__init__``.
+        from redteam.control.audit import redact_arguments, redact_sensitive_text
+
         if decision.action_id != proposal.action_id:
             raise ValueError("decision.action_id does not match proposal.action_id")
         if decision.verdict not in {

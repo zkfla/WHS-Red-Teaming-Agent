@@ -46,13 +46,22 @@
 
 **담당 파일:** `control/approval.py`, `control/audit.py`, `evidence/service.py`, `evidence/stores/*`와 해당 운영 CLI
 
-**작업:**
-- **Audit(감사기록)** `audit.py` — 지금 메모리에만 있음 → 파일 등 durable 저장
-- **Approval(승인)** `approval.py` — 지금 요청만 됨 → 승인/거절/만료 + 사람 개입(CLI) 경로
-- **Evidence 저장소** `evidence/stores/*` — 조회 빠르게(인덱스/DB), digest 검증, 보관정책(retention)
-- **EvidenceService** — `DENY`/`REQUIRE_APPROVAL`로 실행되지 않은 Action도 Evidence로 저장
-  - `record_blocked_action(proposal, decision)` 구현 및 단위 테스트
-  - 재평가·재실행 시 중복 Evidence 방지는 후속 TODO
+**작업 목록과 상태:**
+
+| # | 작업 | 상태 |
+|---|---|---|
+| 1 | Audit 영속 저장 및 정책 결정·CLI 승인/거절 결과 기록 (`audit.py`, `control/stores/filesystem.py`) | ✅ 완료 |
+| 2 | Approval 승인·거절·만료 상태 전이와 사람 개입 CLI (`approval.py`, approvals CLI) | ✅ 완료 (만료 Audit 기록과 자동 실행은 후속) |
+| 3 | Evidence 인덱스 조회, JSONL 줄 무결성 검증, Run 단위 retention (`evidence/stores/*`) | ✅ 완료 |
+| 4 | `DENY`/`REQUIRE_APPROVAL` 차단 Action Evidence (`record_blocked_action`) | ✅ 완료 (재평가·재실행 중복 방지는 후속 TODO) |
+| 5 | Track B 내부 `ArtifactBackend`와 파일 저장 — 독립 참조, 원본 SHA-256, 원자 공개, 경로·symlink 방어 | ✅ 완료 |
+| 6 | 기존 `EvidenceStore` 포트 기반 Evidence ID·기대 문맥 연결 검증 | ✅ 완료 |
+| 7 | Evidence retention 입력 보호 — 0·음수·비유한 기간의 삭제 전 거부 | ✅ 완료 |
+| 8 | 실제 Tool 실행 → Artifact → Evidence 생성 및 Finding/Reporter 연결 | ⏳ PM의 공통 포트·전달 책임 결정 후 타 팀과 통합 |
+| 9 | Audit → 실행 Tool·Invocation·생성 Evidence 연결 및 검증 | ⏳ 실행 후 연결 규격과 책임 계층 협의 필요 |
+
+Raw Artifact와 Evidence 연결 검증의 상세 규약은
+[`artifact-and-evidence-validation.md`](./artifact-and-evidence-validation.md)를 따른다.
 
 승인·Audit와 Evidence 저장소의 동작·제약은
 [`governance-and-evidence-store.md`](./governance-and-evidence-store.md),
@@ -209,6 +218,8 @@ DENY할 때 **왜 막혔는지에 따라 에이전트의 다음 행동이 달라
 | `ControlPlane` 포트에 `resolve_approval` | 오케스트레이션이 승인 해소 | control 모듈 내부 + CLI로 해소 |
 | `EvidenceStore` 포트에 조회 메서드 | hypothesis별 조회 등 | concrete store에만 추가 |
 | `EvidenceRecord.digest` 원본 재검증 규격 | 원본 payload 보존·검증이 필요할 때 | 현재는 저장 JSONL 줄의 해시만 인덱스와 대조. 원본 보존 방식은 PM과 결정 |
+| 공통 Artifact 포트/전달 규격 | Capability·Orchestration 실행 연결 시 | Track B 내부 Backend만 구현하고 실제 실행에는 미연결 |
+| Evidence Target 저장 규격 | Finding의 Target 연결 검증 시 | 공통 Target dict만 비교하고 표시 문자열은 검증 불가 처리 |
 
 **해결됨:** `ActionProposal.risk_level` 추가 요청은 필요 없어졌다. dev에 추가된 read-only `ToolGateway.list_tools_for_action`으로 Registry의 `risk_level`을 Contract 변경 없이 읽을 수 있다 (§2.1).
 
