@@ -121,12 +121,14 @@ def proposal(hypothesis_id: HypothesisId | None = None, host: str = "a.local") -
 
 
 def tool_result(
-    success: bool = True, output: dict[str, Any] | str | None = None
+    success: bool = True,
+    output: dict[str, Any] | str | None = None,
+    tool_id: str = "recon.ping",
 ) -> ToolResult:
     return ToolResult(
         invocation_id=InvocationId("inv_1"),
         action_id=ActionId("action_1"),
-        tool_id=ToolId("recon.ping"),
+        tool_id=ToolId(tool_id),
         success=success,
         output=output if output is not None else {"echo": {"message": "hi"}},
         error=None if success else ToolError(code="timeout", message="no answer"),
@@ -194,7 +196,7 @@ async def test_plan_states_a_hypothesis_before_it_acts() -> None:
     # before the tool ever runs.
     hypotheses = await service.list_hypotheses(status=HYPOTHESIS_OPEN)
     assert len(hypotheses) == 1
-    assert hypotheses[0].metadata["expectation"]["field"] == "echo"
+    assert hypotheses[0].metadata["expectation"]["kind"] == "tool_succeeded"
     assert state["runtime"].active_hypothesis_id == hypotheses[0].hypothesis_id
     assert route_after_plan(state) == "policy"
 
@@ -213,6 +215,30 @@ async def test_plan_produces_nothing_when_the_frontier_is_empty() -> None:
     assert state["action_proposal"] is None
     assert state["runtime"].phase is AgentPhase.REPLAN
     assert route_after_plan(state) == "replan"
+
+
+async def test_plan_warns_when_an_activated_agent_gets_zero_executable_candidates() -> None:
+    """Section 10: distinguishable from ordinary silence -- the agent was
+    activated (a real ENDPOINT matched its precondition) but no tool is
+    registered for its capability/operation at all, so every draft is
+    dropped during compilation."""
+    from redteam.attack_graph.identity import endpoint_node_id
+    from redteam.orchestration.events import AGENT_NO_EXECUTABLE_CANDIDATES
+
+    gateway = DummyToolGateway(tools=[])  # no tool registered for anything
+    d = deps(tool_catalog=gateway, tool_gateway=gateway)
+    service = AttackGraphService(d.graph_store)
+    await service.upsert_node(
+        GraphNodeType.ENDPOINT, node_id=endpoint_node_id("GET", "/", host="a.local")
+    )
+
+    observed = await observe_node(initial_graph_state(runtime()), deps=d)
+    assert observed["runtime"].current_agent == AgentId("web-api-agent")
+
+    state = await plan_node(observed, deps=d)
+
+    assert state["action_proposal"] is None
+    assert AGENT_NO_EXECUTABLE_CANDIDATES in d.event_bus.event_types()
 
 
 async def test_plan_without_a_hypothesis_still_proposes() -> None:
@@ -336,7 +362,7 @@ async def test_execute_uses_the_tool_the_chosen_step_declared() -> None:
 
     result = await execute_node(state, deps=d)
 
-    assert gateway.invocations[0].tool_id == ToolId("recon.ping")
+    assert gateway.invocations[0].tool_id == ToolId("recon.probe")
     assert result["runtime"].actions_executed == 1
     assert result["runtime"].remaining_budget == 2
     assert result["runtime"].consecutive_failures == 0
@@ -518,6 +544,131 @@ async def test_update_does_not_assert_predicates_after_a_failed_tool_call() -> N
     assert attrs_of(node.properties) == {}
     # The attempt is still recorded, so it is not proposed again.
     assert facts_of(node.properties)["attempted_operations"] == ["recon.service_discovery"]
+
+
+# -- UPDATE: Tool Result -> Attack Graph Mutation (recon.http_probe) ------
+
+
+_HTTP_PROBE_OUTPUT = {
+    "target_ref": "a.local",
+    "status_code": 200,
+    "body_bytes": 42,
+    "body_sha256": "deadbeef",
+    "redirect": False,
+    "security_headers_present": {"strict-transport-security": False},
+    "body_omitted": True,
+}
+
+
+async def test_update_discovers_service_and_endpoint_from_a_successful_http_probe() -> None:
+    d = deps()
+    service = AttackGraphService(d.graph_store)
+    state = state_with(
+        runtime(step_count=1),
+        action_proposal=proposal(),
+        tool_result=tool_result(output=_HTTP_PROBE_OUTPUT, tool_id="recon.http_probe"),
+        plan_step=RECON_AGENT.playbook[0],
+    )
+
+    await update_node(state, deps=d)
+
+    host_node = await node_at(service, "host:a.local")
+    assert attrs_of(host_node.properties) == {"reachable": True, "probed": True}
+
+    service_node = await node_at(service, "service:a.local/http")
+    assert attrs_of(service_node.properties) == {"responded": True}
+    assert facts_of(service_node.properties)["scheme"] == "http"
+
+    endpoint_node = await node_at(service, "endpoint:a.local GET /")
+    assert attrs_of(endpoint_node.properties) == {"status_code": 200, "redirect": False}
+    assert facts_of(endpoint_node.properties)["path"] == "/"
+
+    edges = await service.list_edges()
+    edge_types = {(e.type.value, str(e.source_id), str(e.target_id)) for e in edges}
+    assert ("hosts", "host:a.local", "service:a.local/http") in edge_types
+    assert ("exposes", "service:a.local/http", "endpoint:a.local GET /") in edge_types
+
+    # Case E: the pre-existing single-event assertion's *sibling* still
+    # holds -- the host-attrs write happens exactly as before, this is
+    # additive (three more GRAPH_UPDATED events, one per discovered node).
+    assert d.event_bus.event_types() == [EventType.GRAPH_UPDATED] * 3
+
+
+async def test_update_processing_the_same_probe_result_twice_does_not_duplicate_nodes() -> None:
+    d = deps()
+    service = AttackGraphService(d.graph_store)
+    state = state_with(
+        runtime(step_count=1),
+        action_proposal=proposal(),
+        tool_result=tool_result(output=_HTTP_PROBE_OUTPUT, tool_id="recon.http_probe"),
+        plan_step=RECON_AGENT.playbook[0],
+    )
+
+    await update_node(state, deps=d)
+    await update_node(merged(state, runtime=runtime(step_count=2)), deps=d)
+
+    nodes = await service.list_nodes()
+    service_nodes = [n for n in nodes if n.type is GraphNodeType.SERVICE]
+    endpoint_nodes = [n for n in nodes if n.type is GraphNodeType.ENDPOINT]
+    assert len(service_nodes) == 1
+    assert len(endpoint_nodes) == 1
+
+    edges = await service.list_edges()
+    assert len(edges) == 2  # HOSTS + EXPOSES, not duplicated
+
+
+async def test_update_does_not_invent_a_service_from_a_failed_probe() -> None:
+    d = deps()
+    service = AttackGraphService(d.graph_store)
+    state = state_with(
+        runtime(),
+        action_proposal=proposal(),
+        tool_result=tool_result(success=False, tool_id="recon.http_probe"),
+        plan_step=RECON_AGENT.playbook[0],
+    )
+
+    await update_node(state, deps=d)
+
+    nodes = await service.list_nodes()
+    assert all(n.type is GraphNodeType.HOST for n in nodes)
+
+
+async def test_update_ignores_malformed_probe_output_without_crashing() -> None:
+    d = deps()
+    service = AttackGraphService(d.graph_store)
+    state = state_with(
+        runtime(),
+        action_proposal=proposal(),
+        tool_result=tool_result(output={"no_status_code_here": True}, tool_id="recon.http_probe"),
+        plan_step=RECON_AGENT.playbook[0],
+    )
+
+    await update_node(state, deps=d)  # must not raise
+
+    nodes = await service.list_nodes()
+    assert all(n.type is GraphNodeType.HOST for n in nodes)
+
+
+async def test_discovered_service_and_endpoint_activate_the_web_api_agent() -> None:
+    from redteam.orchestration.agents.definition import builtin_agent_definitions
+
+    d = deps()
+    service = AttackGraphService(d.graph_store)
+    state = state_with(
+        runtime(step_count=1),
+        action_proposal=proposal(),
+        tool_result=tool_result(output=_HTTP_PROBE_OUTPUT, tool_id="recon.http_probe"),
+        plan_step=RECON_AGENT.playbook[0],
+    )
+    await update_node(state, deps=d)
+
+    web_api_definition = next(
+        definition
+        for definition in builtin_agent_definitions()
+        if str(definition.agent_id) == "web-api-agent"
+    )
+    observation = await service.observe(step=1)
+    assert web_api_definition.is_active(observation, AgentPhase.OBSERVE)
 
 
 # -- REPLAN ---------------------------------------------------------------

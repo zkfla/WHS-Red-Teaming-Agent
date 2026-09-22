@@ -45,11 +45,12 @@ pytest tests/unit tests/integration -q
 
 | Area | State |
 |---|---|
-| Approval resume | Control port cannot retrieve/consume a resolved approval; orchestration must not infer `ALLOW` from an event |
-| Long-running reconciliation host | one safe `reconcile_once()` tick exists; deployment must host repeated ticks |
+| Approval resume | **Resolved.** `ControlPlane.approval_outcome(approval_id)` (read-only Core Port) resumes the same Run via a conditional START edge straight into POLICY — see `docs/agent/orchestration-implementation-plan.md` section 16. |
+| Long-running reconciliation host | `orchestration.reconciliation.run_reconciliation_loop` (a plain `asyncio` coroutine, not a daemon framework) repeats `reconcile_once()`; the process/CLI entrypoint to drive it is still a deployment-layer choice. |
 | Tool retries | retryable/idempotency and budget semantics belong in the Capability gateway contract; orchestration does not duplicate an approved side effect |
-| Mobile asset scope | Control cannot yet compare `AssetTarget` identity with engagement scope, so it correctly denies Mobile execution until the PM/Control contract is extended |
-| Shared graph tenancy | run-scoped ledger/evidence/reporting are isolated; a shared Attack Graph still needs a PM/Graph-owned engagement namespace |
+| Mobile asset scope | **Resolved.** `EngagementScope.allowed_assets`/`denied_assets` (exact `asset_id` match, `redteam.control.scope._check_asset_scope`) lets Mobile actions ALLOW explicitly; still fail-closed DENY outside scope. |
+| Shared graph tenancy | **Resolved.** `attack_graph.stores.namespaced.EngagementScopedAttackGraphStore` — a decorator over the existing `AttackGraphStore` Core Port, namespacing ids at the store boundary; `app.bootstrap` wires it in by default. |
 | Graph-DB backend | `InMemoryAttackGraphStore` only (deferred, instruction.md §21) |
 | Cleanup execution | the graph tracks what is owed; actually removing a resource is an Orchestration action |
 | Retraction rules | three conservative defaults in `attack_graph/retraction.py`; tune per engagement |
+| Built-in agent playbook depth | Recon/Web/Mobile playbooks are real but thin (3 of 12 canonical operations wired, no built-in step can reach `Verdict.VIOLATION`/produce a `Finding`, no result-driven branching) — see `docs/agent/orchestration-implementation-plan.md` section 16.1 for the full, itemized gap list. |

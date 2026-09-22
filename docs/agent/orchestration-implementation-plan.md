@@ -606,9 +606,12 @@ and (coverage obligations satisfied or every gap has an explicit blocked reason)
 Analysis는 독립 `AnalysisVerifier` 포트와 기본 deterministic reviewer로 VERIFY에
 연결했고, Reporting은 terminal canonical-state projection으로 연결했다. Web/Mobile은
 해당 graph target과 capability tag를 가진 ToolDescriptor가 동시에 있을 때만 실행된다.
-단, 현재 Control scope checker는 `AssetTarget` identity를 허용 범위와 대조하지 못해
-기본 Control Plane에서 Mobile action을 DENY한다. 이는 오케스트레이션이 우회하지 않고
-Control/PM의 Asset scope 계약 확정을 기다리는 명시적 cross-team blocker다.
+~~단, 현재 Control scope checker는 AssetTarget identity를 허용 범위와 대조하지
+못해 기본 Control Plane에서 Mobile action을 DENY한다.~~ **해결됨**:
+`EngagementScope.allowed_assets`/`denied_assets` (canonical `asset_id` exact
+match, host 계열과 별도 규칙 — `redteam.control.scope._check_asset_scope`)로
+Mobile action도 이제 명시적으로 ALLOW 가능하다. Scope 밖 asset은 여전히
+fail-closed DENY.
 
 ### Phase 9 — Event Bus wake-up과 관측성 (reconciliation tick 구현, daemon host 남음)
 
@@ -762,13 +765,122 @@ canonical action key 비교로 수정해야 한다. 추적 문서는
 - [x] 정상 수렴, 예산 종료, 승인 대기, 사용자 중단, 실패 종료가 서로 구분된다.
 - [x] 어떤 종료에서도 partial report를 만들 수 있다.
 
-구현 완료 정의는 11/11 충족한다. 다만 아래는 오케스트레이션 내부 완료와
-별개인 외부 통합 항목이다.
+구현 완료 정의는 11/11 충족한다. 아래 네 항목은 "외부 팀/PM 합의가 먼저
+필요하다"는 이유로 미룬 것이었는데, 이번 Live Integration Gap 작업에서
+전부 구현되었다 — 상태만 갱신한다.
 
-- 승인 해소 후 안전한 재개: resolved approval을 ALLOW로 재평가하는 Control Port 필요
-- action-aware 동적 Tool 선택: PM의 Tool Catalog Core Port 승인 필요
-- multi-tenant shared graph 격리: Attack Graph tenancy 계약 필요
-- 상시 reconciliation loop: 배포 계층 daemon/worker host 필요
+- [x] **승인 해소 후 안전한 재개** — `ControlPlane.approval_outcome(approval_id)`
+  (Core Port, read-only)가 resolved approval을 rate-limit/budget만
+  재평가해 ALLOW/DENY로 돌려준다 (Scope/ROE/Policy는 같은 불변 proposal에
+  이미 한 번 결정론적으로 적용됐으므로 재실행하지 않는다 — 재실행하면
+  REQUIRE_APPROVAL을 다시 발급해 버린다). `orchestration.nodes.replan`이
+  APPROVAL_PENDING 종료 시에만 `action_proposal`/`plan_step`을 체크포인트에
+  보존하고, `orchestration.graph`의 조건부 START edge가 그 상태를
+  OBSERVE/PLAN을 건너뛰고 POLICY로 바로 재진입시킨다
+  (`orchestration.state.resume_graph_state`). `policy_node`는
+  `runtime.pending_approval_id`가 이 proposal과 일치하면 `evaluate()` 대신
+  `approval_outcome()`을 호출해 두 번째 Approval이 생기지 않게 한다. 재개된
+  실행은 원래 WorkItem lease를 재사용하지 않는 단발성 실행이다(의도적
+  단순화 — 아래 참고).
+- [x] **action-aware 동적 Tool 선택** — `docs/proposals/tool-selection-port.md`
+  참고. `ToolGateway.list_tools_for_action` Core Port 추가, PM 승인 완료.
+- [x] **multi-tenant shared graph 격리** — `attack_graph.stores.namespaced.EngagementScopedAttackGraphStore`.
+  `AttackGraphStore` Core Port 시그니처는 그대로 두고, id를 스토어
+  경계에서만 네임스페이스 처리하는 decorator. `app.bootstrap`이 기본으로
+  감싸서 배선한다.
+- [x] **상시 reconciliation loop** — `AgentLoopRunner.reconcile_once()`
+  자체는 이미 있었다(event wake-up + periodic fallback). 이번에 추가된
+  것은 그걸 반복 호출하는 최소 host 루프
+  (`orchestration.reconciliation.run_reconciliation_loop`) — daemon
+  프레임워크가 아니라 평범한 `asyncio` 코루틴이며, 이를 구동할 프로세스
+  자체(및 CLI 진입점)는 여전히 배포/애플리케이션 계층의 몫으로 남는다.
+
+의도적으로 남겨둔 단순화 (다음 이터레이션 후보, 지금 fake로 채우지 않음):
+
+- 재개된 실행은 Work Ledger lease를 재사용하지 않는다 — 원래 WorkItem은
+  REQUIRE_APPROVAL 시점에 `BLOCKED`로 이미 종료 처리되고, 재개 실행은
+  `current_work_id=None`으로 렛저 밖에서 한 번만 도는 단발 실행이다.
+  reporting의 work-ratio 지표가 이 건을 "실행됨"이 아니라 "blocked"로
+  셀 수 있다는 게 유일한 부작용이며, 정확성/안전성 문제는 아니다.
+  `AgentLoopRunner._resume_pending_approval`에 근거와 함께 적어 두었다.
+- `approval_outcome`의 `_pending_proposals`는 프로세스 메모리에만
+  있다 — 프로세스 재시작 후에는 "stale approval"로 fail-closed DENY
+  된다(추측 재구성 금지). 진짜 durable resume(재시작을 넘는)은 이번
+  범위 밖이다.
+- reconciliation host의 CLI 진입점은 만들지 않았다 — 이번 작업 지시에
+  "CLI 구현은 범위 아님"이 명시됨.
+
+### 16.1 2026-09-21 상태 갱신 — Recon→Web 파이프라인 배선 완료, 콘텐츠 gap 발견
+
+**이번에 구현된 것:**
+
+- **Tool Result → Attack Graph Mutation** (`orchestration/observations/`):
+  `ResultMapperRegistry`가 `tool_id`별로 정확히 등록된 mapper만 실행 —
+  `update.py`엔 `if tool_id == ...` 없음. `recon.http_probe` mapper가
+  실제 HTTP 응답을 읽어 HOST 속성 갱신에 더해 SERVICE/ENDPOINT 노드와
+  `HOSTS`/`EXPOSES` edge(기존 `GraphEdgeType` 재사용, 신규 문자열 없음)를
+  생성한다. Port는 그 tool의 output에 원래 없어서 의도적으로 안 채움.
+- **`WEB_API_AGENT` 실행 가능화** (`agents/base.py`,
+  `agents/builtin.py`): 기존 `$target_ref` placeholder 인프라를
+  `$path`까지 일반화(`_PLACEHOLDER_RESOLVERS` dict). `EndpointTarget`에
+  없는 필드를 요구하면 `PlanStep.bound_to()`가 `None`을 반환해 후보
+  자체를 만들지 않는다(추측 금지). 결과: SERVICE/ENDPOINT가 생기면
+  `WEB_API_AGENT`가 activation → 실제 `target_ref`/`path` resolve →
+  진짜 `web.http_request` 호출까지 end-to-end로 이어짐(VulnBank
+  실측 확인, `run.actions_executed`가 recon 1건에서 멈추지 않음).
+- **`AgentNoExecutableCandidates` 이벤트** (`orchestration/events.py`,
+  `nodes/plan.py`): agent가 activation은 됐는데 draft가 있어도 전부
+  compile에서 버려지면(tool 없음/schema 불일치) 기본 로그(verbose
+  아니어도)에 경고 노출 — 이전엔 조용히 묻혔음.
+
+**이번에 고치지 않고 남긴, 새로 확인한 콘텐츠 gap** (배선 문제가 아니라
+"에이전트가 실제로 뭘 할 수 있는가"의 문제 — 별도 작업 필요):
+
+1. **빌트인 playbook이 구조적으로 Violation/Finding을 만들 수 없다.**
+   `Verdict.VIOLATION`은 `Expectation.violation_if_met=True`일 때만
+   나오는데(`orchestration/expectations.py`), `RECON_AGENT`/
+   `WEB_API_AGENT`/`MOBILE_AGENT`의 어떤 step도 `violation_if_met`/
+   `anomaly_if_unmet`을 설정하지 않는다. `WEB_API_AGENT`의 두 step은
+   `expectation` 필드 자체가 없어 `verdict_for()`가 항상 `PASS`를
+   반환한다 — 응답이 401/500/시크릿노출이어도 마찬가지. 10장이
+   서술하는 "candidate finding"/"finding 상태 변화" 산출 경로가
+   현재 코드엔 전혀 없다.
+2. **10.4의 `AnalysisAgent`, 10.5의 `ReportingAgent`는 스케줄링
+   가능한 실체가 아니다.** `definition.py`에 정의는 있고
+   `default_provider_registry()`엔 `"reporting"` provider_id조차
+   없는데, `registry.py`의 `default_registry()`가 실제로 등록하는
+   `AgentSpec`은 `[RECON_AGENT, WEB_API_AGENT, MOBILE_AGENT]`뿐이라
+   `AgentRegistry.next_agent()`가 이 둘을 절대 뽑지 못한다. 실제
+   Analysis는 `verify.py`가 `deps.verifier`를 매 액션마다 직접
+   호출하는 별도 경로(`DeterministicAnalysisVerifier` = `verdict_for()`
+   재호출 래퍼, 독립 재검증 로직 없음)로 동작 — 10.4가 서술하는
+   "원 실행 agent와 문맥 분리" 같은 설계는 미구현.
+3. **`docs/contracts/actions.md`의 canonical operation 12개 중 3개만
+   실제 playbook에서 쓰인다** (`service_discovery`/`http_request`/
+   `static_analysis`). `capability/servers/`에 이미 동작하는
+   `active.py`(nmap), `proxy.py`(HAR replay), `nuclei.py`, `zap.py`,
+   `recon.py`의 `openapi_inventory`/`oidc_inventory`/`tls_inspect`,
+   `mobile.py`의 `device_shell` 전부 이걸 호출하는 playbook step이
+   없어 연결 불가능한 상태 — 6장의 "Tool Catalog에서 후보를 resolve"
+   설계 자체는 맞게 동작하지만, 애초에 그 앞단(provider draft)이
+   이 도구들을 제안한 적이 없다.
+4. **Playbook은 전부 1회성·비분기.** `PlanStep.repeatable` 기본
+   `False`, 빌트인 step 어느 것도 안 바꿈. 결과 내용(예:
+   `status_code=401`)을 보고 다른 operation(`auth_attempt`)을
+   후속 제안하는 메커니즘 자체가 없다 — 11장의 "관련 delta가 생긴
+   agent만 재활성화"는 *다른 agent*를 깨우는 것뿐이고, *같은 agent*가
+   방금 본 결과로 다음 수를 두는 경로는 없다.
+5. **`planner_kind="llm"`이어도 LLM은 고정 목록에서 고르기만 한다**
+   (`agents/planners.py`: "Do not invent steps, tools, or targets").
+   7.4장이 서술하는 "coverage gap 발견 시 LLM 개입"/`FollowupHint`
+   경로는 미구현 — 지금은 매 turn 정적 playbook이 만든 후보 중
+   순서만 LLM이 고르는 정도.
+
+즉 이번 작업은 "파이프라인 배선"(그래프 뮤테이션, activation, argument
+resolution) 문제였고, 위 1~5는 "에이전트 콘텐츠"(뭘 발견할 수 있는가,
+확장 가능한가) 문제로 범주가 다르다. 1번이 가장 심각함 — 나머지를 전부
+고쳐도 Finding이 안 나오면 이 프로젝트가 실질적으로 "보안 테스트
+결과"를 낼 방법이 없다.
 
 ## 17. 블라인드 자기평가와 보정 기록
 

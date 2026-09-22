@@ -23,6 +23,7 @@ from redteam.orchestration.state import (
     RuntimeState,
     TerminationReason,
     initial_graph_state,
+    resume_graph_state,
 )
 from redteam.orchestration.wakeup import EventWakeup, WakeupBatch
 
@@ -65,6 +66,13 @@ _REVISION_GATED_REASONS = frozenset(
         "stalled_no_graph_progress",
     }
 )
+
+#: Every termination reason ``reconcile_once`` can act on -- the generic
+#: reasons above plus ``APPROVAL_PENDING`` (handled by a dedicated branch,
+#: see ``_resume_pending_approval``). Public so a host loop
+#: (``orchestration.reconciliation.run_reconciliation_loop``) knows when to
+#: stop polling a run instead of re-deriving this set itself.
+RECONCILABLE_REASONS = _RECONCILABLE_REASONS | frozenset({TerminationReason.APPROVAL_PENDING})
 
 
 class AgentLoopRunner:
@@ -127,6 +135,14 @@ class AgentLoopRunner:
 
     async def run(self, runtime: RuntimeState) -> RuntimeState:
         """Run the OBSERVE..REPLAN loop until a terminal phase."""
+        return await self._run_state(runtime, initial_graph_state(runtime))
+
+    async def _run_state(self, runtime: RuntimeState, graph_state: GraphState) -> RuntimeState:
+        """Shared invocation path for a fresh run and an approval resume
+        (``reconcile_once`` builds ``graph_state`` via ``resume_graph_state``
+        instead of ``initial_graph_state`` for the latter) — same task
+        tracking, cancellation and failure handling either way.
+        """
         run_key = str(runtime.run_id)
         if self._bound_run_id is not None and self._bound_run_id != run_key:
             raise ValueError("one AgentLoopRunner may execute only one run")
@@ -137,7 +153,7 @@ class AgentLoopRunner:
         assert self._graph is not None
         try:
             self._active_graph_task = asyncio.create_task(
-                self._graph.ainvoke(initial_graph_state(runtime), config=self.config())
+                self._graph.ainvoke(graph_state, config=self.config())
             )
             final: GraphState = await self._active_graph_task
         except asyncio.CancelledError:
@@ -300,9 +316,20 @@ class AgentLoopRunner:
 
         A timeout is also a reconciliation tick. Hard stops such as exhausted
         budget, step ceiling and repeated execution failure are never revived.
+
+        ``APPROVAL_PENDING`` is handled separately from every other
+        reconcilable reason (see ``_resume_pending_approval``): it never
+        re-enters at OBSERVE, and it resumes only once the Approval is
+        actually resolved -- an unrelated graph/evidence delta or a bare
+        timeout must not touch it.
         """
 
         wakeup = await self.wait_for_change(runtime, timeout_seconds=timeout_seconds)
+        if runtime.termination_reason == TerminationReason.APPROVAL_PENDING:
+            resumed = await self._resume_pending_approval(runtime)
+            if resumed is None:
+                return ReconciliationResult(runtime=runtime, wakeup=wakeup)
+            return ReconciliationResult(runtime=resumed, wakeup=wakeup, resumed=True)
         if runtime.termination_reason not in _RECONCILABLE_REASONS:
             return ReconciliationResult(runtime=runtime, wakeup=wakeup)
         if (
@@ -324,6 +351,77 @@ class AgentLoopRunner:
             wakeup=wakeup,
             resumed=True,
         )
+
+    async def _resume_pending_approval(self, runtime: RuntimeState) -> RuntimeState | None:
+        """Resume a run stopped at ``APPROVAL_PENDING``, once resolved.
+
+        ``None`` means "not resumable right now" (still pending, or the
+        checkpointed state this needs is unavailable) -- the caller keeps
+        the existing terminal ``runtime`` unchanged, exactly like an
+        un-triggered reconciliation tick for any other reason.
+        """
+        if runtime.pending_approval_id is None or runtime.pending_action_id is None:
+            return None  # defensive: nothing to resume
+        outcome = await self._deps.control_plane.approval_outcome(runtime.pending_approval_id)
+        if outcome is None:
+            return None  # still pending
+
+        # Resuming needs the checkpointed ActionProposal/PlanStep
+        # replan_node preserved; without checkpointing there is nothing to
+        # resume from. Unlike resume_from/state_history (explicit operator
+        # calls), this runs inside a periodic reconciliation loop, so it
+        # stays quiet rather than raising -- the run just stays terminated.
+        state = await self._latest_graph_state(runtime)
+        proposal = state.get("action_proposal") if state is not None else None
+        if (
+            state is None
+            or proposal is None
+            or proposal.action_id != runtime.pending_action_id
+        ):
+            # The checkpoint this needs (preserved by replan_node's
+            # terminal branch) is missing or does not match -- resuming
+            # blind would risk re-executing against the wrong proposal.
+            # Fail closed: leave the run exactly as terminated.
+            return None
+
+        resumed_runtime = runtime.model_copy(
+            update={
+                "phase": AgentPhase.POLICY,
+                "termination_reason": None,
+                "no_progress_turns": 0,
+            }
+        )
+        seeded = resume_graph_state(
+            resumed_runtime,
+            action_proposal=proposal,
+            plan_step=state.get("plan_step"),
+        )
+        return await self._run_state(resumed_runtime, seeded)
+
+    async def _latest_graph_state(self, runtime: RuntimeState) -> GraphState | None:
+        """The full last-checkpointed state (not just ``runtime``), or
+        ``None`` if checkpointing found nothing for this thread.
+
+        Unlike the ``memory`` backend (built eagerly in ``__init__``), a
+        ``sqlite`` checkpointer is only opened by ``_ensure_graph`` (an
+        async context, since the SQLite saver owns a live connection) --
+        which a caller reaching this method without first calling
+        ``run()`` (e.g. a fresh runner built only to resume) never
+        triggers on its own. Ensure it here too, or ``self._graph``/
+        ``self._checkpointer`` are simply ``None`` and this silently
+        reports "unavailable" forever, never actually checking the file.
+        """
+        try:
+            await self._ensure_graph()
+        except Exception:  # noqa: BLE001 - treat as unavailable, never crash reconciliation
+            return None
+        if self._graph is None or self._checkpointer is None:
+            return None
+        try:
+            snapshot = await self._graph.aget_state(self.config())
+            return snapshot.values if snapshot.values else None
+        except Exception:  # noqa: BLE001 - treat as unavailable, never crash reconciliation
+            return None
 
     async def _canonical_graph_changed(self, runtime: RuntimeState) -> bool:
         observation = await AttackGraphService(self._deps.graph_store).observe(

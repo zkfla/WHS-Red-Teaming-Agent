@@ -13,6 +13,8 @@ dependencies = [
     "pyyaml>=6.0",
     "httpx>=0.28,<1",
     "anyio>=4,<5",
+    # CLI output only (redteam.app.cli.*) -- never imported by core/orchestration/agents.
+    "rich>=13.7,<15",
 ]
 
 [project.optional-dependencies]
@@ -28,6 +30,17 @@ orchestration = [
 # LiteLLM transitively through langchain-litellm.
 llm = [
     "litellm>=1.50",
+]
+# Everything `redteam run` actually needs for a real (non-Fake/non-Example)
+# execution: a real LLM provider, and SQLite-backed checkpoint/work-ledger
+# storage (`redteam run` always uses the SQLite checkpoint backend, e.g.
+# for `redteam approvals approve` to be able to resume the same Run — see
+# README "CLI"). Does not include dev tooling (pytest/ruff/mypy) — combine
+# with `dev` for a full development setup: `pip install -e ".[dev,agent]"`.
+agent = [
+    "litellm>=1.50",
+    "langgraph-checkpoint-sqlite>=3.1,<4.0",
+    "aiosqlite>=0.22,<1.0",
 ]
 dev = [
     "langgraph-checkpoint-sqlite>=3.1,<4.0",

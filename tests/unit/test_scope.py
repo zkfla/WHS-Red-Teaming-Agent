@@ -15,12 +15,13 @@ from redteam.core.contracts.action import ActionProposal
 from redteam.core.contracts.engagement import EngagementScope
 from redteam.core.contracts.target import (
     AnyTarget,
+    AssetTarget,
     DomainTarget,
     HostTarget,
     PrincipalTarget,
     UrlTarget,
 )
-from redteam.core.ids import ActionId, AgentId, EngagementId, PrincipalId, RunId
+from redteam.core.ids import ActionId, AgentId, AssetId, EngagementId, PrincipalId, RunId
 
 
 def _proposal_for(target: AnyTarget) -> ActionProposal:
@@ -146,3 +147,66 @@ def test_principal_target_has_no_scope_identity() -> None:
     ok, reasons, _ = check_scope(_proposal_for(target), scope)
     assert ok is False
     assert "no scope-checkable" in reasons[0]
+
+
+# --- mobile assets -------------------------------------------------------
+
+
+def test_asset_target_allowed_when_listed() -> None:
+    scope = EngagementScope(allowed_assets=["com.example.bank"])
+    target = AssetTarget(asset_id=AssetId("com.example.bank"))
+    ok, reasons, severity = check_scope(_proposal_for(target), scope)
+    assert ok is True
+    assert reasons == []
+    assert severity is None
+
+
+def test_asset_target_denied_when_not_listed() -> None:
+    scope = EngagementScope(allowed_assets=["com.example.bank"])
+    target = AssetTarget(asset_id=AssetId("com.example.other"))
+    ok, reasons, severity = check_scope(_proposal_for(target), scope)
+    assert ok is False
+    assert "not within engagement scope" in reasons[0]
+    assert severity is Severity.BLOCK_ACTION
+
+
+def test_asset_target_denied_by_default_with_no_allowlist() -> None:
+    """Regression: before allowed_assets/denied_assets existed, an
+    AssetTarget had no scope-checkable identity at all and always fell
+    through to the generic host-based DENY — Mobile actions were
+    unconditionally denied regardless of engagement config."""
+    scope = EngagementScope()
+    target = AssetTarget(asset_id=AssetId("com.example.bank"))
+    ok, reasons, _ = check_scope(_proposal_for(target), scope)
+    assert ok is False
+    assert "allowed_assets" in reasons[0]
+
+
+def test_asset_target_denied_list_wins_even_if_allowed() -> None:
+    scope = EngagementScope(
+        allowed_assets=["com.example.bank"], denied_assets=["com.example.bank"]
+    )
+    target = AssetTarget(asset_id=AssetId("com.example.bank"))
+    ok, reasons, _ = check_scope(_proposal_for(target), scope)
+    assert ok is False
+    assert "denied_assets" in reasons[0]
+
+
+def test_asset_target_match_is_case_sensitive_exact_match() -> None:
+    """No host-style case-folding or substring/prefix matching for
+    canonical asset identifiers."""
+    scope = EngagementScope(allowed_assets=["com.example.Bank"])
+    target = AssetTarget(asset_id=AssetId("com.example.bank"))
+    assert check_scope(_proposal_for(target), scope)[0] is False
+
+    substring_scope = EngagementScope(allowed_assets=["example.bank"])
+    assert check_scope(_proposal_for(target), substring_scope)[0] is False
+
+
+def test_asset_scope_does_not_use_host_allow_lists() -> None:
+    """An asset_id that happens to look like a hostname must not be
+    granted scope via allowed_hosts/domains/networks — assets and hosts
+    are different identity spaces."""
+    scope = EngagementScope(allowed_hosts=["com.example.bank"])
+    target = AssetTarget(asset_id=AssetId("com.example.bank"))
+    assert check_scope(_proposal_for(target), scope)[0] is False

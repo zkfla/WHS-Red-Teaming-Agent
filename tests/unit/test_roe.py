@@ -13,7 +13,9 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-from redteam.control.roe import check_roe
+import pytest
+
+from redteam.control.roe import UnsupportedRoePolicyError, check_roe
 from redteam.control.service import DefaultControlPlane
 from redteam.control.severity import Severity
 from redteam.core.contracts.action import ActionProposal
@@ -238,3 +240,84 @@ async def test_control_plane_denies_roe_violation() -> None:
     assert decision.verdict == PolicyVerdict.DENY
     assert "roe" in decision.matched_rules
     assert any("recon.port_scan" in r for r in decision.reasons)
+
+
+# --- availability_impact_allowed ---------------------------------------
+
+
+def test_availability_impacting_action_denied_by_default() -> None:
+    roe = [RuleOfEngagement(name="default")]  # availability_impact_allowed defaults False
+    proposal = _proposal().model_copy(update={"availability_impact": True})
+    ok, reasons, severity = check_roe(proposal, _engagement(roe))
+    assert ok is False
+    assert "availability_impact_allowed=False" in reasons[0]
+    assert severity is Severity.BLOCK_ACTION
+
+
+def test_availability_impacting_action_allowed_when_rule_opts_in() -> None:
+    roe = [RuleOfEngagement(name="ok-with-impact", availability_impact_allowed=True)]
+    proposal = _proposal().model_copy(update={"availability_impact": True})
+    assert check_roe(proposal, _engagement(roe))[0] is True
+
+
+def test_non_impacting_action_unaffected_by_availability_rule() -> None:
+    roe = [RuleOfEngagement(name="default")]
+    assert check_roe(_proposal(), _engagement(roe))[0] is True
+
+
+# --- prohibited_techniques: explicit unsupported, never silently ignored --
+
+
+def test_prohibited_techniques_fails_closed_with_a_clear_error() -> None:
+    roe = [RuleOfEngagement(name="no-brute-force", prohibited_techniques=["brute_force"])]
+    with pytest.raises(UnsupportedRoePolicyError, match="prohibited_techniques"):
+        check_roe(_proposal(), _engagement(roe))
+
+
+async def test_control_plane_aborts_run_on_unsupported_prohibited_techniques() -> None:
+    roe = [RuleOfEngagement(name="no-brute-force", prohibited_techniques=["brute_force"])]
+    engagement = _engagement(roe)
+    plane = DefaultControlPlane({engagement.engagement_id: engagement})
+    decision = await plane.evaluate(
+        _proposal(), ControlContext(engagement_id=engagement.engagement_id)
+    )
+    assert decision.verdict == PolicyVerdict.DENY
+    assert any("abort_run" in rule for rule in decision.matched_rules)
+    assert any("prohibited_techniques" in reason for reason in decision.reasons)
+
+
+# --- max_parallel_actions: runtime signal, fail-closed without it ------
+
+
+def test_max_parallel_actions_denies_at_the_limit() -> None:
+    roe = [RuleOfEngagement(name="one-at-a-time", max_parallel_actions=1)]
+    ok, reasons, severity = check_roe(_proposal(), _engagement(roe), in_flight_actions=1)
+    assert ok is False
+    assert "max_parallel_actions=1" in reasons[0]
+    assert severity is Severity.BLOCK_ACTION
+
+
+def test_max_parallel_actions_allows_under_the_limit() -> None:
+    roe = [RuleOfEngagement(name="two-at-a-time", max_parallel_actions=2)]
+    assert check_roe(_proposal(), _engagement(roe), in_flight_actions=1)[0] is True
+
+
+def test_max_parallel_actions_fails_closed_without_the_runtime_signal() -> None:
+    roe = [RuleOfEngagement(name="one-at-a-time", max_parallel_actions=1)]
+    ok, reasons, severity = check_roe(_proposal(), _engagement(roe))  # no in_flight_actions
+    assert ok is False
+    assert "no in-flight-action count was supplied" in reasons[0]
+    assert severity is Severity.BLOCK_ACTION
+
+
+async def test_control_plane_supplies_in_flight_count_from_context_metadata() -> None:
+    roe = [RuleOfEngagement(name="one-at-a-time", max_parallel_actions=1)]
+    engagement = _engagement(roe)
+    plane = DefaultControlPlane({engagement.engagement_id: engagement})
+    decision = await plane.evaluate(
+        _proposal(),
+        ControlContext(
+            engagement_id=engagement.engagement_id, metadata={"in_flight_actions": 0}
+        ),
+    )
+    assert decision.verdict == PolicyVerdict.ALLOW

@@ -39,4 +39,14 @@ class ActionProposal(BaseModel):
     hypothesis_id: HypothesisId | None = None
     expected_observation: str | None = None
 
+    # Agent-declared intent signal, not inferred from `operation` by
+    # Control: does this specific action risk disrupting the target's
+    # availability (flood/exhaustion/restart-style effects), as opposed to
+    # a read-only or low-volume probe? Defaults to False ("no known
+    # impact") so existing proposals are unaffected; a provider whose step
+    # genuinely can affect availability must set this explicitly for
+    # `RuleOfEngagement.availability_impact_allowed` to have any effect —
+    # see `redteam.control.roe`.
+    availability_impact: bool = False
+
     created_at: datetime

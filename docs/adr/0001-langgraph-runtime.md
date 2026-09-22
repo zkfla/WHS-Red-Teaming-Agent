@@ -40,6 +40,14 @@ sequencing/conditional edges, nothing else.
   `orchestration.graph` and `orchestration.router` need to change —
   node function bodies and `RuntimeDeps`/`RuntimeState` don't, since
   they don't import `langgraph` themselves.
-- Real LLM-driven planning/re-planning is explicitly deferred; every
-  node today is a stub or a hardcoded "Fake Recon Agent"
-  (instruction.md section 14).
+- Real LLM-driven planning/re-planning, deferred at ADR-writing time
+  (instruction.md section 14), is no longer a stub: `orchestration.nodes.plan`
+  calls a real `LLMPlanner`/`PlaybookPlanner` (`orchestration.agents.planners`)
+  over registered specialist agents (`recon-agent`/`web-api-agent`/
+  `mobile-agent`, `orchestration/agents/{registry,builtin}.py`), and
+  `orchestration.nodes.replan` implements real convergence/stuck-detection
+  (`orchestration.convergence`/`orchestration.progress`), not a single
+  pass. What each agent's playbook can actually *do* once scheduled is
+  still thin (see `docs/agent/orchestration-implementation-plan.md`
+  section 16.1) — that is a separate, content-level gap from the
+  runtime-plumbing question this ADR answers.

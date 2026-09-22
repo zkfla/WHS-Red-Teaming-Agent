@@ -24,6 +24,7 @@ from redteam.orchestration.agents.providers import (
 from redteam.orchestration.agents.registry import AgentRegistry, default_registry
 from redteam.orchestration.analysis import AnalysisVerifier, DeterministicAnalysisVerifier
 from redteam.orchestration.context_projection import ContextProjectionCache
+from redteam.orchestration.observations import ResultMapperRegistry, default_result_mapper_registry
 from redteam.orchestration.settings import OrchestrationSettings
 from redteam.orchestration.work.memory import InMemoryWorkStore
 from redteam.orchestration.work.store import WorkStore
@@ -46,6 +47,9 @@ class RuntimeDeps:
     # Agent-Team view of the Capability registry.  ``None`` keeps legacy
     # playbooks operational until Capability/PM finalize a shared catalog port.
     tool_catalog: ToolCatalog | None = None
+    # Tool Result -> Attack Graph Mutation (SERVICE/ENDPOINT discovery from
+    # a successful execution's real output) -- see `orchestration.observations`.
+    result_mappers: ResultMapperRegistry = field(default_factory=default_result_mapper_registry)
     work_store: WorkStore = field(default_factory=InMemoryWorkStore)
     settings: OrchestrationSettings = field(default_factory=OrchestrationSettings)
     context_cache: ContextProjectionCache = field(

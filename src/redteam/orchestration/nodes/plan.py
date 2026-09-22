@@ -31,7 +31,11 @@ from redteam.orchestration.difficulty import (
     evaluate_branch_pruning,
 )
 from redteam.orchestration.dispatch import DispatchItem
-from redteam.orchestration.events import AGENT_PROVIDER_FAILED, CANDIDATE_PRUNED
+from redteam.orchestration.events import (
+    AGENT_NO_EXECUTABLE_CANDIDATES,
+    AGENT_PROVIDER_FAILED,
+    CANDIDATE_PRUNED,
+)
 from redteam.orchestration.nodes._support import advance, graph_service, publisher_for
 from redteam.orchestration.scheduler import WorkScheduler
 from redteam.orchestration.state import GraphState
@@ -69,6 +73,7 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
         if definition is not None
         else None
     )
+    drafts = None
     try:
         if definition is None:
             compiled = await compiler.compile_playbook(
@@ -102,6 +107,21 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             dispatch_items=[],
             last_event_id=failed.event_id,
         )
+    publisher = publisher_for(state, deps, "orchestration.plan")
+    last_event_id = state.get("last_event_id")
+    if drafts and not compiled:
+        # The agent was activated (its playbook precondition genuinely
+        # matched something) and had at least one draft to try, but every
+        # one was dropped during compilation -- no matching/healthy tool,
+        # or a required graph-context field could not be resolved
+        # (`PlanStep.bound_to` returning `None`). Distinct from "nothing
+        # to do" (drafts empty), which stays silent as before.
+        no_candidates = await publisher.publish(
+            AGENT_NO_EXECUTABLE_CANDIDATES,
+            {"agent_id": agent.agent_id, "drafts_offered": len(drafts)},
+            causation_id=last_event_id,
+        )
+        last_event_id = no_candidates.event_id
     history = await deps.work_store.list_items(run_id=runtime.run_id)
     terminal_keys = {
         item.candidate_key for item in history if item.status in TERMINAL_STATUSES
@@ -128,8 +148,6 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
         )
         for candidate in compiled
     ]
-    publisher = publisher_for(state, deps, "orchestration.plan")
-    last_event_id = state.get("last_event_id")
     eligible = []
     for candidate in compiled:
         prune = evaluate_branch_pruning(

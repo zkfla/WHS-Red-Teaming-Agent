@@ -98,6 +98,13 @@ async def replan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             reason = convergence.reason
 
     if reason is not None:
+        # APPROVAL_PENDING is not a dead end: AgentLoopRunner.reconcile_once
+        # resumes it directly at POLICY once a human resolves the Approval
+        # (see orchestration.state.resume_graph_state), and needs this exact
+        # ActionProposal/PlanStep still in the checkpointed state to do that
+        # without re-planning (which would mint a new, uncorrelated action).
+        # Every other terminal reason clears them as before.
+        preserve_pending_action = reason == TerminationReason.APPROVAL_PENDING
         return advance(
             state,
             runtime.model_copy(
@@ -118,10 +125,10 @@ async def replan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                 }
             ),
             last_event_id=last_event_id,
-            action_proposal=None,
-            policy_decision=None,
+            action_proposal=state.get("action_proposal") if preserve_pending_action else None,
+            policy_decision=state.get("policy_decision") if preserve_pending_action else None,
             tool_result=None,
-            plan_step=None,
+            plan_step=state.get("plan_step") if preserve_pending_action else None,
             current_work_id=None,
             dispatch_items=[],
         )

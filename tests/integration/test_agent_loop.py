@@ -17,6 +17,7 @@ from redteam.app.bootstrap import build_runtime_deps, run_engagement
 from redteam.attack_graph.predicates import attrs_of
 from redteam.attack_graph.service import AttackGraphService
 from redteam.attack_graph.stores.memory import InMemoryAttackGraphStore
+from redteam.capability.gateway import MCPToolGateway
 from redteam.capability.registry import MCPToolRegistry
 from redteam.core.contracts.engagement import (
     ApprovalPolicy,
@@ -166,6 +167,10 @@ async def test_pending_approval_has_its_own_terminal_reason_and_partial_report()
                 approval_id=ApprovalId("appr_test"),
                 evaluated_at=datetime.now(timezone.utc),
             )
+
+        async def approval_outcome(self, approval_id):
+            del approval_id
+            return None
 
     target = engagement("a.local")
     gateway = DummyToolGateway()
@@ -409,6 +414,10 @@ async def test_control_plane_exception_fails_closed_and_releases_the_lease() -> 
             del proposal, context
             raise RuntimeError("sensitive policy backend detail")
 
+        async def approval_outcome(self, approval_id):
+            del approval_id
+            return None
+
     gateway = DummyToolGateway()
     deps = build_test_application(
         control_plane=ExplodingControlPlane(),
@@ -476,12 +485,12 @@ async def test_agents_run_in_order_and_share_one_graph() -> None:
 
 
 async def test_default_web_agent_activates_when_target_and_catalog_tool_exist() -> None:
-    catalog = MCPToolRegistry()
+    registry = MCPToolRegistry()
     for tool_id, capability in (
         ("recon.ping", "recon"),
         ("web.http_inspect", "web"),
     ):
-        catalog.register(
+        registry.register(
             ToolDescriptor(
                 tool_id=ToolId(tool_id),
                 server_id="test",
@@ -490,13 +499,16 @@ async def test_default_web_agent_activates_when_target_and_catalog_tool_exist() 
                 health_status=ToolHealthStatus.HEALTHY,
             )
         )
+    catalog = MCPToolGateway(
+        registry, {}, {"recon.ping": ["service_discovery"], "web.http_inspect": ["http_request"]}
+    )
     deps = build_test_application(
         tool_catalog=catalog,
         settings=OrchestrationSettings(max_steps=10, checkpointing=False),
     )
     await AttackGraphService(deps.graph_store).upsert_node(
-        GraphNodeType.SERVICE,
-        key="a.local/http",
+        GraphNodeType.ENDPOINT,
+        key="a.local GET /",
     )
 
     final = await run_with(deps, engagement("a.local"))
@@ -506,12 +518,12 @@ async def test_default_web_agent_activates_when_target_and_catalog_tool_exist() 
 
 
 async def test_round_robin_prevents_recon_from_consuming_all_specialist_budget() -> None:
-    catalog = MCPToolRegistry()
+    registry = MCPToolRegistry()
     for tool_id, capability in (
         ("recon.ping", "recon"),
         ("web.http_inspect", "web"),
     ):
-        catalog.register(
+        registry.register(
             ToolDescriptor(
                 tool_id=ToolId(tool_id),
                 server_id="test",
@@ -520,6 +532,9 @@ async def test_round_robin_prevents_recon_from_consuming_all_specialist_budget()
                 health_status=ToolHealthStatus.HEALTHY,
             )
         )
+    catalog = MCPToolGateway(
+        registry, {}, {"recon.ping": ["service_discovery"], "web.http_inspect": ["http_request"]}
+    )
     gateway = DummyToolGateway()
     deps = build_test_application(
         tool_catalog=catalog,
@@ -527,8 +542,8 @@ async def test_round_robin_prevents_recon_from_consuming_all_specialist_budget()
         settings=OrchestrationSettings(max_steps=10, checkpointing=False),
     )
     await AttackGraphService(deps.graph_store).upsert_node(
-        GraphNodeType.SERVICE,
-        key="a.local/http",
+        GraphNodeType.ENDPOINT,
+        key="a.local GET /",
     )
 
     final = await run_with(

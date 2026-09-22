@@ -12,23 +12,25 @@ routing: `src/redteam/orchestration/router.py`.
 
 ## Minimal Vertical Slice, step by step
 
-Maps to instruction.md section 16. Every step below is real code, not
-a description — run `python -m redteam.app.cli run examples/engagement.yaml`
-to see it happen.
+Maps to instruction.md section 16 and still holds structurally, but two
+cells are historical (from when this was the *only* path) — see the
+"Current status" note under each. Every step below is real code, not a
+description — run `redteam run examples/engagement.yaml` (or bare
+`redteam` for the interactive setup) to see it happen.
 
 | # | Step | Code |
 |---|---|---|
-| 1 | Engagement created | `app.bootstrap.load_engagement` reads `examples/engagement.yaml` into an `Engagement` |
-| 2 | Fake Recon Agent runs | `orchestration.nodes.observe` -> `orchestration.nodes.plan` |
+| 1 | Engagement created | `app.bootstrap.load_engagement` (or, via the CLI, `AppConfig`/`core.config.load_engagement_config`) reads an `engagement.yaml` into an `Engagement` |
+| 2 | An Agent runs | `orchestration.nodes.observe` -> `orchestration.nodes.plan`. **Current status**: real registered agents (`recon-agent`/`web-api-agent`/`mobile-agent`, `orchestration/agents/{registry,builtin}.py`), not the single "fake Recon Agent" this row originally described — see `docs/agent/orchestration-implementation-plan.md` section 16.1 for exactly how thin each one's playbook still is. |
 | 3 | Agent creates `ActionProposal` | `orchestration.nodes.plan.plan_node` |
 | 4 | Control Plane evaluates | `orchestration.nodes.policy.policy_node` calls `deps.control_plane.evaluate(...)` |
 | 5 | ALLOW decision | `control.service.DefaultControlPlane.evaluate` (Scope -> Policy -> RateLimit -> Budget -> Approval) |
 | 6 | ToolGateway called | `orchestration.nodes.execute.execute_node` calls `deps.tool_gateway.invoke(...)` — only reachable on ALLOW |
-| 7 | Dummy MCP Adapter runs | `capability.gateway.MCPToolGateway` routes to `capability.adapters.mcp.example.ExampleMCPAdapter` |
+| 7 | MCP Adapter runs | `capability.gateway.MCPToolGateway` routes to whichever adapter is configured. **Current status**: `capability.adapters.mcp.example.ExampleMCPAdapter` is still the zero-config default (`capability.mcp_servers: []`), but real adapters exist and run in production configs — see `deploy/mcp/README.md`. |
 | 8 | `ToolResult` returned | Normalized shape, regardless of adapter |
 | 9 | Evidence created | `orchestration.nodes.verify.verify_node` writes an `EvidenceRecord` via `deps.evidence_store` |
 | 10 | Events published | `EventEnvelope`s at every step via `deps.event_bus` — see the full list below |
-| 11 | Attack Graph updated | `orchestration.nodes.update.update_node` adds a `GraphNode` via `deps.graph_store` |
+| 11 | Attack Graph updated | `orchestration.nodes.update.update_node` adds/merges a `GraphNode` (and, for a tool_id with a registered `ResultMapper`, e.g. `recon.http_probe`, real SERVICE/ENDPOINT nodes + edges too — `orchestration/observations/`) via `deps.graph_store` |
 | 12 | LangGraph advances state | `RuntimeState.phase` transitions OBSERVE -> ... -> FINISHED |
 | 13 | Run ends | `orchestration.nodes.replan.replan_node` sets phase FINISHED; `app.bootstrap.run_engagement` publishes `RunFinished` |
 
@@ -47,10 +49,17 @@ GraphUpdated
 RunFinished
 ```
 
-Verified by `tests/integration/test_end_to_end.py`. `HypothesisCreated`
-and `FindingVerified` are not emitted yet — the fake planner doesn't
-create Hypotheses/Findings (TODO for Agent Team, see
-`orchestration/nodes/plan.py`).
+Verified by `tests/integration/test_end_to_end.py` for this exact
+sequence. **Current status**: `HypothesisCreated` *does* fire in a real
+run today — every built-in playbook step declares a `HypothesisDraft`
+(`orchestration/agents/{registry,builtin}.py`), and `plan_node` publishes
+it whenever one is set. `FindingCreated`/`FindingVerified` still never
+fire, for a now-precisely-known reason (not just "TODO"): reaching
+`Verdict.VIOLATION` requires a step's `Expectation` to set
+`violation_if_met=True` (or `anomaly_if_unmet=True`), and no built-in
+playbook step sets either — see `docs/agent/orchestration-implementation-plan.md`
+section 16.1, finding 1, for the full detail and why it's the most
+significant remaining gap in this project.
 
 ## `Verdict` vs `ToolResult.success` — two different axes
 
@@ -70,14 +79,25 @@ success=True  + VIOLATION -> tool ran fine, and it confirmed a security violatio
 success=False + UNKNOWN   -> execution failed, so no verdict could be reached
 ```
 
-The current stub (`orchestration.nodes.verify.verify_node`) only does
-the placeholder mapping `success -> PASS`, `not success -> UNKNOWN` —
-it does **not** implement real hypothesis verification (there's no
-hypothesis logic yet at all). Treat `last_verdict` as meaningless until
-Agent Team replaces that TODO; don't read anything into `PASS` beyond
-"the tool call didn't fail." No new contract (e.g. a
-`VerificationResult`) is planned for this — real verification logic
-reuses `Verdict` when it lands.
+**Current status**: this is no longer a `success -> PASS` placeholder.
+`orchestration.nodes.verify.verify_node` calls `deps.verifier.verify(...)`
+(`DeterministicAnalysisVerifier` by default), which evaluates the
+step's `Expectation` against the real `ToolResult`
+(`orchestration.expectations.verdict_for`) and resolves the Hypothesis
+(`open -> confirmed/rejected/inconclusive`) that was recorded before the
+action ran. A `Verdict.VIOLATION` does create a real, verified `Finding`
+carrying the `EvidenceId` behind it — this whole mechanism works
+correctly end to end (`tests/unit/test_orchestration_nodes.py`).
+
+The actual gap is one level up, not here: reaching `VIOLATION` requires
+the step's `Expectation` to set `violation_if_met=True` (or
+`anomaly_if_unmet=True`), and **no built-in playbook step
+(`recon-agent`/`web-api-agent`/`mobile-agent`) sets either** — so every
+real run today produces `PASS`/`UNKNOWN` only, regardless of what the
+target actually does. See
+`docs/agent/orchestration-implementation-plan.md` section 16.1, finding
+1, for the full detail; this is the single most significant remaining
+gap in the project.
 
 ## Denied path
 

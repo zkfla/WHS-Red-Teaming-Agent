@@ -13,14 +13,19 @@ through every orchestration node and this stage avoids no-op renames
 
 Two entry points build a ``RuntimeDeps``:
 
-- ``build_runtime_deps(engagement, ...)`` — the original, ``Engagement``-only
-  entry point. Still what the CLI and most tests use; unchanged.
 - ``build_application(config, ...)`` — the ``AppConfig``-aware entry
-  point. Reads every section of ``AppConfig`` (``LLMConfig`` ->
-  ``LLMClient`` choice, ``CapabilityConfig`` -> tool gateway wiring,
-  ``LoggingConfig`` -> ``logging.basicConfig``) and takes an explicit
-  keyword override for every dependency, so tests can inject Fakes
-  instead of any default this function would otherwise build.
+  point, and the canonical one: reads every section of ``AppConfig``
+  (``LLMConfig`` -> ``LLMClient`` choice, ``CapabilityConfig`` -> tool
+  gateway wiring, ``LoggingConfig`` -> ``logging.basicConfig``) and takes
+  an explicit keyword override for every dependency, so tests can inject
+  Fakes instead of any default this function would otherwise build.
+  ``redteam.app.cli`` uses this path exclusively — a real configured LLM
+  provider or MCP server reaches a `run` invocation only through here.
+- ``build_runtime_deps(engagement, ...)`` — the original, ``Engagement``-only
+  entry point (always fake LLM, always the in-process dummy adapter
+  unless a caller works around it). Kept for callers that only have a
+  bare ``Engagement`` and no ``AppConfig`` (``examples/minimal_run.py``,
+  most unit/integration tests) — never the CLI.
 """
 
 from __future__ import annotations
@@ -30,8 +35,10 @@ import logging
 from datetime import datetime, timezone
 from pathlib import Path
 
+from redteam.app.report_store import save_terminal_report
 from redteam.attack_graph.service import AttackGraphService
 from redteam.attack_graph.stores.memory import InMemoryAttackGraphStore
+from redteam.attack_graph.stores.namespaced import EngagementScopedAttackGraphStore
 from redteam.capability.bootstrap import build_mcp_tool_gateway
 from redteam.control.approval import ApprovalService
 from redteam.control.audit import AuditLog
@@ -76,6 +83,8 @@ from redteam.orchestration.work.memory import InMemoryWorkStore
 from redteam.orchestration.work.sqlite import SQLiteWorkStore
 from redteam.orchestration.work.store import WorkStore
 
+logger = logging.getLogger(__name__)
+
 
 def load_engagement(path: str | Path) -> Engagement:
     """Load an engagement YAML file into a full ``Engagement``.
@@ -88,7 +97,7 @@ def load_engagement(path: str | Path) -> Engagement:
     return config.to_engagement(engagement_id=EngagementId(new_id("eng")))
 
 
-def _build_llm_client(config: LLMConfig) -> LLMClient:
+def build_llm_client(config: LLMConfig) -> LLMClient:
     if config.provider == "litellm":
         from redteam.llm.litellm import LiteLLMClient
 
@@ -137,7 +146,12 @@ async def build_runtime_deps(
     sections this function doesn't.
     """
     event_bus = InMemoryEventBus()
-    graph_store = InMemoryAttackGraphStore()
+    # Namespaced even though this builds one fresh store per call, so an
+    # Engagement never silently depends on being the store's only tenant —
+    # see EngagementScopedAttackGraphStore.
+    graph_store = EngagementScopedAttackGraphStore(
+        InMemoryAttackGraphStore(), engagement_id=engagement.engagement_id
+    )
     evidence_store = FilesystemEvidenceStore(evidence_dir)
     tool_gateway, discovered_catalog = await _build_default_capability(CapabilityConfig())
     audit_log = AuditLog(FilesystemAuditStore(audit_dir))
@@ -202,7 +216,7 @@ async def build_application(
     - ``config.engagement`` -> ``Engagement`` handed to the default
       ``ControlPlane`` (and returned alongside ``RuntimeDeps`` — callers
       pass it to ``run_engagement``).
-    - ``config.llm`` -> ``_build_llm_client`` (``FakeLLMClient`` unless
+    - ``config.llm`` -> ``build_llm_client`` (``FakeLLMClient`` unless
       ``provider: "litellm"``).
     - ``config.capability`` -> ``_build_default_tool_gateway``.
     - ``config.orchestration`` -> ``OrchestrationSettings.from_config``;
@@ -238,8 +252,10 @@ async def build_application(
     else:
         resolved_tool_gateway = tool_gateway
     resolved_event_bus = event_bus or InMemoryEventBus()
-    resolved_attack_graph = attack_graph or InMemoryAttackGraphStore()
-    resolved_llm = llm or _build_llm_client(config.llm)
+    resolved_attack_graph = attack_graph or EngagementScopedAttackGraphStore(
+        InMemoryAttackGraphStore(), engagement_id=engagement.engagement_id
+    )
+    resolved_llm = llm or build_llm_client(config.llm)
     resolved_settings = orchestration_settings or OrchestrationSettings.from_config(
         config.orchestration
     )
@@ -278,6 +294,13 @@ async def _publish_terminal_artifacts(
         evidence_store=deps.evidence_store,
         work_store=deps.work_store,
     )
+    try:
+        # The only thing that makes `redteam status`/`findings`/`report`
+        # work once this process exits (see app.report_store) — never lets
+        # a persistence failure mask the run's real terminal outcome.
+        save_terminal_report(report)
+    except OSError:
+        logger.exception("Failed to persist terminal report for run %s", runtime.run_id)
     await deps.event_bus.publish(
         EventEnvelope(
             event_id=EventId(new_id("evt")),

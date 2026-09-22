@@ -22,6 +22,4 @@ class ToolCatalog(Protocol):
         self,
         capability: str,
         operation: str,
-        *,
-        include_unhealthy: bool = False,
     ) -> list[ToolDescriptor]: ...

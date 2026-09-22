@@ -3,7 +3,25 @@
 from redteam.attack_graph.patterns import NodePattern
 from redteam.core.enums import GraphNodeType
 from redteam.core.ids import AgentId, ToolId
-from redteam.orchestration.agents.base import AgentSpec, HypothesisDraft, PlanStep
+from redteam.orchestration.agents.base import (
+    PATH_PLACEHOLDER,
+    TARGET_REF_PLACEHOLDER,
+    AgentSpec,
+    HypothesisDraft,
+    PlanStep,
+)
+
+#: Real ``web.http_request`` schema (`redteam.capability.servers.web_http`)
+#: requires exactly ``target_ref``/``path`` -- verified directly against
+#: its MCP-declared ``input_schema``, not assumed. ``target_ref`` is the
+#: bound target's host (same semantics as ``RECON_AGENT``'s own
+#: ``$target_ref`` usage -- a policy target key, not a graph node id);
+#: ``path`` comes from the ``EndpointTarget`` a matched ENDPOINT node
+#: resolves to. A ``ServiceTarget`` (the other precondition below) has
+#: no path, so `$path` resolves to ``None`` for it and `PlanStep.bound_to`
+#: drops that candidate -- an honest "not enough context yet", not a
+#: guessed ``"/"``.
+_WEB_HTTP_REQUEST_ARGUMENTS = {"target_ref": TARGET_REF_PLACEHOLDER, "path": PATH_PLACEHOLDER}
 
 WEB_API_AGENT = AgentSpec(
     agent_id=AgentId("web-api-agent"),
@@ -19,6 +37,7 @@ WEB_API_AGENT = AgentSpec(
             tool_id=ToolId("web.http_inspect"),
             target_bind="endpoint",
             preconditions=[NodePattern(type=GraphNodeType.ENDPOINT, bind="endpoint")],
+            arguments=dict(_WEB_HTTP_REQUEST_ARGUMENTS),
             reason="Inspect a discovered endpoint before proposing deeper tests.",
             hypothesis=HypothesisDraft(
                 description="The endpoint exposes behavior that can be analyzed safely.",
@@ -33,6 +52,10 @@ WEB_API_AGENT = AgentSpec(
             tool_id=ToolId("web.http_inspect"),
             target_bind="service",
             preconditions=[NodePattern(type=GraphNodeType.SERVICE, bind="service")],
+            # `$path` never resolves against a ServiceTarget (see module
+            # note) -- this entry stays inert until a real tool exists
+            # that can act on a service without a specific path.
+            arguments=dict(_WEB_HTTP_REQUEST_ARGUMENTS),
             reason="Inspect a discovered HTTP service and enumerate its visible surface.",
             hypothesis=HypothesisDraft(
                 description="The service exposes an HTTP surface suitable for analysis.",

@@ -23,12 +23,11 @@ from redteam.core.contracts.target import (
 )
 from redteam.core.contracts.tool import ToolDescriptor
 from redteam.core.enums import RiskLevel, ToolHealthStatus
-from redteam.core.ids import ToolId
 from redteam.orchestration.action_naming import (
     canonical_action_key,
     tool_matches_action_namespace,
 )
-from redteam.orchestration.agents.base import AgentSpec
+from redteam.orchestration.agents.base import AgentSpec, PlanStep
 from redteam.orchestration.agents.providers import PlaybookCandidateProvider
 from redteam.orchestration.candidates.catalog import ToolCatalog
 from redteam.orchestration.candidates.models import (
@@ -36,6 +35,7 @@ from redteam.orchestration.candidates.models import (
     ExecutableCandidate,
 )
 from redteam.orchestration.candidates.scoring import score_candidate
+from redteam.orchestration.candidates.tool_selection import select_tool
 
 
 @lru_cache(maxsize=256)
@@ -82,94 +82,73 @@ class CandidateCompiler:
                 # Context, work/conflict accounting and evidence routing must
                 # describe the same target that Policy and ToolGateway receive.
                 continue
-            tools = self._resolve_tools(
-                plan_step.tool_id,
-                plan_step.capability,
-                plan_step.operation,
-                plan_step.resolved_target().kind,
+            tool = self._resolve_tool(plan_step)
+            if tool is None or tool.health_status is ToolHealthStatus.UNHEALTHY:
+                continue
+            bound_arguments = self._bind_target_arguments(
+                plan_step.arguments, plan_step.resolved_target(), tool
             )
-            for tool in tools:
-                if tool.health_status is ToolHealthStatus.UNHEALTHY:
-                    continue
-                bound_arguments = self._bind_target_arguments(
-                    plan_step.arguments,
-                    plan_step.resolved_target(),
-                    tool,
+            bound_step = plan_step.model_copy(update={"arguments": bound_arguments})
+            bound_draft = draft.model_copy(update={"plan_step": bound_step})
+            if not self._arguments_match_schema(bound_step.arguments, tool.input_schema):
+                continue
+            key = candidate_key(bound_draft)
+            if key in seen:
+                continue
+            seen.add(key)
+            candidates.append(
+                ExecutableCandidate(
+                    candidate_key=key,
+                    draft=bound_draft,
+                    tool=tool,
+                    priority=score_candidate(
+                        bound_draft,
+                        risk_level=tool.risk_level,
+                        health_status=tool.health_status,
+                    ),
                 )
-                bound_step = plan_step.model_copy(
-                    update={"tool_id": tool.tool_id, "arguments": bound_arguments}
-                )
-                bound_draft = draft.model_copy(update={"plan_step": bound_step})
-                if not self._arguments_match_schema(bound_step.arguments, tool.input_schema):
-                    continue
-                key = candidate_key(bound_draft)
-                if key in seen:
-                    continue
-                seen.add(key)
-                candidates.append(
-                    ExecutableCandidate(
-                        candidate_key=key,
-                        draft=bound_draft,
-                        tool=tool,
-                        priority=score_candidate(
-                            bound_draft,
-                            risk_level=tool.risk_level,
-                            health_status=tool.health_status,
-                        ),
-                    )
-                )
+            )
         return sorted(
             candidates,
             key=lambda item: (-item.priority.total, item.candidate_key),
         )
 
-    def _resolve_tools(
-        self,
-        preferred: ToolId,
-        capability: str,
-        operation: str,
-        target_type: str,
-    ) -> list[ToolDescriptor]:
+    def _resolve_tool(self, plan_step: PlanStep) -> ToolDescriptor | None:
+        preferred, capability, operation = (
+            plan_step.tool_id,
+            plan_step.capability,
+            plan_step.operation,
+        )
         if not tool_matches_action_namespace(preferred, capability):
-            return []
+            return None
         if self._catalog is None:
-            return [
-                ToolDescriptor(
-                    tool_id=preferred,
-                    server_id="legacy-playbook",
-                    tool_name=str(preferred).rpartition(".")[2] or str(preferred),
-                    capability_tags=[capability],
-                    risk_level=RiskLevel.LOW,
-                    health_status=ToolHealthStatus.UNKNOWN,
-                )
-            ]
+            # No live Registry wired (legacy/minimal-vertical-slice path,
+            # e.g. the in-process ExampleMCPAdapter): nothing to select
+            # from, so the provider's declared binding is the only option.
+            return ToolDescriptor(
+                tool_id=preferred,
+                server_id="legacy-playbook",
+                tool_name=str(preferred).rpartition(".")[2] or str(preferred),
+                capability_tags=[capability],
+                risk_level=RiskLevel.LOW,
+                health_status=ToolHealthStatus.UNKNOWN,
+            )
 
-        # A capability tag says only what family a tool belongs to. It is not
-        # an intent-to-tool binding, so the fallback below queries the
-        # operation-aware catalog rather than choosing an arbitrary same-tag
-        # implementation.
-        exact = self._catalog.get(preferred)
-        if exact is not None and capability in exact.capability_tags:
-            return [exact] if self._target_matches(exact, target_type) else []
-
-        # During migration, older Agent playbooks may contain a preferred
-        # ToolId that is not present in the discovered MCP server. Resolve by
-        # the canonical action through the Core catalog port instead of
-        # importing a server implementation into Agent code.
-        try:
-            return [
-                candidate
-                for candidate in self._catalog.list_tools_for_action(capability, operation)
-                if self._target_matches(candidate, target_type)
-            ]
-        except AttributeError:
-            # Legacy test/catalog implementations have no action query yet;
-            # fail closed rather than guessing a same-capability tool.
-            return []
-
-    @staticmethod
-    def _target_matches(tool: ToolDescriptor, target_type: str) -> bool:
-        return not tool.target_types or target_type in tool.target_types
+        # Action-aware selection: never pin to the provider's declared
+        # ``tool_id``. Ask the live Registry which tools are actually
+        # eligible for this canonical action, and pick deterministically —
+        # see ``tool_selection.select_tool``. A tool that disappeared,
+        # went unhealthy, or was never bound to this operation is simply
+        # not offered; that is not distinguished from "no candidate" here
+        # because no ``ActionProposal`` is produced for either case (Policy
+        # never sees a proposal this step could not have executed).
+        candidates = [
+            candidate
+            for candidate in self._catalog.list_tools_for_action(capability, operation)
+            if not candidate.target_types
+            or plan_step.resolved_target().kind in candidate.target_types
+        ]
+        return select_tool(candidates)
 
     @staticmethod
     def _bind_target_arguments(
@@ -179,9 +158,10 @@ class CandidateCompiler:
     ) -> dict:
         """Fill only safe, structurally known MCP arguments from a target.
 
-        This is intentionally conservative: credentials, query values,
-        request bodies and arbitrary tool-specific arguments must come from a
-        provider or operator policy, never from a guessed Agent convention.
+        Credentials, query values, request bodies and arbitrary tool-specific
+        arguments must come from an Agent provider or operator policy. This
+        helper only maps fields whose meaning is fixed by the Core target
+        contract.
         """
         values = dict(arguments)
         target_values: dict[str, object] = {}
@@ -243,7 +223,6 @@ def candidate_key(draft: CandidateDraft) -> str:
         "agent_id": str(draft.agent_id),
         "capability": draft.plan_step.capability,
         "operation": draft.plan_step.operation,
-        "tool_id": str(draft.plan_step.tool_id),
         "arguments": draft.plan_step.arguments,
         "target_node_ids": sorted(map(str, draft.target_node_ids)),
         "hypothesis": hypothesis.description if hypothesis else None,

@@ -69,6 +69,11 @@ class MCPToolGateway:
     def list_by_capability(self, capability_tag: str) -> list[ToolDescriptor]:
         return self._registry.list_by_capability(capability_tag)
 
+    def all(self) -> list[ToolDescriptor]:
+        """Every registered tool, regardless of capability — read-only
+        catalog enumeration for callers like `redteam tools list`."""
+        return self._registry.all()
+
     async def invoke(self, invocation: ToolInvocation) -> ToolResult:
         descriptor = self._registry.get(invocation.tool_id)
         if descriptor is None:

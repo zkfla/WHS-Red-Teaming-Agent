@@ -129,3 +129,35 @@ def initial_graph_state(runtime: RuntimeState) -> GraphState:
         "worker_outcomes": {},
         "last_event_id": None,
     }
+
+
+def resume_graph_state(
+    runtime: RuntimeState,
+    *,
+    action_proposal: ActionProposal,
+    plan_step: PlanStep | None,
+) -> GraphState:
+    """Seed a resume invocation that re-enters directly at POLICY.
+
+    Used only by ``AgentLoopRunner.reconcile_once`` to resume a run that
+    stopped at ``APPROVAL_PENDING``, once the Approval has been resolved —
+    with the exact ``ActionProposal``/``PlanStep`` the original PLAN turn
+    already produced (preserved by ``replan_node``'s terminal branch),
+    never a freshly re-planned one. ``runtime.phase`` must already be
+    ``AgentPhase.POLICY`` (the graph's conditional entry edge — see
+    ``orchestration.graph``) and ``runtime.pending_action_id`` must match
+    ``action_proposal.action_id`` (``policy_node`` asserts this to decide
+    whether to ask Control for a fresh judgement or the resolved outcome).
+    """
+    return {
+        "runtime": runtime,
+        "observation": None,
+        "plan_step": plan_step,
+        "action_proposal": action_proposal,
+        "policy_decision": None,
+        "tool_result": None,
+        "current_work_id": None,
+        "dispatch_items": [],
+        "worker_outcomes": {},
+        "last_event_id": None,
+    }

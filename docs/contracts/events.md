@@ -39,14 +39,17 @@ GraphUpdated
 FindingCreated        FindingVerified
 ```
 
-Only `RunStarted`, `AgentStarted`, `ActionProposed`, `PolicyEvaluated`,
-`ActionApproved`/`ActionDenied`/`ApprovalRequired`,
-`ToolExecutionStarted`/`ToolExecutionFinished`/`ToolExecutionFailed`,
-`EvidenceCreated`, `GraphUpdated`, and `RunFinished` are emitted by the
-current stub flow. `AgentFinished`, `HypothesisCreated`,
-`FindingCreated`, `FindingVerified` aren't yet (no real agent-lifecycle/
-hypothesis/finding logic) — reserved for Agent Team's planner work; the
-vocabulary is fixed by PM so there's nothing to invent when that lands.
+**Current status**: every event above is real and emitted in a normal
+run, including `AgentFinished` (`orchestration.nodes.replan`) and
+`HypothesisCreated` (`orchestration.nodes.plan`, whenever a step
+declares a `HypothesisDraft` — every built-in playbook step does).
+`FindingCreated`/`FindingVerified` are the one pair that still never
+fires: `orchestration.nodes.verify` only publishes a `Finding` when a
+step's `Expectation` reaches `Verdict.VIOLATION`
+(`violation_if_met=True`), and no built-in playbook step sets that —
+see `docs/agent/orchestration-implementation-plan.md` section 16.1,
+finding 1. The vocabulary itself is fixed by PM either way, so nothing
+needs inventing once a playbook actually sets one.
 
 ## Subscribing
 

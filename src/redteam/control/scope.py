@@ -9,6 +9,9 @@ engagement's allow/deny lists:
     NOT — a plain ``str.endswith`` would wrongly allow it)
   - ``allowed_networks``                    — CIDR membership for
     IP-literal targets (``ipaddress``)
+  - ``allowed_assets`` / ``denied_assets``  — exact-match on
+    ``AssetTarget.asset_id`` (mobile artifacts have no host identity, so
+    they cannot use the rules above; see ``_check_asset_scope``)
 
 Deny lists win over allow lists; with no allow-list configured the
 default is DENY (safer for a red-team gate).
@@ -16,8 +19,9 @@ default is DENY (safer for a red-team gate).
 Notes / limitations:
   - No DNS resolution: ``allowed_networks`` only matches targets that are
     already IP literals, not hostnames that would resolve into the range.
-  - ``principal`` / ``asset`` / ``graph_node`` targets have no host
-    identity and therefore fall through to DENY (scope is host-based).
+  - ``principal`` / ``graph_node`` targets have no host identity and
+    therefore fall through to DENY (scope is host-based). ``asset`` is
+    handled separately, by ``allowed_assets``/``denied_assets``.
 """
 
 from __future__ import annotations
@@ -30,6 +34,7 @@ from redteam.core.contracts.action import ActionProposal
 from redteam.core.contracts.engagement import EngagementScope
 from redteam.core.contracts.target import (
     AnyTarget,
+    AssetTarget,
     DomainTarget,
     EndpointTarget,
     HostTarget,
@@ -103,12 +108,46 @@ def _matches_network(candidate: str, networks: list[str]) -> bool:
     return False
 
 
+def _check_asset_scope(
+    target: AssetTarget, scope: EngagementScope
+) -> tuple[bool, list[str], Severity | None]:
+    """Exact-match scope check for mobile artifacts.
+
+    Deliberately not a substring/path check: an ``asset_id`` is a
+    canonical identifier (see ``AssetTarget`` docstring), not a
+    filesystem path, so there is nothing to normalize beyond exact,
+    case-sensitive comparison — unlike a hostname, there is no DNS-style
+    convention that makes two differently-cased identifiers the same
+    artifact.
+    """
+    asset_id = str(target.asset_id)
+
+    if asset_id in scope.denied_assets:
+        return (
+            False,
+            [f"asset '{asset_id}' is explicitly denied (denied_assets)"],
+            Severity.BLOCK_ACTION,
+        )
+    if not scope.allowed_assets:
+        return (
+            False,
+            ["engagement scope has no allowed_assets configured"],
+            Severity.BLOCK_ACTION,
+        )
+    if asset_id in scope.allowed_assets:
+        return True, [], None
+    return False, [f"asset '{asset_id}' is not within engagement scope"], Severity.BLOCK_ACTION
+
+
 def check_scope(
     action: ActionProposal, scope: EngagementScope
 ) -> tuple[bool, list[str], Severity | None]:
     """Returns ``(allowed, reasons, severity)``. Every scope denial is
     ``BLOCK_ACTION``: the agent should try a different (in-scope) target,
     not abandon the goal or the whole run."""
+    if isinstance(action.target, AssetTarget):
+        return _check_asset_scope(action.target, scope)
+
     hosts = _target_hosts(action.target)
     if not hosts:
         return (

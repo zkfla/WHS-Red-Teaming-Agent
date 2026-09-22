@@ -28,8 +28,19 @@ class ActionProposal(BaseModel):
     reason: str
     hypothesis_id: HypothesisId | None = None
     expected_observation: str | None = None
+    availability_impact: bool = False
     created_at: datetime
 ```
+
+`availability_impact` — agent-declared intent, defaults `False` ("no
+known impact"): does *this specific action* risk disrupting the target's
+availability (flood/exhaustion/restart-style effects), as opposed to a
+read-only or low-volume probe? Never inferred from `operation`'s name.
+Consumed by `redteam.control.roe.check_roe` against
+`RuleOfEngagement.availability_impact_allowed` — see
+`redteam.control.roe`'s module docstring for what ROE does and does not
+enforce yet (`prohibited_techniques` has no taxonomy anywhere in this
+codebase and fails a run closed rather than being silently ignored).
 
 ## TargetRef — discriminated union, not a flat dict
 
@@ -225,7 +236,12 @@ class PolicyDecision(BaseModel):
 ```text
 ActionProposal
   -> Scope Check       (redteam.control.scope.check_scope)
-  -> ROE Check          (pass-through stub — TODO)
+  -> ROE Check          (redteam.control.roe.check_roe — real: exact
+                          denied/allowed_operations match, `availability_impact_allowed`
+                          enforced against the agent-declared `ActionProposal.availability_impact`,
+                          `prohibited_techniques` fails the whole run closed
+                          with `UnsupportedRoePolicyError` rather than being
+                          silently ignored — no technique taxonomy exists yet)
   -> Policy Engine      (redteam.control.policy.evaluate_policy)
   -> Rate Limit         (redteam.control.rate_limit.RateLimiter)
   -> Budget             (redteam.control.budget.BudgetTracker)
