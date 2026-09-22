@@ -5,11 +5,11 @@
 # `docker compose run --rm -i apktool-mcp` — this image is not meant to be
 # started with `docker compose up`.
 #
-# Versions/refs below are a best-effort pin; adjust once the team finalizes
-# this candidate.
+# Pin the upstream commit whose MCP input schemas are checked by the
+# mobile/analysis manifest. Update the pin and manifest together.
 FROM python:3.11-slim
 ARG APKTOOL_VERSION=2.9.3
-ARG APKTOOL_MCP_SERVER_REF=master
+ARG APKTOOL_MCP_SERVER_REF=12bb33134af905923a0a58643dcc35fd694ad6f6
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         default-jre-headless \
@@ -33,9 +33,11 @@ RUN pip install --no-cache-dir uv
 ENV UV_PYTHON_INSTALL_DIR=/opt/uv-python
 
 WORKDIR /app
-RUN git clone --depth 1 --branch "${APKTOOL_MCP_SERVER_REF}" \
-        https://github.com/zinja-coder/apktool-mcp-server.git server \
-    && cd server && uv sync --no-dev || uv pip install -r requirements.txt || true
+RUN git init server \
+    && git -C server remote add origin https://github.com/zinja-coder/apktool-mcp-server.git \
+    && git -C server fetch --depth 1 origin "${APKTOOL_MCP_SERVER_REF}" \
+    && git -C server checkout --detach FETCH_HEAD \
+    && cd server && uv sync --no-dev
 
 RUN useradd --create-home --uid 10001 mcp \
     && chown -R mcp:mcp /app /opt/uv-python

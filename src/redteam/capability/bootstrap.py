@@ -10,6 +10,7 @@ from redteam.capability.adapters.mcp.base import MCPAdapter
 from redteam.capability.adapters.mcp.example import ExampleMCPAdapter
 from redteam.capability.adapters.mcp.mobile import MobileMCPAdapter
 from redteam.capability.adapters.mcp.recon import ReconMCPAdapter
+from redteam.capability.adapters.mcp.streamable_http import MCPServerAdapter
 from redteam.capability.adapters.mcp.transport import (
     AllowlistedMCPTransport,
     MCPTransport,
@@ -18,6 +19,10 @@ from redteam.capability.adapters.mcp.transport import (
 )
 from redteam.capability.adapters.mcp.web_api import WebAPIMCPAdapter
 from redteam.capability.gateway import MCPToolGateway
+from redteam.capability.mobile_analysis_manifest import (
+    MOBILE_ANALYSIS_TOOLS,
+    validate_configured_discovery,
+)
 from redteam.capability.registry import MCPToolRegistry
 from redteam.capability.settings import (
     MCPConfigurationError,
@@ -69,6 +74,8 @@ async def _build_gateway(
     operation_bindings: dict[str, tuple[str, ...]] = {}
     server_concurrency: dict[str, int] = {}
     server_output_limits: dict[str, int] = {}
+    output_schemas: dict[str, dict | None] = {}
+    target_types: dict[str, str | None] = {}
     for server_id in server_ids:
         settings = MCPServerSettings.from_environment(server_id)
         transport = _create_transport(settings)
@@ -85,7 +92,7 @@ async def _build_gateway(
                 raise MCPConfigurationError(
                     f"MCP server {server_id!r} operation bindings do not match discovered tools"
                 )
-        registry.replace_server_tools(server_id, descriptors)
+        server_bindings: dict[str, tuple[str, ...]] = {}
         for descriptor in descriptors:
             operations = (
                 settings.tool_operations[descriptor.tool_name]
@@ -93,6 +100,28 @@ async def _build_gateway(
                 else (descriptor.tool_name,)
             )
             operation_bindings[str(descriptor.tool_id)] = operations
+            server_bindings[str(descriptor.tool_id)] = operations
+            if isinstance(adapter, MCPServerAdapter):
+                schema = adapter.output_schema_for_tool(descriptor.tool_id)
+                if schema is not None:
+                    output_schemas[str(descriptor.tool_id)] = schema
+        if settings.tool_operations is not None and server_id in MOBILE_ANALYSIS_TOOLS:
+            server_schemas = {
+                descriptor.tool_name: output_schemas.get(str(descriptor.tool_id))
+                for descriptor in descriptors
+            }
+            try:
+                validate_configured_discovery(
+                    server_id, descriptors, server_bindings, server_schemas
+                )
+            except ValueError as exc:
+                raise MCPConfigurationError(
+                    f"MCP server {server_id!r} discovery differs from configured manifest: {exc}"
+                ) from exc
+        for spec in MOBILE_ANALYSIS_TOOLS.get(server_id, ()):
+            if spec.tool_id in server_bindings:
+                target_types[spec.tool_id] = spec.target_type
+        registry.replace_server_tools(server_id, descriptors)
         adapters[server_id] = adapter
         server_concurrency[server_id] = settings.max_concurrency
         server_output_limits[server_id] = settings.max_output_bytes
@@ -103,6 +132,8 @@ async def _build_gateway(
         operation_bindings,
         server_concurrency=server_concurrency,
         server_output_limits=server_output_limits,
+        output_schemas=output_schemas,
+        target_types=target_types,
     )
 
 

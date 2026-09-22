@@ -19,6 +19,7 @@ class RemoteTool:
     name: str
     description: str
     input_schema: dict[str, Any]
+    output_schema: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -105,6 +106,11 @@ class _SDKMCPTransport:
                         name=tool.name,
                         description=tool.description or "",
                         input_schema=dict(tool.input_schema),
+                        output_schema=(
+                            dict(tool.output_schema)
+                            if getattr(tool, "output_schema", None) is not None
+                            else None
+                        ),
                     )
                     for tool in listing.tools
                 )
