@@ -117,18 +117,6 @@ class WebCandidateProvider:
         disallowed_ids = {
             str(node.id) for node in nodes if endpoint_path_explicitly_disallowed(node)
         }
-        permitted: list[CandidateDraft] = []
-        for candidate in candidates:
-            if any(str(node_id) in disallowed_ids for node_id in candidate.target_node_ids):
-                drops.append(DraftDrop(
-                    step_id=candidate.plan_step.step_id,
-                    target_node_id=str(candidate.target_node_ids[0]),
-                    reason="path_not_allowlisted",
-                    field="path",
-                ))
-            else:
-                permitted.append(candidate)
-        candidates = permitted
         validation_hypotheses = _access_validation_hypotheses(nodes)
         for node in nodes:
             if node.type is not GraphNodeType.ENDPOINT:
@@ -223,9 +211,18 @@ class WebCandidateProvider:
                     latest=latest,
                 )
             )
-        return CandidateBatch(
-            candidates=candidates, diagnostics=diagnostics, drops=drops
-        )
+        permitted: list[CandidateDraft] = []
+        for candidate in candidates:
+            if any(str(node_id) in disallowed_ids for node_id in candidate.target_node_ids):
+                drops.append(DraftDrop(
+                    step_id=candidate.plan_step.step_id,
+                    target_node_id=str(candidate.target_node_ids[0]),
+                    reason="path_not_allowlisted",
+                    field="path",
+                ))
+            else:
+                permitted.append(candidate)
+        return CandidateBatch(candidates=permitted, diagnostics=diagnostics, drops=drops)
 
     def _redirect_followups(
         self,
