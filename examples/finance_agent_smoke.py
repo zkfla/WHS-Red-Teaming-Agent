@@ -1,7 +1,7 @@
 """Exercise the default Agent loop through real MCP servers in the isolated lab.
 
 First retain the shipped approval policy and assert Web waits. Then run an
-explicit synthetic-only read test with no pending approval requirement.
+explicit synthetic-only read test with auto-approval of its high-risk Web tool.
 """
 
 import asyncio
@@ -22,7 +22,10 @@ async def exercise(*, require_approval: bool) -> None:
     assert config.engagement.scope.allowed_hosts == ["mock-bank"]
     assert config.llm.provider == "fake"
     if not require_approval:
+        # The synthetic-only run opts into auto-approval; high-risk Web tools
+        # remain gated by registry risk even when the explicit list is empty.
         config.engagement.approval_policy.require_approval_for = []
+        config.engagement.approval_policy.auto_approve = True
     with TemporaryDirectory() as directory:
         async with AsyncExitStack() as stack:
             engagement, deps = await build_application(
