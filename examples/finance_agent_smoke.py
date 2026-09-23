@@ -10,6 +10,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from redteam.app.bootstrap import build_application, run_engagement
+from redteam.attack_graph.service import AttackGraphService
 from redteam.core.config import load_app_config
 from redteam.core.contracts.events import EventEnvelope, EventType
 from redteam.orchestration.settings import OrchestrationSettings
@@ -40,6 +41,13 @@ async def exercise(*, require_approval: bool) -> None:
             final = await run_engagement(engagement, deps=deps)
             started = [e.payload["tool_id"] for e in events
                        if e.event_type == EventType.TOOL_EXECUTION_STARTED]
+            nodes = await AttackGraphService(deps.graph_store).list_nodes()
+            print(
+                f"TRACE: approval={require_approval} termination={final.termination_reason} "
+                f"actions={final.actions_by_agent} tools={started} "
+                f"nodes={[(str(node.id), node.type.value) for node in nodes]}",
+                flush=True,
+            )
             assert "recon.http_probe" in started, started
             assert not [e for e in events if e.event_type == EventType.TOOL_EXECUTION_FAILED]
             if require_approval:
