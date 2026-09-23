@@ -29,6 +29,7 @@ import argparse
 import json
 import logging
 from collections.abc import Callable
+from contextlib import AsyncExitStack
 from typing import Any
 
 from pydantic import ValidationError
@@ -169,7 +170,7 @@ def _render_event(event: EventEnvelope, *, json_mode: bool) -> None:
 
 
 async def build(
-    config: AppConfig, *, max_steps: int | None
+    config: AppConfig, *, max_steps: int | None, mcp_stack: AsyncExitStack | None = None
 ) -> tuple[Any, RuntimeDeps]:
     """Phase 1 of the shared core (section 17): config -> live
     ``(Engagement, RuntimeDeps)``, via the canonical
@@ -194,7 +195,9 @@ async def build(
         checkpoint_backend="sqlite",
     )
 
-    return await build_application(config, orchestration_settings=orchestration_settings)
+    return await build_application(
+        config, orchestration_settings=orchestration_settings, mcp_stack=mcp_stack
+    )
 
 
 async def execute(
@@ -237,6 +240,11 @@ async def execute(
 
 
 async def run(args: argparse.Namespace) -> int:
+    async with AsyncExitStack() as stack:
+        return await _run(args, mcp_stack=stack)
+
+
+async def _run(args: argparse.Namespace, *, mcp_stack: AsyncExitStack) -> int:
     try:
         config = load_app_config_for_run(args.engagement_path, args.config_path)
     except (OSError, ValidationError, ValueError) as exc:
@@ -247,7 +255,7 @@ async def run(args: argparse.Namespace) -> int:
     logging.basicConfig(level=log_level, force=True)
 
     try:
-        engagement, deps = await build(config, max_steps=args.max_steps)
+        engagement, deps = await build(config, max_steps=args.max_steps, mcp_stack=mcp_stack)
     except MCPConfigurationError as exc:
         eprint(f"ERROR: MCP configuration invalid: {exc}")
         return EXIT_CONFIG_ERROR

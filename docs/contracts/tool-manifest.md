@@ -45,7 +45,7 @@ Recon 결과는 관찰된 값만 구조화한다. HTTP probe는 가능한 경우
 ## 후보 선택과 Graph 반영
 
 후보마다 target type 확인 → 구조적 인자 바인딩 → input schema 검증을 먼저
-수행한 뒤, 실행 가능한 후보 사이에서 기존 건강 상태·위험도·ToolId 순위를 적용한다.
+수행한 뒤, 실행 가능한 후보 사이에서 건강 상태·위험도·ToolId 순위를 적용한다.
 첫 후보의 필수 인자가 없더라도 다른 실행 가능한 후보가 있으면 사용할 수 있다.
 운영자가 명시한 인자를 삭제하거나 자격증명을 추측하여 맞추지 않는다.
 
@@ -59,8 +59,8 @@ Recon 결과는 관찰된 값만 구조화한다. HTTP probe는 가능한 경우
 - `recon.port_scan`: 완료된 스캔의 포트 상태를 기록하고 열린 TCP 포트만 service로
   연결한다. 포트 번호로 HTTP/HTTPS 또는 제품명을 추측하지 않는다.
 
-이 변경은 기본 playbook의 operation 목록을 늘리지 않는다. DNS/TLS/HTTP가 모두
-`service_discovery`로 등록된 설정에서는 schema 적합성만으로 HTTP probe 목적을
-구별할 수 없으며, DNS 결과 자체도 Web Agent를 활성화하지 않는다. 금융 기본 설정의
-host(`mock-bank`)와 policy target_ref(`bank-lab`)를 연결하는 명시적 매핑, 브라우저의
-engagement 단위 지속 연결, 신규 operation별 provider는 별도 통합 작업이 남아 있다.
+금융 랩의 `app.yaml`은 engagement metadata에서 실제 scope host `mock-bank`를
+정책 별칭 `bank-lab`으로 매핑한다. 이는 `ActionProposal.target`이나 Control
+Plane의 scope를 바꾸지 않고, 선택한 MCP 도구의 인자만 바꾼다. CLI 실행은
+engagement 동안 MCP 세션을 유지하고 종료·오류 시 닫는다. 기본 playbook의
+operation 목록은 Agent provider 구현에 따른다.

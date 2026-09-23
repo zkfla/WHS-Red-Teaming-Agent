@@ -1,0 +1,61 @@
+"""Exercise the default Agent loop through real MCP servers in the isolated lab.
+
+First retain the shipped approval policy and assert Web waits. Then run an
+explicit synthetic-only read test with no pending approval requirement.
+"""
+
+import asyncio
+from contextlib import AsyncExitStack
+from pathlib import Path
+from tempfile import TemporaryDirectory
+
+from redteam.app.bootstrap import build_application, run_engagement
+from redteam.core.config import load_app_config
+from redteam.core.contracts.events import EventEnvelope, EventType
+from redteam.orchestration.settings import OrchestrationSettings
+from redteam.orchestration.state import TerminationReason
+
+
+async def exercise(*, require_approval: bool) -> None:
+    config = load_app_config("/app/finance-app.yaml")
+    assert config.engagement.scope.allowed_hosts == ["mock-bank"]
+    assert config.llm.provider == "fake"
+    if not require_approval:
+        config.engagement.approval_policy.require_approval_for = []
+    with TemporaryDirectory() as directory:
+        async with AsyncExitStack() as stack:
+            engagement, deps = await build_application(
+                config, mcp_stack=stack,
+                evidence_dir=Path(directory) / "evidence",
+                audit_dir=Path(directory) / "audit",
+                approval_dir=Path(directory) / "approvals",
+                orchestration_settings=OrchestrationSettings(checkpointing=False),
+            )
+            events: list[EventEnvelope] = []
+
+            async def collect(event: EventEnvelope) -> None:
+                events.append(event)
+
+            await deps.event_bus.subscribe("*", collect)
+            final = await run_engagement(engagement, deps=deps)
+            started = [e.payload["tool_id"] for e in events
+                       if e.event_type == EventType.TOOL_EXECUTION_STARTED]
+            assert "recon.http_probe" in started, started
+            assert not [e for e in events if e.event_type == EventType.TOOL_EXECUTION_FAILED]
+            if require_approval:
+                assert final.termination_reason == TerminationReason.APPROVAL_PENDING, final
+                assert "web.http_request" not in started, started
+            else:
+                assert "web.http_request" in started, started
+                assert final.actions_by_agent.get("web-api-agent", 0) >= 1
+                assert final.actions_by_agent.get("recon-agent", 0) >= 1
+    print(f"PASS: real Agent -> Control -> MCP -> Graph -> Web; approval={require_approval}")
+
+
+async def main() -> None:
+    await exercise(require_approval=True)
+    await exercise(require_approval=False)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

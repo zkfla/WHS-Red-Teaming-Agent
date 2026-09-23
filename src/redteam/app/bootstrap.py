@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from contextlib import AsyncExitStack
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -39,7 +40,7 @@ from redteam.app.report_store import save_terminal_report
 from redteam.attack_graph.service import AttackGraphService
 from redteam.attack_graph.stores.memory import InMemoryAttackGraphStore
 from redteam.attack_graph.stores.namespaced import EngagementScopedAttackGraphStore
-from redteam.capability.bootstrap import build_mcp_tool_gateway
+from redteam.capability.bootstrap import build_mcp_tool_gateway, open_mcp_tool_gateway
 from redteam.control.approval import ApprovalService
 from redteam.control.audit import AuditLog
 from redteam.control.risk import RegistryRiskResolver
@@ -198,6 +199,7 @@ def _build_work_store(settings: OrchestrationSettings) -> WorkStore:
 async def build_application(
     config: AppConfig,
     *,
+    mcp_stack: AsyncExitStack | None = None,
     control_plane: ControlPlane | None = None,
     tool_gateway: ToolGateway | None = None,
     evidence_store: EvidenceStore | None = None,
@@ -243,9 +245,17 @@ async def build_application(
     # read tool risk_level from the Registry for risk-tiered approval.
     resolved_tool_catalog = tool_catalog
     if tool_gateway is None:
-        resolved_tool_gateway, discovered_catalog = await _build_default_capability(
-            config.capability
-        )
+        if mcp_stack is None:
+            resolved_tool_gateway, discovered_catalog = await _build_default_capability(
+                config.capability
+            )
+        else:
+            # The caller enters/exits this stack in the run's owning task.
+            # Keep browser state alive through execution and approval waits.
+            scoped_gateway = await mcp_stack.enter_async_context(
+                open_mcp_tool_gateway(config.capability.mcp_servers)
+            )
+            resolved_tool_gateway, discovered_catalog = scoped_gateway, scoped_gateway
         if resolved_tool_catalog is None:
             resolved_tool_catalog = discovered_catalog
     else:
