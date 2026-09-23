@@ -56,15 +56,19 @@ def _tool(risk: RiskLevel) -> ToolDescriptor:
 
 
 class _FakeGateway:
-    """Minimal ``ToolGateway`` double — only ``list_tools_for_action`` is
-    exercised by these tests, but ``invoke`` must exist (even unused) to
-    structurally satisfy the Protocol under mypy."""
+    """Minimal ToolCatalog/ToolGateway double for the risk resolver."""
 
     def __init__(self, tools: list[ToolDescriptor]) -> None:
         self._tools = tools
 
     def list_tools_for_action(self, capability: str, operation: str) -> list[ToolDescriptor]:
         return self._tools
+
+    def get(self, tool_id: ToolId) -> ToolDescriptor | None:
+        return next((tool for tool in self._tools if tool.tool_id == tool_id), None)
+
+    def list_by_capability(self, capability_tag: str) -> list[ToolDescriptor]:
+        return [tool for tool in self._tools if capability_tag in tool.capability_tags]
 
     async def invoke(self, invocation: ToolInvocation) -> ToolResult:
         raise NotImplementedError("not exercised by risk resolver tests")

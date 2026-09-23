@@ -18,7 +18,7 @@ from redteam.attack_graph.stores.memory import InMemoryAttackGraphStore
 from redteam.core.contracts.target import EndpointTarget
 from redteam.core.contracts.tool import ToolResult
 from redteam.core.enums import GraphNodeType
-from redteam.core.ids import AgentId, InvocationId, ToolId
+from redteam.core.ids import ActionId, AgentId, InvocationId, ToolId
 from redteam.orchestration.agents.builtin import WEB_API_AGENT
 from redteam.orchestration.agents.definition import builtin_agent_definitions
 from redteam.orchestration.agents.providers import (
@@ -27,6 +27,7 @@ from redteam.orchestration.agents.providers import (
     planning_fingerprint,
 )
 from redteam.orchestration.agents.registry import default_registry
+from redteam.orchestration.agents.web import WebCandidateProvider
 from redteam.orchestration.authentication import request_key
 from redteam.orchestration.observations.mapper import (
     default_result_mapper_registry,
@@ -188,6 +189,24 @@ async def test_a_step_that_cannot_fill_its_graph_argument_is_reported_as_a_drop(
     ]
 
 
+async def test_web_provider_drops_an_explicitly_unallowlisted_endpoint() -> None:
+    service = await graph_with(observations=[http_observation(401)])
+    await service.upsert_node(
+        GraphNodeType.ENDPOINT,
+        node_id=endpoint_node_id("GET", PATH, host=HOST),
+        attrs={"path_allowlisted": False},
+        facts={"path_allowlisted": False},
+    )
+    context = GraphCandidateContext(
+        view=service.view(), observation=await service.observe(step=1), step=1
+    )
+
+    batch = await WebCandidateProvider().propose_graph(WEB_API_AGENT, context)
+
+    assert batch.candidates == []
+    assert any(drop.reason == "path_not_allowlisted" for drop in batch.drops)
+
+
 # -- result mappers --------------------------------------------------------
 
 
@@ -204,7 +223,7 @@ def comparison_result(**overrides) -> ToolResult:
     output.update(overrides)
     return ToolResult(
         invocation_id=InvocationId("inv_1"),
-        action_id="action_1",
+        action_id=ActionId("action_1"),
         tool_id=ToolId("web.http_compare_anonymous"),
         success=True,
         output=output,
@@ -250,10 +269,8 @@ def test_the_comparison_mapper_records_what_the_tool_actually_measured() -> None
 
 
 def test_the_comparison_mapper_ignores_malformed_output() -> None:
-    mapper_input = {
-        "target": EndpointTarget(host=HOST, path=PATH),
-        "arguments": {"target_ref": HOST, "path": PATH, "session_ref": "alice"},
-    }
+    target = EndpointTarget(host=HOST, path=PATH)
+    arguments = {"target_ref": HOST, "path": PATH, "session_ref": "alice"}
     cases = [
         comparison_result(anonymous="nope"),
         comparison_result(authenticated={}),
@@ -265,9 +282,13 @@ def test_the_comparison_mapper_ignores_malformed_output() -> None:
     ]
 
     for result in cases[:-1]:
-        assert map_web_compare_anonymous(result=result, **mapper_input).nodes == []
+        assert map_web_compare_anonymous(
+            target=target, arguments=arguments, result=result
+        ).nodes == []
     # Sanity: the well-formed case is not accidentally caught by the guard.
-    assert map_web_compare_anonymous(result=cases[-1], **mapper_input).nodes
+    assert map_web_compare_anonymous(
+        target=target, arguments=arguments, result=cases[-1]
+    ).nodes
 
 
 def test_http_status_validation_rejects_booleans() -> None:

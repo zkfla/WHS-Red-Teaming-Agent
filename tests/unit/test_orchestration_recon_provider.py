@@ -24,7 +24,7 @@ from redteam.capability.registry import MCPToolRegistry
 from redteam.core.contracts.target import HostTarget
 from redteam.core.contracts.tool import ToolDescriptor, ToolResult
 from redteam.core.enums import GraphNodeType, RiskLevel, ToolHealthStatus
-from redteam.core.ids import InvocationId, ToolId
+from redteam.core.ids import ActionId, InvocationId, ToolId
 from redteam.orchestration.agents.providers import GraphCandidateContext
 from redteam.orchestration.agents.recon import (
     RECON_HTML_INVENTORY,
@@ -296,6 +296,24 @@ async def test_a_successful_endpoint_gets_an_html_inventory() -> None:
     assert drafts[0].plan_step.assessment_kind == "observation"
 
 
+async def test_inventory_does_not_visit_an_explicitly_unallowlisted_path() -> None:
+    service_graph = await graph(
+        service=HTTP_SERVICE,
+        endpoints=[(
+            "/assets/test-sdk.js",
+            {"target_ref": TARGET_REF, "path_allowlisted": False},
+            {"status_code": 200, "path_allowlisted": False},
+        )],
+    )
+
+    batch = await propose(service_graph)
+
+    assert not [
+        item for item in batch.candidates
+        if item.plan_step.arguments.get("path") == "/assets/test-sdk.js"
+    ]
+
+
 async def test_an_endpoint_that_never_answered_gets_no_inventory() -> None:
     service_graph = await graph(
         service=HTTP_SERVICE,
@@ -464,7 +482,7 @@ def _oidc_output() -> dict:
 def _tool_result(tool_id: str, output: dict) -> ToolResult:
     return ToolResult(
         invocation_id=InvocationId("inv_inventory"),
-        action_id="action_inventory",
+        action_id=ActionId("action_inventory"),
         tool_id=ToolId(tool_id),
         success=True,
         # The fixture's own target_ref must not win: the Mapper requires the
@@ -542,7 +560,7 @@ def test_the_tls_mapper_only_maps_a_host_scoped_target() -> None:
     # the SERVICE node is an output of this tool, not its execution target.
     result = ToolResult(
         invocation_id=InvocationId("inv_tls"),
-        action_id="action_tls",
+        action_id=ActionId("action_tls"),
         tool_id=ToolId("recon.tls_inspect"),
         success=True,
         output=output,

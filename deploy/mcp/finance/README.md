@@ -61,7 +61,8 @@ docker compose -f deploy/compose/finance-lab.yml down
 `smoke`는 MCP 도구를 직접 호출한다. `agent-smoke`는 기본 Recon/Web Agent가
 Control Plane을 거쳐 실제 MCP 도구를 실행하는지 확인한다. 먼저 기본 승인 정책에서
 Web 요청이 대기하는지 확인하고, 다음으로 합성 대상만 자동 승인하는 독립
-engagement에서 Recon → Graph → Web GET을 확인한다. 대상 별칭은 `app.yaml`의
+engagement에서 Recon → Graph → Web GET, HTML inventory, security posture를
+확인한다. 대상 별칭은 `app.yaml`의
 engagement metadata에 명시하며, 승인 없이 실제 금융기관에 요청하는 설정은 없다.
 
 ## 현재 금융권 웹 접근 가능 여부

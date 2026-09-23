@@ -272,7 +272,7 @@ async def test_the_same_step_id_on_two_targets_stays_two_distinct_options() -> N
 
     assert picked is not None
     assert picked.step_id == "probe-host"
-    assert picked.target is not None and picked.target.host == "b.local"
+    assert isinstance(picked.target, HostTarget) and picked.target.host == "b.local"
     assert planner.last_option_id == "cand_b"
     assert llm.calls == 0
 
@@ -292,7 +292,7 @@ async def test_an_ambiguous_pair_sharing_a_step_id_is_still_distinguishable() ->
     )
 
     assert picked is not None
-    assert picked.target is not None and picked.target.host == "b.local"
+    assert isinstance(picked.target, HostTarget) and picked.target.host == "b.local"
     assert planner.last_decision == "reranked"
     assert planner.last_option_id == "cand_b"
 
@@ -418,7 +418,7 @@ async def test_a_step_id_answer_cannot_resolve_an_ambiguous_option_set() -> None
     )
 
     assert picked is not None
-    assert picked.target is not None and picked.target.host == "a.local"
+    assert isinstance(picked.target, HostTarget) and picked.target.host == "a.local"
     assert planner.last_decision == "fallback"
     assert "was not offered" in (planner.last_fallback_reason or "")
 
@@ -438,7 +438,7 @@ async def test_an_invalid_unique_option_id_falls_back_to_the_top_candidate() -> 
     )
 
     assert picked is not None
-    assert picked.target is not None and picked.target.host == "a.local"
+    assert isinstance(picked.target, HostTarget) and picked.target.host == "a.local"
     assert planner.last_decision == "fallback"
     assert planner.last_option_id == "cand_a"
 

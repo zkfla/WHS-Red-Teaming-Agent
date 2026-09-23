@@ -34,7 +34,7 @@ async def exercise(*, require_approval: bool) -> None:
                 audit_dir=Path(directory) / "audit",
                 approval_dir=Path(directory) / "approvals",
                 orchestration_settings=OrchestrationSettings(
-                    checkpointing=False, max_steps=2
+                    checkpointing=False, max_steps=2 if require_approval else 6
                 ),
             )
             events: list[EventEnvelope] = []
@@ -60,6 +60,8 @@ async def exercise(*, require_approval: bool) -> None:
                 assert "web.http_request" not in started, started
             else:
                 assert "web.http_request" in started, started
+                assert "recon.html_inventory" in started, started
+                assert "web.http_security_posture" in started, started
                 assert final.actions_by_agent.get("web-api-agent", 0) >= 1
                 assert final.actions_by_agent.get("recon-agent", 0) >= 1
     print(f"PASS: real Agent -> Control -> MCP -> Graph -> Web; approval={require_approval}")
