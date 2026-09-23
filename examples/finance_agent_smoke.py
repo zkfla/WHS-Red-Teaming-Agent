@@ -10,6 +10,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from redteam.app.bootstrap import build_application, run_engagement
+from redteam.attack_graph.predicates import attrs_of, facts_of
 from redteam.attack_graph.service import AttackGraphService
 from redteam.core.config import load_app_config
 from redteam.core.contracts.events import EventEnvelope, EventType
@@ -62,6 +63,17 @@ async def exercise(*, require_approval: bool) -> None:
                 assert "web.http_request" in started, started
                 assert "recon.html_inventory" in started, started
                 assert "web.http_security_posture" in started, started
+                disallowed = [
+                    node for node in nodes
+                    if attrs_of(node.properties).get("path_allowlisted") is False
+                ]
+                assert disallowed, "HTML inventory must surface an unallowlisted test path"
+                assert all(
+                    "web.http_request" not in facts_of(node.properties).get(
+                        "attempted_operations", []
+                    )
+                    for node in disallowed
+                ), "Agent must not visit an explicitly unallowlisted endpoint"
                 assert final.actions_by_agent.get("web-api-agent", 0) >= 1
                 assert final.actions_by_agent.get("recon-agent", 0) >= 1
     print(f"PASS: real Agent -> Control -> MCP -> Graph -> Web; approval={require_approval}")
