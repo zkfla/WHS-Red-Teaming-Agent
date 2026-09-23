@@ -33,7 +33,9 @@ async def exercise(*, require_approval: bool) -> None:
                 evidence_dir=Path(directory) / "evidence",
                 audit_dir=Path(directory) / "audit",
                 approval_dir=Path(directory) / "approvals",
-                orchestration_settings=OrchestrationSettings(checkpointing=False),
+                orchestration_settings=OrchestrationSettings(
+                    checkpointing=False, max_steps=2
+                ),
             )
             events: list[EventEnvelope] = []
 
