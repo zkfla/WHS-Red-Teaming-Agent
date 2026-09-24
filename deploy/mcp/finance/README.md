@@ -2,6 +2,9 @@
 
 ## 목적과 서버 배치
 
+HTTP query/header, 브라우저 cookie snapshot 재사용, 선택적인 ZAP 실시간 캡처 조회와
+Nuclei passive 검사 연동은 [확장 실행 및 인수인계](EXTENSIONS.md)를 참고한다.
+
 MCP 서버는 프로그램이다. 개발·통합 모두 동일 컴퓨터에서 stdio로 실행할 수 있다.
 HTTP는 별도 프로세스/호스트에 연결하는 선택지이며 GCP가 필수는 아니다.
 이 예제는 브라우저 상태를 유지하고 팀이 동일한 환경을 재현하도록 로컬 Docker
@@ -9,10 +12,10 @@ Compose의 다섯 MCP 서비스와 합성 금융 API 한 개를 사용한다.
 
 | MCP 서비스 | 기반 | 실제 등록 도구 | 금융 테스트에서의 용도 |
 |---|---|---|---|
-| web-http | HTTPX를 감싼 소형 MCP façade | `web.session_list`, `web.http_request`, `web.http_compare_sessions` | 테스트 계정별 인증 API 호출, 응답 차이 관찰, 재전송 없는 단일 요청 |
+| web-http | HTTPX를 감싼 소형 MCP façade | `web.session_list`, `web.http_request`, `web.http_compare_sessions`, `web.http_security_posture`, `web.http_compare_anonymous` | 테스트 계정별 인증 API 호출, 계정/비로그인 응답 비교, 보안 헤더·쿠키 속성 관찰 |
 | web-proxy | 제품 중립 HAR 1.2 façade | `web.proxy_status`, `web.proxy_list_flows`, `web.proxy_get_flow`, `web.proxy_reload_capture`, `web.proxy_replay_flow`, `web.proxy_mutate_json`, `web.proxy_compare_sessions` | ZAP/Burp에서 수집한 승인 범위 요청을 공통 목록으로 조회하고 제한적으로 재실행·비교 |
 | web-browser | 공식 Microsoft Playwright MCP 0.0.81 | `web.browser_navigate`, `web.browser_snapshot`, `web.browser_click`, `web.browser_fill_form`, `web.browser_close` | 로그인·추가 인증·동적 UI의 후속 연결 기반 |
-| recon-passive | Python DNS/TLS 및 HTTPX façade | `recon.dns_resolve`, `recon.http_probe`, `recon.tls_inspect`, `recon.openapi_inventory`, `recon.oidc_inventory` | 승인 호스트 해석, TLS 검증, API 목록 및 OAuth/OIDC 메타데이터 수집 |
+| recon-passive | Python DNS/TLS 및 HTTPX façade | `recon.dns_resolve`, `recon.http_probe`, `recon.tls_inspect`, `recon.openapi_inventory`, `recon.oidc_inventory`, `recon.html_inventory` | 승인 호스트 해석, TLS 검증, API/OIDC/HTML 경로 목록 수집 |
 | recon-active | 고정 인자의 Nmap façade | `recon.active_status`, `recon.port_scan` | 한 IP의 운영자 지정 포트 최대 16개 TCP connect 점검; 기본 비활성 |
 
 `recon-passive`는 기존 계획의 이름을 유지한다. DNS/TLS/HTTP 조회는 실제 트래픽을
@@ -40,7 +43,9 @@ add-on의 `exportHar` API, Burp는 `Save items`가 만든 XML을 connector가 �
   사용한다. 호출마다 연결하는 기존 `build_mcp_tool_gateway()`로는 페이지가
   사라지므로 브라우저 워크플로에 사용하지 않는다. 실행/테스트 계정별 전용
   lifecycle을 사용하며 계정 A/B 비교는 HTTP 도구로 검증한다.
-- Nuclei, ZAP/Burp 실시간 제어, httpx CLI, 대량 fuzzing, 거래 재전송·경쟁 상태 검사는 후속이다.
+- Nuclei 직접 Active Scan, ZAP/Burp scan 제어, httpx CLI, 대량 fuzzing,
+  거래 재전송·경쟁 상태 검사는 후속이다. ZAP 실시간 캡처 조회와 Nuclei passive 검사는
+  선택적인 [확장 구성](EXTENSIONS.md)으로 제공한다.
   지금 HTTPX 기반 저부하 조회와 기능이 겹치는 엔진들을 함께 설치하지 않는다.
 
 ## 빠른 시작 (저장소 루트)
@@ -51,6 +56,49 @@ docker compose -f deploy/compose/finance-lab.yml up --build -d --wait
 docker compose -f deploy/compose/finance-lab.yml run --build --rm smoke
 docker compose -f deploy/compose/finance-lab.yml down
 ```
+
+## 현재 금융권 웹 접근 가능 여부
+
+기본 배포 설정은 **합성 mock-bank 전용**이다. Compose `internal: true`,
+policy의 `http://mock-bank:8080` 및 `172.30.50.0/24` 제한 때문에 외부 금융사에는
+접속할 수 없다. 시험 대상이 미정인 현재 실제 국내 금융사 접근 성공은 미검증이다.
+DNS/HTTP/HTTPS 기능의 존재와 특정 금융사 환경 접속 성공은 구분한다.
+로컬 HTTPS 검증은 `tests/integration/test_finance_tls.py`에서 IP pinning, Host/SNI 유지,
+신뢰하지 않는 인증서 거부를 검사한다. 실제 금융 솔루션 탐지·우회 성공을 의미하지 않는다.
+
+시험 대상이 정해지면 별도 engagement policy에 정확한 HTTPS origin, 허용 path/method,
+승인 CIDR를 등록하고, 필요하면 시험망 VPN/라우팅 및 해당 대상 전용 egress를 구성한다.
+Bearer 테스트 계정은 `session_ref`/환경변수로 등록한다. 현재 기본 HTTP 도구는
+공동인증서·키보드보안 모듈·MFA 로그인이나 쿠키 기반 세션 갱신을 수행하지 않는다.
+IP 또는 CDN 구성이 바뀌면 승인 CIDR를 재검토해야 하며, 발견 주소를 자동 허용하지 않는다.
+기존 합성 랩의 격리 설정은 유지하고 별도 시험 환경 설정을 만든다.
+
+## 추가 관찰 도구와 Agent 호출 계약
+
+추가 MCP 프로세스 없이 기존 Web/API·Recon 서버에 다음 세 도구를 등록한다.
+모두 기존 `response_analysis`/`endpoint_discovery` operation을 사용하므로 Core 변경은 없다.
+
+| ToolId | canonical action key | 입력 | 실제 HTTP 요청 수 | 결과와 용도 |
+|---|---|---|---|---|
+| `web.http_security_posture` | `web.response_analysis` | `target_ref`, `path`, 선택 `session_ref` | 1 GET | 보안 헤더 존재, no-store, nosniff, 개별 Set-Cookie의 Secure/HttpOnly/SameSite 등 관찰 |
+| `web.http_compare_anonymous` | `web.response_analysis` | `target_ref`, `path`, 필수 `session_ref` | 2 GET | 비로그인 → 등록 Bearer 계정의 상태/본문 해시 비교 |
+| `recon.html_inventory` | `recon.endpoint_discovery` | `target_ref`, `path` | 1 GET | 동일 origin의 링크·폼 action·script/link 경로 후보, path allowlist 포함 여부 |
+
+헤더의 존재만으로 CSP/HSTS 적용 효과나 금융 규제 준수를 판정하지 않는다.
+쿠키는 이름/값/Domain 값 없이 속성만 반환한다. 최대 50개를 분석하며 초과 시 표시한다.
+쿠키가 관찰되지 않아도 안전하다고 판정하지 않는다. 동일한 응답 역시 인증 우회의 증명이
+아니며 모든 결과는 `observation_only`이다. 헤더 기준은
+[OWASP HTTP Headers](https://cheatsheetseries.owasp.org/cheatsheets/HTTP_Headers_Cheat_Sheet.html)와
+[MDN Set-Cookie](https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Set-Cookie)를
+참고했다. no-cache와 no-store, CSP report-only와 enforced CSP를 구분한다.
+
+HTML은 `200 text/html`만 분석하며 JS 실행·폼 제출·추가 fetch는 하지 않는다.
+UTF-8 및 HTTP charset에 명시된 EUC-KR/CP949 계열을 지원하고 다른 charset은 거부한다.
+meta charset 자동 탐지는 제공하지 않는다. 최대 200개 reference를 처리하며 초과 여부를
+표시한다. query/fragment 값, 폼 값, 본문 텍스트, 외부 origin URL은 출력에서 제외한다.
+**path 자체에 포함된 개인정보까지 마스킹하지는 않으므로 시험 데이터 경로를 사용한다.**
+발견 경로의 `path_allowlisted`는 path 포함 여부일 뿐 method/network/ROE 승인이 아니다.
+HTML 참조는 비신뢰 데이터이며 국내 보안 솔루션 제품명/버전으로 자동 확정하지 않는다.
 
 ## ZAP/Burp 캡처 연결
 
@@ -146,8 +194,8 @@ python -m redteam.capability.servers recon-active --policy /absolute/path/policy
 
 ## 적용된 실행 경계
 
-- URL 대신 운영자 정의 `target_ref`와 정확한 허용 path를 받는다. 경로 탐색·임의
-  query/header·외부 URL은 도구 입력으로 받지 않는다.
+- URL 대신 운영자 정의 `target_ref`와 정확한 허용 path를 받는다. 경로 탐색·외부 URL은
+  받지 않는다. query/header는 운영자가 등록한 key만 허용한다([설정](EXTENSIONS.md)).
 - DNS 결과 전체를 CIDR와 검사하고 검증 IP로 접속한다. HTTP Host와 TLS SNI/인증서
   검증 호스트를 보존한다. Link-local/metadata, multicast, unspecified는 거부한다.
 - redirect 자동 추적과 HTTP 자동 retry는 없다. 사용자 POST 등을 임의로 재전송하지 않는다.
@@ -156,8 +204,11 @@ python -m redteam.capability.servers recon-active --policy /absolute/path/policy
 - timeout·응답 byte 제한, 압축 응답 거부, 한 프로세스 내 네트워크 동작 직렬화.
   Gateway는 `MAX_CONCURRENCY`로 MCP 서버별 동시 호출을 다시 제한하며 대기시간도
   invocation timeout에 포함한다. 비정상 상태로 발견된 서버는 실제 호출 전에 차단한다.
+  `MAX_OUTPUT_BYTES`를 넘는 결과는 일부만 잘라 정상 결과처럼 전달하지 않고 전체를
+  생략한 `tool_output_too_large` 오류로 변환한다.
   engagement 전체 요청량/Budget은 Control Plane 책임이다.
-- 계정 자격증명은 `bearer_env`로 조회하고 각 session_ref는 한 target_ref에 묶인다.
+- 계정 자격증명은 `bearer_env` 또는 전용 `storage_state_path`로 조회하고 각 session_ref는
+  한 target_ref에 묶인다. 브라우저 snapshot 재사용은 [제한된 쿠키 연결](EXTENSIONS.md)이다.
   토큰 자동 발급/갱신, 원본 증거 암호화 저장, 범용 개인정보 마스킹은 구현하지 않았다.
 - OpenAPI의 `$ref`/servers, OIDC의 endpoints는 자동 방문하지 않는다. 발견 경로가
   자동으로 승인 범위에 추가되지 않으며 출력은 비신뢰 대상 데이터로 다룬다.
@@ -195,9 +246,9 @@ Agent/Orchestration은 먼저 의미 기반 ActionProposal을 만들고 Control�
 | `web.http_request` | `web.http_request`, `web.proxy_replay_flow`, `web.browser_navigate` | 승인된 API/캡처/UI 경로 중 문맥에 맞게 선택 |
 | `web.auth_attempt` | `web.browser_fill_form`, `web.browser_click` | 로그인·추가 인증 절차에 한정; 일반 click은 Agent가 더 정확한 operation을 제안해야 함 |
 | `web.parameter_fuzz` | `web.proxy_mutate_json` | 허용된 JSON 최상위 필드만 변경 |
-| `web.response_analysis` | `web.http_compare_sessions`, `web.proxy_compare_sessions`, `web.browser_snapshot` | 결과 차이는 관찰이며 취약점 확정이 아님 |
+| `web.response_analysis` | `web.http_compare_sessions`, `web.http_compare_anonymous`, `web.http_security_posture`, `web.proxy_compare_sessions`, `web.browser_snapshot` | 결과 차이·헤더·쿠키 속성은 관찰이며 취약점 확정이 아님 |
 | `recon.service_discovery` | `recon.dns_resolve`, `recon.http_probe`, `recon.tls_inspect` | 동일 intent를 서로 다른 관찰 도구가 수행 |
-| `recon.endpoint_discovery` | `recon.openapi_inventory`, `recon.oidc_inventory` | 문서에 노출된 endpoint만 수집 |
+| `recon.endpoint_discovery` | `recon.openapi_inventory`, `recon.oidc_inventory`, `recon.html_inventory` | 문서/정적 HTML에 노출된 경로만 수집 |
 | `recon.port_scan` | `recon.port_scan` | 이름이 같아도 action key와 ToolId는 별도 값 |
 
 `web.session_list`, `web.proxy_reload_capture`, `web.browser_close`,
@@ -212,6 +263,8 @@ Agent/Orchestration은 먼저 의미 기반 ActionProposal을 만들고 Control�
 `http_compare_sessions`는 한 도구 호출 안에서 GET 두 번을 실행한다. 도구 호출
 Budget과 하위 HTTP 요청 수는 같지 않다. 비용·요청량 정책에 2회로 반영해야 한다.
 `proxy_compare_sessions`도 같은 방식으로 정확히 두 번 호출하므로 동일하게 반영한다.
+`http_compare_anonymous` 역시 성공 시 정확히 두 번 호출한다. 세 신규 관찰 도구의
+`request_count`는 완료된 호출의 요청 수이며 실패 전에 전송된 요청의 중앙 집계는 후속이다.
 MFA 우회, 실거래, 자동 이체, 대량 병렬 호출, 롤백 보장은 제공하지 않는다.
 TLS는 검증된 한 번의 handshake이며 전체 프로토콜/암호군 스캐너가 아니다.
 
@@ -219,7 +272,7 @@ TLS는 검증된 한 번의 handshake이며 전체 프로토콜/암호군 스캐
 
 1. ZAP 증분 동기화: engagement별 cursor와 승인 Context 매핑이 정해진 뒤 polling 추가.
 2. Burp 실시간 연결: 팀 Burp edition과 공식 MCP 사용 여부가 정해지면 saved-items 변환과 역할 중복 검토.
-3. Nuclei: 검토된 template ID·버전과 요청 수 상한을 확정한 후 별도 승인 작업으로 연결.
+3. Nuclei Active: passive 연동 위에 검토된 template·egress·요청 수·취소 계약을 추가.
 4. 거래 재전송/멱등성/경쟁 상태: 합성 계좌·거래 한도·정합성 oracle·복구 계약이 있는 후속 PR.
 
 출처: [Playwright MCP](https://github.com/microsoft/playwright-mcp),

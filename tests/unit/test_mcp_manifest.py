@@ -1,153 +1,157 @@
-"""Manifest framework logic and in-process discovery validation.
-
-The in-process tests below run a *real* ``tools/list`` against the local
-fallback MCP servers and check the manifest against it -- no external server,
-network, or emulator required -- so manifest/discovery drift for our own tools
-is caught in ordinary unit runs.
-"""
+"""MCP discovery -> Registry manifest contract tests."""
 
 from __future__ import annotations
 
-import zipfile
-from pathlib import Path
+from datetime import datetime, timezone
+from typing import Any
 
 import pytest
-from mcp import Client
 
-from redteam.capability.manifest import (
-    CandidateManifest,
-    ManifestDiscoveryMismatch,
-    ManifestError,
-    RiskLevel,
-    TargetKind,
-    ToolManifestEntry,
-    ToolOrigin,
-    argument_contract,
+from redteam.capability.adapters.mcp.base import MCPCallResult
+from redteam.capability.bootstrap import build_mcp_tool_gateway
+from redteam.capability.manifest import validate_tool_manifest
+from redteam.capability.settings import MCPConfigurationError
+from redteam.core.contracts.tool import ToolDescriptor
+from redteam.core.enums import RiskLevel, ToolHealthStatus
+from redteam.core.ids import ToolId
+
+
+def _descriptor(**updates: Any) -> ToolDescriptor:
+    values: dict[str, Any] = {
+        "tool_id": ToolId("web.http_request"),
+        "server_id": "web-test",
+        "tool_name": "http_request",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "target_ref": {"type": "string"},
+                "path": {"type": "string"},
+                "method": {"type": "string"},
+            },
+            "required": ["target_ref", "path"],
+        },
+        "output_schema": {
+            "type": "object",
+            "properties": {"status": {"type": "integer"}},
+            "required": ["status"],
+        },
+        "operations": ["http_request"],
+        "target_types": ["endpoint", "service", "host"],
+        "capability_tags": ["web", "api"],
+        "risk_level": RiskLevel.MEDIUM,
+        "health_status": ToolHealthStatus.HEALTHY,
+    }
+    values.update(updates)
+    return ToolDescriptor(**values)
+
+
+def test_manifest_preserves_agent_visible_metadata() -> None:
+    descriptor = _descriptor()
+
+    validate_tool_manifest(descriptor)
+
+    assert descriptor.required_arguments == ("target_ref", "path")
+    assert descriptor.optional_arguments == ("method",)
+    assert descriptor.operations == ["http_request"]
+    assert descriptor.target_types == ["endpoint", "service", "host"]
+    assert descriptor.output_schema["required"] == ["status"]
+
+
+@pytest.mark.parametrize(
+    "updates",
+    [
+        {"input_schema": {"type": "object", "required": ["path"]}},
+        {"operations": ["HTTP Request"]},
+        {"target_types": ["unknown_target"]},
+        {"output_schema": {"type": "not-a-json-schema-type"}},
+        {"tool_id": ToolId("recon.http_request")},
+    ],
 )
-from redteam.capability.mobile_analysis_manifest import (
-    MOBILE_ANALYSIS_MANIFEST,
-    SERVER_ANALYSIS_LOCAL,
-    SERVER_MOBILE_LOCAL,
-)
-from redteam.capability.servers import analysis, mobile
+def test_manifest_rejects_metadata_or_schema_drift(updates: dict[str, Any]) -> None:
+    with pytest.raises(MCPConfigurationError):
+        validate_tool_manifest(_descriptor(**updates))
 
 
-def _entry(**overrides: object) -> ToolManifestEntry:
-    base: dict[str, object] = dict(
-        tool_id="analysis.decode_apk",
-        server_id="analysis-apktool",
-        tool_name="decode_apk",
-        capability="analysis",
-        operations=("static_analysis",),
-        required_arguments=("apk_path",),
-        optional_arguments=("force",),
-        target_kind=TargetKind.APK_FILE,
-        risk=RiskLevel.LOW,
-        origin=ToolOrigin.EXTERNAL,
+class _DiscoveredAdapter:
+    def __init__(self, server_id: str, descriptor: ToolDescriptor) -> None:
+        self.server_id = server_id
+        self._descriptor = descriptor
+
+    async def discover_tools(self) -> list[ToolDescriptor]:
+        return [self._descriptor]
+
+    async def invoke(self, tool: ToolDescriptor, arguments: dict[str, Any]) -> MCPCallResult:
+        now = datetime.now(timezone.utc)
+        return MCPCallResult(
+            success=True,
+            started_at=now,
+            finished_at=now,
+            output={"status": 200},
+            error=None,
+            metadata={},
+        )
+
+    async def health_check(self) -> ToolHealthStatus:
+        return ToolHealthStatus.HEALTHY
+
+
+async def test_bootstrap_validates_the_same_manifest_it_exposes_to_agent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server_id = "web-manifest-test"
+    prefix = "REDTEAM_MCP_WEB_MANIFEST_TEST"
+    monkeypatch.setenv(f"{prefix}_KIND", "web_api")
+    monkeypatch.setenv(f"{prefix}_TRANSPORT", "stdio")
+    monkeypatch.setenv(f"{prefix}_COMMAND", "unused-for-fake-transport")
+    monkeypatch.setenv(
+        f"{prefix}_TOOL_OPERATIONS_JSON",
+        '{"http_request": ["http_request"]}',
     )
-    base.update(overrides)
-    return ToolManifestEntry(**base)  # type: ignore[arg-type]
-
-
-def test_argument_contract_splits_required_and_optional() -> None:
-    schema = {
-        "type": "object",
-        "properties": {"a": {}, "b": {}, "c": {}},
-        "required": ["a", "b"],
-    }
-    required, optional = argument_contract(schema)
-    assert required == {"a", "b"}
-    assert optional == {"c"}
-
-
-def test_argument_contract_handles_missing_keys() -> None:
-    assert argument_contract({}) == (frozenset(), frozenset())
-    assert argument_contract({"properties": {"x": {}}}) == (frozenset(), {"x"})
-
-
-def test_entry_rejects_argument_in_both_required_and_optional() -> None:
-    with pytest.raises(ManifestError, match="both required and optional"):
-        _entry(required_arguments=("apk_path",), optional_arguments=("apk_path",))
-
-
-def test_manifest_rejects_duplicate_tool_ids() -> None:
-    with pytest.raises(ManifestError, match="duplicate tool_id"):
-        CandidateManifest([_entry(), _entry()])
-
-
-def _snapshot(entry: ToolManifestEntry) -> dict[str, object]:
-    return {
-        "name": entry.tool_name,
-        "input_schema": {
-            "type": "object",
-            "properties": {name: {} for name in entry.argument_names},
-            "required": list(entry.required_arguments),
-        },
-    }
-
-
-def test_validate_against_discovery_accepts_matching_snapshot() -> None:
-    manifest = CandidateManifest([_entry()])
-    manifest.validate_against_discovery("analysis-apktool", [_snapshot(_entry())])
-
-
-def test_validate_against_discovery_rejects_absent_tool() -> None:
-    manifest = CandidateManifest([_entry()])
-    with pytest.raises(ManifestDiscoveryMismatch, match="absent from live discovery"):
-        manifest.validate_against_discovery("analysis-apktool", [])
-
-
-def test_validate_against_discovery_rejects_required_drift() -> None:
-    manifest = CandidateManifest([_entry()])
-    drifted = {
-        "name": "decode_apk",
-        "input_schema": {
-            "type": "object",
-            "properties": {"apk_path": {}, "force": {}},
-            "required": ["apk_path", "force"],  # server now requires 'force'
-        },
-    }
-    with pytest.raises(ManifestDiscoveryMismatch, match="required arguments drifted"):
-        manifest.validate_against_discovery("analysis-apktool", [drifted])
-
-
-def test_validate_against_discovery_rejects_optional_drift() -> None:
-    manifest = CandidateManifest([_entry()])
-    drifted = {
-        "name": "decode_apk",
-        "input_schema": {
-            "type": "object",
-            "properties": {"apk_path": {}, "force": {}, "extra": {}},
-            "required": ["apk_path"],
-        },
-    }
-    with pytest.raises(ManifestDiscoveryMismatch, match="optional arguments drifted"):
-        manifest.validate_against_discovery("analysis-apktool", [drifted])
-
-
-# --- in-process discovery of the local fallback servers ---------------------
-
-
-async def _list_tools(server: object) -> list[object]:
-    async with Client(server) as client:  # type: ignore[arg-type]
-        listing = await client.list_tools()
-    return list(getattr(listing, "tools", listing))
-
-
-async def test_local_mobile_manifest_matches_real_discovery() -> None:
-    policy = mobile.MobileDiagnosticsPolicy.model_validate(
-        {"devices": {"pixel": {"serial": "emulator-5554"}}}
+    descriptor = _descriptor(server_id=server_id)
+    adapter = _DiscoveredAdapter(server_id, descriptor)
+    monkeypatch.setattr(
+        "redteam.capability.bootstrap._create_transport", lambda settings: object()
     )
-    tools = await _list_tools(mobile.create_server(policy))
-    MOBILE_ANALYSIS_MANIFEST.validate_against_discovery(SERVER_MOBILE_LOCAL, tools)
-
-
-async def test_local_analysis_manifest_matches_real_discovery(tmp_path: Path) -> None:
-    apk = tmp_path / "sample.apk"
-    with zipfile.ZipFile(apk, "w") as archive:
-        archive.writestr("AndroidManifest.xml", b"placeholder")
-    policy = analysis.AnalysisServerPolicy.model_validate(
-        {"apks": {"sample": {"path": str(apk)}}}
+    monkeypatch.setattr(
+        "redteam.capability.bootstrap._create_adapter",
+        lambda settings, transport: adapter,
     )
-    tools = await _list_tools(analysis.create_server(policy))
-    MOBILE_ANALYSIS_MANIFEST.validate_against_discovery(SERVER_ANALYSIS_LOCAL, tools)
+
+    gateway = await build_mcp_tool_gateway([server_id])
+    registered = gateway.get(ToolId("web.http_request"))
+
+    assert registered is not None
+    assert registered.operations == ["http_request"]
+    assert registered.required_arguments == ("target_ref", "path")
+    assert registered.optional_arguments == ("method",)
+    assert registered.target_types == ["host", "service", "endpoint"]
+    assert registered.output_schema == descriptor.output_schema
+
+
+async def test_bootstrap_fails_closed_on_discovery_manifest_drift(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server_id = "web-invalid-manifest-test"
+    prefix = "REDTEAM_MCP_WEB_INVALID_MANIFEST_TEST"
+    monkeypatch.setenv(f"{prefix}_KIND", "web_api")
+    monkeypatch.setenv(f"{prefix}_TRANSPORT", "stdio")
+    monkeypatch.setenv(f"{prefix}_COMMAND", "unused-for-fake-transport")
+    monkeypatch.setenv(
+        f"{prefix}_TOOL_OPERATIONS_JSON",
+        '{"http_request": ["http_request"]}',
+    )
+    descriptor = _descriptor(
+        server_id=server_id,
+        input_schema={"type": "object", "required": ["missing"]},
+    )
+    adapter = _DiscoveredAdapter(server_id, descriptor)
+    monkeypatch.setattr(
+        "redteam.capability.bootstrap._create_transport", lambda settings: object()
+    )
+    monkeypatch.setattr(
+        "redteam.capability.bootstrap._create_adapter",
+        lambda settings, transport: adapter,
+    )
+
+    with pytest.raises(MCPConfigurationError, match="absent from properties"):
+        await build_mcp_tool_gateway([server_id])

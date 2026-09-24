@@ -50,8 +50,8 @@ def test_action_proposal_round_trip() -> None:
         run_id=RunId("run_1"),
         engagement_id=EngagementId("eng_1"),
         agent_id=AgentId("agent_1"),
-        capability="recon.example",
-        operation="ping",
+        capability="recon",
+        operation="service_discovery",
         target=HostTarget(host="host_1"),
         reason="test",
         created_at=_now(),
@@ -67,8 +67,8 @@ def test_action_proposal_requires_reason() -> None:
             run_id=RunId("run_1"),
             engagement_id=EngagementId("eng_1"),
             agent_id=AgentId("agent_1"),
-            capability="recon.example",
-            operation="ping",
+            capability="recon",
+            operation="service_discovery",
             target=HostTarget(host="host_1"),
             created_at=_now(),
         )  # type: ignore[call-arg]
@@ -102,7 +102,7 @@ def test_engagement_schema() -> None:
         name="Test",
         scope=EngagementScope(allowed_hosts=["a.local"]),
         rules_of_engagement=[
-            RuleOfEngagement(name="roe-1", allowed_capabilities=["recon.example"])
+            RuleOfEngagement(name="roe-1", allowed_capabilities=["recon"])
         ],
         execution_budget=ExecutionBudget(max_actions=10),
         rate_limit_policy=RateLimitPolicy(max_actions_per_minute=10),
@@ -110,7 +110,7 @@ def test_engagement_schema() -> None:
         created_at=_now(),
     )
     assert engagement.scope.allowed_hosts == ["a.local"]
-    assert engagement.rules_of_engagement[0].allowed_capabilities == ["recon.example"]
+    assert engagement.rules_of_engagement[0].allowed_capabilities == ["recon"]
 
 
 def test_execution_budget_rejects_negative_values() -> None:
@@ -137,7 +137,7 @@ def test_tool_invocation_rejects_nonpositive_timeout() -> None:
             action_id=ActionId("action_1"),
             run_id=RunId("run_1"),
             tool_id=ToolId("tool_1"),
-            operation="ping",
+            operation="service_discovery",
             timeout_seconds=0,
             execution_context=ExecutionContext(
                 engagement_id=EngagementId("eng_1"), run_id=RunId("run_1")

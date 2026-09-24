@@ -19,7 +19,7 @@ from redteam.core.contracts.tool import ToolDescriptor
 from redteam.core.enums import RiskLevel, ToolHealthStatus
 from redteam.core.ids import ToolId
 
-EXAMPLE_TOOL_ID = ToolId("example.ping")
+EXAMPLE_TOOL_ID = ToolId("recon.ping")
 
 
 class ExampleMCPAdapter:
@@ -39,7 +39,14 @@ class ExampleMCPAdapter:
                 tool_name="ping",
                 description="Harmless example tool: echoes arguments back.",
                 input_schema={"type": "object", "properties": {"message": {"type": "string"}}},
-                capability_tags=["recon.example"],
+                output_schema={
+                    "type": "object",
+                    "properties": {"echo": {"type": "object"}, "server_id": {"type": "string"}},
+                    "required": ["echo", "server_id"],
+                },
+                operations=["service_discovery"],
+                target_types=["host"],
+                capability_tags=["recon"],
                 risk_level=RiskLevel.LOW,
                 health_status=ToolHealthStatus.HEALTHY,
             )

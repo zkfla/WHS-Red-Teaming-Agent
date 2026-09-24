@@ -1,101 +1,159 @@
-"""Real-protocol integration for the external mobile MCP candidate (mobile-next).
+"""Real MCP-wire tests for the mobile fallback server.
 
-Gated on ``npx`` being available (the server runs via
-``npx -y @mobilenext/mobile-mcp@<pinned>`` over stdio). These tests exercise the
-real Core Port -> Gateway -> adapter -> transport -> external MCP path and check
-that the pinned manifest still matches live discovery. No device is required for
-discovery/registration; a device-backed invoke is additionally gated on
-``REDTEAM_TEST_DEVICE``.
+Split per item 6 of the capability work: discovery and the error paths that
+never touch a device run unconditionally over a real spawned MCP stdio
+subprocess. Success-path execution against a real ``adb`` binary and device
+only runs when the operator opts in — see ``REDTEAM_TEST_REAL_ADB_SERIAL``
+below — and is skipped otherwise. (The success path itself, with ``adb``
+replaced by a monkeypatched in-process function, is already covered by
+``tests/unit/test_mobile_server.py`` at the real MCP-protocol level via
+``mcp.Client``; this file adds the OS-process/stdio boundary and the full
+settings -> transport -> adapter -> gateway bootstrap on top of that.)
+
+Registering a real external mobile MCP server (e.g. mobile-next/mobile-mcp)
+goes through the same ``MCPServerSettings``/``build_mcp_tool_gateway`` path
+as any other MCP server; see ``deploy/mcp/README.md`` "Mobile capability"
+for the exact ``REDTEAM_MCP_<SERVER_ID>_*`` variables. That candidate is not
+vendored into this repository, so it is not re-tested here.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import shutil
+import sys
 from datetime import datetime, timezone
+from pathlib import Path
 
 import pytest
 
 from redteam.capability.adapters.mcp.transport import StdioMCPTransport
 from redteam.capability.bootstrap import build_mcp_tool_gateway
-from redteam.capability.mobile_analysis_manifest import (
-    MOBILE_ANALYSIS_MANIFEST,
-    MOBILE_NEXT_VERSION,
-    SERVER_MOBILE_NEXT,
-)
 from redteam.core.contracts.tool import ExecutionContext, ToolInvocation
 from redteam.core.ids import ActionId, EngagementId, InvocationId, RunId, ToolId
 
-_NPX = shutil.which("npx")
-_PACKAGE = f"@mobilenext/mobile-mcp@{MOBILE_NEXT_VERSION}"
-_MOBILE_NEXT_ARGS = ["-y", _PACKAGE]
-
-pytestmark = pytest.mark.skipif(_NPX is None, reason="npx not available for mobile-next MCP")
+_MODULE_ARGS = ["-m", "redteam.capability.servers.mobile"]
 
 
-def _env(monkeypatch: pytest.MonkeyPatch) -> None:
-    prefix = "REDTEAM_MCP_MOBILE_NEXT"
-    allow = list(MOBILE_ANALYSIS_MANIFEST.allowed_tools_for_server(SERVER_MOBILE_NEXT))
-    bindings = MOBILE_ANALYSIS_MANIFEST.tool_operations_for_server(SERVER_MOBILE_NEXT)
+def _write_policy(tmp_path: Path, *, adb_path: str = "adb") -> Path:
+    policy_path = tmp_path / "mobile-policy.json"
+    policy_path.write_text(
+        json.dumps(
+            {
+                "devices": {"pixel": {"serial": "emulator-5554"}},
+                "allowed_commands": ["getprop"],
+                "adb_path": adb_path,
+            }
+        ),
+        encoding="utf-8",
+    )
+    return policy_path
+
+
+async def test_real_stdio_process_discovers_device_shell_tool(tmp_path: Path) -> None:
+    policy_path = _write_policy(tmp_path)
+    transport = StdioMCPTransport(
+        sys.executable, args=[*_MODULE_ARGS, "--policy", str(policy_path)]
+    )
+    tools = await transport.list_tools()
+    assert {tool.name for tool in tools} == {"device_shell"}
+
+
+async def test_unknown_device_rejected_over_the_wire_without_touching_adb(
+    tmp_path: Path,
+) -> None:
+    policy_path = _write_policy(tmp_path)
+    transport = StdioMCPTransport(
+        sys.executable, args=[*_MODULE_ARGS, "--policy", str(policy_path)]
+    )
+    result = await transport.call_tool(
+        "device_shell", {"device_ref": "not-registered", "command": "getprop"}
+    )
+    assert result.is_error is True
+
+
+async def test_disallowed_command_rejected_over_the_wire_without_touching_adb(
+    tmp_path: Path,
+) -> None:
+    policy_path = _write_policy(tmp_path)
+    transport = StdioMCPTransport(
+        sys.executable, args=[*_MODULE_ARGS, "--policy", str(policy_path)]
+    )
+    result = await transport.call_tool(
+        "device_shell", {"device_ref": "pixel", "command": "logcat_recent"}
+    )
+    assert result.is_error is True
+
+
+async def test_device_shell_bound_to_canonical_operation_through_full_bootstrap(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Exercises the settings -> transport -> adapter -> gateway path the
+    real ``mobile-next`` server ID would use, with our fallback server
+    standing in as the wire endpoint (see deploy/mcp/README.md)."""
+    policy_path = _write_policy(tmp_path)
+    server_id = "mobile-fallback-test"
+    prefix = f"REDTEAM_MCP_{server_id.upper().replace('-', '_')}"
     monkeypatch.setenv(f"{prefix}_KIND", "mobile")
     monkeypatch.setenv(f"{prefix}_TRANSPORT", "stdio")
-    monkeypatch.setenv(f"{prefix}_COMMAND", _NPX or "npx")
-    monkeypatch.setenv(f"{prefix}_ARGS_JSON", json.dumps(_MOBILE_NEXT_ARGS))
-    monkeypatch.setenv(f"{prefix}_ALLOWED_TOOLS_JSON", json.dumps(allow))
-    monkeypatch.setenv(f"{prefix}_TOOL_OPERATIONS_JSON", json.dumps(bindings))
+    monkeypatch.setenv(f"{prefix}_COMMAND", sys.executable)
+    monkeypatch.setenv(
+        f"{prefix}_ARGS_JSON", json.dumps([*_MODULE_ARGS, "--policy", str(policy_path)])
+    )
+    monkeypatch.setenv(f"{prefix}_ALLOWED_TOOLS_JSON", json.dumps(["device_shell"]))
+    monkeypatch.setenv(
+        f"{prefix}_TOOL_OPERATIONS_JSON", json.dumps({"device_shell": ["device_shell"]})
+    )
 
-
-async def test_manifest_matches_live_mobile_next_discovery() -> None:
-    transport = StdioMCPTransport(_NPX or "npx", args=_MOBILE_NEXT_ARGS)
-    async with transport.session():
-        tools = await transport.list_tools()
-    # The pinned 4 candidates must still exist with the same argument contract.
-    MOBILE_ANALYSIS_MANIFEST.validate_against_discovery(SERVER_MOBILE_NEXT, tools)
-
-
-async def test_bootstrap_registers_only_allowlisted_candidates(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _env(monkeypatch)
-    gateway = await build_mcp_tool_gateway([SERVER_MOBILE_NEXT])
-
-    launch = gateway.list_tools_for_action("mobile", "app_launch")
-    assert {str(t.tool_id) for t in launch} == {"mobile.mobile_launch_app"}
-
-    observation = gateway.list_tools_for_action("mobile", "response_analysis")
-    assert {str(t.tool_id) for t in observation} == {
-        "mobile.mobile_get_device_logs",
-        "mobile.mobile_list_crashes",
-        "mobile.mobile_get_crash",
-    }
-
-
-@pytest.mark.skipif(
-    "REDTEAM_TEST_DEVICE" not in __import__("os").environ,
-    reason="set REDTEAM_TEST_DEVICE=<adb serial> to run a device-backed invoke",
-)
-async def test_response_analysis_invoke_against_configured_device(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    import os
-
-    device = os.environ["REDTEAM_TEST_DEVICE"]
-    _env(monkeypatch)
-    gateway = await build_mcp_tool_gateway([SERVER_MOBILE_NEXT])
-    run_id = RunId("run_mobile_next")
+    gateway = await build_mcp_tool_gateway([server_id])
+    run_id = RunId("run_mobile_fallback")
     result = await gateway.invoke(
         ToolInvocation(
-            invocation_id=InvocationId("inv_mobile_next"),
-            action_id=ActionId("act_mobile_next"),
+            invocation_id=InvocationId("inv_mobile_fallback"),
+            action_id=ActionId("action_mobile_fallback"),
             run_id=run_id,
-            tool_id=ToolId("mobile.mobile_list_crashes"),
-            operation="response_analysis",
-            arguments={"device": device},
-            timeout_seconds=60.0,
+            tool_id=ToolId("mobile.device_shell"),
+            operation="device_shell",
+            arguments={"device_ref": "unknown-device", "command": "getprop"},
             execution_context=ExecutionContext(
-                engagement_id=EngagementId("eng_mobile_next"), run_id=run_id
+                engagement_id=EngagementId("eng_mobile_fallback"),
+                run_id=run_id,
             ),
             created_at=datetime.now(timezone.utc),
         )
     )
-    assert result.success is True
+    # No real adb/device is touched: the "unknown device" rejection alone
+    # proves settings/discovery/allowlist/operation-binding wiring is correct.
+    assert result.success is False
+    assert result.error is not None
+
+
+_REAL_SERIAL = os.environ.get("REDTEAM_TEST_REAL_ADB_SERIAL")
+
+
+@pytest.mark.skipif(
+    shutil.which("adb") is None or not _REAL_SERIAL,
+    reason=(
+        "requires a real adb binary on PATH and REDTEAM_TEST_REAL_ADB_SERIAL "
+        "pointing at an authorized, already-connected device/emulator"
+    ),
+)
+async def test_device_shell_against_a_real_authorized_device(tmp_path: Path) -> None:
+    policy_path = tmp_path / "real-policy.json"
+    policy_path.write_text(
+        json.dumps(
+            {
+                "devices": {"lab-device": {"serial": _REAL_SERIAL}},
+                "allowed_commands": ["getprop"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    transport = StdioMCPTransport(
+        sys.executable, args=[*_MODULE_ARGS, "--policy", str(policy_path)]
+    )
+    result = await transport.call_tool(
+        "device_shell", {"device_ref": "lab-device", "command": "getprop"}
+    )
+    assert result.is_error is False

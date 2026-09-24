@@ -34,6 +34,28 @@ class MCPToolRegistry:
             if capability_tag in tool.capability_tags
         ]
 
+    def list_tools_for_action(
+        self,
+        capability: str,
+        operation: str,
+        *,
+        include_unhealthy: bool = False,
+    ) -> list[ToolDescriptor]:
+        """Compatibility catalog for registry-only test and bootstrap callers.
+
+        The full operation binding policy lives in ``MCPToolCatalog``. A raw
+        Registry can still answer safely for descriptors that carry their own
+        operation metadata, or for legacy descriptors whose remote name is the
+        operation.
+        """
+        return [
+            descriptor
+            for descriptor in self._sorted_tools()
+            if str(descriptor.tool_id).partition(".")[0] == capability
+            and operation in (descriptor.operations or [descriptor.tool_name])
+            and (include_unhealthy or descriptor.health_status != ToolHealthStatus.UNHEALTHY)
+        ]
+
     def list_by_server(self, server_id: str) -> list[ToolDescriptor]:
         return [
             tool.model_copy(deep=True)

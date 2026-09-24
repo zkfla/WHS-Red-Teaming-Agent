@@ -37,9 +37,14 @@ direction, potential conflicts, and the final repository tree.
 
 4. **Capability Layer is Adapter-pattern, not tool-building.**
    `ToolGateway` -> `MCPToolRegistry` -> `MCPAdapter` -> MCP Server.
-   Exactly one dummy adapter (`ExampleMCPAdapter`) exists at this stage,
-   simulated in-process — no real exploit tooling (instruction.md
-   section 21).
+   `ExampleMCPAdapter` (in-process, simulated) is still the zero-config
+   default when no server is configured — but real Capability-owned MCP
+   servers now exist too (`src/redteam/capability/servers/`): bounded
+   wrappers around `nmap`/ZAP/`nuclei` plus self-contained scoped
+   HTTP/recon/proxy/mobile-shell/APK-inspection tools, all
+   policy-allowlisted per target, not general attack tooling (still
+   respects instruction.md section 21 — no payload databases, no
+   unbounded exploit library). See `deploy/mcp/README.md`.
 
 5. **In-memory/filesystem backends everywhere, behind Protocols.**
    `InMemoryEventBus`, `InMemoryAttackGraphStore`, `FilesystemEvidenceStore`.
@@ -53,13 +58,19 @@ direction, potential conflicts, and the final repository tree.
 
 7. **`requires-python = ">=3.10"`** (not 3.11) — verified against the
    only Python actually available in local dev right now (3.10.4).
-   `litellm` currently requires 3.11+ (`typing.NotRequired`), so it's
-   an optional extra (`pip install -e ".[llm]"`) imported lazily inside
-   `redteam.llm.litellm.LiteLLMClient` methods — the base package,
-   `FakeLLMClient`, and everything else stays importable on 3.10.
-   Bump `requires-python` once the team standardizes on 3.11+; nothing
-   else needs to change (`enums.py` already documents the
-   `str, Enum` -> `enum.StrEnum` swap for that point).
+   `litellm` is an optional extra (`pip install -e ".[llm]"`), imported
+   lazily inside `redteam.llm.litellm.LiteLLMClient` methods so the base
+   package, `FakeLLMClient`, and everything else stay importable without
+   pulling its large transitive dependency footprint (`boto3`, `openai`,
+   `tiktoken`, `tokenizers`, ...). This is *not* a Python-version
+   workaround: verified directly (`pip install -e ".[llm]"` then
+   `import litellm` on 3.10.4) that current `litellm` releases satisfying
+   `litellm>=1.50` install and import fine on 3.10 — an earlier claim
+   here that it needed 3.11+ (`typing.NotRequired`) was true of an older
+   `litellm` release, not current ones; see
+   `docs/adr/0002-litellm-gateway.md`. The `enum.StrEnum` swap noted in
+   `enums.py` is an independent, unrelated 3.11+ nicety, not something
+   blocked on this.
 
 ## 2. Module Responsibilities
 
@@ -76,7 +87,8 @@ direction, potential conflicts, and the final repository tree.
 | `capability` | Capability Team | `ToolGateway` impl, `MCPToolRegistry`, `MCPAdapter`s |
 | `deploy` | Capability Team | docker-compose, MCP server images, healthchecks |
 | `llm` | shared | `LLMClient` impls: `LiteLLMClient`, `FakeLLMClient` |
-| `app` | PM (scaffold) / whoever wires new backends | Composition root (`bootstrap.py`) + CLI |
+| `intake` | shared (CLI-facing) | Engagement Intake Assistant: natural-language config authoring only (`EngagementDraft` -> `EngagementConfig`, via `core.ports.llm`) — **not** an Orchestration agent, never touches `ToolGateway`/`ControlPlane`, never executes anything |
+| `app` | PM (scaffold) / whoever wires new backends | Composition root (`bootstrap.py`) + CLI (incl. `app/cli/commands/interactive.py`, the `redteam`-no-subcommand entrypoint that calls `intake`, then hands off to `app.bootstrap`/`orchestration` unchanged) |
 
 ## 3. Dependency Direction
 
@@ -153,13 +165,18 @@ Rules (instruction.md section 4, enforced by `tests/unit/test_control_plane_bypa
   objects to round-trip through stores instead.
 - **`requires-python` target** — 3.10 now vs. committing to 3.11+ and
   blocking local dev on an upgrade.
-- **Scope check semantics** (`control/scope.py`) — currently exact/
-  suffix string matching with default-deny when no allow-list is
-  configured; real CIDR/domain-suffix matching is a TODO.
-- **`replan_node` always ends the run** after one pass — real
-  re-planning (loop back to `observe` based on budget/verdict) is
-  unimplemented; confirm this is acceptable for the "skeleton" stage
-  or should be stubbed differently.
+
+Both are PM decision points, not implementation gaps — left as-is here
+rather than resolved unilaterally.
+
+Removed from this list (verified against current code + git history, not
+assumed): **scope check semantics** — `control/scope.py` does real CIDR
+(`ipaddress`) and domain-suffix matching, not string comparison; and
+**`replan_node` always ends the run** — it now loops back to `observe`
+with real convergence/stuck-detection (`orchestration.convergence`,
+`orchestration.progress`), not a single pass. Both were resolved before
+this note was written; the document had simply not caught up. See
+`docs/agent/orchestration-implementation-plan.md` for what's current.
 
 ## 5. State Ownership
 
@@ -207,7 +224,6 @@ ports without standing up the real thing — see
 repo/
 ├── README.md
 ├── ARCHITECTURE.md
-├── CONTRIBUTING.md
 ├── DEVELOPMENT.md
 ├── instruction.md
 ├── pyproject.toml
@@ -257,9 +273,11 @@ repo/
 │   │
 │   ├── orchestration/                       # Agent Team
 │   │   ├── state.py       (RuntimeState + GraphState)
-│   │   ├── context.py     (RuntimeDeps)
+│   │   ├── context.py     (RuntimeDeps, incl. result_mappers)
 │   │   ├── graph.py       (build_graph)
 │   │   ├── router.py
+│   │   ├── observations/  (Tool Result -> Attack Graph Mutation: GraphMutation,
+│   │   │                   ResultMapperRegistry, per-tool_id mappers e.g. recon_http.py)
 │   │   └── nodes/
 │   │       ├── observe.py
 │   │       ├── plan.py
@@ -300,9 +318,15 @@ repo/
 │   │   ├── litellm.py
 │   │   └── fake.py
 │   │
+│   ├── intake/                              # Engagement Intake Assistant (not an Orchestration agent)
+│   │   ├── models.py       (EngagementDraft, IntakeTurn -- temporary, LLM-facing only)
+│   │   ├── prompts.py
+│   │   ├── assistant.py    (IntakeAssistant, over core.ports.llm.LLMClient)
+│   │   └── serializer.py   (draft -> EngagementConfig -> YAML; merge-patch for Edit)
+│   │
 │   └── app/
 │       ├── bootstrap.py
-│       └── cli.py
+│       └── cli/            (commands/run.py, commands/interactive.py, renderer.py, theme.py, ...)
 │
 ├── deploy/                                  # Capability Team
 │   ├── docker/mcp-example/

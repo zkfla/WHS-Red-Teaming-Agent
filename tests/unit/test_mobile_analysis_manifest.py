@@ -1,112 +1,161 @@
-"""Structure and content checks for the concrete mobile/analysis manifest."""
+"""Compare owned mobile/analysis metadata with real MCP discovery schemas."""
 
 from __future__ import annotations
 
-import re
+import json
+import os
+import zipfile
+from pathlib import Path
 
-from redteam.capability.adapters.mcp.naming import build_mcp_tool_id
-from redteam.capability.manifest import TargetKind, ToolOrigin
+import pytest
+from mcp import Client
+
+from redteam.capability.adapters.mcp.transport import StdioMCPTransport
 from redteam.capability.mobile_analysis_manifest import (
-    APKTOOL_MCP_COMMIT,
-    MOBILE_ANALYSIS_MANIFEST,
-    MOBILE_NEXT_VERSION,
-    SERVER_ANALYSIS_APKTOOL,
-    SERVER_ANALYSIS_LOCAL,
-    SERVER_MOBILE_LOCAL,
-    SERVER_MOBILE_NEXT,
+    MOBILE_ANALYSIS_TOOLS,
+    validate_configured_discovery,
+    validate_discovered_schema,
 )
-
-# Canonical mobile/analysis operations per docs/contracts/actions.md.
-_CONTRACT_OPERATIONS = {
-    "app_launch",
-    "device_shell",
-    "runtime_instrumentation",
-    "static_analysis",
-    "response_analysis",
-}
-_CANONICAL_OPERATION = re.compile(r"^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$")
+from redteam.capability.servers.analysis import AnalysisServerPolicy
+from redteam.capability.servers.analysis import create_server as create_analysis_server
+from redteam.capability.servers.mobile import MobileDiagnosticsPolicy
+from redteam.capability.servers.mobile import create_server as create_mobile_server
+from redteam.core.contracts.tool import ToolDescriptor
+from redteam.core.enums import RiskLevel
+from redteam.core.ids import ToolId
 
 
-def test_manifest_has_expected_candidate_counts() -> None:
-    manifest = MOBILE_ANALYSIS_MANIFEST
-    assert len(manifest.entries()) == 17
-    assert len(manifest.by_server(SERVER_MOBILE_NEXT)) == 4
-    assert len(manifest.by_server(SERVER_ANALYSIS_APKTOOL)) == 9
-    assert len(manifest.by_server(SERVER_MOBILE_LOCAL)) == 1
-    assert len(manifest.by_server(SERVER_ANALYSIS_LOCAL)) == 3
+def test_example_bindings_match_manifest() -> None:
+    example = (Path(__file__).resolve().parents[2] / ".env.example").read_text(
+        encoding="utf-8"
+    )
+    settings = {}
+    for line in example.splitlines():
+        text = line.removeprefix("# ")
+        if text.startswith("REDTEAM_MCP_") and "=" in text:
+            name, value = text.split("=", 1)
+            settings[name] = value
+
+    for server_id, specs in MOBILE_ANALYSIS_TOOLS.items():
+        prefix = f"REDTEAM_MCP_{server_id.upper().replace('-', '_')}"
+        bindings = json.loads(settings[f"{prefix}_TOOL_OPERATIONS_JSON"])
+        capability = settings[f"{prefix}_KIND"]
+        risk = RiskLevel(settings.get(f"{prefix}_RISK_LEVEL", RiskLevel.LOW.value))
+        assert all(spec.capability == capability for spec in specs)
+        assert all(spec.tool_id.startswith(f"{capability}.") for spec in specs)
+        assert all(spec.risk_level == risk for spec in specs)
+        assert bindings == {
+            spec.tool_id.partition(".")[2]: [spec.operation] for spec in specs
+        }
+        if f"{prefix}_ALLOWED_TOOLS_JSON" in settings:
+            assert set(json.loads(settings[f"{prefix}_ALLOWED_TOOLS_JSON"])) == set(bindings)
 
 
-def test_every_operation_is_canonical_and_in_contract() -> None:
-    for entry in MOBILE_ANALYSIS_MANIFEST.entries():
-        assert entry.operations, entry.tool_id
-        for operation in entry.operations:
-            assert _CANONICAL_OPERATION.fullmatch(operation), operation
-            assert operation in _CONTRACT_OPERATIONS, operation
+@pytest.mark.parametrize("server_id", ["mobile-local", "analysis-local"])
+async def test_local_manifest_matches_mcp_discovery(server_id: str, tmp_path: Path) -> None:
+    if server_id == "mobile-local":
+        policy = MobileDiagnosticsPolicy.model_validate(
+            {"devices": {"test": {"serial": "emulator-5554"}}}
+        )
+        server = create_mobile_server(policy)
+    else:
+        apk = tmp_path / "test.apk"
+        with zipfile.ZipFile(apk, "w") as archive:
+            archive.writestr("AndroidManifest.xml", b"test")
+        policy = AnalysisServerPolicy.model_validate(
+            {"apks": {"test": {"path": str(apk)}}}
+        )
+        server = create_analysis_server(policy)
+
+    async with Client(server) as client:
+        discovered = (await client.list_tools()).tools
+    specs = {spec.tool_id.partition(".")[2]: spec for spec in MOBILE_ANALYSIS_TOOLS[server_id]}
+    assert {tool.name for tool in discovered} == set(specs)
+    for tool in discovered:
+        spec = specs[tool.name]
+        assert spec.capability in {"mobile", "analysis"}
+        assert spec.target_type == "asset"
+        validate_discovered_schema(spec, tool.input_schema, tool.output_schema)
 
 
-def test_tool_ids_match_the_capability_naming_rule() -> None:
-    for entry in MOBILE_ANALYSIS_MANIFEST.entries():
-        expected = str(build_mcp_tool_id(entry.capability, entry.tool_name))
-        assert entry.tool_id == expected
-        namespace = entry.tool_id.split(".", 1)[0]
-        assert namespace == entry.capability
+@pytest.mark.parametrize("server_id", ["mobile-next", "apktool"])
+async def test_external_manifest_matches_live_mcp_discovery(server_id: str) -> None:
+    """Opt-in check against an installed external candidate, without a device/APK call."""
+
+    prefix = f"REDTEAM_TEST_{server_id.upper().replace('-', '_')}"
+    command = os.environ.get(f"{prefix}_COMMAND")
+    if not command:
+        pytest.skip(f"set {prefix}_COMMAND and {prefix}_ARGS_JSON for live discovery")
+    args = json.loads(os.environ.get(f"{prefix}_ARGS_JSON", "[]"))
+    transport = StdioMCPTransport(command, args=args, env=dict(os.environ))
+    discovered = {tool.name: tool for tool in await transport.list_tools()}
+    for spec in MOBILE_ANALYSIS_TOOLS[server_id]:
+        name = spec.tool_id.partition(".")[2]
+        assert name in discovered
+        validate_discovered_schema(spec, discovered[name].input_schema)
 
 
-def test_required_and_optional_arguments_are_disjoint_and_named() -> None:
-    for entry in MOBILE_ANALYSIS_MANIFEST.entries():
-        assert not (set(entry.required_arguments) & set(entry.optional_arguments))
-        assert entry.target_kind is None or isinstance(entry.target_kind, TargetKind)
+def test_manifest_rejects_required_argument_drift() -> None:
+    spec = MOBILE_ANALYSIS_TOOLS["mobile-next"][0]
+    with pytest.raises(ValueError, match="input schema differs"):
+        validate_discovered_schema(
+            spec,
+            {"properties": {"device": {}, "packageName": {}}, "required": ["device"]},
+        )
 
 
-def test_mobile_next_selection_is_launch_plus_observation() -> None:
-    entries = {e.tool_name: e for e in MOBILE_ANALYSIS_MANIFEST.by_server(SERVER_MOBILE_NEXT)}
-    assert entries["mobile_launch_app"].operations == ("app_launch",)
-    observation = {"mobile_get_device_logs", "mobile_list_crashes", "mobile_get_crash"}
-    assert observation <= set(entries)
-    for name in observation:
-        assert entries[name].operations == ("response_analysis",)
+def test_manifest_rejects_missing_output_field() -> None:
+    spec = MOBILE_ANALYSIS_TOOLS["mobile-local"][0]
+    with pytest.raises(ValueError, match="output schema differs"):
+        validate_discovered_schema(
+            spec,
+            {"properties": {"device_ref": {}, "command": {}},
+             "required": ["device_ref", "command"]},
+            {"properties": {"device_ref": {}, "command": {}, "output": {}},
+             "required": ["device_ref", "command", "output"]},
+        )
 
 
-def test_apktool_selection_excludes_write_and_meta_tools() -> None:
-    names = {e.tool_name for e in MOBILE_ANALYSIS_MANIFEST.by_server(SERVER_ANALYSIS_APKTOOL)}
-    # Write-capable and destructive tools must never be bound.
-    for forbidden in ("build_apk", "modify_smali_file", "modify_resource_file", "clean_project"):
-        assert forbidden not in names
-    assert "decode_apk" in names and "get_manifest" in names
-    for entry in MOBILE_ANALYSIS_MANIFEST.by_server(SERVER_ANALYSIS_APKTOOL):
-        assert entry.operations == ("static_analysis",)
+def test_configured_candidate_rejects_runtime_schema_drift() -> None:
+    spec = MOBILE_ANALYSIS_TOOLS["mobile-local"][0]
+    descriptor = ToolDescriptor(
+        tool_id=ToolId(spec.tool_id),
+        server_id="mobile-local",
+        tool_name="device_shell",
+        capability_tags=["mobile"],
+        risk_level=spec.risk_level,
+        input_schema={
+            "type": "object",
+            "properties": {"device_ref": {}, "command": {}},
+            "required": ["device_ref", "command"],
+        },
+    )
+    bindings = {spec.tool_id: (spec.operation,)}
+    schemas = {descriptor.tool_name: spec.output_schema}
+    validate_configured_discovery("mobile-local", [descriptor], bindings, schemas)
+    descriptor.input_schema["required"] = ["device_ref"]
+    with pytest.raises(ValueError, match="input schema differs"):
+        validate_configured_discovery("mobile-local", [descriptor], bindings, schemas)
 
 
-def test_external_tools_have_no_guessed_output_schema() -> None:
-    for entry in MOBILE_ANALYSIS_MANIFEST.entries():
-        if entry.origin is ToolOrigin.EXTERNAL:
-            assert entry.known_output_schema is None, entry.tool_id
-
-
-def test_local_fallback_tools_record_their_output_schema() -> None:
-    for entry in MOBILE_ANALYSIS_MANIFEST.entries():
-        if entry.origin is ToolOrigin.LOCAL_FALLBACK:
-            assert entry.known_output_schema is not None, entry.tool_id
-            assert entry.known_output_schema.get("type") == "object"
-
-
-def test_tool_operations_binding_matches_allowlist_for_each_external_server() -> None:
-    for server_id in (SERVER_MOBILE_NEXT, SERVER_ANALYSIS_APKTOOL):
-        allow = set(MOBILE_ANALYSIS_MANIFEST.allowed_tools_for_server(server_id))
-        binding = set(MOBILE_ANALYSIS_MANIFEST.tool_operations_for_server(server_id))
-        # bootstrap requires ALLOWED_TOOLS_JSON keys == TOOL_OPERATIONS_JSON keys.
-        assert allow == binding
-        assert allow
-
-
-def test_candidate_metadata_exposes_enriched_view() -> None:
-    metadata = MOBILE_ANALYSIS_MANIFEST.list_candidate_metadata(capability="analysis")
-    assert metadata
-    sample = metadata[0]
-    for key in ("tool_id", "operations", "target_kind", "risk", "output_schema", "origin"):
-        assert key in sample
-
-
-def test_pins_are_present_for_reproducibility() -> None:
-    assert MOBILE_NEXT_VERSION == "1.0.4"
-    assert re.fullmatch(r"[0-9a-f]{40}", APKTOOL_MCP_COMMIT)
+def test_configured_candidate_rejects_operation_drift() -> None:
+    spec = MOBILE_ANALYSIS_TOOLS["mobile-local"][0]
+    descriptor = ToolDescriptor(
+        tool_id=ToolId(spec.tool_id),
+        server_id="mobile-local",
+        tool_name="device_shell",
+        capability_tags=["mobile"],
+        risk_level=spec.risk_level,
+        input_schema={
+            "type": "object",
+            "properties": {"device_ref": {}, "command": {}},
+            "required": ["device_ref", "command"],
+        },
+    )
+    with pytest.raises(ValueError, match="operation differs"):
+        validate_configured_discovery(
+            "mobile-local",
+            [descriptor],
+            {spec.tool_id: ("response_analysis",)},
+            {descriptor.tool_name: spec.output_schema},
+        )

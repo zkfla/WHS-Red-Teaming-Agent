@@ -4,6 +4,8 @@
       "origin": "http://mock-bank:8080",
       "allowed_paths": ["/", "/health", "/api/accounts/alice", "/api/beneficiaries/validate", "/openapi.json", "/.well-known/openid-configuration"],
       "allowed_methods": ["GET", "HEAD", "OPTIONS"],
+      "allowed_query_keys": {"/health": ["probe"]},
+      "allowed_request_headers": ["x-test-case"],
       "allowed_path_methods": {
         "/api/beneficiaries/validate": ["POST"]
       },

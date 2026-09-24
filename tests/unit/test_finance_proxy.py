@@ -93,6 +93,22 @@ def capture_path(tmp_path: Path) -> Path:
     return path
 
 
+def test_zap_empty_post_data_and_unreceived_site_tree_entries(policy: ServerPolicy) -> None:
+    entries = [{
+        "request": {
+            "method": "GET", "url": "https://bank.test/account", "headers": [],
+            "postData": {"mimeType": "", "text": "", "params": []},
+        },
+        "response": {"status": status, "content": {"text": ""}},
+    } for status in (200, 0)]
+    backend = proxy.HarCaptureBackend.from_bytes(
+        json.dumps({"log": {"entries": entries}}).encode(), policy,
+    )
+    assert len(backend.list_flows()) == 1
+    assert backend.ignored_flow_count == 1
+    assert backend.list_flows()[0].request_json is None
+
+
 def test_har_import_discards_auth_raw_bodies_and_out_of_scope_flows(
     policy: ServerPolicy,
     capture_path: Path,

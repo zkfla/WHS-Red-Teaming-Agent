@@ -61,7 +61,7 @@ def _invocation(
         invocation_id=InvocationId("inv_1"),
         action_id=ActionId("action_1"),
         run_id=RunId("run_1"),
-        tool_id=tool_id or ToolId("example.ping"),
+        tool_id=tool_id or ToolId("recon.ping"),
         operation=operation,
         arguments={"message": "hi"},
         timeout_seconds=timeout_seconds,
@@ -84,6 +84,84 @@ async def test_example_adapter_discovers_and_invokes() -> None:
     assert result.output["echo"] == {"message": "hi"}
 
     assert await adapter.health_check() == ToolHealthStatus.HEALTHY
+
+
+async def test_adapter_preserves_remote_output_schema_in_registry_metadata() -> None:
+    transport = FakeTransport(
+        tools=[
+            RemoteTool(
+                name="http_probe",
+                description="probe",
+                input_schema={
+                    "type": "object",
+                    "properties": {"target_ref": {"type": "string"}},
+                    "required": ["target_ref"],
+                },
+                output_schema={
+                    "type": "object",
+                    "properties": {"status_code": {"type": "integer"}},
+                    "required": ["status_code"],
+                },
+            )
+        ]
+    )
+    tools = await ReconMCPAdapter(
+        server_id="recon", transport=transport
+    ).discover_tools()
+
+    descriptor = tools[0]
+    assert descriptor.required_arguments == ("target_ref",)
+    assert descriptor.optional_arguments == ()
+    assert descriptor.output_schema["required"] == ["status_code"]
+
+
+async def test_adapter_preserves_absent_output_schema_as_none() -> None:
+    transport = FakeTransport(
+        tools=[
+            RemoteTool(
+                name="http_probe",
+                description="probe",
+                input_schema={"type": "object"},
+            )
+        ]
+    )
+    descriptor = (
+        await ReconMCPAdapter(server_id="recon", transport=transport).discover_tools()
+    )[0]
+
+    assert descriptor.output_schema is None
+
+
+async def test_gateway_skips_output_validation_when_schema_is_absent() -> None:
+    adapter = ExampleMCPAdapter()
+    registry = MCPToolRegistry()
+    descriptor = (await adapter.discover_tools())[0].model_copy(
+        update={"output_schema": None}
+    )
+    registry.register(descriptor)
+
+    result = await MCPToolGateway(registry, {adapter.server_id: adapter}).invoke(
+        _invocation(operation="service_discovery")
+    )
+
+    assert result.success is True
+    assert result.output == {"echo": {"message": "hi"}, "server_id": "example-mcp"}
+
+
+async def test_gateway_rejects_output_that_breaks_registered_schema() -> None:
+    adapter = ExampleMCPAdapter()
+    registry = MCPToolRegistry()
+    descriptor = (await adapter.discover_tools())[0].model_copy(
+        update={"output_schema": {"type": "string"}}
+    )
+    registry.register(descriptor)
+    result = await MCPToolGateway(registry, {adapter.server_id: adapter}).invoke(
+        _invocation(operation="service_discovery")
+    )
+
+    assert result.success is False
+    assert result.error is not None
+    assert result.error.code == "tool_output_schema_mismatch"
 
 
 async def test_gateway_routes_invocation_to_registered_adapter() -> None:
@@ -382,6 +460,38 @@ async def test_gateway_limits_concurrency_per_mcp_server() -> None:
 def test_gateway_rejects_concurrency_for_unknown_server() -> None:
     with pytest.raises(ValueError, match="unknown MCP servers"):
         MCPToolGateway(MCPToolRegistry(), {}, server_concurrency={"typo": 1})
+
+
+async def test_gateway_omits_output_above_server_byte_limit() -> None:
+    backend = FakeTransport(
+        tools=[RemoteTool("http_request", "", {})],
+        result=RemoteCallResult(is_error=False, output={"body": "가" * 100}),
+    )
+    adapter = WebAPIMCPAdapter(server_id="http", transport=backend)
+    registry = MCPToolRegistry()
+    registry.replace_server_tools("http", await adapter.discover_tools())
+    gateway = MCPToolGateway(
+        registry,
+        {adapter.server_id: adapter},
+        server_output_limits={adapter.server_id: 128},
+    )
+
+    result = await gateway.invoke(
+        _invocation(tool_id=ToolId("web.http_request"), operation="http_request")
+    )
+
+    assert result.success is False
+    assert result.output is None
+    assert result.error is not None
+    assert result.error.code == "tool_output_too_large"
+    assert result.error.retryable is False
+    assert result.metadata["output_omitted"] is True
+    assert result.metadata["output_bytes"] > result.metadata["max_output_bytes"]
+
+
+def test_gateway_rejects_output_limit_for_unknown_server() -> None:
+    with pytest.raises(ValueError, match="unknown MCP servers"):
+        MCPToolGateway(MCPToolRegistry(), {}, server_output_limits={"typo": 1024})
 
 
 async def test_allowlist_hides_and_blocks_unsafe_remote_tools() -> None:

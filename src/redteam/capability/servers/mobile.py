@@ -6,7 +6,7 @@ device logs/crash retrieval) through their own adapter binding
 (``REDTEAM_MCP_<SERVER_ID>_TOOL_OPERATIONS_JSON``, see
 ``deploy/mcp/README.md``). Neither currently exposes a shell-style primitive,
 so this module implements only the ``device_shell`` canonical operation
-(docs/contracts/actions.md) as a narrow, allowlisted ADB diagnostic tool --
+(docs/contracts/actions.md) as a narrow, allowlisted ADB diagnostic tool —
 following the same policy-scoped, real-but-bounded pattern as
 ``servers/recon.py``/``servers/web_http.py``.
 
@@ -17,8 +17,8 @@ than wrapping an existing one (see instruction.md section 21). That gap is
 left for a dedicated MCP adapter/Issue once the team decides on one.
 
 No UI-automation tools (tap/swipe/screenshot/install/uninstall) are exposed
-here -- those are handled by the external mobile MCP candidate under its own
-allowlist, not by this dependency-free fallback.
+here — those are not canonical operations yet; see the Issue process in
+docs/contracts/actions.md before adding one.
 """
 
 from __future__ import annotations
@@ -27,13 +27,12 @@ import argparse
 import asyncio
 import json
 from pathlib import Path
-from typing import Any
 
 from mcp.server import MCPServer
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 # Read-only/diagnostic ADB shell subcommands only. Values are the exact argv
-# appended after ``adb -s <serial> shell`` -- no operator-supplied argv, no
+# appended after ``adb -s <serial> shell`` — no operator-supplied argv, no
 # shell string interpolation.
 _ALLOWED_ADB_COMMANDS: dict[str, tuple[str, ...]] = {
     "getprop": ("getprop",),
@@ -87,6 +86,15 @@ class MobileDiagnosticsPolicy(BaseModel):
         return cls.model_validate(json.loads(Path(path).read_text(encoding="utf-8")))
 
 
+class DeviceShellOutput(BaseModel):
+    """Fields returned by the bounded ADB diagnostic MCP tool."""
+
+    device_ref: str
+    command: str
+    output: str
+    truncated: bool
+
+
 async def _run_adb(argv: list[str], timeout: float) -> str:
     """Spawn one bounded, non-shell ADB command and return decoded stdout."""
     try:
@@ -115,7 +123,7 @@ def create_server(policy: MobileDiagnosticsPolicy) -> MCPServer:
     execution_lock = asyncio.Lock()
 
     @server.tool()
-    async def device_shell(device_ref: str, command: str) -> dict[str, Any]:
+    async def device_shell(device_ref: str, command: str) -> DeviceShellOutput:
         """Run one allowlisted, read-only ADB diagnostic against a configured device.
 
         Not a general remote-shell primitive: ``command`` selects a fixed,
@@ -137,12 +145,12 @@ def create_server(policy: MobileDiagnosticsPolicy) -> MCPServer:
         ]
         async with execution_lock:
             output = await _run_adb(argv, policy.timeout_seconds)
-        return {
-            "device_ref": device_ref,
-            "command": command,
-            "output": output[:_MAX_OUTPUT_BYTES],
-            "truncated": len(output) > _MAX_OUTPUT_BYTES,
-        }
+        return DeviceShellOutput(
+            device_ref=device_ref,
+            command=command,
+            output=output[:_MAX_OUTPUT_BYTES],
+            truncated=len(output) > _MAX_OUTPUT_BYTES,
+        )
 
     return server
 

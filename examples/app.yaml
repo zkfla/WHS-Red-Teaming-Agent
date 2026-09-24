@@ -47,6 +47,12 @@ orchestration:
   max_steps: 50
 
 capability:
+  # Candidate mobile/analysis MCP servers ("mobile-next", "apktool", and the
+  # in-repo fallbacks "mobile-local"/"analysis-local") are documented in
+  # .env.example and deploy/mcp/README.md but not enabled by default here —
+  # neither upstream tool is finalized yet and neither binary is assumed
+  # installed. Add a server ID below once its REDTEAM_MCP_<ID>_* variables
+  # are set; no code change is needed either way (Adapter pattern).
   mcp_servers: []
 
 logging:

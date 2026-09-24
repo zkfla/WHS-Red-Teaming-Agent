@@ -36,17 +36,22 @@ Framework -> ToolGateway -> MCPToolRegistry -> MCPAdapter -> Existing MCP Server
   `ToolDescriptor`; it never requires the intent name to equal that remote
   tool name.
 
-The example adapter remains as a harmless in-process test double. Real MCP
-servers use stdio, Streamable HTTP, SSE, or legacy HTTP transports through
-the same adapter boundary. Product-specific tools are allowlisted before
-they enter the Registry.
+`ExampleMCPAdapter` remains the harmless in-process test double used when
+no server is configured. Real MCP servers use stdio, Streamable HTTP, SSE,
+or legacy HTTP transports through the same adapter boundary — several now
+exist (`src/redteam/capability/servers/`: bounded `nmap`/ZAP/`nuclei`
+wrappers, plus self-contained scoped HTTP/recon/proxy/mobile-shell/APK
+tools), all target-agnostic (policy-file-driven, not tied to any one
+deployment). Product-specific tools are allowlisted before they enter the
+Registry.
 
 ## Consequences
 
 - Capability Team can build/select real MCP server adapters without
-  reading Agent/Orchestration code — they only implement `MCPAdapter`
-  and register `ToolDescriptor`s in
-  `redteam.app.bootstrap.build_runtime_deps`.
+  reading Agent/Orchestration code — they only implement `MCPAdapter`;
+  registration happens automatically via `discover_tools()` when
+  `capability.bootstrap.build_mcp_tool_gateway` starts a configured
+  server (`capability.mcp_servers`), not by hand in `app.bootstrap`.
 - Swapping or adding an MCP server never touches
   `redteam.orchestration` — verified structurally by
   `tests/unit/test_control_plane_bypass.py` (orchestration cannot
@@ -61,12 +66,20 @@ they enter the Registry.
   substituting a different execution mechanism. An empty binding reserves a
   tool for operator-only lifecycle work.
 - `MCPToolCatalog` returns healthy, namespace-matched candidates for a
-  canonical action but deliberately does not choose one. Exposing that query
-  to Orchestration requires the frozen Core Port change described in
-  `docs/proposals/tool-selection-port.md`.
+  canonical action but deliberately does not choose one. That query is now
+  exposed to Orchestration via `ToolGateway.list_tools_for_action` (Core
+  Port, implemented) — see `docs/proposals/tool-selection-port.md`
+  (status: implemented) and `orchestration.candidates.tool_selection` for
+  the deterministic selection policy that consumes it.
 - The Gateway applies a per-server concurrency semaphore and includes queue
   wait time in the invocation timeout. A tool discovered from an unhealthy
   server is rejected before transport invocation; there is still no automatic
   retry because tool calls cannot be assumed idempotent.
-- `deploy/mcp/finance` provides local Web/API and Recon MCP services plus a
-  persistent browser connection example for the synthetic financial lab.
+- Per-server output limits stop oversized or unexpectedly verbose MCP results
+  before they cross into Orchestration/Evidence. Oversized results are omitted
+  as an explicit error instead of being silently truncated.
+- `deploy/mcp/finance` + `deploy/compose/finance-lab.yml`/`finance-extensions.yml`
+  is one concrete deployment of the general-purpose servers above (Web/API,
+  Recon, Proxy, ZAP, Nuclei) against an isolated synthetic bank target —
+  not the only place these servers can point; any target is a policy-file
+  edit away (see `deploy/mcp/README.md`).

@@ -11,15 +11,20 @@ assume that a tool invocation is idempotent.
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Collection, Mapping
 from datetime import datetime, timezone
 from typing import Any
 
+from jsonschema import Draft202012Validator
+from jsonschema.exceptions import SchemaError, ValidationError
+
 from redteam.capability.adapters.mcp.base import MCPAdapter, MCPCallResult
-from redteam.capability.catalog import MCPToolCatalog
+from redteam.capability.catalog import MCPToolCatalog, ToolCandidateMetadata
 from redteam.capability.registry import MCPToolRegistry
 from redteam.core.contracts.tool import ToolDescriptor, ToolError, ToolInvocation, ToolResult
 from redteam.core.enums import ToolHealthStatus
+from redteam.core.ids import ToolId
 
 
 class MCPToolGateway:
@@ -30,10 +35,18 @@ class MCPToolGateway:
         operation_bindings: Mapping[str, Collection[str]] | None = None,
         *,
         server_concurrency: Mapping[str, int] | None = None,
+        server_output_limits: Mapping[str, int] | None = None,
+        output_schemas: Mapping[str, dict[str, Any] | None] | None = None,
+        target_types: Mapping[str, str | None] | None = None,
     ) -> None:
         self._registry = registry
         self._adapters = adapters
-        self._catalog = MCPToolCatalog(registry, operation_bindings)
+        self._catalog = MCPToolCatalog(
+            registry,
+            operation_bindings,
+            output_schemas=output_schemas,
+            target_types=target_types,
+        )
         concurrency = server_concurrency or {}
         unknown_servers = set(concurrency) - set(adapters)
         if unknown_servers:
@@ -45,6 +58,28 @@ class MCPToolGateway:
             server_id: asyncio.Semaphore(concurrency.get(server_id, 1))
             for server_id in adapters
         }
+        output_limits = server_output_limits or {}
+        unknown_output_servers = set(output_limits) - set(adapters)
+        if unknown_output_servers:
+            names = ", ".join(sorted(unknown_output_servers))
+            raise ValueError(f"output limit configured for unknown MCP servers: {names}")
+        if any(limit < 1 for limit in output_limits.values()):
+            raise ValueError("MCP server output limit must be at least 1 byte")
+        self._server_output_limits = {
+            server_id: output_limits.get(server_id, 1_048_576) for server_id in adapters
+        }
+
+    def get(self, tool_id: ToolId) -> ToolDescriptor | None:
+        """Expose a defensive catalog snapshot to the application composition root."""
+        return self._registry.get(tool_id)
+
+    def list_by_capability(self, capability_tag: str) -> list[ToolDescriptor]:
+        return self._registry.list_by_capability(capability_tag)
+
+    def all(self) -> list[ToolDescriptor]:
+        """Every registered tool, regardless of capability — read-only
+        catalog enumeration for callers like `redteam tools list`."""
+        return self._registry.all()
 
     async def invoke(self, invocation: ToolInvocation) -> ToolResult:
         descriptor = self._registry.get(invocation.tool_id)
@@ -131,6 +166,39 @@ class MCPToolGateway:
                 message=f"adapter execution failed: {type(exc).__name__}",
             )
 
+        output_bytes = _serialized_output_size(adapter_result.output)
+        max_output_bytes = self._server_output_limits[descriptor.server_id]
+        if output_bytes > max_output_bytes:
+            return ToolResult(
+                invocation_id=invocation.invocation_id,
+                action_id=invocation.action_id,
+                tool_id=invocation.tool_id,
+                success=False,
+                output=None,
+                error=ToolError(
+                    code="tool_output_too_large",
+                    message="tool output exceeded the configured byte limit and was omitted",
+                    retryable=False,
+                ),
+                started_at=adapter_result.started_at,
+                finished_at=adapter_result.finished_at,
+                metadata={
+                    "output_omitted": True,
+                    "output_bytes": output_bytes,
+                    "max_output_bytes": max_output_bytes,
+                },
+            )
+
+        if descriptor.output_schema is not None:
+            try:
+                Draft202012Validator(descriptor.output_schema).validate(adapter_result.output)
+            except (SchemaError, ValidationError, TypeError):
+                return self._error_result(
+                    invocation,
+                    code="tool_output_schema_mismatch",
+                    message="MCP output did not match the registered output schema",
+                )
+
         return ToolResult(
             invocation_id=invocation.invocation_id,
             action_id=invocation.action_id,
@@ -153,6 +221,21 @@ class MCPToolGateway:
         """Return eligible Registry candidates without applying selection policy."""
 
         return self._catalog.list_tools_for_action(
+            capability,
+            operation,
+            include_unhealthy=include_unhealthy,
+        )
+
+    def list_candidate_metadata(
+        self,
+        capability: str | None = None,
+        operation: str | None = None,
+        *,
+        include_unhealthy: bool = False,
+    ) -> list[ToolCandidateMetadata]:
+        """Describe registered candidates without selecting or invoking them."""
+
+        return self._catalog.list_candidate_metadata(
             capability,
             operation,
             include_unhealthy=include_unhealthy,
@@ -186,3 +269,18 @@ async def _invoke_with_limit(
 ) -> MCPCallResult:
     async with semaphore:
         return await adapter.invoke(descriptor, arguments)
+
+
+def _serialized_output_size(output: dict[str, Any] | str | None) -> int:
+    if output is None:
+        return 0
+    if isinstance(output, str):
+        return len(output.encode("utf-8"))
+    serialized = json.dumps(
+        output,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+        default=str,
+    )
+    return len(serialized.encode("utf-8"))

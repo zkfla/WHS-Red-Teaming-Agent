@@ -3,7 +3,7 @@
 The candidate external MCP server for this capability (apktool-mcp-server)
 already covers ``static_analysis`` at the decompiled-code level (manifest,
 smali, resources, in-project search) once bound via
-``REDTEAM_MCP_<SERVER_ID>_TOOL_OPERATIONS_JSON`` -- see ``deploy/mcp/README.md``.
+``REDTEAM_MCP_<SERVER_ID>_TOOL_OPERATIONS_JSON`` — see ``deploy/mcp/README.md``.
 Its write-capable tools (build/modify/clean) are deliberately excluded from
 that binding.
 
@@ -11,7 +11,7 @@ This module is a complementary, dependency-free ``static_analysis``
 implementation at the *APK container* level: it reads the zip structure of
 an operator-registered ``.apk`` file directly (stdlib ``zipfile``), without
 requiring apktool/Java to be installed. It does not decompile smali or parse
-binary AndroidManifest.xml -- that stays the job of an apktool-based server.
+binary AndroidManifest.xml — that stays the job of an apktool-based server.
 Useful standalone (or as a fallback) when no apktool MCP server is
 configured yet, following the same policy-scoped, read-only pattern as
 ``servers/recon.py``/``servers/web_http.py``.
@@ -25,7 +25,6 @@ import json
 import re
 import zipfile
 from pathlib import Path
-from typing import Any
 
 from mcp.server import MCPServer
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -63,6 +62,35 @@ class AnalysisServerPolicy(BaseModel):
         return cls.model_validate(json.loads(Path(path).read_text(encoding="utf-8")))
 
 
+class ApkEntry(BaseModel):
+    name: str
+    size: int
+    compressed_size: int
+
+
+class ApkFileListingOutput(BaseModel):
+    apk_ref: str
+    entries: list[ApkEntry]
+    limit: int
+    may_be_truncated: bool
+
+
+class ApkEntryDigestOutput(BaseModel):
+    apk_ref: str
+    entry_name: str
+    size: int
+    sha256: str
+
+
+class ApkStringSearchOutput(BaseModel):
+    apk_ref: str
+    entry_name: str
+    pattern: str
+    match_count: int
+    match_offsets: list[int]
+    may_be_truncated: bool
+
+
 def _resolve(policy: AnalysisServerPolicy, apk_ref: str) -> Path:
     profile = policy.apks.get(apk_ref)
     if profile is None:
@@ -74,7 +102,7 @@ def create_server(policy: AnalysisServerPolicy) -> MCPServer:
     server = MCPServer("analysis-apk-inventory", log_level="WARNING")
 
     @server.tool()
-    def apk_file_listing(apk_ref: str) -> dict[str, Any]:
+    def apk_file_listing(apk_ref: str) -> ApkFileListingOutput:
         """List zip entries inside a registered APK container; no decompilation."""
         path = _resolve(policy, apk_ref)
         try:
@@ -90,15 +118,15 @@ def create_server(policy: AnalysisServerPolicy) -> MCPServer:
                 ]
         except zipfile.BadZipFile as exc:
             raise ToolInputError("registered file is not a valid zip/APK container") from exc
-        return {
-            "apk_ref": apk_ref,
-            "entries": entries,
-            "limit": policy.max_listing_entries,
-            "may_be_truncated": len(entries) == policy.max_listing_entries,
-        }
+        return ApkFileListingOutput(
+            apk_ref=apk_ref,
+            entries=[ApkEntry.model_validate(entry) for entry in entries],
+            limit=policy.max_listing_entries,
+            may_be_truncated=len(entries) == policy.max_listing_entries,
+        )
 
     @server.tool()
-    def apk_entry_digest(apk_ref: str, entry_name: str) -> dict[str, Any]:
+    def apk_entry_digest(apk_ref: str, entry_name: str) -> ApkEntryDigestOutput:
         """SHA-256 of one zip entry's decompressed bytes; content itself is never returned."""
         path = _resolve(policy, apk_ref)
         try:
@@ -108,15 +136,15 @@ def create_server(policy: AnalysisServerPolicy) -> MCPServer:
             raise ToolInputError("registered file is not a valid zip/APK container") from exc
         except KeyError as exc:
             raise ToolInputError("unknown entry_name") from exc
-        return {
-            "apk_ref": apk_ref,
-            "entry_name": entry_name,
-            "size": len(data),
-            "sha256": hashlib.sha256(data).hexdigest(),
-        }
+        return ApkEntryDigestOutput(
+            apk_ref=apk_ref,
+            entry_name=entry_name,
+            size=len(data),
+            sha256=hashlib.sha256(data).hexdigest(),
+        )
 
     @server.tool()
-    def apk_string_search(apk_ref: str, entry_name: str, pattern: str) -> dict[str, Any]:
+    def apk_string_search(apk_ref: str, entry_name: str, pattern: str) -> ApkStringSearchOutput:
         """Fixed-string (non-regex) search within one bounded, text-decoded zip entry."""
         if not 2 <= len(pattern) <= 200:
             raise ToolInputError("pattern must be 2-200 characters")
@@ -134,14 +162,14 @@ def create_server(policy: AnalysisServerPolicy) -> MCPServer:
             raise ToolInputError("registered file is not a valid zip/APK container") from exc
         text = data.decode("utf-8", errors="ignore")
         offsets = [match.start() for match in re.finditer(re.escape(pattern), text)][:50]
-        return {
-            "apk_ref": apk_ref,
-            "entry_name": entry_name,
-            "pattern": pattern,
-            "match_count": len(offsets),
-            "match_offsets": offsets,
-            "may_be_truncated": len(offsets) == 50,
-        }
+        return ApkStringSearchOutput(
+            apk_ref=apk_ref,
+            entry_name=entry_name,
+            pattern=pattern,
+            match_count=len(offsets),
+            match_offsets=offsets,
+            may_be_truncated=len(offsets) == 50,
+        )
 
     return server
 

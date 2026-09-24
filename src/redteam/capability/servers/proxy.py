@@ -139,6 +139,9 @@ def _parse_har_entry(entry: Any, index: int, policy: ServerPolicy) -> ProxyFlow 
         request_json = _request_json(request_item.get("postData"))
     except _UnsupportedRequestBody:
         return None
+    # ZAP exports synthetic site-tree nodes without a received HTTP response.
+    if isinstance(response_item, dict) and response_item.get("status") == 0:
+        return None
     response = _captured_response(response_item, policy.max_response_bytes)
     digest_input = f"{index}\0{target_ref}\0{method}\0{path}".encode()
     flow_ref = f"flow_{hashlib.sha256(digest_input).hexdigest()[:16]}"
@@ -162,6 +165,8 @@ def _request_json(post_data: Any) -> dict[str, Any] | None:
     text = post_data.get("text")
     if not isinstance(text, str):
         raise ToolInputError("invalid captured request body")
+    if not mime_type and text == "" and post_data.get("params", []) == []:
+        return None
     if mime_type != "application/json":
         raise _UnsupportedRequestBody
     if len(text.encode()) > _MAX_REQUEST_BODY_BYTES:

@@ -95,6 +95,8 @@ def create_server(policy: ServerPolicy) -> MCPServer:
         complete = finished is not None and finished.attrib.get("exit") == "success"
         return {
             "target_ref": target_ref,
+            "host": target.host,
+            "address": target.addresses[0],
             "ports": ports,
             "engine_exit_success": complete,
             "verdict": "observation_only",

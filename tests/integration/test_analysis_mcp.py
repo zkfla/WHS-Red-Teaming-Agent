@@ -1,10 +1,15 @@
-"""Real-protocol integration for the external analysis MCP candidate (apktool).
+"""Real MCP-wire tests for the analysis fallback server.
 
-Gated on a local checkout of ``zinja-coder/apktool-mcp-server`` (pointed to by
-``REDTEAM_TEST_APKTOOL_MCP_DIR``) plus ``uv`` and the ``apktool`` binary. The
-decode test additionally needs a real APK at ``REDTEAM_TEST_APK`` (e.g. the
-InsecureBankv2 learning app). These tests drive the real Core Port -> Gateway ->
-adapter -> transport -> external MCP path, decode an APK, and read its manifest.
+The zip-level tools here have no external binary dependency, so the full
+success path runs unconditionally over a real spawned MCP stdio subprocess
+and through the full settings -> transport -> adapter -> gateway bootstrap.
+
+A separate, skipped group exercises the real candidate external MCP server
+(apktool-mcp-server) once the operator has it checked out and ``uv``
+installed — see ``REDTEAM_TEST_APKTOOL_MCP_DIR`` below. That candidate is
+not vendored into this repository and is not finalized (see
+``deploy/mcp/README.md`` "Analysis capability"), so it is skipped by
+default rather than assumed present.
 """
 
 from __future__ import annotations
@@ -12,6 +17,8 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import sys
+import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -19,105 +26,136 @@ import pytest
 
 from redteam.capability.adapters.mcp.transport import StdioMCPTransport
 from redteam.capability.bootstrap import build_mcp_tool_gateway
-from redteam.capability.mobile_analysis_manifest import (
-    MOBILE_ANALYSIS_MANIFEST,
-    SERVER_ANALYSIS_APKTOOL,
-)
 from redteam.core.contracts.tool import ExecutionContext, ToolInvocation
 from redteam.core.ids import ActionId, EngagementId, InvocationId, RunId, ToolId
 
-_UV = shutil.which("uv")
-_APKTOOL = shutil.which("apktool")
-_SERVER_DIR = os.environ.get("REDTEAM_TEST_APKTOOL_MCP_DIR")
+_MODULE_ARGS = ["-m", "redteam.capability.servers.analysis"]
+_STATIC_ANALYSIS_TOOLS = {"apk_file_listing", "apk_entry_digest", "apk_string_search"}
 
 
-def _server_args() -> list[str]:
-    return ["run", "--directory", _SERVER_DIR or "", "apktool_mcp_server.py"]
+@pytest.fixture
+def apk_path(tmp_path: Path) -> Path:
+    path = tmp_path / "sample.apk"
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("AndroidManifest.xml", b"binary-manifest-placeholder")
+        archive.writestr("res/values/strings.xml", b"<resources>lab-only-marker</resources>")
+    return path
 
 
-_READY = bool(_UV and _APKTOOL and _SERVER_DIR and Path(_SERVER_DIR or "").is_dir())
-pytestmark = pytest.mark.skipif(
-    not _READY,
-    reason="need uv, apktool, and REDTEAM_TEST_APKTOOL_MCP_DIR for apktool-mcp",
-)
+def _write_policy(tmp_path: Path, apk_path: Path) -> Path:
+    policy_path = tmp_path / "analysis-policy.json"
+    policy_path.write_text(
+        json.dumps({"apks": {"sample": {"path": str(apk_path)}}}), encoding="utf-8"
+    )
+    return policy_path
 
 
-def _env(monkeypatch: pytest.MonkeyPatch, workspace: str) -> None:
-    prefix = "REDTEAM_MCP_ANALYSIS_APKTOOL"
-    allow = list(MOBILE_ANALYSIS_MANIFEST.allowed_tools_for_server(SERVER_ANALYSIS_APKTOOL))
-    bindings = MOBILE_ANALYSIS_MANIFEST.tool_operations_for_server(SERVER_ANALYSIS_APKTOOL)
+async def test_real_stdio_process_discovers_all_static_analysis_tools(
+    tmp_path: Path, apk_path: Path
+) -> None:
+    policy_path = _write_policy(tmp_path, apk_path)
+    transport = StdioMCPTransport(
+        sys.executable, args=[*_MODULE_ARGS, "--policy", str(policy_path)]
+    )
+    tools = await transport.list_tools()
+    assert {tool.name for tool in tools} == _STATIC_ANALYSIS_TOOLS
+
+
+async def test_real_stdio_process_lists_and_searches_registered_apk(
+    tmp_path: Path, apk_path: Path
+) -> None:
+    policy_path = _write_policy(tmp_path, apk_path)
+    transport = StdioMCPTransport(
+        sys.executable, args=[*_MODULE_ARGS, "--policy", str(policy_path)]
+    )
+
+    listing = await transport.call_tool("apk_file_listing", {"apk_ref": "sample"})
+    assert listing.is_error is False
+    assert isinstance(listing.output, dict)
+    names = {entry["name"] for entry in listing.output["entries"]}
+    assert names == {"AndroidManifest.xml", "res/values/strings.xml"}
+
+    search = await transport.call_tool(
+        "apk_string_search",
+        {
+            "apk_ref": "sample",
+            "entry_name": "res/values/strings.xml",
+            "pattern": "lab-only-marker",
+        },
+    )
+    assert search.is_error is False
+    assert isinstance(search.output, dict)
+    assert search.output["match_count"] == 1
+
+
+async def test_static_analysis_tools_bound_to_canonical_operation_through_full_bootstrap(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, apk_path: Path
+) -> None:
+    """Exercises the settings -> transport -> adapter -> gateway path the
+    real ``apktool`` server ID would use, with our fallback server standing
+    in as the wire endpoint (see deploy/mcp/README.md)."""
+    policy_path = _write_policy(tmp_path, apk_path)
+    server_id = "analysis-fallback-test"
+    prefix = f"REDTEAM_MCP_{server_id.upper().replace('-', '_')}"
     monkeypatch.setenv(f"{prefix}_KIND", "analysis")
     monkeypatch.setenv(f"{prefix}_TRANSPORT", "stdio")
-    monkeypatch.setenv(f"{prefix}_COMMAND", _UV or "uv")
-    monkeypatch.setenv(f"{prefix}_ARGS_JSON", json.dumps(_server_args()))
-    monkeypatch.setenv(f"{prefix}_ALLOWED_TOOLS_JSON", json.dumps(allow))
-    monkeypatch.setenv(f"{prefix}_TOOL_OPERATIONS_JSON", json.dumps(bindings))
-    monkeypatch.setenv("APKTOOL_WORKSPACE", workspace)
-    monkeypatch.setenv(f"{prefix}_PASSTHROUGH_ENV", "APKTOOL_WORKSPACE")
+    monkeypatch.setenv(f"{prefix}_COMMAND", sys.executable)
+    monkeypatch.setenv(
+        f"{prefix}_ARGS_JSON", json.dumps([*_MODULE_ARGS, "--policy", str(policy_path)])
+    )
+    monkeypatch.setenv(
+        f"{prefix}_TOOL_OPERATIONS_JSON",
+        json.dumps(
+            {
+                "apk_file_listing": ["static_analysis"],
+                "apk_entry_digest": ["static_analysis"],
+                "apk_string_search": ["static_analysis"],
+            }
+        ),
+    )
+
+    gateway = await build_mcp_tool_gateway([server_id])
+    run_id = RunId("run_analysis_fallback")
+    result = await gateway.invoke(
+        ToolInvocation(
+            invocation_id=InvocationId("inv_analysis_fallback"),
+            action_id=ActionId("action_analysis_fallback"),
+            run_id=run_id,
+            tool_id=ToolId("analysis.apk_file_listing"),
+            operation="static_analysis",
+            arguments={"apk_ref": "sample"},
+            execution_context=ExecutionContext(
+                engagement_id=EngagementId("eng_analysis_fallback"),
+                run_id=run_id,
+            ),
+            created_at=datetime.now(timezone.utc),
+        )
+    )
+    assert result.success is True
+    assert isinstance(result.output, dict)
+    assert {entry["name"] for entry in result.output["entries"]} == {
+        "AndroidManifest.xml",
+        "res/values/strings.xml",
+    }
 
 
-async def test_manifest_matches_live_apktool_discovery() -> None:
-    transport = StdioMCPTransport(_UV or "uv", args=_server_args())
-    async with transport.session():
-        tools = await transport.list_tools()
-    MOBILE_ANALYSIS_MANIFEST.validate_against_discovery(SERVER_ANALYSIS_APKTOOL, tools)
-
-
-async def test_bootstrap_registers_nine_static_analysis_candidates(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    _env(monkeypatch, str(tmp_path / "ws"))
-    gateway = await build_mcp_tool_gateway([SERVER_ANALYSIS_APKTOOL])
-    candidates = gateway.list_tools_for_action("analysis", "static_analysis")
-    assert len(candidates) == 9
-    assert "analysis.decode_apk" in {str(t.tool_id) for t in candidates}
+_APKTOOL_MCP_DIR = os.environ.get("REDTEAM_TEST_APKTOOL_MCP_DIR")
 
 
 @pytest.mark.skipif(
-    "REDTEAM_TEST_APK" not in os.environ,
-    reason="set REDTEAM_TEST_APK=<path to a learning APK> to run the decode test",
+    shutil.which("uv") is None or not _APKTOOL_MCP_DIR,
+    reason=(
+        "requires the uv package manager on PATH and "
+        "REDTEAM_TEST_APKTOOL_MCP_DIR pointing at a local apktool-mcp-server "
+        "checkout with apktool installed (candidate, not vendored here — "
+        "see deploy/mcp/README.md 'Analysis capability')"
+    ),
 )
-async def test_decode_apk_and_read_manifest_through_gateway(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    apk_path = os.environ["REDTEAM_TEST_APK"]
-    workspace = tmp_path / "ws"
-    _env(monkeypatch, str(workspace))
-    gateway = await build_mcp_tool_gateway([SERVER_ANALYSIS_APKTOOL])
-    run_id = RunId("run_apktool")
-    ctx = ExecutionContext(engagement_id=EngagementId("eng_apktool"), run_id=run_id)
-
-    decode = await gateway.invoke(
-        ToolInvocation(
-            invocation_id=InvocationId("inv_decode"),
-            action_id=ActionId("act_decode"),
-            run_id=run_id,
-            tool_id=ToolId("analysis.decode_apk"),
-            operation="static_analysis",
-            arguments={"apk_path": apk_path},
-            timeout_seconds=180.0,
-            execution_context=ctx,
-            created_at=datetime.now(timezone.utc),
-        )
+async def test_real_apktool_mcp_server_discovery() -> None:
+    transport = StdioMCPTransport(
+        "uv", args=["--directory", str(_APKTOOL_MCP_DIR), "run", "apktool_mcp_server.py"]
     )
-    assert decode.success is True, decode.error
-    assert isinstance(decode.output, dict)
-    project_dir = decode.output.get("output_dir")
-    assert project_dir, decode.output
-
-    manifest = await gateway.invoke(
-        ToolInvocation(
-            invocation_id=InvocationId("inv_manifest"),
-            action_id=ActionId("act_manifest"),
-            run_id=run_id,
-            tool_id=ToolId("analysis.get_manifest"),
-            operation="static_analysis",
-            arguments={"project_dir": project_dir},
-            timeout_seconds=60.0,
-            execution_context=ctx,
-            created_at=datetime.now(timezone.utc),
-        )
-    )
-    assert manifest.success is True, manifest.error
-    assert isinstance(manifest.output, dict)
-    assert "package=" in manifest.output.get("manifest", "")
+    tools = await transport.list_tools()
+    names = {tool.name for tool in tools}
+    assert "decode_apk" in names
+    assert "get_manifest" in names

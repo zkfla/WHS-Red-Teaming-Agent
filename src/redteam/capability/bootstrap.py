@@ -10,6 +10,7 @@ from redteam.capability.adapters.mcp.base import MCPAdapter
 from redteam.capability.adapters.mcp.example import ExampleMCPAdapter
 from redteam.capability.adapters.mcp.mobile import MobileMCPAdapter
 from redteam.capability.adapters.mcp.recon import ReconMCPAdapter
+from redteam.capability.adapters.mcp.streamable_http import MCPServerAdapter
 from redteam.capability.adapters.mcp.transport import (
     AllowlistedMCPTransport,
     MCPTransport,
@@ -18,6 +19,11 @@ from redteam.capability.adapters.mcp.transport import (
 )
 from redteam.capability.adapters.mcp.web_api import WebAPIMCPAdapter
 from redteam.capability.gateway import MCPToolGateway
+from redteam.capability.manifest import validate_tool_manifest
+from redteam.capability.mobile_analysis_manifest import (
+    MOBILE_ANALYSIS_TOOLS,
+    validate_configured_discovery,
+)
 from redteam.capability.registry import MCPToolRegistry
 from redteam.capability.settings import (
     MCPConfigurationError,
@@ -55,8 +61,14 @@ async def _build_gateway(
     if not server_ids:
         example = ExampleMCPAdapter()
         registry = MCPToolRegistry()
-        registry.replace_server_tools(example.server_id, await example.discover_tools())
-        return MCPToolGateway(registry, {example.server_id: example})
+        example_descriptors = await example.discover_tools()
+        for descriptor in example_descriptors:
+            validate_tool_manifest(descriptor)
+        registry.replace_server_tools(example.server_id, example_descriptors)
+        return MCPToolGateway(
+            registry, {example.server_id: example},
+            {str(tool.tool_id): ("service_discovery",) for tool in registry.all()},
+        )
 
     if len(server_ids) != len(set(server_ids)):
         raise MCPConfigurationError("CapabilityConfig.mcp_servers contains duplicates")
@@ -65,6 +77,9 @@ async def _build_gateway(
     adapters: dict[str, MCPAdapter] = {}
     operation_bindings: dict[str, tuple[str, ...]] = {}
     server_concurrency: dict[str, int] = {}
+    server_output_limits: dict[str, int] = {}
+    output_schemas: dict[str, dict | None] = {}
+    target_types: dict[str, str | None] = {}
     for server_id in server_ids:
         settings = MCPServerSettings.from_environment(server_id)
         transport = _create_transport(settings)
@@ -81,23 +96,82 @@ async def _build_gateway(
                 raise MCPConfigurationError(
                     f"MCP server {server_id!r} operation bindings do not match discovered tools"
                 )
-        registry.replace_server_tools(server_id, descriptors)
+        server_bindings: dict[str, tuple[str, ...]] = {}
+        selected_specs = {
+            spec.tool_id: spec for spec in MOBILE_ANALYSIS_TOOLS.get(server_id, ())
+        }
         for descriptor in descriptors:
             operations = (
                 settings.tool_operations[descriptor.tool_name]
                 if settings.tool_operations is not None
                 else (descriptor.tool_name,)
             )
+            # The operation binding is part of the Registry snapshot exposed
+            # to Agent/Orchestration; it must not remain only in a private
+            # Gateway map.
+            descriptor.operations = list(operations)
+            selected_spec = selected_specs.get(str(descriptor.tool_id))
+            descriptor.target_types = (
+                [selected_spec.target_type]
+                if selected_spec is not None
+                else _default_target_types(settings.kind)
+            )
+            # Validate after operator bindings are copied into the descriptor:
+            # this is the exact manifest exposed to Agent/Orchestration.
+            validate_tool_manifest(descriptor)
             operation_bindings[str(descriptor.tool_id)] = operations
+            server_bindings[str(descriptor.tool_id)] = operations
+            if isinstance(adapter, MCPServerAdapter):
+                schema = adapter.output_schema_for_tool(descriptor.tool_id)
+                if schema is not None:
+                    output_schemas[str(descriptor.tool_id)] = schema
+        if settings.tool_operations is not None and server_id in MOBILE_ANALYSIS_TOOLS:
+            server_schemas = {
+                descriptor.tool_name: output_schemas.get(str(descriptor.tool_id))
+                for descriptor in descriptors
+            }
+            try:
+                validate_configured_discovery(
+                    server_id, descriptors, server_bindings, server_schemas
+                )
+            except ValueError as exc:
+                raise MCPConfigurationError(
+                    f"MCP server {server_id!r} discovery differs from configured manifest: {exc}"
+                ) from exc
+        for spec in MOBILE_ANALYSIS_TOOLS.get(server_id, ()):
+            if spec.tool_id in server_bindings:
+                target_types[spec.tool_id] = spec.target_type
+        registry.replace_server_tools(server_id, descriptors)
         adapters[server_id] = adapter
         server_concurrency[server_id] = settings.max_concurrency
+        server_output_limits[server_id] = settings.max_output_bytes
 
     return MCPToolGateway(
         registry,
         adapters,
         operation_bindings,
         server_concurrency=server_concurrency,
+        server_output_limits=server_output_limits,
+        output_schemas=output_schemas,
+        target_types=target_types,
     )
+
+
+def _default_target_types(kind: MCPServerKind) -> list[str]:
+    """Conservative target hints for discovery metadata.
+
+    Server-specific policy may narrow these later; these defaults never add
+    an execution target and are used only to filter Agent candidates.
+    """
+    if kind == MCPServerKind.MOBILE:
+        return ["device", "asset"]
+    if kind == MCPServerKind.ANALYSIS:
+        return ["asset", "endpoint", "observation"]
+    if kind == MCPServerKind.WEB_API:
+        return ["host", "service", "endpoint"]
+    if kind == MCPServerKind.RECON:
+        return ["host", "service", "endpoint"]
+    return []
 
 
 def _create_adapter(settings: MCPServerSettings, transport: MCPTransport) -> MCPAdapter:
