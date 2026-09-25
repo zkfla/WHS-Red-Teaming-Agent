@@ -89,6 +89,28 @@ MOBILE_ANALYSIS_TOOLS: dict[str, tuple[MobileAnalysisToolSpec, ...]] = {
               ("project_dir", "search_pattern"),
               ("case_sensitive", "count", "file_extensions", "max_results", "offset")),
     ),
+    # jadx-mcp-server (zinja-coder): Java-decompilation static analysis, same
+    # canonical op as apktool for candidate diversification. Read-only queries
+    # only -- rename_*/add_comment/clear_cache (state-changing) are never bound.
+    # Unlike apktool/mobile-next, jadx DOES advertise per-tool outputSchema; the
+    # gateway preserves and enforces those at invoke time, so they are not
+    # re-pinned here (the manifest pins the input-argument contract).
+    "jadx": (
+        _spec("analysis", "get_all_classes", "static_analysis", (),
+              ("count", "offset")),
+        _spec("analysis", "get_class_source", "static_analysis", ("class_name",),
+              ("with_line_numbers",)),
+        _spec("analysis", "get_methods_of_class", "static_analysis", ("class_name",)),
+        _spec("analysis", "get_fields_of_class", "static_analysis", ("class_name",)),
+        _spec("analysis", "search_method_by_name", "static_analysis", ("method_name",)),
+        _spec("analysis", "search_classes_by_keyword", "static_analysis", ("search_term",),
+              ("count", "offset", "package", "search_in")),
+        _spec("analysis", "get_android_manifest", "static_analysis", ()),
+        _spec("analysis", "get_strings", "static_analysis", (),
+              ("count", "offset")),
+        _spec("analysis", "get_xrefs_to_method", "static_analysis",
+              ("class_name", "method_name"), ("count", "offset")),
+    ),
     "analysis-local": (
         _spec("analysis", "apk_file_listing", "static_analysis", ("apk_ref",),
               output_schema=ApkFileListingOutput.model_json_schema()),

@@ -175,6 +175,34 @@ apktool_mcp_server.py`; no HTTP mode documented). Containerized via
 (`docker compose run --rm -i apktool-mcp`), not started with `docker
 compose up`.
 
+### Additional candidate: jadx-mcp-server (server ID example: `jadx`)
+
+**Not finalized.** `jadx-mcp-server` (https://github.com/zinja-coder/jadx-mcp-server,
+Apache-2.0) adds **Java-decompilation-level** static analysis, complementing
+apktool's smali/resource view. Same `static_analysis` canonical operation, so
+Agent selection sees more candidates for one intent — no new operation, no
+`gateway.py`/`transport.py` change.
+
+| canonical operation | jadx-mcp-server remote tool | notes |
+|---|---|---|
+| `static_analysis` | `get_all_classes`, `get_class_source`, `get_methods_of_class`, `get_fields_of_class`, `search_method_by_name`, `search_classes_by_keyword`, `get_android_manifest`, `get_strings`, `get_xrefs_to_method` | read-only decompilation queries only |
+
+`rename_variable`, `rename_class`, `rename_field`, `rename_method`,
+`rename_package`, `add_comment`, and `clear_cache` are **deliberately
+excluded** from `REDTEAM_MCP_JADX_ALLOWED_TOOLS_JSON` (state-changing;
+per instruction.md section 21).
+
+Topology differs from apktool: `jadx_mcp_server.py` is an MCP-stdio bridge
+(`uv run jadx_mcp_server.py`) that talks over HTTP to the **jadx-ai-mcp
+plugin** running inside a live **jadx-gui** (default `127.0.0.1:8650`) with an
+APK loaded. Install the plugin with
+`jadx plugins --install "github:zinja-coder:jadx-ai-mcp"`, then launch
+`jadx-gui <app.apk>`. Requires Java 11+, Python 3.10+, and `uv`. Because it
+needs a running GUI it is **not containerized** here; tool *discovery*
+(`tools/list`) works without the GUI, but *invocation* needs jadx-gui up.
+Unlike apktool/mobile-next, jadx advertises per-tool `outputSchema`; the
+gateway preserves and enforces those at invoke time.
+
 ### Mobile/analysis discovery conformance
 
 `redteam.capability.mobile_analysis_manifest` records the selected candidate
