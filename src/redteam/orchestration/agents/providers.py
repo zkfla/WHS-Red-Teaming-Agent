@@ -10,7 +10,10 @@ from typing import TYPE_CHECKING, Protocol
 
 from redteam.attack_graph.identity import node_id_for_target
 from redteam.attack_graph.observation import GraphObservation
+from redteam.attack_graph.predicates import attrs_of, facts_of
 from redteam.attack_graph.view import AttackGraphView
+from redteam.core.contracts.graph import GraphNode
+from redteam.core.enums import GraphNodeType
 from redteam.core.ids import GraphNodeId
 from redteam.orchestration.agents.base import AgentSpec, available_steps
 
@@ -46,6 +49,26 @@ class DraftDrop:
     target_node_id: str
     reason: str
     field: str = ""
+
+
+def endpoint_path_explicitly_disallowed(node: GraphNode) -> bool:
+    """Honor a negative path decision already observed from an MCP inventory.
+
+    Discovery is not authorization. An absent flag stays unknown; a later
+    explicit positive observation can supersede an earlier negative one.
+    The MCP server remains the final path/method/network enforcement point.
+    """
+
+    if node.type is not GraphNodeType.ENDPOINT:
+        return False
+    attrs, facts = attrs_of(node.properties), facts_of(node.properties)
+    return (
+        attrs.get("path_allowlisted") is False
+        and facts.get("path_allowlisted") is not True
+    ) or (
+        facts.get("path_allowlisted") is False
+        and attrs.get("path_allowlisted") is not True
+    )
 
 @dataclass(frozen=True)
 class GraphCandidateContext:

@@ -54,6 +54,7 @@ def test_manifest_preserves_agent_visible_metadata() -> None:
     assert descriptor.optional_arguments == ("method",)
     assert descriptor.operations == ["http_request"]
     assert descriptor.target_types == ["endpoint", "service", "host"]
+    assert descriptor.output_schema is not None
     assert descriptor.output_schema["required"] == ["status"]
 
 

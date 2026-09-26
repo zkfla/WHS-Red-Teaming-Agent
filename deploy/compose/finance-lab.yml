@@ -124,6 +124,29 @@ services:
       recon-active:
         condition: service_healthy
 
+  agent-smoke:
+    <<: *worker
+    profiles: [test]
+    working_dir: /tmp
+    entrypoint: [python, /app/finance_agent_smoke.py]
+    env_file: ../mcp/finance/framework.env.example
+    volumes:
+      - ../../examples/finance_agent_smoke.py:/app/finance_agent_smoke.py:ro
+      - ../mcp/finance/app.yaml:/app/finance-app.yaml:ro
+    healthcheck:
+      disable: true
+    depends_on:
+      web-http:
+        condition: service_healthy
+      web-proxy:
+        condition: service_healthy
+      web-browser:
+        condition: service_healthy
+      recon-passive:
+        condition: service_healthy
+      recon-active:
+        condition: service_healthy
+
 networks:
   lab:
     internal: true

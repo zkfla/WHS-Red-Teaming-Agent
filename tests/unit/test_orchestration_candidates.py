@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 from pydantic import ValidationError
 
@@ -551,10 +553,11 @@ async def test_compiler_reports_an_unhealthy_only_tool_set_as_such() -> None:
 async def test_incompatible_first_tool_does_not_hide_a_valid_alternative() -> None:
     service = await graph()
     registry = MCPToolRegistry()
-    for name, schema in [
+    tool_schemas: list[tuple[str, dict[str, Any]]] = [
         ('a_requires_url', {'type': 'object', 'required': ['url']}),
         ('z_compatible', {'type': 'object'}),
-    ]:
+    ]
+    for name, schema in tool_schemas:
         registry.register(ToolDescriptor(
             tool_id=ToolId(f'recon.{name}'), server_id='test', tool_name=name,
             capability_tags=['recon'], input_schema=schema,

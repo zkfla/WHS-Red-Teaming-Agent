@@ -8,6 +8,8 @@ hypothesis must not be able to turn an observation into a vulnerability.
 
 from __future__ import annotations
 
+from typing import Any
+
 from redteam.attack_graph.service import (
     HYPOTHESIS_CONFIRMED,
     HYPOTHESIS_INCONCLUSIVE,
@@ -18,7 +20,7 @@ from redteam.orchestration.findings import FindingPromoter, PromotionRequest
 
 
 def request(**overrides) -> PromotionRequest:
-    values = {
+    values: dict[str, Any] = {
         "verdict": Verdict.VIOLATION,
         "reason": "anonymous 401 baseline reached with an operator-declared deny session",
         "evidence_ids": ["ev_baseline", "ev_session"],
@@ -101,6 +103,7 @@ def test_the_same_claim_is_not_promoted_twice() -> None:
     promoter = FindingPromoter()
     first = promoter.promote(request())
     assert first.promoted
+    assert first.finding is not None
     claim_key = first.finding.metadata["claim_key"]
 
     second = promoter.promote(request(evidence_ids=["ev_other"]), existing_claims={claim_key})

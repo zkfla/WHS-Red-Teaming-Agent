@@ -33,6 +33,7 @@ from redteam.orchestration.agents.providers import (
     DraftDrop,
     GraphCandidateContext,
     PlaybookCandidateProvider,
+    endpoint_path_explicitly_disallowed,
 )
 from redteam.orchestration.authentication import AuthenticationCheck, AuthSession, request_key
 from redteam.orchestration.candidates.models import CandidateDraft, PrioritySignals
@@ -113,9 +114,14 @@ class WebCandidateProvider:
             candidates = await playbook.propose(spec, view, observation, step=step)
         diagnostics: list[CandidateDiagnostic] = []
         nodes = await view.list_nodes()
+        disallowed_ids = {
+            str(node.id) for node in nodes if endpoint_path_explicitly_disallowed(node)
+        }
         validation_hypotheses = _access_validation_hypotheses(nodes)
         for node in nodes:
             if node.type is not GraphNodeType.ENDPOINT:
+                continue
+            if endpoint_path_explicitly_disallowed(node):
                 continue
             facts = facts_of(node.properties)
             host = facts.get("host")
@@ -205,9 +211,18 @@ class WebCandidateProvider:
                     latest=latest,
                 )
             )
-        return CandidateBatch(
-            candidates=candidates, diagnostics=diagnostics, drops=drops
-        )
+        permitted: list[CandidateDraft] = []
+        for candidate in candidates:
+            if any(str(node_id) in disallowed_ids for node_id in candidate.target_node_ids):
+                drops.append(DraftDrop(
+                    step_id=candidate.plan_step.step_id,
+                    target_node_id=str(candidate.target_node_ids[0]),
+                    reason="path_not_allowlisted",
+                    field="path",
+                ))
+            else:
+                permitted.append(candidate)
+        return CandidateBatch(candidates=permitted, diagnostics=diagnostics, drops=drops)
 
     def _redirect_followups(
         self,
