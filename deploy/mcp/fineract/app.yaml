@@ -1,0 +1,13 @@
+# --config for:
+#   redteam run examples/fineract-engagement.yaml --config deploy/mcp/fineract/app.yaml
+#
+# Only llm/capability/logging are read from here; scope/ROE/metadata come
+# from the positional engagement.yaml (the CLI ignores any engagement: here).
+# The MCP server IDs below are resolved from REDTEAM_MCP_FINERACT_* env vars
+# — source deploy/mcp/fineract/framework.env.example first.
+capability:
+  mcp_servers: [fineract-recon, fineract-web]
+llm:
+  provider: fake
+logging:
+  level: INFO

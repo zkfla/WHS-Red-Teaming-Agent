@@ -1,0 +1,70 @@
+# Self-hosted Apache Fineract target lab (Control-team test harness).
+#
+# STEP 1 of the customer self-service stack: PostgreSQL + Fineract Core.
+# The self-service API (/fineract-provider/api/v1/self/...) is part of
+# Core, so this alone is already a valid CUSTOMER-facing attack surface
+# (auth, IDOR/BOLA on /self/ account/loan/transaction endpoints).
+# STEP 2 (AngularJS self-service web frontend) is layered on later.
+#
+# Authorized target: an instance you run yourself — no third-party
+# authorization needed. Real Fineract bugs -> responsible disclosure to
+# Apache (security@apache.org) before publishing.
+#
+# Reproducibility ("커밋 단위 고정"): pin FINERACT_TAG to a released
+# version, e.g. `FINERACT_TAG=1.11.0 docker compose -f deploy/compose/fineract-lab.yml up -d`.
+# Authoritative wiring reference: apache/fineract official docker-compose.
+# Env values below mirror that compose (verified from the develop branch).
+#
+# NOTE: draft to verify on first `up`. If Fineract fails to connect to
+# the DB, the fallback is the official compose from a pinned checkout:
+#   git clone https://github.com/apache/fineract.git
+#   cd fineract && git checkout <tag> && docker compose up -d
+
+services:
+  db:
+    image: postgres:18.3
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: fineractlab
+    volumes:
+      # Creates fineract_tenants + fineract_default on first start.
+      - ./fineract-initdb:/docker-entrypoint-initdb.d:ro
+      # postgres:18+ stores data one level up; mount /var/lib/postgresql
+      # (not .../data) or the image refuses to start. See docker-library/postgres#1259.
+      - fineract-pgdata:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -q -U postgres"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+
+  fineract:
+    image: apache/fineract:${FINERACT_TAG:-latest}
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      # Plain HTTP so the web/recon MCP servers (which verify TLS and have no
+      # insecure option) can reach it. Host 18080 avoids a conflict with a
+      # host nginx already on 8080; container still serves on 8080.
+      - "18080:8080"
+    environment:
+      FINERACT_HIKARI_DRIVER_SOURCE_CLASS_NAME: org.postgresql.Driver
+      FINERACT_HIKARI_JDBC_URL: jdbc:postgresql://db:5432/fineract_tenants
+      FINERACT_HIKARI_USERNAME: postgres
+      FINERACT_HIKARI_PASSWORD: fineractlab
+      FINERACT_DEFAULT_TENANTDB_HOSTNAME: db
+      FINERACT_DEFAULT_TENANTDB_PORT: "5432"
+      FINERACT_DEFAULT_TENANTDB_UID: postgres
+      FINERACT_DEFAULT_TENANTDB_PWD: fineractlab
+      FINERACT_DEFAULT_TENANTDB_NAME: fineract_default
+      FINERACT_DEFAULT_TENANTDB_IDENTIFIER: default
+      FINERACT_DEFAULT_TENANTDB_TIMEZONE: Asia/Seoul
+      FINERACT_DEFAULT_MASTER_PASSWORD: fineract
+      # Serve plain HTTP on 8080 (no self-signed TLS the MCP client can't verify).
+      FINERACT_SERVER_SSL_ENABLED: "false"
+      FINERACT_SERVER_PORT: "8080"
+      SPRING_PROFILES_ACTIVE: test
+
+volumes:
+  fineract-pgdata:

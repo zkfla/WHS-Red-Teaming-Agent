@@ -1,0 +1,72 @@
+# Engagement config for a SELF-HOSTED Apache Fineract instance.
+#
+# Authorized target: a Fineract instance you run yourself (Docker) on
+# localhost — you own it, so testing needs no third-party authorization.
+# If you find a REAL (not self-inserted) vulnerability in Fineract the
+# software, disclose it privately to the Apache Fineract security team
+# (security@apache.org) before publishing — see docs, not a bug bounty.
+#
+# Used today by `redteam run examples/fineract-engagement.yaml` to prove
+# the Control Plane scope/ROE/approval gate. Real tool execution against
+# Fineract additionally needs a web MCP server wired via --config app.yaml
+# (Capability team) — until then the in-process ExampleMCPAdapter runs.
+
+name: "Apache Fineract (self-hosted)"
+description: "Authorized red-team engagement against a locally self-hosted Apache Fineract core-banking instance."
+
+scope:
+  # Fineract runs on HTTPS :8443 locally (fineract-provider). Scope is
+  # host-based; the port is enforced at the Capability/policy.json layer.
+  # Only 127.0.0.1 — it maps to the policy.json target_ref below. "localhost"
+  # is intentionally omitted (it had no target_ref mapping, so probes failed).
+  allowed_hosts:
+    - "127.0.0.1"
+  allowed_domains: []
+  allowed_networks: []
+  # Anything not listed above is out of scope and will be DENIED by the
+  # scope gate — this is the Control Plane guarantee to demo.
+  denied_hosts: []
+
+rules_of_engagement:
+  - name: "fineract-safe"
+    description: "Read-oriented auth/access-control testing; no service disruption."
+    # No availability impact: never run actions that could degrade or
+    # interrupt the service (matches responsible-testing ethics). The
+    # gate DENIES any proposal that declares availability impact.
+    availability_impact_allowed: false
+    # NOTE: leave prohibited_techniques EMPTY. It has no enforcement path
+    # yet and any entry fails the whole run closed (UnsupportedRoePolicyError).
+    prohibited_techniques: []
+    notes: >
+      Target is a self-owned instance. Focus areas: authentication,
+      role/permission (RBAC) access control, IDOR on account/loan/user
+      endpoints. Coordinate disclosure with Apache for any real finding.
+
+execution_budget:
+  max_actions: 50
+  max_tool_calls: 50
+  max_duration_seconds: 900
+
+rate_limit_policy:
+  # Gentle by design — do not hammer even a self-hosted target.
+  max_actions_per_minute: 20
+  max_concurrent_actions: 1
+
+approval_policy:
+  # These canonical <capability>.<operation> keys require human approval
+  # when a real web MCP server is wired. Higher-risk tools also escalate
+  # automatically via the risk-tiered approval (Tool Registry risk_level).
+  require_approval_for:
+    - "web.auth_attempt"
+    - "web.parameter_fuzz"
+  auto_approve: false
+
+metadata:
+  owner: "control-team"
+  target: "apache-fineract"
+  target_kind: "self-hosted-oss"
+  disclosure: "responsible; apache security team before publish"
+  # Maps the in-scope host to the Capability policy.json target profile
+  # (deploy/mcp/fineract/policy.json). Same mechanism as the finance lab.
+  target_refs:
+    "127.0.0.1": "fineract"
