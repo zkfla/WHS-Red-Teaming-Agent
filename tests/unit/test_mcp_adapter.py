@@ -112,6 +112,7 @@ async def test_adapter_preserves_remote_output_schema_in_registry_metadata() -> 
     descriptor = tools[0]
     assert descriptor.required_arguments == ("target_ref",)
     assert descriptor.optional_arguments == ()
+    assert descriptor.output_schema is not None
     assert descriptor.output_schema["required"] == ["status_code"]
 
 

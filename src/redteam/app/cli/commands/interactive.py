@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+from contextlib import AsyncExitStack
 from pathlib import Path
 
 import yaml
@@ -408,9 +409,18 @@ def _write_engagement(path: Path, engagement_config: EngagementConfig) -> None:
 
 
 async def _execute(console: Console, full_config: AppConfig, *, verbose: bool) -> int:
+    async with AsyncExitStack() as stack:
+        return await _execute_scoped(console, full_config, verbose=verbose, mcp_stack=stack)
+
+
+async def _execute_scoped(
+    console: Console, full_config: AppConfig, *, verbose: bool, mcp_stack: AsyncExitStack
+) -> int:
     with console.status("Starting engagement...", spinner="dots"):
         try:
-            engagement, deps = await run_command.build(full_config, max_steps=None)
+            engagement, deps = await run_command.build(
+                full_config, max_steps=None, mcp_stack=mcp_stack
+            )
         except MCPConfigurationError as exc:
             renderer.render_config_error(
                 console,

@@ -54,18 +54,18 @@ def test_example_bindings_match_manifest() -> None:
 @pytest.mark.parametrize("server_id", ["mobile-local", "analysis-local"])
 async def test_local_manifest_matches_mcp_discovery(server_id: str, tmp_path: Path) -> None:
     if server_id == "mobile-local":
-        policy = MobileDiagnosticsPolicy.model_validate(
+        mobile_policy = MobileDiagnosticsPolicy.model_validate(
             {"devices": {"test": {"serial": "emulator-5554"}}}
         )
-        server = create_mobile_server(policy)
+        server = create_mobile_server(mobile_policy)
     else:
         apk = tmp_path / "test.apk"
         with zipfile.ZipFile(apk, "w") as archive:
             archive.writestr("AndroidManifest.xml", b"test")
-        policy = AnalysisServerPolicy.model_validate(
+        analysis_policy = AnalysisServerPolicy.model_validate(
             {"apks": {"test": {"path": str(apk)}}}
         )
-        server = create_analysis_server(policy)
+        server = create_analysis_server(analysis_policy)
 
     async with Client(server) as client:
         discovered = (await client.list_tools()).tools
@@ -130,7 +130,7 @@ def test_configured_candidate_rejects_runtime_schema_drift() -> None:
             "required": ["device_ref", "command"],
         },
     )
-    bindings = {spec.tool_id: (spec.operation,)}
+    bindings: dict[str, tuple[str, ...]] = {spec.tool_id: (spec.operation,)}
     schemas = {descriptor.tool_name: spec.output_schema}
     validate_configured_discovery("mobile-local", [descriptor], bindings, schemas)
     descriptor.input_schema["required"] = ["device_ref"]
