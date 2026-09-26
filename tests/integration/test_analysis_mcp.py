@@ -159,3 +159,40 @@ async def test_real_apktool_mcp_server_discovery() -> None:
     names = {tool.name for tool in tools}
     assert "decode_apk" in names
     assert "get_manifest" in names
+
+
+_JADX_MCP_DIR = os.environ.get("REDTEAM_TEST_JADX_MCP_DIR")
+
+# The 9 read-only decompilation tools bound for analysis.static_analysis.
+_JADX_ALLOWLISTED = {
+    "get_all_classes", "get_class_source", "get_methods_of_class",
+    "get_fields_of_class", "search_method_by_name", "search_classes_by_keyword",
+    "get_android_manifest", "get_strings", "get_xrefs_to_method",
+}
+# State-changing tools that must never be allowlisted for this candidate.
+_JADX_FORBIDDEN = {
+    "rename_variable", "rename_class", "rename_field", "rename_method",
+    "rename_package", "add_comment", "clear_cache",
+}
+
+
+@pytest.mark.skipif(
+    shutil.which("uv") is None or not _JADX_MCP_DIR,
+    reason=(
+        "requires the uv package manager on PATH and REDTEAM_TEST_JADX_MCP_DIR "
+        "pointing at a local jadx-mcp-server checkout (candidate, not vendored "
+        "here — see deploy/mcp/README.md 'Analysis capability'). Tool discovery "
+        "does not need jadx-gui running; invoking the tools does."
+    ),
+)
+async def test_real_jadx_mcp_server_discovery_exposes_readonly_tools() -> None:
+    transport = StdioMCPTransport(
+        "uv", args=["--directory", str(_JADX_MCP_DIR), "run", "jadx_mcp_server.py"]
+    )
+    tools = await transport.list_tools()
+    names = {tool.name for tool in tools}
+    # All nine bound read-only tools are exposed by the server.
+    assert _JADX_ALLOWLISTED <= names
+    # The state-changing tools exist upstream but are deliberately not bound;
+    # this only asserts we know them, so the manifest keeps excluding them.
+    assert _JADX_FORBIDDEN & names

@@ -147,8 +147,8 @@ python -m redteam.capability.servers.mobile --policy /absolute/path/mobile-polic
   is not implemented anywhere in this capability. It is a fundamentally
   different class of tool than a bounded diagnostic command — building it
   in-repo would mean writing new attack tooling rather than wrapping an
-  existing one (instruction.md section 21). Needs a dedicated MCP
-  adapter/Issue once the team picks a real instrumentation MCP server.
+  existing one. It needs a separate scope and security review once the team
+  picks an instrumentation MCP server.
 
 ## Analysis capability (candidate: apktool-mcp-server)
 
@@ -165,8 +165,8 @@ Canonical operation this capability binds today: `static_analysis`.
 `build_apk`, `modify_smali_file`, `modify_resource_file`, and
 `clean_project` are **deliberately excluded** from
 `REDTEAM_MCP_<SERVER_ID>_ALLOWED_TOOLS_JSON` (see `.env.example`) — this PR
-only wires up inspection, per instruction.md section 21 (no build/modify
-capability without a separate, explicit decision).
+only wires up inspection. Build and modify capability requires a separate,
+explicit decision and must remain excluded from the allowlist until then.
 
 apktool-mcp-server only speaks MCP stdio upstream (`uv run
 apktool_mcp_server.py`; no HTTP mode documented). Containerized via
@@ -174,6 +174,36 @@ apktool_mcp_server.py`; no HTTP mode documented). Containerized via
 `tools`); since it's stdio, that image is built once and invoked per-call
 (`docker compose run --rm -i apktool-mcp`), not started with `docker
 compose up`.
+
+### Additional candidate: jadx-mcp-server (server ID example: `jadx`)
+
+**Not finalized.** `jadx-mcp-server` (https://github.com/zinja-coder/jadx-mcp-server,
+Apache-2.0) adds **Java-decompilation-level** static analysis, complementing
+apktool's smali/resource view. Same `static_analysis` canonical operation, so
+the Capability Registry can register additional candidates for that intent.
+This manifest is discovery-conformance metadata; it does not by itself make
+the default Agent propose or execute jadx analysis. No new operation or
+`gateway.py`/`transport.py` change is needed.
+
+| canonical operation | jadx-mcp-server remote tool | notes |
+|---|---|---|
+| `static_analysis` | `get_all_classes`, `get_class_source`, `get_methods_of_class`, `get_fields_of_class`, `search_method_by_name`, `search_classes_by_keyword`, `get_android_manifest`, `get_strings`, `get_xrefs_to_method` | read-only decompilation queries only |
+
+`rename_variable`, `rename_class`, `rename_field`, `rename_method`,
+`rename_package`, `add_comment`, and `clear_cache` are **deliberately
+excluded** from `REDTEAM_MCP_JADX_ALLOWED_TOOLS_JSON`. These state-changing
+tools require a separate explicit decision before being exposed.
+
+Topology differs from apktool: `jadx_mcp_server.py` is an MCP-stdio bridge
+(`uv run jadx_mcp_server.py`) that talks over HTTP to the **jadx-ai-mcp
+plugin** running inside a live **jadx-gui** (default `127.0.0.1:8650`) with an
+APK loaded. Install the plugin with
+`jadx plugins --install "github:zinja-coder:jadx-ai-mcp"`, then launch
+`jadx-gui <app.apk>`. Requires Java 11+, Python 3.10+, and `uv`. Because it
+needs a running GUI it is **not containerized** here; tool *discovery*
+(`tools/list`) works without the GUI, but *invocation* needs jadx-gui up.
+Unlike apktool/mobile-next, jadx advertises per-tool `outputSchema`; the
+gateway preserves and enforces those at invoke time.
 
 ### Mobile/analysis discovery conformance
 
@@ -356,7 +386,7 @@ the same claim — kept separate below.
    its `REDTEAM_MCP_<SERVER_ID>_*` environment variables. Application
    bootstrap discovers and registers its `ToolDescriptor`s.
 4. No other code should need to change — that's the point of the
-   Adapter pattern (instruction.md section 11).
+   Adapter pattern described in `docs/adr/0003-mcp-capability.md`.
 
 Real attack-tool MCP servers are explicitly out of scope for this
-stage (instruction.md section 21).
+stage; adding one requires a separate scope, authorization and security review.
