@@ -147,8 +147,8 @@ python -m redteam.capability.servers.mobile --policy /absolute/path/mobile-polic
   is not implemented anywhere in this capability. It is a fundamentally
   different class of tool than a bounded diagnostic command — building it
   in-repo would mean writing new attack tooling rather than wrapping an
-  existing one (instruction.md section 21). Needs a dedicated MCP
-  adapter/Issue once the team picks a real instrumentation MCP server.
+  existing one. It needs a separate scope and security review once the team
+  picks an instrumentation MCP server.
 
 ## Analysis capability (candidate: apktool-mcp-server)
 
@@ -165,8 +165,8 @@ Canonical operation this capability binds today: `static_analysis`.
 `build_apk`, `modify_smali_file`, `modify_resource_file`, and
 `clean_project` are **deliberately excluded** from
 `REDTEAM_MCP_<SERVER_ID>_ALLOWED_TOOLS_JSON` (see `.env.example`) — this PR
-only wires up inspection, per instruction.md section 21 (no build/modify
-capability without a separate, explicit decision).
+only wires up inspection. Build and modify capability requires a separate,
+explicit decision and must remain excluded from the allowlist until then.
 
 apktool-mcp-server only speaks MCP stdio upstream (`uv run
 apktool_mcp_server.py`; no HTTP mode documented). Containerized via
@@ -180,8 +180,10 @@ compose up`.
 **Not finalized.** `jadx-mcp-server` (https://github.com/zinja-coder/jadx-mcp-server,
 Apache-2.0) adds **Java-decompilation-level** static analysis, complementing
 apktool's smali/resource view. Same `static_analysis` canonical operation, so
-Agent selection sees more candidates for one intent — no new operation, no
-`gateway.py`/`transport.py` change.
+the Capability Registry can register additional candidates for that intent.
+This manifest is discovery-conformance metadata; it does not by itself make
+the default Agent propose or execute jadx analysis. No new operation or
+`gateway.py`/`transport.py` change is needed.
 
 | canonical operation | jadx-mcp-server remote tool | notes |
 |---|---|---|
@@ -189,8 +191,8 @@ Agent selection sees more candidates for one intent — no new operation, no
 
 `rename_variable`, `rename_class`, `rename_field`, `rename_method`,
 `rename_package`, `add_comment`, and `clear_cache` are **deliberately
-excluded** from `REDTEAM_MCP_JADX_ALLOWED_TOOLS_JSON` (state-changing;
-per instruction.md section 21).
+excluded** from `REDTEAM_MCP_JADX_ALLOWED_TOOLS_JSON`. These state-changing
+tools require a separate explicit decision before being exposed.
 
 Topology differs from apktool: `jadx_mcp_server.py` is an MCP-stdio bridge
 (`uv run jadx_mcp_server.py`) that talks over HTTP to the **jadx-ai-mcp
@@ -384,7 +386,7 @@ the same claim — kept separate below.
    its `REDTEAM_MCP_<SERVER_ID>_*` environment variables. Application
    bootstrap discovers and registers its `ToolDescriptor`s.
 4. No other code should need to change — that's the point of the
-   Adapter pattern (instruction.md section 11).
+   Adapter pattern described in `docs/adr/0003-mcp-capability.md`.
 
 Real attack-tool MCP servers are explicitly out of scope for this
-stage (instruction.md section 21).
+stage; adding one requires a separate scope, authorization and security review.
