@@ -34,7 +34,7 @@ from typing import Any
 
 from pydantic import ValidationError
 
-from redteam.app.bootstrap import build_application, run_engagement
+from redteam.app.bootstrap import build_application, run_engagement, settle_engagement
 from redteam.app.cli._shared import (
     EXIT_CONFIG_ERROR,
     EXIT_FAILURE,
@@ -111,6 +111,7 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
     parser.add_argument("--max-steps", type=int, default=None)
     parser.add_argument("--log-level", default=None)
     parser.add_argument("--json", action="store_true")
+    parser.add_argument("--objective", default=None, help="Natural-language Mission objective")
     parser.set_defaults(handler=run)
 
 
@@ -208,6 +209,7 @@ async def execute(
     non_interactive: bool,
     on_event: EventHandler,
     echo: Echo,
+    objective: str | None = None,
 ) -> RuntimeState:
     """Phase 2 of the shared core: subscribe -> run -> approval wait.
     Callers own exception handling/exit codes and choose the renderer
@@ -220,7 +222,8 @@ async def execute(
     echo(f"Engagement: {engagement.name}")
 
     final = await run_engagement(
-        engagement, deps=deps, orchestration_config=config.orchestration
+        engagement, deps=deps, orchestration_config=config.orchestration,
+        objective=objective,
     )
 
     if final.termination_reason == TerminationReason.APPROVAL_PENDING:
@@ -275,6 +278,7 @@ async def _run(args: argparse.Namespace, *, mcp_stack: AsyncExitStack) -> int:
             non_interactive=args.non_interactive,
             on_event=_event_subscriber(json_mode=args.json),
             echo=echo,
+            objective=getattr(args, "objective", None),
         )
     except Exception as exc:  # noqa: BLE001 - same fail-closed contract as bootstrap
         if logging.getLogger().isEnabledFor(logging.DEBUG):
@@ -320,6 +324,10 @@ async def _wait_for_approval(
         raise  # let main()'s top-level handler set the conventional SIGINT exit code
     finally:
         await resume_runner.aclose()
+    if current.termination_reason != TerminationReason.APPROVAL_PENDING:
+        current = await settle_engagement(
+            current, deps, last_event_id=resume_runner.last_event_id
+        )
     return current
 
 
@@ -329,6 +337,8 @@ def _print_summary(final: RuntimeState) -> None:
         f"termination_reason={final.termination_reason}"
     )
     print(f"RunId: {final.run_id}")
+    if final.mission_status is not None:
+        print(f"Mission: {final.mission_status.value}")
     print(f"Actions executed: {final.actions_executed}")
     print(f"Report: redteam report generate {final.run_id}")
 

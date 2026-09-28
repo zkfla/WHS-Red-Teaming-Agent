@@ -109,11 +109,15 @@ class LLMCandidateProvider:
         # observation -- the generation analog of LLMPlanner refusing a
         # step_id it was not offered. A node id it invents is dropped here,
         # before any tool binding or scope check.
-        known_targets = {
+        observed_targets = {
             node_id
             for node_ids in context.observation.node_ids_by_type.values()
             for node_id in node_ids
         }
+        known_targets = (
+            observed_targets & set(context.task_target_node_ids)
+            if context.task_target_node_ids else observed_targets
+        )
         drafts: list[CandidateDraft] = []
         drops: list[DraftDrop] = []
         for index, action in enumerate(actions[:MAX_DRAFTS_PER_TURN]):
@@ -193,6 +197,8 @@ class LLMCandidateProvider:
             "Attack graph right now:",
             f"  {observation.summary_line()}",
         ]
+        if context.task_objective:
+            lines.insert(2, f"Assigned Task: {context.task_objective}")
         for type_name, labels in sorted(observation.nodes_by_type.items()):
             lines.append(f"  {type_name}: {', '.join(labels)}")
         if observation.open_hypotheses:
@@ -218,9 +224,11 @@ class LLMCandidateProvider:
                 )
         lines.append("")
         lines.append("Known targets (use a target_node_id exactly as written):")
+        scoped_targets = set(context.task_target_node_ids)
         for _type_name, node_ids in sorted(observation.node_ids_by_type.items()):
             for node_id in node_ids:
-                lines.append(f"  - {node_id}")
+                if not scoped_targets or node_id in scoped_targets:
+                    lines.append(f"  - {node_id}")
         lines.append("")
         lines.append(
             "Propose the next investigation actions as JSON. Each action names a "

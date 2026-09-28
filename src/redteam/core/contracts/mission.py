@@ -58,12 +58,21 @@ class Provenance(BaseModel):
         return _reject_secret_material(value, path="provenance.metadata")
 
 
+class MissionCriterionResult(BaseModel):
+    criterion: str
+    met: bool
+    task_ids: list[TaskId] = Field(default_factory=list)
+    evidence_ids: list[str] = Field(default_factory=list)
+    reason: str | None = None
+
+
 class MissionPlan(BaseModel):
     mission_id: MissionId
     engagement_id: EngagementId
     objective: str = Field(min_length=1)
     priorities: list[str] = Field(default_factory=list)
     success_criteria: list[str] = Field(default_factory=list)
+    criterion_results: list[MissionCriterionResult] = Field(default_factory=list)
     initial_workstreams: list[str] = Field(default_factory=list)
     assumptions: list[str] = Field(default_factory=list)
     operator_constraints: dict[str, Any] = Field(default_factory=dict)
@@ -103,6 +112,7 @@ class MissionTask(BaseModel):
     objective: str = Field(min_length=1)
     status: TaskStatus = TaskStatus.PENDING
     priority: int = 0
+    required: bool = True
     assigned_agent: AgentId | None = None
     required_capability: str | None = None
     parent_task_id: TaskId | None = None

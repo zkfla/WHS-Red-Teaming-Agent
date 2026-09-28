@@ -105,6 +105,11 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
     agent = deps.agents.get(runtime.current_agent) if runtime.current_agent else None
     if agent is None:  # pragma: no cover - observe_node routes away first
         return advance(state, runtime.model_copy(update={"phase": AgentPhase.REPLAN}))
+    active_task = (
+        await deps.task_graph_store.get_task(runtime.active_task_id)
+        if runtime.active_task_id is not None
+        else None
+    )
     if (
         agent.max_actions is not None
         and runtime.actions_by_agent.get(str(agent.agent_id), 0) >= agent.max_actions
@@ -151,9 +156,7 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                 available_operations=available_operations,
                 prior_candidate_keys=terminal_keys,
             )
-            llm_generation = (
-                deps.settings.llm_candidate_generation and deps.llm_client is not None
-            )
+            llm_generation = deps.settings.llm_candidate_generation and deps.llm_client is not None
             generation_excerpts: tuple[dict[str, object], ...] = ()
             if llm_generation:
                 # RC#2: give the generator the raw outcome per known target so
@@ -175,6 +178,12 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                 view=service.view(),
                 observation=observation,
                 step=runtime.step_count,
+                task_id=str(active_task.task_id) if active_task else None,
+                task_source=active_task.provenance.source if active_task else None,
+                task_objective=active_task.objective if active_task else None,
+                task_target_node_ids=(
+                    tuple(active_task.related_attack_graph_node_ids) if active_task else ()
+                ),
                 available_capabilities=tuple(str(item) for item in agent.capabilities),
                 open_hypotheses=tuple(observation.open_hypotheses),
                 prior_candidate_keys=frozenset(terminal_keys),
@@ -255,6 +264,12 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             dispatch_items=[],
             last_event_id=failed.event_id,
         )
+    if active_task is not None:
+        if active_task.related_attack_graph_node_ids:
+            targets = set(active_task.related_attack_graph_node_ids)
+            compiled = [
+                item for item in compiled if targets.intersection(item.draft.target_node_ids)
+            ]
     publisher = publisher_for(state, deps, "orchestration.plan")
     last_event_id = state.get("last_event_id")
     for drop in drops:
@@ -313,9 +328,7 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             continue
         rejection = CandidateRejection(
             target_node_id=(
-                str(candidate.draft.target_node_ids[0])
-                if candidate.draft.target_node_ids
-                else ""
+                str(candidate.draft.target_node_ids[0]) if candidate.draft.target_node_ids else ""
             ),
             capability=candidate.plan_step.capability,
             operation=candidate.plan_step.operation,
@@ -355,11 +368,7 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                     }
                 ),
                 "target_node_ids": sorted(
-                    {
-                        str(node_id)
-                        for item in compiled
-                        for node_id in item.draft.target_node_ids
-                    }
+                    {str(node_id) for item in compiled for node_id in item.draft.target_node_ids}
                 ),
             },
             causation_id=last_event_id,
@@ -409,9 +418,7 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                         + [item.reason for item in drops]
                     )
                 ),
-                "provider_diagnostic_summary": dict(
-                    Counter(item.reason for item in diagnostics)
-                ),
+                "provider_diagnostic_summary": dict(Counter(item.reason for item in diagnostics)),
             },
             causation_id=last_event_id,
         )
@@ -504,7 +511,7 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             engagement_id=runtime.engagement_id,
             step=runtime.step_count,
             llm=deps.llm_client,
-            goal=runtime.current_goal,
+            goal=active_task.objective if active_task else runtime.current_goal,
             metadata={
                 "context_profile": (
                     definition.context_profile.profile_id if definition else "default"
@@ -521,10 +528,9 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                 # PM action contract is untouched.
                 "candidate_keys": [candidate.candidate_key for candidate in compiled],
                 "candidate_scores": {
-                    candidate.candidate_key: candidate.priority.total
-                    for candidate in compiled
+                    candidate.candidate_key: candidate.priority.total for candidate in compiled
                 },
-                },
+            },
         )
     )
 

@@ -56,7 +56,7 @@ from redteam.core.config import (
 )
 from redteam.core.contracts.engagement import Engagement
 from redteam.core.contracts.events import EventEnvelope, EventType
-from redteam.core.enums import AgentPhase
+from redteam.core.enums import AgentPhase, MissionStatus
 from redteam.core.ids import EngagementId, EventId, RunId, new_id
 from redteam.core.ports.attack_graph import AttackGraphStore
 from redteam.core.ports.control_plane import ControlPlane
@@ -380,6 +380,8 @@ async def run_engagement(
     engagement: Engagement,
     deps: RuntimeDeps | None = None,
     orchestration_config: OrchestrationConfig | None = None,
+    *,
+    objective: str | None = None,
 ) -> RuntimeState:
     """Runs one engagement: OBSERVE -> ... -> REPLAN, looping until a
     terminal phase (instruction.md section 16, now with real re-planning).
@@ -413,7 +415,11 @@ async def run_engagement(
     # without this still schedules via agent rotation (the mission_id is then
     # None). Secret-free: only scope metadata and role names are used.
     mission_id = await bootstrap_mission(
-        deps.task_graph_store, deps.agents, engagement, now=datetime.now(timezone.utc)
+        deps.task_graph_store,
+        deps.agents,
+        engagement,
+        objective=objective,
+        now=datetime.now(timezone.utc),
     )
 
     run_started = EventEnvelope(
@@ -427,6 +433,25 @@ async def run_engagement(
         payload={"engagement_id": engagement.engagement_id},
     )
     await deps.event_bus.publish(run_started)
+    lifecycle = EventPublisher(
+        deps.event_bus,
+        run_id=run_id,
+        engagement_id=engagement.engagement_id,
+        source="app.bootstrap",
+    )
+    mission_created = await lifecycle.publish(
+        EventType.MISSION_CREATED,
+        {"mission_id": mission_id},
+        causation_id=run_started.event_id,
+    )
+    bootstrap_event_id = mission_created.event_id
+    for task in await deps.task_graph_store.list_tasks(mission_id=mission_id):
+        task_created = await lifecycle.publish(
+            EventType.TASK_CREATED,
+            {"mission_id": mission_id, "task_id": task.task_id},
+            causation_id=bootstrap_event_id,
+        )
+        bootstrap_event_id = task_created.event_id
 
     initial_runtime = RuntimeState(
         run_id=run_id,
@@ -439,7 +464,7 @@ async def run_engagement(
     runner = AgentLoopRunner(deps, settings=settings)
     try:
         try:
-            runtime = await runner.run(initial_runtime, initial_event_id=run_started.event_id)
+            runtime = await runner.run(initial_runtime, initial_event_id=bootstrap_event_id)
         except BaseException as exc:
             recovered_runtime = runner.failure_runtime or initial_runtime
             failed_runtime = recovered_runtime.model_copy(
@@ -467,25 +492,49 @@ async def run_engagement(
             except Exception:  # noqa: BLE001 - never mask the run failure
                 pass
             raise
-        if runtime.mission_id is not None:
-            await finalize_mission(
-                deps.task_graph_store,
-                runtime.mission_id,
-                publisher=EventPublisher(
-                    deps.event_bus,
-                    run_id=runtime.run_id,
-                    engagement_id=runtime.engagement_id,
-                    source="app.bootstrap",
-                ),
-                last_event_id=(
-                    EventId(str(runner.last_event_id)) if runner.last_event_id else None
-                ),
-            )
-        await _publish_terminal_artifacts(
-            runtime,
-            deps,
-            causation_id=str(runner.last_event_id) if runner.last_event_id else None,
-        )
-        return runtime
+        return await settle_engagement(runtime, deps, last_event_id=runner.last_event_id)
     finally:
         await runner.aclose()
+
+
+async def settle_engagement(
+    runtime: RuntimeState,
+    deps: RuntimeDeps,
+    *,
+    last_event_id: EventId | None = None,
+) -> RuntimeState:
+    """Project a run outcome, including one resumed after human approval."""
+    # A pending approval is a suspended run. Settling its active Task would
+    # break the exact proposal's resume path.
+    if (
+        runtime.mission_id is not None
+        and runtime.termination_reason != TerminationReason.APPROVAL_PENDING
+    ):
+        last_event_id = await finalize_mission(
+            deps.task_graph_store,
+            runtime.mission_id,
+            publisher=EventPublisher(
+                deps.event_bus,
+                run_id=runtime.run_id,
+                engagement_id=runtime.engagement_id,
+                source="app.bootstrap",
+            ),
+            last_event_id=last_event_id,
+            evidence_store=deps.evidence_store,
+            run_id=runtime.run_id,
+        )
+        mission = await deps.task_graph_store.get_mission(runtime.mission_id)
+        if mission is not None:
+            updates: dict[str, object] = {"mission_status": mission.status}
+            if (
+                mission.status is MissionStatus.BLOCKED
+                and runtime.termination_reason == TerminationReason.NO_ACTIONABLE_PLAN
+            ):
+                updates["termination_reason"] = TerminationReason.MISSION_BLOCKED
+            runtime = runtime.model_copy(update=updates)
+    await _publish_terminal_artifacts(
+        runtime,
+        deps,
+        causation_id=str(last_event_id) if last_event_id else None,
+    )
+    return runtime

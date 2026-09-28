@@ -48,6 +48,7 @@ class MissionStatus(str, Enum):
     DRAFT = "draft"
     ACTIVE = "active"
     PAUSED = "paused"
+    BLOCKED = "blocked"
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"

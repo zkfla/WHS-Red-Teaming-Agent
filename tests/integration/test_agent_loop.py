@@ -33,7 +33,9 @@ from redteam.core.contracts.tool import ToolDescriptor
 from redteam.core.enums import (
     AgentPhase,
     GraphNodeType,
+    MissionStatus,
     PolicyVerdict,
+    TaskStatus,
     ToolHealthStatus,
     Verdict,
 )
@@ -181,6 +183,10 @@ async def test_pending_approval_has_its_own_terminal_reason_and_partial_report()
     assert final.phase is AgentPhase.FINISHED
     assert final.termination_reason == TerminationReason.APPROVAL_PENDING
     assert final.pending_approval_id == ApprovalId("appr_test")
+    mission = await deps.task_graph_store.get_mission(final.mission_id)
+    assert mission is not None and mission.status is MissionStatus.ACTIVE
+    tasks = await deps.task_graph_store.list_tasks(mission_id=final.mission_id)
+    assert any(task.status is TaskStatus.RUNNING for task in tasks)
     assert gateway.invocations == []
     projected = bus(deps).history(event_type=REPORT_PROJECTED)
     assert projected[0].payload["ready_for_release"] is False

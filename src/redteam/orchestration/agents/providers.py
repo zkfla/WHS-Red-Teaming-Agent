@@ -63,12 +63,9 @@ def endpoint_path_explicitly_disallowed(node: GraphNode) -> bool:
         return False
     attrs, facts = attrs_of(node.properties), facts_of(node.properties)
     return (
-        attrs.get("path_allowlisted") is False
-        and facts.get("path_allowlisted") is not True
-    ) or (
-        facts.get("path_allowlisted") is False
-        and attrs.get("path_allowlisted") is not True
-    )
+        attrs.get("path_allowlisted") is False and facts.get("path_allowlisted") is not True
+    ) or (facts.get("path_allowlisted") is False and attrs.get("path_allowlisted") is not True)
+
 
 @dataclass(frozen=True)
 class GraphCandidateContext:
@@ -86,6 +83,10 @@ class GraphCandidateContext:
     view: AttackGraphView
     observation: GraphObservation
     step: int
+    task_id: str | None = None
+    task_source: str | None = None
+    task_objective: str | None = None
+    task_target_node_ids: tuple[GraphNodeId, ...] = ()
     available_capabilities: tuple[str, ...] = ()
     open_hypotheses: tuple[str, ...] = ()
     prior_candidate_keys: frozenset[str] = frozenset()
@@ -154,6 +155,7 @@ def planning_fingerprint(
     encoded = json.dumps(payload, sort_keys=True, default=str, separators=(",", ":")).encode()
     return hashlib.sha256(encoded).hexdigest()[:24]
 
+
 class GraphCandidateProvider(Protocol):
     async def propose_graph(
         self, spec: AgentSpec, context: GraphCandidateContext
@@ -189,9 +191,7 @@ class PlaybookCandidateProvider:
     ) -> CandidateBatch:
         """Default graph-aware seam while retaining playbook semantics."""
 
-        return await self._propose(
-            spec, context.view, context.observation, step=context.step
-        )
+        return await self._propose(spec, context.view, context.observation, step=context.step)
 
     async def _propose(
         self,
@@ -205,9 +205,7 @@ class PlaybookCandidateProvider:
 
         drops: list[tuple[str, str, str]] = []
         drafts: list[CandidateDraft] = []
-        for plan_step in await available_steps(
-            spec, view, observation, step=step, drops=drops
-        ):
+        for plan_step in await available_steps(spec, view, observation, step=step, drops=drops):
             target_id = node_id_for_target(plan_step.resolved_target())
             drafts.append(
                 CandidateDraft(
@@ -270,10 +268,7 @@ def default_provider_registry() -> CandidateProviderRegistry:
     providers: list[tuple[str, CandidateProvider]] = [
         ("playbook:recon", ReconCandidateProvider()),
         ("playbook:web_api", WebCandidateProvider()),
-        *[
-            (f"playbook:{role}", playbook)
-            for role in ("mobile", "analysis", "reporting")
-        ],
+        *[(f"playbook:{role}", playbook) for role in ("mobile", "analysis", "reporting")],
     ]
 
     return CandidateProviderRegistry(providers)

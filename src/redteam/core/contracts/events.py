@@ -109,6 +109,7 @@ class EventType:
     TASK_CREATED = "TaskCreated"
     TASK_STARTED = "TaskStarted"
     TASK_BLOCKED = "TaskBlocked"
+    TASK_UNBLOCKED = "TaskUnblocked"
     TASK_COMPLETED = "TaskCompleted"
     TASK_FAILED = "TaskFailed"
     TASK_PRIORITY_CHANGED = "TaskPriorityChanged"

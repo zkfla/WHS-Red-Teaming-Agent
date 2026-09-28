@@ -42,6 +42,7 @@ class TerminationReason:
     """Why a run stopped. Every exit path names itself."""
 
     NO_ACTIONABLE_PLAN = "no_actionable_plan"
+    MISSION_BLOCKED = "mission_blocked"
     MAX_STEPS_REACHED = "max_steps_reached"
     BUDGET_EXHAUSTED = "budget_exhausted"
     CONSECUTIVE_FAILURES = "consecutive_failures"

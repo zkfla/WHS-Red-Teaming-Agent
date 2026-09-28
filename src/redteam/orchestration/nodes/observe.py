@@ -42,14 +42,27 @@ def _agent_exhausted(
     agent: AgentSpec,
     runtime: RuntimeState,
     observation: GraphObservation,
+    task_id: TaskId,
 ) -> bool:
     """True once an Agent has run its frontier dry for the current graph — the
     same revision-aware "finished" signal Agent rotation uses, reused here to
     decide a Task is done."""
-    if agent.agent_id not in set(runtime.finished_agents):
+    if runtime.active_task_id != task_id or agent.agent_id not in set(runtime.finished_agents):
         return False
     cursor = runtime.agent_revision_cursors.get(str(agent.agent_id))
     return cursor == agents.revision_fingerprint(agent.agent_id, observation)
+
+
+def _task_agent(
+    agents: AgentRegistry, task: object, observation: GraphObservation
+) -> AgentSpec | None:
+    agent = _resolve_agent(agents, task)
+    if agent is None:
+        return None
+    definition = agents.definition(agent.agent_id)
+    if definition is not None and not definition.is_active(observation, AgentPhase.OBSERVE):
+        return None
+    return agent
 
 
 async def _select_task_first(
@@ -75,12 +88,30 @@ async def _select_task_first(
             continue
         agent = _resolve_agent(deps.agents, task)
         if agent is None:
-            continue
-        if _agent_exhausted(deps.agents, agent, runtime, observation):
-            await store.transition_task(task.task_id, TaskStatus.COMPLETED, now=now)
+            await store.transition_task(
+                task.task_id, TaskStatus.BLOCKED, now=now,
+                reason="no registered agent can perform this task",
+            )
             event = await publisher.publish(
-                EventType.TASK_COMPLETED,
-                {"task_id": task.task_id, "agent_id": agent.agent_id},
+                EventType.TASK_BLOCKED,
+                {"task_id": task.task_id, "reason": "no_registered_agent"},
+                causation_id=last_event_id,
+            )
+            last_event_id = event.event_id
+            continue
+        if _task_agent(deps.agents, task, observation) is None:
+            continue
+        if _agent_exhausted(deps.agents, agent, runtime, observation, task.task_id):
+            unmet = task.provenance.source.startswith("replan:") or (
+                task.required and runtime.actions_by_agent.get(str(agent.agent_id), 0) == 0
+            )
+            outcome = TaskStatus.BLOCKED if unmet else TaskStatus.COMPLETED
+            reason = "no candidate achieved the task objective" if unmet else None
+            await store.transition_task(task.task_id, outcome, now=now, reason=reason)
+            event = await publisher.publish(
+                EventType.TASK_BLOCKED if unmet else EventType.TASK_COMPLETED,
+                {"task_id": task.task_id, "agent_id": agent.agent_id,
+                 **({"reason": reason} if reason else {})},
                 causation_id=last_event_id,
             )
             last_event_id = event.event_id
@@ -94,7 +125,7 @@ async def _select_task_first(
             )
             last_event_id = event.event_id
         return agent, task.task_id, last_event_id
-    return None, runtime.active_task_id, last_event_id
+    return None, None, last_event_id
 
 
 async def observe_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
@@ -145,6 +176,7 @@ async def observe_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             runtime.model_copy(
                 update={
                     "phase": AgentPhase.REPLAN,
+                    "active_task_id": current_task_id,
                     "termination_reason": runtime.termination_reason or no_agent_reason,
                     "last_progress_fingerprint": fingerprint,
                     "no_progress_turns": no_progress_turns,

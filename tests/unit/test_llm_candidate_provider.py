@@ -5,7 +5,7 @@ from typing import Any
 from redteam.attack_graph.identity import make_node_id
 from redteam.attack_graph.observation import GraphObservation
 from redteam.core.enums import GraphNodeType
-from redteam.core.ids import AgentId
+from redteam.core.ids import AgentId, GraphNodeId
 from redteam.orchestration.agents.base import AgentSpec
 from redteam.orchestration.agents.llm_provider import LLMCandidateProvider
 from redteam.orchestration.agents.providers import GraphCandidateContext
@@ -75,6 +75,33 @@ async def test_hallucinated_target_is_dropped_not_executed() -> None:
         ]
     )
     batch = await LLMCandidateProvider(llm).propose_graph(_spec(), _context())
+    assert batch.candidates == []
+    assert [drop.reason for drop in batch.drops] == ["unknown_target_node"]
+
+
+async def test_generator_receives_and_obeys_the_assigned_task() -> None:
+    other = str(make_node_id(GraphNodeType.ENDPOINT, "mock-bank GET /unrelated"))
+    observation = GraphObservation(
+        step=1,
+        nodes_by_type={"endpoint": [ENDPOINT_KEY, "mock-bank GET /unrelated"]},
+        node_ids_by_type={"endpoint": [ENDPOINT_ID, other]},
+    )
+    context = GraphCandidateContext(
+        view=None,  # type: ignore[arg-type]
+        observation=observation,
+        step=1,
+        task_id="task_authz",
+        task_objective="Compare access to the account object",
+        task_target_node_ids=(GraphNodeId(ENDPOINT_ID),),
+    )
+    llm = _ScriptedLLM([
+        {"capability": "web", "operation": "http_request", "target_node_id": other}
+    ])
+
+    batch = await LLMCandidateProvider(llm).propose_graph(_spec(), context)
+
+    assert "Assigned Task: Compare access to the account object" in llm.last_prompt
+    assert f"  - {other}" not in llm.last_prompt
     assert batch.candidates == []
     assert [drop.reason for drop in batch.drops] == ["unknown_target_node"]
 

@@ -15,6 +15,7 @@ from redteam.orchestration.engagement_planner import (
     extract_focus_areas,
     parse_objective,
     plan_mission,
+    sanitize_objective,
 )
 
 
@@ -85,3 +86,26 @@ async def test_parse_objective_uses_a_clean_llm_rewrite() -> None:
     objective, focus = await parse_objective("인증 좀", llm=_CleanLLM())
     assert objective == "Assess authentication on the web tier"
     assert "authentication" in focus
+
+
+async def test_objective_redacts_credentials_before_llm_and_mission_storage() -> None:
+    class _RecordingLLM:
+        prompt = ""
+
+        async def complete_structured(self, **kwargs: Any) -> dict[str, Any]:
+            self.prompt = str(kwargs["messages"])
+            return {"objective": "Assess web authorization"}
+
+    llm = _RecordingLLM()
+    objective, _focus = await parse_objective(
+        "웹 인가 점검, password is hunter2", llm=llm
+    )
+    mission = plan_mission(
+        _engagement(), MissionId("m_secret"),
+        objective="웹 인가 점검, Bearer sensitive-token",
+        now=_now(),
+    )
+    assert "hunter2" not in llm.prompt
+    assert "hunter2" not in objective
+    assert "sensitive-token" not in mission.model_dump_json()
+    assert "***REDACTED***" in sanitize_objective("token=hidden")

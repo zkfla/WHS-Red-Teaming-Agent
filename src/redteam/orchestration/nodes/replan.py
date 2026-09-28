@@ -10,6 +10,7 @@ from redteam.orchestration.context import RuntimeDeps
 from redteam.orchestration.convergence import evaluate_convergence
 from redteam.orchestration.events import REPLAN_TRIGGERED
 from redteam.orchestration.nodes._support import advance, graph_service, publisher_for
+from redteam.orchestration.nodes.observe import _task_agent
 from redteam.orchestration.replanning import replan_task_graph
 from redteam.orchestration.state import GraphState, RuntimeState, TerminationReason
 
@@ -104,25 +105,42 @@ async def replan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                 causation_id=last_event_id,
             )
             last_event_id = retired.event_id
-            # Task-first: the Agent finishing its frontier means its active
-            # Task is done -- complete it now (before any termination decision)
-            # so the Task Graph reflects progress and the Mission can settle.
+            # Exhausting a role's generic frontier does not prove a focused
+            # dynamic objective (such as authorization comparison) succeeded.
             if runtime.mission_id is not None and runtime.active_task_id is not None:
                 task = await deps.task_graph_store.get_task(runtime.active_task_id)
                 if task is not None and task.status is TaskStatus.RUNNING:
+                    unmet = task.provenance.source.startswith("replan:") or (
+                        task.required and runtime.actions_by_agent.get(str(agent_id), 0) == 0
+                    )
+                    outcome = TaskStatus.BLOCKED if unmet else TaskStatus.COMPLETED
+                    reason_text = "no candidate achieved the task objective" if unmet else None
                     await deps.task_graph_store.transition_task(
                         runtime.active_task_id,
-                        TaskStatus.COMPLETED,
+                        outcome,
                         now=datetime.now(timezone.utc),
+                        reason=reason_text,
                     )
                     completed = await publisher.publish(
-                        EventType.TASK_COMPLETED,
-                        {"task_id": runtime.active_task_id, "agent_id": agent_id},
+                        EventType.TASK_BLOCKED if unmet else EventType.TASK_COMPLETED,
+                        {"task_id": runtime.active_task_id, "agent_id": agent_id,
+                         **({"reason": reason_text} if reason_text else {})},
                         causation_id=last_event_id,
                     )
                     last_event_id = completed.event_id
 
     reason = runtime.termination_reason or _hard_stop(runtime, deps)
+    if reason == TerminationReason.NO_ACTIONABLE_PLAN and runtime.mission_id is not None:
+        # REPLAN may have just created a READY Task from the latest graph.
+        # OBSERVE's earlier no-agent decision was made before that mutation.
+        tasks = await deps.task_graph_store.list_tasks(mission_id=runtime.mission_id)
+        observation = state.get("observation")
+        if observation is not None and any(
+            task.status in {TaskStatus.READY, TaskStatus.RUNNING}
+            and _task_agent(deps.agents, task, observation) is not None
+            for task in tasks
+        ):
+            reason = None
     next_agent = None
     if reason in {TerminationReason.NO_AGENTS, TerminationReason.NO_ACTIONABLE_PLAN}:
         convergence = await evaluate_convergence(
@@ -141,6 +159,18 @@ async def replan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
         # runnable work, so force one fresh OBSERVE before judging quiescence.
         if observation is None and proposal is not None:
             next_agent = deps.agents.get(proposal.agent_id)
+        elif runtime.mission_id is not None:
+            tasks = await deps.task_graph_store.list_tasks(mission_id=runtime.mission_id)
+            next_agent = next(
+                (
+                    agent
+                    for task in tasks
+                    if task.status in {TaskStatus.READY, TaskStatus.RUNNING}
+                    if observation is not None
+                    if (agent := _task_agent(deps.agents, task, observation)) is not None
+                ),
+                None,
+            )
         else:
             next_agent = deps.agents.next_agent(
                 current=agent_id,
@@ -258,6 +288,7 @@ async def replan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                 "agent_revision_cursors": revision_cursors,
                 "pending_action_id": None,
                 "active_hypothesis_id": None,
+                "termination_reason": None,
             }
         ),
         last_event_id=last_event_id,

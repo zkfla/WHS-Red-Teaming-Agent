@@ -76,6 +76,7 @@ async def verify_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                 "capability": proposal.capability,
                 "operation": proposal.operation,
                 "candidate_key": step.candidate_key if step is not None else "",
+                "mission_task_id": str(runtime.active_task_id) if runtime.active_task_id else None,
             }
         }
     )
@@ -147,7 +148,11 @@ async def verify_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
     auth_assessment = None
     if step is not None and step.authentication_check is not None:
         auth_assessment = await assess_authentication(
-            step.authentication_check, proposal, result, evidence, deps.evidence_store,
+            step.authentication_check,
+            proposal,
+            result,
+            evidence,
+            deps.evidence_store,
         )
         is_violation = auth_assessment.outcome == ACCESS_CONTROL_VIOLATION
         comparison = {
@@ -157,16 +162,21 @@ async def verify_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             "expected_access": step.authentication_check.expected_access,
         }
         await service.observe_target(
-            proposal.target, facts={"authentication_checks": [comparison]},
-            provenance=provenance, step=runtime.step_count,
+            proposal.target,
+            facts={"authentication_checks": [comparison]},
+            provenance=provenance,
+            step=runtime.step_count,
         )
         if proposal.hypothesis_id is not None:
             await service.upsert_node(
                 GraphNodeType.HYPOTHESIS,
                 node_id=hypothesis_node_id(str(proposal.hypothesis_id)),
-                facts={"evidence_ids": auth_assessment.evidence_ids,
-                       "authentication_outcome": auth_assessment.outcome},
-                provenance=provenance, step=runtime.step_count,
+                facts={
+                    "evidence_ids": auth_assessment.evidence_ids,
+                    "authentication_outcome": auth_assessment.outcome,
+                },
+                provenance=provenance,
+                step=runtime.step_count,
             )
         if auth_assessment.outcome in {"session_access_observed", ACCESS_CONTROL_VIOLATION}:
             target_ref = str(
@@ -178,7 +188,8 @@ async def verify_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                 node_id=session_principal_node_id(target_ref, session_ref),
                 attrs={"authenticated": True, "operator_managed_session": True},
                 facts={"target_ref": target_ref, "session_refs": [session_ref]},
-                provenance=provenance, step=runtime.step_count,
+                provenance=provenance,
+                step=runtime.step_count,
             )
             credential = await service.upsert_node(
                 GraphNodeType.CREDENTIAL,
@@ -211,15 +222,19 @@ async def verify_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             )
         compared = await publisher.publish(
             AUTHENTICATION_CHECKED,
-            {**comparison, "action_id": proposal.action_id,
-             "hypothesis_id": proposal.hypothesis_id,
-             # The step's own declaration, not the outcome. A security_check
-             # whose deny expectation was *enforced* is still a security
-             # check -- labelling it "observation" would misreport what was
-             # under test, and the label is what downstream consumers use to
-             # decide whether a conclusion was claimed at all.
-             "assessment_kind": step.assessment_kind},
-            correlation_id=correlation_id, causation_id=last_event_id,
+            {
+                **comparison,
+                "action_id": proposal.action_id,
+                "hypothesis_id": proposal.hypothesis_id,
+                # The step's own declaration, not the outcome. A security_check
+                # whose deny expectation was *enforced* is still a security
+                # check -- labelling it "observation" would misreport what was
+                # under test, and the label is what downstream consumers use to
+                # decide whether a conclusion was claimed at all.
+                "assessment_kind": step.assessment_kind,
+            },
+            correlation_id=correlation_id,
+            causation_id=last_event_id,
         )
         last_event_id = compared.event_id
         if is_violation:
@@ -244,9 +259,13 @@ async def verify_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
         reason = "response recorded as an observation; no security claim was verified"
         observed = await publisher.publish(
             OBSERVATION_RECORDED,
-            {"evidence_id": evidence.evidence_id, "action_id": proposal.action_id,
-             "target_node_id": str(node_id_for_target(proposal.target)),
-             "assessment_kind": "observation", "tool_success": result.success},
+            {
+                "evidence_id": evidence.evidence_id,
+                "action_id": proposal.action_id,
+                "target_node_id": str(node_id_for_target(proposal.target)),
+                "assessment_kind": "observation",
+                "tool_success": result.success,
+            },
             correlation_id=correlation_id,
             causation_id=last_event_id,
         )

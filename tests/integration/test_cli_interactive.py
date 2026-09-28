@@ -128,6 +128,86 @@ async def test_no_config_intake_completes_preflight_and_runs(
     assert saved.metadata["source"] == "intake-assistant"
 
 
+async def test_existing_config_accepts_one_line_mission_objective() -> None:
+    from redteam.core.config import EngagementConfig
+
+    config = EngagementConfig.model_validate({
+        "name": "VulnBank", "scope": {"allowed_hosts": ["example.local"]},
+        "execution_budget": {"max_actions": 5},
+    })
+    console = _FakeConsole(["VulnBank 웹 레드티밍 해줘. 인증/인가 중심으로."])
+
+    selected = await interactive._existing_config_menu(
+        console, config, _ScriptedIntakeLLM([])
+    )
+
+    assert selected == (config, "VulnBank 웹 레드티밍 해줘. 인증/인가 중심으로.")
+
+
+async def test_existing_config_quick_start_needs_only_objective_input(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from redteam.core.config import EngagementConfig
+
+    config = EngagementConfig.model_validate({
+        "name": "VulnBank", "scope": {"allowed_hosts": ["example.local"]},
+        "execution_budget": {"max_actions": 5},
+    })
+    (tmp_path / "engagement.yaml").write_text(
+        yaml.safe_dump(config.model_dump(mode="json")), encoding="utf-8"
+    )
+    console = _patch(
+        monkeypatch, tmp_path,
+        answers=["VulnBank 웹 레드티밍 해줘. 인증/인가 중심으로."],
+        llm=_ScriptedIntakeLLM([]),
+    )
+
+    assert await interactive.run(_args()) == _shared.EXIT_OK
+    assert any("RunId:" in line for line in console.transcript)
+
+
+async def test_guided_intake_asks_only_next_missing_question() -> None:
+    from redteam.intake.assistant import IntakeAssistant, IntakeSession
+
+    llm = _ScriptedIntakeLLM([
+        {
+            "draft": {"name": "VulnBank", "allowed_hosts": ["example.local"]},
+            "follow_up_questions": ["최대 action 수는?", "이미 알려준 범위는?"],
+            "ready": False,
+        },
+        {"draft": {"max_actions": 5}, "follow_up_questions": [], "ready": True},
+    ])
+    console = _FakeConsole(["5"])
+
+    config = await interactive._intake_loop(
+        console, IntakeAssistant(llm), IntakeSession(), "VulnBank 점검"
+    )
+
+    assert config is not None
+    assert config.execution_budget.max_actions == 5
+    assert any("최대 action 수는?" in line for line in console.transcript)
+    assert not any("이미 알려준 범위는?" in line for line in console.transcript)
+
+
+async def test_guided_intake_recovers_from_llm_failure_without_repeating_input() -> None:
+    from redteam.intake.assistant import IntakeAssistant, IntakeSession
+
+    class _UnavailableLLM:
+        async def complete_structured(self, **_kwargs):  # noqa: ANN202
+            raise RuntimeError("unavailable")
+
+    console = _FakeConsole(["5", "recon, web"])
+    config = await interactive._intake_loop(
+        console, IntakeAssistant(_UnavailableLLM()), IntakeSession(),
+        "https://example.local:8443 테스트해줘",
+    )
+
+    assert config is not None
+    assert config.scope.allowed_hosts == ["example.local:8443"]
+    assert config.execution_budget.max_actions == 5
+    assert config.rules_of_engagement[0].allowed_capabilities == ["recon", "web"]
+
+
 async def test_intake_llm_never_receives_a_secret(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

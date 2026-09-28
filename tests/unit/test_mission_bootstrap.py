@@ -66,3 +66,17 @@ async def test_bootstrap_carries_no_secret_material() -> None:
     dumped = mission.model_dump_json().lower()
     for secret in ("password", "token", "cookie", "bearer"):
         assert secret not in dumped
+
+
+async def test_explicit_mobile_focus_changes_post_recon_task_priority() -> None:
+    store = InMemoryTaskGraphStore()
+    mission_id = await bootstrap_mission(
+        store, default_registry(), _engagement(),
+        objective="모바일 앱 점검을 우선해줘",
+        now=datetime.now(timezone.utc),
+    )
+
+    tasks = await store.list_tasks(mission_id=mission_id)
+    assert [str(task.assigned_agent) for task in tasks] == [
+        "recon-agent", "mobile-agent", "web-api-agent",
+    ]

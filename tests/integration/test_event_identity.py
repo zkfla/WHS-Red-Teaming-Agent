@@ -5,7 +5,7 @@ from __future__ import annotations
 from redteam.app.bootstrap import build_runtime_deps, run_engagement
 from redteam.core.contracts.events import EventEnvelope, EventType
 from redteam.core.ids import RunId
-from redteam.orchestration.events import HYPOTHESIS_RESOLVED, REPLAN_TRIGGERED
+from redteam.orchestration.events import HYPOTHESIS_RESOLVED, REPLAN_TRIGGERED, REPORT_PROJECTED
 from tests.integration.test_end_to_end import _engagement
 
 
@@ -74,15 +74,21 @@ async def test_replan_triggered_keeps_run_identity_and_cites_its_cause(tmp_path)
 async def test_agent_started_cites_run_started_as_causation(tmp_path) -> None:
     events, _run_id = await _run_with_events(tmp_path)
     run_started = next(event for event in events if event.event_type == EventType.RUN_STARTED)
+    mission_created = next(
+        event for event in events if event.event_type == EventType.MISSION_CREATED
+    )
+    task_created = [event for event in events if event.event_type == EventType.TASK_CREATED]
     task_started = next(event for event in events if event.event_type == EventType.TASK_STARTED)
     agent_started = next(event for event in events if event.event_type == EventType.AGENT_STARTED)
 
     assert run_started.correlation_id == str(run_started.run_id)
     assert agent_started.correlation_id == run_started.correlation_id
-    # Task-first causation chain: RunStarted -> TaskStarted -> AgentStarted.
-    # The Agent is dispatched by its Task, so it cites the TaskStarted that
-    # scheduled it, which in turn traces back to RunStarted.
-    assert task_started.causation_id == run_started.event_id
+    # The initial Mission/Task creation chain precedes Task dispatch.
+    assert mission_created.causation_id == run_started.event_id
+    assert task_created[0].causation_id == mission_created.event_id
+    for parent, child in zip(task_created, task_created[1:], strict=False):
+        assert child.causation_id == parent.event_id
+    assert task_started.causation_id == task_created[-1].event_id
     assert agent_started.causation_id == task_started.event_id
 
 
@@ -90,7 +96,12 @@ async def test_run_finished_cites_the_last_event_and_keeps_run_correlation(tmp_p
     events, run_id = await _run_with_events(tmp_path)
     run_started = next(event for event in events if event.event_type == EventType.RUN_STARTED)
     run_finished = next(event for event in events if event.event_type == EventType.RUN_FINISHED)
+    mission_updated = next(
+        event for event in events if event.event_type == EventType.MISSION_UPDATED
+    )
+    report_projected = next(event for event in events if event.event_type == REPORT_PROJECTED)
 
     assert run_started.correlation_id == str(run_id)
     assert run_finished.correlation_id == str(run_id)
     assert run_finished.causation_id == events[-2].event_id
+    assert report_projected.causation_id == mission_updated.event_id

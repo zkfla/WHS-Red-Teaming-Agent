@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 
 from redteam.app.bootstrap import build_runtime_deps, run_engagement
 from redteam.attack_graph.predicates import attrs_of, facts_of
+from redteam.attack_graph.service import AttackGraphService
 from redteam.core.contracts.engagement import (
     ApprovalPolicy,
     Engagement,
@@ -24,7 +25,7 @@ from redteam.core.contracts.engagement import (
     RateLimitPolicy,
 )
 from redteam.core.contracts.events import EventEnvelope, EventType
-from redteam.core.enums import AgentPhase, Verdict
+from redteam.core.enums import AgentPhase, GraphNodeType, MissionStatus, TaskStatus, Verdict
 from redteam.core.ids import AgentId, EngagementId, GraphNodeId
 from redteam.orchestration.events import (
     CANDIDATE_GENERATED,
@@ -71,6 +72,10 @@ async def test_minimal_vertical_slice_end_to_end(tmp_path) -> None:
     # the right run/engagement.
     expected_in_order = [
         EventType.RUN_STARTED,
+        EventType.MISSION_CREATED,
+        EventType.TASK_CREATED,
+        EventType.TASK_CREATED,
+        EventType.TASK_CREATED,
         # Task-first: the Mission's Task is started before its Agent is dispatched.
         EventType.TASK_STARTED,
         EventType.AGENT_STARTED,
@@ -108,8 +113,17 @@ async def test_minimal_vertical_slice_end_to_end(tmp_path) -> None:
     # From the hypothesis the action was raised for through the update that
     # settled it -- CandidateGenerated is not part of this action's chain
     # (it summarises the whole compiled frontier, before a step is chosen).
-    # (indices shifted by one now that TASK_STARTED precedes AGENT_STARTED)
-    assert correlated == expected_in_order[4:13]
+    assert correlated == [
+        EventType.HYPOTHESIS_CREATED,
+        EventType.ACTION_PROPOSED,
+        EventType.POLICY_EVALUATED,
+        EventType.ACTION_APPROVED,
+        EventType.TOOL_EXECUTION_STARTED,
+        EventType.TOOL_EXECUTION_FINISHED,
+        EventType.EVIDENCE_CREATED,
+        HYPOTHESIS_RESOLVED,
+        EventType.GRAPH_UPDATED,
+    ]
 
     # 9. Evidence was recorded for the run, correlated to the action.
     evidence = await deps.evidence_store.list_for_run(final_state.run_id)
@@ -126,3 +140,46 @@ async def test_minimal_vertical_slice_end_to_end(tmp_path) -> None:
     # ...and the attempt is recorded, which is what stops the planner
     # proposing the same probe again.
     assert facts_of(node.properties)["attempted_operations"] == ["recon.service_discovery"]
+
+
+async def test_quick_start_objective_reaches_mission_without_secret(tmp_path) -> None:
+    engagement = _engagement()
+    deps = await build_runtime_deps(engagement, evidence_dir=tmp_path)
+
+    final = await run_engagement(
+        engagement, deps=deps,
+        objective="VulnBank 웹 레드티밍, 인증/인가 중심. token=privatevalue",
+    )
+
+    mission = await deps.task_graph_store.get_mission(final.mission_id)
+    assert mission is not None
+    assert mission.priorities[:2] == ["authentication", "authorization"]
+    assert "privatevalue" not in mission.model_dump_json()
+    tasks = await deps.task_graph_store.list_tasks(mission_id=final.mission_id)
+    assert any(task.required and task.required_capability == "web" for task in tasks)
+    assert final.actions_executed > 0
+
+
+async def test_object_endpoint_creates_blocked_authz_dependency_in_runtime(tmp_path) -> None:
+    engagement = _engagement()
+    deps = await build_runtime_deps(engagement, evidence_dir=tmp_path)
+    graph = AttackGraphService(deps.graph_store)
+    await graph.upsert_node(
+        GraphNodeType.ENDPOINT,
+        key="example.local GET /api/orders/{id}",
+        facts={"path_parameters": ["id"]},
+    )
+
+    final = await run_engagement(
+        engagement, deps=deps, objective="API 인가 점검"
+    )
+
+    tasks = await deps.task_graph_store.list_tasks(mission_id=final.mission_id)
+    acquire = next(t for t in tasks if t.provenance.source == "replan:acquire_second_principal")
+    auth = next(t for t in tasks if t.provenance.source == "replan:object_bound_endpoint")
+    mission = await deps.task_graph_store.get_mission(final.mission_id)
+    assert mission is not None and mission.status is MissionStatus.BLOCKED
+    assert final.termination_reason == TerminationReason.MISSION_BLOCKED
+    assert acquire.status is TaskStatus.BLOCKED
+    assert auth.status is TaskStatus.BLOCKED
+    assert acquire.task_id in auth.dependency_task_ids

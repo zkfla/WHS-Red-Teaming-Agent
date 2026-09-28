@@ -14,6 +14,7 @@ never sourced from an LLM.
 
 from __future__ import annotations
 
+import re
 from datetime import datetime
 from typing import Any
 
@@ -21,17 +22,32 @@ from redteam.core.contracts.engagement import Engagement
 from redteam.core.contracts.mission import MissionPlan, Provenance
 from redteam.core.enums import MissionStatus
 from redteam.core.ids import MissionId
+from redteam.core.redaction import redact_sensitive_text
 
 #: Deterministic focus keywords -> a canonical workstream/priority label.
 #: Korean and English, because operators type either.
 _FOCUS_KEYWORDS: dict[str, tuple[str, ...]] = {
-    "authentication": ("auth", "authn", "인증", "login", "로그인"),
+    "authentication": ("authentication", "인증", "login", "로그인"),
     "authorization": ("authz", "authorization", "인가", "권한", "access control", "접근"),
     "api": ("api", "endpoint", "rest"),
     "web": ("web", "웹", "http"),
     "mobile": ("mobile", "모바일", "apk", "android", "ios"),
     "reconnaissance": ("recon", "정찰", "discovery", "탐색"),
 }
+
+_INLINE_SECRET = re.compile(
+    r"\b(bearer\s+|(?:password|passwd|token|cookie|api[_-]?key|secret)"
+    r"\s+(?:is\s+|는\s*|은\s*|:|=)?\s*)([^\s,;]+)",
+    re.IGNORECASE,
+)
+
+
+def sanitize_objective(text: str) -> str:
+    """Strip common inline credentials before LLM input or durable Mission state."""
+    return _INLINE_SECRET.sub(
+        lambda match: f"{match.group(1)}***REDACTED***",
+        redact_sensitive_text(text),
+    )
 
 
 def extract_focus_areas(text: str) -> list[str]:
@@ -41,6 +57,7 @@ def extract_focus_areas(text: str) -> list[str]:
         label
         for label, needles in _FOCUS_KEYWORDS.items()
         if any(needle in lowered for needle in needles)
+        or (label == "authentication" and re.search(r"\bauthn?\b", lowered))
     ]
     return list(dict.fromkeys(found))
 
@@ -59,8 +76,8 @@ def plan_mission(
     objective text, then any recorded on ``Engagement.metadata['focus_areas']``.
     """
 
-    objective_text = (objective or "").strip() or (
-        f"Assess the declared scope of {engagement.name}"
+    objective_text = sanitize_objective((objective or "").strip()) or (
+        f"Assess the declared scope of {sanitize_objective(engagement.name)}"
     )
     recorded = engagement.metadata.get("focus_areas")
     focus = (
@@ -69,7 +86,12 @@ def plan_mission(
         or (list(recorded) if isinstance(recorded, list) else [])
     )
     priorities = [str(item) for item in focus] or ["reconnaissance", "web/api assessment"]
-    success_criteria = [f"verified evidence for {priority}" for priority in priorities]
+    # The default web sweep is optional until a relevant surface is found.
+    # Only promise evidence for workstreams the operator explicitly requested.
+    success_criteria = [
+        f"verified evidence for {priority}"
+        for priority in (priorities if focus else ["reconnaissance"])
+    ]
 
     return MissionPlan(
         mission_id=mission_id,
@@ -94,7 +116,7 @@ async def parse_objective(utterance: str, *, llm: Any = None) -> tuple[str, list
     convenience, never the authorization source.
     """
 
-    cleaned = utterance.strip()
+    cleaned = sanitize_objective(utterance.strip())
     focus = extract_focus_areas(cleaned)
     if llm is None:
         return cleaned or "Assess the declared scope", focus
@@ -116,7 +138,7 @@ async def parse_objective(utterance: str, *, llm: Any = None) -> tuple[str, list
     candidate = str(reply.get("objective", "")).strip() if isinstance(reply, dict) else ""
     if not candidate or _looks_secret(candidate):
         return cleaned or "Assess the declared scope", focus
-    return candidate, focus or extract_focus_areas(candidate)
+    return sanitize_objective(candidate), focus or extract_focus_areas(candidate)
 
 
 def _looks_secret(text: str) -> bool:

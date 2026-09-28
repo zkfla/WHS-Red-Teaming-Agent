@@ -56,6 +56,7 @@ from redteam.core.config import (
 )
 from redteam.core.ports.llm import LLMClient
 from redteam.intake.assistant import IntakeAssistant, IntakeAssistantError, IntakeSession
+from redteam.intake.fallback import deterministic_intake_turn
 from redteam.intake.models import missing_required_fields
 from redteam.intake.serializer import (
     DraftIncompleteError,
@@ -66,6 +67,7 @@ from redteam.intake.serializer import (
     merge_draft,
     scope_diff,
 )
+from redteam.orchestration.engagement_planner import sanitize_objective
 
 logger = logging.getLogger(__name__)
 
@@ -109,12 +111,14 @@ async def _run(console: Console, *, verbose: bool) -> int:
     else:
         engagement_config = load_engagement_config(DEFAULT_ENGAGEMENT_PATH)
 
-    engagement_config = await _existing_config_menu(console, engagement_config, llm_client)
-    if engagement_config is None:
+    selected = await _existing_config_menu(console, engagement_config, llm_client)
+    if selected is None:
         return EXIT_OK
+    engagement_config, objective = selected
 
     engagement_config = await _preflight_loop(
-        console, engagement_config, llm_client, llm_config, capability_config
+        console, engagement_config, llm_client, llm_config, capability_config,
+        auto_start=objective is not None,
     )
     if engagement_config is None:
         return EXIT_OK
@@ -128,7 +132,7 @@ async def _run(console: Console, *, verbose: bool) -> int:
         logging=logging_config,
     )
     logging.basicConfig(level=logging_config.level, force=True)
-    return await _execute(console, full_config, verbose=verbose)
+    return await _execute(console, full_config, verbose=verbose, objective=objective)
 
 
 # --- runtime (LLM/capability) config: a short one-time prompt, never an ----
@@ -237,13 +241,12 @@ async def _intake_loop(
     message = first_message
     while True:
         try:
-            turn = await assistant.step(session, message)
+            turn = await assistant.step(session, sanitize_objective(message))
         except IntakeAssistantError as exc:
-            console.print(f"[red]{renderer.theme.ICON_FAILURE} {exc}[/red]")
-            message = console.input("[cyan]>[/cyan] ")
-            if not message.strip():
+            if session.editing:
+                console.print(f"[red]{renderer.theme.ICON_FAILURE} {exc}[/red]")
                 return None
-            continue
+            turn = deterministic_intake_turn(session.draft, sanitize_objective(message))
 
         session.draft = merge_draft(session.draft, turn.draft)
         if turn.acknowledgement:
@@ -263,8 +266,8 @@ async def _intake_loop(
             questions = [f"확인이 더 필요합니다: {', '.join(missing) or 'unspecified'}"]
 
         console.print("\n테스트 범위를 조금 더 확인하겠습니다.\n")
-        for index, question in enumerate(questions, start=1):
-            console.print(f"  {index}. {question}")
+        # Recheck the draft after each answer; ask only the next missing item.
+        console.print(f"  1. {questions[0]}")
         message = console.input("\n[cyan]>[/cyan] ")
         if not message.strip() or message.strip().lower() in {"q", "quit"}:
             return None
@@ -288,7 +291,7 @@ async def _intake_loop(
 
 async def _existing_config_menu(
     console: Console, engagement_config: EngagementConfig, llm_client: LLMClient
-) -> EngagementConfig | None:
+) -> tuple[EngagementConfig, str | None] | None:
     while True:
         renderer.render_engagement_panel(
             console,
@@ -299,23 +302,27 @@ async def _existing_config_menu(
             focus=" · ".join(engagement_config.metadata.get("focus_areas", [])) or None,
         )
         choice = renderer.prompt_choice(
-            console, "", "[ Enter ] Start   [ E ] Edit   [ N ] New   [ Q ] Quit"
+            console, "", "[ Enter ] Start   [ E ] Edit   [ N ] New   [ Q ] Quit\n"
+            "Or type a Mission objective:", normalize=False
         )
-        if choice in ("", "start", "s"):
-            return engagement_config
-        if choice in ("e", "edit"):
+        command = choice.lower()
+        if command in ("", "start", "s"):
+            return engagement_config, None
+        if command in ("e", "edit"):
             updated = await _edit_engagement(console, llm_client, engagement_config)
             if updated is not None:
                 engagement_config = updated
                 _write_engagement(DEFAULT_ENGAGEMENT_PATH, engagement_config)
             continue
-        if choice in ("n", "new"):
+        if command in ("n", "new"):
             fresh = await _new_engagement(console, llm_client)
             if fresh is not None:
                 engagement_config = fresh
                 _write_engagement(DEFAULT_ENGAGEMENT_PATH, engagement_config)
             continue
-        return None
+        if command in ("q", "quit"):
+            return None
+        return engagement_config, choice
 
 
 # --- Preflight (section 10, 21) --------------------------------------------
@@ -327,6 +334,8 @@ async def _preflight_loop(
     llm_client: LLMClient,
     llm_config: LLMConfig,
     capability_config: CapabilityConfig,
+    *,
+    auto_start: bool = False,
 ) -> EngagementConfig | None:
     while True:
         scope_problems = check_scope(engagement_config)
@@ -382,6 +391,8 @@ async def _preflight_loop(
                 continue
             return None
 
+        if auto_start:
+            return engagement_config
         choice = renderer.prompt_choice(
             console, "Ready to start?", "[ Enter ] Start   [ E ] Edit   [ Q ] Quit"
         )
@@ -408,13 +419,18 @@ def _write_engagement(path: Path, engagement_config: EngagementConfig) -> None:
 # --- Execution (section 18/19, via commands.run's shared core) ------------
 
 
-async def _execute(console: Console, full_config: AppConfig, *, verbose: bool) -> int:
+async def _execute(
+    console: Console, full_config: AppConfig, *, verbose: bool, objective: str | None = None
+) -> int:
     async with AsyncExitStack() as stack:
-        return await _execute_scoped(console, full_config, verbose=verbose, mcp_stack=stack)
+        return await _execute_scoped(
+            console, full_config, verbose=verbose, mcp_stack=stack, objective=objective
+        )
 
 
 async def _execute_scoped(
-    console: Console, full_config: AppConfig, *, verbose: bool, mcp_stack: AsyncExitStack
+    console: Console, full_config: AppConfig, *, verbose: bool, mcp_stack: AsyncExitStack,
+    objective: str | None = None,
 ) -> int:
     with console.status("Starting engagement...", spinner="dots"):
         try:
@@ -451,6 +467,7 @@ async def _execute_scoped(
             non_interactive=False,
             on_event=event_renderer,
             echo=lambda line: console.print(line),
+            objective=objective,
         )
     except Exception as exc:  # noqa: BLE001 - same fail-closed contract as commands.run
         if logging.getLogger().isEnabledFor(logging.DEBUG):
@@ -467,6 +484,8 @@ async def _execute_scoped(
         tool_calls=event_renderer.tool_calls,
         violations=event_renderer.violations,
     )
+    if final.mission_status is not None:
+        console.print(f"Mission: {final.mission_status.value}")
     console.print(f"\n[dim]RunId: {final.run_id}[/dim]")
     console.print(f"[dim]Report: redteam report generate {final.run_id}[/dim]")
     return EXIT_FAILURE if final.phase.value == "failed" else EXIT_OK

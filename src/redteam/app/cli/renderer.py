@@ -396,7 +396,8 @@ def render_capability_warning(console: Console) -> None:
     )
 
 
-def prompt_choice(console: Console, prompt: str, options: str) -> str:
+def prompt_choice(console: Console, prompt: str, options: str, *, normalize: bool = True) -> str:
     console.print(f"\n{prompt}\n")
     console.print(f"  {options}")
-    return console.input("\n> ").strip().lower()
+    answer = console.input("\n> ").strip()
+    return answer.lower() if normalize else answer
