@@ -71,6 +71,8 @@ async def test_minimal_vertical_slice_end_to_end(tmp_path) -> None:
     # the right run/engagement.
     expected_in_order = [
         EventType.RUN_STARTED,
+        # Task-first: the Mission's Task is started before its Agent is dispatched.
+        EventType.TASK_STARTED,
         EventType.AGENT_STARTED,
         CANDIDATE_GENERATED,
         EventType.HYPOTHESIS_CREATED,
@@ -83,7 +85,11 @@ async def test_minimal_vertical_slice_end_to_end(tmp_path) -> None:
         HYPOTHESIS_RESOLVED,
         EventType.GRAPH_UPDATED,
         EventType.AGENT_FINISHED,
+        # Task-first: the finished Agent's Task is completed in the same turn.
+        EventType.TASK_COMPLETED,
         REPLAN_TRIGGERED,
+        # The Mission is settled from its final Task states at run end.
+        EventType.MISSION_UPDATED,
         REPORT_PROJECTED,
         EventType.RUN_FINISHED,
     ]
@@ -102,7 +108,8 @@ async def test_minimal_vertical_slice_end_to_end(tmp_path) -> None:
     # From the hypothesis the action was raised for through the update that
     # settled it -- CandidateGenerated is not part of this action's chain
     # (it summarises the whole compiled frontier, before a step is chosen).
-    assert correlated == expected_in_order[3:12]
+    # (indices shifted by one now that TASK_STARTED precedes AGENT_STARTED)
+    assert correlated == expected_in_order[4:13]
 
     # 9. Evidence was recorded for the run, correlated to the action.
     evidence = await deps.evidence_store.list_for_run(final_state.run_id)

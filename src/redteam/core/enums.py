@@ -44,6 +44,36 @@ class RunStatus(str, Enum):
     CANCELLED = "cancelled"
 
 
+class MissionStatus(str, Enum):
+    DRAFT = "draft"
+    ACTIVE = "active"
+    PAUSED = "paused"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+class TaskStatus(str, Enum):
+    PENDING = "pending"
+    READY = "ready"
+    RUNNING = "running"
+    BLOCKED = "blocked"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+class OperatorIntentType(str, Enum):
+    REPRIORITIZE = "reprioritize"
+    FOCUS = "focus"
+    EXCLUDE = "exclude"
+    PAUSE = "pause"
+    RESUME = "resume"
+    STOP = "stop"
+    EXPLANATION_QUERY = "explanation_query"
+    STATUS_QUERY = "status_query"
+
+
 class PolicyVerdict(str, Enum):
     ALLOW = "allow"
     DENY = "deny"

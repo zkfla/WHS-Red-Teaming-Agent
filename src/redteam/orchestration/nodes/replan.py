@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 from redteam.core.contracts.events import EventType
-from redteam.core.enums import AgentPhase
+from redteam.core.enums import AgentPhase, TaskStatus
 from redteam.orchestration.context import RuntimeDeps
 from redteam.orchestration.convergence import evaluate_convergence
 from redteam.orchestration.events import REPLAN_TRIGGERED
 from redteam.orchestration.nodes._support import advance, graph_service, publisher_for
+from redteam.orchestration.replanning import replan_task_graph
 from redteam.orchestration.state import GraphState, RuntimeState, TerminationReason
 
 #: Why a replan happened, in the Event Bus vocabulary rather than the run's
@@ -56,6 +59,19 @@ async def replan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
     publisher = publisher_for(state, deps, "orchestration.replan")
     last_event_id = state.get("last_event_id")
 
+    # Dynamic replanning: grow the Task Graph from what the Attack Graph now
+    # knows (e.g. an object-bound endpoint -> an authorization Task). New work
+    # coincides with a graph change, so the "graph changed -> continue" path
+    # below keeps the run going and OBSERVE schedules it Task-first.
+    if runtime.mission_id is not None:
+        last_event_id = await replan_task_graph(
+            deps.task_graph_store,
+            graph_service(deps),
+            runtime.mission_id,
+            publisher=publisher,
+            last_event_id=last_event_id,
+        )
+
     agent_id = runtime.current_agent
     finished_agents = list(runtime.finished_agents)
     revision_cursors = dict(runtime.agent_revision_cursors)
@@ -88,6 +104,23 @@ async def replan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                 causation_id=last_event_id,
             )
             last_event_id = retired.event_id
+            # Task-first: the Agent finishing its frontier means its active
+            # Task is done -- complete it now (before any termination decision)
+            # so the Task Graph reflects progress and the Mission can settle.
+            if runtime.mission_id is not None and runtime.active_task_id is not None:
+                task = await deps.task_graph_store.get_task(runtime.active_task_id)
+                if task is not None and task.status is TaskStatus.RUNNING:
+                    await deps.task_graph_store.transition_task(
+                        runtime.active_task_id,
+                        TaskStatus.COMPLETED,
+                        now=datetime.now(timezone.utc),
+                    )
+                    completed = await publisher.publish(
+                        EventType.TASK_COMPLETED,
+                        {"task_id": runtime.active_task_id, "agent_id": agent_id},
+                        causation_id=last_event_id,
+                    )
+                    last_event_id = completed.event_id
 
     reason = runtime.termination_reason or _hard_stop(runtime, deps)
     next_agent = None

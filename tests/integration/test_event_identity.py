@@ -74,11 +74,16 @@ async def test_replan_triggered_keeps_run_identity_and_cites_its_cause(tmp_path)
 async def test_agent_started_cites_run_started_as_causation(tmp_path) -> None:
     events, _run_id = await _run_with_events(tmp_path)
     run_started = next(event for event in events if event.event_type == EventType.RUN_STARTED)
+    task_started = next(event for event in events if event.event_type == EventType.TASK_STARTED)
     agent_started = next(event for event in events if event.event_type == EventType.AGENT_STARTED)
 
     assert run_started.correlation_id == str(run_started.run_id)
     assert agent_started.correlation_id == run_started.correlation_id
-    assert agent_started.causation_id == run_started.event_id
+    # Task-first causation chain: RunStarted -> TaskStarted -> AgentStarted.
+    # The Agent is dispatched by its Task, so it cites the TaskStarted that
+    # scheduled it, which in turn traces back to RunStarted.
+    assert task_started.causation_id == run_started.event_id
+    assert agent_started.causation_id == task_started.event_id
 
 
 async def test_run_finished_cites_the_last_event_and_keeps_run_correlation(tmp_path) -> None:

@@ -63,9 +63,11 @@ from redteam.core.ports.control_plane import ControlPlane
 from redteam.core.ports.event_bus import EventBus
 from redteam.core.ports.evidence_store import EvidenceStore
 from redteam.core.ports.llm import LLMClient
+from redteam.core.ports.task_graph import MissionTaskStore
 from redteam.core.ports.tool_catalog import ToolCatalog
 from redteam.core.ports.tool_gateway import ToolGateway
 from redteam.event_bus.memory import InMemoryEventBus
+from redteam.event_bus.publisher import EventPublisher
 from redteam.evidence.service import EvidenceService
 from redteam.evidence.stores.filesystem import FilesystemEvidenceStore
 from redteam.llm.fake import FakeLLMClient
@@ -76,11 +78,15 @@ from redteam.orchestration.agents.providers import (
 from redteam.orchestration.agents.registry import AgentRegistry, default_registry
 from redteam.orchestration.context import RuntimeDeps
 from redteam.orchestration.events import REPORT_PROJECTED
+from redteam.orchestration.mission_bootstrap import bootstrap_mission
+from redteam.orchestration.replanning import finalize_mission
 from redteam.orchestration.reporting import ReportingAgent
 from redteam.orchestration.runner import AgentLoopRunner
 from redteam.orchestration.seed import seed_from_engagement
 from redteam.orchestration.settings import OrchestrationSettings
 from redteam.orchestration.state import RuntimeState, TerminationReason
+from redteam.orchestration.task_graph.memory import InMemoryTaskGraphStore
+from redteam.orchestration.task_graph.sqlite import SQLiteTaskGraphStore
 from redteam.orchestration.work.memory import InMemoryWorkStore
 from redteam.orchestration.work.sqlite import SQLiteWorkStore
 from redteam.orchestration.work.store import WorkStore
@@ -131,6 +137,7 @@ async def build_runtime_deps(
     agents: AgentRegistry | None = None,
     candidate_providers: CandidateProviderRegistry | None = None,
     tool_catalog: ToolCatalog | None = None,
+    task_graph_store: MissionTaskStore | None = None,
 ) -> RuntimeDeps:
     """Wire in-memory/dummy backends for every port, from an ``Engagement`` alone.
 
@@ -180,14 +187,19 @@ async def build_runtime_deps(
         llm_client=llm_client,
         agents=agents if agents is not None else default_registry(),
         candidate_providers=(
-            candidate_providers
-            if candidate_providers is not None
-            else default_provider_registry()
+            candidate_providers if candidate_providers is not None else default_provider_registry()
         ),
         tool_catalog=(tool_catalog if tool_catalog is not None else discovered_catalog),
         work_store=_build_work_store(settings),
+        task_graph_store=(task_graph_store or _build_task_graph_store(settings)),
         settings=settings,
     )
+
+
+def _build_task_graph_store(settings: OrchestrationSettings) -> MissionTaskStore:
+    if settings.task_graph_backend == "sqlite":
+        return SQLiteTaskGraphStore(settings.task_graph_path)
+    return InMemoryTaskGraphStore()
 
 
 def _build_work_store(settings: OrchestrationSettings) -> WorkStore:
@@ -213,6 +225,7 @@ async def build_application(
     agents: AgentRegistry | None = None,
     candidate_providers: CandidateProviderRegistry | None = None,
     tool_catalog: ToolCatalog | None = None,
+    task_graph_store: MissionTaskStore | None = None,
 ) -> tuple[Engagement, RuntimeDeps]:
     """``AppConfig``-aware composition root. Every dependency is overridable.
 
@@ -289,12 +302,11 @@ async def build_application(
         llm_client=resolved_llm,
         agents=agents if agents is not None else default_registry(),
         candidate_providers=(
-            candidate_providers
-            if candidate_providers is not None
-            else default_provider_registry()
+            candidate_providers if candidate_providers is not None else default_provider_registry()
         ),
         tool_catalog=resolved_tool_catalog,
         work_store=_build_work_store(resolved_settings),
+        task_graph_store=(task_graph_store or _build_task_graph_store(resolved_settings)),
         settings=resolved_settings,
     )
     return engagement, deps
@@ -396,6 +408,14 @@ async def run_engagement(
 
     await seed_from_engagement(AttackGraphService(deps.graph_store), engagement, run_id=run_id)
 
+    # Task-first runtime: open a Mission and seed its initial Task Graph so the
+    # Orchestrator schedules Task -> Agent, not Agent first. Additive — a run
+    # without this still schedules via agent rotation (the mission_id is then
+    # None). Secret-free: only scope metadata and role names are used.
+    mission_id = await bootstrap_mission(
+        deps.task_graph_store, deps.agents, engagement, now=datetime.now(timezone.utc)
+    )
+
     run_started = EventEnvelope(
         event_id=EventId(new_id("evt")),
         event_type=EventType.RUN_STARTED,
@@ -412,6 +432,7 @@ async def run_engagement(
         run_id=run_id,
         engagement_id=engagement.engagement_id,
         phase=AgentPhase.OBSERVE,
+        mission_id=mission_id,
         current_goal=f"map and probe the declared scope of {engagement.name}",
         remaining_budget=engagement.execution_budget.max_actions,
     )
@@ -446,6 +467,20 @@ async def run_engagement(
             except Exception:  # noqa: BLE001 - never mask the run failure
                 pass
             raise
+        if runtime.mission_id is not None:
+            await finalize_mission(
+                deps.task_graph_store,
+                runtime.mission_id,
+                publisher=EventPublisher(
+                    deps.event_bus,
+                    run_id=runtime.run_id,
+                    engagement_id=runtime.engagement_id,
+                    source="app.bootstrap",
+                ),
+                last_event_id=(
+                    EventId(str(runner.last_event_id)) if runner.last_event_id else None
+                ),
+            )
         await _publish_terminal_artifacts(
             runtime,
             deps,
