@@ -1,8 +1,17 @@
 """Read-only synthetic bank for local tests. No payment/transfer endpoints."""
 
 import json
+import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
+
+# ponytail: single env gate for the deliberately-vulnerable demo target.
+# Unset (default) => secure server, identical to production behaviour.
+# VULNERABLE_DEMO=1 => broken object-level auth on /api/accounts/alice
+# (any bearer is accepted), so a deny-declared session gets 2xx and the
+# agent promotes an ACCESS_CONTROL_VIOLATION finding. Referenced by
+# deploy/compose/finance-vulnerable-demo.yml.
+VULN = os.environ.get("VULNERABLE_DEMO") == "1"
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -23,8 +32,15 @@ class Handler(BaseHTTPRequestHandler):
         elif urlsplit(self.path).path == "/health":
             body = b'{"status":"ok"}'
         elif self.path == "/api/accounts/alice":
-            if self.headers.get("Authorization") == "Bearer synthetic-alice":
+            auth = self.headers.get("Authorization", "")
+            authorized = auth == "Bearer synthetic-alice" or (VULN and auth.startswith("Bearer "))
+            if authorized:
                 body = b'{"owner":"test-alice","balance":1000,"currency":"KRW"}'
+            elif VULN:
+                # Unauthenticated baseline is 401 so the access-control check
+                # (authentication.py requires a 401 anonymous baseline) fires.
+                status = 401
+                body = b'{"error":"unauthorized"}'
             else:
                 status = 403
                 body = b'{"error":"forbidden"}'

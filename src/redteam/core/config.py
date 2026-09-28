@@ -74,6 +74,10 @@ class LLMConfig(BaseModel):
 class OrchestrationConfig(BaseModel):
     max_retries: int = Field(default=3, ge=0)
     max_steps: int = Field(default=50, ge=1)
+    #: RC#1 opt-in: let the LLM generate candidate drafts in addition to the
+    #: playbook frontier. Off by default; every generated draft is still
+    #: compiled and policy-checked like any other before it can run.
+    llm_candidate_generation: bool = Field(default=False)
 
 
 class CapabilityConfig(BaseModel):

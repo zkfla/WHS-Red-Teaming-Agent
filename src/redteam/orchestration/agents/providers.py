@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 from redteam.attack_graph.identity import node_id_for_target
 from redteam.attack_graph.observation import GraphObservation
@@ -103,6 +103,12 @@ class GraphCandidateContext:
     #: the global graph revision counter). Recorded so a replan can say *what*
     #: changed instead of only that a counter moved.
     planning_fingerprint: str = ""
+    #: RC#2: target-linked evidence outcomes (status/error/summary dicts, as
+    #: produced by ``project_evidence_excerpts``). Gives a generating provider
+    #: the raw result material -- not just the graph summary -- so the model
+    #: can reason past what a playbook anticipated. Dicts, not the model type,
+    #: to keep this seam import-cycle free.
+    evidence_excerpts: tuple[Mapping[str, Any], ...] = ()
 
     def can_execute(self, capability: str, operation: str) -> bool:
         """Whether a candidate for this action could actually be executed.

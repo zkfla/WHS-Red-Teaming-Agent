@@ -16,8 +16,9 @@ from redteam.core.contracts.events import EventType
 from redteam.core.contracts.graph import Hypothesis
 from redteam.core.contracts.target import target_display_name
 from redteam.core.enums import AgentPhase
-from redteam.core.ids import ActionId, HypothesisId, new_id
+from redteam.core.ids import ActionId, GraphNodeId, HypothesisId, new_id
 from redteam.orchestration.agents.base import AgentSpec, PlanningContext
+from redteam.orchestration.agents.llm_provider import LLMCandidateProvider
 from redteam.orchestration.agents.planners import build_planner
 from redteam.orchestration.agents.providers import (
     CandidateBatch,
@@ -150,6 +151,26 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                 available_operations=available_operations,
                 prior_candidate_keys=terminal_keys,
             )
+            llm_generation = (
+                deps.settings.llm_candidate_generation and deps.llm_client is not None
+            )
+            generation_excerpts: tuple[dict[str, object], ...] = ()
+            if llm_generation:
+                # RC#2: give the generator the raw outcome per known target so
+                # it can propose a follow-up the playbook never anticipated.
+                observation_targets = [
+                    GraphNodeId(node_id)
+                    for node_ids in observation.node_ids_by_type.values()
+                    for node_id in node_ids
+                ]
+                generation_excerpts = tuple(
+                    excerpt.model_dump(mode="json")
+                    for excerpt in project_evidence_excerpts(
+                        await deps.evidence_store.list_for_run(runtime.run_id),
+                        target_node_ids=observation_targets,
+                        limit=deps.settings.planner_rerank_top_k,
+                    )
+                )
             context = GraphCandidateContext(
                 view=service.view(),
                 observation=observation,
@@ -160,6 +181,7 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                 available_operations=available_operations,
                 operations_verified=operations_verified,
                 planning_fingerprint=planning_digest,
+                evidence_excerpts=generation_excerpts,
             )
             graph_propose = getattr(provider, "propose_graph", None)
             offered = (
@@ -174,6 +196,35 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                 drops = offered.drops
             else:
                 drafts = offered
+            if llm_generation:
+                # RC#1: the model may add drafts the playbook never listed.
+                # They join the same list and are compiled/policy-checked
+                # identically. Generation is kept purely *additive*: a draft
+                # whose (target, operation) the playbook already covers is
+                # dropped, so a generated variant can never crowd out the
+                # argument-bound playbook draft for the same work -- the model
+                # only fills gaps the playbook left open.
+                llm_batch = await LLMCandidateProvider(deps.llm_client).propose_graph(
+                    agent, context
+                )
+                covered = {
+                    (str(target), draft.plan_step.operation_key)
+                    for draft in drafts
+                    for target in draft.target_node_ids
+                }
+                for gen_draft in llm_batch.candidates:
+                    key = (str(gen_draft.target_node_ids[0]), gen_draft.plan_step.operation_key)
+                    if key in covered:
+                        drops.append(
+                            DraftDrop(
+                                step_id=gen_draft.plan_step.step_id,
+                                target_node_id=str(gen_draft.target_node_ids[0]),
+                                reason="covered_by_playbook",
+                            )
+                        )
+                    else:
+                        drafts.append(gen_draft)
+                drops = [*drops, *llm_batch.drops]
             compiled, rejections = compiler.compile_drafts_with_rejections(drafts)
             for draft in drafts:
                 check = draft.plan_step.authentication_check

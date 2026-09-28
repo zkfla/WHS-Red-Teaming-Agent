@@ -67,6 +67,13 @@ class OrchestrationSettings(BaseModel):
     #: planner can only ever return one of these.
     planner_rerank_top_k: int = Field(default=3, ge=2, le=20)
 
+    #: RC#1: when on (and an LLM client is wired), the model may *generate*
+    #: candidate drafts each turn in addition to the playbook frontier. Every
+    #: generated draft is compiled and policy-checked exactly like a playbook
+    #: draft, so this only widens what is proposed, never what may run.
+    #: Default off: the playbook-only frontier stays the baseline behaviour.
+    llm_candidate_generation: bool = Field(default=False)
+
     #: Overrides the value derived from ``max_steps`` when set.
     recursion_limit: int | None = Field(default=None, ge=1)
 
@@ -93,5 +100,6 @@ class OrchestrationSettings(BaseModel):
         if config is not None:
             base["max_steps"] = config.max_steps
             base["max_retries"] = config.max_retries
+            base["llm_candidate_generation"] = config.llm_candidate_generation
         base.update({key: value for key, value in overrides.items() if value is not None})
         return cls.model_validate(base)

@@ -82,6 +82,15 @@ async def verify_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
     response_observation = http_observation(proposal.arguments, result)
     if response_observation is not None:
         evidence.metadata["http_observation"] = response_observation
+    if not result.success and result.error is not None:
+        # RC#2: keep the non-secret failure code so a later planning turn can
+        # read *why* a step failed and adapt. The free-text message and
+        # details may carry target data, so only the code/retryable flag --
+        # both bounded and non-secret -- are recorded here.
+        evidence.metadata["error"] = {
+            "code": result.error.code,
+            "retryable": result.error.retryable,
+        }
     await deps.evidence_store.append(evidence)
 
     created = await publisher.publish(

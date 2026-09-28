@@ -135,9 +135,16 @@ class LLMPlanner:
         if evidence_excerpts:
             lines.append("Target-linked evidence excerpts:")
             for item in evidence_excerpts:
+                outcome = ""
+                if item.get("status_code") is not None:
+                    outcome += f" status={item['status_code']}"
+                if item.get("error_code"):
+                    outcome += f" error={item['error_code']}"
                 lines.append(
                     "  - evidence_id={evidence_id} target={target_node_id} "
-                    "source={source_id} summary={summary}".format(**item)
+                    "source={source_id}{outcome} summary={summary}".format(
+                        outcome=outcome, **item
+                    )
                 )
 
         lines.append("")
@@ -336,9 +343,16 @@ class HybridPlanner(LLMPlanner):
         if evidence_excerpts:
             lines.append("Target-linked evidence excerpts:")
             for item in evidence_excerpts:
+                outcome = ""
+                if item.get("status_code") is not None:
+                    outcome += f" status={item['status_code']}"
+                if item.get("error_code"):
+                    outcome += f" error={item['error_code']}"
                 lines.append(
                     "  - evidence_id={evidence_id} target={target_node_id} "
-                    "source={source_id} summary={summary}".format(**item)
+                    "source={source_id}{outcome} summary={summary}".format(
+                        outcome=outcome, **item
+                    )
                 )
 
         lines.append("")
