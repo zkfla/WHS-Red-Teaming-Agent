@@ -1,0 +1,261 @@
+{
+  "verification_id": "AG-GRAPH-BASIC-RUNTIME-20260928",
+  "baseline_commit": "c042e8478555d192340f82fe113647a40cc53058",
+  "llm": "fake",
+  "scope": "programmatic app loop; isolated local synthetic HTTP; real MCP stdio",
+  "runs": [
+    {
+      "require_approval": true,
+      "llm_provider": "fake",
+      "transport": "stdio",
+      "termination": "approval_pending",
+      "actions": 1,
+      "actions_by_agent": {
+        "recon-agent": 1
+      },
+      "tools": [
+        "recon.http_probe"
+      ],
+      "tool_failures": 0,
+      "node_types": {
+        "host": 1,
+        "hypothesis": 2,
+        "service": 1,
+        "endpoint": 1
+      },
+      "nodes": [
+        {
+          "id": "host:127.0.0.1",
+          "type": "host"
+        },
+        {
+          "id": "hypothesis:hyp_dc9d5c009202",
+          "type": "hypothesis"
+        },
+        {
+          "id": "service:127.0.0.1/http:42567",
+          "type": "service"
+        },
+        {
+          "id": "endpoint:127.0.0.1:42567 GET /",
+          "type": "endpoint"
+        },
+        {
+          "id": "hypothesis:hyp_b82b35a3a64e",
+          "type": "hypothesis"
+        }
+      ],
+      "evidence_count": 2,
+      "graph_evidence_references": 1,
+      "graph_evidence_references_resolve": true,
+      "findings": 0,
+      "disallowed_paths": [],
+      "disallowed_paths_not_requested": true,
+      "trace": [
+        {
+          "event": "ToolExecutionStarted",
+          "tool_id": "recon.http_probe",
+          "node_id": null
+        },
+        {
+          "event": "GraphUpdated",
+          "tool_id": null,
+          "node_id": "host:127.0.0.1"
+        },
+        {
+          "event": "GraphUpdated",
+          "tool_id": null,
+          "node_id": "service:127.0.0.1/http:42567"
+        },
+        {
+          "event": "GraphUpdated",
+          "tool_id": null,
+          "node_id": "endpoint:127.0.0.1:42567 GET /"
+        },
+        {
+          "event": "ApprovalRequired",
+          "tool_id": null,
+          "node_id": null
+        },
+        {
+          "event": "GraphUpdated",
+          "tool_id": null,
+          "node_id": "endpoint:127.0.0.1:42567 GET /"
+        },
+        {
+          "event": "ReportProjected",
+          "tool_id": null,
+          "node_id": null
+        }
+      ]
+    },
+    {
+      "require_approval": false,
+      "llm_provider": "fake",
+      "transport": "stdio",
+      "termination": "max_steps_reached",
+      "actions": 5,
+      "actions_by_agent": {
+        "recon-agent": 2,
+        "web-api-agent": 3
+      },
+      "tools": [
+        "recon.http_probe",
+        "web.http_request",
+        "recon.html_inventory",
+        "web.http_security_posture",
+        "web.http_request"
+      ],
+      "tool_failures": 0,
+      "node_types": {
+        "host": 1,
+        "hypothesis": 5,
+        "service": 1,
+        "endpoint": 3
+      },
+      "nodes": [
+        {
+          "id": "host:127.0.0.1",
+          "type": "host"
+        },
+        {
+          "id": "hypothesis:hyp_cb64d717888f",
+          "type": "hypothesis"
+        },
+        {
+          "id": "service:127.0.0.1/http:42567",
+          "type": "service"
+        },
+        {
+          "id": "endpoint:127.0.0.1:42567 GET /",
+          "type": "endpoint"
+        },
+        {
+          "id": "hypothesis:hyp_2c5ee84caf41",
+          "type": "hypothesis"
+        },
+        {
+          "id": "hypothesis:hyp_cdd3468177be",
+          "type": "hypothesis"
+        },
+        {
+          "id": "endpoint:127.0.0.1:42567 GET /api/accounts/alice",
+          "type": "endpoint"
+        },
+        {
+          "id": "endpoint:127.0.0.1:42567 GET /assets/test-sdk.js",
+          "type": "endpoint"
+        },
+        {
+          "id": "hypothesis:hyp_10a974646a53",
+          "type": "hypothesis"
+        },
+        {
+          "id": "hypothesis:hyp_58e219119165",
+          "type": "hypothesis"
+        }
+      ],
+      "evidence_count": 5,
+      "graph_evidence_references": 5,
+      "graph_evidence_references_resolve": true,
+      "findings": 0,
+      "disallowed_paths": [
+        "endpoint:127.0.0.1:42567 GET /assets/test-sdk.js"
+      ],
+      "disallowed_paths_not_requested": true,
+      "trace": [
+        {
+          "event": "ToolExecutionStarted",
+          "tool_id": "recon.http_probe",
+          "node_id": null
+        },
+        {
+          "event": "GraphUpdated",
+          "tool_id": null,
+          "node_id": "host:127.0.0.1"
+        },
+        {
+          "event": "GraphUpdated",
+          "tool_id": null,
+          "node_id": "service:127.0.0.1/http:42567"
+        },
+        {
+          "event": "GraphUpdated",
+          "tool_id": null,
+          "node_id": "endpoint:127.0.0.1:42567 GET /"
+        },
+        {
+          "event": "ToolExecutionStarted",
+          "tool_id": "web.http_request",
+          "node_id": null
+        },
+        {
+          "event": "GraphUpdated",
+          "tool_id": null,
+          "node_id": "endpoint:127.0.0.1:42567 GET /"
+        },
+        {
+          "event": "GraphUpdated",
+          "tool_id": null,
+          "node_id": "endpoint:127.0.0.1:42567 GET /"
+        },
+        {
+          "event": "ToolExecutionStarted",
+          "tool_id": "recon.html_inventory",
+          "node_id": null
+        },
+        {
+          "event": "GraphUpdated",
+          "tool_id": null,
+          "node_id": "endpoint:127.0.0.1:42567 GET /"
+        },
+        {
+          "event": "GraphUpdated",
+          "tool_id": null,
+          "node_id": "endpoint:127.0.0.1:42567 GET /api/accounts/alice"
+        },
+        {
+          "event": "GraphUpdated",
+          "tool_id": null,
+          "node_id": "endpoint:127.0.0.1:42567 GET /assets/test-sdk.js"
+        },
+        {
+          "event": "ToolExecutionStarted",
+          "tool_id": "web.http_security_posture",
+          "node_id": null
+        },
+        {
+          "event": "GraphUpdated",
+          "tool_id": null,
+          "node_id": "endpoint:127.0.0.1:42567 GET /"
+        },
+        {
+          "event": "GraphUpdated",
+          "tool_id": null,
+          "node_id": "endpoint:127.0.0.1:42567 GET /"
+        },
+        {
+          "event": "ToolExecutionStarted",
+          "tool_id": "web.http_request",
+          "node_id": null
+        },
+        {
+          "event": "GraphUpdated",
+          "tool_id": null,
+          "node_id": "endpoint:127.0.0.1:42567 GET /api/accounts/alice"
+        },
+        {
+          "event": "GraphUpdated",
+          "tool_id": null,
+          "node_id": "endpoint:127.0.0.1:42567 GET /api/accounts/alice"
+        },
+        {
+          "event": "ReportProjected",
+          "tool_id": null,
+          "node_id": null
+        }
+      ]
+    }
+  ]
+}
+
