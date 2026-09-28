@@ -26,6 +26,13 @@ from redteam.core.contracts.tool import ToolDescriptor, ToolError, ToolInvocatio
 from redteam.core.enums import ToolHealthStatus
 from redteam.core.ids import ToolId
 
+# Health is a liveness signal, not an authorization decision. A single probe
+# is always bounded by this timeout so a hung MCP server can never stall an
+# already-approved invocation. ``0`` for the interval means "probe before
+# every invocation"; a positive interval throttles repeated probes per server.
+DEFAULT_HEALTH_REFRESH_INTERVAL_SECONDS = 0.0
+DEFAULT_HEALTH_REFRESH_TIMEOUT_SECONDS = 5.0
+
 
 class MCPToolGateway:
     def __init__(
@@ -38,6 +45,9 @@ class MCPToolGateway:
         server_output_limits: Mapping[str, int] | None = None,
         output_schemas: Mapping[str, dict[str, Any] | None] | None = None,
         target_types: Mapping[str, str | None] | None = None,
+        health_refresh_enabled: bool = True,
+        health_refresh_interval_seconds: float = DEFAULT_HEALTH_REFRESH_INTERVAL_SECONDS,
+        health_refresh_timeout_seconds: float = DEFAULT_HEALTH_REFRESH_TIMEOUT_SECONDS,
     ) -> None:
         self._registry = registry
         self._adapters = adapters
@@ -68,6 +78,19 @@ class MCPToolGateway:
         self._server_output_limits = {
             server_id: output_limits.get(server_id, 1_048_576) for server_id in adapters
         }
+        if health_refresh_interval_seconds < 0:
+            raise ValueError("health refresh interval must be >= 0 seconds")
+        if health_refresh_timeout_seconds <= 0:
+            raise ValueError("health refresh timeout must be > 0 seconds")
+        self._health_refresh_enabled = health_refresh_enabled
+        self._health_refresh_interval = float(health_refresh_interval_seconds)
+        self._health_refresh_timeout = float(health_refresh_timeout_seconds)
+        # Discovery just probed every adapter, so that probe counts as the
+        # first refresh instant; a positive interval can then skip repeats.
+        bootstrapped_at = datetime.now(timezone.utc)
+        self._last_health_refresh: dict[str, datetime] = {
+            server_id: bootstrapped_at for server_id in adapters
+        }
 
     def get(self, tool_id: ToolId) -> ToolDescriptor | None:
         """Expose a defensive catalog snapshot to the application composition root."""
@@ -80,6 +103,86 @@ class MCPToolGateway:
         """Every registered tool, regardless of capability — read-only
         catalog enumeration for callers like `redteam tools list`."""
         return self._registry.all()
+
+    def health_snapshot(self) -> dict[str, ToolHealthStatus]:
+        """Current per-server health from the live Registry (no probing)."""
+
+        return self._catalog.health_snapshot()
+
+    def last_health_refresh(self, server_id: str) -> datetime | None:
+        """When this gateway last *attempted* a health probe for a server.
+
+        Recorded even for failed/timed-out probes so the interval throttles a
+        persistently unreachable server instead of retrying it unboundedly.
+        """
+
+        return self._last_health_refresh.get(server_id)
+
+    async def refresh_health(
+        self,
+        server_ids: Collection[str] | None = None,
+        *,
+        force: bool = False,
+    ) -> dict[str, ToolHealthStatus]:
+        """Probe server health, update the Registry, and return the result.
+
+        This is the planner-facing refresh path: call it before
+        ``list_tools_for_action`` so candidate selection sees a live status
+        instead of the discovery-time snapshot. Every probe is bounded by
+        ``health_refresh_timeout_seconds``; a timeout or transport failure
+        keeps the last known status rather than failing the refresh.
+
+        Health is *not* authorization: this method never consults the Control
+        Plane and never blocks a call. It only updates a liveness signal.
+        """
+
+        selected = list(self._adapters) if server_ids is None else list(server_ids)
+        unknown = set(selected) - set(self._adapters)
+        if unknown:
+            names = ", ".join(sorted(unknown))
+            raise ValueError(f"health refresh requested for unknown MCP servers: {names}")
+        if not self._health_refresh_enabled:
+            return self._health_statuses(selected)
+        now = datetime.now(timezone.utc)
+        pending = [
+            server_id
+            for server_id in selected
+            if force or self._needs_health_refresh(server_id, now)
+        ]
+        if pending:
+            await asyncio.gather(
+                *(self._refresh_server_health(server_id) for server_id in pending),
+                return_exceptions=True,
+            )
+        return self._health_statuses(selected)
+
+    def _health_statuses(self, server_ids: Collection[str]) -> dict[str, ToolHealthStatus]:
+        statuses: dict[str, ToolHealthStatus] = {}
+        for server_id in server_ids:
+            status = self._registry.server_health(server_id)
+            statuses[server_id] = status if status is not None else ToolHealthStatus.UNKNOWN
+        return statuses
+
+    def _needs_health_refresh(self, server_id: str, now: datetime) -> bool:
+        if self._health_refresh_interval <= 0:
+            return True
+        last = self._last_health_refresh.get(server_id)
+        if last is None:
+            return True
+        return (now - last).total_seconds() >= self._health_refresh_interval
+
+    async def _refresh_server_health(self, server_id: str) -> ToolHealthStatus | None:
+        adapter = self._adapters[server_id]
+        # Record the attempt before awaiting so a hung probe still throttles.
+        self._last_health_refresh[server_id] = datetime.now(timezone.utc)
+        try:
+            status = await asyncio.wait_for(
+                adapter.health_check(), timeout=self._health_refresh_timeout
+            )
+        except Exception:  # noqa: BLE001 - a probe failure must never raise into a caller
+            return None
+        self._registry.update_server_health(server_id, status)
+        return status
 
     async def invoke(self, invocation: ToolInvocation) -> ToolResult:
         descriptor = self._registry.get(invocation.tool_id)
@@ -130,6 +233,18 @@ class MCPToolGateway:
                 started_at=occurred_at, finished_at=occurred_at,
                 metadata={"dry_run": True},
             )
+
+        # Refresh the discovery-time health snapshot before deciding. This is
+        # a bounded liveness probe, not authorization: the Control Plane has
+        # already allowed this invocation. A failed/timed-out probe leaves the
+        # last known status in place and never by itself turns into an error.
+        if self._health_refresh_enabled:
+            now = datetime.now(timezone.utc)
+            if self._needs_health_refresh(descriptor.server_id, now):
+                await self._refresh_server_health(descriptor.server_id)
+                refreshed = self._registry.get(invocation.tool_id)
+                if refreshed is not None:
+                    descriptor = refreshed
 
         if descriptor.health_status == ToolHealthStatus.UNHEALTHY:
             return self._error_result(

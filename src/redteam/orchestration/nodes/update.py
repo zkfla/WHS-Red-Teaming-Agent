@@ -15,6 +15,7 @@ from redteam.orchestration.action_naming import canonical_action_key
 from redteam.orchestration.context import RuntimeDeps
 from redteam.orchestration.events import GRAPH_MUTATION_APPLIED, RESULT_MAPPER_FAILED
 from redteam.orchestration.nodes._support import advance, graph_service, publisher_for
+from redteam.orchestration.nodes.policy import denial_severity
 from redteam.orchestration.state import GraphState
 from redteam.orchestration.work.models import WorkStatus
 
@@ -75,9 +76,16 @@ async def update_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
     if verification_failed:
         facts["last_verification_failed"] = True
     if blocked:
+        # A policy block is a *decision*, not an execution failure: nothing ran,
+        # so UPDATE must never touch ``consecutive_failures`` / retry counters
+        # (it does not -- those are owned by EXECUTE/VERIFY). It only records
+        # what was blocked and why, including Control's reaction hint.
         facts["last_operation_blocked"] = True
         facts["last_block_verdict"] = decision.verdict.value if decision else None
         facts["last_block_reasons"] = list(decision.reasons) if decision else []
+        block_severity = denial_severity(decision)
+        if block_severity is not None:
+            facts["last_block_severity"] = block_severity
 
     node = await service.observe_target(
         proposal.target,

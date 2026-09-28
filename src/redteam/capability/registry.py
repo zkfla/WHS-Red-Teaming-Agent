@@ -96,10 +96,36 @@ class MCPToolRegistry:
         }
         self._tools = {**retained, **replacements}
 
-    def update_server_health(self, server_id: str, status: ToolHealthStatus) -> None:
+    def update_server_health(self, server_id: str, status: ToolHealthStatus) -> bool:
+        """Refresh the health status of every tool owned by one MCP server.
+
+        Returns ``True`` when at least one descriptor actually changed. An
+        unknown server is a no-op so a stale server list can never mutate the
+        Registry. Health is the only field this method touches — it is a
+        liveness signal, never an authorization decision.
+        """
+
+        changed = False
         for tool_id, descriptor in tuple(self._tools.items()):
+            if descriptor.server_id != server_id:
+                continue
+            if descriptor.health_status == status:
+                continue
+            self._tools[tool_id] = descriptor.model_copy(update={"health_status": status})
+            changed = True
+        return changed
+
+    def server_health(self, server_id: str) -> ToolHealthStatus | None:
+        """Current health for one server, or ``None`` when it owns no tools.
+
+        The server's descriptors are refreshed in unison, so the first matching
+        descriptor is representative.
+        """
+
+        for descriptor in self._sorted_tools():
             if descriptor.server_id == server_id:
-                self._tools[tool_id] = descriptor.model_copy(update={"health_status": status})
+                return descriptor.health_status
+        return None
 
     def _sorted_tools(self) -> list[ToolDescriptor]:
         return sorted(self._tools.values(), key=lambda descriptor: str(descriptor.tool_id))

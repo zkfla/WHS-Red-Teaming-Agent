@@ -40,6 +40,7 @@ from redteam.app.report_store import save_terminal_report
 from redteam.attack_graph.service import AttackGraphService
 from redteam.attack_graph.stores.memory import InMemoryAttackGraphStore
 from redteam.attack_graph.stores.namespaced import EngagementScopedAttackGraphStore
+from redteam.attack_graph.stores.sqlite import SQLiteAttackGraphStore
 from redteam.capability.bootstrap import build_mcp_tool_gateway, open_mcp_tool_gateway
 from redteam.control.approval import ApprovalService
 from redteam.control.audit import AuditLog
@@ -79,6 +80,7 @@ from redteam.orchestration.agents.registry import AgentRegistry, default_registr
 from redteam.orchestration.context import RuntimeDeps
 from redteam.orchestration.events import REPORT_PROJECTED
 from redteam.orchestration.mission_bootstrap import bootstrap_mission
+from redteam.orchestration.operator_intents import build_operator_intent_store
 from redteam.orchestration.replanning import finalize_mission
 from redteam.orchestration.reporting import ReportingAgent
 from redteam.orchestration.runner import AgentLoopRunner
@@ -192,6 +194,10 @@ async def build_runtime_deps(
         tool_catalog=(tool_catalog if tool_catalog is not None else discovered_catalog),
         work_store=_build_work_store(settings),
         task_graph_store=(task_graph_store or _build_task_graph_store(settings)),
+        operator_intent_store=build_operator_intent_store(
+            settings.operator_intent_backend, settings.operator_intent_path
+        ),
+        tool_semaphore=asyncio.Semaphore(engagement.rate_limit_policy.max_concurrent_actions),
         settings=settings,
     )
 
@@ -226,6 +232,7 @@ async def build_application(
     candidate_providers: CandidateProviderRegistry | None = None,
     tool_catalog: ToolCatalog | None = None,
     task_graph_store: MissionTaskStore | None = None,
+    engagement_id: EngagementId | None = None,
 ) -> tuple[Engagement, RuntimeDeps]:
     """``AppConfig``-aware composition root. Every dependency is overridable.
 
@@ -249,7 +256,9 @@ async def build_application(
     """
     logging.basicConfig(level=config.logging.level)
 
-    engagement = config.engagement.to_engagement(engagement_id=EngagementId(new_id("eng")))
+    engagement = config.engagement.to_engagement(
+        engagement_id=engagement_id or EngagementId(new_id("eng"))
+    )
 
     # Build the evidence store first so both the Control Plane (blocked
     # actions) and Orchestration (executed results) share one store.
@@ -285,13 +294,16 @@ async def build_application(
         ),
     )
     resolved_event_bus = event_bus or InMemoryEventBus()
-    resolved_attack_graph = attack_graph or EngagementScopedAttackGraphStore(
-        InMemoryAttackGraphStore(), engagement_id=engagement.engagement_id
-    )
-    resolved_llm = llm or build_llm_client(config.llm)
     resolved_settings = orchestration_settings or OrchestrationSettings.from_config(
         config.orchestration
     )
+    resolved_attack_graph = attack_graph or EngagementScopedAttackGraphStore(
+        SQLiteAttackGraphStore(resolved_settings.attack_graph_path)
+        if resolved_settings.attack_graph_backend == "sqlite"
+        else InMemoryAttackGraphStore(),
+        engagement_id=engagement.engagement_id,
+    )
+    resolved_llm = llm or build_llm_client(config.llm)
 
     deps = RuntimeDeps(
         control_plane=resolved_control_plane,
@@ -307,6 +319,10 @@ async def build_application(
         tool_catalog=resolved_tool_catalog,
         work_store=_build_work_store(resolved_settings),
         task_graph_store=(task_graph_store or _build_task_graph_store(resolved_settings)),
+        operator_intent_store=build_operator_intent_store(
+            resolved_settings.operator_intent_backend, resolved_settings.operator_intent_path
+        ),
+        tool_semaphore=asyncio.Semaphore(engagement.rate_limit_policy.max_concurrent_actions),
         settings=resolved_settings,
     )
     return engagement, deps
@@ -318,6 +334,7 @@ async def _publish_terminal_artifacts(
     *,
     error_type: str | None = None,
     causation_id: str | None = None,
+    publish_run_finished: bool = True,
 ) -> None:
     """Project and publish a report for every terminal outcome."""
 
@@ -326,6 +343,7 @@ async def _publish_terminal_artifacts(
         graph=AttackGraphService(deps.graph_store),
         evidence_store=deps.evidence_store,
         work_store=deps.work_store,
+        task_store=deps.task_graph_store,
     )
     try:
         # The only thing that makes `redteam status`/`findings`/`report`
@@ -355,6 +373,10 @@ async def _publish_terminal_artifacts(
         },
     )
     await deps.event_bus.publish(report_event)
+    if not publish_run_finished:
+        # Approval is a suspension: the partial projection remains inspectable,
+        # but a RUN_FINISHED event would falsely end the same resumable run.
+        return
     run_finished = EventEnvelope(
         event_id=EventId(new_id("evt")),
         event_type=EventType.RUN_FINISHED,
@@ -456,6 +478,7 @@ async def run_engagement(
     initial_runtime = RuntimeState(
         run_id=run_id,
         engagement_id=engagement.engagement_id,
+        started_at=datetime.now(timezone.utc),
         phase=AgentPhase.OBSERVE,
         mission_id=mission_id,
         current_goal=f"map and probe the declared scope of {engagement.name}",
@@ -504,6 +527,10 @@ async def settle_engagement(
     last_event_id: EventId | None = None,
 ) -> RuntimeState:
     """Project a run outcome, including one resumed after human approval."""
+    if runtime.termination_reason == TerminationReason.OPERATOR_PAUSED:
+        # A pause is a checkpointed suspension, not a terminal result/report.
+        # Leave required Tasks, Mission status and pending Action linkage intact.
+        return runtime.model_copy(update={"mission_status": MissionStatus.PAUSED})
     # A pending approval is a suspended run. Settling its active Task would
     # break the exact proposal's resume path.
     if (
@@ -536,5 +563,6 @@ async def settle_engagement(
         runtime,
         deps,
         causation_id=str(last_event_id) if last_event_id else None,
+        publish_run_finished=runtime.termination_reason != TerminationReason.APPROVAL_PENDING,
     )
     return runtime

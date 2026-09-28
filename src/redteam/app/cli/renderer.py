@@ -25,6 +25,7 @@ from rich.text import Text
 from redteam.app.cli import theme
 from redteam.app.cli._shared import mask_secrets
 from redteam.core.contracts.events import EventEnvelope, EventType
+from redteam.core.enums import ApprovalStatus
 from redteam.orchestration.events import (
     AGENT_NO_EXECUTABLE_CANDIDATES,
     AUTHENTICATION_CHECK_DEFERRED,
@@ -35,6 +36,11 @@ from redteam.orchestration.events import (
     HYPOTHESIS_RESOLVED,
     REPLAN_TRIGGERED,
     RESULT_MAPPER_FAILED,
+)
+from redteam.orchestration.operator_intents.models import (
+    IntentApplication,
+    IntentExplanation,
+    IntentStatusReport,
 )
 
 # Events worth a line in the default (human-readable) stream. Same
@@ -394,6 +400,149 @@ def render_capability_warning(console: Console) -> None:
         f"\n    [{theme.MUTED}]Development/test adapter only.\n"
         f"    Real tool execution is unavailable.[/{theme.MUTED}]"
     )
+
+
+# --- Operator console (PROMPT 4+5: persistent runtime input) --------------
+#
+# These helpers return *plain* strings on purpose. They are printed through
+# the same ``echo`` sink ``commands.run.execute`` already threads through to
+# both renderers (Rich ``console.print`` in the interactive entrypoint,
+# ``print`` in ``redteam run``), so they may not contain Rich-style markup
+# tags (the plain path would print them literally). One line per call keeps
+# operator/event output serialized on the single asyncio loop.
+
+
+def operator_welcome_text(*, live: bool = False) -> str:
+    if live:
+        return (
+            "operator> live input enabled -- type 'help' for "
+            "pause/resume/stop/focus/exclude, 'status' or 'explain' to inspect, "
+            "and 'approve' / 'deny' when an action is pending."
+        )
+    return (
+        "operator> no interactive input on this stdin -- this run cannot be "
+        "steered here. Resolve approvals from another terminal with "
+        "'redteam approvals approve|deny <id>'."
+    )
+
+
+def operator_help_text() -> str:
+    return (
+        "operator console commands:\n"
+        "  pause                 pause the mission (active task preserved)\n"
+        "  resume                resume a paused mission\n"
+        "  stop                  stop the mission and cancel open tasks\n"
+        "  focus AREA            raise priority of matching tasks\n"
+        "  exclude AREA          cancel matching non-running tasks\n"
+        "  reprioritize AREA N   set priority N on matching tasks\n"
+        "  status | query        show mission/task status\n"
+        "  explain               explain the current position\n"
+        "  approve ID            approve the pending action (in-session)\n"
+        "  deny ID               deny the pending action (in-session)\n"
+        "  help                  show this help\n"
+        "Areas: recon, web, api, authentication, authorization, mobile"
+    )
+
+
+def operator_intent_text(application: IntentApplication) -> str:
+    if not application.applied:
+        reason = application.reason or application.outcome or "rejected"
+        return f"operator> intent {application.status.value}: {reason}"
+    intent_type = application.intent_type.value if application.intent_type else "intent"
+    affected = len(application.affected_task_ids)
+    suffix = f" ({affected} task(s))" if affected else ""
+    return f"operator> {intent_type}: {application.outcome}{suffix}"
+
+
+def operator_status_text(report: IntentStatusReport) -> str:
+    counts = ", ".join(
+        f"{name} {count}" for name, count in sorted(report.task_status_counts.items())
+    )
+    lines = [
+        f"operator> mission {report.mission_status.value}; "
+        f"{report.task_count} task(s)"
+        + (f" ({counts})" if counts else "")
+        + (" (paused)" if report.paused else "")
+    ]
+    if report.focus_areas:
+        lines.append(f"  focus: {', '.join(report.focus_areas)}")
+    if report.excluded_areas:
+        lines.append(f"  excluded: {', '.join(report.excluded_areas)}")
+    if report.excluded_endpoints:
+        lines.append(f"  excluded endpoints: {', '.join(report.excluded_endpoints[:3])}")
+    for task in report.blocked_tasks[:3]:
+        lines.append(f"  blocked {task.task_id}: {task.blocking_reason}")
+    for entry in report.recent_intents[-3:]:
+        lines.append(
+            f"  - {entry.intent_type.value}: {entry.status.value}"
+            + (f" ({entry.outcome})" if entry.outcome else "")
+        )
+    return "\n".join(lines)
+
+
+def operator_explanation_text(explanation: IntentExplanation) -> str:
+    lines = [f"operator> {explanation.summary}"]
+    if explanation.paused:
+        lines.append("  (paused -- use 'resume' to continue the same task)")
+    if explanation.active_task_title:
+        lines.append(f"  active task: {explanation.active_task_title}")
+    top = sorted(explanation.task_priorities.items(), key=lambda item: -item[1])[:3]
+    if top:
+        lines.append("  top priorities: " + ", ".join(f"{tid}={prio}" for tid, prio in top))
+    for task in explanation.blocked_tasks[:3]:
+        deps = ", ".join(str(item) for item in task.blocked_dependency_ids[:3])
+        lines.append(
+            f"  blocked {task.task_id}: {task.blocking_reason}"
+            + (f" (waiting on {deps})" if deps else "")
+        )
+    for candidate in explanation.rejected_candidates[:3]:
+        score = f" (score={candidate.priority:g})" if candidate.priority is not None else ""
+        lines.append(
+            f"  rejected {candidate.operation}{score}: {candidate.reason or 'unspecified'}"
+        )
+    for action in explanation.chosen_actions[:3]:
+        score = f" score={action.priority:g}" if action.priority is not None else ""
+        policy = f" policy={action.policy_verdict}" if action.policy_verdict else ""
+        reason = f" ({action.policy_reasons[0]})" if action.policy_reasons else ""
+        lines.append(
+            f"  chosen {action.operation}: {action.status or 'proposed'}{score}{policy}{reason}"
+        )
+    return "\n".join(lines)
+
+
+def operator_approval_prompt_text(approval_id: str) -> str:
+    return (
+        f"operator> approval {approval_id} pending -- type 'approve' to allow "
+        f"this exact action or 'deny' to reject it."
+    )
+
+
+def operator_approval_pending_text(approval_id: str, run_id: str) -> str:
+    return (
+        f"operator> approval {approval_id} pending for run {run_id} -- resolve with "
+        f"'redteam approvals approve|deny {approval_id}', then "
+        f"'redteam resume {run_id} <engagement.yaml>'."
+    )
+
+
+def operator_paused_text(run_id: str, *, live: bool = False) -> str:
+    if live:
+        return (
+            f"operator> run {run_id} paused -- type 'resume' to continue the "
+            f"same Mission, or 'stop'."
+        )
+    return (
+        f"operator> run {run_id} paused -- no interactive input here; resume "
+        f"from an interactive session to continue the same Mission."
+    )
+
+
+def operator_approval_resolved_text(approval_id: str, status: ApprovalStatus) -> str:
+    return f"operator> approval {approval_id} -> {status.value}"
+
+
+def operator_notice_text(message: str) -> str:
+    return f"operator> {message}"
 
 
 def prompt_choice(console: Console, prompt: str, options: str, *, normalize: bool = True) -> str:

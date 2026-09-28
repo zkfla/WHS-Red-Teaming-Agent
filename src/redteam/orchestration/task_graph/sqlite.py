@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sqlite3
 from datetime import datetime
 from pathlib import Path
 
-from redteam.core.contracts.mission import MissionPlan, MissionTask
+from redteam.core.contracts.mission import MissionPlan, MissionTask, redact_secret_material
 from redteam.core.enums import TaskStatus
 from redteam.core.ids import EngagementId, MissionId, TaskId
 from redteam.orchestration.task_graph.memory import InMemoryTaskGraphStore
@@ -49,11 +50,11 @@ class SQLiteTaskGraphStore:
                     ON mission_tasks(mission_id,status,priority DESC,task_id);
                 """)
                 missions = [
-                    MissionPlan.model_validate_json(row[0])
+                    MissionPlan.model_validate(redact_secret_material(json.loads(row[0])))
                     for row in db.execute("SELECT payload FROM missions")
                 ]
                 tasks = [
-                    MissionTask.model_validate_json(row[0])
+                    MissionTask.model_validate(redact_secret_material(json.loads(row[0])))
                     for row in db.execute("SELECT payload FROM mission_tasks")
                 ]
             self._memory._missions = {item.mission_id: item for item in missions}
@@ -69,7 +70,7 @@ class SQLiteTaskGraphStore:
             db.executemany(
                 "INSERT INTO missions VALUES(?,?,?)",
                 [
-                    (str(v.mission_id), str(v.engagement_id), v.model_dump_json())
+                    (str(v.mission_id), str(v.engagement_id), v.redacted_copy().model_dump_json())
                     for v in self._memory._missions.values()
                 ],
             )
@@ -81,7 +82,7 @@ class SQLiteTaskGraphStore:
                         str(v.mission_id),
                         v.status.value,
                         v.priority,
-                        v.model_dump_json(),
+                        v.redacted_copy().model_dump_json(),
                     )
                     for v in self._memory._tasks.values()
                 ],

@@ -19,3 +19,18 @@ tests/vulnbank/
 
 공통 개발 시작 프롬프트.md
 변경사항.md
+
+# --- scratch / temp artifacts (defensive; no tracked file matches) ---
+*.log
+*.tmp
+*.orig
+*.rej
+*.bak
+# Local run/DB outputs outside /data/ (checkpoints, work, task-graph strays)
+*.sqlite3
+*.db
+# Coverage / tox caches
+.coverage
+htmlcov/
+.tox/
+.nox/

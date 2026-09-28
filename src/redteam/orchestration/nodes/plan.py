@@ -50,9 +50,27 @@ from redteam.orchestration.events import (
     CANDIDATE_REJECTED,
 )
 from redteam.orchestration.nodes._support import advance, graph_service, publisher_for
+from redteam.orchestration.operator_intents.suppression import endpoint_excluded
 from redteam.orchestration.scheduler import WorkScheduler
-from redteam.orchestration.state import GraphState
+from redteam.orchestration.settings import OrchestrationSettings
+from redteam.orchestration.state import GraphState, RuntimeState
 from redteam.orchestration.work.models import TERMINAL_STATUSES, WorkStatus
+
+
+def _verification_batch_capacity(runtime: RuntimeState, settings: OrchestrationSettings) -> int:
+    """Admit only actions whose worst-case retries leave the reserve intact."""
+    remaining = runtime.remaining_budget
+    if remaining is None:
+        return settings.max_actions_per_turn
+    if not settings.enforce_verification_reserve:
+        return remaining
+    total_budget = runtime.actions_executed + remaining
+    available = max(remaining - settings.verification_reserve(total_budget), 0)
+    if available <= 1 or not settings.retry_retryable_tool_failures:
+        return available
+    # Separate workers see independent budget mirrors. Reserve retry slots
+    # before dispatching more than one; AGGREGATE cannot undo tool side effects.
+    return max(1, available // (1 + settings.max_retries))
 
 
 def _declared_operations(agent: AgentSpec, provider: object) -> list[tuple[str, str]]:
@@ -128,6 +146,15 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
     await deps.work_store.reclaim_expired(now=now)
     history = await deps.work_store.list_items(run_id=runtime.run_id)
     terminal_keys = {item.candidate_key for item in history if item.status in TERMINAL_STATUSES}
+    # Capability health is a liveness signal, not an authorization verdict.
+    # Refresh the optional live gateway before catalog-based feasibility checks;
+    # Control remains the sole authority for whether an action may run.
+    refresh_health = getattr(deps.tool_gateway, "refresh_health", None)
+    if callable(refresh_health):
+        try:
+            await refresh_health()
+        except Exception:  # noqa: BLE001 - stale health cannot bypass Control
+            pass
     compiler = CandidateCompiler(deps.tool_catalog)
     definition = deps.agents.definition(agent.agent_id)
     provider = (
@@ -272,6 +299,72 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             ]
     publisher = publisher_for(state, deps, "orchestration.plan")
     last_event_id = state.get("last_event_id")
+    if runtime.mission_id is not None:
+        mission = await deps.task_graph_store.get_mission(runtime.mission_id)
+        excluded = (
+            list(mission.operator_preferences.get("excluded_endpoints") or [])
+            if mission is not None
+            else []
+        )
+        excluded_areas = (
+            set(mission.operator_preferences.get("excluded_areas") or [])
+            if mission is not None
+            else set()
+        )
+        excluded_task_ids = (
+            set(mission.operator_preferences.get("excluded_task_ids") or [])
+            if mission is not None
+            else set()
+        )
+        if excluded or excluded_areas or excluded_task_ids:
+            allowed = []
+            for candidate in compiled:
+                endpoint_blocked = any(
+                    endpoint_excluded(node_id, excluded)
+                    for node_id in candidate.draft.target_node_ids
+                )
+                capability = candidate.plan_step.capability
+                area_blocked = bool(
+                    (capability == "web" and excluded_areas.intersection({"web", "api"}))
+                    or (capability == "recon" and "reconnaissance" in excluded_areas)
+                    or (capability == "mobile" and "mobile" in excluded_areas)
+                    or (
+                        "authorization" in excluded_areas
+                        and active_task is not None
+                        and "authorization" in active_task.objective.lower()
+                    )
+                    or (
+                        "authentication" in excluded_areas
+                        and active_task is not None
+                        and "authentication" in active_task.objective.lower()
+                    )
+                )
+                task_blocked = (
+                    active_task is not None
+                    and str(active_task.task_id) in excluded_task_ids
+                )
+                if endpoint_blocked or area_blocked or task_blocked:
+                    rejected = await publisher.publish(
+                        CANDIDATE_REJECTED,
+                        {
+                            "agent_id": agent.agent_id,
+                            "target_node_id": str(candidate.draft.target_node_ids[0]),
+                            "capability": candidate.plan_step.capability,
+                            "operation": candidate.plan_step.operation,
+                            "tool_id": str(candidate.tool.tool_id),
+                            "reason": (
+                                "operator_excluded_endpoint"
+                                if endpoint_blocked else "operator_excluded_area_or_task"
+                            ),
+                            "field": "",
+                            "candidate_key": candidate.candidate_key,
+                        },
+                        causation_id=last_event_id,
+                    )
+                    last_event_id = rejected.event_id
+                else:
+                    allowed.append(candidate)
+            compiled = allowed
     for drop in drops:
         # A playbook entry that matched real graph context but could not be
         # turned into a draft (an argument the bound target cannot supply)
@@ -576,7 +669,7 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             agent.max_actions - runtime.actions_by_agent.get(str(agent.agent_id), 0),
         )
     if runtime.remaining_budget is not None:
-        batch_limit = min(batch_limit, runtime.remaining_budget)
+        batch_limit = min(batch_limit, _verification_batch_capacity(runtime, deps.settings))
     if batch_limit < 1:
         return advance(
             state,
@@ -787,6 +880,7 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
 
     first = dispatch_items[0]
     use_fan_out = len(dispatch_items) > 1
+    deps.batch_pending_approvals.discard(runtime.run_id)
 
     return advance(
         state,

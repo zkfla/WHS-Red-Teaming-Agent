@@ -5,12 +5,20 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from redteam.core.contracts.events import EventType
+from redteam.core.contracts.policy import PolicyDecision
 from redteam.core.enums import AgentPhase, TaskStatus
+from redteam.core.ids import EventId
+from redteam.event_bus.publisher import EventPublisher
 from redteam.orchestration.context import RuntimeDeps
 from redteam.orchestration.convergence import evaluate_convergence
 from redteam.orchestration.events import REPLAN_TRIGGERED
 from redteam.orchestration.nodes._support import advance, graph_service, publisher_for
 from redteam.orchestration.nodes.observe import _task_agent
+from redteam.orchestration.nodes.policy import (
+    SEVERITY_ABORT_RUN,
+    SEVERITY_REPLAN_GOAL,
+    denial_severity,
+)
 from redteam.orchestration.replanning import replan_task_graph
 from redteam.orchestration.state import GraphState, RuntimeState, TerminationReason
 
@@ -53,6 +61,61 @@ def _hard_stop(runtime: RuntimeState, deps: RuntimeDeps) -> str | None:
     if runtime.no_progress_turns >= settings.max_no_progress_turns:
         return TerminationReason.STALLED
     return None
+
+
+def _abort_run_reason(decision: PolicyDecision | None) -> str:
+    """Name why a Control ``ABORT_RUN`` denial ends the run.
+
+    Budget exhaustion keeps its own exit reason; every other Control abort
+    (a closed ROE time window, an unenforceable ROE policy, a stale approval)
+    is reported as ``MISSION_BLOCKED`` -- the run cannot proceed.
+    """
+
+    if decision is not None and any(rule == "budget" for rule in decision.matched_rules):
+        return TerminationReason.BUDGET_EXHAUSTED
+    return TerminationReason.MISSION_BLOCKED
+
+
+#: Task states the goal-blocking transition may start from. Any terminal
+#: state is left untouched: a REJECTED approval can arrive after the work was
+#: closed elsewhere, and blocking a settled Task raises.
+_GOAL_BLOCKABLE = {TaskStatus.PENDING, TaskStatus.READY, TaskStatus.RUNNING}
+
+
+async def _block_goal_task(
+    deps: RuntimeDeps,
+    runtime: RuntimeState,
+    decision: PolicyDecision | None,
+    publisher: EventPublisher,
+    last_event_id: EventId | None,
+) -> tuple[EventId | None, bool]:
+    """Block the active Task after Control declared its goal unviable.
+
+    ``REPLAN_GOAL`` means the capability/action class itself is rejected, so
+    the Task that requires it is not runnable. It is transitioned to BLOCKED
+    (never FAILED -- nothing executed) and a different Task can be scheduled
+    on the next OBSERVE. Returns ``(last_event_id, blocked)``.
+    """
+
+    assert runtime.active_task_id is not None
+    task = await deps.task_graph_store.get_task(runtime.active_task_id)
+    if task is None or task.status not in _GOAL_BLOCKABLE:
+        # Already settled (or gone): leave it exactly as-is rather than crash
+        # the replan with an invalid transition.
+        return last_event_id, False
+    reasons = "; ".join(decision.reasons) if decision is not None else "policy denial"
+    await deps.task_graph_store.transition_task(
+        task.task_id,
+        TaskStatus.BLOCKED,
+        now=datetime.now(timezone.utc),
+        reason=f"policy rejected the goal: {reasons}",
+    )
+    event = await publisher.publish(
+        EventType.TASK_BLOCKED,
+        {"task_id": task.task_id, "reason": "policy_replan_goal"},
+        causation_id=last_event_id,
+    )
+    return event.event_id, True
 
 
 async def replan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
@@ -130,6 +193,18 @@ async def replan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                     last_event_id = completed.event_id
 
     reason = runtime.termination_reason or _hard_stop(runtime, deps)
+    # Control tags a denial with the reaction it recommends. Orchestration
+    # owns the reaction: implicit about *whether* an action passed, explicit
+    # about what the run does next. An untagged denial keeps the historical
+    # "block this action, replan" behavior.
+    decision = state.get("policy_decision")
+    severity = denial_severity(decision)
+    if severity == SEVERITY_ABORT_RUN:
+        # Nothing more can proceed (time window closed, budget exhausted,
+        # stale approval). End now instead of re-planning impossible work
+        # until the step ceiling. This is not an execution failure: the
+        # failure counters are untouched.
+        reason = _abort_run_reason(decision)
     if reason == TerminationReason.NO_ACTIONABLE_PLAN and runtime.mission_id is not None:
         # REPLAN may have just created a READY Task from the latest graph.
         # OBSERVE's earlier no-agent decision was made before that mutation.
@@ -141,6 +216,19 @@ async def replan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             for task in tasks
         ):
             reason = None
+    goal_blocked = False
+    if (
+        reason is None
+        and severity == SEVERITY_REPLAN_GOAL
+        and runtime.mission_id is not None
+        and runtime.active_task_id is not None
+    ):
+        # The whole goal/capability is not viable, not just this one action:
+        # block the Task so the run switches to a different goal instead of
+        # re-proposing rejected work. A REJECTED approval carries this tag.
+        last_event_id, goal_blocked = await _block_goal_task(
+            deps, runtime, decision, publisher, last_event_id
+        )
     next_agent = None
     if reason in {TerminationReason.NO_AGENTS, TerminationReason.NO_ACTIONABLE_PLAN}:
         convergence = await evaluate_convergence(
@@ -289,6 +377,9 @@ async def replan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                 "pending_action_id": None,
                 "active_hypothesis_id": None,
                 "termination_reason": None,
+                # A goal-blocked Task must not remain the active one; OBSERVE
+                # re-selects from the still-runnable Tasks.
+                "active_task_id": None if goal_blocked else runtime.active_task_id,
             }
         ),
         last_event_id=last_event_id,

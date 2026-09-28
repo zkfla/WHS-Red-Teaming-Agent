@@ -29,19 +29,19 @@ class InMemoryTaskGraphStore:
         async with self._lock:
             if mission.mission_id in self._missions:
                 raise DuplicateTaskError(f"mission exists: {mission.mission_id}")
-            self._missions[mission.mission_id] = mission.model_copy(deep=True)
+            self._missions[mission.mission_id] = mission.redacted_copy()
 
     async def get_mission(self, mission_id: MissionId) -> MissionPlan | None:
         async with self._lock:
             value = self._missions.get(mission_id)
-            return value.model_copy(deep=True) if value else None
+            return value.redacted_copy() if value else None
 
     async def list_missions(
         self, *, engagement_id: EngagementId | None = None
     ) -> list[MissionPlan]:
         async with self._lock:
             return [
-                v.model_copy(deep=True)
+                v.redacted_copy()
                 for v in sorted(self._missions.values(), key=lambda x: str(x.mission_id))
                 if engagement_id is None or v.engagement_id == engagement_id
             ]
@@ -55,7 +55,7 @@ class InMemoryTaskGraphStore:
                 raise ValueError("engagement_id is immutable")
             if mission.revision != old.revision + 1:
                 raise ValueError("mission revision must increase by exactly one")
-            self._missions[mission.mission_id] = mission.model_copy(deep=True)
+            self._missions[mission.mission_id] = mission.redacted_copy()
 
     async def create_task(self, task: MissionTask) -> None:
         async with self._lock:
@@ -75,12 +75,12 @@ class InMemoryTaskGraphStore:
             task, self._tasks
         ):
             raise InvalidDependency("task cannot be ready before dependencies complete")
-        self._tasks[task.task_id] = task.model_copy(deep=True)
+        self._tasks[task.task_id] = task.redacted_copy()
 
     async def get_task(self, task_id: TaskId) -> MissionTask | None:
         async with self._lock:
             value = self._tasks.get(task_id)
-            return value.model_copy(deep=True) if value else None
+            return value.redacted_copy() if value else None
 
     async def list_tasks(
         self, *, mission_id: MissionId | None = None, status: TaskStatus | None = None
@@ -93,7 +93,7 @@ class InMemoryTaskGraphStore:
                 and (status is None or v.status is status)
             ]
             return [
-                v.model_copy(deep=True)
+                v.redacted_copy()
                 for v in sorted(values, key=lambda x: (-x.priority, str(x.task_id)))
             ]
 
@@ -109,7 +109,7 @@ class InMemoryTaskGraphStore:
             if old.dependency_task_ids != task.dependency_task_ids:
                 raise InvalidDependency("use add_dependency to change dependencies")
             validate_dependencies(task, self._tasks)
-            self._tasks[task.task_id] = task.model_copy(deep=True)
+            self._tasks[task.task_id] = task.redacted_copy()
 
     async def transition_task(
         self, task_id: TaskId, status: TaskStatus, *, now: datetime, reason: str | None = None
@@ -131,7 +131,7 @@ class InMemoryTaskGraphStore:
                     else None,
                     "updated_at": now,
                 }
-            )
+            ).redacted_copy()
             self._tasks[task_id] = updated
             return updated.model_copy(deep=True)
 
@@ -158,7 +158,7 @@ class InMemoryTaskGraphStore:
                     else task.status,
                     "updated_at": now,
                 }
-            )
+            ).redacted_copy()
             validate_dependencies(updated, self._tasks)
             self._tasks[task_id] = updated
             return updated.model_copy(deep=True)
@@ -168,7 +168,9 @@ class InMemoryTaskGraphStore:
     ) -> MissionTask:
         async with self._lock:
             task = self._require(task_id)
-            updated = task.model_copy(update={"priority": priority, "updated_at": now})
+            updated = task.model_copy(
+                update={"priority": priority, "updated_at": now}
+            ).redacted_copy()
             self._tasks[task_id] = updated
             return updated.model_copy(deep=True)
 
@@ -186,7 +188,7 @@ class InMemoryTaskGraphStore:
             validate_transition(task.status, target)
             updated = task.model_copy(
                 update={"status": target, "blocking_reason": None, "updated_at": now}
-            )
+            ).redacted_copy()
             self._tasks[task_id] = updated
             return updated.model_copy(deep=True)
 
@@ -203,10 +205,11 @@ class InMemoryTaskGraphStore:
                     )
                 if child.task_id in staged:
                     raise DuplicateTaskError(f"task exists: {child.task_id}")
+                child = child.redacted_copy()
                 validate_dependencies(child, staged)
                 staged[child.task_id] = child
             self._tasks = staged
-            return [child.model_copy(deep=True) for child in children]
+            return [staged[child.task_id].model_copy(deep=True) for child in children]
 
     def _require(self, task_id: TaskId) -> MissionTask:
         task = self._tasks.get(task_id)

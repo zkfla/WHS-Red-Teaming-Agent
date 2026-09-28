@@ -68,6 +68,7 @@ from redteam.intake.serializer import (
     scope_diff,
 )
 from redteam.orchestration.engagement_planner import sanitize_objective
+from redteam.orchestration.state import TerminationReason
 
 logger = logging.getLogger(__name__)
 
@@ -468,6 +469,12 @@ async def _execute_scoped(
             on_event=event_renderer,
             echo=lambda line: console.print(line),
             objective=objective,
+            # PROMPT 4+5: keep a persistent operator channel live for the
+            # whole run (pause/resume/stop/focus/exclude/status and in-session
+            # approve/deny at the approval suspension). This is the
+            # interactive entrypoint by definition; the explicit
+            # `redteam run --non-interactive`/`--json` paths never set it.
+            allow_operator_input=True,
         )
     except Exception as exc:  # noqa: BLE001 - same fail-closed contract as commands.run
         if logging.getLogger().isEnabledFor(logging.DEBUG):
@@ -487,5 +494,9 @@ async def _execute_scoped(
     if final.mission_status is not None:
         console.print(f"Mission: {final.mission_status.value}")
     console.print(f"\n[dim]RunId: {final.run_id}[/dim]")
-    console.print(f"[dim]Report: redteam report generate {final.run_id}[/dim]")
+    if final.termination_reason not in {
+        TerminationReason.OPERATOR_PAUSED,
+        TerminationReason.APPROVAL_PENDING,
+    }:
+        console.print(f"[dim]Report: redteam report generate {final.run_id}[/dim]")
     return EXIT_FAILURE if final.phase.value == "failed" else EXIT_OK

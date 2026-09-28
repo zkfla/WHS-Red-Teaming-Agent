@@ -19,6 +19,7 @@ from redteam.orchestration.agents.base import AgentSpec
 from redteam.orchestration.agents.registry import AgentRegistry
 from redteam.orchestration.context import RuntimeDeps
 from redteam.orchestration.nodes._support import advance, graph_service, publisher_for
+from redteam.orchestration.operator_intents import OperatorIntentService
 from redteam.orchestration.progress import observation_fingerprint
 from redteam.orchestration.state import GraphState, RuntimeState, TerminationReason
 
@@ -148,6 +149,55 @@ async def observe_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
 
     publisher = publisher_for(state, deps, "orchestration.observe")
     last_event_id = state.get("last_event_id")
+
+    # Operator Intent channel: drain anything that arrived out-of-band before
+    # scheduling work, so PAUSE takes effect before any action can execute.
+    # ``None`` when no intent store is wired -> legacy runs are unchanged.
+    intent_service = OperatorIntentService.from_deps(deps)
+    if intent_service is not None and runtime.mission_id is not None:
+        drain = await intent_service.process_pending(
+            mission_id=runtime.mission_id,
+            run_id=runtime.run_id,
+            publisher=publisher,
+            last_event_id=last_event_id,
+        )
+        last_event_id = drain.last_event_id
+        if drain.last_intent_id is not None:
+            runtime = runtime.model_copy(update={"operator_intent_id": drain.last_intent_id})
+        if drain.mission_status is not None:
+            runtime = runtime.model_copy(update={"mission_status": drain.mission_status})
+        if drain.stopped:
+            return advance(
+                state,
+                runtime.model_copy(
+                    update={
+                        "phase": AgentPhase.REPLAN,
+                        "current_agent": None,
+                        "termination_reason": TerminationReason.OPERATOR_STOPPED,
+                    }
+                ),
+                last_event_id=last_event_id,
+                observation=None,
+                plan_step=None,
+            )
+        if drain.paused:
+            # Clear the active agent so REPLAN cannot mistake the preserved
+            # RUNNING Task for an exhausted one and close it. The Task itself
+            # (active_task_id / status) is deliberately left untouched for
+            # the RESUME intent.
+            return advance(
+                state,
+                runtime.model_copy(
+                    update={
+                        "phase": AgentPhase.REPLAN,
+                        "current_agent": None,
+                        "termination_reason": TerminationReason.OPERATOR_PAUSED,
+                    }
+                ),
+                last_event_id=last_event_id,
+                observation=None,
+                plan_step=None,
+            )
 
     current_task_id = runtime.active_task_id
     if runtime.mission_id is not None:

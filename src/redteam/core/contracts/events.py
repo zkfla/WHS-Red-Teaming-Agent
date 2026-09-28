@@ -16,8 +16,9 @@ from typing import Any
 from pydantic import BaseModel, Field, field_validator
 
 from redteam.core.ids import EngagementId, EventId, RunId
+from redteam.core.redaction import redact_sensitive_text
 
-_SECRET_KEYS = {
+_SECRET_KEY_PARTS = {
     "password",
     "passwd",
     "secret",
@@ -29,13 +30,16 @@ _SECRET_KEYS = {
     "authorization",
     "proxy_authorization",
     "set_cookie",
+    "bearer",
+    "private_key",
 }
 _REDACTED = "***REDACTED***"
 
 
 def _redact_secret_material(value: Any, *, key: str | None = None) -> Any:
     normalized = (key or "").lower().replace("-", "_")
-    if normalized in _SECRET_KEYS and not normalized.endswith(("_ref", "_reference", "_id")):
+    if (not normalized.endswith(("_ref", "_reference", "_id"))
+            and any(part in normalized for part in _SECRET_KEY_PARTS)):
         return _REDACTED
     if isinstance(value, dict):
         return {
@@ -46,6 +50,11 @@ def _redact_secret_material(value: Any, *, key: str | None = None) -> Any:
         return [_redact_secret_material(item) for item in value]
     if isinstance(value, tuple):
         return tuple(_redact_secret_material(item) for item in value)
+    if isinstance(value, str):
+        # Domain events also carry free-form policy/task reasons. A token in
+        # one of those strings must not survive merely because its key is
+        # called "reason" rather than "token".
+        return redact_sensitive_text(value)
     return value
 
 
@@ -113,5 +122,7 @@ class EventType:
     TASK_COMPLETED = "TaskCompleted"
     TASK_FAILED = "TaskFailed"
     TASK_PRIORITY_CHANGED = "TaskPriorityChanged"
+    TASK_CANCELLED = "TaskCancelled"
     OPERATOR_INSTRUCTION_RECEIVED = "OperatorInstructionReceived"
     OPERATOR_INTENT_APPLIED = "OperatorIntentApplied"
+    OPERATOR_INTENT_REJECTED = "OperatorIntentRejected"

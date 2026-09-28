@@ -18,7 +18,11 @@ from redteam.capability.adapters.mcp.transport import (
     StreamableHTTPMCPTransport,
 )
 from redteam.capability.adapters.mcp.web_api import WebAPIMCPAdapter
-from redteam.capability.gateway import MCPToolGateway
+from redteam.capability.gateway import (
+    DEFAULT_HEALTH_REFRESH_INTERVAL_SECONDS,
+    DEFAULT_HEALTH_REFRESH_TIMEOUT_SECONDS,
+    MCPToolGateway,
+)
 from redteam.capability.manifest import validate_tool_manifest
 from redteam.capability.mobile_analysis_manifest import (
     MOBILE_ANALYSIS_TOOLS,
@@ -33,18 +37,37 @@ from redteam.capability.settings import (
 )
 
 
-async def build_mcp_tool_gateway(server_ids: list[str]) -> MCPToolGateway:
+async def build_mcp_tool_gateway(
+    server_ids: list[str],
+    *,
+    health_refresh_enabled: bool = True,
+    health_refresh_interval_seconds: float = DEFAULT_HEALTH_REFRESH_INTERVAL_SECONDS,
+    health_refresh_timeout_seconds: float = DEFAULT_HEALTH_REFRESH_TIMEOUT_SECONDS,
+) -> MCPToolGateway:
     """Discover configured servers and return a ready-to-invoke gateway.
 
     An empty list intentionally preserves the deterministic in-process example
-    used by the repository's minimal vertical slice.
+    used by the repository's minimal vertical slice. Health-refresh settings
+    are forwarded to the Gateway so the composition root can tune the bounded
+    liveness probe without widening the frozen Core config contract.
     """
 
-    return await _build_gateway(server_ids)
+    return await _build_gateway(
+        server_ids,
+        health_refresh_enabled=health_refresh_enabled,
+        health_refresh_interval_seconds=health_refresh_interval_seconds,
+        health_refresh_timeout_seconds=health_refresh_timeout_seconds,
+    )
 
 
 @asynccontextmanager
-async def open_mcp_tool_gateway(server_ids: list[str]) -> AsyncIterator[MCPToolGateway]:
+async def open_mcp_tool_gateway(
+    server_ids: list[str],
+    *,
+    health_refresh_enabled: bool = True,
+    health_refresh_interval_seconds: float = DEFAULT_HEALTH_REFRESH_INTERVAL_SECONDS,
+    health_refresh_timeout_seconds: float = DEFAULT_HEALTH_REFRESH_TIMEOUT_SECONDS,
+) -> AsyncIterator[MCPToolGateway]:
     """Engagement-scoped connections, required for stateful browser operations.
 
     The orchestration owner must enter/exit in the same task and finish all
@@ -52,11 +75,22 @@ async def open_mcp_tool_gateway(server_ids: list[str]) -> AsyncIterator[MCPToolG
     Partial startup failures close previously opened connections as well.
     """
     async with AsyncExitStack() as stack:
-        yield await _build_gateway(server_ids, stack)
+        yield await _build_gateway(
+            server_ids,
+            stack,
+            health_refresh_enabled=health_refresh_enabled,
+            health_refresh_interval_seconds=health_refresh_interval_seconds,
+            health_refresh_timeout_seconds=health_refresh_timeout_seconds,
+        )
 
 
 async def _build_gateway(
-    server_ids: list[str], stack: AsyncExitStack | None = None,
+    server_ids: list[str],
+    stack: AsyncExitStack | None = None,
+    *,
+    health_refresh_enabled: bool = True,
+    health_refresh_interval_seconds: float = DEFAULT_HEALTH_REFRESH_INTERVAL_SECONDS,
+    health_refresh_timeout_seconds: float = DEFAULT_HEALTH_REFRESH_TIMEOUT_SECONDS,
 ) -> MCPToolGateway:
     if not server_ids:
         example = ExampleMCPAdapter()
@@ -68,6 +102,9 @@ async def _build_gateway(
         return MCPToolGateway(
             registry, {example.server_id: example},
             {str(tool.tool_id): ("service_discovery",) for tool in registry.all()},
+            health_refresh_enabled=health_refresh_enabled,
+            health_refresh_interval_seconds=health_refresh_interval_seconds,
+            health_refresh_timeout_seconds=health_refresh_timeout_seconds,
         )
 
     if len(server_ids) != len(set(server_ids)):
@@ -154,6 +191,9 @@ async def _build_gateway(
         server_output_limits=server_output_limits,
         output_schemas=output_schemas,
         target_types=target_types,
+        health_refresh_enabled=health_refresh_enabled,
+        health_refresh_interval_seconds=health_refresh_interval_seconds,
+        health_refresh_timeout_seconds=health_refresh_timeout_seconds,
     )
 
 

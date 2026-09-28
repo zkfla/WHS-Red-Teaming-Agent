@@ -23,10 +23,11 @@ from redteam.attack_graph.service import AttackGraphService
 from redteam.core.contracts.events import EventType
 from redteam.core.contracts.mission import MissionCriterionResult, MissionTask, Provenance
 from redteam.core.enums import GraphNodeType, MissionStatus, TaskStatus
-from redteam.core.ids import EventId, MissionId, RunId, TaskId, new_id
+from redteam.core.ids import EventId, GraphNodeId, MissionId, RunId, TaskId, new_id
 from redteam.core.ports.evidence_store import EvidenceStore
 from redteam.core.ports.task_graph import MissionTaskStore
 from redteam.event_bus.publisher import EventPublisher
+from redteam.orchestration.operator_intents.suppression import endpoint_excluded
 
 #: Provenance marker for endpoint-scoped second-principal acquisition Tasks.
 _ACQUIRE_SOURCE = "replan:acquire_second_principal"
@@ -50,6 +51,17 @@ async def replan_task_graph(
     """
 
     now = now or datetime.now(timezone.utc)
+    mission = await store.get_mission(mission_id)
+    excluded_endpoints = (
+        list(mission.operator_preferences.get("excluded_endpoints") or [])
+        if mission is not None
+        else []
+    )
+    excluded_areas = (
+        set(mission.operator_preferences.get("excluded_areas") or [])
+        if mission is not None
+        else set()
+    )
     nodes = await graph.list_nodes()
     principals_by_target: dict[str, set[str]] = {}
     for principal in nodes:
@@ -83,6 +95,10 @@ async def replan_task_graph(
 
     for node in nodes:
         if node.type is not GraphNodeType.ENDPOINT:
+            continue
+        if excluded_areas.intersection({"web", "api", "authorization"}) or endpoint_excluded(
+            node.id, excluded_endpoints
+        ):
             continue
         params = facts_of(node.properties).get("path_parameters")
         if not params or str(node.id) in covered:
@@ -177,7 +193,7 @@ async def replan_task_graph(
             continue
         target_ref = acquisition.provenance.metadata.get("target_ref")
         if not isinstance(target_ref, str):
-            endpoint = await graph.get_node(endpoint_id)
+            endpoint = await graph.get_node(GraphNodeId(endpoint_id))
             target_ref = facts_of(endpoint.properties).get("target_ref") if endpoint else None
         if not isinstance(target_ref, str):
             continue
@@ -291,6 +307,11 @@ async def finalize_mission(
         MissionStatus.COMPLETED,
         MissionStatus.FAILED,
         MissionStatus.BLOCKED,
+        # A paused Mission is suspended, not finished: settling it here would
+        # rewrite PAUSED to BLOCKED and destroy the operator's intent to
+        # resume the same Task. CANCELLED is already a deliberate outcome.
+        MissionStatus.PAUSED,
+        MissionStatus.CANCELLED,
     }:
         return last_event_id
 

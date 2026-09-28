@@ -1,6 +1,7 @@
 """Mission/Task/Intent contracts and both Task Graph backends."""
 
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
@@ -187,4 +188,5 @@ def test_legacy_runtime_checkpoint_shape_and_engagement_yaml_still_load() -> Non
         and restored.mission_id is None
         and restored.active_task_id is None
     )
-    assert load_engagement("engagement.yaml").name
+    example = Path(__file__).resolve().parents[2] / "examples" / "engagement.yaml"
+    assert load_engagement(example).name

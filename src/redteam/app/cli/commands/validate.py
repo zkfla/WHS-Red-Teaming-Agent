@@ -74,7 +74,9 @@ async def run(args: argparse.Namespace) -> int:
 
     if ok:
         for name, _, _ in checks:
-            print(f"✓ {name}")
+            # stdout may be a cp949 pipe/console on Windows. A Unicode
+            # checkmark can make a valid legacy YAML exit with code 2.
+            print(f"[OK] {name}")
         print("\nConfiguration valid.")
         return EXIT_OK
     return _fail(args, checks)

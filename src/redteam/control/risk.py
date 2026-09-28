@@ -43,6 +43,15 @@ def risk_meets_threshold(risk: RiskLevel, threshold: RiskLevel) -> bool:
     return _RISK_ORDER[risk] >= _RISK_ORDER[threshold]
 
 
+def risk_at_or_below(risk: RiskLevel, ceiling: RiskLevel) -> bool:
+    """True if ``risk`` is no more severe than ``ceiling``.
+
+    The inverse direction of ``risk_meets_threshold``; used by bounded
+    auto-approval (``ApprovalPolicy.auto_approve_up_to``).
+    """
+    return _RISK_ORDER[risk] <= _RISK_ORDER[ceiling]
+
+
 class RiskResolver(Protocol):
     """Resolves the risk level of a canonical action (capability, operation)."""
 

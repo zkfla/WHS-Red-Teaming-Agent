@@ -6,14 +6,17 @@ Rationale: ``docs/agent/orchestration.md``.
 from __future__ import annotations
 
 import asyncio
+import logging
+import sqlite3
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel, Field
 
 from redteam.attack_graph.service import AttackGraphService
-from redteam.core.enums import AgentPhase
-from redteam.core.ids import EventId
+from redteam.core.enums import AgentPhase, MissionStatus
+from redteam.core.ids import EventId, RunId
 from redteam.orchestration.checkpointing import build_checkpointer, open_checkpointer
 from redteam.orchestration.context import RuntimeDeps
 from redteam.orchestration.graph import build_graph
@@ -27,6 +30,14 @@ from redteam.orchestration.state import (
     resume_graph_state,
 )
 from redteam.orchestration.wakeup import EventWakeup, WakeupBatch
+
+logger = logging.getLogger(__name__)
+
+#: Checkpoint branches whose next super-step runs a tool. Replaying one could
+#: repeat a side effect that may already have happened (the checkpoint is
+#: written before the node's effect is durably observable), so a durable
+#: recovery/auto-resume refuses to act on such a snapshot -- fail closed.
+_UNSAFE_REPLAY_NODES = frozenset({"execute", "worker"})
 
 
 class CheckpointSnapshot(BaseModel):
@@ -51,6 +62,7 @@ class ReconciliationResult(BaseModel):
 
 _RECONCILABLE_REASONS = frozenset(
     {
+        TerminationReason.OPERATOR_PAUSED,
         "no_actionable_plan",
         "no_agents_registered",
         "stalled_no_graph_progress",
@@ -67,6 +79,30 @@ _REVISION_GATED_REASONS = frozenset(
         "stalled_no_graph_progress",
     }
 )
+
+# The memory saver can be shared by multiple runners within a process. Claims
+# are never released: after a crash the tool may already have been invoked,
+# so retrying the same approval would be unsafe without an operator review.
+_MEMORY_RESUME_CLAIMS: set[tuple[int, str, str]] = set()
+
+
+def _claim_durable_approval(path: str, run_id: str, approval_id: str) -> bool:
+    """Atomically claim one approved action across CLI processes."""
+    checkpoint = Path(path)
+    # The checkpointer created this database before we reach the claim gate.
+    with sqlite3.connect(checkpoint, timeout=10) as db:
+        db.execute("BEGIN IMMEDIATE")
+        db.execute(
+            "CREATE TABLE IF NOT EXISTS redteam_resume_claims ("
+            "run_id TEXT NOT NULL, approval_id TEXT NOT NULL, "
+            "PRIMARY KEY (run_id, approval_id))"
+        )
+        cursor = db.execute(
+            "INSERT OR IGNORE INTO redteam_resume_claims (run_id, approval_id) VALUES (?, ?)",
+            (run_id, approval_id),
+        )
+        db.commit()
+        return cursor.rowcount == 1
 
 #: Every termination reason ``reconcile_once`` can act on -- the generic
 #: reasons above plus ``APPROVAL_PENDING`` (handled by a dedicated branch,
@@ -343,6 +379,13 @@ class AgentLoopRunner:
             if resumed is None:
                 return ReconciliationResult(runtime=runtime, wakeup=wakeup)
             return ReconciliationResult(runtime=resumed, wakeup=wakeup, resumed=True)
+        if runtime.termination_reason == TerminationReason.OPERATOR_PAUSED:
+            mission = (
+                await self._deps.task_graph_store.get_mission(runtime.mission_id)
+                if runtime.mission_id is not None else None
+            )
+            if mission is None or mission.status is not MissionStatus.ACTIVE:
+                return ReconciliationResult(runtime=runtime, wakeup=wakeup)
         if runtime.termination_reason not in _RECONCILABLE_REASONS:
             return ReconciliationResult(runtime=runtime, wakeup=wakeup)
         if (
@@ -357,6 +400,9 @@ class AgentLoopRunner:
                 "phase": AgentPhase.OBSERVE,
                 "termination_reason": None,
                 "no_progress_turns": 0,
+                "mission_status": MissionStatus.ACTIVE
+                if runtime.termination_reason == TerminationReason.OPERATOR_PAUSED
+                else runtime.mission_status,
             }
         )
         return ReconciliationResult(
@@ -364,6 +410,115 @@ class AgentLoopRunner:
             wakeup=wakeup,
             resumed=True,
         )
+
+    async def recover_runtime(self, run_id: RunId | str) -> RuntimeState | None:
+        """Recover the durable terminal ``RuntimeState`` for ``run_id``.
+
+        Reads the latest checkpoint of the run's thread -- the same durable
+        artifact a later ``redteam resume`` process rebuilds its runner
+        against. The run id *is* the checkpoint thread id (``_run_state``
+        binds one to the other), so nothing new needs to be recorded.
+
+        Returns ``None`` when the run has no checkpoint, the checkpoint
+        cannot be read, the recovered ``run_id`` does not match, or the
+        latest snapshot is unsafe to replay -- it still has EXECUTE/WORKER
+        pending, so re-entering it could repeat a tool side effect that may
+        already have happened. Callers decide whether to resume via
+        ``resume_recovered``.
+        """
+        self._require_checkpointing("recover_runtime")
+        run_key = str(run_id)
+        if self._bound_run_id is not None and self._bound_run_id != run_key:
+            raise ValueError("one AgentLoopRunner may execute only one run")
+        self._bound_run_id = run_key
+        self._thread_id = self._thread_id or run_key
+        snapshot = await self._latest_snapshot()
+        if snapshot is None:
+            return None
+        values = snapshot.values if snapshot.values else None
+        runtime = values.get("runtime") if values else None
+        if not isinstance(runtime, RuntimeState) or str(runtime.run_id) != run_key:
+            return None
+        if self._snapshot_replays_execution(snapshot):
+            return None
+        return runtime
+
+    async def resume_recovered(self, runtime: RuntimeState) -> RuntimeState:
+        """Resume a ``recover_runtime`` result without waiting for an event.
+
+        ``APPROVAL_PENDING`` first re-establishes the durable
+        Approval<->proposal link (``DefaultControlPlane.register_pending_proposal``)
+        from the safe checkpoint, then re-enters exactly at POLICY with the
+        original ``ActionProposal``/``PlanStep`` -- never a freshly
+        re-planned one. Any failure to link or validate fails closed: the run
+        is returned exactly as terminated, never resumed against a guessed or
+        mismatched action. Other reconcilable terminal reasons re-enter at
+        OBSERVE; a hard stop is returned unchanged.
+        """
+        if runtime.termination_reason == TerminationReason.APPROVAL_PENDING:
+            # A control plane that exposes the durable-resume extension must
+            # link the checkpointed proposal successfully before we re-enter;
+            # one that does not (e.g. an in-process test double) falls through
+            # to the same path ``reconcile_once`` uses.
+            if hasattr(self._deps.control_plane, "register_pending_proposal"):
+                if not await self._register_pending_checkpoint(runtime):
+                    return runtime
+            resumed = await self._resume_pending_approval(runtime)
+            return resumed if resumed is not None else runtime
+        if runtime.termination_reason not in _RECONCILABLE_REASONS:
+            return runtime
+        if runtime.termination_reason == TerminationReason.OPERATOR_PAUSED:
+            mission = (
+                await self._deps.task_graph_store.get_mission(runtime.mission_id)
+                if runtime.mission_id is not None else None
+            )
+            if mission is None or mission.status is not MissionStatus.ACTIVE:
+                return runtime
+        resume_runtime = runtime.model_copy(
+            update={
+                "phase": AgentPhase.OBSERVE,
+                "termination_reason": None,
+                "no_progress_turns": 0,
+                "mission_status": MissionStatus.ACTIVE
+                if runtime.termination_reason == TerminationReason.OPERATOR_PAUSED
+                else runtime.mission_status,
+            }
+        )
+        return await self.run(resume_runtime)
+
+    async def _register_pending_checkpoint(self, runtime: RuntimeState) -> bool:
+        """Re-link the checkpointed proposal to its Approval, or fail closed.
+
+        Returns ``False`` (never raises) when the pending approval/proposal
+        cannot be linked safely: a missing/mismatched proposal, an unsafe
+        snapshot, a control plane without the durable-resume extension, or a
+        registration that itself rejects the pairing.
+        """
+        if runtime.pending_approval_id is None or runtime.pending_action_id is None:
+            return False
+        snapshot = await self._latest_snapshot()
+        state = snapshot.values if snapshot is not None and snapshot.values else None
+        proposal = state.get("action_proposal") if state is not None else None
+        if (
+            proposal is None
+            or proposal.action_id != runtime.pending_action_id
+            or proposal.run_id != runtime.run_id
+            or proposal.engagement_id != runtime.engagement_id
+            or self._snapshot_replays_execution(snapshot)
+        ):
+            return False
+        register = getattr(self._deps.control_plane, "register_pending_proposal", None)
+        if register is None:
+            return False
+        try:
+            await register(runtime.pending_approval_id, proposal)
+        except Exception:  # noqa: BLE001 - a bad link must never become a resume
+            logger.exception(
+                "refusing to resume: could not link checkpointed proposal to approval %s",
+                runtime.pending_approval_id,
+            )
+            return False
+        return True
 
     async def _resume_pending_approval(self, runtime: RuntimeState) -> RuntimeState | None:
         """Resume a run stopped at ``APPROVAL_PENDING``, once resolved.
@@ -375,26 +530,81 @@ class AgentLoopRunner:
         """
         if runtime.pending_approval_id is None or runtime.pending_action_id is None:
             return None  # defensive: nothing to resume
-        outcome = await self._deps.control_plane.approval_outcome(runtime.pending_approval_id)
-        if outcome is None:
-            return None  # still pending
+        if runtime.mission_id is not None:
+            mission = await self._deps.task_graph_store.get_mission(runtime.mission_id)
+            # An approval only admits the held action; it is not an operator
+            # instruction. It must never revive a Mission the operator has
+            # paused (PAUSED), stopped (CANCELLED), or otherwise settled
+            # (COMPLETED/FAILED/BLOCKED/DRAFT) -- require ACTIVE, exactly like
+            # the OPERATOR_PAUSED resume path below. Fail closed on an
+            # unreadable Mission too, rather than resuming against unknown
+            # operator state.
+            if mission is None or mission.status is not MissionStatus.ACTIVE:
+                return None
 
         # Resuming needs the checkpointed ActionProposal/PlanStep
         # replan_node preserved; without checkpointing there is nothing to
         # resume from. Unlike resume_from/state_history (explicit operator
         # calls), this runs inside a periodic reconciliation loop, so it
         # stays quiet rather than raising -- the run just stays terminated.
-        state = await self._latest_graph_state(runtime)
+        # Validated *before* asking Control for an outcome, so a checkpoint
+        # that is missing, mismatched, or unsafe to replay cannot consume a
+        # resolution or reserve budget on the way to being refused.
+        snapshot = await self._latest_snapshot()
+        state = snapshot.values if snapshot is not None and snapshot.values else None
         proposal = state.get("action_proposal") if state is not None else None
         if (
             state is None
             or proposal is None
             or proposal.action_id != runtime.pending_action_id
+            or proposal.run_id != runtime.run_id
+            or proposal.engagement_id != runtime.engagement_id
+            or self._snapshot_replays_execution(snapshot)
         ):
             # The checkpoint this needs (preserved by replan_node's
             # terminal branch) is missing or does not match -- resuming
             # blind would risk re-executing against the wrong proposal.
             # Fail closed: leave the run exactly as terminated.
+            return None
+
+        checkpoint_runtime = state.get("runtime")
+        if (
+            not isinstance(checkpoint_runtime, RuntimeState)
+            or checkpoint_runtime.run_id != runtime.run_id
+            or checkpoint_runtime.engagement_id != runtime.engagement_id
+            or checkpoint_runtime.termination_reason != TerminationReason.APPROVAL_PENDING
+            or checkpoint_runtime.pending_approval_id != runtime.pending_approval_id
+        ):
+            return None
+
+        outcome = await self._deps.control_plane.approval_outcome(runtime.pending_approval_id)
+        if outcome is None:
+            return None  # still pending
+
+        # A second process may have recovered the same safe checkpoint before
+        # this approval was resolved. Its independent Control counters cannot
+        # serialize the tool side effect: claim once in the shared checkpoint
+        # database before either process re-enters POLICY. Keep the claim even
+        # if execution raises, because the tool may already have run.
+        try:
+            if self._settings.checkpoint_backend == "sqlite":
+                claimed = await asyncio.to_thread(
+                    _claim_durable_approval, self._settings.checkpoint_path,
+                    str(runtime.run_id), str(runtime.pending_approval_id),
+                )
+            else:
+                claim = (
+                    id(self._checkpointer),
+                    str(runtime.run_id),
+                    str(runtime.pending_approval_id),
+                )
+                claimed = claim not in _MEMORY_RESUME_CLAIMS
+                if claimed:
+                    _MEMORY_RESUME_CLAIMS.add(claim)
+        except (OSError, sqlite3.Error):
+            logger.exception("refusing approval resume: durable claim unavailable")
+            return None
+        if not claimed:
             return None
 
         resumed_runtime = runtime.model_copy(
@@ -411,9 +621,15 @@ class AgentLoopRunner:
         )
         return await self._run_state(resumed_runtime, seeded)
 
-    async def _latest_graph_state(self, runtime: RuntimeState) -> GraphState | None:
-        """The full last-checkpointed state (not just ``runtime``), or
-        ``None`` if checkpointing found nothing for this thread.
+    @staticmethod
+    def _snapshot_replays_execution(snapshot: Any) -> bool:
+        """Whether replaying ``snapshot`` would re-enter a tool execution."""
+        next_nodes = getattr(snapshot, "next", None) or ()
+        return bool(_UNSAFE_REPLAY_NODES.intersection(next_nodes))
+
+    async def _latest_snapshot(self) -> Any | None:
+        """The latest checkpointed ``StateSnapshot`` for this thread, or
+        ``None`` if checkpointing is unavailable.
 
         Unlike the ``memory`` backend (built eagerly in ``__init__``), a
         ``sqlite`` checkpointer is only opened by ``_ensure_graph`` (an
@@ -431,8 +647,7 @@ class AgentLoopRunner:
         if self._graph is None or self._checkpointer is None:
             return None
         try:
-            snapshot = await self._graph.aget_state(self.config())
-            return snapshot.values if snapshot.values else None
+            return await self._graph.aget_state(self.config())
         except Exception:  # noqa: BLE001 - treat as unavailable, never crash reconciliation
             return None
 

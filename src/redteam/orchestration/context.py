@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, field
 
+from redteam.core.ids import RunId
 from redteam.core.ports.attack_graph import AttackGraphStore
 from redteam.core.ports.control_plane import ControlPlane
 from redteam.core.ports.event_bus import EventBus
@@ -26,6 +27,7 @@ from redteam.orchestration.agents.registry import AgentRegistry, default_registr
 from redteam.orchestration.analysis import AnalysisVerifier, DeterministicAnalysisVerifier
 from redteam.orchestration.context_projection import ContextProjectionCache
 from redteam.orchestration.observations import ResultMapperRegistry, default_result_mapper_registry
+from redteam.orchestration.operator_intents.store import OperatorIntentStore
 from redteam.orchestration.settings import OrchestrationSettings
 from redteam.orchestration.task_graph.memory import InMemoryTaskGraphStore
 from redteam.orchestration.work.memory import InMemoryWorkStore
@@ -54,6 +56,7 @@ class RuntimeDeps:
     result_mappers: ResultMapperRegistry = field(default_factory=default_result_mapper_registry)
     work_store: WorkStore = field(default_factory=InMemoryWorkStore)
     task_graph_store: MissionTaskStore = field(default_factory=InMemoryTaskGraphStore)
+    operator_intent_store: OperatorIntentStore | None = None
     settings: OrchestrationSettings = field(default_factory=OrchestrationSettings)
     context_cache: ContextProjectionCache = field(
         default_factory=ContextProjectionCache, compare=False
@@ -61,3 +64,13 @@ class RuntimeDeps:
     # DefaultControlPlane owns mutable rate/budget counters. Policy admission
     # is intentionally serialized while approved tool calls may run in parallel.
     policy_lock: asyncio.Lock = field(default_factory=asyncio.Lock, compare=False)
+    # Serialized by policy_lock. Once one worker in a batch requests approval,
+    # siblings defer without minting uncheckpointed/orphan Approvals.
+    batch_pending_approvals: set[RunId] = field(default_factory=set, compare=False)
+    #: Bounds how many approved tool invocations may execute at once. One
+    #: shared semaphore per run, wired by bootstrap from the engagement's
+    #: ``RateLimitPolicy.max_concurrent_actions``. ``None`` (default) leaves
+    #: execution unbounded, preserving the behaviour before this knob was
+    #: enforced. The bound is applied at the tool call site (EXECUTE), not at
+    #: policy admission, so a bounded fan-out batch still executes fully.
+    tool_semaphore: asyncio.Semaphore | None = field(default=None, compare=False)

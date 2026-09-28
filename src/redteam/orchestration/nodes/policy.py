@@ -30,6 +30,41 @@ _OUTCOME = {
     PolicyVerdict.DENY: (EventType.ACTION_DENIED, AgentPhase.REPLAN),
 }
 
+#: Control's machine-readable reaction hint rides in
+#: ``PolicyDecision.matched_rules`` as ``severity:<value>`` because the frozen
+#: ``PolicyDecision`` contract has no dedicated field (see
+#: ``redteam.control.severity``). Orchestration may not import Control's
+#: concrete package (dependency rules), so the documented tag string is read
+#: back here rather than through the enum. These are the three levels:
+#:
+#: - ``BLOCK_ACTION`` — block only this action; retry a *different* action
+#:   toward the same goal.
+#: - ``REPLAN_GOAL`` — this goal/capability is not viable; switch goals (the
+#:   active Task is not, in itself, runnable).
+#: - ``ABORT_RUN`` — nothing more can proceed; end the run.
+_SEVERITY_TAG_PREFIX = "severity:"
+SEVERITY_BLOCK_ACTION = "block_action"
+SEVERITY_REPLAN_GOAL = "replan_goal"
+SEVERITY_ABORT_RUN = "abort_run"
+
+
+def denial_severity(decision: PolicyDecision | None) -> str | None:
+    """Read the Control-supplied reaction hint out of a decision.
+
+    Returns the raw level string (``"block_action"`` / ``"replan_goal"`` /
+    ``"abort_run"``), or ``None`` when the decision is untagged or malformed.
+    Untagged denials keep the historical behavior: block this action and
+    replan.
+    """
+
+    if decision is None or decision.verdict is not PolicyVerdict.DENY:
+        return None
+    for rule in decision.matched_rules:
+        if rule.startswith(_SEVERITY_TAG_PREFIX):
+            value = rule[len(_SEVERITY_TAG_PREFIX) :]
+            return value or None
+    return None
+
 
 async def policy_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
     runtime = state["runtime"]
@@ -141,8 +176,18 @@ async def policy_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
     elif resuming_approval:
         # The approval cycle is fully resolved now (ALLOW or DENY) --
         # clear the markers so a later, unrelated action is never
-        # mistaken for a resume of this one.
-        runtime_update.update({"pending_approval_id": None, "pending_action_id": None})
+        # mistaken for a resume of this one. Also clear the terminal
+        # ``APPROVAL_PENDING`` marker: it is no longer pending, and leaving
+        # it set would make REPLAN re-enter its terminal branch (a rejected
+        # approval would never replan, and an approved one would stop right
+        # after executing). The run resumes/replans from the resolved verdict.
+        runtime_update.update(
+            {
+                "pending_approval_id": None,
+                "pending_action_id": None,
+                "termination_reason": None,
+            }
+        )
 
     return advance(
         state,

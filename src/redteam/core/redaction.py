@@ -6,7 +6,7 @@ import re
 
 _SENSITIVE_TEXT_VALUE_PATTERN = re.compile(
     r"\b(api\s*[_-]?\s*key|access[_-]?token|refresh[_-]?token|session(?:[_-]?(?:id|token))?|"
-    r"csrf(?:[_-]?token)?|token|password|passwd|secret|credential|account|card|ssn|"
+    r"csrf(?:[_-]?token)?|token|cookie|password|passwd|secret|credential|account|card|ssn|"
     r"authorization|auth)(\s*[:=]\s*)(\"[^\"]*\"|'[^']*'|[^\s,;]+)",
     re.IGNORECASE,
 )
