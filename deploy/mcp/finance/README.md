@@ -4,6 +4,9 @@
 
 HTTP query/header, 브라우저 cookie snapshot 재사용, 선택적인 ZAP 실시간 캡처 조회와
 Nuclei passive 검사 연동은 [확장 실행 및 인수인계](EXTENSIONS.md)를 참고한다.
+운영자 데스크톱의 공식 ZAP/Burp MCP, chrome-use, Cua Driver 연결은
+[외부 Web MCP 프로필](../external/README.md)을 참고한다. 해당 프로필은 기본 합성 랩에
+자동으로 포함되지 않는다.
 
 MCP 서버는 프로그램이다. 개발·통합 모두 동일 컴퓨터에서 stdio로 실행할 수 있다.
 HTTP는 별도 프로세스/호스트에 연결하는 선택지이며 GCP가 필수는 아니다.

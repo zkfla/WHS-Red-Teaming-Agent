@@ -48,6 +48,7 @@ class MCPServerSettings:
     args: tuple[str, ...] = ()
     risk_level: RiskLevel = RiskLevel.LOW
     bearer_token: str | None = field(default=None, repr=False)
+    authorization_value: str | None = field(default=None, repr=False)
     process_environment: dict[str, str] = field(default_factory=dict, repr=False)
     allowed_tools: tuple[str, ...] | None = None
     tool_operations: dict[str, tuple[str, ...]] | None = None
@@ -82,12 +83,19 @@ class MCPServerSettings:
         command: str | None = None
         args: tuple[str, ...] = ()
         token: str | None = None
+        authorization_value: str | None = None
         process_environment: dict[str, str] = {}
 
         if transport == MCPTransportKind.STREAMABLE_HTTP:
             endpoint = _required_environment_value(f"{prefix}_ENDPOINT")
             _validate_endpoint(endpoint, prefix)
             token = _load_bearer_token(prefix)
+            authorization_value = _load_authorization_value(prefix)
+            if token is not None and authorization_value is not None:
+                raise MCPConfigurationError(
+                    f"{prefix}_TOKEN_ENV_VAR and {prefix}_AUTHORIZATION_ENV_VAR "
+                    "are mutually exclusive"
+                )
         else:
             command = _required_environment_value(f"{prefix}_COMMAND")
             _validate_command(command, prefix)
@@ -116,6 +124,7 @@ class MCPServerSettings:
             args=args,
             risk_level=risk_level,
             bearer_token=token,
+            authorization_value=authorization_value,
             process_environment=process_environment,
             allowed_tools=allowed_tools,
             tool_operations=tool_operations,
@@ -124,6 +133,8 @@ class MCPServerSettings:
         )
 
     def request_headers(self) -> dict[str, str]:
+        if self.authorization_value is not None:
+            return {"Authorization": self.authorization_value}
         if self.bearer_token is None:
             return {}
         return {"Authorization": f"Bearer {self.bearer_token}"}
@@ -154,6 +165,31 @@ def _load_bearer_token(prefix: str) -> str | None:
     if not token:
         raise MCPConfigurationError(f"secret environment variable {token_env_var!r} is not set")
     return token
+
+
+def _load_authorization_value(prefix: str) -> str | None:
+    """Load an exact Authorization value through secret-name indirection.
+
+    Some MCP servers, including ZAP's official MCP add-on, require a raw
+    security key rather than a Bearer token.  The value remains outside app
+    configuration and descriptor metadata, just like ``TOKEN_ENV_VAR``.
+    """
+
+    value_env_var = os.environ.get(f"{prefix}_AUTHORIZATION_ENV_VAR")
+    if not value_env_var:
+        return None
+    if not _SAFE_ENVIRONMENT_NAME.fullmatch(value_env_var):
+        raise MCPConfigurationError(
+            f"{prefix}_AUTHORIZATION_ENV_VAR is not a valid environment variable name"
+        )
+    value = os.environ.get(value_env_var)
+    if not value:
+        raise MCPConfigurationError(
+            f"secret environment variable {value_env_var!r} is not set"
+        )
+    if "\r" in value or "\n" in value:
+        raise MCPConfigurationError("Authorization value must not contain line breaks")
+    return value
 
 
 def _load_stdio_arguments(prefix: str) -> tuple[str, ...]:
@@ -273,7 +309,8 @@ def _validate_endpoint(endpoint: str, prefix: str) -> None:
         raise MCPConfigurationError(f"{prefix}_ENDPOINT must be an absolute http(s) URL")
     if parsed.username is not None or parsed.password is not None:
         raise MCPConfigurationError(
-            f"{prefix}_ENDPOINT must not contain credentials; use TOKEN_ENV_VAR"
+            f"{prefix}_ENDPOINT must not contain credentials; use TOKEN_ENV_VAR "
+            f"or AUTHORIZATION_ENV_VAR"
         )
     allow_insecure = os.environ.get(f"{prefix}_ALLOW_INSECURE_HTTP", "false").lower()
     if parsed.scheme == "http" and parsed.hostname not in _LOCAL_HOSTS and allow_insecure != "true":

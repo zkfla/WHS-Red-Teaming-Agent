@@ -43,6 +43,46 @@ def test_server_settings_load_endpoint_kind_risk_and_secret_by_indirection(
     assert "secret-value" not in repr(settings)
 
 
+def test_server_settings_load_exact_authorization_value_by_indirection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("REDTEAM_MCP_ZAP_ENDPOINT", "http://127.0.0.1:8282")
+    monkeypatch.setenv("REDTEAM_MCP_ZAP_KIND", "web_api")
+    monkeypatch.setenv("REDTEAM_MCP_ZAP_AUTHORIZATION_ENV_VAR", "ZAP_MCP_KEY")
+    monkeypatch.setenv("ZAP_MCP_KEY", "raw-zap-security-key")
+
+    settings = MCPServerSettings.from_environment("zap")
+
+    assert settings.request_headers() == {"Authorization": "raw-zap-security-key"}
+    assert "raw-zap-security-key" not in repr(settings)
+
+
+def test_bearer_and_exact_authorization_are_mutually_exclusive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("REDTEAM_MCP_ZAP_ENDPOINT", "http://127.0.0.1:8282")
+    monkeypatch.setenv("REDTEAM_MCP_ZAP_KIND", "web_api")
+    monkeypatch.setenv("REDTEAM_MCP_ZAP_TOKEN_ENV_VAR", "BEARER_SECRET")
+    monkeypatch.setenv("REDTEAM_MCP_ZAP_AUTHORIZATION_ENV_VAR", "ZAP_MCP_KEY")
+    monkeypatch.setenv("BEARER_SECRET", "bearer-secret")
+    monkeypatch.setenv("ZAP_MCP_KEY", "raw-key")
+
+    with pytest.raises(MCPConfigurationError, match="mutually exclusive"):
+        MCPServerSettings.from_environment("zap")
+
+
+def test_exact_authorization_rejects_header_injection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("REDTEAM_MCP_ZAP_ENDPOINT", "http://127.0.0.1:8282")
+    monkeypatch.setenv("REDTEAM_MCP_ZAP_KIND", "web_api")
+    monkeypatch.setenv("REDTEAM_MCP_ZAP_AUTHORIZATION_ENV_VAR", "ZAP_MCP_KEY")
+    monkeypatch.setenv("ZAP_MCP_KEY", "key\r\nX-Injected: true")
+
+    with pytest.raises(MCPConfigurationError, match="line breaks"):
+        MCPServerSettings.from_environment("zap")
+
+
 def test_server_settings_load_canonical_tool_operation_bindings(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
