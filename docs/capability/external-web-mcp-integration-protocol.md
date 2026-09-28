@@ -70,9 +70,15 @@ implementation, define:
 - response and evidence redaction;
 - a synthetic positive and negative fixture for every enabled template.
 
-Initial active templates must be low-volume HTTP checks.  Code, headless,
-file, network and workflow templates remain disabled.  Active Nuclei is not
-considered connected until its egress and request-count tests pass.
+The first implemented profile is `reflected-query-marker`: one generated GET
+against an exact allowlisted path/query key, connected to the already validated
+IP while preserving Host and HTTPS SNI.  It disables redirect, retry, OAST and
+updates and returns `observation_only`; reflection is not an XSS finding.
+
+Community/CVE templates are still not enabled.  Before adding any, keep the
+requirements above: pinned hashes, reviewed request counts and synthetic
+positive/negative fixtures.  Code, headless, file, network and workflow
+templates remain disabled.
 
 ## Non-goals
 
@@ -82,4 +88,3 @@ considered connected until its egress and request-count tests pass.
 - production scans, real transactions, race tests or rollback;
 - treating a scanner alert as a verified Finding without an independent
   reproduction and the engagement's business oracle.
-

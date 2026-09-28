@@ -46,9 +46,11 @@ add-on의 `exportHar` API, Burp는 `Save items`가 만든 XML을 connector가 �
   사용한다. 호출마다 연결하는 기존 `build_mcp_tool_gateway()`로는 페이지가
   사라지므로 브라우저 워크플로에 사용하지 않는다. 실행/테스트 계정별 전용
   lifecycle을 사용하며 계정 A/B 비교는 HTTP 도구로 검증한다.
-- Nuclei 직접 Active Scan, ZAP/Burp scan 제어, httpx CLI, 대량 fuzzing,
+- Nuclei 범용/CVE Active Scan, ZAP/Burp scan 제어, httpx CLI, 대량 fuzzing,
   거래 재전송·경쟁 상태 검사는 후속이다. ZAP 실시간 캡처 조회와 Nuclei passive 검사는
   선택적인 [확장 구성](EXTENSIONS.md)으로 제공한다.
+  Nuclei의 단일 allowlisted query reflection probe는 별도 high-risk 프로필로 제공하지만
+  임의 template이나 URL을 받지 않으며 취약점으로 확정하지 않는다.
   지금 HTTPX 기반 저부하 조회와 기능이 겹치는 엔진들을 함께 설치하지 않는다.
 
 ## 빠른 시작 (저장소 루트)
@@ -283,7 +285,8 @@ TLS는 검증된 한 번의 handshake이며 전체 프로토콜/암호군 스캐
 
 1. ZAP 증분 동기화: engagement별 cursor와 승인 Context 매핑이 정해진 뒤 polling 추가.
 2. Burp 실시간 연결: 팀 Burp edition과 공식 MCP 사용 여부가 정해지면 saved-items 변환과 역할 중복 검토.
-3. Nuclei Active: passive 연동 위에 검토된 template·egress·요청 수·취소 계약을 추가.
+3. Nuclei Active 확장: 현재 단일 reflection probe 위에 hash가 고정된 검토 template,
+   template별 요청 수·취소 계약과 합성 positive/negative fixture를 추가.
 4. 거래 재전송/멱등성/경쟁 상태: 합성 계좌·거래 한도·정합성 oracle·복구 계약이 있는 후속 PR.
 
 출처: [Playwright MCP](https://github.com/microsoft/playwright-mcp),

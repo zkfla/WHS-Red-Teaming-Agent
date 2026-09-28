@@ -76,10 +76,13 @@ server-side login state.
 
 ## Nuclei Active status
 
-Active Nuclei is deliberately not included in these ready-to-load profiles.
-The existing `web-nuclei` server remains passive.  The required implementation
-and acceptance gates are in
-`docs/capability/external-web-mcp-integration-protocol.md`.  Directly wrapping
-`nuclei -u <agent-url>` would bypass DNS/IP pinning, path allowlists and request
-budgets, so it is not an acceptable intermediate implementation.
+The in-repo `web-nuclei` process now exposes an optional
+`nuclei_active_query_probe`. Register the same endpoint as
+`web-nuclei-active` using `deploy/mcp/finance/extensions.env.example`, and set
+`active_enabled=true` only in the authorized engagement policy. It performs one
+generated reflection probe against an exact allowlisted path/query key and
+returns an observation, not an XSS finding.
 
+Community/CVE templates remain disabled. Directly wrapping
+`nuclei -u <agent-url>` would bypass target selection, path allowlists and
+request budgets, so it remains prohibited.
