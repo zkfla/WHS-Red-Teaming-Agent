@@ -11,7 +11,7 @@ from redteam.attack_graph.identity import (
     session_credential_node_id,
     session_principal_node_id,
 )
-from redteam.core.contracts.target import HostTarget
+from redteam.core.contracts.target import HostTarget, UrlTarget
 from redteam.core.contracts.tool import ToolResult
 from redteam.core.enums import GraphEdgeType, GraphNodeType
 from redteam.core.ids import ActionId, InvocationId, ToolId
@@ -103,6 +103,32 @@ def test_proxy_list_maps_redacted_flows_to_resources_and_endpoints() -> None:
         GraphEdgeType.OBSERVED,
         GraphEdgeType.DERIVED_FROM,
     }
+
+
+def test_browser_navigation_maps_execution_without_page_content() -> None:
+    url = "http://bank.local/accounts"
+    result = ToolResult(
+        invocation_id=InvocationId("inv_browser"),
+        action_id=ActionId("action_browser"),
+        tool_id=ToolId("web.browser_navigate"),
+        success=True,
+        output="page content that must not be copied",
+        started_at=NOW,
+        finished_at=NOW,
+    )
+
+    mutation = default_result_mapper_registry().map_result(
+        tool_id=ToolId("web.browser_navigate"),
+        target=UrlTarget(url=url),
+        arguments={"url": url},
+        result=result,
+    )
+
+    assert len(mutation.nodes) == 1
+    node = mutation.nodes[0]
+    assert node.attrs["browser_navigated"] is True
+    assert node.observations[0]["page_content_omitted"] is True
+    assert "page content" not in str(node.observations[0])
 
 
 def test_multiple_captures_merge_the_endpoint_but_preserve_each_observation() -> None:

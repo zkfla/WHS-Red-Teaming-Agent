@@ -26,6 +26,15 @@ Framework 설정은 `framework.env.example`에 `extensions.env.example`을 함�
 AppConfig의 `capability.mcp_servers`에 `web-zap`, `web-nuclei`를 추가한다.
 공통 Core 계약 변경 없이 기존 `web.response_analysis`에 매핑한다.
 
+`web-nuclei`를 AppConfig에 추가하면 Web/API Agent는 실제 HTTP 응답이 Graph에 있는
+경우 `web.nuclei_response_check`를 하나의 bounded 후보로 만들 수 있다. 이 후보는
+Control을 통과한 뒤에만 실행되고, 실행 결과는 `observation_only`로 Graph에 기록된다.
+같은 방식으로 기본 `web-browser`와 `web-proxy`가 healthy하면 Agent는 각각 관찰된
+URL의 `web.browser_navigate`와 대상별 `web.proxy_list_flows` 후보를 만들 수 있다.
+Browser는 HTTPX 요청보다 낮은 우선순위의 렌더링 fallback이고, Proxy 후보는 history
+조회만 자동 제안한다. 전체 경로의 합성 검증표는
+`docs/capability/agent-mcp-readonly-integration.md`에 있다.
+
 | ToolId | operation | 입력 | 지원 범위 |
 |---|---|---|---|
 | `web.http_request` (확장) | `http_request` | 기존 입력 + `query`, `request_headers` | 경로별 허용 key와 허용 header를 사용한 단일 요청 |

@@ -93,6 +93,10 @@ class GraphCandidateContext:
     #: them in the live catalog. Only meaningful together with
     #: operations_verified.
     available_operations: tuple[tuple[str, str], ...] = ()
+    #: Concrete healthy ToolIds in the live catalog.  Operations alone are
+    #: intentionally not enough when several adapters implement the same
+    #: intent (for example HTTPX and a browser navigator).
+    available_tool_ids: tuple[str, ...] = ()
     #: True when available_operations was actually derived from a live Tool
     #: Catalog. False means "unknown", not "none": with no catalog wired in,
     #: the provider's declared ToolId binding is the only evidence of
@@ -117,11 +121,17 @@ class GraphCandidateContext:
             return True
         return (capability, operation) in self.available_operations
 
+    def has_tool(self, tool_id: str) -> bool:
+        """Whether a concrete tool is available in a verified live catalog."""
+
+        return self.operations_verified and tool_id in self.available_tool_ids
+
 
 def planning_fingerprint(
     *,
     observation: GraphObservation,
     available_operations: Iterable[tuple[str, str]] = (),
+    available_tool_ids: Iterable[str] = (),
     prior_candidate_keys: Iterable[str] = (),
 ) -> str:
     """Stable digest of what a planning turn could actually have planned from.
@@ -143,6 +153,7 @@ def planning_fingerprint(
         "findings": observation.findings,
         "attempted": observation.attempted,
         "available_operations": sorted([list(item) for item in available_operations]),
+        "available_tool_ids": sorted(available_tool_ids),
         "prior_candidate_keys": sorted(prior_candidate_keys),
     }
     encoded = json.dumps(payload, sort_keys=True, default=str, separators=(",", ":")).encode()

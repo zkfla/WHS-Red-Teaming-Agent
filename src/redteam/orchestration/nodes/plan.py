@@ -96,6 +96,28 @@ def _available_operations(
     return tuple(available), True
 
 
+def _available_tool_ids(catalog: ToolCatalog | None, capability: str) -> tuple[str, ...]:
+    """Return concrete healthy ToolIds for provider-specific candidates.
+
+    Candidate providers may need to distinguish two tools bound to the same
+    canonical action (HTTP request vs browser navigation).  This is metadata
+    only; the compiler and Gateway remain the execution authorities.
+    """
+
+    if catalog is None:
+        return ()
+    try:
+        return tuple(
+            sorted(
+                str(tool.tool_id)
+                for tool in catalog.list_by_capability(capability)
+                if getattr(tool.health_status, "value", tool.health_status) != "unhealthy"
+            )
+        )
+    except (AttributeError, ValueError):
+        return ()
+
+
 async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
     runtime = state["runtime"]
     observation = state.get("observation")
@@ -145,9 +167,11 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             available_operations, operations_verified = _available_operations(
                 deps.tool_catalog, _declared_operations(agent, provider)
             )
+            available_tool_ids = _available_tool_ids(deps.tool_catalog, "web")
             planning_digest = planning_fingerprint(
                 observation=observation,
                 available_operations=available_operations,
+                available_tool_ids=available_tool_ids,
                 prior_candidate_keys=terminal_keys,
             )
             context = GraphCandidateContext(
@@ -158,6 +182,7 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                 open_hypotheses=tuple(observation.open_hypotheses),
                 prior_candidate_keys=frozenset(terminal_keys),
                 available_operations=available_operations,
+                available_tool_ids=available_tool_ids,
                 operations_verified=operations_verified,
                 planning_fingerprint=planning_digest,
             )
