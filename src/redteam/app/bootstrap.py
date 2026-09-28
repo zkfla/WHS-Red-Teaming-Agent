@@ -57,7 +57,7 @@ from redteam.core.config import (
 )
 from redteam.core.contracts.engagement import Engagement
 from redteam.core.contracts.events import EventEnvelope, EventType
-from redteam.core.enums import AgentPhase, MissionStatus
+from redteam.core.enums import AgentPhase, MissionStatus, TaskStatus
 from redteam.core.ids import EngagementId, EventId, RunId, new_id
 from redteam.core.ports.attack_graph import AttackGraphStore
 from redteam.core.ports.control_plane import ControlPlane
@@ -553,11 +553,20 @@ async def settle_engagement(
         mission = await deps.task_graph_store.get_mission(runtime.mission_id)
         if mission is not None:
             updates: dict[str, object] = {"mission_status": mission.status}
+            # A Mission can end BLOCKED with no blocked Task: an unmet success
+            # criterion (for example a target that returned no usable
+            # evidence) is not the same as work the plan itself could not
+            # reach. Only the latter -- an actual BLOCKED Task -- is reported
+            # as MISSION_BLOCKED; otherwise the historical run-level reason
+            # (no_actionable_plan) stands and the Mission status/report carry
+            # the unmet criteria.
             if (
                 mission.status is MissionStatus.BLOCKED
                 and runtime.termination_reason == TerminationReason.NO_ACTIONABLE_PLAN
             ):
-                updates["termination_reason"] = TerminationReason.MISSION_BLOCKED
+                tasks = await deps.task_graph_store.list_tasks(mission_id=runtime.mission_id)
+                if any(task.status is TaskStatus.BLOCKED for task in tasks):
+                    updates["termination_reason"] = TerminationReason.MISSION_BLOCKED
             runtime = runtime.model_copy(update=updates)
     await _publish_terminal_artifacts(
         runtime,

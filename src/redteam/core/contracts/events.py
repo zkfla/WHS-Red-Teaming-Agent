@@ -38,8 +38,14 @@ _REDACTED = "***REDACTED***"
 
 def _redact_secret_material(value: Any, *, key: str | None = None) -> Any:
     normalized = (key or "").lower().replace("-", "_")
-    if (not normalized.endswith(("_ref", "_reference", "_id"))
-            and any(part in normalized for part in _SECRET_KEY_PARTS)):
+    # A secret-shaped key is the whole key or a trailing segment
+    # (``access_token``, ``client_secret``, ``proxy_authorization``). A longer
+    # descriptive name that merely contains the word -- such as the
+    # diagnostic reason ``no_registered_session_for_path`` -- is not a secret.
+    if not normalized.endswith(("_ref", "_reference", "_id")) and any(
+        normalized == part or normalized.endswith(f"_{part}")
+        for part in _SECRET_KEY_PARTS
+    ):
         return _REDACTED
     if isinstance(value, dict):
         return {
