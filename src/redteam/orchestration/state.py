@@ -16,7 +16,7 @@ from redteam.attack_graph.observation import GraphObservation
 from redteam.core.contracts.action import ActionProposal
 from redteam.core.contracts.policy import PolicyDecision
 from redteam.core.contracts.tool import ToolResult
-from redteam.core.enums import AgentPhase, Verdict
+from redteam.core.enums import AgentPhase, MissionStatus, Verdict
 from redteam.core.ids import (
     ActionId,
     AgentId,
@@ -25,7 +25,10 @@ from redteam.core.ids import (
     EventId,
     EvidenceId,
     HypothesisId,
+    MissionId,
+    OperatorIntentId,
     RunId,
+    TaskId,
 )
 from redteam.orchestration.agents.base import PlanStep
 from redteam.orchestration.dispatch import (
@@ -60,6 +63,12 @@ class RuntimeState(BaseModel):
     current_agent: AgentId | None = None
 
     current_goal: str | None = None
+    # Additive references for task-first execution. Optional defaults keep
+    # checkpoints created before Mission contracts loadable.
+    mission_id: MissionId | None = None
+    active_task_id: TaskId | None = None
+    operator_intent_id: OperatorIntentId | None = None
+    mission_status: MissionStatus | None = None
 
     active_hypothesis_id: HypothesisId | None = None
     pending_action_id: ActionId | None = None

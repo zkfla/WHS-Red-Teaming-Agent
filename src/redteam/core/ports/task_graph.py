@@ -1,0 +1,46 @@
+"""Ports for Mission persistence and the Task Graph domain."""
+
+from __future__ import annotations
+
+from datetime import datetime
+from typing import Protocol
+
+from redteam.core.contracts.mission import MissionPlan, MissionTask
+from redteam.core.enums import TaskStatus
+from redteam.core.ids import EngagementId, MissionId, TaskId
+
+
+class MissionStore(Protocol):
+    async def create_mission(self, mission: MissionPlan) -> None: ...
+    async def get_mission(self, mission_id: MissionId) -> MissionPlan | None: ...
+    async def list_missions(
+        self, *, engagement_id: EngagementId | None = None
+    ) -> list[MissionPlan]: ...
+    async def update_mission(self, mission: MissionPlan) -> None: ...
+
+
+class TaskGraphStore(Protocol):
+    async def create_task(self, task: MissionTask) -> None: ...
+    async def get_task(self, task_id: TaskId) -> MissionTask | None: ...
+    async def list_tasks(
+        self, *, mission_id: MissionId | None = None, status: TaskStatus | None = None
+    ) -> list[MissionTask]: ...
+    async def update_task(self, task: MissionTask) -> None: ...
+    async def transition_task(
+        self, task_id: TaskId, status: TaskStatus, *, now: datetime, reason: str | None = None
+    ) -> MissionTask: ...
+    async def add_dependency(
+        self, task_id: TaskId, dependency_id: TaskId, *, now: datetime
+    ) -> MissionTask: ...
+    async def update_priority(
+        self, task_id: TaskId, priority: int, *, now: datetime
+    ) -> MissionTask: ...
+    async def block_task(self, task_id: TaskId, reason: str, *, now: datetime) -> MissionTask: ...
+    async def unblock_task(self, task_id: TaskId, *, now: datetime) -> MissionTask: ...
+    async def split_task(
+        self, parent_id: TaskId, children: list[MissionTask]
+    ) -> list[MissionTask]: ...
+
+
+class MissionTaskStore(MissionStore, TaskGraphStore, Protocol):
+    """Combined persistence boundary used by the runtime composition root."""

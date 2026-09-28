@@ -15,6 +15,7 @@ from redteam.core.ports.control_plane import ControlPlane
 from redteam.core.ports.event_bus import EventBus
 from redteam.core.ports.evidence_store import EvidenceStore
 from redteam.core.ports.llm import LLMClient
+from redteam.core.ports.task_graph import MissionTaskStore
 from redteam.core.ports.tool_catalog import ToolCatalog
 from redteam.core.ports.tool_gateway import ToolGateway
 from redteam.orchestration.agents.providers import (
@@ -26,6 +27,7 @@ from redteam.orchestration.analysis import AnalysisVerifier, DeterministicAnalys
 from redteam.orchestration.context_projection import ContextProjectionCache
 from redteam.orchestration.observations import ResultMapperRegistry, default_result_mapper_registry
 from redteam.orchestration.settings import OrchestrationSettings
+from redteam.orchestration.task_graph.memory import InMemoryTaskGraphStore
 from redteam.orchestration.work.memory import InMemoryWorkStore
 from redteam.orchestration.work.store import WorkStore
 
@@ -51,6 +53,7 @@ class RuntimeDeps:
     # a successful execution's real output) -- see `orchestration.observations`.
     result_mappers: ResultMapperRegistry = field(default_factory=default_result_mapper_registry)
     work_store: WorkStore = field(default_factory=InMemoryWorkStore)
+    task_graph_store: MissionTaskStore = field(default_factory=InMemoryTaskGraphStore)
     settings: OrchestrationSettings = field(default_factory=OrchestrationSettings)
     context_cache: ContextProjectionCache = field(
         default_factory=ContextProjectionCache, compare=False

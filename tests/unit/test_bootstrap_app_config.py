@@ -13,6 +13,7 @@ from redteam.core.config import load_app_config
 from redteam.core.enums import AgentPhase, PolicyVerdict, Verdict
 from redteam.core.ids import ToolId
 from redteam.orchestration.settings import OrchestrationSettings
+from redteam.orchestration.task_graph.sqlite import SQLiteTaskGraphStore
 from redteam.orchestration.work.sqlite import SQLiteWorkStore
 from tests.fakes import DummyToolGateway, FakeControlPlane, FakeEventBus, FakeEvidenceStore
 
@@ -86,6 +87,23 @@ async def test_build_application_accepts_fake_overrides_for_every_port(tmp_path)
     assert final_state.last_verdict == Verdict.PASS
     assert len(fake_control_plane.evaluated) == 1
     assert len(fake_tool_gateway.invocations) == 1
+
+
+async def test_build_application_can_wire_the_durable_task_graph(tmp_path) -> None:
+    config = load_app_config("examples/app.yaml")
+    settings = OrchestrationSettings(
+        checkpointing=False,
+        task_graph_backend="sqlite",
+        task_graph_path=str(tmp_path / "task-graph.sqlite3"),
+    )
+
+    _, deps = await build_application(
+        config,
+        evidence_dir=tmp_path / "evidence",
+        orchestration_settings=settings,
+    )
+
+    assert isinstance(deps.task_graph_store, SQLiteTaskGraphStore)
 
 
 async def test_build_application_can_wire_the_durable_work_ledger(tmp_path) -> None:

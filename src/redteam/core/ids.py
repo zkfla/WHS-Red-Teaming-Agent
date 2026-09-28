@@ -28,6 +28,9 @@ GraphNodeId = NewType("GraphNodeId", str)
 GraphEdgeId = NewType("GraphEdgeId", str)
 PrincipalId = NewType("PrincipalId", str)
 AssetId = NewType("AssetId", str)
+MissionId = NewType("MissionId", str)
+TaskId = NewType("TaskId", str)
+OperatorIntentId = NewType("OperatorIntentId", str)
 
 
 def new_id(prefix: str) -> str:

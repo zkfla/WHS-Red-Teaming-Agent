@@ -45,6 +45,8 @@ class OrchestrationSettings(BaseModel):
 
     work_backend: Literal["memory", "sqlite"] = "memory"
     work_path: str = "data/orchestration/work.sqlite3"
+    task_graph_backend: Literal["memory", "sqlite"] = "memory"
+    task_graph_path: str = "data/orchestration/task_graph.sqlite3"
 
     global_concurrency: int = Field(default=4, ge=1)
     #: Number of independent candidates admitted from one planning frontier.
@@ -76,6 +78,8 @@ class OrchestrationSettings(BaseModel):
             raise ValueError("sqlite checkpointing needs a non-blank checkpoint_path")
         if self.work_backend == "sqlite" and not self.work_path.strip():
             raise ValueError("sqlite work backend needs a non-blank work_path")
+        if self.task_graph_backend == "sqlite" and not self.task_graph_path.strip():
+            raise ValueError("sqlite task graph backend needs a non-blank task_graph_path")
         return self
 
     @property

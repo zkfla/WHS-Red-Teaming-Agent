@@ -63,6 +63,7 @@ from redteam.core.ports.control_plane import ControlPlane
 from redteam.core.ports.event_bus import EventBus
 from redteam.core.ports.evidence_store import EvidenceStore
 from redteam.core.ports.llm import LLMClient
+from redteam.core.ports.task_graph import MissionTaskStore
 from redteam.core.ports.tool_catalog import ToolCatalog
 from redteam.core.ports.tool_gateway import ToolGateway
 from redteam.event_bus.memory import InMemoryEventBus
@@ -81,6 +82,8 @@ from redteam.orchestration.runner import AgentLoopRunner
 from redteam.orchestration.seed import seed_from_engagement
 from redteam.orchestration.settings import OrchestrationSettings
 from redteam.orchestration.state import RuntimeState, TerminationReason
+from redteam.orchestration.task_graph.memory import InMemoryTaskGraphStore
+from redteam.orchestration.task_graph.sqlite import SQLiteTaskGraphStore
 from redteam.orchestration.work.memory import InMemoryWorkStore
 from redteam.orchestration.work.sqlite import SQLiteWorkStore
 from redteam.orchestration.work.store import WorkStore
@@ -131,6 +134,7 @@ async def build_runtime_deps(
     agents: AgentRegistry | None = None,
     candidate_providers: CandidateProviderRegistry | None = None,
     tool_catalog: ToolCatalog | None = None,
+    task_graph_store: MissionTaskStore | None = None,
 ) -> RuntimeDeps:
     """Wire in-memory/dummy backends for every port, from an ``Engagement`` alone.
 
@@ -180,14 +184,19 @@ async def build_runtime_deps(
         llm_client=llm_client,
         agents=agents if agents is not None else default_registry(),
         candidate_providers=(
-            candidate_providers
-            if candidate_providers is not None
-            else default_provider_registry()
+            candidate_providers if candidate_providers is not None else default_provider_registry()
         ),
         tool_catalog=(tool_catalog if tool_catalog is not None else discovered_catalog),
         work_store=_build_work_store(settings),
+        task_graph_store=(task_graph_store or _build_task_graph_store(settings)),
         settings=settings,
     )
+
+
+def _build_task_graph_store(settings: OrchestrationSettings) -> MissionTaskStore:
+    if settings.task_graph_backend == "sqlite":
+        return SQLiteTaskGraphStore(settings.task_graph_path)
+    return InMemoryTaskGraphStore()
 
 
 def _build_work_store(settings: OrchestrationSettings) -> WorkStore:
@@ -213,6 +222,7 @@ async def build_application(
     agents: AgentRegistry | None = None,
     candidate_providers: CandidateProviderRegistry | None = None,
     tool_catalog: ToolCatalog | None = None,
+    task_graph_store: MissionTaskStore | None = None,
 ) -> tuple[Engagement, RuntimeDeps]:
     """``AppConfig``-aware composition root. Every dependency is overridable.
 
@@ -289,12 +299,11 @@ async def build_application(
         llm_client=resolved_llm,
         agents=agents if agents is not None else default_registry(),
         candidate_providers=(
-            candidate_providers
-            if candidate_providers is not None
-            else default_provider_registry()
+            candidate_providers if candidate_providers is not None else default_provider_registry()
         ),
         tool_catalog=resolved_tool_catalog,
         work_store=_build_work_store(resolved_settings),
+        task_graph_store=(task_graph_store or _build_task_graph_store(resolved_settings)),
         settings=resolved_settings,
     )
     return engagement, deps
