@@ -12,10 +12,9 @@ dist/
 build/
 .DS_Store
 /data/
-/app.yaml
 /engagement.yaml
 /vulnbank-web-policy.json
-tests/vulnbank/
+tests/vuln-bank/
 
 공통 개발 시작 프롬프트.md
 변경사항.md

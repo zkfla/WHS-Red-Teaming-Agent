@@ -16,23 +16,8 @@ from typing import Any
 from pydantic import BaseModel, Field, field_validator
 
 from redteam.core.ids import EngagementId, EventId, RunId
-from redteam.core.redaction import redact_sensitive_text
+from redteam.core.redaction import SECRET_KEY_PARTS, redact_sensitive_text
 
-_SECRET_KEY_PARTS = {
-    "password",
-    "passwd",
-    "secret",
-    "token",
-    "cookie",
-    "api_key",
-    "credential",
-    "session",
-    "authorization",
-    "proxy_authorization",
-    "set_cookie",
-    "bearer",
-    "private_key",
-}
 _REDACTED = "***REDACTED***"
 
 
@@ -44,7 +29,7 @@ def _redact_secret_material(value: Any, *, key: str | None = None) -> Any:
     # diagnostic reason ``no_registered_session_for_path`` -- is not a secret.
     if not normalized.endswith(("_ref", "_reference", "_id")) and any(
         normalized == part or normalized.endswith(f"_{part}")
-        for part in _SECRET_KEY_PARTS
+        for part in SECRET_KEY_PARTS
     ):
         return _REDACTED
     if isinstance(value, dict):

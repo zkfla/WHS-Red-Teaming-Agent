@@ -9,6 +9,7 @@ brief).
 from __future__ import annotations
 
 from redteam.app.bootstrap import build_application, run_engagement
+from redteam.capability.bootstrap import build_mcp_tool_gateway
 from redteam.core.config import load_app_config
 from redteam.core.enums import AgentPhase, PolicyVerdict, Verdict
 from redteam.core.ids import ToolId
@@ -24,8 +25,19 @@ async def test_build_application_from_app_config_runs_end_to_end(tmp_path) -> No
     for rule in config.engagement.rules_of_engagement:
         rule.allowed_time_windows = []
 
+    # examples/app.yaml deliberately ships `capability.mcp_servers: []`, and
+    # build_application() itself no longer substitutes ExampleMCPAdapter for
+    # an empty list (production must never do that silently -- see
+    # `app.bootstrap._empty_tool_gateway`). This end-to-end wiring test
+    # still wants one real, executable tool, so it asks for the same
+    # in-process example adapter explicitly, the same way any other caller
+    # now has to.
+    example_gateway = await build_mcp_tool_gateway([])
+
     engagement, deps = await build_application(
         config,
+        tool_gateway=example_gateway,
+        tool_catalog=example_gateway,
         evidence_dir=tmp_path / "evidence",
         audit_dir=tmp_path / "audit",
         approval_dir=tmp_path / "approvals",

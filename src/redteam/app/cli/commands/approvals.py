@@ -39,6 +39,12 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
     list_parser = sub.add_parser("list", help="List pending approvals")
     list_parser.add_argument("--run", dest="run_id", default=None)
     list_parser.add_argument("--dir", default="data/approvals", dest="approval_dir")
+    # Only actually read when --run is given (run_list's own audit lookup is
+    # conditional on args.run_id) -- added because run_list already reads
+    # args.audit_dir unconditionally on that branch, which previously raised
+    # AttributeError for any real `--run` invocation (untested: the existing
+    # unit test only covers run_id=None).
+    list_parser.add_argument("--audit-dir", default="data/audit", dest="audit_dir")
     list_parser.add_argument("--json", action="store_true")
     list_parser.set_defaults(handler=run_list)
 

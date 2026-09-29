@@ -42,6 +42,8 @@ from redteam.attack_graph.stores.memory import InMemoryAttackGraphStore
 from redteam.attack_graph.stores.namespaced import EngagementScopedAttackGraphStore
 from redteam.attack_graph.stores.sqlite import SQLiteAttackGraphStore
 from redteam.capability.bootstrap import build_mcp_tool_gateway, open_mcp_tool_gateway
+from redteam.capability.gateway import MCPToolGateway
+from redteam.capability.registry import MCPToolRegistry
 from redteam.control.approval import ApprovalService
 from redteam.control.audit import AuditLog
 from redteam.control.risk import RegistryRiskResolver
@@ -95,6 +97,12 @@ from redteam.orchestration.work.store import WorkStore
 
 logger = logging.getLogger(__name__)
 
+#: The one, explicit, self-documenting way to request the in-process
+#: ExampleMCPAdapter test/dev fixture from `capability.mcp_servers` --
+#: never chosen automatically (see `build_application`'s tool-gateway
+#: resolution and `_empty_tool_gateway`).
+EXAMPLE_MCP_SENTINEL = "example"
+
 
 def load_engagement(path: str | Path) -> Engagement:
     """Load an engagement YAML file into a full ``Engagement``.
@@ -108,11 +116,23 @@ def load_engagement(path: str | Path) -> Engagement:
 
 
 def build_llm_client(config: LLMConfig) -> LLMClient:
+    """Explicit provider names only -- an unrecognized string (a typo like
+    ``"litellmm"``, or someone writing ``"openai"``/``"anthropic"``
+    expecting it to just work) must be a loud config error, not a silent
+    ``FakeLLMClient``. Silently treating "anything that isn't literally
+    'litellm'" as fake previously masked exactly that kind of
+    misconfiguration -- offline/test use of ``FakeLLMClient`` remains
+    exactly as easy, via the explicit ``provider: "fake"``.
+    """
     if config.provider == "litellm":
         from redteam.llm.litellm import LiteLLMClient
 
         return LiteLLMClient(model=config.default_model, api_key=config.resolve_api_key())
-    return FakeLLMClient()
+    if config.provider == "fake":
+        return FakeLLMClient()
+    raise ValueError(
+        f"unknown LLM provider {config.provider!r} -- expected 'fake' or 'litellm'"
+    )
 
 
 async def _build_default_capability(
@@ -129,6 +149,23 @@ async def _build_default_tool_gateway(config: CapabilityConfig) -> ToolGateway:
     return gateway
 
 
+def _empty_tool_gateway() -> MCPToolGateway:
+    """A real, zero-tool ``MCPToolGateway`` -- no adapters, nothing to invoke.
+
+    ``build_application`` (the real ``redteam run``/CLI production path)
+    uses this instead of ``capability.bootstrap.build_mcp_tool_gateway([])``
+    when no MCP server is configured, so an unconfigured deployment gets an
+    honest empty catalog (visible via ``redteam tools list`` / the
+    ``AGENT_NO_EXECUTABLE_CANDIDATES`` event) rather than the harmless
+    in-process ``ExampleMCPAdapter`` silently standing in as if a real
+    tool had run. ``ExampleMCPAdapter`` itself is unchanged and remains
+    available exactly as before via an explicit
+    ``build_mcp_tool_gateway([])``/``build_runtime_deps`` call -- both are
+    test/example fixtures, never something this function reaches for.
+    """
+    return MCPToolGateway(MCPToolRegistry(), {})
+
+
 async def build_runtime_deps(
     engagement: Engagement,
     evidence_dir: str | Path = "data/evidence",
@@ -142,6 +179,13 @@ async def build_runtime_deps(
     task_graph_store: MissionTaskStore | None = None,
 ) -> RuntimeDeps:
     """Wire in-memory/dummy backends for every port, from an ``Engagement`` alone.
+
+    A **test/example-only composition helper** -- never a second
+    production entry point, and never conflated with ``build_application``
+    (the sole production path, used by every CLI command that executes an
+    Engagement). It exists for callers that only have a bare ``Engagement``
+    and no ``AppConfig`` at all: ``examples/minimal_run.py`` and most
+    unit/integration test fixtures. The CLI never calls this function.
 
     TODO(each-team): swap in your real backend here once it's ready —
     e.g. Capability Team adds real ``MCPAdapter``s to
@@ -266,8 +310,26 @@ async def build_application(
     # Resolve the tool gateway before the Control Plane so the latter can
     # read tool risk_level from the Registry for risk-tiered approval.
     resolved_tool_catalog = tool_catalog
+    resolved_tool_gateway: ToolGateway
+    discovered_catalog: ToolCatalog
     if tool_gateway is None:
-        if mcp_stack is None:
+        if not config.capability.mcp_servers:
+            # No MCP server configured for this run: an honest empty
+            # catalog, never the in-process ExampleMCPAdapter (that fallback
+            # made a misconfigured/unconfigured deployment look like a real
+            # tool had executed -- see `_empty_tool_gateway`).
+            discovered_catalog = _empty_tool_gateway()
+            resolved_tool_gateway = discovered_catalog
+        elif config.capability.mcp_servers == [EXAMPLE_MCP_SENTINEL]:
+            # Explicit, deliberate opt-in to the harmless in-process test
+            # fixture (never automatic -- see `_empty_tool_gateway`'s
+            # docstring). The only way to reach this from a `redteam`
+            # subprocess is to actually write this exact value, e.g.
+            # `REDTEAM_MCP_SERVERS=example` or `capability.mcp_servers:
+            # ["example"]` -- there is no default path that produces it.
+            discovered_catalog = await build_mcp_tool_gateway([])
+            resolved_tool_gateway = discovered_catalog
+        elif mcp_stack is None:
             resolved_tool_gateway, discovered_catalog = await _build_default_capability(
                 config.capability
             )

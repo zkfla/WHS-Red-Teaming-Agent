@@ -3,12 +3,22 @@ the harmless in-process `ExampleMCPAdapter` as the "MCP ping server"
 (section 27 -- no real exploit tooling is exercised by this CLI's own
 tests). Each test runs in its own `tmp_path` so the filesystem-backed
 Approval/Audit/Evidence/report stores never collide across tests.
+
+`build_application` no longer substitutes `ExampleMCPAdapter` for an
+unconfigured (empty) `capability.mcp_servers` -- a production run must
+never silently pretend an unconfigured MCP connection is a working one.
+Tests that need a real, executable tool to exercise (e.g. the Approval
+lifecycle, which needs an actual `recon.*` Action to request approval
+for) opt into the in-process fixture explicitly via
+`REDTEAM_MCP_SERVERS=example` (see `app.bootstrap.EXAMPLE_MCP_SENTINEL`),
+the same one, explicit mechanism a real deployment would use.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -63,6 +73,11 @@ async def _run_cli(*args: str, cwd: Path) -> tuple[int, str, str]:
         "redteam.app.cli",
         *args,
         cwd=str(cwd),
+        # Explicit, not a default: `redteam run` requires REDTEAM_LLM_PROVIDER
+        # to be set (section 4/20) -- there is no app.yaml/--config path any
+        # more. `init`/`validate`/`status`/`findings`/`report` don't read it
+        # at all, so setting it here unconditionally is harmless for those.
+        env={**os.environ, "REDTEAM_LLM_PROVIDER": "fake"},
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
@@ -129,6 +144,7 @@ async def test_require_approval_then_approve_resumes_the_same_run(tmp_path: Path
         "run",
         "engagement.yaml",
         cwd=str(tmp_path),
+        env={**os.environ, "REDTEAM_MCP_SERVERS": "example", "REDTEAM_LLM_PROVIDER": "fake"},
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
@@ -160,6 +176,7 @@ async def test_require_approval_then_deny_never_executes(tmp_path: Path) -> None
         "run",
         "engagement.yaml",
         cwd=str(tmp_path),
+        env={**os.environ, "REDTEAM_MCP_SERVERS": "example", "REDTEAM_LLM_PROVIDER": "fake"},
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )

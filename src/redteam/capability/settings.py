@@ -129,6 +129,20 @@ class MCPServerSettings:
         return {"Authorization": f"Bearer {self.bearer_token}"}
 
 
+def mcp_server_ids_from_environment(env_var: str = "REDTEAM_MCP_SERVERS") -> list[str]:
+    """Which MCP servers to activate -- the CLI's only source for
+    ``capability.mcp_servers`` (there is no application-config file).
+
+    A comma-separated list of server ids, e.g. ``REDTEAM_MCP_SERVERS=recon,web-http``
+    -- each id still resolves its own connection details (endpoint/transport/
+    credential) via ``MCPServerSettings.from_environment``. Unset or blank
+    means no server: the caller gets an honest empty tool catalog, never an
+    automatic fallback.
+    """
+    raw = os.environ.get(env_var, "")
+    return [item.strip() for item in raw.split(",") if item.strip()]
+
+
 def environment_prefix(server_id: str) -> str:
     if not _SAFE_SERVER_ID.fullmatch(server_id):
         raise MCPConfigurationError("MCP server IDs must use lowercase kebab-case")

@@ -371,6 +371,10 @@ def _finished_runtime() -> RuntimeState:
 
 
 async def _run_with_flags(tmp_path: Path, monkeypatch, *, non_interactive: bool, json: bool):
+    # build/execute are mocked below, but the real load_app_config_for_run()
+    # still runs first and now requires an explicit provider (section 4/20)
+    # -- there is no --config app.yaml path any more.
+    monkeypatch.setenv("REDTEAM_LLM_PROVIDER", "fake")
     config = SimpleNamespace(engagement_path=str(_engagement_yaml(tmp_path)))
     engagement = Engagement(
         engagement_id=EngagementId("eng_wiring"),
@@ -389,7 +393,6 @@ async def _run_with_flags(tmp_path: Path, monkeypatch, *, non_interactive: bool,
 
     args = argparse.Namespace(
         engagement_path=config.engagement_path,
-        config_path=None,
         non_interactive=non_interactive,
         max_steps=None,
         log_level=None,

@@ -47,11 +47,19 @@ approval_policy:
     return path
 
 
+@pytest.fixture(autouse=True)
+def _explicit_fake_llm_provider(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every test here calls the real ``load_app_config_for_run()``, which
+    now requires an explicit provider (section 4/20) before
+    ``resume_command``'s own mocks ever take over -- there is no
+    ``--config app.yaml`` path any more."""
+    monkeypatch.setenv("REDTEAM_LLM_PROVIDER", "fake")
+
+
 def _args(engagement_path: Path, *, run_id: str = "run_resume") -> argparse.Namespace:
     return argparse.Namespace(
         run_id=run_id,
         engagement_path=str(engagement_path),
-        config_path=None,
         max_steps=None,
         log_level="WARNING",
         json=True,

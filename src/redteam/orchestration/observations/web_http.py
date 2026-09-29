@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
 import re
 from typing import Any
 
@@ -18,6 +16,7 @@ from redteam.core.contracts.tool import ToolResult
 from redteam.core.enums import GraphEdgeType, GraphNodeType
 from redteam.core.ids import GraphNodeId
 from redteam.orchestration.authentication import http_observation, request_key
+from redteam.orchestration.observations._shared import deterministic_key, is_hex64
 from redteam.orchestration.observations.mapper import (
     EdgeMutation,
     GraphMutation,
@@ -26,7 +25,6 @@ from redteam.orchestration.observations.mapper import (
 )
 
 _REFERENCE = re.compile(r"^[A-Za-z0-9_.:@/-]{1,128}$")
-_HEX_64 = re.compile(r"^[0-9a-fA-F]{64}$")
 _SECURITY_HEADERS = frozenset(
     {
         "strict-transport-security",
@@ -71,8 +69,8 @@ def _endpoint_context(
 
 
 def _comparison_key(kind: str, path: str, *session_refs: str) -> str:
-    encoded = json.dumps([kind, path, *session_refs], separators=(",", ":")).encode()
-    return hashlib.sha256(encoded).hexdigest()[:24]
+    """Domain-named wrapper over the shared ``deterministic_key`` core."""
+    return deterministic_key(kind, path, *session_refs)
 
 
 def _session_identity_mutations(
@@ -169,10 +167,8 @@ def map_web_compare_sessions(
         or first_principal is None
         or second_principal is None
         or first_principal == second_principal
-        or not isinstance(first_digest, str)
-        or _HEX_64.fullmatch(first_digest) is None
-        or not isinstance(second_digest, str)
-        or _HEX_64.fullmatch(second_digest) is None
+        or not is_hex64(first_digest)
+        or not is_hex64(second_digest)
         or output["same_status"] != (first_status == second_status)
         or output["same_body"] != (first_digest == second_digest)
     ):
@@ -414,10 +410,8 @@ def map_web_compare_anonymous(
     if (
         not is_http_status(anonymous_status)
         or not is_http_status(authenticated_status)
-        or not isinstance(anonymous_digest, str)
-        or _HEX_64.fullmatch(anonymous_digest) is None
-        or not isinstance(authenticated_digest, str)
-        or _HEX_64.fullmatch(authenticated_digest) is None
+        or not is_hex64(anonymous_digest)
+        or not is_hex64(authenticated_digest)
         or output["same_status"] != (anonymous_status == authenticated_status)
         or output["same_body"] != (anonymous_digest == authenticated_digest)
     ):
@@ -522,8 +516,7 @@ def map_web_http_request(
             "cache-control",
         }
         or any(type(value) is not bool for value in headers.values())
-        or not isinstance(digest, str)
-        or _HEX_64.fullmatch(digest) is None
+        or not is_hex64(digest)
         or output.get("body_omitted") is not True
         or type(output.get("body_bytes")) is not int
         or output["body_bytes"] < 0

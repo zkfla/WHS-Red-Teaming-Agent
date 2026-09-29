@@ -106,9 +106,9 @@ def _claim_durable_approval(path: str, run_id: str, approval_id: str) -> bool:
 
 #: Every termination reason ``reconcile_once`` can act on -- the generic
 #: reasons above plus ``APPROVAL_PENDING`` (handled by a dedicated branch,
-#: see ``_resume_pending_approval``). Public so a host loop
-#: (``orchestration.reconciliation.run_reconciliation_loop``) knows when to
-#: stop polling a run instead of re-deriving this set itself.
+#: see ``_resume_pending_approval``). Public so a caller that polls a
+#: suspended run (e.g. ``commands.run._wait_for_approval``) knows when to
+#: stop instead of re-deriving this set itself.
 RECONCILABLE_REASONS = _RECONCILABLE_REASONS | frozenset({TerminationReason.APPROVAL_PENDING})
 
 

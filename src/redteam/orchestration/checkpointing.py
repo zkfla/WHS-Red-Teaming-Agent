@@ -24,15 +24,42 @@ from pydantic import BaseModel
 STATE_PACKAGES = ("redteam.core", "redteam.attack_graph", "redteam.orchestration")
 
 
+def _fail_on_scan_error(package_name: str) -> None:
+    """``pkgutil.walk_packages`` silently swallows an ``ImportError`` while
+    scanning a package when no ``onerror`` is given -- meaning a broken
+    submodule would silently *exclude* every state type it defines from
+    the checkpoint allowlist, with no error at all (the exact "unknown
+    type falls through silently" failure section 11 asks not to allow,
+    just one step earlier: silently absent from the allowlist, rather
+    than present but unrecognized). Re-raise instead of swallowing.
+    """
+    raise ImportError(f"checkpoint state scan could not import package {package_name!r}")
+
+
 @lru_cache(maxsize=1)
 def state_type_allowlist() -> tuple[tuple[str, str], ...]:
-    """Every Pydantic model / Enum that can appear in ``GraphState``."""
+    """Every Pydantic model / Enum that can appear in ``GraphState``.
+
+    Deliberately still discovered by walking ``STATE_PACKAGES`` rather
+    than hand-typed as an explicit tuple: the alternative is a
+    hand-maintained list of every ``BaseModel``/``Enum`` across three
+    large packages (core, attack_graph, orchestration), which would
+    silently go stale the next time someone adds a new state-carrying
+    model and forgets to extend it -- a worse silent-failure mode than
+    the one this reflection was meant to solve. What *is* made explicit,
+    and was not before: a broken submodule (an ``ImportError`` while
+    walking a package) now fails this call loudly instead of the walk
+    silently pretending that submodule, and every state type it defines,
+    does not exist.
+    """
     found: set[tuple[str, str]] = set()
     for package_name in STATE_PACKAGES:
         package = importlib.import_module(package_name)
         modules = [package]
         for info in pkgutil.walk_packages(
-            getattr(package, "__path__", []), prefix=f"{package_name}."
+            getattr(package, "__path__", []),
+            prefix=f"{package_name}.",
+            onerror=_fail_on_scan_error,
         ):
             modules.append(importlib.import_module(info.name))
 

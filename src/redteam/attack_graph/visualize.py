@@ -1,4 +1,10 @@
-"""Rendering the graph as a standalone HTML page.
+"""Rendering the graph as a standalone HTML page -- a development/debugging
+utility, not part of the core Tool Calling path (no CLI command or
+reporting code calls this; verified against ``src/`` at review time).
+Kept, not deleted, because it is genuinely useful for inspecting a real
+Attack Graph by hand and has its own real test coverage
+(``tests/unit/test_graph_visualize.py``) -- but it must not be read as a
+production runtime dependency.
 
 Hand-rolled SVG: no plotting library, no CDN, no script tag, so the output
 opens offline. Layout is deterministic, so two runs can be compared.

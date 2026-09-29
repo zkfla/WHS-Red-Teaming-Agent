@@ -81,6 +81,29 @@ class PolicyVerdict(str, Enum):
     REQUIRE_APPROVAL = "require_approval"
 
 
+class Severity(str, Enum):
+    """A Control-side hint about how the orchestrator should react to a
+    non-ALLOW ``PolicyDecision`` (enforcement is Orchestration's, not
+    decided here). Lives in ``core`` -- not ``redteam.control`` -- because
+    ``orchestration`` must read it (``nodes/policy.py``) without importing
+    Control's concrete package (dependency rules; see
+    ``tests/unit/test_control_plane_bypass.py``). ``redteam.control.severity``
+    re-exports this name so existing callers are unaffected.
+
+      - ``BLOCK_ACTION`` -- block only this action; retry a *different
+        action* toward the same goal (one target out of scope, one
+        operation denied, rate limit hit).
+      - ``REPLAN_GOAL`` -- this goal/capability is not viable at all;
+        switch to a *different goal* (a whole capability is ROE-forbidden).
+      - ``ABORT_RUN`` -- nothing more can proceed; end the run (outside
+        the allowed time window, execution budget exhausted).
+    """
+
+    BLOCK_ACTION = "block_action"
+    REPLAN_GOAL = "replan_goal"
+    ABORT_RUN = "abort_run"
+
+
 class Verdict(str, Enum):
     """Outcome of verifying an observation/hypothesis against expectations.
 

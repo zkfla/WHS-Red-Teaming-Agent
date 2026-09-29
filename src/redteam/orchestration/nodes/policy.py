@@ -18,7 +18,7 @@ from datetime import datetime, timezone
 
 from redteam.core.contracts.events import EventType
 from redteam.core.contracts.policy import ControlContext, PolicyDecision
-from redteam.core.enums import AgentPhase, PolicyVerdict
+from redteam.core.enums import AgentPhase, PolicyVerdict, Severity
 from redteam.orchestration.context import RuntimeDeps
 from redteam.orchestration.nodes._support import advance, publisher_for
 from redteam.orchestration.state import GraphState, TerminationReason
@@ -35,17 +35,14 @@ _OUTCOME = {
 #: ``PolicyDecision`` contract has no dedicated field (see
 #: ``redteam.control.severity``). Orchestration may not import Control's
 #: concrete package (dependency rules), so the documented tag string is read
-#: back here rather than through the enum. These are the three levels:
-#:
-#: - ``BLOCK_ACTION`` — block only this action; retry a *different* action
-#:   toward the same goal.
-#: - ``REPLAN_GOAL`` — this goal/capability is not viable; switch goals (the
-#:   active Task is not, in itself, runnable).
-#: - ``ABORT_RUN`` — nothing more can proceed; end the run.
+#: back here rather than through ``redteam.control.severity`` directly --
+#: but the *definition* of what each level means is not re-declared: these
+#: three constants derive from the one shared ``core.enums.Severity`` (see
+#: its docstring for the three levels), not independent string literals.
 _SEVERITY_TAG_PREFIX = "severity:"
-SEVERITY_BLOCK_ACTION = "block_action"
-SEVERITY_REPLAN_GOAL = "replan_goal"
-SEVERITY_ABORT_RUN = "abort_run"
+SEVERITY_BLOCK_ACTION = Severity.BLOCK_ACTION.value
+SEVERITY_REPLAN_GOAL = Severity.REPLAN_GOAL.value
+SEVERITY_ABORT_RUN = Severity.ABORT_RUN.value
 
 
 def denial_severity(decision: PolicyDecision | None) -> str | None:

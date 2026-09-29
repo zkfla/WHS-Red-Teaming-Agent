@@ -18,32 +18,14 @@ from redteam.core.ids import (
     OperatorIntentId,
     TaskId,
 )
-from redteam.core.redaction import redact_sensitive_text
-
-_SECRET_KEY_PARTS = (
-    "password",
-    "passwd",
-    "secret",
-    "token",
-    "cookie",
-    "api_key",
-    "credential",
-    "session",
-    "authorization",
-    "bearer",
-    "private_key",
-)
-#: Suffixes that mark an *opaque reference* to a secret rather than the
-#: secret itself (``credential_ref``, ``session_id``, ...). Kept in sync with
-#: ``orchestration.operator_intents.redaction``.
-_OPAQUE_SUFFIXES = ("_ref", "_reference", "_id")
+from redteam.core.redaction import OPAQUE_SUFFIXES, SECRET_KEY_PARTS, redact_sensitive_text
 
 
 def _is_secret_key(key: Any) -> bool:
     normalized = str(key).lower().replace("-", "_")
-    if normalized.endswith(_OPAQUE_SUFFIXES):
+    if normalized.endswith(OPAQUE_SUFFIXES):
         return False
-    return any(part in normalized for part in _SECRET_KEY_PARTS)
+    return any(part in normalized for part in SECRET_KEY_PARTS)
 
 
 def _reject_secret_material(value: Any, *, path: str = "metadata") -> Any:

@@ -26,29 +26,10 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from redteam.core.redaction import redact_sensitive_text
+from redteam.core.redaction import OPAQUE_SUFFIXES as _OPAQUE_SUFFIXES
+from redteam.core.redaction import SECRET_KEY_PARTS, redact_sensitive_text
 
 REDACTED = "***REDACTED***"
-
-#: Key names that always mean raw secret material (lower-cased, ``-``/``_``
-#: normalized). Kept in sync with ``core.contracts.events._SECRET_KEYS``.
-SECRET_KEY_PARTS = (
-    "password",
-    "passwd",
-    "secret",
-    "token",
-    "cookie",
-    "api_key",
-    "credential",
-    "session",
-    "authorization",
-    "bearer",
-    "private_key",
-)
-
-#: Suffixes that mark an *opaque reference* to a secret rather than the
-#: secret itself (``credential_ref``, ``session_id``, ...).
-_OPAQUE_SUFFIXES = ("_ref", "_reference", "_id")
 
 _KEY_VALUE_RE = re.compile(
     r"(?i)\b(password|passwd|secret|token|api[_-]?key|cookie|credential|"

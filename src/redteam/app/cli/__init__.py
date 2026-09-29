@@ -118,7 +118,31 @@ async def _dispatch(handler, args: argparse.Namespace) -> int | None:  # noqa: A
                     pass
 
 
+def _use_utf8_console_streams() -> None:
+    """Reconfigure stdout/stderr to UTF-8 before anything prints.
+
+    The renderer's theme icons (``theme.ICON_SUCCESS`` etc.) and Korean
+    prompt text are non-ASCII. On a plain Windows console (the default
+    legacy codepage for a Korean-locale machine is ``cp949``, not
+    UTF-8), printing one of those raises ``UnicodeEncodeError`` and takes
+    the whole interactive session down mid-Preflight -- the exact "CLI
+    전체 crash" this project's own design notes say must not happen.
+    ``TextIOWrapper.reconfigure`` is a no-op-safe, stdlib-only fix; it is
+    skipped (never raises) when a stream doesn't support it (already
+    UTF-8, replaced by a test harness, redirected through something
+    else) so this can never itself break a working setup.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            try:
+                reconfigure(encoding="utf-8", errors="replace")
+            except (ValueError, OSError):  # noqa: PERF203 - defensive, never fatal
+                pass
+
+
 def main() -> None:
+    _use_utf8_console_streams()
     logging.basicConfig(level=os.environ.get("REDTEAM_LOG_LEVEL", "INFO"))
     parser = _build_parser()
     args = parser.parse_args()

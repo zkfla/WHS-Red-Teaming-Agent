@@ -72,8 +72,8 @@ mypy src/redteam
 `redteam` is the installed console script (`pyproject.toml`
 `[project.scripts]`); `python -m redteam.app.cli ...` works identically.
 See "CLI" below for the full command reference, including
-`--config app.yaml` (real LLM provider + real MCP servers) and the
-Approval workflow (`redteam approvals approve/deny`).
+`REDTEAM_LLM_*`/`REDTEAM_MCP_*` (real LLM provider + real MCP servers) and
+the Approval workflow (`redteam approvals approve/deny`).
 
 `LiteLLMClient` (`redteam.llm.litellm`) needs the optional `llm` extra
 (`pip install -e ".[llm]"`) to use a real LLM provider — it installs and
@@ -243,16 +243,19 @@ CLI-only shortcut. Every other command reads durable state directly
 redteam
 ```
 
-No YAML, no flags: this reads `engagement.yaml`/`app.yaml` from the
-current directory if they exist (offering `Start`/`Edit`/`New`/`Quit`),
-or starts a natural-language setup ("어떤 대상을 테스트하려고 하나요?")
-if they don't. `Edit` re-opens the same conversation on the existing
-config and patches only what you ask to change — it never regenerates
-scope/ROE from scratch. Either way you land on a Preflight screen
-(target/scope/focus/budget, enforced ROE vs. documented-only notes,
-LLM/config/scope/MCP status) before anything executes, and `Enter`
-there hands off to the *exact same* `build_application`/`run_engagement`
-path `redteam run` uses below — nothing is re-implemented for this mode.
+No YAML, no flags: this reads `engagement.yaml` from the current
+directory if it exists (offering `Start`/`Edit`/`New`/`Quit`), or starts
+a natural-language setup ("어떤 대상을 테스트하려고 하나요?") if it
+doesn't. The first run also does a one-time LLM setup prompt (skipped
+once `REDTEAM_LLM_PROVIDER` is set — see Config below), persisting the
+answer to `.env`, never to a YAML file. `Edit` re-opens the same
+conversation on the existing config and patches only what you ask to
+change — it never regenerates scope/ROE from scratch. Either way you
+land on a Preflight screen (target/scope/focus/budget, enforced ROE vs.
+documented-only notes, LLM/config/scope/MCP status) before anything
+executes, and `Enter` there hands off to the *exact same*
+`build_application`/`run_engagement` path `redteam run` uses below —
+nothing is re-implemented for this mode.
 
 The natural-language layer is `redteam.intake` (the **Engagement Intake
 Assistant**), a distinct role from the Orchestrator:
@@ -285,25 +288,46 @@ the automation/CI-safe, non-interactive entrypoint.
 
 ### Config
 
+`engagement.yaml` (target/scope/ROE/budget) is always required.
+Everything else — which LLM, which MCP servers — is environment-specific
+and comes **only** from the process environment; there is no
+application-config YAML file or `--config` flag in this CLI:
+
 ```bash
-redteam run engagement.yaml                    # AppConfig = engagement only, FakeLLMClient, no MCP servers
-redteam run engagement.yaml --config app.yaml   # AppConfig = engagement + app.yaml's llm/orchestration/capability/logging
+REDTEAM_LLM_PROVIDER=litellm REDTEAM_LLM_MODEL=gpt-4o-mini \
+REDTEAM_MCP_SERVERS=recon,web-http \
+  redteam run engagement.yaml
 ```
 
-`app.yaml` is the `AppConfig` shape (`examples/app.yaml`) minus its own
-`engagement:` key — the positional `engagement.yaml` is always
-authoritative for scope/ROE, so there is exactly one place to look for
-it. `LLM_API_KEY`/MCP secrets still come from the process environment
-(`.env.example`) — this CLI does not parse `.env` itself, matching the
-"copy to `.env` and source it before running" convention that file
-already documents. Using `llm.provider: litellm` needs the `agent`
-extra installed (`pip install -e ".[agent]"`) — see Quick Start.
+`REDTEAM_LLM_PROVIDER` has **no implicit default** — unset is a
+configuration error, not a silent `FakeLLMClient`. Set it explicitly:
+`REDTEAM_LLM_PROVIDER=fake` for the offline/test client (an explicit
+choice, never a fallback), or `REDTEAM_LLM_PROVIDER=litellm` (with
+`REDTEAM_LLM_MODEL`) for a real provider. `redteam validate` never calls
+an LLM at all (see its own `--help`), so this requirement does not apply
+to it. Using `litellm` needs the `agent` extra installed
+(`pip install -e ".[agent]"`) — see Quick Start. `LLM_API_KEY`/MCP
+secrets still come from the process environment (`.env.example`) — this
+CLI does not parse `.env` itself, matching the "copy to `.env` and
+source it before running" convention that file already documents (the
+one exception: the interactive `redteam` entrypoint's one-time LLM setup
+prompt writes `REDTEAM_LLM_PROVIDER`/`REDTEAM_LLM_MODEL` straight into
+`.env` for you).
 
-An empty (or omitted) `capability.mcp_servers` is not an error: `run`,
-`tools list` and `tools health` all fall back to the in-process
-`ExampleMCPAdapter` and print an explicit `WARNING` to stderr every time
-they do — development/test only, never a silent difference from a real
-MCP-backed run. A *configured but broken* MCP server (bad/missing
+`redteam.core.config.AppConfig`/`load_app_config()` (a YAML-loadable
+`AppConfig` shape, e.g. `examples/app.yaml`) still exist as a general
+library capability for code that calls
+`redteam.app.bootstrap.build_application()` directly, outside this CLI
+(see `examples/finance_agent_demo.py`) — the CLI itself never reads one.
+
+An empty (or unset) `REDTEAM_MCP_SERVERS`/`capability.mcp_servers` is not
+an error: `run`, `tools list` and `tools health` all get an honest empty
+tool catalog and print an explicit `WARNING` to stderr — no Action can
+execute, but nothing pretends a fake tool ran either. The literal value
+`REDTEAM_MCP_SERVERS=example` (or `capability.mcp_servers: ["example"]`)
+is the one explicit way to opt into the harmless in-process
+`ExampleMCPAdapter` test/dev fixture instead — never chosen
+automatically. A *configured but broken* MCP server (bad/missing
 `REDTEAM_MCP_<ID>_*` env vars) fails the command instead
 (`MCPConfigurationError`, exit 2) — see `redteam validate` to catch this
 before `run`.
@@ -313,13 +337,13 @@ before `run`.
 ```bash
 redteam [--verbose]                               # interactive setup/Preflight/run -- see above
 redteam init [--output engagement.yaml]          # write a starter Engagement config (from examples/engagement.yaml)
-redteam validate engagement.yaml [--config app.yaml] [--json]
+redteam validate engagement.yaml [--json]
                                                    # schema/scope/ROE/capability checks -- never touches a target
-redteam run engagement.yaml [--config app.yaml] [--non-interactive] [--max-steps N] [--json]
+redteam run engagement.yaml [--non-interactive] [--max-steps N] [--json]
 redteam status <run-id> [--json]                  # from the persisted terminal report; "unknown" if still running elsewhere
 redteam roe show engagement.yaml [--json]
-redteam tools list [--config app.yaml engagement.yaml] [--json]
-redteam tools health [--config app.yaml engagement.yaml] [--json]
+redteam tools list [--json]
+redteam tools health [--json]
 redteam approvals list [--run <run-id>] [--json]
 redteam approvals approve <approval-id> [--by <name>]
 redteam approvals deny <approval-id> [--by <name>]

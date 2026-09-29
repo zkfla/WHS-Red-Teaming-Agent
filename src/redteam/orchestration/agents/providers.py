@@ -157,19 +157,26 @@ def planning_fingerprint(
 
 
 class GraphCandidateProvider(Protocol):
+    """The one candidate-provider contract (section 4 consolidation): every
+    provider registered in ``CandidateProviderRegistry`` is expected to
+    implement ``propose_graph``.
+
+    This used to be two independently declared Protocols
+    (``GraphCandidateProvider.propose_graph`` and a narrower
+    ``CandidateProvider.propose(spec, view, observation, *, step=)``) for
+    the same responsibility. They are merged into this one formal contract.
+    A provider that only implements the narrower, three-argument shape
+    (no :class:`GraphCandidateContext`) is still accepted -- ``plan_node``
+    dispatches to it as a documented, minimal fallback for simple/plugin
+    providers that do not need the richer context (see
+    ``tests/integration/test_agent_loop.py``'s ``Provider``/
+    ``BrokenProvider``) -- but that shape is no longer a second, equally
+    authoritative Protocol declaration; conform to ``propose_graph`` unless
+    there is a real reason not to.
+    """
+
     async def propose_graph(
         self, spec: AgentSpec, context: GraphCandidateContext
-    ) -> list[CandidateDraft] | CandidateBatch: ...
-
-
-class CandidateProvider(Protocol):
-    async def propose(
-        self,
-        spec: AgentSpec,
-        view: AttackGraphView,
-        observation: GraphObservation,
-        *,
-        step: int,
     ) -> list[CandidateDraft] | CandidateBatch: ...
 
 
@@ -237,12 +244,14 @@ class DuplicateProviderError(ValueError):
 class CandidateProviderRegistry:
     """Provider lookup by stable id; adding a role never edits graph.py."""
 
-    def __init__(self, providers: Iterable[tuple[str, CandidateProvider]] = ()) -> None:
-        self._providers: dict[str, CandidateProvider] = {}
+    def __init__(self, providers: Iterable[tuple[str, GraphCandidateProvider]] = ()) -> None:
+        self._providers: dict[str, GraphCandidateProvider] = {}
         for provider_id, provider in providers:
             self.register(provider_id, provider)
 
-    def register(self, provider_id: str, provider: CandidateProvider) -> CandidateProvider:
+    def register(
+        self, provider_id: str, provider: GraphCandidateProvider
+    ) -> GraphCandidateProvider:
         key = provider_id.strip()
         if not key:
             raise ValueError("provider id may not be blank")
@@ -251,7 +260,7 @@ class CandidateProviderRegistry:
         self._providers[key] = provider
         return provider
 
-    def get(self, provider_id: str) -> CandidateProvider | None:
+    def get(self, provider_id: str) -> GraphCandidateProvider | None:
         return self._providers.get(provider_id)
 
     @property
@@ -265,7 +274,7 @@ def default_provider_registry() -> CandidateProviderRegistry:
 
     playbook = PlaybookCandidateProvider()
 
-    providers: list[tuple[str, CandidateProvider]] = [
+    providers: list[tuple[str, GraphCandidateProvider]] = [
         ("playbook:recon", ReconCandidateProvider()),
         ("playbook:web_api", WebCandidateProvider()),
         *[(f"playbook:{role}", playbook) for role in ("mobile", "analysis", "reporting")],

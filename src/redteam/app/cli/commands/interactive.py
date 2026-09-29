@@ -26,13 +26,11 @@ import os
 from contextlib import AsyncExitStack
 from pathlib import Path
 
-import yaml
 from rich.console import Console
 
 from redteam.app.bootstrap import build_llm_client
-from redteam.app.cli import renderer
+from redteam.app.cli import interactive_commands, renderer
 from redteam.app.cli._shared import (
-    DEFAULT_APP_CONFIG_PATH,
     DEFAULT_ENGAGEMENT_PATH,
     DEFAULT_ENV_PATH,
     EXIT_CONFIG_ERROR,
@@ -44,7 +42,8 @@ from redteam.app.cli._shared import (
 )
 from redteam.app.cli.commands import run as run_command
 from redteam.app.cli.commands.validate import check_capability, check_roe, check_scope
-from redteam.capability.settings import MCPConfigurationError
+from redteam.app.cli.interactive_commands import InteractiveSession
+from redteam.capability.settings import MCPConfigurationError, mcp_server_ids_from_environment
 from redteam.core.config import (
     AppConfig,
     CapabilityConfig,
@@ -67,8 +66,9 @@ from redteam.intake.serializer import (
     merge_draft,
     scope_diff,
 )
+from redteam.llm.fake import FakeLLMClient
 from redteam.orchestration.engagement_planner import sanitize_objective
-from redteam.orchestration.state import TerminationReason
+from redteam.orchestration.state import RuntimeState, TerminationReason
 
 logger = logging.getLogger(__name__)
 
@@ -83,11 +83,12 @@ async def run(args: argparse.Namespace) -> int:
     except EOFError:
         # No more input to read (section 23): a script/CI piped this
         # process no stdin at all. The explicit, automation-friendly
-        # command is `redteam run <engagement> --config <app>`.
+        # command is `redteam run <engagement>` (+ REDTEAM_LLM_*/REDTEAM_MCP_*
+        # environment variables).
         console.print(
             "\n[dim]No input available -- this is the interactive setup. "
             "Non-interactive environments should use "
-            "`redteam run <engagement.yaml> --config <app.yaml> --non-interactive` "
+            "`redteam run <engagement.yaml> --non-interactive` "
             "instead.[/dim]"
         )
         return EXIT_CONFIG_ERROR
@@ -98,7 +99,7 @@ async def run(args: argparse.Namespace) -> int:
 
 async def _run(console: Console, *, verbose: bool) -> int:
     llm_config, orchestration_config, capability_config, logging_config = (
-        await _ensure_runtime_config(console, DEFAULT_APP_CONFIG_PATH)
+        await _ensure_runtime_config(console)
     )
     llm_client = build_llm_client(llm_config)
 
@@ -133,7 +134,21 @@ async def _run(console: Console, *, verbose: bool) -> int:
         logging=logging_config,
     )
     logging.basicConfig(level=logging_config.level, force=True)
-    return await _execute(console, full_config, verbose=verbose, objective=objective)
+    _exit_code, final = await _execute(console, full_config, verbose=verbose, objective=objective)
+
+    # RunFinished ends this Run, not the CLI Session (sections 4-5, 19):
+    # return to a persistent prompt instead of exiting the process here.
+    session = InteractiveSession(engagement_config=engagement_config, llm_config=llm_config)
+    session.record_run(final)
+    return await _session_loop(
+        console,
+        session,
+        llm_config=llm_config,
+        orchestration_config=orchestration_config,
+        capability_config=capability_config,
+        logging_config=logging_config,
+        verbose=verbose,
+    )
 
 
 # --- runtime (LLM/capability) config: a short one-time prompt, never an ----
@@ -142,18 +157,26 @@ async def _run(console: Console, *, verbose: bool) -> int:
 
 
 async def _ensure_runtime_config(
-    console: Console, path: Path
+    console: Console,
 ) -> tuple[LLMConfig, OrchestrationConfig, CapabilityConfig, LoggingConfig]:
-    if path.exists():
-        raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    """One-time interactive LLM setup, persisted to ``.env`` -- never a
+    ``app.yaml``/application-config file (there is no such file in this
+    CLI; see ``_shared.load_app_config_for_run``).
+
+    ``REDTEAM_LLM_PROVIDER`` already set (this process's environment, or a
+    previous run's ``.env`` the shell already sourced) means setup already
+    happened -- read the same way ``redteam run`` does
+    (``LLMConfig.from_environment()``), no prompt.
+    """
+    if os.environ.get("REDTEAM_LLM_PROVIDER"):
         return (
-            LLMConfig.model_validate(raw.get("llm", {})),
-            OrchestrationConfig.model_validate(raw.get("orchestration", {})),
-            CapabilityConfig.model_validate(raw.get("capability", {})),
-            LoggingConfig.model_validate(raw.get("logging", {})),
+            LLMConfig.from_environment(),
+            OrchestrationConfig(),
+            CapabilityConfig(mcp_servers=mcp_server_ids_from_environment()),
+            LoggingConfig(),
         )
 
-    console.print(f"\n[dim]No {path} found -- one-time runtime setup.[/dim]")
+    console.print("\n[dim]No REDTEAM_LLM_PROVIDER set -- one-time runtime setup.[/dim]")
     model = console.input(
         "LLM model (e.g. chatgpt/gpt-5.5, gpt-4o-mini) [blank = offline/fake]: "
     ).strip()
@@ -174,30 +197,45 @@ async def _ensure_runtime_config(
                 write_env_var(DEFAULT_ENV_PATH, llm_config.api_key_env_var, key)
                 os.environ[llm_config.api_key_env_var] = key
 
+    write_env_var(DEFAULT_ENV_PATH, "REDTEAM_LLM_PROVIDER", llm_config.provider)
+    os.environ["REDTEAM_LLM_PROVIDER"] = llm_config.provider
+    if model:
+        write_env_var(DEFAULT_ENV_PATH, "REDTEAM_LLM_MODEL", llm_config.default_model)
+        os.environ["REDTEAM_LLM_MODEL"] = llm_config.default_model
+    console.print(f"[dim]Wrote REDTEAM_LLM_PROVIDER to {DEFAULT_ENV_PATH}.[/dim]")
+
     orchestration_config = OrchestrationConfig()
-    capability_config = CapabilityConfig()
+    capability_config = CapabilityConfig(mcp_servers=mcp_server_ids_from_environment())
     logging_config = LoggingConfig()
-    path.write_text(
-        yaml.safe_dump(
-            {
-                "llm": llm_config.model_dump(),
-                "orchestration": orchestration_config.model_dump(),
-                "capability": capability_config.model_dump(),
-                "logging": logging_config.model_dump(),
-            },
-            sort_keys=False,
-        ),
-        encoding="utf-8",
-    )
-    console.print(f"[dim]Wrote {path}.[/dim]")
     return llm_config, orchestration_config, capability_config, logging_config
 
 
 # --- Engagement Intake (sections 9, 12) ------------------------------------
 
 
+def _build_intake_assistant(llm_client: LLMClient) -> IntakeAssistant | None:
+    """``None`` when there is no real model to talk to.
+
+    ``FakeLLMClient.complete_structured`` returns ``{}`` by default, which
+    validates as a syntactically-valid but empty ``IntakeTurn`` rather than
+    raising -- so ``IntakeAssistant.step`` never raises
+    ``IntakeAssistantError`` for it, and the deterministic regex fallback
+    (``redteam.intake.fallback.deterministic_intake_turn``, which *can*
+    read something like "127.0.0.1 대상으로 분석 시작해줘") never engages.
+    Left unguarded, the zero-config offline default (blank LLM model at
+    first-run setup -> ``build_llm_client`` -> ``FakeLLMClient``) makes the
+    natural-language Intake conversation repeat the same generic "more
+    info needed" prompt forever, no matter what the user types. Skipping
+    the LLM round trip entirely for this one known stand-in avoids that
+    without changing ``FakeLLMClient``/``IntakeAssistant`` themselves --
+    both are relied on elsewhere (tests, other Protocol callers) exactly
+    as documented.
+    """
+    return None if isinstance(llm_client, FakeLLMClient) else IntakeAssistant(llm_client)
+
+
 async def _new_engagement(console: Console, llm_client: LLMClient) -> EngagementConfig | None:
-    assistant = IntakeAssistant(llm_client)
+    assistant = _build_intake_assistant(llm_client)
     session = IntakeSession()
     first_message = console.input("[cyan]>[/cyan] 어떤 대상을 테스트하려고 하나요? ")
     if not first_message.strip():
@@ -214,7 +252,7 @@ async def _edit_engagement(
         console.print(f"\n[red]{exc}[/red]")
         return None
 
-    assistant = IntakeAssistant(llm_client)
+    assistant = _build_intake_assistant(llm_client)
     session = IntakeSession(draft=draft, editing=True)
     message = console.input("[cyan]>[/cyan] 뭘 바꿀까요? ")
     if not message.strip():
@@ -237,17 +275,26 @@ async def _edit_engagement(
 
 
 async def _intake_loop(
-    console: Console, assistant: IntakeAssistant, session: IntakeSession, first_message: str
+    console: Console,
+    assistant: IntakeAssistant | None,
+    session: IntakeSession,
+    first_message: str,
 ) -> EngagementConfig | None:
     message = first_message
     while True:
-        try:
-            turn = await assistant.step(session, sanitize_objective(message))
-        except IntakeAssistantError as exc:
-            if session.editing:
-                console.print(f"[red]{renderer.theme.ICON_FAILURE} {exc}[/red]")
-                return None
+        if assistant is None:
+            # No real model configured (see _build_intake_assistant) -- go
+            # straight to the deterministic parser every turn instead of
+            # round-tripping a canned, unhelpful structured response.
             turn = deterministic_intake_turn(session.draft, sanitize_objective(message))
+        else:
+            try:
+                turn = await assistant.step(session, sanitize_objective(message))
+            except IntakeAssistantError as exc:
+                if session.editing:
+                    console.print(f"[red]{renderer.theme.ICON_FAILURE} {exc}[/red]")
+                    return None
+                turn = deterministic_intake_turn(session.draft, sanitize_objective(message))
 
         session.draft = merge_draft(session.draft, turn.draft)
         if turn.acknowledgement:
@@ -382,7 +429,7 @@ async def _preflight_loop(
                 target=engagement_config.name,
                 problem="; ".join(problems),
                 suggested_fix="Choose [E] Edit to fix this through the assistant, "
-                "or edit engagement.yaml/app.yaml directly.",
+                "or edit engagement.yaml directly.",
             )
             choice = renderer.prompt_choice(console, "", "[ E ] Edit   [ Q ] Quit")
             if choice in ("e", "edit"):
@@ -422,7 +469,17 @@ def _write_engagement(path: Path, engagement_config: EngagementConfig) -> None:
 
 async def _execute(
     console: Console, full_config: AppConfig, *, verbose: bool, objective: str | None = None
-) -> int:
+) -> tuple[int, RuntimeState | None]:
+    """Runs one Engagement to a terminal/suspended state and returns
+    ``(exit_code, final_runtime_state)``.
+
+    The ``RuntimeState`` is returned (not just the exit code) so a caller
+    that keeps the CLI process alive after this -- see ``_session_loop``,
+    section 4/19: ``RunFinished`` ends the *Run*, not the CLI Session --
+    can project it into ``InteractiveSession`` (``run_id``, phase,
+    termination reason) for ``/status``/``/findings`` to default against,
+    without re-deriving it from event-renderer side effects.
+    """
     async with AsyncExitStack() as stack:
         return await _execute_scoped(
             console, full_config, verbose=verbose, mcp_stack=stack, objective=objective
@@ -432,7 +489,7 @@ async def _execute(
 async def _execute_scoped(
     console: Console, full_config: AppConfig, *, verbose: bool, mcp_stack: AsyncExitStack,
     objective: str | None = None,
-) -> int:
+) -> tuple[int, RuntimeState | None]:
     with console.status("Starting engagement...", spinner="dots"):
         try:
             engagement, deps = await run_command.build(
@@ -446,7 +503,7 @@ async def _execute_scoped(
                 suggested_fix="Fix the REDTEAM_MCP_<ID>_* environment variables for the "
                 "configured server(s).",
             )
-            return EXIT_CONFIG_ERROR
+            return EXIT_CONFIG_ERROR, None
         except Exception as exc:  # noqa: BLE001 - fail closed with a readable message
             if logging.getLogger().isEnabledFor(logging.DEBUG):
                 logging.exception("Application bootstrap failed")
@@ -456,7 +513,7 @@ async def _execute_scoped(
                 problem=f"failed to start application: {exc}",
                 suggested_fix=None,
             )
-            return EXIT_FAILURE
+            return EXIT_FAILURE, None
 
     console.print()
     event_renderer = renderer.RichEventRenderer(console, verbose=verbose)
@@ -480,7 +537,7 @@ async def _execute_scoped(
         if logging.getLogger().isEnabledFor(logging.DEBUG):
             logging.exception("Run failed")
         console.print(f"\n[red]{renderer.theme.ICON_FAILURE} run failed: {exc}[/red]")
-        return EXIT_FAILURE
+        return EXIT_FAILURE, None
 
     console.print()
     renderer.render_run_summary(
@@ -499,4 +556,60 @@ async def _execute_scoped(
         TerminationReason.APPROVAL_PENDING,
     }:
         console.print(f"[dim]Report: redteam report generate {final.run_id}[/dim]")
-    return EXIT_FAILURE if final.phase.value == "failed" else EXIT_OK
+    exit_code = EXIT_FAILURE if final.phase.value == "failed" else EXIT_OK
+    return exit_code, final
+
+
+async def _session_loop(
+    console: Console,
+    session: InteractiveSession,
+    *,
+    llm_config: LLMConfig,
+    orchestration_config: OrchestrationConfig,
+    capability_config: CapabilityConfig,
+    logging_config: LoggingConfig,
+    verbose: bool,
+) -> int:
+    """Keeps the CLI process alive after ``RunFinished`` (sections 4-5,
+    19): a Run ending is not the same as the CLI Session ending. Reads one
+    line at a time -- ``/...`` dispatches through the Command Registry
+    (``interactive_commands.dispatch``, never the Agent Runtime; sections
+    3, 13-15), anything else becomes a new Mission objective run through
+    the exact same ``_execute`` core the first run used (Gate D: no
+    duplicated Runtime-invocation path for the "next" request).
+
+    A recoverable condition here -- an unknown slash command, a command
+    handler raising, ``KeyboardInterrupt`` while idle at the prompt --
+    prints a message and returns to the prompt (section 21). Only
+    ``/exit``/``EOFError`` (Ctrl+D) end the loop.
+    """
+    while True:
+        try:
+            text = console.input("\n[cyan]❯[/cyan] ")
+        except EOFError:
+            console.print("\n[dim]Session ended.[/dim]")
+            return EXIT_OK
+        except KeyboardInterrupt:
+            console.print(
+                "\n[dim](Ctrl+C -- type /exit or press Ctrl+D to end the session)[/dim]"
+            )
+            continue
+
+        text = text.strip()
+        if not text:
+            continue
+        if text.startswith("/"):
+            should_continue = await interactive_commands.dispatch(console, session, text)
+            if not should_continue:
+                return EXIT_OK
+            continue
+
+        full_config = AppConfig(
+            engagement=session.engagement_config,
+            llm=llm_config,
+            orchestration=orchestration_config,
+            capability=capability_config,
+            logging=logging_config,
+        )
+        _exit_code, final = await _execute(console, full_config, verbose=verbose, objective=text)
+        session.record_run(final)

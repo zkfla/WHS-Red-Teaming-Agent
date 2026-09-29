@@ -22,19 +22,6 @@ from redteam.core.config import load_engagement_config
 
 pytestmark = pytest.mark.asyncio
 
-_APP_YAML = """
-llm:
-  provider: fake
-  default_model: gpt-4o-mini
-orchestration:
-  max_retries: 3
-  max_steps: 20
-capability:
-  mcp_servers: []
-logging:
-  level: INFO
-"""
-
 
 class _FakeConsole:
     """Minimal duck-typed stand-in for ``rich.console.Console`` -- only
@@ -78,7 +65,12 @@ def _patch(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, answers: list[str], llm  # noqa: ANN001
 ) -> _FakeConsole:
     monkeypatch.chdir(tmp_path)
-    (tmp_path / "app.yaml").write_text(_APP_YAML, encoding="utf-8")
+    # REDTEAM_LLM_PROVIDER already set (section 4/20's canonical env source)
+    # means `_ensure_runtime_config` skips its one-time prompt entirely --
+    # no application-config file involved.
+    monkeypatch.setenv("REDTEAM_LLM_PROVIDER", "fake")
+    monkeypatch.setenv("REDTEAM_LLM_MODEL", "gpt-4o-mini")
+    monkeypatch.delenv("REDTEAM_MCP_SERVERS", raising=False)
     console = _FakeConsole(answers)
     monkeypatch.setattr(interactive, "Console", lambda: console)
     monkeypatch.setattr(interactive, "build_llm_client", lambda config: llm)  # noqa: ARG005

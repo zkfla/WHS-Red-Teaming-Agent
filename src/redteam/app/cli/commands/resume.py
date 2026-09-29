@@ -61,7 +61,6 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
     )
     parser.add_argument("run_id")
     parser.add_argument("engagement_path")
-    parser.add_argument("--config", dest="config_path", default=None)
     parser.add_argument("--max-steps", type=int, default=None)
     parser.add_argument("--log-level", default=None)
     parser.add_argument("--json", action="store_true")
@@ -75,7 +74,7 @@ async def run(args: argparse.Namespace) -> int:
 
 async def _run(args: argparse.Namespace, *, mcp_stack: AsyncExitStack) -> int:
     try:
-        config = load_app_config_for_run(args.engagement_path, args.config_path)
+        config = load_app_config_for_run(args.engagement_path)
     except (OSError, ValidationError, ValueError) as exc:
         eprint(f"ERROR: {exc}")
         return EXIT_CONFIG_ERROR

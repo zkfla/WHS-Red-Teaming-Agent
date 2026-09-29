@@ -1,4 +1,16 @@
-"""In-memory MCP Tool Registry. Owned by Capability Team."""
+"""In-memory MCP Tool Registry. Owned by Capability Team.
+
+Responsibility boundary with ``MCPToolCatalog`` (``capability/catalog.py``):
+this Registry is the authoritative store of *what was discovered* --
+plain ``register``/``get``/``all``/``list_by_capability``/health bookkeeping,
+with no operation-binding or candidate-metadata policy of its own. Which
+canonical ``capability.operation`` a discovered tool actually answers to
+(``list_tools_for_action``, ``list_candidate_metadata``) is a bound,
+per-Gateway *view* over one discovery snapshot -- ``MCPToolCatalog``'s job,
+not duplicated here. A tool's discovery snapshot legitimately needs both:
+this class does not know or care about operation bindings; the Catalog
+never itself stores a tool.
+"""
 
 from __future__ import annotations
 
@@ -32,28 +44,6 @@ class MCPToolRegistry:
             tool.model_copy(deep=True)
             for tool in self._sorted_tools()
             if capability_tag in tool.capability_tags
-        ]
-
-    def list_tools_for_action(
-        self,
-        capability: str,
-        operation: str,
-        *,
-        include_unhealthy: bool = False,
-    ) -> list[ToolDescriptor]:
-        """Compatibility catalog for registry-only test and bootstrap callers.
-
-        The full operation binding policy lives in ``MCPToolCatalog``. A raw
-        Registry can still answer safely for descriptors that carry their own
-        operation metadata, or for legacy descriptors whose remote name is the
-        operation.
-        """
-        return [
-            descriptor
-            for descriptor in self._sorted_tools()
-            if str(descriptor.tool_id).partition(".")[0] == capability
-            and operation in (descriptor.operations or [descriptor.tool_name])
-            and (include_unhealthy or descriptor.health_status != ToolHealthStatus.UNHEALTHY)
         ]
 
     def list_by_server(self, server_id: str) -> list[ToolDescriptor]:

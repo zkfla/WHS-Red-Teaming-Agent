@@ -48,8 +48,11 @@ services:
       LAB_BOB_TOKEN: synthetic-bob
       REDTEAM_MCP_RECON_PASSIVE_ALLOWED_TOOLS_JSON: '["http_probe"]'
       REDTEAM_MCP_RECON_PASSIVE_TOOL_OPERATIONS_JSON: '{"http_probe":["service_discovery"]}'
+      # No --config/app.yaml in the CLI: the vulnerable-demo AppConfig's
+      # llm/capability sections (app.vulnerable-demo.yaml) live here instead.
+      REDTEAM_LLM_PROVIDER: fake
+      REDTEAM_MCP_SERVERS: web-http,recon-passive
     volumes:
-      - ../mcp/finance/app.vulnerable-demo.yaml:/config/app.yaml:ro
       - ../mcp/finance/engagement-vulnerable-demo.yaml:/config/engagement.yaml:ro
       - finance-demo-data:/workspace/data
       - finance-demo-reports:/workspace/reports

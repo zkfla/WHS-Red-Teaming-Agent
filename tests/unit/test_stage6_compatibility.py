@@ -178,6 +178,10 @@ def test_plain_event_stream_skips_unrendered_types_and_masks_secrets(capsys) -> 
 async def test_run_json_mode_suppresses_human_echo_and_summary(
     tmp_path: Path, monkeypatch, capsys  # noqa: ANN001
 ) -> None:
+    # build/execute are mocked below, but the real load_app_config_for_run()
+    # still runs first and now requires an explicit provider (section 4/20)
+    # -- there is no --config app.yaml path any more.
+    monkeypatch.setenv("REDTEAM_LLM_PROVIDER", "fake")
     path = _engagement_yaml(tmp_path)
 
     async def fake_build(config, *, max_steps, mcp_stack=None):  # noqa: ANN001, ANN202
@@ -191,7 +195,6 @@ async def test_run_json_mode_suppresses_human_echo_and_summary(
     monkeypatch.setattr(run_command, "execute", fake_execute)
     args = argparse.Namespace(
         engagement_path=str(path),
-        config_path=None,
         non_interactive=True,
         max_steps=None,
         log_level="WARNING",
@@ -208,6 +211,7 @@ async def test_run_json_mode_suppresses_human_echo_and_summary(
 async def test_run_plain_mode_still_prints_the_human_summary(
     tmp_path: Path, monkeypatch, capsys  # noqa: ANN001
 ) -> None:
+    monkeypatch.setenv("REDTEAM_LLM_PROVIDER", "fake")
     path = _engagement_yaml(tmp_path)
 
     async def fake_build(config, *, max_steps, mcp_stack=None):  # noqa: ANN001, ANN202
@@ -221,7 +225,6 @@ async def test_run_plain_mode_still_prints_the_human_summary(
     monkeypatch.setattr(run_command, "execute", fake_execute)
     args = argparse.Namespace(
         engagement_path=str(path),
-        config_path=None,
         non_interactive=True,
         max_steps=None,
         log_level="WARNING",
@@ -410,7 +413,11 @@ approval_policy:
         encoding="utf-8",
     )
 
-    config = load_app_config_for_run(str(path), None)
+    # This test is only about EngagementConfig compatibility, not LLM
+    # selection -- require_llm=False matches redteam validate/tools'
+    # own reasoning (section 4/20 only targets commands that actually
+    # build an LLM client).
+    config = load_app_config_for_run(str(path), require_llm=False)
     policy = config.engagement.approval_policy
 
     assert policy.auto_approve is True

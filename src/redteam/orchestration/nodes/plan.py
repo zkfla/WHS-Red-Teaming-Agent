@@ -219,14 +219,27 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                 planning_fingerprint=planning_digest,
                 evidence_excerpts=generation_excerpts,
             )
+            # `GraphCandidateProvider` (section 4 consolidation) declares
+            # only `propose_graph` -- a provider that instead implements
+            # only the narrower three-argument `propose` shape (a
+            # documented, intentional exception for simple/plugin
+            # providers; see that Protocol's docstring) is still accepted,
+            # looked up dynamically rather than through either static
+            # method name. A provider with neither is a real registration
+            # bug and must fail loudly, not with a bare AttributeError.
             graph_propose = getattr(provider, "propose_graph", None)
-            offered = (
-                await graph_propose(agent, context)
-                if callable(graph_propose)
-                else await provider.propose(
+            legacy_propose = getattr(provider, "propose", None)
+            if callable(graph_propose):
+                offered = await graph_propose(agent, context)
+            elif callable(legacy_propose):
+                offered = await legacy_propose(
                     agent, context.view, context.observation, step=context.step
                 )
-            )
+            else:
+                raise TypeError(
+                    f"candidate provider {definition.provider_id!r} implements neither "
+                    f"propose_graph(spec, context) nor propose(spec, view, observation, step=)"
+                )
             if isinstance(offered, CandidateBatch):
                 drafts, diagnostics = offered.candidates, offered.diagnostics
                 drops = offered.drops

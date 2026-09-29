@@ -2,7 +2,7 @@
 
 Canonical path, no CLI-only shortcut:
 
-    engagement.yaml (+ --config app.yaml) -> AppConfig
+    engagement.yaml + environment (REDTEAM_LLM_*/REDTEAM_MCP_*) -> AppConfig
         -> app.bootstrap.build_application(config)   (real LLM, real MCP, real Control)
         -> app.bootstrap.run_engagement(engagement, deps=deps)
         -> Orchestration -> ActionProposal -> Control -> Tool Selection
@@ -122,7 +122,6 @@ _APPROVAL_POLL_SECONDS_IN_SESSION = 1.0
 def add_parser(subparsers: argparse._SubParsersAction) -> None:
     parser = subparsers.add_parser("run", help="Run an Engagement end-to-end")
     parser.add_argument("engagement_path")
-    parser.add_argument("--config", dest="config_path", default=None)
     parser.add_argument("--non-interactive", action="store_true")
     parser.add_argument("--max-steps", type=int, default=None)
     parser.add_argument("--log-level", default=None)
@@ -547,10 +546,9 @@ async def build(
     """
     if not config.capability.mcp_servers:
         eprint(
-            "WARNING: no MCP servers configured (capability.mcp_servers is empty) -- "
-            "using the in-process ExampleMCPAdapter (development/test only; no real "
-            "tool execution). Configure --config app.yaml capability.mcp_servers for "
-            "a production run."
+            "WARNING: no MCP servers configured -- this run has an empty tool catalog "
+            "and cannot execute any Action. Set REDTEAM_MCP_SERVERS (comma-separated "
+            "server ids) and each server's REDTEAM_MCP_<ID>_* environment variables."
         )
 
     orchestration_settings = OrchestrationSettings.for_durable_run(
@@ -664,7 +662,7 @@ async def run(args: argparse.Namespace) -> int:
 
 async def _run(args: argparse.Namespace, *, mcp_stack: AsyncExitStack) -> int:
     try:
-        config = load_app_config_for_run(args.engagement_path, args.config_path)
+        config = load_app_config_for_run(args.engagement_path)
     except (OSError, ValidationError, ValueError) as exc:
         eprint(f"ERROR: {exc}")
         return EXIT_CONFIG_ERROR
