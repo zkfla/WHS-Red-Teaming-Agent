@@ -93,7 +93,7 @@ the complete live test passed in 218.25 seconds.
 | `5664e7c` | Schedule the bounded Analysis Agent |
 | `64e0d11` | Map manifest results to findings and graph relations |
 | `2dcf969` | Add autonomous failure/recovery/drift coverage and fix discovered orchestration defects |
-| current A6 commit | Add the real apktool engagement test and make its deployment configuration executable |
+| `4c65c5a` | Add the real apktool engagement test and make its deployment configuration executable |
 
 ## Validation
 
