@@ -78,7 +78,7 @@ async def test_local_manifest_matches_mcp_discovery(server_id: str, tmp_path: Pa
         validate_discovered_schema(spec, tool.input_schema, tool.output_schema)
 
 
-@pytest.mark.parametrize("server_id", ["mobile-next", "apktool"])
+@pytest.mark.parametrize("server_id", ["mobile-next", "apktool", "jadx"])
 async def test_external_manifest_matches_live_mcp_discovery(server_id: str) -> None:
     """Opt-in check against an installed external candidate, without a device/APK call."""
 
