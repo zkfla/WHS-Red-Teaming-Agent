@@ -369,6 +369,7 @@ def candidate_key(draft: CandidateDraft) -> str:
         "agent_id": str(draft.agent_id),
         "capability": draft.plan_step.capability,
         "operation": draft.plan_step.operation,
+        "attempt_record_key": draft.plan_step.attempt_record_key,
         "arguments": draft.plan_step.arguments,
         "target_node_ids": sorted(map(str, draft.target_node_ids)),
         "prerequisite_ids": sorted(draft.prerequisite_ids),

@@ -337,6 +337,12 @@ class AgentLoopRunner:
         timeout must not touch it.
         """
 
+        # A fresh runner may enter through reconciliation without ever
+        # calling run(), which is where the checkpoint thread is normally
+        # bound. Bind it from the terminal runtime before looking up the
+        # state needed to resume an approval.
+        self._thread_id = self._thread_id or str(runtime.run_id)
+
         wakeup = await self.wait_for_change(runtime, timeout_seconds=timeout_seconds)
         if runtime.termination_reason == TerminationReason.APPROVAL_PENDING:
             resumed = await self._resume_pending_approval(runtime)

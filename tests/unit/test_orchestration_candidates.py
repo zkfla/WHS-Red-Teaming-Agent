@@ -440,6 +440,18 @@ async def test_candidate_key_distinguishes_different_action_arguments() -> None:
     assert candidate_key(changed) != candidate.candidate_key
 
 
+async def test_candidate_key_distinguishes_steps_with_different_attempt_keys() -> None:
+    service = await graph()
+    observation = await service.observe(step=1)
+    candidate = (
+        await CandidateCompiler().compile_playbook(agent(), service.view(), observation, step=1)
+    )[0]
+    changed = candidate.draft.model_copy(deep=True)
+    changed.plan_step.attempt_key = "recon:follow-up-probe"
+
+    assert candidate_key(changed) != candidate.candidate_key
+
+
 async def test_compiler_rejects_a_draft_whose_execution_target_is_not_referenced() -> None:
     service = await graph()
     observation = await service.observe(step=1)
