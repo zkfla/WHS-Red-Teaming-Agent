@@ -1,0 +1,40 @@
+# Authorized training-lab configuration for the mobile/analysis MCP stack.
+# Define the matching REDTEAM_MCP_<ID>_* variables from .env.example before
+# loading this file. Remove `jadx` when the optional local GUI bridge is not used.
+engagement:
+  name: InsecureBankv2 mobile analysis lab
+  description: Static and bounded dynamic analysis of an intentionally vulnerable training APK.
+  scope:
+    allowed_assets: [insecurebankv2]
+  rules_of_engagement:
+    - name: training-app-only
+      description: Limit execution to the operator-provided InsecureBankv2 lab artifact and device.
+      allowed_capabilities: [analysis, mobile]
+      allowed_operations: [static_analysis, app_launch, response_analysis]
+      prohibited_techniques: [app_install, app_uninstall, ui_automation, runtime_instrumentation]
+  execution_budget:
+    max_actions: 30
+    max_tool_calls: 30
+    max_duration_seconds: 600
+  rate_limit_policy:
+    max_actions_per_minute: 10
+    max_concurrent_actions: 1
+  approval_policy:
+    auto_approve: false
+    require_approval_for: [mobile.app_launch]
+  metadata:
+    asset_ref: insecurebankv2
+    apk_ref: insecurebankv2
+
+capability:
+  mcp_servers: [apktool, jadx, mobile-next]
+
+llm:
+  provider: fake
+
+orchestration:
+  max_retries: 3
+  max_steps: 50
+
+logging:
+  level: INFO

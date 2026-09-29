@@ -20,6 +20,7 @@ from redteam.capability.servers.analysis import AnalysisServerPolicy
 from redteam.capability.servers.analysis import create_server as create_analysis_server
 from redteam.capability.servers.mobile import MobileDiagnosticsPolicy
 from redteam.capability.servers.mobile import create_server as create_mobile_server
+from redteam.core.config import load_app_config
 from redteam.core.contracts.tool import ToolDescriptor
 from redteam.core.enums import RiskLevel
 from redteam.core.ids import ToolId
@@ -64,6 +65,20 @@ def test_mobile_next_image_pins_verified_runtime() -> None:
     assert "ARG MOBILE_MCP_VERSION=1.0.4" in dockerfile
     assert '@mobilenext/mobile-mcp@latest' not in dockerfile
     assert 'ENTRYPOINT ["mcp-server-mobile", "--listen", "0.0.0.0:3000"]' in dockerfile
+
+
+def test_mobile_analysis_app_registers_installed_candidates() -> None:
+    app_path = (
+        Path(__file__).resolve().parents[2]
+        / "deploy"
+        / "mcp"
+        / "mobile-analysis"
+        / "app.yaml"
+    )
+    config = load_app_config(app_path)
+
+    assert config.engagement.scope.allowed_assets == ["insecurebankv2"]
+    assert config.capability.mcp_servers == ["apktool", "jadx", "mobile-next"]
 
 
 @pytest.mark.parametrize("server_id", ["mobile-local", "analysis-local"])

@@ -91,7 +91,8 @@ REDTEAM_MCP_<SERVER_ID>_PASSTHROUGH_ENV=ANDROID_SERIAL,ANDROID_HOME
 **Not finalized.** `mobile-next/mobile-mcp` (https://github.com/mobile-next/mobile-mcp)
 is being evaluated, not adopted — `MobileMCPAdapter` only knows the generic
 `MCPServerAdapter`/`MCPTransport` shapes, so swapping it for a different
-mobile MCP server later means changing `.env.example`/`examples/app.yaml`
+mobile MCP server later means changing `.env.example` and the enabled
+`deploy/mcp/mobile-analysis/app.yaml`
 only, no Adapter code.
 
 Canonical operations this capability binds today (see
@@ -117,11 +118,14 @@ any of them up.
 
 mobile-next/mobile-mcp supports both transports: stdio (its default,
 `npx -y @mobilenext/mobile-mcp@1.0.4`, run directly on a host with
-ADB/Xcode tooling already set up) and Streamable HTTP (`--listen <port>`,
-containerized via `deploy/docker/mobile-next-mcp` + the `mobile-next-mcp`
-compose service, profile `mobile`, `network_mode: host` since it needs to
-reach adb/simulators on the host). Either way it needs a real,
-operator-authorized device or emulator — there is no lab/dummy mode.
+ADB/Xcode tooling already set up) and Streamable HTTP (`--listen <port>`).
+The container image installs 1.0.4 at build time on Node 22 and starts
+`mcp-server-mobile --listen 0.0.0.0:3000`; the Compose service uses profile
+`mobile` and `network_mode: host` so it can reach adb/simulators on the host.
+On Docker Desktop, enable host networking before using the HTTP endpoint.
+Either transport needs a real, operator-authorized device or emulator and a
+working host `adb devices`; there is no lab/dummy mode. The installed server
+advertises 32 tools, but the allowlist binds only the four tools in the table.
 
 ### Local fallback: `redteam.capability.servers.mobile` (server ID example: `mobile-local`)
 
@@ -173,7 +177,13 @@ apktool_mcp_server.py`; no HTTP mode documented). Containerized via
 `deploy/docker/apktool-mcp` + the `apktool-mcp` compose service (profile
 `tools`); since it's stdio, that image is built once and invoked per-call
 (`docker compose run --rm -i apktool-mcp`), not started with `docker
-compose up`.
+compose up`).
+
+The Compose service sets `APKTOOL_WORKSPACE=/work` and mounts the
+operator-selected `APKTOOL_MCP_WORKDIR` there. Both settings are required:
+the upstream server rejects decoded project paths outside its configured
+workspace. A verified session decoded InsecureBankv2 with apktool 2.9.3 and
+then returned its text Android manifest through `get_manifest`.
 
 ### Additional candidate: jadx-mcp-server (server ID example: `jadx`)
 
@@ -205,14 +215,27 @@ needs a running GUI it is **not containerized** here; tool *discovery*
 Unlike apktool/mobile-next, jadx advertises per-tool `outputSchema`; the
 gateway preserves and enforces those at invoke time.
 
+Local verification used JADX 1.5.6, jadx-ai-mcp plugin 6.4.1, and
+jadx-mcp-server commit `d99d130d53f1da14ba152d3c0de3d3b672049d4f`.
+With InsecureBankv2 loaded, the bridge returned its decoded manifest through
+`get_android_manifest`.
+
 ### Mobile/analysis discovery conformance
 
 `redteam.capability.mobile_analysis_manifest` records the selected candidate
 tools' ToolId, canonical operation, required/optional arguments, asset target
 kind, risk level and advertised output schema where one exists. The candidate
 versions used to check those argument lists are `@mobilenext/mobile-mcp@1.0.4`
-and apktool-mcp-server commit `12bb33134af905923a0a58643dcc35fd694ad6f6`.
+and apktool-mcp-server commit `12bb33134af905923a0a58643dcc35fd694ad6f6`;
+the optional JADX bridge version is recorded above.
 Update the manifest and pin together whenever a candidate changes.
+
+`deploy/mcp/mobile-analysis/app.yaml` is the enabled AppConfig example. It
+registers `apktool`, `jadx`, and `mobile-next` under
+`capability.mcp_servers`; remove the optional `jadx` ID when its local GUI
+bridge is not running. The matching `REDTEAM_MCP_<ID>_*` values remain in
+`.env.example` so secrets and machine-specific absolute paths stay outside
+YAML.
 
 The in-repo `mobile-local` and `analysis-local` MCP servers advertise specific
 Pydantic output schemas. The external mobile-next and apktool candidates do
@@ -223,7 +246,7 @@ projects every registered MCP tool and canonical operation into candidate
 metadata: ToolId, capability, operation, required/optional arguments, target
 kind when known, risk level, and output schema when available. Missing schema
 fields remain `None`; they are not inferred. For explicitly configured
-mobile-next, apktool, mobile-local, and analysis-local candidates, bootstrap
+mobile-next, apktool, jadx, mobile-local, and analysis-local candidates, bootstrap
 checks the manifest against discovery before registration and fails on drift.
 The Core `ToolDescriptor` and `ToolGateway` Port still do not expose this
 candidate view, so Agent use needs a PM-reviewed Contract change.
@@ -231,9 +254,10 @@ candidate view, so Agent use needs a PM-reviewed Contract change.
 `tests/unit/test_mobile_analysis_manifest.py` checks the local servers' real
 MCP discovery on every run. To check an installed external candidate, set
 `REDTEAM_TEST_MOBILE_NEXT_COMMAND` and `REDTEAM_TEST_MOBILE_NEXT_ARGS_JSON`,
-or `REDTEAM_TEST_APKTOOL_COMMAND` and `REDTEAM_TEST_APKTOOL_ARGS_JSON`, then
-run that test file. The external check only lists tools; it does not contact a
-device or analyze an APK.
+`REDTEAM_TEST_APKTOOL_COMMAND` and `REDTEAM_TEST_APKTOOL_ARGS_JSON`, or
+`REDTEAM_TEST_JADX_COMMAND` and `REDTEAM_TEST_JADX_ARGS_JSON`, then run that
+test file. The external check only lists tools; it does not contact a device or
+analyze an APK.
 
 For an apktool result smoke test, call `decode_apk` on a permitted test APK,
 then `get_manifest` with the returned project directory. Leave resource
