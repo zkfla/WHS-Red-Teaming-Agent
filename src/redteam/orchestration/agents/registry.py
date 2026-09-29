@@ -19,7 +19,11 @@ from redteam.orchestration.agents.base import (
     HypothesisDraft,
     PlanStep,
 )
-from redteam.orchestration.agents.builtin import MOBILE_AGENT, WEB_API_AGENT
+from redteam.orchestration.agents.builtin import (
+    ANALYSIS_AGENT,
+    MOBILE_AGENT,
+    WEB_API_AGENT,
+)
 from redteam.orchestration.agents.definition import (
     AgentDefinition,
     builtin_agent_definitions,
@@ -254,11 +258,11 @@ RECON_AGENT = AgentSpec(
 def default_registry() -> AgentRegistry:
     """The registry used when nothing else is wired in ``app.bootstrap``.
 
-    Analysis is injected as ``AnalysisVerifier`` and Reporting is a terminal
-    read-only projector; Web/API and Mobile are executable when both their
-    activation predicate and a matching Tool Catalog capability are present.
+    Reporting remains a terminal read-only projector. The other roles are
+    executable when their activation predicate and a matching Tool Catalog
+    capability are present.
     """
     return AgentRegistry(
-        [RECON_AGENT, WEB_API_AGENT, MOBILE_AGENT],
+        [RECON_AGENT, WEB_API_AGENT, MOBILE_AGENT, ANALYSIS_AGENT],
         definitions=builtin_agent_definitions(),
     )

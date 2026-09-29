@@ -174,7 +174,12 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                 drops = offered.drops
             else:
                 drafts = offered
-            compiled, rejections = compiler.compile_drafts_with_rejections(drafts)
+            compiled, rejections = compiler.compile_drafts_with_rejections(
+                drafts,
+                allowed_capabilities=(
+                    set(agent.capabilities) if agent.capabilities else None
+                ),
+            )
             for draft in drafts:
                 check = draft.plan_step.authentication_check
                 if check is not None and not any(item.draft == draft for item in compiled):

@@ -76,14 +76,25 @@ class CandidateCompiler:
         drafts = await PlaybookCandidateProvider().propose(
             spec, view, observation, step=step
         )
-        return self.compile_drafts(drafts)
+        allowed = set(spec.capabilities) if spec.capabilities else None
+        return self.compile_drafts(drafts, allowed_capabilities=allowed)
 
-    def compile_drafts(self, drafts: list[CandidateDraft]) -> list[ExecutableCandidate]:
+    def compile_drafts(
+        self,
+        drafts: list[CandidateDraft],
+        *,
+        allowed_capabilities: set[str] | None = None,
+    ) -> list[ExecutableCandidate]:
         """Apply generic catalog/schema/health constraints to provider drafts."""
-        return self.compile_drafts_with_rejections(drafts)[0]
+        return self.compile_drafts_with_rejections(
+            drafts, allowed_capabilities=allowed_capabilities
+        )[0]
 
     def compile_drafts_with_rejections(
-        self, drafts: list[CandidateDraft]
+        self,
+        drafts: list[CandidateDraft],
+        *,
+        allowed_capabilities: set[str] | None = None,
     ) -> tuple[list[ExecutableCandidate], list[CandidateRejection]]:
         """Like :meth:`compile_drafts`, but also returns why each dropped draft
         was dropped (dedup drops are not reported)."""
@@ -91,7 +102,9 @@ class CandidateCompiler:
         rejections: list[CandidateRejection] = []
         seen: set[str] = set()
         for draft in drafts:
-            candidate, rejection = self._evaluate_draft(draft, seen)
+            candidate, rejection = self._evaluate_draft(
+                draft, seen, allowed_capabilities=allowed_capabilities
+            )
             if candidate is not None:
                 candidates.append(candidate)
             elif rejection is not None:
@@ -102,9 +115,18 @@ class CandidateCompiler:
         )
 
     def _evaluate_draft(
-        self, draft: CandidateDraft, seen: set[str]
+        self,
+        draft: CandidateDraft,
+        seen: set[str],
+        *,
+        allowed_capabilities: set[str] | None,
     ) -> tuple[ExecutableCandidate | None, CandidateRejection | None]:
         plan_step = draft.plan_step
+        if (
+            allowed_capabilities is not None
+            and plan_step.capability not in allowed_capabilities
+        ):
+            return None, self._reject(draft, "agent_capability_not_allowed")
         try:
             json.dumps(plan_step.arguments, sort_keys=True, allow_nan=False)
         except (TypeError, ValueError):

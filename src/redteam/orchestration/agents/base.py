@@ -276,6 +276,14 @@ class AgentSpec(BaseModel):
         step_ids = [step.step_id for step in self.playbook]
         if len(step_ids) != len(set(step_ids)):
             raise ValueError(f"agent {self.agent_id!r} has duplicate step_id values")
+        if self.capabilities:
+            allowed = set(self.capabilities)
+            outside = sorted({step.capability for step in self.playbook} - allowed)
+            if outside:
+                raise ValueError(
+                    f"agent {self.agent_id!r} has playbook capabilities {outside!r} "
+                    "outside the agent's allowed capabilities"
+                )
         return self
 
 

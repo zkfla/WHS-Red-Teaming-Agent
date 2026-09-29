@@ -444,8 +444,9 @@ def test_the_default_registry_ships_executable_specialists() -> None:
         AgentId("recon-agent"),
         AgentId("web-api-agent"),
         AgentId("mobile-agent"),
+        AgentId("analysis-agent"),
     ]
-    assert len(registry) == 3
+    assert len(registry) == 4
     assert registry.get(AgentId("nope")) is None
     assert registry.definition_ids == [
         AgentId("recon-agent"),
@@ -454,14 +455,28 @@ def test_the_default_registry_ships_executable_specialists() -> None:
         AgentId("analysis-agent"),
         AgentId("reporting-agent"),
     ]
-    # Architecture invariant: exactly the schedulable roles have executable
-    # specs. Analysis/Reporting are seams (verifier/projector), so they are
-    # defined roles but carry no spec -- this guards against the drift PM
-    # flagged (a definition that looks schedulable but was never wired).
+    # Architecture invariant: exactly the schedulable roles have executable specs.
     schedulable = [d.agent_id for d in registry.definitions() if d.schedulable]
     assert schedulable == registry.agent_ids
     seams = [d.agent_id for d in registry.definitions() if not d.schedulable]
-    assert seams == [AgentId("analysis-agent"), AgentId("reporting-agent")]
+    assert seams == [AgentId("reporting-agent")]
+    analysis = registry.definition(AgentId("analysis-agent"))
+    assert analysis is not None
+    assert analysis.activation_rules[0].node_types == [GraphNodeType.ASSET]
+
+
+def test_agent_spec_rejects_a_playbook_capability_it_was_not_granted() -> None:
+    step = probe_step().model_copy(
+        update={"capability": "web", "tool_id": ToolId("web.http_request")}
+    )
+
+    with pytest.raises(ValidationError, match="outside the agent's allowed capabilities"):
+        AgentSpec(
+            agent_id=AgentId("bounded"),
+            name="bounded",
+            capabilities=["recon"],
+            playbook=[step],
+        )
 
 
 # -- planners -------------------------------------------------------------

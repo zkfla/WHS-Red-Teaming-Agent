@@ -16,6 +16,7 @@ from redteam.core.contracts.tool import ToolDescriptor
 from redteam.core.enums import GraphNodeType, RiskLevel, ToolHealthStatus
 from redteam.core.ids import AgentId, GraphNodeId, ToolId
 from redteam.orchestration.agents import AgentSpec, PlanStep
+from redteam.orchestration.agents.providers import PlaybookCandidateProvider
 from redteam.orchestration.candidates.compiler import CandidateCompiler, candidate_key
 from redteam.orchestration.candidates.models import PrioritySignals
 
@@ -41,6 +42,7 @@ def agent(tool_id: str = "recon.ping") -> AgentSpec:
     return AgentSpec(
         agent_id=AgentId("recon"),
         name="recon",
+        capabilities=["recon"],
         playbook=[
             PlanStep(
                 step_id="probe",
@@ -59,6 +61,26 @@ def agent(tool_id: str = "recon.ping") -> AgentSpec:
             )
         ],
     )
+
+
+async def test_compiler_rejects_provider_candidate_outside_agent_capabilities() -> None:
+    service = await graph()
+    observation = await service.observe(step=1)
+    spec = agent()
+    drafts = await PlaybookCandidateProvider().propose(
+        spec, service.view(), observation, step=1
+    )
+    outside_step = drafts[0].plan_step.model_copy(
+        update={"capability": "web", "tool_id": ToolId("web.http_request")}
+    )
+    outside = drafts[0].model_copy(update={"plan_step": outside_step})
+
+    candidates, rejections = CandidateCompiler().compile_drafts_with_rejections(
+        [outside], allowed_capabilities=set(spec.capabilities)
+    )
+
+    assert candidates == []
+    assert rejections[0].reason == "agent_capability_not_allowed"
 
 
 async def graph():
