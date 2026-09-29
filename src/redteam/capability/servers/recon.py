@@ -70,6 +70,10 @@ def create_server(policy: ServerPolicy) -> MCPServer:
                 certificate = tls.getpeercert(binary_form=True)
                 return {
                     "target_ref": target_ref,
+                    "host": target.host,
+                    "port": target.port,
+                    "scheme": "https",
+                    "service": "tls",
                     "verified": True,
                     "protocol": tls.version(),
                     "cipher": tls.cipher()[0],

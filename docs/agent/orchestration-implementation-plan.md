@@ -789,11 +789,12 @@ canonical action key 비교로 수정해야 한다. 추적 문서는
   경계에서만 네임스페이스 처리하는 decorator. `app.bootstrap`이 기본으로
   감싸서 배선한다.
 - [x] **상시 reconciliation loop** — `AgentLoopRunner.reconcile_once()`
-  자체는 이미 있었다(event wake-up + periodic fallback). 이번에 추가된
-  것은 그걸 반복 호출하는 최소 host 루프
-  (`orchestration.reconciliation.run_reconciliation_loop`) — daemon
-  프레임워크가 아니라 평범한 `asyncio` 코루틴이며, 이를 구동할 프로세스
-  자체(및 CLI 진입점)는 여전히 배포/애플리케이션 계층의 몫으로 남는다.
+  자체는 이미 있었다(event wake-up + periodic fallback). 이번에 추가됐던
+  `orchestration.reconciliation.run_reconciliation_loop`(그걸 반복 호출하는
+  최소 host 루프)는 이후 감사에서 실제 runtime/CLI caller가 전혀 없는 것으로
+  확인되어 제거됐다 — `reconcile_once()` 자체와, 그걸 실제로 구동하는
+  `commands/run.py`의 폴링(`_wait_for_approval`/`_wait_for_pause`)은 영향
+  없음. 별도 상시 host 루프가 다시 필요해지면 그때 추가한다.
 
 의도적으로 남겨둔 단순화 (다음 이터레이션 후보, 지금 fake로 채우지 않음):
 

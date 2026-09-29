@@ -1,0 +1,21 @@
+name: Finance lab access-control demo
+description: Deliberately vulnerable local-only mentoring demonstration
+scope:
+  allowed_hosts: [mock-bank]
+execution_budget:
+  max_actions: 12
+  max_tool_calls: 12
+  max_duration_seconds: 120
+rate_limit_policy:
+  max_actions_per_minute: 60
+  max_concurrent_actions: 1
+approval_policy:
+  auto_approve: true
+metadata:
+  target_refs:
+    mock-bank: bank-lab
+  auth_sessions:
+    mock-bank:
+      - session_ref: bob
+        paths: [/]
+        expected_access: deny

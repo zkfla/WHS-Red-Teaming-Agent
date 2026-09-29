@@ -18,7 +18,7 @@ from datetime import datetime, timezone
 
 from redteam.core.contracts.events import EventType
 from redteam.core.contracts.policy import ControlContext, PolicyDecision
-from redteam.core.enums import AgentPhase, PolicyVerdict
+from redteam.core.enums import AgentPhase, PolicyVerdict, Severity
 from redteam.orchestration.context import RuntimeDeps
 from redteam.orchestration.nodes._support import advance, publisher_for
 from redteam.orchestration.state import GraphState, TerminationReason
@@ -29,6 +29,38 @@ _OUTCOME = {
     PolicyVerdict.REQUIRE_APPROVAL: (EventType.APPROVAL_REQUIRED, AgentPhase.REPLAN),
     PolicyVerdict.DENY: (EventType.ACTION_DENIED, AgentPhase.REPLAN),
 }
+
+#: Control's machine-readable reaction hint rides in
+#: ``PolicyDecision.matched_rules`` as ``severity:<value>`` because the frozen
+#: ``PolicyDecision`` contract has no dedicated field (see
+#: ``redteam.control.severity``). Orchestration may not import Control's
+#: concrete package (dependency rules), so the documented tag string is read
+#: back here rather than through ``redteam.control.severity`` directly --
+#: but the *definition* of what each level means is not re-declared: these
+#: three constants derive from the one shared ``core.enums.Severity`` (see
+#: its docstring for the three levels), not independent string literals.
+_SEVERITY_TAG_PREFIX = "severity:"
+SEVERITY_BLOCK_ACTION = Severity.BLOCK_ACTION.value
+SEVERITY_REPLAN_GOAL = Severity.REPLAN_GOAL.value
+SEVERITY_ABORT_RUN = Severity.ABORT_RUN.value
+
+
+def denial_severity(decision: PolicyDecision | None) -> str | None:
+    """Read the Control-supplied reaction hint out of a decision.
+
+    Returns the raw level string (``"block_action"`` / ``"replan_goal"`` /
+    ``"abort_run"``), or ``None`` when the decision is untagged or malformed.
+    Untagged denials keep the historical behavior: block this action and
+    replan.
+    """
+
+    if decision is None or decision.verdict is not PolicyVerdict.DENY:
+        return None
+    for rule in decision.matched_rules:
+        if rule.startswith(_SEVERITY_TAG_PREFIX):
+            value = rule[len(_SEVERITY_TAG_PREFIX) :]
+            return value or None
+    return None
 
 
 async def policy_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
@@ -141,8 +173,18 @@ async def policy_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
     elif resuming_approval:
         # The approval cycle is fully resolved now (ALLOW or DENY) --
         # clear the markers so a later, unrelated action is never
-        # mistaken for a resume of this one.
-        runtime_update.update({"pending_approval_id": None, "pending_action_id": None})
+        # mistaken for a resume of this one. Also clear the terminal
+        # ``APPROVAL_PENDING`` marker: it is no longer pending, and leaving
+        # it set would make REPLAN re-enter its terminal branch (a rejected
+        # approval would never replan, and an approved one would stop right
+        # after executing). The run resumes/replans from the resolved verdict.
+        runtime_update.update(
+            {
+                "pending_approval_id": None,
+                "pending_action_id": None,
+                "termination_reason": None,
+            }
+        )
 
     return advance(
         state,

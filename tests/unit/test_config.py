@@ -11,6 +11,8 @@ from redteam.core.config import (
     load_app_config,
     load_engagement_config,
 )
+from redteam.core.contracts.engagement import ApprovalPolicy
+from redteam.core.enums import RiskLevel
 from redteam.core.ids import EngagementId
 
 
@@ -28,6 +30,27 @@ def test_engagement_config_to_engagement_assigns_runtime_fields() -> None:
     engagement = config.to_engagement(engagement_id=EngagementId("eng_1"))
     assert engagement.engagement_id == EngagementId("eng_1")
     assert engagement.created_at is not None
+
+
+def test_engagement_config_round_trips_approval_risk_fields() -> None:
+    config = EngagementConfig(
+        name="t",
+        execution_budget={"max_actions": 5},  # type: ignore[arg-type]
+        approval_policy=ApprovalPolicy(
+            risk_threshold=RiskLevel.LOW,
+            auto_approve_up_to=RiskLevel.HIGH,
+        ),
+    )
+    engagement = config.to_engagement(engagement_id=EngagementId("eng_risk_cfg"))
+    assert engagement.approval_policy.risk_threshold is RiskLevel.LOW
+    assert engagement.approval_policy.auto_approve_up_to is RiskLevel.HIGH
+
+
+def test_approval_policy_defaults_preserve_legacy_behaviour() -> None:
+    policy = ApprovalPolicy()
+    assert policy.auto_approve is False
+    assert policy.risk_threshold is None
+    assert policy.auto_approve_up_to is None
 
 
 def test_app_config_loads_from_examples_yaml() -> None:

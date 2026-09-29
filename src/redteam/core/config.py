@@ -70,10 +70,59 @@ class LLMConfig(BaseModel):
     def resolve_api_key(self) -> str | None:
         return os.environ.get(self.api_key_env_var)
 
+    @classmethod
+    def from_environment(cls) -> LLMConfig:
+        """The CLI's only source for ``llm`` (mirrors
+        ``MCPServerSettings.from_environment``): ``REDTEAM_LLM_PROVIDER``/
+        ``REDTEAM_LLM_MODEL``/``REDTEAM_LLM_API_KEY_ENV_VAR``.
+
+        ``REDTEAM_LLM_PROVIDER`` is required here -- there is no implicit
+        default. A production run with no provider set is a real
+        misconfiguration and must fail loudly, not silently run
+        against ``FakeLLMClient`` (which the old "default to the
+        ``provider='fake'`` field value" behavior amounted to). Using the
+        offline/test client from this path is still one line away:
+        ``REDTEAM_LLM_PROVIDER=fake`` -- an explicit choice, not a default.
+        An unrecognized provider string (a typo, or a name only a *real*
+        provider would use, like ``"openai"``) is the same error, not a
+        silent fallback either; ``build_llm_client`` enforces the actual
+        provider allowlist, this only enforces that *something* was said.
+        """
+        provider = os.environ.get("REDTEAM_LLM_PROVIDER")
+        if not provider:
+            raise ValueError(
+                "REDTEAM_LLM_PROVIDER is not set. Set it explicitly -- "
+                "REDTEAM_LLM_PROVIDER=fake for the offline/test client, or "
+                "REDTEAM_LLM_PROVIDER=litellm (with REDTEAM_LLM_MODEL) for "
+                "a real provider. There is no implicit default."
+            )
+        kwargs: dict[str, str] = {"provider": provider}
+        model = os.environ.get("REDTEAM_LLM_MODEL")
+        if model:
+            kwargs["default_model"] = model
+        api_key_env_var = os.environ.get("REDTEAM_LLM_API_KEY_ENV_VAR")
+        if api_key_env_var:
+            kwargs["api_key_env_var"] = api_key_env_var
+        return cls(**kwargs)
+
 
 class OrchestrationConfig(BaseModel):
     max_retries: int = Field(default=3, ge=0)
     max_steps: int = Field(default=50, ge=1)
+    #: RC#1 opt-in: let the LLM generate candidate drafts in addition to the
+    #: playbook frontier. Off by default; every generated draft is still
+    #: compiled and policy-checked like any other before it can run.
+    llm_candidate_generation: bool = Field(default=False)
+
+    @classmethod
+    def from_environment(cls) -> OrchestrationConfig:
+        """CLI runtime settings, validated with the same rules as library config."""
+        values = {
+            field: os.environ[f"REDTEAM_ORCHESTRATION_{field.upper()}"]
+            for field in ("max_steps", "max_retries", "llm_candidate_generation")
+            if f"REDTEAM_ORCHESTRATION_{field.upper()}" in os.environ
+        }
+        return cls.model_validate(values)
 
 
 class CapabilityConfig(BaseModel):

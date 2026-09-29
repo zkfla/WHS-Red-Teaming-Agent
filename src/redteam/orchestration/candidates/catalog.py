@@ -1,25 +1,10 @@
-"""Agent-Team view of Tool Catalog without importing Capability code."""
+"""Compatibility import for the Agent team's canonical Tool Catalog port.
 
-from __future__ import annotations
+The orchestration layer may consume this name for backwards compatibility,
+but the contract is owned by Core.  Keeping a second Protocol here made it
+easy for Agent code and Capability code to drift apart.
+"""
 
-from typing import Protocol
+from redteam.core.ports.tool_catalog import ToolCatalog
 
-from redteam.core.contracts.tool import ToolDescriptor
-from redteam.core.ids import ToolId
-
-
-class ToolCatalog(Protocol):
-    """Structural subset already implemented by ``MCPToolGateway``/``MCPToolRegistry``."""
-
-    def get(self, tool_id: ToolId) -> ToolDescriptor | None: ...
-
-    def list_by_capability(self, capability_tag: str) -> list[ToolDescriptor]: ...
-
-    def list_tools_for_action(self, capability: str, operation: str) -> list[ToolDescriptor]:
-        """Eligible, healthy candidates bound to this canonical action.
-
-        Mirrors ``redteam.core.ports.tool_gateway.ToolGateway.list_tools_for_action``
-        — read-only, no selection policy. See
-        ``docs/proposals/tool-selection-port.md``.
-        """
-        ...
+__all__ = ["ToolCatalog"]

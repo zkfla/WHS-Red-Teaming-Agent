@@ -14,7 +14,7 @@ from pathlib import Path
 
 from redteam.app.cli._shared import EXIT_FAILURE, EXIT_OK, eprint
 from redteam.app.report_store import load_terminal_report
-from redteam.orchestration.reporting import TerminalReportProjection
+from redteam.orchestration.reporting import MissionProjection, TerminalReportProjection
 
 
 def add_parser(subparsers: argparse._SubParsersAction) -> None:
@@ -85,4 +85,45 @@ def _render_markdown(report: TerminalReportProjection) -> str:
     if report.outstanding_cleanup:
         lines += ["", "## Outstanding cleanup", ""]
         lines += [f"- {item}" for item in report.outstanding_cleanup]
+    if report.mission is not None:
+        lines += _render_mission(report.mission)
     return "\n".join(lines) + "\n"
+
+
+def _render_mission(mission: MissionProjection) -> list[str]:
+    lines = [
+        "",
+        "## Mission",
+        "",
+        f"- Objective: {mission.objective}",
+        f"- Status: {mission.status}",
+        f"- Tasks: {mission.completed_task_count} completed / "
+        f"{mission.partial_task_count} in progress / {mission.blocked_task_count} blocked",
+        f"- Verified findings: {mission.verified_finding_count}",
+        f"- Evidence recorded: {mission.evidence_count}",
+        "",
+        "### Workstreams",
+        "",
+    ]
+    if not mission.workstreams:
+        lines.append("(none)")
+    for workstream in mission.workstreams:
+        detail = f" — {workstream.reason}" if workstream.reason else ""
+        lines.append(f"- **[{workstream.status.upper()}]** {workstream.name}{detail}")
+    blocked = [task for task in mission.tasks if task.status in {"blocked", "failed"}]
+    if blocked:
+        lines += ["", "### Blocked tasks", ""]
+        for task in blocked:
+            reason = task.blocked_reason or "no blocking reason recorded"
+            lines.append(f"- {task.title} [{task.status}]: {reason}")
+    lines += ["", "### Success criteria", ""]
+    if not mission.success_criteria:
+        lines.append("(none)")
+    for criterion in mission.success_criteria:
+        mark = "MET" if criterion.met else "UNMET"
+        detail = f" — {criterion.reason}" if criterion.reason else ""
+        lines.append(
+            f"- **[{mark}]** {criterion.criterion} "
+            f"(evidence: {criterion.evidence_count}){detail}"
+        )
+    return lines

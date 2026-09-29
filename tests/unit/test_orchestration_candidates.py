@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 from pydantic import ValidationError
 
@@ -268,6 +270,64 @@ async def test_required_tool_schema_fields_are_hard_constraints() -> None:
     )
 
 
+async def test_incompatible_first_tool_does_not_hide_executable_alternative() -> None:
+    service = await graph()
+    observation = await service.observe(step=1)
+    registry = MCPToolRegistry()
+    for name, required in (("a_url_tool", "url"), ("z_host_tool", "target_ref")):
+        registry.register(ToolDescriptor(
+            tool_id=ToolId(f"recon.{name}"), server_id="test", tool_name=name,
+            input_schema={
+                "type": "object", "properties": {required: {"type": "string"}},
+                "required": [required], "additionalProperties": False,
+            },
+            capability_tags=["recon"], health_status=ToolHealthStatus.HEALTHY,
+        ))
+    spec = agent()
+    candidates = await CandidateCompiler(catalog_for(registry)).compile_playbook(
+        spec, service.view(), observation, step=1
+    )
+    assert len(candidates) == 2
+    assert all(c.tool.tool_id == "recon.z_host_tool" for c in candidates)
+    assert {c.draft.plan_step.arguments["target_ref"] for c in candidates} == {
+        "a.local", "b.local",
+    }
+    assert spec.playbook[0].arguments == {}
+
+
+async def test_target_type_mismatch_only_removes_the_incompatible_tool() -> None:
+    service = await graph()
+    observation = await service.observe(step=1)
+    registry = MCPToolRegistry()
+    for name, target_types in (
+        ("a_endpoint_only", ["endpoint"]),
+        ("z_host", ["host"]),
+    ):
+        registry.register(
+            ToolDescriptor(
+                tool_id=ToolId(f"recon.{name}"),
+                server_id="test",
+                tool_name=name,
+                input_schema={
+                    "type": "object",
+                    "properties": {"target_ref": {"type": "string"}},
+                    "required": ["target_ref"],
+                    "additionalProperties": False,
+                },
+                target_types=target_types,
+                capability_tags=["recon"],
+                health_status=ToolHealthStatus.HEALTHY,
+            )
+        )
+
+    candidates = await CandidateCompiler(catalog_for(registry)).compile_playbook(
+        agent(), service.view(), observation, step=1
+    )
+
+    assert len(candidates) == 2
+    assert {candidate.tool.tool_id for candidate in candidates} == {"recon.z_host"}
+
+
 async def test_full_json_schema_rejects_wrong_argument_types() -> None:
     service = await graph()
     observation = await service.observe(step=1)
@@ -493,10 +553,11 @@ async def test_compiler_reports_an_unhealthy_only_tool_set_as_such() -> None:
 async def test_incompatible_first_tool_does_not_hide_a_valid_alternative() -> None:
     service = await graph()
     registry = MCPToolRegistry()
-    for name, schema in [
+    tool_schemas: list[tuple[str, dict[str, Any]]] = [
         ('a_requires_url', {'type': 'object', 'required': ['url']}),
         ('z_compatible', {'type': 'object'}),
-    ]:
+    ]
+    for name, schema in tool_schemas:
         registry.register(ToolDescriptor(
             tool_id=ToolId(f'recon.{name}'), server_id='test', tool_name=name,
             capability_tags=['recon'], input_schema=schema,

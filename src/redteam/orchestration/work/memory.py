@@ -161,6 +161,19 @@ class InMemoryWorkStore:
             del self._leases[work_id]
             return True
 
+    async def release(self, work_id: str, *, owner: str, now: datetime) -> bool:
+        """Return an unexecuted leased item to the runnable frontier."""
+        async with self._lock:
+            lease = self._leases.get(work_id)
+            item = self._items.get(work_id)
+            if lease is None or item is None or lease.owner != owner or lease.expires_at <= now:
+                return False
+            self._items[work_id] = item.model_copy(
+                update={"status": WorkStatus.PENDING, "updated_at": now}
+            )
+            del self._leases[work_id]
+            return True
+
     async def reclaim_expired(self, *, now: datetime) -> list[str]:
         async with self._lock:
             expired = sorted(

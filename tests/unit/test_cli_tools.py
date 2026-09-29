@@ -5,23 +5,35 @@ from __future__ import annotations
 import argparse
 import json
 
+import pytest
+
 from redteam.app.cli._shared import EXIT_OK
 from redteam.app.cli.commands import tools as tools_command
 
 
-def _args(*, config_path=None, engagement_path=None, json_mode=False):  # noqa: ANN001, ANN202
-    return argparse.Namespace(
-        config_path=config_path, engagement_path=engagement_path, json=json_mode
-    )
+@pytest.fixture(autouse=True)
+def _no_mcp_servers_configured(monkeypatch: pytest.MonkeyPatch) -> None:
+    """These tests exercise the "nothing configured" reality -- an honest
+    empty catalog, never a silent ExampleMCPAdapter substitute -- so a
+    dev/CI machine's own ``REDTEAM_MCP_SERVERS`` must not leak in."""
+    monkeypatch.delenv("REDTEAM_MCP_SERVERS", raising=False)
 
 
-async def test_empty_registry_uses_example_adapter_and_warns(capsys) -> None:
+def _args(*, json_mode=False):  # noqa: ANN001, ANN202
+    return argparse.Namespace(json=json_mode)
+
+
+async def test_empty_registry_shows_no_tools_and_warns(capsys) -> None:
+    """No MCP server configured -> an honest empty catalog, never a
+    silent ExampleMCPAdapter substitute (production must never hide a
+    missing/misconfigured MCP connection behind a fake working tool)."""
     exit_code = await tools_command.run_list(_args())
     assert exit_code == EXIT_OK
     out, err = capsys.readouterr()
-    assert "recon.ping" in out
+    assert "recon.ping" not in out
+    assert "(none)" in out
     assert "WARNING" in err
-    assert "ExampleMCPAdapter" in err
+    assert "ExampleMCPAdapter" not in err
 
 
 async def test_list_is_deterministic_across_calls(capsys) -> None:
@@ -32,17 +44,16 @@ async def test_list_is_deterministic_across_calls(capsys) -> None:
     assert first == second
 
 
-async def test_health_reports_example_server_healthy(capsys) -> None:
+async def test_health_with_no_servers_shows_none_registered(capsys) -> None:
     exit_code = await tools_command.run_health(_args())
     assert exit_code == EXIT_OK
     out = capsys.readouterr().out
-    assert "example-mcp" in out
-    assert "HEALTHY" in out
+    assert "example-mcp" not in out
+    assert "(no MCP servers registered)" in out
 
 
 async def test_tools_json_output_is_valid(capsys) -> None:
     exit_code = await tools_command.run_list(_args(json_mode=True))
     assert exit_code == EXIT_OK
     payload = json.loads(capsys.readouterr().out)
-    assert isinstance(payload, list)
-    assert payload[0]["tool_id"] == "recon.ping"
+    assert payload == []

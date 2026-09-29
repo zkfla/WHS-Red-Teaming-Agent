@@ -14,21 +14,14 @@ only place this tool's ``output`` dict is built)::
         "body_omitted": True,
     }
 
-That server deliberately never returns the resolved host/port/scheme
-back to the model ("No raw response, header values, URL query or token
-is returned" -- see ``network.py``): only ``status_code`` and the
-security-header booleans are real, observed facts about the target this
-mapper can use. ``host``/``path`` are not guessed from that output --
-they come from the ``ActionProposal.target`` actually probed and the
-``path`` argument actually sent, both already known to the framework
-independently of the tool's response. GET and the HTTP application
-protocol are fixed by this specific tool. The URL scheme and port are
-not returned, so the mapper does not claim either one.
+Current responses also carry the resolved host, port, and scheme. They
+are validated against the executed target before becoming graph identity;
+legacy responses may omit port and scheme. The path comes from the actual
+request, and GET is fixed by this tool.
 """
 
 from __future__ import annotations
 
-import re
 from typing import Any
 
 from redteam.attack_graph.identity import endpoint_node_id, host_node_id, service_node_id
@@ -36,6 +29,7 @@ from redteam.core.contracts.target import AnyTarget, HostTarget
 from redteam.core.contracts.tool import ToolResult
 from redteam.core.enums import GraphEdgeType, GraphNodeType
 from redteam.orchestration.authentication import request_key
+from redteam.orchestration.observations._shared import is_hex64
 from redteam.orchestration.observations.mapper import (
     EdgeMutation,
     GraphMutation,
@@ -45,7 +39,6 @@ from redteam.orchestration.observations.mapper import (
 
 _APPLICATION_PROTOCOL = "http"
 _METHOD = "GET"
-_HEX_64 = re.compile(r"^[0-9a-fA-F]{64}$")
 
 
 def map_recon_http_probe(
@@ -65,6 +58,14 @@ def map_recon_http_probe(
         return GraphMutation()
 
     output = result.output
+    if "host" in output and output["host"] != host:
+        return GraphMutation()
+    port = output.get("port")
+    if port is not None and (type(port) is not int or not 1 <= port <= 65535):
+        return GraphMutation()
+    scheme = output.get("scheme")
+    if scheme is not None and scheme not in {"http", "https"}:
+        return GraphMutation()
     status_code = output.get("status_code")
     target_ref = arguments.get("target_ref")
     output_target_ref = output.get("target_ref")
@@ -87,8 +88,7 @@ def map_recon_http_probe(
             "x-content-type-options",
             "cache-control",
         }
-        or not isinstance(digest, str)
-        or _HEX_64.fullmatch(digest) is None
+        or not is_hex64(digest)
         or output.get("body_omitted") is not True
         or type(output.get("body_bytes")) is not int
         or output["body_bytes"] < 0
@@ -119,21 +119,30 @@ def map_recon_http_probe(
         "target_ref": output_target_ref,
         "security_headers_present": dict(security_headers),
     }
+    service_facts: dict[str, Any] = {
+        "host": host,
+        "application_protocol": _APPLICATION_PROTOCOL,
+        "target_ref": output_target_ref,
+    }
+    if port is not None:
+        endpoint_facts["port"] = port
+        service_facts["port"] = port
+    if scheme is not None:
+        endpoint_facts["scheme"] = scheme
+        service_facts["scheme"] = scheme
 
     host_id = host_node_id(host)
-    service_id = service_node_id(_APPLICATION_PROTOCOL, host=host)
-    endpoint_id = endpoint_node_id(_METHOD, path, host=host)
+    service_name = scheme or _APPLICATION_PROTOCOL
+    if port is not None:
+        service_name = f"{service_name}:{port}"
+    service_id = service_node_id(service_name, host=host)
+    endpoint_id = endpoint_node_id(_METHOD, path, host=host, port=port)
 
     service_node = NodeMutation(
         node_type=GraphNodeType.SERVICE,
         node_id=service_id,
         attrs={"responded": True},
-        facts={
-            "host": host,
-            "application_protocol": _APPLICATION_PROTOCOL,
-            "display_name": f"{host} {_APPLICATION_PROTOCOL}",
-            "target_ref": output_target_ref,
-        },
+        facts={**service_facts, "display_name": f"{host} {service_name}"},
         labels=["discovered-by:recon.http_probe"],
     )
     endpoint_node = NodeMutation(

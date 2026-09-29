@@ -27,7 +27,13 @@ class ProjectionCacheKey:
 
 
 class EvidenceExcerpt(BaseModel):
-    """Small target-linked evidence reference safe for planner prompts."""
+    """Small target-linked evidence reference safe for planner prompts.
+
+    ``status_code``/``error_code`` are the RC#2 addition: the raw outcome the
+    model needs to reason past a playbook -- e.g. "this returned 401" or
+    "that failed with schema_mismatch" -- without leaking bodies, tokens or
+    free-text error messages (only bounded, non-secret codes cross here).
+    """
 
     evidence_id: str
     target_node_id: str
@@ -36,6 +42,8 @@ class EvidenceExcerpt(BaseModel):
     summary: str | None = None
     hypothesis_id: str | None = None
     digest: str
+    status_code: int | None = None
+    error_code: str | None = None
 
 
 def project_evidence_excerpts(
@@ -58,6 +66,10 @@ def project_evidence_excerpts(
         target_id = str(record.metadata.get("target_node_id", ""))
         if target_id not in targets:
             continue
+        observation = record.metadata.get("http_observation")
+        status = observation.get("status_code") if isinstance(observation, dict) else None
+        error = record.metadata.get("error")
+        error_code = error.get("code") if isinstance(error, dict) else None
         associated.append(
             EvidenceExcerpt(
                 evidence_id=str(record.evidence_id),
@@ -73,6 +85,8 @@ def project_evidence_excerpts(
                     str(record.hypothesis_id) if record.hypothesis_id is not None else None
                 ),
                 digest=record.digest,
+                status_code=status if isinstance(status, int) else None,
+                error_code=str(error_code) if isinstance(error_code, str) else None,
             )
         )
     return associated[-limit:]

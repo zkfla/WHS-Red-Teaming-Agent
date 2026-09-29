@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-import hashlib
 import ipaddress
-import json
 import re
 from typing import Any
 
@@ -17,9 +15,9 @@ from redteam.attack_graph.identity import (
 from redteam.core.contracts.target import AnyTarget, HostTarget
 from redteam.core.contracts.tool import ToolResult
 from redteam.core.enums import GraphEdgeType, GraphNodeType
+from redteam.orchestration.observations._shared import deterministic_key, is_hex64, safe_path
 from redteam.orchestration.observations.mapper import EdgeMutation, GraphMutation, NodeMutation
 
-_HEX_64 = re.compile(r"^[0-9a-fA-F]{64}$")
 _SAFE_VALUE = re.compile(r"^[A-Za-z0-9_.:+/@-]{1,100}$")
 _OIDC_CAPABILITIES = frozenset(
     {
@@ -62,11 +60,6 @@ _NMAP_STATES = frozenset(
 )
 
 
-def _context_key(kind: str, *parts: object) -> str:
-    encoded = json.dumps([kind, *parts], separators=(",", ":"), sort_keys=True).encode()
-    return hashlib.sha256(encoded).hexdigest()[:24]
-
-
 def _host_context(
     *, target: AnyTarget, arguments: dict[str, Any], result: ToolResult
 ) -> tuple[str, str, dict[str, Any]] | None:
@@ -84,16 +77,6 @@ def _host_context(
     ):
         return None
     return target.host, target_ref, result.output
-
-
-def _safe_path(value: Any) -> str | None:
-    if not isinstance(value, str) or not value.startswith("/") or len(value) > 512:
-        return None
-    if any(ord(char) < 32 or char in "?#%\\" for char in value):
-        return None
-    if "//" in value or any(part in {".", ".."} for part in value.split("/")):
-        return None
-    return value
 
 
 def map_recon_dns_resolve(
@@ -126,7 +109,7 @@ def map_recon_dns_resolve(
                 observations=[
                     {
                         "kind": "dns_resolution",
-                        "context_key": _context_key("dns", host, normalized),
+                        "context_key": deterministic_key("dns", host, normalized),
                         "target_ref": target_ref,
                         "addresses": normalized,
                     }
@@ -152,15 +135,14 @@ def map_recon_tls_inspect(
         or _SAFE_VALUE.fullmatch(protocol) is None
         or not isinstance(cipher, str)
         or _SAFE_VALUE.fullmatch(cipher) is None
-        or not isinstance(digest, str)
-        or _HEX_64.fullmatch(digest) is None
+        or not is_hex64(digest)
     ):
         return GraphMutation()
     host_id = host_node_id(host)
     service_id = service_node_id("tls", host)
     observation = {
         "kind": "tls_handshake",
-        "context_key": _context_key("tls", host, protocol, cipher, digest),
+        "context_key": deterministic_key("tls", host, protocol, cipher, digest),
         "target_ref": target_ref,
         "verified": True,
         "protocol": protocol,
@@ -193,7 +175,7 @@ def map_recon_oidc_inventory(
     *, target: AnyTarget, arguments: dict[str, Any], result: ToolResult
 ) -> GraphMutation:
     context = _host_context(target=target, arguments=arguments, result=result)
-    path = _safe_path(arguments.get("path"))
+    path = safe_path(arguments.get("path"))
     if context is None or path is None:
         return GraphMutation()
     host, target_ref, output = context
@@ -226,7 +208,7 @@ def map_recon_oidc_inventory(
     endpoint_id = endpoint_node_id("GET", path, host=host)
     observation = {
         "kind": "oidc_inventory",
-        "context_key": _context_key(
+        "context_key": deterministic_key(
             "oidc", host, path, safe_capabilities, safe_endpoint_presence
         ),
         "target_ref": target_ref,
@@ -305,7 +287,7 @@ def map_recon_port_scan(
             observations=[
                 {
                     "kind": "tcp_port_scan",
-                    "context_key": _context_key("ports", host, normalized),
+                    "context_key": deterministic_key("ports", host, normalized),
                     "target_ref": target_ref,
                     "ports": normalized,
                     "engine_exit_success": output["engine_exit_success"],

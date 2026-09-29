@@ -116,7 +116,7 @@ Propose one via Issue (docs/contracts/actions.md's process) before wiring
 any of them up.
 
 mobile-next/mobile-mcp supports both transports: stdio (its default,
-`npx -y @mobilenext/mobile-mcp@latest`, run directly on a host with
+`npx -y @mobilenext/mobile-mcp@1.0.4`, run directly on a host with
 ADB/Xcode tooling already set up) and Streamable HTTP (`--listen <port>`,
 containerized via `deploy/docker/mobile-next-mcp` + the `mobile-next-mcp`
 compose service, profile `mobile`, `network_mode: host` since it needs to
@@ -147,8 +147,8 @@ python -m redteam.capability.servers.mobile --policy /absolute/path/mobile-polic
   is not implemented anywhere in this capability. It is a fundamentally
   different class of tool than a bounded diagnostic command — building it
   in-repo would mean writing new attack tooling rather than wrapping an
-  existing one (instruction.md section 21). Needs a dedicated MCP
-  adapter/Issue once the team picks a real instrumentation MCP server.
+  existing one. It needs a separate scope and security review once the team
+  picks an instrumentation MCP server.
 
 ## Analysis capability (candidate: apktool-mcp-server)
 
@@ -165,8 +165,8 @@ Canonical operation this capability binds today: `static_analysis`.
 `build_apk`, `modify_smali_file`, `modify_resource_file`, and
 `clean_project` are **deliberately excluded** from
 `REDTEAM_MCP_<SERVER_ID>_ALLOWED_TOOLS_JSON` (see `.env.example`) — this PR
-only wires up inspection, per instruction.md section 21 (no build/modify
-capability without a separate, explicit decision).
+only wires up inspection. Build and modify capability requires a separate,
+explicit decision and must remain excluded from the allowlist until then.
 
 apktool-mcp-server only speaks MCP stdio upstream (`uv run
 apktool_mcp_server.py`; no HTTP mode documented). Containerized via
@@ -174,6 +174,76 @@ apktool_mcp_server.py`; no HTTP mode documented). Containerized via
 `tools`); since it's stdio, that image is built once and invoked per-call
 (`docker compose run --rm -i apktool-mcp`), not started with `docker
 compose up`.
+
+### Additional candidate: jadx-mcp-server (server ID example: `jadx`)
+
+**Not finalized.** `jadx-mcp-server` (https://github.com/zinja-coder/jadx-mcp-server,
+Apache-2.0) adds **Java-decompilation-level** static analysis, complementing
+apktool's smali/resource view. Same `static_analysis` canonical operation, so
+the Capability Registry can register additional candidates for that intent.
+This manifest is discovery-conformance metadata; it does not by itself make
+the default Agent propose or execute jadx analysis. No new operation or
+`gateway.py`/`transport.py` change is needed.
+
+| canonical operation | jadx-mcp-server remote tool | notes |
+|---|---|---|
+| `static_analysis` | `get_all_classes`, `get_class_source`, `get_methods_of_class`, `get_fields_of_class`, `search_method_by_name`, `search_classes_by_keyword`, `get_android_manifest`, `get_strings`, `get_xrefs_to_method` | read-only decompilation queries only |
+
+`rename_variable`, `rename_class`, `rename_field`, `rename_method`,
+`rename_package`, `add_comment`, and `clear_cache` are **deliberately
+excluded** from `REDTEAM_MCP_JADX_ALLOWED_TOOLS_JSON`. These state-changing
+tools require a separate explicit decision before being exposed.
+
+Topology differs from apktool: `jadx_mcp_server.py` is an MCP-stdio bridge
+(`uv run jadx_mcp_server.py`) that talks over HTTP to the **jadx-ai-mcp
+plugin** running inside a live **jadx-gui** (default `127.0.0.1:8650`) with an
+APK loaded. Install the plugin with
+`jadx plugins --install "github:zinja-coder:jadx-ai-mcp"`, then launch
+`jadx-gui <app.apk>`. Requires Java 11+, Python 3.10+, and `uv`. Because it
+needs a running GUI it is **not containerized** here; tool *discovery*
+(`tools/list`) works without the GUI, but *invocation* needs jadx-gui up.
+Unlike apktool/mobile-next, jadx advertises per-tool `outputSchema`; the
+gateway preserves and enforces those at invoke time.
+
+### Mobile/analysis discovery conformance
+
+`redteam.capability.mobile_analysis_manifest` records the selected candidate
+tools' ToolId, canonical operation, required/optional arguments, asset target
+kind, risk level and advertised output schema where one exists. The candidate
+versions used to check those argument lists are `@mobilenext/mobile-mcp@1.0.4`
+and apktool-mcp-server commit `12bb33134af905923a0a58643dcc35fd694ad6f6`.
+Update the manifest and pin together whenever a candidate changes.
+
+The in-repo `mobile-local` and `analysis-local` MCP servers advertise specific
+Pydantic output schemas. The external mobile-next and apktool candidates do
+not advertise output schemas for the selected tools; the manifest leaves those
+unknown instead of claiming a shape. The Capability transport preserves an
+advertised output schema, and `MCPToolGateway.list_candidate_metadata()`
+projects every registered MCP tool and canonical operation into candidate
+metadata: ToolId, capability, operation, required/optional arguments, target
+kind when known, risk level, and output schema when available. Missing schema
+fields remain `None`; they are not inferred. For explicitly configured
+mobile-next, apktool, mobile-local, and analysis-local candidates, bootstrap
+checks the manifest against discovery before registration and fails on drift.
+The Core `ToolDescriptor` and `ToolGateway` Port still do not expose this
+candidate view, so Agent use needs a PM-reviewed Contract change.
+
+`tests/unit/test_mobile_analysis_manifest.py` checks the local servers' real
+MCP discovery on every run. To check an installed external candidate, set
+`REDTEAM_TEST_MOBILE_NEXT_COMMAND` and `REDTEAM_TEST_MOBILE_NEXT_ARGS_JSON`,
+or `REDTEAM_TEST_APKTOOL_COMMAND` and `REDTEAM_TEST_APKTOOL_ARGS_JSON`, then
+run that test file. The external check only lists tools; it does not contact a
+device or analyze an APK.
+
+For an apktool result smoke test, call `decode_apk` on a permitted test APK,
+then `get_manifest` with the returned project directory. Leave resource
+decoding enabled (`no_res=false`); with `no_res=true`, the manifest remains
+binary and `get_manifest` cannot parse it as text. On Windows, some
+`apktool.bat` distributions pause for input at exit. Use a noninteractive
+apktool launcher on `PATH` or the Docker image before interpreting an MCP
+timeout as a server failure. A local direct MCP smoke on InsecureBankv2.apk
+confirmed both calls on apktool 2.9.3. It did not exercise Agent selection or
+the Core `ToolGateway` Port.
 
 ### Local fallback: `redteam.capability.servers.analysis` (server ID example: `analysis-local`)
 
@@ -193,6 +263,118 @@ Policy shape:
 python -m redteam.capability.servers.analysis --policy /absolute/path/analysis-policy.json
 ```
 
+## Local fallback vs. external MCP: not a transparent substitute
+
+`mobile-local`/`analysis-local` exist so the capability works without the
+external candidate installed, but they are **not** functionally
+interchangeable with mobile-next/apktool-mcp-server for the same canonical
+operation, even though Action-aware Tool Selection
+(`orchestration.candidates.tool_selection.select_tool`) can pick either one:
+
+- `analysis-local`'s `static_analysis` tools read the APK's zip container
+  only (`zipfile`, no decompilation) — `apktool-mcp-server`'s decode
+  smali/`AndroidManifest.xml` at the decompiled-code level. Same canonical
+  operation, materially different depth of analysis; see each server's own
+  module docstring (`capability/servers/analysis.py`).
+- `mobile-local`'s `device_shell` is not a fallback for anything
+  mobile-next exposes — mobile-next has no shell-style primitive at all
+  (see the operation table above). It fills a gap, it does not substitute
+  an existing one.
+- If both `apktool` and `analysis-local` are configured for the same
+  engagement, both bind `analysis.static_analysis` with the same
+  (`healthy`, `LOW` risk) tier today, so `select_tool`'s final tie-break —
+  stable `tool_id` lexical order — decides between them. `analysis.apk_*`
+  (analysis-local) sorts before `analysis.decode_apk`/`analysis.get_*`
+  (apktool) alphabetically, so the *shallower* zip-level tool would win
+  every time a candidate is actually picked, not the decompiling one. This
+  is Orchestration-owned selection logic (out of scope here to change) —
+  documented so an operator configuring both together understands the
+  consequence, rather than assuming "more candidates" means "the best one
+  gets used."
+
+Only treat two candidates as a genuine transparent fallback of each other
+when their input contract, output shape, and risk classification all
+match — not just their canonical operation name.
+
+## Risk level rationale (mobile/analysis)
+
+No new risk taxonomy — this project's single `RiskLevel` (LOW/MEDIUM/HIGH/
+CRITICAL, `core.enums.RiskLevel`) stays the only axis. Current assignments
+in `mobile_analysis_manifest.py`, and why:
+
+- **`static_analysis`, all candidates (apktool, analysis-local) — `LOW`.**
+  Read-only file/zip parsing against an operator-registered local artifact;
+  no device or network interaction.
+- **`device_shell` (mobile-local) — `LOW`.** A fixed four-command allowlist
+  (`getprop`, `pm_list_packages`, `dumpsys_battery`, `logcat_recent`), all
+  read-only diagnostics with capped output (`capability/servers/mobile.py`)
+  — no device state is ever mutated, and the command set cannot grow at
+  runtime.
+- **`app_launch` (mobile-next) — `MEDIUM`.** Starts a real process on a
+  real device — the one operation in this set that mutates device state.
+- **`response_analysis` (mobile-next: device logs/crash retrieval) —
+  `MEDIUM`, not `LOW`.** Also read-only, but deliberately rated above
+  `device_shell`: the upstream server, not this project, decides what a
+  log/crash dump contains, with no fixed allowlist or output cap on this
+  project's side — broader, less-bounded read access than the four fixed
+  diagnostics above.
+
+One adapter-level `REDTEAM_MCP_<SERVER_ID>_RISK_LEVEL` applies uniformly to
+every tool discovered from that server (`MCPServerAdapter.discover_tools`,
+`capability/adapters/mcp/streamable_http.py`) — the manifest's per-tool
+`risk_level` is what `validate_configured_discovery` checks that value
+against at startup, not a per-tool override. This is why every
+mobile-next tool in the manifest carries the same `MEDIUM` and every
+apktool tool carries the same `LOW`: a single env var per server can only
+express one tier, so today's manifest keeps every tool on one server at a
+uniform tier by construction. If a future candidate server mixes tiers
+across its own tools, per-tool risk would need to move from the manifest
+into something the adapter can read per remote tool name — not attempted
+here (no new enum, no Contract change; scope stays this PR's four
+candidate servers).
+
+## Mobile/analysis status (2026-09-22)
+
+"A tool is registered" and "an Agent can actually use it today" are not
+the same claim — kept separate below.
+
+**Implemented:**
+
+- mobile-next discovery (`app_launch`, `response_analysis` x3)
+- apktool discovery (`static_analysis` x9)
+- `mobile-local`/`analysis-local` fallbacks (`device_shell`,
+  `static_analysis` x3)
+- manifest ↔ MCP discovery conformance validation
+  (`validate_configured_discovery`, fails registration on drift)
+- candidate metadata (`MCPToolGateway.list_candidate_metadata()`) —
+  per-candidate, never collapsed when several tools share an operation
+- direct Gateway invocation (`MCPToolGateway.invoke`)
+- structured output schemas for the two local-fallback servers
+- external MCP `outputSchema` preservation where advertised, `None`
+  where not (never inferred)
+
+**Validated (real execution, not just registration):**
+
+- apktool MCP direct call (`decode_apk` then `get_manifest`)
+- `MCPToolGateway.invoke("analysis.get_manifest")` through the full
+  transport/adapter/gateway stack
+- `InsecureBankv2.apk` manifest extraction (`com.android.insecurebankv2`)
+  via that path
+
+**Not yet validated:**
+
+- `mobile.app_launch` real execution — no online emulator/device in this
+  environment (`tests/integration/test_mobile_mcp.py` has an opt-in real
+  test ready; needs a device, not new test code)
+- Agent -> Control -> Capability full E2E for mobile/analysis (see the
+  Integration Issue in
+  `docs/capability/issues/0001-tool-candidate-metadata-contract.md`)
+- MobSF Docker integration (excluded from this work's scope)
+- Structured interpretation of external MCP tool output that has no
+  advertised `outputSchema` — documented as available metadata only, no
+  Result Mapper implemented (that decision belongs with Agent
+  Team/Observation, not Capability alone)
+
 ## Adding a new MCP server
 
 1. Add the server's image/build to `deploy/compose/docker-compose.yml`
@@ -204,7 +386,7 @@ python -m redteam.capability.servers.analysis --policy /absolute/path/analysis-p
    its `REDTEAM_MCP_<SERVER_ID>_*` environment variables. Application
    bootstrap discovers and registers its `ToolDescriptor`s.
 4. No other code should need to change — that's the point of the
-   Adapter pattern (instruction.md section 11).
+   Adapter pattern described in `docs/adr/0003-mcp-capability.md`.
 
 Real attack-tool MCP servers are explicitly out of scope for this
-stage (instruction.md section 21).
+stage; adding one requires a separate scope, authorization and security review.

@@ -46,7 +46,7 @@ pytest tests/unit tests/integration -q
 | Area | State |
 |---|---|
 | Approval resume | **Resolved.** `ControlPlane.approval_outcome(approval_id)` (read-only Core Port) resumes the same Run via a conditional START edge straight into POLICY — see `docs/agent/orchestration-implementation-plan.md` section 16. |
-| Long-running reconciliation host | `orchestration.reconciliation.run_reconciliation_loop` (a plain `asyncio` coroutine, not a daemon framework) repeats `reconcile_once()`; the process/CLI entrypoint to drive it is still a deployment-layer choice. |
+| Long-running reconciliation host | Removed (`orchestration.reconciliation.run_reconciliation_loop` had no real runtime/CLI caller — it was never wired into any host process; `AgentLoopRunner.reconcile_once()` itself is unaffected and still drives the actual Approval-resume/polling paths in `commands/run.py`). A standalone repeating host loop remains a deployment-layer choice if one is ever needed. |
 | Tool retries | retryable/idempotency and budget semantics belong in the Capability gateway contract; orchestration does not duplicate an approved side effect |
 | Mobile asset scope | **Resolved.** `EngagementScope.allowed_assets`/`denied_assets` (exact `asset_id` match, `redteam.control.scope._check_asset_scope`) lets Mobile actions ALLOW explicitly; still fail-closed DENY outside scope. |
 | Shared graph tenancy | **Resolved.** `attack_graph.stores.namespaced.EngagementScopedAttackGraphStore` — a decorator over the existing `AttackGraphStore` Core Port, namespacing ids at the store boundary; `app.bootstrap` wires it in by default. |

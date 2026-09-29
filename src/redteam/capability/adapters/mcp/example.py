@@ -39,6 +39,13 @@ class ExampleMCPAdapter:
                 tool_name="ping",
                 description="Harmless example tool: echoes arguments back.",
                 input_schema={"type": "object", "properties": {"message": {"type": "string"}}},
+                output_schema={
+                    "type": "object",
+                    "properties": {"echo": {"type": "object"}, "server_id": {"type": "string"}},
+                    "required": ["echo", "server_id"],
+                },
+                operations=["service_discovery"],
+                target_types=["host"],
                 capability_tags=["recon"],
                 risk_level=RiskLevel.LOW,
                 health_status=ToolHealthStatus.HEALTHY,

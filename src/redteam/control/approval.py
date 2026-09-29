@@ -35,7 +35,7 @@ class ApprovalStore(Protocol):
 
     async def save(self, approval: Approval) -> None: ...
 
-    async def get(self, approval_id: ApprovalId) -> Approval | None: ...
+    async def get(self, approval_id: ApprovalId | str) -> Approval | None: ...
 
     async def list_pending(self) -> list[Approval]: ...
 
@@ -49,8 +49,8 @@ class InMemoryApprovalStore:
     async def save(self, approval: Approval) -> None:
         self._approvals[approval.approval_id] = approval
 
-    async def get(self, approval_id: ApprovalId) -> Approval | None:
-        return self._approvals.get(approval_id)
+    async def get(self, approval_id: ApprovalId | str) -> Approval | None:
+        return self._approvals.get(ApprovalId(str(approval_id)))
 
     async def list_pending(self) -> list[Approval]:
         return [a for a in self._approvals.values() if a.status == ApprovalStatus.PENDING]
@@ -71,9 +71,10 @@ class ApprovalService:
         return approval
 
     async def resolve(
-        self, approval_id: ApprovalId, status: ApprovalStatus, resolved_by: str
+        self, approval_id: ApprovalId | str, status: ApprovalStatus, resolved_by: str
     ) -> Approval:
-        approval = await self._store.get(approval_id)
+        normalized_id = ApprovalId(str(approval_id))
+        approval = await self._store.get(normalized_id)
         if approval is None:
             raise KeyError(f"no such approval: {approval_id}")
         if approval.status != ApprovalStatus.PENDING:
@@ -90,8 +91,8 @@ class ApprovalService:
         await self._store.save(updated)
         return updated
 
-    async def get(self, approval_id: ApprovalId) -> Approval | None:
-        return await self._store.get(approval_id)
+    async def get(self, approval_id: ApprovalId | str) -> Approval | None:
+        return await self._store.get(ApprovalId(str(approval_id)))
 
     async def list_pending(self) -> list[Approval]:
         return await self._store.list_pending()

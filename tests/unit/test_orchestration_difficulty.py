@@ -20,6 +20,7 @@ from tests.unit.test_orchestration_candidates import agent
 
 def candidate() -> ExecutableCandidate:
     step = agent().playbook[0].bound_to(HostTarget(host="a.local"))
+    assert step is not None
     draft = CandidateDraft(
         agent_id=agent().agent_id,
         plan_step=step,

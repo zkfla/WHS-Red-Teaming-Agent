@@ -15,6 +15,7 @@ dependencies = [
     "anyio>=4,<5",
     # CLI output only (redteam.app.cli.*) -- never imported by core/orchestration/agents.
     "rich>=13.7,<15",
+    "prompt-toolkit>=3.0,<4",
 ]
 
 [project.optional-dependencies]

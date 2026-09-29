@@ -8,6 +8,7 @@ per-turn hand-offs that never leave this subpackage.
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Annotated, TypedDict
 
 from pydantic import BaseModel, Field
@@ -16,7 +17,7 @@ from redteam.attack_graph.observation import GraphObservation
 from redteam.core.contracts.action import ActionProposal
 from redteam.core.contracts.policy import PolicyDecision
 from redteam.core.contracts.tool import ToolResult
-from redteam.core.enums import AgentPhase, Verdict
+from redteam.core.enums import AgentPhase, MissionStatus, Verdict
 from redteam.core.ids import (
     ActionId,
     AgentId,
@@ -25,7 +26,10 @@ from redteam.core.ids import (
     EventId,
     EvidenceId,
     HypothesisId,
+    MissionId,
+    OperatorIntentId,
     RunId,
+    TaskId,
 )
 from redteam.orchestration.agents.base import PlanStep
 from redteam.orchestration.dispatch import (
@@ -39,6 +43,7 @@ class TerminationReason:
     """Why a run stopped. Every exit path names itself."""
 
     NO_ACTIONABLE_PLAN = "no_actionable_plan"
+    MISSION_BLOCKED = "mission_blocked"
     MAX_STEPS_REACHED = "max_steps_reached"
     BUDGET_EXHAUSTED = "budget_exhausted"
     CONSECUTIVE_FAILURES = "consecutive_failures"
@@ -50,6 +55,12 @@ class TerminationReason:
     APPROVAL_PENDING = "approval_pending"
     USER_INTERRUPTED = "user_interrupted"
     EXECUTION_ERROR = "execution_error"
+    #: Operator asked to hold the run before the next action executes. The
+    #: active Task and Mission are preserved so a RESUME intent continues
+    #: the same work instead of starting a new Mission.
+    OPERATOR_PAUSED = "operator_paused"
+    #: Operator asked to end the Mission. Never resumed automatically.
+    OPERATOR_STOPPED = "operator_stopped"
 
 
 class RuntimeState(BaseModel):
@@ -60,6 +71,12 @@ class RuntimeState(BaseModel):
     current_agent: AgentId | None = None
 
     current_goal: str | None = None
+    # Additive references for task-first execution. Optional defaults keep
+    # checkpoints created before Mission contracts loadable.
+    mission_id: MissionId | None = None
+    active_task_id: TaskId | None = None
+    operator_intent_id: OperatorIntentId | None = None
+    mission_status: MissionStatus | None = None
 
     active_hypothesis_id: HypothesisId | None = None
     pending_action_id: ActionId | None = None
@@ -69,6 +86,9 @@ class RuntimeState(BaseModel):
     step_count: int = 0
 
     remaining_budget: int | None = None
+    # Wall-clock start of a run for restoring duration limits after restart.
+    # Optional for checkpoints written before duration accounting existed.
+    started_at: datetime | None = None
 
     last_verdict: Verdict | None = None
 
@@ -77,6 +97,9 @@ class RuntimeState(BaseModel):
     #: Set once, when the loop exits. See ``TerminationReason``.
     termination_reason: str | None = None
     actions_executed: int = 0
+    # Durable count of additional tool calls made by bounded retries. The
+    # Control Plane restores its tool-call budget from this on restart.
+    retry_tool_calls: int = Field(default=0, ge=0)
     actions_by_agent: dict[str, int] = Field(default_factory=dict)
     consecutive_failures: int = 0
     no_progress_turns: int = 0

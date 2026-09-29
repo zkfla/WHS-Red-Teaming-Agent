@@ -70,6 +70,7 @@ from redteam.orchestration.agents.providers import (
     DraftDrop,
     GraphCandidateContext,
     PlaybookCandidateProvider,
+    endpoint_path_explicitly_disallowed,
 )
 from redteam.orchestration.candidates.models import CandidateDraft, PrioritySignals
 
@@ -247,6 +248,8 @@ class ReconCandidateProvider:
                 if tls is not None:
                     candidates.append(tls)
             elif node.type is GraphNodeType.ENDPOINT:
+                if endpoint_path_explicitly_disallowed(node):
+                    continue
                 candidates.extend(
                     await self._inventory_drafts(
                         spec=spec,

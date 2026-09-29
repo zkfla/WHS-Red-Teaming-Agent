@@ -38,13 +38,27 @@ async def test_step_never_sends_secret_shaped_data_even_if_user_pastes_one() -> 
     assistant = IntakeAssistant(llm)
     session = IntakeSession()
 
-    # A user might paste something secret-looking by mistake; the draft
-    # model has no field to carry it forward, but the raw turn text
-    # necessarily passes through messages -- this test documents that
-    # the *draft* (what gets serialized/persisted) never carries it.
+    # The redacted turn is what reaches the LLM and conversational history.
     turn = await assistant.step(session, "my api key is sk-live-abc123, test 127.0.0.1")
 
     assert "sk-live-abc123" not in turn.draft.model_dump_json()
+    assert "sk-live-abc123" not in str(session.history)
+
+
+async def test_llm_reply_secret_is_redacted_before_draft_and_history() -> None:
+    llm = FakeLLMClient(canned_structured={
+        "draft": {"name": "Demo", "notes": ["password is hunter2"]},
+        "acknowledgement": "Bearer private-token",
+        "ready": False,
+    })
+    session = IntakeSession()
+
+    turn = await IntakeAssistant(llm).step(session, "Demo")
+
+    assert "hunter2" not in turn.model_dump_json()
+    assert "private-token" not in turn.model_dump_json()
+    assert "hunter2" not in str(session.history)
+    assert "private-token" not in str(session.history)
 
 
 class _BrokenLLMClient:

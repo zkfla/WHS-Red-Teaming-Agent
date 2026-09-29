@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 from redteam.attack_graph.identity import node_id_for_target
 from redteam.attack_graph.observation import GraphObservation
+from redteam.attack_graph.predicates import attrs_of, facts_of
 from redteam.attack_graph.view import AttackGraphView
+from redteam.core.contracts.graph import GraphNode
+from redteam.core.enums import GraphNodeType
 from redteam.core.ids import GraphNodeId
 from redteam.orchestration.agents.base import AgentSpec, available_steps
 
@@ -47,6 +50,23 @@ class DraftDrop:
     reason: str
     field: str = ""
 
+
+def endpoint_path_explicitly_disallowed(node: GraphNode) -> bool:
+    """Honor a negative path decision already observed from an MCP inventory.
+
+    Discovery is not authorization. An absent flag stays unknown; a later
+    explicit positive observation can supersede an earlier negative one.
+    The MCP server remains the final path/method/network enforcement point.
+    """
+
+    if node.type is not GraphNodeType.ENDPOINT:
+        return False
+    attrs, facts = attrs_of(node.properties), facts_of(node.properties)
+    return (
+        attrs.get("path_allowlisted") is False and facts.get("path_allowlisted") is not True
+    ) or (facts.get("path_allowlisted") is False and attrs.get("path_allowlisted") is not True)
+
+
 @dataclass(frozen=True)
 class GraphCandidateContext:
     """Bounded read-only context for graph-driven candidate providers.
@@ -63,6 +83,10 @@ class GraphCandidateContext:
     view: AttackGraphView
     observation: GraphObservation
     step: int
+    task_id: str | None = None
+    task_source: str | None = None
+    task_objective: str | None = None
+    task_target_node_ids: tuple[GraphNodeId, ...] = ()
     available_capabilities: tuple[str, ...] = ()
     open_hypotheses: tuple[str, ...] = ()
     prior_candidate_keys: frozenset[str] = frozenset()
@@ -80,6 +104,12 @@ class GraphCandidateContext:
     #: the global graph revision counter). Recorded so a replan can say *what*
     #: changed instead of only that a counter moved.
     planning_fingerprint: str = ""
+    #: RC#2: target-linked evidence outcomes (status/error/summary dicts, as
+    #: produced by ``project_evidence_excerpts``). Gives a generating provider
+    #: the raw result material -- not just the graph summary -- so the model
+    #: can reason past what a playbook anticipated. Dicts, not the model type,
+    #: to keep this seam import-cycle free.
+    evidence_excerpts: tuple[Mapping[str, Any], ...] = ()
 
     def can_execute(self, capability: str, operation: str) -> bool:
         """Whether a candidate for this action could actually be executed.
@@ -125,20 +155,28 @@ def planning_fingerprint(
     encoded = json.dumps(payload, sort_keys=True, default=str, separators=(",", ":")).encode()
     return hashlib.sha256(encoded).hexdigest()[:24]
 
+
 class GraphCandidateProvider(Protocol):
+    """The one candidate-provider contract (section 4 consolidation): every
+    provider registered in ``CandidateProviderRegistry`` is expected to
+    implement ``propose_graph``.
+
+    This used to be two independently declared Protocols
+    (``GraphCandidateProvider.propose_graph`` and a narrower
+    ``CandidateProvider.propose(spec, view, observation, *, step=)``) for
+    the same responsibility. They are merged into this one formal contract.
+    A provider that only implements the narrower, three-argument shape
+    (no :class:`GraphCandidateContext`) is still accepted -- ``plan_node``
+    dispatches to it as a documented, minimal fallback for simple/plugin
+    providers that do not need the richer context (see
+    ``tests/integration/test_agent_loop.py``'s ``Provider``/
+    ``BrokenProvider``) -- but that shape is no longer a second, equally
+    authoritative Protocol declaration; conform to ``propose_graph`` unless
+    there is a real reason not to.
+    """
+
     async def propose_graph(
         self, spec: AgentSpec, context: GraphCandidateContext
-    ) -> list[CandidateDraft] | CandidateBatch: ...
-
-
-class CandidateProvider(Protocol):
-    async def propose(
-        self,
-        spec: AgentSpec,
-        view: AttackGraphView,
-        observation: GraphObservation,
-        *,
-        step: int,
     ) -> list[CandidateDraft] | CandidateBatch: ...
 
 
@@ -160,9 +198,7 @@ class PlaybookCandidateProvider:
     ) -> CandidateBatch:
         """Default graph-aware seam while retaining playbook semantics."""
 
-        return await self._propose(
-            spec, context.view, context.observation, step=context.step
-        )
+        return await self._propose(spec, context.view, context.observation, step=context.step)
 
     async def _propose(
         self,
@@ -176,9 +212,7 @@ class PlaybookCandidateProvider:
 
         drops: list[tuple[str, str, str]] = []
         drafts: list[CandidateDraft] = []
-        for plan_step in await available_steps(
-            spec, view, observation, step=step, drops=drops
-        ):
+        for plan_step in await available_steps(spec, view, observation, step=step, drops=drops):
             target_id = node_id_for_target(plan_step.resolved_target())
             drafts.append(
                 CandidateDraft(
@@ -210,12 +244,14 @@ class DuplicateProviderError(ValueError):
 class CandidateProviderRegistry:
     """Provider lookup by stable id; adding a role never edits graph.py."""
 
-    def __init__(self, providers: Iterable[tuple[str, CandidateProvider]] = ()) -> None:
-        self._providers: dict[str, CandidateProvider] = {}
+    def __init__(self, providers: Iterable[tuple[str, GraphCandidateProvider]] = ()) -> None:
+        self._providers: dict[str, GraphCandidateProvider] = {}
         for provider_id, provider in providers:
             self.register(provider_id, provider)
 
-    def register(self, provider_id: str, provider: CandidateProvider) -> CandidateProvider:
+    def register(
+        self, provider_id: str, provider: GraphCandidateProvider
+    ) -> GraphCandidateProvider:
         key = provider_id.strip()
         if not key:
             raise ValueError("provider id may not be blank")
@@ -224,7 +260,7 @@ class CandidateProviderRegistry:
         self._providers[key] = provider
         return provider
 
-    def get(self, provider_id: str) -> CandidateProvider | None:
+    def get(self, provider_id: str) -> GraphCandidateProvider | None:
         return self._providers.get(provider_id)
 
     @property
@@ -238,13 +274,10 @@ def default_provider_registry() -> CandidateProviderRegistry:
 
     playbook = PlaybookCandidateProvider()
 
-    providers: list[tuple[str, CandidateProvider]] = [
+    providers: list[tuple[str, GraphCandidateProvider]] = [
         ("playbook:recon", ReconCandidateProvider()),
         ("playbook:web_api", WebCandidateProvider()),
-        *[
-            (f"playbook:{role}", playbook)
-            for role in ("mobile", "analysis", "reporting")
-        ],
+        *[(f"playbook:{role}", playbook) for role in ("mobile", "analysis", "reporting")],
     ]
 
     return CandidateProviderRegistry(providers)

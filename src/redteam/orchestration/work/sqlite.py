@@ -315,6 +315,29 @@ class SQLiteWorkStore:
             await db.commit()
             return True
 
+    async def release(self, work_id: str, *, owner: str, now: datetime) -> bool:
+        """Atomically return an unexecuted leased item to PENDING."""
+        await self.setup()
+        aiosqlite = _aiosqlite()
+        async with aiosqlite.connect(self._path) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            cursor = await db.execute(
+                "SELECT expires_at FROM work_leases WHERE work_id=? AND owner=?",
+                (work_id, owner),
+            )
+            row = await cursor.fetchone()
+            await cursor.close()
+            item = await _load_item(db, work_id)
+            if row is None or item is None or datetime.fromisoformat(row[0]) <= now:
+                await db.rollback()
+                return False
+            await _save_item(
+                db, item.model_copy(update={"status": WorkStatus.PENDING, "updated_at": now})
+            )
+            await db.execute("DELETE FROM work_leases WHERE work_id=?", (work_id,))
+            await db.commit()
+            return True
+
     async def reclaim_expired(self, *, now: datetime) -> list[str]:
         await self.setup()
         aiosqlite = _aiosqlite()
