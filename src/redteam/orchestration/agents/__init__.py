@@ -20,7 +20,7 @@ from redteam.orchestration.agents.base import (
     PlanStep,
     available_steps,
 )
-from redteam.orchestration.agents.builtin import MOBILE_AGENT, WEB_API_AGENT
+from redteam.orchestration.agents.builtin import ANALYSIS_AGENT, MOBILE_AGENT, WEB_API_AGENT
 from redteam.orchestration.agents.definition import (
     ActivationRule,
     AgentDefinition,
@@ -72,6 +72,7 @@ __all__ = [
     "FollowupHint",
     "WEB_API_AGENT",
     "MOBILE_AGENT",
+    "ANALYSIS_AGENT",
     "CandidateProvider",
     "CandidateProviderRegistry",
     "DuplicateProviderError",

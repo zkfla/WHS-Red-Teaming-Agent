@@ -42,6 +42,15 @@ MAX_CANDIDATES_PER_STEP = 25
 #: shape). Add to this dict only when a real tool needs another one.
 TARGET_REF_PLACEHOLDER = "$target_ref"
 PATH_PLACEHOLDER = "$path"
+ASSET_REF_PLACEHOLDER = "$asset_ref"
+APK_REF_PLACEHOLDER = "$apk_ref"
+PROJECT_DIR_PLACEHOLDER = "$project_dir"
+
+_NODE_FACT_PLACEHOLDERS = {
+    ASSET_REF_PLACEHOLDER: "asset_ref",
+    APK_REF_PLACEHOLDER: "apk_ref",
+    PROJECT_DIR_PLACEHOLDER: "project_dir",
+}
 
 
 def _target_ref_value(target: AnyTarget) -> str | None:
@@ -120,6 +129,10 @@ class PlanStep(BaseModel):
     #: Predicates to write onto the target node when the step succeeds.
     observed_attrs: dict[str, bool | str | int] = Field(default_factory=dict)
 
+    #: Optional finer-grained ledger key for multi-tool workflows whose
+    #: steps intentionally share one canonical capability/operation.
+    attempt_key: str = ""
+
     #: ``False`` (the default) means: propose this at most once per target.
     repeatable: bool = False
 
@@ -156,12 +169,23 @@ class PlanStep(BaseModel):
         """Canonical ROE/action key recorded in the graph."""
         return canonical_action_key(self.capability, self.operation)
 
+    @property
+    def attempt_record_key(self) -> str:
+        """Graph ledger identity; canonical operation remains the default."""
+        return self.attempt_key.strip() or self.operation_key
+
     def resolved_target(self) -> AnyTarget:
         if self.target is None:  # pragma: no cover - guarded by the validator
             raise ValueError(f"step {self.step_id!r} has no concrete target yet")
         return self.target
 
-    def bound_to(self, target: AnyTarget, *, target_ref: str | None = None) -> PlanStep | None:
+    def bound_to(
+        self,
+        target: AnyTarget,
+        *,
+        target_ref: str | None = None,
+        node_facts: dict[str, Any] | None = None,
+    ) -> PlanStep | None:
         """A concrete copy of this step, pinned to one target, with every
         placeholder in :data:`_PLACEHOLDER_RESOLVERS` resolved from that
         target's real fields — lets a static playbook argument stay in
@@ -177,10 +201,16 @@ class PlanStep(BaseModel):
         either fail tool-schema validation or, worse, reach a real tool
         as a literal argument value.
         """
-        if self.unresolved_placeholder(target, target_ref=target_ref) is not None:
+        if self.unresolved_placeholder(
+            target, target_ref=target_ref, node_facts=node_facts
+        ) is not None:
             return None
         arguments: dict[str, Any] = {}
         for key, value in self.arguments.items():
+            fact_key = _NODE_FACT_PLACEHOLDERS.get(value) if isinstance(value, str) else None
+            if fact_key is not None:
+                arguments[key] = (node_facts or {})[fact_key]
+                continue
             resolver = _PLACEHOLDER_RESOLVERS.get(value) if isinstance(value, str) else None
             if resolver is None:
                 arguments[key] = value
@@ -194,7 +224,11 @@ class PlanStep(BaseModel):
         )
 
     def unresolved_placeholder(
-        self, target: AnyTarget, *, target_ref: str | None = None
+        self,
+        target: AnyTarget,
+        *,
+        target_ref: str | None = None,
+        node_facts: dict[str, Any] | None = None,
     ) -> str | None:
         """The first argument key whose placeholder this target cannot fill.
 
@@ -205,6 +239,12 @@ class PlanStep(BaseModel):
         """
 
         for key, value in self.arguments.items():
+            fact_key = _NODE_FACT_PLACEHOLDERS.get(value) if isinstance(value, str) else None
+            if fact_key is not None:
+                fact_value = (node_facts or {}).get(fact_key)
+                if not isinstance(fact_value, str) or not fact_value:
+                    return key
+                continue
             resolver = _PLACEHOLDER_RESOLVERS.get(value) if isinstance(value, str) else None
             if resolver is None:
                 continue
@@ -324,10 +364,11 @@ async def available_steps(
             )
             if not result.ok:
                 continue
+            node_facts = facts_of(node.properties)
             target = target_for_node(
-                node.id, node.type, observed=facts_of(node.properties).get("observed_target")
+                node.id, node.type, observed=node_facts.get("observed_target")
             )
-            node_target_ref = facts_of(node.properties).get("target_ref")
+            node_target_ref = node_facts.get("target_ref")
             host = getattr(target, "host", None)
             host_node = await view.get_node(host_node_id(host)) if host else None
             host_target_ref = (
@@ -341,7 +382,11 @@ async def available_steps(
                 ),
                 None,
             )
-            bound = entry.bound_to(target, target_ref=target_ref)
+            bound = entry.bound_to(
+                target,
+                target_ref=target_ref,
+                node_facts=node_facts,
+            )
             if bound is None:
                 # A placeholder this step needs could not be resolved
                 # from this particular node (section 7: never guess) --
@@ -351,7 +396,12 @@ async def available_steps(
                         (
                             entry.step_id,
                             str(node.id),
-                            entry.unresolved_placeholder(target, target_ref=target_ref) or "",
+                            entry.unresolved_placeholder(
+                                target,
+                                target_ref=target_ref,
+                                node_facts=node_facts,
+                            )
+                            or "",
                         )
                     )
                 continue
@@ -364,4 +414,4 @@ async def available_steps(
 def _already_attempted(step: PlanStep, node_id: object, observation: GraphObservation) -> bool:
     if step.repeatable:
         return False
-    return observation.has_attempted(f"{step.operation_key}@{node_id}")
+    return observation.has_attempted(f"{step.attempt_record_key}@{node_id}")

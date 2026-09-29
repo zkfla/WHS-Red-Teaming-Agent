@@ -4,7 +4,9 @@ from redteam.attack_graph.patterns import NodePattern
 from redteam.core.enums import GraphNodeType
 from redteam.core.ids import AgentId, ToolId
 from redteam.orchestration.agents.base import (
+    ASSET_REF_PLACEHOLDER,
     PATH_PLACEHOLDER,
+    PROJECT_DIR_PLACEHOLDER,
     TARGET_REF_PLACEHOLDER,
     AgentSpec,
     HypothesisDraft,
@@ -71,22 +73,111 @@ MOBILE_AGENT = AgentSpec(
     agent_id=AgentId("mobile-agent"),
     name="Mobile Agent",
     description="Analyzes discovered APK/IPA artifacts through Capability tools.",
-    capabilities=["mobile"],
+    capabilities=["mobile", "analysis"],
     planner_kind="llm",
     playbook=[
         PlanStep(
             step_id="analyze-mobile-artifact",
-            capability="mobile",
+            capability="analysis",
             operation="static_analysis",
-            tool_id=ToolId("mobile.artifact_analyze"),
+            tool_id=ToolId("analysis.decode_apk"),
+            compatible_tool_ids=[ToolId("analysis.decode_apk")],
             target_bind="asset",
             preconditions=[NodePattern(type=GraphNodeType.ASSET, bind="asset")],
+            arguments={"apk_path": ASSET_REF_PLACEHOLDER},
             reason="Extract security-relevant structure from the discovered mobile artifact.",
             hypothesis=HypothesisDraft(
                 description="The artifact contains security-relevant components or endpoints.",
                 confidence=0.3,
             ),
-            observed_attrs={"mobile_analyzed": True},
+            observed_attrs={"analysis_decoded": True},
+            attempt_key="analysis.static_analysis:decode_apk",
         )
+    ],
+)
+
+
+_IN_SCOPE_ASSET = NodePattern(
+    type=GraphNodeType.ASSET,
+    attrs={"in_scope": True},
+    bind="asset",
+)
+_DECODED_ASSET = NodePattern(
+    type=GraphNodeType.ASSET,
+    attrs={"in_scope": True, "analysis_decoded": True},
+    bind="asset",
+)
+
+
+ANALYSIS_AGENT = AgentSpec(
+    agent_id=AgentId("analysis-agent"),
+    name="Analysis Agent",
+    description="Decodes authorized APKs and inspects their manifest and smali surface.",
+    capabilities=["analysis"],
+    planner_kind="llm",
+    playbook=[
+        PlanStep(
+            step_id="decode-apk",
+            capability="analysis",
+            operation="static_analysis",
+            tool_id=ToolId("analysis.decode_apk"),
+            compatible_tool_ids=[ToolId("analysis.decode_apk")],
+            assessment_kind="observation",
+            target_bind="asset",
+            preconditions=[_IN_SCOPE_ASSET.model_copy(deep=True)],
+            arguments={"apk_path": ASSET_REF_PLACEHOLDER},
+            reason="Decode the authorized APK before inspecting its extracted files.",
+            observed_attrs={"analysis_decoded": True},
+            attempt_key="analysis.static_analysis:decode_apk",
+        ),
+        PlanStep(
+            step_id="inspect-manifest",
+            capability="analysis",
+            operation="static_analysis",
+            tool_id=ToolId("analysis.get_manifest"),
+            compatible_tool_ids=[ToolId("analysis.get_manifest")],
+            target_bind="asset",
+            preconditions=[_DECODED_ASSET.model_copy(deep=True)],
+            arguments={"project_dir": PROJECT_DIR_PLACEHOLDER},
+            reason="Inspect AndroidManifest.xml for security-relevant application settings.",
+            hypothesis=HypothesisDraft(
+                description="The manifest contains an unsafe Android security configuration.",
+                confidence=0.4,
+                violation_if_confirmed=True,
+            ),
+            observed_attrs={"manifest_analyzed": True},
+            attempt_key="analysis.static_analysis:get_manifest",
+        ),
+        PlanStep(
+            step_id="list-smali",
+            capability="analysis",
+            operation="static_analysis",
+            tool_id=ToolId("analysis.list_smali_files"),
+            compatible_tool_ids=[ToolId("analysis.list_smali_files")],
+            assessment_kind="observation",
+            target_bind="asset",
+            preconditions=[_DECODED_ASSET.model_copy(deep=True)],
+            arguments={"project_dir": PROJECT_DIR_PLACEHOLDER},
+            reason="Inventory decoded smali files for bounded follow-up analysis.",
+            observed_attrs={"smali_inventoried": True},
+            attempt_key="analysis.static_analysis:list_smali_files",
+        ),
+        PlanStep(
+            step_id="search-sensitive-strings",
+            capability="analysis",
+            operation="static_analysis",
+            tool_id=ToolId("analysis.search_in_files"),
+            compatible_tool_ids=[ToolId("analysis.search_in_files")],
+            assessment_kind="observation",
+            target_bind="asset",
+            preconditions=[_DECODED_ASSET.model_copy(deep=True)],
+            arguments={
+                "project_dir": PROJECT_DIR_PLACEHOLDER,
+                "search_pattern": "password",
+            },
+            reason="Search decoded files for password-related hard-coded strings.",
+            observed_attrs={"sensitive_strings_searched": True},
+            attempt_key="analysis.static_analysis:search_in_files",
+        ),
     ],
 )

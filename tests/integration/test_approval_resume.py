@@ -20,6 +20,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
+from redteam.attack_graph.patterns import NodePattern
 from redteam.attack_graph.service import AttackGraphService
 from redteam.capability.gateway import MCPToolGateway
 from redteam.capability.registry import MCPToolRegistry
@@ -33,13 +34,30 @@ from redteam.core.contracts.engagement import (
 )
 from redteam.core.contracts.tool import ToolDescriptor
 from redteam.core.enums import ApprovalStatus, GraphNodeType, ToolHealthStatus
-from redteam.core.ids import EngagementId, RunId, ToolId
-from redteam.orchestration.agents import MOBILE_AGENT, AgentRegistry
+from redteam.core.ids import AgentId, EngagementId, RunId, ToolId
+from redteam.orchestration.agents import AgentRegistry, AgentSpec, PlanStep
 from redteam.orchestration.runner import AgentLoopRunner
 from redteam.orchestration.settings import OrchestrationSettings
 from redteam.orchestration.state import RuntimeState, TerminationReason
 from redteam.orchestration.work.models import WorkStatus
 from tests.fakes import DummyToolGateway, build_test_application
+
+MOBILE_APPROVAL_AGENT = AgentSpec(
+    agent_id=AgentId("mobile-approval-test"),
+    name="Mobile approval test agent",
+    capabilities=["mobile"],
+    playbook=[
+        PlanStep(
+            step_id="launch-app",
+            capability="mobile",
+            operation="app_launch",
+            tool_id=ToolId("mobile.mobile_launch_app"),
+            target_bind="asset",
+            preconditions=[NodePattern(type=GraphNodeType.ASSET, bind="asset")],
+            reason="Exercise the approval and resume path.",
+        )
+    ],
+)
 
 
 def _engagement(*, max_actions: int = 5) -> Engagement:
@@ -58,15 +76,15 @@ def _mobile_catalog() -> MCPToolGateway:
     registry = MCPToolRegistry()
     registry.register(
         ToolDescriptor(
-            tool_id=ToolId("mobile.artifact_analyze"),
+            tool_id=ToolId("mobile.mobile_launch_app"),
             server_id="test",
-            tool_name="artifact_analyze",
+            tool_name="mobile_launch_app",
             capability_tags=["mobile"],
             health_status=ToolHealthStatus.HEALTHY,
         )
     )
     return MCPToolGateway(
-        registry, {}, {"mobile.artifact_analyze": ["static_analysis"]}
+        registry, {}, {"mobile.mobile_launch_app": ["app_launch"]}
     )
 
 
@@ -78,7 +96,7 @@ async def _setup(*, max_actions: int = 5):
         control_plane=control_plane,
         tool_gateway=gateway,
         tool_catalog=_mobile_catalog(),
-        agents=AgentRegistry([MOBILE_AGENT]),
+        agents=AgentRegistry([MOBILE_APPROVAL_AGENT]),
         settings=OrchestrationSettings(
             checkpointing=True, max_steps=10, checkpoint_backend="memory"
         ),
@@ -111,7 +129,7 @@ async def test_require_approval_then_approve_then_allow_and_execute() -> None:
     assert result.runtime.actions_executed == 1
     assert result.runtime.run_id == initial.run_id  # same Run, not a new one
     assert result.runtime.pending_approval_id is None  # consumed, not left dangling
-    assert [str(inv.tool_id) for inv in gateway.invocations] == ["mobile.artifact_analyze"]
+    assert [str(inv.tool_id) for inv in gateway.invocations] == ["mobile.mobile_launch_app"]
     # The original WorkItem (leased before REQUIRE_APPROVAL) was already
     # finalized BLOCKED by UPDATE at that point -- the resumed execution is
     # a deliberate one-off outside the Work Ledger's lease tracking, not a

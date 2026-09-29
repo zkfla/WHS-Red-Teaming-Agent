@@ -88,8 +88,9 @@ async def update_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
         step=runtime.step_count,
     )
 
+    attempt_record_key = step.attempt_record_key if step is not None else operation_key
     await service.record_attempt(
-        node.id, operation_key, step=runtime.step_count, provenance=provenance
+        node.id, attempt_record_key, step=runtime.step_count, provenance=provenance
     )
 
     last_event = await publisher.publish(
