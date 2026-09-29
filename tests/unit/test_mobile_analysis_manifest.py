@@ -51,6 +51,21 @@ def test_example_bindings_match_manifest() -> None:
             assert set(json.loads(settings[f"{prefix}_ALLOWED_TOOLS_JSON"])) == set(bindings)
 
 
+def test_mobile_next_image_pins_verified_runtime() -> None:
+    dockerfile = (
+        Path(__file__).resolve().parents[2]
+        / "deploy"
+        / "docker"
+        / "mobile-next-mcp"
+        / "Dockerfile"
+    ).read_text(encoding="utf-8")
+
+    assert "FROM node:22-slim" in dockerfile
+    assert "ARG MOBILE_MCP_VERSION=1.0.4" in dockerfile
+    assert '@mobilenext/mobile-mcp@latest' not in dockerfile
+    assert 'ENTRYPOINT ["mcp-server-mobile", "--listen", "0.0.0.0:3000"]' in dockerfile
+
+
 @pytest.mark.parametrize("server_id", ["mobile-local", "analysis-local"])
 async def test_local_manifest_matches_mcp_discovery(server_id: str, tmp_path: Path) -> None:
     if server_id == "mobile-local":
