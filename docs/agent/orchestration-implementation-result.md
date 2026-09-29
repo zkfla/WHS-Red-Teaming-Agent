@@ -472,3 +472,6 @@ $env:PYTHONPATH='src'
   `ToolResult` 계약이 보장하지 않으므로 추론하지 않는다. 비인증 Web 보안 정책
   입력도 아직 없다.
 - 위 두 계약이 Capability/Core 쪽에서 확정되면 mapper/provider 규칙 추가로 확장한다.
+
+> 2026-09-29 mobile/analysis Track 0 result:
+> [`docs/agent/mobile-analysis-track0-result.md`](mobile-analysis-track0-result.md)
