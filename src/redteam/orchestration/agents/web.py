@@ -90,8 +90,11 @@ class WebCandidateProvider:
     ) -> CandidateBatch:
         """The authoritative path: plan from the graph, not just the playbook."""
 
-        if context.task_source == "replan:acquire_second_principal":
-            return await self._acquisition_candidates(spec, context)
+        if context.task_source in {
+            "replan:acquire_second_principal",
+            "replan:object_bound_endpoint",
+        }:
+            return await self._principal_comparison_candidates(spec, context)
 
         return await self._build(
             spec,
@@ -101,7 +104,7 @@ class WebCandidateProvider:
             context=context,
         )
 
-    async def _acquisition_candidates(
+    async def _principal_comparison_candidates(
         self, spec: AgentSpec, context: GraphCandidateContext
     ) -> CandidateBatch:
         """Use registered opaque refs through the normal Control/MCP path.
@@ -146,7 +149,9 @@ class WebCandidateProvider:
                                 "first_session_ref": first,
                                 "second_session_ref": second,
                             },
-                            reason="Validate two configured session references on the same endpoint",
+                            reason=(
+                                "Validate two configured session references on the same endpoint"
+                            ),
                         ),
                         target_node_ids=[node.id],
                         conflict_keys=[f"target:{node.id}"],

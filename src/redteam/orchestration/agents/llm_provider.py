@@ -28,6 +28,7 @@ import logging
 from typing import Any
 
 from redteam.attack_graph.identity import split_node_id, target_for_node
+from redteam.attack_graph.predicates import facts_of
 from redteam.core.ids import AgentId, GraphNodeId, ToolId
 from redteam.orchestration.agents.base import AgentSpec, PlanStep
 from redteam.orchestration.agents.providers import (
@@ -118,10 +119,24 @@ class LLMCandidateProvider:
             observed_targets & set(context.task_target_node_ids)
             if context.task_target_node_ids else observed_targets
         )
+        # The concrete path/URL a node was seen at is a graph fact, not
+        # something the model may assert: a node id normalises to a template
+        # (/orders/{id}), so acting on it needs the graph's observed_target
+        # (/orders/1234). Read it here from the same fact the deterministic
+        # provider uses (agents/base.py), so an executable target is never
+        # taken from the model reply.
+        observed_by_node: dict[str, str] = {}
+        for node_id in known_targets:
+            node = await context.view.get_node(GraphNodeId(node_id))
+            observed = facts_of(node.properties).get("observed_target") if node else None
+            if isinstance(observed, str):
+                observed_by_node[node_id] = observed
         drafts: list[CandidateDraft] = []
         drops: list[DraftDrop] = []
         for index, action in enumerate(actions[:MAX_DRAFTS_PER_TURN]):
-            draft, drop = self._to_draft(spec.agent_id, action, index, known_targets)
+            draft, drop = self._to_draft(
+                spec.agent_id, action, index, known_targets, observed_by_node
+            )
             if draft is not None:
                 drafts.append(draft)
             elif drop is not None:
@@ -129,7 +144,12 @@ class LLMCandidateProvider:
         return CandidateBatch(candidates=drafts, drops=drops)
 
     def _to_draft(
-        self, agent_id: AgentId, action: Any, index: int, known_targets: set[str]
+        self,
+        agent_id: AgentId,
+        action: Any,
+        index: int,
+        known_targets: set[str],
+        observed_by_node: dict[str, str],
     ) -> tuple[CandidateDraft | None, DraftDrop | None]:
         step_id = f"llm-{index}"
         if not isinstance(action, dict):
@@ -149,7 +169,7 @@ class LLMCandidateProvider:
             )
         try:
             target = target_for_node(
-                GraphNodeId(node_id_str), node_type, observed=action.get("observed")
+                GraphNodeId(node_id_str), node_type, observed=observed_by_node.get(node_id_str)
             )
         except Exception:
             return None, DraftDrop(

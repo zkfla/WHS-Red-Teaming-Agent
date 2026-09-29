@@ -1091,7 +1091,8 @@ async def test_context_profile_bounds_the_candidate_frontier_before_fan_out() ->
                 role="bounded",
                 name="Bounded",
                 provider_id="playbook:recon",
-                capabilities=["recon"],  # must match `bounded.capabilities` (copied from RECON_AGENT)
+                # Must match bounded.capabilities, copied from RECON_AGENT.
+                capabilities=["recon"],
                 context_profile=ContextProfile(
                     profile_id="bounded",
                     max_candidates=1,

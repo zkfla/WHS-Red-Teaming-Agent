@@ -114,6 +114,16 @@ class OrchestrationConfig(BaseModel):
     #: compiled and policy-checked like any other before it can run.
     llm_candidate_generation: bool = Field(default=False)
 
+    @classmethod
+    def from_environment(cls) -> OrchestrationConfig:
+        """CLI runtime settings, validated with the same rules as library config."""
+        values = {
+            field: os.environ[f"REDTEAM_ORCHESTRATION_{field.upper()}"]
+            for field in ("max_steps", "max_retries", "llm_candidate_generation")
+            if f"REDTEAM_ORCHESTRATION_{field.upper()}" in os.environ
+        }
+        return cls.model_validate(values)
+
 
 class CapabilityConfig(BaseModel):
     mcp_servers: list[str] = Field(default_factory=list)

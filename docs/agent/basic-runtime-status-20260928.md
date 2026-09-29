@@ -4,7 +4,7 @@
 - 검증 ID: AG-GRAPH-BASIC-RUNTIME-20260928
 - 기준 코드: 공유된 `dev` 커밋 `c042e8478555d192340f82fe113647a40cc53058`
 - 확인 범위: 도구 결과가 Attack Graph에 반영되고 다음 행동으로 연결되는 기본 실행 흐름
-- 방법: 해당 커밋을 별도 임시 디렉터리에 추출하여 검증. 현재 작업 폴더에서 진행 중인 미커밋 변경은 공유 코드의 완료 실적에서 제외.
+- 방법: 해당 커밋을 별도 폴더에서 실행해 이후 작업 중인 코드와 구분했습니다.
 
 ## 1. 현재 상태 및 결론
 
@@ -16,9 +16,9 @@ Attack Graph도 도구가 찾아낸 정보를 저장하고 다음 행동 후보�
 
 | 단계 | 현재 확인 내용 | 확인 수준 |
 |---|---|---|
-| 상태를 보고 행동 후보 생성 | Recon/Web Provider가 그래프의 Host·Service·Endpoint와 관측 정보를 사용 | 코드·관련 테스트·합성 서버 실행 |
+| 상태를 보고 행동 후보 생성 | Recon/Web Provider가 그래프의 Host·Service·Endpoint와 관측 정보를 사용 | 코드·관련 테스트·테스트용 은행 사이트 실행 |
 | 후보 검증 및 선택 | CandidateCompiler가 등록된 도구와 인자를 검증. 기본 HybridPlanner는 점수에 따라 선택하고 모호한 경우 LLM에 선택을 요청 | 구조 및 테스트 확인. 이번 실제 통신 실행은 fake LLM 사용 |
-| Control 검사와 실제 MCP 호출 | 실제 Control Plane과 Capability Gateway를 거쳐 stdio MCP 서버 호출 | 합성 서버 실행 확인 |
+| Control 검사와 실제 MCP 호출 | 실제 Control Plane과 Capability Gateway를 거쳐 stdio MCP 서버 호출 | 테스트용 은행 사이트에서 실행 확인 |
 | 결과를 그래프에 반영 | `ToolResult → Result Mapper → GraphMutation → Attack Graph`로 저장하고 Evidence ID 연결 | 실제 결과·그래프·증거 대조 |
 | 결과를 보고 후속 행동 실행 | 처음 제공하지 않았던 계정 경로가 HTML에서 발견된 뒤 Web 요청 대상으로 사용됨 | 실제 이벤트 순서로 확인 |
 | 최종 판단 및 종료 | 실행 제한·승인 대기 사유와 ReportProjected 이벤트 확인 | 전체 검사의 자연 종료 및 최종 보고서 내용 품질은 이번 검증 대상 밖 |
@@ -27,9 +27,9 @@ Attack Graph도 도구가 찾아낸 정보를 저장하고 다음 행동 후보�
 
 ## 3. 이번에 직접 확인한 실행 결과
 
-공유된 dev 코드와 저장소의 기본 `finance-mock/server.py`를 외부 네트워크가 없는 임시 Docker 컨테이너에서 실행했습니다. HTTP 요청과 MCP stdio 통신은 실제로 일어났습니다. 로컬에서 따로 수정 중인 취약 버전 사이트는 사용하지 않았고, CLI 대신 `build_application → run_engagement`를 직접 호출했습니다.
+저장소에 포함된 테스트용 은행 사이트(`finance-mock/server.py`)를 Docker에서 띄우고, 에이전트가 그 사이트에 요청을 보내도록 했습니다. HTTP 요청과 MCP 통신은 실제로 일어났습니다. 외부 사이트에는 접속하지 않았고, CLI 화면 대신 `build_application → run_engagement`를 직접 호출했습니다.
 
-### A. 합성 랩에서 Web 실행을 허용한 경우
+### A. 테스트용 은행 사이트에서 Web 실행을 허용한 경우
 
 ```text
 recon.http_probe
@@ -52,7 +52,7 @@ web.http_request
 - Finding: **0개**. 이번 검증은 취약점 발견 성능이나 실제 금융 솔루션 우회를 증명하지 않음
 - 종료 사유: `max_steps_reached`. 6회 루프 단계 제한에 도달한 결과이며 전체 대상 검사가 끝났다는 뜻이 아님
 
-위 실행에서는 흐름을 확인하기 위해 합성 랩에서만 `auto_approve`를 켰습니다. 실제 운영 환경의 자동 승인 동작을 확인한 결과는 아닙니다.
+위 실행에서는 흐름을 끝까지 확인하기 위해 이 테스트에서만 `auto_approve`를 켰습니다. 다른 대상에서의 자동 승인 동작을 확인한 결과는 아닙니다.
 
 ### B. 기본 승인 필요 정책을 유지한 경우
 
@@ -84,13 +84,13 @@ web.http_request
 | 동적 후보·Recon/Web 후속 행동·HybridPlanner 단위 테스트 | 92 |
 | Agent 루프·Recon→Web·인증 후속 관측·Finding·MCP 관련 통합 테스트 | 95 |
 
-499개 중에는 가짜 Gateway와 합성 응답을 사용하는 테스트도 있습니다. 따라서 이 숫자 전체를 실제 MCP 실행 결과로 볼 수는 없습니다. 실제 MCP와 HTTP가 연결되는지는 별도의 Docker 실행 두 건으로 확인했습니다.
+499개 중에는 실제 MCP 대신 미리 준비한 도구 응답을 사용하는 테스트도 있습니다. 따라서 499개 전체가 실제 MCP를 호출한 결과는 아닙니다. 실제 MCP 호출과 HTTP 요청이 이어지는지는 위의 Docker 실행 두 건으로 따로 확인했습니다.
 
 이번에는 전체 저장소 테스트나 lint/type 검사까지 돌리지는 않았습니다. 실제 LLM, 자연어 CLI 입력, 로그인된 Chrome/chrome-use, 실제 금융 대상도 아직 확인하지 못했습니다.
 
 ## 6. 우선 후속 확인
 
-1. 동일한 제한된 합성 시나리오에서 실제 LLM을 연결하고, 선택 이유 및 fallback 여부와 실제 Tool 선택 결과를 기록합니다.
+1. 같은 테스트용 은행 사이트에 실제 LLM을 연결하고, 어떤 도구를 골랐는지와 선택 이유, fallback 여부를 기록합니다.
 2. 실제 CLI에서 사용자가 입력한 목표로 같은 흐름이 실행되는지 확인합니다.
 3. chrome-use가 연결되면 화면 관측 → 행동 후보 → Control 검사 → 실제 행동 → 결과 매핑 → 후속 후보까지 동일 기준으로 검증합니다.
 

@@ -27,6 +27,7 @@ from contextlib import AsyncExitStack
 from pathlib import Path
 
 from rich.console import Console
+from yaml import YAMLError
 
 from redteam.app.bootstrap import build_llm_client
 from redteam.app.cli import interactive_commands, renderer
@@ -98,9 +99,12 @@ async def run(args: argparse.Namespace) -> int:
 
 
 async def _run(console: Console, *, verbose: bool) -> int:
-    llm_config, orchestration_config, capability_config, logging_config = (
-        await _ensure_runtime_config(console)
-    )
+    (
+        llm_config,
+        orchestration_config,
+        capability_config,
+        logging_config,
+    ) = await _ensure_runtime_config(console)
     llm_client = build_llm_client(llm_config)
 
     if not DEFAULT_ENGAGEMENT_PATH.exists():
@@ -119,7 +123,11 @@ async def _run(console: Console, *, verbose: bool) -> int:
     engagement_config, objective = selected
 
     engagement_config = await _preflight_loop(
-        console, engagement_config, llm_client, llm_config, capability_config,
+        console,
+        engagement_config,
+        llm_client,
+        llm_config,
+        capability_config,
         auto_start=objective is not None,
     )
     if engagement_config is None:
@@ -171,7 +179,7 @@ async def _ensure_runtime_config(
     if os.environ.get("REDTEAM_LLM_PROVIDER"):
         return (
             LLMConfig.from_environment(),
-            OrchestrationConfig(),
+            OrchestrationConfig.from_environment(),
             CapabilityConfig(mcp_servers=mcp_server_ids_from_environment()),
             LoggingConfig(),
         )
@@ -180,8 +188,10 @@ async def _ensure_runtime_config(
     model = console.input(
         "LLM model (e.g. chatgpt/gpt-5.5, gpt-4o-mini) [blank = offline/fake]: "
     ).strip()
-    llm_config = LLMConfig(provider="fake") if not model else LLMConfig(
-        provider="litellm", default_model=model
+    llm_config = (
+        LLMConfig(provider="fake")
+        if not model
+        else LLMConfig(provider="litellm", default_model=model)
     )
     if llm_config.provider == "litellm" and not llm_config.resolve_api_key():
         # A `chatgpt/...` model authenticates via the OAuth device flow
@@ -204,7 +214,7 @@ async def _ensure_runtime_config(
         os.environ["REDTEAM_LLM_MODEL"] = llm_config.default_model
     console.print(f"[dim]Wrote REDTEAM_LLM_PROVIDER to {DEFAULT_ENV_PATH}.[/dim]")
 
-    orchestration_config = OrchestrationConfig()
+    orchestration_config = OrchestrationConfig.from_environment()
     capability_config = CapabilityConfig(mcp_servers=mcp_server_ids_from_environment())
     logging_config = LoggingConfig()
     return llm_config, orchestration_config, capability_config, logging_config
@@ -350,8 +360,10 @@ async def _existing_config_menu(
             focus=" · ".join(engagement_config.metadata.get("focus_areas", [])) or None,
         )
         choice = renderer.prompt_choice(
-            console, "", "[ Enter ] Start   [ E ] Edit   [ N ] New   [ Q ] Quit\n"
-            "Or type a Mission objective:", normalize=False
+            console,
+            "",
+            "[ Enter ] Start   [ E ] Edit   [ N ] New   [ Q ] Quit\nOr type a Mission objective:",
+            normalize=False,
         )
         command = choice.lower()
         if command in ("", "start", "s"):
@@ -487,7 +499,11 @@ async def _execute(
 
 
 async def _execute_scoped(
-    console: Console, full_config: AppConfig, *, verbose: bool, mcp_stack: AsyncExitStack,
+    console: Console,
+    full_config: AppConfig,
+    *,
+    verbose: bool,
+    mcp_stack: AsyncExitStack,
     objective: str | None = None,
 ) -> tuple[int, RuntimeState | None]:
     with console.status("Starting engagement...", spinner="dots"):
@@ -590,9 +606,7 @@ async def _session_loop(
             console.print("\n[dim]Session ended.[/dim]")
             return EXIT_OK
         except KeyboardInterrupt:
-            console.print(
-                "\n[dim](Ctrl+C -- type /exit or press Ctrl+D to end the session)[/dim]"
-            )
+            console.print("\n[dim](Ctrl+C -- type /exit or press Ctrl+D to end the session)[/dim]")
             continue
 
         text = text.strip()
@@ -604,8 +618,23 @@ async def _session_loop(
                 return EXIT_OK
             continue
 
+        try:
+            refreshed = load_engagement_config(session.engagement_path)
+            problems = [*check_scope(refreshed), *check_roe(refreshed)]
+        except (OSError, ValueError, YAMLError) as exc:
+            console.print(
+                f"[red]Cannot load engagement configuration ({type(exc).__name__}). "
+                "Fix the engagement file before starting another Mission.[/red]"
+            )
+            continue
+        if problems:
+            console.print(
+                "[red]Invalid engagement configuration: " + "; ".join(problems) + "[/red]"
+            )
+            continue
+        session.engagement_config = refreshed
         full_config = AppConfig(
-            engagement=session.engagement_config,
+            engagement=refreshed,
             llm=llm_config,
             orchestration=orchestration_config,
             capability=capability_config,

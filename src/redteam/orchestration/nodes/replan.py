@@ -33,9 +33,7 @@ _REPLAN_REASON_BY_TERMINATION = {
 }
 
 
-def _replan_reason(
-    *, termination: str | None, reactivated: bool, switched: bool
-) -> str:
+def _replan_reason(*, termination: str | None, reactivated: bool, switched: bool) -> str:
     """Name the replan, or return "" when nothing meaningful happened."""
 
     if termination is not None:
@@ -134,6 +132,8 @@ async def replan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             runtime.mission_id,
             publisher=publisher,
             last_event_id=last_event_id,
+            evidence_store=deps.evidence_store,
+            run_id=runtime.run_id,
         )
 
     agent_id = runtime.current_agent
@@ -186,8 +186,11 @@ async def replan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                     )
                     completed = await publisher.publish(
                         EventType.TASK_BLOCKED if unmet else EventType.TASK_COMPLETED,
-                        {"task_id": runtime.active_task_id, "agent_id": agent_id,
-                         **({"reason": reason_text} if reason_text else {})},
+                        {
+                            "task_id": runtime.active_task_id,
+                            "agent_id": agent_id,
+                            **({"reason": reason_text} if reason_text else {}),
+                        },
                         causation_id=last_event_id,
                     )
                     last_event_id = completed.event_id
@@ -288,17 +291,10 @@ async def replan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
         reactivated = (
             next_agent.agent_id in finished_agents
             and cursor is not None
-            and cursor
-            != deps.agents.revision_fingerprint(next_agent.agent_id, observation)
+            and cursor != deps.agents.revision_fingerprint(next_agent.agent_id, observation)
         )
-    switched = (
-        next_agent is not None
-        and agent_id is not None
-        and next_agent.agent_id != agent_id
-    )
-    event_reason = _replan_reason(
-        termination=reason, reactivated=reactivated, switched=switched
-    )
+    switched = next_agent is not None and agent_id is not None and next_agent.agent_id != agent_id
+    event_reason = _replan_reason(termination=reason, reactivated=reactivated, switched=switched)
 
     if reason is not None:
         triggered = await publisher.publish(

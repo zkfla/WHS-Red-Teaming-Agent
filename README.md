@@ -320,6 +320,17 @@ library capability for code that calls
 `redteam.app.bootstrap.build_application()` directly, outside this CLI
 (see `examples/finance_agent_demo.py`) — the CLI itself never reads one.
 
+Runtime settings also have a shared environment path for interactive, `run`, and
+`resume`: `REDTEAM_ORCHESTRATION_MAX_STEPS` (default `50`),
+`REDTEAM_ORCHESTRATION_MAX_RETRIES` (default `3`), and
+`REDTEAM_ORCHESTRATION_LLM_CANDIDATE_GENERATION` (default `false`, set `true`
+to enable generated candidates). Invalid values fail configuration validation.
+The `--max-steps` option overrides the environment value.
+
+Before starting another Mission in an interactive session, the CLI reloads and
+validates `engagement.yaml`, including scope, ROE, and budget. A missing or invalid
+file prevents that Mission from starting; the previous configuration is not reused.
+
 An empty (or unset) `REDTEAM_MCP_SERVERS`/`capability.mcp_servers` is not
 an error: `run`, `tools list` and `tools health` all get an honest empty
 tool catalog and print an explicit `WARNING` to stderr — no Action can
