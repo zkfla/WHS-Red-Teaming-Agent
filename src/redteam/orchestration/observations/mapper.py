@@ -24,8 +24,9 @@ from redteam.attack_graph.predicates import (
 )
 from redteam.core.contracts.target import AnyTarget
 from redteam.core.contracts.tool import ToolResult
-from redteam.core.enums import GraphEdgeType, GraphNodeType
+from redteam.core.enums import GraphEdgeType, GraphNodeType, Verdict
 from redteam.core.ids import GraphNodeId, ToolId
+from redteam.orchestration.expectations import Expectation
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +57,27 @@ class EdgeMutation:
 
 
 @dataclass(frozen=True)
+class FindingMutation:
+    """Evidence-independent finding description produced by a pure mapper.
+
+    UPDATE attaches the Evidence created by VERIFY before writing the
+    Hypothesis and verified Finding into the Attack Graph.
+    """
+
+    check_id: str
+    hypothesis_id: str
+    finding_id: str
+    title: str
+    description: str
+    severity: str
+    expectation: Expectation
+    verdict: Verdict
+    reason: str
+    target_node_id: GraphNodeId
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class GraphMutation:
     """What a mapper discovered. Empty means "nothing new" -- UPDATE's
     existing target-node write (``step.observed_attrs``) is unaffected
@@ -63,6 +85,7 @@ class GraphMutation:
 
     nodes: list[NodeMutation] = field(default_factory=list)
     edges: list[EdgeMutation] = field(default_factory=list)
+    findings: list[FindingMutation] = field(default_factory=list)
 
 
 def is_http_status(value: Any) -> TypeGuard[int]:
@@ -110,6 +133,31 @@ def _validate_mutation(mutation: GraphMutation, *, target: AnyTarget) -> None:
         known_ids = set(node_types) | {node_id_for_target(target)}
         if edge.source_id not in known_ids or edge.target_id not in known_ids:
             raise ValueError("mapper emitted an edge whose endpoint is not in its mutation")
+    target_node_id = node_id_for_target(target)
+    for finding in mutation.findings:
+        if finding.target_node_id != target_node_id:
+            raise ValueError("mapper emitted a finding for a different target")
+        if finding.verdict is not Verdict.VIOLATION:
+            raise ValueError("mapper finding must represent a verified violation")
+        if not all(
+            value.strip()
+            for value in (
+                finding.check_id,
+                finding.hypothesis_id,
+                finding.finding_id,
+                finding.title,
+                finding.description,
+                finding.severity,
+                finding.reason,
+            )
+        ):
+            raise ValueError("mapper finding fields must not be blank")
+        validate_facts(
+            {
+                "expectation": finding.expectation.model_dump(mode="json"),
+                "metadata": finding.metadata,
+            }
+        )
 
 
 class ResultMapperRegistry:
@@ -157,6 +205,10 @@ class ResultMapperRegistry:
 
 
 def default_result_mapper_registry() -> ResultMapperRegistry:
+    from redteam.orchestration.observations.mobile_analysis import (
+        map_apktool_decode,
+        map_apktool_manifest,
+    )
     from redteam.orchestration.observations.recon_http import map_recon_http_probe
     from redteam.orchestration.observations.recon_inventory import (
         map_recon_html_inventory,
@@ -185,6 +237,8 @@ def default_result_mapper_registry() -> ResultMapperRegistry:
     )
 
     registry = ResultMapperRegistry()
+    registry.register("analysis.decode_apk", map_apktool_decode)
+    registry.register("analysis.get_manifest", map_apktool_manifest)
     registry.register("recon.dns_resolve", map_recon_dns_resolve)
     registry.register("recon.http_probe", map_recon_http_probe)
     registry.register("recon.tls_inspect", map_recon_tls_inspect)

@@ -23,6 +23,7 @@ from __future__ import annotations
 
 from redteam.orchestration.observations.mapper import (
     EdgeMutation,
+    FindingMutation,
     GraphMutation,
     NodeMutation,
     ResultMapperRegistry,
@@ -32,6 +33,7 @@ from redteam.orchestration.observations.mapper import (
 __all__ = [
     "EdgeMutation",
     "GraphMutation",
+    "FindingMutation",
     "NodeMutation",
     "ResultMapperRegistry",
     "default_result_mapper_registry",

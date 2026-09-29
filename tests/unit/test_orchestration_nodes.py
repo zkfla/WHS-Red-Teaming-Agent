@@ -18,12 +18,13 @@ from redteam.attack_graph.service import (
 from redteam.core.contracts.action import ActionProposal
 from redteam.core.contracts.events import EventType
 from redteam.core.contracts.graph import Hypothesis
-from redteam.core.contracts.target import HostTarget
+from redteam.core.contracts.target import AssetTarget, HostTarget
 from redteam.core.contracts.tool import ToolError, ToolResult
 from redteam.core.enums import AgentPhase, GraphEdgeType, GraphNodeType, PolicyVerdict, Verdict
 from redteam.core.ids import (
     ActionId,
     AgentId,
+    AssetId,
     EngagementId,
     EvidenceId,
     GraphNodeId,
@@ -33,7 +34,13 @@ from redteam.core.ids import (
     ToolId,
 )
 from redteam.event_bus.memory import InMemoryEventBus
-from redteam.orchestration.agents import AgentRegistry, AgentSpec, HypothesisDraft, PlanStep
+from redteam.orchestration.agents import (
+    ANALYSIS_AGENT,
+    AgentRegistry,
+    AgentSpec,
+    HypothesisDraft,
+    PlanStep,
+)
 from redteam.orchestration.agents.registry import RECON_AGENT
 from redteam.orchestration.candidates.compiler import CandidateCompiler
 from redteam.orchestration.events import (
@@ -674,6 +681,64 @@ async def test_update_discovers_service_and_endpoint_from_a_successful_http_prob
     assert d.event_bus.event_types() == [EventType.GRAPH_UPDATED] * 3 + [
         GRAPH_MUTATION_APPLIED
     ]
+
+
+async def test_update_records_manifest_findings_with_evidence_and_graph_relations() -> None:
+    d = deps()
+    service = AttackGraphService(d.graph_store)
+    target = AssetTarget(asset_id=AssetId("insecurebankv2"))
+    manifest = """<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+      package="com.example.insecure">
+      <uses-permission android:name="android.permission.SEND_SMS" />
+      <application android:debuggable="true" android:usesCleartextTraffic="true">
+        <activity android:name=".Exported" android:exported="true" />
+      </application>
+    </manifest>"""
+    analysis_proposal = ActionProposal(
+        action_id=ActionId("action_manifest"),
+        run_id=RUN,
+        engagement_id=ENGAGEMENT,
+        agent_id=AgentId("analysis-agent"),
+        capability="analysis",
+        operation="static_analysis",
+        target=target,
+        reason="inspect manifest",
+        created_at=NOW,
+    )
+    state = state_with(
+        runtime(step_count=2),
+        action_proposal=analysis_proposal,
+        tool_result=tool_result(
+            output={"success": True, "manifest": manifest},
+            tool_id="analysis.get_manifest",
+        ),
+        plan_step=ANALYSIS_AGENT.playbook[1],
+        result_evidence_id=EvidenceId("ev_manifest"),
+    )
+
+    await update_node(state, deps=d)
+
+    findings = await service.list_findings(verified=True)
+    assert len(findings) == 4
+    assert all(finding.evidence_ids == ["ev_manifest"] for finding in findings)
+    assert {finding.metadata["verdict"] for finding in findings} == {
+        Verdict.VIOLATION.value
+    }
+    hypotheses = await service.list_hypotheses(status=HYPOTHESIS_CONFIRMED)
+    assert len(hypotheses) == 4
+    edges = await service.list_edges()
+    assert sum(edge.type is GraphEdgeType.TARGETS for edge in edges) == 8
+    assert sum(edge.type is GraphEdgeType.SUPPORTED_BY for edge in edges) == 4
+    assert len(d.event_bus.history(event_type=EventType.FINDING_CREATED)) == 4
+    assert len(d.event_bus.history(event_type=EventType.FINDING_VERIFIED)) == 4
+
+    await update_node(merged(state, runtime=runtime(step_count=3)), deps=d)
+
+    assert len(await service.list_findings(verified=True)) == 4
+    assert len(await service.list_hypotheses(status=HYPOTHESIS_CONFIRMED)) == 4
+    assert len(await service.list_edges()) == 12
+    assert len(d.event_bus.history(event_type=EventType.FINDING_CREATED)) == 4
+    assert len(d.event_bus.history(event_type=EventType.FINDING_VERIFIED)) == 4
 
 
 async def test_update_processing_the_same_probe_result_twice_does_not_duplicate_nodes() -> None:

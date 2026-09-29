@@ -140,11 +140,6 @@ ANALYSIS_AGENT = AgentSpec(
             preconditions=[_DECODED_ASSET.model_copy(deep=True)],
             arguments={"project_dir": PROJECT_DIR_PLACEHOLDER},
             reason="Inspect AndroidManifest.xml for security-relevant application settings.",
-            hypothesis=HypothesisDraft(
-                description="The manifest contains an unsafe Android security configuration.",
-                confidence=0.4,
-                violation_if_confirmed=True,
-            ),
             observed_attrs={"manifest_analyzed": True},
             attempt_key="analysis.static_analysis:get_manifest",
         ),

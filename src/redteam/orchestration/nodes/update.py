@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 
 from redteam.attack_graph.predicates import Confidence, Provenance
 from redteam.core.contracts.events import EventType
+from redteam.core.contracts.graph import Finding, Hypothesis
 from redteam.core.enums import AgentPhase
 from redteam.orchestration.action_naming import canonical_action_key
 from redteam.orchestration.context import RuntimeDeps
@@ -174,7 +175,84 @@ async def update_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                 provenance=provenance,
             )
 
-        if mutation.nodes or mutation.edges:
+        if provenance.evidence_id:
+            for finding_mutation in mutation.findings:
+                existing = await service.get_finding(finding_mutation.finding_id)
+                evidence_ids = sorted(
+                    {
+                        provenance.evidence_id,
+                        *(existing.evidence_ids if existing is not None else []),
+                    }
+                )
+                hypothesis = Hypothesis(
+                    hypothesis_id=finding_mutation.hypothesis_id,
+                    description=finding_mutation.expectation.description,
+                    confidence=1.0,
+                    status="confirmed",
+                    metadata={
+                        "check_id": finding_mutation.check_id,
+                        "expectation": finding_mutation.expectation.model_dump(mode="json"),
+                        "verdict": finding_mutation.verdict.value,
+                        "reason": finding_mutation.reason,
+                        "evidence_ids": evidence_ids,
+                        "target_node_id": str(finding_mutation.target_node_id),
+                    },
+                )
+                await service.record_hypothesis(
+                    hypothesis,
+                    about=finding_mutation.target_node_id,
+                    step=runtime.step_count,
+                    provenance=provenance,
+                )
+                finding = Finding(
+                    finding_id=finding_mutation.finding_id,
+                    title=finding_mutation.title,
+                    description=finding_mutation.description,
+                    severity=finding_mutation.severity,
+                    verified=True,
+                    evidence_ids=evidence_ids,
+                    metadata={
+                        **finding_mutation.metadata,
+                        "hypothesis_id": finding_mutation.hypothesis_id,
+                        "target": str(finding_mutation.target_node_id),
+                        "expectation": finding_mutation.expectation.model_dump(mode="json"),
+                        "verdict": finding_mutation.verdict.value,
+                        "verification_reason": finding_mutation.reason,
+                    },
+                )
+                await service.record_finding(
+                    finding,
+                    hypothesis_id=finding_mutation.hypothesis_id,
+                    about=finding_mutation.target_node_id,
+                    step=runtime.step_count,
+                    provenance=provenance,
+                )
+                if existing is None:
+                    created = await publisher.publish(
+                        EventType.FINDING_CREATED,
+                        {
+                            "finding_id": finding.finding_id,
+                            "title": finding.title,
+                            "severity": finding.severity,
+                            "evidence_ids": finding.evidence_ids,
+                            "hypothesis_id": finding_mutation.hypothesis_id,
+                            "action_id": proposal.action_id,
+                            "candidate_key": step.candidate_key,
+                        },
+                        correlation_id=correlation_id,
+                        causation_id=last_event.event_id,
+                    )
+                    last_event = await publisher.publish(
+                        EventType.FINDING_VERIFIED,
+                        {
+                            "finding_id": finding.finding_id,
+                            "reason": finding_mutation.reason,
+                        },
+                        correlation_id=correlation_id,
+                        causation_id=created.event_id,
+                    )
+
+        if mutation.nodes or mutation.edges or mutation.findings:
             last_event = await publisher.publish(
                 GRAPH_MUTATION_APPLIED,
                 {
@@ -182,6 +260,7 @@ async def update_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                     "tool_id": str(result.tool_id),
                     "nodes": len(mutation.nodes),
                     "edges": len(mutation.edges),
+                    "findings": len(mutation.findings),
                 },
                 correlation_id=correlation_id,
                 causation_id=last_event.event_id,
