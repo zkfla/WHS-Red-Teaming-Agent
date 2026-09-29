@@ -5,8 +5,6 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timezone
 
-import pytest
-
 from redteam.app.bootstrap import run_engagement
 from redteam.attack_graph.predicates import facts_of
 from redteam.attack_graph.service import AttackGraphService
@@ -252,13 +250,15 @@ async def test_analysis_approval_resumes_the_same_run_without_bypassing_control(
 
 
 async def test_analysis_gateway_timeout_is_evidence_not_a_finding(
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr("redteam.orchestration.nodes.execute.DEFAULT_TIMEOUT_SECONDS", 0.01)
     engagement = _engagement()
     adapter = ScriptedApktoolAdapter(delay=0.05)
     gateway = _gateway(adapter)
-    _, deps = _deps(engagement, gateway)
+    _, deps = _deps(
+        engagement,
+        gateway,
+        settings=OrchestrationSettings(tool_timeout_seconds=0.01, max_steps=30),
+    )
 
     final = await run_engagement(engagement, deps=deps)
 

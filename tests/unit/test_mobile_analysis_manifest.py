@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 from mcp import Client
 
+from redteam.app.cli.commands.validate import check_roe
 from redteam.capability.adapters.mcp.transport import StdioMCPTransport
 from redteam.capability.mobile_analysis_manifest import (
     MOBILE_ANALYSIS_TOOLS,
@@ -24,6 +25,7 @@ from redteam.core.config import load_app_config
 from redteam.core.contracts.tool import ToolDescriptor
 from redteam.core.enums import RiskLevel
 from redteam.core.ids import ToolId
+from redteam.orchestration.settings import OrchestrationSettings
 
 
 def test_example_bindings_match_manifest() -> None:
@@ -78,7 +80,19 @@ def test_mobile_analysis_app_registers_installed_candidates() -> None:
     config = load_app_config(app_path)
 
     assert config.engagement.scope.allowed_assets == ["insecurebankv2"]
+    assert config.engagement.metadata["asset_ref"] == "/work/InsecureBankv2.apk"
+    assert config.engagement.rules_of_engagement[0].allowed_operations == [
+        "analysis.static_analysis",
+        "mobile.app_launch",
+        "mobile.response_analysis",
+    ]
+    assert check_roe(config.engagement) == []
     assert config.capability.mcp_servers == ["apktool", "jadx", "mobile-next"]
+    assert config.orchestration.tool_timeout_seconds == 180
+    assert (
+        OrchestrationSettings.from_config(config.orchestration).tool_timeout_seconds
+        == 180
+    )
 
 
 @pytest.mark.parametrize("server_id", ["mobile-local", "analysis-local"])

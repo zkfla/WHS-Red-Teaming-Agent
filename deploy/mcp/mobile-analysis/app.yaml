@@ -10,8 +10,9 @@ engagement:
     - name: training-app-only
       description: Limit execution to the operator-provided InsecureBankv2 lab artifact and device.
       allowed_capabilities: [analysis, mobile]
-      allowed_operations: [static_analysis, app_launch, response_analysis]
-      prohibited_techniques: [app_install, app_uninstall, ui_automation, runtime_instrumentation]
+      allowed_operations: [analysis.static_analysis, mobile.app_launch, mobile.response_analysis]
+      # app install/uninstall, UI automation, and runtime instrumentation stay
+      # excluded by this operation allowlist and the MCP tool allowlists.
   execution_budget:
     max_actions: 30
     max_tool_calls: 30
@@ -23,7 +24,7 @@ engagement:
     auto_approve: false
     require_approval_for: [mobile.app_launch]
   metadata:
-    asset_ref: insecurebankv2
+    asset_ref: /work/InsecureBankv2.apk
     apk_ref: insecurebankv2
 
 capability:
@@ -35,6 +36,7 @@ llm:
 orchestration:
   max_retries: 3
   max_steps: 50
+  tool_timeout_seconds: 180
 
 logging:
   level: INFO

@@ -22,8 +22,6 @@ from redteam.orchestration.context import RuntimeDeps
 from redteam.orchestration.nodes._support import advance, publisher_for
 from redteam.orchestration.state import GraphState
 
-DEFAULT_TIMEOUT_SECONDS = 10.0
-
 
 async def _renew_lease_until_stopped(
     *,
@@ -74,7 +72,7 @@ async def execute_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
         proposal,
         decision,
         tool_id=step.tool_id,
-        timeout_seconds=DEFAULT_TIMEOUT_SECONDS,
+        timeout_seconds=deps.settings.tool_timeout_seconds,
         correlation_id=correlation_id,
     )
 

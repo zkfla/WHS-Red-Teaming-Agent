@@ -27,6 +27,7 @@ class OrchestrationSettings(BaseModel):
     #: Control Plane's ``ExecutionBudget``. Both must hold.
     max_steps: int = Field(default=8, ge=1)
     max_retries: int = Field(default=3, ge=0)
+    tool_timeout_seconds: float = Field(default=10.0, gt=0, le=600)
     #: Stop after this many tool executions fail back to back — a target
     #: that keeps erroring should not be hammered for the whole budget.
     max_consecutive_failures: int = Field(default=3, ge=1)
@@ -93,5 +94,6 @@ class OrchestrationSettings(BaseModel):
         if config is not None:
             base["max_steps"] = config.max_steps
             base["max_retries"] = config.max_retries
+            base["tool_timeout_seconds"] = config.tool_timeout_seconds
         base.update({key: value for key, value in overrides.items() if value is not None})
         return cls.model_validate(base)
