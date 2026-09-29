@@ -65,6 +65,8 @@ services:
     container_name: redteam-mcp-apktool
     networks:
       - redteam-net
+    environment:
+      APKTOOL_WORKSPACE: /work
     volumes:
       - ${APKTOOL_MCP_WORKDIR:-./apktool-workdir}:/work
     stdin_open: true
