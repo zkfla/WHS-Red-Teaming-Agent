@@ -327,9 +327,20 @@ async def available_steps(
             target = target_for_node(
                 node.id, node.type, observed=facts_of(node.properties).get("observed_target")
             )
+            node_target_ref = facts_of(node.properties).get("target_ref")
             host = getattr(target, "host", None)
             host_node = await view.get_node(host_node_id(host)) if host else None
-            target_ref = facts_of(host_node.properties).get("target_ref") if host_node else None
+            host_target_ref = (
+                facts_of(host_node.properties).get("target_ref") if host_node else None
+            )
+            target_ref = next(
+                (
+                    value
+                    for value in (node_target_ref, host_target_ref)
+                    if isinstance(value, str) and value
+                ),
+                None,
+            )
             bound = entry.bound_to(target, target_ref=target_ref)
             if bound is None:
                 # A placeholder this step needs could not be resolved
