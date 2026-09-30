@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from typing import cast
 
 from redteam.orchestration.paths.models import (
     PATH_STATUSES,
@@ -10,6 +11,7 @@ from redteam.orchestration.paths.models import (
     PathPlan,
     PathValidationError,
     PathVersionConflict,
+    changed_steps_and_descendants,
     is_active_status,
     normalize_path_status,
     normalize_step_status,
@@ -27,9 +29,7 @@ def _check_plan(path: PathPlan) -> str:
         raise PathValidationError(f"unknown path status: {path.status!r}")
     for step in path.steps:
         if normalize_step_status(step.status) not in STEP_STATUSES:
-            raise PathValidationError(
-                f"unknown step status: {step.status!r} (step {step.step_id})"
-            )
+            raise PathValidationError(f"unknown step status: {step.status!r} (step {step.step_id})")
     validate_path_structure(path.steps)
     return normalized_status
 
@@ -69,7 +69,7 @@ class InMemoryPathStore:
             justified = set(snapshot.changed_step_ids or [])
             for step_id, older in parent_steps.items():
                 carried = self._progress.get(
-                    (run_id, path_id, snapshot.parent_version, step_id)
+                    (run_id, path_id, cast(int, snapshot.parent_version), step_id)
                 )
                 effective = normalize_step_status(
                     carried["status"] if carried is not None else older.status
@@ -83,16 +83,25 @@ class InMemoryPathStore:
                             f"completed step reset without justification: {step_id} "
                             "(add it to changed_step_ids)"
                         )
+        if parent is not None:
+            snapshot.changed_step_ids = changed_steps_and_descendants(
+                parent.steps,
+                snapshot.steps,
+                snapshot.changed_step_ids,
+            )
         changed: list[str] = []
         seeded: dict = {}
         for step in snapshot.steps:
             record_key = (run_id, path_id, version, step.step_id)
-            older = parent_steps.get(step.step_id)
-            if parent is not None and older is not None \
-                    and step_definition_equal(older, step) \
-                    and step.step_id not in snapshot.changed_step_ids:
+            prev_step = parent_steps.get(step.step_id)
+            if (
+                parent is not None
+                and prev_step is not None
+                and step_definition_equal(prev_step, step)
+                and step.step_id not in snapshot.changed_step_ids
+            ):
                 carried = self._progress.get(
-                    (run_id, path_id, snapshot.parent_version, step.step_id)
+                    (run_id, path_id, cast(int, snapshot.parent_version), step.step_id)
                 )
                 if carried is not None:
                     seeded[record_key] = {
@@ -102,9 +111,9 @@ class InMemoryPathStore:
                     }
                 else:
                     seeded[record_key] = {
-                        "status": normalize_step_status(older.status),
-                        "outcome": older.outcome,
-                        "evidence_ids": list(older.evidence_ids),
+                        "status": normalize_step_status(prev_step.status),
+                        "outcome": prev_step.outcome,
+                        "evidence_ids": list(prev_step.evidence_ids),
                     }
             elif parent is None and snapshot.parent_version is None:
                 seeded[record_key] = {
@@ -142,8 +151,11 @@ class InMemoryPathStore:
             return [self._merged(snapshot) for snapshot in snapshots]
 
     async def register(
-        self, path: PathPlan, expected_version: int | None = None,
-        *, expected_path_id: str | None = None,
+        self,
+        path: PathPlan,
+        expected_version: int | None = None,
+        *,
+        expected_path_id: str | None = None,
     ) -> PathPlan:
         """Store one version snapshot, optionally moving the active pointer."""
         normalized_status = _check_plan(path)
@@ -154,12 +166,13 @@ class InMemoryPathStore:
             if is_active_status(path.status):
                 pointer = self._active.get(path.run_id)
                 current = pointer[1] if pointer is not None else None
-                if expected_path_id is not None and (pointer is None or pointer[0] != expected_path_id):
+                if expected_path_id is not None and (
+                    pointer is None or pointer[0] != expected_path_id
+                ):
                     raise PathVersionConflict("active path identity changed")
                 if expected_version != current:
                     raise PathVersionConflict(
-                        f"stale active version: expected {expected_version}, "
-                        f"current {current}"
+                        f"stale active version: expected {expected_version}, current {current}"
                     )
             snapshot = path.model_copy(deep=True)
             changed, seeded = self._plan_progress(snapshot)
@@ -181,9 +194,11 @@ class InMemoryPathStore:
         step_id: str,
         status: str,
         outcome: str | None = None,
-        evidence_ids: list[str] = [],
+        evidence_ids: list[str] | None = None,
     ) -> PathPlan | None:
         """Update progress for one step of the active path version."""
+        if evidence_ids is None:
+            evidence_ids = []
         normalized = normalize_step_status(status)
         if normalized not in STEP_STATUSES:
             raise PathValidationError(f"unknown step status: {status!r}")
@@ -192,9 +207,7 @@ class InMemoryPathStore:
             if snapshot is None:
                 return None
             if self._active.get(run_id) != (path_id, version):
-                raise PathVersionConflict(
-                    f"not the active version: {(path_id, version)}"
-                )
+                raise PathVersionConflict(f"not the active version: {(path_id, version)}")
             if step_id not in {step.step_id for step in snapshot.steps}:
                 return None
             record_key = (run_id, path_id, version, step_id)

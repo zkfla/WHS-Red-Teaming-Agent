@@ -84,3 +84,11 @@ class TaskLease(BaseModel):
     issued_at: datetime
     expires_at: datetime
     heartbeat_at: datetime
+
+
+def is_unexecuted_stale(item: WorkItem) -> bool:
+    if item.status is not WorkStatus.STALE:
+        return False
+    if item.job_id:
+        return False
+    return item.attempt == 0 or item.outcome_reason == "invalidated_before_execution"

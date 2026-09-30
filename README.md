@@ -301,9 +301,10 @@ REDTEAM_MCP_SERVERS=recon,web-http \
 
 `REDTEAM_LLM_PROVIDER` has **no implicit default** — unset is a
 configuration error, not a silent `FakeLLMClient`. Set it explicitly:
-`REDTEAM_LLM_PROVIDER=fake` for the offline/test client (an explicit
-choice, never a fallback), or `REDTEAM_LLM_PROVIDER=litellm` (with
-`REDTEAM_LLM_MODEL`) for a real provider. `redteam validate` never calls
+`REDTEAM_LLM_PROVIDER=litellm` with `REDTEAM_LLM_MODEL` for a real provider.
+Offline clients must be explicitly injected by tests; `fake` is rejected
+for an operational run. LLM reasoning drives investigation paths and actions;
+rule candidates provide review context only. `redteam validate` never calls
 an LLM at all (see its own `--help`), so this requirement does not apply
 to it. Using `litellm` needs the `agent` extra installed
 (`pip install -e ".[agent]"`) — see Quick Start. `LLM_API_KEY`/MCP

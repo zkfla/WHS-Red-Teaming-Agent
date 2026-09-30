@@ -31,12 +31,12 @@ from __future__ import annotations
 
 import inspect
 import json
-from typing import Any, Callable
-
-from tenacity import AsyncRetrying, retry_if_exception_type, stop_after_attempt
+from collections.abc import Callable
+from typing import Any
 
 from jsonschema import ValidationError
 from jsonschema import validate as _validate_schema
+from tenacity import AsyncRetrying, retry_if_exception_type, stop_after_attempt
 
 DECISION_KINDS = ("transport", "format", "budget", "unknown")
 
@@ -127,7 +127,7 @@ class _RetryableDecisionError(Exception):
         super().__init__(feedback)
 
 
-def _truncate(text: str, limit: int = _MAX_FEEDBACK_CHARS) -> str:
+def _truncate(text: object, limit: int = _MAX_FEEDBACK_CHARS) -> str:
     text = " ".join(str(text).split())
     return text if len(text) <= limit else text[:limit] + "..."
 
@@ -217,13 +217,9 @@ class StructuredDecisionClient:
         for key, value in extra.items():
             working.setdefault(key, value)
         json.dumps(working)
-        return await self._ask_with_tenacity(
-            stage, working, response_schema, system, budget
-        )
+        return await self._ask_with_tenacity(stage, working, response_schema, system, budget)
 
-    async def _resolve_extra_context(
-        self, stage: str, payload: dict[str, Any]
-    ) -> dict[str, Any]:
+    async def _resolve_extra_context(self, stage: str, payload: dict[str, Any]) -> dict[str, Any]:
         provider = self._context_provider
         if provider is None:
             return {}

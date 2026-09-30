@@ -31,9 +31,7 @@ PATH_STATUS_ALIASES = {"accepted": "active"}
 #: Canonical step progress states. ``pending`` waits; ``running`` executes;
 #: ``completed``/``failed``/``blocked``/``skipped`` are terminal progress marks.
 #: Progress lives per version and merges over the immutable snapshot on read.
-STEP_STATUSES = frozenset(
-    {"pending", "running", "completed", "failed", "blocked", "skipped"}
-)
+STEP_STATUSES = frozenset({"pending", "running", "completed", "failed", "blocked", "skipped"})
 
 #: Legacy alias accepted on input and normalized to ``running``.
 STEP_STATUS_ALIASES = {"in_progress": "running"}
@@ -102,9 +100,16 @@ def _single_criterion_key(criterion: CompletionCriterion | str) -> str:
         return "str:" + criterion
     refs = ",".join(sorted(criterion.principal_refs))
     return (
-        "model:" + criterion.kind + "|" + criterion.description
-        + "|" + str(criterion.min_evidence) + "|" + str(criterion.hypothesis_id)
-        + "|" + refs
+        "model:"
+        + criterion.kind
+        + "|"
+        + criterion.description
+        + "|"
+        + str(criterion.min_evidence)
+        + "|"
+        + str(criterion.hypothesis_id)
+        + "|"
+        + refs
     )
 
 
@@ -187,8 +192,7 @@ def step_definition_equal(first: PathStep, second: PathStep) -> bool:
     return (
         first.objective == second.objective
         and sorted(first.depends_on) == sorted(second.depends_on)
-        and criteria_key(first.completion_criteria)
-        == criteria_key(second.completion_criteria)
+        and criteria_key(first.completion_criteria) == criteria_key(second.completion_criteria)
         and sorted(first.allowed_operations) == sorted(second.allowed_operations)
         and sorted(first.target_node_ids) == sorted(second.target_node_ids)
         and sorted(first.principal_refs) == sorted(second.principal_refs)
@@ -197,6 +201,31 @@ def step_definition_equal(first: PathStep, second: PathStep) -> bool:
         and first.required == second.required
         and sorted(first.unknowns) == sorted(second.unknowns)
     )
+
+
+def changed_steps_and_descendants(
+    previous: list[PathStep],
+    current: list[PathStep],
+    declared: list[str],
+) -> list[str]:
+    """Changes invalidate descendants in either version of the dependency DAG."""
+    old = {item.step_id: item for item in previous}
+    new = {item.step_id: item for item in current}
+    changed = set(declared) | (set(old) - set(new))
+    changed.update(
+        identity
+        for identity in old.keys() & new.keys()
+        if not step_definition_equal(old[identity], new[identity])
+    )
+    graph = nx.DiGraph()
+    for item in [*previous, *current]:
+        graph.add_node(item.step_id)
+        graph.add_edges_from((dependency, item.step_id) for dependency in item.depends_on)
+    affected = set(changed)
+    for identity in changed:
+        if identity in graph:
+            affected.update(nx.descendants(graph, identity))
+    return sorted(affected)
 
 
 def validate_path_structure(steps: list[PathStep]) -> None:
@@ -213,9 +242,7 @@ def validate_path_structure(steps: list[PathStep]) -> None:
             if dependency == step.step_id:
                 raise PathValidationError(f"self dependency: {step.step_id}")
             if dependency not in known:
-                raise PathValidationError(
-                    f"unknown depends_on: {dependency} (step {step.step_id})"
-                )
+                raise PathValidationError(f"unknown depends_on: {dependency} (step {step.step_id})")
     graph = nx.DiGraph()
     graph.add_nodes_from(known)
     for step in steps:

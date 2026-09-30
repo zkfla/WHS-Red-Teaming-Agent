@@ -22,10 +22,8 @@ Two entry points build a ``RuntimeDeps``:
   ``redteam.app.cli`` uses this path exclusively — a real configured LLM
   provider or MCP server reaches a `run` invocation only through here.
 - ``build_runtime_deps(engagement, ...)`` — the original, ``Engagement``-only
-  entry point (always fake LLM, always the in-process dummy adapter
-  unless a caller works around it). Kept for callers that only have a
-  bare ``Engagement`` and no ``AppConfig`` (``examples/minimal_run.py``,
-  most unit/integration tests) — never the CLI.
+  composition helper. It requires an explicitly supplied LLM client;
+  test doubles are injected by tests, never selected automatically.
 """
 
 from __future__ import annotations
@@ -73,7 +71,6 @@ from redteam.event_bus.memory import InMemoryEventBus
 from redteam.event_bus.publisher import EventPublisher
 from redteam.evidence.service import EvidenceService
 from redteam.evidence.stores.filesystem import FilesystemEvidenceStore
-from redteam.llm.fake import FakeLLMClient
 from redteam.orchestration.agents.providers import (
     CandidateProviderRegistry,
     default_provider_registry,
@@ -164,6 +161,7 @@ async def build_runtime_deps(
     audit_dir: str | Path = "data/audit",
     approval_dir: str | Path = "data/approvals",
     *,
+    llm: LLMClient,
     orchestration_settings: OrchestrationSettings | None = None,
     agents: AgentRegistry | None = None,
     candidate_providers: CandidateProviderRegistry | None = None,
@@ -192,6 +190,8 @@ async def build_runtime_deps(
     full ``AppConfig`` available — it reads the LLM/Capability/Logging
     sections this function doesn't.
     """
+    if llm is None:
+        raise ValueError("an explicit LLM client is required")
     event_bus = InMemoryEventBus()
     # Namespaced even though this builds one fresh store per call, so an
     # Engagement never silently depends on being the store's only tenant —
@@ -213,7 +213,6 @@ async def build_runtime_deps(
         # Risk-tiered approval reads tool risk_level from the Registry.
         risk_resolver=RegistryRiskResolver(discovered_catalog),
     )
-    llm_client = FakeLLMClient()
     settings = orchestration_settings or OrchestrationSettings()
 
     return RuntimeDeps(
@@ -222,7 +221,7 @@ async def build_runtime_deps(
         event_bus=event_bus,
         graph_store=graph_store,
         evidence_store=evidence_store,
-        llm_client=llm_client,
+        llm_client=llm,
         engagement=engagement,
         agents=agents if agents is not None else default_registry(),
         candidate_providers=(
@@ -549,13 +548,16 @@ async def run_engagement(
         )
         bootstrap_event_id = task_created.event_id
 
+    saved_mission = await deps.task_graph_store.get_mission(mission_id)
+    if saved_mission is None:
+        raise RuntimeError("created mission is missing from the task store")
     initial_runtime = RuntimeState(
         run_id=run_id,
         engagement_id=engagement.engagement_id,
         started_at=datetime.now(timezone.utc),
         phase=AgentPhase.OBSERVE,
         mission_id=mission_id,
-        current_goal=(await deps.task_graph_store.get_mission(mission_id)).objective,
+        current_goal=saved_mission.objective,
         remaining_budget=engagement.execution_budget.max_actions,
     )
     runner = AgentLoopRunner(deps, settings=settings)

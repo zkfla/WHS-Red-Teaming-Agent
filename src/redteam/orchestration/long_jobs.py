@@ -30,9 +30,10 @@ Integration contract (root-owned wiring, agent-owned protocol):
 from __future__ import annotations
 
 from enum import Enum
-from typing import Any, Protocol
+from typing import Protocol
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
+
 from redteam.core.contracts.tool import ToolInvocation, ToolResult
 
 

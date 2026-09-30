@@ -58,7 +58,8 @@ async def update_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
         run_id=str(runtime.run_id),
         evidence_id=(
             str(state["result_evidence_id"])
-            if result is not None and state.get("result_evidence_id") else None
+            if result is not None and state.get("result_evidence_id")
+            else None
         ),
         confidence=Confidence.MEASURED if succeeded else Confidence.INFERRED,
     )
@@ -179,9 +180,12 @@ async def update_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                 node_mutation.node_type,
                 node_id=node_mutation.node_id,
                 attrs=node_mutation.attrs,
-                facts={**observed_facts, **(
-                    {"evidence_ids": [provenance.evidence_id]} if provenance.evidence_id else {}
-                )},
+                facts={
+                    **observed_facts,
+                    **(
+                        {"evidence_ids": [provenance.evidence_id]} if provenance.evidence_id else {}
+                    ),
+                },
                 labels=node_mutation.labels,
                 provenance=provenance,
                 step=runtime.step_count,
@@ -223,9 +227,20 @@ async def update_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
     work_id = state.get("current_work_id")
     approval_waiting = decision is not None and decision.verdict is PolicyVerdict.REQUIRE_APPROVAL
     if work_id is not None and approval_waiting:
-        await deps.work_store.release(work_id, owner=str(runtime.run_id), now=datetime.now(timezone.utc))
+        await deps.work_store.release(
+            work_id, owner=str(runtime.run_id), now=datetime.now(timezone.utc)
+        )
     elif work_id is not None:
-        if blocked:
+        error_code = result.error.code if result is not None and result.error else None
+        invalidated = (
+            blocked
+            and decision is not None
+            and "orchestration:stale_or_invalid_path" in (decision.matched_rules or [])
+        ) or error_code in {"tool_binding_invalid", "lease_lost_before_execution"}
+        if invalidated:
+            work_status = WorkStatus.STALE
+            reason = "invalidated_before_execution"
+        elif blocked:
             work_status = WorkStatus.BLOCKED
             reason = decision.verdict.value if decision is not None else "blocked"
         elif succeeded:
@@ -236,7 +251,7 @@ async def update_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             if verification_failed:
                 reason = f"verification_exception:{verification_exception}"
             else:
-                reason = result.error.code if result is not None and result.error else "tool_failed"
+                reason = error_code if error_code else "tool_failed"
         await deps.work_store.complete(
             work_id,
             owner=str(runtime.run_id),

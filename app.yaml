@@ -1,5 +1,5 @@
 llm:
-  provider: fake
+  provider: litellm
   default_model: gpt-4o-mini
   api_key_env_var: LLM_API_KEY
 orchestration:

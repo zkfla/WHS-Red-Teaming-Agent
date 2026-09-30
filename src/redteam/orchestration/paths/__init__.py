@@ -12,8 +12,8 @@ from redteam.orchestration.paths.models import (
     PathValidationError,
     PathVersionConflict,
     criteria_key,
-    is_known_criterion,
     is_active_status,
+    is_known_criterion,
 )
 from redteam.orchestration.paths.sqlite import SQLitePathStore
 from redteam.orchestration.paths.store import PathStore

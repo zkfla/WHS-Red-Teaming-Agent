@@ -6,7 +6,13 @@ planner; the Control Plane still decides whether acting on it is allowed.
 
 from __future__ import annotations
 
-from redteam.attack_graph.predicates import Confidence, Provenance, attrs_of, facts_of, provenance_of
+from redteam.attack_graph.predicates import (
+    Confidence,
+    Provenance,
+    attrs_of,
+    facts_of,
+    provenance_of,
+)
 from redteam.attack_graph.service import AttackGraphService
 from redteam.core.contracts.engagement import Engagement
 from redteam.core.contracts.graph import GraphNode
@@ -26,8 +32,7 @@ async def seed_from_engagement(
 ) -> list[GraphNode]:
     """Create one in-scope Host node per allowed host/domain."""
     denied = {
-        host.lower()
-        for host in (*engagement.scope.denied_hosts, *engagement.scope.denied_domains)
+        host.lower() for host in (*engagement.scope.denied_hosts, *engagement.scope.denied_domains)
     }
     declared = [
         value
@@ -37,8 +42,7 @@ async def seed_from_engagement(
 
     target_refs = engagement.metadata.get("target_refs", {})
     if not isinstance(target_refs, dict) or any(
-        not isinstance(host, str) or not host.strip()
-        or not isinstance(ref, str) or not ref.strip()
+        not isinstance(host, str) or not host.strip() or not isinstance(ref, str) or not ref.strip()
         for host, ref in target_refs.items()
     ):
         raise ValueError(
@@ -72,8 +76,10 @@ async def seed_from_engagement(
                 GraphNodeType.HOST,
                 key=value,
                 attrs={"in_scope": True},
-                facts={"target_ref": target_refs.get(value, value),
-                       "auth_session_config": {"sessions": auth_sessions.get(value, [])}},
+                facts={
+                    "target_ref": target_refs.get(value, value),
+                    "auth_session_config": {"sessions": auth_sessions.get(value, [])},
+                },
                 labels=[SCOPE_LABEL],
                 provenance=provenance,
                 step=step,
@@ -126,4 +132,3 @@ async def list_provided_nodes(service: AttackGraphService) -> list[GraphNode]:
     provided = [n for n in (nodes or []) if is_provided_node(n)]
     provided.sort(key=lambda n: str(n.id))
     return provided
-

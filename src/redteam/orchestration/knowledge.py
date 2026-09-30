@@ -16,37 +16,48 @@ reference list; known_targets is a list where every item carries node_id
 and id. Excluded plan-promoted flags are counted at the top level and
 size-cut identifiers are reported as omitted lists.
 """
+
 from __future__ import annotations
 
+import builtins
 from datetime import datetime
 from typing import Any
 
 from pydantic import BaseModel, Field
 
 from redteam.attack_graph.identity import finding_node_id, hypothesis_node_id
-from redteam.attack_graph.predicates import attrs_of, claim_provenance_of, digest_value, facts_of, provenance_of, values_equal
-from redteam.core.contracts.graph import Finding, Hypothesis
+from redteam.attack_graph.predicates import (
+    attrs_of,
+    claim_provenance_of,
+    digest_value,
+    facts_of,
+    provenance_of,
+    values_equal,
+)
+from redteam.core.contracts.graph import Hypothesis
 from redteam.core.enums import GraphNodeType
 
 SCOPE_LABEL = "engagement-scope"
 
 PLAN_PROMOTED_ATTR_KEYS = frozenset({"reachable", "probed", "web_inspected", "mobile_analyzed"})
 
-EXCLUDED_FACT_KEYS = frozenset({
-    "attempted_operations",
-    "evidence_ids",
-    "last_operation",
-    "last_operation_succeeded",
-    "last_tool_succeeded",
-    "last_verification_failed",
-    "last_operation_blocked",
-    "last_block_verdict",
-    "last_block_reasons",
-    "last_block_severity",
-    "expected_observation",
-    "reason",
-    "hypothesis",
-})
+EXCLUDED_FACT_KEYS = frozenset(
+    {
+        "attempted_operations",
+        "evidence_ids",
+        "last_operation",
+        "last_operation_succeeded",
+        "last_tool_succeeded",
+        "last_verification_failed",
+        "last_operation_blocked",
+        "last_block_verdict",
+        "last_block_reasons",
+        "last_block_severity",
+        "expected_observation",
+        "reason",
+        "hypothesis",
+    }
+)
 
 #: Declared scope attributes are never measured facts. They stay in
 #: ``provided`` no matter which provenance a later write attaches.
@@ -60,37 +71,43 @@ DECLARED_ATTR_KEYS = frozenset({"in_scope"})
 #: declared promotion, so a session_list/compare response that really
 #: returned them is a legitimate provisioned-binding fact (not an auth
 #: success claim). Ungrounded declarations still never become facts.
-DECLARED_FACT_KEYS = frozenset({
-    "auth_session_config",
-    "display_name",
-})
+DECLARED_FACT_KEYS = frozenset(
+    {
+        "auth_session_config",
+        "display_name",
+    }
+)
 
 #: Execution audit and mapper-failure bookkeeping. Kept on the node for
 #: traceability, never projected as observed facts.
-AUDIT_FACT_KEYS = frozenset({
-    "mapper_failure",
-    "mapping_failure",
-    "recovery_note",
-    "recovery_result",
-    "record_kind",
-    "source_evidence_id",
-    "authentication_checks",
-    "authentication_outcome",
-})
+AUDIT_FACT_KEYS = frozenset(
+    {
+        "mapper_failure",
+        "mapping_failure",
+        "recovery_note",
+        "recovery_result",
+        "record_kind",
+        "source_evidence_id",
+        "authentication_checks",
+        "authentication_outcome",
+    }
+)
 
 #: Cap for per-id diagnostic lists so one noisy run cannot blow up the
 #: projection payload.
 MAX_DIAGNOSTIC_IDS = 200
 
-USABLE_TARGET_TYPES = frozenset({
-    GraphNodeType.HOST,
-    GraphNodeType.SERVICE,
-    GraphNodeType.ENDPOINT,
-    GraphNodeType.RESOURCE,
-    GraphNodeType.ASSET,
-    GraphNodeType.PRINCIPAL,
-    GraphNodeType.CREDENTIAL,
-})
+USABLE_TARGET_TYPES = frozenset(
+    {
+        GraphNodeType.HOST,
+        GraphNodeType.SERVICE,
+        GraphNodeType.ENDPOINT,
+        GraphNodeType.RESOURCE,
+        GraphNodeType.ASSET,
+        GraphNodeType.PRINCIPAL,
+        GraphNodeType.CREDENTIAL,
+    }
+)
 
 MAX_PROVIDED_ITEMS = 50
 MAX_FACT_ITEMS = 100
@@ -99,6 +116,8 @@ MAX_FINDING_ITEMS = 50
 MAX_TARGET_ITEMS = 100
 MAX_OBSERVATIONS_PER_NODE = 10
 MAX_EVIDENCE_IDS_PER_ITEM = 20
+
+
 class ProvidedClaim(BaseModel):
     node_id: str = ""
     node_type: str = ""
@@ -127,6 +146,8 @@ class FactItem(BaseModel):
     origin: str = "observed"
     grounded_evidence_ids: list[str] = Field(default_factory=list)
     claim_sources: dict[str, dict[str, Any]] = Field(default_factory=dict)
+
+
 class ExcludedAttr(BaseModel):
     node_id: str = ""
     attr: str = ""
@@ -240,13 +261,17 @@ def _provenance_summary(properties: dict[str, Any]) -> list[dict[str, Any]]:
     for entry in provenance_of(properties):
         if not isinstance(entry, dict):
             continue
-        out.append({
-            "source": str(entry.get("source", "")),
-            "confidence": str(entry.get("confidence", "")),
-            "step": int(entry.get("step", 0)) if isinstance(entry.get("step"), int) else 0,
-            "run_id": str(entry.get("run_id")) if entry.get("run_id") is not None else None,
-            "evidence_id": str(entry.get("evidence_id")) if entry.get("evidence_id") is not None else None,
-        })
+        out.append(
+            {
+                "source": str(entry.get("source", "")),
+                "confidence": str(entry.get("confidence", "")),
+                "step": int(entry.get("step", 0)) if isinstance(entry.get("step"), int) else 0,
+                "run_id": str(entry.get("run_id")) if entry.get("run_id") is not None else None,
+                "evidence_id": str(entry.get("evidence_id"))
+                if entry.get("evidence_id") is not None
+                else None,
+            }
+        )
     return out
 
 
@@ -279,7 +304,9 @@ def _record_has_raw(record: Any) -> bool:
     return False
 
 
-async def _build_evidence_index(evidence_store: Any, run_id: str) -> tuple[dict[str, Any], dict[str, Any]]:
+async def _build_evidence_index(
+    evidence_store: Any, run_id: str
+) -> tuple[dict[str, Any], dict[str, Any]]:
     """Same-run evidence by id, plus explicit lookup diagnostics.
 
     A store failure never becomes an empty list: it marks ``lookup_failed``
@@ -394,6 +421,8 @@ def _node_has_grounded_presence(
         if grounded:
             return True
     return False
+
+
 class HypothesisService:
     """Dedicated hypothesis read/write path over the existing graph schema.
 
@@ -410,17 +439,23 @@ class HypothesisService:
     async def list(self, status: str | None = None) -> list[Hypothesis]:
         func = getattr(self._graph, "list_hypotheses", None)
         if not callable(func):
-            raise TypeError("graph service has no list_hypotheses; hypotheses need the dedicated lookup path")
+            raise TypeError(
+                "graph service has no list_hypotheses; hypotheses need the dedicated lookup path"
+            )
         items = await func(status=status) if status is not None else await func()
         return sorted(list(items or []), key=lambda h: str(h.hypothesis_id))
 
     async def get(self, hypothesis_id: str) -> Hypothesis | None:
         func = getattr(self._graph, "get_hypothesis", None)
         if not callable(func):
-            raise TypeError("graph service has no get_hypothesis; hypotheses need the dedicated lookup path")
+            raise TypeError(
+                "graph service has no get_hypothesis; hypotheses need the dedicated lookup path"
+            )
         return await func(str(hypothesis_id))
 
-    async def record(self, hypothesis: Hypothesis, about: Any = None, step: int = 0, provenance: Any = None) -> Any:
+    async def record(
+        self, hypothesis: Hypothesis, about: Any = None, step: int = 0, provenance: Any = None
+    ) -> Any:
         func = getattr(self._graph, "record_hypothesis", None)
         if not callable(func):
             raise TypeError("graph service has no record_hypothesis")
@@ -431,7 +466,9 @@ class HypothesisService:
             kwargs["provenance"] = provenance
         return await func(hypothesis, **kwargs)
 
-    async def resolve(self, hypothesis_id: str, status: str, confidence: float | None = None, step: int = 0) -> Any:
+    async def resolve(
+        self, hypothesis_id: str, status: str, confidence: float | None = None, step: int = 0
+    ) -> Any:
         func = getattr(self._graph, "resolve_hypothesis", None)
         if not callable(func):
             raise TypeError("graph service has no resolve_hypothesis")
@@ -440,7 +477,9 @@ class HypothesisService:
             kwargs["confidence"] = confidence
         return await func(str(hypothesis_id), **kwargs)
 
-    async def relations_for(self, hypothesis_id: str) -> list[dict[str, Any]]:
+    async def relations_for(
+        self, hypothesis_id: str
+    ) -> builtins.list[dict[str, Any]]:
         node_id = str(hypothesis_node_id(str(hypothesis_id)))
         try:
             edges = await self._graph.list_edges()
@@ -449,15 +488,21 @@ class HypothesisService:
         rels: list[dict[str, Any]] = []
         for edge in edges or []:
             if str(edge.source_id) == node_id or str(edge.target_id) == node_id:
-                rels.append({
-                    "edge_type": str(edge.type.value if hasattr(edge.type, "value") else edge.type),
-                    "source_id": str(edge.source_id),
-                    "target_id": str(edge.target_id),
-                })
+                rels.append(
+                    {
+                        "edge_type": str(
+                            edge.type.value if hasattr(edge.type, "value") else edge.type
+                        ),
+                        "source_id": str(edge.source_id),
+                        "target_id": str(edge.target_id),
+                    }
+                )
         rels.sort(key=lambda d: (d["edge_type"], d["source_id"], d["target_id"]))
         return rels
 
-    async def evidence_ids_for(self, hypothesis_id: str, evidence_store: Any, run_id: str) -> list[str]:
+    async def evidence_ids_for(
+        self, hypothesis_id: str, evidence_store: Any, run_id: str
+    ) -> builtins.list[str]:
         hid = str(hypothesis_id)
         ids: list[str] = []
         hyp = await self.get(hid)
@@ -483,7 +528,12 @@ class HypothesisService:
         return _sorted_str(ids)
 
 
-def _provided_claim(node: Any, run_id: str = "", evidence_index: dict[str, Any] | None = None, index_failed: bool = False) -> ProvidedClaim:
+def _provided_claim(
+    node: Any,
+    run_id: str = "",
+    evidence_index: dict[str, Any] | None = None,
+    index_failed: bool = False,
+) -> ProvidedClaim:
     props = getattr(node, "properties", {}) or {}
     facts = facts_of(props)
     first, last = _steps_of(props)
@@ -524,7 +574,6 @@ def _provided_claim(node: Any, run_id: str = "", evidence_index: dict[str, Any] 
         first_seen_step=first,
         last_seen_step=last,
     )
-
 
 
 def _node_evidence_ids(node: Any) -> list[str]:
@@ -572,7 +621,14 @@ def _is_provided_node(node: Any) -> bool:
             if str(entry.get("source", "")).startswith("engagement:"):
                 return True
     return False
-def _fact_view(node: Any, run_id: str, evidence_index: dict[str, Any] | None = None, diagnostics: dict[str, Any] | None = None) -> tuple:
+
+
+def _fact_view(
+    node: Any,
+    run_id: str,
+    evidence_index: dict[str, Any] | None = None,
+    diagnostics: dict[str, Any] | None = None,
+) -> tuple:
     """Claim-level fact projection for one node.
 
     Every attr/fact key needs its own ``measured`` claim-map entry whose
@@ -613,38 +669,59 @@ def _fact_view(node: Any, run_id: str, evidence_index: dict[str, Any] | None = N
         run = entry.get("run_id")
         if run is None:
             run = entry.get("run")
-        historical.append({
-            "node_id": node_id,
-            "kind": kind,
-            "key": str(key),
-            "run": str(run) if run is not None else None,
-            "source": str(entry.get("source", "")),
-        })
+        historical.append(
+            {
+                "node_id": node_id,
+                "kind": kind,
+                "key": str(key),
+                "run": str(run) if run is not None else None,
+                "source": str(entry.get("source", "")),
+            }
+        )
 
     for key in sorted(attrs, key=str):
         value = _jsonable(attrs[key])
         if key in DECLARED_ATTR_KEYS:
-            excluded.append(ExcludedAttr(node_id=node_id, attr=str(key), value=value, reason="declared_never_fact"))
+            excluded.append(
+                ExcludedAttr(
+                    node_id=node_id, attr=str(key), value=value, reason="declared_never_fact"
+                )
+            )
             continue
         entry = claims.get("attrs:" + str(key))
-        grounded, reason, eid = _claim_grounding(entry, run_id=run_id, evidence_index=index, index_failed=index_failed)
+        grounded, reason, eid = _claim_grounding(
+            entry, run_id=run_id, evidence_index=index, index_failed=index_failed
+        )
         if reason == "historical" and isinstance(entry, dict):
             _note_historical("attr", key, entry)
             _note_evidence(reason, eid)
             continue
         if not grounded:
             if key in PLAN_PROMOTED_ATTR_KEYS:
-                excluded.append(ExcludedAttr(node_id=node_id, attr=str(key), value=value, reason="plan_promoted_without_observation"))
+                excluded.append(
+                    ExcludedAttr(
+                        node_id=node_id,
+                        attr=str(key),
+                        value=value,
+                        reason="plan_promoted_without_observation",
+                    )
+                )
             else:
-                excluded.append(ExcludedAttr(node_id=node_id, attr=str(key), value=value, reason=reason))
+                excluded.append(
+                    ExcludedAttr(node_id=node_id, attr=str(key), value=value, reason=reason)
+                )
             _note_evidence(reason, eid)
             continue
         if not isinstance(entry, dict) or "value" not in entry:
-            excluded.append(ExcludedAttr(node_id=node_id, attr=str(key), value=value, reason="legacy_no_value"))
+            excluded.append(
+                ExcludedAttr(node_id=node_id, attr=str(key), value=value, reason="legacy_no_value")
+            )
             _note_evidence(reason, eid)
             continue
         if not values_equal(entry.get("value"), attrs[key]):
-            excluded.append(ExcludedAttr(node_id=node_id, attr=str(key), value=value, reason="value_changed"))
+            excluded.append(
+                ExcludedAttr(node_id=node_id, attr=str(key), value=value, reason="value_changed")
+            )
             _note_evidence(reason, eid)
             continue
         kept_attrs[str(key)] = value
@@ -653,7 +730,9 @@ def _fact_view(node: Any, run_id: str, evidence_index: dict[str, Any] | None = N
         if isinstance(entry, dict):
             claim_sources["attrs:" + str(key)] = {
                 "source": str(entry.get("source", "")),
-                "run": str(entry.get("run_id") if entry.get("run_id") is not None else entry.get("run")),
+                "run": str(
+                    entry.get("run_id") if entry.get("run_id") is not None else entry.get("run")
+                ),
                 "confidence": str(entry.get("confidence", "")),
                 "evidence_id": eid,
             }
@@ -663,24 +742,51 @@ def _fact_view(node: Any, run_id: str, evidence_index: dict[str, Any] | None = N
         if key == "observations":
             continue
         if key in DECLARED_FACT_KEYS:
-            excluded.append(ExcludedAttr(node_id=node_id, attr=str(key), value=_jsonable(facts[key]), reason="declared_never_fact"))
+            excluded.append(
+                ExcludedAttr(
+                    node_id=node_id,
+                    attr=str(key),
+                    value=_jsonable(facts[key]),
+                    reason="declared_never_fact",
+                )
+            )
             continue
         if key in AUDIT_FACT_KEYS:
-            excluded.append(ExcludedAttr(node_id=node_id, attr=str(key), value=_jsonable(facts[key]), reason="audit_not_fact"))
+            excluded.append(
+                ExcludedAttr(
+                    node_id=node_id,
+                    attr=str(key),
+                    value=_jsonable(facts[key]),
+                    reason="audit_not_fact",
+                )
+            )
             continue
         entry = claims.get("facts:" + str(key))
-        grounded, reason, eid = _claim_grounding(entry, run_id=run_id, evidence_index=index, index_failed=index_failed)
+        grounded, reason, eid = _claim_grounding(
+            entry, run_id=run_id, evidence_index=index, index_failed=index_failed
+        )
         if reason == "historical" and isinstance(entry, dict):
             _note_historical("fact", key, entry)
             _note_evidence(reason, eid)
             continue
         if not grounded:
-            excluded.append(ExcludedAttr(node_id=node_id, attr=str(key), value=_jsonable(facts[key]), reason=reason))
+            excluded.append(
+                ExcludedAttr(
+                    node_id=node_id, attr=str(key), value=_jsonable(facts[key]), reason=reason
+                )
+            )
             _note_evidence(reason, eid)
             continue
         merged_value = facts[key]
         if not isinstance(entry, dict) or "value" not in entry:
-            excluded.append(ExcludedAttr(node_id=node_id, attr=str(key), value=_jsonable(merged_value), reason="legacy_no_value"))
+            excluded.append(
+                ExcludedAttr(
+                    node_id=node_id,
+                    attr=str(key),
+                    value=_jsonable(merged_value),
+                    reason="legacy_no_value",
+                )
+            )
             _note_evidence(reason, eid)
             continue
         if isinstance(merged_value, list):
@@ -723,20 +829,31 @@ def _fact_view(node: Any, run_id: str, evidence_index: dict[str, Any] | None = N
                 if element_eid:
                     grounded_ids.add(element_eid)
             if dropped and diagnostics is not None:
-                diag.setdefault("excluded_elements", []).append({
-                    "node_id": node_id,
-                    "key": str(key),
-                    "excluded_count": dropped,
-                    "sample": dropped_sample,
-                })
+                diag.setdefault("excluded_elements", []).append(
+                    {
+                        "node_id": node_id,
+                        "key": str(key),
+                        "excluded_count": dropped,
+                        "sample": dropped_sample,
+                    }
+                )
             if not kept_elements:
-                excluded.append(ExcludedAttr(node_id=node_id, attr=str(key), value=_jsonable(merged_value), reason="no_grounded_elements"))
+                excluded.append(
+                    ExcludedAttr(
+                        node_id=node_id,
+                        attr=str(key),
+                        value=_jsonable(merged_value),
+                        reason="no_grounded_elements",
+                    )
+                )
                 continue
             kept_facts[str(key)] = kept_elements
             if isinstance(entry, dict):
                 claim_sources["facts:" + str(key)] = {
                     "source": str(entry.get("source", "")),
-                    "run": str(entry.get("run_id") if entry.get("run_id") is not None else entry.get("run")),
+                    "run": str(
+                        entry.get("run_id") if entry.get("run_id") is not None else entry.get("run")
+                    ),
                     "confidence": str(entry.get("confidence", "")),
                     "evidence_id": eid,
                     "grounded_elements": len(kept_elements),
@@ -744,7 +861,14 @@ def _fact_view(node: Any, run_id: str, evidence_index: dict[str, Any] | None = N
                 }
             continue
         if not values_equal(entry.get("value"), merged_value):
-            excluded.append(ExcludedAttr(node_id=node_id, attr=str(key), value=_jsonable(merged_value), reason="value_changed"))
+            excluded.append(
+                ExcludedAttr(
+                    node_id=node_id,
+                    attr=str(key),
+                    value=_jsonable(merged_value),
+                    reason="value_changed",
+                )
+            )
             _note_evidence(reason, eid)
             continue
         kept_facts[str(key)] = _jsonable(merged_value)
@@ -753,7 +877,9 @@ def _fact_view(node: Any, run_id: str, evidence_index: dict[str, Any] | None = N
         if isinstance(entry, dict):
             claim_sources["facts:" + str(key)] = {
                 "source": str(entry.get("source", "")),
-                "run": str(entry.get("run_id") if entry.get("run_id") is not None else entry.get("run")),
+                "run": str(
+                    entry.get("run_id") if entry.get("run_id") is not None else entry.get("run")
+                ),
                 "confidence": str(entry.get("confidence", "")),
                 "evidence_id": eid,
             }
@@ -763,7 +889,14 @@ def _fact_view(node: Any, run_id: str, evidence_index: dict[str, Any] | None = N
         context_key = str(obs.get("context_key", "")) if isinstance(obs, dict) else ""
         if not obs_eid or str(obs_eid) not in index or not _record_has_raw(index.get(str(obs_eid))):
             reason = "evidence_lookup_failed" if index_failed else "observation_ungrounded"
-            excluded.append(ExcludedAttr(node_id=node_id, attr="observations:" + context_key, value=_jsonable(obs), reason=reason))
+            excluded.append(
+                ExcludedAttr(
+                    node_id=node_id,
+                    attr="observations:" + context_key,
+                    value=_jsonable(obs),
+                    reason=reason,
+                )
+            )
             if obs_eid and not index_failed:
                 _note_evidence("evidence_not_found", str(obs_eid))
             continue
@@ -771,16 +904,22 @@ def _fact_view(node: Any, run_id: str, evidence_index: dict[str, Any] | None = N
         grounded_ids.add(str(obs_eid))
     all_ids = _node_evidence_ids(node)
     if len(all_ids) > MAX_EVIDENCE_IDS_PER_ITEM and diagnostics is not None:
-        diag.setdefault("truncated", []).append({
-            "node_id": node_id,
-            "omitted_evidence_ids": all_ids[MAX_EVIDENCE_IDS_PER_ITEM:],
-        })
+        diag.setdefault("truncated", []).append(
+            {
+                "node_id": node_id,
+                "omitted_evidence_ids": all_ids[MAX_EVIDENCE_IDS_PER_ITEM:],
+            }
+        )
     evidence_ids = all_ids[:MAX_EVIDENCE_IDS_PER_ITEM]
     if not kept_attrs and not kept_facts and not kept_observations:
         return None, excluded, historical
     item = FactItem(
         node_id=node_id,
-        node_type=str(node_type.value if hasattr(node_type, "value") else node_type),
+        node_type=str(
+            node_type.value
+            if node_type is not None and hasattr(node_type, "value")
+            else node_type
+        ),
         observed_attrs=kept_attrs,
         observed_facts=kept_facts,
         observations=kept_observations,
@@ -799,7 +938,15 @@ def _priority(last_seen: int, node_id: str, targets: set[str], step: int) -> tup
     in_target = 0 if node_id in targets else 1
     future = 0 if last_seen <= step else 1
     return (in_target, future, -last_seen, node_id)
-async def _hypothesis_items(graph_service: Any, evidence_index: dict[str, Any] | None, run_id: str, targets: set[str], step: int) -> list:
+
+
+async def _hypothesis_items(
+    graph_service: Any,
+    evidence_index: dict[str, Any] | None,
+    run_id: str,
+    targets: set[str],
+    step: int,
+) -> list:
     svc = HypothesisService(graph_service)
     try:
         hyps = await svc.list()
@@ -840,8 +987,7 @@ async def _hypothesis_items(graph_service: Any, evidence_index: dict[str, Any] |
             node = None
         first = last = None
         if node is not None:
-            f, l = _steps_of(getattr(node, "properties", {}) or {})
-            first, last = f, l
+            first, last = _steps_of(getattr(node, "properties", {}) or {})
         node_evidence: list[str] = []
         if node is not None:
             node_evidence.extend(_node_evidence_ids(node))
@@ -850,7 +996,9 @@ async def _hypothesis_items(graph_service: Any, evidence_index: dict[str, Any] |
             raw = meta.get(key, [])
             if isinstance(raw, list):
                 meta_evidence.extend([str(v) for v in raw])
-        linked = _sorted_str(node_evidence + meta_evidence + by_hyp.get(hid, []))[:MAX_EVIDENCE_IDS_PER_ITEM]
+        linked = _sorted_str(node_evidence + meta_evidence + by_hyp.get(hid, []))[
+            :MAX_EVIDENCE_IDS_PER_ITEM
+        ]
         status = str(hyp.status or "open")
         # Support/refute needs an explicit record: an inconclusive outcome is
         # not refuting evidence, and an open TARGETS link is not supporting
@@ -859,70 +1007,103 @@ async def _hypothesis_items(graph_service: Any, evidence_index: dict[str, Any] |
         explicit_refuting: list[str] = []
         raw_support = meta.get("supporting_evidence_ids", [])
         raw_refuting = meta.get("refuting_evidence_ids", [])
-        explicit_supporting = _sorted_str([str(v) for v in raw_support]) if isinstance(raw_support, list) else []
-        explicit_refuting = _sorted_str([str(v) for v in raw_refuting]) if isinstance(raw_refuting, list) else []
+        explicit_supporting = (
+            _sorted_str([str(v) for v in raw_support]) if isinstance(raw_support, list) else []
+        )
+        explicit_refuting = (
+            _sorted_str([str(v) for v in raw_refuting]) if isinstance(raw_refuting, list) else []
+        )
         supporting = _sorted_str(explicit_supporting)[:MAX_EVIDENCE_IDS_PER_ITEM]
         refuting = _sorted_str(explicit_refuting)[:MAX_EVIDENCE_IDS_PER_ITEM]
         neutral = [eid for eid in linked if eid not in set(supporting) and eid not in set(refuting)]
         meta_target = meta.get("target_node_id", None)
         edge_targets = sorted(set(target_links.get(hid, [])))
-        target_node_id = str(meta_target) if isinstance(meta_target, str) and meta_target else (edge_targets[0] if edge_targets else None)
+        target_node_id = (
+            str(meta_target)
+            if isinstance(meta_target, str) and meta_target
+            else (edge_targets[0] if edge_targets else None)
+        )
         related = _sorted_str(edge_targets + finding_links.get(hid, []))
         rels: list[dict[str, Any]] = []
         hnode = str(hypothesis_node_id(hid))
         for edge in edge_list:
             if str(edge.source_id) == hnode or str(edge.target_id) == hnode:
-                rels.append({
-                    "edge_type": str(edge.type.value if hasattr(edge.type, "value") else edge.type),
-                    "source_id": str(edge.source_id),
-                    "target_id": str(edge.target_id),
-                })
+                rels.append(
+                    {
+                        "edge_type": str(
+                            edge.type.value if hasattr(edge.type, "value") else edge.type
+                        ),
+                        "source_id": str(edge.source_id),
+                        "target_id": str(edge.target_id),
+                    }
+                )
         rels.sort(key=lambda d: (d["edge_type"], d["source_id"], d["target_id"]))
         needs: list[str] = []
         if status == "open":
             if target_node_id:
-                needs.append("observe " + target_node_id + " with a tool that records evidence for this claim")
+                needs.append(
+                    "observe "
+                    + target_node_id
+                    + " with a tool that records evidence for this claim"
+                )
             else:
                 needs.append("pin the claim to one concrete target node before further validation")
             exp = meta.get("expectation", None)
             if isinstance(exp, dict) and exp.get("description"):
                 needs.append("check expectation: " + str(exp.get("description"))[:240])
             else:
-                needs.append("record supporting or refuting evidence with the hypothesis id attached")
-        expectation = _jsonable(meta.get("expectation")) if meta.get("expectation") is not None else None
+                needs.append(
+                    "record supporting or refuting evidence with the hypothesis id attached"
+                )
+        expectation = (
+            _jsonable(meta.get("expectation")) if meta.get("expectation") is not None else None
+        )
         if expectation is not None and not isinstance(expectation, dict):
             expectation = {"value": expectation}
-        items.append(HypothesisItem(
-            hypothesis_id=hid,
-            claim=str(hyp.description or ""),
-            confidence=float(hyp.confidence or 0.0),
-            status=status,
-            target_node_id=target_node_id,
-            target=str(meta.get("target")) if meta.get("target") is not None else None,
-            agent_id=str(meta.get("agent_id")) if meta.get("agent_id") is not None else None,
-            step_id=str(meta.get("step_id")) if meta.get("step_id") is not None else None,
-            violation_if_confirmed=bool(meta.get("violation_if_confirmed")) if meta.get("violation_if_confirmed") is not None else None,
-            severity=str(meta.get("severity")) if meta.get("severity") is not None else None,
-            expectation=expectation,
-            supporting_evidence_ids=supporting,
-            refuting_evidence_ids=refuting,
-            evidence_ids=linked,
-            neutral_evidence_ids=neutral,
-            finding_ids=_sorted_str([s.partition(":")[2] if s.startswith("finding:") else s for s in finding_links.get(hid, [])]),
-            related_node_ids=related,
-            relations=rels,
-            needs=needs,
-            first_seen_step=first,
-            last_seen_step=last,
-            origin="inferred",
-        ))
+        items.append(
+            HypothesisItem(
+                hypothesis_id=hid,
+                claim=str(hyp.description or ""),
+                confidence=float(hyp.confidence or 0.0),
+                status=status,
+                target_node_id=target_node_id,
+                target=str(meta.get("target")) if meta.get("target") is not None else None,
+                agent_id=str(meta.get("agent_id")) if meta.get("agent_id") is not None else None,
+                step_id=str(meta.get("step_id")) if meta.get("step_id") is not None else None,
+                violation_if_confirmed=bool(meta.get("violation_if_confirmed"))
+                if meta.get("violation_if_confirmed") is not None
+                else None,
+                severity=str(meta.get("severity")) if meta.get("severity") is not None else None,
+                expectation=expectation,
+                supporting_evidence_ids=supporting,
+                refuting_evidence_ids=refuting,
+                evidence_ids=linked,
+                neutral_evidence_ids=neutral,
+                finding_ids=_sorted_str(
+                    [
+                        s.partition(":")[2] if s.startswith("finding:") else s
+                        for s in finding_links.get(hid, [])
+                    ]
+                ),
+                related_node_ids=related,
+                relations=rels,
+                needs=needs,
+                first_seen_step=first,
+                last_seen_step=last,
+                origin="inferred",
+            )
+        )
+
     def _key(item: HypothesisItem) -> tuple:
         pri = 0 if (item.target_node_id in targets) else 1
         last_seen = item.last_seen_step if isinstance(item.last_seen_step, int) else -1
         future = 0 if last_seen <= step else 1
         return (pri, future, -last_seen, item.hypothesis_id)
+
     items.sort(key=_key)
     return items
+
+
 async def _finding_items(graph_service: Any, run_id: str, targets: set[str], step: int) -> list:
     try:
         findings = await graph_service.list_findings()
@@ -941,7 +1122,9 @@ async def _finding_items(graph_service: Any, run_id: str, targets: set[str], ste
         tgt = str(edge.target_id)
         if etype == "supported_by" and src.startswith("finding:"):
             fid = src.partition(":")[2]
-            hyp_links.setdefault(fid, []).append(tgt.partition(":")[2] if tgt.startswith("hypothesis:") else tgt)
+            hyp_links.setdefault(fid, []).append(
+                tgt.partition(":")[2] if tgt.startswith("hypothesis:") else tgt
+            )
         if etype == "targets" and src.startswith("finding:"):
             fid = src.partition(":")[2]
             tgt_links.setdefault(fid, []).append(tgt)
@@ -959,25 +1142,29 @@ async def _finding_items(graph_service: Any, run_id: str, targets: set[str], ste
             first, last = a, b
         ev = _sorted_str(list(f.evidence_ids or []))[:MAX_EVIDENCE_IDS_PER_ITEM]
         grounded = bool(ev) if bool(f.verified) else True
-        items.append(FindingItem(
-            finding_id=fid,
-            title=str(f.title or ""),
-            description=str(f.description or ""),
-            severity=str(f.severity or "info"),
-            verified=bool(f.verified),
-            evidence_ids=ev,
-            hypothesis_ids=_sorted_str(hyp_links.get(fid, [])),
-            target_node_ids=_sorted_str(tgt_links.get(fid, [])),
-            is_grounded=grounded,
-            origin="observed" if ev else "inferred",
-            first_seen_step=first,
-            last_seen_step=last,
-        ))
+        items.append(
+            FindingItem(
+                finding_id=fid,
+                title=str(f.title or ""),
+                description=str(f.description or ""),
+                severity=str(f.severity or "info"),
+                verified=bool(f.verified),
+                evidence_ids=ev,
+                hypothesis_ids=_sorted_str(hyp_links.get(fid, [])),
+                target_node_ids=_sorted_str(tgt_links.get(fid, [])),
+                is_grounded=grounded,
+                origin="observed" if ev else "inferred",
+                first_seen_step=first,
+                last_seen_step=last,
+            )
+        )
+
     def _key(item: FindingItem) -> tuple:
         hit = 0 if (targets and any(t in targets for t in item.target_node_ids)) else 1
         last_seen = item.last_seen_step if isinstance(item.last_seen_step, int) else -1
         future = 0 if last_seen <= step else 1
         return (hit, future, -last_seen, item.finding_id)
+
     items.sort(key=_key)
     return items
 
@@ -1008,7 +1195,15 @@ def _target_address(node: Any) -> tuple[str | None, str | None, str | None]:
     return address, target_ref, observed
 
 
-async def _known_targets(nodes: list, run_id: str, targets: set[str], step: int, evidence_index: dict[str, Any] | None = None, diagnostics: dict[str, Any] | None = None, grounded_node_ids: set[str] | None = None) -> tuple:
+async def _known_targets(
+    nodes: list,
+    run_id: str,
+    targets: set[str],
+    step: int,
+    evidence_index: dict[str, Any] | None = None,
+    diagnostics: dict[str, Any] | None = None,
+    grounded_node_ids: set[str] | None = None,
+) -> tuple:
     """Provided targets plus actually observed ones (grounded only).
 
     Non-provided nodes join only with grounded measured content from this
@@ -1018,7 +1213,9 @@ async def _known_targets(nodes: list, run_id: str, targets: set[str], step: int,
     out: list[KnownTarget] = []
     historical_targets: list[dict[str, Any]] = []
     index: dict[str, Any] = evidence_index or {}
-    index_failed = bool((diagnostics or {}).get("lookup_failed")) if diagnostics is not None else True
+    index_failed = (
+        bool((diagnostics or {}).get("lookup_failed")) if diagnostics is not None else True
+    )
     grounded: set[str] = grounded_node_ids or set()
     for node in nodes:
         ntype = getattr(node, "type", None)
@@ -1028,13 +1225,20 @@ async def _known_targets(nodes: list, run_id: str, targets: set[str], step: int,
         provided = _is_provided_node(node)
         if provided:
             origin = "declared"
-            confirmed = _node_has_grounded_presence(props, run_id=run_id, evidence_index=index, index_failed=index_failed)
+            confirmed = _node_has_grounded_presence(
+                props, run_id=run_id, evidence_index=index, index_failed=index_failed
+            )
             verification = "confirmed" if confirmed else "unconfirmed"
         else:
             if str(node.id) in grounded:
                 origin = "observed"
                 verification = "confirmed"
-            elif ntype in (GraphNodeType.PRINCIPAL, GraphNodeType.CREDENTIAL) and _node_has_grounded_presence(props, run_id=run_id, evidence_index=index, index_failed=index_failed):
+            elif ntype in (
+                GraphNodeType.PRINCIPAL,
+                GraphNodeType.CREDENTIAL,
+            ) and _node_has_grounded_presence(
+                props, run_id=run_id, evidence_index=index, index_failed=index_failed
+            ):
                 origin = "observed"
                 verification = "confirmed"
             else:
@@ -1045,7 +1249,11 @@ async def _known_targets(nodes: list, run_id: str, targets: set[str], step: int,
                     claim_run = claim_entry.get("run_id")
                     if claim_run is None:
                         claim_run = claim_entry.get("run")
-                    if claim_run is not None and str(claim_run) != "" and str(claim_run) != str(run_id):
+                    if (
+                        claim_run is not None
+                        and str(claim_run) != ""
+                        and str(claim_run) != str(run_id)
+                    ):
                         runs.append(str(claim_run))
                 runs = _sorted_str(runs)
                 if runs:
@@ -1054,31 +1262,33 @@ async def _known_targets(nodes: list, run_id: str, targets: set[str], step: int,
         address, target_ref, observed = _target_address(node)
         if not address:
             continue
-        f, l = _steps_of(props)
-        out.append(KnownTarget(
-            node_id=str(node.id),
-            node_type=str(ntype.value if hasattr(ntype, "value") else ntype),
-            address=str(address),
-            target_ref=target_ref,
-            observed_target=observed,
-            origin=origin,
-            verification=verification,
-            last_seen_step=l,
-        ))
+        _, last_seen = _steps_of(props)
+        out.append(
+            KnownTarget(
+                node_id=str(node.id),
+                node_type=str(ntype.value if hasattr(ntype, "value") else ntype),
+                address=str(address),
+                target_ref=target_ref,
+                observed_target=observed,
+                origin=origin,
+                verification=verification,
+                last_seen_step=last_seen,
+            )
+        )
     out.sort(key=lambda t: _priority(t.last_seen_step, t.node_id, targets, step))
     return out, historical_targets
 
 
 def _fact_refs_for_item(item: FactItem) -> list[str]:
     refs: list[str] = [str(item.node_id)]
-    for key in (item.observed_attrs or {}):
+    for key in item.observed_attrs or {}:
         refs.append(str(item.node_id) + "#attr:" + str(key))
-    for key in (item.observed_facts or {}):
+    for key in item.observed_facts or {}:
         refs.append(str(item.node_id) + "#fact:" + str(key))
-    for obs in (item.observations or []):
+    for obs in item.observations or []:
         if isinstance(obs, dict) and obs.get("context_key"):
             refs.append(str(item.node_id) + "#obs:" + str(obs.get("context_key")))
-    for eid in (item.evidence_ids or []):
+    for eid in item.evidence_ids or []:
         refs.append("evidence:" + str(eid))
     out: list[str] = []
     for r in refs:
@@ -1086,7 +1296,14 @@ def _fact_refs_for_item(item: FactItem) -> list[str]:
             out.append(r)
     return sorted(out)
 
-async def project_knowledge(graph_service: Any, evidence_store: Any, run_id: str, step: int = 0, target_node_ids: list[str] | None = None) -> dict:
+
+async def project_knowledge(
+    graph_service: Any,
+    evidence_store: Any,
+    run_id: str,
+    step: int = 0,
+    target_node_ids: list[str] | None = None,
+) -> dict:
     run = str(run_id)
     targets: set[str] = set([str(v) for v in (target_node_ids or [])])
     try:
@@ -1147,7 +1364,9 @@ async def project_knowledge(graph_service: Any, evidence_store: Any, run_id: str
     find_map = {f.finding_id: f for f in finds}
     findings = [find_map[i].model_dump(mode="json") for i in find_kept]
 
-    known_all, historical_targets = await _known_targets(node_list, run, targets, step, evidence_index, evidence_diagnostics, grounded_node_ids)
+    known_all, historical_targets = await _known_targets(
+        node_list, run, targets, step, evidence_index, evidence_diagnostics, grounded_node_ids
+    )
     known_ids = [t.node_id for t in known_all]
     known_kept, known_omitted = _truncate_ids(known_ids, MAX_TARGET_ITEMS)
     known_map = {t.node_id: t for t in known_all}
@@ -1216,10 +1435,3 @@ __all__ = [
     "AUDIT_FACT_KEYS",
     "project_knowledge",
 ]
-
-
-
-
-
-
-

@@ -414,7 +414,11 @@ def _claim_meta(provenance: Provenance | None, step: int) -> dict[str, Any] | No
     """Write source without any value snapshot."""
     if provenance is None:
         return None
-    confidence = provenance.confidence.value if isinstance(provenance.confidence, Confidence) else str(provenance.confidence)
+    confidence = (
+        provenance.confidence.value
+        if isinstance(provenance.confidence, Confidence)
+        else str(provenance.confidence)
+    )
     return {
         "source": provenance.source,
         "evidence_id": provenance.evidence_id,
@@ -439,7 +443,9 @@ def _element_entries(elements: Any, meta: dict[str, Any]) -> list[dict[str, Any]
     return out
 
 
-def _claim_entry_for_value(provenance: Provenance | None, step: int, value: Any) -> dict[str, Any] | None:
+def _claim_entry_for_value(
+    provenance: Provenance | None, step: int, value: Any
+) -> dict[str, Any] | None:
     """One claim-map entry: write source plus the asserted value snapshot.
 
     Lists additionally carry per-element assertions, so a later union with
@@ -697,16 +703,16 @@ def merge_claim_provenance(
     merged: dict[str, dict[str, Any]] = {}
     for claim_key, entry in existing.items():
         if claim_key.startswith(CLAIM_ATTR_PREFIX):
-            if str(claim_key[len(CLAIM_ATTR_PREFIX):]) in merged_attrs:
+            if str(claim_key[len(CLAIM_ATTR_PREFIX) :]) in merged_attrs:
                 merged[claim_key] = dict(entry)
         elif claim_key.startswith(CLAIM_FACT_PREFIX):
-            if str(claim_key[len(CLAIM_FACT_PREFIX):]) in merged_facts:
+            if str(claim_key[len(CLAIM_FACT_PREFIX) :]) in merged_facts:
                 merged[claim_key] = dict(entry)
     for claim_key, entry in incoming.items():
         if not isinstance(entry, dict):
             continue
         if claim_key.startswith(CLAIM_ATTR_PREFIX):
-            key = str(claim_key[len(CLAIM_ATTR_PREFIX):])
+            key = str(claim_key[len(CLAIM_ATTR_PREFIX) :])
             if key not in merged_attrs:
                 continue
             if key in blocked and incoming_step <= blocked[key]:
@@ -721,7 +727,7 @@ def merge_claim_provenance(
                 continue  # not applied (sticky True); source stays
             merged[claim_key] = dict(entry)
         elif claim_key.startswith(CLAIM_FACT_PREFIX):
-            key = str(claim_key[len(CLAIM_FACT_PREFIX):])
+            key = str(claim_key[len(CLAIM_FACT_PREFIX) :])
             if key not in merged_facts:
                 continue
             if key not in incoming_facts:
@@ -761,9 +767,7 @@ def merge_properties(existing: dict[str, Any], incoming: dict[str, Any]) -> dict
     ignored, ``last_seen_step`` moves forward only.
     """
     merged: dict[str, Any] = {
-        key: value
-        for key, value in existing.items()
-        if key not in RESERVED_KEYS
+        key: value for key, value in existing.items() if key not in RESERVED_KEYS
     }
     for key, value in incoming.items():
         if key not in RESERVED_KEYS:
@@ -790,8 +794,7 @@ def merge_properties(existing: dict[str, Any], incoming: dict[str, Any]) -> dict
         seen_at=existing_seen,
     )
     merged[ATTRS_SEEN_KEY] = {
-        key: max(existing_seen.get(key, 0), incoming_seen.get(key, 0))
-        for key in merged[ATTRS_KEY]
+        key: max(existing_seen.get(key, 0), incoming_seen.get(key, 0)) for key in merged[ATTRS_KEY]
     }
     existing_facts = facts_of(existing)
     incoming_facts = facts_of(incoming)

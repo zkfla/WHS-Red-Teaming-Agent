@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import yaml
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, TypeAdapter
 
 from redteam.core.contracts.engagement import (
     ApprovalPolicy,
@@ -121,11 +121,15 @@ class OrchestrationConfig(BaseModel):
     @classmethod
     def from_environment(cls) -> OrchestrationConfig:
         """CLI runtime settings, validated with the same rules as library config."""
-        values = {
+        values: dict[str, Any] = {
             field: os.environ[f"REDTEAM_ORCHESTRATION_{field.upper()}"]
             for field in ("max_steps", "max_retries", "llm_candidate_generation")
             if f"REDTEAM_ORCHESTRATION_{field.upper()}" in os.environ
         }
+        if "llm_candidate_generation" in values:
+            values["llm_candidate_generation"] = TypeAdapter(bool).validate_python(
+                str(values["llm_candidate_generation"]).strip()
+            )
         return cls.model_validate(values)
 
 

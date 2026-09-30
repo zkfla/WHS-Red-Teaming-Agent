@@ -12,6 +12,7 @@ from redteam.orchestration.work.models import (
     TaskLease,
     WorkItem,
     WorkStatus,
+    is_unexecuted_stale,
 )
 
 
@@ -57,13 +58,7 @@ class InMemoryWorkStore:
                 self._items[target.work_id] = refreshed
                 return False
             blocking = [
-                existing
-                for existing in same_candidate
-                if not (
-                    existing.status is WorkStatus.STALE
-                    and existing.attempt == 0
-                    and not existing.job_id
-                )
+                existing for existing in same_candidate if not is_unexecuted_stale(existing)
             ]
             if blocking and not item.repeatable:
                 return False

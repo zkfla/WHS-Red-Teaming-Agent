@@ -3,21 +3,21 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from typing import Any, Literal, Protocol
 
 from pydantic import BaseModel, Field
 
-from redteam.core.contracts.action import ActionProposal
-from redteam.core.contracts.tool import ToolResult
-from redteam.core.enums import EvidenceSourceType, Verdict
 from redteam.attack_graph.identity import node_id_for_target
+from redteam.core.contracts.action import ActionProposal
+from redteam.core.contracts.evidence import EvidenceRecord
+from redteam.core.contracts.tool import ToolResult
+from redteam.core.convert import digest_payload
+from redteam.core.enums import EvidenceSourceType, Verdict
+from redteam.core.ids import EvidenceId, new_id
 from redteam.core.ports.evidence_store import EvidenceStore
 from redteam.orchestration.action_naming import tool_matches_action_namespace
 from redteam.orchestration.cognition import StructuredDecisionClient
-from redteam.core.contracts.evidence import EvidenceRecord
-from redteam.core.convert import digest_payload
-from redteam.core.ids import EvidenceId, new_id
-from datetime import datetime, timezone
 from redteam.orchestration.expectations import Expectation, ExpectationOutcome, verdict_for
 
 VerificationOutcome = Literal["success", "refuted", "inconclusive", "blocked", "unknown"]
@@ -30,6 +30,7 @@ class VerificationRequest(BaseModel):
     source_refs: list[str] = Field(default_factory=list)
     hypothesis_claim: str | None = None
     violation_if_confirmed: bool | None = None
+    principal_ref: str | None = None
 
 
 class VerificationAssessment(BaseModel):
@@ -53,9 +54,7 @@ class DeterministicAnalysisVerifier:
 
     async def verify(self, request: VerificationRequest) -> VerificationAssessment:
         verdict, reason = verdict_for(request.expectation, request.result)
-        outcome: VerificationOutcome | None = _outcome_for_deterministic(
-            request, verdict
-        )
+        outcome: VerificationOutcome | None = _outcome_for_deterministic(request, verdict)
         claim_text = (request.hypothesis_claim or "").strip()
         if outcome == "success" and claim_text:
             claim_flag: bool | None = True
@@ -87,7 +86,6 @@ def _truncate_for_prompt(output: Any, *, budget: int = 2000) -> Any:
         text = output
     else:
         text = json.dumps(output, ensure_ascii=False, default=str)
-    return text if len(text) <= budget else text[:budget]
     return text if len(text) <= budget else text[:budget]
 
 
@@ -127,10 +125,7 @@ def _is_anonymous_metadata(metadata: dict[str, Any]) -> bool:
         return True
     multi = metadata.get("principal_refs")
     if isinstance(multi, (list, tuple, set)):
-        return any(
-            isinstance(item, str) and item.strip().lower() == "anonymous"
-            for item in multi
-        )
+        return any(isinstance(item, str) and item.strip().lower() == "anonymous" for item in multi)
     return False
 
 
@@ -192,6 +187,46 @@ def _clean_identity(value: Any) -> str | None:
     if isinstance(value, str) and value.strip():
         return value.strip()
     return None
+
+
+def session_list_pairs(
+    output: Any, arguments_target_ref: str | None
+) -> tuple[set[str], set[str], list[tuple[str, str]]]:
+    """Sessions/principals/pairs from web.session_list rows only.
+
+    Only rows whose target_ref exactly equals the original proposal arguments
+    target_ref count. Row targets are configured aliases and may differ from
+    the canonical metadata target_node_id, so the canonical value must NOT
+    be used here. Missing or mismatched row targets are skipped (fail closed).
+    """
+    sessions: set[str] = set()
+    principals: set[str] = set()
+    pairs: list[tuple[str, str]] = []
+    if not isinstance(output, dict):
+        return (sessions, principals, pairs)
+    rows = output.get("sessions")
+    if not isinstance(rows, list):
+        return (sessions, principals, pairs)
+    expected: str | None = None
+    if isinstance(arguments_target_ref, str) and arguments_target_ref.strip():
+        expected = arguments_target_ref.strip()
+    if expected is None:
+        return (sessions, principals, pairs)
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        row_target = row.get("target_ref")
+        if not isinstance(row_target, str) or row_target.strip() != expected:
+            continue
+        cleaned_session = _clean_identity(row.get("session_ref"))
+        cleaned_principal = _clean_identity(row.get("principal_ref"))
+        if cleaned_session is not None:
+            sessions.add(cleaned_session)
+        if cleaned_principal is not None:
+            principals.add(cleaned_principal)
+        if cleaned_session is not None and cleaned_principal is not None:
+            pairs.append((cleaned_session, cleaned_principal))
+    return (sessions, principals, pairs)
 
 
 def _has_raw_account_artifact(
@@ -256,6 +291,15 @@ def _has_raw_account_artifact(
                 cleaned = _clean_identity(nested.get("principal_ref"))
                 if cleaned is not None:
                     raw_principals.add(cleaned)
+    try:
+        args_target = arguments.get("target_ref") if isinstance(arguments, dict) else None
+    except Exception:
+        args_target = None
+    row_sessions, row_principals, _row_pairs = session_list_pairs(
+        output, args_target if isinstance(args_target, str) else None
+    )
+    raw_sessions |= row_sessions
+    raw_principals |= row_principals
     if comparison_dict is not None:
         first_principal = _clean_identity(comparison_dict.get("first_principal_ref"))
         second_principal = _clean_identity(comparison_dict.get("second_principal_ref"))
@@ -273,33 +317,7 @@ def _has_raw_account_artifact(
             for observed in (first_session, second_session):
                 if observed is not None and observed not in expected_sessions:
                     return False
-    if expected_sessions and (raw_sessions & expected_sessions):
-        return True
-    if expected_principals and (raw_principals & expected_principals):
-        return True
-    return False
-
-
-def _graph_node_type_name(node: Any) -> str:
-    node_type = getattr(node, "type", None)
-    try:
-        value = node_type.value if hasattr(node_type, "value") else node_type
-    except Exception:
-        value = node_type
-    return str(value or "").strip().lower()
-
-
-def _node_pair_facts(node: Any) -> tuple[dict[str, Any], dict[str, Any], Any]:
-    props = getattr(node, "properties", {}) or {}
-    if not isinstance(props, dict):
-        return ({}, {}, props)
-    facts = props.get("facts", {})
-    attrs = props.get("attrs", {})
-    if not isinstance(facts, dict):
-        facts = {}
-    if not isinstance(attrs, dict):
-        attrs = {}
-    return (facts, attrs, props)
+    return claimed in raw_principals or claimed in (raw_sessions & expected_sessions)
 
 
 async def _session_alias_grounded(
@@ -310,98 +328,57 @@ async def _session_alias_grounded(
     target_ref: str,
     session_name: str,
     principal_name: str,
+    arguments_target_ref: str | None = None,
 ) -> bool:
-    """True only with a measured same-run same-target session->principal mapping."""
-    cleaned_session = session_name.strip() if isinstance(session_name, str) else ""
-    cleaned_principal = principal_name.strip() if isinstance(principal_name, str) else ""
-    cleaned_target = target_ref.strip() if isinstance(target_ref, str) else ""
-    if not cleaned_session or not cleaned_principal or not cleaned_target:
+    """Use successful raw receipts from this run and target for exact aliases."""
+    if not all(
+        isinstance(item, str) and item.strip()
+        for item in (target_ref, session_name, principal_name)
+    ):
         return False
-    if graph_service is not None:
-        lister = getattr(graph_service, "list_nodes", None)
-        nodes = await lister() if callable(lister) else []
-        for node in list(nodes or []):
-            if _graph_node_type_name(node) not in ("principal", "credential"):
-                continue
-            facts, _attrs, props = _node_pair_facts(node)
-            node_target = facts.get("target_ref")
-            if not isinstance(node_target, str) or node_target.strip() != cleaned_target:
-                continue
-            sessions: set[str] = set()
-            for key in ("session_ref", "session_refs"):
-                value = facts.get(key)
-                if isinstance(value, list):
-                    for item in value:
-                        if isinstance(item, str) and item.strip():
-                            sessions.add(item.strip())
-                elif isinstance(value, str) and value.strip():
-                    sessions.add(value.strip())
-            node_principal = facts.get("principal_ref")
-            if not isinstance(node_principal, str) or node_principal.strip() != cleaned_principal:
-                continue
-            if cleaned_session not in sessions:
-                continue
-            measured = False
-            provenance = props.get("provenance", []) if isinstance(props, dict) else []
-            if isinstance(provenance, list):
-                for entry in provenance:
-                    if not isinstance(entry, dict):
-                        continue
-                    if str(entry.get("confidence", "")) != "measured":
-                        continue
-                    entry_run = entry.get("run_id")
-                    if entry_run is not None and str(entry_run) != str(run_id):
-                        continue
-                    measured = True
-                    break
-            if not measured:
-                continue
+    wanted = (session_name.strip(), principal_name.strip())
+    for record in await evidence_store.list_for_run(run_id):
+        if str(record.run_id) != str(run_id):
+            continue
+        meta = record.metadata
+        if str(meta.get("target_node_id", "")).strip() != target_ref.strip():
+            continue
+        raw = meta.get("tool_result") or meta.get("raw_tool_result")
+        if not isinstance(raw, dict) or raw.get("success") is not True:
+            continue
+        if not record.action_id or not record.invocation_id:
+            continue
+        if str(raw.get("action_id")) != str(record.action_id) or (
+            str(raw.get("invocation_id")) != str(record.invocation_id)
+        ):
+            continue
+        if str(raw.get("tool_id")) != str(record.source_id):
+            continue
+        stored = meta.get("proposal")
+        if not isinstance(stored, dict) or str(stored.get("action_id")) != str(record.action_id):
+            continue
+        args = stored.get("arguments", {})
+        output = raw.get("output")
+        if not isinstance(output, dict):
+            continue
+        candidates: list[Any] = [output]
+        candidates.extend(output.get(key) for key in ("first", "second", "authenticated"))
+        for item in candidates:
+            if (
+                isinstance(item, dict)
+                and (
+                    _clean_identity(item.get("session_ref", item.get("session"))),
+                    _clean_identity(item.get("principal_ref")),
+                )
+                == wanted
+            ):
+                return True
+        record_target = args.get("target_ref") if isinstance(args, dict) else None
+        if record_target != arguments_target_ref:
+            continue
+        _, _, pairs = session_list_pairs(output, arguments_target_ref)
+        if wanted in pairs:
             return True
-    records = await evidence_store.list_for_run(run_id)
-    for rec in list(records or []):
-        try:
-            meta = getattr(rec, "metadata", None) or {}
-        except Exception:
-            continue
-        if not isinstance(meta, dict):
-            continue
-        if str(meta.get("target_node_id", "") or "").strip() != cleaned_target:
-            continue
-        comparison = meta.get("session_comparison")
-        if isinstance(comparison, dict):
-            pairs = [
-                (comparison.get("first_session_ref"), comparison.get("first_principal_ref")),
-                (comparison.get("second_session_ref"), comparison.get("second_principal_ref")),
-            ]
-            for raw_session, raw_principal in pairs:
-                if (
-                    isinstance(raw_session, str)
-                    and isinstance(raw_principal, str)
-                    and raw_session.strip() == cleaned_session
-                    and raw_principal.strip() == cleaned_principal
-                ):
-                    return True
-        raw = meta.get("tool_result")
-        if not isinstance(raw, dict):
-            raw = meta.get("raw_tool_result")
-        try:
-            output = raw.get("output") if isinstance(raw, dict) else None
-        except Exception:
-            output = None
-        if isinstance(output, dict):
-            for nested_key in ("first", "second", "authenticated"):
-                nested = output.get(nested_key)
-                if not isinstance(nested, dict):
-                    continue
-                nested_session = nested.get("session_ref", nested.get("session"))
-                nested_principal = nested.get("principal_ref")
-                if (
-                    isinstance(nested_session, str)
-                    and isinstance(nested_principal, str)
-                    and nested_session.strip() == cleaned_session
-                    and nested_principal.strip() == cleaned_principal
-                ):
-                    return True
     return False
 
 
@@ -458,13 +435,16 @@ class StructuredLLMAnalysisVerifier:
                 suffix = " (" + str(kind) + ")" if kind else ""
                 assessment = self._unknown(
                     request,
-                    "model decision failed" + suffix + ": " + type(exc).__name__
+                    "model decision failed"
+                    + suffix
+                    + ": "
+                    + type(exc).__name__
                     + "; evidence preserved, no verdict reached",
                 )
             else:
                 assessment = await self._decide(request, meaning)
         try:
-            receipt = await append_review_receipt(
+            _receipt = await append_review_receipt(
                 evidence_store=self._store,
                 proposal=request.proposal,
                 result=request.result,
@@ -547,7 +527,8 @@ class StructuredLLMAnalysisVerifier:
         if outcome not in self._OUTCOMES:
             return self._unknown(
                 request,
-                "model outcome uninterpretable (" + str(outcome)
+                "model outcome uninterpretable ("
+                + str(outcome)
                 + "); evidence preserved, no verdict reached",
             )
         if not request.result.success:
@@ -576,9 +557,7 @@ class StructuredLLMAnalysisVerifier:
                     outcome=outcome,  # type: ignore[assignment]
                 )
             preserved: VerificationOutcome = outcome  # type: ignore[assignment]
-            return self._unknown(
-                request, "model reached no conclusion" + suffix, outcome=preserved
-            )
+            return self._unknown(request, "model reached no conclusion" + suffix, outcome=preserved)
         expectation = request.expectation
         if expectation is None:
             return self._unknown(
@@ -591,7 +570,9 @@ class StructuredLLMAnalysisVerifier:
                 return self._unknown(
                     request,
                     "model claims success but the recorded expectation did not hold ("
-                    + assessment.value + ")" + suffix,
+                    + assessment.value
+                    + ")"
+                    + suffix,
                 )
             claim_text = (request.hypothesis_claim or "").strip()
             if not claim_text:
@@ -620,7 +601,10 @@ class StructuredLLMAnalysisVerifier:
                     )
                 return VerificationAssessment(
                     verdict=Verdict.VIOLATION,
-                    reason="model confirms the tested claim and the violation-marked expectation held" + suffix,
+                    reason=(
+                        "model confirms the tested claim and the "
+                        "violation-marked expectation held" + suffix
+                    ),
                     reviewer_id=self.reviewer_id,
                     source_refs=request.source_refs,
                     outcome="success",
@@ -663,6 +647,7 @@ class StructuredLLMAnalysisVerifier:
             outcome="refuted",
             claim_supported=False,
         )
+
     async def _grounding_gaps(self, request: VerificationRequest) -> list[str]:
         gaps: list[str] = []
         proposal = request.proposal
@@ -688,7 +673,7 @@ class StructuredLLMAnalysisVerifier:
         record = None
         for ref in refs:
             try:
-                candidate = await self._store.get(ref)
+                candidate = await self._store.get(EvidenceId(ref))
             except Exception:  # noqa: BLE001 - an unreadable store proves nothing
                 return "evidence store unreadable"
             if candidate is not None:
@@ -698,9 +683,7 @@ class StructuredLLMAnalysisVerifier:
             return "linked evidence is missing"
         if str(record.run_id) != str(request.proposal.run_id):
             return "linked evidence belongs to another run"
-        if record.action_id is None or str(record.action_id) != str(
-            request.proposal.action_id
-        ):
+        if record.action_id is None or str(record.action_id) != str(request.proposal.action_id):
             return "linked evidence does not answer this action"
         if record.invocation_id is None or str(record.invocation_id) != str(
             request.result.invocation_id
@@ -739,13 +722,32 @@ class StructuredLLMAnalysisVerifier:
         stored_proposal = metadata.get("proposal")
         if isinstance(stored_proposal, dict):
             stored_action = stored_proposal.get("action_id")
-            if stored_action is not None and str(stored_action) != str(
-                request.proposal.action_id
-            ):
+            if stored_action is not None and str(stored_action) != str(request.proposal.action_id):
                 return "stored proposal answers another action"
-        claimed = _claimed_principal(request.proposal)
         recorded = metadata.get("principal_ref")
         recorded_refs = metadata.get("principal_refs")
+        # Prefer the code-stored step account over tool args: tool schemas
+        # often carry only a session_ref (no principal field), so args-first
+        # would falsely reject a valid step binding (e.g. step Alice vs arg
+        # SessionA). Use the step value when it is consistent with the
+        # record's declared account; otherwise fall back to args.
+        step_claimed_raw = getattr(request, "principal_ref", None)
+        step_claimed = (
+            step_claimed_raw.strip()
+            if isinstance(step_claimed_raw, str) and step_claimed_raw.strip()
+            else None
+        )
+        declared_pool: set[str] = set()
+        if isinstance(recorded, str) and recorded.strip():
+            declared_pool.add(recorded.strip())
+        if isinstance(recorded_refs, (list, tuple, set)):
+            for _item in recorded_refs:
+                if isinstance(_item, str) and _item.strip():
+                    declared_pool.add(_item.strip())
+        if step_claimed is not None and step_claimed in declared_pool:
+            claimed: str | None = step_claimed
+        else:
+            claimed = _claimed_principal(request.proposal)
         if claimed is not None:
             if _is_anonymous_metadata(metadata):
                 return "anonymous evidence cannot satisfy an account-scoped action"
@@ -760,7 +762,9 @@ class StructuredLLMAnalysisVerifier:
                 if not pool:
                     return "an account was used but the evidence names none"
                 return "linked evidence names another account"
-            args = request.proposal.arguments if isinstance(request.proposal.arguments, dict) else {}
+            args = (
+                request.proposal.arguments if isinstance(request.proposal.arguments, dict) else {}
+            )
             if _has_raw_account_artifact(metadata, raw, claimed, args):
                 pass
             else:
@@ -768,7 +772,10 @@ class StructuredLLMAnalysisVerifier:
                 raw_session_hit = False
                 if bound_session is not None:
                     http_obs = metadata.get("http_observation")
-                    if isinstance(http_obs, dict) and _clean_identity(http_obs.get("session_ref")) == bound_session:
+                    if (
+                        isinstance(http_obs, dict)
+                        and _clean_identity(http_obs.get("session_ref")) == bound_session
+                    ):
                         raw_session_hit = True
                     if not raw_session_hit:
                         try:
@@ -802,6 +809,9 @@ class StructuredLLMAnalysisVerifier:
                         target_ref=str(metadata.get("target_node_id", "") or ""),
                         session_name=bound_session,
                         principal_name=claimed,
+                        arguments_target_ref=args.get("target_ref")
+                        if isinstance(args, dict)
+                        else None,
                     )
                 except Exception:
                     return "session binding lookup failed; treating as ungrounded"
@@ -880,6 +890,21 @@ async def _covered_principals_from_sources(store: Any, source_refs: Any) -> list
                     cleaned = _clean_receipt_identity(nested.get("principal_ref"))
                     if cleaned is not None and cleaned not in seen:
                         seen[cleaned] = None
+        try:
+            stored_args = (
+                metadata.get("proposal", {}).get("arguments", {})
+                if isinstance(metadata.get("proposal"), dict)
+                else {}
+            )
+            args_target = stored_args.get("target_ref") if isinstance(stored_args, dict) else None
+        except Exception:
+            args_target = None
+        _, row_principals, _ = session_list_pairs(
+            output, args_target if isinstance(args_target, str) else None
+        )
+        for cleaned in row_principals:
+            if cleaned not in seen:
+                seen[cleaned] = None
     return sorted(seen)
 
 
@@ -922,7 +947,9 @@ async def append_review_receipt(
         "admission": admission,
         "supersedes": superseded_stages,
         "reviewer_id": assessment.reviewer_id,
-        "verdict": assessment.verdict.value if hasattr(assessment.verdict, "value") else str(assessment.verdict),
+        "verdict": assessment.verdict.value
+        if hasattr(assessment.verdict, "value")
+        else str(assessment.verdict),
         "outcome": outcome,
         "reason": assessment.reason,
         "claim_supported": getattr(assessment, "claim_supported", None),
@@ -931,7 +958,9 @@ async def append_review_receipt(
         "capability": proposal.capability,
         "operation": proposal.operation,
         "target_node_id": target_node,
-        "hypothesis_id": str(proposal.hypothesis_id) if proposal.hypothesis_id is not None else None,
+        "hypothesis_id": str(proposal.hypothesis_id)
+        if proposal.hypothesis_id is not None
+        else None,
         "source_evidence_ids": [str(item) for item in (assessment.source_refs or [])],
         "supporting_evidence_ids": supporting,
         "refuting_evidence_ids": refuting,
@@ -949,7 +978,14 @@ async def append_review_receipt(
         content_type="application/json",
         artifact_ref=None,
         digest=digest_payload(payload),
-        summary=("review " + str(outcome or "unknown") + "/" + str(payload["verdict"]) + " for " + str(proposal.action_id))[:280],
+        summary=(
+            "review "
+            + str(outcome or "unknown")
+            + "/"
+            + str(payload["verdict"])
+            + " for "
+            + str(proposal.action_id)
+        )[:280],
         created_at=datetime.now(timezone.utc),
         metadata=payload,
     )

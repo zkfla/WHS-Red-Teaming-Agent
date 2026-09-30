@@ -13,7 +13,7 @@ from __future__ import annotations
 from typing import Any
 
 from redteam.core.enums import EvidenceSourceType
-from redteam.orchestration.analysis import is_final_admission_receipt
+from redteam.orchestration.analysis import is_final_admission_receipt, session_list_pairs
 from redteam.orchestration.paths import (
     ALLOWED_CRITERION_KINDS,
     CompletionCriterion,
@@ -214,7 +214,9 @@ def _has_exact_account_proof(
     stored_args: dict[str, Any] | None,
 ) -> bool:
     """Exact structural identity equality only; never bare or substring."""
-    cleaned_claimed = {str(item).strip() for item in (claimed_accounts or set()) if str(item).strip()}
+    cleaned_claimed = {
+        str(item).strip() for item in (claimed_accounts or set()) if str(item).strip()
+    }
     if not cleaned_claimed:
         return False
     args = stored_args if isinstance(stored_args, dict) else {}
@@ -269,6 +271,12 @@ def _has_exact_account_proof(
                 cleaned = _clean_completion_identity(nested.get("principal_ref"))
                 if cleaned is not None:
                     raw_principals.add(cleaned)
+    args_target = stored_args.get("target_ref") if isinstance(stored_args, dict) else None
+    row_sessions, row_principals, _ = session_list_pairs(
+        output, args_target if isinstance(args_target, str) else None
+    )
+    raw_sessions |= row_sessions
+    raw_principals |= row_principals
     if comparison_dict is not None:
         first_principal = _clean_completion_identity(comparison_dict.get("first_principal_ref"))
         second_principal = _clean_completion_identity(comparison_dict.get("second_principal_ref"))
@@ -290,92 +298,6 @@ def _has_exact_account_proof(
         return True
     if expected_principals and (raw_principals & expected_principals):
         return True
-    return False
-
-
-def _node_type_name(node: Any) -> str:
-    node_type = getattr(node, "type", None)
-    try:
-        value = node_type.value if hasattr(node_type, "value") else node_type
-    except Exception:
-        value = node_type
-    return str(value or "").strip().lower()
-
-
-def _node_has_measured_binding(props: Any, evidence_id: str, run_id: str) -> bool:
-    if not isinstance(props, dict):
-        return False
-    facts = props.get("facts", {}) if isinstance(props.get("facts"), dict) else {}
-    raw_ids = facts.get("evidence_ids", []) if isinstance(facts, dict) else []
-    if isinstance(raw_ids, list) and str(evidence_id) in {str(item) for item in raw_ids}:
-        return True
-    provenance = props.get("provenance", [])
-    if isinstance(provenance, list):
-        for entry in provenance:
-            if not isinstance(entry, dict):
-                continue
-            if str(entry.get("confidence", "")) != "measured":
-                continue
-            if str(entry.get("evidence_id", "") or "") == str(evidence_id):
-                return True
-            if str(entry.get("run_id", "") or "") and str(entry.get("run_id")) == str(run_id):
-                return True
-    return False
-
-
-async def _has_stored_session_binding(
-    graph_service: Any,
-    claimed: set[str],
-    target_ref: str,
-    evidence_id: str,
-    run_id: str,
-) -> bool:
-    cleaned_claimed = {str(item).strip() for item in (claimed or set()) if str(item).strip()}
-    if not cleaned_claimed or graph_service is None:
-        return False
-    cleaned_target = str(target_ref or "").strip()
-    if not cleaned_target:
-        return False
-    func = getattr(graph_service, "list_nodes", None)
-    if not callable(func):
-        func = getattr(graph_service, "query", None)
-    if not callable(func):
-        return False
-    nodes = await func()
-    try:
-        items = list(nodes or [])
-    except TypeError:
-        return False
-    for node in items:
-        try:
-            if _node_type_name(node) not in ("principal", "credential"):
-                continue
-            props = getattr(node, "properties", {}) or {}
-            if not isinstance(props, dict):
-                continue
-            facts = props.get("facts", {}) if isinstance(props.get("facts"), dict) else {}
-            attrs = props.get("attrs", {}) if isinstance(props.get("attrs"), dict) else {}
-            node_target = facts.get("target_ref") if isinstance(facts, dict) else None
-            if not isinstance(node_target, str) or node_target.strip() != cleaned_target:
-                continue
-            if not _node_has_measured_binding(props, str(evidence_id), str(run_id)):
-                continue
-            candidates: list[Any] = []
-            if isinstance(facts, dict):
-                for key in ("session_ref", "principal_ref", "session_refs"):
-                    value = facts.get(key)
-                    if isinstance(value, list):
-                        candidates.extend(value)
-                    else:
-                        candidates.append(value)
-            if isinstance(attrs, dict):
-                for key in ("session_ref", "principal_ref"):
-                    candidates.append(attrs.get(key))
-            for candidate in candidates:
-                if isinstance(candidate, str) and candidate.strip() in cleaned_claimed:
-                    return True
-        except Exception:
-            continue
     return False
 
 
@@ -422,6 +344,43 @@ async def _load_final_receipts(evidence_store: Any, run_id: str) -> list[dict[st
     return [meta for _, meta in latest.values()]
 
 
+async def _verify_prior_lineage(
+    path_store: Any,
+    run_id: str,
+    path_id: str,
+    current_version: Any,
+    source_version: Any,
+    step_id: str,
+    step: PathStep,
+) -> tuple[bool, str]:
+    from redteam.orchestration.paths.models import step_definition_equal
+
+    plans = await path_store.list_paths(run_id)
+    versions = {
+        str(item.version): item
+        for item in plans
+        if item.run_id == run_id and item.path_id == path_id
+    }
+    current = str(current_version)
+    source = str(source_version)
+    seen = set()
+    while True:
+        plan = versions.get(current)
+        if plan is None or current in seen:
+            return False, "version lineage does not reach the source version"
+        seen.add(current)
+        saved_step = next((item for item in plan.steps if item.step_id == step_id), None)
+        if saved_step is None or not step_definition_equal(saved_step, step):
+            return False, "step redefined in the version lineage"
+        if current == source:
+            return True, ""
+        if step_id in plan.changed_step_ids:
+            return False, "step changed or reset in the version lineage"
+        if plan.parent_version is None:
+            return False, "version lineage does not reach the source version"
+        current = str(plan.parent_version)
+
+
 def _pool_record_ids(pool: list[Any]) -> tuple[set[str], set[tuple[str, str]]]:
     ids: set[str] = set()
     pairs: set[tuple[str, str]] = set()
@@ -458,7 +417,9 @@ def _final_receipt_confirms(
             receipt_hid = meta.get("hypothesis_id")
             if receipt_hid is None or str(receipt_hid).strip() != hypothesis_id.strip():
                 continue
-        sources = {str(item) for item in (meta.get("source_evidence_ids", []) or []) if str(item).strip()}
+        sources = {
+            str(item) for item in (meta.get("source_evidence_ids", []) or []) if str(item).strip()
+        }
         if not (sources & pool_ids):
             continue
         action = str(meta.get("action_id", "") or "").strip()
@@ -490,7 +451,9 @@ def _final_receipt_refutes(
             receipt_hid = meta.get("hypothesis_id")
             if receipt_hid is None or str(receipt_hid).strip() != hypothesis_id.strip():
                 continue
-        sources = {str(item) for item in (meta.get("source_evidence_ids", []) or []) if str(item).strip()}
+        sources = {
+            str(item) for item in (meta.get("source_evidence_ids", []) or []) if str(item).strip()
+        }
         if not (sources & pool_ids):
             continue
         action = str(meta.get("action_id", "") or "").strip()
@@ -521,7 +484,9 @@ def _final_success_violation_receipt(
             receipt_hid = meta.get("hypothesis_id")
             if receipt_hid is None or str(receipt_hid).strip() != hypothesis_id.strip():
                 continue
-        sources = {str(item) for item in (meta.get("source_evidence_ids", []) or []) if str(item).strip()}
+        sources = {
+            str(item) for item in (meta.get("source_evidence_ids", []) or []) if str(item).strip()
+        }
         if not (sources & pool_ids):
             continue
         action = str(meta.get("action_id", "") or "").strip()
@@ -541,7 +506,9 @@ def _verified_completion_accounts(
     stored_args: dict[str, Any] | None,
 ) -> set[str]:
     """Exact account names proven by raw identity; for criterion coverage."""
-    cleaned_claimed = {str(item).strip() for item in (claimed_accounts or set()) if str(item).strip()}
+    cleaned_claimed = {
+        str(item).strip() for item in (claimed_accounts or set()) if str(item).strip()
+    }
     if not cleaned_claimed:
         return set()
     args = stored_args if isinstance(stored_args, dict) else {}
@@ -595,12 +562,18 @@ def _verified_completion_accounts(
                 value = nested.get("principal_ref")
                 if isinstance(value, str) and value.strip():
                     raw_principals.add(value.strip())
+    args_target = args.get("target_ref") if isinstance(args, dict) else None
+    row_sessions, row_principals, _ = session_list_pairs(
+        output, args_target if isinstance(args_target, str) else None
+    )
+    raw_sessions |= row_sessions
+    raw_principals |= row_principals
     verified: set[str] = set()
     for name in cleaned_claimed:
         if name in raw_principals:
             verified.add(name)
     for session in expected_sessions:
-        if session in raw_sessions:
+        if session in raw_sessions and session in cleaned_claimed:
             verified.add(session)
     return verified
 
@@ -613,85 +586,19 @@ async def _completion_alias_grounded(
     target_ref: str,
     session_name: str,
     principal_name: str,
+    arguments_target_ref: str | None = None,
 ) -> bool:
-    """Measured same-run same-target session->principal mapping only."""
-    cleaned_session = session_name.strip() if isinstance(session_name, str) else ""
-    cleaned_principal = principal_name.strip() if isinstance(principal_name, str) else ""
-    cleaned_target = target_ref.strip() if isinstance(target_ref, str) else ""
-    if not cleaned_session or not cleaned_principal or not cleaned_target:
-        return False
-    if graph_service is not None:
-        lister = getattr(graph_service, "list_nodes", None)
-        if lister is None or not callable(lister):
-            lister = getattr(graph_service, "query", None)
-        if callable(lister):
-            nodes = await lister()
-            for node in list(nodes or []):
-                if _node_type_name(node) not in ("principal", "credential"):
-                    continue
-                props = getattr(node, "properties", {}) or {}
-                if not isinstance(props, dict):
-                    continue
-                facts = props.get("facts", {}) if isinstance(props.get("facts"), dict) else {}
-                node_target = facts.get("target_ref") if isinstance(facts, dict) else None
-                if not isinstance(node_target, str) or node_target.strip() != cleaned_target:
-                    continue
-                sessions: set[str] = set()
-                for key in ("session_ref", "session_refs"):
-                    value = facts.get(key) if isinstance(facts, dict) else None
-                    if isinstance(value, list):
-                        for item in value:
-                            if isinstance(item, str) and item.strip():
-                                sessions.add(item.strip())
-                    elif isinstance(value, str) and value.strip():
-                        sessions.add(value.strip())
-                node_principal = facts.get("principal_ref") if isinstance(facts, dict) else None
-                if not isinstance(node_principal, str) or node_principal.strip() != cleaned_principal:
-                    continue
-                if cleaned_session not in sessions:
-                    continue
-                if not _node_has_measured_binding(props, "", str(run_id)):
-                    provenance = props.get("provenance", []) if isinstance(props, dict) else []
-                    measured = False
-                    if isinstance(provenance, list):
-                        for entry in provenance:
-                            if not isinstance(entry, dict):
-                                continue
-                            if str(entry.get("confidence", "")) != "measured":
-                                continue
-                            entry_run = entry.get("run_id")
-                            if entry_run is not None and str(entry_run) != str(run_id):
-                                continue
-                            measured = True
-                            break
-                    if not measured:
-                        continue
-                return True
-    records = await evidence_store.list_for_run(run_id)
-    for rec in list(records or []):
-        try:
-            meta = getattr(rec, "metadata", None) or {}
-        except Exception:
-            continue
-        if not isinstance(meta, dict):
-            continue
-        if str(meta.get("target_node_id", "") or "").strip() != cleaned_target:
-            continue
-        comparison = meta.get("session_comparison")
-        if isinstance(comparison, dict):
-            pairs = [
-                (comparison.get("first_session_ref"), comparison.get("first_principal_ref")),
-                (comparison.get("second_session_ref"), comparison.get("second_principal_ref")),
-            ]
-            for raw_session, raw_principal in pairs:
-                if (
-                    isinstance(raw_session, str)
-                    and isinstance(raw_principal, str)
-                    and raw_session.strip() == cleaned_session
-                    and raw_principal.strip() == cleaned_principal
-                ):
-                    return True
-    return False
+    from redteam.orchestration.analysis import _session_alias_grounded
+
+    return await _session_alias_grounded(
+        evidence_store=evidence_store,
+        graph_service=graph_service,
+        run_id=run_id,
+        target_ref=target_ref,
+        session_name=session_name,
+        principal_name=principal_name,
+        arguments_target_ref=arguments_target_ref,
+    )
 
 
 def _proposal_claims(proposal: dict) -> list[tuple[str, bool | None]]:
@@ -743,6 +650,7 @@ async def validate_completion(
     evidence_store: Any,
     graph_service: Any,
     run_id: str,
+    path_store: Any | None = None,
 ) -> list[str]:
     """Code checks for a step completion proposal. Empty list means pass."""
     issues: list[str] = []
@@ -783,7 +691,8 @@ async def validate_completion(
     outcome = _s(proposal.get("outcome", "")).strip().lower()
     if outcome not in _VALID_OUTCOMES:
         issues.append(
-            f"outcome must be one of success/refuted/inconclusive/blocked (got={proposal.get('outcome')!r})"
+            "outcome must be one of success/refuted/inconclusive/blocked "
+            f"(got={proposal.get('outcome')!r})"
         )
         outcome = ""
     reason = proposal.get("reason", "")
@@ -793,7 +702,9 @@ async def validate_completion(
     if isinstance(raw_evidence_ids, str):
         raw_evidence_ids = [raw_evidence_ids]
     try:
-        evidence_ids = [_s(item).strip() for item in list(raw_evidence_ids or []) if _s(item).strip()]
+        evidence_ids = [
+            _s(item).strip() for item in list(raw_evidence_ids or []) if _s(item).strip()
+        ]
     except TypeError:
         evidence_ids = []
         issues.append("proposal evidence_ids must be a list of evidence id strings")
@@ -805,8 +716,12 @@ async def validate_completion(
     # (worker D records path_id/path_version/path_step_id/principal_ref).
     valid_records: list[Any] = []
     verified_by_evidence: dict[str, set[str]] = {}
-    step_target_set = {_s(item).strip() for item in (step.target_node_ids or []) if _s(item).strip()}
-    step_principal_set = {_s(item).strip() for item in (step.principal_refs or []) if _s(item).strip()}
+    step_target_set = {
+        _s(item).strip() for item in (step.target_node_ids or []) if _s(item).strip()
+    }
+    step_principal_set = {
+        _s(item).strip() for item in (step.principal_refs or []) if _s(item).strip()
+    }
     step_op_set = {
         _s(item).strip().lower() for item in (step.allowed_operations or []) if _s(item).strip()
     }
@@ -831,8 +746,7 @@ async def validate_completion(
         m_step_id = _s(meta.get("path_step_id", "")).strip()
         if not m_path_id or m_version is None or _s(m_version).strip() == "" or not m_step_id:
             issues.append(
-                f"evidence '{eid}' has no path linkage "
-                "(path_id/path_version/path_step_id required)"
+                f"evidence '{eid}' has no path linkage (path_id/path_version/path_step_id required)"
             )
             continue
         ev_principals = _evidence_principal_refs(record)
@@ -864,8 +778,21 @@ async def validate_completion(
             issues.append(f"evidence '{eid}' belongs to a different path (path_id mismatch)")
             continue
         if _s(m_version).strip() != _s(path_version).strip():
-            issues.append(f"evidence '{eid}' belongs to a different path version")
-            continue
+            if path_store is None:
+                issues.append(f"evidence '{eid}' belongs to a different path version")
+                continue
+            try:
+                lineage_ok, lineage_reason = await _verify_prior_lineage(
+                    path_store, run, path_id, path_version, m_version, step_id, step
+                )
+            except Exception:
+                issues.append(
+                    f"evidence '{eid}' prior-version lineage lookup failed; treating as unproven"
+                )
+                continue
+            if not lineage_ok:
+                issues.append(f"evidence '{eid}' {lineage_reason}")
+                continue
         if m_step_id != step_id:
             issues.append(f"evidence '{eid}' belongs to a different step")
             continue
@@ -884,8 +811,7 @@ async def validate_completion(
         raw = _stored_raw_result(meta)
         if raw is None:
             issues.append(
-                f"evidence '{eid}' has no preserved raw ToolResult "
-                "(metadata tool_result required)"
+                f"evidence '{eid}' has no preserved raw ToolResult (metadata tool_result required)"
             )
             continue
         target_ref = _s(meta.get("target_node_id", "")).strip()
@@ -942,7 +868,21 @@ async def validate_completion(
             if stored_operation.strip() != _s(meta.get("operation", "")).strip():
                 issues.append(f"evidence '{eid}' stored behavior disagrees with its record")
                 continue
-        stored_claimed = _claimed_proposal_principal(stored_proposal)
+        # Prefer the code-stored step account over tool args (same false-
+        # rejection as the review path: args may carry only a session_ref).
+        plan_step_dump = meta.get("plan_step")
+        step_account_raw = (
+            plan_step_dump.get("principal_ref") if isinstance(plan_step_dump, dict) else None
+        )
+        step_account = (
+            step_account_raw.strip()
+            if isinstance(step_account_raw, str) and step_account_raw.strip()
+            else None
+        )
+        if step_account is not None and step_account in ev_principals:
+            stored_claimed: str | None = step_account
+        else:
+            stored_claimed = _claimed_proposal_principal(stored_proposal)
         if stored_claimed is not None and stored_claimed not in ev_principals:
             issues.append(f"evidence '{eid}' stored account differs from its record")
             continue
@@ -950,14 +890,11 @@ async def validate_completion(
         if not isinstance(raw_success, bool):
             raw_success = meta.get("success")
         failed_original = raw_success is False or (
-            raw_success is None
-            and isinstance(meta.get("error"), dict)
-            and bool(meta.get("error"))
+            raw_success is None and isinstance(meta.get("error"), dict) and bool(meta.get("error"))
         )
         if outcome == "success" and failed_original:
             issues.append(
-                f"evidence '{eid}' records a failed original result "
-                "and cannot support success"
+                f"evidence '{eid}' records a failed original result and cannot support success"
             )
             continue
         if outcome == "refuted" and failed_original:
@@ -969,7 +906,9 @@ async def validate_completion(
             continue
         if step_principal_set and not explicit_anonymous:
             claimed_accounts = {str(item).strip() for item in ev_principals if str(item).strip()}
-            stored_args = stored_proposal.get("arguments") if isinstance(stored_proposal, dict) else None
+            stored_args = (
+                stored_proposal.get("arguments") if isinstance(stored_proposal, dict) else None
+            )
             verified_names = _verified_completion_accounts(meta, raw, claimed_accounts, stored_args)
             if verified_names:
                 verified_by_evidence[eid] = set(verified_names)
@@ -979,7 +918,7 @@ async def validate_completion(
                     candidate = stored_args.get("session_ref")
                     if isinstance(candidate, str) and candidate.strip():
                         bound_session = candidate.strip()
-                alias_ok = False
+                _alias_ok = False
                 alias_verified: set[str] = set()
                 if bound_session is not None:
                     try:
@@ -991,32 +930,26 @@ async def validate_completion(
                                 target_ref=target_ref,
                                 session_name=bound_session,
                                 principal_name=claimed_name,
+                                arguments_target_ref=stored_args.get("target_ref")
+                                if isinstance(stored_args, dict)
+                                else None,
                             ):
                                 alias_verified.add(claimed_name)
                     except Exception:
-                        issues.append(f"evidence '{eid}' session binding lookup failed; treating as ungrounded")
+                        issues.append(
+                            f"evidence '{eid}' session binding lookup failed; "
+                            "treating as ungrounded"
+                        )
                         continue
                 if alias_verified:
                     verified_by_evidence[eid] = set(alias_verified)
                 else:
-                    stored_verified: set[str] = set()
-                    try:
-                        for claimed_name in sorted(claimed_accounts):
-                            if await _has_stored_session_binding(
-                                graph_service, {claimed_name}, target_ref, eid, run
-                            ):
-                                stored_verified.add(claimed_name)
-                    except Exception:
-                        issues.append(f"evidence '{eid}' session binding lookup failed; treating as ungrounded")
-                        continue
-                    if not stored_verified:
-                        issues.append(
-                            f"evidence '{eid}' declares account {sorted(claimed_accounts)} but has "
-                            "no exact raw session receipt or stored session binding; "
-                            "declaration alone is not proof"
-                        )
-                        continue
-                    verified_by_evidence[eid] = set(stored_verified)
+                    issues.append(
+                        f"evidence '{eid}' declares account {sorted(claimed_accounts)} but has "
+                        "no exact raw session receipt or grounded session binding; "
+                        "declaration alone is not proof"
+                    )
+                    continue
         valid_records.append(record)
     criteria = _criteria_list(step)
     if not criteria:
@@ -1052,7 +985,7 @@ async def validate_completion(
                 verified = verified_by_evidence.get(rec_id, set())
                 if verified & required_principals:
                     verified_pool.append(rec)
-                    have |= (verified & required_principals)
+                    have |= verified & required_principals
             pool = verified_pool
             missing_principals = required_principals - have
             if missing_principals:
@@ -1074,7 +1007,9 @@ async def validate_completion(
                 continue
             status = _norm_status(_field(hypothesis, "status", ""))
             if kind == "hypothesis_confirmed" and status != "confirmed":
-                issues.append(f"{label} hypothesis '{hid}' is not confirmed (status={status or '?'})")
+                issues.append(
+                    f"{label} hypothesis '{hid}' is not confirmed (status={status or '?'})"
+                )
                 evaluated.append((criterion, False, "hypothesis status"))
                 continue
             if kind == "hypothesis_refuted" and status not in {"rejected", "refuted"}:
@@ -1122,9 +1057,10 @@ async def validate_completion(
             for rec in pool:
                 rec_meta = _field(rec, "metadata", {}) or {}
                 ok = isinstance(rec_meta, dict) and rec_meta.get("success") is True
-                if _field(rec, "source_type", None) is not None and _field(
-                    rec, "source_type", None
-                ) is not EvidenceSourceType.TOOL:
+                if (
+                    _field(rec, "source_type", None) is not None
+                    and _field(rec, "source_type", None) is not EvidenceSourceType.TOOL
+                ):
                     ok = False
                 if ok:
                     backed = True
@@ -1166,7 +1102,9 @@ async def validate_completion(
             finding_ok = False
             for finding in verified_findings:
                 try:
-                    finding_evidence = {str(item) for item in (finding.evidence_ids or []) if str(item).strip()}
+                    finding_evidence = {
+                        str(item) for item in (finding.evidence_ids or []) if str(item).strip()
+                    }
                     finding_meta = getattr(finding, "metadata", None) or {}
                 except Exception:
                     continue
@@ -1181,14 +1119,12 @@ async def validate_completion(
                 finding_ok = True
                 break
             if not finding_ok:
-                issues.append(
-                    f"{label} has no verified Finding for the same hypothesis and source"
-                )
+                issues.append(f"{label} has no verified Finding for the same hypothesis and source")
                 evaluated.append((criterion, False, "poc finding"))
                 continue
         evaluated.append((criterion, True, "ok"))
     if outcome == "success":
-        for criterion, passed, _why in evaluated:
+        for _criterion, passed, _why in evaluated:
             if not passed:
                 break
         else:
@@ -1202,13 +1138,14 @@ async def validate_completion(
             issues.append("refuted outcome needs a hypothesis_refuted completion condition")
         else:
             refuted_ok = any(
-                passed for criterion, passed, _ in evaluated
+                passed
+                for criterion, passed, _ in evaluated
                 if _criterion_kind(criterion) == "hypothesis_refuted"
             )
             if not refuted_ok:
                 issues.append("refuted outcome has no satisfied hypothesis_refuted condition")
-        for criterion, passed, _ in evaluated:
-            kind = _criterion_kind(criterion)
+        for eval_criterion, passed, _ in evaluated:
+            kind = _criterion_kind(eval_criterion)
             if kind == "poc" and passed:
                 issues.append("refuted outcome cannot claim PoC success")
                 break
@@ -1226,9 +1163,7 @@ async def validate_completion(
             continue
         for index, criterion in enumerate(criteria):
             if _claim_matches_criterion(key, criterion, index):
-                actual = next(
-                    (passed for crit, passed, _ in evaluated if crit is criterion), None
-                )
+                actual = next((passed for crit, passed, _ in evaluated if crit is criterion), None)
                 if actual is False:
                     issues.append(
                         f"proposal claims '{key}' is met but "
@@ -1242,5 +1177,6 @@ async def validate_completion(
             seen.add(item)
             deduped.append(item)
     return deduped
+
 
 __all__ = ["validate_completion"]

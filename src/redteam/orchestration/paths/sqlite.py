@@ -13,6 +13,7 @@ from redteam.orchestration.paths.models import (
     PathPlan,
     PathValidationError,
     PathVersionConflict,
+    changed_steps_and_descendants,
     is_active_status,
     normalize_step_status,
     step_definition_equal,
@@ -102,8 +103,7 @@ class SQLitePathStore:
                 if row is None:
                     return None
                 payload = db.execute(
-                    "SELECT payload FROM path_snapshots "
-                    "WHERE run_id=? AND path_id=? AND version=?",
+                    "SELECT payload FROM path_snapshots WHERE run_id=? AND path_id=? AND version=?",
                     (run_id, row[0], row[1]),
                 ).fetchone()
                 if payload is None:
@@ -134,8 +134,11 @@ class SQLitePathStore:
                 db.close()
 
     async def register(
-        self, path: PathPlan, expected_version: int | None = None,
-        *, expected_path_id: str | None = None,
+        self,
+        path: PathPlan,
+        expected_version: int | None = None,
+        *,
+        expected_path_id: str | None = None,
     ) -> PathPlan:
         """Store one version snapshot, optionally moving the active pointer."""
         normalized_status = _check_plan(path)
@@ -146,13 +149,17 @@ class SQLitePathStore:
                 db.execute("BEGIN IMMEDIATE")
                 try:
                     exists = db.execute(
-                        "SELECT 1 FROM path_snapshots "
-                        "WHERE run_id=? AND path_id=? AND version=?",
+                        "SELECT 1 FROM path_snapshots WHERE run_id=? AND path_id=? AND version=?",
                         (snapshot.run_id, snapshot.path_id, snapshot.version),
                     ).fetchone()
                     if exists is not None:
+                        version_key = (
+                            snapshot.run_id,
+                            snapshot.path_id,
+                            snapshot.version,
+                        )
                         raise PathVersionConflict(
-                            f"path version exists: {(snapshot.run_id, snapshot.path_id, snapshot.version)}"
+                            f"path version exists: {version_key}"
                         )
                     if is_active_status(snapshot.status):
                         active = db.execute(
@@ -160,7 +167,9 @@ class SQLitePathStore:
                             (snapshot.run_id,),
                         ).fetchone()
                         current = active[0] if active is not None else None
-                        if expected_path_id is not None and (active is None or active[1] != expected_path_id):
+                        if expected_path_id is not None and (
+                            active is None or active[1] != expected_path_id
+                        ):
                             raise PathVersionConflict("active path identity changed")
                         if expected_version != current:
                             raise PathVersionConflict(
@@ -180,9 +189,7 @@ class SQLitePathStore:
                             parent_progress = _load_progress(
                                 db, snapshot.run_id, snapshot.path_id, snapshot.parent_version
                             )
-                    parent_steps = (
-                        {step.step_id: step for step in parent.steps} if parent else {}
-                    )
+                    parent_steps = {step.step_id: step for step in parent.steps} if parent else {}
                     if parent is not None:
                         justified = set(snapshot.changed_step_ids or [])
                         new_steps = {step.step_id: step for step in snapshot.steps}
@@ -200,13 +207,22 @@ class SQLitePathStore:
                                         f"completed step reset without justification: {step_id} "
                                         "(add it to changed_step_ids)"
                                     )
+                    if parent is not None:
+                        snapshot.changed_step_ids = changed_steps_and_descendants(
+                            parent.steps,
+                            snapshot.steps,
+                            snapshot.changed_step_ids,
+                        )
                     changed: list[str] = []
                     seeded: dict = {}
                     for step in snapshot.steps:
-                        older = parent_steps.get(step.step_id)
-                        if parent is not None and older is not None \
-                                and step_definition_equal(older, step) \
-                                and step.step_id not in snapshot.changed_step_ids:
+                        prev_step = parent_steps.get(step.step_id)
+                        if (
+                            parent is not None
+                            and prev_step is not None
+                            and step_definition_equal(prev_step, step)
+                            and step.step_id not in snapshot.changed_step_ids
+                        ):
                             carried = parent_progress.get(step.step_id)
                             if carried is not None:
                                 seeded[step.step_id] = {
@@ -216,9 +232,9 @@ class SQLitePathStore:
                                 }
                             else:
                                 seeded[step.step_id] = {
-                                    "status": normalize_step_status(older.status),
-                                    "outcome": older.outcome,
-                                    "evidence_ids": list(older.evidence_ids),
+                                    "status": normalize_step_status(prev_step.status),
+                                    "outcome": prev_step.outcome,
+                                    "evidence_ids": list(prev_step.evidence_ids),
                                 }
                         elif parent is None and snapshot.parent_version is None:
                             seeded[step.step_id] = {
@@ -287,9 +303,11 @@ class SQLitePathStore:
         step_id: str,
         status: str,
         outcome: str | None = None,
-        evidence_ids: list[str] = [],
+        evidence_ids: list[str] | None = None,
     ) -> PathPlan | None:
         """Update progress for one step of the active path version."""
+        if evidence_ids is None:
+            evidence_ids = []
         normalized = normalize_step_status(status)
         if normalized not in STEP_STATUSES:
             raise PathValidationError(f"unknown step status: {status!r}")
@@ -311,9 +329,7 @@ class SQLitePathStore:
                         (run_id,),
                     ).fetchone()
                     if active is None or (active[0], active[1]) != (path_id, version):
-                        raise PathVersionConflict(
-                            f"not the active version: {(path_id, version)}"
-                        )
+                        raise PathVersionConflict(f"not the active version: {(path_id, version)}")
                     snapshot = _parse_plan(payload[0])
                     if step_id not in {step.step_id for step in snapshot.steps}:
                         db.rollback()
@@ -324,14 +340,12 @@ class SQLitePathStore:
                         (run_id, path_id, version, step_id),
                     ).fetchone()
                     if row is None:
-                        current_status, current_outcome, current_evidence = (
-                            "pending",
+                        current_outcome, current_evidence = (
                             None,
                             [],
                         )
                     else:
-                        current_status, current_outcome, current_evidence = (
-                            row[0],
+                        current_outcome, current_evidence = (
                             row[1],
                             json.loads(row[2]),
                         )

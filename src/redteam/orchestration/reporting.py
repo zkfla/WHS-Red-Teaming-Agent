@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from collections import Counter
-
 from collections.abc import Collection
 
 from pydantic import BaseModel, Field
@@ -161,7 +160,8 @@ class ReportingAgent:
             required_unresolved = [item for item in unresolved if str(item) in required]
             deferred = [item for item in unresolved if str(item) not in required]
         evidence = [
-            item for item in await evidence_store.list_for_run(runtime.run_id)
+            item
+            for item in await evidence_store.list_for_run(runtime.run_id)
             if item.engagement_id == runtime.engagement_id
         ]
         current_evidence_ids = {str(item.evidence_id) for item in evidence}
@@ -190,16 +190,13 @@ class ReportingAgent:
                 mission = _project_mission(
                     plan,
                     tasks,
-                    verified_finding_count=sum(
-                        1 for item in projected_findings if item.verified
-                    ),
+                    verified_finding_count=sum(1 for item in projected_findings if item.verified),
                     evidence_count=len(evidence),
                 )
         actions = runtime.actions_executed
         terminal_work = sum(status_counts.values())
         dead_ends = sum(
-            status_counts.get(status, 0)
-            for status in ("failed", "blocked", "stale", "cancelled")
+            status_counts.get(status, 0) for status in ("failed", "blocked", "stale", "cancelled")
         )
         effectiveness = RunEffectiveness(
             successful_work_per_action=(
@@ -232,7 +229,8 @@ class ReportingAgent:
                 # A depleted candidate frontier is not evidence that the
                 # Mission's required work or success criteria were met.
                 and (
-                    mission is None and runtime.mission_id is None
+                    mission is None
+                    and runtime.mission_id is None
                     or mission is not None
                     and mission.status == MissionStatus.COMPLETED.value
                     and all(criterion.met for criterion in mission.success_criteria)
@@ -354,9 +352,7 @@ def _project_mission(
     )
 
 
-def _build_workstream(
-    name: str, tasks: list[MissionTask]
-) -> MissionWorkstreamProjection:
+def _build_workstream(name: str, tasks: list[MissionTask]) -> MissionWorkstreamProjection:
     statuses = Counter(task.status.value for task in tasks)
     total = len(tasks)
     task_ids = [task.task_id for task in tasks]
@@ -373,11 +369,7 @@ def _build_workstream(
             completed_task_count=completed,
             task_ids=task_ids,
         )
-    stalled = [
-        task
-        for task in tasks
-        if task.status in (TaskStatus.BLOCKED, TaskStatus.FAILED)
-    ]
+    stalled = [task for task in tasks if task.status in (TaskStatus.BLOCKED, TaskStatus.FAILED)]
     if completed == 0 and stalled:
         reasons = [
             task.blocking_reason
@@ -410,8 +402,7 @@ def _project_criteria(mission: MissionPlan) -> list[MissionCriterionProjection]:
             criterion=redact_text(criterion),
             met=results[criterion].met,
             reason=(
-                redact_text(str(results[criterion].reason))
-                if results[criterion].reason else None
+                redact_text(str(results[criterion].reason)) if results[criterion].reason else None
             ),
             evidence_count=len(results[criterion].evidence_ids),
         )

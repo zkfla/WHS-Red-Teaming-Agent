@@ -238,9 +238,7 @@ class ContextProjector:
         return GraphObservation(
             step=observation.step,
             node_counts={
-                name: count
-                for name, count in observation.node_counts.items()
-                if type_allowed(name)
+                name: count for name, count in observation.node_counts.items() if type_allowed(name)
             },
             nodes_by_type=nodes_by_type,
             node_ids_by_type=node_ids_by_type,
@@ -250,22 +248,27 @@ class ContextProjector:
                 else []
             ),
             findings=(
-                observation.findings[: profile.max_evidence]
-                if profile.include_findings
-                else []
+                observation.findings[: profile.max_evidence] if profile.include_findings else []
             ),
             attempted=(
-                observation.attempted[: profile.max_nodes]
-                if profile.include_attempted
-                else []
+                observation.attempted[: profile.max_nodes] if profile.include_attempted else []
             ),
             truncated=observation.truncated,
         )
 
 
-async def project_knowledge_section(graph_service: object, evidence_store: object, run_id: str, step: int = 0, target_node_ids: list[str] | None = None) -> dict:
+async def project_knowledge_section(
+    graph_service: object,
+    evidence_store: object,
+    run_id: str,
+    step: int = 0,
+    target_node_ids: list[str] | None = None,
+) -> dict:
     from redteam.orchestration.knowledge import project_knowledge
-    return await project_knowledge(graph_service, evidence_store, str(run_id), step=step, target_node_ids=target_node_ids)
+
+    return await project_knowledge(
+        graph_service, evidence_store, str(run_id), step=step, target_node_ids=target_node_ids
+    )
 
 
 def format_knowledge_for_prompt(knowledge: dict) -> str:
@@ -276,47 +279,92 @@ def format_knowledge_for_prompt(knowledge: dict) -> str:
     targets = knowledge.get("known_targets", {}) if isinstance(knowledge, dict) else {}
     lines: list[str] = []
     claims = provided.get("claims", []) if isinstance(provided, dict) else []
-    lines.append("provided(" + str(len(claims)) + "): declared scope and target notes, unconfirmed until observed")
+    lines.append(
+        "provided("
+        + str(len(claims))
+        + "): declared scope and target notes, unconfirmed until observed"
+    )
     for c in claims[:10]:
         if isinstance(c, dict):
-            lines.append("- " + str(c.get("node_id", "?")) + " ref=" + str(c.get("target_ref")) + " verification=" + str(c.get("verification", "?")))
+            lines.append(
+                "- "
+                + str(c.get("node_id", "?"))
+                + " ref="
+                + str(c.get("target_ref"))
+                + " verification="
+                + str(c.get("verification", "?"))
+            )
     omitted = provided.get("omitted_node_ids", []) if isinstance(provided, dict) else []
     if omitted:
         lines.append("provided omitted: " + ", ".join([str(v) for v in omitted[:10]]))
     if isinstance(facts, list):
         obs = facts
-        excluded_count = knowledge.get("excluded_inferred_attr_count", 0) if isinstance(knowledge, dict) else 0
-        fact_omitted = knowledge.get("omitted_fact_node_ids", []) if isinstance(knowledge, dict) else []
+        excluded_count = (
+            knowledge.get("excluded_inferred_attr_count", 0) if isinstance(knowledge, dict) else 0
+        )
+        fact_omitted = (
+            knowledge.get("omitted_fact_node_ids", []) if isinstance(knowledge, dict) else []
+        )
     else:
         obs = facts.get("observations", []) if isinstance(facts, dict) else []
-        excluded_count = facts.get("excluded_inferred_attr_count", 0) if isinstance(facts, dict) else 0
+        excluded_count = (
+            facts.get("excluded_inferred_attr_count", 0) if isinstance(facts, dict) else 0
+        )
         fact_omitted = facts.get("omitted_node_ids", []) if isinstance(facts, dict) else []
     lines.append("facts(" + str(len(obs)) + "): measured tool-result normalization only")
     for f in obs[:10]:
         if isinstance(f, dict):
-            lines.append("- " + str(f.get("node_id", "?")) + " ref=" + str(f.get("fact_ref", "?")) + " attrs=" + str(sorted((f.get("observed_attrs", {}) or {}).keys())))
+            lines.append(
+                "- "
+                + str(f.get("node_id", "?"))
+                + " ref="
+                + str(f.get("fact_ref", "?"))
+                + " attrs="
+                + str(sorted((f.get("observed_attrs", {}) or {}).keys()))
+            )
     lines.append("excluded inferred attrs: " + str(excluded_count))
     if fact_omitted:
         lines.append("facts omitted: " + ", ".join([str(v) for v in fact_omitted[:10]]))
     fact_refs = knowledge.get("fact_refs", []) if isinstance(knowledge, dict) else []
     if isinstance(fact_refs, list) and fact_refs:
-        lines.append("fact_refs(" + str(len(fact_refs)) + "): " + ", ".join([str(v) for v in fact_refs[:10]]))
+        lines.append(
+            "fact_refs(" + str(len(fact_refs)) + "): " + ", ".join([str(v) for v in fact_refs[:10]])
+        )
     hyps = hypotheses.get("items", []) if isinstance(hypotheses, dict) else {}
-    lines.append("hypotheses(" + str(len(hyps) if isinstance(hyps, list) else 0) + "): open questions, not facts")
-    for h in (hyps[:10] if isinstance(hyps, list) else []):
+    lines.append(
+        "hypotheses("
+        + str(len(hyps) if isinstance(hyps, list) else 0)
+        + "): open questions, not facts"
+    )
+    for h in hyps[:10] if isinstance(hyps, list) else []:
         if isinstance(h, dict):
-            lines.append("- " + str(h.get("hypothesis_id", "?")) + " [" + str(h.get("status", "?")) + "] " + str(h.get("claim", ""))[:120])
+            lines.append(
+                "- "
+                + str(h.get("hypothesis_id", "?"))
+                + " ["
+                + str(h.get("status", "?"))
+                + "] "
+                + str(h.get("claim", ""))[:120]
+            )
     finds = findings.get("items", []) if isinstance(findings, dict) else {}
     lines.append("findings(" + str(len(finds) if isinstance(finds, list) else 0) + ")")
     if isinstance(targets, list):
         tgts = targets
     else:
         tgts = targets.get("targets", []) if isinstance(targets, dict) else []
-    lines.append("known_targets(" + str(len(tgts) if isinstance(tgts, list) else 0) + "): declared plus observed usable refs")
-    for t in (tgts[:10] if isinstance(tgts, list) else []):
+    lines.append(
+        "known_targets("
+        + str(len(tgts) if isinstance(tgts, list) else 0)
+        + "): declared plus observed usable refs"
+    )
+    for t in tgts[:10] if isinstance(tgts, list) else []:
         if isinstance(t, str):
             lines.append("- " + t)
         elif isinstance(t, dict):
-            lines.append("- " + str(t.get("node_id", t.get("id", "?"))) + " " + str(t.get("address", ""))[:120])
+            lines.append(
+                "- "
+                + str(t.get("node_id", t.get("id", "?")))
+                + " "
+                + str(t.get("address", ""))[:120]
+            )
     return "\n".join(lines)
-

@@ -12,10 +12,26 @@ from redteam.core.enums import GraphEdgeType, GraphNodeType
 
 def knowledge_fingerprint(knowledge: dict) -> str:
     """Progress is content or supported conclusions, never a new receipt name."""
-    ignored = {"evidence_id", "evidence_ids", "invocation_id", "action_id", "run_id",
-               "created_at", "updated_at", "step", "summary", "source_refs", "reason",
-               "first_seen_step", "last_seen_step", "provenance", "observed_at", "timestamp",
-               "hypothesis_id", "finding_id"}
+    ignored = {
+        "evidence_id",
+        "evidence_ids",
+        "invocation_id",
+        "action_id",
+        "run_id",
+        "created_at",
+        "updated_at",
+        "step",
+        "summary",
+        "source_refs",
+        "reason",
+        "first_seen_step",
+        "last_seen_step",
+        "provenance",
+        "observed_at",
+        "timestamp",
+        "hypothesis_id",
+        "finding_id",
+    }
 
     def canonical(value):
         if isinstance(value, dict):
@@ -26,12 +42,23 @@ def knowledge_fingerprint(knowledge: dict) -> str:
         return value
 
     hypothesis_section = knowledge.get("hypotheses", [])
-    hypothesis_items = (hypothesis_section.get("items", [])
-                        if isinstance(hypothesis_section, dict) else hypothesis_section)
-    hypotheses = [item for item in hypothesis_items
-                  if isinstance(item, dict) and item.get("status") in {"confirmed", "refuted", "rejected"}
-                  and (item.get("evidence_ids") or item.get("supporting_evidence_ids")
-                       or item.get("refuting_evidence_ids") or item.get("source_refs"))]
+    hypothesis_items = (
+        hypothesis_section.get("items", [])
+        if isinstance(hypothesis_section, dict)
+        else hypothesis_section
+    )
+    hypotheses = [
+        item
+        for item in hypothesis_items
+        if isinstance(item, dict)
+        and item.get("status") in {"confirmed", "refuted", "rejected"}
+        and (
+            item.get("evidence_ids")
+            or item.get("supporting_evidence_ids")
+            or item.get("refuting_evidence_ids")
+            or item.get("source_refs")
+        )
+    ]
     payload = canonical({"facts": knowledge.get("facts", []), "conclusions": hypotheses})
     return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()
 
@@ -72,24 +99,20 @@ def observation_fingerprint(
         return name not in ignored_types and (included is None or name in included)
 
     subscribed_edges = {
-        item.value if isinstance(item, GraphEdgeType) else str(item)
-        for item in include_edge_types
+        item.value if isinstance(item, GraphEdgeType) else str(item) for item in include_edge_types
     }
 
     payload = {
         "observation_context_counts": {
-            name: count for name, count in observation.observation_context_counts.items()
+            name: count
+            for name, count in observation.observation_context_counts.items()
             if relevant(name)
         },
         "node_counts": {
-            name: count
-            for name, count in observation.node_counts.items()
-            if relevant(name)
+            name: count for name, count in observation.node_counts.items() if relevant(name)
         },
         "nodes_by_type": {
-            name: labels
-            for name, labels in observation.nodes_by_type.items()
-            if relevant(name)
+            name: labels for name, labels in observation.nodes_by_type.items() if relevant(name)
         },
         "open_hypotheses": observation.open_hypotheses if include_hypotheses else [],
         "findings": observation.findings if include_findings else [],
@@ -98,9 +121,7 @@ def observation_fingerprint(
         # response, a newly registered session) -- those leave node ids and
         # counts untouched.
         "content_digests": {
-            name: digest
-            for name, digest in observation.content_digests.items()
-            if relevant(name)
+            name: digest for name, digest in observation.content_digests.items() if relevant(name)
         },
         "edge_counts": {
             name: count

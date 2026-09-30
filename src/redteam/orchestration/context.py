@@ -10,9 +10,9 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, field
 
-from redteam.core.ids import RunId
 from redteam.attack_graph.service import AttackGraphService
 from redteam.core.contracts.engagement import Engagement
+from redteam.core.ids import RunId
 from redteam.core.ports.attack_graph import AttackGraphStore
 from redteam.core.ports.control_plane import ControlPlane
 from redteam.core.ports.event_bus import EventBus
@@ -28,10 +28,10 @@ from redteam.orchestration.agents.providers import (
 from redteam.orchestration.agents.registry import AgentRegistry, default_registry
 from redteam.orchestration.analysis import AnalysisVerifier, StructuredLLMAnalysisVerifier
 from redteam.orchestration.context_projection import ContextProjectionCache
+from redteam.orchestration.long_jobs import LongJobAdapter
 from redteam.orchestration.observations import ResultMapperRegistry, default_result_mapper_registry
 from redteam.orchestration.operator_intents.store import OperatorIntentStore
 from redteam.orchestration.paths import InMemoryPathStore, PathStore
-from redteam.orchestration.long_jobs import LongJobAdapter
 from redteam.orchestration.settings import OrchestrationSettings
 from redteam.orchestration.task_graph.memory import InMemoryTaskGraphStore
 from redteam.orchestration.work.memory import InMemoryWorkStore
@@ -84,6 +84,12 @@ class RuntimeDeps:
 
     def __post_init__(self) -> None:
         if self.verifier is None:
-            object.__setattr__(self, "verifier", StructuredLLMAnalysisVerifier(
-                self.llm_client, self.evidence_store, AttackGraphService(self.graph_store),
-            ))
+            object.__setattr__(
+                self,
+                "verifier",
+                StructuredLLMAnalysisVerifier(
+                    self.llm_client,
+                    self.evidence_store,
+                    AttackGraphService(self.graph_store),
+                ),
+            )

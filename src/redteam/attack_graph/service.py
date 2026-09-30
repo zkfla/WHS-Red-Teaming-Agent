@@ -32,8 +32,8 @@ from redteam.attack_graph.observation import (
 )
 from redteam.attack_graph.patterns import NodePattern, ResolveResult
 from redteam.attack_graph.predicates import (
-    CLAIM_PROVENANCE_KEY,
     CLAIM_FACT_PREFIX,
+    CLAIM_PROVENANCE_KEY,
     CLEANUP_KEY,
     MAX_PROVENANCE_ENTRIES,
     RESERVED_KEYS,
@@ -248,10 +248,7 @@ class AttackGraphService:
                 merged_labels = sorted(set(existing.labels) | set(labels or []))
                 merged_properties = merge_properties(existing.properties, incoming)
                 # A write that changes nothing is not a write.
-                if (
-                    merged_labels == existing.labels
-                    and merged_properties == existing.properties
-                ):
+                if merged_labels == existing.labels and merged_properties == existing.properties:
                     return existing
                 node = existing.model_copy(
                     update={
@@ -357,17 +354,13 @@ class AttackGraphService:
             step=step,
         )
 
-    async def retract(
-        self, node_id: GraphNodeId, key: str, *, step: int, reason: str
-    ) -> bool:
+    async def retract(self, node_id: GraphNodeId, key: str, *, step: int, reason: str) -> bool:
         """Withdraw a predicate that no longer holds, with a reason."""
         async with _node_lock(self._store, node_id):
             node = await self._store.get_node(node_id)
             if node is None:
                 return False
-            properties, changed = apply_retraction(
-                node.properties, key, step=step, reason=reason
-            )
+            properties, changed = apply_retraction(node.properties, key, step=step, reason=reason)
             if not changed:
                 return False
             await self._store.add_node(
@@ -447,7 +440,7 @@ class AttackGraphService:
             merged_claims = dict(prior_claims)
             for claim_key, entry in fresh_claims.items():
                 prop_key = (
-                    claim_key[len(CLAIM_FACT_PREFIX):]
+                    claim_key[len(CLAIM_FACT_PREFIX) :]
                     if claim_key.startswith(CLAIM_FACT_PREFIX)
                     else None
                 )
@@ -704,9 +697,7 @@ class AttackGraphService:
     async def mark_cleanup_not_required(
         self, node_id: GraphNodeId, *, note: str
     ) -> CleanupItem | None:
-        return await self._update_cleanup(
-            node_id, status=CleanupStatus.NOT_REQUIRED, note=note
-        )
+        return await self._update_cleanup(node_id, status=CleanupStatus.NOT_REQUIRED, note=note)
 
     async def cleanup_report(self) -> CleanupReport:
         return collect(await self.list_nodes())
@@ -765,16 +756,12 @@ class AttackGraphService:
     ) -> list[PlannedRetraction]:
         """Withdraw predicates whose observations went stale. Call once per
         turn; ``dry_run`` reports without writing."""
-        planned = plan_retractions(
-            await self.list_nodes(), current_step=current_step, rules=rules
-        )
+        planned = plan_retractions(await self.list_nodes(), current_step=current_step, rules=rules)
         if dry_run:
             return planned
         applied: list[PlannedRetraction] = []
         for item in planned:
-            if await self.retract(
-                item.node_id, item.attr, step=current_step, reason=item.reason
-            ):
+            if await self.retract(item.node_id, item.attr, step=current_step, reason=item.reason):
                 applied.append(item)
         return applied
 

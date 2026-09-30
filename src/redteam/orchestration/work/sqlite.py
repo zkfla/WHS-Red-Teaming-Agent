@@ -18,6 +18,7 @@ from redteam.orchestration.work.models import (
     TaskLease,
     WorkItem,
     WorkStatus,
+    is_unexecuted_stale,
 )
 
 
@@ -129,13 +130,7 @@ class SQLiteWorkStore:
                     await db.commit()
                     return False
                 blocking = [
-                    entry
-                    for entry in same_candidate
-                    if not (
-                        entry.status is WorkStatus.STALE
-                        and entry.attempt == 0
-                        and not entry.job_id
-                    )
+                    entry for entry in same_candidate if not is_unexecuted_stale(entry)
                 ]
                 if blocking and not item.repeatable:
                     await db.rollback()

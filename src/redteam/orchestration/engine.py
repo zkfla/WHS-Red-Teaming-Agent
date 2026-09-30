@@ -1,36 +1,43 @@
 """LLM-led path reasoning, with code-owned registration and execution checks."""
+
 from __future__ import annotations
 
 import hashlib
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Any, Literal
 from urllib.parse import urlsplit
 
-from pydantic import BaseModel, Field, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
-from redteam.attack_graph.identity import target_for_node, node_id_for_target
-from redteam.attack_graph.predicates import facts_of
-from redteam.core.contracts.mission import MissionCriterionResult
-from redteam.core.contracts.graph import Hypothesis
+from redteam.attack_graph.identity import node_id_for_target, target_for_node
+from redteam.attack_graph.predicates import Confidence, Provenance, facts_of
 from redteam.core.contracts.evidence import EvidenceRecord
-from redteam.attack_graph.predicates import Confidence, Provenance
-from redteam.core.enums import MissionStatus, TaskStatus, EvidenceSourceType
+from redteam.core.contracts.graph import Hypothesis
+from redteam.core.contracts.mission import MissionCriterionResult
+from redteam.core.enums import EvidenceSourceType, MissionStatus, TaskStatus
 from redteam.core.ids import GraphNodeId, new_id
-from redteam.orchestration.agents.base import PlanStep, HypothesisDraft
-from redteam.orchestration.expectations import Expectation
-from redteam.orchestration.authentication import AuthenticationCheck
+from redteam.orchestration.agents.base import HypothesisDraft, PlanStep
 from redteam.orchestration.agents.providers import PlaybookCandidateProvider
+from redteam.orchestration.authentication import AuthenticationCheck
 from redteam.orchestration.candidates.compiler import CandidateCompiler
 from redteam.orchestration.candidates.models import CandidateDraft
-from redteam.orchestration.cognition import StructuredDecisionClient, DecisionBudget, DecisionFailure
+from redteam.orchestration.cognition import (
+    DecisionBudget,
+    DecisionFailure,
+    StructuredDecisionClient,
+)
 from redteam.orchestration.completion import validate_completion
 from redteam.orchestration.evidence_access import EvidenceReader
+from redteam.orchestration.expectations import Expectation
 from redteam.orchestration.knowledge import project_knowledge
-from redteam.orchestration.paths import PathPlan, PathError, is_known_criterion
-from redteam.orchestration.paths.models import validate_path_structure
-from redteam.orchestration.work.models import WorkStatus
+from redteam.orchestration.paths import PathError, PathPlan, is_known_criterion
+from redteam.orchestration.paths.models import (
+    changed_steps_and_descendants,
+    validate_path_structure,
+)
 from redteam.orchestration.progress import knowledge_fingerprint
+from redteam.orchestration.work.models import WorkStatus, is_unexecuted_stale
 
 
 class ActionIntent(BaseModel):
@@ -49,7 +56,9 @@ class ActionIntent(BaseModel):
     existing_hypothesis_id: str | None = None
     expectation: Expectation | None = None
     authentication_check: AuthenticationCheck | None = None
-    availability_impact: bool = Field(default=False, description="Whether this action may disrupt target availability")
+    availability_impact: bool = Field(
+        default=False, description="Whether this action may disrupt target availability"
+    )
 
 
 class ReviewDecision(BaseModel):
@@ -61,8 +70,18 @@ class ReviewDecision(BaseModel):
 
 class TurnDecision(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    mode: Literal["actions", "revise_path", "switch_path", "complete_step", "complete_goal",
-                  "hold", "read_evidence", "update_hypothesis", "recover_evidence", "reconcile_job"]
+    mode: Literal[
+        "actions",
+        "revise_path",
+        "switch_path",
+        "complete_step",
+        "complete_goal",
+        "hold",
+        "read_evidence",
+        "update_hypothesis",
+        "recover_evidence",
+        "reconcile_job",
+    ]
     reason: str
     actions: list[ActionIntent] = Field(default_factory=list)
     path: PathPlan | None = None
@@ -78,10 +97,12 @@ SYSTEM = (
     "and findings are separate. Reason about investigation paths, dependencies and evidence. "
     "Return only the requested structured decision with concise justification, not private "
     "chain-of-thought. Code reference paths are hints, not an execution pool or an exhaustive "
-    "strategy list. Never claim completion from tool success alone. Operations use capability.operation. "
+    "strategy list. Never claim completion from tool success alone. "
+    "Operations use capability.operation. "
     "Completion criteria must be typed and measurable, with evidence requirements; unknown future "
     "steps may stay pending. Do not invent observed facts or evidence. "
-    "Declare availability_impact for actions that can disrupt service, and obey the engagement constraints."
+    "Declare availability_impact for actions that can disrupt service, "
+    "and obey the engagement constraints."
 )
 
 
@@ -116,7 +137,11 @@ def principal_bindings(knowledge: dict) -> dict[str, set[str]]:
     bindings: dict[str, set[str]] = {"anonymous": set()}
     provided = knowledge.get("provided", {}).get("claims", [])
     for item in [*knowledge.get("facts", []), *provided]:
-        facts = item.get("observed_facts", item.get("facts", {})) if isinstance(item, dict) else {}
+        if not isinstance(item, dict):
+            continue
+        facts = item.get("observed_facts", item.get("facts", {}))
+        if not isinstance(facts, dict):
+            continue
         for reference in item.get("auth_session_refs", []):
             bindings.setdefault(str(reference), set()).add(str(reference))
         sessions = facts.get("auth_session_config", {}).get("sessions", [])
@@ -152,36 +177,55 @@ def ready_step(path, step, knowledge: dict) -> list[str]:
 class InvestigationEngine:
     def __init__(self, deps) -> None:
         self.deps = deps
-        self.client = StructuredDecisionClient(deps.llm_client,
-                                               max_attempts=deps.settings.decision_max_attempts)
+        self.client = StructuredDecisionClient(
+            deps.llm_client, max_attempts=deps.settings.decision_max_attempts
+        )
 
-    async def record_completion_review(self, stage, path, runtime, review, evidence_ids,
-                                       *, step_id=None):
-        payload = {"record_kind": "completion_review", "stage": stage,
-                   "path_id": path.path_id, "path_version": path.version,
-                   "path_step_id": step_id, "model_judgment": review,
-                   "source_evidence_ids": list(evidence_ids),
-                   "code_admission": "separate_completion_gate"}
+    async def record_completion_review(
+        self, stage, path, runtime, review, evidence_ids, *, step_id=None
+    ):
+        payload = {
+            "record_kind": "completion_review",
+            "stage": stage,
+            "path_id": path.path_id,
+            "path_version": path.version,
+            "path_step_id": step_id,
+            "model_judgment": review,
+            "source_evidence_ids": list(evidence_ids),
+            "code_admission": "separate_completion_gate",
+        }
         try:
-            await self.deps.evidence_store.append(EvidenceRecord(
-                evidence_id=new_id("evidence"), run_id=runtime.run_id,
-                engagement_id=runtime.engagement_id, source_type=EvidenceSourceType.SYSTEM,
-                source_id="orchestration." + stage, content_type="application/json",
-                digest=hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest(),
-                summary=str(review.get("reason", ""))[:280],
-                created_at=datetime.now(timezone.utc), metadata=payload,
-            ))
+            await self.deps.evidence_store.append(
+                EvidenceRecord(
+                    evidence_id=new_id("evidence"),
+                    run_id=runtime.run_id,
+                    engagement_id=runtime.engagement_id,
+                    source_type=EvidenceSourceType.SYSTEM,
+                    source_id="orchestration." + stage,
+                    content_type="application/json",
+                    digest=hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest(),
+                    summary=str(review.get("reason", ""))[:280],
+                    created_at=datetime.now(timezone.utc),
+                    metadata=payload,
+                )
+            )
         except Exception as exc:
-            raise DecisionFailure(stage, "unknown", 0,
-                                  "review_receipt_write_failed:" + type(exc).__name__) from exc
+            raise DecisionFailure(
+                stage, "unknown", 0, "review_receipt_write_failed:" + type(exc).__name__
+            ) from exc
 
     async def context(self, runtime, observation) -> dict:
         from redteam.attack_graph.service import AttackGraphService
+
         service = AttackGraphService(self.deps.graph_store)
-        knowledge = await project_knowledge(service, self.deps.evidence_store,
-                                            str(runtime.run_id), step=runtime.step_count)
-        mission = (await self.deps.task_graph_store.get_mission(runtime.mission_id)
-                   if runtime.mission_id else None)
+        knowledge = await project_knowledge(
+            service, self.deps.evidence_store, str(runtime.run_id), step=runtime.step_count
+        )
+        mission = (
+            await self.deps.task_graph_store.get_mission(runtime.mission_id)
+            if runtime.mission_id
+            else None
+        )
         active = await self.deps.path_store.get_active(str(runtime.run_id))
         tools = {}
         if self.deps.tool_catalog is not None:
@@ -190,18 +234,29 @@ class InvestigationEngine:
                 for tool in self.deps.tool_catalog.list_by_capability(capability):
                     tools[str(tool.tool_id)] = tool.model_dump(mode="json")
         records = await self.deps.evidence_store.list_for_run(runtime.run_id)
-        evidence = [{"evidence_id": str(item.evidence_id), "summary": item.summary,
-                     "artifact_ref": item.artifact_ref, "metadata": {
-                         key: value for key, value in item.metadata.items()
-                         if key not in {"raw_tool_result", "tool_result", "proposal", "plan_step"}}}
-                    for item in records[-20:]]
+        evidence = [
+            {
+                "evidence_id": str(item.evidence_id),
+                "summary": item.summary,
+                "artifact_ref": item.artifact_ref,
+                "metadata": {
+                    key: value
+                    for key, value in item.metadata.items()
+                    if key not in {"raw_tool_result", "tool_result", "proposal", "plan_step"}
+                },
+            }
+            for item in records[-20:]
+        ]
         work_history = await self.deps.work_store.list_items(run_id=runtime.run_id)
         history = [item.model_dump(mode="json") for item in work_history[-20:]]
         instructions = []
         if self.deps.operator_intent_store is not None and runtime.mission_id:
-            instructions = [item.model_dump(mode="json") for item in
-                            await self.deps.operator_intent_store.list_for_mission(
-                                runtime.mission_id, limit=10)]
+            instructions = [
+                item.model_dump(mode="json")
+                for item in await self.deps.operator_intent_store.list_for_mission(
+                    runtime.mission_id, limit=10
+                )
+            ]
         return {
             "goal": mission.objective if mission else runtime.current_goal,
             "success_criteria": mission.success_criteria if mission else [runtime.current_goal],
@@ -209,15 +264,22 @@ class InvestigationEngine:
             "operator_instructions": instructions,
             "engagement_constraints": {
                 "scope": self.deps.engagement.scope.model_dump(mode="json"),
-                "rules_of_engagement": [item.model_dump(mode="json")
-                                        for item in self.deps.engagement.rules_of_engagement],
+                "rules_of_engagement": [
+                    item.model_dump(mode="json")
+                    for item in self.deps.engagement.rules_of_engagement
+                ],
                 "execution_budget": self.deps.engagement.execution_budget.model_dump(mode="json"),
-            } if self.deps.engagement else None,
+            }
+            if self.deps.engagement
+            else None,
             "knowledge": knowledge,
             "active_path": active.model_dump(mode="json") if active else None,
-            "roles": [{"agent_id": str(agent.agent_id), "capabilities": agent.capabilities}
-                      for agent in self.deps.agents.all()],
-            "tools": list(tools.values()), "evidence": evidence,
+            "roles": [
+                {"agent_id": str(agent.agent_id), "capabilities": agent.capabilities}
+                for agent in self.deps.agents.all()
+            ],
+            "tools": list(tools.values()),
+            "evidence": evidence,
             "evidence_index": [str(item.evidence_id) for item in records],
             "execution_history": history[-20:],
             "remaining_budget": runtime.remaining_budget,
@@ -230,28 +292,40 @@ class InvestigationEngine:
         for agent in self.deps.agents.all():
             try:
                 drafts = await PlaybookCandidateProvider().propose(
-                    agent, service, observation, step=runtime.step_count,
+                    agent,
+                    service,
+                    observation,
+                    step=runtime.step_count,
                 )
             except (ValueError, KeyError):
                 continue
             for draft in drafts:
-                references.append({"operation": draft.plan_step.operation_key,
-                                   "purpose": draft.plan_step.reason,
-                                   "targets": list(map(str, draft.target_node_ids)),
-                                   "prerequisites": draft.prerequisite_ids})
+                references.append(
+                    {
+                        "operation": draft.plan_step.operation_key,
+                        "purpose": draft.plan_step.reason,
+                        "targets": list(map(str, draft.target_node_ids)),
+                        "prerequisites": draft.prerequisite_ids,
+                    }
+                )
         return references
 
-    async def register_path(self, proposed, runtime, context, observation,
-                            *, switch: bool = False, budget=None):
+    async def register_path(
+        self, proposed, runtime, context, observation, *, switch: bool = False, budget=None
+    ):
         from redteam.attack_graph.service import AttackGraphService
+
         active = await self.deps.path_store.get_active(str(runtime.run_id))
         candidate = proposed.model_dump(mode="json")
-        candidate.update(run_id=str(runtime.run_id), mission_id=str(runtime.mission_id)
-                         if runtime.mission_id else None,
-                         path_id=active.path_id if active and not switch else new_id("path"),
-                         version=active.version + 1 if active else 1,
-                         parent_version=active.version if active and not switch else None,
-                         status="candidate", goal=context["goal"])
+        candidate.update(
+            run_id=str(runtime.run_id),
+            mission_id=str(runtime.mission_id) if runtime.mission_id else None,
+            path_id=active.path_id if active and not switch else new_id("path"),
+            version=active.version + 1 if active else 1,
+            parent_version=active.version if active and not switch else None,
+            status="candidate",
+            goal=context["goal"],
+        )
         path = PathPlan.model_validate(candidate)
         validate_path_structure(path.steps)
         service = AttackGraphService(self.deps.graph_store)
@@ -279,21 +353,42 @@ class InvestigationEngine:
             ):
                 raise ValueError("new paths require typed completion criteria")
         references = await self.reference_paths(
-            observation, AttackGraphService(self.deps.graph_store), runtime,
+            observation,
+            AttackGraphService(self.deps.graph_store),
+            runtime,
         )
-        review = ReviewDecision.model_validate(await self.client.ask(
-            stage="path_review", payload={**context, "draft_path": path.model_dump(mode="json"),
-                                          "code_references": references,
-                                          "code_checks": "structure and references passed"},
-            response_schema=ReviewDecision.model_json_schema(), system=SYSTEM, budget=budget,
-        ))
+        review = ReviewDecision.model_validate(
+            await self.client.ask(
+                stage="path_review",
+                payload={
+                    **context,
+                    "draft_path": path.model_dump(mode="json"),
+                    "code_references": references,
+                    "code_checks": "structure and references passed",
+                },
+                response_schema=ReviewDecision.model_json_schema(),
+                system=SYSTEM,
+                budget=budget,
+            )
+        )
         if review.decision == "revise":
             if review.path is None:
                 raise ValueError("revision review requires a replacement path")
             replacement = review.path.model_dump(mode="json")
-            replacement.update({key: candidate[key] for key in
-                                ("run_id", "mission_id", "path_id", "version",
-                                 "parent_version", "status", "goal")})
+            replacement.update(
+                {
+                    key: candidate[key]
+                    for key in (
+                        "run_id",
+                        "mission_id",
+                        "path_id",
+                        "version",
+                        "parent_version",
+                        "status",
+                        "goal",
+                    )
+                }
+            )
             path = PathPlan.model_validate(replacement)
             validate_path_structure(path.steps)
             for identity in path.hypothesis_ids:
@@ -305,41 +400,38 @@ class InvestigationEngine:
                     raise ValueError("reviewed path cites unrelated evidence")
             for step in path.steps:
                 step.status, step.outcome, step.evidence_ids = "pending", None, []
-                if (set(step.target_node_ids) - known
+                if (
+                    set(step.target_node_ids) - known
                     or set(step.principal_refs) - known_principals
                     or (step.agent_id and self.deps.agents.get(step.agent_id) is None)
                     or not step.completion_criteria
-                    or any(not is_known_criterion(item) for item in step.completion_criteria)):
+                    or any(not is_known_criterion(item) for item in step.completion_criteria)
+                ):
                     raise ValueError("reviewed path has invalid references or criteria")
         if review.decision in {"reject", "hold"}:
             history = path.model_dump(mode="json")
-            history.update(path_id=new_id("path_review"), version=1, parent_version=None,
-                           status="rejected" if review.decision == "reject" else "candidate",
-                           reason=review.reason)
+            history.update(
+                path_id=new_id("path_review"),
+                version=1,
+                parent_version=None,
+                status="rejected" if review.decision == "reject" else "candidate",
+                reason=review.reason,
+            )
             await self.deps.path_store.register(PathPlan.model_validate(history))
             return None
         accepted = path.model_dump(mode="json")
         accepted.update(status="accepted", reason=review.reason)
         if active:
-            changed = set(path.changed_step_ids)
-            old_steps = {item.step_id: item for item in active.steps}
-            new_steps = {item.step_id: item for item in path.steps}
-            excluded = {"status", "outcome", "evidence_ids"}
-            changed.update(set(old_steps) - set(new_steps))
-            changed.update(identity for identity, old in old_steps.items()
-                           if identity in new_steps and old.model_dump(exclude=excluded)
-                           != new_steps[identity].model_dump(exclude=excluded))
-            while True:
-                descendants = {item.step_id for item in [*active.steps, *path.steps]
-                               if set(item.depends_on) & changed}
-                if descendants <= changed:
-                    break
-                changed.update(descendants)
-            accepted["changed_step_ids"] = sorted(changed)
+            accepted["changed_step_ids"] = changed_steps_and_descendants(
+                active.steps,
+                path.steps,
+                path.changed_step_ids,
+            )
         if "review_records" in PathPlan.model_fields:
             accepted["review_records"] = {"decision": review.decision, "reason": review.reason}
         registered = await self.deps.path_store.register(
-            PathPlan.model_validate(accepted), expected_version=active.version if active else None,
+            PathPlan.model_validate(accepted),
+            expected_version=active.version if active else None,
             expected_path_id=active.path_id if active else None,
         )
         if active:
@@ -357,8 +449,9 @@ class InvestigationEngine:
                 if old.model_dump(exclude=exclude) != new.model_dump(exclude=exclude):
                     changed.add(identity)
         while True:
-            descendants = {item.step_id for item in previous.steps
-                           if set(item.depends_on) & changed}
+            descendants = {
+                item.step_id for item in previous.steps if set(item.depends_on) & changed
+            }
             if descendants <= changed:
                 break
             changed.update(descendants)
@@ -366,7 +459,10 @@ class InvestigationEngine:
             changed = set(previous_steps)
         now = datetime.now(timezone.utc)
         await self.deps.work_store.invalidate_pending(
-            run_id=runtime.run_id, path_id=previous.path_id, step_ids=changed, now=now,
+            run_id=runtime.run_id,
+            path_id=previous.path_id,
+            step_ids=changed,
+            now=now,
         )
         # LEASED is checked again on admission; RUNNING keeps its real result.
 
@@ -377,19 +473,25 @@ class InvestigationEngine:
             drafting_budget = DecisionBudget(self.deps.settings.decision_max_attempts)
             while drafting_budget.remaining:
                 try:
-                    draft = PathPlan.model_validate(await self.client.ask(
-                        stage="path_draft", payload=context,
-                        response_schema=PathPlan.model_json_schema(), system=SYSTEM,
-                        budget=drafting_budget,
-                    ))
-                    path = await self.register_path(draft, runtime, context, observation,
-                                                    budget=drafting_budget)
+                    draft = PathPlan.model_validate(
+                        await self.client.ask(
+                            stage="path_draft",
+                            payload=context,
+                            response_schema=PathPlan.model_json_schema(),
+                            system=SYSTEM,
+                            budget=drafting_budget,
+                        )
+                    )
+                    path = await self.register_path(
+                        draft, runtime, context, observation, budget=drafting_budget
+                    )
                     break
                 except (ValueError, TypeError, PathError) as exc:
                     context["feedback"] = [str(exc)]
             else:
-                raise DecisionFailure("path_draft", "budget", drafting_budget.used,
-                                      str(context["feedback"]))
+                raise DecisionFailure(
+                    "path_draft", "budget", drafting_budget.used, str(context["feedback"])
+                )
             if path is None:
                 return None, [], "path held or rejected"
         extra = []
@@ -397,23 +499,33 @@ class InvestigationEngine:
         budget = DecisionBudget(self.deps.settings.decision_max_attempts)
         while budget.remaining:
             context["active_path"] = path.model_dump(mode="json")
-            decision = TurnDecision.model_validate(await self.client.ask(
-                stage="next_action", payload={**context, "additional_evidence": extra},
-                response_schema=TurnDecision.model_json_schema(), system=SYSTEM, budget=budget,
-            ))
+            decision = TurnDecision.model_validate(
+                await self.client.ask(
+                    stage="next_action",
+                    payload={**context, "additional_evidence": extra},
+                    response_schema=TurnDecision.model_json_schema(),
+                    system=SYSTEM,
+                    budget=budget,
+                )
+            )
             try:
                 last_control_succeeded = False
                 if decision.mode == "read_evidence":
                     request = decision.evidence_request
-                    extra.append(await EvidenceReader(self.deps.evidence_store).read(
-                        evidence_id=str(request.get("evidence_id", "")),
-                        run_id=str(runtime.run_id), offset=int(request.get("offset", 0)),
-                        limit=min(int(request.get("limit", 4000)), 8000), query=request.get("query"),
-                    ))
+                    extra.append(
+                        await EvidenceReader(self.deps.evidence_store).read(
+                            evidence_id=str(request.get("evidence_id", "")),
+                            run_id=str(runtime.run_id),
+                            offset=int(request.get("offset", 0)),
+                            limit=min(int(request.get("limit", 4000)), 8000),
+                            query=request.get("query"),
+                        )
+                    )
                     last_control_succeeded = True
                     continue
                 if decision.mode == "update_hypothesis":
                     from redteam.attack_graph.service import AttackGraphService
+
                     service = AttackGraphService(self.deps.graph_store)
                     suggestion = decision.hypothesis_update
                     target_id = str(suggestion.get("target_node_id", ""))
@@ -429,41 +541,67 @@ class InvestigationEngine:
                     evidence_ids = list(map(str, suggestion.get("evidence_ids", [])))
                     for identity in evidence_ids:
                         evidence = await self.deps.evidence_store.get(identity)
-                        if (evidence is None or str(evidence.run_id) != str(runtime.run_id)
-                            or evidence.metadata.get("target_node_id") != target_id):
+                        if (
+                            evidence is None
+                            or str(evidence.run_id) != str(runtime.run_id)
+                            or evidence.metadata.get("target_node_id") != target_id
+                        ):
                             raise ValueError("hypothesis cites unrelated evidence")
-                    revision_history = list(existing.metadata.get("revisions", [])) if existing else []
-                    if existing:
-                        revision_history.append({"claim": existing.description,
-                                                 "status": _text(existing.status),
-                                                 "evidence_ids": existing.metadata.get("evidence_ids", [])})
-                    hypothesis = Hypothesis(
-                        hypothesis_id=hypothesis_id, description=description,
-                        confidence=float(suggestion.get("confidence", 0.3)), status="open",
-                        metadata={**(existing.metadata if existing else {}),
-                                  "target_node_id": target_id, "evidence_ids": evidence_ids,
-                                  "needs": suggestion.get("needs", []),
-                                  "previous_claim": existing.description if existing else None,
-                                  "revisions": revision_history,
-                                  "neutral_evidence_ids": evidence_ids,
-                                  "supporting_evidence_ids": [], "refuting_evidence_ids": [],
-                                  "path_id": path.path_id, "path_version": path.version},
+                    revision_history = (
+                        list(existing.metadata.get("revisions", [])) if existing else []
                     )
-                    await service.record_hypothesis(hypothesis, about=GraphNodeId(target_id),
-                        step=runtime.step_count, provenance=Provenance(
-                            source="llm:hypothesis", run_id=str(runtime.run_id),
-                            step=runtime.step_count, confidence=Confidence.INFERRED))
+                    if existing:
+                        revision_history.append(
+                            {
+                                "claim": existing.description,
+                                "status": _text(existing.status),
+                                "evidence_ids": existing.metadata.get("evidence_ids", []),
+                            }
+                        )
+                    hypothesis = Hypothesis(
+                        hypothesis_id=hypothesis_id,
+                        description=description,
+                        confidence=float(suggestion.get("confidence", 0.3)),
+                        status="open",
+                        metadata={
+                            **(existing.metadata if existing else {}),
+                            "target_node_id": target_id,
+                            "evidence_ids": evidence_ids,
+                            "needs": suggestion.get("needs", []),
+                            "previous_claim": existing.description if existing else None,
+                            "revisions": revision_history,
+                            "neutral_evidence_ids": evidence_ids,
+                            "supporting_evidence_ids": [],
+                            "refuting_evidence_ids": [],
+                            "path_id": path.path_id,
+                            "path_version": path.version,
+                        },
+                    )
+                    await service.record_hypothesis(
+                        hypothesis,
+                        about=GraphNodeId(target_id),
+                        step=runtime.step_count,
+                        provenance=Provenance(
+                            source="llm:hypothesis",
+                            run_id=str(runtime.run_id),
+                            step=runtime.step_count,
+                            confidence=Confidence.INFERRED,
+                        ),
+                    )
                     context = await self.context(runtime, observation)
                     last_control_succeeded = True
                     continue
                 if decision.mode == "recover_evidence":
                     from redteam.attack_graph.service import AttackGraphService
                     from redteam.orchestration.recovery import reprocess_evidence
+
                     recovered = await reprocess_evidence(
                         evidence_id=str(decision.evidence_request.get("evidence_id", "")),
-                        run_id=str(runtime.run_id), evidence_store=self.deps.evidence_store,
+                        run_id=str(runtime.run_id),
+                        evidence_store=self.deps.evidence_store,
                         graph_service=AttackGraphService(self.deps.graph_store),
-                        verifier=self.deps.verifier, result_mappers=self.deps.result_mappers,
+                        verifier=self.deps.verifier,
+                        result_mappers=self.deps.result_mappers,
                     )
                     extra.append(recovered)
                     context = await self.context(runtime, observation)
@@ -480,7 +618,10 @@ class InvestigationEngine:
                     if not budget.remaining:
                         return path, [], "continue_planning"
                     updated = await self.register_path(
-                        decision.path, runtime, context, observation,
+                        decision.path,
+                        runtime,
+                        context,
+                        observation,
                         switch=decision.mode == "switch_path",
                         budget=budget,
                     )
@@ -492,14 +633,18 @@ class InvestigationEngine:
                 if decision.mode == "complete_step":
                     if not budget.remaining:
                         return path, [], "continue_planning"
-                    path, errors = await self.complete_step(path, decision, runtime, context, budget=budget)
+                    path, errors = await self.complete_step(
+                        path, decision, runtime, context, budget=budget
+                    )
                     context["feedback"] = errors
                     last_control_succeeded = not errors
                     continue
                 if decision.mode == "complete_goal":
                     if not budget.remaining:
                         return path, [], "continue_planning"
-                    errors = await self.complete_goal(path, decision, runtime, context, budget=budget)
+                    errors = await self.complete_goal(
+                        path, decision, runtime, context, budget=budget
+                    )
                     if not errors:
                         return path, [], "goal_achieved"
                     context["feedback"] = errors
@@ -508,7 +653,9 @@ class InvestigationEngine:
                     return path, [], decision.reason
                 if not decision.actions:
                     raise ValueError("actions decision contained no actions")
-                compiled, errors = await self.compile_actions(path, decision.actions, runtime, context)
+                compiled, errors = await self.compile_actions(
+                    path, decision.actions, runtime, context
+                )
                 if errors:
                     context["feedback"] = errors
                     continue
@@ -522,6 +669,7 @@ class InvestigationEngine:
 
     async def compile_actions(self, path, intents, runtime, context):
         from redteam.attack_graph.service import AttackGraphService
+
         service = AttackGraphService(self.deps.graph_store)
         steps = {step.step_id: step for step in path.steps}
         drafts = []
@@ -550,55 +698,84 @@ class InvestigationEngine:
                     raise ValueError("action principal is outside step envelope")
                 if step.principal_refs and not intent.principal_ref:
                     raise ValueError("step requires a principal reference")
-                validate_principal_arguments(step, intent.principal_ref, intent.arguments,
-                                             context["knowledge"])
+                validate_principal_arguments(
+                    step, intent.principal_ref, intent.arguments, context["knowledge"]
+                )
                 node = await service.get_node(GraphNodeId(intent.target_node_id))
                 if node is None:
                     raise ValueError("referenced action target disappeared")
-                target = target_for_node(node.id, node.type,
-                                        observed=facts_of(node.properties).get("observed_target"))
+                target = target_for_node(
+                    node.id, node.type, observed=facts_of(node.properties).get("observed_target")
+                )
                 if self.deps.tool_catalog is None:
                     raise ValueError("a real tool catalog is required for action compilation")
                 if self.deps.tool_catalog.get(intent.tool_id) is None:
                     raise ValueError("requested tool is absent from catalog")
-                validate_argument_target(target, intent.arguments, target_aliases(self.deps, target))
+                validate_argument_target(
+                    target, intent.arguments, target_aliases(self.deps, target)
+                )
                 if await self.has_ambiguous_execution(intent, runtime):
-                    raise ValueError("matching execution is uncertain; reconcile its stored result/job")
-                if (intent.expectation and intent.expectation.violation_if_met and
-                    (intent.expectation.kind == "tool_succeeded" or
-                     intent.expectation.field in {"status", "status_code", "success"})):
+                    raise ValueError(
+                        "matching execution is uncertain; reconcile its stored result/job"
+                    )
+                if (
+                    intent.expectation
+                    and intent.expectation.violation_if_met
+                    and (
+                        intent.expectation.kind == "tool_succeeded"
+                        or intent.expectation.field in {"status", "status_code", "success"}
+                    )
+                ):
                     raise ValueError("tool success or status alone cannot prove a violation")
                 if intent.existing_hypothesis_id:
+                    if intent.hypothesis is not None:
+                        raise ValueError("choose an existing hypothesis or a new claim, not both")
                     hypothesis = await service.get_hypothesis(intent.existing_hypothesis_id)
                     if hypothesis is None:
                         raise ValueError("action references a missing hypothesis")
                     if hypothesis.metadata.get("target_node_id") != intent.target_node_id:
                         raise ValueError("existing hypothesis has no matching target binding")
                 plan = PlanStep(
-                    step_id=step.step_id, path_id=path.path_id, path_version=path.version,
-                    path_step_id=step.step_id, principal_ref=intent.principal_ref,
+                    step_id=step.step_id,
+                    path_id=path.path_id,
+                    path_version=path.version,
+                    path_step_id=step.step_id,
+                    principal_ref=intent.principal_ref,
                     operator_intent_id=await operator_epoch(self.deps, runtime),
                     intent_index=intent_index,
                     availability_impact=intent.availability_impact,
-                    capability=intent.capability, operation=intent.operation,
-                    tool_id=intent.tool_id, compatible_tool_ids=[intent.tool_id],
-                    target=target, arguments=intent.arguments, reason=intent.reason,
+                    capability=intent.capability,
+                    operation=intent.operation,
+                    tool_id=intent.tool_id,
+                    compatible_tool_ids=[intent.tool_id],
+                    target=target,
+                    arguments=intent.arguments,
+                    reason=intent.reason,
                     expected_observation=intent.expected_observation,
                     hypothesis=intent.hypothesis,
                     existing_hypothesis_id=intent.existing_hypothesis_id,
-                    expectation=intent.expectation, authentication_check=intent.authentication_check,
-                    assessment_kind="security_check" if intent.hypothesis
-                    or intent.existing_hypothesis_id else "observation",
+                    expectation=intent.expectation,
+                    authentication_check=intent.authentication_check,
+                    assessment_kind="security_check"
+                    if intent.hypothesis or intent.existing_hypothesis_id
+                    else "observation",
                 )
-                drafts.append(CandidateDraft(
-                    agent_id=intent.agent_id, plan_step=plan,
-                    target_node_ids=[node_id_for_target(target)],
-                    prerequisite_fingerprint=knowledge_fingerprint({"facts": context["knowledge"]["facts"]}),
-                    conflict_keys=[f"target:{node.id}"],
-                ))
+                drafts.append(
+                    CandidateDraft(
+                        agent_id=intent.agent_id,
+                        plan_step=plan,
+                        target_node_ids=[node_id_for_target(target)],
+                        prerequisite_fingerprint=knowledge_fingerprint(
+                            {"facts": context["knowledge"]["facts"]}
+                        ),
+                        conflict_keys=[f"target:{node.id}"],
+                    )
+                )
             except (ValueError, TypeError, KeyError) as exc:
                 errors.append(str(exc))
-        compiled, rejected = CandidateCompiler(self.deps.tool_catalog).compile_drafts_with_rejections(
+        compiled, rejected = CandidateCompiler(
+            self.deps.tool_catalog
+        ).compile_drafts_with_rejections(
             drafts,
         )
         errors.extend(f"{item.reason}: {item.field}" for item in rejected)
@@ -607,28 +784,42 @@ class InvestigationEngine:
         # Execution identity does not change when a claim, role or path is renamed.
         # A different tool or grounded investigation state is a different attempt.
         for item in compiled:
-            identity = {"tool_id": str(item.tool.tool_id),
-                        "operation": item.plan_step.operation_key,
-                        "arguments": item.plan_step.arguments,
-                        "targets": list(map(str, item.draft.target_node_ids)),
-                        "principal_ref": item.plan_step.principal_ref,
-                        "knowledge": item.draft.prerequisite_fingerprint}
-            item.candidate_key = "cand_" + hashlib.sha256(
-                json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
-            ).hexdigest()[:24]
+            identity = {
+                "tool_id": str(item.tool.tool_id),
+                "operation": item.plan_step.operation_key,
+                "arguments": item.plan_step.arguments,
+                "targets": list(map(str, item.draft.target_node_ids)),
+                "principal_ref": item.plan_step.principal_ref,
+                "knowledge": item.draft.prerequisite_fingerprint,
+            }
+            item.candidate_key = (
+                "cand_"
+                + hashlib.sha256(
+                    json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
+                ).hexdigest()[:24]
+            )
         for item in compiled:
             try:
-                validate_argument_target(item.plan_step.resolved_target(), item.plan_step.arguments,
-                                         target_aliases(self.deps, item.plan_step.resolved_target()))
-                validate_principal_arguments(steps[item.plan_step.path_step_id],
-                                             item.plan_step.principal_ref, item.plan_step.arguments,
-                                             context["knowledge"])
+                validate_argument_target(
+                    item.plan_step.resolved_target(),
+                    item.plan_step.arguments,
+                    target_aliases(self.deps, item.plan_step.resolved_target()),
+                )
+                validate_principal_arguments(
+                    steps[item.plan_step.path_step_id],
+                    item.plan_step.principal_ref,
+                    item.plan_step.arguments,
+                    context["knowledge"],
+                )
             except (ValueError, TypeError) as exc:
                 errors.append(str(exc))
             history = await self.deps.work_store.list_items(run_id=runtime.run_id)
-            if any(work.candidate_key == item.candidate_key and work.status is not WorkStatus.PENDING
-                   and not (work.status is WorkStatus.STALE and work.attempt == 0 and not work.job_id)
-                   for work in history):
+            if any(
+                work.candidate_key == item.candidate_key
+                and work.status is not WorkStatus.PENDING
+                and not is_unexecuted_stale(work)
+                for work in history
+            ):
                 errors.append("identical action already recorded; choose an evidenced new action")
         return compiled, errors
 
@@ -639,23 +830,32 @@ class InvestigationEngine:
             metadata = raw.get("metadata", {}) if isinstance(raw, dict) else {}
             if not metadata.get("orchestration_exception"):
                 continue
-            if raw.get("error", {}).get("code") in {"tool_binding_invalid", "lease_lost_before_execution"}:
+            if raw.get("error", {}).get("code") in {
+                "tool_binding_invalid",
+                "lease_lost_before_execution",
+            }:
                 continue
-            if (record.metadata.get("target_node_id") == intent.target_node_id
+            if (
+                record.metadata.get("target_node_id") == intent.target_node_id
                 and proposal.get("capability") == intent.capability
                 and proposal.get("operation") == intent.operation
-                and proposal.get("arguments") == intent.arguments):
+                and proposal.get("arguments") == intent.arguments
+            ):
                 siblings = await self.deps.evidence_store.list_for_action(record.action_id)
-                if not any(item.metadata.get("tool_result", {}).get("metadata", {}).get(
-                    "execution_reconciled") for item in siblings):
+                if not any(
+                    item.metadata.get("tool_result", {})
+                    .get("metadata", {})
+                    .get("execution_reconciled")
+                    for item in siblings
+                ):
                     return True
         return False
 
     async def reconcile_job(self, request, runtime):
-        from redteam.orchestration.long_jobs import LongJobManager, LongJobState
         from redteam.core.contracts.action import ActionProposal
-        from redteam.orchestration.nodes.verify import verify_node
+        from redteam.orchestration.long_jobs import LongJobManager, LongJobState
         from redteam.orchestration.nodes.update import update_node
+        from redteam.orchestration.nodes.verify import verify_node
         from redteam.orchestration.state import initial_graph_state
 
         work = await self.deps.work_store.get(str(request.get("work_id", "")))
@@ -663,68 +863,120 @@ class InvestigationEngine:
             return {"status": "no_registered_job"}
         manager = LongJobManager(self.deps.long_job_adapter)
         status = await manager.status(work.job_id)
-        if status.state not in {LongJobState.SUCCEEDED, LongJobState.FAILED, LongJobState.CANCELLED}:
+        if status.state not in {
+            LongJobState.SUCCEEDED,
+            LongJobState.FAILED,
+            LongJobState.CANCELLED,
+        }:
             return {"status": status.state.value, "work_id": work.work_id}
         records = await self.deps.evidence_store.list_for_run(runtime.run_id)
-        original = next((record for record in records if
-            record.metadata.get("candidate_key") == work.candidate_key
-            and record.metadata.get("proposal") and record.metadata.get("plan_step")), None)
+        original = next(
+            (
+                record
+                for record in records
+                if record.metadata.get("candidate_key") == work.candidate_key
+                and record.metadata.get("proposal")
+                and record.metadata.get("plan_step")
+            ),
+            None,
+        )
         if original is None:
             return {"status": "missing_original_action"}
         result = (await manager.result(work.job_id)).require_result()
         proposal = ActionProposal.model_validate(original.metadata["proposal"])
         step = PlanStep.model_validate(original.metadata["plan_step"])
-        if (result.action_id != proposal.action_id or result.tool_id != step.tool_id
-            or result.invocation_id != original.invocation_id):
+        if (
+            result.action_id != proposal.action_id
+            or result.tool_id != step.tool_id
+            or result.invocation_id != original.invocation_id
+        ):
             return {"status": "unrelated_job_result"}
-        result = result.model_copy(update={"metadata": {**result.metadata,
-            "execution_reconciled": True, "job_id": work.job_id}})
+        result = result.model_copy(
+            update={
+                "metadata": {**result.metadata, "execution_reconciled": True, "job_id": work.job_id}
+            }
+        )
         replay = initial_graph_state(runtime)
-        replay.update(action_proposal=proposal, plan_step=step, tool_result=result,
-                      current_work_id=work.work_id)
+        replay.update(
+            action_proposal=proposal,
+            plan_step=step,
+            tool_result=result,
+            current_work_id=work.work_id,
+        )
         reviewed = await verify_node(replay, deps=self.deps)
         await update_node(reviewed, deps=self.deps)
         reconciled = await self.deps.work_store.reconcile_job(
-            work.work_id, job_id=work.job_id,
+            work.work_id,
+            job_id=work.job_id,
             status=WorkStatus.SUCCEEDED if result.success else WorkStatus.FAILED,
             now=datetime.now(timezone.utc),
         )
         if not reconciled:
-            return {"status": "result_collected_ledger_unsettled", "job_id": work.job_id,
-                    "evidence_id": str(reviewed.get("result_evidence_id"))}
-        return {"status": "collected", "job_id": work.job_id,
-                "evidence_id": str(reviewed.get("result_evidence_id"))}
+            return {
+                "status": "result_collected_ledger_unsettled",
+                "job_id": work.job_id,
+                "evidence_id": str(reviewed.get("result_evidence_id")),
+            }
+        return {
+            "status": "collected",
+            "job_id": work.job_id,
+            "evidence_id": str(reviewed.get("result_evidence_id")),
+        }
 
     async def complete_step(self, path, decision, runtime, context, *, budget=None):
         from redteam.attack_graph.service import AttackGraphService
+
         step = next((item for item in path.steps if item.step_id == decision.path_step_id), None)
         if step is None:
             return path, ["completion refers to an unknown step"]
         proposal = decision.completion
         errors = await validate_completion(
-            path=path, step=step, proposal=proposal,
+            path=path,
+            step=step,
+            proposal=proposal,
             evidence_store=self.deps.evidence_store,
-            graph_service=AttackGraphService(self.deps.graph_store), run_id=str(runtime.run_id),
+            graph_service=AttackGraphService(self.deps.graph_store),
+            run_id=str(runtime.run_id),
+            path_store=self.deps.path_store,
         )
         if errors:
             return path, errors
         review = await self.client.ask(
-            stage="completion_review", payload={**context, "step": step.model_dump(mode="json"),
-                                                 "completion_proposal": proposal},
-            response_schema={"type": "object", "properties": {
-                "accepted": {"type": "boolean"}, "reason": {"type": "string"}},
-                "required": ["accepted", "reason"], "additionalProperties": False}, system=SYSTEM,
+            stage="completion_review",
+            payload={
+                **context,
+                "step": step.model_dump(mode="json"),
+                "completion_proposal": proposal,
+            },
+            response_schema={
+                "type": "object",
+                "properties": {"accepted": {"type": "boolean"}, "reason": {"type": "string"}},
+                "required": ["accepted", "reason"],
+                "additionalProperties": False,
+            },
+            system=SYSTEM,
             budget=budget,
         )
-        await self.record_completion_review("completion_review", path, runtime, review,
-                                            proposal.get("evidence_ids", []), step_id=step.step_id)
+        await self.record_completion_review(
+            "completion_review",
+            path,
+            runtime,
+            review,
+            proposal.get("evidence_ids", []),
+            step_id=step.step_id,
+        )
         if not review["accepted"]:
             return path, [review["reason"]]
         outcome = proposal.get("outcome", "inconclusive")
         status = "completed" if outcome in {"success", "refuted"} else "blocked"
         updated = await self.deps.path_store.update_step(
-            str(runtime.run_id), path.path_id, path.version, step.step_id,
-            status, outcome=outcome, evidence_ids=proposal.get("evidence_ids", []),
+            str(runtime.run_id),
+            path.path_id,
+            path.version,
+            step.step_id,
+            status,
+            outcome=outcome,
+            evidence_ids=proposal.get("evidence_ids", []),
         )
         return updated or path, []
 
@@ -736,42 +988,74 @@ class InvestigationEngine:
         if runtime.mission_id is None:
             return ["goal completion requires an operator mission"]
         active_work = await self.deps.work_store.list_items(run_id=runtime.run_id)
-        if any(work.status in {WorkStatus.PENDING, WorkStatus.LEASED, WorkStatus.RUNNING}
-               for work in active_work):
+        if any(
+            work.status in {WorkStatus.PENDING, WorkStatus.LEASED, WorkStatus.RUNNING}
+            for work in active_work
+        ):
             return ["unfinished execution records remain"]
         records = await self.deps.evidence_store.list_for_run(runtime.run_id)
-        settled_actions = {str(record.action_id) for record in records
-                           if record.metadata.get("tool_result", {}).get("metadata", {}).get(
-                               "execution_reconciled")}
+        settled_actions = {
+            str(record.action_id)
+            for record in records
+            if record.metadata.get("tool_result", {})
+            .get("metadata", {})
+            .get("execution_reconciled")
+        }
         for record in records:
             raw = record.metadata.get("tool_result")
             if not isinstance(raw, dict):
                 continue
             if raw.get("metadata", {}).get("orchestration_exception"):
                 error = raw.get("error") or {}
-                if (error.get("code") not in {"tool_binding_invalid", "lease_lost_before_execution"}
-                    and str(record.action_id) not in settled_actions):
+                if (
+                    error.get("code") not in {"tool_binding_invalid", "lease_lost_before_execution"}
+                    and str(record.action_id) not in settled_actions
+                ):
                     return ["an execution outcome is uncertain; collect its actual result or hold"]
         from redteam.attack_graph.service import AttackGraphService
+
         cleanup = await AttackGraphService(self.deps.graph_store).cleanup_report()
         if cleanup.outstanding:
             return ["required cleanup is still outstanding"]
         review = await self.client.ask(
-            stage="goal_completion_review", payload={**context,
+            stage="goal_completion_review",
+            payload={
+                **context,
                 "completion_proposal": decision.completion,
-                "path": path.model_dump(mode="json")},
-            response_schema={"type": "object", "properties": {
-                "accepted": {"type": "boolean"}, "reason": {"type": "string"},
-                "criteria": {"type": "array", "items": {"type": "object", "properties": {
-                    "criterion": {"type": "string"}, "met": {"type": "boolean"},
-                    "evidence_ids": {"type": "array", "items": {"type": "string"}}},
-                    "required": ["criterion", "met", "evidence_ids"],
-                    "additionalProperties": False}}},
-                "required": ["accepted", "reason", "criteria"], "additionalProperties": False},
-            system=SYSTEM, budget=budget,
+                "path": path.model_dump(mode="json"),
+            },
+            response_schema={
+                "type": "object",
+                "properties": {
+                    "accepted": {"type": "boolean"},
+                    "reason": {"type": "string"},
+                    "criteria": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "criterion": {"type": "string"},
+                                "met": {"type": "boolean"},
+                                "evidence_ids": {"type": "array", "items": {"type": "string"}},
+                            },
+                            "required": ["criterion", "met", "evidence_ids"],
+                            "additionalProperties": False,
+                        },
+                    },
+                },
+                "required": ["accepted", "reason", "criteria"],
+                "additionalProperties": False,
+            },
+            system=SYSTEM,
+            budget=budget,
         )
-        await self.record_completion_review("goal_completion_review", path, runtime, review,
-                                            [identity for step in path.steps for identity in step.evidence_ids])
+        await self.record_completion_review(
+            "goal_completion_review",
+            path,
+            runtime,
+            review,
+            [identity for step in path.steps for identity in step.evidence_ids],
+        )
         mission = await self.deps.task_graph_store.get_mission(runtime.mission_id)
         if not review["accepted"] or mission is None:
             return [review["reason"]]
@@ -784,34 +1068,57 @@ class InvestigationEngine:
                 return ["goal criterion lacks evidence"]
             for identity in criterion["evidence_ids"]:
                 evidence = await self.deps.evidence_store.get(identity)
-                if evidence is None or str(evidence.run_id) != str(runtime.run_id) or identity not in receipts:
+                if (
+                    evidence is None
+                    or str(evidence.run_id) != str(runtime.run_id)
+                    or identity not in receipts
+                ):
                     return ["goal criterion cites unrelated evidence"]
         now = datetime.now(timezone.utc)
         tasks = await self.deps.task_graph_store.list_tasks(mission_id=runtime.mission_id)
         for task in tasks:
             if task.required and task.status not in {TaskStatus.RUNNING, TaskStatus.COMPLETED}:
                 return ["required mission task is not ready for completion"]
-            if (task.required and task.status is TaskStatus.RUNNING
-                and task.task_id != runtime.active_task_id):
+            if (
+                task.required
+                and task.status is TaskStatus.RUNNING
+                and task.task_id != runtime.active_task_id
+            ):
                 return ["another required mission task needs its own completion"]
         for task in tasks:
             if task.required and task.status is TaskStatus.RUNNING:
-                await self.deps.task_graph_store.transition_task(task.task_id, TaskStatus.COMPLETED, now=now)
-        await self.deps.task_graph_store.update_mission(mission.model_copy(update={
-            "status": MissionStatus.COMPLETED, "updated_at": now,
-            "criterion_results": [MissionCriterionResult(
-                criterion=item["criterion"], met=True, evidence_ids=item["evidence_ids"],
-                task_ids=[task.task_id for task in tasks if task.required], reason=review["reason"],
-            ) for item in criteria.values()],
-        }))
+                await self.deps.task_graph_store.transition_task(
+                    task.task_id, TaskStatus.COMPLETED, now=now
+                )
+        await self.deps.task_graph_store.update_mission(
+            mission.model_copy(
+                update={
+                    "status": MissionStatus.COMPLETED,
+                    "updated_at": now,
+                    "revision": mission.revision + 1,
+                    "criterion_results": [
+                        MissionCriterionResult(
+                            criterion=item["criterion"],
+                            met=True,
+                            evidence_ids=item["evidence_ids"],
+                            task_ids=[task.task_id for task in tasks if task.required],
+                            reason=review["reason"],
+                        )
+                        for item in criteria.values()
+                    ],
+                }
+            )
+        )
         return []
 
 
 def validate_principal_arguments(step, principal, arguments, knowledge) -> None:
     bindings = principal_bindings(knowledge)
-    session_refs = [str(arguments[name]) for name in
-                    ("session_ref", "first_session_ref", "second_session_ref")
-                    if arguments.get(name) is not None]
+    session_refs = [
+        str(arguments[name])
+        for name in ("session_ref", "first_session_ref", "second_session_ref")
+        if arguments.get(name) is not None
+    ]
     if principal and principal not in bindings:
         raise ValueError("action references an unregistered principal")
     if session_refs:
@@ -828,14 +1135,22 @@ def target_aliases(deps, target) -> set[str]:
     host = getattr(target, "host", None) or getattr(target, "domain", None)
     if getattr(target, "url", None):
         host = urlsplit(target.url).hostname
-    aliases = {str(value) for value in
-               (host, getattr(target, "url", None), getattr(target, "asset_id", None),
-                getattr(target, "service_name", None)) if value}
+    aliases = {
+        str(value)
+        for value in (
+            host,
+            getattr(target, "url", None),
+            getattr(target, "asset_id", None),
+            getattr(target, "service_name", None),
+        )
+        if value
+    }
     if deps.engagement and host:
         mapping = deps.engagement.metadata.get("target_refs", {})
         if isinstance(mapping, dict):
-            configured = {str(ref) for name, ref in mapping.items()
-                          if str(name).lower() == str(host).lower()}
+            configured = {
+                str(ref) for name, ref in mapping.items() if str(name).lower() == str(host).lower()
+            }
             if configured:
                 return configured
     return aliases
@@ -856,7 +1171,11 @@ def validate_argument_target(target, arguments: dict, aliases: set[str] | None =
         parsed_target = urlsplit(target_url)
         target_port = parsed_target.port or (443 if parsed_target.scheme == "https" else 80)
     for name in ("host", "domain", "hostname"):
-        if name in arguments and target_host and str(arguments[name]).lower() != str(target_host).lower():
+        if (
+            name in arguments
+            and target_host
+            and str(arguments[name]).lower() != str(target_host).lower()
+        ):
             raise ValueError("tool argument address differs from proposal target")
     for name in ("url", "base_url", "target_url"):
         value = arguments.get(name)
@@ -880,14 +1199,18 @@ async def operator_epoch(deps, runtime) -> str | None:
     if deps.operator_intent_store is None or not runtime.mission_id:
         return None
     records = await deps.operator_intent_store.list_for_mission(runtime.mission_id)
-    actionable = [record for record in records if _text(record.intent.intent_type)
-                  not in {"status_query", "explanation_query"}]
+    actionable = [
+        record
+        for record in records
+        if _text(record.intent.intent_type) not in {"status_query", "explanation_query"}
+    ]
     return str(actionable[-1].intent.intent_id) if actionable else None
 
 
 async def validate_current_action(deps, runtime, step, proposal=None) -> list[str]:
     """Used at policy admission AND immediately before an actual invocation."""
     from redteam.attack_graph.service import AttackGraphService
+
     if step is None or not step.path_id or step.path_version is None or not step.path_step_id:
         return ["action needs an accepted investigation path"]
     path = await deps.path_store.get_active(str(runtime.run_id))
@@ -896,8 +1219,12 @@ async def validate_current_action(deps, runtime, step, proposal=None) -> list[st
     current = next((item for item in path.steps if item.step_id == step.path_step_id), None)
     if current is None:
         return ["accepted path step is missing"]
-    knowledge = await project_knowledge(AttackGraphService(deps.graph_store), deps.evidence_store,
-                                        str(runtime.run_id), step=runtime.step_count)
+    knowledge = await project_knowledge(
+        AttackGraphService(deps.graph_store),
+        deps.evidence_store,
+        str(runtime.run_id),
+        step=runtime.step_count,
+    )
     problems = ready_step(path, current, knowledge)
     if str(node_id_for_target(step.resolved_target())) not in current.target_node_ids:
         problems.append("action target left the step envelope")
@@ -910,15 +1237,21 @@ async def validate_current_action(deps, runtime, step, proposal=None) -> list[st
     if await operator_epoch(deps, runtime) != step.operator_intent_id:
         problems.append("operator instruction changed since action planning")
     if proposal is not None:
-        if (proposal.run_id != runtime.run_id or proposal.engagement_id != runtime.engagement_id
-            or proposal.capability != step.capability or proposal.operation != step.operation
-            or proposal.target != step.resolved_target() or proposal.arguments != step.arguments
+        if (
+            proposal.run_id != runtime.run_id
+            or proposal.engagement_id != runtime.engagement_id
+            or proposal.capability != step.capability
+            or proposal.operation != step.operation
+            or proposal.target != step.resolved_target()
+            or proposal.arguments != step.arguments
             or proposal.availability_impact != step.availability_impact
-            or (current.agent_id and str(proposal.agent_id) != current.agent_id)):
+            or (current.agent_id and str(proposal.agent_id) != current.agent_id)
+        ):
             problems.append("proposal differs from the accepted compiled action")
     try:
-        validate_argument_target(step.resolved_target(), step.arguments,
-                                 target_aliases(deps, step.resolved_target()))
+        validate_argument_target(
+            step.resolved_target(), step.arguments, target_aliases(deps, step.resolved_target())
+        )
         validate_principal_arguments(current, step.principal_ref, step.arguments, knowledge)
     except ValueError as exc:
         problems.append(str(exc))

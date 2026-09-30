@@ -5,6 +5,8 @@ verified ``Finding`` carrying the ``EvidenceId`` behind it.
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 from redteam.attack_graph.identity import (
     hypothesis_node_id,
     node_id_for_target,
@@ -14,8 +16,10 @@ from redteam.attack_graph.identity import (
 from redteam.attack_graph.predicates import Confidence, Provenance
 from redteam.attack_graph.service import HYPOTHESIS_INCONCLUSIVE, HYPOTHESIS_OPEN
 from redteam.core.contracts.events import EventType
-from redteam.core.convert import tool_result_to_evidence
-from redteam.core.enums import AgentPhase, GraphEdgeType, GraphNodeType, Verdict
+from redteam.core.contracts.evidence import EvidenceRecord
+from redteam.core.convert import digest_payload, tool_result_to_evidence
+from redteam.core.enums import AgentPhase, EvidenceSourceType, GraphEdgeType, GraphNodeType, Verdict
+from redteam.core.ids import EvidenceId, new_id
 from redteam.orchestration.action_naming import canonical_action_key
 from redteam.orchestration.analysis import (
     VerificationAssessment,
@@ -136,6 +140,7 @@ async def verify_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
     except Exception:
         hypothesis_claim_text, violation_flag = (None, None)
     try:
+        assert deps.verifier is not None
         assessment = await deps.verifier.verify(
             VerificationRequest(
                 proposal=proposal,
@@ -144,6 +149,7 @@ async def verify_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                 source_refs=[str(evidence.evidence_id), str(result.invocation_id)],
                 hypothesis_claim=hypothesis_claim_text,
                 violation_if_confirmed=violation_flag,
+                principal_ref=getattr(step, "principal_ref", None) if step is not None else None,
             )
         )
     except Exception as exc:  # noqa: BLE001 - preserve evidence and close work safely
@@ -190,7 +196,6 @@ async def verify_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             evidence,
             deps.evidence_store,
         )
-        is_violation = auth_assessment.outcome == ACCESS_CONTROL_VIOLATION
         comparison = {
             **auth_assessment.model_dump(),
             "session_ref": step.authentication_check.session_ref,
@@ -290,9 +295,7 @@ async def verify_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             auth_dir = "confirm"
         elif auth_outcome in {"session_not_accepted", "access_denied"}:
             auth_dir = "reject"
-        auth_contradiction = (
-            llm_dir is not None and auth_dir is not None and llm_dir != auth_dir
-        )
+        auth_contradiction = llm_dir is not None and auth_dir is not None and llm_dir != auth_dir
 
     observation_only = step is not None and step.assessment_kind == "observation"
     if observation_only:
@@ -325,10 +328,18 @@ async def verify_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
         admitted = VerificationAssessment(
             verdict=Verdict.UNKNOWN,
             reason=(
-                "admitted UNKNOWN (" + downgrade_cause + "); original "
-                + str(assessment.verdict.value if hasattr(assessment.verdict, "value") else assessment.verdict)
-                + "/" + str(getattr(assessment, "outcome", None) or "unknown")
-                + ": " + str(assessment.reason)
+                "admitted UNKNOWN ("
+                + downgrade_cause
+                + "); original "
+                + str(
+                    assessment.verdict.value
+                    if hasattr(assessment.verdict, "value")
+                    else assessment.verdict
+                )
+                + "/"
+                + str(getattr(assessment, "outcome", None) or "unknown")
+                + ": "
+                + str(assessment.reason)
             )[:1000],
             reviewer_id=assessment.reviewer_id,
             source_refs=list(assessment.source_refs),
@@ -394,7 +405,7 @@ async def verify_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             # Guarded adoption: same hypothesis and same outcome direction only.
             # Anything else stays inconclusive; code never confirms via override.
             auth_status = auth_assessment.hypothesis_status
-            auth_dir: str | None = None
+            auth_dir = None
             if auth_status == "confirmed":
                 auth_dir = "confirm"
             elif auth_status == "rejected":
@@ -442,8 +453,45 @@ async def verify_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                 provenance=provenance,
                 step=runtime.step_count,
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            try:
+                audit_payload: dict = {
+                    "record_kind": "hypothesis_support_audit",
+                    "status": "failed",
+                    "hypothesis_id": str(proposal.hypothesis_id),
+                    "verification_outcome": outcome_name,
+                    "verification_verdict": verdict.value,
+                    "error": type(exc).__name__,
+                    "source_evidence_id": str(evidence.evidence_id),
+                }
+                audit_record = EvidenceRecord(
+                    evidence_id=EvidenceId(new_id("ev")),
+                    run_id=runtime.run_id,
+                    engagement_id=runtime.engagement_id,
+                    source_type=EvidenceSourceType.SYSTEM,
+                    source_id="orchestration.verify",
+                    action_id=proposal.action_id,
+                    invocation_id=result.invocation_id,
+                    hypothesis_id=proposal.hypothesis_id,
+                    content_type="application/json",
+                    artifact_ref=None,
+                    digest=digest_payload(audit_payload),
+                    summary=("hypothesis support audit failed for " + str(proposal.hypothesis_id))[
+                        :280
+                    ],
+                    created_at=datetime.now(timezone.utc),
+                    metadata=audit_payload,
+                )
+                await deps.evidence_store.append(audit_record)
+            except Exception:
+                result = result.model_copy(
+                    update={
+                        "metadata": {
+                            **result.metadata,
+                            "support_audit_write_failed": "hypothesis_support_audit",
+                        }
+                    }
+                )
         if resolved is not None:
             settled = await publisher.publish(
                 HYPOTHESIS_RESOLVED,
