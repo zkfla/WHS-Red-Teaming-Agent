@@ -56,6 +56,10 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
     if path:
         updates.update(active_path_id=path.path_id, active_path_version=path.version)
     if outcome is not None:
+        if outcome == "continue_planning":
+            updates.update(phase=AgentPhase.REPLAN, termination_reason=None)
+            return advance(state, runtime.model_copy(update=updates), plan_step=None,
+                           action_proposal=None, dispatch_items=[])
         updates.update(phase=AgentPhase.REPLAN,
                        termination_reason=TerminationReason.GOAL_ACHIEVED
                        if outcome == "goal_achieved" else TerminationReason.INVESTIGATION_HELD)
@@ -89,6 +93,7 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
     now = datetime.now(timezone.utc)
     await WorkScheduler(deps.work_store).enqueue(
         chosen, graph_revision=runtime.step_count, run_id=runtime.run_id, now=now,
+        mission_task_id=runtime.active_task_id,
     )
     pending = {item.candidate_key: item for item in await deps.work_store.list_items(
         status=WorkStatus.PENDING, run_id=runtime.run_id)}
@@ -127,6 +132,7 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             capability=step.capability, operation=step.operation, target=step.resolved_target(),
             arguments=step.arguments, reason=step.reason, hypothesis_id=hypothesis_id,
             expected_observation=step.expected_observation, created_at=now,
+            availability_impact=step.availability_impact,
         )
         event = await publisher.publish(EventType.ACTION_PROPOSED, {
             "action_id": proposal.action_id, "agent_id": proposal.agent_id,

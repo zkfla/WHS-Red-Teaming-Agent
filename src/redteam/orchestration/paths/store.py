@@ -19,7 +19,8 @@ class PathStore(Protocol):
         ...
 
     async def register(
-        self, path: PathPlan, expected_version: int | None = None
+        self, path: PathPlan, expected_version: int | None = None,
+        *, expected_path_id: str | None = None,
     ) -> PathPlan:
         """Store one version snapshot, optionally moving the active pointer."""
         ...

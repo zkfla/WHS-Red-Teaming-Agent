@@ -67,3 +67,7 @@ class WorkStore(Protocol):
         now: datetime,
         reason: str,
     ) -> list[str]: ...
+
+    async def reconcile_job(
+        self, work_id: str, *, job_id: str, status: str, now: datetime
+    ) -> bool: ...

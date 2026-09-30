@@ -72,7 +72,7 @@ async def policy_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
     correlation_id = str(proposal.action_id)
     publisher = publisher_for(state, deps, "orchestration.policy")
 
-    problems = await validate_current_action(deps, runtime, state.get("plan_step"))
+    problems = await validate_current_action(deps, runtime, state.get("plan_step"), proposal)
     if problems:
         decision = PolicyDecision(
             action_id=proposal.action_id, verdict=PolicyVerdict.DENY,
@@ -139,7 +139,7 @@ async def policy_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
     else:
         context = ControlContext(
             engagement_id=runtime.engagement_id,
-            agent_id=runtime.current_agent,
+            agent_id=proposal.agent_id,
             correlation_id=correlation_id,
             metadata={"in_flight_actions": in_flight},
         )

@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import hashlib
+import json
 
 from redteam.attack_graph.observation import GraphObservation
 from redteam.core.contracts.events import EventType
@@ -52,6 +54,10 @@ async def observe_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
         service, deps.evidence_store, str(runtime.run_id), step=runtime.step_count + 1,
     )
     fingerprint = knowledge_fingerprint(knowledge)
+    path = await deps.path_store.get_active(str(runtime.run_id))
+    completed = [(item.step_id, item.objective, item.outcome)
+                 for item in path.steps if item.status == "completed" and item.evidence_ids] if path else []
+    fingerprint = hashlib.sha256(json.dumps([fingerprint, sorted(completed)]).encode()).hexdigest()
     no_progress = (runtime.no_progress_turns + 1
                    if runtime.last_progress_fingerprint == fingerprint else 0)
     task_id = runtime.active_task_id

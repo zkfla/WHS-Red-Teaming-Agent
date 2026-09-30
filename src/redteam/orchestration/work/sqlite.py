@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from redteam.core.ids import RunId
@@ -86,16 +86,58 @@ class SQLiteWorkStore:
             async with aiosqlite.connect(self._path) as db:
                 await db.execute("BEGIN IMMEDIATE")
                 cursor = await db.execute(
-                    "SELECT status FROM work_items WHERE run_id=? AND candidate_key=?",
-                    (_run_key(item.run_id), item.candidate_key),
+                    "SELECT 1 FROM work_items WHERE work_id=?", (item.work_id,)
                 )
-                existing = [row[0] for row in await cursor.fetchall()]
+                collision = await cursor.fetchone()
                 await cursor.close()
-                active_values = {status.value for status in ACTIVE_STATUSES}
-                if any(status in active_values for status in existing):
+                if collision is not None:
                     await db.rollback()
                     return False
-                if existing and not item.repeatable:
+                cursor = await db.execute(
+                    "SELECT payload FROM work_items WHERE run_id=? AND candidate_key=?",
+                    (_run_key(item.run_id), item.candidate_key),
+                )
+                same_candidate = [
+                    _item_from_payload(row[0]) for row in await cursor.fetchall()
+                ]
+                await cursor.close()
+                if any(
+                    entry.status in {WorkStatus.LEASED, WorkStatus.RUNNING}
+                    for entry in same_candidate
+                ):
+                    await db.rollback()
+                    return False
+                pending = [
+                    entry
+                    for entry in same_candidate
+                    if entry.status is WorkStatus.PENDING
+                ]
+                if pending:
+                    target = sorted(pending, key=lambda entry: entry.work_id)[0]
+                    refreshed = item.model_copy(deep=True).model_copy(
+                        update={
+                            "work_id": target.work_id,
+                            "created_at": target.created_at,
+                            "attempt": target.attempt,
+                            "hypothesis_id": target.hypothesis_id or item.hypothesis_id,
+                            "job_id": target.job_id,
+                            "status": WorkStatus.PENDING,
+                            "outcome_reason": None,
+                        }
+                    )
+                    await _save_item(db, refreshed)
+                    await db.commit()
+                    return False
+                blocking = [
+                    entry
+                    for entry in same_candidate
+                    if not (
+                        entry.status is WorkStatus.STALE
+                        and entry.attempt == 0
+                        and not entry.job_id
+                    )
+                ]
+                if blocking and not item.repeatable:
                     await db.rollback()
                     return False
                 await db.execute(
@@ -143,13 +185,19 @@ class SQLiteWorkStore:
         async with _aiosqlite().connect(self._path) as db:
             await db.execute("BEGIN IMMEDIATE")
             cursor = await db.execute(
-                "SELECT owner FROM work_leases WHERE work_id=?", (work_id,),
+                "SELECT owner, expires_at FROM work_leases WHERE work_id=?", (work_id,),
             )
             lease = await cursor.fetchone()
             await cursor.close()
             item = await _load_item(db, work_id)
             if (lease is None or lease[0] != owner or item is None
                 or (item.job_id and item.job_id != job_id)):
+                await db.rollback()
+                return False
+            expires_at = datetime.fromisoformat(lease[1])
+            if expires_at.tzinfo is None:
+                expires_at = expires_at.replace(tzinfo=timezone.utc)
+            if expires_at <= datetime.now(timezone.utc):
                 await db.rollback()
                 return False
             await _save_item(db, item.model_copy(update={"job_id": job_id}))
@@ -457,6 +505,98 @@ class SQLiteWorkStore:
                     abandoned.append(item.work_id)
                 await db.commit()
                 return sorted(abandoned)
+            except Exception:
+                await db.rollback()
+                raise
+
+    async def reconcile_job(
+        self, work_id: str, *, job_id: str, status: str, now: datetime
+    ) -> bool:
+        try:
+            target = WorkStatus(status)
+        except (ValueError, TypeError):
+            return False
+        if target not in {
+            WorkStatus.SUCCEEDED,
+            WorkStatus.FAILED,
+            WorkStatus.CANCELLED,
+        }:
+            return False
+        await self.setup()
+        aiosqlite = _aiosqlite()
+        async with aiosqlite.connect(self._path) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            try:
+                item = await _load_item(db, work_id)
+                if item is None:
+                    await db.rollback()
+                    return False
+                if not item.job_id or item.job_id != job_id:
+                    await db.rollback()
+                    return False
+                if item.status is target:
+                    previous = item.outcome_reason
+                    if previous and "job_reconciled" in previous:
+                        await db.execute(
+                            "DELETE FROM work_leases WHERE work_id=?", (work_id,)
+                        )
+                        await db.commit()
+                        return True
+                    marker = f"job_reconciled:{target.value}"
+                    reason = marker if not previous else f"{marker}:{previous}"
+                    await _save_item(
+                        db,
+                        item.model_copy(
+                            update={
+                                "status": target,
+                                "updated_at": now,
+                                "outcome_reason": reason,
+                            }
+                        ),
+                    )
+                    await db.execute(
+                        "DELETE FROM work_leases WHERE work_id=?", (work_id,)
+                    )
+                    await db.commit()
+                    return True
+                if item.status in {WorkStatus.FAILED, WorkStatus.STALE}:
+                    previous = item.outcome_reason
+                    marker = f"job_reconciled:{target.value}"
+                    reason = marker if not previous else f"{marker}:{previous}"
+                    await _save_item(
+                        db,
+                        item.model_copy(
+                            update={
+                                "status": target,
+                                "updated_at": now,
+                                "outcome_reason": reason,
+                            }
+                        ),
+                    )
+                    await db.execute(
+                        "DELETE FROM work_leases WHERE work_id=?", (work_id,)
+                    )
+                    await db.commit()
+                    return True
+                if item.status not in ACTIVE_STATUSES:
+                    await db.rollback()
+                    return False
+                previous = item.outcome_reason
+                marker = f"job_reconciled:{target.value}"
+                reason = marker if not previous else f"{marker}:{previous}"
+                await _save_item(
+                    db,
+                    item.model_copy(
+                        update={
+                            "status": target,
+                            "updated_at": now,
+                            "outcome_reason": reason,
+                        }
+                    ),
+                )
+                await db.execute("DELETE FROM work_leases WHERE work_id=?", (work_id,))
+                await db.commit()
+                return True
             except Exception:
                 await db.rollback()
                 raise

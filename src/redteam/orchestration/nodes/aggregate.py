@@ -145,5 +145,5 @@ async def aggregate_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
         # batch into durable counters, so replace the channel explicitly.
         worker_outcomes=Overwrite(value={}),
         policy_decision=summary,
-        current_work_id=None,
+        current_work_id=pending_dispatch.work_id if pending_dispatch else None,
     )

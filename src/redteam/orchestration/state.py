@@ -172,6 +172,7 @@ def resume_graph_state(
     *,
     action_proposal: ActionProposal,
     plan_step: PlanStep | None,
+    current_work_id: str | None = None,
 ) -> GraphState:
     """Seed a resume invocation that re-enters directly at POLICY.
 
@@ -193,7 +194,7 @@ def resume_graph_state(
         "policy_decision": None,
         "tool_result": None,
         "result_evidence_id": None,
-        "current_work_id": None,
+        "current_work_id": current_work_id,
         "dispatch_items": [],
         "worker_outcomes": {},
         "last_event_id": None,

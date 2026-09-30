@@ -28,9 +28,14 @@ from redteam.core.convert import digest_payload
 from redteam.core.enums import EvidenceSourceType, Verdict
 from redteam.core.ids import EvidenceId, new_id
 from redteam.orchestration.agents.base import PlanStep
-from redteam.orchestration.analysis import VerificationRequest
+from redteam.orchestration.analysis import (
+    VerificationRequest,
+    append_review_receipt,
+    hypothesis_status_for_assessment,
+    resolve_claim_for_review,
+)
 from redteam.orchestration.findings import FindingPromoter, PromotionRequest
-from redteam.orchestration.service_status import HYPOTHESIS_STATUS_BY_VERDICT, severity_for
+from redteam.orchestration.service_status import severity_for
 
 __all__ = [
     "is_execution_ambiguous",
@@ -67,6 +72,253 @@ def _stored_raw(record: EvidenceRecord) -> Any | None:
     return None
 
 
+def _clean_recovery_identity(value: Any) -> str | None:
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
+
+
+def _recovery_node_type(node: Any) -> str:
+    node_type = getattr(node, "type", None)
+    try:
+        value = node_type.value if hasattr(node_type, "value") else node_type
+    except Exception:
+        value = node_type
+    return str(value or "").strip().lower()
+
+
+async def _recovery_alias_grounded(
+    *,
+    evidence_store: Any,
+    graph_service: Any,
+    run_id: str,
+    target_ref: str,
+    session_name: str,
+    principal_name: str,
+) -> bool:
+    cleaned_session = session_name.strip() if isinstance(session_name, str) else ""
+    cleaned_principal = principal_name.strip() if isinstance(principal_name, str) else ""
+    cleaned_target = target_ref.strip() if isinstance(target_ref, str) else ""
+    if not cleaned_session or not cleaned_principal or not cleaned_target:
+        return False
+    if graph_service is not None:
+        lister = getattr(graph_service, "list_nodes", None)
+        if lister is None or not callable(lister):
+            lister = getattr(graph_service, "query", None)
+        if callable(lister):
+            nodes = await lister()
+            for node in list(nodes or []):
+                if _recovery_node_type(node) not in ("principal", "credential"):
+                    continue
+                props = getattr(node, "properties", {}) or {}
+                if not isinstance(props, dict):
+                    continue
+                facts = props.get("facts", {}) if isinstance(props.get("facts"), dict) else {}
+                node_target = facts.get("target_ref") if isinstance(facts, dict) else None
+                if not isinstance(node_target, str) or node_target.strip() != cleaned_target:
+                    continue
+                sessions: set[str] = set()
+                for key in ("session_ref", "session_refs"):
+                    value = facts.get(key) if isinstance(facts, dict) else None
+                    if isinstance(value, list):
+                        for item in value:
+                            if isinstance(item, str) and item.strip():
+                                sessions.add(item.strip())
+                    elif isinstance(value, str) and value.strip():
+                        sessions.add(value.strip())
+                node_principal = facts.get("principal_ref") if isinstance(facts, dict) else None
+                if not isinstance(node_principal, str) or node_principal.strip() != cleaned_principal:
+                    continue
+                if cleaned_session not in sessions:
+                    continue
+                provenance = props.get("provenance", []) if isinstance(props, dict) else []
+                measured = False
+                if isinstance(provenance, list):
+                    for entry in provenance:
+                        if not isinstance(entry, dict):
+                            continue
+                        if str(entry.get("confidence", "")) != "measured":
+                            continue
+                        entry_run = entry.get("run_id")
+                        if entry_run is not None and str(entry_run) != str(run_id):
+                            continue
+                        measured = True
+                        break
+                if not measured:
+                    continue
+                return True
+    records = await evidence_store.list_for_run(run_id)
+    for rec in list(records or []):
+        try:
+            meta = getattr(rec, "metadata", None) or {}
+        except Exception:
+            continue
+        if not isinstance(meta, dict):
+            continue
+        if str(meta.get("target_node_id", "") or "").strip() != cleaned_target:
+            continue
+        comparison = meta.get("session_comparison")
+        if isinstance(comparison, dict):
+            pairs = [
+                (comparison.get("first_session_ref"), comparison.get("first_principal_ref")),
+                (comparison.get("second_session_ref"), comparison.get("second_principal_ref")),
+            ]
+            for raw_session, raw_principal in pairs:
+                if (
+                    isinstance(raw_session, str)
+                    and isinstance(raw_principal, str)
+                    and raw_session.strip() == cleaned_session
+                    and raw_principal.strip() == cleaned_principal
+                ):
+                    return True
+    return False
+
+
+async def _recovery_stored_binding(
+    graph_service: Any, claimed_name: str, target_ref: str, run_id: str
+) -> bool:
+    cleaned_claimed = claimed_name.strip() if isinstance(claimed_name, str) else ""
+    cleaned_target = target_ref.strip() if isinstance(target_ref, str) else ""
+    if not cleaned_claimed or not cleaned_target or graph_service is None:
+        return False
+    lister = getattr(graph_service, "list_nodes", None)
+    if lister is None or not callable(lister):
+        lister = getattr(graph_service, "query", None)
+    if not callable(lister):
+        return False
+    nodes = await lister()
+    for node in list(nodes or []):
+        if _recovery_node_type(node) not in ("principal", "credential"):
+            continue
+        props = getattr(node, "properties", {}) or {}
+        if not isinstance(props, dict):
+            continue
+        facts = props.get("facts", {}) if isinstance(props.get("facts"), dict) else {}
+        attrs = props.get("attrs", {}) if isinstance(props.get("attrs"), dict) else {}
+        node_target = facts.get("target_ref") if isinstance(facts, dict) else None
+        if not isinstance(node_target, str) or node_target.strip() != cleaned_target:
+            continue
+        candidates: list[Any] = []
+        if isinstance(facts, dict):
+            for key in ("session_ref", "principal_ref", "session_refs"):
+                value = facts.get(key)
+                if isinstance(value, list):
+                    candidates.extend(value)
+                else:
+                    candidates.append(value)
+        if isinstance(attrs, dict):
+            for key in ("session_ref", "principal_ref"):
+                candidates.append(attrs.get(key))
+        matched = any(isinstance(c, str) and c.strip() == cleaned_claimed for c in candidates)
+        if not matched:
+            continue
+        provenance = props.get("provenance", []) if isinstance(props, dict) else []
+        measured = False
+        if isinstance(provenance, list):
+            for entry in provenance:
+                if not isinstance(entry, dict):
+                    continue
+                if str(entry.get("confidence", "")) != "measured":
+                    continue
+                entry_run = entry.get("run_id")
+                if entry_run is not None and str(entry_run) != str(run_id):
+                    continue
+                measured = True
+                break
+        if not measured:
+            continue
+        return True
+    return False
+
+
+def _has_exact_recovery_proof(
+    meta: dict[str, Any],
+    raw: dict[str, Any],
+    claimed_accounts: set[str],
+    stored_proposal: dict[str, Any] | None,
+) -> bool:
+    """Exact structural identity equality only; never bare or substring."""
+    cleaned_claimed = {str(item).strip() for item in (claimed_accounts or set()) if str(item).strip()}
+    if not cleaned_claimed:
+        return False
+    args = stored_proposal.get("arguments") if isinstance(stored_proposal, dict) else {}
+    if not isinstance(args, dict):
+        args = {}
+    expected_principals = set(cleaned_claimed)
+    for key in ("principal_ref", "principal", "first_principal_ref", "second_principal_ref"):
+        cleaned = _clean_recovery_identity(args.get(key))
+        if cleaned is not None:
+            expected_principals.add(cleaned)
+    expected_sessions: set[str] = set()
+    for key in ("session_ref", "first_session_ref", "second_session_ref"):
+        cleaned = _clean_recovery_identity(args.get(key))
+        if cleaned is not None:
+            expected_sessions.add(cleaned)
+    raw_principals: set[str] = set()
+    raw_sessions: set[str] = set()
+    http_obs = meta.get("http_observation")
+    if isinstance(http_obs, dict):
+        cleaned = _clean_recovery_identity(http_obs.get("session_ref"))
+        if cleaned is not None:
+            raw_sessions.add(cleaned)
+    comparison = meta.get("session_comparison")
+    comparison_dict: dict[str, Any] | None = comparison if isinstance(comparison, dict) else None
+    if comparison_dict is not None:
+        for key in ("first_session_ref", "second_session_ref"):
+            cleaned = _clean_recovery_identity(comparison_dict.get(key))
+            if cleaned is not None:
+                raw_sessions.add(cleaned)
+        for key in ("first_principal_ref", "second_principal_ref"):
+            cleaned = _clean_recovery_identity(comparison_dict.get(key))
+            if cleaned is not None:
+                raw_principals.add(cleaned)
+    try:
+        output = raw.get("output") if isinstance(raw, dict) else None
+    except Exception:
+        output = None
+    if isinstance(output, dict):
+        for key in ("session_ref", "first_session_ref", "second_session_ref"):
+            cleaned = _clean_recovery_identity(output.get(key))
+            if cleaned is not None:
+                raw_sessions.add(cleaned)
+        for key in ("principal_ref", "first_principal_ref", "second_principal_ref"):
+            cleaned = _clean_recovery_identity(output.get(key))
+            if cleaned is not None:
+                raw_principals.add(cleaned)
+        for nested_key in ("first", "second", "authenticated", "anonymous"):
+            nested = output.get(nested_key)
+            if isinstance(nested, dict):
+                for key in ("session_ref", "session"):
+                    cleaned = _clean_recovery_identity(nested.get(key))
+                    if cleaned is not None:
+                        raw_sessions.add(cleaned)
+                cleaned = _clean_recovery_identity(nested.get("principal_ref"))
+                if cleaned is not None:
+                    raw_principals.add(cleaned)
+    if comparison_dict is not None:
+        first_principal = _clean_recovery_identity(comparison_dict.get("first_principal_ref"))
+        second_principal = _clean_recovery_identity(comparison_dict.get("second_principal_ref"))
+        if first_principal is not None or second_principal is not None:
+            if not expected_principals:
+                return False
+            for observed in (first_principal, second_principal):
+                if observed is not None and observed not in expected_principals:
+                    return False
+            if first_principal is None or second_principal is None:
+                return False
+        first_session = _clean_recovery_identity(comparison_dict.get("first_session_ref"))
+        second_session = _clean_recovery_identity(comparison_dict.get("second_session_ref"))
+        if (first_session is not None or second_session is not None) and expected_sessions:
+            for observed in (first_session, second_session):
+                if observed is not None and observed not in expected_sessions:
+                    return False
+    if expected_sessions and (raw_sessions & expected_sessions):
+        return True
+    if expected_principals and (raw_principals & expected_principals):
+        return True
+    return False
+
+
 async def reprocess_evidence(
     *,
     evidence_id: str,
@@ -93,9 +345,12 @@ async def reprocess_evidence(
     original record, which is never rewritten.
 
     Status is one of "ok" / "not_found" / "run_mismatch" / "no_raw" /
-    "invalid_raw" / "no_proposal" / "invalid_proposal". Lookup failures
-    ("not_found", "run_mismatch", "no_raw") write nothing; everything
-    from "invalid_raw" on leaves a companion note behind.
+    "invalid_raw" / "no_proposal" / "invalid_proposal" / "no_canonical" /
+    "link_mismatch" / "anonymous_blocked" / "no_account_proof". Lookup
+    failures ("not_found", "run_mismatch", "no_raw") write nothing;
+    everything from "invalid_raw" on leaves a companion note behind.
+    The tool gateway is never called here; only the stored payload, the
+    passed verifier, the graph, and the mappers are touched.
     """
     record = await evidence_store.get(evidence_id)
     if record is None:
@@ -189,15 +444,307 @@ async def reprocess_evidence(
         except Exception:  # noqa: BLE001 - replay continues without step context
             step_degraded = True
     expectation = step.expectation if step is not None else None
-    assessment = await verifier.verify(
-        VerificationRequest(
+    meta = record.metadata if isinstance(record.metadata, dict) else {}
+    canonical_value = str(meta.get("canonical_operation") or meta.get("operation_key") or "").strip()
+    if not canonical_value:
+        companion = await record_recovery_note(
+            evidence_store=evidence_store,
+            run_id=record.run_id,
+            engagement_id=record.engagement_id,
+            source_evidence_id=str(record.evidence_id),
+            note="reprocessing blocked: no canonical operation proof (bare operation alone proves nothing)",
+            action_id=record.action_id,
+            invocation_id=record.invocation_id,
+            hypothesis_id=record.hypothesis_id,
+        )
+        return {
+            "status": "no_canonical",
+            "evidence_id": str(evidence_id),
+            "requested_run_id": str(run_id),
+            "companion_evidence_id": str(companion.evidence_id),
+        }
+    if str(raw.get("action_id", "")).strip() != str(record.action_id or "").strip():
+        companion = await record_recovery_note(
+            evidence_store=evidence_store,
+            run_id=record.run_id,
+            engagement_id=record.engagement_id,
+            source_evidence_id=str(record.evidence_id),
+            note="reprocessing blocked: preserved raw result answers another action",
+            action_id=record.action_id,
+            invocation_id=record.invocation_id,
+            hypothesis_id=record.hypothesis_id,
+        )
+        return {
+            "status": "link_mismatch",
+            "evidence_id": str(evidence_id),
+            "requested_run_id": str(run_id),
+            "companion_evidence_id": str(companion.evidence_id),
+        }
+    if str(raw.get("invocation_id", "")).strip() != str(record.invocation_id or "").strip():
+        companion = await record_recovery_note(
+            evidence_store=evidence_store,
+            run_id=record.run_id,
+            engagement_id=record.engagement_id,
+            source_evidence_id=str(record.evidence_id),
+            note="reprocessing blocked: preserved raw result answers another invocation",
+            action_id=record.action_id,
+            invocation_id=record.invocation_id,
+            hypothesis_id=record.hypothesis_id,
+        )
+        return {
+            "status": "link_mismatch",
+            "evidence_id": str(evidence_id),
+            "requested_run_id": str(run_id),
+            "companion_evidence_id": str(companion.evidence_id),
+        }
+    if str(stored_proposal.get("action_id", "")).strip() != str(record.action_id or "").strip():
+        companion = await record_recovery_note(
+            evidence_store=evidence_store,
+            run_id=record.run_id,
+            engagement_id=record.engagement_id,
+            source_evidence_id=str(record.evidence_id),
+            note="reprocessing blocked: stored proposal answers another action; identifier alone is not proof",
+            action_id=record.action_id,
+            invocation_id=record.invocation_id,
+            hypothesis_id=record.hypothesis_id,
+        )
+        return {
+            "status": "link_mismatch",
+            "evidence_id": str(evidence_id),
+            "requested_run_id": str(run_id),
+            "companion_evidence_id": str(companion.evidence_id),
+        }
+    target_ref = str(meta.get("target_node_id", "") or "").strip()
+    if not target_ref:
+        companion = await record_recovery_note(
+            evidence_store=evidence_store,
+            run_id=record.run_id,
+            engagement_id=record.engagement_id,
+            source_evidence_id=str(record.evidence_id),
+            note="reprocessing blocked: stored evidence names no target",
+            action_id=record.action_id,
+            invocation_id=record.invocation_id,
+            hypothesis_id=record.hypothesis_id,
+        )
+        return {
+            "status": "link_mismatch",
+            "evidence_id": str(evidence_id),
+            "requested_run_id": str(run_id),
+            "companion_evidence_id": str(companion.evidence_id),
+        }
+    try:
+        expected_target = str(node_id_for_target(proposal.target))
+    except Exception:
+        expected_target = ""
+    if expected_target and target_ref != expected_target:
+        companion = await record_recovery_note(
+            evidence_store=evidence_store,
+            run_id=record.run_id,
+            engagement_id=record.engagement_id,
+            source_evidence_id=str(record.evidence_id),
+            note="reprocessing blocked: stored evidence observed another target",
+            action_id=record.action_id,
+            invocation_id=record.invocation_id,
+            hypothesis_id=record.hypothesis_id,
+        )
+        return {
+            "status": "link_mismatch",
+            "evidence_id": str(evidence_id),
+            "requested_run_id": str(run_id),
+            "companion_evidence_id": str(companion.evidence_id),
+        }
+    record_principal = meta.get("principal_ref")
+    anonymous_record = meta.get("anonymous") is True or (
+        isinstance(record_principal, str) and record_principal.strip().lower() == "anonymous"
+    )
+    step_principal = getattr(step, "principal_ref", None) if step is not None else None
+    account_scoped = isinstance(step_principal, str) and step_principal.strip() and step_principal.strip().lower() != "anonymous"
+    if not account_scoped and isinstance(record_principal, str) and record_principal.strip():
+        account_scoped = record_principal.strip().lower() != "anonymous"
+    if anonymous_record and account_scoped:
+        companion = await record_recovery_note(
+            evidence_store=evidence_store,
+            run_id=record.run_id,
+            engagement_id=record.engagement_id,
+            source_evidence_id=str(record.evidence_id),
+            note="reprocessing blocked: anonymous evidence cannot satisfy an account-scoped replay",
+            action_id=record.action_id,
+            invocation_id=record.invocation_id,
+            hypothesis_id=record.hypothesis_id,
+        )
+        return {
+            "status": "anonymous_blocked",
+            "evidence_id": str(evidence_id),
+            "requested_run_id": str(run_id),
+            "companion_evidence_id": str(companion.evidence_id),
+        }
+    if account_scoped:
+        claimed_set: set[str] = set()
+        if isinstance(record_principal, str) and record_principal.strip():
+            cleaned_principal = record_principal.strip()
+            if cleaned_principal.lower() != "anonymous":
+                claimed_set.add(cleaned_principal)
+        if isinstance(step_principal, str) and step_principal.strip():
+            cleaned_step = step_principal.strip()
+            if cleaned_step.lower() != "anonymous":
+                claimed_set.add(cleaned_step)
+        exact_ok = _has_exact_recovery_proof(meta, raw, claimed_set, stored_proposal)
+        if not exact_ok:
+            stored_args_map = stored_proposal.get("arguments") if isinstance(stored_proposal, dict) else {}
+            if not isinstance(stored_args_map, dict):
+                stored_args_map = {}
+            bound_session = stored_args_map.get("session_ref")
+            if not isinstance(bound_session, str) or not bound_session.strip():
+                bound_session = None
+            else:
+                bound_session = bound_session.strip()
+            alias_verified: set[str] = set()
+            if bound_session is not None:
+                try:
+                    for claimed_name in sorted(claimed_set):
+                        if await _recovery_alias_grounded(
+                            evidence_store=evidence_store,
+                            graph_service=graph_service,
+                            run_id=str(record.run_id),
+                            target_ref=target_ref,
+                            session_name=bound_session,
+                            principal_name=claimed_name,
+                        ):
+                            alias_verified.add(claimed_name)
+                except Exception:
+                    companion = await record_recovery_note(
+                        evidence_store=evidence_store,
+                        run_id=record.run_id,
+                        engagement_id=record.engagement_id,
+                        source_evidence_id=str(record.evidence_id),
+                        note="reprocessing blocked: session binding lookup failed; treating as ungrounded",
+                        action_id=record.action_id,
+                        invocation_id=record.invocation_id,
+                        hypothesis_id=record.hypothesis_id,
+                    )
+                    return {
+                        "status": "no_account_proof",
+                        "evidence_id": str(evidence_id),
+                        "requested_run_id": str(run_id),
+                        "companion_evidence_id": str(companion.evidence_id),
+                    }
+            if not alias_verified:
+                stored_verified: set[str] = set()
+                try:
+                    for claimed_name in sorted(claimed_set):
+                        if await _recovery_stored_binding(
+                            graph_service, claimed_name, target_ref, str(record.run_id)
+                        ):
+                            stored_verified.add(claimed_name)
+                except Exception:
+                    companion = await record_recovery_note(
+                        evidence_store=evidence_store,
+                        run_id=record.run_id,
+                        engagement_id=record.engagement_id,
+                        source_evidence_id=str(record.evidence_id),
+                        note="reprocessing blocked: session binding lookup failed; treating as ungrounded",
+                        action_id=record.action_id,
+                        invocation_id=record.invocation_id,
+                        hypothesis_id=record.hypothesis_id,
+                    )
+                    return {
+                        "status": "no_account_proof",
+                        "evidence_id": str(evidence_id),
+                        "requested_run_id": str(run_id),
+                        "companion_evidence_id": str(companion.evidence_id),
+                    }
+                if not stored_verified:
+                    companion = await record_recovery_note(
+                        evidence_store=evidence_store,
+                        run_id=record.run_id,
+                        engagement_id=record.engagement_id,
+                        source_evidence_id=str(record.evidence_id),
+                        note="reprocessing blocked: account claim has no exact raw session receipt; declaration alone is not proof",
+                        action_id=record.action_id,
+                        invocation_id=record.invocation_id,
+                        hypothesis_id=record.hypothesis_id,
+                    )
+                    return {
+                        "status": "no_account_proof",
+                        "evidence_id": str(evidence_id),
+                        "requested_run_id": str(run_id),
+                        "companion_evidence_id": str(companion.evidence_id),
+                    }
+    try:
+        stored_claim, stored_flag = await resolve_claim_for_review(
+            graph_service, proposal.hypothesis_id, step
+        )
+    except Exception:
+        stored_claim, stored_flag = (None, None)
+    try:
+        assessment = await verifier.verify(
+            VerificationRequest(
+                proposal=proposal,
+                result=result,
+                expectation=expectation,
+                source_refs=[str(record.evidence_id), str(result.invocation_id)],
+                hypothesis_claim=stored_claim,
+                violation_if_confirmed=stored_flag,
+            )
+        )
+    except Exception:
+        from redteam.orchestration.analysis import VerificationAssessment as _VA
+
+        assessment = _VA(
+            verdict=Verdict.UNKNOWN,
+            reason="meaning review failed; evidence preserved, no verdict reached",
+            reviewer_id="analysis:error:recovery",
+            source_refs=[str(record.evidence_id), str(result.invocation_id)],
+            outcome="unknown",
+            claim_supported=False,
+        )
+    verdict, reason = assessment.verdict, assessment.reason
+    # Observation steps never approve: downgrade before receipt/hypothesis/finding.
+    if step is not None and step.assessment_kind != "security_check":
+        from redteam.orchestration.analysis import VerificationAssessment as _VC
+
+        _prior_stage = getattr(assessment, "last_record_stage", None)
+        assessment = _VC(
+            verdict=Verdict.UNKNOWN,
+            reason="response recorded as an observation; no security claim was verified",
+            reviewer_id=getattr(assessment, "reviewer_id", "analysis:recovery"),
+            source_refs=list(getattr(assessment, "source_refs", [str(record.evidence_id)])),
+            outcome="unknown",
+            last_record_stage=None,
+            claim_supported=False,
+        )
+        verdict, reason = assessment.verdict, assessment.reason
+    receipt_stage: str | None = getattr(assessment, "last_record_stage", None)
+    supersede_chain: list[str] = []
+    if receipt_stage is not None:
+        supersede_chain.append(str(receipt_stage))
+    try:
+        await append_review_receipt(
+            evidence_store=evidence_store,
             proposal=proposal,
             result=result,
-            expectation=expectation,
-            source_refs=[str(record.evidence_id), str(result.invocation_id)],
+            assessment=assessment,
+            admission="final",
+            supersedes=supersede_chain,
         )
-    )
-    verdict, reason = assessment.verdict, assessment.reason
+        receipt_status = "appended"
+        try:
+            assessment.last_record_stage = "recovery_final"
+        except Exception:
+            pass
+    except Exception:
+        from redteam.orchestration.analysis import VerificationAssessment as _VB
+
+        assessment = _VB(
+            verdict=Verdict.UNKNOWN,
+            reason="review_receipt_write_failed; evidence preserved, no verdict reached",
+            reviewer_id=getattr(assessment, "reviewer_id", "analysis:recovery"),
+            source_refs=list(getattr(assessment, "source_refs", [str(record.evidence_id)])),
+            outcome="unknown",
+            claim_supported=False,
+        )
+        verdict, reason = assessment.verdict, assessment.reason
+        receipt_status = "failed"
     provenance = Provenance(
         step=0,
         source="recovery:tool:" + str(result.tool_id),
@@ -210,10 +757,34 @@ async def reprocess_evidence(
         if step is not None and step.assessment_kind != "security_check":
             hypothesis_status = HYPOTHESIS_INCONCLUSIVE
         else:
-            hypothesis_status = HYPOTHESIS_STATUS_BY_VERDICT[verdict]
+            hypothesis_status = hypothesis_status_for_assessment(assessment)
         await graph_service.resolve_hypothesis(
             str(proposal.hypothesis_id), status=hypothesis_status
         )
+        try:
+            outcome_name = getattr(assessment, "outcome", None)
+            supporting_ids: list[str] = []
+            refuting_ids: list[str] = []
+            if outcome_name == "success":
+                supporting_ids = [str(record.evidence_id)]
+            elif outcome_name == "refuted":
+                refuting_ids = [str(record.evidence_id)]
+            from redteam.attack_graph.identity import hypothesis_node_id as _hid
+            from redteam.core.enums import GraphNodeType as _GNT
+
+            await graph_service.upsert_node(
+                _GNT.HYPOTHESIS,
+                node_id=_hid(str(proposal.hypothesis_id)),
+                facts={
+                    "supporting_evidence_ids": supporting_ids,
+                    "refuting_evidence_ids": refuting_ids,
+                    "verification_outcome": outcome_name,
+                    "verification_verdict": verdict.value if hasattr(verdict, "value") else str(verdict),
+                },
+                provenance=provenance,
+            )
+        except Exception:
+            pass
     finding_id = None
     if verdict is Verdict.VIOLATION and proposal.hypothesis_id is not None:
         existing_claims = {
@@ -315,6 +886,8 @@ async def reprocess_evidence(
         parts.append("step context unreadable, replayed degraded")
     if mapper_failure is not None:
         parts.append("mapper_failure=" + str(mapper_failure["reason"]))
+    parts.append("receipt=" + str(receipt_status))
+    parts.append("outcome=" + str(getattr(assessment, "outcome", None) or "unknown"))
     companion = await record_recovery_note(
         evidence_store=evidence_store,
         run_id=record.run_id,
@@ -332,6 +905,7 @@ async def reprocess_evidence(
         "requested_run_id": str(run_id),
         "verdict": verdict.value,
         "reason": reason,
+        "outcome": getattr(assessment, "outcome", None) or "unknown",
         "hypothesis_id": str(proposal.hypothesis_id)
         if proposal.hypothesis_id is not None
         else None,
@@ -340,6 +914,7 @@ async def reprocess_evidence(
         "mutation": mutation_summary,
         "mapper_failure": mapper_failure,
         "companion_evidence_id": str(companion.evidence_id),
+        "review_receipt": receipt_status,
     }
 async def record_mapping_failure(
     *,

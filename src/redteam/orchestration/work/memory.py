@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from redteam.core.ids import RunId
 from redteam.orchestration.work.models import (
@@ -31,9 +31,41 @@ class InMemoryWorkStore:
                 if existing.run_id == item.run_id
                 and existing.candidate_key == item.candidate_key
             ]
-            if any(existing.status in ACTIVE_STATUSES for existing in same_candidate):
+            if any(
+                existing.status in {WorkStatus.LEASED, WorkStatus.RUNNING}
+                for existing in same_candidate
+            ):
                 return False
-            if same_candidate and not item.repeatable:
+            pending = [
+                existing
+                for existing in same_candidate
+                if existing.status is WorkStatus.PENDING
+            ]
+            if pending:
+                target = sorted(pending, key=lambda entry: entry.work_id)[0]
+                refreshed = item.model_copy(deep=True).model_copy(
+                    update={
+                        "work_id": target.work_id,
+                        "created_at": target.created_at,
+                        "attempt": target.attempt,
+                        "hypothesis_id": target.hypothesis_id or item.hypothesis_id,
+                        "job_id": target.job_id,
+                        "status": WorkStatus.PENDING,
+                        "outcome_reason": None,
+                    }
+                )
+                self._items[target.work_id] = refreshed
+                return False
+            blocking = [
+                existing
+                for existing in same_candidate
+                if not (
+                    existing.status is WorkStatus.STALE
+                    and existing.attempt == 0
+                    and not existing.job_id
+                )
+            ]
+            if blocking and not item.repeatable:
                 return False
             self._items[item.work_id] = item.model_copy(deep=True)
             return True
@@ -61,6 +93,11 @@ class InMemoryWorkStore:
             lease = self._leases.get(work_id)
             item = self._items.get(work_id)
             if lease is None or item is None or lease.owner != owner:
+                return False
+            expires_at = lease.expires_at
+            if expires_at.tzinfo is None:
+                expires_at = expires_at.replace(tzinfo=timezone.utc)
+            if expires_at <= datetime.now(timezone.utc):
                 return False
             if item.job_id and item.job_id != job_id:
                 return False
@@ -241,6 +278,57 @@ class InMemoryWorkStore:
                 self._leases.pop(work_id, None)
                 abandoned.append(work_id)
             return sorted(abandoned)
+
+    async def reconcile_job(
+        self, work_id: str, *, job_id: str, status: str, now: datetime
+    ) -> bool:
+        try:
+            target = WorkStatus(status)
+        except (ValueError, TypeError):
+            return False
+        if target not in {
+            WorkStatus.SUCCEEDED,
+            WorkStatus.FAILED,
+            WorkStatus.CANCELLED,
+        }:
+            return False
+        async with self._lock:
+            item = self._items.get(work_id)
+            if item is None:
+                return False
+            if not item.job_id or item.job_id != job_id:
+                return False
+            if item.status is target:
+                previous = item.outcome_reason
+                if previous and "job_reconciled" in previous:
+                    self._leases.pop(work_id, None)
+                    return True
+                marker = f"job_reconciled:{target.value}"
+                reason = marker if not previous else f"{marker}:{previous}"
+                self._items[work_id] = item.model_copy(
+                    update={"status": target, "updated_at": now, "outcome_reason": reason}
+                )
+                self._leases.pop(work_id, None)
+                return True
+            if item.status in {WorkStatus.FAILED, WorkStatus.STALE}:
+                previous = item.outcome_reason
+                marker = f"job_reconciled:{target.value}"
+                reason = marker if not previous else f"{marker}:{previous}"
+                self._items[work_id] = item.model_copy(
+                    update={"status": target, "updated_at": now, "outcome_reason": reason}
+                )
+                self._leases.pop(work_id, None)
+                return True
+            if item.status not in ACTIVE_STATUSES:
+                return False
+            previous = item.outcome_reason
+            marker = f"job_reconciled:{target.value}"
+            reason = marker if not previous else f"{marker}:{previous}"
+            self._items[work_id] = item.model_copy(
+                update={"status": target, "updated_at": now, "outcome_reason": reason}
+            )
+            self._leases.pop(work_id, None)
+            return True
 
     def _dependencies_succeeded(self, item: WorkItem) -> bool:
         return all(

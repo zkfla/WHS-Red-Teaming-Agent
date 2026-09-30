@@ -20,6 +20,7 @@ class WorkScheduler:
         *,
         graph_revision: int,
         run_id: RunId,
+        mission_task_id: str | None = None,
         now: datetime | None = None,
     ) -> list[WorkItem]:
         created_at = now or datetime.now(timezone.utc)
@@ -29,6 +30,7 @@ class WorkScheduler:
             item = WorkItem(
                 work_id=new_id("work"),
                 run_id=run_id,
+                mission_task_id=mission_task_id,
                 candidate_key=candidate.candidate_key,
                 agent_id=draft.agent_id,
                 graph_revision=graph_revision,

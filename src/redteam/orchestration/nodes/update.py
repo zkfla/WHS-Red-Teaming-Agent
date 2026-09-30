@@ -11,7 +11,7 @@ from typing import Any
 
 from redteam.attack_graph.predicates import Confidence, Provenance
 from redteam.core.contracts.events import EventType
-from redteam.core.enums import AgentPhase
+from redteam.core.enums import AgentPhase, PolicyVerdict
 from redteam.orchestration.action_naming import canonical_action_key
 from redteam.orchestration.context import RuntimeDeps
 from redteam.orchestration.events import GRAPH_MUTATION_APPLIED, RESULT_MAPPER_FAILED
@@ -221,7 +221,10 @@ async def update_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             )
 
     work_id = state.get("current_work_id")
-    if work_id is not None:
+    approval_waiting = decision is not None and decision.verdict is PolicyVerdict.REQUIRE_APPROVAL
+    if work_id is not None and approval_waiting:
+        await deps.work_store.release(work_id, owner=str(runtime.run_id), now=datetime.now(timezone.utc))
+    elif work_id is not None:
         if blocked:
             work_status = WorkStatus.BLOCKED
             reason = decision.verdict.value if decision is not None else "blocked"
@@ -246,5 +249,5 @@ async def update_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
         state,
         runtime.model_copy(update={"phase": AgentPhase.REPLAN}),
         last_event_id=last_event.event_id,
-        current_work_id=None,
+        current_work_id=work_id if approval_waiting else None,
     )

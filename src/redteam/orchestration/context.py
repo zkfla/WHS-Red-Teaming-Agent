@@ -11,6 +11,8 @@ import asyncio
 from dataclasses import dataclass, field
 
 from redteam.core.ids import RunId
+from redteam.attack_graph.service import AttackGraphService
+from redteam.core.contracts.engagement import Engagement
 from redteam.core.ports.attack_graph import AttackGraphStore
 from redteam.core.ports.control_plane import ControlPlane
 from redteam.core.ports.event_bus import EventBus
@@ -47,13 +49,14 @@ class RuntimeDeps:
     verifier: AnalysisVerifier | None = None
     path_store: PathStore = field(default_factory=InMemoryPathStore)
     long_job_adapter: LongJobAdapter | None = None
+    engagement: Engagement | None = None
 
     agents: AgentRegistry = field(default_factory=default_registry)
     candidate_providers: CandidateProviderRegistry = field(
         default_factory=default_provider_registry
     )
-    # Agent-Team view of the Capability registry.  ``None`` keeps legacy
-    # playbooks operational until Capability/PM finalize a shared catalog port.
+    # The actual tool registry is mandatory when compiling actions.
+    # None supports read-only projections and explicit error scenarios.
     tool_catalog: ToolCatalog | None = None
     # Tool Result -> Attack Graph Mutation (SERVICE/ENDPOINT discovery from
     # a successful execution's real output) -- see `orchestration.observations`.
@@ -82,5 +85,5 @@ class RuntimeDeps:
     def __post_init__(self) -> None:
         if self.verifier is None:
             object.__setattr__(self, "verifier", StructuredLLMAnalysisVerifier(
-                self.llm_client, self.evidence_store,
+                self.llm_client, self.evidence_store, AttackGraphService(self.graph_store),
             ))

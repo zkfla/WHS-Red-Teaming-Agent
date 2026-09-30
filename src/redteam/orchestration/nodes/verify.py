@@ -17,7 +17,13 @@ from redteam.core.contracts.events import EventType
 from redteam.core.convert import tool_result_to_evidence
 from redteam.core.enums import AgentPhase, GraphEdgeType, GraphNodeType, Verdict
 from redteam.orchestration.action_naming import canonical_action_key
-from redteam.orchestration.analysis import VerificationAssessment, VerificationRequest
+from redteam.orchestration.analysis import (
+    VerificationAssessment,
+    VerificationRequest,
+    append_review_receipt,
+    hypothesis_status_for_assessment,
+    resolve_claim_for_review,
+)
 from redteam.orchestration.authentication import (
     ACCESS_CONTROL_VIOLATION,
     assess_authentication,
@@ -33,7 +39,6 @@ from redteam.orchestration.findings import FindingPromoter, PromotionRequest
 from redteam.orchestration.nodes._support import advance, graph_service, publisher_for
 from redteam.orchestration.observations.web_http import map_web_compare_sessions
 from redteam.orchestration.service_status import (
-    HYPOTHESIS_STATUS_BY_VERDICT,
     severity_for,
 )
 from redteam.orchestration.state import GraphState
@@ -125,12 +130,20 @@ async def verify_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
     expectation = step.expectation if step is not None else None
     verification_failed = False
     try:
+        hypothesis_claim_text, violation_flag = await resolve_claim_for_review(
+            service, proposal.hypothesis_id, step
+        )
+    except Exception:
+        hypothesis_claim_text, violation_flag = (None, None)
+    try:
         assessment = await deps.verifier.verify(
             VerificationRequest(
                 proposal=proposal,
                 result=result,
                 expectation=expectation,
                 source_refs=[str(evidence.evidence_id), str(result.invocation_id)],
+                hypothesis_claim=hypothesis_claim_text,
+                violation_if_confirmed=violation_flag,
             )
         )
     except Exception as exc:  # noqa: BLE001 - preserve evidence and close work safely
@@ -148,8 +161,16 @@ async def verify_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             reason="analysis verifier failed before reaching a verdict",
             reviewer_id=f"analysis:error:{type(exc).__name__}",
             source_refs=[str(evidence.evidence_id), str(result.invocation_id)],
+            outcome="unknown",
+            claim_supported=False,
         )
     verdict, reason = assessment.verdict, assessment.reason
+
+    # The public receipt is appended once below as the final admission,
+    # after contradiction/observation/failure downgrades. The verifier may
+    # already have left an interim receipt; the final one supersedes it so a
+    # stale positive can never count as approval.
+    prior_record_stage = getattr(assessment, "last_record_stage", None)
 
     provenance = Provenance(
         step=runtime.step_count,
@@ -160,6 +181,7 @@ async def verify_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
     )
 
     auth_assessment = None
+    auth_contradiction = False
     if step is not None and step.authentication_check is not None:
         auth_assessment = await assess_authentication(
             step.authentication_check,
@@ -251,26 +273,29 @@ async def verify_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             causation_id=last_event_id,
         )
         last_event_id = compared.event_id
-        if is_violation:
-            verdict = Verdict.VIOLATION
-            reason = (
-                "registered session reached an operator-declared deny path "
-                f"(status {auth_assessment.session_status}); access-control "
-                "violation confirmed against the anonymous 401 baseline"
-            )
-        elif (
-            step is not None
-            and step.assessment_kind == "security_check"
-            and step.authentication_check.expected_access == "deny"
-            and auth_assessment.outcome in {"session_not_accepted", "access_denied"}
-        ):
-            verdict = Verdict.PASS
-            reason = "the operator-declared deny expectation was enforced"
+        # Code never raises a verdict. The comparison above stays mapped as
+        # physical observations; the semantic verdict comes only from the LLM.
+        # A comparison that contradicts a positive LLM judgment on the same
+        # hypothesis falls back to UNKNOWN with feedback for replan.
+        llm_outcome = getattr(assessment, "outcome", None)
+        llm_dir: str | None = None
+        if not verification_failed and assessment.verdict is not Verdict.UNKNOWN:
+            if llm_outcome == "success":
+                llm_dir = "confirm"
+            elif llm_outcome == "refuted":
+                llm_dir = "reject"
+        auth_outcome = auth_assessment.outcome
+        auth_dir: str | None = None
+        if auth_outcome in {ACCESS_CONTROL_VIOLATION, "session_access_observed"}:
+            auth_dir = "confirm"
+        elif auth_outcome in {"session_not_accepted", "access_denied"}:
+            auth_dir = "reject"
+        auth_contradiction = (
+            llm_dir is not None and auth_dir is not None and llm_dir != auth_dir
+        )
 
     observation_only = step is not None and step.assessment_kind == "observation"
     if observation_only:
-        verdict = Verdict.UNKNOWN
-        reason = "response recorded as an observation; no security claim was verified"
         observed = await publisher.publish(
             OBSERVATION_RECORDED,
             {
@@ -285,10 +310,80 @@ async def verify_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
         )
         last_event_id = observed.event_id
 
+    # Final admission: contradiction, observation-only, or verification failure
+    # downgrades the code-approved assessment itself to outcome=unknown. The
+    # auth branch below can never re-raise it (no re-promotion), and support
+    # evidence plus the final receipt derive from this admitted assessment.
+    downgrade_cause: str | None = None
+    if verification_failed:
+        downgrade_cause = "verification_failed"
+    elif observation_only:
+        downgrade_cause = "observation_only"
+    elif auth_contradiction:
+        downgrade_cause = "auth_contradiction"
+    if downgrade_cause is not None:
+        admitted = VerificationAssessment(
+            verdict=Verdict.UNKNOWN,
+            reason=(
+                "admitted UNKNOWN (" + downgrade_cause + "); original "
+                + str(assessment.verdict.value if hasattr(assessment.verdict, "value") else assessment.verdict)
+                + "/" + str(getattr(assessment, "outcome", None) or "unknown")
+                + ": " + str(assessment.reason)
+            )[:1000],
+            reviewer_id=assessment.reviewer_id,
+            source_refs=list(assessment.source_refs),
+            outcome="unknown",
+            last_record_stage=getattr(assessment, "last_record_stage", None),
+            claim_supported=False,
+        )
+    else:
+        admitted = assessment
+    verdict, reason = admitted.verdict, admitted.reason
+
+    # Final admission receipt: supersedes any interim receipt so a stale
+    # positive can never count as approval. Completion consumers must require
+    # admission == "final" (see is_final_admission_receipt in analysis).
+    superseded_stages: list[str] = []
+    if prior_record_stage is not None:
+        superseded_stages.append(str(prior_record_stage))
+    try:
+        await append_review_receipt(
+            evidence_store=deps.evidence_store,
+            proposal=proposal,
+            result=result,
+            assessment=admitted,
+            admission="final",
+            supersedes=superseded_stages,
+        )
+        try:
+            admitted.last_record_stage = "verify_node_final"
+        except Exception:
+            pass
+    except Exception:
+        result = result.model_copy(
+            update={
+                "metadata": {
+                    **result.metadata,
+                    "verification_exception": "review_receipt_write_failed",
+                }
+            }
+        )
+        verification_failed = True
+        admitted = VerificationAssessment(
+            verdict=Verdict.UNKNOWN,
+            reason="review_receipt_write_failed; evidence preserved, no verdict reached",
+            reviewer_id=admitted.reviewer_id,
+            source_refs=list(admitted.source_refs),
+            outcome="unknown",
+            last_record_stage=None,
+            claim_supported=False,
+        )
+        verdict, reason = admitted.verdict, admitted.reason
+
     hypothesis_status = ""
     resolution_reason = ""
     if proposal.hypothesis_id is not None:
-        hypothesis_status = HYPOTHESIS_STATUS_BY_VERDICT[verdict]
+        hypothesis_status = hypothesis_status_for_assessment(admitted)
         if (
             observation_only
             or result.metadata.get("orchestration_exception")
@@ -296,7 +391,29 @@ async def verify_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
         ):
             hypothesis_status = "inconclusive"
         if auth_assessment is not None:
-            hypothesis_status = auth_assessment.hypothesis_status
+            # Guarded adoption: same hypothesis and same outcome direction only.
+            # Anything else stays inconclusive; code never confirms via override.
+            auth_status = auth_assessment.hypothesis_status
+            auth_dir: str | None = None
+            if auth_status == "confirmed":
+                auth_dir = "confirm"
+            elif auth_status == "rejected":
+                auth_dir = "reject"
+            if admitted.verdict is Verdict.UNKNOWN or observation_only:
+                hypothesis_status = "inconclusive"
+                auth_dir = None
+            base_outcome = getattr(admitted, "outcome", None)
+            base_dir: str | None = None
+            if not verification_failed and base_outcome == "success":
+                base_dir = "confirm"
+            elif not verification_failed and base_outcome == "refuted":
+                base_dir = "reject"
+            if auth_dir is not None and auth_dir == base_dir and base_dir is not None:
+                hypothesis_status = auth_status
+            elif auth_dir is not None and base_dir is not None and auth_dir != base_dir:
+                hypothesis_status = "inconclusive"
+            if expectation is None and not observation_only and not resolution_reason:
+                resolution_reason = "needs_test_expectation_for_claim"
         if hypothesis_status == HYPOTHESIS_OPEN and not _follow_up_possible(step):
             hypothesis_status = HYPOTHESIS_INCONCLUSIVE
             resolution_reason = "no_follow_up_verification_available"
@@ -305,6 +422,28 @@ async def verify_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             status=hypothesis_status,
             step=runtime.step_count,
         )
+        try:
+            outcome_name = getattr(admitted, "outcome", None)
+            supporting_ids: list[str] = []
+            refuting_ids: list[str] = []
+            if outcome_name == "success":
+                supporting_ids = [str(evidence.evidence_id)]
+            elif outcome_name == "refuted":
+                refuting_ids = [str(evidence.evidence_id)]
+            await service.upsert_node(
+                GraphNodeType.HYPOTHESIS,
+                node_id=hypothesis_node_id(str(proposal.hypothesis_id)),
+                facts={
+                    "supporting_evidence_ids": supporting_ids,
+                    "refuting_evidence_ids": refuting_ids,
+                    "verification_outcome": outcome_name,
+                    "verification_verdict": verdict.value,
+                },
+                provenance=provenance,
+                step=runtime.step_count,
+            )
+        except Exception:
+            pass
         if resolved is not None:
             settled = await publisher.publish(
                 HYPOTHESIS_RESOLVED,
@@ -342,8 +481,8 @@ async def verify_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             operation=proposal.operation,
             agent_id=str(proposal.agent_id),
             action_id=str(proposal.action_id),
-            reviewer_id=assessment.reviewer_id,
-            source_refs=list(assessment.source_refs),
+            reviewer_id=admitted.reviewer_id,
+            source_refs=list(admitted.source_refs),
             severity=severity_for(step),
             assessment_kind=(step.assessment_kind if step is not None else "observation"),
         ),

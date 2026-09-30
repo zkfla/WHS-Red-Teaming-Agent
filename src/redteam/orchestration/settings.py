@@ -77,24 +77,15 @@ class OrchestrationSettings(BaseModel):
     branch_prune_difficulty_threshold: float = Field(default=0.65, ge=0.0, le=1.0)
     branch_prune_objective_override: float = Field(default=0.8, ge=0.0, le=1.0)
 
-    #: Hybrid planning: a single candidate, or a top-1 score lead of at least
-    #: this much, is chosen deterministically and costs no LLM call. Anything
-    #: closer is genuinely ambiguous and goes to a bounded rerank.
+    #: Legacy compatibility; the LLM-led runtime ignores ranking knobs.
     planner_score_margin: float = Field(default=0.15, ge=0.0, le=10.0)
-    #: How many of the top candidates a rerank is allowed to consider. The
-    #: planner can only ever return one of these.
+    #: Retained for older settings; never limits LLM-generated actions.
     planner_rerank_top_k: int = Field(default=3, ge=2, le=20)
 
-    #: RC#1: when on (and an LLM client is wired), the model may *generate*
-    #: candidate drafts each turn in addition to the playbook frontier. Every
-    #: generated draft is compiled and policy-checked exactly like a playbook
-    #: draft, so this only widens what is proposed, never what may run.
-    #: Default off: the playbook-only frontier stays the baseline behaviour.
-    # Accepted only for reading old configs; there is one LLM-led runtime.
+    #: One runtime mode; frozen legacy core flags do not select it.
     llm_candidate_generation: Literal[True] = True
     decision_max_attempts: int = Field(default=3, ge=1, le=6)
     path_backend: Literal["memory", "sqlite"] = "memory"
-    path_store_path: str = ".redteam/tasks.sqlite"
 
     #: Overrides the value derived from ``max_steps`` when set.
     recursion_limit: int | None = Field(default=None, ge=1)

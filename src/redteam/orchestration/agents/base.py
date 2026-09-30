@@ -1,8 +1,7 @@
-"""``AgentSpec``/``PlanStep``/``Planner`` and the frontier calculation.
+"""Role, action and legacy reference-playbook contracts.
 
-An agent is a declared playbook plus a chooser: a planner picks from
-``available_steps`` and cannot invent a capability, operation or tool id
-that was never declared. Rationale: ``docs/agent/orchestration.md``.
+Production planning uses the LLM and the real tool catalog. Frontier
+helpers produce reference material, never an execution pool.
 """
 
 from __future__ import annotations
@@ -96,6 +95,8 @@ class PlanStep(BaseModel):
     path_step_id: str | None = None
     principal_ref: str | None = None
     operator_intent_id: str | None = None
+    intent_index: int = 0
+    availability_impact: bool = False
     capability: str
     operation: str
     tool_id: ToolId

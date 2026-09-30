@@ -116,14 +116,7 @@ def load_engagement(path: str | Path) -> Engagement:
 
 
 def build_llm_client(config: LLMConfig) -> LLMClient:
-    """Explicit provider names only -- an unrecognized string (a typo like
-    ``"litellmm"``, or someone writing ``"openai"``/``"anthropic"``
-    expecting it to just work) must be a loud config error, not a silent
-    ``FakeLLMClient``. Silently treating "anything that isn't literally
-    'litellm'" as fake previously masked exactly that kind of
-    misconfiguration -- offline/test use of ``FakeLLMClient`` remains
-    exactly as easy, via the explicit ``provider: "fake"``.
-    """
+    """Build the mandatory real model; test clients require explicit injection."""
     if config.provider == "litellm":
         from redteam.llm.litellm import LiteLLMClient
 
@@ -230,6 +223,7 @@ async def build_runtime_deps(
         graph_store=graph_store,
         evidence_store=evidence_store,
         llm_client=llm_client,
+        engagement=engagement,
         agents=agents if agents is not None else default_registry(),
         candidate_providers=(
             candidate_providers if candidate_providers is not None else default_provider_registry()
@@ -237,6 +231,7 @@ async def build_runtime_deps(
         tool_catalog=(tool_catalog if tool_catalog is not None else discovered_catalog),
         work_store=_build_work_store(settings),
         task_graph_store=(task_graph_store or _build_task_graph_store(settings)),
+        path_store=_build_path_store(settings),
         operator_intent_store=build_operator_intent_store(
             settings.operator_intent_backend, settings.operator_intent_path
         ),
@@ -293,8 +288,7 @@ async def build_application(
     - ``config.engagement`` -> ``Engagement`` handed to the default
       ``ControlPlane`` (and returned alongside ``RuntimeDeps`` — callers
       pass it to ``run_engagement``).
-    - ``config.llm`` -> ``build_llm_client`` (``FakeLLMClient`` unless
-      ``provider: "litellm"``).
+    - ``config.llm`` -> ``build_llm_client`` (requires ``provider: "litellm"``).
     - ``config.capability`` -> ``_build_default_tool_gateway``.
     - ``config.orchestration`` -> ``OrchestrationSettings.from_config``;
       an explicit ``orchestration_settings`` may additionally select durable
@@ -382,6 +376,7 @@ async def build_application(
         graph_store=resolved_attack_graph,
         evidence_store=resolved_evidence_store,
         llm_client=resolved_llm,
+        engagement=engagement,
         agents=agents if agents is not None else default_registry(),
         candidate_providers=(
             candidate_providers if candidate_providers is not None else default_provider_registry()
@@ -497,7 +492,8 @@ async def run_engagement(
     frontier, so without this the planner would have nothing to choose
     from on the first turn.
     """
-    deps = deps if deps is not None else await build_runtime_deps(engagement)
+    if deps is None:
+        raise ValueError("run_engagement requires dependencies with an explicitly configured LLM")
     settings = deps.settings
     if orchestration_config is not None:
         settings = settings.model_copy(

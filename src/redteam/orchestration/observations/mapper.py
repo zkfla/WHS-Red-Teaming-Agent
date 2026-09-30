@@ -173,6 +173,7 @@ def default_result_mapper_registry() -> ResultMapperRegistry:
         map_web_compare_sessions,
         map_web_http_request,
         map_web_http_security_posture,
+        map_web_session_list,
     )
     from redteam.orchestration.observations.web_proxy import (
         map_web_nuclei_response_check,
@@ -196,6 +197,7 @@ def default_result_mapper_registry() -> ResultMapperRegistry:
     registry.register("web.http_compare_sessions", map_web_compare_sessions)
     registry.register("web.http_compare_anonymous", map_web_compare_anonymous)
     registry.register("web.http_security_posture", map_web_http_security_posture)
+    registry.register("web.session_list", map_web_session_list)
     registry.register("web.proxy_list_flows", map_web_proxy_list_flows)
     registry.register("web.proxy_get_flow", map_web_proxy_get_flow)
     registry.register("web.proxy_replay_flow", map_web_proxy_replay_flow)

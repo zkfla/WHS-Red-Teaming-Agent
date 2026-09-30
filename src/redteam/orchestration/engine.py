@@ -13,8 +13,9 @@ from redteam.attack_graph.identity import target_for_node, node_id_for_target
 from redteam.attack_graph.predicates import facts_of
 from redteam.core.contracts.mission import MissionCriterionResult
 from redteam.core.contracts.graph import Hypothesis
+from redteam.core.contracts.evidence import EvidenceRecord
 from redteam.attack_graph.predicates import Confidence, Provenance
-from redteam.core.enums import MissionStatus, TaskStatus
+from redteam.core.enums import MissionStatus, TaskStatus, EvidenceSourceType
 from redteam.core.ids import GraphNodeId, new_id
 from redteam.orchestration.agents.base import PlanStep, HypothesisDraft
 from redteam.orchestration.expectations import Expectation
@@ -22,11 +23,11 @@ from redteam.orchestration.authentication import AuthenticationCheck
 from redteam.orchestration.agents.providers import PlaybookCandidateProvider
 from redteam.orchestration.candidates.compiler import CandidateCompiler
 from redteam.orchestration.candidates.models import CandidateDraft
-from redteam.orchestration.cognition import StructuredDecisionClient
+from redteam.orchestration.cognition import StructuredDecisionClient, DecisionBudget, DecisionFailure
 from redteam.orchestration.completion import validate_completion
 from redteam.orchestration.evidence_access import EvidenceReader
 from redteam.orchestration.knowledge import project_knowledge
-from redteam.orchestration.paths import PathPlan, is_known_criterion
+from redteam.orchestration.paths import PathPlan, PathError, is_known_criterion
 from redteam.orchestration.paths.models import validate_path_structure
 from redteam.orchestration.work.models import WorkStatus
 from redteam.orchestration.progress import knowledge_fingerprint
@@ -48,6 +49,7 @@ class ActionIntent(BaseModel):
     existing_hypothesis_id: str | None = None
     expectation: Expectation | None = None
     authentication_check: AuthenticationCheck | None = None
+    availability_impact: bool = Field(default=False, description="Whether this action may disrupt target availability")
 
 
 class ReviewDecision(BaseModel):
@@ -78,7 +80,8 @@ SYSTEM = (
     "chain-of-thought. Code reference paths are hints, not an execution pool or an exhaustive "
     "strategy list. Never claim completion from tool success alone. Operations use capability.operation. "
     "Completion criteria must be typed and measurable, with evidence requirements; unknown future "
-    "steps may stay pending. Do not invent observed facts or evidence."
+    "steps may stay pending. Do not invent observed facts or evidence. "
+    "Declare availability_impact for actions that can disrupt service, and obey the engagement constraints."
 )
 
 
@@ -108,6 +111,29 @@ def fact_refs(knowledge: dict) -> set[str]:
     return refs
 
 
+def principal_bindings(knowledge: dict) -> dict[str, set[str]]:
+    """Non-secret identity references; supplied registrations stay declarations."""
+    bindings: dict[str, set[str]] = {"anonymous": set()}
+    provided = knowledge.get("provided", {}).get("claims", [])
+    for item in [*knowledge.get("facts", []), *provided]:
+        facts = item.get("observed_facts", item.get("facts", {})) if isinstance(item, dict) else {}
+        for reference in item.get("auth_session_refs", []):
+            bindings.setdefault(str(reference), set()).add(str(reference))
+        sessions = facts.get("auth_session_config", {}).get("sessions", [])
+        for session in sessions:
+            if isinstance(session, dict) and session.get("session_ref"):
+                reference = str(session["session_ref"])
+                bindings.setdefault(reference, set()).add(reference)
+        refs = facts.get("session_refs", [])
+        if facts.get("session_ref"):
+            refs = [*refs, facts["session_ref"]]
+        if facts.get("principal_ref"):
+            bindings.setdefault(str(facts["principal_ref"]), set()).update(map(str, refs))
+        if item.get("node_type") in {"principal", "credential"}:
+            bindings.setdefault(str(item.get("node_id")), set()).update(map(str, refs))
+    return bindings
+
+
 def ready_step(path, step, knowledge: dict) -> list[str]:
     problems = []
     steps = {item.step_id: item for item in path.steps}
@@ -129,6 +155,26 @@ class InvestigationEngine:
         self.client = StructuredDecisionClient(deps.llm_client,
                                                max_attempts=deps.settings.decision_max_attempts)
 
+    async def record_completion_review(self, stage, path, runtime, review, evidence_ids,
+                                       *, step_id=None):
+        payload = {"record_kind": "completion_review", "stage": stage,
+                   "path_id": path.path_id, "path_version": path.version,
+                   "path_step_id": step_id, "model_judgment": review,
+                   "source_evidence_ids": list(evidence_ids),
+                   "code_admission": "separate_completion_gate"}
+        try:
+            await self.deps.evidence_store.append(EvidenceRecord(
+                evidence_id=new_id("evidence"), run_id=runtime.run_id,
+                engagement_id=runtime.engagement_id, source_type=EvidenceSourceType.SYSTEM,
+                source_id="orchestration." + stage, content_type="application/json",
+                digest=hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest(),
+                summary=str(review.get("reason", ""))[:280],
+                created_at=datetime.now(timezone.utc), metadata=payload,
+            ))
+        except Exception as exc:
+            raise DecisionFailure(stage, "unknown", 0,
+                                  "review_receipt_write_failed:" + type(exc).__name__) from exc
+
     async def context(self, runtime, observation) -> dict:
         from redteam.attack_graph.service import AttackGraphService
         service = AttackGraphService(self.deps.graph_store)
@@ -149,8 +195,8 @@ class InvestigationEngine:
                          key: value for key, value in item.metadata.items()
                          if key not in {"raw_tool_result", "tool_result", "proposal", "plan_step"}}}
                     for item in records[-20:]]
-        history = [item.model_dump(mode="json")
-                   for item in await self.deps.work_store.list_items(run_id=runtime.run_id)]
+        work_history = await self.deps.work_store.list_items(run_id=runtime.run_id)
+        history = [item.model_dump(mode="json") for item in work_history[-20:]]
         instructions = []
         if self.deps.operator_intent_store is not None and runtime.mission_id:
             instructions = [item.model_dump(mode="json") for item in
@@ -161,6 +207,12 @@ class InvestigationEngine:
             "success_criteria": mission.success_criteria if mission else [runtime.current_goal],
             "mission": mission.model_dump(mode="json") if mission else None,
             "operator_instructions": instructions,
+            "engagement_constraints": {
+                "scope": self.deps.engagement.scope.model_dump(mode="json"),
+                "rules_of_engagement": [item.model_dump(mode="json")
+                                        for item in self.deps.engagement.rules_of_engagement],
+                "execution_budget": self.deps.engagement.execution_budget.model_dump(mode="json"),
+            } if self.deps.engagement else None,
             "knowledge": knowledge,
             "active_path": active.model_dump(mode="json") if active else None,
             "roles": [{"agent_id": str(agent.agent_id), "capabilities": agent.capabilities}
@@ -190,25 +242,36 @@ class InvestigationEngine:
         return references
 
     async def register_path(self, proposed, runtime, context, observation,
-                            *, switch: bool = False):
+                            *, switch: bool = False, budget=None):
         from redteam.attack_graph.service import AttackGraphService
         active = await self.deps.path_store.get_active(str(runtime.run_id))
         candidate = proposed.model_dump(mode="json")
         candidate.update(run_id=str(runtime.run_id), mission_id=str(runtime.mission_id)
                          if runtime.mission_id else None,
                          path_id=active.path_id if active and not switch else new_id("path"),
-                         version=active.version + 1 if active and not switch else 1,
+                         version=active.version + 1 if active else 1,
                          parent_version=active.version if active and not switch else None,
                          status="candidate", goal=context["goal"])
         path = PathPlan.model_validate(candidate)
         validate_path_structure(path.steps)
+        service = AttackGraphService(self.deps.graph_store)
+        for identity in path.hypothesis_ids:
+            if await service.get_hypothesis(identity) is None:
+                raise ValueError("path references a missing hypothesis")
+        for identity in path.evidence_ids:
+            evidence = await self.deps.evidence_store.get(identity)
+            if evidence is None or str(evidence.run_id) != str(runtime.run_id):
+                raise ValueError("path cites evidence from another run or missing evidence")
         # Progress and receipts are code-owned, never accepted from a model draft.
         for step in path.steps:
             step.status, step.outcome, step.evidence_ids = "pending", None, []
         known = _known_ids(context["knowledge"])
+        known_principals = set(principal_bindings(context["knowledge"]))
         for step in path.steps:
             if set(step.target_node_ids) - known:
                 raise ValueError("path references unknown target(s)")
+            if set(step.principal_refs) - known_principals:
+                raise ValueError("path references unregistered principal(s)")
             if step.agent_id and self.deps.agents.get(step.agent_id) is None:
                 raise ValueError("path references unknown role")
             if not step.completion_criteria or any(
@@ -222,7 +285,7 @@ class InvestigationEngine:
             stage="path_review", payload={**context, "draft_path": path.model_dump(mode="json"),
                                           "code_references": references,
                                           "code_checks": "structure and references passed"},
-            response_schema=ReviewDecision.model_json_schema(), system=SYSTEM,
+            response_schema=ReviewDecision.model_json_schema(), system=SYSTEM, budget=budget,
         ))
         if review.decision == "revise":
             if review.path is None:
@@ -233,9 +296,19 @@ class InvestigationEngine:
                                  "parent_version", "status", "goal")})
             path = PathPlan.model_validate(replacement)
             validate_path_structure(path.steps)
+            for identity in path.hypothesis_ids:
+                if await service.get_hypothesis(identity) is None:
+                    raise ValueError("reviewed path references a missing hypothesis")
+            for identity in path.evidence_ids:
+                evidence = await self.deps.evidence_store.get(identity)
+                if evidence is None or str(evidence.run_id) != str(runtime.run_id):
+                    raise ValueError("reviewed path cites unrelated evidence")
             for step in path.steps:
                 step.status, step.outcome, step.evidence_ids = "pending", None, []
-                if (set(step.target_node_ids) - known or not step.completion_criteria
+                if (set(step.target_node_ids) - known
+                    or set(step.principal_refs) - known_principals
+                    or (step.agent_id and self.deps.agents.get(step.agent_id) is None)
+                    or not step.completion_criteria
                     or any(not is_known_criterion(item) for item in step.completion_criteria)):
                     raise ValueError("reviewed path has invalid references or criteria")
         if review.decision in {"reject", "hold"}:
@@ -247,10 +320,27 @@ class InvestigationEngine:
             return None
         accepted = path.model_dump(mode="json")
         accepted.update(status="accepted", reason=review.reason)
+        if active:
+            changed = set(path.changed_step_ids)
+            old_steps = {item.step_id: item for item in active.steps}
+            new_steps = {item.step_id: item for item in path.steps}
+            excluded = {"status", "outcome", "evidence_ids"}
+            changed.update(set(old_steps) - set(new_steps))
+            changed.update(identity for identity, old in old_steps.items()
+                           if identity in new_steps and old.model_dump(exclude=excluded)
+                           != new_steps[identity].model_dump(exclude=excluded))
+            while True:
+                descendants = {item.step_id for item in [*active.steps, *path.steps]
+                               if set(item.depends_on) & changed}
+                if descendants <= changed:
+                    break
+                changed.update(descendants)
+            accepted["changed_step_ids"] = sorted(changed)
         if "review_records" in PathPlan.model_fields:
             accepted["review_records"] = {"decision": review.decision, "reason": review.reason}
         registered = await self.deps.path_store.register(
             PathPlan.model_validate(accepted), expected_version=active.version if active else None,
+            expected_path_id=active.path_id if active else None,
         )
         if active:
             await self.invalidate_pending(active, registered, runtime)
@@ -259,7 +349,7 @@ class InvestigationEngine:
     async def invalidate_pending(self, previous, current, runtime):
         previous_steps = {item.step_id: item for item in previous.steps}
         current_steps = {item.step_id: item for item in current.steps}
-        changed = set(previous_steps) - set(current_steps)
+        changed = set(current.changed_step_ids) | (set(previous_steps) - set(current_steps))
         for identity, old in previous_steps.items():
             new = current_steps.get(identity)
             if new is not None:
@@ -284,108 +374,151 @@ class InvestigationEngine:
         context = await self.context(runtime, observation)
         path = await self.deps.path_store.get_active(str(runtime.run_id))
         if path is None:
-            draft = PathPlan.model_validate(await self.client.ask(
-                stage="path_draft", payload=context,
-                response_schema=PathPlan.model_json_schema(), system=SYSTEM,
-            ))
-            path = await self.register_path(draft, runtime, context, observation)
+            drafting_budget = DecisionBudget(self.deps.settings.decision_max_attempts)
+            while drafting_budget.remaining:
+                try:
+                    draft = PathPlan.model_validate(await self.client.ask(
+                        stage="path_draft", payload=context,
+                        response_schema=PathPlan.model_json_schema(), system=SYSTEM,
+                        budget=drafting_budget,
+                    ))
+                    path = await self.register_path(draft, runtime, context, observation,
+                                                    budget=drafting_budget)
+                    break
+                except (ValueError, TypeError, PathError) as exc:
+                    context["feedback"] = [str(exc)]
+            else:
+                raise DecisionFailure("path_draft", "budget", drafting_budget.used,
+                                      str(context["feedback"]))
             if path is None:
                 return None, [], "path held or rejected"
         extra = []
-        for _ in range(self.deps.settings.decision_max_attempts):
+        last_control_succeeded = False
+        budget = DecisionBudget(self.deps.settings.decision_max_attempts)
+        while budget.remaining:
             context["active_path"] = path.model_dump(mode="json")
             decision = TurnDecision.model_validate(await self.client.ask(
                 stage="next_action", payload={**context, "additional_evidence": extra},
-                response_schema=TurnDecision.model_json_schema(), system=SYSTEM,
+                response_schema=TurnDecision.model_json_schema(), system=SYSTEM, budget=budget,
             ))
-            if decision.mode == "read_evidence":
-                request = decision.evidence_request
-                extra.append(await EvidenceReader(self.deps.evidence_store).read(
-                    evidence_id=str(request.get("evidence_id", "")),
-                    run_id=str(runtime.run_id), offset=int(request.get("offset", 0)),
-                    limit=min(int(request.get("limit", 4000)), 8000), query=request.get("query"),
-                ))
+            try:
+                last_control_succeeded = False
+                if decision.mode == "read_evidence":
+                    request = decision.evidence_request
+                    extra.append(await EvidenceReader(self.deps.evidence_store).read(
+                        evidence_id=str(request.get("evidence_id", "")),
+                        run_id=str(runtime.run_id), offset=int(request.get("offset", 0)),
+                        limit=min(int(request.get("limit", 4000)), 8000), query=request.get("query"),
+                    ))
+                    last_control_succeeded = True
+                    continue
+                if decision.mode == "update_hypothesis":
+                    from redteam.attack_graph.service import AttackGraphService
+                    service = AttackGraphService(self.deps.graph_store)
+                    suggestion = decision.hypothesis_update
+                    target_id = str(suggestion.get("target_node_id", ""))
+                    if target_id not in _known_ids(context["knowledge"]):
+                        raise ValueError("hypothesis target is unknown")
+                    description = suggestion.get("description")
+                    if not isinstance(description, str) or not description.strip():
+                        raise ValueError("hypothesis needs a claim")
+                    hypothesis_id = str(suggestion.get("hypothesis_id") or new_id("hyp"))
+                    existing = await service.get_hypothesis(hypothesis_id)
+                    if existing and existing.metadata.get("target_node_id") != target_id:
+                        raise ValueError("a hypothesis revision cannot change its target identity")
+                    evidence_ids = list(map(str, suggestion.get("evidence_ids", [])))
+                    for identity in evidence_ids:
+                        evidence = await self.deps.evidence_store.get(identity)
+                        if (evidence is None or str(evidence.run_id) != str(runtime.run_id)
+                            or evidence.metadata.get("target_node_id") != target_id):
+                            raise ValueError("hypothesis cites unrelated evidence")
+                    revision_history = list(existing.metadata.get("revisions", [])) if existing else []
+                    if existing:
+                        revision_history.append({"claim": existing.description,
+                                                 "status": _text(existing.status),
+                                                 "evidence_ids": existing.metadata.get("evidence_ids", [])})
+                    hypothesis = Hypothesis(
+                        hypothesis_id=hypothesis_id, description=description,
+                        confidence=float(suggestion.get("confidence", 0.3)), status="open",
+                        metadata={**(existing.metadata if existing else {}),
+                                  "target_node_id": target_id, "evidence_ids": evidence_ids,
+                                  "needs": suggestion.get("needs", []),
+                                  "previous_claim": existing.description if existing else None,
+                                  "revisions": revision_history,
+                                  "neutral_evidence_ids": evidence_ids,
+                                  "supporting_evidence_ids": [], "refuting_evidence_ids": [],
+                                  "path_id": path.path_id, "path_version": path.version},
+                    )
+                    await service.record_hypothesis(hypothesis, about=GraphNodeId(target_id),
+                        step=runtime.step_count, provenance=Provenance(
+                            source="llm:hypothesis", run_id=str(runtime.run_id),
+                            step=runtime.step_count, confidence=Confidence.INFERRED))
+                    context = await self.context(runtime, observation)
+                    last_control_succeeded = True
+                    continue
+                if decision.mode == "recover_evidence":
+                    from redteam.attack_graph.service import AttackGraphService
+                    from redteam.orchestration.recovery import reprocess_evidence
+                    recovered = await reprocess_evidence(
+                        evidence_id=str(decision.evidence_request.get("evidence_id", "")),
+                        run_id=str(runtime.run_id), evidence_store=self.deps.evidence_store,
+                        graph_service=AttackGraphService(self.deps.graph_store),
+                        verifier=self.deps.verifier, result_mappers=self.deps.result_mappers,
+                    )
+                    extra.append(recovered)
+                    context = await self.context(runtime, observation)
+                    last_control_succeeded = True
+                    continue
+                if decision.mode == "reconcile_job":
+                    extra.append(await self.reconcile_job(decision.evidence_request, runtime))
+                    context = await self.context(runtime, observation)
+                    last_control_succeeded = True
+                    continue
+                if decision.mode in {"revise_path", "switch_path"}:
+                    if decision.path is None:
+                        raise ValueError("path change needs a structured path")
+                    if not budget.remaining:
+                        return path, [], "continue_planning"
+                    updated = await self.register_path(
+                        decision.path, runtime, context, observation,
+                        switch=decision.mode == "switch_path",
+                        budget=budget,
+                    )
+                    if updated is None:
+                        return path, [], "path revision held"
+                    path = updated
+                    last_control_succeeded = True
+                    continue
+                if decision.mode == "complete_step":
+                    if not budget.remaining:
+                        return path, [], "continue_planning"
+                    path, errors = await self.complete_step(path, decision, runtime, context, budget=budget)
+                    context["feedback"] = errors
+                    last_control_succeeded = not errors
+                    continue
+                if decision.mode == "complete_goal":
+                    if not budget.remaining:
+                        return path, [], "continue_planning"
+                    errors = await self.complete_goal(path, decision, runtime, context, budget=budget)
+                    if not errors:
+                        return path, [], "goal_achieved"
+                    context["feedback"] = errors
+                    continue
+                if decision.mode == "hold":
+                    return path, [], decision.reason
+                if not decision.actions:
+                    raise ValueError("actions decision contained no actions")
+                compiled, errors = await self.compile_actions(path, decision.actions, runtime, context)
+                if errors:
+                    context["feedback"] = errors
+                    continue
+                return path, compiled, None
+            except (ValueError, TypeError, KeyError, PathError) as exc:
+                context["feedback"] = [str(exc)]
                 continue
-            if decision.mode == "update_hypothesis":
-                from redteam.attack_graph.service import AttackGraphService
-                service = AttackGraphService(self.deps.graph_store)
-                suggestion = decision.hypothesis_update
-                target_id = str(suggestion.get("target_node_id", ""))
-                if target_id not in _known_ids(context["knowledge"]):
-                    raise ValueError("hypothesis target is unknown")
-                description = suggestion.get("description")
-                if not isinstance(description, str) or not description.strip():
-                    raise ValueError("hypothesis needs a claim")
-                hypothesis_id = str(suggestion.get("hypothesis_id") or new_id("hyp"))
-                existing = await service.get_hypothesis(hypothesis_id)
-                evidence_ids = list(map(str, suggestion.get("evidence_ids", [])))
-                for identity in evidence_ids:
-                    evidence = await self.deps.evidence_store.get(identity)
-                    if (evidence is None or str(evidence.run_id) != str(runtime.run_id)
-                        or evidence.metadata.get("target_node_id") != target_id):
-                        raise ValueError("hypothesis cites unrelated evidence")
-                hypothesis = Hypothesis(
-                    hypothesis_id=hypothesis_id, description=description,
-                    confidence=float(suggestion.get("confidence", 0.3)), status="open",
-                    metadata={**(existing.metadata if existing else {}),
-                              "target_node_id": target_id, "evidence_ids": evidence_ids,
-                              "needs": suggestion.get("needs", []),
-                              "previous_claim": existing.description if existing else None,
-                              "path_id": path.path_id, "path_version": path.version},
-                )
-                await service.record_hypothesis(hypothesis, about=GraphNodeId(target_id),
-                    step=runtime.step_count, provenance=Provenance(
-                        source="llm:hypothesis", run_id=str(runtime.run_id),
-                        step=runtime.step_count, confidence=Confidence.INFERRED))
-                context = await self.context(runtime, observation)
-                continue
-            if decision.mode == "recover_evidence":
-                from redteam.attack_graph.service import AttackGraphService
-                from redteam.orchestration.recovery import reprocess_evidence
-                recovered = await reprocess_evidence(
-                    evidence_id=str(decision.evidence_request.get("evidence_id", "")),
-                    run_id=str(runtime.run_id), evidence_store=self.deps.evidence_store,
-                    graph_service=AttackGraphService(self.deps.graph_store),
-                    verifier=self.deps.verifier, result_mappers=self.deps.result_mappers,
-                )
-                extra.append(recovered)
-                context = await self.context(runtime, observation)
-                continue
-            if decision.mode == "reconcile_job":
-                extra.append(await self.reconcile_job(decision.evidence_request, runtime))
-                context = await self.context(runtime, observation)
-                continue
-            if decision.mode in {"revise_path", "switch_path"}:
-                if decision.path is None:
-                    raise ValueError("path change needs a structured path")
-                updated = await self.register_path(
-                    decision.path, runtime, context, observation,
-                    switch=decision.mode == "switch_path",
-                )
-                if updated is None:
-                    return path, [], "path revision held"
-                path = updated
-                continue
-            if decision.mode == "complete_step":
-                path, errors = await self.complete_step(path, decision, runtime, context)
-                context["feedback"] = errors
-                continue
-            if decision.mode == "complete_goal":
-                errors = await self.complete_goal(path, decision, runtime, context)
-                if not errors:
-                    return path, [], "goal_achieved"
-                context["feedback"] = errors
-                continue
-            if decision.mode == "hold":
-                return path, [], decision.reason
-            if not decision.actions:
-                raise ValueError("actions decision contained no actions")
-            compiled, errors = await self.compile_actions(path, decision.actions, runtime, context)
-            if errors:
-                context["feedback"] = errors
-                continue
-            return path, compiled, None
-        raise ValueError("decision revision/read budget exhausted")
+        if last_control_succeeded:
+            return path, [], "continue_planning"
+        raise DecisionFailure("next_action", "budget", budget.used, str(context["feedback"]))
 
     async def compile_actions(self, path, intents, runtime, context):
         from redteam.attack_graph.service import AttackGraphService
@@ -393,7 +526,7 @@ class InvestigationEngine:
         steps = {step.step_id: step for step in path.steps}
         drafts = []
         errors = []
-        for intent in intents:
+        for intent_index, intent in enumerate(intents):
             try:
                 step = steps.get(intent.path_step_id)
                 if step is None:
@@ -417,6 +550,8 @@ class InvestigationEngine:
                     raise ValueError("action principal is outside step envelope")
                 if step.principal_refs and not intent.principal_ref:
                     raise ValueError("step requires a principal reference")
+                validate_principal_arguments(step, intent.principal_ref, intent.arguments,
+                                             context["knowledge"])
                 node = await service.get_node(GraphNodeId(intent.target_node_id))
                 if node is None:
                     raise ValueError("referenced action target disappeared")
@@ -426,22 +561,25 @@ class InvestigationEngine:
                     raise ValueError("a real tool catalog is required for action compilation")
                 if self.deps.tool_catalog.get(intent.tool_id) is None:
                     raise ValueError("requested tool is absent from catalog")
-                validate_argument_target(target, intent.arguments)
+                validate_argument_target(target, intent.arguments, target_aliases(self.deps, target))
                 if await self.has_ambiguous_execution(intent, runtime):
                     raise ValueError("matching execution is uncertain; reconcile its stored result/job")
                 if (intent.expectation and intent.expectation.violation_if_met and
                     (intent.expectation.kind == "tool_succeeded" or
                      intent.expectation.field in {"status", "status_code", "success"})):
                     raise ValueError("tool success or status alone cannot prove a violation")
-                if intent.existing_hypothesis_id and await service.get_hypothesis(
-                    intent.existing_hypothesis_id
-                ) is None:
-                    raise ValueError("action references a missing hypothesis")
+                if intent.existing_hypothesis_id:
+                    hypothesis = await service.get_hypothesis(intent.existing_hypothesis_id)
+                    if hypothesis is None:
+                        raise ValueError("action references a missing hypothesis")
+                    if hypothesis.metadata.get("target_node_id") != intent.target_node_id:
+                        raise ValueError("existing hypothesis has no matching target binding")
                 plan = PlanStep(
                     step_id=step.step_id, path_id=path.path_id, path_version=path.version,
                     path_step_id=step.step_id, principal_ref=intent.principal_ref,
-                    operator_intent_id=str(runtime.operator_intent_id)
-                    if runtime.operator_intent_id else None,
+                    operator_intent_id=await operator_epoch(self.deps, runtime),
+                    intent_index=intent_index,
+                    availability_impact=intent.availability_impact,
                     capability=intent.capability, operation=intent.operation,
                     tool_id=intent.tool_id, compatible_tool_ids=[intent.tool_id],
                     target=target, arguments=intent.arguments, reason=intent.reason,
@@ -455,8 +593,8 @@ class InvestigationEngine:
                 drafts.append(CandidateDraft(
                     agent_id=intent.agent_id, plan_step=plan,
                     target_node_ids=[node_id_for_target(target)],
-                    prerequisite_fingerprint=knowledge_fingerprint(context["knowledge"]),
-                    conflict_keys=[f"target:{node.id}:principal:{intent.principal_ref or 'anonymous'}"],
+                    prerequisite_fingerprint=knowledge_fingerprint({"facts": context["knowledge"]["facts"]}),
+                    conflict_keys=[f"target:{node.id}"],
                 ))
             except (ValueError, TypeError, KeyError) as exc:
                 errors.append(str(exc))
@@ -465,13 +603,31 @@ class InvestigationEngine:
         )
         errors.extend(f"{item.reason}: {item.field}" for item in rejected)
         # Scores are telemetry. Preserve the LLM's order exactly.
-        order = {draft.plan_step.model_dump_json(): index for index, draft in enumerate(drafts)}
-        compiled.sort(key=lambda item: next((i for i, draft in enumerate(drafts)
-                      if draft.plan_step.step_id == item.plan_step.step_id
-                      and draft.plan_step.arguments == item.plan_step.arguments), len(order)))
+        compiled.sort(key=lambda item: item.plan_step.intent_index)
+        # Execution identity does not change when a claim, role or path is renamed.
+        # A different tool or grounded investigation state is a different attempt.
         for item in compiled:
+            identity = {"tool_id": str(item.tool.tool_id),
+                        "operation": item.plan_step.operation_key,
+                        "arguments": item.plan_step.arguments,
+                        "targets": list(map(str, item.draft.target_node_ids)),
+                        "principal_ref": item.plan_step.principal_ref,
+                        "knowledge": item.draft.prerequisite_fingerprint}
+            item.candidate_key = "cand_" + hashlib.sha256(
+                json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
+            ).hexdigest()[:24]
+        for item in compiled:
+            try:
+                validate_argument_target(item.plan_step.resolved_target(), item.plan_step.arguments,
+                                         target_aliases(self.deps, item.plan_step.resolved_target()))
+                validate_principal_arguments(steps[item.plan_step.path_step_id],
+                                             item.plan_step.principal_ref, item.plan_step.arguments,
+                                             context["knowledge"])
+            except (ValueError, TypeError) as exc:
+                errors.append(str(exc))
             history = await self.deps.work_store.list_items(run_id=runtime.run_id)
             if any(work.candidate_key == item.candidate_key and work.status is not WorkStatus.PENDING
+                   and not (work.status is WorkStatus.STALE and work.attempt == 0 and not work.job_id)
                    for work in history):
                 errors.append("identical action already recorded; choose an evidenced new action")
         return compiled, errors
@@ -482,6 +638,8 @@ class InvestigationEngine:
             proposal = record.metadata.get("proposal", {})
             metadata = raw.get("metadata", {}) if isinstance(raw, dict) else {}
             if not metadata.get("orchestration_exception"):
+                continue
+            if raw.get("error", {}).get("code") in {"tool_binding_invalid", "lease_lost_before_execution"}:
                 continue
             if (record.metadata.get("target_node_id") == intent.target_node_id
                 and proposal.get("capability") == intent.capability
@@ -516,18 +674,28 @@ class InvestigationEngine:
         result = (await manager.result(work.job_id)).require_result()
         proposal = ActionProposal.model_validate(original.metadata["proposal"])
         step = PlanStep.model_validate(original.metadata["plan_step"])
-        if result.action_id != proposal.action_id or result.tool_id != step.tool_id:
+        if (result.action_id != proposal.action_id or result.tool_id != step.tool_id
+            or result.invocation_id != original.invocation_id):
             return {"status": "unrelated_job_result"}
         result = result.model_copy(update={"metadata": {**result.metadata,
             "execution_reconciled": True, "job_id": work.job_id}})
         replay = initial_graph_state(runtime)
-        replay.update(action_proposal=proposal, plan_step=step, tool_result=result)
+        replay.update(action_proposal=proposal, plan_step=step, tool_result=result,
+                      current_work_id=work.work_id)
         reviewed = await verify_node(replay, deps=self.deps)
         await update_node(reviewed, deps=self.deps)
+        reconciled = await self.deps.work_store.reconcile_job(
+            work.work_id, job_id=work.job_id,
+            status=WorkStatus.SUCCEEDED if result.success else WorkStatus.FAILED,
+            now=datetime.now(timezone.utc),
+        )
+        if not reconciled:
+            return {"status": "result_collected_ledger_unsettled", "job_id": work.job_id,
+                    "evidence_id": str(reviewed.get("result_evidence_id"))}
         return {"status": "collected", "job_id": work.job_id,
                 "evidence_id": str(reviewed.get("result_evidence_id"))}
 
-    async def complete_step(self, path, decision, runtime, context):
+    async def complete_step(self, path, decision, runtime, context, *, budget=None):
         from redteam.attack_graph.service import AttackGraphService
         step = next((item for item in path.steps if item.step_id == decision.path_step_id), None)
         if step is None:
@@ -546,7 +714,10 @@ class InvestigationEngine:
             response_schema={"type": "object", "properties": {
                 "accepted": {"type": "boolean"}, "reason": {"type": "string"}},
                 "required": ["accepted", "reason"], "additionalProperties": False}, system=SYSTEM,
+            budget=budget,
         )
+        await self.record_completion_review("completion_review", path, runtime, review,
+                                            proposal.get("evidence_ids", []), step_id=step.step_id)
         if not review["accepted"]:
             return path, [review["reason"]]
         outcome = proposal.get("outcome", "inconclusive")
@@ -557,7 +728,7 @@ class InvestigationEngine:
         )
         return updated or path, []
 
-    async def complete_goal(self, path, decision, runtime, context):
+    async def complete_goal(self, path, decision, runtime, context, *, budget=None):
         if any(step.required and _text(step.status) != "completed" for step in path.steps):
             return ["required path steps are unfinished"]
         if not any(step.required for step in path.steps):
@@ -568,6 +739,23 @@ class InvestigationEngine:
         if any(work.status in {WorkStatus.PENDING, WorkStatus.LEASED, WorkStatus.RUNNING}
                for work in active_work):
             return ["unfinished execution records remain"]
+        records = await self.deps.evidence_store.list_for_run(runtime.run_id)
+        settled_actions = {str(record.action_id) for record in records
+                           if record.metadata.get("tool_result", {}).get("metadata", {}).get(
+                               "execution_reconciled")}
+        for record in records:
+            raw = record.metadata.get("tool_result")
+            if not isinstance(raw, dict):
+                continue
+            if raw.get("metadata", {}).get("orchestration_exception"):
+                error = raw.get("error") or {}
+                if (error.get("code") not in {"tool_binding_invalid", "lease_lost_before_execution"}
+                    and str(record.action_id) not in settled_actions):
+                    return ["an execution outcome is uncertain; collect its actual result or hold"]
+        from redteam.attack_graph.service import AttackGraphService
+        cleanup = await AttackGraphService(self.deps.graph_store).cleanup_report()
+        if cleanup.outstanding:
+            return ["required cleanup is still outstanding"]
         review = await self.client.ask(
             stage="goal_completion_review", payload={**context,
                 "completion_proposal": decision.completion,
@@ -580,8 +768,10 @@ class InvestigationEngine:
                     "required": ["criterion", "met", "evidence_ids"],
                     "additionalProperties": False}}},
                 "required": ["accepted", "reason", "criteria"], "additionalProperties": False},
-            system=SYSTEM,
+            system=SYSTEM, budget=budget,
         )
+        await self.record_completion_review("goal_completion_review", path, runtime, review,
+                                            [identity for step in path.steps for identity in step.evidence_ids])
         mission = await self.deps.task_graph_store.get_mission(runtime.mission_id)
         if not review["accepted"] or mission is None:
             return [review["reason"]]
@@ -601,6 +791,9 @@ class InvestigationEngine:
         for task in tasks:
             if task.required and task.status not in {TaskStatus.RUNNING, TaskStatus.COMPLETED}:
                 return ["required mission task is not ready for completion"]
+            if (task.required and task.status is TaskStatus.RUNNING
+                and task.task_id != runtime.active_task_id):
+                return ["another required mission task needs its own completion"]
         for task in tasks:
             if task.required and task.status is TaskStatus.RUNNING:
                 await self.deps.task_graph_store.transition_task(task.task_id, TaskStatus.COMPLETED, now=now)
@@ -614,22 +807,85 @@ class InvestigationEngine:
         return []
 
 
-def validate_argument_target(target, arguments: dict) -> None:
+def validate_principal_arguments(step, principal, arguments, knowledge) -> None:
+    bindings = principal_bindings(knowledge)
+    session_refs = [str(arguments[name]) for name in
+                    ("session_ref", "first_session_ref", "second_session_ref")
+                    if arguments.get(name) is not None]
+    if principal and principal not in bindings:
+        raise ValueError("action references an unregistered principal")
+    if session_refs:
+        if principal is None or principal == "anonymous":
+            raise ValueError("session arguments require an identified principal")
+        allowed = set().union(*(bindings.get(ref, set()) for ref in step.principal_refs))
+        if set(session_refs) - allowed or not set(session_refs) & bindings.get(principal, set()):
+            raise ValueError("session arguments do not match accepted principal bindings")
+    if arguments.get("principal_ref") is not None and str(arguments["principal_ref"]) != principal:
+        raise ValueError("principal tool argument differs from action identity")
+
+
+def target_aliases(deps, target) -> set[str]:
+    host = getattr(target, "host", None) or getattr(target, "domain", None)
+    if getattr(target, "url", None):
+        host = urlsplit(target.url).hostname
+    aliases = {str(value) for value in
+               (host, getattr(target, "url", None), getattr(target, "asset_id", None),
+                getattr(target, "service_name", None)) if value}
+    if deps.engagement and host:
+        mapping = deps.engagement.metadata.get("target_refs", {})
+        if isinstance(mapping, dict):
+            configured = {str(ref) for name, ref in mapping.items()
+                          if str(name).lower() == str(host).lower()}
+            if configured:
+                return configured
+    return aliases
+
+
+def validate_argument_target(target, arguments: dict, aliases: set[str] | None = None) -> None:
     """A claimed in-scope target cannot hide a different remote address in arguments."""
     target_host = getattr(target, "host", None) or getattr(target, "domain", None)
     target_url = getattr(target, "url", None)
     if target_url:
         target_host = urlsplit(target_url).hostname
+    if arguments.get("target_ref") is not None:
+        allowed = aliases if aliases is not None else {str(target_host), str(target_url)}
+        if str(arguments["target_ref"]) not in allowed:
+            raise ValueError("tool target reference differs from proposal target binding")
+    target_port = getattr(target, "port", None)
+    if target_url:
+        parsed_target = urlsplit(target_url)
+        target_port = parsed_target.port or (443 if parsed_target.scheme == "https" else 80)
     for name in ("host", "domain", "hostname"):
         if name in arguments and target_host and str(arguments[name]).lower() != str(target_host).lower():
             raise ValueError("tool argument address differs from proposal target")
     for name in ("url", "base_url", "target_url"):
         value = arguments.get(name)
-        if isinstance(value, str) and target_host and urlsplit(value).hostname != str(target_host).lower():
-            raise ValueError("tool argument URL differs from proposal target")
+        if isinstance(value, str) and target_host:
+            if value.startswith("/") and not value.startswith("//"):
+                continue
+            parsed = urlsplit(value if "://" in value or value.startswith("//") else "//" + value)
+            if parsed.hostname != str(target_host).lower():
+                raise ValueError("tool argument URL differs from proposal target")
+            actual_port = parsed.port or (443 if parsed.scheme == "https" else 80)
+            if target_port is not None and actual_port != target_port:
+                raise ValueError("tool argument port differs from proposal target")
+            if target_url and parsed.scheme and parsed.scheme != urlsplit(target_url).scheme:
+                raise ValueError("tool argument scheme differs from proposal target")
+    if arguments.get("port") is not None and target_port is not None:
+        if int(arguments["port"]) != target_port:
+            raise ValueError("tool argument port differs from proposal target")
 
 
-async def validate_current_action(deps, runtime, step) -> list[str]:
+async def operator_epoch(deps, runtime) -> str | None:
+    if deps.operator_intent_store is None or not runtime.mission_id:
+        return None
+    records = await deps.operator_intent_store.list_for_mission(runtime.mission_id)
+    actionable = [record for record in records if _text(record.intent.intent_type)
+                  not in {"status_query", "explanation_query"}]
+    return str(actionable[-1].intent.intent_id) if actionable else None
+
+
+async def validate_current_action(deps, runtime, step, proposal=None) -> list[str]:
     """Used at policy admission AND immediately before an actual invocation."""
     from redteam.attack_graph.service import AttackGraphService
     if step is None or not step.path_id or step.path_version is None or not step.path_step_id:
@@ -649,11 +905,21 @@ async def validate_current_action(deps, runtime, step) -> list[str]:
         problems.append("action operation left the step envelope")
     if step.principal_ref and step.principal_ref not in current.principal_refs:
         problems.append("action principal left the step envelope")
-    if deps.operator_intent_store is not None and runtime.mission_id:
-        records = await deps.operator_intent_store.list_for_mission(runtime.mission_id)
-        actionable = [record for record in records if _text(record.intent.intent_type)
-                      not in {"status_query", "explanation_query"}]
-        if actionable and str(actionable[-1].intent.intent_id) != step.operator_intent_id:
-            problems.append("operator instruction changed since action planning")
-    validate_argument_target(step.resolved_target(), step.arguments)
+    if current.principal_refs and not step.principal_ref:
+        problems.append("accepted step requires a principal")
+    if await operator_epoch(deps, runtime) != step.operator_intent_id:
+        problems.append("operator instruction changed since action planning")
+    if proposal is not None:
+        if (proposal.run_id != runtime.run_id or proposal.engagement_id != runtime.engagement_id
+            or proposal.capability != step.capability or proposal.operation != step.operation
+            or proposal.target != step.resolved_target() or proposal.arguments != step.arguments
+            or proposal.availability_impact != step.availability_impact
+            or (current.agent_id and str(proposal.agent_id) != current.agent_id)):
+            problems.append("proposal differs from the accepted compiled action")
+    try:
+        validate_argument_target(step.resolved_target(), step.arguments,
+                                 target_aliases(deps, step.resolved_target()))
+        validate_principal_arguments(current, step.principal_ref, step.arguments, knowledge)
+    except ValueError as exc:
+        problems.append(str(exc))
     return problems

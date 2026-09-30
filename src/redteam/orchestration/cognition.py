@@ -10,9 +10,13 @@ Contract notes for the orchestration loop:
 - Native schema enforcement lives in the LLM adapter; this client always
   calls complete_structured and re-validates, so either path still lets
   the model decide.
-- Transport and format/schema errors share one budget (max_attempts).
-  Each retry appends the previous validation message to the prompt.
-- Budget spent raises DecisionFailure; empty results are never returned.
+- Transport and format/schema errors share one DecisionBudget
+  (max_attempts). Each retry appends the previous validation message to
+  the prompt. One decision uses one budget: pass the same DecisionBudget
+  to several ask calls (draft, review, action) to share it; never nest an
+  outer caller count with the client budget.
+- Budget spent raises DecisionFailure(kind="budget"); empty results are
+  never returned.
 - SDK-level retries are disabled (num_retries=0); this client is the only
   retry layer.
 - Chain-of-thought is never requested or stored; the system prompt is
@@ -34,7 +38,7 @@ from tenacity import AsyncRetrying, retry_if_exception_type, stop_after_attempt
 from jsonschema import ValidationError
 from jsonschema import validate as _validate_schema
 
-DECISION_KINDS = ("transport", "format", "unknown")
+DECISION_KINDS = ("transport", "format", "budget", "unknown")
 
 _MAX_FEEDBACK_CHARS = 500
 
@@ -43,8 +47,11 @@ class DecisionFailure(Exception):
     """Raised when the attempt budget is spent without a valid decision.
 
     Attributes are kept for the loop: stage names the calling step, kind
-    is one of transport, format, or unknown, attempts counts the tries
-    actually made, and detail carries the last truncated error message.
+    is one of transport, format, budget, or unknown, attempts counts the
+    budgeted LLM requests actually made, and detail carries the last
+    truncated error message. kind == "budget" means the shared
+    DecisionBudget was spent (see DecisionBudget); detail then names the
+    last transport/format failure and the max/used counters.
     """
 
     def __init__(self, stage: str, kind: str, attempts: int, detail: str = "") -> None:
@@ -56,6 +63,61 @@ class DecisionFailure(Exception):
         if detail:
             message += f": {detail}"
         super().__init__(message)
+
+
+class DecisionBudget:
+    """Shared attempt budget for one decision or a chain of decisions.
+
+    One budgeted unit is consumed per actual LLM request. Transport
+    failures, format/schema failures, and caller-side semantic retries
+    that call ask again share the same instance, so an outer caller loop
+    must not multiply its own limit with the client's max_attempts.
+    A single decision uses a single budget: when ask receives one it is
+    the sole limit and max_attempts is ignored (no nesting).
+
+    Exposes remaining/used counters for the loop. When remaining reaches
+    zero the next ask raises DecisionFailure with kind "budget" instead
+    of returning an empty dict.
+    """
+
+    def __init__(self, max_attempts: int = 3) -> None:
+        if max_attempts < 1:
+            raise ValueError("max_attempts must be >= 1")
+        self._max_attempts = int(max_attempts)
+        self._used = 0
+
+    @property
+    def max_attempts(self) -> int:
+        """Total budgeted LLM requests for this instance."""
+        return self._max_attempts
+
+    @property
+    def used(self) -> int:
+        """LLM requests consumed so far."""
+        return self._used
+
+    @property
+    def remaining(self) -> int:
+        """LLM requests still available (max_attempts - used)."""
+        return self._max_attempts - self._used
+
+    def consume(self) -> int:
+        """Consume one budgeted LLM request and return remaining.
+
+        Raises RuntimeError when no budget remains; the client checks
+        remaining first and raises DecisionFailure(kind="budget")
+        instead, so this error only signals a programming bug.
+        """
+        if self._used >= self._max_attempts:
+            raise RuntimeError("decision budget exhausted")
+        self._used += 1
+        return self.remaining
+
+    def __repr__(self) -> str:
+        return (
+            f"DecisionBudget(max_attempts={self._max_attempts}, "
+            f"used={self._used}, remaining={self.remaining})"
+        )
 
 
 class _RetryableDecisionError(Exception):
@@ -104,12 +166,19 @@ class StructuredDecisionClient:
 
     The model always decides; schema enforcement never substitutes a
     rule-based answer. Transport failures and format/schema mismatches
-    share one attempt budget (max_attempts). Each retry carries the
-    previous failure message back into the user prompt. Budget spent
-    raises DecisionFailure, never an empty dict.
+    share one DecisionBudget. Each retry carries the previous failure
+    message back into the user prompt. Budget spent raises
+    DecisionFailure(kind="budget"), never an empty dict.
 
     No chain-of-thought is requested or stored; system is passed through
     unchanged.
+
+    Budget sharing: pass the same DecisionBudget to several ask calls to
+    share one limit across draft, review, and action decisions (and any
+    caller-side semantic retry loop). When budget is None an internal
+    DecisionBudget(self._max_attempts) is used, so existing callers keep
+    working. When a budget is given it is the sole limit;
+    self._max_attempts is ignored and never multiplied with it.
 
     Evidence hook: context_provider is an optional (stage, payload)
     callable, sync or async, injected by the root. When present it may
@@ -137,13 +206,20 @@ class StructuredDecisionClient:
         payload: dict[str, Any],
         response_schema: dict[str, Any],
         system: str = "",
+        budget: DecisionBudget | None = None,
     ) -> dict[str, Any]:
+        if budget is None:
+            budget = DecisionBudget(self._max_attempts)
+        elif not isinstance(budget, DecisionBudget):
+            raise TypeError("budget must be a DecisionBudget or None")
         working = dict(payload)
         extra = await self._resolve_extra_context(stage, payload)
         for key, value in extra.items():
             working.setdefault(key, value)
         json.dumps(working)
-        return await self._ask_with_tenacity(stage, working, response_schema, system)
+        return await self._ask_with_tenacity(
+            stage, working, response_schema, system, budget
+        )
 
     async def _resolve_extra_context(
         self, stage: str, payload: dict[str, Any]
@@ -208,27 +284,62 @@ class StructuredDecisionClient:
         working: dict[str, Any],
         response_schema: dict[str, Any],
         system: str,
+        budget: DecisionBudget,
     ) -> dict[str, Any]:
+        if budget.remaining <= 0:
+            raise DecisionFailure(
+                stage,
+                "budget",
+                budget.used,
+                f"decision budget exhausted before first attempt "
+                f"(max_attempts={budget.max_attempts}, used={budget.used})",
+            )
+        allowed = budget.remaining
         state: dict[str, str] = {"feedback": "", "kind": "unknown"}
-        attempts = 0
-        async for attempt in AsyncRetrying(
-            stop=stop_after_attempt(self._max_attempts),
-            retry=retry_if_exception_type(_RetryableDecisionError),
-            reraise=True,
-        ):
-            attempts += 1
-            with attempt:
-                try:
-                    return await self._attempt_once(
-                        stage=stage,
-                        working=working,
-                        response_schema=response_schema,
-                        system=system,
-                        feedback=state["feedback"],
-                        kind=state["kind"],
+        try:
+            async for attempt in AsyncRetrying(
+                stop=stop_after_attempt(allowed),
+                retry=retry_if_exception_type(_RetryableDecisionError),
+                reraise=True,
+            ):
+                if budget.remaining <= 0:
+                    raise DecisionFailure(
+                        stage,
+                        "budget",
+                        budget.used,
+                        f"decision budget exhausted during retries "
+                        f"(max_attempts={budget.max_attempts}, used={budget.used}); "
+                        f"last failure ({state['kind']}): {state['feedback']}",
                     )
-                except _RetryableDecisionError as exc:
-                    state["feedback"] = exc.feedback
-                    state["kind"] = exc.kind
-                    raise
-        raise DecisionFailure(stage, state["kind"], attempts, state["feedback"])
+                budget.consume()
+                with attempt:
+                    try:
+                        return await self._attempt_once(
+                            stage=stage,
+                            working=working,
+                            response_schema=response_schema,
+                            system=system,
+                            feedback=state["feedback"],
+                            kind=state["kind"],
+                        )
+                    except _RetryableDecisionError as exc:
+                        state["feedback"] = exc.feedback
+                        state["kind"] = exc.kind
+                        raise
+        except _RetryableDecisionError as exc:
+            raise DecisionFailure(
+                stage,
+                "budget",
+                budget.used,
+                f"decision budget exhausted (max_attempts={budget.max_attempts}, "
+                f"used={budget.used}); last failure "
+                f"({state['kind']}): {state['feedback']}",
+            ) from exc
+        raise DecisionFailure(
+            stage,
+            "budget",
+            budget.used,
+            f"decision budget exhausted (max_attempts={budget.max_attempts}, "
+            f"used={budget.used}); last failure "
+            f"({state['kind']}): {state['feedback']}",
+        )

@@ -30,7 +30,10 @@ async def worker_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
     item = state["dispatch_item"]
     action_id = str(item.proposal.action_id)
     local: GraphState = {
-        "runtime": runtime.model_copy(deep=True),
+        "runtime": runtime.model_copy(deep=True, update={
+            "current_agent": item.proposal.agent_id,
+            "active_path_step_id": item.plan_step.path_step_id,
+        }),
         "observation": None,
         "plan_step": item.plan_step,
         "action_proposal": item.proposal,

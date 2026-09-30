@@ -134,7 +134,8 @@ class SQLitePathStore:
                 db.close()
 
     async def register(
-        self, path: PathPlan, expected_version: int | None = None
+        self, path: PathPlan, expected_version: int | None = None,
+        *, expected_path_id: str | None = None,
     ) -> PathPlan:
         """Store one version snapshot, optionally moving the active pointer."""
         normalized_status = _check_plan(path)
@@ -155,10 +156,12 @@ class SQLitePathStore:
                         )
                     if is_active_status(snapshot.status):
                         active = db.execute(
-                            "SELECT version FROM path_active WHERE run_id=?",
+                            "SELECT version, path_id FROM path_active WHERE run_id=?",
                             (snapshot.run_id,),
                         ).fetchone()
                         current = active[0] if active is not None else None
+                        if expected_path_id is not None and (active is None or active[1] != expected_path_id):
+                            raise PathVersionConflict("active path identity changed")
                         if expected_version != current:
                             raise PathVersionConflict(
                                 f"stale active version: expected {expected_version}, "
@@ -202,7 +205,8 @@ class SQLitePathStore:
                     for step in snapshot.steps:
                         older = parent_steps.get(step.step_id)
                         if parent is not None and older is not None \
-                                and step_definition_equal(older, step):
+                                and step_definition_equal(older, step) \
+                                and step.step_id not in snapshot.changed_step_ids:
                             carried = parent_progress.get(step.step_id)
                             if carried is not None:
                                 seeded[step.step_id] = {

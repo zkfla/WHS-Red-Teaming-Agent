@@ -24,7 +24,7 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from redteam.attack_graph.identity import finding_node_id, hypothesis_node_id
-from redteam.attack_graph.predicates import attrs_of, facts_of, provenance_of
+from redteam.attack_graph.predicates import attrs_of, claim_provenance_of, digest_value, facts_of, provenance_of, values_equal
 from redteam.core.contracts.graph import Finding, Hypothesis
 from redteam.core.enums import GraphNodeType
 
@@ -47,6 +47,40 @@ EXCLUDED_FACT_KEYS = frozenset({
     "reason",
     "hypothesis",
 })
+
+#: Declared scope attributes are never measured facts. They stay in
+#: ``provided`` no matter which provenance a later write attaches.
+DECLARED_ATTR_KEYS = frozenset({"in_scope"})
+
+#: Provided-only configuration. The declared participation config (which
+#: sessions exist, display labels) stays in ``provided`` no matter what.
+#: Actually returned binding values (``target_ref``, ``session_refs``,
+#: ``session_ref``, ``credential_kind``) are deliberately NOT banned here:
+#: the measured-source + same-run-raw + value-snapshot gate already blocks
+#: declared promotion, so a session_list/compare response that really
+#: returned them is a legitimate provisioned-binding fact (not an auth
+#: success claim). Ungrounded declarations still never become facts.
+DECLARED_FACT_KEYS = frozenset({
+    "auth_session_config",
+    "display_name",
+})
+
+#: Execution audit and mapper-failure bookkeeping. Kept on the node for
+#: traceability, never projected as observed facts.
+AUDIT_FACT_KEYS = frozenset({
+    "mapper_failure",
+    "mapping_failure",
+    "recovery_note",
+    "recovery_result",
+    "record_kind",
+    "source_evidence_id",
+    "authentication_checks",
+    "authentication_outcome",
+})
+
+#: Cap for per-id diagnostic lists so one noisy run cannot blow up the
+#: projection payload.
+MAX_DIAGNOSTIC_IDS = 200
 
 USABLE_TARGET_TYPES = frozenset({
     GraphNodeType.HOST,
@@ -91,6 +125,8 @@ class FactItem(BaseModel):
     first_seen_step: int = 0
     last_seen_step: int = 0
     origin: str = "observed"
+    grounded_evidence_ids: list[str] = Field(default_factory=list)
+    claim_sources: dict[str, dict[str, Any]] = Field(default_factory=dict)
 class ExcludedAttr(BaseModel):
     node_id: str = ""
     attr: str = ""
@@ -113,6 +149,7 @@ class HypothesisItem(BaseModel):
     supporting_evidence_ids: list[str] = Field(default_factory=list)
     refuting_evidence_ids: list[str] = Field(default_factory=list)
     evidence_ids: list[str] = Field(default_factory=list)
+    neutral_evidence_ids: list[str] = Field(default_factory=list)
     finding_ids: list[str] = Field(default_factory=list)
     related_node_ids: list[str] = Field(default_factory=list)
     relations: list[dict[str, Any]] = Field(default_factory=list)
@@ -225,6 +262,138 @@ def _has_measured(properties: dict[str, Any], run_id: str | None = None) -> bool
         if entry_run is None or str(entry_run) == str(run_id):
             return True
     return False
+
+
+#: Evidence metadata keys holding the preserved raw tool payload.
+_RAW_EVIDENCE_KEYS = ("tool_result", "raw_tool_result")
+
+
+def _record_has_raw(record: Any) -> bool:
+    """Whether an evidence record carries its raw tool payload."""
+    meta = getattr(record, "metadata", {}) or {}
+    if not isinstance(meta, dict):
+        return False
+    for key in _RAW_EVIDENCE_KEYS:
+        if meta.get(key) is not None:
+            return True
+    return False
+
+
+async def _build_evidence_index(evidence_store: Any, run_id: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Same-run evidence by id, plus explicit lookup diagnostics.
+
+    A store failure never becomes an empty list: it marks ``lookup_failed``
+    so every measured claim stays ungrounded with a reason instead of
+    silently vanishing.
+    """
+    diagnostics: dict[str, Any] = {
+        "lookup_failed": False,
+        "lookup_error": None,
+        "not_found": [],
+        "no_raw": [],
+        "run_mismatch": [],
+        "truncated": [],
+    }
+    if evidence_store is None:
+        diagnostics["lookup_failed"] = True
+        diagnostics["lookup_error"] = "no_evidence_store"
+        return {}, diagnostics
+    try:
+        records = await evidence_store.list_for_run(run_id)
+    except Exception as exc:  # noqa: BLE001 - lookup failure is data, not a crash
+        diagnostics["lookup_failed"] = True
+        diagnostics["lookup_error"] = type(exc).__name__
+        return {}, diagnostics
+    by_id: dict[str, Any] = {}
+    no_raw: list[str] = []
+    for rec in records or []:
+        eid = str(getattr(rec, "evidence_id", "") or "")
+        if not eid:
+            continue
+        by_id[eid] = rec
+        if not _record_has_raw(rec):
+            no_raw.append(eid)
+    diagnostics["no_raw"] = _sorted_str(no_raw)[:MAX_DIAGNOSTIC_IDS]
+    return by_id, diagnostics
+
+
+def _claim_grounding(
+    entry: dict[str, Any] | None,
+    *,
+    run_id: str,
+    evidence_index: dict[str, Any],
+    index_failed: bool,
+) -> tuple[bool, str, str | None]:
+    """Grounding check for one claim-map entry.
+
+    Returns ``(grounded, reason, evidence_id)``. Only a ``measured`` entry
+    whose evidence resolves to a same-run record with a raw payload is
+    grounded. ``historical`` means the claim belongs to another run and is
+    reported separately, never merged into current facts.
+    """
+    if entry is None:
+        return False, "legacy_no_claim", None
+    confidence = str(entry.get("confidence", "") or "")
+    if confidence != "measured":
+        return False, "no_measured_provenance", None
+    claim_run = entry.get("run_id")
+    if claim_run is None:
+        claim_run = entry.get("run")
+    evidence_id = entry.get("evidence_id")
+    if evidence_id is None:
+        evidence_id = entry.get("evidence")
+    if claim_run is None or str(claim_run) == "":
+        return False, "run_missing", str(evidence_id) if evidence_id else None
+    if str(claim_run) != str(run_id):
+        return False, "historical", str(evidence_id) if evidence_id else None
+    if evidence_id is None or str(evidence_id) == "":
+        return False, "no_evidence", None
+    eid = str(evidence_id)
+    if index_failed:
+        return False, "evidence_lookup_failed", eid
+    rec = evidence_index.get(eid)
+    if rec is None:
+        return False, "evidence_not_found", eid
+    if not _record_has_raw(rec):
+        return False, "evidence_no_raw", eid
+    return True, "grounded", eid
+
+
+def _node_has_grounded_presence(
+    props: dict[str, Any],
+    *,
+    run_id: str,
+    evidence_index: dict[str, Any],
+    index_failed: bool,
+) -> bool:
+    """Whether *any* claim on the node is grounded (presence, not promotion).
+
+    Used only for provided-target verification: a target counts as observed
+    once a tool actually ran against it with evidence, even though the
+    recorded bookkeeping keys themselves never become facts.
+    """
+    if index_failed:
+        return False
+    for entry in claim_provenance_of(props).values():
+        if not isinstance(entry, dict):
+            continue
+        elements = entry.get("elements")
+        if isinstance(elements, list) and elements:
+            for element in elements:
+                if not isinstance(element, dict):
+                    continue
+                grounded, _, _ = _claim_grounding(
+                    element, run_id=run_id, evidence_index=evidence_index, index_failed=index_failed
+                )
+                if grounded:
+                    return True
+            continue
+        grounded, _, _ = _claim_grounding(
+            entry, run_id=run_id, evidence_index=evidence_index, index_failed=index_failed
+        )
+        if grounded:
+            return True
+    return False
 class HypothesisService:
     """Dedicated hypothesis read/write path over the existing graph schema.
 
@@ -314,7 +483,7 @@ class HypothesisService:
         return _sorted_str(ids)
 
 
-def _provided_claim(node: Any) -> ProvidedClaim:
+def _provided_claim(node: Any, run_id: str = "", evidence_index: dict[str, Any] | None = None, index_failed: bool = False) -> ProvidedClaim:
     props = getattr(node, "properties", {}) or {}
     facts = facts_of(props)
     first, last = _steps_of(props)
@@ -331,9 +500,16 @@ def _provided_claim(node: Any) -> ProvidedClaim:
                 elif isinstance(item, str):
                     sessions.append(item)
     target_ref = facts.get("target_ref", None)
-    measured = _has_measured(props)
-    observed = bool(_node_observations(node)) or bool(_node_evidence_ids(node))
-    verification = "confirmed" if (measured and observed) else "unconfirmed"
+    # Declared scope is never self-confirming: confirmed needs a grounded
+    # measured write (an actual tool run with same-run raw evidence) behind
+    # this node. Node-level flags and bare evidence-id lists do not count.
+    if evidence_index is None:
+        verification = "unconfirmed"
+    else:
+        observed = _node_has_grounded_presence(
+            props, run_id=run_id, evidence_index=evidence_index, index_failed=index_failed
+        )
+        verification = "confirmed" if observed else "unconfirmed"
     return ProvidedClaim(
         node_id=str(node.id),
         node_type=str(node.type.value if hasattr(node.type, "value") else node.type),
@@ -396,59 +572,234 @@ def _is_provided_node(node: Any) -> bool:
             if str(entry.get("source", "")).startswith("engagement:"):
                 return True
     return False
-def _fact_view(node: Any, run_id: str) -> tuple:
+def _fact_view(node: Any, run_id: str, evidence_index: dict[str, Any] | None = None, diagnostics: dict[str, Any] | None = None) -> tuple:
+    """Claim-level fact projection for one node.
+
+    Every attr/fact key needs its own ``measured`` claim-map entry whose
+    evidence resolves to a same-run record with a raw payload. A node-level
+    measured flag never promotes sibling claims; declared, auth and audit
+    keys never become facts. Returns ``(item|None, excluded, historical)``.
+    """
     node_type = getattr(node, "type", None)
     if node_type in (GraphNodeType.HYPOTHESIS, GraphNodeType.FINDING):
-        return None, []
+        return None, [], []
     props = getattr(node, "properties", {}) or {}
     facts = facts_of(props)
     attrs = attrs_of(props)
     first, last = _steps_of(props)
-    measured = _has_measured(props, run_id) or _has_measured(props, None)
-    observations = _node_observations(node)
-    evidence_ids = _node_evidence_ids(node)[:MAX_EVIDENCE_IDS_PER_ITEM]
-    has_support = bool(observations) or bool(evidence_ids)
+    claims = claim_provenance_of(props)
+    index: dict[str, Any] = evidence_index or {}
+    diag: dict[str, Any] = diagnostics if diagnostics is not None else {}
+    index_failed = bool(diag.get("lookup_failed")) if diagnostics is not None else True
+    node_id = str(node.id)
     excluded: list[ExcludedAttr] = []
+    historical: list[dict[str, Any]] = []
     kept_attrs: dict[str, Any] = {}
+    kept_facts: dict[str, Any] = {}
+    grounded_ids: set[str] = set()
+    claim_sources: dict[str, dict[str, Any]] = {}
+
+    def _note_evidence(reason: str, eid: str | None) -> None:
+        if not eid or diagnostics is None:
+            return
+        if reason in ("evidence_not_found",):
+            diag.setdefault("not_found", []).append(eid)
+        elif reason in ("evidence_no_raw",):
+            diag.setdefault("no_raw", []).append(eid)
+        elif reason in ("historical",):
+            diag.setdefault("run_mismatch", []).append(eid)
+
+    def _note_historical(kind: str, key: str, entry: dict[str, Any]) -> None:
+        run = entry.get("run_id")
+        if run is None:
+            run = entry.get("run")
+        historical.append({
+            "node_id": node_id,
+            "kind": kind,
+            "key": str(key),
+            "run": str(run) if run is not None else None,
+            "source": str(entry.get("source", "")),
+        })
+
     for key in sorted(attrs, key=str):
         value = _jsonable(attrs[key])
-        if key in PLAN_PROMOTED_ATTR_KEYS and not (measured and has_support):
-            excluded.append(ExcludedAttr(node_id=str(node.id), attr=str(key), value=value, reason="plan_promoted_without_observation"))
+        if key in DECLARED_ATTR_KEYS:
+            excluded.append(ExcludedAttr(node_id=node_id, attr=str(key), value=value, reason="declared_never_fact"))
             continue
-        if not measured:
-            excluded.append(ExcludedAttr(node_id=str(node.id), attr=str(key), value=value, reason="no_measured_provenance"))
+        entry = claims.get("attrs:" + str(key))
+        grounded, reason, eid = _claim_grounding(entry, run_id=run_id, evidence_index=index, index_failed=index_failed)
+        if reason == "historical" and isinstance(entry, dict):
+            _note_historical("attr", key, entry)
+            _note_evidence(reason, eid)
+            continue
+        if not grounded:
+            if key in PLAN_PROMOTED_ATTR_KEYS:
+                excluded.append(ExcludedAttr(node_id=node_id, attr=str(key), value=value, reason="plan_promoted_without_observation"))
+            else:
+                excluded.append(ExcludedAttr(node_id=node_id, attr=str(key), value=value, reason=reason))
+            _note_evidence(reason, eid)
+            continue
+        if not isinstance(entry, dict) or "value" not in entry:
+            excluded.append(ExcludedAttr(node_id=node_id, attr=str(key), value=value, reason="legacy_no_value"))
+            _note_evidence(reason, eid)
+            continue
+        if not values_equal(entry.get("value"), attrs[key]):
+            excluded.append(ExcludedAttr(node_id=node_id, attr=str(key), value=value, reason="value_changed"))
+            _note_evidence(reason, eid)
             continue
         kept_attrs[str(key)] = value
-    kept_facts: dict[str, Any] = {}
-    if measured:
-        for key in sorted(facts, key=str):
-            if key in EXCLUDED_FACT_KEYS:
+        if eid:
+            grounded_ids.add(eid)
+        if isinstance(entry, dict):
+            claim_sources["attrs:" + str(key)] = {
+                "source": str(entry.get("source", "")),
+                "run": str(entry.get("run_id") if entry.get("run_id") is not None else entry.get("run")),
+                "confidence": str(entry.get("confidence", "")),
+                "evidence_id": eid,
+            }
+    for key in sorted(facts, key=str):
+        if key in EXCLUDED_FACT_KEYS:
+            continue
+        if key == "observations":
+            continue
+        if key in DECLARED_FACT_KEYS:
+            excluded.append(ExcludedAttr(node_id=node_id, attr=str(key), value=_jsonable(facts[key]), reason="declared_never_fact"))
+            continue
+        if key in AUDIT_FACT_KEYS:
+            excluded.append(ExcludedAttr(node_id=node_id, attr=str(key), value=_jsonable(facts[key]), reason="audit_not_fact"))
+            continue
+        entry = claims.get("facts:" + str(key))
+        grounded, reason, eid = _claim_grounding(entry, run_id=run_id, evidence_index=index, index_failed=index_failed)
+        if reason == "historical" and isinstance(entry, dict):
+            _note_historical("fact", key, entry)
+            _note_evidence(reason, eid)
+            continue
+        if not grounded:
+            excluded.append(ExcludedAttr(node_id=node_id, attr=str(key), value=_jsonable(facts[key]), reason=reason))
+            _note_evidence(reason, eid)
+            continue
+        merged_value = facts[key]
+        if not isinstance(entry, dict) or "value" not in entry:
+            excluded.append(ExcludedAttr(node_id=node_id, attr=str(key), value=_jsonable(merged_value), reason="legacy_no_value"))
+            _note_evidence(reason, eid)
+            continue
+        if isinstance(merged_value, list):
+            # Element-level verdict: only elements a grounded measured write
+            # asserted survive. Older declared/inferred elements merged into
+            # the same list are dropped and reported as diagnostics.
+            element_map: dict[str, dict[str, Any]] = {}
+            raw_elements = entry.get("elements", [])
+            if isinstance(raw_elements, list):
+                for element in raw_elements:
+                    if isinstance(element, dict) and element.get("digest"):
+                        element_map.setdefault(str(element["digest"]), element)
+            kept_elements: list[Any] = []
+            dropped = 0
+            dropped_sample: list[Any] = []
+            for item in merged_value:
+                element = element_map.get(digest_value(item))
+                if element is None:
+                    dropped += 1
+                    if len(dropped_sample) < 5:
+                        dropped_sample.append(_jsonable(item))
+                    continue
+                element_grounded, element_reason, element_eid = _claim_grounding(
+                    element, run_id=run_id, evidence_index=index, index_failed=index_failed
+                )
+                if element_reason == "historical":
+                    _note_historical("fact_element", key, element)
+                    _note_evidence(element_reason, element_eid)
+                    dropped += 1
+                    if len(dropped_sample) < 5:
+                        dropped_sample.append(_jsonable(item))
+                    continue
+                if not element_grounded:
+                    dropped += 1
+                    if len(dropped_sample) < 5:
+                        dropped_sample.append(_jsonable(item))
+                    _note_evidence(element_reason, element_eid)
+                    continue
+                kept_elements.append(_jsonable(item))
+                if element_eid:
+                    grounded_ids.add(element_eid)
+            if dropped and diagnostics is not None:
+                diag.setdefault("excluded_elements", []).append({
+                    "node_id": node_id,
+                    "key": str(key),
+                    "excluded_count": dropped,
+                    "sample": dropped_sample,
+                })
+            if not kept_elements:
+                excluded.append(ExcludedAttr(node_id=node_id, attr=str(key), value=_jsonable(merged_value), reason="no_grounded_elements"))
                 continue
-            if key == "observations":
-                continue
-            kept_facts[str(key)] = _jsonable(facts[key])
-    if not kept_attrs and not kept_facts and not observations:
-        return None, excluded
+            kept_facts[str(key)] = kept_elements
+            if isinstance(entry, dict):
+                claim_sources["facts:" + str(key)] = {
+                    "source": str(entry.get("source", "")),
+                    "run": str(entry.get("run_id") if entry.get("run_id") is not None else entry.get("run")),
+                    "confidence": str(entry.get("confidence", "")),
+                    "evidence_id": eid,
+                    "grounded_elements": len(kept_elements),
+                    "total_elements": len(merged_value),
+                }
+            continue
+        if not values_equal(entry.get("value"), merged_value):
+            excluded.append(ExcludedAttr(node_id=node_id, attr=str(key), value=_jsonable(merged_value), reason="value_changed"))
+            _note_evidence(reason, eid)
+            continue
+        kept_facts[str(key)] = _jsonable(merged_value)
+        if eid:
+            grounded_ids.add(eid)
+        if isinstance(entry, dict):
+            claim_sources["facts:" + str(key)] = {
+                "source": str(entry.get("source", "")),
+                "run": str(entry.get("run_id") if entry.get("run_id") is not None else entry.get("run")),
+                "confidence": str(entry.get("confidence", "")),
+                "evidence_id": eid,
+            }
+    kept_observations: list[dict[str, Any]] = []
+    for obs in _node_observations(node):
+        obs_eid = obs.get("evidence_id") if isinstance(obs, dict) else None
+        context_key = str(obs.get("context_key", "")) if isinstance(obs, dict) else ""
+        if not obs_eid or str(obs_eid) not in index or not _record_has_raw(index.get(str(obs_eid))):
+            reason = "evidence_lookup_failed" if index_failed else "observation_ungrounded"
+            excluded.append(ExcludedAttr(node_id=node_id, attr="observations:" + context_key, value=_jsonable(obs), reason=reason))
+            if obs_eid and not index_failed:
+                _note_evidence("evidence_not_found", str(obs_eid))
+            continue
+        kept_observations.append(obs)
+        grounded_ids.add(str(obs_eid))
+    all_ids = _node_evidence_ids(node)
+    if len(all_ids) > MAX_EVIDENCE_IDS_PER_ITEM and diagnostics is not None:
+        diag.setdefault("truncated", []).append({
+            "node_id": node_id,
+            "omitted_evidence_ids": all_ids[MAX_EVIDENCE_IDS_PER_ITEM:],
+        })
+    evidence_ids = all_ids[:MAX_EVIDENCE_IDS_PER_ITEM]
+    if not kept_attrs and not kept_facts and not kept_observations:
+        return None, excluded, historical
     item = FactItem(
-        node_id=str(node.id),
+        node_id=node_id,
         node_type=str(node_type.value if hasattr(node_type, "value") else node_type),
         observed_attrs=kept_attrs,
         observed_facts=kept_facts,
-        observations=observations,
+        observations=kept_observations,
         evidence_ids=evidence_ids,
         provenance=_provenance_summary(props),
         first_seen_step=first,
         last_seen_step=last,
         origin="observed",
+        grounded_evidence_ids=_sorted_str(grounded_ids),
+        claim_sources=claim_sources,
     )
-    return item, excluded
+    return item, excluded, historical
 
 
 def _priority(last_seen: int, node_id: str, targets: set[str], step: int) -> tuple:
     in_target = 0 if node_id in targets else 1
     future = 0 if last_seen <= step else 1
     return (in_target, future, -last_seen, node_id)
-async def _hypothesis_items(graph_service: Any, evidence_store: Any, run_id: str, targets: set[str], step: int) -> list:
+async def _hypothesis_items(graph_service: Any, evidence_index: dict[str, Any] | None, run_id: str, targets: set[str], step: int) -> list:
     svc = HypothesisService(graph_service)
     try:
         hyps = await svc.list()
@@ -461,15 +812,11 @@ async def _hypothesis_items(graph_service: Any, evidence_store: Any, run_id: str
     except Exception:
         edges = []
     edge_list = list(edges or [])
-    try:
-        records = await evidence_store.list_for_run(run_id)
-    except Exception:
-        records = []
     by_hyp: dict[str, list[str]] = {}
-    for rec in records or []:
+    for eid, rec in (evidence_index or {}).items():
         hid = str(getattr(rec, "hypothesis_id", "") or "")
         if hid:
-            by_hyp.setdefault(hid, []).append(str(rec.evidence_id))
+            by_hyp.setdefault(hid, []).append(str(eid))
     finding_links: dict[str, list[str]] = {}
     target_links: dict[str, list[str]] = {}
     for edge in edge_list:
@@ -505,12 +852,18 @@ async def _hypothesis_items(graph_service: Any, evidence_store: Any, run_id: str
                 meta_evidence.extend([str(v) for v in raw])
         linked = _sorted_str(node_evidence + meta_evidence + by_hyp.get(hid, []))[:MAX_EVIDENCE_IDS_PER_ITEM]
         status = str(hyp.status or "open")
-        if status in ("rejected", "inconclusive"):
-            supporting: list[str] = []
-            refuting = list(linked)
-        else:
-            supporting = list(linked)
-            refuting = []
+        # Support/refute needs an explicit record: an inconclusive outcome is
+        # not refuting evidence, and an open TARGETS link is not supporting
+        # evidence. Everything else stays neutral in evidence_ids.
+        explicit_supporting: list[str] = []
+        explicit_refuting: list[str] = []
+        raw_support = meta.get("supporting_evidence_ids", [])
+        raw_refuting = meta.get("refuting_evidence_ids", [])
+        explicit_supporting = _sorted_str([str(v) for v in raw_support]) if isinstance(raw_support, list) else []
+        explicit_refuting = _sorted_str([str(v) for v in raw_refuting]) if isinstance(raw_refuting, list) else []
+        supporting = _sorted_str(explicit_supporting)[:MAX_EVIDENCE_IDS_PER_ITEM]
+        refuting = _sorted_str(explicit_refuting)[:MAX_EVIDENCE_IDS_PER_ITEM]
+        neutral = [eid for eid in linked if eid not in set(supporting) and eid not in set(refuting)]
         meta_target = meta.get("target_node_id", None)
         edge_targets = sorted(set(target_links.get(hid, [])))
         target_node_id = str(meta_target) if isinstance(meta_target, str) and meta_target else (edge_targets[0] if edge_targets else None)
@@ -554,6 +907,7 @@ async def _hypothesis_items(graph_service: Any, evidence_store: Any, run_id: str
             supporting_evidence_ids=supporting,
             refuting_evidence_ids=refuting,
             evidence_ids=linked,
+            neutral_evidence_ids=neutral,
             finding_ids=_sorted_str([s.partition(":")[2] if s.startswith("finding:") else s for s in finding_links.get(hid, [])]),
             related_node_ids=related,
             relations=rels,
@@ -654,31 +1008,48 @@ def _target_address(node: Any) -> tuple[str | None, str | None, str | None]:
     return address, target_ref, observed
 
 
-async def _known_targets(nodes: list, run_id: str, targets: set[str], step: int) -> list:
+async def _known_targets(nodes: list, run_id: str, targets: set[str], step: int, evidence_index: dict[str, Any] | None = None, diagnostics: dict[str, Any] | None = None, grounded_node_ids: set[str] | None = None) -> tuple:
+    """Provided targets plus actually observed ones (grounded only).
+
+    Non-provided nodes join only with grounded measured content from this
+    run; other-run claims are reported as historical, never merged in.
+    Returns ``(known, historical_targets)``.
+    """
     out: list[KnownTarget] = []
+    historical_targets: list[dict[str, Any]] = []
+    index: dict[str, Any] = evidence_index or {}
+    index_failed = bool((diagnostics or {}).get("lookup_failed")) if diagnostics is not None else True
+    grounded: set[str] = grounded_node_ids or set()
     for node in nodes:
         ntype = getattr(node, "type", None)
         if ntype not in USABLE_TARGET_TYPES:
             continue
         props = getattr(node, "properties", {}) or {}
         provided = _is_provided_node(node)
-        measured = _has_measured(props, run_id) or _has_measured(props, None)
-        observations = _node_observations(node)
-        evidence_ids = _node_evidence_ids(node)
         if provided:
             origin = "declared"
-            verification = "confirmed" if (measured and (observations or evidence_ids)) else "unconfirmed"
+            confirmed = _node_has_grounded_presence(props, run_id=run_id, evidence_index=index, index_failed=index_failed)
+            verification = "confirmed" if confirmed else "unconfirmed"
         else:
-            if not measured:
-                continue
-            if not (observations or evidence_ids or facts_of(props).get("target_ref") or facts_of(props).get("observed_target")):
-                if ntype in (GraphNodeType.PRINCIPAL, GraphNodeType.CREDENTIAL):
-                    pass
-                else:
-                    continue
-            origin = "observed"
-            verification = "confirmed" if (observations or evidence_ids) else "unconfirmed"
-            if verification != "confirmed":
+            if str(node.id) in grounded:
+                origin = "observed"
+                verification = "confirmed"
+            elif ntype in (GraphNodeType.PRINCIPAL, GraphNodeType.CREDENTIAL) and _node_has_grounded_presence(props, run_id=run_id, evidence_index=index, index_failed=index_failed):
+                origin = "observed"
+                verification = "confirmed"
+            else:
+                runs: list[str] = []
+                for claim_entry in claim_provenance_of(props).values():
+                    if not isinstance(claim_entry, dict):
+                        continue
+                    claim_run = claim_entry.get("run_id")
+                    if claim_run is None:
+                        claim_run = claim_entry.get("run")
+                    if claim_run is not None and str(claim_run) != "" and str(claim_run) != str(run_id):
+                        runs.append(str(claim_run))
+                runs = _sorted_str(runs)
+                if runs:
+                    historical_targets.append({"node_id": str(node.id), "runs": runs})
                 continue
         address, target_ref, observed = _target_address(node)
         if not address:
@@ -695,7 +1066,7 @@ async def _known_targets(nodes: list, run_id: str, targets: set[str], step: int)
             last_seen_step=l,
         ))
     out.sort(key=lambda t: _priority(t.last_seen_step, t.node_id, targets, step))
-    return out
+    return out, historical_targets
 
 
 def _fact_refs_for_item(item: FactItem) -> list[str]:
@@ -723,10 +1094,12 @@ async def project_knowledge(graph_service: Any, evidence_store: Any, run_id: str
     except Exception:
         nodes = []
     node_list = list(nodes or [])
+    evidence_index, evidence_diagnostics = await _build_evidence_index(evidence_store, run)
+    index_failed = bool(evidence_diagnostics.get("lookup_failed"))
     provided_all: list[ProvidedClaim] = []
     for node in sorted(node_list, key=lambda n: str(n.id)):
         if _is_provided_node(node):
-            provided_all.append(_provided_claim(node))
+            provided_all.append(_provided_claim(node, run, evidence_index, index_failed))
     provided_all.sort(key=lambda c: _priority(c.last_seen_step, c.node_id, targets, step))
     provided_ids = [c.node_id for c in provided_all]
     provided_kept, provided_omitted = _truncate_ids(provided_ids, MAX_PROVIDED_ITEMS)
@@ -735,11 +1108,14 @@ async def project_knowledge(graph_service: Any, evidence_store: Any, run_id: str
 
     fact_all: list[FactItem] = []
     excluded_all: list[ExcludedAttr] = []
+    historical_facts: list[dict[str, Any]] = []
     for node in sorted(node_list, key=lambda n: str(n.id)):
-        item, exc = _fact_view(node, run)
+        item, exc, hist = _fact_view(node, run, evidence_index, evidence_diagnostics)
         excluded_all.extend(exc)
+        historical_facts.extend(hist)
         if item is not None:
             fact_all.append(item)
+    grounded_node_ids = set(item.node_id for item in fact_all)
     fact_all.sort(key=lambda f: _priority(f.last_seen_step, f.node_id, targets, step))
     fact_ids = [f.node_id for f in fact_all]
     fact_kept, fact_omitted = _truncate_ids(fact_ids, MAX_FACT_ITEMS)
@@ -759,7 +1135,7 @@ async def project_knowledge(graph_service: Any, evidence_store: Any, run_id: str
     fact_refs = _sorted_str(all_fact_refs)
     excluded_all.sort(key=lambda e: (e.node_id, e.attr))
 
-    hyps = await _hypothesis_items(graph_service, evidence_store, run, targets, step)
+    hyps = await _hypothesis_items(graph_service, evidence_index, run, targets, step)
     hyp_ids = [h.hypothesis_id for h in hyps]
     hyp_kept, hyp_omitted = _truncate_ids(hyp_ids, MAX_HYPOTHESIS_ITEMS)
     hyp_map = {h.hypothesis_id: h for h in hyps}
@@ -771,7 +1147,7 @@ async def project_knowledge(graph_service: Any, evidence_store: Any, run_id: str
     find_map = {f.finding_id: f for f in finds}
     findings = [find_map[i].model_dump(mode="json") for i in find_kept]
 
-    known_all = await _known_targets(node_list, run, targets, step)
+    known_all, historical_targets = await _known_targets(node_list, run, targets, step, evidence_index, evidence_diagnostics, grounded_node_ids)
     known_ids = [t.node_id for t in known_all]
     known_kept, known_omitted = _truncate_ids(known_ids, MAX_TARGET_ITEMS)
     known_map = {t.node_id: t for t in known_all}
@@ -793,7 +1169,31 @@ async def project_knowledge(graph_service: Any, evidence_store: Any, run_id: str
         "excluded_inferred_attrs": [e.model_dump(mode="json") for e in excluded_all],
         "omitted_fact_node_ids": fact_omitted,
         "omitted_known_target_ids": known_omitted,
+        "historical": {
+            "facts": historical_facts,
+            "targets": historical_targets,
+            "note": "other-run claims are listed here, never merged into facts/known_targets",
+        },
+        "evidence_diagnostics": _finalize_diagnostics(evidence_diagnostics),
     }
+
+
+def _finalize_diagnostics(diagnostics: dict[str, Any]) -> dict[str, Any]:
+    """Dedupe and cap diagnostic lists (lookup failure stays explicit)."""
+    final: dict[str, Any] = {
+        "lookup_failed": bool(diagnostics.get("lookup_failed", False)),
+        "lookup_error": diagnostics.get("lookup_error"),
+    }
+    for key in ("not_found", "no_raw", "run_mismatch"):
+        raw = diagnostics.get(key, [])
+        ids = [str(v) if not isinstance(v, dict) else str(v) for v in (raw or [])]
+        final[key] = _sorted_str(ids)[:MAX_DIAGNOSTIC_IDS]
+    truncated = diagnostics.get("truncated", [])
+    final["truncated"] = list(truncated or [])[:MAX_DIAGNOSTIC_IDS]
+    excluded_elements = diagnostics.get("excluded_elements", [])
+    final["excluded_elements"] = list(excluded_elements or [])[:MAX_DIAGNOSTIC_IDS]
+    final["excluded_element_count"] = len(excluded_elements or [])
+    return final
 
 
 def _truncate_ids(sorted_ids: list[str], limit: int) -> tuple[list[str], list[str]]:
@@ -811,6 +1211,9 @@ __all__ = [
     "FindingItem",
     "KnownTarget",
     "PLAN_PROMOTED_ATTR_KEYS",
+    "DECLARED_ATTR_KEYS",
+    "DECLARED_FACT_KEYS",
+    "AUDIT_FACT_KEYS",
     "project_knowledge",
 ]
 

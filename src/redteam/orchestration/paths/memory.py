@@ -89,7 +89,8 @@ class InMemoryPathStore:
             record_key = (run_id, path_id, version, step.step_id)
             older = parent_steps.get(step.step_id)
             if parent is not None and older is not None \
-                    and step_definition_equal(older, step):
+                    and step_definition_equal(older, step) \
+                    and step.step_id not in snapshot.changed_step_ids:
                 carried = self._progress.get(
                     (run_id, path_id, snapshot.parent_version, step.step_id)
                 )
@@ -141,7 +142,8 @@ class InMemoryPathStore:
             return [self._merged(snapshot) for snapshot in snapshots]
 
     async def register(
-        self, path: PathPlan, expected_version: int | None = None
+        self, path: PathPlan, expected_version: int | None = None,
+        *, expected_path_id: str | None = None,
     ) -> PathPlan:
         """Store one version snapshot, optionally moving the active pointer."""
         normalized_status = _check_plan(path)
@@ -152,6 +154,8 @@ class InMemoryPathStore:
             if is_active_status(path.status):
                 pointer = self._active.get(path.run_id)
                 current = pointer[1] if pointer is not None else None
+                if expected_path_id is not None and (pointer is None or pointer[0] != expected_path_id):
+                    raise PathVersionConflict("active path identity changed")
                 if expected_version != current:
                     raise PathVersionConflict(
                         f"stale active version: expected {expected_version}, "

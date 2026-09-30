@@ -8,7 +8,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -581,6 +581,16 @@ class AgentLoopRunner:
         if outcome is None:
             return None  # still pending
 
+        work_id = state.get("current_work_id")
+        if work_id is None:
+            return None
+        lease = await self._deps.work_store.acquire(
+            work_id, owner=str(runtime.run_id), now=datetime.now(timezone.utc),
+            ttl=timedelta(seconds=self._settings.lease_ttl_seconds),
+        )
+        if lease is None:
+            return None
+
         # A second process may have recovered the same safe checkpoint before
         # this approval was resolved. Its independent Control counters cannot
         # serialize the tool side effect: claim once in the shared checkpoint
@@ -603,8 +613,10 @@ class AgentLoopRunner:
                     _MEMORY_RESUME_CLAIMS.add(claim)
         except (OSError, sqlite3.Error):
             logger.exception("refusing approval resume: durable claim unavailable")
+            await self._deps.work_store.release(work_id, owner=str(runtime.run_id), now=datetime.now(timezone.utc))
             return None
         if not claimed:
+            await self._deps.work_store.release(work_id, owner=str(runtime.run_id), now=datetime.now(timezone.utc))
             return None
 
         resumed_runtime = runtime.model_copy(
@@ -618,6 +630,7 @@ class AgentLoopRunner:
             resumed_runtime,
             action_proposal=proposal,
             plan_step=state.get("plan_step"),
+            current_work_id=state.get("current_work_id"),
         )
         return await self._run_state(resumed_runtime, seeded)
 
@@ -668,6 +681,9 @@ class AgentLoopRunner:
         self._require_checkpointing("resume_from")
         await self._ensure_graph()
         assert self._graph is not None
+        snapshot = await self._graph.aget_state(self.config(checkpoint_id=checkpoint_id))
+        if self._snapshot_replays_execution(snapshot):
+            raise ValueError("checkpoint would repeat an execution; collect its stored result first")
         final: GraphState = await self._graph.ainvoke(
             None, config=self.config(checkpoint_id=checkpoint_id)
         )

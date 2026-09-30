@@ -7,14 +7,19 @@ accounting (budget, consecutive failures).
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 from contextlib import suppress
 from datetime import datetime, timedelta, timezone
 
 from redteam.core.contracts.action import ActionProposal
 from redteam.core.contracts.events import EventType
+from redteam.core.contracts.evidence import EvidenceRecord
 from redteam.core.contracts.tool import ToolError, ToolInvocation, ToolResult
 from redteam.core.convert import build_tool_invocation
-from redteam.core.enums import AgentPhase, RiskLevel, ToolHealthStatus
+from redteam.core.enums import AgentPhase, RiskLevel, ToolHealthStatus, EvidenceSourceType
+from redteam.core.ids import new_id
+from redteam.attack_graph.identity import node_id_for_target
 from redteam.orchestration.action_naming import (
     canonical_action_key,
     tool_matches_action_namespace,
@@ -89,6 +94,7 @@ async def _renew_lease_until_stopped(
 
 async def _invoke_with_semaphore(
     deps: RuntimeDeps, invocation: ToolInvocation, *, runtime=None, step=None, work_id=None,
+    proposal=None,
 ) -> ToolResult:
     """Invoke the tool, honoring the run-wide execution bound.
 
@@ -99,7 +105,7 @@ async def _invoke_with_semaphore(
     """
 
     async def invoke():
-        problems = await validate_current_action(deps, runtime, step)
+        problems = await validate_current_action(deps, runtime, step, proposal)
         if problems:
             raise ValueError("action changed before invocation")
         if deps.long_job_adapter is None:
@@ -113,16 +119,27 @@ async def _invoke_with_semaphore(
             job_id = await manager.submit(invocation)
             if not await deps.work_store.bind_job(work_id, owner=str(runtime.run_id), job_id=job_id):
                 raise RuntimeError("submitted job could not be recorded; reconcile before retry")
-        while True:
-            status = await manager.status(job_id)
-            if status.state in {LongJobState.SUCCEEDED, LongJobState.FAILED, LongJobState.CANCELLED}:
-                result = (await manager.result(job_id)).require_result()
-                if result.action_id != invocation.action_id or result.tool_id != invocation.tool_id:
-                    raise RuntimeError("long job returned an unrelated result")
-                return result
-            if status.state is LongJobState.UNKNOWN:
-                raise RuntimeError("long job execution state is unknown; do not resubmit")
-            await asyncio.sleep(0.5)
+        try:
+            deadline = asyncio.get_running_loop().time() + invocation.timeout_seconds
+            while True:
+                status = await manager.status(job_id)
+                if status.job_id != job_id:
+                    raise RuntimeError("backend returned another job status")
+                if status.state in {LongJobState.SUCCEEDED, LongJobState.FAILED, LongJobState.CANCELLED}:
+                    result = (await manager.result(job_id)).require_result()
+                    if result.action_id != invocation.action_id or result.tool_id != invocation.tool_id:
+                        raise RuntimeError("long job returned an unrelated result")
+                    return result
+                if status.state is LongJobState.UNKNOWN:
+                    raise RuntimeError("long job execution state is unknown; do not resubmit")
+                if asyncio.get_running_loop().time() >= deadline:
+                    raise TimeoutError("registered job is still running; collect its result later")
+                await asyncio.sleep(0.5)
+        except asyncio.CancelledError:
+            # Keep the registered identity even if cancellation is unconfirmed.
+            with suppress(Exception):
+                await asyncio.shield(manager.cancel(job_id))
+            raise
 
     semaphore = deps.tool_semaphore
     if semaphore is None:
@@ -193,6 +210,7 @@ async def execute_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
         and descriptor is not None
         and descriptor.risk_level is RiskLevel.LOW
         and _retry_safe(proposal)
+        and deps.long_job_adapter is None
     )
     max_retries = deps.settings.max_retries
     if work_id is not None:
@@ -211,13 +229,32 @@ async def execute_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
 
     retry_attempts = 0
     try:
-        path_problems = await validate_current_action(deps, runtime, step)
+        path_problems = await validate_current_action(deps, runtime, step, proposal)
         if path_problems:
             binding_ready = False
         if not binding_ready:
             raise RuntimeError("tool binding is no longer valid for the approved action")
         if not lease_ready:
             raise RuntimeError("work lease was lost before tool execution")
+        # Persist the original invocation before submission, so an uncertain
+        # job can be collected later without reconstructing or repeating it.
+        if deps.long_job_adapter is not None:
+            receipt = {"proposal": proposal.model_dump(mode="json"),
+                       "plan_step": step.model_dump(mode="json"),
+                       "invocation": invocation.model_dump(mode="json"),
+                       "candidate_key": step.candidate_key,
+                       "target_node_id": str(node_id_for_target(proposal.target)),
+                       "work_id": work_id, "receipt_kind": "execution_submission"}
+            await deps.evidence_store.append(EvidenceRecord(
+                evidence_id=new_id("evidence"), run_id=runtime.run_id,
+                engagement_id=runtime.engagement_id, source_type=EvidenceSourceType.AGENT,
+                source_id="orchestration.execute", action_id=proposal.action_id,
+                invocation_id=invocation.invocation_id, hypothesis_id=proposal.hypothesis_id,
+                content_type="application/json",
+                digest=hashlib.sha256(json.dumps(receipt, sort_keys=True).encode()).hexdigest(),
+                summary="Registered original execution for job reconciliation",
+                created_at=datetime.now(timezone.utc), metadata=receipt,
+            ))
         if work_id is not None:
             stop_heartbeat = asyncio.Event()
             heartbeat_task = asyncio.create_task(
@@ -231,7 +268,7 @@ async def execute_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             )
         while True:
             result = await _invoke_with_semaphore(
-                deps, invocation, runtime=runtime, step=step, work_id=work_id,
+                deps, invocation, runtime=runtime, step=step, work_id=work_id, proposal=proposal,
             )
             error = result.error
             if (

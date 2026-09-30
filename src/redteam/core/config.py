@@ -17,7 +17,7 @@ from __future__ import annotations
 import os
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import yaml
 from pydantic import BaseModel, Field
@@ -63,7 +63,7 @@ class EngagementConfig(BaseModel):
 
 
 class LLMConfig(BaseModel):
-    provider: str = "fake"  # "fake" | "litellm" — see redteam.llm
+    provider: str = "litellm"  # Production requires the real LLM adapter.
     default_model: str = "gpt-4o-mini"
     api_key_env_var: str = "LLM_API_KEY"
 
@@ -81,8 +81,7 @@ class LLMConfig(BaseModel):
         misconfiguration and must fail loudly, not silently run
         against ``FakeLLMClient`` (which the old "default to the
         ``provider='fake'`` field value" behavior amounted to). Using the
-        offline/test client from this path is still one line away:
-        ``REDTEAM_LLM_PROVIDER=fake`` -- an explicit choice, not a default.
+        test clients must be explicitly injected by the test composition root.
         An unrecognized provider string (a typo, or a name only a *real*
         provider would use, like ``"openai"``) is the same error, not a
         silent fallback either; ``build_llm_client`` enforces the actual
@@ -92,7 +91,6 @@ class LLMConfig(BaseModel):
         if not provider:
             raise ValueError(
                 "REDTEAM_LLM_PROVIDER is not set. Set it explicitly -- "
-                "REDTEAM_LLM_PROVIDER=fake for the offline/test client, or "
                 "REDTEAM_LLM_PROVIDER=litellm (with REDTEAM_LLM_MODEL) for "
                 "a real provider. There is no implicit default."
             )
@@ -107,12 +105,18 @@ class LLMConfig(BaseModel):
 
 
 class OrchestrationConfig(BaseModel):
+    """실행 상한 전용 설정. 후보 생성 방식 선택지가 아니다.
+
+    계획 수립은 항상 언어모델 주도이며, 규칙 후보는 참고용이다.
+    구 이름만 호환용으로 남겼고 값은 항상 참으로 고정된다.
+    거짓은 규칙 경로 선택이 아니라 검증 오류로 거부된다.
+    """
     max_retries: int = Field(default=3, ge=0)
     max_steps: int = Field(default=50, ge=1)
-    #: RC#1 opt-in: let the LLM generate candidate drafts in addition to the
-    #: playbook frontier. Off by default; every generated draft is still
-    #: compiled and policy-checked like any other before it can run.
-    llm_candidate_generation: bool = Field(default=False)
+    #: Legacy opt-in name retained for compatibility; not a mode switch.
+    #: Planning is always LLM-led — False (or "false") fails validation
+    #: instead of selecting a rule path.
+    llm_candidate_generation: Literal[True] = True
 
     @classmethod
     def from_environment(cls) -> OrchestrationConfig:

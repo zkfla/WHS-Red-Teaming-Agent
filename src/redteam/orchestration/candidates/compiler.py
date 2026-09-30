@@ -271,10 +271,12 @@ class CandidateCompiler:
     ) -> dict:
         """Fill schema-declared identity fields from the selected target.
 
-        Endpoint discovery starts at the selected target's known path. A
-        host/service has no path yet, so ``/`` is the bounded root fallback,
-        but only when the selected tool schema says that ``path`` is required.
-        Explicit arguments and concrete endpoint/URL paths always win.
+        Only binds what the selected target actually knows: target identity
+        (host/target_ref and friends) and an actually known endpoint path
+        (concrete Endpoint/URL path). Never invents values. Explicit
+        arguments always win; when no known path exists the argument stays
+        missing so schema validation reports it as missing for the LLM
+        to refill.
         """
 
         values = dict(arguments)
@@ -319,7 +321,12 @@ class CandidateCompiler:
             known_path = None
             if isinstance(target, UrlTarget):
                 known_path = urlsplit(target.url).path or None
-            values["path"] = known_path or "/"
+            # EndpointTarget.path is already bound above via target_values.
+            # Bind here only when the target actually knows a path; otherwise
+            # leave it missing so _schema_rejection reports
+            # missing_required_argument for the LLM to refill.
+            if known_path:
+                values["path"] = known_path
         return values
 
     @staticmethod

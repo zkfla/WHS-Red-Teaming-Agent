@@ -32,16 +32,21 @@ from redteam.attack_graph.observation import (
 )
 from redteam.attack_graph.patterns import NodePattern, ResolveResult
 from redteam.attack_graph.predicates import (
+    CLAIM_PROVENANCE_KEY,
+    CLAIM_FACT_PREFIX,
     CLEANUP_KEY,
     MAX_PROVENANCE_ENTRIES,
     RESERVED_KEYS,
     Provenance,
     apply_retraction,
     build_properties,
+    claim_entries_for_fact_keys,
+    claim_provenance_of,
     cleanup_of,
     facts_of,
     merge_properties,
     validate_properties,
+    values_equal,
 )
 from redteam.attack_graph.retraction import PlannedRetraction, RetractionRule, plan_retractions
 from redteam.attack_graph.snapshot import from_records, to_records
@@ -298,6 +303,15 @@ class AttackGraphService:
                 *built["provenance"],
             ]
             built["retractions"] = [*raw.get("retractions", []), *built["retractions"]]
+            recorded_claims = raw.get(CLAIM_PROVENANCE_KEY, {})
+            if not isinstance(recorded_claims, dict):
+                recorded_claims = {}
+            fresh_claims = built.get(CLAIM_PROVENANCE_KEY, {})
+            if not isinstance(fresh_claims, dict):
+                fresh_claims = {}
+            # Same per-key rule as the live merge: the fresh write wins where
+            # it asserts, recorded history survives everywhere else.
+            built[CLAIM_PROVENANCE_KEY] = {**recorded_claims, **fresh_claims}
             recorded_first = raw.get("first_seen_step", 0)
             recorded_last = raw.get("last_seen_step", 0)
             if step is None:
@@ -414,6 +428,39 @@ class AttackGraphService:
                 if len(recorded) <= MAX_PROVENANCE_ENTRIES
                 else [recorded[0], *recorded[-(MAX_PROVENANCE_ENTRIES - 1) :]]
             )
+            # Per-claim source for the relation content. Flat edge properties
+            # read as ``facts:<key>`` under the same convention as nodes.
+            # Older edges without a claim map keep loading: readers only look
+            # up the coarse keys they already know.
+            relation_values = {
+                key: value
+                for key, value in edge_properties.items()
+                if key not in ("provenance", CLAIM_PROVENANCE_KEY)
+            }
+            fresh_claims = claim_entries_for_fact_keys(
+                relation_values,
+                provenance,
+                provenance.step,
+            )
+            prior_claims = claim_provenance_of(existing.properties) if existing else {}
+            prior_values = dict(existing.properties) if existing else {}
+            merged_claims = dict(prior_claims)
+            for claim_key, entry in fresh_claims.items():
+                prop_key = (
+                    claim_key[len(CLAIM_FACT_PREFIX):]
+                    if claim_key.startswith(CLAIM_FACT_PREFIX)
+                    else None
+                )
+                if (
+                    prop_key is not None
+                    and prop_key in prior_values
+                    and prop_key in relation_values
+                    and claim_key in prior_claims
+                    and values_equal(prior_values[prop_key], relation_values[prop_key])
+                ):
+                    continue  # unchanged relation keeps its source (sticky)
+                merged_claims[claim_key] = entry
+            edge_properties[CLAIM_PROVENANCE_KEY] = merged_claims
 
         edge = GraphEdge(
             id=edge_id,

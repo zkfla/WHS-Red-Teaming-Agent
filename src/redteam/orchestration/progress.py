@@ -29,7 +29,7 @@ def knowledge_fingerprint(knowledge: dict) -> str:
     hypothesis_items = (hypothesis_section.get("items", [])
                         if isinstance(hypothesis_section, dict) else hypothesis_section)
     hypotheses = [item for item in hypothesis_items
-                  if isinstance(item, dict) and item.get("status") in {"confirmed", "refuted"}
+                  if isinstance(item, dict) and item.get("status") in {"confirmed", "refuted", "rejected"}
                   and (item.get("evidence_ids") or item.get("supporting_evidence_ids")
                        or item.get("refuting_evidence_ids") or item.get("source_refs"))]
     payload = canonical({"facts": knowledge.get("facts", []), "conclusions": hypotheses})
