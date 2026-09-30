@@ -31,7 +31,7 @@ from redteam.orchestration.completion import validate_completion
 from redteam.orchestration.evidence_access import EvidenceReader
 from redteam.orchestration.expectations import Expectation
 from redteam.orchestration.knowledge import project_knowledge
-from redteam.orchestration.paths import PathError, PathPlan, is_known_criterion
+from redteam.orchestration.paths import PathError, PathPlan, is_active_status, is_known_criterion
 from redteam.orchestration.paths.models import (
     changed_steps_and_descendants,
     validate_path_structure,
@@ -75,6 +75,7 @@ class TurnDecision(BaseModel):
         "revise_path",
         "switch_path",
         "complete_step",
+        "complete_task",
         "complete_goal",
         "hold",
         "read_evidence",
@@ -103,6 +104,8 @@ SYSTEM = (
     "steps may stay pending. Do not invent observed facts or evidence. "
     "Declare availability_impact for actions that can disrupt service, "
     "and obey the engagement constraints."
+    " Use complete_task to close the current mission task before proceeding to another required "
+    "task; complete_goal settles the original mission only after all required tasks are covered."
 )
 
 
@@ -227,6 +230,29 @@ class InvestigationEngine:
             else None
         )
         active = await self.deps.path_store.get_active(str(runtime.run_id))
+        active_task = (
+            await self.deps.task_graph_store.get_task(runtime.active_task_id)
+            if runtime.active_task_id
+            else None
+        )
+        completed_task_paths = []
+        if runtime.mission_id:
+            tasks = await self.deps.task_graph_store.list_tasks(mission_id=runtime.mission_id)
+            completed_ids = {
+                str(task.task_id) for task in tasks if task.status is TaskStatus.COMPLETED
+            }
+            latest: dict[str, PathPlan] = {}
+            for saved in await self.deps.path_store.list_paths(str(runtime.run_id)):
+                if (
+                    saved.mission_id != str(runtime.mission_id)
+                    or saved.mission_task_id not in completed_ids
+                    or not is_active_status(saved.status)
+                ):
+                    continue
+                previous = latest.get(saved.mission_task_id)
+                if previous is None or previous.version < saved.version:
+                    latest[saved.mission_task_id] = saved
+            completed_task_paths = [item.model_dump(mode="json") for item in latest.values()]
         tools = {}
         if self.deps.tool_catalog is not None:
             capabilities = {cap for agent in self.deps.agents.all() for cap in agent.capabilities}
@@ -261,6 +287,7 @@ class InvestigationEngine:
             "goal": mission.objective if mission else runtime.current_goal,
             "success_criteria": mission.success_criteria if mission else [runtime.current_goal],
             "mission": mission.model_dump(mode="json") if mission else None,
+            "active_task": (active_task.model_dump(mode="json") if active_task else None),
             "operator_instructions": instructions,
             "engagement_constraints": {
                 "scope": self.deps.engagement.scope.model_dump(mode="json"),
@@ -274,6 +301,7 @@ class InvestigationEngine:
             else None,
             "knowledge": knowledge,
             "active_path": active.model_dump(mode="json") if active else None,
+            "completed_task_paths": completed_task_paths,
             "roles": [
                 {"agent_id": str(agent.agent_id), "capabilities": agent.capabilities}
                 for agent in self.deps.agents.all()
@@ -316,10 +344,17 @@ class InvestigationEngine:
         from redteam.attack_graph.service import AttackGraphService
 
         active = await self.deps.path_store.get_active(str(runtime.run_id))
+        switch = switch or bool(
+            active
+            and active.mission_task_id
+            and runtime.active_task_id
+            and active.mission_task_id != str(runtime.active_task_id)
+        )
         candidate = proposed.model_dump(mode="json")
         candidate.update(
             run_id=str(runtime.run_id),
             mission_id=str(runtime.mission_id) if runtime.mission_id else None,
+            mission_task_id=str(runtime.active_task_id) if runtime.active_task_id else None,
             path_id=active.path_id if active and not switch else new_id("path"),
             version=active.version + 1 if active else 1,
             parent_version=active.version if active and not switch else None,
@@ -381,6 +416,7 @@ class InvestigationEngine:
                     for key in (
                         "run_id",
                         "mission_id",
+                        "mission_task_id",
                         "path_id",
                         "version",
                         "parent_version",
@@ -469,6 +505,13 @@ class InvestigationEngine:
     async def decide(self, runtime, observation):
         context = await self.context(runtime, observation)
         path = await self.deps.path_store.get_active(str(runtime.run_id))
+        if (
+            path
+            and path.mission_task_id
+            and runtime.active_task_id
+            and path.mission_task_id != str(runtime.active_task_id)
+        ):
+            path = None
         if path is None:
             drafting_budget = DecisionBudget(self.deps.settings.decision_max_attempts)
             while drafting_budget.remaining:
@@ -649,6 +692,16 @@ class InvestigationEngine:
                         return path, [], "goal_achieved"
                     context["feedback"] = errors
                     continue
+                if decision.mode == "complete_task":
+                    if not budget.remaining:
+                        return path, [], "continue_planning"
+                    errors = await self.complete_task(
+                        path, decision, runtime, context, budget=budget
+                    )
+                    if not errors:
+                        return path, [], "task_completed"
+                    context["feedback"] = errors
+                    continue
                 if decision.mode == "hold":
                     return path, [], decision.reason
                 if not decision.actions:
@@ -692,6 +745,16 @@ class InvestigationEngine:
                 if step.agent_id and step.agent_id != intent.agent_id:
                     raise ValueError("action role is outside accepted step")
                 operation = f"{intent.capability}.{intent.operation}"
+                exclusions = await operator_exclusions(
+                    self.deps,
+                    runtime,
+                    GraphNodeId(intent.target_node_id),
+                    operation,
+                    arguments=intent.arguments,
+                    assessment_text=step.objective,
+                )
+                if exclusions:
+                    raise ValueError("; ".join(exclusions))
                 if operation not in step.allowed_operations:
                     raise ValueError("action operation is outside step envelope")
                 if intent.principal_ref and intent.principal_ref not in step.principal_refs:
@@ -1014,6 +1077,24 @@ class InvestigationEngine:
                     return ["an execution outcome is uncertain; collect its actual result or hold"]
         from redteam.attack_graph.service import AttackGraphService
 
+        for step in path.steps:
+            if not step.required:
+                continue
+            errors = await validate_completion(
+                path=path,
+                step=step,
+                proposal={
+                    "evidence_ids": step.evidence_ids,
+                    "outcome": step.outcome or "success",
+                    "reason": step.objective,
+                },
+                evidence_store=self.deps.evidence_store,
+                graph_service=AttackGraphService(self.deps.graph_store),
+                run_id=str(runtime.run_id),
+                path_store=self.deps.path_store,
+            )
+            if errors:
+                return errors
         cleanup = await AttackGraphService(self.deps.graph_store).cleanup_report()
         if cleanup.outstanding:
             return ["required cleanup is still outstanding"]
@@ -1063,6 +1144,47 @@ class InvestigationEngine:
         if set(criteria) != set(mission.success_criteria):
             return ["goal review must cover the original operator criteria exactly"]
         receipts = {identity for step in path.steps for identity in step.evidence_ids}
+        latest_task_paths = {}
+        for saved in await self.deps.path_store.list_paths(str(runtime.run_id)):
+            if (
+                saved.mission_id != str(runtime.mission_id)
+                or not saved.mission_task_id
+                or not is_active_status(saved.status)
+            ):
+                continue
+            previous = latest_task_paths.get(saved.mission_task_id)
+            if previous is None or previous.version < saved.version:
+                latest_task_paths[saved.mission_task_id] = saved
+        tasks = await self.deps.task_graph_store.list_tasks(mission_id=runtime.mission_id)
+        for task in tasks:
+            saved = latest_task_paths.get(str(task.task_id))
+            if task.status is not TaskStatus.COMPLETED:
+                continue
+            if saved is None:
+                if task.required:
+                    return ["completed required task lacks an accepted evidence-bearing path"]
+                continue
+            for saved_step in saved.steps:
+                if not saved_step.required:
+                    continue
+                if saved_step.status != "completed":
+                    return ["completed task has unfinished path steps"]
+                errors = await validate_completion(
+                    path=saved,
+                    step=saved_step,
+                    proposal={
+                        "evidence_ids": saved_step.evidence_ids,
+                        "outcome": saved_step.outcome or "success",
+                        "reason": saved_step.objective,
+                    },
+                    evidence_store=self.deps.evidence_store,
+                    graph_service=AttackGraphService(self.deps.graph_store),
+                    run_id=str(runtime.run_id),
+                    path_store=self.deps.path_store,
+                )
+                if errors:
+                    return errors
+                receipts.update(saved_step.evidence_ids)
         for criterion in criteria.values():
             if not criterion["met"] or not criterion["evidence_ids"]:
                 return ["goal criterion lacks evidence"]
@@ -1075,10 +1197,15 @@ class InvestigationEngine:
                 ):
                     return ["goal criterion cites unrelated evidence"]
         now = datetime.now(timezone.utc)
-        tasks = await self.deps.task_graph_store.list_tasks(mission_id=runtime.mission_id)
         for task in tasks:
             if task.required and task.status not in {TaskStatus.RUNNING, TaskStatus.COMPLETED}:
                 return ["required mission task is not ready for completion"]
+            if (
+                task.required
+                and task.status is TaskStatus.RUNNING
+                and path.mission_task_id != str(task.task_id)
+            ):
+                return ["goal path is not bound to the required running mission task"]
             if (
                 task.required
                 and task.status is TaskStatus.RUNNING
@@ -1108,6 +1235,96 @@ class InvestigationEngine:
                     ],
                 }
             )
+        )
+        return []
+
+    async def complete_task(self, path, decision, runtime, context, *, budget=None):
+        """Close one evidence-backed mission task without claiming the whole goal."""
+        from redteam.attack_graph.service import AttackGraphService
+
+        if not runtime.mission_id or not runtime.active_task_id:
+            return ["task completion requires an active mission task"]
+        task = await self.deps.task_graph_store.get_task(runtime.active_task_id)
+        if (
+            task is None
+            or task.mission_id != runtime.mission_id
+            or task.status is not TaskStatus.RUNNING
+        ):
+            return ["task completion requires the current running task"]
+        if path.mission_task_id != str(task.task_id):
+            return ["task completion path is not bound to this mission task"]
+        required = [step for step in path.steps if step.required]
+        if not required or any(
+            step.status != "completed" or not step.evidence_ids for step in required
+        ):
+            return ["task requires completed evidence-bearing path steps"]
+        for step in required:
+            errors = await validate_completion(
+                path=path,
+                step=step,
+                proposal={
+                    "evidence_ids": step.evidence_ids,
+                    "outcome": step.outcome or "success",
+                    "reason": step.objective,
+                },
+                evidence_store=self.deps.evidence_store,
+                graph_service=AttackGraphService(self.deps.graph_store),
+                run_id=str(runtime.run_id),
+                path_store=self.deps.path_store,
+            )
+            if errors:
+                return errors
+        history = await self.deps.work_store.list_items(run_id=runtime.run_id)
+        if any(
+            work.status in {WorkStatus.PENDING, WorkStatus.LEASED, WorkStatus.RUNNING}
+            for work in history
+        ):
+            return ["task has unfinished execution records"]
+        records = await self.deps.evidence_store.list_for_run(runtime.run_id)
+        settled = {
+            str(record.action_id)
+            for record in records
+            if record.metadata.get("tool_result", {})
+            .get("metadata", {})
+            .get("execution_reconciled")
+        }
+        for record in records:
+            raw = record.metadata.get("tool_result")
+            if (
+                isinstance(raw, dict)
+                and raw.get("metadata", {}).get("orchestration_exception")
+                and (raw.get("error") or {}).get("code")
+                not in {"tool_binding_invalid", "lease_lost_before_execution"}
+                and str(record.action_id) not in settled
+            ):
+                return ["task has an uncertain execution outcome"]
+        review = await self.client.ask(
+            stage="task_completion_review",
+            payload={
+                **context,
+                "task": task.model_dump(mode="json"),
+                "path": path.model_dump(mode="json"),
+            },
+            response_schema={
+                "type": "object",
+                "properties": {"accepted": {"type": "boolean"}, "reason": {"type": "string"}},
+                "required": ["accepted", "reason"],
+                "additionalProperties": False,
+            },
+            system=SYSTEM,
+            budget=budget,
+        )
+        await self.record_completion_review(
+            "task_completion_review",
+            path,
+            runtime,
+            review,
+            [identity for step in required for identity in step.evidence_ids],
+        )
+        if not review["accepted"]:
+            return [review["reason"]]
+        await self.deps.task_graph_store.transition_task(
+            task.task_id, TaskStatus.COMPLETED, now=datetime.now(timezone.utc)
         )
         return []
 
@@ -1203,8 +1420,81 @@ async def operator_epoch(deps, runtime) -> str | None:
         record
         for record in records
         if _text(record.intent.intent_type) not in {"status_query", "explanation_query"}
+        and _text(record.status) != "rejected"
     ]
     return str(actionable[-1].intent.intent_id) if actionable else None
+
+
+async def operator_exclusions(
+    deps, runtime, target_node_id, operation, *, arguments=None, assessment_text=""
+) -> list[str]:
+    """Apply recorded operator exclusions to every model-proposed action."""
+    from redteam.attack_graph.identity import endpoint_node_id
+    from redteam.orchestration.operator_intents.service import _is_suppressed
+    from redteam.orchestration.operator_intents.suppression import endpoint_excluded
+
+    if not runtime.mission_id:
+        return []
+    mission = await deps.task_graph_store.get_mission(runtime.mission_id)
+    if mission is None:
+        return ["operator mission is missing"]
+    preferences = mission.operator_preferences or {}
+    problems = []
+    if endpoint_excluded(target_node_id, preferences.get("excluded_endpoints") or []):
+        problems.append("operator_excluded_endpoint")
+    node = await deps.graph_store.get_node(target_node_id)
+    arguments = arguments or {}
+    if node is not None:
+        target = target_for_node(
+            node.id, node.type, observed=facts_of(node.properties).get("observed_target")
+        )
+        host = getattr(target, "host", None)
+        port = getattr(target, "port", None)
+        url = getattr(target, "url", None)
+        if url:
+            parsed_target = urlsplit(url)
+            host, port = parsed_target.hostname, parsed_target.port
+        selectors = list(preferences.get("excluded_endpoints") or [])
+        for address in (
+            arguments.get("url"),
+            arguments.get("base_url"),
+            arguments.get("target_url"),
+            arguments.get("endpoint"),
+            arguments.get("path"),
+            url,
+        ):
+            if not isinstance(address, str) or not address:
+                continue
+            parsed = urlsplit(address)
+            address_host = parsed.hostname or host
+            address_port = parsed.port or port
+            authority = f"{address_host}:{address_port}" if address_port else address_host
+            if authority and parsed.path:
+                endpoint = endpoint_node_id("GET", parsed.path, host=authority)
+                if endpoint_excluded(endpoint, selectors):
+                    problems.append("operator_excluded_endpoint")
+    capability = operation.split(".", 1)[0]
+    areas = set(preferences.get("excluded_areas") or [])
+    action_areas = {capability}
+    if capability == "recon":
+        action_areas.add("reconnaissance")
+    if capability == "web":
+        action_areas.add("api")
+    purpose = f"{operation} {assessment_text}".lower()
+    if any(word in purpose for word in ("authentication", "login", "인증")):
+        action_areas.add("authentication")
+    if any(
+        word in purpose
+        for word in ("authorization", "access control", "bola", "idor", "권한", "인가")
+    ):
+        action_areas.add("authorization")
+    if action_areas & areas:
+        problems.append("operator_excluded_area")
+    if runtime.active_task_id:
+        task = await deps.task_graph_store.get_task(runtime.active_task_id)
+        if task is not None and _is_suppressed(task, mission):
+            problems.append("operator_excluded_task")
+    return list(dict.fromkeys(problems))
 
 
 async def validate_current_action(deps, runtime, step, proposal=None) -> list[str]:
@@ -1226,6 +1516,16 @@ async def validate_current_action(deps, runtime, step, proposal=None) -> list[st
         step=runtime.step_count,
     )
     problems = ready_step(path, current, knowledge)
+    problems.extend(
+        await operator_exclusions(
+            deps,
+            runtime,
+            node_id_for_target(step.resolved_target()),
+            step.operation_key,
+            arguments=step.arguments,
+            assessment_text=current.objective,
+        )
+    )
     if str(node_id_for_target(step.resolved_target())) not in current.target_node_ids:
         problems.append("action target left the step envelope")
     if step.operation_key not in current.allowed_operations:

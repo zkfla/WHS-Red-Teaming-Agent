@@ -26,7 +26,8 @@ async def main() -> None:
             llm=LLMConfig.from_environment(),
             capability=CapabilityConfig(
                 mcp_servers=[
-                    name.strip() for name in os.environ.get("REDTEAM_MCP_SERVERS", "").split(",")
+                    name.strip()
+                    for name in os.environ.get("REDTEAM_MCP_SERVERS", "").split(",")
                     if name.strip()
                 ]
             ),

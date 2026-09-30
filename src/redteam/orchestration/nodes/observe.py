@@ -89,10 +89,50 @@ async def observe_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
     )
     task_id = runtime.active_task_id
     if runtime.mission_id is not None:
+        from redteam.orchestration.operator_intents.service import _is_suppressed
+
+        mission = await deps.task_graph_store.get_mission(runtime.mission_id)
+        tasks = await deps.task_graph_store.list_tasks(mission_id=runtime.mission_id)
+        # Dependency readiness is bookkeeping, not a strategy decision. Only
+        # release tasks already registered by the operator/planning layer.
+        by_id = {item.task_id: item for item in tasks}
+        for item in tasks:
+            if item.status not in {TaskStatus.PENDING, TaskStatus.BLOCKED}:
+                continue
+            if mission is not None and _is_suppressed(item, mission):
+                continue
+            if not item.dependency_task_ids:
+                continue
+            if not all(
+                identity in by_id and by_id[identity].status is TaskStatus.COMPLETED
+                for identity in item.dependency_task_ids
+            ):
+                continue
+            if item.status is TaskStatus.PENDING:
+                await deps.task_graph_store.transition_task(
+                    item.task_id, TaskStatus.READY, now=datetime.now(timezone.utc)
+                )
+            elif item.blocking_reason == "required dependency is blocked":
+                await deps.task_graph_store.unblock_task(
+                    item.task_id, now=datetime.now(timezone.utc)
+                )
+                event = await publisher.publish(
+                    EventType.TASK_UNBLOCKED,
+                    {"task_id": item.task_id, "reason": "dependencies_completed"},
+                    causation_id=last_event_id,
+                )
+                last_event_id = event.event_id
         tasks = await deps.task_graph_store.list_tasks(mission_id=runtime.mission_id)
         task = next(
-            (item for item in tasks if item.status in {TaskStatus.READY, TaskStatus.RUNNING}), None
+            (
+                item
+                for item in tasks
+                if item.status in {TaskStatus.READY, TaskStatus.RUNNING}
+                and (mission is None or not _is_suppressed(item, mission))
+            ),
+            None,
         )
+        task_id = task.task_id if task else None
         if task is not None:
             task_id = task.task_id
             if task.status is TaskStatus.READY:

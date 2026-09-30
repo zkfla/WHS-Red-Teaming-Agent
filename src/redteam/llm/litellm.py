@@ -39,7 +39,8 @@ Responses API.
 from __future__ import annotations
 
 import json
-from typing import Any
+from collections.abc import AsyncIterator
+from typing import Any, cast
 
 _CHATGPT_PROVIDER = "chatgpt"
 
@@ -226,7 +227,7 @@ class LiteLLMClient:
         )
 
         text_parts: list[str] = []
-        async for chunk in response:
+        async for chunk in cast(AsyncIterator[Any], response):
             delta = getattr(chunk, "delta", None)
             if delta:
                 text_parts.append(delta)

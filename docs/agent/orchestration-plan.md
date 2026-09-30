@@ -114,6 +114,8 @@ LLM이 최초 조사, 조사 경로 생성·검토, 행동 계획, 재계획, �
 
 Instructor는 현 설치 LiteLLM과 해당 연동 extra의 버전 제약이 맞지 않아 추가하지 않는다. DeepAgents의 현 버전은 Python 3.11 이상과 더 높은 LangChain 버전을 요구하며 실행기·저장 역할도 겹친다. PydanticAI·다른 Agent SDK·Langfuse·새 벡터 저장소도 현재 요구를 해결하는 데 필요한 추가 이점이 확인되지 않아 제외한다. 설치는 이번 구현이 실제 사용하는 패키지에만 한정한다.
 
+최종 설치 확인에서 LangChain MCP Adapters 0.3.2의 MCP 1.x 요구가 저장소의 MCP 2.x와 충돌했다. 현재 소스에 이 어댑터를 사용하는 곳이 없으므로 추가 의존성에서 제외하고 기존 MCP 게이트웨이를 사용한다. [공식 배포 의존성](https://pypi.org/pypi/langchain-mcp-adapters/json)을 기준으로 판단했다.
+
 ## 연구·소스에 따른 선택
 
 | 확인 자료 | 적용할 패턴 | 적용하지 않을 부분·한계 |

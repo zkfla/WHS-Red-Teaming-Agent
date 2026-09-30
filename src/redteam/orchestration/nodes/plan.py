@@ -11,7 +11,7 @@ from redteam.attack_graph.predicates import Confidence, Provenance
 from redteam.core.contracts.action import ActionProposal
 from redteam.core.contracts.events import EventType
 from redteam.core.contracts.graph import Hypothesis
-from redteam.core.enums import AgentPhase
+from redteam.core.enums import AgentPhase, TaskStatus
 from redteam.core.ids import ActionId, new_id
 from redteam.orchestration.candidates.models import ExecutableCandidate
 from redteam.orchestration.cognition import DecisionFailure
@@ -44,6 +44,15 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
     runtime = state["runtime"]
     observation = state.get("observation")
     publisher = publisher_for(state, deps, "orchestration.plan")
+    completed_before = (
+        {
+            task.task_id
+            for task in await deps.task_graph_store.list_tasks(mission_id=runtime.mission_id)
+            if task.status is TaskStatus.COMPLETED
+        }
+        if runtime.mission_id
+        else set()
+    )
     try:
         path, candidates, outcome = await InvestigationEngine(deps).decide(runtime, observation)
     except (DecisionFailure, PathError, ValueError, TypeError) as exc:
@@ -87,16 +96,32 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             phase=AgentPhase.REPLAN,
             termination_reason=TerminationReason.GOAL_ACHIEVED
             if outcome == "goal_achieved"
+            else None
+            if outcome == "task_completed"
             else TerminationReason.INVESTIGATION_HELD,
         )
         last_event_id = state.get("last_event_id")
-        if outcome == "goal_achieved" and runtime.active_task_id is not None:
+        tasks = (
+            await deps.task_graph_store.list_tasks(mission_id=runtime.mission_id)
+            if runtime.mission_id
+            else []
+        )
+        for task in tasks:
+            if task.status is not TaskStatus.COMPLETED or task.task_id in completed_before:
+                continue
             completed = await publisher.publish(
                 EventType.TASK_COMPLETED,
-                {"mission_id": runtime.mission_id, "task_id": runtime.active_task_id},
+                {"mission_id": runtime.mission_id, "task_id": task.task_id},
                 causation_id=last_event_id,
             )
             last_event_id = completed.event_id
+        if outcome == "goal_achieved":
+            settled = await publisher.publish(
+                EventType.MISSION_UPDATED,
+                {"mission_id": runtime.mission_id, "status": "completed"},
+                causation_id=last_event_id,
+            )
+            last_event_id = settled.event_id
         return advance(
             state,
             runtime.model_copy(update=updates),

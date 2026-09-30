@@ -167,6 +167,7 @@ class PathPlan(BaseModel):
     path_id: str
     run_id: str
     mission_id: str | None = None
+    mission_task_id: str | None = None
     version: int
     parent_version: int | None = None
     status: str
