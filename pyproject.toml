@@ -9,6 +9,8 @@ dependencies = [
     "pydantic>=2.6",
     "jsonschema>=4.20,<5.0",
     "langgraph>=0.2",
+    "networkx==3.4.2",
+    "tenacity>=9.1,<10",
     "mcp>=2,<3",
     "pyyaml>=6.0",
     "httpx>=0.28,<1",

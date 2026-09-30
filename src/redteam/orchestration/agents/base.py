@@ -91,6 +91,11 @@ class PlanStep(BaseModel):
     #: Runtime-assigned safe identity for cross-event lookup. Providers leave
     #: it blank; PLAN fills it only after compilation.
     candidate_key: str = ""
+    path_id: str | None = None
+    path_version: int | None = None
+    path_step_id: str | None = None
+    principal_ref: str | None = None
+    operator_intent_id: str | None = None
     capability: str
     operation: str
     tool_id: ToolId
@@ -117,7 +122,7 @@ class PlanStep(BaseModel):
     existing_hypothesis_id: HypothesisId | None = None
     expectation: Expectation | None = None
 
-    #: Predicates to write onto the target node when the step succeeds.
+    #: Legacy planning hints, never promoted as measured facts.
     observed_attrs: dict[str, bool | str | int] = Field(default_factory=dict)
 
     #: ``False`` (the default) means: propose this at most once per target.
@@ -226,7 +231,7 @@ class AgentSpec(BaseModel):
 
     #: ``"playbook"`` takes the first available step; ``"llm"`` asks the
     #: LLM gateway to choose among them (falling back to the first).
-    planner_kind: str = "playbook"
+    planner_kind: Literal["llm"] = "llm"
     system_prompt: str = ""
     #: Stop offering this agent after this many executed actions.
     max_actions: int | None = Field(default=None, ge=1)

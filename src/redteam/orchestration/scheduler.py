@@ -24,9 +24,7 @@ class WorkScheduler:
     ) -> list[WorkItem]:
         created_at = now or datetime.now(timezone.utc)
         enqueued: list[WorkItem] = []
-        for candidate in sorted(
-            candidates, key=lambda item: (-item.priority.total, item.candidate_key)
-        ):
+        for candidate in candidates:
             draft = candidate.draft
             item = WorkItem(
                 work_id=new_id("work"),
@@ -34,6 +32,9 @@ class WorkScheduler:
                 candidate_key=candidate.candidate_key,
                 agent_id=draft.agent_id,
                 graph_revision=graph_revision,
+                path_id=draft.plan_step.path_id,
+                path_version=draft.plan_step.path_version,
+                path_step_id=draft.plan_step.path_step_id,
                 target_node_ids=draft.target_node_ids,
                 hypothesis_id=(
                     draft.plan_step.existing_hypothesis_id

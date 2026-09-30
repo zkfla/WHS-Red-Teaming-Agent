@@ -117,6 +117,45 @@ class SQLiteWorkStore:
             await cursor.close()
         return _item_from_payload(row[0]) if row else None
 
+    async def invalidate_pending(self, *, run_id, path_id, step_ids, now) -> list[str]:
+        await self.setup()
+        changed = []
+        async with _aiosqlite().connect(self._path) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            cursor = await db.execute(
+                "SELECT payload FROM work_items WHERE run_id=? AND status='pending'",
+                (_run_key(run_id),),
+            )
+            for row in await cursor.fetchall():
+                item = _item_from_payload(row[0])
+                if item.path_id == path_id and item.path_step_id in step_ids:
+                    await _save_item(db, item.model_copy(update={
+                        "status": WorkStatus.STALE, "updated_at": now,
+                        "outcome_reason": "path_step_changed",
+                    }))
+                    changed.append(item.work_id)
+            await cursor.close()
+            await db.commit()
+        return changed
+
+    async def bind_job(self, work_id: str, *, owner: str, job_id: str) -> bool:
+        await self.setup()
+        async with _aiosqlite().connect(self._path) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            cursor = await db.execute(
+                "SELECT owner FROM work_leases WHERE work_id=?", (work_id,),
+            )
+            lease = await cursor.fetchone()
+            await cursor.close()
+            item = await _load_item(db, work_id)
+            if (lease is None or lease[0] != owner or item is None
+                or (item.job_id and item.job_id != job_id)):
+                await db.rollback()
+                return False
+            await _save_item(db, item.model_copy(update={"job_id": job_id}))
+            await db.commit()
+        return True
+
     async def list_items(
         self,
         *,

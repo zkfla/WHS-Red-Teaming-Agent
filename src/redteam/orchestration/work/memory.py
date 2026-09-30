@@ -43,6 +43,30 @@ class InMemoryWorkStore:
             item = self._items.get(work_id)
             return item.model_copy(deep=True) if item is not None else None
 
+    async def invalidate_pending(self, *, run_id, path_id, step_ids, now) -> list[str]:
+        changed = []
+        async with self._lock:
+            for identity, item in self._items.items():
+                if (item.run_id == run_id and item.path_id == path_id
+                    and item.path_step_id in step_ids and item.status is WorkStatus.PENDING):
+                    self._items[identity] = item.model_copy(update={
+                        "status": WorkStatus.STALE, "updated_at": now,
+                        "outcome_reason": "path_step_changed",
+                    })
+                    changed.append(identity)
+        return changed
+
+    async def bind_job(self, work_id: str, *, owner: str, job_id: str) -> bool:
+        async with self._lock:
+            lease = self._leases.get(work_id)
+            item = self._items.get(work_id)
+            if lease is None or item is None or lease.owner != owner:
+                return False
+            if item.job_id and item.job_id != job_id:
+                return False
+            self._items[work_id] = item.model_copy(update={"job_id": job_id})
+        return True
+
     async def list_items(
         self,
         *,

@@ -90,7 +90,11 @@ class OrchestrationSettings(BaseModel):
     #: generated draft is compiled and policy-checked exactly like a playbook
     #: draft, so this only widens what is proposed, never what may run.
     #: Default off: the playbook-only frontier stays the baseline behaviour.
-    llm_candidate_generation: bool = Field(default=False)
+    # Accepted only for reading old configs; there is one LLM-led runtime.
+    llm_candidate_generation: Literal[True] = True
+    decision_max_attempts: int = Field(default=3, ge=1, le=6)
+    path_backend: Literal["memory", "sqlite"] = "memory"
+    path_store_path: str = ".redteam/tasks.sqlite"
 
     #: Overrides the value derived from ``max_steps`` when set.
     recursion_limit: int | None = Field(default=None, ge=1)
@@ -123,6 +127,7 @@ class OrchestrationSettings(BaseModel):
             checkpoint_backend="sqlite",
             work_backend="sqlite",
             task_graph_backend="sqlite",
+            path_backend="sqlite",
             attack_graph_backend="sqlite",
             operator_intent_backend="sqlite",
             enforce_verification_reserve=True,
@@ -156,6 +161,5 @@ class OrchestrationSettings(BaseModel):
         if config is not None:
             base["max_steps"] = config.max_steps
             base["max_retries"] = config.max_retries
-            base["llm_candidate_generation"] = config.llm_candidate_generation
         base.update({key: value for key, value in overrides.items() if value is not None})
         return cls.model_validate(base)
