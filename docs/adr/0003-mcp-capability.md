@@ -36,8 +36,13 @@ Framework -> ToolGateway -> MCPToolRegistry -> MCPAdapter -> Existing MCP Server
   `ToolDescriptor`; it never requires the intent name to equal that remote
   tool name.
 
-`ExampleMCPAdapter` remains the harmless in-process test double used when
-no server is configured. Real MCP servers use stdio, Streamable HTTP, SSE,
+`ExampleMCPAdapter` is a harmless in-process test double, reachable only
+by explicit opt-in (`REDTEAM_MCP_SERVERS=example`/
+`capability.mcp_servers=["example"]`) — an unconfigured deployment
+(`capability.mcp_servers` empty) gets an honest empty tool catalog
+instead, never an automatic substitution (a later hardening pass removed
+that fallback: a misconfigured/unconfigured MCP connection must never
+look like a real tool executed). Real MCP servers use stdio, Streamable HTTP, SSE,
 or legacy HTTP transports through the same adapter boundary — several now
 exist (`src/redteam/capability/servers/`: bounded `nmap`/ZAP/`nuclei`
 wrappers, plus self-contained scoped HTTP/recon/proxy/mobile-shell/APK
@@ -67,10 +72,12 @@ Registry.
   tool for operator-only lifecycle work.
 - `MCPToolCatalog` returns healthy, namespace-matched candidates for a
   canonical action but deliberately does not choose one. That query is now
-  exposed to Orchestration via `ToolGateway.list_tools_for_action` (Core
-  Port, implemented) — see `docs/proposals/tool-selection-port.md`
-  (status: implemented) and `orchestration.candidates.tool_selection` for
-  the deterministic selection policy that consumes it.
+  exposed to Orchestration via `redteam.core.ports.tool_catalog.ToolCatalog
+  .list_tools_for_action` (the Core Port; `MCPToolGateway`'s own
+  same-named method just delegates to its `MCPToolCatalog`) — see
+  `docs/proposals/tool-selection-port.md` (status: implemented) and
+  `orchestration.candidates.tool_selection` for the deterministic
+  selection policy that consumes it.
 - The Gateway applies a per-server concurrency semaphore and includes queue
   wait time in the invocation timeout. A tool discovered from an unhealthy
   server is rejected before transport invocation; there is still no automatic
