@@ -307,12 +307,17 @@ choice, never a fallback), or `REDTEAM_LLM_PROVIDER=litellm` (with
 an LLM at all (see its own `--help`), so this requirement does not apply
 to it. Using `litellm` needs the `agent` extra installed
 (`pip install -e ".[agent]"`) — see Quick Start. `LLM_API_KEY`/MCP
-secrets still come from the process environment (`.env.example`) — this
-CLI does not parse `.env` itself, matching the "copy to `.env` and
-source it before running" convention that file already documents (the
-one exception: the interactive `redteam` entrypoint's one-time LLM setup
-prompt writes `REDTEAM_LLM_PROVIDER`/`REDTEAM_LLM_MODEL` straight into
-`.env` for you).
+secrets still come from the process environment (`.env.example`).
+`redteam` (every subcommand, not just the interactive entrypoint) loads a
+`.env` in the current directory into its own process environment at
+startup, best-effort (`_shared.load_dotenv_if_present`) — a real
+shell/CI-exported variable always wins over a `.env` value, so this can
+only fill in what is otherwise unset, never override an explicit choice.
+The interactive `redteam` entrypoint's one-time setup writes
+`REDTEAM_LLM_PROVIDER`/`REDTEAM_LLM_MODEL` (and, if you opt in,
+`REDTEAM_MCP_SERVERS`/`REDTEAM_MCP_RECON_PASSIVE_*` for a single
+low-risk recon-passive server against your first declared host) straight
+into `.env` for you.
 
 `redteam.core.config.AppConfig`/`load_app_config()` (a YAML-loadable
 `AppConfig` shape, e.g. `examples/app.yaml`) still exist as a general

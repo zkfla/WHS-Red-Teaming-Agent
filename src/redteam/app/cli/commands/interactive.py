@@ -21,8 +21,11 @@ or executes any of this.
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
+import socket
+import sys
 from contextlib import AsyncExitStack
 from pathlib import Path
 
@@ -118,6 +121,8 @@ async def _run(console: Console, *, verbose: bool) -> int:
         return EXIT_OK
     engagement_config, objective = selected
 
+    capability_config = await _ensure_mcp_config(console, engagement_config, capability_config)
+
     engagement_config = await _preflight_loop(
         console, engagement_config, llm_client, llm_config, capability_config,
         auto_start=objective is not None,
@@ -208,6 +213,133 @@ async def _ensure_runtime_config(
     capability_config = CapabilityConfig(mcp_servers=mcp_server_ids_from_environment())
     logging_config = LoggingConfig()
     return llm_config, orchestration_config, capability_config, logging_config
+
+
+# Every tool `recon.py`'s `recon-passive` server discovers (servers/recon.py's
+# `@server.tool()` list) must appear here -- `build_mcp_tool_gateway` rejects
+# a binding whose keys don't exactly match the server's discovered tool
+# names. Same canonical operations `deploy/mcp/finance/framework.env.example`
+# already uses for this server in production, not a one-off invention.
+_RECON_PASSIVE_TOOL_OPERATIONS = {
+    "dns_resolve": ["service_discovery"],
+    "http_probe": ["service_discovery"],
+    "tls_inspect": ["service_discovery"],
+    "openapi_inventory": ["endpoint_discovery"],
+    "oidc_inventory": ["endpoint_discovery"],
+    "html_inventory": ["endpoint_discovery"],
+}
+
+
+async def _ensure_mcp_config(
+    console: Console, engagement_config: EngagementConfig, capability_config: CapabilityConfig
+) -> CapabilityConfig:
+    """One-time, opt-in MCP setup for a brand-new environment, persisted to
+    ``.env`` exactly like ``_ensure_runtime_config``'s LLM prompt.
+
+    ``REDTEAM_MCP_SERVERS`` already set means an operator already made this
+    choice -- never overridden or re-prompted. With nothing set and no
+    scope to point at yet either, this stays a no-op: `run`/`tools` already
+    print an honest "no MCP servers configured" warning for that case, and
+    there is nothing safe to default to without a real host.
+
+    When it *can* offer something, it only ever offers the single
+    lowest-risk, read-only capability (``recon-passive``, risk=low) against
+    the first declared ``allowed_hosts`` entry -- never multiple servers,
+    never a guess at write-capable/high-risk tooling -- and only after an
+    explicit yes. Declining leaves ``capability_config`` exactly as it was.
+    """
+    if os.environ.get("REDTEAM_MCP_SERVERS"):
+        return capability_config
+    if not engagement_config.scope.allowed_hosts:
+        return capability_config
+
+    host = engagement_config.scope.allowed_hosts[0].strip().lower()
+    console.print(
+        "\n[dim]No REDTEAM_MCP_SERVERS set -- no MCP server is attached yet, "
+        "so no Action can execute.[/dim]"
+    )
+    answer = console.input(
+        f"Attach the local, read-only recon-passive MCP server against {host!r} "
+        "now? [Y/n]: "
+    ).strip().lower()
+    if answer not in ("", "y", "yes"):
+        return capability_config
+
+    try:
+        policy_path = _write_recon_policy(host)
+    except (OSError, ValueError) as exc:
+        console.print(
+            f"[yellow]{renderer.theme.ICON_WARNING} could not auto-configure MCP: {exc}[/yellow]"
+        )
+        return capability_config
+
+    settings = {
+        "KIND": "recon",
+        "TRANSPORT": "stdio",
+        "COMMAND": sys.executable,
+        "ARGS_JSON": json.dumps(
+            ["-m", "redteam.capability.servers", "recon-passive", "--policy", str(policy_path)]
+        ),
+        "RISK_LEVEL": "low",
+        # Without this, every discovered tool falls back to its own literal
+        # name as its "operation" (see `capability.bootstrap`) instead of a
+        # canonical one (`service_discovery`/`endpoint_discovery`) -- the
+        # Recon Agent's candidates ask for the canonical operation, so a
+        # missing binding here means every candidate is rejected as
+        # `operation_unsupported` and the Mission blocks with zero actions.
+        "TOOL_OPERATIONS_JSON": json.dumps(_RECON_PASSIVE_TOOL_OPERATIONS),
+    }
+    write_env_var(DEFAULT_ENV_PATH, "REDTEAM_MCP_SERVERS", "recon-passive")
+    os.environ["REDTEAM_MCP_SERVERS"] = "recon-passive"
+    for suffix, value in settings.items():
+        key = f"REDTEAM_MCP_RECON_PASSIVE_{suffix}"
+        write_env_var(DEFAULT_ENV_PATH, key, value)
+        os.environ[key] = value
+    console.print(
+        f"[dim]Wrote recon-passive MCP settings to {DEFAULT_ENV_PATH} "
+        f"(policy: {policy_path}). Other hosts/servers can be added the same "
+        f"way -- see .env.example.[/dim]"
+    )
+    return CapabilityConfig(mcp_servers=["recon-passive"])
+
+
+def _write_recon_policy(host: str) -> Path:
+    """A minimal, tightly-scoped ``recon-passive`` policy for exactly one
+    host: read-only paths, and ``allowed_networks`` pinned to that host's
+    own resolved addresses (a /32 or /128 each, not an open range) --
+    never a broader default than the single host the operator just
+    declared in scope.
+
+    Resolves via ``socket.getaddrinfo`` -- the same dual-stack lookup
+    ``servers/network.py``'s ``resolve_target`` actually validates every
+    real request against, and which requires *every* resolved address to
+    fall inside an allowed network. ``socket.gethostbyname`` (IPv4-only)
+    previously missed a host's IPv6 address -- "localhost" resolves to
+    both ``127.0.0.1`` and ``::1`` on Windows -- so a real, reachable
+    request to that same host still failed "target address outside
+    configured networks" the moment resolution returned the IPv6 entry.
+    """
+    hostname = host.rsplit(":", 1)[0] if ":" in host and not host.startswith("[") else host
+    port_text = host.rsplit(":", 1)[1] if ":" in host and not host.startswith("[") else None
+    port = int(port_text) if port_text else 80
+    try:
+        infos = socket.getaddrinfo(hostname, port, type=socket.SOCK_STREAM)
+    except OSError as exc:
+        raise ValueError(f"could not resolve {hostname!r}: {exc}") from exc
+    addresses = sorted({str(info[4][0]) for info in infos})
+    if not addresses:
+        raise ValueError(f"could not resolve {hostname!r} to any address")
+    networks = [
+        f"{address}/32" if ":" not in address else f"{address}/128" for address in addresses
+    ]
+
+    policy = {
+        "targets": {host: {"origin": f"http://{host}", "allowed_paths": ["/"]}},
+        "allowed_networks": networks,
+    }
+    path = Path("mcp-recon-policy.json")
+    path.write_text(json.dumps(policy, indent=2) + "\n", encoding="utf-8")
+    return path.resolve()
 
 
 # --- Engagement Intake (sections 9, 12) ------------------------------------

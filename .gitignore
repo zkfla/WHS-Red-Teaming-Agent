@@ -14,6 +14,7 @@ build/
 /data/
 /engagement.yaml
 /vulnbank-web-policy.json
+/mcp-recon-policy.json
 tests/vuln-bank/
 
 공통 개발 시작 프롬프트.md
