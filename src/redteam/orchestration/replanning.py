@@ -457,6 +457,12 @@ def _evaluate_criterion(
     tasks: list[MissionTask],
     evidence: list[EvidenceRecord],
 ) -> MissionCriterionResult:
+    """Evaluate one mission success string. Unknown conditions never pass.
+
+    Any criterion without a supported evaluator (wrong prefix or unknown
+    workstream) returns met=False so it can never read as satisfied.
+    Caller signature is unchanged.
+    """
     prefix = "verified evidence for "
     if not criterion.startswith(prefix):
         return MissionCriterionResult(

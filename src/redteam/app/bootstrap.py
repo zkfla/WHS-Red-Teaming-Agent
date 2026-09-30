@@ -128,10 +128,9 @@ def build_llm_client(config: LLMConfig) -> LLMClient:
         from redteam.llm.litellm import LiteLLMClient
 
         return LiteLLMClient(model=config.default_model, api_key=config.resolve_api_key())
-    if config.provider == "fake":
-        return FakeLLMClient()
     raise ValueError(
-        f"unknown LLM provider {config.provider!r} -- expected 'fake' or 'litellm'"
+        f"production requires a real LLM provider, received {config.provider!r}; "
+        "configure 'litellm' (test clients must be explicitly injected)"
     )
 
 
@@ -252,6 +251,14 @@ def _build_task_graph_store(settings: OrchestrationSettings) -> MissionTaskStore
     return InMemoryTaskGraphStore()
 
 
+def _build_path_store(settings: OrchestrationSettings):
+    from redteam.orchestration.paths import InMemoryPathStore, SQLitePathStore
+
+    if settings.path_backend == "sqlite" or settings.task_graph_backend == "sqlite":
+        return SQLitePathStore(settings.task_graph_path)
+    return InMemoryPathStore()
+
+
 def _build_work_store(settings: OrchestrationSettings) -> WorkStore:
     if settings.work_backend == "sqlite":
         return SQLiteWorkStore(settings.work_path)
@@ -277,6 +284,7 @@ async def build_application(
     tool_catalog: ToolCatalog | None = None,
     task_graph_store: MissionTaskStore | None = None,
     engagement_id: EngagementId | None = None,
+    long_job_adapter=None,
 ) -> tuple[Engagement, RuntimeDeps]:
     """``AppConfig``-aware composition root. Every dependency is overridable.
 
@@ -381,6 +389,8 @@ async def build_application(
         tool_catalog=resolved_tool_catalog,
         work_store=_build_work_store(resolved_settings),
         task_graph_store=(task_graph_store or _build_task_graph_store(resolved_settings)),
+        path_store=_build_path_store(resolved_settings),
+        long_job_adapter=long_job_adapter,
         operator_intent_store=build_operator_intent_store(
             resolved_settings.operator_intent_backend, resolved_settings.operator_intent_path
         ),
@@ -400,12 +410,18 @@ async def _publish_terminal_artifacts(
 ) -> None:
     """Project and publish a report for every terminal outcome."""
 
+    path = await deps.path_store.get_active(str(runtime.run_id))
+    required_hypotheses = {
+        criterion.hypothesis_id for step in path.steps if step.required
+        for criterion in step.completion_criteria if criterion.hypothesis_id
+    } if path else set()
     report = await ReportingAgent().project(
         runtime,
         graph=AttackGraphService(deps.graph_store),
         evidence_store=deps.evidence_store,
         work_store=deps.work_store,
         task_store=deps.task_graph_store,
+        required_hypothesis_ids=required_hypotheses,
     )
     try:
         # The only thing that makes `redteam status`/`findings`/`report`
@@ -543,7 +559,7 @@ async def run_engagement(
         started_at=datetime.now(timezone.utc),
         phase=AgentPhase.OBSERVE,
         mission_id=mission_id,
-        current_goal=f"map and probe the declared scope of {engagement.name}",
+        current_goal=(await deps.task_graph_store.get_mission(mission_id)).objective,
         remaining_budget=engagement.execution_budget.max_actions,
     )
     runner = AgentLoopRunner(deps, settings=settings)

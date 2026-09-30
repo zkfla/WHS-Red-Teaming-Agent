@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from collections import Counter
 
+from collections.abc import Collection
+
 from pydantic import BaseModel, Field
 
 from redteam.attack_graph.service import AttackGraphService
@@ -123,6 +125,10 @@ class TerminalReportProjection(BaseModel):
     integrity_blockers: list[str] = Field(default_factory=list)
     unresolved_hypotheses: list[str] = Field(default_factory=list)
     outstanding_cleanup: list[str] = Field(default_factory=list)
+    #: Required-scope split of unresolved_hypotheses. Additive only:
+    #: unresolved_hypotheses keeps the full list, these two scope it.
+    required_unresolved_hypotheses: list[str] = Field(default_factory=list)
+    deferred_hypotheses: list[str] = Field(default_factory=list)
     #: Optional so reports persisted before Mission reporting existed still load.
     mission: MissionProjection | None = None
     effectiveness: RunEffectiveness = Field(default_factory=RunEffectiveness)
@@ -139,12 +145,21 @@ class ReportingAgent:
         evidence_store: EvidenceStore,
         work_store: WorkStore,
         task_store: MissionTaskStore | None = None,
+        required_hypothesis_ids: Collection[str] | None = None,
     ) -> TerminalReportProjection:
         if not runtime.is_terminal:
             raise ValueError("reporting projection requires a terminal runtime")
 
         integrity = await graph.integrity_report()
         cleanup = await graph.cleanup_report()
+        unresolved = list(integrity.unresolved_hypotheses)
+        if required_hypothesis_ids is None:
+            required_unresolved = list(unresolved)
+            deferred = []
+        else:
+            required = {str(item) for item in required_hypothesis_ids}
+            required_unresolved = [item for item in unresolved if str(item) in required]
+            deferred = [item for item in unresolved if str(item) not in required]
         evidence = [
             item for item in await evidence_store.list_for_run(runtime.run_id)
             if item.engagement_id == runtime.engagement_id
@@ -210,7 +225,9 @@ class ReportingAgent:
                 runtime.phase is AgentPhase.FINISHED
                 and runtime.termination_reason == TerminationReason.NO_ACTIONABLE_PLAN
                 and not integrity.blocking
-                and not integrity.unresolved_hypotheses
+                # Required scope only: non-required open hypotheses are
+                # reported as deferred and never alone block release.
+                and not required_unresolved
                 and cleanup.is_clear
                 # A depleted candidate frontier is not evidence that the
                 # Mission's required work or success criteria were met.
@@ -232,7 +249,9 @@ class ReportingAgent:
             findings=projected_findings,
             evidence_ids=[item.evidence_id for item in evidence],
             integrity_blockers=integrity.blocking,
-            unresolved_hypotheses=integrity.unresolved_hypotheses,
+            unresolved_hypotheses=unresolved,
+            required_unresolved_hypotheses=required_unresolved,
+            deferred_hypotheses=deferred,
             outstanding_cleanup=[str(item.node_id) for item in cleanup.outstanding],
             mission=mission,
             effectiveness=effectiveness,

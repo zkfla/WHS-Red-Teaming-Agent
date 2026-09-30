@@ -85,13 +85,13 @@ def plan_mission(
         or extract_focus_areas(objective_text)
         or (list(recorded) if isinstance(recorded, list) else [])
     )
-    priorities = [str(item) for item in focus] or ["reconnaissance", "web/api assessment"]
-    # The default web sweep is optional until a relevant surface is found.
-    # Only promise evidence for workstreams the operator explicitly requested.
-    success_criteria = [
-        f"verified evidence for {priority}"
-        for priority in (priorities if focus else ["reconnaissance"])
-    ]
+    priorities = [str(item) for item in focus]
+    supplied_criteria = engagement.metadata.get("success_criteria")
+    success_criteria = (
+        [str(item) for item in supplied_criteria]
+        if isinstance(supplied_criteria, list) and supplied_criteria
+        else [objective_text]
+    )
 
     return MissionPlan(
         mission_id=mission_id,

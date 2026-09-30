@@ -10,6 +10,32 @@ from redteam.attack_graph.observation import GraphObservation
 from redteam.core.enums import GraphEdgeType, GraphNodeType
 
 
+def knowledge_fingerprint(knowledge: dict) -> str:
+    """Progress is content or supported conclusions, never a new receipt name."""
+    ignored = {"evidence_id", "evidence_ids", "invocation_id", "action_id", "run_id",
+               "created_at", "updated_at", "step", "summary", "source_refs", "reason",
+               "first_seen_step", "last_seen_step", "provenance", "observed_at", "timestamp",
+               "hypothesis_id", "finding_id"}
+
+    def canonical(value):
+        if isinstance(value, dict):
+            return {key: canonical(item) for key, item in value.items() if key not in ignored}
+        if isinstance(value, list):
+            unique = {json.dumps(canonical(item), sort_keys=True, default=str) for item in value}
+            return sorted(unique)
+        return value
+
+    hypothesis_section = knowledge.get("hypotheses", [])
+    hypothesis_items = (hypothesis_section.get("items", [])
+                        if isinstance(hypothesis_section, dict) else hypothesis_section)
+    hypotheses = [item for item in hypothesis_items
+                  if isinstance(item, dict) and item.get("status") in {"confirmed", "refuted"}
+                  and (item.get("evidence_ids") or item.get("supporting_evidence_ids")
+                       or item.get("refuting_evidence_ids") or item.get("source_refs"))]
+    payload = canonical({"facts": knowledge.get("facts", []), "conclusions": hypotheses})
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()
+
+
 def observation_fingerprint(
     observation: GraphObservation,
     *,

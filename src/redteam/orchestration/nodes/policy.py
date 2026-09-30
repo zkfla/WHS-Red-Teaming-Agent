@@ -20,6 +20,7 @@ from redteam.core.contracts.events import EventType
 from redteam.core.contracts.policy import ControlContext, PolicyDecision
 from redteam.core.enums import AgentPhase, PolicyVerdict, Severity
 from redteam.orchestration.context import RuntimeDeps
+from redteam.orchestration.engine import validate_current_action
 from redteam.orchestration.nodes._support import advance, publisher_for
 from redteam.orchestration.state import GraphState, TerminationReason
 from redteam.orchestration.work.models import WorkStatus
@@ -70,6 +71,21 @@ async def policy_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
 
     correlation_id = str(proposal.action_id)
     publisher = publisher_for(state, deps, "orchestration.policy")
+
+    problems = await validate_current_action(deps, runtime, state.get("plan_step"))
+    if problems:
+        decision = PolicyDecision(
+            action_id=proposal.action_id, verdict=PolicyVerdict.DENY,
+            reasons=problems, matched_rules=["orchestration:stale_or_invalid_path"],
+            evaluated_at=datetime.now(timezone.utc),
+        )
+        event = await publisher.publish(EventType.ACTION_DENIED, {
+            "action_id": proposal.action_id, "reasons": problems,
+        }, correlation_id=correlation_id, causation_id=state.get("last_event_id"))
+        return advance(state, runtime.model_copy(update={
+            "phase": AgentPhase.REPLAN, "pending_approval_id": None,
+            "termination_reason": None, "planning_feedback": problems,
+        }), last_event_id=event.event_id, policy_decision=decision)
 
     # Live concurrency signal for ROE's max_parallel_actions (control/roe.py
     # cannot compute this itself: the Work Ledger is Orchestration's, not

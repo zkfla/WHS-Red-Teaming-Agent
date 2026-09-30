@@ -24,10 +24,12 @@ from redteam.orchestration.agents.providers import (
     default_provider_registry,
 )
 from redteam.orchestration.agents.registry import AgentRegistry, default_registry
-from redteam.orchestration.analysis import AnalysisVerifier, DeterministicAnalysisVerifier
+from redteam.orchestration.analysis import AnalysisVerifier, StructuredLLMAnalysisVerifier
 from redteam.orchestration.context_projection import ContextProjectionCache
 from redteam.orchestration.observations import ResultMapperRegistry, default_result_mapper_registry
 from redteam.orchestration.operator_intents.store import OperatorIntentStore
+from redteam.orchestration.paths import InMemoryPathStore, PathStore
+from redteam.orchestration.long_jobs import LongJobAdapter
 from redteam.orchestration.settings import OrchestrationSettings
 from redteam.orchestration.task_graph.memory import InMemoryTaskGraphStore
 from redteam.orchestration.work.memory import InMemoryWorkStore
@@ -42,7 +44,9 @@ class RuntimeDeps:
     graph_store: AttackGraphStore
     evidence_store: EvidenceStore
     llm_client: LLMClient
-    verifier: AnalysisVerifier = field(default_factory=DeterministicAnalysisVerifier)
+    verifier: AnalysisVerifier | None = None
+    path_store: PathStore = field(default_factory=InMemoryPathStore)
+    long_job_adapter: LongJobAdapter | None = None
 
     agents: AgentRegistry = field(default_factory=default_registry)
     candidate_providers: CandidateProviderRegistry = field(
@@ -74,3 +78,9 @@ class RuntimeDeps:
     #: enforced. The bound is applied at the tool call site (EXECUTE), not at
     #: policy admission, so a bounded fan-out batch still executes fully.
     tool_semaphore: asyncio.Semaphore | None = field(default=None, compare=False)
+
+    def __post_init__(self) -> None:
+        if self.verifier is None:
+            object.__setattr__(self, "verifier", StructuredLLMAnalysisVerifier(
+                self.llm_client, self.evidence_store,
+            ))

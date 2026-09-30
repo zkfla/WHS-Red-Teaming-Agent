@@ -16,6 +16,7 @@ from redteam.attack_graph.service import HYPOTHESIS_INCONCLUSIVE, HYPOTHESIS_OPE
 from redteam.core.contracts.events import EventType
 from redteam.core.convert import tool_result_to_evidence
 from redteam.core.enums import AgentPhase, GraphEdgeType, GraphNodeType, Verdict
+from redteam.orchestration.action_naming import canonical_action_key
 from redteam.orchestration.analysis import VerificationAssessment, VerificationRequest
 from redteam.orchestration.authentication import (
     ACCESS_CONTROL_VIOLATION,
@@ -66,7 +67,7 @@ async def verify_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
         run_id=runtime.run_id,
         engagement_id=runtime.engagement_id,
         hypothesis_id=proposal.hypothesis_id,
-        summary=proposal.expected_observation,
+        summary=_summarize_result(result),
     )
     evidence = evidence.model_copy(
         update={
@@ -77,7 +78,7 @@ async def verify_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                 "capability": proposal.capability,
                 "operation": proposal.operation,
                 "candidate_key": step.candidate_key if step is not None else "",
-                "mission_task_id": str(runtime.active_task_id) if runtime.active_task_id else None,
+                **_evidence_metadata(proposal, result, step, runtime),
             }
         }
     )
@@ -416,3 +417,82 @@ async def verify_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
         tool_result=result,
         result_evidence_id=evidence.evidence_id,
     )
+
+
+def _summarize_result(result) -> str:
+    """One line on what actually happened -- output shape or error code.
+
+    Never the expected text: the plan's hope is stored separately under
+    "expected_observation". Values stay out on purpose (keys and counts
+    only), so the summary cannot leak payload data into reports.
+    """
+    tool = str(result.tool_id)
+    if result.success:
+        output = result.output
+        if isinstance(output, dict):
+            status = output.get("status_code")
+            if type(status) is int:
+                return tool + " succeeded (status " + str(status) + ")"
+            keys = sorted(str(key) for key in list(output)[:5])
+            if keys:
+                return tool + " succeeded (output keys: " + ",".join(keys) + ")"
+            return tool + " succeeded (empty output)"
+        if isinstance(output, str):
+            if output.strip():
+                return tool + " succeeded (text output, " + str(len(output)) + " chars)"
+            return tool + " succeeded (empty output)"
+        return tool + " succeeded (no output)"
+    code = result.error.code if result.error is not None else "unknown_error"
+    return tool + " failed (" + code + ")"
+
+
+def _evidence_metadata(proposal, result, step, runtime) -> dict:
+    """Metadata for the evidence record: raw payload, split expectation, path refs.
+
+    The summary already carries what happened; here the full raw result is
+    preserved for later reprocessing, the plan's expected observation is
+    kept as its own entry (never as the summary), and the path position
+    (path/version/step/account) is recorded when known -- missing refs are
+    left out, never invented.
+    """
+    metadata: dict = {}
+    if proposal.expected_observation is not None:
+        metadata["expected_observation"] = proposal.expected_observation
+    metadata["tool_result"] = result.model_dump(mode="json")
+    metadata["action_id"] = str(proposal.action_id)
+    metadata["invocation_id"] = str(result.invocation_id)
+    metadata["tool_id"] = str(result.tool_id)
+    try:
+        canonical_operation = canonical_action_key(proposal.capability, proposal.operation)
+    except ValueError:
+        canonical_operation = proposal.capability + "." + proposal.operation
+    metadata["canonical_operation"] = canonical_operation
+    metadata["proposal"] = proposal.model_dump(mode="json")
+    if step is not None:
+        metadata["plan_step"] = step.model_dump(mode="json")
+    if runtime.active_task_id is not None:
+        metadata["mission_task_id"] = str(runtime.active_task_id)
+    path_id = getattr(step, "path_id", None)
+    if path_id is None:
+        path_id = getattr(runtime, "active_path_id", None)
+    path_version = getattr(step, "path_version", None)
+    if path_version is None:
+        path_version = getattr(runtime, "active_path_version", None)
+    path_step_id = getattr(step, "path_step_id", None)
+    if path_step_id is None:
+        path_step_id = getattr(runtime, "active_path_step_id", None)
+    principal_ref = getattr(step, "principal_ref", None)
+    operator_intent_id = getattr(step, "operator_intent_id", None)
+    if operator_intent_id is None:
+        operator_intent_id = getattr(runtime, "operator_intent_id", None)
+    if path_id is not None:
+        metadata["path_id"] = path_id
+    if path_version is not None:
+        metadata["path_version"] = path_version
+    if path_step_id is not None:
+        metadata["path_step_id"] = path_step_id
+    if principal_ref is not None:
+        metadata["principal_ref"] = principal_ref
+    if operator_intent_id is not None:
+        metadata["operator_intent_id"] = str(operator_intent_id)
+    return metadata

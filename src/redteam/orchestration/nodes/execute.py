@@ -20,6 +20,8 @@ from redteam.orchestration.action_naming import (
     tool_matches_action_namespace,
 )
 from redteam.orchestration.context import RuntimeDeps
+from redteam.orchestration.engine import validate_current_action
+from redteam.orchestration.long_jobs import LongJobManager, LongJobState
 from redteam.orchestration.nodes._support import advance, publisher_for
 from redteam.orchestration.state import GraphState
 
@@ -85,7 +87,9 @@ async def _renew_lease_until_stopped(
             return
 
 
-async def _invoke_with_semaphore(deps: RuntimeDeps, invocation: ToolInvocation) -> ToolResult:
+async def _invoke_with_semaphore(
+    deps: RuntimeDeps, invocation: ToolInvocation, *, runtime=None, step=None, work_id=None,
+) -> ToolResult:
     """Invoke the tool, honoring the run-wide execution bound.
 
     The semaphore is the *actual* ``RateLimitPolicy.max_concurrent_actions``
@@ -94,11 +98,37 @@ async def _invoke_with_semaphore(deps: RuntimeDeps, invocation: ToolInvocation) 
     execution unbounded (legacy).
     """
 
+    async def invoke():
+        problems = await validate_current_action(deps, runtime, step)
+        if problems:
+            raise ValueError("action changed before invocation")
+        if deps.long_job_adapter is None:
+            return await deps.tool_gateway.invoke(invocation)
+        if work_id is None:
+            raise ValueError("long jobs require a durable execution record")
+        manager = LongJobManager(deps.long_job_adapter)
+        work = await deps.work_store.get(work_id)
+        job_id = work.job_id if work else None
+        if job_id is None:
+            job_id = await manager.submit(invocation)
+            if not await deps.work_store.bind_job(work_id, owner=str(runtime.run_id), job_id=job_id):
+                raise RuntimeError("submitted job could not be recorded; reconcile before retry")
+        while True:
+            status = await manager.status(job_id)
+            if status.state in {LongJobState.SUCCEEDED, LongJobState.FAILED, LongJobState.CANCELLED}:
+                result = (await manager.result(job_id)).require_result()
+                if result.action_id != invocation.action_id or result.tool_id != invocation.tool_id:
+                    raise RuntimeError("long job returned an unrelated result")
+                return result
+            if status.state is LongJobState.UNKNOWN:
+                raise RuntimeError("long job execution state is unknown; do not resubmit")
+            await asyncio.sleep(0.5)
+
     semaphore = deps.tool_semaphore
     if semaphore is None:
-        return await deps.tool_gateway.invoke(invocation)
+        return await invoke()
     async with semaphore:
-        return await deps.tool_gateway.invoke(invocation)
+        return await invoke()
 
 
 async def execute_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
@@ -181,6 +211,9 @@ async def execute_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
 
     retry_attempts = 0
     try:
+        path_problems = await validate_current_action(deps, runtime, step)
+        if path_problems:
+            binding_ready = False
         if not binding_ready:
             raise RuntimeError("tool binding is no longer valid for the approved action")
         if not lease_ready:
@@ -197,7 +230,9 @@ async def execute_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                 )
             )
         while True:
-            result = await _invoke_with_semaphore(deps, invocation)
+            result = await _invoke_with_semaphore(
+                deps, invocation, runtime=runtime, step=step, work_id=work_id,
+            )
             error = result.error
             if (
                 result.success
