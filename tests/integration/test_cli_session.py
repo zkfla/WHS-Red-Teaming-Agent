@@ -117,6 +117,7 @@ async def test_run_finished_returns_to_prompt_and_accepts_slash_commands(
         answers=[
             "127.0.0.1:5000의 VulnBank 테스트, 최대 100개",  # first message -> intake
             "",  # existing-config menu -> Start
+            "n",  # one-time MCP auto-setup prompt -> decline
             "",  # preflight -> Start
             "/help",
             "/status",
@@ -160,6 +161,7 @@ async def test_natural_language_second_request_runs_a_second_agent_run(
         answers=[
             "127.0.0.1:5000의 VulnBank 테스트, 최대 100개",
             "",
+            "n",  # one-time MCP auto-setup prompt -> decline
             "",
             "127.0.0.1:5000 다시 한 번 점검해줘",  # second objective, plain text
             "/exit",
@@ -188,6 +190,7 @@ async def test_unknown_slash_command_does_not_end_the_session(
         answers=[
             "127.0.0.1:5000의 VulnBank 테스트, 최대 100개",
             "",
+            "n",  # one-time MCP auto-setup prompt -> decline
             "",
             "/this-command-does-not-exist",
             "/exit",
@@ -215,6 +218,7 @@ async def test_eof_at_idle_prompt_ends_the_session_cleanly(
         answers=[
             "127.0.0.1:5000의 VulnBank 테스트, 최대 100개",
             "",
+            "n",  # one-time MCP auto-setup prompt -> decline
             "",
             # nothing after the first run -- console.input() raises EOFError
         ],

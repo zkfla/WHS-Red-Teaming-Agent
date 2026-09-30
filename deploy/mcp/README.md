@@ -43,8 +43,12 @@ owned by another server is rejected instead of silently overwritten.
 
 ## Server and transport configuration
 
-`CapabilityConfig.mcp_servers` contains stable server IDs. Each ID is
-resolved from environment variables before discovery:
+`CapabilityConfig.mcp_servers` contains stable server IDs — in the CLI,
+populated from `REDTEAM_MCP_SERVERS` (a comma-separated list; unset/empty
+is an honest empty tool catalog with a `WARNING`, never an automatic
+`ExampleMCPAdapter` substitute — `REDTEAM_MCP_SERVERS=example` is the one
+explicit opt-in path to that fixture). Each listed ID is then resolved
+from its own environment variables before discovery:
 
 ```text
 REDTEAM_MCP_<SERVER_ID>_KIND=web_api|mobile|recon|analysis
@@ -91,8 +95,12 @@ REDTEAM_MCP_<SERVER_ID>_PASSTHROUGH_ENV=ANDROID_SERIAL,ANDROID_HOME
 **Not finalized.** `mobile-next/mobile-mcp` (https://github.com/mobile-next/mobile-mcp)
 is being evaluated, not adopted — `MobileMCPAdapter` only knows the generic
 `MCPServerAdapter`/`MCPTransport` shapes, so swapping it for a different
-mobile MCP server later means changing `.env.example`/`examples/app.yaml`
-only, no Adapter code.
+mobile MCP server later means changing only the `REDTEAM_MCP_<SERVER_ID>_*`
+environment variables (see `.env.example`), no Adapter code. There is no
+application-config YAML file in this CLI — `redteam.core.config.AppConfig`/
+`load_app_config()` still exist as a general library capability for
+non-CLI direct callers (`examples/finance_agent_demo.py`,
+`deploy/mcp/finance/app.yaml`), but the CLI itself never reads one.
 
 Canonical operations this capability binds today (see
 `docs/contracts/actions.md`): `app_launch`, `device_shell`,
@@ -382,9 +390,9 @@ the same claim — kept separate below.
 2. Select `web_api`, `mobile`, `recon`, or `analysis`; the bootstrap selects
    the matching adapter. Implement a custom `MCPAdapter` only when the server
    needs non-standard normalization.
-3. Add the stable server ID to `capability.mcp_servers` and configure
-   its `REDTEAM_MCP_<SERVER_ID>_*` environment variables. Application
-   bootstrap discovers and registers its `ToolDescriptor`s.
+3. Add the stable server ID to `REDTEAM_MCP_SERVERS` (comma-separated) and
+   configure its own `REDTEAM_MCP_<SERVER_ID>_*` environment variables.
+   Application bootstrap discovers and registers its `ToolDescriptor`s.
 4. No other code should need to change — that's the point of the
    Adapter pattern described in `docs/adr/0003-mcp-capability.md`.
 

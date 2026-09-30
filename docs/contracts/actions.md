@@ -297,3 +297,12 @@ Every MCP adapter's output is normalized into this shape by
 framework sees it — including filling in `action_id`/`invocation_id`,
 which adapters don't know about (see
 `redteam.capability.adapters.mcp.example.ExampleMCPAdapter`).
+
+A failed adapter call (`success=False`, a populated `error`) is returned
+as-is, before the output-size and output-schema checks below it in
+`MCPToolGateway.execute` — those two only ever validate a *successful*
+call's `output`. Running them unconditionally used to mask the adapter's
+real `error` (never shaped like the tool's success schema, so it always
+failed schema validation) behind a generic `tool_output_schema_mismatch`
+naming the wrong problem; the server's own `ToolError`/message (e.g. "target
+address outside configured networks") reaches `ToolResult.error` now.

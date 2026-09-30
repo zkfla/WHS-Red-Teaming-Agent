@@ -86,3 +86,8 @@ api_key = config.resolve_api_key()  # os.environ.get("LLM_API_KEY")
 ```
 
 `.env.example` documents the variables teams are expected to set.
+`redteam` (every subcommand) loads a `.env` file from the current
+directory into its own process environment automatically at startup,
+best-effort (`redteam.app.cli._shared.load_dotenv_if_present`) — a real
+shell/CI-exported variable always wins over a `.env` value, so this only
+fills in what is otherwise unset.

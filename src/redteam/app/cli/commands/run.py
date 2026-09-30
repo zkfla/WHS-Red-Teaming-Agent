@@ -320,7 +320,20 @@ class OperatorConsole:
             )
             return
         try:
-            self._prompt_context = patch_stdout()
+            # `raw=True`: every event line printed here comes from our own
+            # Rich renderer, never from untrusted/user-controlled text, so
+            # it is safe to let its ANSI codes through unmangled.
+            # `patch_stdout()`'s default (`raw=False`) calls
+            # `Output.write()`, whose vt100/Windows10 backends do
+            # ``data.replace("\x1b", "?")`` to neutralize *arbitrary*
+            # escape sequences -- turning every `\x1b[32m` into a literal
+            # `?[32m` on screen. macOS/Linux terminals happened to still
+            # look fine whenever stdin wasn't a live TTY (patch_stdout
+            # never engaged at all, so nothing was ever mangled there);
+            # Windows makes the corruption visible on any real terminal
+            # session. `raw=True` uses `Output.write_raw()` instead, which
+            # passes escape sequences straight through on every platform.
+            self._prompt_context = patch_stdout(raw=True)
             self._prompt_context.__enter__()
             self._prompt_session = PromptSession()
             self._input_live = True

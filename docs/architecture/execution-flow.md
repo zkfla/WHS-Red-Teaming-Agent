@@ -26,7 +26,7 @@ description — run `redteam run examples/engagement.yaml` (or bare
 | 4 | Control Plane evaluates | `orchestration.nodes.policy.policy_node` calls `deps.control_plane.evaluate(...)` |
 | 5 | ALLOW decision | `control.service.DefaultControlPlane.evaluate` (Scope -> Policy -> RateLimit -> Budget -> Approval) |
 | 6 | ToolGateway called | `orchestration.nodes.execute.execute_node` calls `deps.tool_gateway.invoke(...)` — only reachable on ALLOW |
-| 7 | MCP Adapter runs | `capability.gateway.MCPToolGateway` routes to whichever adapter is configured. **Current status**: `capability.adapters.mcp.example.ExampleMCPAdapter` is still the zero-config default (`capability.mcp_servers: []`), but real adapters exist and run in production configs — see `deploy/mcp/README.md`. |
+| 7 | MCP Adapter runs | `capability.gateway.MCPToolGateway` routes to whichever adapter is configured. **Current status**: an empty/unset `capability.mcp_servers` (`REDTEAM_MCP_SERVERS` unset, no CLI config file at all) now gets an honest empty tool catalog (`app.bootstrap._empty_tool_gateway`) — no Action can execute, but nothing pretends a fake tool ran. `capability.adapters.mcp.example.ExampleMCPAdapter` only appears via the explicit, literal opt-in `REDTEAM_MCP_SERVERS=example`; real adapters exist and run in production configs — see `deploy/mcp/README.md`. |
 | 8 | `ToolResult` returned | Normalized shape, regardless of adapter |
 | 9 | Evidence created | `orchestration.nodes.verify.verify_node` writes an `EvidenceRecord` via `deps.evidence_store` |
 | 10 | Events published | `EventEnvelope`s at every step via `deps.event_bus` — see the full list below |

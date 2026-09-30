@@ -103,6 +103,7 @@ async def test_no_config_intake_completes_preflight_and_runs(
             "127.0.0.1:5000의 VulnBank 테스트, 인증/금융 로직 위주, "
             "DoS/데이터삭제 금지, 최대 100개",
             "",  # existing-config menu -> Start (config was just created)
+            "n",  # one-time MCP auto-setup prompt -> decline
             "",  # preflight -> Start
         ],
         llm=llm,
@@ -150,7 +151,7 @@ async def test_existing_config_quick_start_needs_only_objective_input(
     )
     console = _patch(
         monkeypatch, tmp_path,
-        answers=["VulnBank 웹 레드티밍 해줘. 인증/인가 중심으로."],
+        answers=["VulnBank 웹 레드티밍 해줘. 인증/인가 중심으로.", "n"],
         llm=_ScriptedIntakeLLM([]),
     )
 
@@ -210,8 +211,9 @@ async def test_intake_llm_never_receives_a_secret(
         answers=[
             "127.0.0.1:5000의 VulnBank 테스트, 인증/금융 로직 위주, "
             "DoS/데이터삭제 금지, 최대 100개",
-            "",
-            "",
+            "",  # existing-config menu -> Start
+            "n",  # one-time MCP auto-setup prompt -> decline
+            "",  # preflight -> Start
         ],
         llm=llm,
     )
@@ -276,6 +278,7 @@ async def test_edit_patches_only_the_requested_field(
             "e",  # existing-config menu -> Edit
             "최대 action을 200으로 바꿔줘",
             "",  # back at existing-config menu after the edit -> Start
+            "n",  # one-time MCP auto-setup prompt -> decline
             "",  # preflight -> Start
         ],
         llm=llm,

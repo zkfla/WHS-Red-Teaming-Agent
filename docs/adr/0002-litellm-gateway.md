@@ -21,8 +21,14 @@ Define `redteam.core.ports.llm.LLMClient` (`complete`,
 `complete_structured`) as the only interface Agent/Orchestration code
 depends on. Two implementations:
 
-- `redteam.llm.fake.FakeLLMClient` — deterministic, no network, used
-  by default in the current stub flow and in tests.
+- `redteam.llm.fake.FakeLLMClient` — deterministic, no network. The
+  `LLMConfig` model's own field default is `provider="fake"` (tests and
+  any direct, non-CLI `AppConfig()` construction get it for free), but
+  the CLI itself has no implicit default at all:
+  `LLMConfig.from_environment()` (`redteam run`/`resume`, the interactive
+  entrypoint) raises if `REDTEAM_LLM_PROVIDER` is unset --
+  `REDTEAM_LLM_PROVIDER=fake` is an explicit choice there, never a
+  silent fallback.
 - `redteam.llm.litellm.LiteLLMClient` — wraps `litellm.acompletion` for
   every provider except the `chatgpt/<model>` subscription path (ChatGPT
   Plus/Pro via OAuth device flow, no API key), which calls
@@ -58,9 +64,10 @@ shouldn't force on everyone:
   to a different LLM gateway (or drops LiteLLM) — implement
   `LLMClient` and rewire `redteam.app.bootstrap`.
 - Without the `llm` extra installed, `LiteLLMClient` can be constructed
-  but its methods raise `ImportError` when actually called. Tests and
-  the default vertical slice use `FakeLLMClient`, so this doesn't block
-  anything at this stage.
+  but its methods raise `ImportError` when actually called. Tests
+  construct `FakeLLMClient`/`LLMConfig()` directly, so this doesn't
+  block anything at this stage; the CLI itself needs `REDTEAM_LLM_PROVIDER`
+  set regardless of which client that resolves to.
 - `requires-python` (3.10) is unrelated to this ADR now — nothing here
   blocks on a Python version bump.
 - litellm caches a persistent async HTTP client per provider for

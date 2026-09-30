@@ -29,7 +29,13 @@ import logging
 import os
 import sys
 
-from redteam.app.cli._shared import EXIT_CONFIG_ERROR, EXIT_FAILURE, EXIT_OK, eprint
+from redteam.app.cli._shared import (
+    EXIT_CONFIG_ERROR,
+    EXIT_FAILURE,
+    EXIT_OK,
+    eprint,
+    load_dotenv_if_present,
+)
 from redteam.app.cli.commands import (
     approvals,
     evidence,
@@ -143,6 +149,11 @@ def _use_utf8_console_streams() -> None:
 
 def main() -> None:
     _use_utf8_console_streams()
+    # A real shell/CI export always wins -- this only fills in what a
+    # previous `redteam` run's one-time setup (or an operator by hand) left
+    # in `.env`, so it takes effect without a separate manual export/source
+    # step before every invocation (see `_shared.load_dotenv_if_present`).
+    load_dotenv_if_present()
     logging.basicConfig(level=os.environ.get("REDTEAM_LOG_LEVEL", "INFO"))
     parser = _build_parser()
     args = parser.parse_args()

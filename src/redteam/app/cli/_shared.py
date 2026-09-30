@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import getpass
 import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -167,6 +168,37 @@ def write_env_var(env_path: Path, key: str, value: str) -> None:
     else:
         lines.append(f"{prefix}{value}")
     env_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def load_dotenv_if_present(env_path: Path = DEFAULT_ENV_PATH) -> None:
+    """Best-effort ``.env`` loader for this process's own environment.
+
+    A real shell/CI export always wins -- this only fills in what is
+    otherwise unset, so it can never override an operator's explicit
+    environment with a stale ``.env`` value. Not a config source of truth
+    by itself: it exists purely so a value ``write_env_var`` (or an
+    operator by hand) put in ``.env`` takes effect without a separate
+    manual ``export``/`source`` step before every ``redteam`` invocation.
+    A missing file, unreadable file, or malformed line is silently
+    skipped -- never fatal, and never a reason to block the CLI.
+    """
+    if not env_path.exists():
+        return
+    try:
+        lines = env_path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        key, _, value = stripped.partition("=")
+        key = key.strip()
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        if key and key not in os.environ:
+            os.environ[key] = value
 
 
 def render_table(headers: list[str], rows: list[list[str]]) -> None:

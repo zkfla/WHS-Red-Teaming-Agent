@@ -281,6 +281,28 @@ class MCPToolGateway:
                 message=f"adapter execution failed: {type(exc).__name__}",
             )
 
+        if not adapter_result.success:
+            # A deliberate MCP tool-level rejection (e.g. `ToolError` on the
+            # server, surfaced here as `adapter_result.error`) is not a
+            # successful call with malformed output -- the size/output-schema
+            # checks below exist to validate a *successful* tool's output,
+            # and applying them to error content (never shaped like the
+            # success schema) always failed the schema check, discarding the
+            # adapter's already-correct error in favor of an opaque
+            # "MCP output did not match the registered output schema" that
+            # named the wrong problem.
+            return ToolResult(
+                invocation_id=invocation.invocation_id,
+                action_id=invocation.action_id,
+                tool_id=invocation.tool_id,
+                success=False,
+                output=adapter_result.output,
+                error=adapter_result.error,
+                started_at=adapter_result.started_at,
+                finished_at=adapter_result.finished_at,
+                metadata=adapter_result.metadata,
+            )
+
         output_bytes = _serialized_output_size(adapter_result.output)
         max_output_bytes = self._server_output_limits[descriptor.server_id]
         if output_bytes > max_output_bytes:
