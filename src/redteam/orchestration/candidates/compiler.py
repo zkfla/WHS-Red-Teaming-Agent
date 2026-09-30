@@ -6,6 +6,7 @@ import hashlib
 import json
 from dataclasses import dataclass
 from functools import lru_cache
+from urllib.parse import urlsplit
 
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import SchemaError, ValidationError
@@ -121,7 +122,7 @@ class CandidateCompiler:
             reason, field = tool_rejection or ("no_compatible_tool", "")
             return None, self._reject(draft, reason, field=field)
         bound_arguments = self._bind_target_arguments(
-            plan_step.arguments, plan_step.resolved_target(), tool
+            plan_step.arguments, plan_step.resolved_target(), tool, plan_step.operation
         )
         bound_step = plan_step.model_copy(update={"arguments": bound_arguments})
         bound_draft = draft.model_copy(update={"plan_step": bound_step})
@@ -243,14 +244,17 @@ class CandidateCompiler:
             for tool in healthy
             if self._arguments_match_schema(
                 self._bind_target_arguments(
-                    plan_step.arguments, plan_step.resolved_target(), tool
+                    plan_step.arguments, plan_step.resolved_target(), tool, plan_step.operation
                 ),
                 tool.input_schema,
             )
         ]
         if not schema_ok:
             bound_arguments = self._bind_target_arguments(
-                plan_step.arguments, plan_step.resolved_target(), healthy[0]
+                plan_step.arguments,
+                plan_step.resolved_target(),
+                healthy[0],
+                plan_step.operation,
             )
             reason, field = self._schema_rejection(
                 bound_arguments, healthy[0].input_schema
@@ -263,8 +267,15 @@ class CandidateCompiler:
         arguments: dict,
         target: AnyTarget,
         tool: ToolDescriptor,
+        operation: str,
     ) -> dict:
-        """Fill schema-declared identity fields from the selected target."""
+        """Fill schema-declared identity fields from the selected target.
+
+        Endpoint discovery starts at the selected target's known path. A
+        host/service has no path yet, so ``/`` is the bounded root fallback,
+        but only when the selected tool schema says that ``path`` is required.
+        Explicit arguments and concrete endpoint/URL paths always win.
+        """
 
         values = dict(arguments)
         target_values: dict[str, object] = {}
@@ -300,6 +311,15 @@ class CandidateCompiler:
         for name, value in target_values.items():
             if name in properties and value is not None and name not in values:
                 values[name] = value
+        if (
+            operation == "endpoint_discovery"
+            and "path" in tool.required_arguments
+            and "path" not in values
+        ):
+            known_path = None
+            if isinstance(target, UrlTarget):
+                known_path = urlsplit(target.url).path or None
+            values["path"] = known_path or "/"
         return values
 
     @staticmethod

@@ -1,13 +1,15 @@
 """RC#1: the model generates candidate drafts; the same guards still gate them."""
 
+from dataclasses import replace
 from datetime import datetime, timezone
 from typing import Any
 
 from redteam.attack_graph.identity import make_node_id
 from redteam.attack_graph.observation import GraphObservation
 from redteam.core.contracts.graph import GraphNode
+from redteam.core.contracts.tool import ToolDescriptor
 from redteam.core.enums import GraphNodeType
-from redteam.core.ids import AgentId, GraphNodeId
+from redteam.core.ids import AgentId, GraphNodeId, ToolId
 from redteam.orchestration.agents.base import AgentSpec
 from redteam.orchestration.agents.llm_provider import LLMCandidateProvider
 from redteam.orchestration.agents.providers import GraphCandidateContext
@@ -189,6 +191,39 @@ async def test_raw_outcome_is_fed_to_the_model_prompt() -> None:
     await LLMCandidateProvider(llm).propose_graph(_spec(), context)
     assert "status=401" in llm.last_prompt
     assert "error=tool_output_schema_mismatch" in llm.last_prompt
+
+
+async def test_prompt_uses_tool_schema_required_arguments() -> None:
+    class _Catalog:
+        def list_tools_for_action(
+            self, capability: str, operation: str
+        ) -> list[ToolDescriptor]:
+            assert (capability, operation) == ("recon", "endpoint_discovery")
+            return [
+                ToolDescriptor(
+                    tool_id=ToolId("recon.html_inventory"),
+                    server_id="test",
+                    tool_name="html_inventory",
+                    input_schema={
+                        "type": "object",
+                        "required": ["target_ref", "path"],
+                        "properties": {
+                            "target_ref": {"type": "string"},
+                            "path": {"type": "string"},
+                        },
+                    },
+                )
+            ]
+
+    llm = _ScriptedLLM([])
+    context = _context()
+    context = replace(
+        context, available_operations=(("recon", "endpoint_discovery"),)
+    )
+
+    await LLMCandidateProvider(llm, _Catalog()).propose_graph(_spec(), context)
+
+    assert "required arguments from tool schema: path, target_ref" in llm.last_prompt
 
 
 async def test_generation_failure_degrades_to_empty_not_crash() -> None:

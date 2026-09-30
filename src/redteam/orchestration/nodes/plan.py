@@ -253,9 +253,9 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                 # dropped, so a generated variant can never crowd out the
                 # argument-bound playbook draft for the same work -- the model
                 # only fills gaps the playbook left open.
-                llm_batch = await LLMCandidateProvider(deps.llm_client).propose_graph(
-                    agent, context
-                )
+                llm_batch = await LLMCandidateProvider(
+                    deps.llm_client, deps.tool_catalog
+                ).propose_graph(agent, context)
                 covered = {
                     (str(target), draft.plan_step.operation_key)
                     for draft in drafts

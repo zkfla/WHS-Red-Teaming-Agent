@@ -30,6 +30,7 @@ from typing import Any
 from redteam.attack_graph.identity import split_node_id, target_for_node
 from redteam.attack_graph.predicates import facts_of
 from redteam.core.ids import AgentId, GraphNodeId, ToolId
+from redteam.core.ports.tool_catalog import ToolCatalog
 from redteam.orchestration.agents.base import AgentSpec, PlanStep
 from redteam.orchestration.agents.providers import (
     CandidateBatch,
@@ -84,8 +85,9 @@ SYSTEM_PROMPT = (
 class LLMCandidateProvider:
     """Generates candidate drafts from the model; the compiler still gates them."""
 
-    def __init__(self, llm: Any) -> None:
+    def __init__(self, llm: Any, catalog: ToolCatalog | None = None) -> None:
         self._llm = llm
+        self._catalog = catalog
 
     async def propose_graph(
         self, spec: AgentSpec, context: GraphCandidateContext
@@ -207,8 +209,7 @@ class LLMCandidateProvider:
         )
         return draft, None
 
-    @staticmethod
-    def _render(spec: AgentSpec, context: GraphCandidateContext) -> str:
+    def _render(self, spec: AgentSpec, context: GraphCandidateContext) -> str:
         observation = context.observation
         lines = [
             f"Agent: {spec.name} — {spec.description}",
@@ -227,7 +228,24 @@ class LLMCandidateProvider:
         if context.available_operations:
             lines.append("Executable (capability, operation) pairs:")
             for capability, operation in sorted(context.available_operations):
-                lines.append(f"  - {capability} / {operation}")
+                tools = (
+                    self._catalog.list_tools_for_action(capability, operation)
+                    if self._catalog is not None
+                    else []
+                )
+                requirements = sorted(
+                    {
+                        required
+                        for tool in tools
+                        for required in tool.required_arguments
+                    }
+                )
+                suffix = (
+                    f"; required arguments from tool schema: {', '.join(requirements)}"
+                    if requirements
+                    else ""
+                )
+                lines.append(f"  - {capability} / {operation}{suffix}")
         if context.evidence_excerpts:
             # RC#2: the raw outcome per target (status/error), not just the
             # graph summary -- the material the model needs to adapt.
