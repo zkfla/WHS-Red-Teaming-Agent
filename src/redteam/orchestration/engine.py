@@ -16,7 +16,7 @@ from redteam.core.contracts.evidence import EvidenceRecord
 from redteam.core.contracts.graph import Hypothesis
 from redteam.core.contracts.mission import MissionCriterionResult, redact_secret_material
 from redteam.core.enums import EvidenceSourceType, MissionStatus, TaskStatus, ToolHealthStatus
-from redteam.core.ids import EventId, GraphNodeId, new_id
+from redteam.core.ids import EventId, GraphNodeId, TaskId, new_id
 from redteam.event_bus.publisher import EventPublisher
 from redteam.orchestration.agents.base import HypothesisDraft, PlanStep
 from redteam.orchestration.agents.providers import PlaybookCandidateProvider
@@ -29,14 +29,27 @@ from redteam.orchestration.cognition import (
     StructuredDecisionClient,
 )
 from redteam.orchestration.completion import validate_completion
+from redteam.orchestration.coordination import (
+    ChangeSet,
+    StateConflict,
+    content_hash,
+    coordinator_for,
+)
+from redteam.orchestration.diagnostics import DecisionDiagnostic, diagnostic_for_exception
 from redteam.orchestration.events import AGENT_CONTEXT_PREPARED, AGENT_TURN_DECIDED
 from redteam.orchestration.evidence_access import EvidenceReader
 from redteam.orchestration.expectations import Expectation
 from redteam.orchestration.knowledge import project_knowledge
 from redteam.orchestration.paths import PathError, PathPlan, is_active_status, is_known_criterion
 from redteam.orchestration.paths.models import (
+    ALLOWED_CRITERION_KINDS,
     changed_steps_and_descendants,
     validate_path_structure,
+)
+from redteam.orchestration.paths.writing import (
+    CriterionWritingError,
+    validate_written_criteria,
+    writing_schema,
 )
 from redteam.orchestration.progress import knowledge_fingerprint
 from redteam.orchestration.runtime_observation import observations_for_prompt
@@ -224,6 +237,20 @@ def ready_step(path, step, knowledge: dict) -> list[str]:
     return problems
 
 
+class DecisionRuleError(ValueError):
+    """A code-owned validation rule, safe to carry into correction feedback."""
+
+    def __init__(self, summary: str):
+        self.diagnostic = DecisionDiagnostic(
+            code="decision_rule_violation",
+            stage="validation",
+            kind="format",
+            summary=summary,
+            retryable=True,
+        )
+        super().__init__(summary)
+
+
 class InvestigationEngine:
     def __init__(self, deps) -> None:
         self.deps = deps
@@ -232,11 +259,25 @@ class InvestigationEngine:
         )
         self.last_event_id: EventId | None = None
         self._event_runtime: Any = None
+        self.planning_diagnostic: DecisionDiagnostic | None = None
 
     async def _ask(self, *, stage, payload, **kwargs):
+        # Raw writing validation occurs before permissive storage models can
+        # normalize unknown kinds or fill omitted fields.
+        kwargs["system"] = (
+            kwargs.get("system", "")
+            + " Supported completion kinds: "
+            + ", ".join(sorted(ALLOWED_CRITERION_KINDS))
+            + ". New conditions require kind, nonblank description, min_evidence >= 1; "
+            "hypothesis kinds require hypothesis_id."
+        )
         runtime = self._event_runtime
+        if runtime is not None and runtime.mission_id is not None:
+            await self._review_token(runtime)
         if runtime is None:
-            return await self.client.ask(stage=stage, payload=payload, **kwargs)
+            result = await self.client.ask(stage=stage, payload=payload, **kwargs)
+            validate_written_criteria(result)
+            return result
         publisher = EventPublisher(
             self.deps.event_bus,
             run_id=runtime.run_id,
@@ -257,6 +298,7 @@ class InvestigationEngine:
         )
         self.last_event_id = prepared.event_id
         result = await self.client.ask(stage=stage, payload=payload, **kwargs)
+        validate_written_criteria(result)
         public = {
             "stage": stage,
             **refs,
@@ -373,13 +415,22 @@ class InvestigationEngine:
             redact_secret_material(item.model_dump(mode="json")) for item in work_history[-20:]
         ]
         instructions = []
-        if self.deps.operator_intent_store is not None and runtime.mission_id:
-            instructions = [
-                item.model_dump(mode="json")
-                for item in await self.deps.operator_intent_store.list_for_mission(
-                    runtime.mission_id, limit=10
+        if runtime.mission_id:
+            coordinator = coordinator_for(self.deps.task_graph_store, self.deps.path_store)
+
+            async def canonical_instructions(change):
+                change.binding(
+                    str(runtime.run_id), str(runtime.mission_id), str(runtime.engagement_id)
                 )
-            ]
+                return [
+                    item
+                    for (kind, _), item in change.records.items()
+                    if kind == "intent"
+                    and item["run_id"] == str(runtime.run_id)
+                    and item["intent"]["mission_id"] == str(runtime.mission_id)
+                ][-10:]
+
+            instructions = await coordinator.change(canonical_instructions)
         return {
             "goal": mission.objective if mission else runtime.current_goal,
             "success_criteria": mission.success_criteria if mission else [runtime.current_goal],
@@ -465,11 +516,43 @@ class InvestigationEngine:
             "omitted_count": max(len(relevant) - 8, 0),
         }
 
+    async def _review_token(self, runtime):
+        coordinator = coordinator_for(self.deps.task_graph_store, self.deps.path_store)
+
+        async def capture(change):
+            if runtime.mission_id is not None:
+                change.admit(str(runtime.run_id), str(runtime.mission_id))
+            else:
+                change.legacy_scope(str(runtime.run_id))
+            return change.token(str(runtime.run_id), str(runtime.mission_id or ""))
+
+        return await coordinator.change(capture)
+
+    async def _check_review_path(self, runtime, path):
+        current = await self.deps.path_store.get_active(str(runtime.run_id))
+        if current is None or content_hash(current) != content_hash(path):
+            raise StateConflict("completion_path_snapshot_changed")
+
+    async def _commit_review(self, runtime, token, mutation):
+        coordinator = coordinator_for(self.deps.task_graph_store, self.deps.path_store)
+
+        async def commit(change: ChangeSet):
+            if runtime.mission_id is not None:
+                change.admit(str(runtime.run_id), str(runtime.mission_id), token=token)
+            elif change.token(str(runtime.run_id), "") != token:
+                raise StateConflict("reviewed_path_changed")
+            return await mutation(change)
+
+        return await coordinator.change(commit)
+
     async def register_path(
         self, proposed, runtime, context, observation, *, switch: bool = False, budget=None
     ):
         from redteam.attack_graph.service import AttackGraphService
 
+        budget = budget or DecisionBudget(self.deps.settings.decision_max_attempts)
+        token = await self._review_token(runtime)
+        validate_written_criteria(proposed.model_dump(mode="json"))
         active = await self.deps.path_store.get_active(str(runtime.run_id))
         switch = switch or bool(
             active
@@ -493,11 +576,11 @@ class InvestigationEngine:
         service = AttackGraphService(self.deps.graph_store)
         for identity in path.hypothesis_ids:
             if await service.get_hypothesis(identity) is None:
-                raise ValueError("path references a missing hypothesis")
+                raise DecisionRuleError("path references a missing hypothesis")
         for identity in path.evidence_ids:
             evidence = await self.deps.evidence_store.get(identity)
             if evidence is None or str(evidence.run_id) != str(runtime.run_id):
-                raise ValueError("path cites evidence from another run or missing evidence")
+                raise DecisionRuleError("path cites evidence from another run or missing evidence")
         # Progress and receipts are code-owned, never accepted from a model draft.
         for step in path.steps:
             step.status, step.outcome, step.evidence_ids = "pending", None, []
@@ -505,15 +588,15 @@ class InvestigationEngine:
         known_principals = set(principal_bindings(context["knowledge"]))
         for step in path.steps:
             if set(step.target_node_ids) - known:
-                raise ValueError("path references unknown target(s)")
+                raise DecisionRuleError("path references unknown target(s)")
             if set(step.principal_refs) - known_principals:
-                raise ValueError("path references unregistered principal(s)")
+                raise DecisionRuleError("path references unregistered principal(s)")
             if step.agent_id and self.deps.agents.get(step.agent_id) is None:
-                raise ValueError("path references unknown role")
+                raise DecisionRuleError("path references unknown role")
             if not step.completion_criteria or any(
                 not is_known_criterion(item) for item in step.completion_criteria
             ):
-                raise ValueError("new paths require typed completion criteria")
+                raise DecisionRuleError("new paths require typed completion criteria")
         references = await self.reference_paths(
             observation,
             AttackGraphService(self.deps.graph_store),
@@ -528,14 +611,14 @@ class InvestigationEngine:
                     "code_references": references,
                     "code_checks": "structure and references passed",
                 },
-                response_schema=ReviewDecision.model_json_schema(),
+                response_schema=writing_schema(ReviewDecision),
                 system=SYSTEM,
                 budget=budget,
             )
         )
         if review.decision == "revise":
             if review.path is None:
-                raise ValueError("revision review requires a replacement path")
+                raise DecisionRuleError("revision review requires a replacement path")
             replacement = review.path.model_dump(mode="json")
             replacement.update(
                 {
@@ -556,11 +639,11 @@ class InvestigationEngine:
             validate_path_structure(path.steps)
             for identity in path.hypothesis_ids:
                 if await service.get_hypothesis(identity) is None:
-                    raise ValueError("reviewed path references a missing hypothesis")
+                    raise DecisionRuleError("reviewed path references a missing hypothesis")
             for identity in path.evidence_ids:
                 evidence = await self.deps.evidence_store.get(identity)
                 if evidence is None or str(evidence.run_id) != str(runtime.run_id):
-                    raise ValueError("reviewed path cites unrelated evidence")
+                    raise DecisionRuleError("reviewed path cites unrelated evidence")
             for step in path.steps:
                 step.status, step.outcome, step.evidence_ids = "pending", None, []
                 if (
@@ -570,7 +653,13 @@ class InvestigationEngine:
                     or not step.completion_criteria
                     or any(not is_known_criterion(item) for item in step.completion_criteria)
                 ):
-                    raise ValueError("reviewed path has invalid references or criteria")
+                    raise DecisionRuleError("reviewed path has invalid references or criteria")
+        if review.decision == "revise":
+            # The review supplied a replacement, which has not itself passed a
+            # semantic review. Re-enter using the same shared call budget.
+            return await self.register_path(
+                path, runtime, context, observation, switch=switch, budget=budget
+            )
         if review.decision in {"reject", "hold"}:
             history = path.model_dump(mode="json")
             history.update(
@@ -580,7 +669,11 @@ class InvestigationEngine:
                 status="rejected" if review.decision == "reject" else "candidate",
                 reason=review.reason,
             )
-            await self.deps.path_store.register(PathPlan.model_validate(history))
+
+            async def save_history(change):
+                return await change.paths.register(PathPlan.model_validate(history))
+
+            await self._commit_review(runtime, token, save_history)
             return None
         accepted = path.model_dump(mode="json")
         accepted.update(status="accepted", reason=review.reason)
@@ -592,11 +685,15 @@ class InvestigationEngine:
             )
         if "review_records" in PathPlan.model_fields:
             accepted["review_records"] = {"decision": review.decision, "reason": review.reason}
-        registered = await self.deps.path_store.register(
-            PathPlan.model_validate(accepted),
-            expected_version=active.version if active else None,
-            expected_path_id=active.path_id if active else None,
-        )
+
+        async def save_path(change):
+            return await change.paths.register(
+                PathPlan.model_validate(accepted),
+                expected_version=active.version if active else None,
+                expected_path_id=active.path_id if active else None,
+            )
+
+        registered = await self._commit_review(runtime, token, save_path)
         if active:
             await self.invalidate_pending(active, registered, runtime)
         return registered
@@ -629,9 +726,36 @@ class InvestigationEngine:
         )
         # LEASED is checked again on admission; RUNNING keeps its real result.
 
+    @staticmethod
+    def _safe_errors(errors, budget):
+        diagnostics = getattr(errors, "diagnostics", [])
+        if diagnostics:
+            budget.last_failure = diagnostics[-1].model_copy(update={"attempts": budget.used})
+            return [item.feedback() for item in diagnostics[-10:]]
+        return errors[-10:]
+
+    @staticmethod
+    def _budget_failure(stage, budget):
+        return DecisionFailure(
+            stage,
+            "budget",
+            budget.used,
+            diagnostic=DecisionDiagnostic(
+                code="decision_budget_exhausted",
+                stage=stage,
+                kind="budget",
+                attempts=budget.used,
+                summary="The shared decision budget ended before semantic admission.",
+                retryable=False,
+                last_cause=budget.last_failure,
+                location=budget.last_failure.location if budget.last_failure else "",
+            ),
+        )
+
     async def decide(self, runtime, observation, *, last_event_id=None):
         self._event_runtime = runtime
         self.last_event_id = last_event_id
+        await self._review_token(runtime)
         context = await self.context(runtime, observation)
         path = await self.deps.path_store.get_active(str(runtime.run_id))
         if (
@@ -649,7 +773,7 @@ class InvestigationEngine:
                         await self._ask(
                             stage="path_draft",
                             payload=context,
-                            response_schema=PathPlan.model_json_schema(),
+                            response_schema=writing_schema(PathPlan),
                             system=SYSTEM,
                             budget=drafting_budget,
                         )
@@ -659,11 +783,24 @@ class InvestigationEngine:
                     )
                     break
                 except (ValueError, TypeError, PathError) as exc:
-                    context["feedback"] = [str(exc)]
+                    diagnostic = diagnostic_for_exception(exc, stage="path_draft")
+                    if isinstance(exc, CriterionWritingError):
+                        diagnostic = DecisionDiagnostic(
+                            code=exc.code,
+                            stage="path_draft",
+                            kind="format",
+                            location=exc.location,
+                            summary=exc.description,
+                            retryable=True,
+                        )
+                    drafting_budget.last_failure = diagnostic
+                    context["feedback"] = (
+                        [exc.correction()]
+                        if isinstance(exc, CriterionWritingError)
+                        else [diagnostic.feedback()]
+                    )
             else:
-                raise DecisionFailure(
-                    "path_draft", "budget", drafting_budget.used, str(context["feedback"])
-                )
+                raise self._budget_failure("path_draft", drafting_budget)
             if path is None:
                 return None, [], "path held or rejected"
         extra = []
@@ -671,15 +808,32 @@ class InvestigationEngine:
         budget = DecisionBudget(self.deps.settings.decision_max_attempts)
         while budget.remaining:
             context["active_path"] = path.model_dump(mode="json")
-            decision = TurnDecision.model_validate(
-                await self._ask(
-                    stage="next_action",
-                    payload={**context, "additional_evidence": extra},
-                    response_schema=TurnDecision.model_json_schema(),
-                    system=SYSTEM,
-                    budget=budget,
+            try:
+                decision = TurnDecision.model_validate(
+                    await self._ask(
+                        stage="next_action",
+                        payload={**context, "additional_evidence": extra},
+                        response_schema=writing_schema(TurnDecision),
+                        system=SYSTEM,
+                        budget=budget,
+                    )
                 )
-            )
+            except (ValueError, TypeError, PathError) as exc:
+                diagnostic = diagnostic_for_exception(exc, stage="next_action")
+                if isinstance(exc, CriterionWritingError):
+                    diagnostic = DecisionDiagnostic(
+                        code=exc.code,
+                        stage="next_action",
+                        kind="format",
+                        location=exc.location,
+                        summary=exc.description,
+                        retryable=True,
+                    )
+                    context["feedback"] = [exc.correction()]
+                else:
+                    context["feedback"] = [diagnostic.feedback()]
+                budget.last_failure = diagnostic.model_copy(update={"attempts": budget.used})
+                continue
             try:
                 last_control_succeeded = False
                 if decision.mode == "read_evidence":
@@ -702,14 +856,16 @@ class InvestigationEngine:
                     suggestion = decision.hypothesis_update
                     target_id = str(suggestion.get("target_node_id", ""))
                     if target_id not in _known_ids(context["knowledge"]):
-                        raise ValueError("hypothesis target is unknown")
+                        raise DecisionRuleError("hypothesis target is unknown")
                     description = suggestion.get("description")
                     if not isinstance(description, str) or not description.strip():
-                        raise ValueError("hypothesis needs a claim")
+                        raise DecisionRuleError("hypothesis needs a claim")
                     hypothesis_id = str(suggestion.get("hypothesis_id") or new_id("hyp"))
                     existing = await service.get_hypothesis(hypothesis_id)
                     if existing and existing.metadata.get("target_node_id") != target_id:
-                        raise ValueError("a hypothesis revision cannot change its target identity")
+                        raise DecisionRuleError(
+                            "a hypothesis revision cannot change its target identity"
+                        )
                     evidence_ids = list(map(str, suggestion.get("evidence_ids", [])))
                     for identity in evidence_ids:
                         evidence = await self.deps.evidence_store.get(identity)
@@ -718,7 +874,7 @@ class InvestigationEngine:
                             or str(evidence.run_id) != str(runtime.run_id)
                             or evidence.metadata.get("target_node_id") != target_id
                         ):
-                            raise ValueError("hypothesis cites unrelated evidence")
+                            raise DecisionRuleError("hypothesis cites unrelated evidence")
                     revision_history = (
                         list(existing.metadata.get("revisions", [])) if existing else []
                     )
@@ -786,7 +942,7 @@ class InvestigationEngine:
                     continue
                 if decision.mode in {"revise_path", "switch_path"}:
                     if decision.path is None:
-                        raise ValueError("path change needs a structured path")
+                        raise DecisionRuleError("path change needs a structured path")
                     if not budget.remaining:
                         return path, [], "continue_planning"
                     updated = await self.register_path(
@@ -804,42 +960,83 @@ class InvestigationEngine:
                     continue
                 if decision.mode == "complete_step":
                     if not budget.remaining:
+                        self.planning_diagnostic = self._budget_failure(
+                            "completion_review", budget
+                        ).diagnostic
                         return path, [], "continue_planning"
                     path, errors = await self.complete_step(
                         path, decision, runtime, context, budget=budget
                     )
-                    context["feedback"] = errors
+                    budget.last_failure = DecisionDiagnostic(
+                        code="completion_or_action_not_admitted",
+                        stage="next_action",
+                        kind="format",
+                        attempts=budget.used,
+                        summary="Evidence, path or execution checks rejected this decision.",
+                        retryable=True,
+                    )
+                    context["feedback"] = self._safe_errors(errors, budget)
                     last_control_succeeded = not errors
                     continue
                 if decision.mode == "complete_goal":
                     if not budget.remaining:
+                        self.planning_diagnostic = self._budget_failure(
+                            "completion_review", budget
+                        ).diagnostic
                         return path, [], "continue_planning"
                     errors = await self.complete_goal(
                         path, decision, runtime, context, budget=budget
                     )
                     if not errors:
                         return path, [], "goal_achieved"
-                    context["feedback"] = errors
+                    budget.last_failure = DecisionDiagnostic(
+                        code="completion_or_action_not_admitted",
+                        stage="next_action",
+                        kind="format",
+                        attempts=budget.used,
+                        summary="Evidence, path or execution checks rejected this decision.",
+                        retryable=True,
+                    )
+                    context["feedback"] = self._safe_errors(errors, budget)
                     continue
                 if decision.mode == "complete_task":
                     if not budget.remaining:
+                        self.planning_diagnostic = self._budget_failure(
+                            "completion_review", budget
+                        ).diagnostic
                         return path, [], "continue_planning"
                     errors = await self.complete_task(
                         path, decision, runtime, context, budget=budget
                     )
                     if not errors:
                         return path, [], "task_completed"
-                    context["feedback"] = errors
+                    budget.last_failure = DecisionDiagnostic(
+                        code="completion_or_action_not_admitted",
+                        stage="next_action",
+                        kind="format",
+                        attempts=budget.used,
+                        summary="Evidence, path or execution checks rejected this decision.",
+                        retryable=True,
+                    )
+                    context["feedback"] = self._safe_errors(errors, budget)
                     continue
                 if decision.mode == "hold":
                     return path, [], decision.reason
                 if not decision.actions:
-                    raise ValueError("actions decision contained no actions")
+                    raise DecisionRuleError("actions decision contained no actions")
                 compiled, errors = await self.compile_actions(
                     path, decision.actions, runtime, context
                 )
                 if errors:
-                    context["feedback"] = errors
+                    budget.last_failure = DecisionDiagnostic(
+                        code="completion_or_action_not_admitted",
+                        stage="next_action",
+                        kind="format",
+                        attempts=budget.used,
+                        summary="Evidence, path or execution checks rejected this decision.",
+                        retryable=True,
+                    )
+                    context["feedback"] = self._safe_errors(errors, budget)
                     from redteam.attack_graph.service import AttackGraphService
 
                     context["repair_references"] = await self.repair_references(
@@ -851,13 +1048,16 @@ class InvestigationEngine:
                     continue
                 return path, compiled, None
             except (ValueError, TypeError, KeyError, PathError) as exc:
-                context["feedback"] = [str(exc)]
+                diagnostic = diagnostic_for_exception(exc, stage="next_action")
+                budget.last_failure = diagnostic
+                context["feedback"] = [diagnostic.feedback()]
                 continue
         if last_control_succeeded:
             return path, [], "continue_planning"
-        raise DecisionFailure("next_action", "budget", budget.used, str(context["feedback"]))
+        raise self._budget_failure("next_action", budget)
 
     async def compile_actions(self, path, intents, runtime, context):
+        await self._review_token(runtime)
         from redteam.attack_graph.service import AttackGraphService
 
         service = AttackGraphService(self.deps.graph_store)
@@ -868,19 +1068,19 @@ class InvestigationEngine:
             try:
                 step = steps.get(intent.path_step_id)
                 if step is None:
-                    raise ValueError("action is outside accepted path")
+                    raise DecisionRuleError("action is outside accepted path")
                 checks = ready_step(path, step, context["knowledge"])
                 if checks:
-                    raise ValueError("; ".join(checks))
+                    raise DecisionRuleError("accepted step prerequisites are not satisfied")
                 if intent.target_node_id not in step.target_node_ids:
-                    raise ValueError("action target is outside step envelope")
+                    raise DecisionRuleError("action target is outside step envelope")
                 if intent.target_node_id not in _known_ids(context["knowledge"]):
-                    raise ValueError("action target is not supplied or observed")
+                    raise DecisionRuleError("action target is not supplied or observed")
                 agent = self.deps.agents.get(intent.agent_id)
                 if agent is None or intent.capability not in agent.capabilities:
-                    raise ValueError("action role/capability is unavailable")
+                    raise DecisionRuleError("action role/capability is unavailable")
                 if step.agent_id and step.agent_id != intent.agent_id:
-                    raise ValueError("action role is outside accepted step")
+                    raise DecisionRuleError("action role is outside accepted step")
                 operation = f"{intent.capability}.{intent.operation}"
                 exclusions = await operator_exclusions(
                     self.deps,
@@ -891,31 +1091,33 @@ class InvestigationEngine:
                     assessment_text=step.objective,
                 )
                 if exclusions:
-                    raise ValueError("; ".join(exclusions))
+                    raise DecisionRuleError("; ".join(exclusions))
                 if operation not in step.allowed_operations:
-                    raise ValueError("action operation is outside step envelope")
+                    raise DecisionRuleError("action operation is outside step envelope")
                 if intent.principal_ref and intent.principal_ref not in step.principal_refs:
-                    raise ValueError("action principal is outside step envelope")
+                    raise DecisionRuleError("action principal is outside step envelope")
                 if step.principal_refs and not intent.principal_ref:
-                    raise ValueError("step requires a principal reference")
+                    raise DecisionRuleError("step requires a principal reference")
                 validate_principal_arguments(
                     step, intent.principal_ref, intent.arguments, context["knowledge"]
                 )
                 node = await service.get_node(GraphNodeId(intent.target_node_id))
                 if node is None:
-                    raise ValueError("referenced action target disappeared")
+                    raise DecisionRuleError("referenced action target disappeared")
                 target = target_for_node(
                     node.id, node.type, observed=facts_of(node.properties).get("observed_target")
                 )
                 if self.deps.tool_catalog is None:
-                    raise ValueError("a real tool catalog is required for action compilation")
+                    raise DecisionRuleError(
+                        "a real tool catalog is required for action compilation"
+                    )
                 if self.deps.tool_catalog.get(intent.tool_id) is None:
-                    raise ValueError("requested tool is absent from catalog")
+                    raise DecisionRuleError("requested tool is absent from catalog")
                 validate_argument_target(
                     target, intent.arguments, target_aliases(self.deps, target)
                 )
                 if await self.has_ambiguous_execution(intent, runtime):
-                    raise ValueError(
+                    raise DecisionRuleError(
                         "matching execution is uncertain; reconcile its stored result/job"
                     )
                 if (
@@ -926,15 +1128,19 @@ class InvestigationEngine:
                         or intent.expectation.field in {"status", "status_code", "success"}
                     )
                 ):
-                    raise ValueError("tool success or status alone cannot prove a violation")
+                    raise DecisionRuleError("tool success or status alone cannot prove a violation")
                 if intent.existing_hypothesis_id:
                     if intent.hypothesis is not None:
-                        raise ValueError("choose an existing hypothesis or a new claim, not both")
+                        raise DecisionRuleError(
+                            "choose an existing hypothesis or a new claim, not both"
+                        )
                     hypothesis = await service.get_hypothesis(intent.existing_hypothesis_id)
                     if hypothesis is None:
-                        raise ValueError("action references a missing hypothesis")
+                        raise DecisionRuleError("action references a missing hypothesis")
                     if hypothesis.metadata.get("target_node_id") != intent.target_node_id:
-                        raise ValueError("existing hypothesis has no matching target binding")
+                        raise DecisionRuleError(
+                            "existing hypothesis has no matching target binding"
+                        )
                 plan = PlanStep(
                     step_id=step.step_id,
                     path_id=path.path_id,
@@ -972,7 +1178,11 @@ class InvestigationEngine:
                     )
                 )
             except (ValueError, TypeError, KeyError) as exc:
-                errors.append(str(exc))
+                errors.append(
+                    exc.diagnostic.summary
+                    if isinstance(exc, DecisionRuleError)
+                    else diagnostic_for_exception(exc, stage="action_compilation").feedback()
+                )
         compiled, rejected = CandidateCompiler(
             self.deps.tool_catalog
         ).compile_drafts_with_rejections(
@@ -1012,7 +1222,11 @@ class InvestigationEngine:
                     context["knowledge"],
                 )
             except (ValueError, TypeError) as exc:
-                errors.append(str(exc))
+                errors.append(
+                    exc.diagnostic.summary
+                    if isinstance(exc, DecisionRuleError)
+                    else diagnostic_for_exception(exc, stage="action_compilation").feedback()
+                )
             history = await self.deps.work_store.list_items(run_id=runtime.run_id)
             if any(
                 work.candidate_key == item.candidate_key
@@ -1126,6 +1340,7 @@ class InvestigationEngine:
     async def complete_step(self, path, decision, runtime, context, *, budget=None):
         from redteam.attack_graph.service import AttackGraphService
 
+        token = await self._review_token(runtime)
         step = next((item for item in path.steps if item.step_id == decision.path_step_id), None)
         if step is None:
             return path, ["completion refers to an unknown step"]
@@ -1141,6 +1356,7 @@ class InvestigationEngine:
         )
         if errors:
             return path, errors
+        await self._check_review_path(runtime, path)
         review = await self._ask(
             stage="completion_review",
             payload={
@@ -1166,21 +1382,26 @@ class InvestigationEngine:
             step_id=step.step_id,
         )
         if not review["accepted"]:
-            return path, [review["reason"]]
+            return path, ["semantic completion review rejected the evidence"]
         outcome = proposal.get("outcome", "inconclusive")
         status = "completed" if outcome in {"success", "refuted"} else "blocked"
-        updated = await self.deps.path_store.update_step(
-            str(runtime.run_id),
-            path.path_id,
-            path.version,
-            step.step_id,
-            status,
-            outcome=outcome,
-            evidence_ids=proposal.get("evidence_ids", []),
-        )
+
+        async def complete(change):
+            return await change.paths.update_step(
+                str(runtime.run_id),
+                path.path_id,
+                path.version,
+                step.step_id,
+                status,
+                outcome=outcome,
+                evidence_ids=proposal.get("evidence_ids", []),
+            )
+
+        updated = await self._commit_review(runtime, token, complete)
         return updated or path, []
 
     async def complete_goal(self, path, decision, runtime, context, *, budget=None):
+        token = await self._review_token(runtime)
         if any(step.required and _text(step.status) != "completed" for step in path.steps):
             return ["required path steps are unfinished"]
         if not any(step.required for step in path.steps):
@@ -1235,6 +1456,7 @@ class InvestigationEngine:
         cleanup = await AttackGraphService(self.deps.graph_store).cleanup_report()
         if cleanup.outstanding:
             return ["required cleanup is still outstanding"]
+        await self._check_review_path(runtime, path)
         review = await self._ask(
             stage="goal_completion_review",
             payload={
@@ -1276,11 +1498,19 @@ class InvestigationEngine:
         )
         mission = await self.deps.task_graph_store.get_mission(runtime.mission_id)
         if not review["accepted"] or mission is None:
-            return [review["reason"]]
+            return ["semantic completion review rejected the evidence"]
         criteria = {item["criterion"]: item for item in review["criteria"]}
-        if set(criteria) != set(mission.success_criteria):
+        if len(review["criteria"]) != len(mission.success_criteria) or set(criteria) != set(
+            mission.success_criteria
+        ):
             return ["goal review must cover the original operator criteria exactly"]
         receipts = {identity for step in path.steps for identity in step.evidence_ids}
+        receipt_tasks = {}
+        if path.mission_task_id:
+            for step in path.steps:
+                if step.required:
+                    for identity in step.evidence_ids:
+                        receipt_tasks.setdefault(identity, set()).add(TaskId(path.mission_task_id))
         latest_task_paths = {}
         for saved in await self.deps.path_store.list_paths(str(runtime.run_id)):
             if (
@@ -1322,6 +1552,9 @@ class InvestigationEngine:
                 if errors:
                     return errors
                 receipts.update(saved_step.evidence_ids)
+                for identity in saved_step.evidence_ids:
+                    receipt_tasks.setdefault(identity, set()).add(task.task_id)
+        criterion_tasks = {}
         for criterion in criteria.values():
             if not criterion["met"] or not criterion["evidence_ids"]:
                 return ["goal criterion lacks evidence"]
@@ -1333,6 +1566,12 @@ class InvestigationEngine:
                     or identity not in receipts
                 ):
                     return ["goal criterion cites unrelated evidence"]
+            owners = set().union(
+                *(receipt_tasks.get(identity, set()) for identity in criterion["evidence_ids"])
+            )
+            if not owners:
+                return ["goal criterion evidence lacks validated task ownership"]
+            criterion_tasks[criterion["criterion"]] = sorted(owners, key=str)
         now = datetime.now(timezone.utc)
         for task in tasks:
             if task.required and task.status not in {TaskStatus.RUNNING, TaskStatus.COMPLETED}:
@@ -1349,34 +1588,38 @@ class InvestigationEngine:
                 and task.task_id != runtime.active_task_id
             ):
                 return ["another required mission task needs its own completion"]
-        for task in tasks:
-            if task.required and task.status is TaskStatus.RUNNING:
-                await self.deps.task_graph_store.transition_task(
-                    task.task_id, TaskStatus.COMPLETED, now=now
+
+        async def complete(change):
+            for task in tasks:
+                if task.required and task.status is TaskStatus.RUNNING:
+                    await change.tasks.transition_task(task.task_id, TaskStatus.COMPLETED, now=now)
+            await change.tasks.update_mission(
+                mission.model_copy(
+                    update={
+                        "status": MissionStatus.COMPLETED,
+                        "updated_at": now,
+                        "revision": mission.revision + 1,
+                        "criterion_results": [
+                            MissionCriterionResult(
+                                criterion=item["criterion"],
+                                met=True,
+                                evidence_ids=item["evidence_ids"],
+                                task_ids=criterion_tasks[item["criterion"]],
+                                reason=review["reason"],
+                            )
+                            for item in criteria.values()
+                        ],
+                    }
                 )
-        await self.deps.task_graph_store.update_mission(
-            mission.model_copy(
-                update={
-                    "status": MissionStatus.COMPLETED,
-                    "updated_at": now,
-                    "revision": mission.revision + 1,
-                    "criterion_results": [
-                        MissionCriterionResult(
-                            criterion=item["criterion"],
-                            met=True,
-                            evidence_ids=item["evidence_ids"],
-                            task_ids=[task.task_id for task in tasks if task.required],
-                            reason=review["reason"],
-                        )
-                        for item in criteria.values()
-                    ],
-                }
             )
-        )
+            change.binding(str(runtime.run_id), str(runtime.mission_id))["closed"] = True
+
+        await self._commit_review(runtime, token, complete)
         return []
 
     async def complete_task(self, path, decision, runtime, context, *, budget=None):
         """Close one evidence-backed mission task without claiming the whole goal."""
+        token = await self._review_token(runtime)
         from redteam.attack_graph.service import AttackGraphService
 
         if not runtime.mission_id or not runtime.active_task_id:
@@ -1435,6 +1678,7 @@ class InvestigationEngine:
                 and str(record.action_id) not in settled
             ):
                 return ["task has an uncertain execution outcome"]
+        await self._check_review_path(runtime, path)
         review = await self._ask(
             stage="task_completion_review",
             payload={
@@ -1459,10 +1703,14 @@ class InvestigationEngine:
             [identity for step in required for identity in step.evidence_ids],
         )
         if not review["accepted"]:
-            return [review["reason"]]
-        await self.deps.task_graph_store.transition_task(
-            task.task_id, TaskStatus.COMPLETED, now=datetime.now(timezone.utc)
-        )
+            return ["semantic completion review rejected the evidence"]
+
+        async def complete(change):
+            return await change.tasks.transition_task(
+                task.task_id, TaskStatus.COMPLETED, now=datetime.now(timezone.utc)
+            )
+
+        await self._commit_review(runtime, token, complete)
         return []
 
 
@@ -1474,15 +1722,15 @@ def validate_principal_arguments(step, principal, arguments, knowledge) -> None:
         if arguments.get(name) is not None
     ]
     if principal and principal not in bindings:
-        raise ValueError("action references an unregistered principal")
+        raise DecisionRuleError("action references an unregistered principal")
     if session_refs:
         if principal is None or principal == "anonymous":
-            raise ValueError("session arguments require an identified principal")
+            raise DecisionRuleError("session arguments require an identified principal")
         allowed = set().union(*(bindings.get(ref, set()) for ref in step.principal_refs))
         if set(session_refs) - allowed or not set(session_refs) & bindings.get(principal, set()):
-            raise ValueError("session arguments do not match accepted principal bindings")
+            raise DecisionRuleError("session arguments do not match accepted principal bindings")
     if arguments.get("principal_ref") is not None and str(arguments["principal_ref"]) != principal:
-        raise ValueError("principal tool argument differs from action identity")
+        raise DecisionRuleError("principal tool argument differs from action identity")
 
 
 def target_aliases(deps, target) -> set[str]:
@@ -1519,7 +1767,7 @@ def validate_argument_target(target, arguments: dict, aliases: set[str] | None =
     if arguments.get("target_ref") is not None:
         allowed = aliases if aliases is not None else {str(target_host), str(target_url)}
         if str(arguments["target_ref"]) not in allowed:
-            raise ValueError("tool target reference differs from proposal target binding")
+            raise DecisionRuleError("tool target reference differs from proposal target binding")
     target_port = getattr(target, "port", None)
     if target_url:
         parsed_target = urlsplit(target_url)
@@ -1530,7 +1778,7 @@ def validate_argument_target(target, arguments: dict, aliases: set[str] | None =
             and target_host
             and str(arguments[name]).lower() != str(target_host).lower()
         ):
-            raise ValueError("tool argument address differs from proposal target")
+            raise DecisionRuleError("tool argument address differs from proposal target")
     for name in ("url", "base_url", "target_url"):
         value = arguments.get(name)
         if isinstance(value, str) and target_host:
@@ -1538,28 +1786,78 @@ def validate_argument_target(target, arguments: dict, aliases: set[str] | None =
                 continue
             parsed = urlsplit(value if "://" in value or value.startswith("//") else "//" + value)
             if parsed.hostname != str(target_host).lower():
-                raise ValueError("tool argument URL differs from proposal target")
+                raise DecisionRuleError("tool argument URL differs from proposal target")
             actual_port = parsed.port or (443 if parsed.scheme == "https" else 80)
             if target_port is not None and actual_port != target_port:
-                raise ValueError("tool argument port differs from proposal target")
+                raise DecisionRuleError("tool argument port differs from proposal target")
             if target_url and parsed.scheme and parsed.scheme != urlsplit(target_url).scheme:
-                raise ValueError("tool argument scheme differs from proposal target")
+                raise DecisionRuleError("tool argument scheme differs from proposal target")
     if arguments.get("port") is not None and target_port is not None:
         if int(arguments["port"]) != target_port:
-            raise ValueError("tool argument port differs from proposal target")
+            raise DecisionRuleError("tool argument port differs from proposal target")
 
 
 async def operator_epoch(deps, runtime) -> str | None:
-    if deps.operator_intent_store is None or not runtime.mission_id:
+    if not runtime.mission_id:
         return None
-    records = await deps.operator_intent_store.list_for_mission(runtime.mission_id)
-    actionable = [
-        record
-        for record in records
-        if _text(record.intent.intent_type) not in {"status_query", "explanation_query", "guidance"}
-        and _text(record.status) != "rejected"
-    ]
-    return str(actionable[-1].intent.intent_id) if actionable else None
+    coordinator = coordinator_for(deps.task_graph_store, deps.path_store)
+
+    async def epoch(change):
+        change.binding(str(runtime.run_id), str(runtime.mission_id), str(runtime.engagement_id))
+        generation = change.generation(str(runtime.run_id), str(runtime.mission_id))
+        return str(generation) if generation else None
+
+    return await coordinator.change(epoch)
+
+
+async def claim_action_admission(deps, runtime, step, proposal) -> None:
+    """Linearize a tool's start before releasing the lock for external I/O."""
+    if runtime is None:
+        return
+    coordinator = coordinator_for(deps.task_graph_store, deps.path_store)
+    if runtime.mission_id is None:
+
+        async def legacy(change):
+            change.legacy_scope(str(runtime.run_id))
+
+        await coordinator.change(legacy)
+        return
+
+    async def claim(change):
+        change.admit(str(runtime.run_id), str(runtime.mission_id))
+        generation = change.generation(str(runtime.run_id), str(runtime.mission_id))
+        epoch = str(generation) if generation else None
+        if epoch != step.operator_intent_id:
+            raise StateConflict("operator_generation_changed")
+        path = await change.paths.get_active(str(runtime.run_id))
+        if path is None or path.path_id != step.path_id or path.version != step.path_version:
+            raise StateConflict("action_path_changed")
+        current = next((item for item in path.steps if item.step_id == step.path_step_id), None)
+        if current is None or current.status in {"completed", "blocked", "failed", "skipped"}:
+            raise StateConflict("action_step_no_longer_runnable")
+        parents = {item.step_id: item for item in path.steps}
+        if any(
+            identity not in parents or parents[identity].status != "completed"
+            for identity in current.depends_on
+        ):
+            raise StateConflict("action_prerequisite_changed")
+        if runtime.active_task_id:
+            task = await change.tasks.get_task(runtime.active_task_id)
+            if (
+                task is None
+                or task.mission_id != runtime.mission_id
+                or task.status is not TaskStatus.RUNNING
+            ):
+                raise StateConflict("action_task_no_longer_running")
+        change.records[("admission", str(proposal.action_id))] = {
+            "run_id": str(runtime.run_id),
+            "mission_id": str(runtime.mission_id),
+            "generation": generation,
+            "path_id": path.path_id,
+            "path_version": path.version,
+        }
+
+    await coordinator.change(claim)
 
 
 async def operator_exclusions(
@@ -1640,6 +1938,13 @@ async def validate_current_action(deps, runtime, step, proposal=None) -> list[st
 
     if step is None or not step.path_id or step.path_version is None or not step.path_step_id:
         return ["action needs an accepted investigation path"]
+    if runtime.mission_id:
+        try:
+            await coordinator_for(deps.task_graph_store, deps.path_store).review_token(
+                str(runtime.run_id), str(runtime.mission_id)
+            )
+        except (ValueError, PathError):
+            return ["operator mutation or inactive mission blocks action admission"]
     path = await deps.path_store.get_active(str(runtime.run_id))
     if path is None or path.path_id != step.path_id or path.version != step.path_version:
         return ["action belongs to a stale path version"]
@@ -1691,5 +1996,9 @@ async def validate_current_action(deps, runtime, step, proposal=None) -> list[st
         )
         validate_principal_arguments(current, step.principal_ref, step.arguments, knowledge)
     except ValueError as exc:
-        problems.append(str(exc))
+        problems.append(
+            exc.diagnostic.summary
+            if isinstance(exc, DecisionRuleError)
+            else diagnostic_for_exception(exc, stage="action_admission").feedback()
+        )
     return problems

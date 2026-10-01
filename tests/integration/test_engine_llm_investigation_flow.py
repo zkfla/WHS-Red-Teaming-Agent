@@ -431,6 +431,7 @@ async def test_budget_zero_allows_completion_review_but_blocks_new_execution():
         criteria=["criterion-1"],
         task_id="task-t1-zero",
     )
+    mission = mission.model_copy(update={"status": MissionStatus.ACTIVE})
     await world.tasks.create_mission(mission)
     await world.tasks.create_task(task)
     runtime = h.make_runtime(
@@ -440,6 +441,11 @@ async def test_budget_zero_allows_completion_review_but_blocks_new_execution():
         task_id="task-t1-zero",
     )
     runtime.remaining_budget = 0
+    from redteam.orchestration.coordination import coordinator_for
+
+    await coordinator_for(world.tasks, world.deps.path_store).bind(
+        str(runtime.run_id), str(mission.mission_id), str(mission.engagement_id)
+    )
     engine = InvestigationEngine(world.deps)
 
     # The single allowed call already answered; completion review is

@@ -537,6 +537,7 @@ async def test_wrong_task_receipts_rejected() -> None:
             mission_id=mission_id,
             engagement_id=EngagementId("eng-t1"),
             objective="guard",
+            status=MissionStatus.ACTIVE,
             success_criteria=["guard"],
             created_at=now,
             updated_at=now,
@@ -555,6 +556,11 @@ async def test_wrong_task_receipts_rejected() -> None:
             created_at=now,
             updated_at=now,
         )
+    )
+    from redteam.orchestration.coordination import coordinator_for
+
+    await coordinator_for(world.tasks, world.deps.path_store).bind(
+        str(runtime.run_id), str(mission_id), str(runtime.engagement_id)
     )
     other_path = PathPlan(
         path_id="path-other",
@@ -715,6 +721,11 @@ async def test_authorization_exclusion_allows_independent_web_read() -> None:
         engagement_id=EngagementId("eng_authz_scope"),
         mission_id=mission_id,
         phase=AgentPhase.PLAN,
+    )
+    from redteam.orchestration.coordination import coordinator_for
+
+    await coordinator_for(deps.task_graph_store, deps.path_store).bind(
+        str(run_id), str(mission_id), str(runtime.engagement_id)
     )
     path = PathPlan(
         path_id="path-authz-scope",

@@ -14,6 +14,7 @@ from typing import Any
 
 from redteam.core.enums import EvidenceSourceType
 from redteam.orchestration.analysis import is_final_admission_receipt, session_list_pairs
+from redteam.orchestration.diagnostics import DecisionDiagnostic
 from redteam.orchestration.paths import (
     ALLOWED_CRITERION_KINDS,
     CompletionCriterion,
@@ -642,6 +643,37 @@ def _claim_matches_criterion(key: str, criterion: CompletionCriterion | str, ind
     return False
 
 
+class CompletionIssues(list[str]):
+    """Compatibility messages plus code-owned correction data without inputs."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.diagnostics: list[DecisionDiagnostic] = []
+
+    def add(self, message: str, *, code: str, summary: str) -> None:
+        self.append(message)
+        self.diagnostics.append(
+            DecisionDiagnostic(
+                code=code,
+                stage="completion_validation",
+                kind="format",
+                location="$.completion",
+                summary=summary,
+                retryable=True,
+            )
+        )
+
+    def deduplicated(self) -> CompletionIssues:
+        result = CompletionIssues()
+        seen: set[str] = set()
+        for message, diagnostic in zip(self, self.diagnostics, strict=True):
+            if message not in seen:
+                result.append(message)
+                result.diagnostics.append(diagnostic)
+                seen.add(message)
+        return result
+
+
 async def validate_completion(
     *,
     path: PathPlan,
@@ -653,51 +685,89 @@ async def validate_completion(
     path_store: Any | None = None,
 ) -> list[str]:
     """Code checks for a step completion proposal. Empty list means pass."""
-    issues: list[str] = []
+    issues = CompletionIssues()
     if not isinstance(proposal, dict):
         return ["proposal must be a dict with evidence_ids/outcome/reason/criterion_results"]
     try:
         criteria_key(step.completion_criteria)
     except Exception as exc:  # noqa: BLE001 - malformed fixed criteria block success
-        issues.append(f"step '{step.step_id or '?'}' has malformed completion criteria: {exc}")
+        issues.add(
+            f"step '{step.step_id or '?'}' has malformed completion criteria: {exc}",
+            code="completion_step_reference_has_malformed_completion_criteria_11",
+            summary="step 'reference' has malformed completion criteria: reference",
+        )
     run = _s(run_id).strip()
     if not run:
-        issues.append("run_id is required")
+        issues.add(
+            "run_id is required",
+            code="completion_run_id_is_required_1",
+            summary="run_id is required",
+        )
     path_id = _s(path.path_id).strip()
     path_version = path.version
     step_id = _s(step.step_id).strip()
     if not path_id:
-        issues.append("path has no path_id")
+        issues.add(
+            "path has no path_id",
+            code="completion_path_has_no_path_id_2",
+            summary="path has no path_id",
+        )
     if not step_id:
-        issues.append("step has no step_id")
+        issues.add(
+            "step has no step_id",
+            code="completion_step_has_no_step_id_3",
+            summary="step has no step_id",
+        )
     if not is_active_status(path.status):
-        issues.append(f"path '{path_id or '?'}' is not active (status={path.status or 'missing'})")
+        issues.add(
+            f"path '{path_id or '?'}' is not active (status={path.status or 'missing'})",
+            code="completion_path_reference_is_not_active_status_4",
+            summary="path 'reference' is not active (status=reference)",
+        )
     path_step_ids = {_s(item.step_id).strip() for item in path.steps}
     if step_id and path_step_ids and step_id not in path_step_ids:
-        issues.append(f"step '{step_id}' does not belong to path '{path_id or '?'}'")
+        issues.add(
+            f"step '{step_id}' does not belong to path '{path_id or '?'}'",
+            code="completion_step_reference_does_not_belong_to_5",
+            summary="step 'reference' does not belong to path 'reference'",
+        )
     # Predecessors: only required ones block completion.
     dep_ids = [_s(item).strip() for item in (step.depends_on or []) if _s(item).strip()]
     by_id = {_s(item.step_id).strip(): item for item in path.steps}
     for dep_id in dep_ids:
         dep = by_id.get(dep_id)
         if dep is None:
-            issues.append(f"predecessor step '{dep_id}' not found in path '{path_id or '?'}'")
+            issues.add(
+                f"predecessor step '{dep_id}' not found in path '{path_id or '?'}'",
+                code="completion_predecessor_step_reference_not_found_in_12",
+                summary="predecessor step 'reference' not found in path 'reference'",
+            )
             continue
         if bool(dep.required) and not _is_completed_status(dep.status):
-            issues.append(
+            issues.add(
                 f"required predecessor step '{dep_id}' is not completed "
-                f"(status={dep.status or 'missing'})"
+                f"(status={dep.status or 'missing'})",
+                code="completion_required_predecessor_step_reference_is_not_13",
+                summary=(
+                    "required predecessor step 'reference' is not completed (status=reference)"
+                ),
             )
     outcome = _s(proposal.get("outcome", "")).strip().lower()
     if outcome not in _VALID_OUTCOMES:
-        issues.append(
+        issues.add(
             "outcome must be one of success/refuted/inconclusive/blocked "
-            f"(got={proposal.get('outcome')!r})"
+            f"(got={proposal.get('outcome')!r})",
+            code="completion_outcome_must_be_one_of_success_6",
+            summary=("outcome must be one of success/refuted/inconclusive/blocked (got=reference)"),
         )
         outcome = ""
     reason = proposal.get("reason", "")
     if not isinstance(reason, str) or not reason.strip():
-        issues.append("proposal reason is required")
+        issues.add(
+            "proposal reason is required",
+            code="completion_proposal_reason_is_required_7",
+            summary="proposal reason is required",
+        )
     raw_evidence_ids = proposal.get("evidence_ids", [])
     if isinstance(raw_evidence_ids, str):
         raw_evidence_ids = [raw_evidence_ids]
@@ -707,11 +777,23 @@ async def validate_completion(
         ]
     except TypeError:
         evidence_ids = []
-        issues.append("proposal evidence_ids must be a list of evidence id strings")
+        issues.add(
+            "proposal evidence_ids must be a list of evidence id strings",
+            code="completion_proposal_evidence_ids_must_be_a_14",
+            summary="proposal evidence_ids must be a list of evidence id strings",
+        )
     if not evidence_ids:
-        issues.append("proposal has no evidence; completion needs real evidence")
+        issues.add(
+            "proposal has no evidence; completion needs real evidence",
+            code="completion_proposal_has_no_evidence_completion_needs_8",
+            summary="proposal has no evidence; completion needs real evidence",
+        )
     if outcome in {"inconclusive", "blocked"}:
-        issues.append(f"outcome '{outcome}' is not a successful completion")
+        issues.add(
+            f"outcome '{outcome}' is not a successful completion",
+            code="completion_outcome_reference_is_not_a_successful_9",
+            summary="outcome 'reference' is not a successful completion",
+        )
     # Per-evidence linkage checks. Missing path linkage can never succeed
     # (worker D records path_id/path_version/path_step_id/principal_ref).
     valid_records: list[Any] = []
@@ -729,24 +811,46 @@ async def validate_completion(
         try:
             record = await evidence_store.get(eid)  # type: ignore[union-attr]
         except Exception as exc:  # noqa: BLE001 - store failure is a validation issue
-            issues.append(f"evidence '{eid}' lookup failed: {type(exc).__name__}")
+            issues.add(
+                f"evidence '{eid}' lookup failed: {type(exc).__name__}",
+                code="completion_evidence_reference_lookup_failed_reference_39",
+                summary="evidence 'reference' lookup failed: reference",
+            )
             continue
         if record is None:
-            issues.append(f"evidence '{eid}' does not exist")
+            issues.add(
+                f"evidence '{eid}' does not exist",
+                code="completion_evidence_reference_does_not_exist_15",
+                summary="evidence 'reference' does not exist",
+            )
             continue
         if _s(_field(record, "run_id", "")) != run:
-            issues.append(f"evidence '{eid}' belongs to a different run")
+            issues.add(
+                f"evidence '{eid}' belongs to a different run",
+                code="completion_evidence_reference_belongs_to_a_different_16",
+                summary="evidence 'reference' belongs to a different run",
+            )
             continue
         meta = _field(record, "metadata", {}) or {}
         if not isinstance(meta, dict):
-            issues.append(f"evidence '{eid}' has unreadable metadata")
+            issues.add(
+                f"evidence '{eid}' has unreadable metadata",
+                code="completion_evidence_reference_has_unreadable_metadata_17",
+                summary="evidence 'reference' has unreadable metadata",
+            )
             continue
         m_path_id = _s(meta.get("path_id", "")).strip()
         m_version = meta.get("path_version", None)
         m_step_id = _s(meta.get("path_step_id", "")).strip()
         if not m_path_id or m_version is None or _s(m_version).strip() == "" or not m_step_id:
-            issues.append(
-                f"evidence '{eid}' has no path linkage (path_id/path_version/path_step_id required)"
+            issues.add(
+                f"evidence '{eid}' has no path linkage "
+                "(path_id/path_version/path_step_id required)",
+                code="completion_evidence_reference_has_no_path_linkage_18",
+                summary=(
+                    "evidence 'reference' has no path linkage "
+                    "(path_id/path_version/path_step_id required)"
+                ),
             )
             continue
         ev_principals = _evidence_principal_refs(record)
@@ -759,74 +863,134 @@ async def validate_completion(
             if not step_principal_set or explicit_anonymous:
                 pass
             else:
-                issues.append(
+                issues.add(
                     f"evidence '{eid}' is anonymous but the step requires an account; "
-                    "anonymous receipt cannot satisfy an account-scoped step"
+                    "anonymous receipt cannot satisfy an account-scoped step",
+                    code="completion_evidence_reference_is_anonymous_but_the_40",
+                    summary=(
+                        "evidence 'reference' is anonymous but the step requires an "
+                        "account; anonymous receipt cannot satisfy an account-scoped step"
+                    ),
                 )
                 continue
         elif step_principal_set:
             if not ev_principals:
-                issues.append(f"evidence '{eid}' has no principal_ref")
+                issues.add(
+                    f"evidence '{eid}' has no principal_ref",
+                    code="completion_evidence_reference_has_no_principal_ref_60",
+                    summary="evidence 'reference' has no principal_ref",
+                )
                 continue
             if ev_principals.isdisjoint(step_principal_set):
-                issues.append(f"evidence '{eid}' uses a principal outside the step scope")
+                issues.add(
+                    f"evidence '{eid}' uses a principal outside the step scope",
+                    code="completion_evidence_reference_uses_a_principal_outside_61",
+                    summary="evidence 'reference' uses a principal outside the step scope",
+                )
                 continue
         # A step with no principal scope accepts anonymous initial
         # reconnaissance evidence as-is; an account-scoped step never does
         # unless it explicitly lists anonymous.
         if m_path_id != path_id:
-            issues.append(f"evidence '{eid}' belongs to a different path (path_id mismatch)")
+            issues.add(
+                f"evidence '{eid}' belongs to a different path (path_id mismatch)",
+                code="completion_evidence_reference_belongs_to_a_different_19",
+                summary="evidence 'reference' belongs to a different path (path_id mismatch)",
+            )
             continue
         if _s(m_version).strip() != _s(path_version).strip():
             if path_store is None:
-                issues.append(f"evidence '{eid}' belongs to a different path version")
+                issues.add(
+                    f"evidence '{eid}' belongs to a different path version",
+                    code="completion_evidence_reference_belongs_to_a_different_41",
+                    summary="evidence 'reference' belongs to a different path version",
+                )
                 continue
             try:
                 lineage_ok, lineage_reason = await _verify_prior_lineage(
                     path_store, run, path_id, path_version, m_version, step_id, step
                 )
             except Exception:
-                issues.append(
-                    f"evidence '{eid}' prior-version lineage lookup failed; treating as unproven"
+                issues.add(
+                    f"evidence '{eid}' prior-version lineage lookup failed; treating as unproven",
+                    code="completion_evidence_reference_prior_version_lineage_lookup_62",
+                    summary=(
+                        "evidence 'reference' prior-version lineage lookup failed; "
+                        "treating as unproven"
+                    ),
                 )
                 continue
             if not lineage_ok:
-                issues.append(f"evidence '{eid}' {lineage_reason}")
+                issues.add(
+                    f"evidence '{eid}' {lineage_reason}",
+                    code="completion_evidence_reference_reference_42",
+                    summary="evidence 'reference' reference",
+                )
                 continue
         if m_step_id != step_id:
-            issues.append(f"evidence '{eid}' belongs to a different step")
+            issues.add(
+                f"evidence '{eid}' belongs to a different step",
+                code="completion_evidence_reference_belongs_to_a_different_20",
+                summary="evidence 'reference' belongs to a different step",
+            )
             continue
         canonical_value = _canonical_evidence_value(meta)
         if not canonical_value:
-            issues.append(
+            issues.add(
                 f"evidence '{eid}' has no canonical operation proof "
-                "(bare operation alone proves nothing)"
+                "(bare operation alone proves nothing)",
+                code="completion_evidence_reference_has_no_canonical_operation_21",
+                summary=(
+                    "evidence 'reference' has no canonical operation proof (bare "
+                    "operation alone proves nothing)"
+                ),
             )
             continue
         if step_op_set:
             ev_op_names = _evidence_operation_names(meta)
             if ev_op_names.isdisjoint(step_op_set):
-                issues.append(f"evidence '{eid}' uses an operation outside the step scope")
+                issues.add(
+                    f"evidence '{eid}' uses an operation outside the step scope",
+                    code="completion_evidence_reference_uses_an_operation_outside_43",
+                    summary="evidence 'reference' uses an operation outside the step scope",
+                )
                 continue
         raw = _stored_raw_result(meta)
         if raw is None:
-            issues.append(
-                f"evidence '{eid}' has no preserved raw ToolResult (metadata tool_result required)"
+            issues.add(
+                f"evidence '{eid}' has no preserved raw ToolResult (metadata tool_result required)",
+                code="completion_evidence_reference_has_no_preserved_raw_22",
+                summary=(
+                    "evidence 'reference' has no preserved raw ToolResult (metadata "
+                    "tool_result required)"
+                ),
             )
             continue
         target_ref = _s(meta.get("target_node_id", "")).strip()
         if not target_ref:
-            issues.append(f"evidence '{eid}' has no target linkage")
+            issues.add(
+                f"evidence '{eid}' has no target linkage",
+                code="completion_evidence_reference_has_no_target_linkage_23",
+                summary="evidence 'reference' has no target linkage",
+            )
             continue
         if step_target_set and target_ref not in step_target_set:
-            issues.append(f"evidence '{eid}' targets a different object")
+            issues.add(
+                f"evidence '{eid}' targets a different object",
+                code="completion_evidence_reference_targets_a_different_object_24",
+                summary="evidence 'reference' targets a different object",
+            )
             continue
         action_id = _field(record, "action_id", None)
         invocation_id = _field(record, "invocation_id", None)
         action_ref = _s(action_id).strip()
         invocation_ref = _s(invocation_id).strip()
         if not action_ref or not invocation_ref:
-            issues.append(f"evidence '{eid}' needs both action_id and invocation_id linkage")
+            issues.add(
+                f"evidence '{eid}' needs both action_id and invocation_id linkage",
+                code="completion_evidence_reference_needs_both_action_id_25",
+                summary="evidence 'reference' needs both action_id and invocation_id linkage",
+            )
             continue
         mismatched = next(
             (
@@ -839,34 +1003,63 @@ async def validate_completion(
             None,
         )
         if mismatched is not None:
-            issues.append(f"evidence '{eid}' {mismatched} disagrees with its original result")
+            issues.add(
+                f"evidence '{eid}' {mismatched} disagrees with its original result",
+                code="completion_evidence_reference_reference_disagrees_with_its_26",
+                summary="evidence 'reference' reference disagrees with its original result",
+            )
             continue
         if str(raw.get("action_id", "")).strip() != action_ref:
-            issues.append(f"evidence '{eid}' preserved raw result answers another action")
+            issues.add(
+                f"evidence '{eid}' preserved raw result answers another action",
+                code="completion_evidence_reference_preserved_raw_result_answers_27",
+                summary="evidence 'reference' preserved raw result answers another action",
+            )
             continue
         if str(raw.get("invocation_id", "")).strip() != invocation_ref:
-            issues.append(f"evidence '{eid}' preserved raw result answers another invocation")
+            issues.add(
+                f"evidence '{eid}' preserved raw result answers another invocation",
+                code="completion_evidence_reference_preserved_raw_result_answers_28",
+                summary="evidence 'reference' preserved raw result answers another invocation",
+            )
             continue
         stored_proposal = meta.get("proposal")
         if not isinstance(stored_proposal, dict):
-            issues.append(
+            issues.add(
                 f"evidence '{eid}' has no stored proposal to prove linkage; "
-                "identifier alone is not proof"
+                "identifier alone is not proof",
+                code="completion_evidence_reference_has_no_stored_proposal_29",
+                summary=(
+                    "evidence 'reference' has no stored proposal to prove linkage; "
+                    "identifier alone is not proof"
+                ),
             )
             continue
         stored_action = _s(stored_proposal.get("action_id", "")).strip()
         if not stored_action or stored_action != action_ref:
-            issues.append(f"evidence '{eid}' stored proposal answers another action")
+            issues.add(
+                f"evidence '{eid}' stored proposal answers another action",
+                code="completion_evidence_reference_stored_proposal_answers_another_30",
+                summary="evidence 'reference' stored proposal answers another action",
+            )
             continue
         stored_capability = stored_proposal.get("capability")
         stored_operation = stored_proposal.get("operation")
         if isinstance(stored_capability, str) and stored_capability.strip():
             if stored_capability.strip() != _s(meta.get("capability", "")).strip():
-                issues.append(f"evidence '{eid}' stored behavior disagrees with its record")
+                issues.add(
+                    f"evidence '{eid}' stored behavior disagrees with its record",
+                    code="completion_evidence_reference_stored_behavior_disagrees_with_44",
+                    summary="evidence 'reference' stored behavior disagrees with its record",
+                )
                 continue
         if isinstance(stored_operation, str) and stored_operation.strip():
             if stored_operation.strip() != _s(meta.get("operation", "")).strip():
-                issues.append(f"evidence '{eid}' stored behavior disagrees with its record")
+                issues.add(
+                    f"evidence '{eid}' stored behavior disagrees with its record",
+                    code="completion_evidence_reference_stored_behavior_disagrees_with_45",
+                    summary="evidence 'reference' stored behavior disagrees with its record",
+                )
                 continue
         # Prefer the code-stored step account over tool args (same false-
         # rejection as the review path: args may carry only a session_ref).
@@ -884,7 +1077,11 @@ async def validate_completion(
         else:
             stored_claimed = _claimed_proposal_principal(stored_proposal)
         if stored_claimed is not None and stored_claimed not in ev_principals:
-            issues.append(f"evidence '{eid}' stored account differs from its record")
+            issues.add(
+                f"evidence '{eid}' stored account differs from its record",
+                code="completion_evidence_reference_stored_account_differs_from_31",
+                summary="evidence 'reference' stored account differs from its record",
+            )
             continue
         raw_success = raw.get("success")
         if not isinstance(raw_success, bool):
@@ -893,15 +1090,26 @@ async def validate_completion(
             raw_success is None and isinstance(meta.get("error"), dict) and bool(meta.get("error"))
         )
         if outcome == "success" and failed_original:
-            issues.append(
-                f"evidence '{eid}' records a failed original result and cannot support success"
+            issues.add(
+                f"evidence '{eid}' records a failed original result and cannot support success",
+                code="completion_evidence_reference_records_a_failed_original_32",
+                summary=(
+                    "evidence 'reference' records a failed original result and cannot "
+                    "support success"
+                ),
             )
             continue
         if outcome == "refuted" and failed_original:
-            issues.append(
+            issues.add(
                 f"evidence '{eid}' records a failed original result; "
                 "refuted needs a successful observation with a valid negative result, "
-                "never inconclusive or failure"
+                "never inconclusive or failure",
+                code="completion_evidence_reference_records_a_failed_original_33",
+                summary=(
+                    "evidence 'reference' records a failed original result; refuted "
+                    "needs a successful observation with a valid negative result, "
+                    "never inconclusive or failure"
+                ),
             )
             continue
         if step_principal_set and not explicit_anonymous:
@@ -936,24 +1144,39 @@ async def validate_completion(
                             ):
                                 alias_verified.add(claimed_name)
                     except Exception:
-                        issues.append(
+                        issues.add(
                             f"evidence '{eid}' session binding lookup failed; "
-                            "treating as ungrounded"
+                            "treating as ungrounded",
+                            code="completion_evidence_reference_session_binding_lookup_failed_68",
+                            summary=(
+                                "evidence 'reference' session binding lookup failed; treating as "
+                                "ungrounded"
+                            ),
                         )
                         continue
                 if alias_verified:
                     verified_by_evidence[eid] = set(alias_verified)
                 else:
-                    issues.append(
+                    issues.add(
                         f"evidence '{eid}' declares account {sorted(claimed_accounts)} but has "
                         "no exact raw session receipt or grounded session binding; "
-                        "declaration alone is not proof"
+                        "declaration alone is not proof",
+                        code="completion_evidence_reference_declares_account_reference_but_63",
+                        summary=(
+                            "evidence 'reference' declares account reference but has no exact "
+                            "raw session receipt or grounded session binding; declaration "
+                            "alone is not proof"
+                        ),
                     )
                     continue
         valid_records.append(record)
     criteria = _criteria_list(step)
     if not criteria:
-        issues.append(f"step '{step_id or '?'}' has no fixed completion criteria")
+        issues.add(
+            f"step '{step_id or '?'}' has no fixed completion criteria",
+            code="completion_step_reference_has_no_fixed_completion_10",
+            summary="step 'reference' has no fixed completion criteria",
+        )
     evaluated: list[tuple[CompletionCriterion | str, bool, str]] = []
     final_receipts: list[dict[str, Any]] | None = None
     receipts_failed = False
@@ -963,14 +1186,22 @@ async def validate_completion(
         label = _criterion_label(criterion, index)
         kind = _criterion_kind(criterion)
         if not is_known_criterion(criterion):
-            issues.append(f"unknown completion condition cannot succeed: {label}")
+            issues.add(
+                f"unknown completion condition cannot succeed: {label}",
+                code="completion_unknown_completion_condition_cannot_succeed_reference_34",
+                summary="unknown completion condition cannot succeed: reference",
+            )
             evaluated.append((criterion, False, "unknown"))
             continue
         min_evidence = _criterion_min_evidence(criterion)
         hid = _criterion_hypothesis_id(criterion)
         required_principals = set(_criterion_principal_refs(criterion))
         if kind in {"hypothesis_confirmed", "hypothesis_refuted"} and not hid:
-            issues.append(f"{label} needs a hypothesis_id")
+            issues.add(
+                f"{label} needs a hypothesis_id",
+                code="completion_reference_needs_a_hypothesis_id_35",
+                summary="reference needs a hypothesis_id",
+            )
             evaluated.append((criterion, False, "missing hypothesis"))
             continue
         pool = list(valid_records)
@@ -989,7 +1220,11 @@ async def validate_completion(
             pool = verified_pool
             missing_principals = required_principals - have
             if missing_principals:
-                issues.append(f"{label} missing principal scope: {sorted(missing_principals)}")
+                issues.add(
+                    f"{label} missing principal scope: {sorted(missing_principals)}",
+                    code="completion_reference_missing_principal_scope_reference_46",
+                    summary="reference missing principal scope: reference",
+                )
                 evaluated.append((criterion, False, "principal scope"))
                 continue
         if kind in {"hypothesis_confirmed", "hypothesis_refuted"} and hid:
@@ -998,22 +1233,36 @@ async def validate_completion(
             try:
                 hypothesis = await graph_service.get_hypothesis(hid)  # type: ignore[union-attr]
             except Exception as exc:  # noqa: BLE001 - graph failure blocks success
-                issues.append(f"{label} hypothesis lookup failed: {type(exc).__name__}")
+                issues.add(
+                    f"{label} hypothesis lookup failed: {type(exc).__name__}",
+                    code="completion_reference_hypothesis_lookup_failed_reference_64",
+                    summary="reference hypothesis lookup failed: reference",
+                )
                 evaluated.append((criterion, False, "hypothesis lookup"))
                 continue
             if hypothesis is None:
-                issues.append(f"{label} references an unknown hypothesis '{hid}'")
+                issues.add(
+                    f"{label} references an unknown hypothesis '{hid}'",
+                    code="completion_reference_references_an_unknown_hypothesis_reference_47",
+                    summary="reference references an unknown hypothesis 'reference'",
+                )
                 evaluated.append((criterion, False, "unknown hypothesis"))
                 continue
             status = _norm_status(_field(hypothesis, "status", ""))
             if kind == "hypothesis_confirmed" and status != "confirmed":
-                issues.append(
-                    f"{label} hypothesis '{hid}' is not confirmed (status={status or '?'})"
+                issues.add(
+                    f"{label} hypothesis '{hid}' is not confirmed (status={status or '?'})",
+                    code="completion_reference_hypothesis_reference_is_not_confirmed_48",
+                    summary="reference hypothesis 'reference' is not confirmed (status=reference)",
                 )
                 evaluated.append((criterion, False, "hypothesis status"))
                 continue
             if kind == "hypothesis_refuted" and status not in {"rejected", "refuted"}:
-                issues.append(f"{label} hypothesis '{hid}' is not refuted (status={status or '?'})")
+                issues.add(
+                    f"{label} hypothesis '{hid}' is not refuted (status={status or '?'})",
+                    code="completion_reference_hypothesis_reference_is_not_refuted_49",
+                    summary="reference hypothesis 'reference' is not refuted (status=reference)",
+                )
                 evaluated.append((criterion, False, "hypothesis status"))
                 continue
             if final_receipts is None and not receipts_failed:
@@ -1023,34 +1272,56 @@ async def validate_completion(
                     receipts_failed = True
                     final_receipts = []
             if receipts_failed:
-                issues.append(f"{label} review receipt lookup failed; treating as unproven")
+                issues.add(
+                    f"{label} review receipt lookup failed; treating as unproven",
+                    code="completion_reference_review_receipt_lookup_failed_treating_50",
+                    summary="reference review receipt lookup failed; treating as unproven",
+                )
                 evaluated.append((criterion, False, "receipt lookup"))
                 continue
             assert final_receipts is not None
             pool_ids, pool_pairs = _pool_record_ids(pool)
             if kind == "hypothesis_confirmed":
                 if not _final_receipt_confirms(final_receipts, pool_ids, pool_pairs, hid):
-                    issues.append(
+                    issues.add(
                         f"{label} has no final admission receipt confirming it "
-                        "(benign success with claim_supported True required; interim excluded)"
+                        "(benign success with claim_supported True required; interim excluded)",
+                        code="completion_reference_has_no_final_admission_receipt_65",
+                        summary=(
+                            "reference has no final admission receipt confirming it (benign "
+                            "success with claim_supported True required; interim excluded)"
+                        ),
                     )
                     evaluated.append((criterion, False, "receipt confirmation"))
                     continue
             else:
                 if not _final_receipt_refutes(final_receipts, pool_ids, pool_pairs, hid):
-                    issues.append(
+                    issues.add(
                         f"{label} has no final admission receipt refuting it "
-                        "(claim_supported False required; interim excluded)"
+                        "(claim_supported False required; interim excluded)",
+                        code="completion_reference_has_no_final_admission_receipt_66",
+                        summary=(
+                            "reference has no final admission receipt refuting it "
+                            "(claim_supported False required; interim excluded)"
+                        ),
                     )
                     evaluated.append((criterion, False, "receipt confirmation"))
                     continue
         if len(pool) < min_evidence:
-            issues.append(f"{label} needs {min_evidence} evidence(s), found {len(pool)}")
+            issues.add(
+                f"{label} needs {min_evidence} evidence(s), found {len(pool)}",
+                code="completion_reference_needs_reference_evidence_s_found_36",
+                summary="reference needs reference evidence(s), found reference",
+            )
             evaluated.append((criterion, False, "evidence count"))
             continue
         if kind == "poc":
             if outcome == "refuted":
-                issues.append(f"{label}: refuted is an investigation result, not PoC success")
+                issues.add(
+                    f"{label}: refuted is an investigation result, not PoC success",
+                    code="completion_reference_refuted_is_an_investigation_result_51",
+                    summary="reference: refuted is an investigation result, not PoC success",
+                )
                 evaluated.append((criterion, False, "refuted is not poc"))
                 continue
             backed = False
@@ -1066,7 +1337,11 @@ async def validate_completion(
                     backed = True
                     break
             if not backed:
-                issues.append(f"{label} needs successful tool evidence")
+                issues.add(
+                    f"{label} needs successful tool evidence",
+                    code="completion_reference_needs_successful_tool_evidence_52",
+                    summary="reference needs successful tool evidence",
+                )
                 evaluated.append((criterion, False, "poc backing"))
                 continue
             if final_receipts is None and not receipts_failed:
@@ -1076,15 +1351,24 @@ async def validate_completion(
                     receipts_failed = True
                     final_receipts = []
             if receipts_failed:
-                issues.append(f"{label} review receipt lookup failed; treating as unproven")
+                issues.add(
+                    f"{label} review receipt lookup failed; treating as unproven",
+                    code="completion_reference_review_receipt_lookup_failed_treating_53",
+                    summary="reference review receipt lookup failed; treating as unproven",
+                )
                 evaluated.append((criterion, False, "receipt lookup"))
                 continue
             assert final_receipts is not None
             poc_ids, poc_pairs = _pool_record_ids(pool)
             if not _final_success_violation_receipt(final_receipts, poc_ids, poc_pairs, hid):
-                issues.append(
+                issues.add(
                     f"{label} has no final admission success/violation receipt "
-                    "(same run/action/invocation/source; interim excluded)"
+                    "(same run/action/invocation/source; interim excluded)",
+                    code="completion_reference_has_no_final_admission_success_54",
+                    summary=(
+                        "reference has no final admission success/violation receipt (same "
+                        "run/action/invocation/source; interim excluded)"
+                    ),
                 )
                 evaluated.append((criterion, False, "poc receipt"))
                 continue
@@ -1095,7 +1379,11 @@ async def validate_completion(
                     findings_failed = True
                     verified_findings = []
             if findings_failed:
-                issues.append(f"{label} finding lookup failed; treating as unproven")
+                issues.add(
+                    f"{label} finding lookup failed; treating as unproven",
+                    code="completion_reference_finding_lookup_failed_treating_as_55",
+                    summary="reference finding lookup failed; treating as unproven",
+                )
                 evaluated.append((criterion, False, "finding lookup"))
                 continue
             assert verified_findings is not None
@@ -1119,23 +1407,22 @@ async def validate_completion(
                 finding_ok = True
                 break
             if not finding_ok:
-                issues.append(f"{label} has no verified Finding for the same hypothesis and source")
+                issues.add(
+                    f"{label} has no verified Finding for the same hypothesis and source",
+                    code="completion_reference_has_no_verified_finding_for_56",
+                    summary="reference has no verified Finding for the same hypothesis and source",
+                )
                 evaluated.append((criterion, False, "poc finding"))
                 continue
         evaluated.append((criterion, True, "ok"))
-    if outcome == "success":
-        for _criterion, passed, _why in evaluated:
-            if not passed:
-                break
-        else:
-            if evaluated and all(passed for _, passed, _ in evaluated):
-                pass
-            elif not evaluated:
-                pass
     if outcome == "refuted":
         refuted_kinds = [c for c in criteria if _criterion_kind(c) == "hypothesis_refuted"]
         if not refuted_kinds:
-            issues.append("refuted outcome needs a hypothesis_refuted completion condition")
+            issues.add(
+                "refuted outcome needs a hypothesis_refuted completion condition",
+                code="completion_refuted_outcome_needs_a_hypothesis_refuted_37",
+                summary="refuted outcome needs a hypothesis_refuted completion condition",
+            )
         else:
             refuted_ok = any(
                 passed
@@ -1143,19 +1430,35 @@ async def validate_completion(
                 if _criterion_kind(criterion) == "hypothesis_refuted"
             )
             if not refuted_ok:
-                issues.append("refuted outcome has no satisfied hypothesis_refuted condition")
+                issues.add(
+                    "refuted outcome has no satisfied hypothesis_refuted condition",
+                    code="completion_refuted_outcome_has_no_satisfied_hypothesis_57",
+                    summary="refuted outcome has no satisfied hypothesis_refuted condition",
+                )
         for eval_criterion, passed, _ in evaluated:
             kind = _criterion_kind(eval_criterion)
             if kind == "poc" and passed:
-                issues.append("refuted outcome cannot claim PoC success")
+                issues.add(
+                    "refuted outcome cannot claim PoC success",
+                    code="completion_refuted_outcome_cannot_claim_poc_success_58",
+                    summary="refuted outcome cannot claim PoC success",
+                )
                 break
             if kind == "hypothesis_confirmed" and passed:
-                issues.append("refuted outcome contradicts a confirmed hypothesis condition")
+                issues.add(
+                    "refuted outcome contradicts a confirmed hypothesis condition",
+                    code="completion_refuted_outcome_contradicts_a_confirmed_hypothesis_59",
+                    summary="refuted outcome contradicts a confirmed hypothesis condition",
+                )
                 break
     if outcome == "success" and not valid_records:
         lowered_reason = _s(reason).lower()
         if any(phrase in lowered_reason for phrase in _NO_CANDIDATE_PHRASES):
-            issues.append("lack of candidates alone cannot justify completion")
+            issues.add(
+                "lack of candidates alone cannot justify completion",
+                code="completion_lack_of_candidates_alone_cannot_justify_38",
+                summary="lack of candidates alone cannot justify completion",
+            )
     # Proposal claim vs reality: only flag explicit false-met claims.
     claims = _proposal_claims(proposal)
     for key, claimed in claims:
@@ -1165,18 +1468,14 @@ async def validate_completion(
             if _claim_matches_criterion(key, criterion, index):
                 actual = next((passed for crit, passed, _ in evaluated if crit is criterion), None)
                 if actual is False:
-                    issues.append(
+                    issues.add(
                         f"proposal claims '{key}' is met but "
-                        f"{_criterion_label(criterion, index)} is not satisfied"
+                        f"{_criterion_label(criterion, index)} is not satisfied",
+                        code="completion_proposal_claims_reference_is_met_but_67",
+                        summary="proposal claims 'reference' is met but reference is not satisfied",
                     )
                 break
-    seen: set[str] = set()
-    deduped: list[str] = []
-    for item in issues:
-        if item not in seen:
-            seen.add(item)
-            deduped.append(item)
-    return deduped
+    return issues.deduplicated()
 
 
 __all__ = ["validate_completion"]

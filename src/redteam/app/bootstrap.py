@@ -33,6 +33,7 @@ import logging
 from contextlib import AsyncExitStack
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 from redteam.app.report_store import save_terminal_report
 from redteam.attack_graph.service import AttackGraphService
@@ -77,9 +78,16 @@ from redteam.orchestration.agents.providers import (
 )
 from redteam.orchestration.agents.registry import AgentRegistry, default_registry
 from redteam.orchestration.context import RuntimeDeps
+from redteam.orchestration.coordination import (
+    ChangeSet,
+    CoordinationError,
+    coordinator_for,
+    validate_configuration,
+)
 from redteam.orchestration.events import REPORT_PROJECTED
 from redteam.orchestration.mission_bootstrap import bootstrap_mission
 from redteam.orchestration.operator_intents import build_operator_intent_store
+from redteam.orchestration.outbox import deliver_pending
 from redteam.orchestration.replanning import finalize_mission
 from redteam.orchestration.reporting import ReportingAgent
 from redteam.orchestration.runner import AgentLoopRunner
@@ -301,6 +309,28 @@ async def build_application(
     """
     logging.basicConfig(level=config.logging.level)
 
+    # Inspect actual stores before opening any MCP transport or creating a mission.
+    resolved_settings = orchestration_settings or OrchestrationSettings.from_config(
+        config.orchestration
+    )
+    resolved_tasks = task_graph_store or _build_task_graph_store(resolved_settings)
+    resolved_paths = _build_path_store(resolved_settings)
+    resolved_intents = build_operator_intent_store(
+        resolved_settings.operator_intent_backend, resolved_settings.operator_intent_path
+    )
+    coordinator = validate_configuration(
+        SimpleNamespace(
+            task_graph_store=resolved_tasks,
+            path_store=resolved_paths,
+            operator_intent_store=resolved_intents,
+        )
+    )
+
+    async def initialize(change: ChangeSet) -> None:
+        pass
+
+    await coordinator.change(initialize)
+
     engagement = config.engagement.to_engagement(
         engagement_id=engagement_id or EngagementId(new_id("eng"))
     )
@@ -382,12 +412,10 @@ async def build_application(
         ),
         tool_catalog=resolved_tool_catalog,
         work_store=_build_work_store(resolved_settings),
-        task_graph_store=(task_graph_store or _build_task_graph_store(resolved_settings)),
-        path_store=_build_path_store(resolved_settings),
+        task_graph_store=resolved_tasks,
+        path_store=resolved_paths,
         long_job_adapter=long_job_adapter,
-        operator_intent_store=build_operator_intent_store(
-            resolved_settings.operator_intent_backend, resolved_settings.operator_intent_path
-        ),
+        operator_intent_store=resolved_intents,
         tool_semaphore=asyncio.Semaphore(engagement.rate_limit_policy.max_concurrent_actions),
         settings=resolved_settings,
     )
@@ -405,10 +433,17 @@ async def _publish_terminal_artifacts(
     """Project and publish a report for every terminal outcome."""
 
     path = await deps.path_store.get_active(str(runtime.run_id))
-    required_hypotheses = {
-        criterion.hypothesis_id for step in path.steps if step.required
-        for criterion in step.completion_criteria if criterion.hypothesis_id
-    } if path else set()
+    required_hypotheses = (
+        {
+            criterion.hypothesis_id
+            for step in path.steps
+            if step.required
+            for criterion in step.completion_criteria
+            if criterion.hypothesis_id
+        }
+        if path
+        else set()
+    )
     report = await ReportingAgent().project(
         runtime,
         graph=AttackGraphService(deps.graph_store),
@@ -465,6 +500,13 @@ async def _publish_terminal_artifacts(
             "actions_executed": runtime.actions_executed,
             "steps": runtime.step_count,
             "error_type": error_type,
+            "mission_id": runtime.mission_id,
+            "mission_status": runtime.mission_status.value if runtime.mission_status else None,
+            "planning_diagnostic": runtime.planning_diagnostic.model_dump(mode="json")
+            if runtime.planning_diagnostic
+            else None,
+            "pending_event_count": runtime.pending_event_count,
+            "event_delivery_pending": runtime.event_delivery_pending,
         },
     )
     await deps.event_bus.publish(run_finished)
@@ -493,6 +535,7 @@ async def run_engagement(
     """
     if deps is None:
         raise ValueError("run_engagement requires dependencies with an explicitly configured LLM")
+    coordinator = validate_configuration(deps)
     settings = deps.settings
     if orchestration_config is not None:
         settings = settings.model_copy(
@@ -516,6 +559,8 @@ async def run_engagement(
         objective=objective,
         now=datetime.now(timezone.utc),
     )
+
+    await coordinator.bind(str(run_id), str(mission_id), str(engagement.engagement_id))
 
     run_started = EventEnvelope(
         event_id=EventId(new_id("evt")),
@@ -603,6 +648,38 @@ async def settle_engagement(
     last_event_id: EventId | None = None,
 ) -> RuntimeState:
     """Project a run outcome, including one resumed after human approval."""
+    if runtime.mission_id is not None:
+        from redteam.orchestration.operator_intents.service import OperatorIntentService
+
+        service = OperatorIntentService.from_deps(deps)
+        if service is not None:
+            drained = await service.process_pending(
+                mission_id=runtime.mission_id,
+                run_id=runtime.run_id,
+                publisher=EventPublisher(
+                    deps.event_bus,
+                    run_id=runtime.run_id,
+                    engagement_id=runtime.engagement_id,
+                    source="app.bootstrap",
+                ),
+                last_event_id=last_event_id,
+            )
+            last_event_id = drained.last_event_id or last_event_id
+            newly_paused = any(
+                item.applied and item.outcome == "mission_paused" for item in drained.applications
+            )
+            newly_stopped = any(
+                item.applied and item.outcome == "mission_stopped" for item in drained.applications
+            )
+            if newly_paused or newly_stopped:
+                runtime = runtime.model_copy(
+                    update={
+                        "mission_status": drained.mission_status,
+                        "termination_reason": TerminationReason.OPERATOR_PAUSED
+                        if newly_paused
+                        else TerminationReason.OPERATOR_STOPPED,
+                    }
+                )
     if runtime.termination_reason == TerminationReason.OPERATOR_PAUSED:
         # A pause is a checkpointed suspension, not a terminal result/report.
         # Leave required Tasks, Mission status and pending Action linkage intact.
@@ -625,10 +702,30 @@ async def settle_engagement(
             last_event_id=last_event_id,
             evidence_store=deps.evidence_store,
             run_id=runtime.run_id,
+            llm_client=deps.llm_client,
+            decision_max_attempts=deps.settings.decision_max_attempts,
+            path_store=deps.path_store,
         )
         mission = await deps.task_graph_store.get_mission(runtime.mission_id)
         if mission is not None:
             updates: dict[str, object] = {"mission_status": mission.status}
+
+            async def terminal_diagnostic(change: ChangeSet):
+                return change.records.get(("terminal_review", str(runtime.run_id)))
+
+            raw_diagnostic = await coordinator_for(deps.task_graph_store, deps.path_store).change(
+                terminal_diagnostic
+            )
+            if raw_diagnostic is not None:
+                from redteam.orchestration.diagnostics import DecisionDiagnostic
+
+                diagnostic = DecisionDiagnostic.model_validate(raw_diagnostic)
+                if runtime.planning_diagnostic is None:
+                    updates["planning_diagnostic"] = diagnostic
+                    updates["planning_diagnostic_history"] = [
+                        *runtime.planning_diagnostic_history,
+                        diagnostic,
+                    ][-10:]
             # A Mission can end BLOCKED with no blocked Task: an unmet success
             # criterion (for example a target that returned no usable
             # evidence) is not the same as work the plan itself could not
@@ -644,6 +741,47 @@ async def settle_engagement(
                 if any(task.status is TaskStatus.BLOCKED for task in tasks):
                     updates["termination_reason"] = TerminationReason.MISSION_BLOCKED
             runtime = runtime.model_copy(update=updates)
+    if runtime.mission_id is not None:
+        coordinator = coordinator_for(deps.task_graph_store, deps.path_store)
+        try:
+            pending = await deliver_pending(
+                coordinator,
+                run_id=str(runtime.run_id),
+                engagement_id=str(runtime.engagement_id),
+                event_bus=deps.event_bus,
+            )
+        except CoordinationError:
+            # Delivery is best-effort; a binding anomaly must not block the
+            # terminal report. Undelivered events stay recoverable (plan 10).
+            pending = runtime.pending_event_count
+        runtime = runtime.model_copy(
+            update={"pending_event_count": pending, "event_delivery_pending": bool(pending)}
+        )
+        if runtime.termination_reason != TerminationReason.APPROVAL_PENDING:
+
+            async def close(change: ChangeSet):
+                binding = change.binding(
+                    str(runtime.run_id), str(runtime.mission_id), str(runtime.engagement_id)
+                )
+                # Reconcilable BLOCKED missions keep their original run identity.
+                suspended_or_reconcilable = {
+                    TerminationReason.APPROVAL_PENDING,
+                    TerminationReason.OPERATOR_PAUSED,
+                    TerminationReason.NO_ACTIONABLE_PLAN,
+                    TerminationReason.NO_AGENTS,
+                    TerminationReason.STALLED,
+                    TerminationReason.INCOMPLETE_ACTIVE_WORK,
+                    TerminationReason.UNRESOLVED_HYPOTHESES,
+                    TerminationReason.CLEANUP_REQUIRED,
+                }
+                if (
+                    runtime.mission_status
+                    in {MissionStatus.COMPLETED, MissionStatus.FAILED, MissionStatus.CANCELLED}
+                    or runtime.termination_reason not in suspended_or_reconcilable
+                ):
+                    binding["closed"] = True
+
+            await coordinator.change(close)
     await _publish_terminal_artifacts(
         runtime,
         deps,

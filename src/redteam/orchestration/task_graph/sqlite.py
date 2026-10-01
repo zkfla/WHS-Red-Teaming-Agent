@@ -11,15 +11,19 @@ from pathlib import Path
 from redteam.core.contracts.mission import MissionPlan, MissionTask, redact_secret_material
 from redteam.core.enums import TaskStatus
 from redteam.core.ids import EngagementId, MissionId, TaskId
+from redteam.orchestration.sqlite_support import connect, run_sqlite, run_transaction
 from redteam.orchestration.task_graph.memory import InMemoryTaskGraphStore
 
 
 class SQLiteTaskGraphStore:
     def __init__(self, path: str | Path) -> None:
         self._path = Path(path)
-        self._memory = InMemoryTaskGraphStore()
         self._ready = False
         self._lock = asyncio.Lock()
+
+    def _connect(self) -> sqlite3.Connection:
+        """Connection helper for the coordinator; call and close in its worker thread."""
+        return connect(self._path)
 
     async def setup(self) -> None:
         if self._ready:
@@ -27,74 +31,115 @@ class SQLiteTaskGraphStore:
         async with self._lock:
             if self._ready:
                 return
-            self._path.parent.mkdir(parents=True, exist_ok=True)
-            with sqlite3.connect(self._path) as db:
-                db.executescript("""
-                PRAGMA journal_mode=WAL;
-                CREATE TABLE IF NOT EXISTS missions (
-                    mission_id TEXT PRIMARY KEY,
-                    engagement_id TEXT NOT NULL,
-                    payload TEXT NOT NULL
-                );
-                CREATE INDEX IF NOT EXISTS idx_missions_engagement
-                    ON missions(engagement_id, mission_id);
-                CREATE TABLE IF NOT EXISTS mission_tasks (
-                    task_id TEXT PRIMARY KEY,
-                    mission_id TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    priority INTEGER NOT NULL,
-                    payload TEXT NOT NULL,
-                    FOREIGN KEY(mission_id) REFERENCES missions(mission_id)
-                );
-                CREATE INDEX IF NOT EXISTS idx_tasks_mission_status_priority
-                    ON mission_tasks(mission_id,status,priority DESC,task_id);
-                """)
-                missions = [
-                    MissionPlan.model_validate(redact_secret_material(json.loads(row[0])))
-                    for row in db.execute("SELECT payload FROM missions")
-                ]
-                tasks = [
-                    MissionTask.model_validate(redact_secret_material(json.loads(row[0])))
-                    for row in db.execute("SELECT payload FROM mission_tasks")
-                ]
-            self._memory._missions = {item.mission_id: item for item in missions}
-            self._memory._tasks = {item.task_id: item for item in tasks}
+
+            def initialize() -> None:
+                self._path.parent.mkdir(parents=True, exist_ok=True)
+                db = self._connect()
+                try:
+                    db.execute("PRAGMA journal_mode=WAL")
+                    db.execute("BEGIN IMMEDIATE")
+                    self._create_schema(db)
+                    db.commit()
+                except BaseException:
+                    db.rollback()
+                    raise
+                finally:
+                    db.close()
+
+            await run_sqlite(initialize)
             self._ready = True
 
-    def _flush(self) -> None:
-        with sqlite3.connect(self._path) as db:
-            db.execute("PRAGMA foreign_keys=ON")
-            db.execute("BEGIN IMMEDIATE")
-            db.execute("DELETE FROM mission_tasks")
-            db.execute("DELETE FROM missions")
-            db.executemany(
-                "INSERT INTO missions VALUES(?,?,?)",
-                [
-                    (str(v.mission_id), str(v.engagement_id), v.redacted_copy().model_dump_json())
-                    for v in self._memory._missions.values()
-                ],
-            )
-            db.executemany(
-                "INSERT INTO mission_tasks VALUES(?,?,?,?,?)",
-                [
+    @staticmethod
+    def _create_schema(db: sqlite3.Connection) -> None:
+        # Execute separately: executescript would implicitly commit the outer transaction.
+        for statement in (
+            """CREATE TABLE IF NOT EXISTS missions (
+                mission_id TEXT PRIMARY KEY, engagement_id TEXT NOT NULL, payload TEXT NOT NULL
+            )""",
+            """CREATE INDEX IF NOT EXISTS idx_missions_engagement
+                ON missions(engagement_id,mission_id)""",
+            """CREATE TABLE IF NOT EXISTS mission_tasks (
+                task_id TEXT PRIMARY KEY, mission_id TEXT NOT NULL, status TEXT NOT NULL,
+                priority INTEGER NOT NULL, payload TEXT NOT NULL,
+                FOREIGN KEY(mission_id) REFERENCES missions(mission_id)
+            )""",
+            """CREATE INDEX IF NOT EXISTS idx_tasks_mission_status_priority
+                ON mission_tasks(mission_id,status,priority DESC,task_id)""",
+        ):
+            db.execute(statement)
+
+    @staticmethod
+    def _load_memory(db: sqlite3.Connection) -> InMemoryTaskGraphStore:
+        """Read a fresh validation snapshot using the caller's active transaction."""
+        memory = InMemoryTaskGraphStore()
+        missions = [
+            MissionPlan.model_validate(redact_secret_material(json.loads(row[0])))
+            for row in db.execute("SELECT payload FROM missions")
+        ]
+        tasks = [
+            MissionTask.model_validate(redact_secret_material(json.loads(row[0])))
+            for row in db.execute("SELECT payload FROM mission_tasks")
+        ]
+        memory._missions = {item.mission_id: item for item in missions}
+        memory._tasks = {item.task_id: item for item in tasks}
+        return memory
+
+    @staticmethod
+    def _save_memory(db: sqlite3.Connection, memory: InMemoryTaskGraphStore) -> None:
+        """Persist changed rows only, without opening or committing a transaction.
+
+        The coordinator supplies a snapshot loaded inside this same transaction.
+        No cached snapshot, unrelated row, or other orchestration table is deleted.
+        """
+        missions = dict(db.execute("SELECT mission_id,payload FROM missions"))
+        tasks = dict(db.execute("SELECT task_id,payload FROM mission_tasks"))
+        for mission in memory._missions.values():
+            payload = mission.redacted_copy().model_dump_json()
+            if missions.get(str(mission.mission_id)) != payload:
+                db.execute(
+                    """INSERT INTO missions(mission_id,engagement_id,payload) VALUES(?,?,?)
+                    ON CONFLICT(mission_id) DO UPDATE SET
+                    engagement_id=excluded.engagement_id,payload=excluded.payload""",
+                    (str(mission.mission_id), str(mission.engagement_id), payload),
+                )
+        for task in memory._tasks.values():
+            payload = task.redacted_copy().model_dump_json()
+            if tasks.get(str(task.task_id)) != payload:
+                db.execute(
+                    """INSERT INTO mission_tasks(task_id,mission_id,status,priority,payload)
+                    VALUES(?,?,?,?,?) ON CONFLICT(task_id) DO UPDATE SET
+                    mission_id=excluded.mission_id,status=excluded.status,
+                    priority=excluded.priority,payload=excluded.payload""",
                     (
-                        str(v.task_id),
-                        str(v.mission_id),
-                        v.status.value,
-                        v.priority,
-                        v.redacted_copy().model_dump_json(),
-                    )
-                    for v in self._memory._tasks.values()
-                ],
-            )
-            db.commit()
+                        str(task.task_id),
+                        str(task.mission_id),
+                        task.status.value,
+                        task.priority,
+                        payload,
+                    ),
+                )
 
     async def _mutate(self, method: str, *args, **kwargs):
         await self.setup()
-        async with self._lock:
-            result = await getattr(self._memory, method)(*args, **kwargs)
-            self._flush()
+
+        def mutate(db: sqlite3.Connection):
+            memory = self._load_memory(db)
+            # These staged memory methods only run existing domain rules against local copies.
+            # They never call an asynchronous SQLite store or open a nested transaction.
+            result = asyncio.run(getattr(memory, method)(*args, **kwargs))
+            self._save_memory(db, memory)
             return result
+
+        return await run_transaction(self._path, mutate, write=True)
+
+    async def _read(self, method: str, *args, **kwargs):
+        await self.setup()
+
+        def read(db: sqlite3.Connection):
+            memory = self._load_memory(db)
+            return asyncio.run(getattr(memory, method)(*args, **kwargs))
+
+        return await run_transaction(self._path, read)
 
     async def create_mission(self, mission: MissionPlan) -> None:
         await self._mutate("create_mission", mission)
@@ -133,21 +178,17 @@ class SQLiteTaskGraphStore:
         return await self._mutate("split_task", parent_id, children)
 
     async def get_mission(self, mission_id: MissionId) -> MissionPlan | None:
-        await self.setup()
-        return await self._memory.get_mission(mission_id)
+        return await self._read("get_mission", mission_id)
 
     async def list_missions(
         self, *, engagement_id: EngagementId | None = None
     ) -> list[MissionPlan]:
-        await self.setup()
-        return await self._memory.list_missions(engagement_id=engagement_id)
+        return await self._read("list_missions", engagement_id=engagement_id)
 
     async def get_task(self, task_id: TaskId) -> MissionTask | None:
-        await self.setup()
-        return await self._memory.get_task(task_id)
+        return await self._read("get_task", task_id)
 
     async def list_tasks(
         self, *, mission_id: MissionId | None = None, status: TaskStatus | None = None
     ) -> list[MissionTask]:
-        await self.setup()
-        return await self._memory.list_tasks(mission_id=mission_id, status=status)
+        return await self._read("list_tasks", mission_id=mission_id, status=status)

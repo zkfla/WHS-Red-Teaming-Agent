@@ -6,7 +6,7 @@ import json
 
 from redteam.attack_graph.observation import GraphObservation
 from redteam.core.contracts.events import EventType
-from redteam.core.enums import OperatorIntentType
+from redteam.core.enums import MissionStatus, OperatorIntentType
 from redteam.core.ids import AgentId
 from redteam.orchestration.agents.providers import PlaybookCandidateProvider
 from redteam.orchestration.agents.registry import default_registry
@@ -256,10 +256,16 @@ async def test_guidance_keeps_epoch_but_exclude_moves_it():
         engagement_id="eng-t1",
         criteria=["evidence-backed result"],
     )
+    mission = mission.model_copy(update={"status": MissionStatus.ACTIVE})
     await world.tasks.create_mission(mission)
     await world.tasks.create_task(task)
     runtime = h.make_runtime(
         "run-merged-guide", "eng-t1", mission_id="mission-merged", task_id="task-t1"
+    )
+    from redteam.orchestration.coordination import coordinator_for
+
+    await coordinator_for(world.tasks, world.paths).bind(
+        str(runtime.run_id), str(mission.mission_id), str(mission.engagement_id)
     )
     svc = OperatorIntentService(
         store=intents,

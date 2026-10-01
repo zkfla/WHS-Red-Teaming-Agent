@@ -95,6 +95,8 @@ async def test_build_application_can_wire_the_durable_task_graph(tmp_path) -> No
         checkpointing=False,
         task_graph_backend="sqlite",
         task_graph_path=str(tmp_path / "task-graph.sqlite3"),
+        operator_intent_backend="sqlite",
+        operator_intent_path=str(tmp_path / "intent-history.sqlite3"),
     )
 
     _, deps = await build_application(
