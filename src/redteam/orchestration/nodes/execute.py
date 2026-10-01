@@ -28,6 +28,10 @@ from redteam.orchestration.context import RuntimeDeps
 from redteam.orchestration.engine import validate_current_action
 from redteam.orchestration.long_jobs import LongJobManager, LongJobState
 from redteam.orchestration.nodes._support import advance, publisher_for
+from redteam.orchestration.runtime_observation import (
+    RuntimeObservation,
+    append_runtime_observation,
+)
 from redteam.orchestration.state import GraphState
 
 DEFAULT_TIMEOUT_SECONDS = 10.0
@@ -412,8 +416,7 @@ async def execute_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
     agent_key = str(proposal.agent_id)
     actions_by_agent[agent_key] = actions_by_agent.get(agent_key, 0) + 1
 
-    return advance(
-        state,
+    next_runtime = append_runtime_observation(
         runtime.model_copy(
             update={
                 "phase": AgentPhase.VERIFY,
@@ -425,6 +428,30 @@ async def execute_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                 "actions_by_agent": actions_by_agent,
             }
         ),
+        RuntimeObservation(
+            kind="tool",
+            summary=(
+                f"Tool {result.tool_id} "
+                + ("succeeded" if result.success else "failed")
+                + (
+                    f" with {result.error.code}: {result.error.message}"
+                    if result.error is not None
+                    else ""
+                )
+            )[:500],
+            outcome="success" if result.success else "failed",
+            step=runtime.step_count,
+            action_id=str(proposal.action_id),
+            capability=proposal.capability,
+            operation=proposal.operation,
+            reasons=([result.error.code, result.error.message] if result.error is not None else []),
+            alternative_allowed=True,
+        ),
+    )
+
+    return advance(
+        state,
+        next_runtime,
         last_event_id=finished.event_id,
         tool_result=result,
     )

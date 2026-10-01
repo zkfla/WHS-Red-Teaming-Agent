@@ -21,6 +21,7 @@ or executes any of this.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import logging
 import os
@@ -44,10 +45,21 @@ from redteam.app.cli._shared import (
     prompt_secret,
     write_env_var,
 )
+from redteam.app.cli.commands import approvals as approvals_command
+from redteam.app.cli.commands import resume as resume_command
 from redteam.app.cli.commands import run as run_command
 from redteam.app.cli.commands.validate import check_capability, check_roe, check_scope
+from redteam.app.cli.conversation import (
+    ConversationAssistant,
+    ConversationDecision,
+    ConversationError,
+    catalog_tool_labels,
+)
 from redteam.app.cli.interactive_commands import InteractiveSession
 from redteam.capability.settings import MCPConfigurationError, mcp_server_ids_from_environment
+from redteam.control.approval import ApprovalService
+from redteam.control.audit import AuditLog
+from redteam.control.stores.filesystem import FilesystemApprovalStore, FilesystemAuditStore
 from redteam.core.config import (
     AppConfig,
     CapabilityConfig,
@@ -57,6 +69,8 @@ from redteam.core.config import (
     OrchestrationConfig,
     load_engagement_config,
 )
+from redteam.core.enums import ApprovalStatus
+from redteam.core.ids import ApprovalId
 from redteam.core.ports.llm import LLMClient
 from redteam.intake.assistant import IntakeAssistant, IntakeAssistantError, IntakeSession
 from redteam.intake.fallback import deterministic_intake_turn
@@ -70,7 +84,6 @@ from redteam.intake.serializer import (
     merge_draft,
     scope_diff,
 )
-from redteam.llm.fake import FakeLLMClient
 from redteam.orchestration.engagement_planner import sanitize_objective
 from redteam.orchestration.state import RuntimeState, TerminationReason
 
@@ -109,6 +122,7 @@ async def _run(console: Console, *, verbose: bool) -> int:
         logging_config,
     ) = await _ensure_runtime_config(console)
     llm_client = build_llm_client(llm_config)
+    conversation = ConversationAssistant(llm_client)
 
     if not DEFAULT_ENGAGEMENT_PATH.exists():
         console.print("\nNo engagement configuration found.\n")
@@ -147,7 +161,13 @@ async def _run(console: Console, *, verbose: bool) -> int:
         logging=logging_config,
     )
     logging.basicConfig(level=logging_config.level, force=True)
-    _exit_code, final = await _execute(console, full_config, verbose=verbose, objective=objective)
+    _exit_code, final = await _execute(
+        console,
+        full_config,
+        verbose=verbose,
+        objective=objective,
+        conversation=conversation,
+    )
 
     # RunFinished ends this Run, not the CLI Session (sections 4-5, 19):
     # return to a persistent prompt instead of exiting the process here.
@@ -161,6 +181,7 @@ async def _run(console: Console, *, verbose: bool) -> int:
         capability_config=capability_config,
         logging_config=logging_config,
         verbose=verbose,
+        conversation=conversation,
     )
 
 
@@ -190,15 +211,15 @@ async def _ensure_runtime_config(
         )
 
     console.print("\n[dim]No REDTEAM_LLM_PROVIDER set -- one-time runtime setup.[/dim]")
-    model = console.input(
-        "LLM model (e.g. chatgpt/gpt-5.5, gpt-4o-mini) [blank = offline/fake]: "
-    ).strip()
-    llm_config = (
-        LLMConfig(provider="fake")
-        if not model
-        else LLMConfig(provider="litellm", default_model=model)
-    )
-    if llm_config.provider == "litellm" and not llm_config.resolve_api_key():
+    while True:
+        model = console.input("LLM model (e.g. chatgpt/gpt-5.5, gpt-4o-mini): ").strip()
+        if model:
+            break
+        console.print(
+            "[red]A real LLM model is required -- runs without a model are not supported.[/red]"
+        )
+    llm_config = LLMConfig(provider="litellm", default_model=model)
+    if not llm_config.resolve_api_key():
         # A `chatgpt/...` model authenticates via the OAuth device flow
         # documented in README, not an API key -- nothing to collect here.
         if not model.startswith("chatgpt/"):
@@ -214,9 +235,8 @@ async def _ensure_runtime_config(
 
     write_env_var(DEFAULT_ENV_PATH, "REDTEAM_LLM_PROVIDER", llm_config.provider)
     os.environ["REDTEAM_LLM_PROVIDER"] = llm_config.provider
-    if model:
-        write_env_var(DEFAULT_ENV_PATH, "REDTEAM_LLM_MODEL", llm_config.default_model)
-        os.environ["REDTEAM_LLM_MODEL"] = llm_config.default_model
+    write_env_var(DEFAULT_ENV_PATH, "REDTEAM_LLM_MODEL", llm_config.default_model)
+    os.environ["REDTEAM_LLM_MODEL"] = llm_config.default_model
     console.print(f"[dim]Wrote REDTEAM_LLM_PROVIDER to {DEFAULT_ENV_PATH}.[/dim]")
 
     orchestration_config = OrchestrationConfig.from_environment()
@@ -268,10 +288,13 @@ async def _ensure_mcp_config(
         "\n[dim]No REDTEAM_MCP_SERVERS set -- no MCP server is attached yet, "
         "so no Action can execute.[/dim]"
     )
-    answer = console.input(
-        f"Attach the local, read-only recon-passive MCP server against {host!r} "
-        "now? [Y/n]: "
-    ).strip().lower()
+    answer = (
+        console.input(
+            f"Attach the local, read-only recon-passive MCP server against {host!r} now? [Y/n]: "
+        )
+        .strip()
+        .lower()
+    )
     if answer not in ("", "y", "yes"):
         return capability_config
 
@@ -355,25 +378,9 @@ def _write_recon_policy(host: str) -> Path:
 # --- Engagement Intake (sections 9, 12) ------------------------------------
 
 
-def _build_intake_assistant(llm_client: LLMClient) -> IntakeAssistant | None:
-    """``None`` when there is no real model to talk to.
-
-    ``FakeLLMClient.complete_structured`` returns ``{}`` by default, which
-    validates as a syntactically-valid but empty ``IntakeTurn`` rather than
-    raising -- so ``IntakeAssistant.step`` never raises
-    ``IntakeAssistantError`` for it, and the deterministic regex fallback
-    (``redteam.intake.fallback.deterministic_intake_turn``, which *can*
-    read something like "127.0.0.1 대상으로 분석 시작해줘") never engages.
-    Left unguarded, the zero-config offline default (blank LLM model at
-    first-run setup -> ``build_llm_client`` -> ``FakeLLMClient``) makes the
-    natural-language Intake conversation repeat the same generic "more
-    info needed" prompt forever, no matter what the user types. Skipping
-    the LLM round trip entirely for this one known stand-in avoids that
-    without changing ``FakeLLMClient``/``IntakeAssistant`` themselves --
-    both are relied on elsewhere (tests, other Protocol callers) exactly
-    as documented.
-    """
-    return None if isinstance(llm_client, FakeLLMClient) else IntakeAssistant(llm_client)
+def _build_intake_assistant(llm_client: LLMClient) -> IntakeAssistant:
+    """Use the configured model for structured intake in every environment."""
+    return IntakeAssistant(llm_client)
 
 
 async def _new_engagement(console: Console, llm_client: LLMClient) -> EngagementConfig | None:
@@ -612,7 +619,14 @@ def _write_engagement(path: Path, engagement_config: EngagementConfig) -> None:
 
 
 async def _execute(
-    console: Console, full_config: AppConfig, *, verbose: bool, objective: str | None = None
+    console: Console,
+    full_config: AppConfig,
+    *,
+    verbose: bool,
+    objective: str | None = None,
+    conversation: ConversationAssistant | None = None,
+    prepared_decision: ConversationDecision | None = None,
+    user_message: str | None = None,
 ) -> tuple[int, RuntimeState | None]:
     """Runs one Engagement to a terminal/suspended state and returns
     ``(exit_code, final_runtime_state)``.
@@ -626,7 +640,14 @@ async def _execute(
     """
     async with AsyncExitStack() as stack:
         return await _execute_scoped(
-            console, full_config, verbose=verbose, mcp_stack=stack, objective=objective
+            console,
+            full_config,
+            verbose=verbose,
+            mcp_stack=stack,
+            objective=objective,
+            conversation=conversation,
+            prepared_decision=prepared_decision,
+            user_message=user_message,
         )
 
 
@@ -637,6 +658,9 @@ async def _execute_scoped(
     verbose: bool,
     mcp_stack: AsyncExitStack,
     objective: str | None = None,
+    conversation: ConversationAssistant | None = None,
+    prepared_decision: ConversationDecision | None = None,
+    user_message: str | None = None,
 ) -> tuple[int, RuntimeState | None]:
     with console.status("Starting engagement...", spinner="dots"):
         try:
@@ -663,7 +687,79 @@ async def _execute_scoped(
             )
             return EXIT_FAILURE, None
 
-    console.print()
+    shown_message = sanitize_objective(user_message or objective or "")
+    effective_objective = sanitize_objective(objective or "").strip() or (
+        f"Assess the declared scope of {full_config.engagement.name}"
+    )
+    if conversation is not None and (user_message or objective):
+        # Initial objective normalization through the dialogue model. Only
+        # an execute decision proceeds; answer/clarify/guidance are displayed
+        # and stop with no execution (prefer_execute is only a wording hint
+        # inside decide, never a mode conversion).
+        scope = _scope_values(full_config.engagement)
+        decision = prepared_decision
+        try:
+            if decision is None:
+                with console.status("Understanding your request...", spinner="dots"):
+                    decision = await conversation.decide(
+                        user_message or objective or "",
+                        engagement_name=full_config.engagement.name,
+                        scope=scope,
+                        tools=catalog_tool_labels(deps.tool_catalog),
+                    )
+            if shown_message:
+                renderer.render_user_message(console, shown_message)
+            renderer.render_conversation_decision(console, decision)
+            clarification_count = 0
+            while decision.mode == "clarify" and clarification_count < 2:
+                try:
+                    reply = sanitize_objective(console.input("\n[cyan]operator>[/cyan] ")).strip()
+                except EOFError:
+                    console.print("[dim]No action started; more detail is required.[/dim]")
+                    return EXIT_OK, None
+                if not reply:
+                    console.print("[dim]No action started; more detail is required.[/dim]")
+                    return EXIT_OK, None
+                renderer.render_user_message(console, reply)
+                clarification_count += 1
+                with console.status("Updating the plan...", spinner="dots"):
+                    decision = await conversation.decide(
+                        f"Clarification for the current request: {reply}",
+                        engagement_name=full_config.engagement.name,
+                        scope=scope,
+                        tools=catalog_tool_labels(deps.tool_catalog),
+                    )
+                renderer.render_conversation_decision(console, decision)
+            if decision.mode == "clarify":
+                console.print(
+                    "[dim]No action started; the request still needs clarification.[/dim]"
+                )
+                return EXIT_OK, None
+            if decision.mode != "execute":
+                return EXIT_OK, None
+            effective_objective = decision.objective or effective_objective
+        except asyncio.CancelledError:
+            raise
+        except ConversationError as exc:
+            logging.getLogger(__name__).warning(
+                "Initial conversation decision failed (%s)", type(exc).__name__
+            )
+            console.print(
+                f"[red]Could not interpret the request ({type(exc).__name__}); "
+                "no action started.[/red]"
+            )
+            return EXIT_FAILURE, None
+        except Exception as exc:  # noqa: BLE001 - fail closed, no execution
+            logging.getLogger(__name__).warning(
+                "Initial conversation decision failed (%s)", type(exc).__name__
+            )
+            console.print(
+                f"[red]Could not interpret the request ({type(exc).__name__}); "
+                "no action started.[/red]"
+            )
+            return EXIT_FAILURE, None
+    else:
+        console.print()
     event_renderer = renderer.RichEventRenderer(console, verbose=verbose)
     try:
         final = await run_command.execute(
@@ -673,13 +769,14 @@ async def _execute_scoped(
             non_interactive=False,
             on_event=event_renderer,
             echo=lambda line: console.print(line),
-            objective=objective,
+            objective=effective_objective,
             # PROMPT 4+5: keep a persistent operator channel live for the
             # whole run (pause/resume/stop/focus/exclude/status and in-session
             # approve/deny at the approval suspension). This is the
             # interactive entrypoint by definition; the explicit
             # `redteam run --non-interactive`/`--json` paths never set it.
             allow_operator_input=True,
+            conversation=conversation,
         )
     except Exception as exc:  # noqa: BLE001 - same fail-closed contract as commands.run
         if logging.getLogger().isEnabledFor(logging.DEBUG):
@@ -704,8 +801,109 @@ async def _execute_scoped(
         TerminationReason.APPROVAL_PENDING,
     }:
         console.print(f"[dim]Report: redteam report generate {final.run_id}[/dim]")
+    if conversation is not None:
+        # Deterministic summary from the actual terminal state (W1 makes
+        # zero extra LLM calls here); displayed, never executed.
+        answer = await conversation.final_response(final)
+        renderer.render_final_answer(console, answer)
     exit_code = EXIT_FAILURE if final.phase.value == "failed" else EXIT_OK
     return exit_code, final
+
+
+def _scope_values(engagement_config: EngagementConfig) -> list[str]:
+    scope = engagement_config.scope
+    return [
+        *scope.allowed_hosts,
+        *scope.allowed_domains,
+        *scope.allowed_networks,
+        *scope.allowed_assets,
+    ]
+
+
+def _render_conversation_decision(console: Console, decision: ConversationDecision) -> None:
+    renderer.render_conversation_decision(console, decision)
+
+
+async def _handle_idle_approval(
+    console: Console, session: InteractiveSession, text: str, head: str
+) -> None:
+    """Resolve an idle approve/deny, then resume the same original run.
+
+    The approval record itself is re-read from the durable stores (never
+    the session cache): it must still be PENDING, its audit trail must
+    bind it to this session's last run, and the cached identifier must
+    match the freshly-read record. Unknown, already-resolved, unlinked,
+    or stale approvals are only announced -- they never mutate and never
+    start a new execution. A successful record change resumes through the
+    canonical ``commands/resume`` recovery path with ``session.record_run``
+    so the session projects the settled state.
+    """
+    console.print(renderer.operator_user_text(sanitize_objective(text)))
+    pending = session.last_pending_approval_id
+    if pending is None:
+        console.print("[Agent] No action is awaiting approval.")
+        return
+    if session.last_run_id is None:
+        console.print("[Agent] No run is active in this session; cannot resume an approval.")
+        return
+    approval_id = ApprovalId(pending)
+    try:
+        record = await ApprovalService(FilesystemApprovalStore("data/approvals")).get(approval_id)
+    except Exception as exc:  # noqa: BLE001 - announce, never mutate
+        logging.getLogger(__name__).warning("Idle approval lookup failed (%s)", type(exc).__name__)
+        console.print("[Agent] Could not verify the pending approval; nothing changed.")
+        return
+    if record is None:
+        console.print("[Agent] That approval no longer exists; nothing changed.")
+        return
+    if record.status != ApprovalStatus.PENDING:
+        console.print(
+            f"[Agent] Approval {pending} is already {record.status.value}; nothing changed."
+        )
+        return
+    if str(record.approval_id) != pending:
+        console.print("[Agent] The pending approval changed since the last run; nothing changed.")
+        return
+    try:
+        request = await AuditLog(FilesystemAuditStore("data/audit")).find_approval_request(
+            record.action_id, record.approval_id
+        )
+    except Exception as exc:  # noqa: BLE001 - announce, never mutate
+        logging.getLogger(__name__).warning(
+            "Idle approval audit lookup failed (%s)", type(exc).__name__
+        )
+        console.print(
+            "[Agent] Could not verify which run this approval belongs to; nothing changed."
+        )
+        return
+    if request is None or str(request.run_id) != str(session.last_run_id):
+        console.print(
+            "[Agent] That approval does not belong to this session's last run; nothing changed."
+        )
+        return
+    command = (
+        approvals_command.run_approve if head in {"approve", "승인"} else approvals_command.run_deny
+    )
+    resolve_code = await command(
+        argparse.Namespace(
+            approval_id=pending,
+            resolved_by=None,
+            approval_dir="data/approvals",
+            audit_dir="data/audit",
+        )
+    )
+    if resolve_code != EXIT_OK:
+        return
+    await resume_command.run(
+        argparse.Namespace(
+            run_id=str(session.last_run_id),
+            engagement_path=str(session.engagement_path),
+            max_steps=None,
+            log_level=None,
+            json=False,
+        ),
+        on_finished=session.record_run,
+    )
 
 
 async def _session_loop(
@@ -717,6 +915,7 @@ async def _session_loop(
     capability_config: CapabilityConfig,
     logging_config: LoggingConfig,
     verbose: bool,
+    conversation: ConversationAssistant | None = None,
 ) -> int:
     """Keeps the CLI process alive after ``RunFinished`` (sections 4-5,
     19): a Run ending is not the same as the CLI Session ending. Reads one
@@ -731,40 +930,72 @@ async def _session_loop(
     prints a message and returns to the prompt (section 21). Only
     ``/exit``/``EOFError`` (Ctrl+D) end the loop.
     """
+    if conversation is None:
+        conversation = ConversationAssistant(build_llm_client(llm_config))
     while True:
         try:
-            text = console.input("\n[cyan]❯[/cyan] ")
+            text = console.input("\n[cyan]❯[/cyan] ").strip()
         except EOFError:
             console.print("\n[dim]Session ended.[/dim]")
             return EXIT_OK
         except KeyboardInterrupt:
-            console.print("\n[dim](Ctrl+C -- type /exit or press Ctrl+D to end the session)[/dim]")
+            console.print("\n[dim]Use /exit or Ctrl+D to end the session.[/dim]")
             continue
-
-        text = text.strip()
         if not text:
             continue
         if text.startswith("/"):
-            should_continue = await interactive_commands.dispatch(console, session, text)
-            if not should_continue:
+            if not await interactive_commands.dispatch(console, session, text):
                 return EXIT_OK
             continue
-
+        head = text.split(maxsplit=1)[0].lower()
+        if head in {"exit", "quit", "종료", "stop", "중단"}:
+            console.print(renderer.operator_user_text(sanitize_objective(text)))
+            return EXIT_OK
+        if head in {"approve", "deny", "승인", "거부"}:
+            await _handle_idle_approval(console, session, text, head)
+            continue
+        if text.lower() in {"status", "상태", "현황", "why", "explain", "설명"}:
+            console.print(session.explain_last_run())
+            continue
         try:
             refreshed = load_engagement_config(session.engagement_path)
             problems = [*check_scope(refreshed), *check_roe(refreshed)]
-        except (OSError, ValueError, YAMLError) as exc:
-            console.print(
-                f"[red]Cannot load engagement configuration ({type(exc).__name__}). "
-                "Fix the engagement file before starting another Mission.[/red]"
+            if problems:
+                console.print("[red]Invalid engagement configuration: " + "; ".join(problems))
+                continue
+            session.engagement_config = refreshed
+            decision = await conversation.decide(
+                text,
+                engagement_name=refreshed.name,
+                scope=_scope_values(refreshed),
+                session_context=session.explain_last_run(),
             )
+            # Changes during judgment invalidate its execution context.
+            latest = load_engagement_config(session.engagement_path)
+            problems = [*check_scope(latest), *check_roe(latest)]
+            if problems:
+                console.print("[red]Invalid engagement configuration: " + "; ".join(problems))
+                continue
+            if latest != refreshed:
+                refreshed = latest
+                session.engagement_config = refreshed
+                decision = await conversation.decide(
+                    text,
+                    engagement_name=refreshed.name,
+                    scope=_scope_values(refreshed),
+                    session_context=session.explain_last_run(),
+                )
+                if load_engagement_config(session.engagement_path) != refreshed:
+                    console.print("[Agent] Configuration changed again; submit the request again.")
+                    continue
+        except asyncio.CancelledError:
+            raise
+        except (OSError, ValueError, YAMLError, ConversationError) as exc:
+            console.print(f"[Agent] Request not started ({type(exc).__name__}).")
             continue
-        if problems:
-            console.print(
-                "[red]Invalid engagement configuration: " + "; ".join(problems) + "[/red]"
-            )
+        _render_conversation_decision(console, decision)
+        if decision.mode != "execute":
             continue
-        session.engagement_config = refreshed
         full_config = AppConfig(
             engagement=refreshed,
             llm=llm_config,
@@ -772,5 +1003,13 @@ async def _session_loop(
             capability=capability_config,
             logging=logging_config,
         )
-        _exit_code, final = await _execute(console, full_config, verbose=verbose, objective=text)
+        _, final = await _execute(
+            console,
+            full_config,
+            verbose=verbose,
+            objective=decision.objective or text,
+            conversation=conversation,
+            prepared_decision=decision,
+            user_message=text,
+        )
         session.record_run(final)

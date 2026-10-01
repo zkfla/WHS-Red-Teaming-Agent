@@ -79,8 +79,9 @@ the Approval workflow (`redteam approvals approve/deny`).
 (`pip install -e ".[llm]"`) to use a real LLM provider — it installs and
 imports fine on this project's 3.10+ floor (verified directly; an older
 `litellm` release once needed 3.11+, current ones don't). The base
-install and everything else works on 3.10+ using `FakeLLMClient` by
-default without it.
+install and everything else works on 3.10+ without it, but an operational
+run always needs a real provider: `FakeLLMClient` is a test-only injection
+and is rejected for real runs.
 
 ## Repository Structure
 
@@ -93,7 +94,7 @@ src/redteam/
   control/         Control Team — Engagement Control Plane.
   evidence/        Control Team — Evidence Store.
   capability/      Capability Team — ToolGateway, MCPToolRegistry, MCPAdapters.
-  llm/             LLM Gateway implementations (LiteLLM + Fake).
+  llm/             LLM Gateway implementations (LiteLLM for runs, Fake for tests).
   app/             Composition root (bootstrap.py) + CLI.
 
 deploy/            Capability Team — docker-compose, MCP server images.
@@ -257,6 +258,16 @@ executes, and `Enter` there hands off to the *exact same*
 `build_application`/`run_engagement` path `redteam run` uses below —
 nothing is re-implemented for this mode.
 
+The terminal then stays open as a chat session. With a real LLM, the runtime's
+actual planning turn prints a concise response, explicit assumptions and the
+reason for its next concrete action; the CLI does not show a separate,
+speculative pre-run plan. During a Run, ordinary sentences are answered or
+converted into bounded Mission guidance; they no longer have to match a fixed
+command keyword. After a Run, questions are answered from the saved run
+summary instead of being mistaken for a new Mission. The displayed reasoning
+is a decision summary, not private chain-of-thought. Every concrete action
+still passes candidate compilation, Control and MCP execution.
+
 The natural-language layer is `redteam.intake` (the **Engagement Intake
 Assistant**), a distinct role from the Orchestrator:
 
@@ -314,11 +325,18 @@ secrets still come from the process environment (`.env.example`).
 startup, best-effort (`_shared.load_dotenv_if_present`) — a real
 shell/CI-exported variable always wins over a `.env` value, so this can
 only fill in what is otherwise unset, never override an explicit choice.
+There are no planning modes: one mandatory LLM flow (path draft, path review,
+next action) always proposes from the live MCP catalog, and a failed model
+call or an uncompilable draft returns errors for model correction instead of
+executing any rule or playbook fallback. Planning never authorizes. Scope,
+risk, approval, rate limits and budget are always decided later by the
+Control Plane.
 The interactive `redteam` entrypoint's one-time setup writes
-`REDTEAM_LLM_PROVIDER`/`REDTEAM_LLM_MODEL` (and, if you opt in,
-`REDTEAM_MCP_SERVERS`/`REDTEAM_MCP_RECON_PASSIVE_*` for a single
-low-risk recon-passive server against your first declared host) straight
-into `.env` for you.
+`REDTEAM_LLM_PROVIDER`/`REDTEAM_LLM_MODEL` and, if you opt in,
+`REDTEAM_MCP_SERVERS`/`REDTEAM_MCP_RECON_PASSIVE_*` for a single low-risk
+recon-passive server against your first declared host. An explicitly empty
+MCP configuration stays empty. Other servers require explicit configuration
+and their corresponding devices, captures or artifacts.
 
 `redteam.core.config.AppConfig`/`load_app_config()` (a YAML-loadable
 `AppConfig` shape, e.g. `examples/app.yaml`) still exist as a general
@@ -329,8 +347,8 @@ library capability for code that calls
 Runtime settings also have a shared environment path for interactive, `run`, and
 `resume`: `REDTEAM_ORCHESTRATION_MAX_STEPS` (default `50`),
 `REDTEAM_ORCHESTRATION_MAX_RETRIES` (default `3`), and
-`REDTEAM_ORCHESTRATION_LLM_CANDIDATE_GENERATION` (default `false`, set `true`
-to enable generated candidates). Invalid values fail configuration validation.
+`REDTEAM_ORCHESTRATION_LLM_CANDIDATE_GENERATION` (default `true`; LLM reasoning
+is mandatory and `false` is rejected). Invalid values fail configuration validation.
 The `--max-steps` option overrides the environment value.
 
 Before starting another Mission in an interactive session, the CLI reloads and

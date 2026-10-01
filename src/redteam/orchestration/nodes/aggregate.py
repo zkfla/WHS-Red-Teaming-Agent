@@ -12,6 +12,7 @@ from redteam.core.ids import ActionId
 from redteam.orchestration.context import RuntimeDeps
 from redteam.orchestration.nodes._support import advance
 from redteam.orchestration.nodes.policy import SEVERITY_ABORT_RUN, SEVERITY_REPLAN_GOAL
+from redteam.orchestration.runtime_observation import append_runtime_observation
 from redteam.orchestration.state import GraphState, TerminationReason
 
 
@@ -64,24 +65,33 @@ async def aggregate_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
     last_with_event = next(
         (item for item in reversed(outcomes) if item.last_event_id is not None), None
     )
-    pending_approval = next(
-        (item for item in outcomes if item.approval_id is not None), None
-    )
+    pending_approval = next((item for item in outcomes if item.approval_id is not None), None)
     pending_dispatch = next(
-        (item for item in items if pending_approval and
-         str(item.proposal.action_id) == pending_approval.action_id),
+        (
+            item
+            for item in items
+            if pending_approval and str(item.proposal.action_id) == pending_approval.action_id
+        ),
         None,
     )
     # Workers are isolated: their policy decisions otherwise disappear before
     # REPLAN. Keep the strongest denial's *redacted summary*, not raw Control
     # text, so a batch cannot silently drop an abort or goal-level block.
     strongest_denial = next(
-        (item for item in outcomes if item.policy_verdict is PolicyVerdict.DENY
-         and item.policy_severity == SEVERITY_ABORT_RUN),
+        (
+            item
+            for item in outcomes
+            if item.policy_verdict is PolicyVerdict.DENY
+            and item.policy_severity == SEVERITY_ABORT_RUN
+        ),
         None,
     ) or next(
-        (item for item in outcomes if item.policy_verdict is PolicyVerdict.DENY
-         and item.policy_severity == SEVERITY_REPLAN_GOAL),
+        (
+            item
+            for item in outcomes
+            if item.policy_verdict is PolicyVerdict.DENY
+            and item.policy_severity == SEVERITY_REPLAN_GOAL
+        ),
         None,
     )
     summary = (
@@ -95,48 +105,59 @@ async def aggregate_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             ],
             evaluated_at=datetime.now(timezone.utc),
         )
-        if strongest_denial is not None else None
+        if strongest_denial is not None
+        else None
     )
+
+    next_runtime = runtime.model_copy(
+        update={
+            "phase": AgentPhase.REPLAN,
+            "actions_executed": runtime.actions_executed + len(executed),
+            "retry_tool_calls": (
+                runtime.retry_tool_calls + sum(item.retry_attempts for item in executed)
+            ),
+            "consecutive_failures": consecutive_failures,
+            "remaining_budget": remaining_budget,
+            "actions_by_agent": actions_by_agent,
+            "last_verdict": (
+                last_with_verdict.verdict if last_with_verdict else runtime.last_verdict
+            ),
+            "pending_action_id": (
+                pending_dispatch.proposal.action_id if pending_dispatch is not None else None
+            ),
+            "pending_approval_id": (
+                pending_approval.approval_id
+                if pending_approval is not None
+                else runtime.pending_approval_id
+            ),
+            "active_hypothesis_id": None,
+            "termination_reason": (
+                TerminationReason.APPROVAL_PENDING
+                if pending_approval is not None
+                else runtime.termination_reason
+            ),
+        }
+    )
+    # Fold each isolated worker's own records back in dispatch order so the
+    # next decision turn sees the whole batch in a stable sequence.
+    for dispatch_item in items:
+        outcome = all_outcomes.get(str(dispatch_item.proposal.action_id))
+        if outcome is None:
+            continue
+        for observation in outcome.runtime_observations:
+            next_runtime = append_runtime_observation(next_runtime, observation)
 
     return advance(
         state,
-        runtime.model_copy(
-            update={
-                "phase": AgentPhase.REPLAN,
-                "actions_executed": runtime.actions_executed + len(executed),
-                "retry_tool_calls": (
-                    runtime.retry_tool_calls + sum(item.retry_attempts for item in executed)
-                ),
-                "consecutive_failures": consecutive_failures,
-                "remaining_budget": remaining_budget,
-                "actions_by_agent": actions_by_agent,
-                "last_verdict": (
-                    last_with_verdict.verdict if last_with_verdict else runtime.last_verdict
-                ),
-                "pending_action_id": (
-                    pending_dispatch.proposal.action_id if pending_dispatch is not None else None
-                ),
-                "pending_approval_id": (
-                    pending_approval.approval_id
-                    if pending_approval is not None
-                    else runtime.pending_approval_id
-                ),
-                "active_hypothesis_id": None,
-                "termination_reason": (
-                    TerminationReason.APPROVAL_PENDING
-                    if pending_approval is not None
-                    else runtime.termination_reason
-                ),
-            }
-        ),
+        next_runtime,
         last_event_id=last_with_event.last_event_id if last_with_event else None,
         action_proposal=(
-            pending_dispatch.proposal if pending_dispatch is not None
+            pending_dispatch.proposal
+            if pending_dispatch is not None
             else state.get("action_proposal")
         ),
         plan_step=(
-            pending_dispatch.plan_step if pending_dispatch is not None
-            else state.get("plan_step")
+            pending_dispatch.plan_step if pending_dispatch is not None else state.get("plan_step")
         ),
         dispatch_items=[],
         # ``worker_outcomes`` has a merge reducer so parallel workers can write

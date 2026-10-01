@@ -161,6 +161,12 @@ def check_capability(app_config: AppConfig) -> list[str]:
     if len(app_config.capability.mcp_servers) != len(set(app_config.capability.mcp_servers)):
         problems.append("capability.mcp_servers contains duplicate server ids")
     for server_id in app_config.capability.mcp_servers:
+        # The explicit in-process example adapter is a sentinel consumed by
+        # app.bootstrap, not a configured external MCP server. Requiring
+        # REDTEAM_MCP_EXAMPLE_* here made the interactive Preflight reject the
+        # same configuration that `redteam run` correctly accepts.
+        if server_id == "example":
+            continue
         try:
             MCPServerSettings.from_environment(server_id)
         except MCPConfigurationError as exc:

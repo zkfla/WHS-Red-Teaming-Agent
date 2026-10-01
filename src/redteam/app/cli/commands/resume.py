@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+from collections.abc import Callable
 from contextlib import AsyncExitStack
 from datetime import datetime, timezone
 from typing import Any
@@ -67,12 +68,29 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
     parser.set_defaults(handler=run)
 
 
-async def run(args: argparse.Namespace) -> int:
+async def run(
+    args: argparse.Namespace,
+    *,
+    on_finished: Callable[[RuntimeState], None] | None = None,
+) -> int:
+    """Resume args.run_id; when the resumed run settles, on_finished runs.
+
+    The callback only fires after settle_engagement actually completes,
+    so the interactive session can project the settled state via
+    session.record_run(final). Every early return (missing checkpoint,
+    unsafe snapshot, failed bootstrap, unresumed run) skips it, and the CLI
+    parser keeps calling run(args) exactly as before.
+    """
     async with AsyncExitStack() as stack:
-        return await _run(args, mcp_stack=stack)
+        return await _run(args, mcp_stack=stack, on_finished=on_finished)
 
 
-async def _run(args: argparse.Namespace, *, mcp_stack: AsyncExitStack) -> int:
+async def _run(
+    args: argparse.Namespace,
+    *,
+    mcp_stack: AsyncExitStack,
+    on_finished: Callable[[RuntimeState], None] | None = None,
+) -> int:
     try:
         config = load_app_config_for_run(args.engagement_path)
     except (OSError, ValidationError, ValueError) as exc:
@@ -190,6 +208,8 @@ async def _run(args: argparse.Namespace, *, mcp_stack: AsyncExitStack) -> int:
     finally:
         await runner.aclose()
 
+    if on_finished is not None:
+        on_finished(final)
     if not args.json:
         _print_summary(final)
     return _exit_code_for(final)

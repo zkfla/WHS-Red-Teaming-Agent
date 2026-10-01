@@ -64,7 +64,10 @@ class _ScriptedIntakeLLM:
 
 
 def _patch(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, answers: list[str], llm  # noqa: ANN001
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    answers: list[str],
+    llm,  # noqa: ANN001
 ) -> _FakeConsole:
     monkeypatch.chdir(tmp_path)
     # REDTEAM_LLM_PROVIDER already set (section 4/20's canonical env source)
@@ -75,7 +78,11 @@ def _patch(
     monkeypatch.delenv("REDTEAM_MCP_SERVERS", raising=False)
     console = _FakeConsole(answers)
     monkeypatch.setattr(interactive, "Console", lambda: console)
+    from tests.integration.test_cli_session import _ConversationLLM
+
+    monkeypatch.setattr(interactive, "build_llm_client", lambda config: _ConversationLLM())
     from redteam.intake.assistant import IntakeAssistant
+
     monkeypatch.setattr(interactive, "_build_intake_assistant", lambda client: IntakeAssistant(llm))
     return console
 
@@ -127,10 +134,13 @@ async def test_no_config_intake_completes_preflight_and_runs(
 async def test_existing_config_accepts_one_line_mission_objective() -> None:
     from redteam.core.config import EngagementConfig
 
-    config = EngagementConfig.model_validate({
-        "name": "VulnBank", "scope": {"allowed_hosts": ["example.local"]},
-        "execution_budget": {"max_actions": 5},
-    })
+    config = EngagementConfig.model_validate(
+        {
+            "name": "VulnBank",
+            "scope": {"allowed_hosts": ["example.local"]},
+            "execution_budget": {"max_actions": 5},
+        }
+    )
     console = _FakeConsole(["VulnBank 웹 레드티밍 해줘. 인증/인가 중심으로."])
 
     selected = await interactive._existing_config_menu(
@@ -145,15 +155,19 @@ async def test_existing_config_quick_start_needs_only_objective_input(
 ) -> None:
     from redteam.core.config import EngagementConfig
 
-    config = EngagementConfig.model_validate({
-        "name": "VulnBank", "scope": {"allowed_hosts": ["example.local"]},
-        "execution_budget": {"max_actions": 5},
-    })
+    config = EngagementConfig.model_validate(
+        {
+            "name": "VulnBank",
+            "scope": {"allowed_hosts": ["example.local"]},
+            "execution_budget": {"max_actions": 5},
+        }
+    )
     (tmp_path / "engagement.yaml").write_text(
         yaml.safe_dump(config.model_dump(mode="json")), encoding="utf-8"
     )
     console = _patch(
-        monkeypatch, tmp_path,
+        monkeypatch,
+        tmp_path,
         answers=["VulnBank 웹 레드티밍 해줘. 인증/인가 중심으로.", "n"],
         llm=_ScriptedIntakeLLM([]),
     )
@@ -165,14 +179,16 @@ async def test_existing_config_quick_start_needs_only_objective_input(
 async def test_guided_intake_asks_only_next_missing_question() -> None:
     from redteam.intake.assistant import IntakeAssistant, IntakeSession
 
-    llm = _ScriptedIntakeLLM([
-        {
-            "draft": {"name": "VulnBank", "allowed_hosts": ["example.local"]},
-            "follow_up_questions": ["최대 action 수는?", "이미 알려준 범위는?"],
-            "ready": False,
-        },
-        {"draft": {"max_actions": 5}, "follow_up_questions": [], "ready": True},
-    ])
+    llm = _ScriptedIntakeLLM(
+        [
+            {
+                "draft": {"name": "VulnBank", "allowed_hosts": ["example.local"]},
+                "follow_up_questions": ["최대 action 수는?", "이미 알려준 범위는?"],
+                "ready": False,
+            },
+            {"draft": {"max_actions": 5}, "follow_up_questions": [], "ready": True},
+        ]
+    )
     console = _FakeConsole(["5"])
 
     config = await interactive._intake_loop(
@@ -203,7 +219,9 @@ async def test_guided_intake_recovers_from_llm_failure_without_repeating_input()
 
     console = _FakeConsole(["5", "recon, web"])
     config = await interactive._intake_loop(
-        cast(Console, console), IntakeAssistant(_UnavailableLLM()), IntakeSession(),
+        cast(Console, console),
+        IntakeAssistant(_UnavailableLLM()),
+        IntakeSession(),
         "https://example.local:8443 테스트해줘",
     )
 
@@ -342,6 +360,7 @@ async def test_fake_provider_is_rejected_by_production_builder() -> None:
 
     from redteam.app.bootstrap import build_llm_client
     from redteam.core.config import LLMConfig
+
     with pytest.raises(ValueError, match="real LLM provider"):
         build_llm_client(LLMConfig(provider="fake"))
 

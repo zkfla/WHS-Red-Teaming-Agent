@@ -37,6 +37,7 @@ from redteam.orchestration.dispatch import (
     WorkerOutcome,
     merge_worker_outcomes,
 )
+from redteam.orchestration.runtime_observation import RuntimeObservation
 
 
 class TerminationReason:
@@ -83,6 +84,7 @@ class RuntimeState(BaseModel):
     active_path_step_id: str | None = None
     planning_error: str | None = None
     planning_feedback: list[str] = Field(default_factory=list)
+    recent_observations: list[RuntimeObservation] = Field(default_factory=list)
     operator_intent_id: OperatorIntentId | None = None
     mission_status: MissionStatus | None = None
 

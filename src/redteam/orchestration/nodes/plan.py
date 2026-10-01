@@ -18,6 +18,7 @@ from redteam.orchestration.cognition import DecisionFailure
 from redteam.orchestration.context import RuntimeDeps
 from redteam.orchestration.dispatch import DispatchItem
 from redteam.orchestration.engine import InvestigationEngine
+from redteam.orchestration.events import AGENT_DECISION_RECORDED, MCP_TOOL_SELECTED
 from redteam.orchestration.nodes._support import advance, graph_service, publisher_for
 from redteam.orchestration.paths import PathError
 from redteam.orchestration.scheduler import WorkScheduler
@@ -53,8 +54,11 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
         if runtime.mission_id
         else set()
     )
+    engine = InvestigationEngine(deps)
     try:
-        path, candidates, outcome = await InvestigationEngine(deps).decide(runtime, observation)
+        path, candidates, outcome = await engine.decide(
+            runtime, observation, last_event_id=state.get("last_event_id")
+        )
     except (DecisionFailure, PathError, ValueError, TypeError) as exc:
         event = await publisher.publish(
             "PlanningFailed",
@@ -63,7 +67,7 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                 "stage": getattr(exc, "stage", "path_or_action"),
                 "error_type": type(exc).__name__,
             },
-            causation_id=state.get("last_event_id"),
+            causation_id=engine.last_event_id,
         )
         return advance(
             state,
@@ -80,6 +84,7 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             dispatch_items=[],
         )
     updates: dict[str, Any] = {"planning_error": None}
+    state = {**state, "last_event_id": engine.last_event_id}
     if path:
         updates.update(active_path_id=path.path_id, active_path_version=path.version)
     if outcome is not None:
@@ -100,7 +105,7 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             if outcome == "task_completed"
             else TerminationReason.INVESTIGATION_HELD,
         )
-        last_event_id = state.get("last_event_id")
+        last_event_id = engine.last_event_id
         tasks = (
             await deps.task_graph_store.list_tasks(mission_id=runtime.mission_id)
             if runtime.mission_id
@@ -196,7 +201,7 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
     }
     service = graph_service(deps)
     dispatch = []
-    last_event_id = state.get("last_event_id")
+    last_event_id = engine.last_event_id
     for candidate in chosen:
         work = pending.get(candidate.candidate_key)
         if work is None:
@@ -258,6 +263,36 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             created_at=now,
             availability_impact=step.availability_impact,
         )
+        selected = await publisher.publish(
+            AGENT_DECISION_RECORDED,
+            {
+                "action_id": proposal.action_id,
+                "path_id": step.path_id,
+                "path_version": step.path_version,
+                "path_step_id": step.path_step_id,
+                "operation": step.operation,
+                "rationale": step.reason,
+                "selection_basis": "llm_accepted_path",
+            },
+            correlation_id=str(proposal.action_id),
+            causation_id=last_event_id,
+        )
+        bound = await publisher.publish(
+            MCP_TOOL_SELECTED,
+            {
+                "action_id": proposal.action_id,
+                "path_id": step.path_id,
+                "path_version": step.path_version,
+                "path_step_id": step.path_step_id,
+                "tool_id": str(candidate.tool.tool_id),
+                "server_id": candidate.tool.server_id,
+                "tool_name": candidate.tool.tool_name,
+                "risk_level": candidate.tool.risk_level.value,
+                "health_status": candidate.tool.health_status.value,
+            },
+            correlation_id=str(proposal.action_id),
+            causation_id=selected.event_id,
+        )
         event = await publisher.publish(
             EventType.ACTION_PROPOSED,
             {
@@ -272,7 +307,7 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                 "batch_size": len(chosen),
             },
             correlation_id=str(proposal.action_id),
-            causation_id=last_event_id,
+            causation_id=bound.event_id,
         )
         last_event_id = event.event_id
         dispatch.append(

@@ -17,6 +17,10 @@ from redteam.orchestration.context import RuntimeDeps
 from redteam.orchestration.events import GRAPH_MUTATION_APPLIED, RESULT_MAPPER_FAILED
 from redteam.orchestration.nodes._support import advance, graph_service, publisher_for
 from redteam.orchestration.nodes.policy import denial_severity
+from redteam.orchestration.runtime_observation import (
+    RuntimeObservation,
+    append_runtime_observation,
+)
 from redteam.orchestration.state import GraphState
 from redteam.orchestration.work.models import WorkStatus
 
@@ -124,6 +128,8 @@ async def update_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
     # facts about discovered nodes, and it never raises
     # -- `ResultMapperRegistry.map_result` degrades to "nothing new" for
     # an unmapped tool_id, a failed/blocked action, or malformed output.
+    mutated_nodes = 0
+    mutated_edges = 0
     if succeeded and result is not None and step is not None:
         mutation = deps.result_mappers.map_result(
             tool_id=result.tool_id,
@@ -131,6 +137,8 @@ async def update_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             arguments=proposal.arguments,
             result=result,
         )
+        mutated_nodes = len(mutation.nodes)
+        mutated_edges = len(mutation.edges)
         mapper_failure = deps.result_mappers.last_failure
         if mapper_failure is not None:
             try:
@@ -260,9 +268,29 @@ async def update_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             reason=reason,
         )
 
+    state_outcome = "blocked" if blocked else "updated" if succeeded else "failed"
+    next_runtime = append_runtime_observation(
+        runtime.model_copy(update={"phase": AgentPhase.REPLAN}),
+        RuntimeObservation(
+            kind="state",
+            summary=(
+                f"Attack graph {state_outcome} for {node.type.value} {node.id}; "
+                f"added {mutated_nodes} node(s) and {mutated_edges} edge(s)"
+            )[:500],
+            outcome=state_outcome,
+            step=runtime.step_count,
+            action_id=str(proposal.action_id),
+            capability=proposal.capability,
+            operation=proposal.operation,
+            target=str(node.id),
+            reasons=(list(decision.reasons[:8]) if blocked and decision is not None else []),
+            alternative_allowed=True,
+        ),
+    )
+
     return advance(
         state,
-        runtime.model_copy(update={"phase": AgentPhase.REPLAN}),
+        next_runtime,
         last_event_id=last_event.event_id,
         current_work_id=work_id if approval_waiting else None,
     )

@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from rich.console import Console
@@ -51,6 +51,8 @@ class InteractiveSession:
     last_phase: str | None = None
     last_termination_reason: str | None = None
     last_actions_executed: int = 0
+    last_pending_approval_id: str | None = None
+    last_observations: list[str] = field(default_factory=list)
 
     def record_run(self, final: RuntimeState | None) -> None:
         if final is None:
@@ -59,6 +61,24 @@ class InteractiveSession:
         self.last_phase = final.phase.value
         self.last_termination_reason = final.termination_reason
         self.last_actions_executed = final.actions_executed
+        self.last_observations = [item.summary for item in final.recent_observations[-5:]]
+        self.last_pending_approval_id = (
+            str(final.pending_approval_id) if final.pending_approval_id is not None else None
+        )
+
+    def explain_last_run(self) -> str:
+        if self.last_run_id is None:
+            return "[Agent] No run has been executed in this session yet."
+        reason = self.last_termination_reason or "completed"
+        summary = (
+            f"[Agent] Run {self.last_run_id} is {self.last_phase or 'unknown'} because "
+            f"'{reason}'. It executed {self.last_actions_executed} action(s)."
+        )
+        if self.last_observations:
+            summary += "\n  Recent observations:\n" + "\n".join(
+                f"  - {item}" for item in self.last_observations
+            )
+        return summary
 
 
 class SessionExit(Exception):
@@ -87,8 +107,8 @@ async def _cmd_help(console: Console, _session: InteractiveSession, _rest: str) 
         aliases = f" ({', '.join('/' + a for a in command.aliases)})" if command.aliases else ""
         console.print(f"  /{command.name:<10}{aliases}  {command.description}")
     console.print(
-        "\n[dim]Anything not starting with \"/\" is sent as a new Mission "
-        "objective on the current engagement.[/dim]"
+        '\n[dim]Other input is interpreted as a question, clarification, '
+        "or investigation request for the current engagement.[/dim]"
     )
 
 

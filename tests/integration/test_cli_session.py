@@ -22,9 +22,12 @@ scenario in one process.
 from __future__ import annotations
 
 import contextlib
+import json
+from io import StringIO
 from pathlib import Path
 
 import pytest
+from rich.console import Console
 
 from redteam.app.cli import _shared
 from redteam.app.cli.commands import interactive
@@ -53,7 +56,12 @@ class _FakeConsole:
 
     def print(self, *args: object, **_kwargs: object) -> None:
         for arg in args:
-            self.transcript.append(str(arg))
+            if isinstance(arg, str):
+                self.transcript.append(arg)
+            else:
+                output = StringIO()
+                Console(file=output, width=140, color_system=None).print(arg)
+                self.transcript.append(output.getvalue())
 
     def input(self, prompt: str = "") -> str:
         self.transcript.append(str(prompt))
@@ -86,12 +94,32 @@ class _ScriptedIntakeLLM:
         return self._turns.pop(0)
 
 
+class _ConversationLLM:
+    """Explicit conversation decisions, independent of intake and engine scripts."""
+
+    async def complete_structured(self, *, messages, **kwargs):
+        payload = json.loads(messages[0]["content"])
+        message = payload["user_message"]
+        if message in {"방금 왜 실패했어?", "결과에서 확인된 내용이 뭐야?"}:
+            return {
+                "mode": "answer",
+                "response": "[Agent] Run summary because " + payload["session_context"],
+            }
+        return {"mode": "execute", "response": "등록된 범위를 조사합니다.", "objective": message}
+
+    async def complete(self, **kwargs):
+        raise AssertionError("conversation uses structured decisions only")
+
+
 class _HoldLLM:
     """Execution model: valid draft/review, then hold forever (no tools)."""
+
     def __init__(self):
         self.calls = []
+
     async def complete(self, *, messages, system=None, **kwargs):
         return ""
+
     @staticmethod
     def _route_key(schema):
         props = schema.get("properties", {})
@@ -108,14 +136,17 @@ class _HoldLLM:
         if "claim_supported" in props:
             return "analysis_verify"
         return "unknown"
+
     @staticmethod
     def _find_host(messages):
         import re
+
         blob = str([m.get("content") if isinstance(m, dict) else "" for m in (messages or [])])
         found = re.search(r"host:[A-Za-z0-9.\-_:]+", blob)
         if found:
             return found.group(0).rstrip(".,;:")
         return "host:127.0.0.1:5000"
+
     def _draft(self, node_id):
         return {
             "path_id": "path-session-hold",
@@ -151,6 +182,7 @@ class _HoldLLM:
             "changed_step_ids": [],
             "review_records": {},
         }
+
     @staticmethod
     def _hold():
         return {
@@ -163,6 +195,7 @@ class _HoldLLM:
             "evidence_request": {},
             "hypothesis_update": {},
         }
+
     async def complete_structured(self, *, messages, response_schema, system=None, **kwargs):
         route = self._route_key(response_schema)
         self.calls.append(route)
@@ -194,19 +227,27 @@ def _patch(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, answers: list[str]) 
     # no application-config file involved.
     monkeypatch.setenv("REDTEAM_LLM_PROVIDER", "litellm")
     monkeypatch.setenv("REDTEAM_LLM_MODEL", "gpt-4o-mini")
-    monkeypatch.delenv("REDTEAM_MCP_SERVERS", raising=False)
+    # Explicit adapter choice avoids consuming the session's answers in MCP setup.
+    # The separate MCP tests cover opt-in prompts and declining registration.
+    monkeypatch.setenv("REDTEAM_MCP_SERVERS", "example")
     console = _FakeConsole(answers)
     monkeypatch.setattr(interactive, "Console", lambda: console)
+    monkeypatch.setattr(interactive, "build_llm_client", lambda config: _ConversationLLM())
     from redteam.intake.assistant import IntakeAssistant
+
     intake_llm = _ScriptedIntakeLLM([dict(_COMPLETE_TURN)])
+
     def _intake_for_test(client):
         return IntakeAssistant(intake_llm)
+
     monkeypatch.setattr(interactive, "_build_intake_assistant", _intake_for_test)
     hold_llm = _HoldLLM()
     original_build = run_command.build_application
+
     async def _build_with_explicit_llm(config, **kwargs):
         kwargs.setdefault("llm", hold_llm)
         return await original_build(config, **kwargs)
+
     monkeypatch.setattr(run_command, "build_application", _build_with_explicit_llm)
     return console
 
@@ -229,7 +270,6 @@ async def test_run_finished_returns_to_prompt_and_accepts_slash_commands(
         answers=[
             "127.0.0.1:5000의 VulnBank 테스트, 최대 100개",  # first message -> intake
             "",  # existing-config menu -> Start
-            "n",  # one-time MCP auto-setup prompt -> decline
             "",  # preflight -> Start
             "/help",
             "/status",
@@ -253,12 +293,9 @@ async def test_run_finished_returns_to_prompt_and_accepts_slash_commands(
     # /status (no argument) resolved against the session's own last run id --
     # never a hardcoded/faked run id.
     assert "Status: FINISHED" in stdout
-    # /tools reused the exact same Capability Gateway `redteam tools list`
-    # uses -- REDTEAM_MCP_SERVERS is unset in this fixture, so both now
-    # agree on an honest empty catalog (never a silent ExampleMCPAdapter
-    # substitute; see app.bootstrap._empty_tool_gateway).
-    assert "(none)" in stdout
-    assert "recon.ping" not in stdout
+    # A missing MCP env now gets the same safe built-in baseline the Run used.
+    assert "recon.ping" in stdout
+    assert "web.http_request" not in stdout  # no implicit web server registration
 
 
 async def test_natural_language_second_request_runs_a_second_agent_run(
@@ -273,7 +310,6 @@ async def test_natural_language_second_request_runs_a_second_agent_run(
         answers=[
             "127.0.0.1:5000의 VulnBank 테스트, 최대 100개",
             "",
-            "n",  # one-time MCP auto-setup prompt -> decline
             "",
             "127.0.0.1:5000 다시 한 번 점검해줘",  # second objective, plain text
             "/exit",
@@ -290,6 +326,74 @@ async def test_natural_language_second_request_runs_a_second_agent_run(
     assert run_id_lines[0] != run_id_lines[1]
 
 
+async def test_natural_language_explanation_does_not_start_a_new_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A sentence containing ``왜`` is a query even when it is not the
+    first token; it must describe the last Run instead of becoming a Mission
+    objective."""
+    console = _patch(
+        monkeypatch,
+        tmp_path,
+        answers=[
+            "127.0.0.1:5000의 VulnBank 테스트, 최대 100개",
+            "",
+            "",
+            "방금 왜 실패했어?",
+            "/exit",
+        ],
+    )
+
+    exit_code = await interactive.run(_args())
+
+    assert exit_code == _shared.EXIT_OK
+    assert len([line for line in console.transcript if "RunId:" in line]) == 1
+    assert any("Run summary because" in line for line in console.transcript)
+
+
+async def test_free_form_question_is_answered_without_starting_a_new_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    console = _patch(
+        monkeypatch,
+        tmp_path,
+        answers=[
+            "127.0.0.1:5000의 VulnBank 테스트, 최대 100개",
+            "",
+            "",
+            "결과에서 확인된 내용이 뭐야?",
+            "/exit",
+        ],
+    )
+
+    exit_code = await interactive.run(_args())
+
+    assert exit_code == _shared.EXIT_OK
+    assert len([line for line in console.transcript if "RunId:" in line]) == 1
+    assert console.transcript.count("\n[cyan]❯[/cyan] ") >= 2
+
+
+async def test_bare_exit_ends_session_without_starting_a_new_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    console = _patch(
+        monkeypatch,
+        tmp_path,
+        answers=[
+            "127.0.0.1:5000의 VulnBank 테스트, 최대 100개",
+            "",
+            "",
+            "exit",
+        ],
+    )
+
+    exit_code = await interactive.run(_args())
+
+    assert exit_code == _shared.EXIT_OK
+    assert len([line for line in console.transcript if "RunId:" in line]) == 1
+    assert "[User] exit" in console.transcript
+
+
 # --- Gate I: error recovery ------------------------------------------------
 
 
@@ -302,7 +406,6 @@ async def test_unknown_slash_command_does_not_end_the_session(
         answers=[
             "127.0.0.1:5000의 VulnBank 테스트, 최대 100개",
             "",
-            "n",  # one-time MCP auto-setup prompt -> decline
             "",
             "/this-command-does-not-exist",
             "/exit",
@@ -330,7 +433,6 @@ async def test_eof_at_idle_prompt_ends_the_session_cleanly(
         answers=[
             "127.0.0.1:5000의 VulnBank 테스트, 최대 100개",
             "",
-            "n",  # one-time MCP auto-setup prompt -> decline
             "",
             # nothing after the first run -- console.input() raises EOFError
         ],

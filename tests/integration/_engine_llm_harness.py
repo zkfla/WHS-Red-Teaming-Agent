@@ -43,6 +43,7 @@ from redteam.core.ids import (
     TaskId,
     ToolId,
 )
+from redteam.event_bus.memory import InMemoryEventBus
 from redteam.orchestration.agents.registry import default_registry
 from redteam.orchestration.analysis import (
     VerificationAssessment,
@@ -232,6 +233,7 @@ def make_world(
     paths = InMemoryPathStore()
     settings = OrchestrationSettings(decision_max_attempts=decision_max_attempts)
     deps = SimpleNamespace(
+        event_bus=InMemoryEventBus(),
         llm_client=llm,
         settings=settings,
         evidence_store=evidence,

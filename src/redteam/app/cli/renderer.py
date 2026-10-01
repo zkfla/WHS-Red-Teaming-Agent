@@ -24,16 +24,20 @@ from rich.text import Text
 
 from redteam.app.cli import theme
 from redteam.app.cli._shared import mask_secrets
+from redteam.app.cli.conversation import ConversationDecision
 from redteam.core.contracts.events import EventEnvelope, EventType
 from redteam.core.enums import ApprovalStatus
 from redteam.orchestration.events import (
-    AGENT_NO_EXECUTABLE_CANDIDATES,
+    AGENT_CONTEXT_PREPARED,
+    AGENT_DECISION_RECORDED,
+    AGENT_TURN_DECIDED,
     AUTHENTICATION_CHECK_DEFERRED,
     AUTHENTICATION_CHECKED,
     CANDIDATE_GENERATED,
     CANDIDATE_REJECTED,
     GRAPH_MUTATION_APPLIED,
     HYPOTHESIS_RESOLVED,
+    MCP_TOOL_SELECTED,
     REPLAN_TRIGGERED,
     RESULT_MAPPER_FAILED,
 )
@@ -47,10 +51,18 @@ from redteam.orchestration.operator_intents.models import (
 # filtering intent as `commands.run._RENDERED_EVENTS`, kept separate
 # since that module's own plain-line format is a documented, tested
 # backward-compat surface this renderer must not touch (section 23).
+# PlanningFailed is published by the planning node with payload
+# {kind, stage, error_type} but has no shared constant yet (that module
+# is owned elsewhere) -- the literal is kept here so a failed planning
+# turn still gets an effective line instead of vanishing from the stream.
+_PLANNING_FAILED = "PlanningFailed"
+
+
 _RENDERED_EVENTS = frozenset(
     {
         EventType.RUN_STARTED,
         EventType.ACTION_PROPOSED,
+        EventType.POLICY_EVALUATED,
         EventType.ACTION_APPROVED,
         EventType.ACTION_DENIED,
         EventType.APPROVAL_REQUIRED,
@@ -59,15 +71,20 @@ _RENDERED_EVENTS = frozenset(
         EventType.GRAPH_UPDATED,
         EventType.FINDING_CREATED,
         EventType.FINDING_VERIFIED,
-        AGENT_NO_EXECUTABLE_CANDIDATES,
+        EventType.RUN_FINISHED,
+        AGENT_CONTEXT_PREPARED,
+        AGENT_DECISION_RECORDED,
+        AGENT_TURN_DECIDED,
         CANDIDATE_GENERATED,
         CANDIDATE_REJECTED,
         GRAPH_MUTATION_APPLIED,
         HYPOTHESIS_RESOLVED,
+        MCP_TOOL_SELECTED,
         REPLAN_TRIGGERED,
         RESULT_MAPPER_FAILED,
         AUTHENTICATION_CHECK_DEFERRED,
         AUTHENTICATION_CHECKED,
+        _PLANNING_FAILED,
     }
 )
 
@@ -159,9 +176,59 @@ class RichEventRenderer:
             )
             return (
                 Text(f"[{timestamp}] ", style=theme.MUTED)
-                + Text(f"{agent:<14}", style=theme.EMPHASIS)
-                + Text(f" {theme.ICON_TRANSITION} ", style=theme.MUTED)
-                + Text(phrase)
+                + Text("[Action] ", style=theme.EMPHASIS)
+                + Text(f"{agent}: {phrase}")
+            )
+
+        if event.event_type == AGENT_TURN_DECIDED:
+            response = str(payload.get("response") or "다음 행동을 검토했습니다.")
+            summary = str(payload.get("decision_summary") or "")
+            assumptions = payload.get("assumptions") or []
+            result = Text(f"[{timestamp}] ", style=theme.MUTED) + Text(
+                f"[Agent] {response}", style=theme.EMPHASIS
+            )
+            if summary:
+                result.append(f"\n           [Reason] {summary}", style=theme.MUTED)
+            for assumption in assumptions[:3]:
+                result.append(f"\n           [Assumption] {assumption}", style=theme.MUTED)
+            return result
+
+        if event.event_type == AGENT_CONTEXT_PREPARED:
+            summary = str(payload.get("graph_summary") or "no graph summary")
+            feedback = int(payload.get("runtime_observation_count") or 0)
+            suffix = f"; {feedback} prior runtime observation(s)" if feedback else ""
+            return Text(f"[{timestamp}] ", style=theme.MUTED) + Text(
+                f"[Observation] {summary}{suffix}", style=theme.MUTED
+            )
+
+        if event.event_type == AGENT_DECISION_RECORDED:
+            rationale = str(payload.get("rationale") or "selected from executable candidates")
+            operation = str(payload.get("operation") or "next action")
+            basis = str(payload.get("selection_basis") or "planner")
+            return Text(f"[{timestamp}] ", style=theme.MUTED) + Text(
+                f"[Agent] {rationale} -> {operation} ({basis})", style=theme.EMPHASIS
+            )
+
+        if event.event_type == MCP_TOOL_SELECTED:
+            server = str(payload.get("server_id") or "mcp")
+            tool = str(payload.get("tool_name") or payload.get("tool_id") or "tool")
+            risk = str(payload.get("risk_level") or "unknown")
+            health = str(payload.get("health_status") or "unknown")
+            return Text(f"[{timestamp}] ", style=theme.MUTED) + Text(
+                f"[MCP] {server}/{tool} selected (risk={risk}, health={health})",
+                style=theme.MUTED,
+            )
+
+        if event.event_type == EventType.POLICY_EVALUATED:
+            verdict = str(payload.get("verdict") or "unknown").upper()
+            reasons = "; ".join(str(item) for item in payload.get("reasons", []) or [])
+            rules = ", ".join(str(item) for item in payload.get("matched_rules", []) or [])
+            detail = reasons or "no additional reason"
+            if rules:
+                detail += f"; policy={rules}"
+            return Text(f"[{timestamp}] ", style=theme.MUTED) + Text(
+                f"[Control] {verdict} — {detail}",
+                style=(theme.SUCCESS if verdict == "ALLOW" else theme.WARNING),
             )
 
         if event.event_type == EventType.ACTION_APPROVED:
@@ -184,16 +251,26 @@ class RichEventRenderer:
 
         if event.event_type == EventType.TOOL_EXECUTION_FINISHED:
             success = bool(payload.get("success"))
-            icon, style = (theme.ICON_SUCCESS, theme.SUCCESS) if success else (
-                theme.ICON_FAILURE,
-                theme.DANGER,
+            icon, style = (
+                (theme.ICON_SUCCESS, theme.SUCCESS)
+                if success
+                else (
+                    theme.ICON_FAILURE,
+                    theme.DANGER,
+                )
             )
-            text = "Tool call succeeded" if success else "Tool call failed"
+            text = (
+                "[Tool Result] Tool call succeeded" if success else "[Tool Result] Tool call failed"
+            )
             return Text(f"[{timestamp}] ", style=theme.MUTED) + Text(f"{icon} {text}", style=style)
 
         if event.event_type == EventType.TOOL_EXECUTION_FAILED:
+            error = payload.get("error_code")
+            message = payload.get("error_message")
+            detail = ": ".join(str(item) for item in (error, message) if item)
+            suffix = f" ({detail})" if detail else ""
             return Text(f"[{timestamp}] ", style=theme.MUTED) + Text(
-                f"{theme.ICON_FAILURE} Tool call failed", style=theme.DANGER
+                f"{theme.ICON_FAILURE} [Tool Result] Tool call failed{suffix}", style=theme.DANGER
             )
 
         if event.event_type == EventType.GRAPH_UPDATED:
@@ -201,14 +278,13 @@ class RichEventRenderer:
             node_id = str(payload.get("node_id", ""))
             label = node_id.split(":", 1)[-1] if ":" in node_id else node_id
             return Text(f"[{timestamp}] ", style=theme.MUTED) + Text(
-                f"{theme.ICON_TRANSITION} Updating attack graph: {node_type} {label}",
+                f"{theme.ICON_TRANSITION} [State] Attack graph: {node_type} {label}",
                 style=theme.MUTED,
             )
 
         if event.event_type == CANDIDATE_REJECTED:
             return Text(f"[{timestamp}] ", style=theme.MUTED) + Text(
-                f"{theme.ICON_WARNING} Candidate rejected: "
-                f"{_rejection_text(payload)}",
+                f"{theme.ICON_WARNING} Candidate rejected: {_rejection_text(payload)}",
                 style=theme.WARNING,
             )
 
@@ -221,7 +297,7 @@ class RichEventRenderer:
 
         if event.event_type == GRAPH_MUTATION_APPLIED:
             return Text(f"[{timestamp}] ", style=theme.MUTED) + Text(
-                f"{theme.ICON_TRANSITION} Graph mutation applied: "
+                f"{theme.ICON_TRANSITION} [State] Graph mutation applied: "
                 f"{payload.get('nodes', 0)} node(s), {payload.get('edges', 0)} edge(s)",
                 style=theme.MUTED,
             )
@@ -234,8 +310,7 @@ class RichEventRenderer:
 
         if event.event_type == REPLAN_TRIGGERED:
             return Text(f"[{timestamp}] ", style=theme.MUTED) + Text(
-                f"Replan: {payload.get('outcome', 'unknown')} "
-                f"({payload.get('reason', 'unknown')})",
+                f"[Next] {payload.get('outcome', 'unknown')} ({payload.get('reason', 'unknown')})",
                 style=theme.MUTED,
             )
 
@@ -263,22 +338,20 @@ class RichEventRenderer:
                 str(payload.get("outcome", "inconclusive")), style=theme.MUTED
             )
 
-        if event.event_type == AGENT_NO_EXECUTABLE_CANDIDATES:
-            agent = _agent_label(str(payload.get("agent_id", "agent")))
-            drafts = payload.get("drafts_offered", 0)
-            summary = Text(
-                f"{theme.ICON_WARNING} {agent}: activated, but produced no executable "
-                f"candidate ({drafts} draft step(s) had no matching/healthy tool or "
-                f"could not be resolved from what's known so far)",
+        if event.event_type == _PLANNING_FAILED:
+            kind = str(payload.get("kind") or "unknown")
+            stage = str(payload.get("stage") or "unknown")
+            error_type = str(payload.get("error_type") or "unknown")
+            return Text(f"[{timestamp}] ", style=theme.MUTED) + Text(
+                f"{theme.ICON_WARNING} Planning failed: kind={kind} stage={stage} ({error_type})",
                 style=theme.WARNING,
             )
-            rejections = payload.get("rejections", [])
-            if not isinstance(rejections, list):
-                rejections = []
-            for item in rejections[:3]:
-                if isinstance(item, dict):
-                    summary.append(f"\n  - {_rejection_text(item)}", style=theme.MUTED)
-            return Text(f"[{timestamp}] ", style=theme.MUTED) + summary
+
+        if event.event_type == EventType.RUN_FINISHED:
+            reason = str(payload.get("termination_reason") or "completed")
+            return Text(f"[{timestamp}] ", style=theme.MUTED) + Text(
+                f"[Agent] Waiting — run ended: {reason}", style=theme.MUTED
+            )
 
         return None
 
@@ -323,6 +396,50 @@ def render_run_summary(
     table.add_row("Violations", Text(str(violations), style=style))
     table.add_row("Actions executed", str(actions_executed))
     console.print(table)
+
+
+def render_user_message(console: Console, text: str) -> None:
+    """Render a chat turn without surrounding it in noisy terminal chrome."""
+
+    console.print()
+    console.print(Text.assemble(("› ", f"bold {theme.EMPHASIS}"), text))
+
+
+def render_conversation_decision(console: Console, decision: ConversationDecision) -> None:
+    """Codex-style public reasoning summary: response, assumptions and plan.
+
+    These fields are explicitly requested as short user-facing summaries;
+    they are not model chain-of-thought.
+    Single LLM-path flow only: no fallback-recipe line is ever shown.
+    """
+
+    body = Text(decision.response)
+    if decision.assumptions:
+        body.append("\n\nAssumptions\n", style=f"bold {theme.WARNING}")
+        for item in decision.assumptions:
+            body.append(f"  • {item}\n", style=theme.MUTED)
+    if decision.plan:
+        body.append("\nPlan\n", style=f"bold {theme.EMPHASIS}")
+        for index, item in enumerate(decision.plan, start=1):
+            body.append(f"  {index}. {item}\n", style=theme.MUTED)
+    console.print(Panel(body, title="Assistant", border_style=theme.EMPHASIS, padding=(1, 2)))
+
+
+def render_assistant_decision(console: Console, decision: ConversationDecision) -> None:
+    """Backward-compatible alias of render_conversation_decision."""
+
+    render_conversation_decision(console, decision)
+
+
+def render_final_answer(console: Console, text: str) -> None:
+    console.print(
+        Panel(
+            Text(text),
+            title="Result",
+            border_style=theme.SUCCESS,
+            padding=(1, 2),
+        )
+    )
 
 
 def elapsed_since(started_at: datetime) -> str:
@@ -426,6 +543,21 @@ def operator_welcome_text(*, live: bool = False) -> str:
     )
 
 
+def operator_user_text(text: str) -> str:
+    """Echo accepted input in the same trace vocabulary as runtime events."""
+
+    return f"[User] {text}"
+
+
+def operator_assistant_text(decision: ConversationDecision) -> str:
+    """Plain serialization for the live input channel's shared echo sink."""
+
+    lines = [f"[Assistant] {decision.response}"]
+    lines.extend(f"  assumption: {item}" for item in decision.assumptions)
+    lines.extend(f"  plan {index}: {item}" for index, item in enumerate(decision.plan, start=1))
+    return "\n".join(lines)
+
+
 def operator_help_text() -> str:
     return (
         "operator console commands:\n"
@@ -437,6 +569,7 @@ def operator_help_text() -> str:
         "  reprioritize AREA N   set priority N on matching tasks\n"
         "  status | query        show mission/task status\n"
         "  explain               explain the current position\n"
+        "  try another method    add strategy guidance to the next decision\n"
         "  approve ID            approve the pending action (in-session)\n"
         "  deny ID               deny the pending action (in-session)\n"
         "  help                  show this help\n"
@@ -512,8 +645,8 @@ def operator_explanation_text(explanation: IntentExplanation) -> str:
 
 def operator_approval_prompt_text(approval_id: str) -> str:
     return (
-        f"operator> approval {approval_id} pending -- type 'approve' to allow "
-        f"this exact action or 'deny' to reject it."
+        f"[Assistant] 이 Action은 실행 전에 승인이 필요합니다 ({approval_id}). "
+        "실행할까요? approve = 이 Action만 허용 / deny = 거부 후 다른 전략 검토"
     )
 
 

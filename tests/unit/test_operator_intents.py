@@ -287,6 +287,119 @@ def test_unknown_and_empty_instructions_are_rejected() -> None:
             classify_instruction(instruction)
 
 
+async def test_live_channel_accepts_safe_free_form_guidance_for_next_decision() -> None:
+    task_store = await seeded_task_store(task("web"))
+    svc = service(task_store=task_store, intent_store=InMemoryOperatorIntentStore())
+
+    result = await svc.receive_and_apply(
+        "다른 허용된 방법으로 시도해",
+        mission_id=MISSION,
+        run_id=RUN,
+        allow_guidance=True,
+    )
+
+    updated = await task_store.get_mission(MISSION)
+    assert result.intent_type is OperatorIntentType.GUIDANCE
+    assert result.applied is True
+    assert updated is not None
+    assert updated.operator_preferences["guidance"] == ["다른 허용된 방법으로 시도해"]
+
+
+async def test_explicit_guidance_with_stop_word_is_memo_only() -> None:
+    task_store = await seeded_task_store(
+        task("web", priority=10),
+        task("mobile", capability="mobile", objective="Investigate mobile surface"),
+    )
+    intents = InMemoryOperatorIntentStore()
+    bus = InMemoryEventBus()
+    svc = service(task_store=task_store, intent_store=intents)
+    pub = publisher(bus)
+
+    result = await svc.receive_guidance_and_apply(
+        "조언 내용에는 stop이라는 단어가 있습니다",
+        mission_id=MISSION,
+        run_id=RUN,
+        publisher=pub,
+    )
+
+    assert result.intent_type is OperatorIntentType.GUIDANCE
+    assert result.applied is True
+    assert result.outcome == "guidance_added_for_next_decision"
+    assert result.received_event_id is not None
+    assert result.applied_event_id is not None
+
+    mission = await task_store.get_mission(MISSION)
+    assert mission is not None
+    assert mission.status is MissionStatus.ACTIVE
+    assert mission.operator_preferences["guidance"] == ["조언 내용에는 stop이라는 단어가 있습니다"]
+    assert len(await task_store.list_tasks(mission_id=MISSION)) == 2
+    web = await task_store.get_task(TaskId("web"))
+    mobile = await task_store.get_task(TaskId("mobile"))
+    assert web is not None and web.priority == 10
+    assert mobile is not None and mobile.status is TaskStatus.READY
+
+    chain = bus.correlated(str(result.intent_id))
+    assert [event.event_type for event in chain] == [
+        EventType.OPERATOR_INSTRUCTION_RECEIVED,
+        EventType.OPERATOR_INTENT_APPLIED,
+    ]
+    assert chain[1].causation_id == chain[0].event_id
+
+
+async def test_polite_pause_and_exclude_still_map_to_control() -> None:
+    paused_store = await seeded_task_store(task("web", priority=10))
+    paused_svc = service(task_store=paused_store, intent_store=InMemoryOperatorIntentStore())
+    paused = await paused_svc.receive_and_apply(
+        "잠시 멈춰 주세요",
+        mission_id=MISSION,
+        run_id=RUN,
+        allow_guidance=True,
+    )
+    assert paused.intent_type is OperatorIntentType.PAUSE
+    assert paused.applied is True
+    paused_mission = await paused_store.get_mission(MISSION)
+    assert paused_mission is not None and paused_mission.status is MissionStatus.PAUSED
+
+    excluded_store = await seeded_task_store(task("web", priority=10))
+    excluded_svc = service(task_store=excluded_store, intent_store=InMemoryOperatorIntentStore())
+    excluded = await excluded_svc.receive_and_apply(
+        "그 경로는 제외해 주세요",
+        mission_id=MISSION,
+        run_id=RUN,
+        allow_guidance=True,
+    )
+    assert excluded.intent_type is OperatorIntentType.EXCLUDE
+    assert excluded.applied is True
+
+
+async def test_explicit_guidance_redacts_secret_and_rejects_empty() -> None:
+    secret_store = await seeded_task_store(task("web", priority=10))
+    secret_intents = InMemoryOperatorIntentStore()
+    secret_svc = service(task_store=secret_store, intent_store=secret_intents)
+
+    secreted = await secret_svc.receive_guidance_and_apply(
+        "token=hunter2",
+        mission_id=MISSION,
+        run_id=RUN,
+    )
+    assert secreted.applied is True
+    persisted = await secret_intents.list_for_mission(MISSION)
+    assert len(persisted) == 1
+    assert "hunter2" not in persisted[0].model_dump_json()
+    stored_mission = await secret_store.get_mission(MISSION)
+    assert stored_mission is not None
+    assert "hunter2" not in json.dumps(stored_mission.operator_preferences)
+
+    empty = await secret_svc.receive_guidance_and_apply(
+        "   ",
+        mission_id=MISSION,
+        run_id=RUN,
+    )
+    assert empty.status is IntentStatus.REJECTED
+    assert empty.applied is False
+    assert len(await secret_intents.list_for_mission(MISSION)) == 1
+
+
 def test_interpreter_extracts_areas_and_priority_and_redacts() -> None:
     focus = interpret_instruction(
         "focus on web and api with token=supersecret", mission_id=MISSION, now=NOW
@@ -915,7 +1028,8 @@ async def test_explanation_does_not_mix_other_runs_on_shared_event_bus() -> None
     bus = InMemoryEventBus()
     svc = service(
         task_store=await seeded_task_store(task("docs")),
-        intent_store=InMemoryOperatorIntentStore(), bus=bus,
+        intent_store=InMemoryOperatorIntentStore(),
+        bus=bus,
     )
     await publisher(bus).publish(
         CANDIDATE_REJECTED, {"operation": "this-run", "reason": "not viable"}
@@ -938,9 +1052,11 @@ async def test_operator_renderer_shows_bounded_structured_reasons_without_secret
     store = await seeded_task_store(
         task("missing", objective="Probe /api/other"),
         blocked_task(
-            "blocked", reason="missing token=do-not-print",
-            depends_on="missing", objective="Probe /api/other",
-        )
+            "blocked",
+            reason="missing token=do-not-print",
+            depends_on="missing",
+            objective="Probe /api/other",
+        ),
     )
     svc = service(task_store=store, intent_store=InMemoryOperatorIntentStore())
     await svc.receive_and_apply("exclude /api/docs", mission_id=MISSION, run_id=RUN)

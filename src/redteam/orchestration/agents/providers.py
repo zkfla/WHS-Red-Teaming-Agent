@@ -86,6 +86,10 @@ class GraphCandidateContext:
     task_id: str | None = None
     task_source: str | None = None
     task_objective: str | None = None
+    #: The operator's original/current Mission objective. Kept separate from
+    #: the role-scoped task so the LLM receives both instead of losing the
+    #: user's request during task decomposition.
+    mission_objective: str | None = None
     task_target_node_ids: tuple[GraphNodeId, ...] = ()
     available_capabilities: tuple[str, ...] = ()
     open_hypotheses: tuple[str, ...] = ()
@@ -94,6 +98,10 @@ class GraphCandidateContext:
     #: them in the live catalog. Only meaningful together with
     #: operations_verified.
     available_operations: tuple[tuple[str, str], ...] = ()
+    #: Redacted, bounded metadata for the live MCP tools behind
+    #: ``available_operations``. This lets an LLM choose arguments/tool ids
+    #: from reality instead of guessing from an operation name.
+    available_tools: tuple[Mapping[str, Any], ...] = ()
     #: True when available_operations was actually derived from a live Tool
     #: Catalog. False means "unknown", not "none": with no catalog wired in,
     #: the provider's declared ToolId binding is the only evidence of
@@ -110,6 +118,12 @@ class GraphCandidateContext:
     #: can reason past what a playbook anticipated. Dicts, not the model type,
     #: to keep this seam import-cycle free.
     evidence_excerpts: tuple[Mapping[str, Any], ...] = ()
+    #: Bounded Control/tool/state feedback from prior turns. These are safe
+    #: summaries, not raw output or hidden reasoning.
+    runtime_observations: tuple[Mapping[str, Any], ...] = ()
+    #: Redacted operator guidance that should influence strategy without ever
+    #: expanding the set of known targets or bypassing candidate compilation.
+    operator_guidance: tuple[str, ...] = ()
 
     def can_execute(self, capability: str, operation: str) -> bool:
         """Whether a candidate for this action could actually be executed.

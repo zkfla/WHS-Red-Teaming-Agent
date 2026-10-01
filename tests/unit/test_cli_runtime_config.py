@@ -7,6 +7,7 @@ from pydantic import ValidationError
 
 from redteam.app.cli._shared import load_app_config_for_run
 from redteam.app.cli.commands import interactive
+from redteam.app.cli.conversation import ConversationAssistant
 from redteam.app.cli.interactive_commands import InteractiveSession
 from redteam.core.config import (
     CapabilityConfig,
@@ -17,7 +18,7 @@ from redteam.core.config import (
 )
 from redteam.intake.serializer import dump_engagement_yaml
 from redteam.orchestration.settings import OrchestrationSettings
-from tests.integration.test_cli_session import _FakeConsole
+from tests.integration.test_cli_session import _ConversationLLM, _FakeConsole
 
 
 def _engagement(host="old.example", budget=10):
@@ -70,6 +71,7 @@ async def _session(console, session):
         capability_config=CapabilityConfig(),
         logging_config=LoggingConfig(),
         verbose=False,
+        conversation=ConversationAssistant(_ConversationLLM()),
     )
 
 

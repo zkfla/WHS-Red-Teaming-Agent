@@ -296,7 +296,9 @@ def _durable_settings(tmp_path) -> OrchestrationSettings:  # noqa: ANN001
 
 
 def _plane(
-    engagement: Engagement, approval_dir, audit_dir  # noqa: ANN001
+    engagement: Engagement,
+    approval_dir,
+    audit_dir,  # noqa: ANN001
 ) -> DefaultControlPlane:
     return DefaultControlPlane(
         {engagement.engagement_id: engagement},
@@ -382,7 +384,10 @@ async def _run_to_pending(tmp_path, *, max_actions: int = 5):  # noqa: ANN202
 
 
 def _second_process_with_deps(  # noqa: ANN202
-    engagement: Engagement, settings: OrchestrationSettings, approval_dir, audit_dir  # noqa: ANN001
+    engagement: Engagement,
+    settings: OrchestrationSettings,
+    approval_dir,
+    audit_dir,  # noqa: ANN001
 ):
     """Fresh process: reopen the same SQLite files, rescript the model tail."""
     files = _files(Path(settings.checkpoint_path).parent)
@@ -418,7 +423,10 @@ def _second_process_with_deps(  # noqa: ANN202
 
 
 def _second_process(  # noqa: ANN202
-    engagement: Engagement, settings: OrchestrationSettings, approval_dir, audit_dir  # noqa: ANN001
+    engagement: Engagement,
+    settings: OrchestrationSettings,
+    approval_dir,
+    audit_dir,  # noqa: ANN001
 ):
     runner, plane, gateway, _ = _second_process_with_deps(
         engagement, settings, approval_dir, audit_dir
@@ -462,9 +470,7 @@ async def test_approved_durable_resume_executes_the_original_action(tmp_path) ->
     active = await SQLitePathStore(files["paths"]).get_active(RUN_ID)
     assert active is not None
     assert is_active_status(active.status)
-    assert any(
-        ASSET_NODE_ID in [str(t) for t in step.target_node_ids] for step in active.steps
-    )
+    assert any(ASSET_NODE_ID in [str(t) for t in step.target_node_ids] for step in active.steps)
     graph_store = SQLiteAttackGraphStore(files["graph"])
     await graph_store.setup()
     asset_nodes = [n for n in await graph_store.list_nodes() if n.type == GraphNodeType.ASSET]
@@ -562,9 +568,7 @@ async def test_durable_resume_requires_the_explicit_link_not_a_stale_guess(tmp_p
 
 async def test_recover_runtime_refuses_a_checkpoint_with_execution_pending() -> None:
     deps = build_test_application(settings=OrchestrationSettings(checkpointing=True))
-    runtime = RuntimeState(
-        run_id=RunId("run_unsafe"), engagement_id=EngagementId("eng_unsafe")
-    )
+    runtime = RuntimeState(run_id=RunId("run_unsafe"), engagement_id=EngagementId("eng_unsafe"))
 
     class _FakeGraph:
         def __init__(self, snapshot: object) -> None:
@@ -632,9 +636,7 @@ async def test_sqlite_active_path_and_step_progress_survive_reopen(tmp_path) -> 
     before = await SQLitePathStore(files["paths"]).get_active(RUN_ID)
     assert before is not None
     assert is_active_status(before.status)
-    assert any(
-        ASSET_NODE_ID in [str(t) for t in step.target_node_ids] for step in before.steps
-    )
+    assert any(ASSET_NODE_ID in [str(t) for t in step.target_node_ids] for step in before.steps)
 
     task_reopened = SQLiteTaskGraphStore(files["tasks"])
     await task_reopened.setup()
@@ -660,9 +662,7 @@ async def test_sqlite_active_path_and_step_progress_survive_reopen(tmp_path) -> 
     progressed = await deps.path_store.get_active(RUN_ID)
     assert progressed is not None
     assert progressed.path_id == before.path_id
-    succeeded = await deps.work_store.list_items(
-        run_id=RunId(RUN_ID), status=WorkStatus.SUCCEEDED
-    )
+    succeeded = await deps.work_store.list_items(run_id=RunId(RUN_ID), status=WorkStatus.SUCCEEDED)
     assert len(succeeded) == 1
 
     again = await SQLitePathStore(files["paths"]).get_active(RUN_ID)
@@ -681,9 +681,7 @@ async def test_durable_evidence_hides_secrets_but_keeps_linkage(tmp_path) -> Non
     await ApprovalService(FilesystemApprovalStore(approval_dir)).resolve(
         stopped.pending_approval_id, ApprovalStatus.APPROVED, "operator"
     )
-    runner, _, _, deps = _second_process_with_deps(
-        engagement, settings, approval_dir, audit_dir
-    )
+    runner, _, _, deps = _second_process_with_deps(engagement, settings, approval_dir, audit_dir)
     try:
         runtime = await runner.recover_runtime(RUN_ID)
         assert runtime is not None
@@ -702,3 +700,76 @@ async def test_durable_evidence_hides_secrets_but_keeps_linkage(tmp_path) -> Non
     mission = await deps.task_graph_store.get_mission(final.mission_id)
     assert mission is not None
     assert "api_key" not in json.dumps(mission.model_dump(mode="json"), default=str).lower()
+
+
+async def test_legacy_checkpoint_without_recent_observations_recovers_and_resumes(
+    tmp_path,
+) -> None:
+    """Old 40aedb2 payload (no recent_observations) recovers on the new runner."""
+    engagement, settings, approval_dir, audit_dir, stopped = await _run_to_pending(tmp_path)
+    files = _files(tmp_path)
+    assert stopped.pending_approval_id is not None
+    assert stopped.pending_action_id is not None
+    assert stopped.mission_id is not None
+    before_path = await SQLitePathStore(files["paths"]).get_active(RUN_ID)
+    assert before_path is not None
+    new_dump = stopped.model_dump()
+    assert "recent_observations" in new_dump
+    old_dict = dict(new_dump)
+    old_dict.pop("recent_observations", None)
+    assert "recent_observations" not in old_dict
+    legacy_runtime = stopped.model_copy()
+    legacy_runtime.__dict__.pop("recent_observations", None)
+    assert "recent_observations" not in legacy_runtime.__dict__
+    legacy_blob = legacy_runtime.model_dump()
+    assert "recent_observations" not in legacy_blob
+    revalidated = RuntimeState.model_validate(old_dict)
+    assert isinstance(revalidated, RuntimeState)
+    assert revalidated.recent_observations == []
+    assert revalidated.run_id == stopped.run_id
+    assert revalidated.pending_approval_id == stopped.pending_approval_id
+    writer, _, _, _ = _second_process_with_deps(engagement, settings, approval_dir, audit_dir)
+    try:
+        await writer._ensure_graph()
+        assert writer._graph is not None
+        snapshot_before = await writer._graph.aget_state(writer.config())
+        assert snapshot_before.values is not None
+        assert snapshot_before.values.get("runtime") is not None
+        proposal_before = snapshot_before.values.get("action_proposal")
+        assert proposal_before is not None
+        work_id_before = snapshot_before.values.get("current_work_id")
+        assert work_id_before is not None
+        update: dict[str, object] = {"runtime": legacy_runtime}
+        plan_step_before = snapshot_before.values.get("plan_step")
+        if plan_step_before is not None:
+            update["plan_step"] = plan_step_before
+        update["action_proposal"] = proposal_before
+        update["current_work_id"] = work_id_before
+        await writer._graph.aupdate_state(writer.config(), update)
+    finally:
+        await writer.aclose()
+    runner, _, gateway = _second_process(engagement, settings, approval_dir, audit_dir)
+    try:
+        recovered = await runner.recover_runtime(RUN_ID)
+        assert recovered is not None
+        assert isinstance(recovered, RuntimeState)
+        assert recovered.run_id == stopped.run_id
+        assert recovered.engagement_id == stopped.engagement_id
+        assert recovered.mission_id == stopped.mission_id
+        assert recovered.active_task_id == stopped.active_task_id
+        assert recovered.active_path_id == stopped.active_path_id
+        assert recovered.pending_approval_id == stopped.pending_approval_id
+        assert recovered.pending_action_id == stopped.pending_action_id
+        assert recovered.recent_observations == []
+        active = await SQLitePathStore(files["paths"]).get_active(RUN_ID)
+        assert active is not None
+        assert active.path_id == before_path.path_id
+        await ApprovalService(FilesystemApprovalStore(approval_dir)).resolve(
+            stopped.pending_approval_id, ApprovalStatus.APPROVED, "operator"
+        )
+        final = await runner.resume_recovered(recovered)
+    finally:
+        await runner.aclose()
+    assert final.run_id == stopped.run_id
+    assert final.actions_executed == 1
+    assert [str(inv.tool_id) for inv in gateway.invocations] == ["mobile.artifact_analyze"]
