@@ -660,3 +660,15 @@ Skill에는 ToolId 대신 자료 ID·버전·로드 경로를 기록한다. 메�
 | 환경 의존 | 확장 결과 계약·통합 | MobSF 동적 분석 | Intruder 지원 검토·Collaborator 승인 | 기기·에디션·외부통신·권한 준비 |
 
 담당자 A의 방법론 책임은 자료 제공·버전 관리·계약까지다. Agent의 추론·분야 선택·Skill 로드는 Agent 팀 책임이며, 이를 Capability 팀 작업 완료로 대신하지 않는다. 담당자 C는 확장 항목이 많으므로 같은 단계 안에서도 조회 기능부터 순차 진행한다. 공통 파일은 A가 통합 관리하고 다른 담당자는 자기 모듈·테스트 중심으로 작업한다.
+
+## 17. A 역할 구현 상태 — 2026-10-01
+
+최신 dev `8979cac`를 capability에 병합하고 A의 기초 파일 도구를 구현했다. `analysis.list_directory/read_file/search_files/write_file/apply_patch`를 실제 stdio MCP, Registry, Gateway에 연결했다. 읽기/쓰기 프로필을 분리하고 승인된 Asset·engagement·run, 안전한 상대 경로, 텍스트·검색·quota 제한, SHA-256 기반 수정 경계를 검증했다.
+
+신규 파일 도구 테스트 59개 및 실제 discovery/schema·주어진 CandidateCompiler 후보·Control 승인 후 실행이 확인됐다. operation 5개는 기존 namespace 안에서 공통 명명 목록에 호환 확장했으며 dev 통합 전 PM/Agent/Control 검토가 필요하다. 기본 Agent가 이를 자율적으로 계획·선택하도록 Provider/스케줄을 바꾼 것은 아니다.
+
+AppThreat VDB·m4vic/Rifteo 자료 검토·Agent Skill loader, B/C 도구 및 실제 금융 시험환경 E2E는 완료 처리하지 않는다. 기존 전체 checklist는 이번 구현만으로 일괄 체크하지 않는다.
+
+- [사전 검수 및 protocol](basic-computer-tools-a-protocol.md)
+- [구현 근거·테스트·남은 작업 순서](basic-computer-tools-a-result.md)
+- [작업공간 MCP 실행·팀 연결 안내](../../deploy/mcp/workspace/README.md)
