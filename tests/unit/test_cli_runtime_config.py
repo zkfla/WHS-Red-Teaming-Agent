@@ -1,5 +1,6 @@
 """CLI configuration reaches the runtime and each new Mission reads current ROE."""
 
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -16,8 +17,11 @@ from redteam.core.config import (
     LoggingConfig,
     OrchestrationConfig,
 )
+from redteam.core.enums import AgentPhase
+from redteam.core.ids import EngagementId, RunId
 from redteam.intake.serializer import dump_engagement_yaml
 from redteam.orchestration.settings import OrchestrationSettings
+from redteam.orchestration.state import RuntimeState
 from tests.integration.test_cli_session import _ConversationLLM, _FakeConsole
 
 
@@ -84,11 +88,22 @@ async def test_next_mission_uses_current_scope_and_budget(tmp_path, monkeypatch)
         llm_config=LLMConfig(),
         engagement_path=path,
     )
-    execute = AsyncMock(return_value=(0, None))
-    monkeypatch.setattr(interactive, "_execute", execute)
+    execute = AsyncMock(
+        return_value=RuntimeState(
+            run_id=RunId("run_config"),
+            engagement_id=EngagementId("eng_config"),
+            phase=AgentPhase.FINISHED,
+        )
+    )
+    monkeypatch.setattr(interactive.run_command, "execute", execute)
+    monkeypatch.setattr(
+        interactive.run_command,
+        "build",
+        AsyncMock(return_value=(SimpleNamespace(), SimpleNamespace())),
+    )
     await _session(_FakeConsole(["assess the scope", "/exit"]), session)
     assert execute.await_count == 1
-    assert execute.call_args.args[1].engagement == new
+    assert execute.call_args.kwargs["config"].engagement == new
     assert session.engagement_config == new
 
 
@@ -107,6 +122,6 @@ async def test_invalid_file_never_falls_back_to_cached_scope(tmp_path, monkeypat
         engagement_path=path,
     )
     execute = AsyncMock(return_value=(0, None))
-    monkeypatch.setattr(interactive, "_execute", execute)
+    monkeypatch.setattr(interactive.run_command, "execute", execute)
     assert await _session(_FakeConsole(["assess the scope", "/exit"]), session) == 0
     execute.assert_not_awaited()

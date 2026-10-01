@@ -48,8 +48,19 @@ async def session_run(tmp_path, monkeypatch, model):
     if not path.exists():
         path.write_text(dump_engagement_yaml(_engagement()), encoding="utf8")
     session = InteractiveSession(_engagement(), LLMConfig(), engagement_path=path)
-    execute = AsyncMock(return_value=(0, None))
-    monkeypatch.setattr(interactive, "_execute", execute)
+    execute = AsyncMock(
+        return_value=RuntimeState(
+            run_id=RunId("run_schema"),
+            engagement_id=EngagementId("eng_schema"),
+            phase=AgentPhase.FINISHED,
+        )
+    )
+    monkeypatch.setattr(interactive.run_command, "execute", execute)
+    monkeypatch.setattr(
+        interactive.run_command,
+        "build",
+        AsyncMock(return_value=(SimpleNamespace(), SimpleNamespace())),
+    )
     result = await interactive._session_loop(
         _FakeConsole(["요청을 처리해", "/exit"]),
         session,
@@ -91,8 +102,8 @@ async def test_changed_scope_requires_a_new_model_decision(
     assert execute.await_count == executions
     assert session.engagement_config == new
     if executions:
-        assert execute.call_args.args[1].engagement == new
-        assert execute.call_args.kwargs["prepared_decision"].mode == "execute"
+        assert execute.call_args.kwargs["config"].engagement == new
+        assert execute.call_args.kwargs["objective"] == "assess scope"
 
 
 @pytest.mark.parametrize("case", ["foreign", "resolved", "pending"])

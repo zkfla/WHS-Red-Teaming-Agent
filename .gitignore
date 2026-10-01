@@ -16,6 +16,8 @@ build/
 /vulnbank-web-policy.json
 /mcp-recon-policy.json
 tests/vuln-bank/
+tests/vulnbank/
+/plan.md
 
 공통 개발 시작 프롬프트.md
 변경사항.md

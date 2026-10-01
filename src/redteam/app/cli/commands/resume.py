@@ -72,6 +72,8 @@ async def run(
     args: argparse.Namespace,
     *,
     on_finished: Callable[[RuntimeState], None] | None = None,
+    session_channel: Any | None = None,
+    on_event: Any | None = None,
 ) -> int:
     """Resume args.run_id; when the resumed run settles, on_finished runs.
 
@@ -82,7 +84,13 @@ async def run(
     parser keeps calling run(args) exactly as before.
     """
     async with AsyncExitStack() as stack:
-        return await _run(args, mcp_stack=stack, on_finished=on_finished)
+        return await _run(
+            args,
+            mcp_stack=stack,
+            on_finished=on_finished,
+            session_channel=session_channel,
+            on_event=on_event,
+        )
 
 
 async def _run(
@@ -90,6 +98,8 @@ async def _run(
     *,
     mcp_stack: AsyncExitStack,
     on_finished: Callable[[RuntimeState], None] | None = None,
+    session_channel: Any | None = None,
+    on_event: Any | None = None,
 ) -> int:
     try:
         config = load_app_config_for_run(args.engagement_path)
@@ -98,11 +108,10 @@ async def _run(
         return EXIT_CONFIG_ERROR
 
     log_level = args.log_level or config.logging.level
-    logging.basicConfig(level=log_level, force=True)
+    if session_channel is None:
+        logging.basicConfig(level=log_level, force=True)
 
-    settings = OrchestrationSettings.for_durable_run(
-        config.orchestration, max_steps=args.max_steps
-    )
+    settings = OrchestrationSettings.for_durable_run(config.orchestration, max_steps=args.max_steps)
 
     try:
         hint = await _read_checkpoint_runtime(settings, args.run_id)
@@ -130,6 +139,8 @@ async def _run(
         return EXIT_FAILURE
 
     runner = AgentLoopRunner(deps, settings=settings)
+    observing = True
+    operator = None
     try:
         try:
             runtime = await runner.recover_runtime(args.run_id)
@@ -149,9 +160,7 @@ async def _run(
                 await rehydrate(
                     runtime.engagement_id,
                     actions_consumed=runtime.actions_executed,
-                    tool_calls_consumed=(
-                        runtime.actions_executed + runtime.retry_tool_calls
-                    ),
+                    tool_calls_consumed=(runtime.actions_executed + runtime.retry_tool_calls),
                     elapsed_duration_seconds=(
                         max(
                             0.0,
@@ -164,6 +173,28 @@ async def _run(
             except Exception as exc:  # noqa: BLE001 - never restore a fresh budget on error
                 eprint(f"ERROR: could not restore Control accounting: {type(exc).__name__}")
                 return EXIT_FAILURE
+
+        if session_channel is not None:
+            from redteam.app.cli.commands.run import OperatorConsole, RuntimeIdentity
+
+            identity = RuntimeIdentity(
+                run_id=runtime.run_id,
+                engagement_id=runtime.engagement_id,
+                mission_id=runtime.mission_id,
+            )
+            operator = OperatorConsole(deps, session_channel.output.emit, identity=identity)
+            session_channel.attach(operator)
+
+            async def observe(event):
+                if not observing or event.run_id != runtime.run_id:
+                    return
+                identity.observe(event)
+                session_channel.observe(event)
+                if on_event is not None:
+                    await on_event(event)
+
+            await deps.event_bus.subscribe("*", observe)
+            session_channel.ready.set()
 
         if runtime.termination_reason == TerminationReason.OPERATOR_PAUSED:
             service = OperatorIntentService.from_deps(deps)
@@ -205,12 +236,26 @@ async def _run(
             return EXIT_FAILURE
 
         final = await settle_engagement(final, deps, last_event_id=runner.last_event_id)
+        if session_channel is not None:
+            from redteam.app.cli.commands.run import wait_for_suspensions
+
+            final = await wait_for_suspensions(
+                final,
+                deps,
+                operator_console=operator,
+                input_live=lambda: session_channel.input_available,
+                echo=session_channel.output.emit,
+                session_channel=session_channel,
+            )
     finally:
+        observing = False
+        if session_channel is not None:
+            await session_channel.detach()
         await runner.aclose()
 
     if on_finished is not None:
         on_finished(final)
-    if not args.json:
+    if not args.json and session_channel is None:
         _print_summary(final)
     return _exit_code_for(final)
 
@@ -271,10 +316,7 @@ async def _read_checkpoint_runtime(
 
 
 def _print_summary(final: RuntimeState) -> None:
-    print(
-        f"\nRun resumed: phase={final.phase.value} "
-        f"termination_reason={final.termination_reason}"
-    )
+    print(f"\nRun resumed: phase={final.phase.value} termination_reason={final.termination_reason}")
     print(f"RunId: {final.run_id}")
     if final.mission_status is not None:
         print(f"Mission: {final.mission_status.value}")

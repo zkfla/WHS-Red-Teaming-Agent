@@ -15,7 +15,13 @@ Control/tool/state outcomes are also appended to the bounded
 turn. The CLI displays the actual decision, Control verdict, tool result and
 state update; approval suspension preserves the original action for resume.
 
-The interactive shell routes chat into a Mission objective/guidance, but the
+The interactive shell classifies chat before mutation: read-only questions,
+guidance for the original Run attachment, explicit new investigations, or
+clarification. A session-wide editor preserves drafts across Run completion;
+control commands and chat classification use separate workers. See
+[CLI session architecture](cli-session.md) for routing, output fences and lifecycle.
+
+The shell sends accepted execution requests into a Mission objective/guidance, but the
 visible action response comes from the PLAN node's actual LLM turn. The facade
 has no ToolGateway path. Therefore natural language cannot skip PLAN, the
 candidate compiler, POLICY or MCP selection.

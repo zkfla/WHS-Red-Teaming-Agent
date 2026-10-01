@@ -84,6 +84,18 @@ def _patch(
     from redteam.intake.assistant import IntakeAssistant
 
     monkeypatch.setattr(interactive, "_build_intake_assistant", lambda client: IntakeAssistant(llm))
+    # Setup/UI tests must not call a real provider. Exercise the canonical
+    # application runtime with the same explicit hold model as session tests.
+    from redteam.app.cli.commands import run as run_command
+    from tests.integration.test_cli_session import _HoldLLM
+
+    original_build = run_command.build_application
+
+    async def build_with_model(config, **kwargs):
+        kwargs.setdefault("llm", _HoldLLM())
+        return await original_build(config, **kwargs)
+
+    monkeypatch.setattr(run_command, "build_application", build_with_model)
     return console
 
 

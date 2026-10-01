@@ -227,14 +227,13 @@ pytest tests/integration -q  # end-to-end vertical slice
 
 ## CLI
 
-`redteam` (`src/redteam/app/cli/`) is a thin interface: argument parsing,
-one call into `redteam.app.bootstrap`/`redteam.control`/`redteam.capability`,
-then rendering + exit code. No ROE/Scope/Tool-selection/Approval decision
-is made in this package — `redteam run` is the only command that reaches
-the domain layer, and it always goes through the canonical
+`redteam` (`src/redteam/app/cli/`) owns terminal interaction, request routing,
+and session lifetimes, but not domain policy. No ROE/Scope/Tool-selection/Approval
+policy decision is made in this package. New investigations go through the canonical
 `app.bootstrap.build_application(AppConfig)` path (real configured LLM
 provider, real configured MCP servers, real Control Plane) — never a
-CLI-only shortcut. Every other command reads durable state directly
+CLI-only shortcut. Resume and approval operations use their existing public APIs;
+read-only commands read durable state directly
 (Approval/Audit/Evidence stores, or the persisted terminal report — see
 `redteam.app.report_store`).
 
@@ -258,15 +257,46 @@ executes, and `Enter` there hands off to the *exact same*
 `build_application`/`run_engagement` path `redteam run` uses below —
 nothing is re-implemented for this mode.
 
-The terminal then stays open as a chat session. With a real LLM, the runtime's
-actual planning turn prints a concise response, explicit assumptions and the
-reason for its next concrete action; the CLI does not show a separate,
-speculative pre-run plan. During a Run, ordinary sentences are answered or
-converted into bounded Mission guidance; they no longer have to match a fixed
-command keyword. After a Run, questions are answered from the saved run
-summary instead of being mistaken for a new Mission. The displayed reasoning
-is a decision summary, not private chain-of-thought. Every concrete action
-still passes candidate compilation, Control and MCP execution.
+The terminal stays open with one editor across Runs. Public Agent decisions,
+correlated action/policy/tool results, and a persistent activity/status area
+replace the event-per-line panel layout. Ordinary chat is classified **before**
+any mutation: read-only question, guidance for the original Run, explicit new
+investigation, or clarification. A new investigation waits behind the current
+one; it is not silently turned into guidance. Typing across a Run's end keeps
+the draft, cursor and original Run attachment. Expired guidance is reported as
+undelivered, never redirected to the next Run. Displayed reasoning is a public
+decision summary, not private chain-of-thought; detailed assumptions/events are
+available in the bounded trace. All actions still pass the existing Control
+Plane and MCP path.
+
+| Input | Meaning |
+|---|---|
+| Natural-language chat | Question / current guidance / new investigation, classified by the LLM |
+| `/new <objective>` | Explicit new investigation within the existing validated scope |
+| `/status`, `/explain` | Read-only state for the input's Run context |
+| `/stop`, `/pause`, `/resume` | Existing Run control APIs; not session exit |
+| `approve <ID>`, `deny <ID>` | Explicit decision for the captured pending approval, revalidated against its Run |
+| `/pending`, `/cancel <input_id>` | Inspect queued/uncertain requests; cancel only undispatched requests |
+| Ctrl+O, `/trace` | Recent redacted details; at most 300 display-history entries |
+| Enter / Ctrl+J | Submit / newline (Shift+Enter is not assumed portable) |
+| Ctrl+C / Ctrl+D | Clear draft / exit on an empty draft |
+| `/exit` | Stop intake, request Run stop, drain outstanding work and close the session |
+
+`/` + Tab completes actual commands. Approval and stop use a separate worker,
+so a slow chat classification does not block them. Service acceptance does not
+claim that the Agent has already consumed guidance. Uncertain writes are not
+automatically retried. `phase`, termination reason, and Mission status are
+shown separately; the CLI does **not** reinterpret `completed` as proof of a
+successful or exhaustive assessment.
+
+`REDTEAM_CLI_PLAIN=1 redteam` (also selected with `TERM=dumb`) uses a static,
+sequential transcript with simple status markers. It does not accept live
+steering during execution; suspended Runs remain available for explicit
+approval/resume. Redirected stdin uses a sequential fallback. JSON and
+`--non-interactive` retain their existing output contracts. The TTY
+`redteam run ...` entrypoint uses the same editor but exits after its single Run.
+See [CLI session architecture](docs/architecture/cli-session.md) for lifecycle,
+race handling, verification, and known boundaries.
 
 The natural-language layer is `redteam.intake` (the **Engagement Intake
 Assistant**), a distinct role from the Orchestrator:
@@ -291,11 +321,9 @@ Secrets (API keys) are collected by the CLI directly (`getpass`, stored
 in `.env`) — the Intake Assistant's schema has no field that could carry
 one, by construction.
 
-`--verbose` shows internal ids/metadata (`action_id`, `candidate_key`,
-`priority_components`, ...) alongside each human-readable event line;
-the default view hides them. This mode is purely additive: every
-`redteam run ...` invocation below is completely unchanged and remains
-the automation/CI-safe, non-interactive entrypoint.
+`--verbose` adds diagnostic event details; `/trace` and Ctrl+O expose recent
+safe details without changing policy or execution. For automation, use
+`redteam run ... --non-interactive` (and optionally `--json`).
 
 ### Config
 
@@ -375,6 +403,7 @@ redteam init [--output engagement.yaml]          # write a starter Engagement co
 redteam validate engagement.yaml [--json]
                                                    # schema/scope/ROE/capability checks -- never touches a target
 redteam run engagement.yaml [--non-interactive] [--max-steps N] [--json]
+redteam resume <run-id> engagement.yaml          # reconnect a safe durable checkpoint
 redteam status <run-id> [--json]                  # from the persisted terminal report; "unknown" if still running elsewhere
 redteam roe show engagement.yaml [--json]
 redteam tools list [--json]
@@ -397,16 +426,16 @@ not. The difference is what happens next:
 
 - **default (interactive):** `run` prints the pending Approval, then
   polls (`AgentLoopRunner.reconcile_once`, the same reconciliation
-  primitive a host loop would use) until a human resolves it from
-  another terminal, then resumes **the same Run** — no new Run, no new
-  Action, `RunId`/`ActionId`/`ApprovalId` all unchanged. Ctrl+C stops
-  watching (exit 130) without losing the pending Approval; there is no
-  `resume` command in this v1 to reconnect afterwards — keep the
-  interactive `run` alive, or check back with `redteam status`.
+  primitive a host loop would use) until a human resolves it with explicit
+  `approve`/`deny` in the live session or from another terminal. It resumes
+  **the same Run**, preserving the pending action identity. In the new TTY
+  editor Ctrl+C clears the draft; `/stop` requests Run stop and `/exit`
+  closes the session. Durable safe checkpoints can be reconnected with
+  `redteam resume <run-id> engagement.yaml`.
 - **`--non-interactive`:** stops at `APPROVAL_PENDING` immediately and
   exits 0 (a correct policy outcome, not a CLI failure — see Exit codes
   below). `redteam approvals approve/deny` still resolves the Approval
-  durably, but nothing resumes that specific Run afterward in v1.
+  durably; use the explicit `resume` command to continue the safe checkpoint.
 
 ```bash
 redteam approvals approve appr_abc123

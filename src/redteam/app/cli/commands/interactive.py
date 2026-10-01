@@ -31,10 +31,9 @@ from contextlib import AsyncExitStack
 from pathlib import Path
 
 from rich.console import Console
-from yaml import YAMLError
 
 from redteam.app.bootstrap import build_llm_client
-from redteam.app.cli import interactive_commands, renderer
+from redteam.app.cli import renderer
 from redteam.app.cli._shared import (
     DEFAULT_ENGAGEMENT_PATH,
     DEFAULT_ENV_PATH,
@@ -161,28 +160,18 @@ async def _run(console: Console, *, verbose: bool) -> int:
         logging=logging_config,
     )
     logging.basicConfig(level=logging_config.level, force=True)
-    _exit_code, final = await _execute(
+    from redteam.app.cli.session_runtime import run_session
+
+    session = InteractiveSession(engagement_config=engagement_config, llm_config=llm_config)
+    result = await run_session(
         console,
         full_config,
-        verbose=verbose,
-        objective=objective,
-        conversation=conversation,
-    )
-
-    # RunFinished ends this Run, not the CLI Session (sections 4-5, 19):
-    # return to a persistent prompt instead of exiting the process here.
-    session = InteractiveSession(engagement_config=engagement_config, llm_config=llm_config)
-    session.record_run(final)
-    return await _session_loop(
-        console,
-        session,
-        llm_config=llm_config,
-        orchestration_config=orchestration_config,
-        capability_config=capability_config,
-        logging_config=logging_config,
+        session=session,
+        objective=objective or f"/new Assess the declared scope of {engagement_config.name}",
         verbose=verbose,
         conversation=conversation,
     )
+    return result.exit_code
 
 
 # --- runtime (LLM/capability) config: a short one-time prompt, never an ----
@@ -568,7 +557,11 @@ async def _preflight_loop(
         ]
         if capability_config.mcp_servers:
             runtime_checks.append(
-                ("MCP", True, f"{len(capability_config.mcp_servers)} server(s) configured")
+                (
+                    "MCP",
+                    None,
+                    f"{len(capability_config.mcp_servers)} server(s) configured — 연결 확인 전",
+                )
             )
         renderer.render_runtime_checklist(console, checks=runtime_checks)
         if not capability_config.mcp_servers:
@@ -917,99 +910,21 @@ async def _session_loop(
     verbose: bool,
     conversation: ConversationAssistant | None = None,
 ) -> int:
-    """Keeps the CLI process alive after ``RunFinished`` (sections 4-5,
-    19): a Run ending is not the same as the CLI Session ending. Reads one
-    line at a time -- ``/...`` dispatches through the Command Registry
-    (``interactive_commands.dispatch``, never the Agent Runtime; sections
-    3, 13-15), anything else becomes a new Mission objective run through
-    the exact same ``_execute`` core the first run used (Gate D: no
-    duplicated Runtime-invocation path for the "next" request).
+    """Compatibility entrypoint; all subsequent input uses the session controller."""
+    from redteam.app.cli.session_runtime import run_session
 
-    A recoverable condition here -- an unknown slash command, a command
-    handler raising, ``KeyboardInterrupt`` while idle at the prompt --
-    prints a message and returns to the prompt (section 21). Only
-    ``/exit``/``EOFError`` (Ctrl+D) end the loop.
-    """
-    if conversation is None:
-        conversation = ConversationAssistant(build_llm_client(llm_config))
-    while True:
-        try:
-            text = console.input("\n[cyan]❯[/cyan] ").strip()
-        except EOFError:
-            console.print("\n[dim]Session ended.[/dim]")
-            return EXIT_OK
-        except KeyboardInterrupt:
-            console.print("\n[dim]Use /exit or Ctrl+D to end the session.[/dim]")
-            continue
-        if not text:
-            continue
-        if text.startswith("/"):
-            if not await interactive_commands.dispatch(console, session, text):
-                return EXIT_OK
-            continue
-        head = text.split(maxsplit=1)[0].lower()
-        if head in {"exit", "quit", "종료", "stop", "중단"}:
-            console.print(renderer.operator_user_text(sanitize_objective(text)))
-            return EXIT_OK
-        if head in {"approve", "deny", "승인", "거부"}:
-            await _handle_idle_approval(console, session, text, head)
-            continue
-        if text.lower() in {"status", "상태", "현황", "why", "explain", "설명"}:
-            console.print(session.explain_last_run())
-            continue
-        try:
-            refreshed = load_engagement_config(session.engagement_path)
-            problems = [*check_scope(refreshed), *check_roe(refreshed)]
-            if problems:
-                console.print("[red]Invalid engagement configuration: " + "; ".join(problems))
-                continue
-            session.engagement_config = refreshed
-            decision = await conversation.decide(
-                text,
-                engagement_name=refreshed.name,
-                scope=_scope_values(refreshed),
-                session_context=session.explain_last_run(),
-            )
-            # Changes during judgment invalidate its execution context.
-            latest = load_engagement_config(session.engagement_path)
-            problems = [*check_scope(latest), *check_roe(latest)]
-            if problems:
-                console.print("[red]Invalid engagement configuration: " + "; ".join(problems))
-                continue
-            if latest != refreshed:
-                refreshed = latest
-                session.engagement_config = refreshed
-                decision = await conversation.decide(
-                    text,
-                    engagement_name=refreshed.name,
-                    scope=_scope_values(refreshed),
-                    session_context=session.explain_last_run(),
-                )
-                if load_engagement_config(session.engagement_path) != refreshed:
-                    console.print("[Agent] Configuration changed again; submit the request again.")
-                    continue
-        except asyncio.CancelledError:
-            raise
-        except (OSError, ValueError, YAMLError, ConversationError) as exc:
-            console.print(f"[Agent] Request not started ({type(exc).__name__}).")
-            continue
-        _render_conversation_decision(console, decision)
-        if decision.mode != "execute":
-            continue
-        full_config = AppConfig(
-            engagement=refreshed,
+    conversation = conversation or ConversationAssistant(build_llm_client(llm_config))
+    result = await run_session(
+        console,
+        AppConfig(
+            engagement=session.engagement_config,
             llm=llm_config,
             orchestration=orchestration_config,
             capability=capability_config,
             logging=logging_config,
-        )
-        _, final = await _execute(
-            console,
-            full_config,
-            verbose=verbose,
-            objective=decision.objective or text,
-            conversation=conversation,
-            prepared_decision=decision,
-            user_message=text,
-        )
-        session.record_run(final)
+        ),
+        session=session,
+        conversation=conversation,
+        verbose=verbose,
+    )
+    return result.exit_code
