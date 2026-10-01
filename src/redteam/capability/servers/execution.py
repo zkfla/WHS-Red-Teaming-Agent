@@ -142,9 +142,11 @@ class DockerExecutionEngine:
         policy: ExecutionPolicy,
         *,
         process_factory: ProcessFactory = asyncio.create_subprocess_exec,
+        cleanup_process_factory: ProcessFactory | None = None,
     ) -> None:
         self.policy = policy
         self._process_factory = process_factory
+        self._cleanup_process_factory = cleanup_process_factory or process_factory
 
     def _check_context(
         self,
@@ -239,28 +241,126 @@ class DockerExecutionEngine:
             stderr=asyncio.subprocess.PIPE,
             env=_safe_host_environment(),
         )
+        stdout_buffer = bytearray()
+        stderr_buffer = bytearray()
+        stdout_truncated = False
+        stderr_truncated = False
         try:
-            stdout, stderr = await asyncio.wait_for(
-                process.communicate(), timeout=timeout_seconds
+            stdout_truncated, stderr_truncated = await asyncio.wait_for(
+                self._collect_output(process, stdout_buffer, stderr_buffer),
+                timeout=timeout_seconds,
             )
-        except TimeoutError as exc:
-            process.kill()
-            await process.wait()
-            raise ExecutionError("execution_timeout_cleanup_incomplete") from exc
+        except TimeoutError:
+            await self._cleanup_container(process, container_name)
+            duration_ms = max(0, round((time.monotonic() - started) * 1000))
+            stdout, stderr, truncated = self._bounded_result(
+                stdout_buffer,
+                stderr_buffer,
+                stdout_truncated or stderr_truncated,
+            )
+            return CommandResult(
+                exit_code=None,
+                stdout=stdout,
+                stderr=stderr,
+                timed_out=True,
+                truncated=truncated,
+                duration_ms=duration_ms,
+            )
+        except asyncio.CancelledError:
+            cleanup = asyncio.create_task(self._cleanup_container(process, container_name))
+            await asyncio.shield(cleanup)
+            raise
         duration_ms = max(0, round((time.monotonic() - started) * 1000))
-        combined = len(stdout) + len(stderr)
-        truncated = combined > self.policy.max_output_bytes
-        stdout = stdout[: self.policy.max_output_bytes]
-        remaining = max(0, self.policy.max_output_bytes - len(stdout))
-        stderr = stderr[:remaining]
+        stdout, stderr, truncated = self._bounded_result(
+            stdout_buffer,
+            stderr_buffer,
+            stdout_truncated or stderr_truncated,
+        )
         return CommandResult(
             exit_code=process.returncode,
-            stdout=stdout.decode("utf-8", errors="replace"),
-            stderr=stderr.decode("utf-8", errors="replace"),
+            stdout=stdout,
+            stderr=stderr,
             timed_out=False,
             truncated=truncated,
             duration_ms=duration_ms,
         )
+
+    async def _collect_output(
+        self,
+        process: Any,
+        stdout_buffer: bytearray,
+        stderr_buffer: bytearray,
+    ) -> tuple[bool, bool]:
+        if process.stdout is None or process.stderr is None:
+            raise ExecutionError("execution_process_stream_unavailable")
+        stdout_task = asyncio.create_task(
+            self._read_bounded(process.stdout, stdout_buffer)
+        )
+        stderr_task = asyncio.create_task(
+            self._read_bounded(process.stderr, stderr_buffer)
+        )
+        try:
+            stdout_truncated, stderr_truncated, _ = await asyncio.gather(
+                stdout_task,
+                stderr_task,
+                process.wait(),
+            )
+        finally:
+            for task in (stdout_task, stderr_task):
+                if not task.done():
+                    task.cancel()
+        return bool(stdout_truncated), bool(stderr_truncated)
+
+    async def _read_bounded(self, stream: Any, output: bytearray) -> bool:
+        truncated = False
+        while True:
+            chunk = await stream.read(8192)
+            if not chunk:
+                return truncated
+            remaining = self.policy.max_output_bytes - len(output)
+            if remaining > 0:
+                output.extend(chunk[:remaining])
+            if len(chunk) > remaining:
+                truncated = True
+
+    def _bounded_result(
+        self,
+        stdout_buffer: bytearray,
+        stderr_buffer: bytearray,
+        stream_truncated: bool,
+    ) -> tuple[str, str, bool]:
+        stdout = bytes(stdout_buffer[: self.policy.max_output_bytes])
+        remaining = max(0, self.policy.max_output_bytes - len(stdout))
+        stderr = bytes(stderr_buffer[:remaining])
+        truncated = stream_truncated or len(stderr_buffer) > remaining
+        return (
+            stdout.decode("utf-8", errors="replace"),
+            stderr.decode("utf-8", errors="replace"),
+            truncated,
+        )
+
+    async def _cleanup_container(self, process: Any, container_name: str) -> None:
+        cleanup_succeeded = False
+        try:
+            cleanup = await self._cleanup_process_factory(
+                self.policy.docker_binary,
+                "rm",
+                "--force",
+                container_name,
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+                env=_safe_host_environment(),
+            )
+            cleanup_succeeded = await asyncio.wait_for(cleanup.wait(), timeout=5) == 0
+        except (OSError, TimeoutError):
+            cleanup_succeeded = False
+        finally:
+            if process.returncode is None:
+                process.kill()
+            await process.wait()
+        if not cleanup_succeeded:
+            raise ExecutionError("execution_container_cleanup_failed")
 
 
 def ensure_runtime_available(policy: ExecutionPolicy) -> None:

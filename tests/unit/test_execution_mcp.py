@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import subprocess
 from pathlib import Path
@@ -16,20 +17,47 @@ from redteam.capability.servers.execution import (
 
 
 class CompletedProcess:
-    returncode = 0
-
-    def __init__(self, stdout: bytes = b"ok\n", stderr: bytes = b"") -> None:
-        self.stdout = stdout
-        self.stderr = stderr
+    def __init__(
+        self,
+        stdout: bytes = b"ok\n",
+        stderr: bytes = b"",
+        returncode: int = 0,
+    ) -> None:
+        self.stdout = asyncio.StreamReader()
+        self.stdout.feed_data(stdout)
+        self.stdout.feed_eof()
+        self.stderr = asyncio.StreamReader()
+        self.stderr.feed_data(stderr)
+        self.stderr.feed_eof()
+        self.returncode: int | None = returncode
         self.killed = False
-
-    async def communicate(self) -> tuple[bytes, bytes]:
-        return self.stdout, self.stderr
 
     def kill(self) -> None:
         self.killed = True
 
     async def wait(self) -> int:
+        assert self.returncode is not None
+        return self.returncode
+
+
+class HangingProcess:
+    def __init__(self) -> None:
+        self.stdout = asyncio.StreamReader()
+        self.stderr = asyncio.StreamReader()
+        self.returncode: int | None = None
+        self.killed = False
+        self._finished = asyncio.Event()
+
+    def kill(self) -> None:
+        self.killed = True
+        self.returncode = -9
+        self.stdout.feed_eof()
+        self.stderr.feed_eof()
+        self._finished.set()
+
+    async def wait(self) -> int:
+        await self._finished.wait()
+        assert self.returncode is not None
         return self.returncode
 
 
@@ -168,3 +196,94 @@ def test_server_start_refuses_windows_or_missing_docker(
     monkeypatch.setattr(subprocess, "run", missing)
     with pytest.raises(ExecutionError, match="execution_docker_unavailable"):
         ensure_runtime_available(policy)
+
+
+async def test_nonzero_exit_is_distinct_from_transport_failure(
+    policy: ExecutionPolicy,
+) -> None:
+    async def spawn(*args: Any, **kwargs: Any) -> CompletedProcess:
+        return CompletedProcess(stderr=b"no match\n", returncode=2)
+
+    result = await DockerExecutionEngine(policy, process_factory=spawn).run_command(
+        "workspace-test", "grep", ["missing", "input.txt"], 3, "eng-test", "run-test"
+    )
+    assert result.exit_code == 2
+    assert result.stderr == "no match\n"
+    assert result.timed_out is False
+
+
+async def test_output_is_bounded_and_reports_truncation(policy: ExecutionPolicy) -> None:
+    process = CompletedProcess(
+        stdout=b"a" * policy.max_output_bytes,
+        stderr=b"secret-tail" * 100,
+    )
+
+    async def spawn(*args: Any, **kwargs: Any) -> CompletedProcess:
+        return process
+
+    result = await DockerExecutionEngine(policy, process_factory=spawn).run_command(
+        "workspace-test", "sort", ["input.txt"], 3, "eng-test", "run-test"
+    )
+    assert len(result.stdout.encode()) == policy.max_output_bytes
+    assert result.stderr == ""
+    assert result.truncated is True
+
+
+async def test_timeout_forces_container_and_process_cleanup(policy: ExecutionPolicy) -> None:
+    running = HangingProcess()
+    cleanup_calls: list[tuple[str, ...]] = []
+
+    async def spawn(*args: Any, **kwargs: Any) -> HangingProcess:
+        return running
+
+    async def cleanup(*args: str, **kwargs: Any) -> CompletedProcess:
+        cleanup_calls.append(args)
+        return CompletedProcess()
+
+    result = await DockerExecutionEngine(
+        policy,
+        process_factory=spawn,
+        cleanup_process_factory=cleanup,
+    ).run_command(
+        "workspace-test", "wc", ["input.txt"], 0.01, "eng-test", "run-test"
+    )
+
+    assert result.timed_out is True
+    assert result.exit_code is None
+    assert running.killed is True
+    assert running.returncode == -9
+    assert len(cleanup_calls) == 1
+    assert cleanup_calls[0][:3] == ("docker", "rm", "--force")
+
+
+async def test_cancellation_forces_container_and_child_cleanup(
+    policy: ExecutionPolicy,
+) -> None:
+    running = HangingProcess()
+    active_containers: set[str] = set()
+
+    async def spawn(*args: Any, **kwargs: Any) -> HangingProcess:
+        active_containers.add(args[args.index("--name") + 1])
+        return running
+
+    async def cleanup(*args: str, **kwargs: Any) -> CompletedProcess:
+        active_containers.discard(args[-1])
+        return CompletedProcess()
+
+    engine = DockerExecutionEngine(
+        policy,
+        process_factory=spawn,
+        cleanup_process_factory=cleanup,
+    )
+    task = asyncio.create_task(
+        engine.run_command(
+            "workspace-test", "wc", ["input.txt"], 10, "eng-test", "run-test"
+        )
+    )
+    await asyncio.sleep(0)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert running.killed is True
+    assert active_containers == set()
