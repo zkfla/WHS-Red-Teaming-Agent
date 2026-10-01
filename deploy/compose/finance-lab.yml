@@ -124,6 +124,19 @@ services:
       recon-active:
         condition: service_healthy
 
+  browser-smoke:
+    <<: *worker
+    profiles: [test]
+    entrypoint: [python, /app/finance_browser_smoke.py]
+    env_file: ../mcp/finance/browser.env.example
+    volumes:
+      - ../../examples/finance_browser_smoke.py:/app/finance_browser_smoke.py:ro
+    healthcheck:
+      disable: true
+    depends_on:
+      web-browser:
+        condition: service_healthy
+
   agent-smoke:
     <<: *worker
     profiles: [test]
