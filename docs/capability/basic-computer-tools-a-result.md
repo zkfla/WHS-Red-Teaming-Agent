@@ -129,3 +129,12 @@ clean 스냅샷의 skip은 6개다. 차이 1개는 사용자가 미커밋 상태
 8. **공통 통합 검수:** B의 제한된 shell/MobSF, C의 웹검색/EIP/GitHub/Burp 연결과 schema·위험도·실행 권한이 일치하는지 확인하고, 실제 Agent 사용·승인 거절·오류 처리까지 검증한 후 PR 판단을 한다.
 
 즉, **지금은 기본 파일 도구의 실제 호출 기반이 준비됐고, 다음은 이름/권한 팀 검토와 Agent 자동 사용 연결, 이어서 A의 VDB·방법론 확장이다.** 전체 A 역할 완료나 실제 금융권 레드티밍 완료로 보고하지 않는다.
+
+## 8. 후속 진행 기록 — VDB 단건 및 상태 조회
+
+위 4–5번의 첫 단계를 후속 작업에서 진행했다. `analysis.vdb_status/search_by_cve/search_by_purl_like`를 우리 읽기 전용 bridge로 연결하고, 원본 AppThreat VDB7 검색 라이브러리의 실제 버전 비교 및 합성 DB 조회를 검증했다. 원본 server startup/DB 갱신은 실행 권한에서 분리했다. 이전 본문의 “VDB 미등록”은 당시 파일 도구 작업 범위의 기록이며 현재 전체 상태는 아래 후속 결과를 따른다.
+
+GHSA/alias/CPE/URL 전용 조회·bulk/SBOM·shard fan-out·실제 대량 DB·기본 LLM 자동 선택은 완료하지 않았다. 파일 도구와 VDB의 context 바인딩은 공통 scoped Analysis Adapter로 추출했으며 workspace 오류 코드와 권한 경계는 유지한다.
+
+- [후속 VDB 구현·검증 근거와 남은 작업](vdb-readonly-result.md)
+- [VDB 실행 설정·Agent 팀 연결](../../deploy/mcp/vdb/README.md)

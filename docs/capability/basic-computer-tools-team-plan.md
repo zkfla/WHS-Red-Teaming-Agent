@@ -672,3 +672,22 @@ AppThreat VDB·m4vic/Rifteo 자료 검토·Agent Skill loader, B/C 도구 및 �
 - [사전 검수 및 protocol](basic-computer-tools-a-protocol.md)
 - [구현 근거·테스트·남은 작업 순서](basic-computer-tools-a-result.md)
 - [작업공간 MCP 실행·팀 연결 안내](../../deploy/mcp/workspace/README.md)
+
+## 18. A 후속 VDB 구현 상태 — 2026-10-01
+
+VDB 단건 조회와 데이터 상태를 실제 stdio MCP로 구현했다. 원본 AppThreat VDB7 검색 라이브러리를 사용하는 **우리 읽기 전용 bridge**이며 원본 서버 전체 등록이 아니다. 원본 startup의 자동 다운로드/갱신 및 missing DB 생성 경로를 피한다. 원본 source commit `2dc040a44986da0c4eac1366ba77633f09e593b6`를 검수했고 MIT 라이선스를 확인했다.
+
+| 이번 제공 | 실제 연결 상태 | 남은 범위 |
+|---|---|---|
+| DB 상태 | `analysis.vdb_status`, response_analysis, asset/medium | 운영자가 실제 DB를 별도 준비해야 함 |
+| CVE 단건 | `analysis.search_by_cve`, static_analysis, asset/medium | GHSA/alias/CPE/URL 전용 조회 미구현 |
+| 버전 명시 PURL | `analysis.search_by_purl_like`, static_analysis, asset/medium | shard fan-out 및 bulk/SBOM 미구현 |
+| Agent 연결 경계 | discovery/schema → 주어진 CandidateCompiler 후보 → Control → 실제 Gateway 호출 검증 | 기본 LLM의 자율 조회 선택·결과 추론은 Agent 팀 후속 |
+
+누락/빈 DB/불완전 shard/손상/metadata 불일치는 성공한 빈 조회로 보고하지 않는다. 오래된 DB는 stale, 날짜 불명은 unknown을 유지한다. 조회 결과는 knowledge_only이며 실제 금융 대상 취약점 확정·제품 버전 추측·PoC 실행과 구분한다. 이번 원본 backend 테스트는 가짜 advisory 3건의 작은 합성 DB를 사용했고 대량 feed DB·실제 금융 타깃은 사용하지 않았다.
+
+기존 VDB 전체 식별자/bulk/SBOM checklist를 일괄 완료 처리하지 않는다. 다음 A 단계는 m4vic·Rifteo·VDB 방법론 자료의 출처/고정 버전/읽기 경로 검수다. Skill 자료가 도구 실행·ROE 권한을 바꾸지 않도록 하며 Agent의 Skill loader는 Agent 팀 책임이다.
+
+- [VDB 사전 검수 protocol](vdb-readonly-protocol.md)
+- [VDB 실행 설정 및 Agent 인수인계](../../deploy/mcp/vdb/README.md)
+- [VDB 후속 구현 결과](vdb-readonly-result.md)
