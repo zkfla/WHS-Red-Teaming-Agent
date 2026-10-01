@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -104,7 +105,11 @@ def policy(tmp_path: Path, *, writable: bool = False) -> ExecutionPolicy:
         run_id="run-test",
         workspace_root=str(tmp_path.resolve()),
         image="example/text-tools@sha256:" + "1" * 64,
-        allowed_executables={"wc": "/usr/bin/wc", "sort": "/usr/bin/sort"},
+        allowed_executables={
+            "wc": "/usr/bin/wc",
+            "sort": "/usr/bin/sort",
+            "tail": "/usr/bin/tail",
+        },
         writable=writable,
     )
 
@@ -426,7 +431,60 @@ async def test_real_stdio_docker_execution(
         after = await gateway.invoke(
             workspace_invocation("read_file", {"path": "result.txt"})
         )
+        timed_out = await gateway.invoke(
+            invocation(
+                {
+                    "asset_ref": "workspace-test",
+                    "executable": "tail",
+                    "args": ["-f", "input.txt"],
+                    "timeout_seconds": 0.2,
+                }
+            )
+        )
+        started = await gateway.invoke(
+            job_invocation(
+                "job_start",
+                {
+                    "asset_ref": "workspace-test",
+                    "executable": "tail",
+                    "args": ["-f", "input.txt"],
+                    "timeout_seconds": 10,
+                },
+                action_id="action-live-job-start",
+            )
+        )
+        await asyncio.sleep(0.2)
+        cancelled = await gateway.invoke(
+            job_invocation(
+                "job_cancel",
+                {
+                    "asset_ref": "workspace-test",
+                    "job_id": started.output["job_id"],
+                },
+                action_id="action-live-job-cancel",
+            )
+        )
     assert listed.success and before.output["content"] == "b\na\n"
     assert result.success
     assert result.output["exit_code"] == 0
     assert after.success and after.output["content"] == "a\nb\n"
+    assert timed_out.success and timed_out.output["timed_out"] is True
+    assert cancelled.success and cancelled.output["status"] == "cancelled"
+    remaining = subprocess.run(
+        [
+            "docker",
+            "ps",
+            "--filter",
+            "name=redteam-exec-",
+            "--format",
+            "{{.Names}}",
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+        env={
+            "PATH": os.environ.get("PATH", ""),
+            "LANG": os.environ.get("LANG", "C.UTF-8"),
+        },
+    )
+    assert remaining.stdout.strip() == ""

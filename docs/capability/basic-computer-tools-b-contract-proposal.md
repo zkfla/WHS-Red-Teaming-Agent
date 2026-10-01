@@ -1,7 +1,7 @@
 # Execution Substrate 계약 제안
 
-상태: **합의 필요(제안)**  
-담당: Capability 담당자 B  
+상태: **합의 필요(제안)**
+담당: Capability 담당자 B
 근거: `basic-computer-tools-team-plan.md` 3장, 5장, 7장, 8장
 
 이 문서는 구현을 위한 Capability 측 제안이다. Core·Control 계약을 승인하거나
