@@ -6,6 +6,9 @@
 
 ## 실제 등록되는 도구
 
+기본 프로필 아래 3개는 유지된다. GHSA·CPE·목록·승인 SBOM은 별도 opt-in
+[`vdb_readonly_extended` 설정 안내](EXTENDED.md)를 따른다(기본 3개 + 확장 4개 = 총 7개).
+
 | ToolId | canonical action key | 필수 입력 | 선택 입력 | 대상/최소 risk |
 |---|---|---|---|---|
 | analysis.vdb_status | analysis.response_analysis | asset_ref | engagement_id, run_id | asset / medium |
@@ -55,7 +58,7 @@ stdio 프로세스는 한 engagement/run에 한 DB root만 바인딩한다. sear
 - `freshness`: fresh / stale / unknown. file mtime 대신 metadata `created_utc`를 기준으로 판단한다. 빌드 날짜도 원천 advisory의 완전성·신선도를 보증하지 않는다.
 - `required_backend_version/required_upstream_commit`은 요구 pin, `observed_backend_version`은 확인한 설치 버전이다. `source_revision_verified=false`: runtime은 설치 버전을 확인하지만 설치된 소스 SHA를 암호학적으로 검증하지 않는다. 별도 upstream 테스트는 검수 checkout의 SHA를 확인한다.
 - 오래된 DB는 stale 표시를 유지한 채 지식 조회할 수 있다. 날짜를 확인할 수 없으면 unknown이지 fresh가 아니다. missing/empty/partial/invalid는 조회 실패이며 성공한 빈 결과로 바꾸지 않는다.
-- 조회 결과: advisory_id, affected_versions, purl_prefix, source, severity, score, published, updated, aliases, references. 없는 값은 null/빈 배열이며 추측하지 않는다. 검색은 원본의 버전 비교 로직을 재사용한다. 원본 데이터 본문과 arbitrary evidence는 반환하지 않는다.
+- 조회 결과: advisory_id, affected_versions, purl_prefix, source, severity, score, published, updated, aliases, references, description, match_basis, text_truncated. 없는 값은 null/빈 배열이며 추측하지 않는다. 검색은 원본의 버전 비교 로직을 재사용한다. 원본 데이터 본문과 arbitrary evidence는 반환하지 않는다.
 - 항상 `assessment=knowledge_only`, `target_vulnerability_confirmed=false`. 결과 0건은 `no_known_match_in_loaded_snapshot`이며 “안전”, “패치됨”, “규제 준수” 판정이 아니다. reference URL은 자료이며 자동 방문·명령 실행하지 않는다.
 - 결과 건수/필드/UTF-8 출력 크기를 제한한다. SQLite progress 기반 제한은 협력적 query timeout이며 OS 메모리·CPU sandbox가 아니다. 읽기 전용 연결은 snapshot 쓰기를 막지만 프로세스 전체 권한·네트워크 egress 격리를 대신하지 않는다. 운영에서는 최소 권한/읽기 전용 mount/egress deny/프로세스 quota를 별도로 적용한다.
-- 아직 없음: GHSA·CPE·URL·alias·fulltext 전용 조회, patch/fix 추출, shard fan-out, bulk/SBOM, Agent DB 갱신, PoC/Exploit 실행, 방법론 Skill loader, 실제 금융 타깃 검증, 기본 LLM의 자동 선택 E2E.
+- 기본 프로필에는 GHSA·CPE·bulk/SBOM이 없지만 [확장 프로필](EXTENDED.md)에서 제한된 읽기 전용 조회를 제공한다. 아직 없음: 일반 URL/OSV alias/fulltext 전용 조회, patch/fix 추출, shard fan-out, Agent DB 갱신, PoC/Exploit 실행, 실제 금융 타깃 검증, 기본 LLM의 자동 선택 E2E. 방법론 자료 연결의 최신 상태는 docs/capability/methodology-agent-integration-result.md 및 approved-deployment-result.md를 따른다.

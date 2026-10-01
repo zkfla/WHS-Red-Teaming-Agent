@@ -66,7 +66,10 @@ def build(root: Path) -> None:
             )
             index.execute(
                 "INSERT INTO cve_metadata_text VALUES(?,?,?,?,?)",
-                (cve, "", "https://example.invalid/synthetic-advisory", "synthetic", ""),
+                (
+                    cve, "GHSA-2345-6789-cfgh" if number == 0 else "",
+                    "https://example.invalid/synthetic-advisory", "synthetic", "",
+                ),
             )
     finally:
         data.close()

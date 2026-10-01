@@ -224,7 +224,12 @@ async def test_snapshot_state_is_not_silently_clean(seeded, case, state, freshne
     assert snapshot(seeded) == before
 
 
-async def test_candidate_control_and_actual_vdb_lookup(seeded):
+async def test_candidate_control_and_actual_vdb_lookup(
+    seeded,
+    *,
+    tool_name="search_by_cve",
+    arguments=None,
+):
     target = AssetTarget(asset_id=AssetId("vdb-test"))
     async with open_mcp_tool_gateway(["vdb-test"], health_refresh_enabled=False) as gateway:
         draft = CandidateDraft(
@@ -234,9 +239,9 @@ async def test_candidate_control_and_actual_vdb_lookup(seeded):
                 step_id="lookup",
                 capability="analysis",
                 operation="static_analysis",
-                tool_id=ToolId("analysis.search_by_cve"),
+                tool_id=ToolId(f"analysis.{tool_name}"),
                 target=target,
-                arguments={"cve_id": "CVE-2026-900001"},
+                arguments=arguments or {"cve_id": "CVE-2026-900001"},
                 reason="investigate knowledge only",
                 assessment_kind="observation",
             ),
@@ -276,7 +281,9 @@ async def test_candidate_control_and_actual_vdb_lookup(seeded):
         result = await gateway.invoke(
             build_tool_invocation(proposal, decision, tool_id=step.tool_id)
         )
-        assert result.success and result.output["matches"], result
+        assert result.success and (result.output.get("matches") or result.output.get("items")), (
+            result
+        )
         proposal.arguments["asset_ref"] = "different-db"
         refused = await plane.evaluate(
             proposal, ControlContext(engagement_id=engagement.engagement_id)

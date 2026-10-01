@@ -691,3 +691,26 @@ VDB 단건 조회와 데이터 상태를 실제 stdio MCP로 구현했다. 원�
 - [VDB 사전 검수 protocol](vdb-readonly-protocol.md)
 - [VDB 실행 설정 및 Agent 인수인계](../../deploy/mcp/vdb/README.md)
 - [VDB 후속 구현 결과](vdb-readonly-result.md)
+
+## 19. A 단독 VDB 확장 상태 — 2026-10-01
+
+17~18절은 각각 당시 구현 상태 기록이다. 이후 방법론 자료 제공/Agent 참고 데이터
+연결 및 승인 경로·시험 세션 동기화를 추가했으며, 이번에는 B/C와 독립적으로
+VDB GHSA·제한된 CPE·버전 PURL 목록·승인 CycloneDX 조회를 구현했다.
+기본 3개는 유지하고 `vdb_readonly_extended`에서 총 7개를 제공한다.
+
+- VDB-02: CVE에 더해 정확한 GHSA/direct ID·alias 조회. 기타 OSV alias는 미지원.
+- VDB-03: PURL에 더해 구체적 버전의 제한된 CPE 2.3. 일반 URL/무버전 package 추측은 안 함.
+- VDB-04: 크기/시간/출력 제한 및 항목별 오류·미조회가 있는 버전 PURL 목록 조회.
+- VDB-05: 운영자 승인 참조·digest에 바인딩된 작은 CycloneDX JSON 페이지 조회.
+- VDB-01/06: metadata coverage 및 source filter, 운영자 DB 준비/갱신/rollback 절차 안내.
+  실제 대량 DB 다운로드·갱신·운영 성능 검증은 수행하지 않았다.
+- Agent 연결: 새 4개 각각 Registry discovery → 주어진 Candidate → 실제 Control →
+  Gateway → stdio MCP 실행 검증. 실제 LLM의 자율 도구 선택 품질은 완료 처리하지 않는다.
+
+각 항목의 제한된 구현이지 원본/이미지의 모든 조회 방식 및 운영 기능을 지원한다는 뜻은 아니다.
+URL/추가 alias/fulltext·patch/fix 근거·shard·대규모 DB·B/C 통합·dev 반영은 여전히 남는다.
+
+- [검수 계획](vdb-extension-plan.md)
+- [구현/검증 결과 및 남은 범위](vdb-extension-result.md)
+- [확장 프로필 운영 안내](../../deploy/mcp/vdb/EXTENDED.md)

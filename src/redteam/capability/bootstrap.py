@@ -160,8 +160,10 @@ async def _build_gateway(
             if settings.profile is not None:
                 descriptor.target_types = ["asset"]
                 try:
-                    if settings.profile == "vdb_readonly":
-                        validate_vdb_descriptor(descriptor, settings.vdb_asset_ref or "")
+                    if settings.profile in {"vdb_readonly", "vdb_readonly_extended"}:
+                        validate_vdb_descriptor(
+                            descriptor, settings.vdb_asset_ref or "", settings.profile
+                        )
                     else:
                         validate_workspace_descriptor(
                             descriptor,
@@ -236,7 +238,11 @@ def _create_adapter(settings: MCPServerSettings, transport: MCPTransport) -> MCP
     if settings.allowed_tools is not None:
         transport = AllowlistedMCPTransport(transport, settings.allowed_tools)
     if settings.profile is not None:
-        adapter_class = VDBMCPAdapter if settings.profile == "vdb_readonly" else WorkspaceMCPAdapter
+        adapter_class = (
+            VDBMCPAdapter
+            if settings.profile in {"vdb_readonly", "vdb_readonly_extended"}
+            else WorkspaceMCPAdapter
+        )
         return adapter_class(
             server_id=settings.server_id,
             risk_level=settings.risk_level,

@@ -28,6 +28,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 UPSTREAM_COMMIT = "2dc040a44986da0c4eac1366ba77633f09e593b6"
 BACKEND_VERSION = "7.0.1"
 CVE_PATTERN = r"^CVE-[0-9]{4}-[0-9]{4,10}$"
+GHSA_PATTERN = r"^GHSA-[23456789cfghjmpqrvwx]{4}(?:-[23456789cfghjmpqrvwx]{4}){2}$"
 _LOCK = threading.Lock()  # upstream connection globals belong to one process
 
 
@@ -81,6 +82,7 @@ class VDBStatus(BaseModel):
     data_rows: int | None = None
     index_rows: int | None = None
     metadata_rows: int | None = None
+    metadata_coverage: Literal["full", "partial", "missing", "unknown"] = "unknown"
     synthetic: bool
     required_backend_version: str = BACKEND_VERSION
     required_upstream_commit: str = UPSTREAM_COMMIT
@@ -101,11 +103,18 @@ class VDBMatch(BaseModel):
     updated: str | None = None
     aliases: list[str] = Field(default_factory=list)
     references: list[str] = Field(default_factory=list)
+    description: str | None = None
+    text_truncated: bool = False
+    match_basis: (
+        Literal["advisory_id", "advisory_alias", "versioned_purl", "concrete_cpe"] | None
+    ) = None
 
 
 class VDBLookup(BaseModel):
     database: VDBStatus
     query: str
+    query_kind: Literal["cve", "purl", "ghsa", "cpe"] | None = None
+    requested_sources: list[str] = Field(default_factory=list)
     matches: list[VDBMatch]
     truncated: bool
     interpretation: Literal["knowledge_matches", "no_known_match_in_loaded_snapshot"]
@@ -148,6 +157,17 @@ class VDBReader:
         if not result.data_rows or not result.index_rows:
             result.state = "empty"
             return result
+        missing = index.execute(
+            "SELECT EXISTS(SELECT 1 FROM cve_index i "
+            "LEFT JOIN cve_metadata m ON m.cve_id=i.cve_id "
+            "AND m.vers=i.vers AND m.purl_prefix=i.purl_prefix "
+            "LEFT JOIN cve_metadata_text t ON t.cve_id=i.cve_id "
+            "WHERE m.cve_id IS NULL OR t.cve_id IS NULL "
+            "OR m.source IS NULL OR m.source='' LIMIT 1)"
+        ).fetchone()[0]
+        result.metadata_coverage = (
+            "missing" if not result.metadata_rows else "partial" if missing else "full"
+        )
         try:
             meta_path = self._regular("vdb.meta")
             descriptor = os.open(meta_path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
@@ -195,7 +215,7 @@ class VDBReader:
         return result
 
     @contextmanager
-    def _connections(self):
+    def _connections(self, deadline: float | None = None):
         # Importing upstream config can create directories. Only import search
         # after preflight, using an existing root and private temporary cache.
         if self.root.resolve() != self.root:
@@ -212,7 +232,8 @@ class VDBReader:
         apsw = importlib.import_module("apsw")
         connections = []
         try:
-            deadline = time.monotonic() + self.policy.query_timeout_seconds
+            query_deadline = time.monotonic() + self.policy.query_timeout_seconds
+            deadline = min(deadline, query_deadline) if deadline is not None else query_deadline
             for path in paths:
                 conn = apsw.Connection(
                     path.as_uri() + "?mode=ro&immutable=1",
@@ -229,10 +250,10 @@ class VDBReader:
             for conn in connections:
                 conn.close()
 
-    def status(self) -> VDBStatus:
+    def status(self, *, deadline: float | None = None) -> VDBStatus:
         with _LOCK:
             try:
-                with self._connections() as (data, index):
+                with self._connections(deadline) as (data, index):
                     return self._status(data, index)
             except FileNotFoundError:
                 state = "missing"
@@ -252,21 +273,44 @@ class VDBReader:
                 asset_ref=self.policy.asset_ref, state=state, synthetic=self.policy.synthetic
             )
 
-    def lookup(self, kind: Literal["cve", "purl"], query: str, limit: int) -> VDBLookup:
+    def lookup(
+        self,
+        kind: Literal["cve", "purl", "ghsa", "cpe"],
+        query: str,
+        limit: int,
+        *,
+        sources: list[str] | None = None,
+        deadline: float | None = None,
+    ) -> VDBLookup:
         if not 1 <= limit <= self.policy.max_results or isinstance(limit, bool):
             raise VDBError("vdb_invalid_limit")
         if not isinstance(query, str) or len(query) > 512 or any(ord(c) < 32 for c in query):
             raise VDBError("vdb_invalid_query")
         if kind == "cve" and not re.fullmatch(CVE_PATTERN, query):
             raise VDBError("vdb_invalid_cve")
-        if kind not in {"cve", "purl"}:
+        if kind == "ghsa" and not re.fullmatch(GHSA_PATTERN, query):
+            raise VDBError("vdb_invalid_ghsa")
+        if kind not in {"cve", "purl", "ghsa", "cpe"}:
             raise VDBError("vdb_invalid_query")
+        if sources is not None and (
+            len(sources) > 5
+            or len(set(sources)) != len(sources)
+            or any(not re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", source) for source in sources)
+        ):
+            raise VDBError("vdb_invalid_sources")
+        if deadline is not None and time.monotonic() >= deadline:
+            raise VDBError("vdb_batch_timeout")
         with _LOCK:
             try:
-                with self._connections() as (data, index):
+                with self._connections(deadline) as (data, index):
                     status = self._status(data, index)
                     if status.state != "ready":
                         raise VDBError(f"vdb_{status.state}")
+                    if kind == "ghsa" or sources:
+                        # Original alias/filter APIs can silently answer [] on
+                        # non-extended artifacts. Require complete query metadata.
+                        if status.metadata_coverage != "full":
+                            raise VDBError("vdb_metadata_coverage_gap")
                     with tempfile.TemporaryDirectory(prefix="redteam-vdb-cache-") as cache:
                         os.environ.update(
                             VDB_HOME=str(self.root),
@@ -294,6 +338,7 @@ class VDBReader:
                             index.createscalarfunction(
                                 "vers_compare", db.vers_compare, deterministic=True
                             )
+                            filters = {"sources": sources} if sources else None
                             if kind == "purl":
                                 from packageurl import PackageURL
 
@@ -307,21 +352,60 @@ class VDBReader:
                                 raw = search.search_by_purl_like(
                                     query,
                                     with_data=False,
+                                    filters=filters,
                                     max_results=limit + 1,
+                                )
+                            elif kind == "cpe":
+                                # Do not broaden an unknown/wildcard version into
+                                # all versions. Strict concrete CPE 2.3 subset.
+                                parts = query.split(":")
+                                if (
+                                    len(parts) != 13
+                                    or parts[:2] != ["cpe", "2.3"]
+                                    or parts[2] not in {"a", "o", "h"}
+                                    or any(
+                                        not re.fullmatch(r"[A-Za-z0-9_.+-]+", p) for p in parts[3:6]
+                                    )
+                                    or parts[5] == "-"
+                                    or any(p != "*" for p in parts[6:])
+                                ):
+                                    raise VDBError("vdb_concrete_cpe_required")
+                                raw = search.search_by_cpe_like(
+                                    query, with_data=False, filters=filters, max_results=limit + 1
                                 )
                             else:
                                 raw = search.search_by_cve(
                                     query,
                                     with_data=False,
+                                    filters=filters,
                                     max_results=limit + 1,
                                 )
+                                if kind == "ghsa" and any(
+                                    hit.get("cve_id") != query
+                                    and query not in hit.get("aliases", [])
+                                    for hit in raw
+                                ):
+                                    # Upstream alias lookup uses substring LIKE.
+                                    # Never silently accept a near-ID or call it clean.
+                                    raise VDBError("vdb_alias_match_inexact")
                         finally:
                             db.db_conn = db.index_conn = db.bound_paths = None
                             db.tables_created = False
                     matches = [self._match(hit) for hit in raw[:limit]]
+                    for match in matches:
+                        match.match_basis = {
+                            "cve": "advisory_id",
+                            "purl": "versioned_purl",
+                            "cpe": "concrete_cpe",
+                            "ghsa": (
+                                "advisory_id" if match.advisory_id == query else "advisory_alias"
+                            ),
+                        }[kind]
                     output = VDBLookup(
                         database=status,
                         query=query,
+                        query_kind=kind,
+                        requested_sources=sources or [],
                         matches=matches,
                         truncated=len(raw) > limit,
                         interpretation=(
@@ -337,6 +421,8 @@ class VDBReader:
             except VDBError:
                 raise
             except Exception:
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise VDBError("vdb_batch_timeout") from None
                 raise VDBError("vdb_lookup_unavailable") from None
 
     @staticmethod
@@ -364,10 +450,21 @@ class VDBReader:
             updated=text("updated"),
             aliases=texts("aliases"),
             references=texts("references"),
+            description=text("description"),
+            text_truncated=any(
+                (isinstance(value, str) and len(value) > 1024)
+                or (
+                    isinstance(value, list)
+                    and (
+                        len(value) > 20 or any(isinstance(v, str) and len(v) > 1024 for v in value)
+                    )
+                )
+                for value in hit.values()
+            ),
         )
 
 
-def create_server(policy: VDBPolicy) -> MCPServer:
+def create_server(policy: VDBPolicy, *, extended: bool = False) -> MCPServer:
     reader = VDBReader(policy)
     server = MCPServer("vdb-readonly", log_level="WARNING")
 
@@ -400,14 +497,27 @@ def create_server(policy: VDBPolicy) -> MCPServer:
         if "purl" in function.__annotations__:
             function.__annotations__["purl"] = Annotated[str, Field(min_length=1, max_length=512)]
         server.tool()(function)
+    if extended:
+        from redteam.capability.servers.vdb_extended import register_extended_tools
+
+        register_extended_tools(server, policy)
     return server
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--policy", required=True)
+    parser.add_argument(
+        "--profile", choices=("vdb_readonly", "vdb_readonly_extended"), default="vdb_readonly"
+    )
     args = parser.parse_args()
-    create_server(VDBPolicy.load(args.policy)).run(transport="stdio")
+    if args.profile == "vdb_readonly_extended":
+        from redteam.capability.servers.vdb_extended import VDBExtendedPolicy
+
+        policy = VDBExtendedPolicy.load(args.policy)
+    else:
+        policy = VDBPolicy.load(args.policy)
+    create_server(policy, extended=args.profile == "vdb_readonly_extended").run(transport="stdio")
 
 
 if __name__ == "__main__":

@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from redteam.capability.servers.vdb_readonly import CVE_PATTERN, VDBLookup, VDBStatus
+from redteam.capability.servers.vdb_extended import MAX_BATCH_ITEMS, VDBBatch
+from redteam.capability.servers.vdb_readonly import CVE_PATTERN, GHSA_PATTERN, VDBLookup, VDBStatus
 from redteam.capability.workspace_manifest import WorkspaceToolSpec
 from redteam.core.contracts.tool import ToolDescriptor
 
@@ -28,9 +29,49 @@ VDB_TOOLS = {
     ),
 }
 
+VDB_EXTENDED_TOOLS = {
+    **VDB_TOOLS,
+    "search_by_ghsa": WorkspaceToolSpec(
+        "static_analysis",
+        frozenset({"asset_ref", "ghsa_id"}),
+        _CONTEXT | {"limit", "sources"},
+        VDBLookup.model_json_schema(),
+    ),
+    "search_by_cpe_like": WorkspaceToolSpec(
+        "static_analysis",
+        frozenset({"asset_ref", "cpe"}),
+        _CONTEXT | {"limit", "sources"},
+        VDBLookup.model_json_schema(),
+    ),
+    "search_packages": WorkspaceToolSpec(
+        "static_analysis",
+        frozenset({"asset_ref", "purls"}),
+        _CONTEXT | {"limit", "sources"},
+        VDBBatch.model_json_schema(),
+    ),
+    "search_sbom": WorkspaceToolSpec(
+        "static_analysis",
+        frozenset({"asset_ref", "sbom_ref"}),
+        _CONTEXT | {"limit", "sources", "offset", "max_items"},
+        VDBBatch.model_json_schema(),
+    ),
+}
 
-def validate_vdb_descriptor(descriptor: ToolDescriptor, asset_ref: str) -> None:
-    spec = VDB_TOOLS.get(descriptor.tool_name)
+
+def vdb_specs(profile: str) -> dict[str, WorkspaceToolSpec]:
+    if profile == "vdb_readonly":
+        return VDB_TOOLS
+    if profile == "vdb_readonly_extended":
+        return VDB_EXTENDED_TOOLS
+    raise ValueError("vdb unknown profile")
+
+
+def validate_vdb_descriptor(
+    descriptor: ToolDescriptor,
+    asset_ref: str,
+    profile: str = "vdb_readonly",
+) -> None:
+    spec = vdb_specs(profile).get(descriptor.tool_name)
     if spec is None or descriptor.capability_tags != ["analysis"]:
         raise ValueError("vdb unexpected tool/capability")
     if (
@@ -47,7 +88,14 @@ def validate_vdb_descriptor(descriptor: ToolDescriptor, asset_ref: str) -> None:
     if properties.get("asset_ref", {}).get("const") != asset_ref:
         raise ValueError("vdb asset differs from operator configuration")
     for name, schema in properties.items():
-        if schema.get("type") != ("integer" if name == "limit" else "string"):
+        expected_type = (
+            "integer"
+            if name in {"limit", "offset", "max_items"}
+            else "array"
+            if name in {"purls", "sources"}
+            else "string"
+        )
+        if schema.get("type") != expected_type:
             raise ValueError("vdb argument type drift")
     if "limit" in properties:
         bound = properties["limit"]
@@ -57,3 +105,36 @@ def validate_vdb_descriptor(descriptor: ToolDescriptor, asset_ref: str) -> None:
         raise ValueError("vdb CVE validation drift")
     if "purl" in properties and properties["purl"].get("maxLength") != 512:
         raise ValueError("vdb PURL bound drift")
+    if "ghsa_id" in properties and properties["ghsa_id"].get("pattern") != GHSA_PATTERN:
+        raise ValueError("vdb GHSA validation drift")
+    if "cpe" in properties and properties["cpe"].get("maxLength") != 512:
+        raise ValueError("vdb CPE bound drift")
+    if "purls" in properties:
+        schema = properties["purls"]
+        if (
+            schema.get("minItems") != 1
+            or not 1 <= schema.get("maxItems", 0) <= MAX_BATCH_ITEMS
+            or schema.get("items", {}).get("type") != "string"
+            or schema["items"].get("maxLength") != 512
+        ):
+            raise ValueError("vdb package list bound drift")
+    if "sources" in properties:
+        schema = properties["sources"]
+        if (
+            schema.get("maxItems") != 5
+            or schema.get("items", {}).get("pattern") != r"^[a-z][a-z0-9_-]{0,31}$"
+        ):
+            raise ValueError("vdb source filter drift")
+    if "sbom_ref" in properties and properties["sbom_ref"].get("pattern") != (
+        r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$"
+    ):
+        raise ValueError("vdb SBOM ref drift")
+    if "offset" in properties and (
+        properties["offset"].get("minimum") != 0 or properties["offset"].get("maximum") != 500
+    ):
+        raise ValueError("vdb SBOM offset drift")
+    if "max_items" in properties and (
+        properties["max_items"].get("minimum") != 1
+        or not 1 <= properties["max_items"].get("maximum", 0) <= MAX_BATCH_ITEMS
+    ):
+        raise ValueError("vdb SBOM page size drift")
