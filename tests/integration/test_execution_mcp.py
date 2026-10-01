@@ -17,7 +17,10 @@ from redteam.attack_graph.identity import node_id_for_target
 from redteam.capability.adapters.mcp.execution import ExecutionMCPAdapter
 from redteam.capability.adapters.mcp.transport import RemoteCallResult, RemoteTool
 from redteam.capability.bootstrap import open_mcp_tool_gateway
-from redteam.capability.execution_manifest import validate_execution_descriptor
+from redteam.capability.execution_manifest import (
+    EXECUTION_TOOLS,
+    validate_execution_descriptor,
+)
 from redteam.capability.gateway import MCPToolGateway
 from redteam.capability.registry import MCPToolRegistry
 from redteam.capability.servers.execution import (
@@ -123,6 +126,28 @@ def invocation(arguments: dict[str, Any]) -> ToolInvocation:
     )
 
 
+def job_invocation(
+    name: str,
+    arguments: dict[str, Any],
+    *,
+    action_id: str,
+) -> ToolInvocation:
+    run_id = RunId("run-test")
+    return ToolInvocation(
+        invocation_id=InvocationId(f"inv-{action_id}"),
+        action_id=ActionId(action_id),
+        run_id=run_id,
+        tool_id=ToolId(f"analysis.{name}"),
+        operation=EXECUTION_TOOLS[name].operation,
+        arguments=arguments,
+        execution_context=ExecutionContext(
+            engagement_id=EngagementId("eng-test"),
+            run_id=run_id,
+        ),
+        created_at=datetime.now(timezone.utc),
+    )
+
+
 def workspace_invocation(name: str, arguments: dict[str, Any]) -> ToolInvocation:
     run_id = RunId("run-test")
     profile = "workspace_write" if name == "write_file" else "workspace_read"
@@ -162,19 +187,22 @@ async def test_registry_candidate_control_gateway_and_real_mcp_tool(
         transport=InProcessTransport(server),
     )
     descriptors = await adapter.discover_tools()
-    assert len(descriptors) == 1
-    descriptor = descriptors[0]
-    descriptor.operations = ["command_run"]
-    descriptor.target_types = ["asset"]
-    validate_execution_descriptor(descriptor, "workspace-test")
+    assert {item.tool_name for item in descriptors} == set(EXECUTION_TOOLS)
+    for item in descriptors:
+        item.operations = [EXECUTION_TOOLS[item.tool_name].operation]
+        item.target_types = ["asset"]
+        validate_execution_descriptor(item, "workspace-test")
     registry = MCPToolRegistry()
     registry.replace_server_tools("execution", descriptors)
     gateway = MCPToolGateway(
         registry,
         {"execution": adapter},
-        {"analysis.run_command": ("command_run",)},
-        output_schemas={"analysis.run_command": descriptor.output_schema},
-        target_types={"analysis.run_command": "asset"},
+        {
+            f"analysis.{name}": (spec.operation,)
+            for name, spec in EXECUTION_TOOLS.items()
+        },
+        output_schemas={str(item.tool_id): item.output_schema for item in descriptors},
+        target_types={str(item.tool_id): "asset" for item in descriptors},
         health_refresh_enabled=False,
     )
 
@@ -244,6 +272,46 @@ async def test_registry_candidate_control_gateway_and_real_mcp_tool(
     assert result.success and result.output["exit_code"] == 0
     assert starts == 1
 
+    started = await gateway.invoke(
+        job_invocation(
+            "job_start",
+            {
+                "asset_ref": "workspace-test",
+                "executable": "wc",
+                "args": ["input.txt"],
+            },
+            action_id="action-job-start",
+        )
+    )
+    assert started.success and started.output["job_id"].startswith("job-")
+    job_id = started.output["job_id"]
+    for index in range(20):
+        status = await gateway.invoke(
+            job_invocation(
+                "job_status",
+                {"asset_ref": "workspace-test", "job_id": job_id},
+                action_id=f"action-job-status-{index}",
+            )
+        )
+        assert status.success
+        if status.output["status"] != "running":
+            break
+        await asyncio.sleep(0)
+    assert status.output["status"] == "completed"
+    cancelled = await gateway.invoke(
+        job_invocation(
+            "job_cancel",
+            {"asset_ref": "workspace-test", "job_id": job_id},
+            action_id="action-job-cancel",
+        )
+    )
+    assert cancelled.success
+    assert cancelled.output == {
+        "job_id": job_id,
+        "status": "completed",
+        "cancelled": False,
+    }
+
     denied_proposal = proposal.model_copy(deep=True)
     denied_proposal.action_id = ActionId("action-denied")
     denied_proposal.target = AssetTarget(asset_id=AssetId("workspace-other"))
@@ -255,7 +323,7 @@ async def test_registry_candidate_control_gateway_and_real_mcp_tool(
     assert denied.verdict == PolicyVerdict.DENY
     with pytest.raises(NonAllowDecisionError):
         build_tool_invocation(denied_proposal, denied, tool_id=step.tool_id)
-    assert starts == 1
+    assert starts == 2
 
 
 @pytest.mark.skipif(

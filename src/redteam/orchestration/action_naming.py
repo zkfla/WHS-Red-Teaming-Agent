@@ -34,6 +34,9 @@ CANONICAL_OPERATIONS = frozenset(
         "file_edit",
         # Execution Substrate proposal: pending cross-team contract agreement.
         "command_run",
+        "command_job_start",
+        "command_job_status",
+        "command_job_cancel",
     }
 )
 _LOWER_SNAKE_CASE = re.compile(r"^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$")

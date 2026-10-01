@@ -8,6 +8,7 @@ from typing import Any
 
 import pytest
 
+from redteam.capability.servers import execution
 from redteam.capability.servers.execution import (
     DockerExecutionEngine,
     ExecutionError,
@@ -287,3 +288,129 @@ async def test_cancellation_forces_container_and_child_cleanup(
 
     assert running.killed is True
     assert active_containers == set()
+
+
+async def wait_for_terminal_job(
+    engine: DockerExecutionEngine,
+    job_id: str,
+) -> str:
+    for _ in range(20):
+        status = await engine.job_status(
+            "workspace-test", job_id, "eng-test", "run-test"
+        )
+        if status.status != "running":
+            return status.status
+        await asyncio.sleep(0)
+    pytest.fail("job did not reach a terminal state")
+
+
+async def test_job_start_status_and_completed_result(policy: ExecutionPolicy) -> None:
+    async def spawn(*args: Any, **kwargs: Any) -> CompletedProcess:
+        return CompletedProcess(stdout=b"3 input.txt\n")
+
+    engine = DockerExecutionEngine(policy, process_factory=spawn)
+    started = await engine.job_start(
+        "workspace-test", "wc", ["-l", "input.txt"], 3, "eng-test", "run-test"
+    )
+    assert started.job_id.startswith("job-")
+    assert await wait_for_terminal_job(engine, started.job_id) == "completed"
+    status = await engine.job_status(
+        "workspace-test", started.job_id, "eng-test", "run-test"
+    )
+    assert status.result is not None
+    assert status.result.exit_code == 0
+    assert status.result.stdout == "3 input.txt\n"
+
+
+async def test_job_failure_is_distinct_from_command_exit(policy: ExecutionPolicy) -> None:
+    async def spawn(*args: Any, **kwargs: Any) -> CompletedProcess:
+        raise OSError("sensitive host error")
+
+    engine = DockerExecutionEngine(policy, process_factory=spawn)
+    started = await engine.job_start(
+        "workspace-test", "wc", ["input.txt"], 3, "eng-test", "run-test"
+    )
+    assert await wait_for_terminal_job(engine, started.job_id) == "failed"
+    status = await engine.job_status(
+        "workspace-test", started.job_id, "eng-test", "run-test"
+    )
+    assert status.result is None
+    assert status.error == "execution_job_failed"
+    assert "sensitive" not in status.error
+
+
+async def test_job_cancel_waits_for_container_cleanup(policy: ExecutionPolicy) -> None:
+    running = HangingProcess()
+    active_containers: set[str] = set()
+
+    async def spawn(*args: Any, **kwargs: Any) -> HangingProcess:
+        active_containers.add(args[args.index("--name") + 1])
+        return running
+
+    async def cleanup(*args: str, **kwargs: Any) -> CompletedProcess:
+        active_containers.discard(args[-1])
+        return CompletedProcess()
+
+    engine = DockerExecutionEngine(
+        policy,
+        process_factory=spawn,
+        cleanup_process_factory=cleanup,
+    )
+    started = await engine.job_start(
+        "workspace-test", "wc", ["input.txt"], 10, "eng-test", "run-test"
+    )
+    await asyncio.sleep(0)
+    cancelled = await engine.job_cancel(
+        "workspace-test", started.job_id, "eng-test", "run-test"
+    )
+    assert cancelled.status == "cancelled"
+    assert cancelled.cancelled is True
+    assert running.killed is True
+    assert active_containers == set()
+
+
+async def test_job_access_is_bound_to_asset_engagement_and_run(
+    policy: ExecutionPolicy,
+) -> None:
+    async def spawn(*args: Any, **kwargs: Any) -> CompletedProcess:
+        return CompletedProcess()
+
+    engine = DockerExecutionEngine(policy, process_factory=spawn)
+    started = await engine.job_start(
+        "workspace-test", "wc", ["input.txt"], 3, "eng-test", "run-test"
+    )
+    with pytest.raises(ExecutionError, match="execution_context_mismatch"):
+        await engine.job_status(
+            "workspace-test", started.job_id, "eng-test", "run-other"
+        )
+    with pytest.raises(ExecutionError, match="execution_context_mismatch"):
+        await engine.job_cancel(
+            "workspace-other", started.job_id, "eng-test", "run-test"
+        )
+    with pytest.raises(ExecutionError, match="execution_job_not_found"):
+        await engine.job_status(
+            "workspace-test", "job-unknown", "eng-test", "run-test"
+        )
+
+
+async def test_completed_jobs_expire_after_policy_ttl(
+    policy: ExecutionPolicy,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = [0.0]
+    monkeypatch.setattr(execution.time, "monotonic", lambda: clock[0])
+
+    async def spawn(*args: Any, **kwargs: Any) -> CompletedProcess:
+        return CompletedProcess()
+
+    expiring_policy = policy.model_copy(update={"completed_job_ttl_seconds": 1.0})
+    engine = DockerExecutionEngine(expiring_policy, process_factory=spawn)
+    started = await engine.job_start(
+        "workspace-test", "wc", ["input.txt"], 3, "eng-test", "run-test"
+    )
+    assert await wait_for_terminal_job(engine, started.job_id) == "completed"
+    clock[0] = 2.0
+    with pytest.raises(ExecutionError, match="execution_job_not_found"):
+        await engine.job_status(
+            "workspace-test", started.job_id, "eng-test", "run-test"
+        )

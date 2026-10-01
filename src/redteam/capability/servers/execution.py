@@ -17,6 +17,7 @@ import subprocess
 import time
 import uuid
 from collections.abc import Awaitable, Callable, Sequence
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Annotated, Any, Literal
 
@@ -58,6 +59,8 @@ class ExecutionPolicy(BaseModel):
     cpus: float = Field(default=0.5, gt=0, le=2.0)
     container_user: str = Field(default="65532:65532", pattern=r"^[1-9][0-9]*:[1-9][0-9]*$")
     docker_binary: str = "docker"
+    max_jobs: int = Field(default=32, ge=1, le=256)
+    completed_job_ttl_seconds: float = Field(default=300.0, ge=1.0, le=86_400.0)
 
     @field_validator("asset_ref", "engagement_id", "run_id")
     @classmethod
@@ -136,6 +139,36 @@ class CommandResult(BaseModel):
     duration_ms: int
 
 
+class JobStartResult(BaseModel):
+    job_id: str
+    status: Literal["running"] = "running"
+
+
+class JobStatusResult(BaseModel):
+    job_id: str
+    status: Literal["running", "completed", "failed", "cancelled"]
+    result: CommandResult | None = None
+    error: str | None = None
+
+
+class JobCancelResult(BaseModel):
+    job_id: str
+    status: Literal["running", "completed", "failed", "cancelled"]
+    cancelled: bool
+
+
+@dataclass
+class _JobRecord:
+    asset_ref: str
+    engagement_id: str
+    run_id: str
+    updated_at: float
+    status: Literal["running", "completed", "failed", "cancelled"] = "running"
+    task: asyncio.Task[None] | None = None
+    result: CommandResult | None = None
+    error: str | None = None
+
+
 ProcessFactory = Callable[..., Awaitable[Any]]
 
 
@@ -168,6 +201,8 @@ class DockerExecutionEngine:
         self.policy = policy
         self._process_factory = process_factory
         self._cleanup_process_factory = cleanup_process_factory or process_factory
+        self._jobs: dict[str, _JobRecord] = {}
+        self._jobs_lock = asyncio.Lock()
 
     def _check_context(
         self,
@@ -306,6 +341,168 @@ class DockerExecutionEngine:
             duration_ms=duration_ms,
         )
 
+    async def job_start(
+        self,
+        asset_ref: str,
+        executable: str,
+        args: Sequence[str],
+        timeout_seconds: float,
+        engagement_id: str,
+        run_id: str,
+    ) -> JobStartResult:
+        self._check_context(asset_ref, engagement_id, run_id)
+        if not 0 < timeout_seconds <= self.policy.max_timeout_seconds:
+            raise ExecutionError("execution_invalid_timeout")
+        self.docker_arguments(
+            container_name="redteam-exec-validation",
+            executable=executable,
+            args=args,
+        )
+        job_id = f"job-{uuid.uuid4().hex}"
+        async with self._jobs_lock:
+            self._prune_jobs_locked()
+            if len(self._jobs) >= self.policy.max_jobs:
+                raise ExecutionError("execution_job_capacity_reached")
+            record = _JobRecord(
+                asset_ref=asset_ref,
+                engagement_id=engagement_id,
+                run_id=run_id,
+                updated_at=time.monotonic(),
+            )
+            self._jobs[job_id] = record
+            record.task = asyncio.create_task(
+                self._run_job(
+                    job_id,
+                    asset_ref,
+                    executable,
+                    tuple(args),
+                    timeout_seconds,
+                    engagement_id,
+                    run_id,
+                )
+            )
+        return JobStartResult(job_id=job_id)
+
+    async def job_status(
+        self,
+        asset_ref: str,
+        job_id: str,
+        engagement_id: str,
+        run_id: str,
+    ) -> JobStatusResult:
+        self._check_context(asset_ref, engagement_id, run_id)
+        async with self._jobs_lock:
+            self._prune_jobs_locked()
+            record = self._owned_job(job_id, asset_ref, engagement_id, run_id)
+            return JobStatusResult(
+                job_id=job_id,
+                status=record.status,
+                result=record.result,
+                error=record.error,
+            )
+
+    async def job_cancel(
+        self,
+        asset_ref: str,
+        job_id: str,
+        engagement_id: str,
+        run_id: str,
+    ) -> JobCancelResult:
+        self._check_context(asset_ref, engagement_id, run_id)
+        async with self._jobs_lock:
+            self._prune_jobs_locked()
+            record = self._owned_job(job_id, asset_ref, engagement_id, run_id)
+            task = record.task if record.status == "running" else None
+        if task is not None:
+            task.cancel()
+            await asyncio.shield(task)
+        async with self._jobs_lock:
+            record = self._owned_job(job_id, asset_ref, engagement_id, run_id)
+            return JobCancelResult(
+                job_id=job_id,
+                status=record.status,
+                cancelled=task is not None and record.status == "cancelled",
+            )
+
+    async def _run_job(
+        self,
+        job_id: str,
+        asset_ref: str,
+        executable: str,
+        args: Sequence[str],
+        timeout_seconds: float,
+        engagement_id: str,
+        run_id: str,
+    ) -> None:
+        try:
+            result = await self.run_command(
+                asset_ref,
+                executable,
+                args,
+                timeout_seconds,
+                engagement_id,
+                run_id,
+            )
+        except asyncio.CancelledError:
+            async with self._jobs_lock:
+                record = self._jobs.get(job_id)
+                if record is not None:
+                    record.status = "cancelled"
+                    record.updated_at = time.monotonic()
+            return
+        except Exception as exc:
+            error = str(exc) if isinstance(exc, ExecutionError) else "execution_job_failed"
+            async with self._jobs_lock:
+                record = self._jobs.get(job_id)
+                if record is not None:
+                    record.status = "failed"
+                    record.error = error
+                    record.updated_at = time.monotonic()
+            return
+        async with self._jobs_lock:
+            record = self._jobs.get(job_id)
+            if record is not None:
+                record.status = "completed"
+                record.result = result
+                record.updated_at = time.monotonic()
+
+    def _owned_job(
+        self,
+        job_id: str,
+        asset_ref: str,
+        engagement_id: str,
+        run_id: str,
+    ) -> _JobRecord:
+        record = self._jobs.get(job_id)
+        if record is None or (
+            record.asset_ref,
+            record.engagement_id,
+            record.run_id,
+        ) != (asset_ref, engagement_id, run_id):
+            raise ExecutionError("execution_job_not_found")
+        return record
+
+    def _prune_jobs_locked(self) -> None:
+        now = time.monotonic()
+        expired = [
+            job_id
+            for job_id, record in self._jobs.items()
+            if record.status != "running"
+            and now - record.updated_at >= self.policy.completed_job_ttl_seconds
+        ]
+        for job_id in expired:
+            del self._jobs[job_id]
+        completed = sorted(
+            (
+                (record.updated_at, job_id)
+                for job_id, record in self._jobs.items()
+                if record.status != "running"
+            )
+        )
+        while len(self._jobs) >= self.policy.max_jobs and completed:
+            _, job_id = completed.pop(0)
+            del self._jobs[job_id]
+
     async def _collect_output(
         self,
         process: Any,
@@ -435,13 +632,61 @@ def create_server(
             run_id,
         )
 
+    async def job_start(
+        asset_ref: str,
+        executable: str,
+        args: list[str],
+        timeout_seconds: float = policy.max_timeout_seconds,
+        engagement_id: str = "",
+        run_id: str = "",
+    ) -> JobStartResult:
+        """Proposed: start one allowlisted Docker command and return its job ID."""
+
+        return await executor.job_start(
+            asset_ref,
+            executable,
+            args,
+            timeout_seconds,
+            engagement_id,
+            run_id,
+        )
+
+    async def job_status(
+        asset_ref: str,
+        job_id: str,
+        engagement_id: str = "",
+        run_id: str = "",
+    ) -> JobStatusResult:
+        """Proposed: inspect one job owned by the trusted asset and run context."""
+
+        return await executor.job_status(asset_ref, job_id, engagement_id, run_id)
+
+    async def job_cancel(
+        asset_ref: str,
+        job_id: str,
+        engagement_id: str = "",
+        run_id: str = "",
+    ) -> JobCancelResult:
+        """Proposed: cancel one running job and wait for container cleanup."""
+
+        return await executor.job_cancel(asset_ref, job_id, engagement_id, run_id)
+
     run_command.__annotations__["asset_ref"] = Literal[policy.asset_ref]
     run_command.__annotations__["args"] = Annotated[list[str], Field(max_length=64)]
     run_command.__annotations__["timeout_seconds"] = Annotated[
         float,
         Field(gt=0, le=policy.max_timeout_seconds),
     ]
-    server.tool()(run_command)
+    job_start.__annotations__["asset_ref"] = Literal[policy.asset_ref]
+    job_start.__annotations__["args"] = Annotated[list[str], Field(max_length=64)]
+    job_start.__annotations__["timeout_seconds"] = Annotated[
+        float,
+        Field(gt=0, le=policy.max_timeout_seconds),
+    ]
+    job_status.__annotations__["asset_ref"] = Literal[policy.asset_ref]
+    job_cancel.__annotations__["asset_ref"] = Literal[policy.asset_ref]
+    for function in (run_command, job_start, job_status, job_cancel):
+        server.tool()(function)
     return server
 
 

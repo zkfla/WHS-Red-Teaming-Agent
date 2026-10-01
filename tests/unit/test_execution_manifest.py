@@ -8,7 +8,10 @@ from typing import Any
 import pytest
 from mcp import Client
 
-from redteam.capability.execution_manifest import validate_execution_descriptor
+from redteam.capability.execution_manifest import (
+    EXECUTION_TOOLS,
+    validate_execution_descriptor,
+)
 from redteam.capability.servers.execution import (
     DockerExecutionEngine,
     ExecutionPolicy,
@@ -77,8 +80,10 @@ def test_execution_profile_pins_policy_tools_operations_and_asset(
     assert settings.profile == "execution"
     assert settings.risk_level == RiskLevel.HIGH
     assert settings.execution_asset_ref == "workspace-test"
-    assert settings.allowed_tools == ("run_command",)
-    assert settings.tool_operations == {"run_command": ("command_run",)}
+    assert settings.allowed_tools == tuple(EXECUTION_TOOLS)
+    assert settings.tool_operations == {
+        name: (spec.operation,) for name, spec in EXECUTION_TOOLS.items()
+    }
     assert settings.args[:4] == (
         "-m",
         "redteam.capability.servers.execution",
@@ -111,24 +116,29 @@ async def test_real_mcp_discovery_matches_pinned_manifest(tmp_path: Path) -> Non
     server = create_server(policy, engine=DockerExecutionEngine(policy, process_factory=spawn))
     async with Client(server) as client:
         listing = await client.list_tools()
-    assert len(listing.tools) == 1
-    remote = listing.tools[0]
-    descriptor = ToolDescriptor(
-        tool_id=ToolId("analysis.run_command"),
-        server_id="execution",
-        tool_name=remote.name,
-        description=remote.description or "",
-        input_schema=dict(remote.input_schema),
-        output_schema=dict(remote.output_schema or {}),
-        operations=["command_run"],
-        target_types=["asset"],
-        capability_tags=["analysis"],
-        risk_level=RiskLevel.HIGH,
-        health_status=ToolHealthStatus.HEALTHY,
-    )
-    validate_execution_descriptor(descriptor, "workspace-test")
+    assert {tool.name for tool in listing.tools} == set(EXECUTION_TOOLS)
+    descriptors = []
+    for remote in listing.tools:
+        spec = EXECUTION_TOOLS[remote.name]
+        descriptor = ToolDescriptor(
+            tool_id=ToolId(f"analysis.{remote.name}"),
+            server_id="execution",
+            tool_name=remote.name,
+            description=remote.description or "",
+            input_schema=dict(remote.input_schema),
+            output_schema=dict(remote.output_schema or {}),
+            operations=[spec.operation],
+            target_types=["asset"],
+            capability_tags=["analysis"],
+            risk_level=RiskLevel.HIGH,
+            health_status=ToolHealthStatus.HEALTHY,
+        )
+        validate_execution_descriptor(descriptor, "workspace-test")
+        descriptors.append(descriptor)
 
-    changed = descriptor.model_copy(deep=True)
+    changed = next(item for item in descriptors if item.tool_name == "run_command").model_copy(
+        deep=True
+    )
     changed.input_schema["required"].remove("args")
     with pytest.raises(ValueError, match="manifest"):
         validate_execution_descriptor(changed, "workspace-test")

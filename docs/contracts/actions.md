@@ -333,3 +333,8 @@ address outside configured networks") reaches `ToolResult.error` now.
 실행 파일과 인자는 MCP의 `run_command` 도구가 받지만, shell 문자열·Docker 옵션·호스트
 경로는 ActionProposal 입력으로 허용하지 않는다. 컨테이너 이미지, workspace root,
 allowlist와 자원 제한은 operator 정책에서만 공급한다.
+
+비동기 확장 제안은 `analysis.command_job_start`,
+`analysis.command_job_status`, `analysis.command_job_cancel`이다. `job_id`는 서버가
+생성하며 asset·engagement·run에 귀속된다. 세 operation 역시 팀 합의 전까지
+**합의 필요(제안)** 상태이고, 현재 profile은 보수적으로 모두 HIGH 위험도로 노출한다.
