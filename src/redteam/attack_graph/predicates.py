@@ -6,6 +6,8 @@ plus the guard that keeps secrets out. Docs: ``docs/agent/attack-graph.md``.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import re
 from enum import Enum
@@ -28,6 +30,13 @@ CLEANUP_KEY = "cleanup"
 #: silently renews a belief nobody re-checked.
 ATTRS_SEEN_KEY = "attrs_observed_at"
 
+#: Per-claim write source. Node-level ``provenance`` records that *something*
+#: about the node was written; it cannot say which predicate or value came
+#: from which run. ``claim_provenance`` maps one entry per asserted claim.
+CLAIM_PROVENANCE_KEY = "claim_provenance"
+CLAIM_ATTR_PREFIX = "attrs:"
+CLAIM_FACT_PREFIX = "facts:"
+
 RESERVED_KEYS = frozenset(
     {
         ATTRS_KEY,
@@ -38,6 +47,7 @@ RESERVED_KEYS = frozenset(
         LAST_SEEN_KEY,
         CLEANUP_KEY,
         ATTRS_SEEN_KEY,
+        CLAIM_PROVENANCE_KEY,
     }
 )
 
@@ -234,6 +244,9 @@ def validate_properties(properties: dict[str, Any]) -> dict[str, Any]:
     for key, value in properties.items():
         if key in (PROVENANCE_KEY, RETRACTIONS_KEY, ATTRS_SEEN_KEY):
             continue  # code-generated bookkeeping, not observed values
+        if key == CLAIM_PROVENANCE_KEY:
+            _validate_claim_provenance(value)
+            continue  # per-claim write source, likewise bookkeeping
         if key == ATTRS_KEY and isinstance(value, dict):
             validate_attrs(value)
             continue
@@ -263,14 +276,21 @@ def build_properties(
     """
     recorded_step = 0 if step is None else step
     validated_attrs = validate_attrs(attrs or {})
+    validated_facts = validate_facts(facts or {})
     properties: dict[str, Any] = {
         ATTRS_KEY: validated_attrs,
         ATTRS_SEEN_KEY: {key: recorded_step for key in validated_attrs},
-        FACTS_KEY: validate_facts(facts or {}),
+        FACTS_KEY: validated_facts,
         PROVENANCE_KEY: [provenance.model_dump(mode="json")] if provenance else [],
         RETRACTIONS_KEY: [],
         FIRST_SEEN_KEY: recorded_step,
         LAST_SEEN_KEY: recorded_step,
+        CLAIM_PROVENANCE_KEY: _claim_entries_for_write(
+            attrs=validated_attrs,
+            facts=validated_facts,
+            provenance=provenance,
+            step=recorded_step,
+        ),
     }
     if cleanup is not None:
         properties[CLEANUP_KEY] = dict(cleanup)
@@ -301,6 +321,186 @@ def provenance_of(properties: dict[str, Any]) -> list[dict[str, Any]]:
 def retractions_of(properties: dict[str, Any]) -> list[dict[str, Any]]:
     value = properties.get(RETRACTIONS_KEY)
     return list(value) if isinstance(value, list) else []
+
+
+def claim_key_for_attr(key: str) -> str:
+    """Claim-map key for one predicate, e.g. ``"attrs:reachable"``."""
+    return f"{CLAIM_ATTR_PREFIX}{key}"
+
+
+def claim_key_for_fact(key: str) -> str:
+    """Claim-map key for one fact value, e.g. ``"facts:status_code"``."""
+    return f"{CLAIM_FACT_PREFIX}{key}"
+
+
+def claim_provenance_of(properties: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Per-claim write source (``attrs:<key>`` / ``facts:<key>`` entries).
+
+    Unknown to older readers, which keep working: they only look up the
+    coarse ``attrs`` / ``facts`` / ``provenance`` keys. Entries carry
+    ``source``, ``evidence_id`` (alias ``evidence``), ``run_id`` (alias
+    ``run``), ``confidence`` and ``step`` of the write that produced them.
+    """
+    value = properties.get(CLAIM_PROVENANCE_KEY)
+    if not isinstance(value, dict):
+        return {}
+    out: dict[str, dict[str, Any]] = {}
+    for claim_key, entry in value.items():
+        if isinstance(entry, dict):
+            out[str(claim_key)] = dict(entry)
+    return out
+
+
+def _validate_claim_provenance(value: Any) -> dict[str, dict[str, Any]]:
+    """Structural check for the claim map; secrets cannot hide here."""
+    if not isinstance(value, dict):
+        raise ValueError("claim_provenance must map claim keys to entries")
+    for claim_key, entry in value.items():
+        key = str(claim_key)
+        if not (key.startswith(CLAIM_ATTR_PREFIX) or key.startswith(CLAIM_FACT_PREFIX)):
+            raise ValueError(f"claim_provenance has an unknown claim key {key!r}")
+        if not isinstance(entry, dict):
+            raise ValueError(f"claim_provenance[{key!r}] must be a mapping")
+        _reject_secret("claim_provenance", key, "")
+    return {str(k): dict(v) for k, v in value.items() if isinstance(v, dict)}
+
+
+def _snapshot_value(value: Any) -> Any:
+    """JSON-safe copy of one asserted value for the claim map."""
+    if isinstance(value, BaseModel):
+        return value.model_dump(mode="json")
+    if isinstance(value, dict):
+        return {str(k): _snapshot_value(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_snapshot_value(v) for v in value]
+    if isinstance(value, (set, frozenset)):
+        return sorted((_snapshot_value(v) for v in value), key=str)
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if hasattr(value, "isoformat"):
+        try:
+            return value.isoformat()
+        except Exception:  # noqa: BLE001 - fall through to str()
+            pass
+    if hasattr(value, "value"):
+        try:
+            return _snapshot_value(value.value)
+        except Exception:  # noqa: BLE001 - fall through to str()
+            pass
+    return str(value)
+
+
+def _canonical_value(value: Any) -> str:
+    """Stable string for value-equality checks (sticky merge, projection)."""
+    return json.dumps(_snapshot_value(value), sort_keys=True, separators=(",", ":"), default=str)
+
+
+def values_equal(first: Any, second: Any) -> bool:
+    """Whether two asserted values are the same (canonical comparison)."""
+    return _canonical_value(first) == _canonical_value(second)
+
+
+def _digest_value(value: Any) -> str:
+    """Short digest identifying one list element across merges."""
+    return hashlib.sha256(_canonical_value(value).encode()).hexdigest()[:16]
+
+
+def digest_value(value: Any) -> str:
+    """Short digest identifying one asserted value (projection side)."""
+    return _digest_value(value)
+
+
+def _claim_meta(provenance: Provenance | None, step: int) -> dict[str, Any] | None:
+    """Write source without any value snapshot."""
+    if provenance is None:
+        return None
+    confidence = (
+        provenance.confidence.value
+        if isinstance(provenance.confidence, Confidence)
+        else str(provenance.confidence)
+    )
+    return {
+        "source": provenance.source,
+        "evidence_id": provenance.evidence_id,
+        "evidence": provenance.evidence_id,
+        "run_id": provenance.run_id,
+        "run": provenance.run_id,
+        "confidence": confidence,
+        "step": step,
+    }
+
+
+def _element_entries(elements: Any, meta: dict[str, Any]) -> list[dict[str, Any]]:
+    """Per-element assertions for one asserted list, deduplicated by digest."""
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in elements or []:
+        digest = _digest_value(item)
+        if digest in seen:
+            continue
+        seen.add(digest)
+        out.append({"digest": digest, "value": _snapshot_value(item), **dict(meta)})
+    return out
+
+
+def _claim_entry_for_value(
+    provenance: Provenance | None, step: int, value: Any
+) -> dict[str, Any] | None:
+    """One claim-map entry: write source plus the asserted value snapshot.
+
+    Lists additionally carry per-element assertions, so a later union with
+    an older list cannot promote elements this write never saw.
+    """
+    meta = _claim_meta(provenance, step)
+    if meta is None:
+        return None
+    entry = dict(meta)
+    entry["value"] = _snapshot_value(value)
+    if isinstance(value, list):
+        entry["elements"] = _element_entries(value, meta)
+    return entry
+
+
+def _claim_entries_for_write(
+    *,
+    attrs: dict[str, Any] | None,
+    facts: dict[str, Any] | None,
+    provenance: Provenance | None,
+    step: int,
+) -> dict[str, dict[str, Any]]:
+    """Fresh claim entries for every key one write asserts, each with the
+
+    asserted value snapshot the projection judges against.
+    """
+    if provenance is None:
+        return {}
+    claims: dict[str, dict[str, Any]] = {}
+    for key, value in (attrs or {}).items():
+        entry = _claim_entry_for_value(provenance, step, value)
+        if entry is not None:
+            claims[claim_key_for_attr(str(key))] = entry
+    for key, value in (facts or {}).items():
+        entry = _claim_entry_for_value(provenance, step, value)
+        if entry is not None:
+            claims[claim_key_for_fact(str(key))] = entry
+    return claims
+
+
+def claim_entries_for_fact_keys(
+    props: dict[str, Any] | Any, provenance: Provenance | None, step: int
+) -> dict[str, dict[str, Any]]:
+    """Claim entries for flat property keys (edges store relation content
+
+    without an attrs/facts split, so each key is recorded as ``facts:<key>``).
+    A mapping snapshots each asserted value; a bare key list records the
+    source only.
+    """
+    if isinstance(props, dict):
+        return _claim_entries_for_write(attrs={}, facts=props, provenance=provenance, step=step)
+    meta = _claim_meta(provenance, step)
+    if meta is None:
+        return {}
+    return {claim_key_for_fact(str(key)): dict(meta) for key in props or []}
 
 
 def attrs_observed_at(properties: dict[str, Any]) -> dict[str, int]:
@@ -441,6 +641,125 @@ def _merge_facts(existing: dict[str, Any], incoming: dict[str, Any]) -> dict[str
     return merged
 
 
+_MISSING: Any = object()
+
+
+def _merge_elements(
+    existing: list[dict[str, Any]],
+    incoming: list[dict[str, Any]],
+    merged_values: list[Any],
+) -> list[dict[str, Any]]:
+    """Union of per-element assertions following the merged list order.
+
+    An element already recorded keeps its entry (sticky); only genuinely
+    new elements take the incoming source. Elements from an unsourced side
+    get no entry, so the projection drops them instead of promoting them.
+    """
+    by_digest: dict[str, dict[str, Any]] = {}
+    for item in existing:
+        if isinstance(item, dict) and item.get("digest"):
+            by_digest.setdefault(str(item["digest"]), item)
+    for item in incoming:
+        if isinstance(item, dict) and item.get("digest"):
+            by_digest.setdefault(str(item["digest"]), item)
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for value in merged_values or []:
+        digest = _digest_value(value)
+        if digest in seen:
+            continue
+        seen.add(digest)
+        found = by_digest.get(digest)
+        if found is not None:
+            out.append(dict(found))
+    return out
+
+
+def merge_claim_provenance(
+    existing: dict[str, dict[str, Any]],
+    incoming: dict[str, dict[str, Any]],
+    *,
+    merged_attrs: dict[str, AttrValue],
+    merged_facts: dict[str, Any],
+    existing_attrs: dict[str, AttrValue],
+    existing_facts: dict[str, Any],
+    incoming_attrs: dict[str, AttrValue],
+    incoming_facts: dict[str, Any],
+    retracted_at: dict[str, int] | None = None,
+    incoming_step: int = 0,
+) -> dict[str, dict[str, Any]]:
+    """Per-key claim source merge matching the attr/fact merge rules.
+
+    A claim entry only moves when its value actually moved. An unchanged
+    value keeps its entry (sticky) even when the latest write is measured;
+    a sticky-``True`` predicate that ignored an incoming ``False``, a fact
+    whose incoming value was ``None``, or a retraction-blocked older write
+    likewise leaves the existing entry in place. List values merge
+    per-element: recorded elements keep their source, only new elements
+    take the incoming one. Entries for retracted predicates are dropped.
+    Writes without a claim entry (no provenance) never erase a recorded one.
+    """
+    blocked = retracted_at or {}
+    merged: dict[str, dict[str, Any]] = {}
+    for claim_key, entry in existing.items():
+        if claim_key.startswith(CLAIM_ATTR_PREFIX):
+            if str(claim_key[len(CLAIM_ATTR_PREFIX) :]) in merged_attrs:
+                merged[claim_key] = dict(entry)
+        elif claim_key.startswith(CLAIM_FACT_PREFIX):
+            if str(claim_key[len(CLAIM_FACT_PREFIX) :]) in merged_facts:
+                merged[claim_key] = dict(entry)
+    for claim_key, entry in incoming.items():
+        if not isinstance(entry, dict):
+            continue
+        if claim_key.startswith(CLAIM_ATTR_PREFIX):
+            key = str(claim_key[len(CLAIM_ATTR_PREFIX) :])
+            if key not in merged_attrs:
+                continue
+            if key in blocked and incoming_step <= blocked[key]:
+                continue
+            if key not in incoming_attrs:
+                continue
+            arrived = incoming_attrs.get(key, _MISSING)
+            current = existing_attrs.get(key, _MISSING)
+            if current is not _MISSING and values_equal(arrived, current):
+                continue  # unchanged value keeps its source (sticky)
+            if not values_equal(merged_attrs[key], arrived):
+                continue  # not applied (sticky True); source stays
+            merged[claim_key] = dict(entry)
+        elif claim_key.startswith(CLAIM_FACT_PREFIX):
+            key = str(claim_key[len(CLAIM_FACT_PREFIX) :])
+            if key not in merged_facts:
+                continue
+            if key not in incoming_facts:
+                continue
+            arrived = incoming_facts.get(key, _MISSING)
+            if arrived is None:
+                continue  # None never erases; source stays
+            current = existing_facts.get(key, _MISSING)
+            if current is not _MISSING and values_equal(arrived, current):
+                continue  # unchanged value keeps its source (sticky)
+            if isinstance(arrived, list) and isinstance(current, list):
+                merged_list = merged_facts[key]
+                if not isinstance(merged_list, list):
+                    continue
+                old_elements = existing.get(claim_key, {}).get("elements", [])
+                new_elements = entry.get("elements", [])
+                if not isinstance(old_elements, list):
+                    old_elements = []
+                if not isinstance(new_elements, list):
+                    new_elements = []
+                merged[claim_key] = {
+                    **dict(entry),
+                    "value": _snapshot_value(merged_list),
+                    "elements": _merge_elements(old_elements, new_elements, merged_list),
+                }
+                continue
+            if not values_equal(merged_facts[key], arrived):
+                continue  # not applied; source stays
+            merged[claim_key] = dict(entry)
+    return merged
+
+
 def merge_properties(existing: dict[str, Any], incoming: dict[str, Any]) -> dict[str, Any]:
     """Fold a fresh observation into what the graph already holds.
 
@@ -448,9 +767,7 @@ def merge_properties(existing: dict[str, Any], incoming: dict[str, Any]) -> dict
     ignored, ``last_seen_step`` moves forward only.
     """
     merged: dict[str, Any] = {
-        key: value
-        for key, value in existing.items()
-        if key not in RESERVED_KEYS
+        key: value for key, value in existing.items() if key not in RESERVED_KEYS
     }
     for key, value in incoming.items():
         if key not in RESERVED_KEYS:
@@ -465,20 +782,37 @@ def merge_properties(existing: dict[str, Any], incoming: dict[str, Any]) -> dict
     incoming_seen = attrs_observed_at(incoming) or dict.fromkeys(
         attrs_of(incoming), last_seen_step(incoming)
     )
+    existing_attrs = attrs_of(existing)
+    incoming_attrs = attrs_of(incoming)
+    retracted_steps = _retracted_at(retractions)
+    incoming_step = last_seen_step(incoming)
     merged[ATTRS_KEY] = _merge_attrs(
-        attrs_of(existing),
-        attrs_of(incoming),
-        retracted_at=_retracted_at(retractions),
-        incoming_step=last_seen_step(incoming),
+        existing_attrs,
+        incoming_attrs,
+        retracted_at=retracted_steps,
+        incoming_step=incoming_step,
         seen_at=existing_seen,
     )
     merged[ATTRS_SEEN_KEY] = {
-        key: max(existing_seen.get(key, 0), incoming_seen.get(key, 0))
-        for key in merged[ATTRS_KEY]
+        key: max(existing_seen.get(key, 0), incoming_seen.get(key, 0)) for key in merged[ATTRS_KEY]
     }
-    merged[FACTS_KEY] = _merge_facts(facts_of(existing), facts_of(incoming))
+    existing_facts = facts_of(existing)
+    incoming_facts = facts_of(incoming)
+    merged[FACTS_KEY] = _merge_facts(existing_facts, incoming_facts)
     merged[PROVENANCE_KEY] = _cap_provenance(
         _union(provenance_of(existing), provenance_of(incoming))
+    )
+    merged[CLAIM_PROVENANCE_KEY] = merge_claim_provenance(
+        claim_provenance_of(existing),
+        claim_provenance_of(incoming),
+        merged_attrs=merged[ATTRS_KEY],
+        merged_facts=merged[FACTS_KEY],
+        existing_attrs=existing_attrs,
+        existing_facts=existing_facts,
+        incoming_attrs=incoming_attrs,
+        incoming_facts=incoming_facts,
+        retracted_at=retracted_steps,
+        incoming_step=incoming_step,
     )
 
     cleanup = _merge_cleanup(cleanup_of(existing), cleanup_of(incoming))
@@ -518,10 +852,14 @@ def apply_retraction(
     seen = attrs_observed_at(properties)
     seen.pop(key, None)
 
+    claims = claim_provenance_of(properties)
+    claims.pop(claim_key_for_attr(key), None)
+
     updated = dict(properties)
     updated[ATTRS_KEY] = attrs
     updated[RETRACTIONS_KEY] = retractions
     updated[ATTRS_SEEN_KEY] = seen
+    updated[CLAIM_PROVENANCE_KEY] = claims
     return updated, True
 
 

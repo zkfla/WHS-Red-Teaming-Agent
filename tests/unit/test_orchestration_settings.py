@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import pytest
+from pydantic import ValidationError
+
 from redteam.core.config import OrchestrationConfig
 from redteam.orchestration.settings import NODES_PER_TURN, RECURSION_SLACK, OrchestrationSettings
 
@@ -33,16 +36,13 @@ def test_recursion_limit_covers_the_whole_loop() -> None:
     assert OrchestrationSettings(max_steps=10, recursion_limit=42).effective_recursion_limit == 42
 
 
-def test_explicit_llm_first_mode_replaces_legacy_additive_planning() -> None:
-    settings = OrchestrationSettings.from_config(
-        OrchestrationConfig(planning_mode="llm_first")
-    )
-    assert settings.planning_mode == "llm_first"
+def test_llm_reasoning_is_required_in_every_config() -> None:
+    settings = OrchestrationSettings.from_config(OrchestrationConfig(llm_candidate_generation=True))
     assert settings.llm_candidate_generation is True
+    assert "planning_mode" not in type(settings).model_fields
 
 
-def test_legacy_generation_flag_maps_to_hybrid_mode() -> None:
-    settings = OrchestrationSettings.from_config(
-        OrchestrationConfig(llm_candidate_generation=True)
-    )
-    assert settings.planning_mode == "hybrid"
+@pytest.mark.parametrize("model", [OrchestrationConfig, OrchestrationSettings])
+def test_disabling_llm_reasoning_is_rejected(model) -> None:
+    with pytest.raises(ValidationError):
+        model(llm_candidate_generation=False)

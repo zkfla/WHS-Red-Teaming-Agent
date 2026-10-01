@@ -136,7 +136,8 @@ async def test_sqlite_restart_recovery(tmp_path) -> None:
     await first.create_mission(mission())
     await first.create_task(task("persisted", priority=9))
     second = SQLiteTaskGraphStore(path)
-    assert (await second.get_mission(MissionId("mission-1"))).status is MissionStatus.ACTIVE
+    restored = await second.get_mission(MissionId("mission-1"))
+    assert restored is not None and restored.status is MissionStatus.ACTIVE
     assert [str(v.task_id) for v in await second.list_tasks()] == ["persisted"]
 
 

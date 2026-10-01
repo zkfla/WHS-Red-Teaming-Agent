@@ -140,7 +140,8 @@ async def test_invocation_refreshes_discovery_snapshot_and_recovers() -> None:
     assert result.success is True
     assert adapter.invocations == 1
     assert adapter.health_calls == 1
-    assert gateway.get(TOOL_ID).health_status is ToolHealthStatus.HEALTHY
+    registered = gateway.get(TOOL_ID)
+    assert registered is not None and registered.health_status is ToolHealthStatus.HEALTHY
 
 
 async def test_invocation_blocks_when_refresh_reports_unhealthy() -> None:
@@ -154,7 +155,8 @@ async def test_invocation_blocks_when_refresh_reports_unhealthy() -> None:
     assert result.error.code == "tool_unhealthy"
     assert adapter.invocations == 0
     assert adapter.health_calls == 1
-    assert gateway.get(TOOL_ID).health_status is ToolHealthStatus.UNHEALTHY
+    registered = gateway.get(TOOL_ID)
+    assert registered is not None and registered.health_status is ToolHealthStatus.UNHEALTHY
 
 
 async def test_refresh_is_time_bounded_and_degrades_to_last_known_status() -> None:
@@ -166,7 +168,8 @@ async def test_refresh_is_time_bounded_and_degrades_to_last_known_status() -> No
     # The hung probe neither stalls nor denies the approved call.
     assert result.success is True
     assert adapter.invocations == 1
-    assert gateway.get(TOOL_ID).health_status is ToolHealthStatus.HEALTHY
+    registered = gateway.get(TOOL_ID)
+    assert registered is not None and registered.health_status is ToolHealthStatus.HEALTHY
     assert gateway.last_health_refresh(SERVER) is not None
 
 
@@ -178,7 +181,8 @@ async def test_probe_failure_is_not_an_authorization_or_execution_failure() -> N
 
     assert result.success is True
     assert adapter.invocations == 1
-    assert gateway.get(TOOL_ID).health_status is ToolHealthStatus.HEALTHY
+    registered = gateway.get(TOOL_ID)
+    assert registered is not None and registered.health_status is ToolHealthStatus.HEALTHY
 
 
 async def test_refresh_disabled_uses_the_discovery_snapshot() -> None:

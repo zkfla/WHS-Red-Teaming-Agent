@@ -16,7 +16,9 @@ from redteam.capability.servers.network import CapturedResponse, ResolvedTarget
 
 
 @pytest.fixture
-def policy() -> ServerPolicy:
+def policy(monkeypatch) -> ServerPolicy:
+    monkeypatch.setenv("TOKEN_A", "synthetic-a")
+    monkeypatch.setenv("TOKEN_B", "synthetic-b")
     return ServerPolicy.model_validate(
         {
             "targets": {

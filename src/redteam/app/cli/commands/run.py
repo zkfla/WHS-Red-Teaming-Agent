@@ -64,7 +64,6 @@ from redteam.orchestration.context import RuntimeDeps
 from redteam.orchestration.events import (
     AGENT_CONTEXT_PREPARED,
     AGENT_DECISION_RECORDED,
-    AGENT_NO_EXECUTABLE_CANDIDATES,
     AGENT_TURN_DECIDED,
     AUTHENTICATION_CHECK_DEFERRED,
     AUTHENTICATION_CHECKED,
@@ -85,6 +84,12 @@ Echo = Callable[[str], None]
 
 # Events worth a human's/CI's attention; TOOL_EXECUTION_STARTED and
 # AGENT_STARTED/FINISHED are structural noise for a single-line stream.
+# PlanningFailed is published by the planning node with payload
+# {kind, stage, error_type} but has no shared constant yet (that module
+# is owned elsewhere) -- the literal is kept here so a failed planning
+# turn still gets an effective line instead of vanishing from the stream.
+_PLANNING_FAILED = "PlanningFailed"
+
 _RENDERED_EVENTS = frozenset(
     {
         EventType.RUN_STARTED,
@@ -100,11 +105,9 @@ _RENDERED_EVENTS = frozenset(
         EventType.FINDING_VERIFIED,
         EventType.GRAPH_UPDATED,
         EventType.RUN_FINISHED,
-        # Not part of the Core vocabulary (redteam.orchestration.events) --
-        # a plain string, same as every EventType member; included so an
-        # agent silently producing zero executable candidates is visible
-        # by default, not only under --verbose (section 10).
-        AGENT_NO_EXECUTABLE_CANDIDATES,
+        # Planning failures (compile failure / budget exhaustion) are the
+        # production signal for "nothing executable came out of planning".
+        _PLANNING_FAILED,
         AGENT_TURN_DECIDED,
         CANDIDATE_GENERATED,
         CANDIDATE_REJECTED,
@@ -173,18 +176,14 @@ def _render_event(event: EventEnvelope, *, json_mode: bool) -> None:
             f"reason={payload.get('reason', 'unknown')}"
         )
         return
-    if event.event_type == AGENT_NO_EXECUTABLE_CANDIDATES:
+    if event.event_type == _PLANNING_FAILED:
         payload = event.payload
         print(
-            "no executable candidates: "
-            f"offered={payload.get('drafts_offered', 0)} "
-            f"rejected={len(payload.get('rejections', []) or [])}"
+            "planning failed: "
+            f"kind={payload.get('kind', 'unknown')} "
+            f"stage={payload.get('stage', 'unknown')} "
+            f"error={payload.get('error_type', 'unknown')}"
         )
-        for item in (payload.get("rejections", []) or [])[:3]:
-            if not isinstance(item, dict):
-                continue
-            field = f"({item['field']})" if item.get("field") else ""
-            print(f"  - {item.get('operation', 'unknown')}: {item.get('reason', 'unknown')}{field}")
         return
     if event.event_type == AGENT_TURN_DECIDED:
         payload = mask_secrets(event.payload)
@@ -193,8 +192,6 @@ def _render_event(event: EventEnvelope, *, json_mode: bool) -> None:
             print(f"[Reason] {payload['decision_summary']}")
         for item in (payload.get("assumptions") or [])[:3]:
             print(f"[Assumption] {item}")
-        if payload.get("candidate_source") == "recipe_fallback":
-            print("[Fallback] LLM proposal was not executable; using a safe recipe.")
         return
     fields = " ".join(f"{k}={v}" for k, v in mask_secrets(event.payload).items() if v is not None)
     print(f"[{event.event_type}] {fields}")
@@ -521,6 +518,11 @@ class OperatorConsole:
     # -- intent path (no tool, no policy) -------------------------------
 
     async def _apply_intent(self, text: str) -> None:
+        from redteam.app.cli.input_router import command
+
+        if self._conversation is not None and command(text) is None:
+            await self._handle_chat_fallback(text)
+            return
         if self._service is None:
             self._echo(
                 renderer.operator_notice_text("operator intent channel is not wired in this run")
@@ -565,25 +567,42 @@ class OperatorConsole:
             return
         status = await service.status(mission_id=mission_id)
         explanation = await service.explain(mission_id=mission_id, run_id=self._identity.run_id)
-        decision = await conversation.decide(
-            text,
-            engagement_name=self._engagement_name,
-            scope=self._scope,
-            tools=catalog_tool_labels(self._deps.tool_catalog),
-            session_context=f"{status.summary} {explanation.summary}",
-            run_active=True,
-        )
+        try:
+            decision = await conversation.decide(
+                text,
+                engagement_name=self._engagement_name,
+                scope=self._scope,
+                tools=catalog_tool_labels(self._deps.tool_catalog),
+                session_context=f"{status.summary} {explanation.summary}",
+                run_active=True,
+            )
+        except Exception as exc:  # noqa: BLE001 - chat is advisory; the active run continues
+            logging.getLogger(__name__).warning(
+                "Operator chat interpretation failed (%s)", type(exc).__name__
+            )
+            self._echo(
+                renderer.operator_notice_text(
+                    "could not interpret that as guidance; the run continues"
+                )
+            )
+            return
         self._echo(renderer.operator_assistant_text(decision))
-        if decision.mode not in {"guidance", "execute"}:
+        if decision.mode != "guidance":
+            if decision.mode == "execute":
+                self._echo(
+                    "새 조사 요청은 현재 Mission 지시로 전달하지 않습니다. "
+                    "대화 세션에서 시작하세요."
+                )
             return
         guidance = decision.guidance or decision.objective or text
-        guided = await service.receive_and_apply(
-            f"alternative method requested: {guidance}",
+        # Frozen explicit-guidance entry point (W4): records the raw
+        # instruction as GUIDANCE without keyword reclassification.
+        guided = await service.receive_guidance_and_apply(
+            guidance,
             mission_id=mission_id,
             run_id=self._identity.run_id,
             publisher=self._publisher(),
             source="operator_chat",
-            allow_guidance=True,
         )
         self._echo(renderer.operator_intent_text(guided))
 
@@ -594,6 +613,62 @@ class OperatorConsole:
             return
         report = await service.status(mission_id=mission_id)
         self._echo(renderer.operator_status_text(report))
+
+    async def session_context(self) -> str:
+        """Read-only context for CLI classification; never writes a user intent."""
+        if self._service is None or self._identity.mission_id is None:
+            return "실행 채널 준비 중"
+        report = await self._service.status(mission_id=self._identity.mission_id)
+        explanation = await self._service.explain(
+            mission_id=self._identity.mission_id, run_id=self._identity.run_id
+        )
+        return (
+            renderer.operator_status_text(report)
+            + "\n"
+            + renderer.operator_explanation_text(explanation)
+        )
+
+    async def dispatch(self, kind: str, value: str) -> tuple[bool, str]:
+        """Already-routed requests only. Errors propagate as uncertain receipts.
+
+        The session owns stdin and mutation task lifetimes. This adapter only
+        calls the existing application services, not tools or policy evaluation.
+        """
+        if kind in {"approve", "deny"}:
+            if not value or value != self._pending_approval_id:
+                return False, "승인 대상이 변경되었거나 없습니다."
+            resolver = getattr(self._deps.control_plane, "resolve_approval", None)
+            if resolver is None:
+                return False, "현재 Control Plane은 세션 내 승인 처리를 지원하지 않습니다."
+            status = ApprovalStatus.APPROVED if kind == "approve" else ApprovalStatus.REJECTED
+            result = await resolver(value, status, self._resolved_by)
+            if str(result.approval_id) != value or result.status != status:
+                raise RuntimeError("approval response did not acknowledge this request")
+            self.clear_pending_approval()
+            return (
+                True,
+                f"승인 결정 수락: {value} · {status.value} — action 실행 성공과 별개입니다.",
+            )
+        if self._service is None or self._identity.mission_id is None:
+            return False, "현재 Mission 입력 채널이 없습니다."
+        kwargs = dict(
+            mission_id=self._identity.mission_id,
+            run_id=self._identity.run_id,
+            publisher=self._publisher(),
+        )
+        if kind == "guidance":
+            application = await self._service.receive_guidance_and_apply(
+                value, **kwargs, source="operator_chat"
+            )
+        else:
+            application = await self._service.receive_and_apply(
+                (kind + " " + value).strip(), **kwargs, allow_guidance=False
+            )
+        return application.applied, (
+            f"{application.outcome} — 지시 수락과 Agent의 실제 반영은 별개입니다."
+            if application.applied
+            else str(application.outcome)
+        )
 
     async def _show_explanation(self) -> None:
         service = self._service
@@ -691,6 +766,7 @@ async def execute(
     allow_operator_input: bool = False,
     wait_for_external_approval: bool = False,
     conversation: ConversationAssistant | None = None,
+    session_channel: Any | None = None,
 ) -> RuntimeState:
     """Phase 2 of the shared core: subscribe -> run -> approval wait.
     Callers own exception handling/exit codes and choose the renderer
@@ -714,7 +790,7 @@ async def execute(
     identity = RuntimeIdentity()
     operator_console: OperatorConsole | None = None
 
-    if allow_operator_input:
+    if allow_operator_input or session_channel is not None:
         engagement_scope = getattr(engagement, "scope", None)
         scope_values = (
             [
@@ -735,8 +811,21 @@ async def execute(
             scope=scope_values,
         )
 
+        observing = True
+
         async def _observing_handler(event: EventEnvelope) -> None:
+            if not observing:
+                # The port has no unsubscribe. Closed callbacks never steer a new run.
+                if session_channel is not None and (
+                    "Failed" in event.event_type or event.event_type == EventType.ACTION_DENIED
+                ):
+                    await on_event(event)
+                return
+            if identity.run_id is not None and event.run_id != identity.run_id:
+                return
             identity.observe(event)
+            if session_channel is not None:
+                session_channel.observe(event)
             await on_event(event)
 
         await deps.event_bus.subscribe("*", _observing_handler)
@@ -745,8 +834,18 @@ async def execute(
     echo(f"Engagement: {engagement.name}")
 
     if operator_console is not None:
-        operator_console.start()
-        echo(renderer.operator_welcome_text(live=operator_console.input_available))
+        if session_channel is not None:
+            session_channel.attach(operator_console)
+        else:
+            operator_console.start()
+            echo(renderer.operator_welcome_text(live=operator_console.input_available))
+
+    def input_live() -> bool:
+        return (
+            session_channel.input_available
+            if session_channel is not None
+            else operator_console is not None and operator_console.input_available
+        )
 
     try:
         final = await run_engagement(
@@ -756,42 +855,76 @@ async def execute(
             objective=objective,
         )
 
-        while final.termination_reason in {
-            TerminationReason.APPROVAL_PENDING,
-            TerminationReason.OPERATOR_PAUSED,
-        }:
-            if final.termination_reason == TerminationReason.OPERATOR_PAUSED:
-                live = operator_console is not None and operator_console.input_available
-                echo(renderer.operator_paused_text(str(final.run_id), live=live))
-                if not live:
-                    # No in-session channel: never block waiting for a
-                    # 'resume' that can never arrive. The Mission stays
-                    # paused and resumable from a real interactive session.
-                    break
-                final = await _wait_for_pause(deps, final, echo=echo)
-                continue
-            console = operator_console
-            live = console is not None and console.input_available
-            if non_interactive or (not live and not wait_for_external_approval):
-                # Without an explicit external-approval watch, a script/CI
-                # or JSON session returns its durable pending checkpoint.
-                echo(
-                    renderer.operator_approval_pending_text(
-                        str(final.pending_approval_id), str(final.run_id)
-                    )
-                )
-                break
-            if live and console is not None:
-                console.set_pending_approval(final.pending_approval_id)
-            try:
-                final = await _wait_for_approval(deps, final, echo=echo, in_session=live)
-            finally:
-                if live and console is not None:
-                    console.clear_pending_approval()
+        final = await wait_for_suspensions(
+            final,
+            deps,
+            operator_console=operator_console,
+            input_live=input_live,
+            echo=echo,
+            non_interactive=non_interactive,
+            wait_for_external_approval=wait_for_external_approval,
+            session_channel=session_channel,
+        )
     finally:
-        if operator_console is not None:
+        if session_channel is not None:
+            await session_channel.detach()
+        elif operator_console is not None:
             await operator_console.aclose()
+        observing = False
 
+    return final
+
+
+async def wait_for_suspensions(
+    final,
+    deps,
+    *,
+    operator_console,
+    input_live,
+    echo,
+    non_interactive=False,
+    wait_for_external_approval=False,
+    session_channel=None,
+):
+    """Shared CLI watch path for newly-started and durably resumed runs."""
+    while final.termination_reason in {
+        TerminationReason.APPROVAL_PENDING,
+        TerminationReason.OPERATOR_PAUSED,
+    }:
+        if session_channel is not None:
+            session_channel.suspended(final)
+        if final.termination_reason == TerminationReason.OPERATOR_PAUSED:
+            live = input_live()
+            echo(renderer.operator_paused_text(str(final.run_id), live=live))
+            if not live:
+                # No in-session channel: never block waiting for a
+                # 'resume' that can never arrive. The Mission stays
+                # paused and resumable from a real interactive session.
+                break
+            final = await _wait_for_pause(deps, final, echo=echo)
+            if session_channel is not None:
+                session_channel.resumed()
+            continue
+        console = operator_console
+        live = input_live()
+        if non_interactive or (not live and not wait_for_external_approval):
+            # Without an explicit external-approval watch, a script/CI
+            # or JSON session returns its durable pending checkpoint.
+            echo(
+                renderer.operator_approval_pending_text(
+                    str(final.pending_approval_id), str(final.run_id)
+                )
+            )
+            break
+        if live and console is not None:
+            console.set_pending_approval(final.pending_approval_id)
+        try:
+            final = await _wait_for_approval(deps, final, echo=echo, in_session=live)
+        finally:
+            if live and console is not None:
+                console.clear_pending_approval()
+            if session_channel is not None:
+                session_channel.resumed()
     return final
 
 
@@ -824,6 +957,29 @@ async def _run(args: argparse.Namespace, *, mcp_stack: AsyncExitStack) -> int:
     echo: Echo = (lambda _line: None) if args.json else print
 
     allow_operator_input = not args.non_interactive and not getattr(args, "json", False)
+    if allow_operator_input and _stdin_is_interactive():
+        from pathlib import Path
+
+        from rich.console import Console
+
+        from redteam.app.bootstrap import build_llm_client
+        from redteam.app.cli.interactive_commands import InteractiveSession
+        from redteam.app.cli.session_runtime import run_session
+
+        session = InteractiveSession(
+            config.engagement, config.llm, engagement_path=Path(args.engagement_path)
+        )
+        result = await run_session(
+            Console(),
+            config,
+            session=session,
+            conversation=ConversationAssistant(build_llm_client(config.llm)),
+            objective=getattr(args, "objective", None)
+            or f"Assess the declared scope of {config.engagement.name}",
+            built=(engagement, deps),
+            single_run=True,
+        )
+        return result.exit_code
     try:
         final = await execute(
             engagement,
@@ -856,7 +1012,11 @@ async def _wait_for_approval(
         # The same-session operator console is live; approving here resolves
         # the *exact* Approval this run is already suspended on (no replan).
         echo(renderer.operator_approval_prompt_text(approval_id))
-    echo("Waiting for resolution (Ctrl+C stops watching; the Run stays pending)...")
+    echo(
+        "승인 대기 중 · /stop 중단 요청 · /exit 세션 종료"
+        if in_session
+        else "Waiting for resolution (Ctrl+C stops watching; the Run stays pending)..."
+    )
 
     resume_settings = deps.settings.model_copy(update={"thread_id": str(final.run_id)})
     resume_runner = AgentLoopRunner(deps, settings=resume_settings)

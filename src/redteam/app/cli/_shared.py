@@ -101,18 +101,16 @@ def load_app_config_for_run(engagement_path: str, *, require_llm: bool = True) -
     need.
     """
     engagement_config = load_engagement_config(engagement_path)
-    llm = LLMConfig.from_environment() if require_llm else LLMConfig()
-    configured_mode = os.environ.get("REDTEAM_PLANNING_MODE")
-    planning_mode = configured_mode or ("llm_first" if llm.provider != "fake" else "playbook_only")
+    from redteam.app.mcp_deployment import synchronize_deployment
+
+    server_ids = mcp_server_ids_from_environment()
+    engagement_config = synchronize_deployment(engagement_config, server_ids)
     return AppConfig(
         engagement=engagement_config,
-        llm=llm,
-        orchestration=OrchestrationConfig(
-            planning_mode=planning_mode,
-            llm_candidate_generation=planning_mode != "playbook_only",
-        ),
+        llm=LLMConfig.from_environment() if require_llm else LLMConfig(),
+        orchestration=OrchestrationConfig.from_environment(),
         capability=CapabilityConfig(
-            mcp_servers=mcp_server_ids_from_environment(),
+            mcp_servers=server_ids,
             methodology=MethodologyConfig.from_environment(),
         ),
     )

@@ -2,21 +2,15 @@
 
 from __future__ import annotations
 
-from redteam.app.bootstrap import build_runtime_deps, run_engagement
+from redteam.app.bootstrap import run_engagement
 from redteam.core.contracts.events import EventEnvelope, EventType
 from redteam.core.ids import RunId
-from redteam.orchestration.events import (
-    HYPOTHESIS_RESOLVED,
-    MCP_TOOL_SELECTED,
-    REPLAN_TRIGGERED,
-    REPORT_PROJECTED,
-)
-from tests.integration.test_end_to_end import _engagement
+from redteam.orchestration.events import HYPOTHESIS_RESOLVED, REPLAN_TRIGGERED, REPORT_PROJECTED
+from tests.integration.test_end_to_end import _world
 
 
 async def _run_with_events(tmp_path) -> tuple[list[EventEnvelope], RunId]:
-    engagement = _engagement()
-    deps = await build_runtime_deps(engagement, evidence_dir=tmp_path)
+    engagement, deps, _gateway = _world()
     events: list[EventEnvelope] = []
 
     async def collect(event: EventEnvelope) -> None:
@@ -35,13 +29,13 @@ async def test_action_event_chain_keeps_correlation_and_direct_causation(tmp_pat
         if event.event_type
         in {
             EventType.HYPOTHESIS_CREATED,
-            MCP_TOOL_SELECTED,
             EventType.ACTION_PROPOSED,
             EventType.POLICY_EVALUATED,
             EventType.ACTION_APPROVED,
             EventType.TOOL_EXECUTION_STARTED,
             EventType.TOOL_EXECUTION_FINISHED,
             EventType.EVIDENCE_CREATED,
+            "ObservationRecorded",
             HYPOTHESIS_RESOLVED,
             EventType.GRAPH_UPDATED,
         }
@@ -110,4 +104,6 @@ async def test_run_finished_cites_the_last_event_and_keeps_run_correlation(tmp_p
     assert run_started.correlation_id == str(run_id)
     assert run_finished.correlation_id == str(run_id)
     assert run_finished.causation_id == events[-2].event_id
-    assert report_projected.causation_id == mission_updated.event_id
+    report_index = events.index(report_projected)
+    assert report_projected.causation_id == events[report_index - 1].event_id
+    assert events.index(mission_updated) < report_index

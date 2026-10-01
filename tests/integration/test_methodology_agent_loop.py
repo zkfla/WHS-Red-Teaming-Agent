@@ -13,6 +13,7 @@ from pathlib import Path
 
 import pytest
 
+from examples.methodology_agent_demo import RecordingLLM
 from redteam.app.bootstrap import build_application, run_engagement
 from redteam.app.methodology import load_reference_library
 from redteam.attack_graph.service import AttackGraphService
@@ -126,20 +127,6 @@ def deployment(tmp_path, monkeypatch, *, real=False):
     ), workspace
 
 
-class RecordingLLM:
-    def __init__(self):
-        self.calls = []
-
-    async def complete_structured(self, *, messages, response_schema, system=None, **kwargs):
-        self.calls.append((messages, system))
-        return {
-            "intent": "finish",
-            "response": "참고 자료 확인을 마쳤습니다.",
-            "decision_summary": "검증한 합성 자료만 참고했습니다.",
-            "actions": [],
-        }
-
-
 async def application(tmp_path, monkeypatch, stack, *, real=False, denied=False):
     method, workspace = deployment(tmp_path, monkeypatch, real=real)
     config = AppConfig.model_validate(
@@ -165,7 +152,6 @@ async def application(tmp_path, monkeypatch, stack, *, real=False, denied=False)
         audit_dir=tmp_path / "audit",
         approval_dir=tmp_path / "approvals",
         orchestration_settings=OrchestrationSettings(
-            planning_mode="llm_first",
             max_steps=250,
             checkpoint_backend="memory",
             enforce_verification_reserve=False,
@@ -207,7 +193,8 @@ async def test_agent_loads_reference_via_mcp_then_passes_data_to_web_llm(
         )
         assert final.run_id == RunId("run-test")
         assert final.actions_executed > 1  # real pagination, not a direct host file read
-        assert all(r.source_id == "analysis.read_file" for r in records)
+        tool_records = [r for r in records if r.metadata.get("tool_result")]
+        assert tool_records and all(r.source_id == "analysis.read_file" for r in tool_records)
         assert llm.calls, (final.termination_reason, final.actions_executed, final.finished_agents)
         prompts = [json.dumps(m, ensure_ascii=False) for m, _s in llm.calls]
         assert any("Untrusted methodology reference DATA" in p for p in prompts)

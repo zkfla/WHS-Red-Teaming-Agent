@@ -558,3 +558,121 @@ def map_web_http_request(
         nodes.extend(identity_nodes)
         edges.extend(identity_edges)
     return GraphMutation(nodes=nodes, edges=edges)
+
+
+_SESSION_LIST_LIMIT = 100
+
+
+def map_web_session_list(
+    *, target: AnyTarget, arguments: dict[str, Any], result: ToolResult
+) -> GraphMutation:
+    """Record operator-provisioned session bindings as identities.
+
+    Real output shape (verified directly against
+    ``redteam.capability.servers.web_http.session_list``, the only place
+    this tool's ``output`` dict is built)::
+
+        {"sessions": [{"session_ref": str, "target_ref": str, "principal_ref": str}, ...]}
+
+    Each returned item becomes a PRINCIPAL/CREDENTIAL pair with the same
+    ``session_for`` identity relationship the HTTP mappers use -- built
+    with the existing ``session_*`` identity helpers, never a new schema.
+    No ``CAN_ACCESS`` edge is created: this tool reports which test
+    sessions the backend provisioned, not an authentication success. That
+    distinction is carried by ``binding_kind``/``identity_basis`` alone.
+    Only actually returned items are processed; an empty list yields an
+    empty mutation, and only references are stored, never secret values.
+    """
+
+    if not result.success or not isinstance(result.output, dict):
+        return GraphMutation()
+    raw_sessions = result.output.get("sessions")
+    if not isinstance(raw_sessions, list) or len(raw_sessions) > _SESSION_LIST_LIMIT:
+        return GraphMutation()
+
+    bindings: dict[tuple[str, str], str | None] = {}
+    conflicted: set[tuple[str, str]] = set()
+    for item in raw_sessions:
+        if not isinstance(item, dict):
+            continue
+        target_ref = _safe_reference(item.get("target_ref"))
+        session_ref = _safe_reference(item.get("session_ref"))
+        if target_ref is None or session_ref is None:
+            continue
+        key = (target_ref, session_ref)
+        if key in conflicted:
+            continue
+        principal = _safe_reference(item.get("principal_ref"))
+        if key in bindings:
+            if bindings[key] != principal:
+                del bindings[key]
+                conflicted.add(key)
+        else:
+            bindings[key] = principal
+
+    nodes: list[NodeMutation] = []
+    edges: list[EdgeMutation] = []
+    for (target_ref, session_ref), principal in bindings.items():
+        principal_id = session_principal_node_id(target_ref, session_ref)
+        credential_id = session_credential_node_id(target_ref, session_ref)
+        principal_facts: dict[str, Any] = {
+            "target_ref": target_ref,
+            "session_refs": [session_ref],
+        }
+        observation: dict[str, Any] = {
+            "kind": "provisioned_session_binding",
+            "context_key": deterministic_key(
+                "provisioned-session-binding", target_ref, session_ref
+            ),
+            "source_tool": "web.session_list",
+            "target_ref": target_ref,
+            "session_ref": session_ref,
+            "binding_kind": "provisioned",
+            "identity_basis": "provisioned_binding",
+            "verdict": "observation_only",
+        }
+        if principal is not None:
+            principal_facts["principal_ref"] = principal
+            observation["principal_ref"] = principal
+        nodes.append(
+            NodeMutation(
+                node_type=GraphNodeType.PRINCIPAL,
+                node_id=principal_id,
+                attrs={
+                    "operator_managed_session": True,
+                    "provisioned_binding": True,
+                },
+                facts=principal_facts,
+                labels=["observed-session-principal", "observed-by:web.session_list"],
+                observations=[observation],
+            )
+        )
+        nodes.append(
+            NodeMutation(
+                node_type=GraphNodeType.CREDENTIAL,
+                node_id=credential_id,
+                attrs={"reference_only": True, "provisioned_binding": True},
+                facts={
+                    "target_ref": target_ref,
+                    "session_ref": session_ref,
+                    "credential_kind": "session_reference",
+                },
+                labels=[
+                    "operator-managed-session-reference",
+                    "observed-by:web.session_list",
+                ],
+            )
+        )
+        edges.append(
+            EdgeMutation(
+                GraphEdgeType.RELATED_TO,
+                credential_id,
+                principal_id,
+                {
+                    "relation": "session_for",
+                    "binding_kind": "provisioned",
+                    "identity_basis": "provisioned_binding",
+                },
+            )
+        )
+    return GraphMutation(nodes=nodes, edges=edges)

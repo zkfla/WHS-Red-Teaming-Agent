@@ -1,0 +1,937 @@
+"""Recovery from stored raw results -- never by re-running a tool.
+
+VERIFY or UPDATE can fail *after* the raw ToolResult was preserved on the
+evidence record (a crashing verifier, a mapper meeting an output shape it
+was not written for). The tool already ran -- its side effects happened --
+so recovery replays the stored payload through verification and
+normalization again instead of invoking anything.
+
+Whether the tool ran at all is answered from the work ledger and the tool
+state first (see is_execution_ambiguous); a missing or stamped result says
+nothing by itself. Mapping failures leave an append-only companion record
+next to the original through record_mapping_failure -- the original record
+is never rewritten.
+"""
+
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from typing import Any
+
+from redteam.attack_graph.identity import node_id_for_target
+from redteam.attack_graph.predicates import Confidence, Provenance
+from redteam.attack_graph.service import HYPOTHESIS_INCONCLUSIVE
+from redteam.core.contracts.action import ActionProposal
+from redteam.core.contracts.evidence import EvidenceRecord
+from redteam.core.contracts.tool import ToolResult
+from redteam.core.convert import digest_payload
+from redteam.core.enums import EvidenceSourceType, Verdict
+from redteam.core.ids import EvidenceId, new_id
+from redteam.orchestration.agents.base import PlanStep
+from redteam.orchestration.analysis import (
+    VerificationRequest,
+    append_review_receipt,
+    hypothesis_status_for_assessment,
+    resolve_claim_for_review,
+    session_list_pairs,
+)
+from redteam.orchestration.findings import FindingPromoter, PromotionRequest
+from redteam.orchestration.service_status import severity_for
+
+__all__ = [
+    "is_execution_ambiguous",
+    "reprocess_evidence",
+    "record_mapping_failure",
+    "record_recovery_note",
+    "recovery_report",
+]
+
+# Raw payload keys, newest first. Mirrors the reader so the two agree.
+_RAW_KEYS = ("tool_result", "raw_tool_result")
+
+
+def is_execution_ambiguous(result: ToolResult | None) -> bool:
+    """True when the caller must check the ledger and tool state first.
+
+    A missing result, or one stamped with an orchestration-side exception,
+    says nothing about whether the tool ran -- reprocessing would be
+    guessing. Returns False only when a real tool payload is in hand.
+    """
+    if result is None:
+        return True
+    return bool(
+        result.metadata.get("orchestration_exception")
+        or result.metadata.get("verification_exception")
+    )
+
+
+def _stored_raw(record: EvidenceRecord) -> Any | None:
+    for key in _RAW_KEYS:
+        raw = record.metadata.get(key)
+        if raw is not None:
+            return raw
+    return None
+
+
+def _clean_recovery_identity(value: Any) -> str | None:
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
+
+
+async def _recovery_alias_grounded(
+    *,
+    evidence_store: Any,
+    graph_service: Any,
+    run_id: str,
+    target_ref: str,
+    session_name: str,
+    principal_name: str,
+    arguments_target_ref: str | None = None,
+) -> bool:
+    from redteam.orchestration.analysis import _session_alias_grounded
+
+    return await _session_alias_grounded(
+        evidence_store=evidence_store,
+        graph_service=graph_service,
+        run_id=run_id,
+        target_ref=target_ref,
+        session_name=session_name,
+        principal_name=principal_name,
+        arguments_target_ref=arguments_target_ref,
+    )
+
+
+def _has_exact_recovery_proof(
+    meta: dict[str, Any],
+    raw: dict[str, Any],
+    claimed_accounts: set[str],
+    stored_proposal: dict[str, Any] | None,
+) -> bool:
+    """Exact structural identity equality only; never bare or substring."""
+    cleaned_claimed = {
+        str(item).strip() for item in (claimed_accounts or set()) if str(item).strip()
+    }
+    if not cleaned_claimed:
+        return False
+    args = stored_proposal.get("arguments") if isinstance(stored_proposal, dict) else {}
+    if not isinstance(args, dict):
+        args = {}
+    expected_principals = set(cleaned_claimed)
+    for key in ("principal_ref", "principal", "first_principal_ref", "second_principal_ref"):
+        cleaned = _clean_recovery_identity(args.get(key))
+        if cleaned is not None:
+            expected_principals.add(cleaned)
+    expected_sessions: set[str] = set()
+    for key in ("session_ref", "first_session_ref", "second_session_ref"):
+        cleaned = _clean_recovery_identity(args.get(key))
+        if cleaned is not None:
+            expected_sessions.add(cleaned)
+    raw_principals: set[str] = set()
+    raw_sessions: set[str] = set()
+    http_obs = meta.get("http_observation")
+    if isinstance(http_obs, dict):
+        cleaned = _clean_recovery_identity(http_obs.get("session_ref"))
+        if cleaned is not None:
+            raw_sessions.add(cleaned)
+    comparison = meta.get("session_comparison")
+    comparison_dict: dict[str, Any] | None = comparison if isinstance(comparison, dict) else None
+    if comparison_dict is not None:
+        for key in ("first_session_ref", "second_session_ref"):
+            cleaned = _clean_recovery_identity(comparison_dict.get(key))
+            if cleaned is not None:
+                raw_sessions.add(cleaned)
+        for key in ("first_principal_ref", "second_principal_ref"):
+            cleaned = _clean_recovery_identity(comparison_dict.get(key))
+            if cleaned is not None:
+                raw_principals.add(cleaned)
+    try:
+        output = raw.get("output") if isinstance(raw, dict) else None
+    except Exception:
+        output = None
+    if isinstance(output, dict):
+        for key in ("session_ref", "first_session_ref", "second_session_ref"):
+            cleaned = _clean_recovery_identity(output.get(key))
+            if cleaned is not None:
+                raw_sessions.add(cleaned)
+        for key in ("principal_ref", "first_principal_ref", "second_principal_ref"):
+            cleaned = _clean_recovery_identity(output.get(key))
+            if cleaned is not None:
+                raw_principals.add(cleaned)
+        for nested_key in ("first", "second", "authenticated", "anonymous"):
+            nested = output.get(nested_key)
+            if isinstance(nested, dict):
+                for key in ("session_ref", "session"):
+                    cleaned = _clean_recovery_identity(nested.get(key))
+                    if cleaned is not None:
+                        raw_sessions.add(cleaned)
+                cleaned = _clean_recovery_identity(nested.get("principal_ref"))
+                if cleaned is not None:
+                    raw_principals.add(cleaned)
+    if comparison_dict is not None:
+        first_principal = _clean_recovery_identity(comparison_dict.get("first_principal_ref"))
+        second_principal = _clean_recovery_identity(comparison_dict.get("second_principal_ref"))
+        if first_principal is not None or second_principal is not None:
+            if not expected_principals:
+                return False
+            for observed in (first_principal, second_principal):
+                if observed is not None and observed not in expected_principals:
+                    return False
+            if first_principal is None or second_principal is None:
+                return False
+        first_session = _clean_recovery_identity(comparison_dict.get("first_session_ref"))
+        second_session = _clean_recovery_identity(comparison_dict.get("second_session_ref"))
+        if (first_session is not None or second_session is not None) and expected_sessions:
+            for observed in (first_session, second_session):
+                if observed is not None and observed not in expected_sessions:
+                    return False
+    args_target = args.get("target_ref") if isinstance(args, dict) else None
+    row_sessions, row_principals, _ = session_list_pairs(
+        output, args_target if isinstance(args_target, str) else None
+    )
+    raw_sessions |= row_sessions
+    raw_principals |= row_principals
+    return cleaned_claimed <= (raw_principals | (raw_sessions & expected_sessions))
+
+
+async def reprocess_evidence(
+    *,
+    evidence_id: str,
+    run_id: str,
+    evidence_store: Any,
+    graph_service: Any,
+    verifier: Any,
+    result_mappers: Any | None = None,
+) -> dict:
+    """Replay one preserved result through meaning review and the graph.
+
+    This is what the root engine's TurnDecision mode "recover_evidence"
+    calls after a verification or normalization failure: the tool already
+    ran, so the only inputs are the raw ToolResult dict and the original
+    proposal and plan step, all preserved on the evidence record itself.
+    The tool gateway is never touched.
+
+    The verdict comes only from the passed verifier (the structured LLM
+    reviewer): no deterministic verdict is produced here, and a negative
+    result is refuted only through that meaning review with the raw
+    payload intact. The outcome lands back in the graph -- hypothesis
+    resolution, an optional promoted finding, replayed mapper mutations --
+    and as an append-only companion note ("recovery_result") next to the
+    original record, which is never rewritten.
+
+    Status is one of "ok" / "not_found" / "run_mismatch" / "no_raw" /
+    "invalid_raw" / "no_proposal" / "invalid_proposal" / "no_canonical" /
+    "link_mismatch" / "anonymous_blocked" / "no_account_proof". Lookup
+    failures ("not_found", "run_mismatch", "no_raw") write nothing;
+    everything from "invalid_raw" on leaves a companion note behind.
+    The tool gateway is never called here; only the stored payload, the
+    passed verifier, the graph, and the mappers are touched.
+    """
+    record = await evidence_store.get(evidence_id)
+    if record is None:
+        return {
+            "status": "not_found",
+            "evidence_id": str(evidence_id),
+            "requested_run_id": str(run_id),
+        }
+    if str(record.run_id) != str(run_id):
+        return {
+            "status": "run_mismatch",
+            "evidence_id": str(evidence_id),
+            "requested_run_id": str(run_id),
+            "actual_run_id": str(record.run_id),
+        }
+    raw = _stored_raw(record)
+    if raw is None:
+        return {
+            "status": "no_raw",
+            "evidence_id": str(evidence_id),
+            "requested_run_id": str(run_id),
+        }
+    try:
+        result = ToolResult.model_validate(raw)
+    except Exception as exc:  # noqa: BLE001 - a corrupt payload is data, not a crash
+        companion = await record_recovery_note(
+            evidence_store=evidence_store,
+            run_id=record.run_id,
+            engagement_id=record.engagement_id,
+            source_evidence_id=str(record.evidence_id),
+            note="reprocessing failed: stored raw result unreadable (" + type(exc).__name__ + ")",
+            action_id=record.action_id,
+            invocation_id=record.invocation_id,
+            hypothesis_id=record.hypothesis_id,
+        )
+        return {
+            "status": "invalid_raw",
+            "evidence_id": str(evidence_id),
+            "requested_run_id": str(run_id),
+            "error": type(exc).__name__,
+            "companion_evidence_id": str(companion.evidence_id),
+        }
+    stored_proposal = record.metadata.get("proposal")
+    if not isinstance(stored_proposal, dict):
+        companion = await record_recovery_note(
+            evidence_store=evidence_store,
+            run_id=record.run_id,
+            engagement_id=record.engagement_id,
+            source_evidence_id=str(record.evidence_id),
+            note="reprocessing failed: no stored proposal to replay from",
+            action_id=record.action_id,
+            invocation_id=record.invocation_id,
+            hypothesis_id=record.hypothesis_id,
+        )
+        return {
+            "status": "no_proposal",
+            "evidence_id": str(evidence_id),
+            "requested_run_id": str(run_id),
+            "companion_evidence_id": str(companion.evidence_id),
+        }
+    try:
+        proposal = ActionProposal.model_validate(stored_proposal)
+    except Exception as exc:  # noqa: BLE001 - a corrupt proposal is data, not a crash
+        companion = await record_recovery_note(
+            evidence_store=evidence_store,
+            run_id=record.run_id,
+            engagement_id=record.engagement_id,
+            source_evidence_id=str(record.evidence_id),
+            note="reprocessing failed: stored proposal unreadable (" + type(exc).__name__ + ")",
+            action_id=record.action_id,
+            invocation_id=record.invocation_id,
+            hypothesis_id=record.hypothesis_id,
+        )
+        return {
+            "status": "invalid_proposal",
+            "evidence_id": str(evidence_id),
+            "requested_run_id": str(run_id),
+            "error": type(exc).__name__,
+            "companion_evidence_id": str(companion.evidence_id),
+        }
+    step = None
+    step_dump = record.metadata.get("plan_step")
+    step_degraded = False
+    if isinstance(step_dump, dict):
+        try:
+            step = PlanStep.model_validate(step_dump)
+        except Exception:  # noqa: BLE001 - replay continues without step context
+            step_degraded = True
+    expectation = step.expectation if step is not None else None
+    meta = record.metadata if isinstance(record.metadata, dict) else {}
+    canonical_value = str(
+        meta.get("canonical_operation") or meta.get("operation_key") or ""
+    ).strip()
+    if not canonical_value:
+        companion = await record_recovery_note(
+            evidence_store=evidence_store,
+            run_id=record.run_id,
+            engagement_id=record.engagement_id,
+            source_evidence_id=str(record.evidence_id),
+            note=(
+                "reprocessing blocked: no canonical operation proof "
+                "(bare operation alone proves nothing)"
+            ),
+            action_id=record.action_id,
+            invocation_id=record.invocation_id,
+            hypothesis_id=record.hypothesis_id,
+        )
+        return {
+            "status": "no_canonical",
+            "evidence_id": str(evidence_id),
+            "requested_run_id": str(run_id),
+            "companion_evidence_id": str(companion.evidence_id),
+        }
+    if str(raw.get("action_id", "")).strip() != str(record.action_id or "").strip():
+        companion = await record_recovery_note(
+            evidence_store=evidence_store,
+            run_id=record.run_id,
+            engagement_id=record.engagement_id,
+            source_evidence_id=str(record.evidence_id),
+            note="reprocessing blocked: preserved raw result answers another action",
+            action_id=record.action_id,
+            invocation_id=record.invocation_id,
+            hypothesis_id=record.hypothesis_id,
+        )
+        return {
+            "status": "link_mismatch",
+            "evidence_id": str(evidence_id),
+            "requested_run_id": str(run_id),
+            "companion_evidence_id": str(companion.evidence_id),
+        }
+    if str(raw.get("invocation_id", "")).strip() != str(record.invocation_id or "").strip():
+        companion = await record_recovery_note(
+            evidence_store=evidence_store,
+            run_id=record.run_id,
+            engagement_id=record.engagement_id,
+            source_evidence_id=str(record.evidence_id),
+            note="reprocessing blocked: preserved raw result answers another invocation",
+            action_id=record.action_id,
+            invocation_id=record.invocation_id,
+            hypothesis_id=record.hypothesis_id,
+        )
+        return {
+            "status": "link_mismatch",
+            "evidence_id": str(evidence_id),
+            "requested_run_id": str(run_id),
+            "companion_evidence_id": str(companion.evidence_id),
+        }
+    if str(stored_proposal.get("action_id", "")).strip() != str(record.action_id or "").strip():
+        companion = await record_recovery_note(
+            evidence_store=evidence_store,
+            run_id=record.run_id,
+            engagement_id=record.engagement_id,
+            source_evidence_id=str(record.evidence_id),
+            note=(
+                "reprocessing blocked: stored proposal answers another action; "
+                "identifier alone is not proof"
+            ),
+            action_id=record.action_id,
+            invocation_id=record.invocation_id,
+            hypothesis_id=record.hypothesis_id,
+        )
+        return {
+            "status": "link_mismatch",
+            "evidence_id": str(evidence_id),
+            "requested_run_id": str(run_id),
+            "companion_evidence_id": str(companion.evidence_id),
+        }
+    target_ref = str(meta.get("target_node_id", "") or "").strip()
+    if not target_ref:
+        companion = await record_recovery_note(
+            evidence_store=evidence_store,
+            run_id=record.run_id,
+            engagement_id=record.engagement_id,
+            source_evidence_id=str(record.evidence_id),
+            note="reprocessing blocked: stored evidence names no target",
+            action_id=record.action_id,
+            invocation_id=record.invocation_id,
+            hypothesis_id=record.hypothesis_id,
+        )
+        return {
+            "status": "link_mismatch",
+            "evidence_id": str(evidence_id),
+            "requested_run_id": str(run_id),
+            "companion_evidence_id": str(companion.evidence_id),
+        }
+    try:
+        expected_target = str(node_id_for_target(proposal.target))
+    except Exception:
+        expected_target = ""
+    if expected_target and target_ref != expected_target:
+        companion = await record_recovery_note(
+            evidence_store=evidence_store,
+            run_id=record.run_id,
+            engagement_id=record.engagement_id,
+            source_evidence_id=str(record.evidence_id),
+            note="reprocessing blocked: stored evidence observed another target",
+            action_id=record.action_id,
+            invocation_id=record.invocation_id,
+            hypothesis_id=record.hypothesis_id,
+        )
+        return {
+            "status": "link_mismatch",
+            "evidence_id": str(evidence_id),
+            "requested_run_id": str(run_id),
+            "companion_evidence_id": str(companion.evidence_id),
+        }
+    record_principal = meta.get("principal_ref")
+    anonymous_record = meta.get("anonymous") is True or (
+        isinstance(record_principal, str) and record_principal.strip().lower() == "anonymous"
+    )
+    step_principal = getattr(step, "principal_ref", None) if step is not None else None
+    account_scoped = (
+        isinstance(step_principal, str)
+        and step_principal.strip()
+        and step_principal.strip().lower() != "anonymous"
+    )
+    if not account_scoped and isinstance(record_principal, str) and record_principal.strip():
+        account_scoped = record_principal.strip().lower() != "anonymous"
+    if anonymous_record and account_scoped:
+        companion = await record_recovery_note(
+            evidence_store=evidence_store,
+            run_id=record.run_id,
+            engagement_id=record.engagement_id,
+            source_evidence_id=str(record.evidence_id),
+            note="reprocessing blocked: anonymous evidence cannot satisfy an account-scoped replay",
+            action_id=record.action_id,
+            invocation_id=record.invocation_id,
+            hypothesis_id=record.hypothesis_id,
+        )
+        return {
+            "status": "anonymous_blocked",
+            "evidence_id": str(evidence_id),
+            "requested_run_id": str(run_id),
+            "companion_evidence_id": str(companion.evidence_id),
+        }
+    if account_scoped:
+        claimed_set: set[str] = set()
+        if isinstance(record_principal, str) and record_principal.strip():
+            cleaned_principal = record_principal.strip()
+            if cleaned_principal.lower() != "anonymous":
+                claimed_set.add(cleaned_principal)
+        if isinstance(step_principal, str) and step_principal.strip():
+            cleaned_step = step_principal.strip()
+            if cleaned_step.lower() != "anonymous":
+                claimed_set.add(cleaned_step)
+        exact_ok = _has_exact_recovery_proof(meta, raw, claimed_set, stored_proposal)
+        if not exact_ok:
+            stored_args_map = (
+                stored_proposal.get("arguments") if isinstance(stored_proposal, dict) else {}
+            )
+            if not isinstance(stored_args_map, dict):
+                stored_args_map = {}
+            bound_session = stored_args_map.get("session_ref")
+            if not isinstance(bound_session, str) or not bound_session.strip():
+                bound_session = None
+            else:
+                bound_session = bound_session.strip()
+            alias_verified: set[str] = set()
+            if bound_session is not None:
+                try:
+                    for claimed_name in sorted(claimed_set):
+                        if await _recovery_alias_grounded(
+                            evidence_store=evidence_store,
+                            graph_service=graph_service,
+                            run_id=str(record.run_id),
+                            target_ref=target_ref,
+                            session_name=bound_session,
+                            principal_name=claimed_name,
+                            arguments_target_ref=stored_args_map.get("target_ref")
+                            if isinstance(stored_args_map, dict)
+                            else None,
+                        ):
+                            alias_verified.add(claimed_name)
+                except Exception:
+                    companion = await record_recovery_note(
+                        evidence_store=evidence_store,
+                        run_id=record.run_id,
+                        engagement_id=record.engagement_id,
+                        source_evidence_id=str(record.evidence_id),
+                        note=(
+                            "reprocessing blocked: session binding lookup failed; "
+                            "treating as ungrounded"
+                        ),
+                        action_id=record.action_id,
+                        invocation_id=record.invocation_id,
+                        hypothesis_id=record.hypothesis_id,
+                    )
+                    return {
+                        "status": "no_account_proof",
+                        "evidence_id": str(evidence_id),
+                        "requested_run_id": str(run_id),
+                        "companion_evidence_id": str(companion.evidence_id),
+                    }
+            if not claimed_set <= alias_verified:
+                companion = await record_recovery_note(
+                    evidence_store=evidence_store,
+                    run_id=record.run_id,
+                    engagement_id=record.engagement_id,
+                    source_evidence_id=str(record.evidence_id),
+                    note=(
+                        "reprocessing blocked: account has no exact raw session receipt or binding"
+                    ),
+                    action_id=record.action_id,
+                    invocation_id=record.invocation_id,
+                    hypothesis_id=record.hypothesis_id,
+                )
+                return {
+                    "status": "no_account_proof",
+                    "evidence_id": str(evidence_id),
+                    "requested_run_id": str(run_id),
+                    "companion_evidence_id": str(companion.evidence_id),
+                }
+    try:
+        stored_claim, stored_flag = await resolve_claim_for_review(
+            graph_service, proposal.hypothesis_id, step
+        )
+    except Exception:
+        stored_claim, stored_flag = (None, None)
+    try:
+        assessment = await verifier.verify(
+            VerificationRequest(
+                proposal=proposal,
+                result=result,
+                expectation=expectation,
+                source_refs=[str(record.evidence_id), str(result.invocation_id)],
+                hypothesis_claim=stored_claim,
+                violation_if_confirmed=stored_flag,
+                principal_ref=getattr(step, "principal_ref", None) if step is not None else None,
+            )
+        )
+    except Exception:
+        from redteam.orchestration.analysis import VerificationAssessment as _VA
+
+        assessment = _VA(
+            verdict=Verdict.UNKNOWN,
+            reason="meaning review failed; evidence preserved, no verdict reached",
+            reviewer_id="analysis:error:recovery",
+            source_refs=[str(record.evidence_id), str(result.invocation_id)],
+            outcome="unknown",
+            claim_supported=False,
+        )
+    verdict, reason = assessment.verdict, assessment.reason
+    # Observation steps never approve: downgrade before receipt/hypothesis/finding.
+    if step is not None and step.assessment_kind != "security_check":
+        from redteam.orchestration.analysis import VerificationAssessment as _VC
+
+        _prior_stage = getattr(assessment, "last_record_stage", None)
+        assessment = _VC(
+            verdict=Verdict.UNKNOWN,
+            reason="response recorded as an observation; no security claim was verified",
+            reviewer_id=getattr(assessment, "reviewer_id", "analysis:recovery"),
+            source_refs=list(getattr(assessment, "source_refs", [str(record.evidence_id)])),
+            outcome="unknown",
+            last_record_stage=None,
+            claim_supported=False,
+        )
+        verdict, reason = assessment.verdict, assessment.reason
+    receipt_stage: str | None = getattr(assessment, "last_record_stage", None)
+    supersede_chain: list[str] = []
+    if receipt_stage is not None:
+        supersede_chain.append(str(receipt_stage))
+    try:
+        await append_review_receipt(
+            evidence_store=evidence_store,
+            proposal=proposal,
+            result=result,
+            assessment=assessment,
+            admission="final",
+            supersedes=supersede_chain,
+        )
+        receipt_status = "appended"
+        try:
+            assessment.last_record_stage = "recovery_final"
+        except Exception:
+            pass
+    except Exception:
+        from redteam.orchestration.analysis import VerificationAssessment as _VB
+
+        assessment = _VB(
+            verdict=Verdict.UNKNOWN,
+            reason="review_receipt_write_failed; evidence preserved, no verdict reached",
+            reviewer_id=getattr(assessment, "reviewer_id", "analysis:recovery"),
+            source_refs=list(getattr(assessment, "source_refs", [str(record.evidence_id)])),
+            outcome="unknown",
+            claim_supported=False,
+        )
+        verdict, reason = assessment.verdict, assessment.reason
+        receipt_status = "failed"
+    provenance = Provenance(
+        step=0,
+        source="recovery:tool:" + str(result.tool_id),
+        evidence_id=str(record.evidence_id),
+        run_id=str(record.run_id),
+        confidence=Confidence.MEASURED,
+    )
+    hypothesis_status = ""
+    if proposal.hypothesis_id is not None:
+        if step is not None and step.assessment_kind != "security_check":
+            hypothesis_status = HYPOTHESIS_INCONCLUSIVE
+        else:
+            hypothesis_status = hypothesis_status_for_assessment(assessment)
+        await graph_service.resolve_hypothesis(
+            str(proposal.hypothesis_id), status=hypothesis_status
+        )
+    support_audit_note: str | None = None
+    if proposal.hypothesis_id is not None:
+        try:
+            outcome_name = getattr(assessment, "outcome", None)
+            supporting_ids: list[str] = []
+            refuting_ids: list[str] = []
+            if outcome_name == "success":
+                supporting_ids = [str(record.evidence_id)]
+            elif outcome_name == "refuted":
+                refuting_ids = [str(record.evidence_id)]
+            from redteam.attack_graph.identity import hypothesis_node_id as _hid
+            from redteam.core.enums import GraphNodeType as _GNT
+
+            await graph_service.upsert_node(
+                _GNT.HYPOTHESIS,
+                node_id=_hid(str(proposal.hypothesis_id)),
+                facts={
+                    "supporting_evidence_ids": supporting_ids,
+                    "refuting_evidence_ids": refuting_ids,
+                    "verification_outcome": outcome_name,
+                    "verification_verdict": verdict.value
+                    if hasattr(verdict, "value")
+                    else str(verdict),
+                },
+                provenance=provenance,
+            )
+        except Exception as exc:
+            try:
+                audit_note = await record_recovery_note(
+                    evidence_store=evidence_store,
+                    run_id=record.run_id,
+                    engagement_id=record.engagement_id,
+                    source_evidence_id=str(record.evidence_id),
+                    note=(
+                        "hypothesis support assignment failed ("
+                        + type(exc).__name__
+                        + ") for "
+                        + str(proposal.hypothesis_id)
+                        + ": outcome="
+                        + str(getattr(assessment, "outcome", None) or "unknown")
+                    ),
+                    record_kind="hypothesis_support_audit",
+                    action_id=proposal.action_id,
+                    invocation_id=result.invocation_id,
+                    hypothesis_id=proposal.hypothesis_id,
+                )
+                support_audit_note = "support_audit=" + str(audit_note.evidence_id)
+            except Exception as exc2:
+                support_audit_note = (
+                    "support_audit_note_failed:"
+                    + type(exc2).__name__
+                    + "(upsert:"
+                    + type(exc).__name__
+                    + ")"
+                )
+    finding_id = None
+    if verdict is Verdict.VIOLATION and proposal.hypothesis_id is not None:
+        existing_claims = {
+            str(item.metadata.get("claim_key"))
+            for item in await graph_service.list_findings()
+            if item.metadata.get("claim_key")
+        }
+        assessment_kind = step.assessment_kind if step is not None else "observation"
+        severity = severity_for(step) if step is not None else "medium"
+        promotion = FindingPromoter().promote(
+            PromotionRequest(
+                verdict=verdict,
+                reason=reason,
+                evidence_ids=[str(record.evidence_id)],
+                hypothesis_id=str(proposal.hypothesis_id),
+                hypothesis_status=hypothesis_status,
+                target_node_id=str(node_id_for_target(proposal.target)),
+                capability=proposal.capability,
+                operation=proposal.operation,
+                agent_id=str(proposal.agent_id),
+                action_id=str(proposal.action_id),
+                reviewer_id=assessment.reviewer_id,
+                source_refs=list(assessment.source_refs),
+                severity=severity,
+                assessment_kind=assessment_kind,
+            ),
+            existing_claims=existing_claims,
+        )
+        if promotion.finding is not None:
+            await graph_service.record_finding(
+                promotion.finding,
+                hypothesis_id=str(proposal.hypothesis_id),
+                about=node_id_for_target(proposal.target),
+                provenance=provenance,
+            )
+            finding_id = str(promotion.finding.finding_id)
+        else:
+            verdict = Verdict.UNKNOWN
+            reason = "violation was not promoted to a Finding: " + promotion.refused_reason
+    mutation_summary = {"nodes": 0, "edges": 0}
+    mapper_failure = None
+    if result_mappers is not None and result.success:
+        mutation = result_mappers.map_result(
+            tool_id=result.tool_id,
+            target=proposal.target,
+            arguments=dict(proposal.arguments),
+            result=result,
+        )
+        failure = result_mappers.last_failure
+        mutation_summary = {"nodes": len(mutation.nodes), "edges": len(mutation.edges)}
+        if failure is not None:
+            mapper_failure = {
+                "tool_id": failure.tool_id,
+                "mapper": failure.mapper,
+                "reason": failure.reason,
+            }
+        for node_mutation in mutation.nodes:
+            observed_facts = dict(node_mutation.facts)
+            if node_mutation.observations:
+                observed_facts["observations"] = [
+                    {**item, "evidence_id": str(record.evidence_id)}
+                    for item in node_mutation.observations
+                ]
+            await graph_service.upsert_node(
+                node_mutation.node_type,
+                node_id=node_mutation.node_id,
+                attrs=node_mutation.attrs,
+                facts={
+                    **observed_facts,
+                    "evidence_ids": [str(record.evidence_id)],
+                },
+                labels=node_mutation.labels,
+                provenance=provenance,
+            )
+        for edge_mutation in mutation.edges:
+            await graph_service.link(
+                edge_mutation.edge_type,
+                edge_mutation.source_id,
+                edge_mutation.target_id,
+                edge_mutation.properties,
+                provenance=provenance,
+            )
+    parts = [
+        "reprocessed " + str(record.evidence_id) + ": verdict=" + verdict.value,
+        "hypothesis="
+        + (
+            str(proposal.hypothesis_id) + "->" + hypothesis_status
+            if proposal.hypothesis_id is not None
+            else "none"
+        ),
+        "finding=" + (finding_id or "none"),
+        "mutation nodes="
+        + str(mutation_summary["nodes"])
+        + " edges="
+        + str(mutation_summary["edges"]),
+    ]
+    if step_degraded:
+        parts.append("step context unreadable, replayed degraded")
+    if mapper_failure is not None:
+        parts.append("mapper_failure=" + str(mapper_failure["reason"]))
+    parts.append("receipt=" + str(receipt_status))
+    parts.append("outcome=" + str(getattr(assessment, "outcome", None) or "unknown"))
+    if support_audit_note is not None:
+        parts.append(support_audit_note)
+    companion = await record_recovery_note(
+        evidence_store=evidence_store,
+        run_id=record.run_id,
+        engagement_id=record.engagement_id,
+        source_evidence_id=str(record.evidence_id),
+        note="; ".join(parts),
+        record_kind="recovery_result",
+        action_id=proposal.action_id,
+        invocation_id=result.invocation_id,
+        hypothesis_id=proposal.hypothesis_id,
+    )
+    return {
+        "status": "ok",
+        "evidence_id": str(evidence_id),
+        "requested_run_id": str(run_id),
+        "verdict": verdict.value,
+        "reason": reason,
+        "outcome": getattr(assessment, "outcome", None) or "unknown",
+        "hypothesis_id": str(proposal.hypothesis_id)
+        if proposal.hypothesis_id is not None
+        else None,
+        "hypothesis_status": hypothesis_status,
+        "finding_id": finding_id,
+        "mutation": mutation_summary,
+        "mapper_failure": mapper_failure,
+        "companion_evidence_id": str(companion.evidence_id),
+        "review_receipt": receipt_status,
+    }
+
+
+async def record_mapping_failure(
+    *,
+    evidence_store: Any,
+    run_id: Any,
+    engagement_id: Any,
+    source_evidence_id: str | None,
+    tool_id: str,
+    mapper: str,
+    reason: str,
+    action_id: Any | None = None,
+    invocation_id: Any | None = None,
+    hypothesis_id: Any | None = None,
+) -> EvidenceRecord:
+    """Append a companion record for a mapper that choked on real output.
+
+    The original evidence record is never touched: this is a new SYSTEM
+    record pointing back at it through "source_evidence_id", so the
+    failure stays traceable without rewriting history.
+    """
+    payload = {
+        "record_kind": "mapper_failure",
+        "source_evidence_id": source_evidence_id,
+        "tool_id": tool_id,
+        "mapper": mapper,
+        "reason": reason,
+    }
+    note = EvidenceRecord(
+        evidence_id=EvidenceId(new_id("ev")),
+        run_id=run_id,
+        engagement_id=engagement_id,
+        source_type=EvidenceSourceType.SYSTEM,
+        source_id="orchestration.recovery",
+        action_id=action_id,
+        invocation_id=invocation_id,
+        hypothesis_id=hypothesis_id,
+        content_type="application/json",
+        artifact_ref=None,
+        digest=digest_payload(payload),
+        summary="result mapper " + mapper + " failed for " + tool_id + " (" + reason + ")",
+        created_at=datetime.now(timezone.utc),
+        metadata=payload,
+    )
+    await evidence_store.append(note)
+    return note
+
+
+async def record_recovery_note(
+    *,
+    evidence_store: Any,
+    run_id: Any,
+    engagement_id: Any,
+    source_evidence_id: str | None,
+    note: str,
+    record_kind: str = "recovery_note",
+    action_id: Any | None = None,
+    invocation_id: Any | None = None,
+    hypothesis_id: Any | None = None,
+) -> EvidenceRecord:
+    """Append a free-form companion note next to an existing record."""
+    payload = {
+        "record_kind": record_kind,
+        "source_evidence_id": source_evidence_id,
+        "note": note,
+    }
+    record = EvidenceRecord(
+        evidence_id=EvidenceId(new_id("ev")),
+        run_id=run_id,
+        engagement_id=engagement_id,
+        source_type=EvidenceSourceType.SYSTEM,
+        source_id="orchestration.recovery",
+        action_id=action_id,
+        invocation_id=invocation_id,
+        hypothesis_id=hypothesis_id,
+        content_type="application/json",
+        artifact_ref=None,
+        digest=digest_payload(payload),
+        summary=note[:280],
+        created_at=datetime.now(timezone.utc),
+        metadata=payload,
+    )
+    await evidence_store.append(record)
+    return record
+
+
+async def recovery_report(*, evidence_store: Any, run_id: str) -> dict:
+    """Summarize how recoverable this run's evidence is.
+
+    Counts what a later reprocessing pass would meet: records carrying a
+    raw payload, records with none, mapper-failure companions, and results
+    stamped with a verification exception. Read-only; changes nothing.
+    """
+    records = await evidence_store.list_for_run(run_id)
+    kinds: dict[str, int] = {}
+    with_raw = 0
+    verification_failures = 0
+    for record in records:
+        kind = record.metadata.get("record_kind")
+        if isinstance(kind, str) and kind:
+            kinds[kind] = kinds.get(kind, 0) + 1
+        raw = record.metadata.get("tool_result") or record.metadata.get("raw_tool_result")
+        if raw is None:
+            continue
+        with_raw += 1
+        if isinstance(raw, dict):
+            nested = raw.get("metadata") or {}
+            if isinstance(nested, dict) and nested.get("verification_exception"):
+                verification_failures += 1
+    return {
+        "run_id": str(run_id),
+        "total_evidence": len(records),
+        "with_raw": with_raw,
+        "missing_raw": len(records) - with_raw,
+        "record_kinds": kinds,
+        "mapping_failures": kinds.get("mapper_failure", 0),
+        "verification_failures": verification_failures,
+    }

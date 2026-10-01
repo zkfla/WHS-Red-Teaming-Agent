@@ -79,6 +79,9 @@ def create_server(policy: ServerPolicy) -> MCPServer:
             or first.principal_ref == second.principal_ref
         ):
             raise ToolInputError("two distinct principals bound to this target are required")
+        # Preflight both registrations/credentials before either network request.
+        session_header(policy, target_ref, first_session_ref, path)
+        session_header(policy, target_ref, second_session_ref, path)
         async with execution_lock:
             a = await request(policy, target_ref, path, session_ref=first_session_ref)
             b = await request(policy, target_ref, path, session_ref=second_session_ref)

@@ -10,6 +10,8 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, field
 
+from redteam.attack_graph.service import AttackGraphService
+from redteam.core.contracts.engagement import Engagement
 from redteam.core.ids import RunId
 from redteam.core.ports.attack_graph import AttackGraphStore
 from redteam.core.ports.control_plane import ControlPlane
@@ -24,11 +26,13 @@ from redteam.orchestration.agents.providers import (
     default_provider_registry,
 )
 from redteam.orchestration.agents.registry import AgentRegistry, default_registry
-from redteam.orchestration.analysis import AnalysisVerifier, DeterministicAnalysisVerifier
+from redteam.orchestration.analysis import AnalysisVerifier, StructuredLLMAnalysisVerifier
 from redteam.orchestration.context_projection import ContextProjectionCache
+from redteam.orchestration.long_jobs import LongJobAdapter
 from redteam.orchestration.methodology import ReferenceLibrary
 from redteam.orchestration.observations import ResultMapperRegistry, default_result_mapper_registry
 from redteam.orchestration.operator_intents.store import OperatorIntentStore
+from redteam.orchestration.paths import InMemoryPathStore, PathStore
 from redteam.orchestration.settings import OrchestrationSettings
 from redteam.orchestration.task_graph.memory import InMemoryTaskGraphStore
 from redteam.orchestration.work.memory import InMemoryWorkStore
@@ -43,14 +47,17 @@ class RuntimeDeps:
     graph_store: AttackGraphStore
     evidence_store: EvidenceStore
     llm_client: LLMClient
-    verifier: AnalysisVerifier = field(default_factory=DeterministicAnalysisVerifier)
+    verifier: AnalysisVerifier | None = None
+    path_store: PathStore = field(default_factory=InMemoryPathStore)
+    long_job_adapter: LongJobAdapter | None = None
+    engagement: Engagement | None = None
 
     agents: AgentRegistry = field(default_factory=default_registry)
     candidate_providers: CandidateProviderRegistry = field(
         default_factory=default_provider_registry
     )
-    # Agent-Team view of the Capability registry.  ``None`` keeps legacy
-    # playbooks operational until Capability/PM finalize a shared catalog port.
+    # The actual tool registry is mandatory when compiling actions.
+    # None supports read-only projections and explicit error scenarios.
     tool_catalog: ToolCatalog | None = None
     methodology_library: ReferenceLibrary | None = None
     # Tool Result -> Attack Graph Mutation (SERVICE/ENDPOINT discovery from
@@ -76,3 +83,15 @@ class RuntimeDeps:
     #: enforced. The bound is applied at the tool call site (EXECUTE), not at
     #: policy admission, so a bounded fan-out batch still executes fully.
     tool_semaphore: asyncio.Semaphore | None = field(default=None, compare=False)
+
+    def __post_init__(self) -> None:
+        if self.verifier is None:
+            object.__setattr__(
+                self,
+                "verifier",
+                StructuredLLMAnalysisVerifier(
+                    self.llm_client,
+                    self.evidence_store,
+                    AttackGraphService(self.graph_store),
+                ),
+            )

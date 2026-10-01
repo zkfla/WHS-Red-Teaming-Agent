@@ -1,12 +1,35 @@
-"""Authentication follow-ups are bounded, policy-gated and observation-only."""
+"""Authentication follow-ups are bounded, policy-gated and observation-only.
 
+New-flow notes: every request below comes from an explicit scripted model
+intent through the production InvestigationEngine path. The old file assumed
+a deterministic candidate frontier (exact invocation counts of 2/3/7 driven
+by auto-generated recon + web probes); those counts are retired. Counts here
+equal the scripted intents: 1 anonymous probe + 1 session check, nothing more.
+
+Retired deterministic items (with replacement):
+- exact auto counts (3 for one session, 7 for five, 2 for deferred/missing) ->
+  this file's scripted 2-call chain (bounded: each session checked at most
+  once, anonymous evidence preserved) keeps the contract without the planner.
+- deferred/tool-missing branches via auto-candidates ->
+  covered as policy/availability outcomes in test_session_followup_deny_blocks
+  and the DENY control-plane cases in test_agent_loop.py.
+- denied-session violation promotion (deny + 200 -> access_control_violation):
+  test_denied_session_200_is_a_confirmed_access_control_finding pins the verified
+  high-severity Finding, the confirmed hypothesis and their linkage on the
+  scripted session path. The observation-only chain above stays finding-free.
+"""
+
+from __future__ import annotations
+
+import json
 from datetime import datetime, timezone
+from typing import Any
 
 import pytest
 
 from redteam.app.bootstrap import run_engagement
-from redteam.attack_graph.predicates import facts_of
-from redteam.attack_graph.service import AttackGraphService
+from redteam.attack_graph.stores.memory import InMemoryAttackGraphStore
+from redteam.core.contracts.action import ActionProposal
 from redteam.core.contracts.engagement import (
     ApprovalPolicy,
     Engagement,
@@ -14,24 +37,49 @@ from redteam.core.contracts.engagement import (
     ExecutionBudget,
     RateLimitPolicy,
 )
-from redteam.core.contracts.tool import ToolDescriptor, ToolError
-from redteam.core.enums import PolicyVerdict, ToolHealthStatus
-from redteam.core.ids import EngagementId, ToolId
+from redteam.core.contracts.evidence import EvidenceRecord
+from redteam.core.contracts.target import HostTarget
+from redteam.core.contracts.tool import ToolDescriptor, ToolError, ToolInvocation, ToolResult
+from redteam.core.enums import EvidenceSourceType, PolicyVerdict
+from redteam.core.ids import (
+    ActionId,
+    AgentId,
+    EngagementId,
+    EvidenceId,
+    InvocationId,
+    RunId,
+    ToolId,
+)
+from redteam.event_bus.memory import InMemoryEventBus
 from redteam.orchestration.agents.registry import default_registry
-from redteam.orchestration.events import AUTHENTICATION_CHECK_DEFERRED, AUTHENTICATION_CHECKED
+from redteam.orchestration.authentication import (
+    AuthenticationCheck,
+    assess_authentication,
+    comparison_outcome,
+)
+from redteam.orchestration.context import RuntimeDeps
+from redteam.orchestration.events import AUTHENTICATION_CHECKED
+from redteam.orchestration.paths import InMemoryPathStore
 from redteam.orchestration.settings import OrchestrationSettings
-from tests.fakes import DummyToolGateway, FakeControlPlane, build_test_application
+from redteam.orchestration.task_graph.memory import InMemoryTaskGraphStore
+from redteam.orchestration.work.memory import InMemoryWorkStore
+from tests.fakes import DummyToolGateway, FakeControlPlane, FakeEvidenceStore
+from tests.integration import _engine_llm_harness as h
+
+HOST_NODE = "host:app.local"
+WEB_AGENT = "web-api-agent"
+WEB_TOOL = "web.http_request"
+WEB_OP_KEY = "web.http_request"
 
 
 class SessionGateway(DummyToolGateway):
-    def __init__(self, status, session_status):
+    def __init__(self, status: int | None, session_status: int | None) -> None:
         tools = [
             ToolDescriptor(
                 tool_id=ToolId(tool),
                 server_id="test",
                 tool_name=tool.split(".")[1],
                 capability_tags=[tag],
-                health_status=ToolHealthStatus.HEALTHY,
                 input_schema={
                     "type": "object",
                     "required": ["target_ref", "path"],
@@ -47,10 +95,10 @@ class SessionGateway(DummyToolGateway):
             for tool, tag in [("recon.http_probe", "recon"), ("web.http_request", "web")]
         ]
         super().__init__(tools=tools)
-        self.status, self.session_status = status, session_status
-        self.disable_after_anonymous = False
+        self.status = status
+        self.session_status = session_status
 
-    async def invoke(self, invocation):
+    async def invoke(self, invocation: ToolInvocation) -> ToolResult:
         result = await super().invoke(invocation)
         if "session_ref" in invocation.arguments:
             if self.session_status is None:
@@ -65,9 +113,7 @@ class SessionGateway(DummyToolGateway):
                 )
             status = self.session_status
         else:
-            status = self.status
-            if invocation.tool_id == "web.http_request" and self.disable_after_anonymous:
-                self._tools = [t for t in self._tools if t.tool_id != "web.http_request"]
+            status = self.status if self.status is not None else 401
         target_ref = invocation.arguments.get("target_ref")
         session_ref = invocation.arguments.get("session_ref")
         return result.model_copy(
@@ -79,12 +125,7 @@ class SessionGateway(DummyToolGateway):
                     "body_bytes": 0,
                     "body_sha256": ("b" if session_ref else "a") * 64,
                     "redirect": 300 <= status < 400,
-                    "security_headers_present": {
-                        "strict-transport-security": False,
-                        "content-security-policy": False,
-                        "x-content-type-options": False,
-                        "cache-control": False,
-                    },
+                    "security_headers_present": {},
                     "body_omitted": True,
                 }
             }
@@ -92,275 +133,491 @@ class SessionGateway(DummyToolGateway):
 
 
 class SessionGate(FakeControlPlane):
-    def __init__(self, verdict):
+    def __init__(self, verdict: PolicyVerdict) -> None:
         super().__init__()
         self.session_verdict = verdict
 
-    async def evaluate(self, proposal, context):
+    async def evaluate(self, proposal: Any, context: Any) -> Any:
         self.default_verdict = (
             self.session_verdict if "session_ref" in proposal.arguments else PolicyVerdict.ALLOW
         )
         return await super().evaluate(proposal, context)
 
 
-async def exercise(
-    *,
-    anonymous=401,
-    authenticated=200,
-    sessions=None,
-    verdict=PolicyVerdict.ALLOW,
-    tool_available=True,
-    max_actions=10,
-):
-    engagement = Engagement(
+class _AuthLLM:
+    """Two scripted web intents: anonymous probe, then one gated session check."""
+
+    def __init__(
+        self,
+        evidence: Any,
+        *,
+        session_ref: str = "alice",
+        expected_access: str = "unspecified",
+    ) -> None:
+        self._evidence = evidence
+        self._session_ref = session_ref
+        self._expected_access = expected_access
+        self.calls: list[dict[str, Any]] = []
+        self._actions = 0
+
+    @staticmethod
+    def _route_key(schema: dict[str, Any]) -> str:
+        props = schema.get("properties", {})
+        if "path_id" in props and "steps" in props:
+            return "path_draft"
+        if "decision" in props:
+            return "path_review"
+        if "mode" in props:
+            return "next_action"
+        if "criteria" in props:
+            return "goal_completion_review"
+        if "accepted" in props:
+            return "completion_review"
+        if "claim_supported" in props:
+            return "analysis_verify"
+        return "unknown"
+
+    @staticmethod
+    def _payload(messages: list[dict[str, Any]]) -> dict[str, Any]:
+        return json.loads(messages[0]["content"])
+
+    @staticmethod
+    def _hold() -> dict[str, Any]:
+        return {
+            "mode": "hold",
+            "reason": "scripted hold after session check",
+            "actions": [],
+            "path": None,
+            "path_step_id": None,
+            "completion": {},
+            "evidence_request": {},
+            "hypothesis_update": {},
+        }
+
+    def _draft(self) -> dict[str, Any]:
+        return {
+            "path_id": "path-draft-1",
+            "run_id": "run-x",
+            "mission_id": None,
+            "version": 1,
+            "parent_version": None,
+            "status": "draft",
+            "reason": "scripted web draft",
+            "goal": "compare anonymous and session responses",
+            "steps": [
+                {
+                    "step_id": "step-1",
+                    "objective": "probe / anonymously for the baseline",
+                    "agent_id": WEB_AGENT,
+                    "target_node_ids": [HOST_NODE],
+                    "principal_refs": [],
+                    "allowed_operations": [WEB_OP_KEY],
+                    "depends_on": [],
+                    "required_fact_refs": [],
+                    "unknowns": [],
+                    "completion_criteria": [
+                        {"kind": "evidence", "description": "baseline recorded", "min_evidence": 1}
+                    ],
+                    "required": True,
+                    "status": "pending",
+                    "outcome": None,
+                    "evidence_ids": [],
+                },
+                {
+                    "step_id": "step-2",
+                    "objective": "re-probe / with the registered session",
+                    "agent_id": WEB_AGENT,
+                    "target_node_ids": [HOST_NODE],
+                    "principal_refs": [self._session_ref],
+                    "allowed_operations": [WEB_OP_KEY],
+                    "depends_on": [],
+                    "required_fact_refs": [],
+                    "unknowns": [],
+                    "completion_criteria": [
+                        {
+                            "kind": "evidence",
+                            "description": "comparison recorded",
+                            "min_evidence": 1,
+                        }
+                    ],
+                    "required": True,
+                    "status": "pending",
+                    "outcome": None,
+                    "evidence_ids": [],
+                },
+            ],
+            "hypothesis_ids": [],
+            "evidence_ids": [],
+            "changed_step_ids": [],
+            "review_records": {},
+        }
+
+    def _anonymous(self) -> dict[str, Any]:
+        return {
+            "mode": "actions",
+            "reason": "scripted anonymous probe",
+            "actions": [
+                {
+                    "path_step_id": "step-1",
+                    "agent_id": WEB_AGENT,
+                    "target_node_id": HOST_NODE,
+                    "principal_ref": None,
+                    "capability": "web",
+                    "operation": "http_request",
+                    "tool_id": WEB_TOOL,
+                    "arguments": {"target_ref": "app", "path": "/", "method": "GET"},
+                    "reason": "record the anonymous baseline",
+                    "expected_observation": "anonymous 401 baseline",
+                    "hypothesis": None,
+                    "existing_hypothesis_id": None,
+                    "expectation": None,
+                    "authentication_check": None,
+                    "availability_impact": False,
+                }
+            ],
+            "path": None,
+            "path_step_id": None,
+            "completion": {},
+            "evidence_request": {},
+            "hypothesis_update": {},
+        }
+
+    def _session(self, baseline_id: str) -> dict[str, Any]:
+        session_ref = self._session_ref
+        return {
+            "mode": "actions",
+            "reason": "scripted session check",
+            "actions": [
+                {
+                    "path_step_id": "step-2",
+                    "agent_id": WEB_AGENT,
+                    "target_node_id": HOST_NODE,
+                    "principal_ref": session_ref,
+                    "capability": "web",
+                    "operation": "http_request",
+                    "tool_id": WEB_TOOL,
+                    "arguments": {
+                        "target_ref": "app",
+                        "path": "/",
+                        "method": "GET",
+                        "session_ref": session_ref,
+                    },
+                    "reason": "compare session against the anonymous baseline",
+                    "expected_observation": "session response for comparison",
+                    "hypothesis": (
+                        {
+                            "description": (
+                                f"Registered session {session_ref} may access / after anonymous 401"
+                            ),
+                            "confidence": 0.5,
+                            "violation_if_confirmed": True,
+                            "metadata": {"kind": "authentication"},
+                        }
+                        if self._expected_access == "deny"
+                        else None
+                    ),
+                    "existing_hypothesis_id": None,
+                    "expectation": (
+                        {
+                            "kind": "output_contains",
+                            "field": "",
+                            "value": session_ref,
+                            "description": (
+                                "denied session response returned for comparison"
+                            ),
+                            "violation_if_met": True,
+                        }
+                        if self._expected_access == "deny"
+                        else None
+                    ),
+                    "authentication_check": {
+                        "baseline_evidence_id": baseline_id,
+                        "session_ref": session_ref,
+                        "expected_access": self._expected_access,
+                    },
+                    "availability_impact": False,
+                }
+            ],
+            "path": None,
+            "path_step_id": None,
+            "completion": {},
+            "evidence_request": {},
+            "hypothesis_update": {},
+        }
+
+    async def complete_structured(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        response_schema: dict[str, Any],
+        system: str | None = None,
+        **_: Any,
+    ) -> dict[str, Any]:
+        route = self._route_key(response_schema)
+        self.calls.append({"route": route})
+        if route == "path_draft":
+            return self._draft()
+        if route == "path_review":
+            return h.review_accept()
+        if route == "analysis_verify":
+            return h.meaning("success", True)
+        if route == "completion_review":
+            return h.completion_accept()
+        if route == "goal_completion_review":
+            payload = self._payload(messages)
+            criteria = payload["mission"]["success_criteria"]
+            receipts: list[str] = []
+            for step in payload["path"]["steps"]:
+                receipts.extend(step.get("evidence_ids", []))
+            return h.goal_accept(
+                [{"criterion": c, "met": True, "evidence_ids": list(receipts)} for c in criteria]
+            )
+        if route == "next_action":
+            self._actions += 1
+            if self._actions == 1:
+                return self._anonymous()
+            if self._actions == 2:
+                payload = self._payload(messages)
+                run_id = payload["active_path"]["run_id"]
+                records = await self._evidence.list_for_run(run_id)
+                tool_evidence = [
+                    str(r.evidence_id)
+                    for r in records
+                    if isinstance(getattr(r, "metadata", {}).get("tool_result"), dict)
+                ]
+                assert tool_evidence, "session check needs the anonymous baseline evidence"
+                return self._session(tool_evidence[0])
+            return self._hold()
+        raise AssertionError(f"no scripted answer for route {route!r}")
+
+    async def complete(
+        self, *, messages: list[dict[str, Any]], system: str | None = None, **_: Any
+    ) -> str:
+        return ""
+
+
+def _auth_engagement(
+    *, session_ref: str = "alice", expected_access: str = "unspecified"
+) -> Engagement:
+    return Engagement(
         engagement_id=EngagementId("eng_auth"),
         name="auth",
         scope=EngagementScope(allowed_hosts=["app.local"]),
         metadata={
             "target_refs": {"app.local": "app"},
-            "auth_sessions": {"app.local": sessions or []},
+            "auth_sessions": {
+                "app.local": [
+                    {"session_ref": session_ref, "paths": ["/"], "expected_access": expected_access}
+                ]
+            },
         },
-        execution_budget=ExecutionBudget(max_actions=max_actions),
+        execution_budget=ExecutionBudget(max_actions=5),
         approval_policy=ApprovalPolicy(),
         rate_limit_policy=RateLimitPolicy(max_actions_per_minute=60),
         created_at=datetime.now(timezone.utc),
     )
-    gateway = SessionGateway(anonymous, authenticated)
-    gateway.disable_after_anonymous = not tool_available
-    control = SessionGate(verdict)
-    deps = build_test_application(
-        tool_gateway=gateway,
-        tool_catalog=gateway,
+
+
+def _auth_deps(
+    engagement: Engagement,
+    gateway: SessionGateway,
+    control: SessionGate,
+    *,
+    session_ref: str = "alice",
+    expected_access: str = "unspecified",
+) -> RuntimeDeps:
+    evidence = FakeEvidenceStore()
+    llm = _AuthLLM(evidence, session_ref=session_ref, expected_access=expected_access)
+    return RuntimeDeps(
         control_plane=control,
-        settings=OrchestrationSettings(max_steps=30),
+        tool_gateway=gateway,
+        event_bus=InMemoryEventBus(),
+        graph_store=InMemoryAttackGraphStore(),
+        evidence_store=evidence,
+        llm_client=llm,
+        engagement=engagement,
         agents=default_registry(),
+        tool_catalog=gateway,
+        work_store=InMemoryWorkStore(),
+        task_graph_store=InMemoryTaskGraphStore(),
+        path_store=InMemoryPathStore(),
+        operator_intent_store=None,
+        settings=OrchestrationSettings(max_steps=8, checkpointing=False),
     )
-    final = await run_engagement(engagement, deps=deps)
-    return final, deps, gateway, control
 
 
 @pytest.mark.parametrize(
-    "status,outcome",
-    [
-        (200, "session_access_observed"),
-        (401, "session_not_accepted"),
-        (403, "access_denied"),
-        (302, "inconclusive_response"),
-        (None, "request_failed_or_uninterpretable"),
-    ],
+    "status,expected",
+    [(200, "session_access_observed"), (401, "session_not_accepted"), (403, "access_denied")],
 )
-async def test_401_creates_exactly_one_gated_session_check(status, outcome):
-    final, deps, gateway, control = await exercise(
-        authenticated=status,
-        sessions=[{"session_ref": "alice", "paths": ["/"]}],
+def test_comparison_outcome_matrix(status: int, expected: str) -> None:
+    assert comparison_outcome(status, "unspecified") == expected
+    assert comparison_outcome(None, "unspecified") == "request_failed_or_uninterpretable"
+    assert comparison_outcome(200, "deny") == "access_control_violation"
+
+
+def _unit_evidence(
+    store: FakeEvidenceStore,
+    *,
+    evidence_id: str,
+    run_id: str,
+    engagement_id: str,
+    http_status: int | None,
+    session_ref: str | None,
+) -> EvidenceRecord:
+    now = datetime.now(timezone.utc)
+    return EvidenceRecord(
+        evidence_id=EvidenceId(evidence_id),
+        run_id=RunId(run_id),
+        engagement_id=EngagementId(engagement_id),
+        source_type=EvidenceSourceType.TOOL,
+        source_id="web.http_request",
+        action_id=ActionId("action_unit"),
+        invocation_id=InvocationId("inv_unit"),
+        content_type="application/json",
+        digest="00" * 32,
+        summary="unit baseline",
+        created_at=now,
+        metadata={
+            "success": True,
+            "target_node_id": HOST_NODE,
+            "http_observation": {
+                "kind": "http_response",
+                "method": "GET",
+                "path": "/",
+                "target_ref": "app",
+                "session_ref": session_ref,
+                "status_code": http_status,
+            },
+        },
     )
-    assert len(gateway.invocations) == 3
-    assert len(control.evaluated) == 3
-    assert gateway.invocations[-1].arguments == {
+
+
+@pytest.mark.parametrize("mismatch", ["missing", "path", "target_ref", "session_ref", "method"])
+async def test_mismatched_baseline_or_request_cannot_confirm(mismatch: str) -> None:
+    store = FakeEvidenceStore()
+    now = datetime.now(timezone.utc)
+    baseline = _unit_evidence(
+        store, evidence_id="ev-base", run_id="run_unit", engagement_id="eng_unit",
+        http_status=401, session_ref=None,
+    )
+    await store.append(baseline)
+    current = _unit_evidence(
+        store, evidence_id="ev-now", run_id="run_unit", engagement_id="eng_unit",
+        http_status=200, session_ref="alice",
+    )
+    arguments: dict[str, Any] = {
         "target_ref": "app",
         "path": "/",
         "method": "GET",
         "session_ref": "alice",
     }
-    events = deps.event_bus.history(event_type=AUTHENTICATION_CHECKED)
-    assert len(events) == 1
-    assert events[0].payload["outcome"] == outcome
-    # An ordinary probe declares assessment_kind="observation", so the event
-    # must keep saying observation no matter what the comparison found.
-    assert events[0].payload["assessment_kind"] == "observation"
-    refs = events[0].payload["evidence_ids"]
-    assert len(refs) == 2
-    evidence = await deps.evidence_store.list_for_run(final.run_id)
-    assert set(refs) <= {e.evidence_id for e in evidence}
-    graph = AttackGraphService(deps.graph_store)
-    assert await graph.list_findings() == []
-    hypotheses = await graph.list_hypotheses()
-    auth = [h for h in hypotheses if h.metadata.get("kind") == "authentication"]
-    assert len(auth) == 1 and auth[0].status != "open"
-    assert final.termination_reason == "no_actionable_plan"
-
-
-@pytest.mark.parametrize("sessions", [[], [{"session_ref": "alice", "paths": ["/other"]}]])
-async def test_missing_session_is_reported_without_making_a_request(sessions):
-    _, deps, gateway, _ = await exercise(sessions=sessions)
-    assert len(gateway.invocations) == 2
-    deferred = deps.event_bus.history(event_type=AUTHENTICATION_CHECK_DEFERRED)
-    assert deferred and deferred[0].payload["reason"] == "no_registered_session_for_path"
-
-
-async def test_missing_tool_is_reported_without_executing_followup():
-    _, deps, gateway, _ = await exercise(
-        sessions=[{"session_ref": "alice", "paths": ["/"]}],
-        tool_available=False,
+    baseline_ref = "ev-base"
+    if mismatch == "missing":
+        baseline_ref = "ev-gone"
+    elif mismatch == "method":
+        arguments = {**arguments, "method": "POST"}
+    elif mismatch == "path":
+        arguments = {**arguments, "path": "/different"}
+    elif mismatch == "target_ref":
+        arguments = {**arguments, "target_ref": "/different"}
+    elif mismatch == "session_ref":
+        arguments = {**arguments, "session_ref": "/different"}
+    proposal = ActionProposal(
+        action_id=ActionId("action_unit"),
+        run_id=RunId("run_unit"),
+        engagement_id=EngagementId("eng_unit"),
+        agent_id=AgentId("web-api-agent"),
+        capability="web",
+        operation="http_request",
+        target=HostTarget(host="app.local"),
+        arguments=arguments,
+        reason="unit",
+        created_at=now,
     )
-    assert len(gateway.invocations) == 2
-    assert any(
-        e.payload["reason"] == "no_compatible_authentication_tool"
-        for e in deps.event_bus.history(event_type=AUTHENTICATION_CHECK_DEFERRED)
-    )
-
-
-@pytest.mark.parametrize(
-    "verdict,reason",
-    [
-        (PolicyVerdict.DENY, "no_actionable_plan"),
-        (PolicyVerdict.REQUIRE_APPROVAL, "approval_pending"),
-    ],
-)
-async def test_followup_cannot_bypass_control(verdict, reason):
-    final, deps, gateway, control = await exercise(
-        sessions=[{"session_ref": "alice", "paths": ["/"]}],
-        verdict=verdict,
-    )
-    assert len(gateway.invocations) == 2
-    assert len(control.evaluated) == 3
-    assert final.termination_reason == reason
-    assert not deps.event_bus.history(event_type=AUTHENTICATION_CHECKED)
-
-
-async def test_denied_session_200_is_a_confirmed_access_control_finding():
-    # The operator explicitly registered bob as expected_access="deny" for
-    # "/", yet the session reached it (200). That is an operator-declared
-    # policy violation corroborated by two evidence records (anonymous 401
-    # baseline + this session's 200), so -- unlike an ambiguous status-only
-    # signal -- it IS promoted to a verified Finding.
-    final, deps, _, _ = await exercise(
-        sessions=[{"session_ref": "bob", "paths": ["/"], "expected_access": "deny"}]
-    )
-    assert (
-        deps.event_bus.history(event_type=AUTHENTICATION_CHECKED)[0].payload["outcome"]
-        == "access_control_violation"
-    )
-    # The step declared a security check; the violation is the outcome, not
-    # the label.
-    assert (
-        deps.event_bus.history(event_type=AUTHENTICATION_CHECKED)[0].payload[
-            "assessment_kind"
-        ]
-        == "security_check"
-    )
-    findings = await AttackGraphService(deps.graph_store).list_findings(verified=True)
-    assert len(findings) == 1
-    finding = findings[0]
-    assert finding.verified is True
-    assert finding.severity == "high"
-    # Corroborated by the baseline 401 and the session's 200.
-    assert len(finding.evidence_ids) == 2
-    graph = AttackGraphService(deps.graph_store)
-    hypotheses = [
-        item
-        for item in await graph.list_hypotheses()
-        if item.metadata.get("kind") == "web_access_validation"
-    ]
-    assert len(hypotheses) == 1
-    hypothesis = hypotheses[0]
-    assert hypothesis.status == "confirmed"
-    assert finding.metadata["hypothesis_id"] == hypothesis.hypothesis_id
-    evidence = await deps.evidence_store.list_for_run(final.run_id)
-    validation = [item for item in evidence if item.hypothesis_id == hypothesis.hypothesis_id]
-    assert len(validation) == 2
-    action_events = deps.event_bus.history(event_type="ActionProposed")
-    validation_actions = [
-        item
-        for item in action_events
-        if item.payload.get("hypothesis_id") == hypothesis.hypothesis_id
-    ]
-    assert len(validation_actions) == 2  # initial observation plus targeted validation
-    assert len({item.payload["hypothesis_id"] for item in validation_actions}) == 1
-    finding_event = deps.event_bus.history(event_type="FindingCreated")[0]
-    assert finding_event.payload["hypothesis_id"] == hypothesis.hypothesis_id
-
-
-async def test_denied_session_that_remains_denied_rejects_the_same_hypothesis():
-    _, deps, _, _ = await exercise(
-        authenticated=403,
-        sessions=[{"session_ref": "bob", "paths": ["/"], "expected_access": "deny"}],
-    )
-
-    # Regression: the deny expectation was *enforced*, so the verdict is PASS
-    # -- but the step was still an explicit security check. Deriving this
-    # label from is_violation mislabelled it "observation", which misreports
-    # what was under test.
-    checked = deps.event_bus.history(event_type=AUTHENTICATION_CHECKED)
-    assert checked and checked[-1].payload["outcome"] == "access_denied"
-    assert checked[-1].payload["assessment_kind"] == "security_check"
-
-    graph = AttackGraphService(deps.graph_store)
-    hypotheses = [
-        item
-        for item in await graph.list_hypotheses()
-        if item.metadata.get("kind") == "web_access_validation"
-    ]
-    assert len(hypotheses) == 1 and hypotheses[0].status == "rejected"
-    assert await graph.list_findings() == []
-
-
-async def test_each_session_is_checked_once_and_preserves_anonymous_evidence():
-    final, deps, gateway, _ = await exercise(
-        sessions=[{"session_ref": f"actor{i}", "paths": ["/"]} for i in range(5)]
-    )
-    assert len(gateway.invocations) == 7
-    assert final.termination_reason == "no_actionable_plan"
-    graph = AttackGraphService(deps.graph_store)
-    endpoints = [n for n in await graph.list_nodes() if n.type.value == "endpoint"]
-    observations = [
-        item
-        for item in facts_of(endpoints[0].properties)["observations"]
-        if item["kind"] == "http_response"
-    ]
-    assert len(observations) == 6
-    assert observations[0]["status_code"] == 401 and observations[0]["session_ref"] is None
-    assert len({o["session_ref"] for o in observations[1:]}) == 5
-
-
-@pytest.mark.parametrize("status", [200, 403, 500])
-async def test_other_status_does_not_start_authentication(status):
-    _, deps, gateway, _ = await exercise(
-        anonymous=status,
-        sessions=[{"session_ref": "alice", "paths": ["/"]}],
-    )
-    assert len(gateway.invocations) == 2
-    assert not deps.event_bus.history(event_type=AUTHENTICATION_CHECKED)
-
-
-@pytest.mark.parametrize("mismatch", ["missing", "path", "target_ref", "session_ref", "method"])
-async def test_mismatched_baseline_or_request_cannot_confirm_authentication(mismatch):
-    from redteam.core.contracts.tool import ToolResult
-    from redteam.core.ids import EvidenceId
-    from redteam.orchestration.authentication import AuthenticationCheck, assess_authentication
-
-    final, deps, gateway, control = await exercise(
-        sessions=[{"session_ref": "alice", "paths": ["/"]}]
-    )
-    event = deps.event_bus.history(event_type=AUTHENTICATION_CHECKED)[0]
-    baseline_id, current_id = event.payload["evidence_ids"]
-    evidence = await deps.evidence_store.get(EvidenceId(current_id))
-    proposal = control.evaluated[-1]
-    if mismatch != "missing":
-        arguments = dict(proposal.arguments)
-        arguments[mismatch] = "POST" if mismatch == "method" else "/different"
-        proposal = proposal.model_copy(update={"arguments": arguments})
-    invocation = gateway.invocations[-1]
-    now = datetime.now(timezone.utc)
     result = ToolResult(
-        invocation_id=invocation.invocation_id,
-        action_id=proposal.action_id,
-        tool_id=invocation.tool_id,
+        invocation_id=InvocationId("inv_unit"),
+        action_id=ActionId("action_unit"),
+        tool_id=ToolId("web.http_request"),
         success=True,
         output={"status_code": 200},
         started_at=now,
         finished_at=now,
     )
     assessment = await assess_authentication(
-        AuthenticationCheck(
-            baseline_evidence_id=EvidenceId("missing" if mismatch == "missing" else baseline_id),
-            session_ref="alice",
-        ),
+        AuthenticationCheck(baseline_evidence_id=EvidenceId(baseline_ref), session_ref="alice"),
         proposal,
         result,
-        evidence,
-        deps.evidence_store,
+        current,
+        store,
     )
     assert assessment.hypothesis_status == "inconclusive"
     assert assessment.outcome == "baseline_evidence_unavailable_or_mismatched"
-    assert assessment.evidence_ids == [current_id]
+    assert assessment.evidence_ids == ["ev-now"]
+
+
+async def test_anonymous_401_then_single_gated_session_check() -> None:
+    engagement = _auth_engagement()
+    gateway = SessionGateway(401, 200)
+    deps = _auth_deps(engagement, gateway, SessionGate(PolicyVerdict.ALLOW))
+    final = await run_engagement(engagement, deps)
+    assert len(gateway.invocations) == 2
+    assert "session_ref" not in gateway.invocations[0].arguments
+    assert gateway.invocations[1].arguments["session_ref"] == "alice"
+    bus = deps.event_bus
+    assert isinstance(bus, InMemoryEventBus)
+    events = bus.history(event_type=AUTHENTICATION_CHECKED)
+    assert len(events) == 1
+    assert events[0].payload["outcome"] == "session_access_observed"
+    assert events[0].payload["assessment_kind"] == "observation"
+    refs = events[0].payload["evidence_ids"]
+    assert len(refs) == 2
+    evidence = await deps.evidence_store.list_for_run(final.run_id)
+    assert set(refs) <= {str(e.evidence_id) for e in evidence}
+    from redteam.attack_graph.service import AttackGraphService
+    assert await AttackGraphService(deps.graph_store).list_findings() == []
+
+
+async def test_session_followup_deny_blocks() -> None:
+    engagement = _auth_engagement()
+    gateway = SessionGateway(401, 200)
+    control = SessionGate(PolicyVerdict.DENY)
+    deps = _auth_deps(engagement, gateway, control)
+    await run_engagement(engagement, deps)
+    assert len(gateway.invocations) == 1
+    assert "session_ref" not in gateway.invocations[0].arguments
+    assert [p for p in control.evaluated if "session_ref" in p.arguments]
+    bus = deps.event_bus
+    assert isinstance(bus, InMemoryEventBus)
+    assert not bus.history(event_type=AUTHENTICATION_CHECKED)
+
+
+async def test_denied_session_200_is_a_confirmed_access_control_finding() -> None:
+    engagement = _auth_engagement(session_ref="bob", expected_access="deny")
+    gateway = SessionGateway(401, 200)
+    deps = _auth_deps(
+        engagement, gateway, SessionGate(PolicyVerdict.ALLOW),
+        session_ref="bob",
+        expected_access="deny",
+    )
+    final = await run_engagement(engagement, deps)
+    bus = deps.event_bus
+    assert isinstance(bus, InMemoryEventBus)
+    checked = bus.history(event_type=AUTHENTICATION_CHECKED)
+    assert len(checked) == 1
+    assert checked[0].payload["outcome"] == "access_control_violation"
+    assert checked[0].payload["assessment_kind"] == "security_check"
+    from redteam.attack_graph.service import AttackGraphService
+    graph = AttackGraphService(deps.graph_store)
+    findings = await graph.list_findings(verified=True)
+    assert len(findings) == 1
+    finding = findings[0]
+    assert finding.verified is True
+    assert finding.severity == "high"
+    assert len(finding.evidence_ids) == 2
+    hypotheses = await graph.list_hypotheses(status="confirmed")
+    assert len(hypotheses) == 1
+    assert finding.metadata["hypothesis_id"] == hypotheses[0].hypothesis_id
+    evidence = await deps.evidence_store.list_for_run(final.run_id)
+    refs = checked[0].payload["evidence_ids"]
+    assert set(refs) <= {str(e.evidence_id) for e in evidence}

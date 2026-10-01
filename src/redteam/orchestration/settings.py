@@ -77,31 +77,21 @@ class OrchestrationSettings(BaseModel):
     branch_prune_difficulty_threshold: float = Field(default=0.65, ge=0.0, le=1.0)
     branch_prune_objective_override: float = Field(default=0.8, ge=0.0, le=1.0)
 
-    #: Hybrid planning: a single candidate, or a top-1 score lead of at least
-    #: this much, is chosen deterministically and costs no LLM call. Anything
-    #: closer is genuinely ambiguous and goes to a bounded rerank.
+    #: Legacy compatibility; the LLM-led runtime ignores ranking knobs.
     planner_score_margin: float = Field(default=0.15, ge=0.0, le=10.0)
-    #: How many of the top candidates a rerank is allowed to consider. The
-    #: planner can only ever return one of these.
+    #: Retained for older settings; never limits LLM-generated actions.
     planner_rerank_top_k: int = Field(default=3, ge=2, le=20)
 
-    #: ``llm_first`` lets one observable LLM turn propose the next action and
-    #: uses role recipes only when that turn fails to produce an executable
-    #: draft. ``hybrid`` retains the older additive behaviour; ``playbook_only``
-    #: is deterministic/offline mode.
-    planning_mode: Literal["llm_first", "hybrid", "playbook_only"] = "playbook_only"
-    #: Deprecated compatibility mirror for callers/tests that still set the
-    #: old flag directly. The model validator normalizes it to hybrid mode.
-    llm_candidate_generation: bool = Field(default=False)
+    #: One runtime mode; frozen legacy core flags do not select it.
+    llm_candidate_generation: Literal[True] = True
+    decision_max_attempts: int = Field(default=3, ge=1, le=6)
+    path_backend: Literal["memory", "sqlite"] = "memory"
 
     #: Overrides the value derived from ``max_steps`` when set.
     recursion_limit: int | None = Field(default=None, ge=1)
 
     @model_validator(mode="after")
     def _checkpoint_path_is_safe(self) -> OrchestrationSettings:
-        if self.llm_candidate_generation and self.planning_mode == "playbook_only":
-            self.planning_mode = "hybrid"
-        self.llm_candidate_generation = self.planning_mode != "playbook_only"
         if self.checkpoint_backend == "sqlite" and not self.checkpoint_path.strip():
             raise ValueError("sqlite checkpointing needs a non-blank checkpoint_path")
         if self.work_backend == "sqlite" and not self.work_path.strip():
@@ -128,6 +118,7 @@ class OrchestrationSettings(BaseModel):
             checkpoint_backend="sqlite",
             work_backend="sqlite",
             task_graph_backend="sqlite",
+            path_backend="sqlite",
             attack_graph_backend="sqlite",
             operator_intent_backend="sqlite",
             enforce_verification_reserve=True,
@@ -161,9 +152,5 @@ class OrchestrationSettings(BaseModel):
         if config is not None:
             base["max_steps"] = config.max_steps
             base["max_retries"] = config.max_retries
-            base["llm_candidate_generation"] = config.llm_candidate_generation
-            base["planning_mode"] = config.planning_mode or (
-                "hybrid" if config.llm_candidate_generation else "playbook_only"
-            )
         base.update({key: value for key, value in overrides.items() if value is not None})
         return cls.model_validate(base)

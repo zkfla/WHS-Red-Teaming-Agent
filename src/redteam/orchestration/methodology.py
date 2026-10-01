@@ -273,7 +273,7 @@ def reference_agent() -> tuple[AgentSpec, AgentDefinition]:
             agent_id=REFERENCE_AGENT_ID,
             name="Methodology Reference Agent",
             capabilities=["analysis"],
-            planner_kind="playbook",
+            planner_kind="llm",
         ),
         AgentDefinition(
             agent_id=REFERENCE_AGENT_ID,

@@ -12,22 +12,30 @@ routing: `src/redteam/orchestration/router.py`.
 
 Control/tool/state outcomes are also appended to the bounded
 `RuntimeState.recent_observations` window and supplied to the next planning
-turn. See [Interactive Agent Runtime](agent-behavior.md) for the operator
-channel, Decision Trace and approval-suspension behavior.
+turn. The CLI displays the actual decision, Control verdict, tool result and
+state update; approval suspension preserves the original action for resume.
 
-The interactive shell routes chat into a Mission objective/guidance, but the
+The interactive shell classifies chat before mutation: read-only questions,
+guidance for the original Run attachment, explicit new investigations, or
+clarification. A session-wide editor preserves drafts across Run completion;
+control commands and chat classification use separate workers. See
+[CLI session architecture](cli-session.md) for routing, output fences and lifecycle.
+
+The shell sends accepted execution requests into a Mission objective/guidance, but the
 visible action response comes from the PLAN node's actual LLM turn. The facade
 has no ToolGateway path. Therefore natural language cannot skip PLAN, the
 candidate compiler, POLICY or MCP selection.
 
-With `planning_mode=llm_first`, PLAN receives the current Attack Graph,
-Evidence excerpts, prior Control/tool observations, operator guidance and the
-healthy live MCP action space. It returns a public decision summary plus
-structured action drafts. Executable drafts continue directly to Control; if
-the LLM call fails or all requested actions fail compilation, the registered
-role provider supplies a playbook/graph recipe fallback. A deliberate
-`intent=finish` does not trigger fallback. `hybrid` preserves the older
-additive mode and `playbook_only` supports deterministic/offline operation.
+PLAN receives the current Attack Graph, Evidence excerpts, prior Control/tool
+observations (the bounded 12-record runtime window), operator guidance and the
+healthy live MCP action space. It returns a public decision summary (public
+reason only, never private chain-of-thought) plus structured action drafts
+through `path_draft` -> `path_review` -> `next_action`. Compiled drafts that
+sit inside the accepted path version continue to Control; a failed model call
+or a draft that fails compilation returns errors for model correction and
+never executes a rule/playbook fallback. Completion modes (`complete_step`,
+`complete_task`, `complete_goal`) close work only through code validation
+against real evidence.
 
 ## Minimal Vertical Slice, step by step
 
@@ -40,7 +48,7 @@ description — run `redteam run examples/engagement.yaml` (or bare
 | # | Step | Code |
 |---|---|---|
 | 1 | Engagement created | `app.bootstrap.load_engagement` (or, via the CLI, `AppConfig`/`core.config.load_engagement_config`) reads an `engagement.yaml` into an `Engagement` |
-| 2 | An Agent runs | `orchestration.nodes.observe` -> `orchestration.nodes.plan`. **Current status**: real registered agents (`recon-agent`/`web-api-agent`/`mobile-agent`, `orchestration/agents/{registry,builtin}.py`), not the single "fake Recon Agent" this row originally described — see `docs/agent/orchestration-implementation-plan.md` section 16.1 for exactly how thin each one's playbook still is. |
+| 2 | An Agent runs | `orchestration.nodes.observe` -> `orchestration.nodes.plan`. **Current status**: real registered agents (`recon-agent`/`web-api-agent`/`mobile-agent`, `orchestration/agents/{registry,builtin}.py`), not the single "fake Recon Agent" this row originally described; role providers supply review reference only and every executed action comes from the accepted compiled path. |
 | 3 | Agent creates `ActionProposal` | `orchestration.nodes.plan.plan_node` |
 | 4 | Control Plane evaluates | `orchestration.nodes.policy.policy_node` calls `deps.control_plane.evaluate(...)` |
 | 5 | ALLOW decision | `control.service.DefaultControlPlane.evaluate` (Scope -> Policy -> RateLimit -> Budget -> Approval) |
@@ -58,9 +66,12 @@ description — run `redteam run examples/engagement.yaml` (or bare
 ```text
 RunStarted
 AgentStarted
-AgentTurnDecided (LLM planning modes)
-CandidateGenerated
-AgentContextPrepared
+AgentContextPrepared (path draft)
+AgentTurnDecided (path draft)
+AgentContextPrepared (path review)
+AgentTurnDecided (path review)
+AgentContextPrepared (next action)
+AgentTurnDecided (next action)
 AgentDecisionRecorded
 MCPToolSelected
 ActionProposed
@@ -99,25 +110,14 @@ success=True  + VIOLATION -> tool ran fine, and it confirmed a security violatio
 success=False + UNKNOWN   -> execution failed, so no verdict could be reached
 ```
 
-**Current status**: this is no longer a `success -> PASS` placeholder.
-`orchestration.nodes.verify.verify_node` calls `deps.verifier.verify(...)`
-(`DeterministicAnalysisVerifier` by default), which evaluates the
-step's `Expectation` against the real `ToolResult`
-(`orchestration.expectations.verdict_for`) and resolves the Hypothesis
-(`open -> confirmed/rejected/inconclusive`) that was recorded before the
-action ran. A `Verdict.VIOLATION` does create a real, verified `Finding`
-carrying the `EvidenceId` behind it — this whole mechanism works
-correctly end to end (`tests/unit/test_orchestration_nodes.py`).
-
-The actual gap is one level up, not here: reaching `VIOLATION` requires
-the step's `Expectation` to set `violation_if_met=True` (or
-`anomaly_if_unmet=True`), and **no built-in playbook step
-(`recon-agent`/`web-api-agent`/`mobile-agent`) sets either** — so every
-real run today produces `PASS`/`UNKNOWN` only, regardless of what the
-target actually does. See
-`docs/agent/orchestration-implementation-plan.md` section 16.1, finding
-1, for the full detail; this is the single most significant remaining
-gap in the project.
+`orchestration.nodes.verify.verify_node` uses the structured LLM analysis
+verifier by default. It interprets the real result against the action's
+hypothesis and expectation, while code checks the referenced run, invocation,
+target and principal evidence. A verified violation can create a Finding
+linked to the supporting evidence. A successful tool call alone does not
+establish a vulnerability or complete the path, task or goal. The retained
+deterministic verifier supports explicit test scenarios; it does not replace
+the production LLM planning flow.
 
 ## Denied path
 

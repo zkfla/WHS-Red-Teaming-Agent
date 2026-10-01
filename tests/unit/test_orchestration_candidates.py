@@ -61,6 +61,50 @@ def agent(tool_id: str = "recon.ping") -> AgentSpec:
     )
 
 
+def endpoint_agent(arguments: dict[str, Any] | None = None) -> AgentSpec:
+    return AgentSpec(
+        agent_id=AgentId("recon"),
+        name="recon",
+        playbook=[
+            PlanStep(
+                step_id="discover",
+                capability="recon",
+                operation="endpoint_discovery",
+                tool_id=ToolId("recon.html_inventory"),
+                target_bind="host",
+                preconditions=[
+                    NodePattern(
+                        type=GraphNodeType.HOST,
+                        attrs={"in_scope": True},
+                        bind="host",
+                    )
+                ],
+                arguments=arguments or {},
+                reason="discover endpoints",
+            )
+        ],
+    )
+
+
+def schema_tool(*, path_required: bool = True) -> ToolDescriptor:
+    required = ["target_ref", "path"] if path_required else ["target_ref"]
+    return ToolDescriptor(
+        tool_id=ToolId("recon.html_inventory"),
+        server_id="test",
+        tool_name="html_inventory",
+        capability_tags=["recon"],
+        health_status=ToolHealthStatus.HEALTHY,
+        input_schema={
+            "type": "object",
+            "required": required,
+            "properties": {
+                "target_ref": {"type": "string"},
+                "path": {"type": "string"},
+            },
+        },
+    )
+
+
 async def graph():
     service = AttackGraphService(InMemoryAttackGraphStore())
     await service.upsert_node(GraphNodeType.HOST, key="b.local", attrs={"in_scope": True})
@@ -430,6 +474,65 @@ async def test_compiler_rejects_a_draft_whose_execution_target_is_not_referenced
     )
 
     assert compiler.compile_drafts([mismatched]) == []
+
+
+async def test_endpoint_discovery_missing_path_is_rejected_without_inventing_path() -> None:
+    from redteam.orchestration.agents.providers import PlaybookCandidateProvider
+
+    service = await graph()
+    registry = MCPToolRegistry()
+    registry.register(schema_tool())
+    compiler = CandidateCompiler(catalog_for(registry, operation="endpoint_discovery"))
+    observation = await service.observe(step=1)
+    drafts = await PlaybookCandidateProvider().propose(
+        endpoint_agent(), service.view(), observation, step=1
+    )
+
+    candidates, rejections = compiler.compile_drafts_with_rejections(drafts)
+
+    assert candidates == []
+    assert rejections
+    assert all(
+        rejection.reason == "missing_required_argument" and rejection.field == "path"
+        for rejection in rejections
+    )
+
+
+async def test_endpoint_discovery_preserves_explicit_path() -> None:
+    service = await graph()
+    registry = MCPToolRegistry()
+    registry.register(schema_tool())
+    compiler = CandidateCompiler(catalog_for(registry, operation="endpoint_discovery"))
+
+    candidates = await compiler.compile_playbook(
+        endpoint_agent({"path": "/openapi.json"}),
+        service.view(),
+        await service.observe(step=1),
+        step=1,
+    )
+
+    assert candidates
+    assert all(
+        candidate.plan_step.arguments["path"] == "/openapi.json"
+        for candidate in candidates
+    )
+
+
+async def test_non_path_operation_does_not_gain_path_argument() -> None:
+    service = await graph()
+    registry = MCPToolRegistry()
+    registry.register(schema_tool(path_required=False))
+    compiler = CandidateCompiler(catalog_for(registry, operation="service_discovery"))
+
+    candidates = await compiler.compile_playbook(
+        agent("recon.html_inventory"),
+        service.view(),
+        await service.observe(step=1),
+        step=1,
+    )
+
+    assert candidates
+    assert all("path" not in candidate.plan_step.arguments for candidate in candidates)
 
 
 def test_custom_priority_signals_require_provenance() -> None:

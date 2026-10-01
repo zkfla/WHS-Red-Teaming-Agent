@@ -19,20 +19,75 @@ from redteam.orchestration.settings import OrchestrationSettings
 
 class RecordingLLM:
     def __init__(self):
-        self.calls = 0
+        self.calls = []
         self.reference_context_calls = 0
 
     async def complete_structured(self, *, messages, response_schema, system=None, **kwargs):
-        self.calls += 1
+        self.calls.append((messages, system))
+        payload = json.loads(messages[0]["content"])
         self.reference_context_calls += int(
-            "Untrusted methodology reference DATA" in json.dumps(messages, ensure_ascii=True)
+            bool(payload.get("Untrusted methodology reference DATA"))
         )
-        return {
-            "intent": "finish",
-            "response": "참고 데이터 전달 seam을 확인했습니다.",
-            "decision_summary": "실제 모델 판단이나 대상 검증은 수행하지 않았습니다.",
-            "actions": [],
-        }
+        properties = response_schema.get("properties", {})
+        if "path_id" in properties and "steps" in properties:
+            target = payload["methodology_reference_options"][0]["target_node_id"]
+            return {
+                "path_id": "reference-demo",
+                "run_id": "placeholder",
+                "version": 1,
+                "status": "draft",
+                "reason": "승인된 자료 조회 데모",
+                "goal": payload["goal"],
+                "steps": [
+                    {
+                        "step_id": "read-reference",
+                        "objective": "참고 자료를 MCP로 조회",
+                        "agent_id": "methodology-agent",
+                        "target_node_ids": [target],
+                        "allowed_operations": ["analysis.file_read"],
+                        "completion_criteria": [{"kind": "evidence", "description": "조회 결과"}],
+                    }
+                ],
+            }
+        if "decision" in properties:
+            return {"decision": "accept", "reason": "합성 데모의 읽기 경로입니다."}
+        if "claim_supported" in properties:
+            return {
+                "meaning": "조회 관측",
+                "outcome": "success",
+                "reason": "조회 결과만 관측",
+                "confidence": 0.8,
+                "claim_supported": False,
+            }
+        if "mode" in properties:
+            pending = next(
+                (
+                    item
+                    for item in payload["methodology_reference_options"]
+                    if item["status"] == "pending"
+                ),
+                None,
+            )
+            if pending is None:
+                # Deliberately no semantic goal-completion claim from a demo model.
+                return {
+                    "mode": "hold",
+                    "reason": "참고 데이터 전달만 확인. 실검증은 하지 않았습니다.",
+                }
+            action = {
+                key: pending[key]
+                for key in (
+                    "agent_id",
+                    "target_node_id",
+                    "capability",
+                    "operation",
+                    "tool_id",
+                    "arguments",
+                )
+            }
+            action.update(path_step_id="read-reference", reason="승인된 참고 데이터 조회")
+            return {"mode": "actions", "reason": "참고 데이터 조회 데모", "actions": [action]}
+        raise ValueError("demo_unexpected_decision_schema")
 
 
 async def main(config_path: str):
@@ -50,7 +105,6 @@ async def main(config_path: str):
             mcp_stack=stack,
             llm=llm,
             orchestration_settings=OrchestrationSettings(
-                planning_mode="llm_first",
                 max_steps=250,
                 checkpoint_backend="memory",
                 enforce_verification_reserve=False,
@@ -67,7 +121,7 @@ async def main(config_path: str):
                     "run_id": str(final.run_id),
                     "actions_executed": final.actions_executed,
                     "reference_progress": progress,
-                    "recording_llm_calls": llm.calls,
+                    "recording_llm_calls": len(llm.calls),
                     "reference_context_calls": llm.reference_context_calls,
                     "live_llm_tested": False,
                     "target_network_tools_enabled": False,

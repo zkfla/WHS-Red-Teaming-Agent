@@ -20,20 +20,23 @@ class WorkScheduler:
         *,
         graph_revision: int,
         run_id: RunId,
+        mission_task_id: str | None = None,
         now: datetime | None = None,
     ) -> list[WorkItem]:
         created_at = now or datetime.now(timezone.utc)
         enqueued: list[WorkItem] = []
-        for candidate in sorted(
-            candidates, key=lambda item: (-item.priority.total, item.candidate_key)
-        ):
+        for candidate in candidates:
             draft = candidate.draft
             item = WorkItem(
                 work_id=new_id("work"),
                 run_id=run_id,
+                mission_task_id=mission_task_id,
                 candidate_key=candidate.candidate_key,
                 agent_id=draft.agent_id,
                 graph_revision=graph_revision,
+                path_id=draft.plan_step.path_id,
+                path_version=draft.plan_step.path_version,
+                path_step_id=draft.plan_step.path_step_id,
                 target_node_ids=draft.target_node_ids,
                 hypothesis_id=(
                     draft.plan_step.existing_hypothesis_id

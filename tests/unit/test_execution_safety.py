@@ -16,14 +16,17 @@ import asyncio
 from dataclasses import replace
 from datetime import datetime, timezone
 
+from redteam.attack_graph.identity import host_node_id
 from redteam.core.contracts.action import ActionProposal
 from redteam.core.contracts.target import HostTarget
 from redteam.core.contracts.tool import ToolDescriptor, ToolError, ToolInvocation, ToolResult
 from redteam.core.enums import PolicyVerdict, RiskLevel
 from redteam.core.ids import ActionId, AgentId, EngagementId, RunId, ToolId
-from redteam.orchestration.agents.registry import RECON_AGENT
+from redteam.orchestration.agents import PlanStep
 from redteam.orchestration.nodes import execute_node, policy_node
 from redteam.orchestration.nodes.execute import _retry_safe
+from redteam.orchestration.paths.models import CompletionCriterion, PathPlan
+from redteam.orchestration.paths.models import PathStep as RegisteredStep
 from redteam.orchestration.router import route_after_policy
 from redteam.orchestration.settings import OrchestrationSettings
 from redteam.orchestration.state import GraphState, RuntimeState, initial_graph_state
@@ -33,6 +36,8 @@ from tests.fakes.tool_gateway import DummyToolGateway
 NOW = datetime.now(timezone.utc)
 RUN = RunId("run_exec_safety")
 ENGAGEMENT = EngagementId("eng_exec_safety")
+_PATH_ID = "path-exec-safety"
+_PATH_STEP_ID = "probe-host"
 
 
 def runtime(**overrides) -> RuntimeState:
@@ -63,6 +68,64 @@ def descriptor(risk: RiskLevel) -> ToolDescriptor:
     )
 
 
+async def _ensure_exec_path(deps) -> None:
+    existing = await deps.path_store.get_active(str(RUN))
+    if existing is not None:
+        return
+    plan = PathPlan(
+        path_id=_PATH_ID,
+        run_id=str(RUN),
+        mission_id=None,
+        version=1,
+        parent_version=None,
+        status="active",
+        reason="test fixture path",
+        goal="probe",
+        steps=[
+            RegisteredStep(
+                step_id=_PATH_STEP_ID,
+                objective="probe host",
+                agent_id="recon-agent",
+                target_node_ids=[str(host_node_id("a.local"))],
+                principal_refs=[],
+                allowed_operations=["recon.service_discovery", "recon.auth_attempt"],
+                depends_on=[],
+                required_fact_refs=[],
+                unknowns=[],
+                completion_criteria=[
+                    CompletionCriterion(kind="evidence", description="probe", min_evidence=1)
+                ],
+                required=True,
+                status="pending",
+            )
+        ],
+        hypothesis_ids=[],
+        evidence_ids=[],
+        changed_step_ids=[],
+        review_records={},
+    )
+    try:
+        await deps.path_store.register(plan)
+    except Exception:
+        pass
+
+
+def _exec_plan_step(prop: ActionProposal) -> PlanStep:
+    return PlanStep(
+        step_id=_PATH_STEP_ID,
+        path_id=_PATH_ID,
+        path_version=1,
+        path_step_id=_PATH_STEP_ID,
+        capability=prop.capability,
+        operation=prop.operation,
+        tool_id=ToolId("recon.probe"),
+        target=prop.target,
+        arguments=dict(prop.arguments),
+        reason="probe",
+        availability_impact=prop.availability_impact,
+    )
+
+
 async def execute(
     deps,
     *,
@@ -70,15 +133,17 @@ async def execute(
     remaining_budget: int | None = 5,
     actions_executed: int = 0,
 ) -> GraphState:
+    await _ensure_exec_path(deps)
     state = initial_graph_state(
         runtime(
             remaining_budget=remaining_budget,
             actions_executed=actions_executed,
         )
     )
-    state["action_proposal"] = proposal(action_id)
+    prop = proposal(action_id)
+    state["action_proposal"] = prop
+    state["plan_step"] = _exec_plan_step(prop)
     state = await policy_node(state, deps=deps)
-    state["plan_step"] = RECON_AGENT.playbook[0]
     return await execute_node(state, deps=deps)
 
 
@@ -233,14 +298,17 @@ async def test_low_risk_state_changing_operation_is_not_retried() -> None:
         tool_gateway=gateway, tool_catalog=gateway,
         settings=OrchestrationSettings(max_retries=3),
     )
+    await _ensure_exec_path(deps)
     state = initial_graph_state(runtime(remaining_budget=5))
-    state["action_proposal"] = proposal().model_copy(update={"operation": "auth_attempt"})
+    prop = proposal().model_copy(update={"operation": "auth_attempt"})
+    state["action_proposal"] = prop
+    state["plan_step"] = _exec_plan_step(prop)
     state = await policy_node(state, deps=deps)
-    state["plan_step"] = RECON_AGENT.playbook[0].model_copy(update={"operation": "auth_attempt"})
 
     result = await execute_node(state, deps=deps)
 
-    assert result["tool_result"].success is False
+    tool_result = result["tool_result"]
+    assert tool_result is not None and tool_result.success is False
     assert len(gateway.invocations) == 1
     assert result["runtime"].retry_count == 0
 

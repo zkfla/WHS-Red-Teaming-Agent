@@ -8,7 +8,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -103,6 +103,7 @@ def _claim_durable_approval(path: str, run_id: str, approval_id: str) -> bool:
         )
         db.commit()
         return cursor.rowcount == 1
+
 
 #: Every termination reason ``reconcile_once`` can act on -- the generic
 #: reasons above plus ``APPROVAL_PENDING`` (handled by a dedicated branch,
@@ -260,9 +261,7 @@ class AgentLoopRunner:
         task.cancel()
         return True
 
-    async def _cleanup_after_failure(
-        self, runtime: RuntimeState, *, reason: str
-    ) -> None:
+    async def _cleanup_after_failure(self, runtime: RuntimeState, *, reason: str) -> None:
         cleanup = self._abandon_active_work(runtime, reason=reason)
         try:
             await asyncio.wait_for(
@@ -382,7 +381,8 @@ class AgentLoopRunner:
         if runtime.termination_reason == TerminationReason.OPERATOR_PAUSED:
             mission = (
                 await self._deps.task_graph_store.get_mission(runtime.mission_id)
-                if runtime.mission_id is not None else None
+                if runtime.mission_id is not None
+                else None
             )
             if mission is None or mission.status is not MissionStatus.ACTIVE:
                 return ReconciliationResult(runtime=runtime, wakeup=wakeup)
@@ -470,7 +470,8 @@ class AgentLoopRunner:
         if runtime.termination_reason == TerminationReason.OPERATOR_PAUSED:
             mission = (
                 await self._deps.task_graph_store.get_mission(runtime.mission_id)
-                if runtime.mission_id is not None else None
+                if runtime.mission_id is not None
+                else None
             )
             if mission is None or mission.status is not MissionStatus.ACTIVE:
                 return runtime
@@ -581,6 +582,18 @@ class AgentLoopRunner:
         if outcome is None:
             return None  # still pending
 
+        work_id = state.get("current_work_id")
+        if work_id is None:
+            return None
+        lease = await self._deps.work_store.acquire(
+            work_id,
+            owner=str(runtime.run_id),
+            now=datetime.now(timezone.utc),
+            ttl=timedelta(seconds=self._settings.lease_ttl_seconds),
+        )
+        if lease is None:
+            return None
+
         # A second process may have recovered the same safe checkpoint before
         # this approval was resolved. Its independent Control counters cannot
         # serialize the tool side effect: claim once in the shared checkpoint
@@ -589,8 +602,10 @@ class AgentLoopRunner:
         try:
             if self._settings.checkpoint_backend == "sqlite":
                 claimed = await asyncio.to_thread(
-                    _claim_durable_approval, self._settings.checkpoint_path,
-                    str(runtime.run_id), str(runtime.pending_approval_id),
+                    _claim_durable_approval,
+                    self._settings.checkpoint_path,
+                    str(runtime.run_id),
+                    str(runtime.pending_approval_id),
                 )
             else:
                 claim = (
@@ -603,8 +618,14 @@ class AgentLoopRunner:
                     _MEMORY_RESUME_CLAIMS.add(claim)
         except (OSError, sqlite3.Error):
             logger.exception("refusing approval resume: durable claim unavailable")
+            await self._deps.work_store.release(
+                work_id, owner=str(runtime.run_id), now=datetime.now(timezone.utc)
+            )
             return None
         if not claimed:
+            await self._deps.work_store.release(
+                work_id, owner=str(runtime.run_id), now=datetime.now(timezone.utc)
+            )
             return None
 
         resumed_runtime = runtime.model_copy(
@@ -618,6 +639,7 @@ class AgentLoopRunner:
             resumed_runtime,
             action_proposal=proposal,
             plan_step=state.get("plan_step"),
+            current_work_id=state.get("current_work_id"),
         )
         return await self._run_state(resumed_runtime, seeded)
 
@@ -668,6 +690,11 @@ class AgentLoopRunner:
         self._require_checkpointing("resume_from")
         await self._ensure_graph()
         assert self._graph is not None
+        snapshot = await self._graph.aget_state(self.config(checkpoint_id=checkpoint_id))
+        if self._snapshot_replays_execution(snapshot):
+            raise ValueError(
+                "checkpoint would repeat an execution; collect its stored result first"
+            )
         final: GraphState = await self._graph.ainvoke(
             None, config=self.config(checkpoint_id=checkpoint_id)
         )

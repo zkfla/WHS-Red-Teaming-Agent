@@ -153,6 +153,7 @@ async def test_release_requires_completed_mission_and_verified_criteria() -> Non
     assert (await _project(store)).ready_for_release is True
 
     completed = await store.get_mission(plan.mission_id)
+    assert completed is not None
     await store.update_mission(
         completed.model_copy(
             update={

@@ -58,10 +58,54 @@ class RuntimeObservation(BaseModel):
         return [redact_sensitive_text(str(item))[:200] for item in value]
 
 
-def append_runtime_observation(runtime, observation: RuntimeObservation):  # noqa: ANN001, ANN201
-    """Return ``runtime`` with a stable, bounded recent-observation window."""
+def _observation_key(observation: RuntimeObservation) -> tuple[int, str | None, str, str]:
+    """Stable update key: same step, action, kind and outcome refresh one entry."""
 
-    recent = [*runtime.recent_observations, observation]
+    return (
+        observation.step,
+        observation.action_id,
+        observation.kind,
+        observation.outcome,
+    )
+
+
+def _deduped(items: list[str], limit: int) -> list[str]:
+    """Remove repeats in first-seen order and keep the most recent limit."""
+
+    seen: set[str] = set()
+    unique: list[str] = []
+    for item in items:
+        if item not in seen:
+            seen.add(item)
+            unique.append(item)
+    return unique[-limit:]
+
+
+def append_runtime_observation(runtime, observation: RuntimeObservation):  # noqa: ANN001, ANN201
+    """Return runtime with a stable, bounded recent-observation window."""
+
+    recent = list(runtime.recent_observations)
+    key = _observation_key(observation)
+    for index, existing in enumerate(recent):
+        if _observation_key(existing) != key:
+            continue
+        merged = dict(observation.model_dump())
+        merged["reasons"] = _deduped([*existing.reasons, *observation.reasons], 8)
+        merged["matched_rules"] = _deduped(
+            [*existing.matched_rules, *observation.matched_rules], 12
+        )
+        if merged.get("approval_id") is None:
+            merged["approval_id"] = existing.approval_id
+        refreshed = type(existing).model_validate(merged)
+        if refreshed.model_dump(mode="json", exclude_none=True) == existing.model_dump(
+            mode="json", exclude_none=True
+        ):
+            return runtime
+        recent[index] = refreshed
+        return runtime.model_copy(
+            update={"recent_observations": recent[-MAX_RUNTIME_OBSERVATIONS:]}
+        )
+    recent.append(observation)
     return runtime.model_copy(update={"recent_observations": recent[-MAX_RUNTIME_OBSERVATIONS:]})
 
 

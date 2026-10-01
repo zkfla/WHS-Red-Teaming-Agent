@@ -10,8 +10,10 @@ rendering itself is already covered by ``tests/unit/test_cli_renderer.py``
 from __future__ import annotations
 
 import argparse
+from typing import cast
 
 import pytest
+from rich.console import Console
 
 from redteam.app.cli import interactive_commands
 from redteam.app.cli.interactive_commands import (
@@ -108,7 +110,7 @@ async def test_aliases_resolve_to_the_same_command(alias: str, canonical: str) -
     original = interactive_commands._REGISTRY
     interactive_commands._REGISTRY = fake_registry
     try:
-        assert await dispatch(console, session, f"/{alias}") is True
+        assert await dispatch(cast(Console, console), session, f"/{alias}") is True
     finally:
         interactive_commands._REGISTRY = original
     assert calls == ["called"]
@@ -120,7 +122,7 @@ async def test_aliases_resolve_to_the_same_command(alias: str, canonical: str) -
 async def test_dispatch_unknown_command_recovers_without_ending_session() -> None:
     console = _FakeConsole()
     session = _session()
-    result = await dispatch(console, session, "/bogus")
+    result = await dispatch(cast(Console, console), session, "/bogus")
     assert result is True
     assert any("Unknown command" in line for line in console.lines)
 
@@ -128,7 +130,7 @@ async def test_dispatch_unknown_command_recovers_without_ending_session() -> Non
 async def test_dispatch_bare_slash_shows_a_hint() -> None:
     console = _FakeConsole()
     session = _session()
-    result = await dispatch(console, session, "/")
+    result = await dispatch(cast(Console, console), session, "/")
     assert result is True
     assert any("/help" in line for line in console.lines)
 
@@ -136,7 +138,7 @@ async def test_dispatch_bare_slash_shows_a_hint() -> None:
 async def test_dispatch_is_case_insensitive() -> None:
     console = _FakeConsole()
     session = _session()
-    assert await dispatch(console, session, "/HELP") is True
+    assert await dispatch(cast(Console, console), session, "/HELP") is True
     assert any("Commands" in line for line in console.lines)
 
 
@@ -155,7 +157,7 @@ async def test_dispatch_handler_exception_is_recovered_not_propagated() -> None:
         "boom": InteractiveCommand("boom", (), "raises", _boom)
     }
     try:
-        result = await dispatch(console, session, "/boom")
+        result = await dispatch(cast(Console, console), session, "/boom")
     finally:
         interactive_commands._REGISTRY = original
 
@@ -169,13 +171,13 @@ async def test_dispatch_handler_exception_is_recovered_not_propagated() -> None:
 async def test_dispatch_exit_ends_the_session() -> None:
     console = _FakeConsole()
     session = _session()
-    assert await dispatch(console, session, "/exit") is False
+    assert await dispatch(cast(Console, console), session, "/exit") is False
 
 
 async def test_exit_command_raises_session_exit_directly() -> None:
     exit_command = next(c for c in COMMANDS if c.name == "exit")
     with pytest.raises(SessionExit):
-        await exit_command.handler(_FakeConsole(), _session(), "")
+        await exit_command.handler(cast(Console, _FakeConsole()), _session(), "")
 
 
 # --- Session lifecycle / view-state projection ----------------------------
@@ -217,7 +219,7 @@ async def test_status_defaults_to_last_run_id_when_no_argument_given(
     monkeypatch.setattr(interactive_commands.status_command, "run", _fake_status_run)
     session = _session(last_run_id=RunId("run_from_session"))
 
-    result = await dispatch(_FakeConsole(), session, "/status")
+    result = await dispatch(cast(Console, _FakeConsole()), session, "/status")
 
     assert result is True
     assert captured["run_id"] == "run_from_session"
@@ -237,7 +239,7 @@ async def test_status_with_no_history_and_no_argument_shows_hint(
     console = _FakeConsole()
     session = _session()  # last_run_id is None
 
-    await dispatch(console, session, "/status")
+    await dispatch(cast(Console, console), session, "/status")
 
     assert called is False
     assert any("No run yet" in line for line in console.lines)
@@ -255,7 +257,7 @@ async def test_status_explicit_run_id_overrides_session(
     monkeypatch.setattr(interactive_commands.status_command, "run", _fake_status_run)
     session = _session(last_run_id=RunId("run_stale"))
 
-    await dispatch(_FakeConsole(), session, "/status run_explicit")
+    await dispatch(cast(Console, _FakeConsole()), session, "/status run_explicit")
 
     assert captured["run_id"] == "run_explicit"
 
@@ -276,12 +278,12 @@ async def test_tools_command_delegates_to_the_shared_tools_run_list(
     monkeypatch.setattr(interactive_commands.tools_command, "run_list", _fake_run_list)
     session = _session()
 
-    await dispatch(_FakeConsole(), session, "/tools")
+    await dispatch(cast(Console, _FakeConsole()), session, "/tools")
 
     assert captured["json"] is False
 
 
 async def test_clear_command_clears_the_console() -> None:
     console = _FakeConsole()
-    await dispatch(console, _session(), "/clear")
+    await dispatch(cast(Console, console), _session(), "/clear")
     assert console.cleared is True

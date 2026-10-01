@@ -22,10 +22,8 @@ Two entry points build a ``RuntimeDeps``:
   ``redteam.app.cli`` uses this path exclusively — a real configured LLM
   provider or MCP server reaches a `run` invocation only through here.
 - ``build_runtime_deps(engagement, ...)`` — the original, ``Engagement``-only
-  entry point (always fake LLM, always the in-process dummy adapter
-  unless a caller works around it). Kept for callers that only have a
-  bare ``Engagement`` and no ``AppConfig`` (``examples/minimal_run.py``,
-  most unit/integration tests) — never the CLI.
+  composition helper. It requires an explicitly supplied LLM client;
+  test doubles are injected by tests, never selected automatically.
 """
 
 from __future__ import annotations
@@ -74,7 +72,6 @@ from redteam.event_bus.memory import InMemoryEventBus
 from redteam.event_bus.publisher import EventPublisher
 from redteam.evidence.service import EvidenceService
 from redteam.evidence.stores.filesystem import FilesystemEvidenceStore
-from redteam.llm.fake import FakeLLMClient
 from redteam.orchestration.agents.providers import (
     CandidateProviderRegistry,
     default_provider_registry,
@@ -117,21 +114,15 @@ def load_engagement(path: str | Path) -> Engagement:
 
 
 def build_llm_client(config: LLMConfig) -> LLMClient:
-    """Explicit provider names only -- an unrecognized string (a typo like
-    ``"litellmm"``, or someone writing ``"openai"``/``"anthropic"``
-    expecting it to just work) must be a loud config error, not a silent
-    ``FakeLLMClient``. Silently treating "anything that isn't literally
-    'litellm'" as fake previously masked exactly that kind of
-    misconfiguration -- offline/test use of ``FakeLLMClient`` remains
-    exactly as easy, via the explicit ``provider: "fake"``.
-    """
+    """Build the mandatory real model; test clients require explicit injection."""
     if config.provider == "litellm":
         from redteam.llm.litellm import LiteLLMClient
 
         return LiteLLMClient(model=config.default_model, api_key=config.resolve_api_key())
-    if config.provider == "fake":
-        return FakeLLMClient()
-    raise ValueError(f"unknown LLM provider {config.provider!r} -- expected 'fake' or 'litellm'")
+    raise ValueError(
+        f"production requires a real LLM provider, received {config.provider!r}; "
+        "configure 'litellm' (test clients must be explicitly injected)"
+    )
 
 
 async def _build_default_capability(
@@ -171,6 +162,7 @@ async def build_runtime_deps(
     audit_dir: str | Path = "data/audit",
     approval_dir: str | Path = "data/approvals",
     *,
+    llm: LLMClient,
     orchestration_settings: OrchestrationSettings | None = None,
     agents: AgentRegistry | None = None,
     candidate_providers: CandidateProviderRegistry | None = None,
@@ -199,6 +191,8 @@ async def build_runtime_deps(
     full ``AppConfig`` available — it reads the LLM/Capability/Logging
     sections this function doesn't.
     """
+    if llm is None:
+        raise ValueError("an explicit LLM client is required")
     event_bus = InMemoryEventBus()
     # Namespaced even though this builds one fresh store per call, so an
     # Engagement never silently depends on being the store's only tenant —
@@ -220,7 +214,6 @@ async def build_runtime_deps(
         # Risk-tiered approval reads tool risk_level from the Registry.
         risk_resolver=RegistryRiskResolver(discovered_catalog),
     )
-    llm_client = FakeLLMClient()
     settings = orchestration_settings or OrchestrationSettings()
 
     return RuntimeDeps(
@@ -229,7 +222,8 @@ async def build_runtime_deps(
         event_bus=event_bus,
         graph_store=graph_store,
         evidence_store=evidence_store,
-        llm_client=llm_client,
+        llm_client=llm,
+        engagement=engagement,
         agents=agents if agents is not None else default_registry(),
         candidate_providers=(
             candidate_providers if candidate_providers is not None else default_provider_registry()
@@ -237,6 +231,7 @@ async def build_runtime_deps(
         tool_catalog=(tool_catalog if tool_catalog is not None else discovered_catalog),
         work_store=_build_work_store(settings),
         task_graph_store=(task_graph_store or _build_task_graph_store(settings)),
+        path_store=_build_path_store(settings),
         operator_intent_store=build_operator_intent_store(
             settings.operator_intent_backend, settings.operator_intent_path
         ),
@@ -249,6 +244,14 @@ def _build_task_graph_store(settings: OrchestrationSettings) -> MissionTaskStore
     if settings.task_graph_backend == "sqlite":
         return SQLiteTaskGraphStore(settings.task_graph_path)
     return InMemoryTaskGraphStore()
+
+
+def _build_path_store(settings: OrchestrationSettings):
+    from redteam.orchestration.paths import InMemoryPathStore, SQLitePathStore
+
+    if settings.path_backend == "sqlite" or settings.task_graph_backend == "sqlite":
+        return SQLitePathStore(settings.task_graph_path)
+    return InMemoryPathStore()
 
 
 def _build_work_store(settings: OrchestrationSettings) -> WorkStore:
@@ -276,6 +279,7 @@ async def build_application(
     tool_catalog: ToolCatalog | None = None,
     task_graph_store: MissionTaskStore | None = None,
     engagement_id: EngagementId | None = None,
+    long_job_adapter=None,
 ) -> tuple[Engagement, RuntimeDeps]:
     """``AppConfig``-aware composition root. Every dependency is overridable.
 
@@ -284,8 +288,7 @@ async def build_application(
     - ``config.engagement`` -> ``Engagement`` handed to the default
       ``ControlPlane`` (and returned alongside ``RuntimeDeps`` — callers
       pass it to ``run_engagement``).
-    - ``config.llm`` -> ``build_llm_client`` (``FakeLLMClient`` unless
-      ``provider: "litellm"``).
+    - ``config.llm`` -> ``build_llm_client`` (requires ``provider: "litellm"``).
     - ``config.capability`` -> ``_build_default_tool_gateway``.
     - ``config.orchestration`` -> ``OrchestrationSettings.from_config``;
       an explicit ``orchestration_settings`` may additionally select durable
@@ -298,6 +301,12 @@ async def build_application(
     real config-driven wiring for others.
     """
     logging.basicConfig(level=config.logging.level)
+
+    from redteam.app.mcp_deployment import synchronize_deployment
+
+    config = config.model_copy(update={
+        "engagement": synchronize_deployment(config.engagement, config.capability.mcp_servers)
+    })
 
     library = (
         load_reference_library(config.capability.methodology)
@@ -364,12 +373,7 @@ async def build_application(
     )
     resolved_event_bus = event_bus or InMemoryEventBus()
     resolved_settings = orchestration_settings or OrchestrationSettings.from_config(
-        config.orchestration,
-        planning_mode=(
-            "llm_first"
-            if config.orchestration.planning_mode is None and config.llm.provider != "fake"
-            else None
-        ),
+        config.orchestration
     )
     resolved_attack_graph = attack_graph or EngagementScopedAttackGraphStore(
         SQLiteAttackGraphStore(resolved_settings.attack_graph_path)
@@ -399,12 +403,15 @@ async def build_application(
         graph_store=resolved_attack_graph,
         evidence_store=resolved_evidence_store,
         llm_client=resolved_llm,
+        engagement=engagement,
         agents=resolved_agents,
         candidate_providers=resolved_providers,
         methodology_library=library,
         tool_catalog=resolved_tool_catalog,
         work_store=_build_work_store(resolved_settings),
         task_graph_store=(task_graph_store or _build_task_graph_store(resolved_settings)),
+        path_store=_build_path_store(resolved_settings),
+        long_job_adapter=long_job_adapter,
         operator_intent_store=build_operator_intent_store(
             resolved_settings.operator_intent_backend, resolved_settings.operator_intent_path
         ),
@@ -424,12 +431,18 @@ async def _publish_terminal_artifacts(
 ) -> None:
     """Project and publish a report for every terminal outcome."""
 
+    path = await deps.path_store.get_active(str(runtime.run_id))
+    required_hypotheses = {
+        criterion.hypothesis_id for step in path.steps if step.required
+        for criterion in step.completion_criteria if criterion.hypothesis_id
+    } if path else set()
     report = await ReportingAgent().project(
         runtime,
         graph=AttackGraphService(deps.graph_store),
         evidence_store=deps.evidence_store,
         work_store=deps.work_store,
         task_store=deps.task_graph_store,
+        required_hypothesis_ids=required_hypotheses,
     )
     try:
         # The only thing that makes `redteam status`/`findings`/`report`
@@ -506,7 +519,8 @@ async def run_engagement(
     frontier, so without this the planner would have nothing to choose
     from on the first turn.
     """
-    deps = deps if deps is not None else await build_runtime_deps(engagement)
+    if deps is None:
+        raise ValueError("run_engagement requires dependencies with an explicitly configured LLM")
     settings = deps.settings
     if orchestration_config is not None:
         settings = settings.model_copy(
@@ -554,7 +568,6 @@ async def run_engagement(
         objective=objective,
         now=datetime.now(timezone.utc),
     )
-    mission = await deps.task_graph_store.get_mission(mission_id)
 
     run_started = EventEnvelope(
         event_id=EventId(new_id("evt")),
@@ -575,11 +588,7 @@ async def run_engagement(
     )
     mission_created = await lifecycle.publish(
         EventType.MISSION_CREATED,
-        {
-            "mission_id": mission_id,
-            "objective": mission.objective if mission is not None else objective,
-            "priorities": mission.priorities if mission is not None else [],
-        },
+        {"mission_id": mission_id},
         causation_id=run_started.event_id,
     )
     bootstrap_event_id = mission_created.event_id
@@ -591,17 +600,16 @@ async def run_engagement(
         )
         bootstrap_event_id = task_created.event_id
 
+    saved_mission = await deps.task_graph_store.get_mission(mission_id)
+    if saved_mission is None:
+        raise RuntimeError("created mission is missing from the task store")
     initial_runtime = RuntimeState(
         run_id=run_id,
         engagement_id=engagement.engagement_id,
         started_at=datetime.now(timezone.utc),
         phase=AgentPhase.OBSERVE,
         mission_id=mission_id,
-        current_goal=(
-            mission.objective
-            if mission is not None
-            else (objective or f"map and probe the declared scope of {engagement.name}")
-        ),
+        current_goal=saved_mission.objective,
         remaining_budget=engagement.execution_budget.max_actions,
     )
     runner = AgentLoopRunner(deps, settings=settings)

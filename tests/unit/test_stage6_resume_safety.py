@@ -191,6 +191,7 @@ async def test_approval_resume_without_a_mission_still_consults_the_resolution()
 async def test_approval_resume_rejects_cross_run_or_engagement_proposal(mismatch: str) -> None:
     plane = _RecordingPlane(None)
     runner, runtime = await _runner_with_mission(MissionStatus.ACTIVE, plane)
+    assert runner._graph is not None
     snapshot = runner._graph._snapshot  # noqa: SLF001 - checkpoint forgery regression
     snapshot.values["action_proposal"] = _proposal().model_copy(
         update={mismatch: (

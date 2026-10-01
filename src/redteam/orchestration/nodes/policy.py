@@ -21,6 +21,7 @@ from redteam.core.contracts.policy import ControlContext, PolicyDecision
 from redteam.core.contracts.target import target_display_name
 from redteam.core.enums import AgentPhase, PolicyVerdict, Severity
 from redteam.orchestration.context import RuntimeDeps
+from redteam.orchestration.engine import validate_current_action
 from redteam.orchestration.nodes._support import advance, publisher_for
 from redteam.orchestration.runtime_observation import (
     RuntimeObservation,
@@ -76,6 +77,54 @@ async def policy_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
     correlation_id = str(proposal.action_id)
     publisher = publisher_for(state, deps, "orchestration.policy")
 
+    problems = await validate_current_action(deps, runtime, state.get("plan_step"), proposal)
+    if problems:
+        decision = PolicyDecision(
+            action_id=proposal.action_id,
+            verdict=PolicyVerdict.DENY,
+            reasons=problems,
+            matched_rules=["orchestration:stale_or_invalid_path"],
+            evaluated_at=datetime.now(timezone.utc),
+        )
+        event = await publisher.publish(
+            EventType.ACTION_DENIED,
+            {
+                "action_id": proposal.action_id,
+                "reasons": problems,
+            },
+            correlation_id=correlation_id,
+            causation_id=state.get("last_event_id"),
+        )
+        rejected_runtime = append_runtime_observation(
+            runtime.model_copy(
+                update={
+                    "phase": AgentPhase.REPLAN,
+                    "pending_approval_id": None,
+                    "termination_reason": None,
+                    "planning_feedback": problems,
+                }
+            ),
+            RuntimeObservation(
+                kind="control",
+                summary=(
+                    f"Control DENY for {proposal.capability}.{proposal.operation}: "
+                    + "; ".join(problems)
+                )[:500],
+                outcome=PolicyVerdict.DENY.value,
+                step=runtime.step_count,
+                action_id=str(proposal.action_id),
+                capability=proposal.capability,
+                operation=proposal.operation,
+                target=target_display_name(proposal.target),
+                reasons=list(problems[:8]),
+                matched_rules=["orchestration:stale_or_invalid_path"],
+                alternative_allowed=True,
+            ),
+        )
+        return advance(
+            state, rejected_runtime, last_event_id=event.event_id, policy_decision=decision
+        )
+
     # Live concurrency signal for ROE's max_parallel_actions (control/roe.py
     # cannot compute this itself: the Work Ledger is Orchestration's, not
     # Control's, to import). "Other" actions already leased/running for
@@ -125,7 +174,7 @@ async def policy_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
     else:
         context = ControlContext(
             engagement_id=runtime.engagement_id,
-            agent_id=runtime.current_agent,
+            agent_id=proposal.agent_id,
             correlation_id=correlation_id,
             metadata={"in_flight_actions": in_flight},
         )
@@ -145,10 +194,7 @@ async def policy_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
         {
             "action_id": decision.action_id,
             "verdict": decision.verdict.value,
-            "reasons": decision.reasons,
             "matched_rules": decision.matched_rules,
-            "approval_id": decision.approval_id,
-            "rate_limit_remaining": decision.rate_limit_remaining,
             "budget_remaining": decision.budget_remaining,
         },
         correlation_id=correlation_id,
@@ -161,7 +207,6 @@ async def policy_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
         {
             "action_id": decision.action_id,
             "reasons": decision.reasons,
-            "matched_rules": decision.matched_rules,
             "approval_id": decision.approval_id,
         },
         correlation_id=correlation_id,
@@ -210,7 +255,15 @@ async def policy_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             target=target_display_name(proposal.target),
             reasons=list(decision.reasons[:8]),
             matched_rules=list(decision.matched_rules[:12]),
-            approval_id=str(decision.approval_id) if decision.approval_id else None,
+            approval_id=(
+                str(decision.approval_id)
+                if decision.approval_id
+                else (
+                    str(runtime.pending_approval_id)
+                    if resuming_approval and runtime.pending_approval_id
+                    else None
+                )
+            ),
             requires_approval=decision.verdict is PolicyVerdict.REQUIRE_APPROVAL,
             alternative_allowed=(
                 decision.verdict is PolicyVerdict.ALLOW or severity != SEVERITY_ABORT_RUN

@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from redteam.core.contracts.action import ActionProposal
 from redteam.core.enums import PolicyVerdict, Verdict
 from redteam.core.ids import ApprovalId, EventId
 from redteam.orchestration.agents.base import PlanStep
+from redteam.orchestration.runtime_observation import RuntimeObservation
 
 
 class DispatchItem(BaseModel):
@@ -35,6 +36,7 @@ class WorkerOutcome(BaseModel):
     verdict: Verdict | None = None
     last_event_id: EventId | None = None
     error: str | None = None
+    runtime_observations: list[RuntimeObservation] = Field(default_factory=list)
 
 
 def merge_worker_outcomes(

@@ -107,8 +107,8 @@ async def _cmd_help(console: Console, _session: InteractiveSession, _rest: str) 
         aliases = f" ({', '.join('/' + a for a in command.aliases)})" if command.aliases else ""
         console.print(f"  /{command.name:<10}{aliases}  {command.description}")
     console.print(
-        '\n[dim]Anything not starting with "/" is sent as a new Mission '
-        "objective on the current engagement.[/dim]"
+        '\n[dim]Other input is interpreted as a question, clarification, '
+        "or investigation request for the current engagement.[/dim]"
     )
 
 

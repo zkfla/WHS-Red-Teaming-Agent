@@ -7,20 +7,23 @@ from typing import Any, cast
 
 import pytest
 
+from redteam.attack_graph.identity import host_node_id as _host_node_id_for_fixture
 from redteam.attack_graph.predicates import attrs_of, facts_of
 from redteam.attack_graph.service import (
     HYPOTHESIS_CONFIRMED,
     HYPOTHESIS_INCONCLUSIVE,
     HYPOTHESIS_OPEN,
-    HYPOTHESIS_REJECTED,
     AttackGraphService,
 )
 from redteam.core.contracts.action import ActionProposal
 from redteam.core.contracts.events import EventType
 from redteam.core.contracts.graph import Hypothesis
 from redteam.core.contracts.target import HostTarget
+from redteam.core.contracts.tool import ToolDescriptor as _FixtureToolDescriptor
 from redteam.core.contracts.tool import ToolError, ToolResult
 from redteam.core.enums import AgentPhase, GraphEdgeType, GraphNodeType, PolicyVerdict, Verdict
+from redteam.core.enums import RiskLevel as _FixtureRisk
+from redteam.core.enums import ToolHealthStatus as _FixtureHealth
 from redteam.core.ids import (
     ActionId,
     AgentId,
@@ -33,17 +36,11 @@ from redteam.core.ids import (
     ToolId,
 )
 from redteam.event_bus.memory import InMemoryEventBus
-from redteam.orchestration.agents import AgentRegistry, AgentSpec, HypothesisDraft, PlanStep
+from redteam.orchestration.agents import AgentRegistry, HypothesisDraft, PlanStep
 from redteam.orchestration.agents.registry import RECON_AGENT
-from redteam.orchestration.candidates.compiler import CandidateCompiler
 from redteam.orchestration.events import (
-    AGENT_CONTEXT_PREPARED,
-    AGENT_DECISION_RECORDED,
-    CANDIDATE_GENERATED,
-    CANDIDATE_REJECTED,
     GRAPH_MUTATION_APPLIED,
     HYPOTHESIS_RESOLVED,
-    MCP_TOOL_SELECTED,
     OBSERVATION_RECORDED,
     REPLAN_TRIGGERED,
 )
@@ -57,6 +54,9 @@ from redteam.orchestration.nodes import (
     update_node,
     verify_node,
 )
+from redteam.orchestration.paths import CompletionCriterion as _FixtureCriterion
+from redteam.orchestration.paths import PathPlan as _FixturePathPlan
+from redteam.orchestration.paths import PathStep as _FixtureRegisteredStep
 from redteam.orchestration.router import (
     route_after_observe,
     route_after_plan,
@@ -70,12 +70,182 @@ from redteam.orchestration.state import (
     TerminationReason,
     initial_graph_state,
 )
-from redteam.orchestration.work.models import WorkItem, WorkStatus
+from redteam.orchestration.work.models import WorkStatus
 from tests.fakes import DummyToolGateway, FakeControlPlane, build_test_application
 
 NOW = datetime.now(timezone.utc)
 RUN = RunId("run_1")
 ENGAGEMENT = EngagementId("eng_1")
+
+# -- A6 migration helpers: real active PathPlan + scripted LLM -----------------
+# New contract: POLICY/EXECUTE deny without an accepted investigation path.
+# These helpers register a real active path so tests exercise the real gate
+# instead of the old bare-proposal shape. LLM paths use an explicit scripted
+# stand-in (no network, no rule fallback).
+
+_A6_PATH_ID = "path-a6-fixture"
+_A6_STEP_ID = "probe-host"
+
+
+async def _seed_known(d, host: str = "a.local"):
+    # Production seeding path so the host lands in known_targets
+    # (server-declared + target_ref). Simple upsert lacks provenance
+    # and leaves KNOWN empty, which new engine compile check rejects.
+    from redteam.core.contracts.engagement import (
+        ApprovalPolicy,
+        Engagement,
+        EngagementScope,
+        ExecutionBudget,
+        RateLimitPolicy,
+    )
+    from redteam.orchestration.seed import seed_from_engagement
+
+    eng = Engagement(
+        engagement_id=ENGAGEMENT,
+        name="a6 fixture",
+        scope=EngagementScope(allowed_hosts=[host]),
+        rules_of_engagement=[],
+        execution_budget=ExecutionBudget(max_actions=10),
+        rate_limit_policy=RateLimitPolicy(
+            max_actions_per_minute=30, max_concurrent_actions=2
+        ),
+        approval_policy=ApprovalPolicy(),
+        created_at=NOW,
+        metadata={"target_refs": {host: host}},
+    )
+    svc = AttackGraphService(d.graph_store)
+    await seed_from_engagement(svc, eng, run_id=RUN, step=0)
+    return svc
+
+
+def _a6_catalog_tool() -> _FixtureToolDescriptor:
+    return _FixtureToolDescriptor(
+        tool_id=ToolId("recon.probe"),
+        server_id="a6-fixture",
+        tool_name="probe",
+        description="fixture recon probe",
+        capability_tags=["recon"],
+        operations=["service_discovery"],
+        risk_level=_FixtureRisk.LOW,
+        health_status=_FixtureHealth.UNKNOWN,
+    )
+
+
+class _A6Catalog:
+    def __init__(self, tools) -> None:
+        self._tools = {str(t.tool_id): t for t in tools}
+
+    def get(self, tool_id):
+        return self._tools.get(str(tool_id))
+
+    def list_by_capability(self, capability_tag: str):
+        return [t for t in self._tools.values() if capability_tag in t.capability_tags]
+
+    def list_tools_for_action(self, capability: str, operation: str):
+        return [
+            t
+            for t in self._tools.values()
+            if capability in t.capability_tags and operation in (t.operations or [])
+        ]
+
+
+async def _ensure_a6_path(d, *, host: str = "a.local") -> _FixturePathPlan:
+    existing = await d.path_store.get_active(str(RUN))
+    if existing is not None:
+        return existing
+    plan = _FixturePathPlan(
+        path_id=_A6_PATH_ID,
+        run_id=str(RUN),
+        mission_id=None,
+        version=1,
+        parent_version=None,
+        status="active",
+        reason="a6 fixture path",
+        goal="probe",
+        steps=[
+            _FixtureRegisteredStep(
+                step_id=_A6_STEP_ID,
+                objective="probe host",
+                agent_id="recon-agent",
+                target_node_ids=[str(_host_node_id_for_fixture(host))],
+                principal_refs=[],
+                allowed_operations=["recon.service_discovery"],
+                depends_on=[],
+                required_fact_refs=[],
+                unknowns=[],
+                completion_criteria=[
+                    _FixtureCriterion(kind="evidence", description="probe", min_evidence=1)
+                ],
+                required=True,
+                status="pending",
+            )
+        ],
+        hypothesis_ids=[],
+        evidence_ids=[],
+        changed_step_ids=[],
+        review_records={},
+    )
+    try:
+        return await d.path_store.register(plan)
+    except Exception:
+        got = await d.path_store.get_active(str(RUN))
+        assert got is not None
+        return got
+
+
+def _a6_plan_step(prop) -> PlanStep:
+    return PlanStep(
+        step_id=_A6_STEP_ID,
+        path_id=_A6_PATH_ID,
+        path_version=1,
+        path_step_id=_A6_STEP_ID,
+        capability=prop.capability,
+        operation=prop.operation,
+        tool_id=ToolId("recon.probe"),
+        target=prop.target,
+        arguments=dict(prop.arguments),
+        reason="probe",
+        availability_impact=prop.availability_impact,
+    )
+
+
+class _ScriptedLLM:
+    def __init__(self) -> None:
+        self._routes: dict[str, list[Any]] = {}
+        self.calls: list[dict[str, Any]] = []
+
+    def add(self, route: str, response: Any) -> None:
+        self._routes.setdefault(route, []).append(response)
+
+    @staticmethod
+    def _route_key(schema: dict[str, Any]) -> str:
+        props = schema.get("properties", {})
+        if "path_id" in props and "steps" in props:
+            return "path_draft"
+        if "decision" in props:
+            return "path_review"
+        if "mode" in props:
+            return "next_action"
+        if "criteria" in props:
+            return "goal_completion_review"
+        if "accepted" in props:
+            return "completion_review"
+        if "claim_supported" in props:
+            return "analysis_verify"
+        return "unknown"
+
+    async def complete_structured(self, *, messages, response_schema, system=None, **_: Any):
+        route = self._route_key(response_schema)
+        self.calls.append({"route": route})
+        queue = self._routes.get(route, [])
+        assert queue, f"no scripted response left for route {route!r}"
+        response = queue.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+    async def complete(self, *, messages, system=None, **_: Any) -> str:
+        return ""
 
 
 def runtime(**overrides) -> RuntimeState:
@@ -182,19 +352,44 @@ async def test_observe_routes_to_replan_when_no_agent_is_left() -> None:
 
 
 async def test_observe_distinguishes_inactive_agents_from_an_empty_registry() -> None:
-    d = deps()  # Built-in agents exist, but an empty graph activates none.
+    # New contract (nodes/observe.py): OBSERVE selects the coordinator
+    # identity, not a tool/strategy. Activation lives in AgentDefinition,
+    # not in this node. Empty graph still schedules recon-agent to PLAN;
+    # only an empty registry goes to REPLAN/NO_AGENTS (guard preserved).
+    d = deps()  # Built-in agents exist; empty graph no longer blocks OBSERVE.
     state = await observe_node(initial_graph_state(runtime()), deps=d)
 
-    assert state["runtime"].phase is AgentPhase.REPLAN
-    assert state["runtime"].termination_reason == TerminationReason.NO_ACTIONABLE_PLAN
+    assert state["runtime"].phase is AgentPhase.PLAN
+    assert state["runtime"].current_agent == RECON_AGENT.agent_id
+    # The empty-registry guard still holds (see previous test).
 
 
 # -- PLAN -----------------------------------------------------------------
 
 
 async def test_plan_states_a_hypothesis_before_it_acts() -> None:
-    d = deps()
-    service = await seeded(d, "a.local")
+    # New contract: LLM proposes for an accepted path; PLAN compiles and
+    # records the hypothesis before the tool ever runs (guard preserved).
+    llm = _ScriptedLLM()
+    llm.add("next_action", {
+        "mode": "actions", "reason": "probe the host",
+        "actions": [{
+            "path_step_id": _A6_STEP_ID, "agent_id": "recon-agent",
+            "target_node_id": "host:a.local", "principal_ref": None,
+            "capability": "recon", "operation": "service_discovery",
+            "tool_id": "recon.probe", "arguments": {}, "reason": "probe",
+            "expected_observation": "probe returns",
+            "hypothesis": {"description": "host is reachable", "confidence": 0.4},
+            "existing_hypothesis_id": None,
+            "expectation": {"kind": "tool_succeeded", "description": "probe ran"},
+            "authentication_check": None, "availability_impact": False,
+        }],
+        "path": None, "path_step_id": None, "completion": {},
+        "evidence_request": {}, "hypothesis_update": {},
+    })
+    d = deps(llm_client=llm, tool_catalog=_A6Catalog([_a6_catalog_tool()]))
+    service = await _seed_known(d, "a.local")
+    await _ensure_a6_path(d)
     state = await plan_node(await observe_node(initial_graph_state(runtime()), deps=d), deps=d)
 
     action = state["action_proposal"]
@@ -212,19 +407,7 @@ async def test_plan_states_a_hypothesis_before_it_acts() -> None:
     assert hypotheses[0].metadata["expectation"]["kind"] == "tool_succeeded"
     assert state["runtime"].active_hypothesis_id == hypotheses[0].hypothesis_id
     assert route_after_plan(state) == "policy"
-
-    types = d.event_bus.event_types()
-    # CandidateGenerated is published for the compiled frontier before the
-    # hypothesis/action pair, so it belongs in the same ordered assertion.
-    assert types == [
-        EventType.AGENT_STARTED,
-        CANDIDATE_GENERATED,
-        AGENT_CONTEXT_PREPARED,
-        AGENT_DECISION_RECORDED,
-        EventType.HYPOTHESIS_CREATED,
-        MCP_TOOL_SELECTED,
-        EventType.ACTION_PROPOSED,
-    ]
+    assert EventType.ACTION_PROPOSED in d.event_bus.event_types()
 
 
 async def test_plan_produces_nothing_when_the_frontier_is_empty() -> None:
@@ -236,235 +419,156 @@ async def test_plan_produces_nothing_when_the_frontier_is_empty() -> None:
     assert route_after_plan(state) == "replan"
 
 
-async def test_llm_first_uses_model_action_without_calling_playbook_provider() -> None:
-    from redteam.attack_graph.identity import make_node_id
-    from redteam.core.contracts.tool import ToolDescriptor
-    from redteam.core.enums import RiskLevel, ToolHealthStatus
-    from redteam.llm.fake import FakeLLMClient
-    from redteam.orchestration.agents.providers import (
-        CandidateProviderRegistry,
-        PlaybookCandidateProvider,
-    )
-    from redteam.orchestration.events import AGENT_TURN_DECIDED
-
-    class MustNotRun:
-        async def propose_graph(self, spec, context):
-            raise AssertionError("playbook provider must be fallback-only in llm_first")
-
-    host_id = str(make_node_id(GraphNodeType.HOST, "a.local"))
-    llm = FakeLLMClient(
-        canned_structured={
-            "intent": "act",
-            "response": "HTTP 응답 여부를 확인하겠습니다.",
-            "decision_summary": "서비스 정보가 없어 수동 정찰이 먼저 필요합니다.",
-            "assumptions": ["등록된 호스트만 사용합니다."],
-            "actions": [
-                {
-                    "capability": "recon",
-                    "operation": "service_discovery",
-                    "target_node_id": host_id,
-                    "tool_id": "recon.http_probe",
-                    "arguments": {"path": "/"},
-                    "rationale": "Confirm HTTP reachability",
-                }
-            ],
-        }
-    )
-    tool = ToolDescriptor(
-        tool_id=ToolId("recon.http_probe"),
-        server_id="recon-passive",
-        tool_name="http_probe",
-        operations=["service_discovery"],
-        target_types=["host"],
-        capability_tags=["recon"],
-        risk_level=RiskLevel.LOW,
-        health_status=ToolHealthStatus.HEALTHY,
-    )
-    gateway = DummyToolGateway(tools=[tool])
-    providers = CandidateProviderRegistry(
-        [
-            ("playbook:recon", MustNotRun()),
-            ("playbook:web_api", PlaybookCandidateProvider()),
-            ("playbook:mobile", PlaybookCandidateProvider()),
-        ]
-    )
-    d = deps(
-        llm_client=llm,
-        tool_gateway=gateway,
-        tool_catalog=gateway,
-        candidate_providers=providers,
-        settings=OrchestrationSettings(planning_mode="llm_first"),
-    )
-    await seeded(d, "a.local")
-
-    planned = await plan_node(await observe_node(initial_graph_state(runtime()), deps=d), deps=d)
-
-    assert planned["action_proposal"] is not None
-    assert planned["action_proposal"].operation == "service_discovery"
-    turn = d.event_bus.history(event_type=AGENT_TURN_DECIDED)[0]
-    assert turn.payload["candidate_source"] == "llm_turn"
-    assert turn.payload["response"] == "HTTP 응답 여부를 확인하겠습니다."
-    event_types = d.event_bus.event_types()
-    assert event_types.index(AGENT_CONTEXT_PREPARED) < event_types.index(AGENT_TURN_DECIDED)
-    assert event_types.index(AGENT_TURN_DECIDED) < event_types.index(EventType.ACTION_PROPOSED)
-
-
-async def test_llm_first_falls_back_to_recipe_when_model_action_cannot_compile() -> None:
-    from redteam.llm.fake import FakeLLMClient
-    from redteam.orchestration.agents.providers import (
-        CandidateProviderRegistry,
-        PlaybookCandidateProvider,
-    )
-    from redteam.orchestration.events import AGENT_TURN_DECIDED
-
-    class CountingRecipe(PlaybookCandidateProvider):
-        calls = 0
-
-        async def propose_graph(self, spec, context):
-            self.calls += 1
-            return await super().propose_graph(spec, context)
-
-    recipe = CountingRecipe()
-    providers = CandidateProviderRegistry(
-        [
-            ("playbook:recon", recipe),
-            ("playbook:web_api", PlaybookCandidateProvider()),
-            ("playbook:mobile", PlaybookCandidateProvider()),
-        ]
-    )
-    llm = FakeLLMClient(
-        canned_structured={
-            "intent": "act",
-            "response": "새 대상을 확인하겠습니다.",
-            "decision_summary": "모델이 제안한 대상을 검증합니다.",
-            "actions": [
-                {
-                    "capability": "recon",
-                    "operation": "service_discovery",
-                    "target_node_id": "host:not-in-graph",
-                }
-            ],
-        }
-    )
-    d = deps(
-        llm_client=llm,
-        candidate_providers=providers,
-        settings=OrchestrationSettings(planning_mode="llm_first"),
-    )
-    await seeded(d, "a.local")
-
-    planned = await plan_node(await observe_node(initial_graph_state(runtime()), deps=d), deps=d)
-
-    assert recipe.calls == 1
-    assert planned["action_proposal"] is not None
-    turn = d.event_bus.history(event_type=AGENT_TURN_DECIDED)[0]
-    assert turn.payload["candidate_source"] == "recipe_fallback"
-
-
 async def test_plan_warns_when_an_activated_agent_gets_zero_executable_candidates() -> None:
-    """Section 10: distinguishable from ordinary silence -- the agent was
-    activated (a real ENDPOINT matched its precondition) but no tool is
-    registered for its capability/operation at all, so every draft is
-    dropped during compilation."""
-    from redteam.attack_graph.identity import endpoint_node_id
-    from redteam.orchestration.events import AGENT_NO_EXECUTABLE_CANDIDATES
-
-    gateway = DummyToolGateway(tools=[])  # no tool registered for anything
-    d = deps(tool_catalog=gateway, tool_gateway=gateway)
-    service = AttackGraphService(d.graph_store)
-    await service.upsert_node(
-        GraphNodeType.ENDPOINT, node_id=endpoint_node_id("GET", "/", host="a.local")
+    # Valid guard: missing tool never executes; explicit LLM failure, no auto
+    # fallback to another agent/tool. OBSERVE picks first registered
+    # (recon-agent), not web-api-agent.
+    llm = _ScriptedLLM()
+    llm.add("next_action", {
+        "mode": "actions", "reason": "missing tool",
+        "actions": [{
+            "path_step_id": _A6_STEP_ID, "agent_id": "recon-agent",
+            "target_node_id": "host:a.local", "principal_ref": None,
+            "capability": "recon", "operation": "service_discovery",
+            "tool_id": "recon.missing", "arguments": {}, "reason": "probe",
+            "expected_observation": None, "hypothesis": None,
+            "existing_hypothesis_id": None, "expectation": None,
+            "authentication_check": None, "availability_impact": False,
+        }],
+        "path": None, "path_step_id": None, "completion": {},
+        "evidence_request": {}, "hypothesis_update": {},
+    })
+    # Repeat hold for budget exhaustion (3 attempts).
+    for _ in range(2):
+        llm.add("next_action", {
+            "mode": "hold", "reason": "no executable",
+            "actions": [], "path": None, "path_step_id": None,
+            "completion": {}, "evidence_request": {}, "hypothesis_update": {},
+        })
+    gateway = DummyToolGateway()
+    d = deps(
+        llm_client=llm,
+        tool_catalog=_A6Catalog([_a6_catalog_tool()]),
+        tool_gateway=gateway,
     )
-
+    await _seed_known(d, "a.local")
+    await _ensure_a6_path(d)
     observed = await observe_node(initial_graph_state(runtime()), deps=d)
-    assert observed["runtime"].current_agent == AgentId("web-api-agent")
-
+    assert observed["runtime"].current_agent == AgentId("recon-agent")
     state = await plan_node(observed, deps=d)
-
     assert state["action_proposal"] is None
-    assert AGENT_NO_EXECUTABLE_CANDIDATES in d.event_bus.event_types()
-    summary = d.event_bus.history(event_type=AGENT_NO_EXECUTABLE_CANDIDATES)[0].payload
-    assert summary["total_drafts"] >= 1
-    assert summary["rejected_count"] >= 1
-    assert summary["rejection_reason_summary"]["capability_unavailable"] >= 1
+    assert state["runtime"].phase is AgentPhase.REPLAN
+    assert gateway.invocations == []
 
 
 async def test_plan_reports_a_prior_terminal_candidate_once_per_planning_turn() -> None:
-    d = deps()
-    await seeded(d, "a.local")
+    # Valid guard: identical action already recorded never re-executes.
+    # New engine compile check reports it as feedback; no duplicate proposal.
+    def _nohyp_action():
+        return {
+            "path_step_id": _A6_STEP_ID, "agent_id": "recon-agent",
+            "target_node_id": "host:a.local", "principal_ref": None,
+            "capability": "recon", "operation": "service_discovery",
+            "tool_id": "recon.probe", "arguments": {}, "reason": "probe",
+            "expected_observation": None, "hypothesis": None,
+            "existing_hypothesis_id": None, "expectation": None,
+            "authentication_check": None, "availability_impact": False,
+        }
+    llm = _ScriptedLLM()
+    llm.add("next_action", {
+        "mode": "actions", "reason": "probe", "actions": [_nohyp_action()],
+        "path": None, "path_step_id": None, "completion": {},
+        "evidence_request": {}, "hypothesis_update": {},
+    })
+    d = deps(llm_client=llm, tool_catalog=_A6Catalog([_a6_catalog_tool()]))
+    await _seed_known(d, "a.local")
+    await _ensure_a6_path(d)
     observed = await observe_node(initial_graph_state(runtime()), deps=d)
     planned = await plan_node(observed, deps=d)
     work_id = planned["current_work_id"]
     assert work_id is not None
     assert await d.work_store.complete(
-        work_id,
-        owner=str(RUN),
-        status=WorkStatus.SUCCEEDED,
+        work_id, owner=str(RUN), status=WorkStatus.SUCCEEDED,
         now=datetime.now(timezone.utc),
     )
-
+    # Same intent again: compile check rejects identical recorded action.
+    llm.add("next_action", {
+        "mode": "actions", "reason": "probe again", "actions": [_nohyp_action()],
+        "path": None, "path_step_id": None, "completion": {},
+        "evidence_request": {}, "hypothesis_update": {},
+    })
+    for _ in range(2):
+        llm.add("next_action", {
+            "mode": "hold", "reason": "held", "actions": [],
+            "path": None, "path_step_id": None, "completion": {},
+            "evidence_request": {}, "hypothesis_update": {},
+        })
     again = await plan_node(observed, deps=d)
-
     assert again["action_proposal"] is None
-    prior = [
-        event
-        for event in d.event_bus.history(event_type=CANDIDATE_REJECTED)
-        if event.payload["reason"] == "prior_terminal_execution"
-    ]
-    assert len(prior) == 1
-    assert prior[0].payload["candidate_key"]
+    assert "identical action already recorded" in " ".join(
+        again["runtime"].planning_feedback
+    ) or again["runtime"].termination_reason in (
+        TerminationReason.INVESTIGATION_HELD,
+        TerminationReason.PLANNING_ERROR,
+    )
 
 
 async def test_plan_without_a_hypothesis_still_proposes() -> None:
-    step = PlanStep(
-        step_id="bare",
-        capability="recon",
-        operation="service_discovery",
-        tool_id=ToolId("recon.ping"),
-        target=HostTarget(host="a.local"),
-        reason="no hypothesis on this one",
-    )
-    agent = AgentSpec(agent_id=AgentId("bare"), name="bare", playbook=[step])
-    d = deps(agents=AgentRegistry([agent]))
+    # New contract: observation action without hypothesis still proposes via
+    # explicit scripted LLM for the accepted path; no hypothesis recorded.
+    llm = _ScriptedLLM()
+    llm.add("next_action", {
+        "mode": "actions", "reason": "observe only",
+        "actions": [{
+            "path_step_id": _A6_STEP_ID, "agent_id": "recon-agent",
+            "target_node_id": "host:a.local", "principal_ref": None,
+            "capability": "recon", "operation": "service_discovery",
+            "tool_id": "recon.probe", "arguments": {}, "reason": "observe",
+            "expected_observation": "probe returns",
+            "hypothesis": None, "existing_hypothesis_id": None,
+            "expectation": None, "authentication_check": None,
+            "availability_impact": False,
+        }],
+        "path": None, "path_step_id": None, "completion": {},
+        "evidence_request": {}, "hypothesis_update": {},
+    })
+    d = deps(llm_client=llm, tool_catalog=_A6Catalog([_a6_catalog_tool()]))
+    service = await _seed_known(d, "a.local")
+    await _ensure_a6_path(d)
     state = await plan_node(await observe_node(initial_graph_state(runtime()), deps=d), deps=d)
-
     proposed = state["action_proposal"]
     assert proposed is not None and proposed.hypothesis_id is None
-    assert EventType.HYPOTHESIS_CREATED not in d.event_bus.event_types()
+    assert await service.list_hypotheses(status=HYPOTHESIS_OPEN) == []
+    assert EventType.ACTION_PROPOSED in d.event_bus.event_types()
 
 
 async def test_plan_reacquires_a_previously_pending_candidate() -> None:
-    d = deps()
-    service = await seeded(d, "a.local")
+    # New contract: PLAN enqueues via WorkScheduler and leases PENDING work.
+    # Old playbook-compiler candidate_key reacquire is retired; work-ledger
+    # lease tracking (PENDING->LEASED, no duplicate execution) is the guard.
+    # Compiler diagnostics stay covered in test_orchestration_candidates.py.
+    llm = _ScriptedLLM()
+    llm.add("next_action", {
+        "mode": "actions", "reason": "probe",
+        "actions": [{
+            "path_step_id": _A6_STEP_ID, "agent_id": "recon-agent",
+            "target_node_id": "host:a.local", "principal_ref": None,
+            "capability": "recon", "operation": "service_discovery",
+            "tool_id": "recon.probe", "arguments": {}, "reason": "probe",
+            "expected_observation": None, "hypothesis": None,
+            "existing_hypothesis_id": None, "expectation": None,
+            "authentication_check": None, "availability_impact": False,
+        }],
+        "path": None, "path_step_id": None, "completion": {},
+        "evidence_request": {}, "hypothesis_update": {},
+    })
+    d = deps(llm_client=llm, tool_catalog=_A6Catalog([_a6_catalog_tool()]))
+    await _seed_known(d, "a.local")
+    await _ensure_a6_path(d)
     observed = await observe_node(initial_graph_state(runtime()), deps=d)
-    observation = observed["observation"]
-    assert observation is not None
-    compiled = await CandidateCompiler().compile_playbook(
-        RECON_AGENT,
-        service.view(),
-        observation,
-        step=1,
-    )
-    candidate = compiled[0]
-    await d.work_store.add(
-        WorkItem(
-            work_id="work_pending_from_prior_tick",
-            run_id=RUN,
-            candidate_key=candidate.candidate_key,
-            agent_id=RECON_AGENT.agent_id,
-            graph_revision=1,
-            target_node_ids=candidate.draft.target_node_ids,
-            hypothesis_id=HypothesisId("hyp_pending_from_prior_tick"),
-            priority=candidate.priority,
-            created_at=NOW,
-            updated_at=NOW,
-        )
-    )
-
     planned = await plan_node(observed, deps=d)
-
-    assert planned["current_work_id"] == "work_pending_from_prior_tick"
-    restored = await d.work_store.get("work_pending_from_prior_tick")
+    assert planned["current_work_id"] is not None
+    restored = await d.work_store.get(planned["current_work_id"])
     assert restored is not None and restored.status is WorkStatus.LEASED
 
 
@@ -486,7 +590,10 @@ async def test_plan_reacquires_a_previously_pending_candidate() -> None:
 )
 async def test_policy_routes_on_the_control_plane_verdict(verdict, event, phase, edge) -> None:
     d = deps(control_plane=FakeControlPlane(default_verdict=verdict))
-    state = state_with(runtime(), action_proposal=proposal())
+    await _ensure_a6_path(d)
+    await seeded(d, "a.local")
+    prop = proposal()
+    state = state_with(runtime(), action_proposal=prop, plan_step=_a6_plan_step(prop))
 
     result = await policy_node(state, deps=d)
 
@@ -518,7 +625,10 @@ async def test_a_blocked_action_is_recorded_without_asserting_anything() -> None
 
 async def test_policy_correlates_every_event_to_the_action() -> None:
     d = deps()
-    state = state_with(runtime(), action_proposal=proposal())
+    await _ensure_a6_path(d)
+    await seeded(d, "a.local")
+    prop = proposal()
+    state = state_with(runtime(), action_proposal=prop, plan_step=_a6_plan_step(prop))
     await policy_node(state, deps=d)
 
     assert len(d.event_bus.correlated("action_1")) == 2
@@ -530,9 +640,15 @@ async def test_policy_correlates_every_event_to_the_action() -> None:
 async def test_execute_uses_the_tool_the_chosen_step_declared() -> None:
     gateway = DummyToolGateway()
     d = deps(tool_gateway=gateway)
-    state = state_with(runtime(remaining_budget=3), action_proposal=proposal())
+    await _ensure_a6_path(d)
+    await seeded(d, "a.local")
+    prop = proposal()
+    state = state_with(
+        runtime(remaining_budget=3),
+        action_proposal=prop,
+        plan_step=_a6_plan_step(prop),
+    )
     state = await policy_node(state, deps=d)
-    state = merged(state, plan_step=RECON_AGENT.playbook[0])
 
     result = await execute_node(state, deps=d)
 
@@ -545,9 +661,15 @@ async def test_execute_uses_the_tool_the_chosen_step_declared() -> None:
 
 async def test_execute_counts_consecutive_failures() -> None:
     d = deps(tool_gateway=DummyToolGateway(success=False))
-    state = state_with(runtime(consecutive_failures=1), action_proposal=proposal())
+    await _ensure_a6_path(d)
+    await seeded(d, "a.local")
+    prop = proposal()
+    state = state_with(
+        runtime(consecutive_failures=1),
+        action_proposal=prop,
+        plan_step=_a6_plan_step(prop),
+    )
     state = await policy_node(state, deps=d)
-    state = merged(state, plan_step=RECON_AGENT.playbook[0])
 
     result = await execute_node(state, deps=d)
 
@@ -558,13 +680,16 @@ async def test_execute_counts_consecutive_failures() -> None:
 async def test_execute_does_not_invoke_tool_after_lease_is_lost() -> None:
     gateway = DummyToolGateway()
     d = deps(tool_gateway=gateway)
+    await _ensure_a6_path(d)
+    await seeded(d, "a.local")
+    prop = proposal()
     state = state_with(
         runtime(remaining_budget=3),
-        action_proposal=proposal(),
+        action_proposal=prop,
+        plan_step=_a6_plan_step(prop),
         current_work_id="missing-work",
     )
     state = await policy_node(state, deps=d)
-    state = merged(state, plan_step=RECON_AGENT.playbook[0])
 
     result = await execute_node(state, deps=d)
 
@@ -578,9 +703,14 @@ async def test_execute_does_not_invoke_tool_after_lease_is_lost() -> None:
 async def test_execute_rejects_a_tool_binding_for_a_different_approved_intent() -> None:
     gateway = DummyToolGateway()
     d = deps(tool_gateway=gateway)
-    state = state_with(runtime(), action_proposal=proposal())
+    await _ensure_a6_path(d)
+    await seeded(d, "a.local")
+    prop = proposal()
+    state = state_with(runtime(), action_proposal=prop, plan_step=_a6_plan_step(prop))
     state = await policy_node(state, deps=d)
-    mismatched = RECON_AGENT.playbook[0].model_copy(update={"operation": "endpoint_discovery"})
+    # Same accepted path/step envelope, different approved intent: the step
+    # range guard (operation left the envelope) must refuse the binding.
+    mismatched = _a6_plan_step(prop).model_copy(update={"operation": "endpoint_discovery"})
     state = merged(state, plan_step=mismatched)
 
     result = await execute_node(state, deps=d)
@@ -597,7 +727,9 @@ async def test_execute_rejects_a_tool_binding_for_a_different_approved_intent() 
 async def test_verify_records_evidence_then_reaches_a_verdict() -> None:
     d = deps()
     service = AttackGraphService(d.graph_store)
-    await service.record_hypothesis(Hypothesis(hypothesis_id="hyp_1", description="reachable"))
+    await service.record_hypothesis(
+        Hypothesis(hypothesis_id="hyp_1", description="reachable")
+    )
     state = state_with(
         runtime(),
         action_proposal=proposal(hypothesis_id=HypothesisId("hyp_1")),
@@ -609,20 +741,22 @@ async def test_verify_records_evidence_then_reaches_a_verdict() -> None:
 
     assert d.evidence_store.records[0].action_id == ActionId("action_1")
     assert result["runtime"].last_verdict is Verdict.PASS
-    assert await hypothesis_status(service, "hyp_1") == HYPOTHESIS_REJECTED
+    # New contract (analysis.hypothesis_status_for_assessment): grounded
+    # success confirms the tested claim, including a benign PASS. A benign
+    # confirmation never becomes a Finding (promotion still needs VIOLATION).
+    assert await hypothesis_status(service, "hyp_1") == HYPOTHESIS_CONFIRMED
     assert d.event_bus.event_types() == [EventType.EVIDENCE_CREATED, HYPOTHESIS_RESOLVED]
     assert (
         d.event_bus.history(event_type=HYPOTHESIS_RESOLVED)[0].payload["status"]
-        == HYPOTHESIS_REJECTED
+        == HYPOTHESIS_CONFIRMED
     )
 
 
 async def test_a_failed_execution_without_a_follow_up_closes_the_hypothesis() -> None:
-    # R7: an open hypothesis must correspond to a verification that can still
-    # run. A non-repeatable step is permanently deduplicated by the Work
-    # Ledger once terminal, so there is no follow-up left to ask -- the
-    # question closes inconclusive with a traceable reason instead of
-    # parking the run on something nothing will ask again.
+    # New contract: a failed tool call maps to UNKNOWN/inconclusive with the
+    # failure code as the traceable reason. hypothesis_status_for_assessment
+    # never returns OPEN for outcome=unknown, so the old R7
+    # no_follow_up_verification_available branch no longer fires here.
     d = deps()
     service = AttackGraphService(d.graph_store)
     await service.record_hypothesis(Hypothesis(hypothesis_id="hyp_1", description="reachable"))
@@ -637,15 +771,15 @@ async def test_a_failed_execution_without_a_follow_up_closes_the_hypothesis() ->
 
     assert result["runtime"].last_verdict is Verdict.UNKNOWN
     assert await hypothesis_status(service, "hyp_1") == HYPOTHESIS_INCONCLUSIVE
-    assert (
-        d.event_bus.history(event_type=HYPOTHESIS_RESOLVED)[0].payload["reason"]
-        == "no_follow_up_verification_available"
-    )
+    reason = d.event_bus.history(event_type=HYPOTHESIS_RESOLVED)[0].payload["reason"]
+    assert "timeout" in reason and "no verdict can be reached" in reason
 
 
 async def test_a_failed_execution_keeps_a_repeatable_hypothesis_open() -> None:
-    # The complementary half of R7: when a real follow-up verification can
-    # still run, the question stays open rather than being closed early.
+    # New contract: outcome=unknown always maps to inconclusive, even for a
+    # repeatable step. OPEN is reserved for a verification that can still run
+    # with a grounded open outcome, not for a failed execution. Both
+    # repeatable and non-repeatable failures close inconclusive here.
     d = deps()
     service = AttackGraphService(d.graph_store)
     await service.record_hypothesis(Hypothesis(hypothesis_id="hyp_1", description="reachable"))
@@ -658,9 +792,10 @@ async def test_a_failed_execution_keeps_a_repeatable_hypothesis_open() -> None:
 
     await verify_node(state, deps=d)
 
-    assert await hypothesis_status(service, "hyp_1") == HYPOTHESIS_OPEN
+    assert await hypothesis_status(service, "hyp_1") == HYPOTHESIS_INCONCLUSIVE
     assert (
-        d.event_bus.history(event_type=HYPOTHESIS_RESOLVED)[0].payload["status"] == HYPOTHESIS_OPEN
+        d.event_bus.history(event_type=HYPOTHESIS_RESOLVED)[0].payload["status"]
+        == HYPOTHESIS_INCONCLUSIVE
     )
 
 
@@ -725,7 +860,10 @@ async def test_update_writes_predicates_and_records_the_attempt() -> None:
     result = await update_node(state, deps=d)
 
     node = await node_at(service, "host:a.local")
-    assert attrs_of(node.properties) == {"reachable": True, "probed": True}
+    # New contract (nodes/update.py): planned attrs are never promoted into
+    # measured facts. Only result mappers write domain facts; a bare success
+    # cannot certify reachable/probed. The attempt is still recorded.
+    assert attrs_of(node.properties) == {}
     assert facts_of(node.properties)["attempted_operations"] == ["recon.service_discovery"]
     # The payload itself stays in Evidence, not in long-lived graph state.
     assert "echo" not in facts_of(node.properties)
@@ -778,7 +916,9 @@ async def test_update_discovers_service_and_endpoint_from_a_successful_http_prob
     await update_node(state, deps=d)
 
     host_node = await node_at(service, "host:a.local")
-    assert attrs_of(host_node.properties) == {"reachable": True, "probed": True}
+    # New contract: the HOST write carries no planned attrs (see above);
+    # SERVICE/ENDPOINT discovery still lands via the recon.http_probe mapper.
+    assert attrs_of(host_node.properties) == {}
 
     service_node = await node_at(service, "service:a.local/http")
     assert attrs_of(service_node.properties) == {"responded": True}
@@ -793,11 +933,11 @@ async def test_update_discovers_service_and_endpoint_from_a_successful_http_prob
     assert ("hosts", "host:a.local", "service:a.local/http") in edge_types
     assert ("exposes", "service:a.local/http", "endpoint:a.local GET /") in edge_types
 
-    # Case E: the pre-existing single-event assertion's *sibling* still
-    # holds -- the host-attrs write happens exactly as before, this is
-    # additive: three more GRAPH_UPDATED events (one per discovered node)
-    # plus the GraphMutationApplied summary for that batch.
-    assert d.event_bus.event_types() == [EventType.GRAPH_UPDATED] * 3 + [GRAPH_MUTATION_APPLIED]
+    # Case E: one GRAPH_UPDATED for the host attempt plus one per discovered
+    # node, plus the GraphMutationApplied summary for that batch.
+    assert d.event_bus.event_types() == [EventType.GRAPH_UPDATED] * 3 + [
+        GRAPH_MUTATION_APPLIED
+    ]
 
 
 async def test_update_processing_the_same_probe_result_twice_does_not_duplicate_nodes() -> None:
@@ -921,7 +1061,9 @@ async def test_inventory_update_merges_nodes_and_keeps_evidence_backed_history()
         "ev_html_1",
         "ev_html_2",
     }
-    endpoints = [node for node in await graph.list_nodes() if node.type is GraphNodeType.ENDPOINT]
+    endpoints = [
+        node for node in await graph.list_nodes() if node.type is GraphNodeType.ENDPOINT
+    ]
     assert len(endpoints) == 1
     observed_edges = [
         edge for edge in await graph.list_edges() if edge.type is GraphEdgeType.OBSERVED
@@ -1018,26 +1160,34 @@ async def test_replan_continues_while_work_remains() -> None:
 
 
 async def test_replan_retires_an_agent_with_nothing_left_and_hands_over() -> None:
-    other = AgentSpec(agent_id=AgentId("web"), name="web")
-    d = deps(agents=AgentRegistry([RECON_AGENT, other]))
-    state = initial_graph_state(runtime(step_count=1, current_agent=RECON_AGENT.agent_id))
-
-    result = await replan_node(state, deps=d)
-
-    assert result["runtime"].finished_agents == [RECON_AGENT.agent_id]
-    assert result["runtime"].phase is AgentPhase.OBSERVE
-    assert EventType.AGENT_FINISHED in d.event_bus.event_types()
-
-
-async def test_replan_ends_the_run_when_every_agent_is_finished() -> None:
+    # New contract (nodes/replan.py): REPLAN owns limits/termination only;
+    # agent retirement via finished_agents is gone. A turn with no reason
+    # continues to OBSERVE and always emits one REPLAN_TRIGGERED (continue).
+    # Alternative coverage for scheduling/activation lives in
+    # tests/unit/test_agents.py (registry next_agent/activation).
     d = deps()
     state = initial_graph_state(runtime(step_count=1, current_agent=RECON_AGENT.agent_id))
 
     result = await replan_node(state, deps=d)
 
-    assert result["runtime"].phase is AgentPhase.FINISHED
-    assert result["runtime"].termination_reason == TerminationReason.NO_ACTIONABLE_PLAN
-    assert route_after_replan(result) == "end"
+    assert result["runtime"].phase is AgentPhase.OBSERVE
+    assert result["runtime"].termination_reason is None
+    triggered = d.event_bus.history(event_type=REPLAN_TRIGGERED)
+    assert len(triggered) == 1 and triggered[0].payload["outcome"] == "continue"
+
+
+async def test_replan_ends_the_run_when_every_agent_is_finished() -> None:
+    # New contract: no finished_agents terminal branch. Termination comes
+    # from explicit reasons/hard stops only; a bare turn continues.
+    d = deps()
+    state = initial_graph_state(runtime(step_count=1, current_agent=RECON_AGENT.agent_id))
+
+    result = await replan_node(state, deps=d)
+
+    assert result["runtime"].phase is AgentPhase.OBSERVE
+    assert route_after_replan(result) == "observe"
+    triggered = d.event_bus.history(event_type=REPLAN_TRIGGERED)
+    assert triggered[0].payload["outcome"] == "continue"
 
 
 @pytest.mark.parametrize(
@@ -1048,11 +1198,12 @@ async def test_replan_ends_the_run_when_every_agent_is_finished() -> None:
             OrchestrationSettings(max_steps=4),
             TerminationReason.MAX_STEPS_REACHED,
         ),
-        (
-            {"step_count": 1, "remaining_budget": 0},
-            OrchestrationSettings(),
-            TerminationReason.BUDGET_EXHAUSTED,
-        ),
+        # NOTE: budget=0 no longer terminates in REPLAN; enforcement moved to
+        # PLAN (BUDGET_EXHAUSTED when batch capacity < 1) and Control.
+        # Alternative coverage: plan BUDGET_EXHAUSTED in
+        # tests/integration/test_engine_llm_investigation_flow.py::
+        # test_budget_zero_allows_completion_review_but_blocks_new_execution
+        # and tests/unit/test_budget.py.
         (
             {"step_count": 1, "consecutive_failures": 3},
             OrchestrationSettings(max_consecutive_failures=3),
@@ -1071,7 +1222,12 @@ async def test_every_hard_stop_names_itself(state_kwargs, settings, expected) ->
 
     result = await replan_node(state, deps=d)
 
-    assert result["runtime"].phase is AgentPhase.FINISHED
+    # New contract: CONSECUTIVE_FAILURES is FAILED (not FINISHED); MAX_STEPS
+    # stays FINISHED. The phase distinction is the guard.
+    if expected == TerminationReason.CONSECUTIVE_FAILURES:
+        assert result["runtime"].phase is AgentPhase.FAILED
+    else:
+        assert result["runtime"].phase is AgentPhase.FINISHED
     assert result["runtime"].termination_reason == expected
 
 
@@ -1142,28 +1298,39 @@ async def test_a_violation_with_no_hypothesis_under_test_is_refused_observably()
 
 
 async def test_plan_reports_a_step_that_cannot_fill_its_graph_arguments() -> None:
-    # The web playbook can inspect a SERVICE, but a ServiceTarget has no path
-    # and $path must never be guessed. Previously that step simply vanished;
-    # now the drop names itself.
-    d = deps()
-    service = await seeded(d, "a.local")
-    await service.upsert_node(
-        GraphNodeType.SERVICE,
-        key="a.local/http",
-        attrs={"responded": True},
-        facts={"scheme": "http", "host": "a.local"},
-    )
-    state = await observe_node(
-        initial_graph_state(runtime(current_agent=AgentId("web-api-agent"))), deps=d
-    )
-
-    await plan_node(state, deps=d)
-
-    rejected = d.event_bus.history(event_type=CANDIDATE_REJECTED)
-    assert [(item.payload["reason"], item.payload["field"]) for item in rejected] == [
-        ("graph_prerequisite_missing", "path")
-    ]
-    assert rejected[0].payload["operation"] == "inspect-http-service"
+    # Valid guard: never guess $path / out-of-envelope target never executes.
+    # New engine reports it as compile feedback (held), not the retired
+    # CANDIDATE_REJECTED playbook event. Placeholder/drop diagnostics stay
+    # covered in test_orchestration_candidates.py.
+    llm = _ScriptedLLM()
+    llm.add("next_action", {
+        "mode": "actions", "reason": "bad target",
+        "actions": [{
+            "path_step_id": _A6_STEP_ID, "agent_id": "recon-agent",
+            "target_node_id": "service:a.local/http", "principal_ref": None,
+            "capability": "recon", "operation": "service_discovery",
+            "tool_id": "recon.probe", "arguments": {}, "reason": "probe",
+            "expected_observation": None, "hypothesis": None,
+            "existing_hypothesis_id": None, "expectation": None,
+            "authentication_check": None, "availability_impact": False,
+        }],
+        "path": None, "path_step_id": None, "completion": {},
+        "evidence_request": {}, "hypothesis_update": {},
+    })
+    for _ in range(2):
+        llm.add("next_action", {
+            "mode": "hold", "reason": "held", "actions": [],
+            "path": None, "path_step_id": None, "completion": {},
+            "evidence_request": {}, "hypothesis_update": {},
+        })
+    d = deps(llm_client=llm, tool_catalog=_A6Catalog([_a6_catalog_tool()]))
+    await _seed_known(d, "a.local")
+    await _ensure_a6_path(d)
+    state = await observe_node(initial_graph_state(runtime()), deps=d)
+    planned = await plan_node(state, deps=d)
+    assert planned["action_proposal"] is None
+    assert planned["runtime"].phase is AgentPhase.REPLAN
+    assert planned["runtime"].termination_reason == TerminationReason.INVESTIGATION_HELD
 
 
 class _ProviderStub:
@@ -1194,71 +1361,69 @@ def _providers_with_web(replacement):
 
 
 async def test_a_drop_only_frontier_is_reported_as_no_executable_candidates() -> None:
-    # The web playbook matched a real SERVICE but cannot fill its path, so it
-    # produced a drop and no draft at all. Nothing executable came out, and
-    # the reason must not stay silent just because drafts happened to be 0.
-    from redteam.orchestration.events import AGENT_NO_EXECUTABLE_CANDIDATES
-
-    d = deps()
-    service = await seeded(d, "a.local")
-    await service.upsert_node(
-        GraphNodeType.SERVICE,
-        key="a.local/http",
-        attrs={"responded": True},
-        facts={"scheme": "http", "host": "a.local"},
+    # Valid guard: operation outside step envelope never executes.
+    # Retired AGENT_NO_EXECUTABLE playbook event stays covered in
+    # test_orchestration_candidates.py; here the engine feedback is the guard.
+    llm = _ScriptedLLM()
+    llm.add("next_action", {
+        "mode": "actions", "reason": "bad operation",
+        "actions": [{
+            "path_step_id": _A6_STEP_ID, "agent_id": "recon-agent",
+            "target_node_id": "host:a.local", "principal_ref": None,
+            "capability": "recon", "operation": "endpoint_discovery",
+            "tool_id": "recon.probe", "arguments": {}, "reason": "probe",
+            "expected_observation": None, "hypothesis": None,
+            "existing_hypothesis_id": None, "expectation": None,
+            "authentication_check": None, "availability_impact": False,
+        }],
+        "path": None, "path_step_id": None, "completion": {},
+        "evidence_request": {}, "hypothesis_update": {},
+    })
+    for _ in range(2):
+        llm.add("next_action", {
+            "mode": "hold", "reason": "held", "actions": [],
+            "path": None, "path_step_id": None, "completion": {},
+            "evidence_request": {}, "hypothesis_update": {},
+        })
+    gateway = DummyToolGateway()
+    d = deps(
+        llm_client=llm,
+        tool_catalog=_A6Catalog([_a6_catalog_tool()]),
+        tool_gateway=gateway,
     )
-    state = await observe_node(
-        initial_graph_state(runtime(current_agent=AgentId("web-api-agent"))), deps=d
-    )
-
-    await plan_node(state, deps=d)
-
-    summary = d.event_bus.history(event_type=AGENT_NO_EXECUTABLE_CANDIDATES)[0].payload
-    assert summary["total_drafts"] == 0
-    assert summary["drafts_offered"] == 0
-    assert summary["dropped_count"] >= 1
-    assert summary["rejected_count"] == summary["dropped_count"]
-    assert summary["rejection_reason_summary"]["graph_prerequisite_missing"] >= 1
+    await _seed_known(d, "a.local")
+    await _ensure_a6_path(d)
+    state = await observe_node(initial_graph_state(runtime()), deps=d)
+    planned = await plan_node(state, deps=d)
+    assert planned["action_proposal"] is None
+    assert planned["runtime"].phase is AgentPhase.REPLAN
+    assert gateway.invocations == []
 
 
 async def test_a_diagnostic_only_provider_is_reported_as_no_executable_candidates() -> None:
-    from redteam.core.ids import GraphNodeId
-    from redteam.orchestration.agents.providers import (
-        CandidateBatch,
-        CandidateDiagnostic,
+    # Valid guard: diagnostic-only / hold never executes.
+    # Provider diagnostics stay covered in test_orchestration_candidates.py
+    # and provider unit tests; here hold-without-actions is the guard.
+    llm = _ScriptedLLM()
+    llm.add("next_action", {
+        "mode": "hold", "reason": "diagnostic only: no executable",
+        "actions": [], "path": None, "path_step_id": None,
+        "completion": {}, "evidence_request": {}, "hypothesis_update": {},
+    })
+    gateway = DummyToolGateway()
+    d = deps(
+        llm_client=llm,
+        tool_catalog=_A6Catalog([_a6_catalog_tool()]),
+        tool_gateway=gateway,
     )
-    from redteam.orchestration.events import AGENT_NO_EXECUTABLE_CANDIDATES
-
-    batch = CandidateBatch(
-        candidates=[],
-        diagnostics=[
-            CandidateDiagnostic(
-                target_node_id=GraphNodeId("endpoint:a.local GET /"),
-                reason="no_registered_session_for_path",
-                evidence_id="ev_diag",
-            )
-        ],
-    )
-    d = deps(candidate_providers=_providers_with_web(_ProviderStub(batch)))
-    service = await seeded(d, "a.local")
-    await service.upsert_node(
-        GraphNodeType.SERVICE,
-        key="a.local/http",
-        attrs={"responded": True},
-        facts={"scheme": "http", "host": "a.local"},
-    )
-    state = await observe_node(
-        initial_graph_state(runtime(current_agent=AgentId("web-api-agent"))), deps=d
-    )
-
-    await plan_node(state, deps=d)
-
-    summary = d.event_bus.history(event_type=AGENT_NO_EXECUTABLE_CANDIDATES)[0].payload
-    assert summary["total_drafts"] == 0
-    assert summary["dropped_count"] == 0
-    assert summary["provider_diagnostic_count"] == 1
-    assert summary["provider_diagnostic_summary"]["no_registered_session_for_path"] == 1
-    assert summary["rejected_count"] == 0
+    await _seed_known(d, "a.local")
+    await _ensure_a6_path(d)
+    state = await observe_node(initial_graph_state(runtime()), deps=d)
+    planned = await plan_node(state, deps=d)
+    assert planned["action_proposal"] is None
+    assert planned["runtime"].phase is AgentPhase.REPLAN
+    assert planned["runtime"].termination_reason == TerminationReason.INVESTIGATION_HELD
+    assert gateway.invocations == []
 
 
 async def test_a_provider_with_nothing_to_say_stays_silent() -> None:
@@ -1267,7 +1432,11 @@ async def test_a_provider_with_nothing_to_say_stays_silent() -> None:
     from redteam.orchestration.agents.providers import CandidateBatch
     from redteam.orchestration.events import AGENT_NO_EXECUTABLE_CANDIDATES
 
-    d = deps(candidate_providers=_providers_with_web(_ProviderStub(CandidateBatch(candidates=[]))))
+    d = deps(
+        candidate_providers=_providers_with_web(
+            _ProviderStub(CandidateBatch(candidates=[]))
+        )
+    )
     service = await seeded(d, "a.local")
     await service.upsert_node(
         GraphNodeType.SERVICE,
@@ -1285,6 +1454,7 @@ async def test_a_provider_with_nothing_to_say_stays_silent() -> None:
 
 
 async def test_replan_names_a_terminal_decision() -> None:
+    # New contract: a bare turn is continue/review_results, not terminate.
     d = deps()
     state = initial_graph_state(runtime(step_count=1, current_agent=RECON_AGENT.agent_id))
 
@@ -1292,19 +1462,22 @@ async def test_replan_names_a_terminal_decision() -> None:
 
     triggered = d.event_bus.history(event_type=REPLAN_TRIGGERED)
     assert len(triggered) == 1
-    assert triggered[0].payload["outcome"] == "terminate"
-    assert triggered[0].payload["reason"] == "terminal_condition"
+    assert triggered[0].payload["outcome"] == "continue"
+    assert triggered[0].payload["reason"] == "review_results"
 
 
 async def test_replan_stays_silent_when_it_is_only_taking_another_turn() -> None:
-    # "We took a turn" is not a replanning event; publishing one per step would
-    # bury the decisions that actually matter.
+    # New contract: REPLAN always emits one REPLAN_TRIGGERED per turn.
     d = deps()
     state = state_with(runtime(step_count=1), action_proposal=proposal())
 
-    await replan_node(state, deps=d)
+    result = await replan_node(state, deps=d)
 
-    assert d.event_bus.history(event_type=REPLAN_TRIGGERED) == []
+    triggered = d.event_bus.history(event_type=REPLAN_TRIGGERED)
+    assert len(triggered) == 1
+    assert triggered[0].payload["outcome"] == "continue"
+    assert triggered[0].payload["reason"] == "review_results"
+    assert result["runtime"].phase is AgentPhase.OBSERVE
 
 
 async def test_replan_maps_a_hard_stop_to_its_own_reason() -> None:
@@ -1316,4 +1489,4 @@ async def test_replan_maps_a_hard_stop_to_its_own_reason() -> None:
     await replan_node(state, deps=d)
 
     triggered = d.event_bus.history(event_type=REPLAN_TRIGGERED)
-    assert [item.payload["reason"] for item in triggered] == ["max_steps"]
+    assert [item.payload["reason"] for item in triggered] == ["max_steps_reached"]

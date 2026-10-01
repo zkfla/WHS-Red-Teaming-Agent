@@ -51,7 +51,7 @@ def test_plan_mission_derives_objective_and_priorities_from_intent() -> None:
     assert "VulnBank" in mission.objective
     assert mission.priorities == ["authentication", "authorization", "web"]
     assert mission.initial_workstreams == mission.priorities
-    assert all("verified evidence" in criterion for criterion in mission.success_criteria)
+    assert mission.success_criteria == ["VulnBank 웹 레드티밍, 인증/인가 중심"]
 
 
 def test_plan_mission_falls_back_to_engagement_when_no_objective() -> None:

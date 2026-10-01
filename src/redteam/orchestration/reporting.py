@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import Counter
+from collections.abc import Collection
 
 from pydantic import BaseModel, Field
 
@@ -123,6 +124,10 @@ class TerminalReportProjection(BaseModel):
     integrity_blockers: list[str] = Field(default_factory=list)
     unresolved_hypotheses: list[str] = Field(default_factory=list)
     outstanding_cleanup: list[str] = Field(default_factory=list)
+    #: Required-scope split of unresolved_hypotheses. Additive only:
+    #: unresolved_hypotheses keeps the full list, these two scope it.
+    required_unresolved_hypotheses: list[str] = Field(default_factory=list)
+    deferred_hypotheses: list[str] = Field(default_factory=list)
     #: Optional so reports persisted before Mission reporting existed still load.
     mission: MissionProjection | None = None
     effectiveness: RunEffectiveness = Field(default_factory=RunEffectiveness)
@@ -139,14 +144,24 @@ class ReportingAgent:
         evidence_store: EvidenceStore,
         work_store: WorkStore,
         task_store: MissionTaskStore | None = None,
+        required_hypothesis_ids: Collection[str] | None = None,
     ) -> TerminalReportProjection:
         if not runtime.is_terminal:
             raise ValueError("reporting projection requires a terminal runtime")
 
         integrity = await graph.integrity_report()
         cleanup = await graph.cleanup_report()
+        unresolved = list(integrity.unresolved_hypotheses)
+        if required_hypothesis_ids is None:
+            required_unresolved = list(unresolved)
+            deferred = []
+        else:
+            required = {str(item) for item in required_hypothesis_ids}
+            required_unresolved = [item for item in unresolved if str(item) in required]
+            deferred = [item for item in unresolved if str(item) not in required]
         evidence = [
-            item for item in await evidence_store.list_for_run(runtime.run_id)
+            item
+            for item in await evidence_store.list_for_run(runtime.run_id)
             if item.engagement_id == runtime.engagement_id
         ]
         current_evidence_ids = {str(item.evidence_id) for item in evidence}
@@ -175,16 +190,13 @@ class ReportingAgent:
                 mission = _project_mission(
                     plan,
                     tasks,
-                    verified_finding_count=sum(
-                        1 for item in projected_findings if item.verified
-                    ),
+                    verified_finding_count=sum(1 for item in projected_findings if item.verified),
                     evidence_count=len(evidence),
                 )
         actions = runtime.actions_executed
         terminal_work = sum(status_counts.values())
         dead_ends = sum(
-            status_counts.get(status, 0)
-            for status in ("failed", "blocked", "stale", "cancelled")
+            status_counts.get(status, 0) for status in ("failed", "blocked", "stale", "cancelled")
         )
         effectiveness = RunEffectiveness(
             successful_work_per_action=(
@@ -210,12 +222,15 @@ class ReportingAgent:
                 runtime.phase is AgentPhase.FINISHED
                 and runtime.termination_reason == TerminationReason.NO_ACTIONABLE_PLAN
                 and not integrity.blocking
-                and not integrity.unresolved_hypotheses
+                # Required scope only: non-required open hypotheses are
+                # reported as deferred and never alone block release.
+                and not required_unresolved
                 and cleanup.is_clear
                 # A depleted candidate frontier is not evidence that the
                 # Mission's required work or success criteria were met.
                 and (
-                    mission is None and runtime.mission_id is None
+                    mission is None
+                    and runtime.mission_id is None
                     or mission is not None
                     and mission.status == MissionStatus.COMPLETED.value
                     and all(criterion.met for criterion in mission.success_criteria)
@@ -232,7 +247,9 @@ class ReportingAgent:
             findings=projected_findings,
             evidence_ids=[item.evidence_id for item in evidence],
             integrity_blockers=integrity.blocking,
-            unresolved_hypotheses=integrity.unresolved_hypotheses,
+            unresolved_hypotheses=unresolved,
+            required_unresolved_hypotheses=required_unresolved,
+            deferred_hypotheses=deferred,
             outstanding_cleanup=[str(item.node_id) for item in cleanup.outstanding],
             mission=mission,
             effectiveness=effectiveness,
@@ -335,9 +352,7 @@ def _project_mission(
     )
 
 
-def _build_workstream(
-    name: str, tasks: list[MissionTask]
-) -> MissionWorkstreamProjection:
+def _build_workstream(name: str, tasks: list[MissionTask]) -> MissionWorkstreamProjection:
     statuses = Counter(task.status.value for task in tasks)
     total = len(tasks)
     task_ids = [task.task_id for task in tasks]
@@ -354,11 +369,7 @@ def _build_workstream(
             completed_task_count=completed,
             task_ids=task_ids,
         )
-    stalled = [
-        task
-        for task in tasks
-        if task.status in (TaskStatus.BLOCKED, TaskStatus.FAILED)
-    ]
+    stalled = [task for task in tasks if task.status in (TaskStatus.BLOCKED, TaskStatus.FAILED)]
     if completed == 0 and stalled:
         reasons = [
             task.blocking_reason
@@ -391,8 +402,7 @@ def _project_criteria(mission: MissionPlan) -> list[MissionCriterionProjection]:
             criterion=redact_text(criterion),
             met=results[criterion].met,
             reason=(
-                redact_text(str(results[criterion].reason))
-                if results[criterion].reason else None
+                redact_text(str(results[criterion].reason)) if results[criterion].reason else None
             ),
             evidence_count=len(results[criterion].evidence_ids),
         )

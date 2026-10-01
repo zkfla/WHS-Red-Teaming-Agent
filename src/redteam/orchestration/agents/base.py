@@ -1,8 +1,7 @@
-"""``AgentSpec``/``PlanStep``/``Planner`` and the frontier calculation.
+"""Role, action and legacy reference-playbook contracts.
 
-An agent is a declared playbook plus a chooser: a planner picks from
-``available_steps`` and cannot invent a capability, operation or tool id
-that was never declared. Rationale: ``docs/agent/orchestration.md``.
+Production planning uses the LLM and the real tool catalog. Frontier
+helpers produce reference material, never an execution pool.
 """
 
 from __future__ import annotations
@@ -91,6 +90,13 @@ class PlanStep(BaseModel):
     #: Runtime-assigned safe identity for cross-event lookup. Providers leave
     #: it blank; PLAN fills it only after compilation.
     candidate_key: str = ""
+    path_id: str | None = None
+    path_version: int | None = None
+    path_step_id: str | None = None
+    principal_ref: str | None = None
+    operator_intent_id: str | None = None
+    intent_index: int = 0
+    availability_impact: bool = False
     capability: str
     operation: str
     tool_id: ToolId
@@ -117,7 +123,7 @@ class PlanStep(BaseModel):
     existing_hypothesis_id: HypothesisId | None = None
     expectation: Expectation | None = None
 
-    #: Predicates to write onto the target node when the step succeeds.
+    #: Legacy planning hints, never promoted as measured facts.
     observed_attrs: dict[str, bool | str | int] = Field(default_factory=dict)
 
     #: ``False`` (the default) means: propose this at most once per target.
@@ -224,9 +230,9 @@ class AgentSpec(BaseModel):
     capabilities: list[str] = Field(default_factory=list)
     playbook: list[PlanStep] = Field(default_factory=list)
 
-    #: ``"playbook"`` takes the first available step; ``"llm"`` asks the
-    #: LLM gateway to choose among them (falling back to the first).
-    planner_kind: str = "playbook"
+    #: One runtime mode: the model generates and reviews paths/actions.
+    #: Playbook steps remain reference material for that reasoning.
+    planner_kind: Literal["llm"] = "llm"
     system_prompt: str = ""
     #: Stop offering this agent after this many executed actions.
     max_actions: int | None = Field(default=None, ge=1)

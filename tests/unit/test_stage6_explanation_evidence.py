@@ -14,6 +14,7 @@ seam they feed is noted in the parent handoff, not edited here.
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from typing import Any
 
 from redteam.app.cli.renderer import operator_explanation_text
 from redteam.core.contracts.events import EventType
@@ -230,7 +231,7 @@ async def test_proposed_action_explanations_are_bounded() -> None:
 
 async def test_work_ledger_fallback_exposes_candidate_score_and_reason() -> None:
     work_store = InMemoryWorkStore()
-    common = dict(
+    common: dict[str, Any] = dict(
         run_id=RUN,
         agent_id=AgentId("web-api-agent"),
         target_node_ids=[GraphNodeId("endpoint:a.local GET /api/docs")],

@@ -12,6 +12,7 @@ short plan.  It never asks for or renders private chain-of-thought.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from typing import Any, Literal
@@ -20,7 +21,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from redteam.core.ports.llm import LLMClient
 from redteam.core.redaction import redact_sensitive_text
-from redteam.llm.fake import FakeLLMClient
+from redteam.orchestration.cognition import DecisionFailure, StructuredDecisionClient
 from redteam.orchestration.engagement_planner import sanitize_objective
 from redteam.orchestration.state import RuntimeState
 
@@ -37,11 +38,15 @@ latest message. If the user writes in Korean, these fields MUST be natural Korea
 tool, policy, target and error identifiers unchanged where translating them would alter meaning.
 
 Choose mode:
-- execute: a concrete request that should start or continue an assessment;
+- execute: a concrete request for a NEW investigation; set investigation="new";
 - answer: a question that can be answered from the supplied session context;
 - clarify: essential target or intent information is missing;
 - guidance: advice that should influence the currently running agent without
-  directly invoking a tool.
+  directly invoking a tool; set investigation="current".
+Do not combine a request for a different investigation with current guidance.
+Questions are read-only. If an instruction refers to an ended investigation,
+clarify whether a follow-up is wanted; do not silently start a new investigation.
+The supplied input binding is authoritative; never invent or change a run ID.
 """
 
 
@@ -49,6 +54,7 @@ class ConversationDecision(BaseModel):
     """Safe, displayable result of interpreting one chat message."""
 
     mode: Literal["execute", "answer", "clarify", "guidance"]
+    investigation: Literal["current", "new"] | None = None
     response: str = Field(min_length=1, max_length=2000)
     objective: str | None = Field(default=None, max_length=1000)
     guidance: str | None = Field(default=None, max_length=1000)
@@ -70,12 +76,30 @@ class ConversationDecision(BaseModel):
         ]
 
 
+class ConversationError(Exception):
+    """Raised when the dialogue model cannot produce a displayable decision.
+
+    Transport, schema, and classification failures are delivered as this
+    error with zero executions. ``asyncio.CancelledError`` is never
+    converted to this error and always propagates.
+    """
+
+
 class ConversationAssistant:
     """Maintains bounded chat history and delegates interpretation to the configured LLM."""
 
-    def __init__(self, llm: LLMClient) -> None:
+    def __init__(
+        self,
+        llm: LLMClient,
+        *,
+        timeout_seconds: float = 30.0,
+        max_attempts: int = 3,
+    ) -> None:
         self._llm = llm
+        self._timeout_seconds = float(timeout_seconds)
+        self._max_attempts = int(max_attempts)
         self._history: list[dict[str, str]] = []
+        self._client = StructuredDecisionClient(self._llm, max_attempts=self._max_attempts)
 
     async def decide(
         self,
@@ -88,51 +112,58 @@ class ConversationAssistant:
         run_active: bool = False,
         prefer_execute: bool = False,
     ) -> ConversationDecision:
-        """Interpret one chat turn without selecting or invoking a tool."""
+        """Interpret one chat turn without selecting or invoking a tool.
+
+        The model always decides through the shared structured-decision
+        helper. No tool is selected, invoked, or approved here.
+        ``prefer_execute`` is accepted for compatibility but never forces
+        a mode conversion.
+        """
 
         safe_message = sanitize_objective(user_message)
-        tools = list(tools or [])
-        if isinstance(self._llm, FakeLLMClient):
-            decision = self._fallback(
-                safe_message,
-                run_active=run_active,
-                prefer_execute=prefer_execute,
-                tools=tools,
-            )
-            self._remember(safe_message, decision)
-            return decision
-
-        prompt = (
-            f"Engagement: {redact_sensitive_text(engagement_name)}\n"
-            f"Allowed scope: {json.dumps(scope[:20], ensure_ascii=False)}\n"
-            f"Discovered MCP tools: {json.dumps(tools[:40], ensure_ascii=False)}\n"
-            f"Run active: {run_active}\n"
-            f"Session context: {redact_sensitive_text(session_context)[:3000]}\n\n"
-            f"User message: {safe_message}"
-        )
+        tool_labels = list(tools or [])
+        payload = {
+            "engagement": redact_sensitive_text(engagement_name),
+            "scope": list(scope[:20]),
+            "tools": tool_labels[:40],
+            "run_active": bool(run_active),
+            "session_context": redact_sensitive_text(session_context)[:3000],
+            "user_message": safe_message,
+            "history": list(self._history[-16:]),
+        }
         try:
-            raw = await self._llm.complete_structured(
-                messages=[*self._history, {"role": "user", "content": prompt}],
-                response_schema=ConversationDecision.model_json_schema(),
-                system=_SYSTEM_PROMPT,
+            raw = await asyncio.wait_for(
+                self._client.ask(
+                    stage="conversation_decide",
+                    payload=payload,
+                    response_schema=ConversationDecision.model_json_schema(),
+                    system=_SYSTEM_PROMPT,
+                ),
+                timeout=self._timeout_seconds,
             )
+        except asyncio.CancelledError:
+            raise
+        except asyncio.TimeoutError as exc:
+            raise ConversationError(
+                f"conversation decision timed out after {self._timeout_seconds:g}s"
+            ) from exc
+        except DecisionFailure as exc:
+            raise ConversationError(
+                f"conversation decision failed kind={exc.kind} "
+                f"stage={exc.stage} attempts={exc.attempts}"
+            ) from exc
+        except ConversationError:
+            raise
+        except Exception as exc:
+            raise ConversationError(
+                f"conversation decision failed {type(exc).__name__}"
+            ) from exc
+        try:
             decision = ConversationDecision.model_validate(raw)
-        except Exception as exc:  # noqa: BLE001 - conversational fallback
-            logger.warning("Conversation LLM failed (%s); using safe fallback", type(exc).__name__)
-            decision = self._fallback(
-                safe_message,
-                run_active=run_active,
-                prefer_execute=prefer_execute,
-                tools=tools,
-            )
-
-        # A message entered in the explicit "Mission objective" path is an
-        # execution request by construction. The model may improve its wording
-        # or ask for clarification, but cannot silently turn it into idle chat.
-        if prefer_execute and decision.mode == "answer":
-            decision = decision.model_copy(
-                update={"mode": "execute", "objective": decision.objective or safe_message}
-            )
+        except Exception as exc:
+            raise ConversationError(
+                f"invalid conversation decision {type(exc).__name__}"
+            ) from exc
         if decision.mode == "execute" and not decision.objective:
             decision = decision.model_copy(update={"objective": safe_message})
         if decision.mode == "guidance" and not decision.guidance:
@@ -141,46 +172,32 @@ class ConversationAssistant:
         return decision
 
     async def final_response(self, state: RuntimeState) -> str:
-        """Produce a concise user-facing result from safe runtime summaries."""
+        """Produce a concise user-facing result from safe runtime summaries.
 
-        observations = [
-            {
-                "kind": item.kind,
-                "summary": item.summary,
-                "outcome": item.outcome,
-                "reasons": item.reasons,
-            }
-            for item in state.recent_observations[-8:]
-        ]
-        deterministic = (
-            f"Run이 {state.termination_reason or state.phase.value} 상태로 끝났습니다. "
-            f"총 {state.actions_executed}개의 Action을 실행했습니다."
-        )
-        if isinstance(self._llm, FakeLLMClient):
-            return deterministic
-        prompt = (
-            "Summarize the completed run for the operator in the operator's language. "
-            "State what happened, any constraint or failure, and the most useful next step. "
-            "Use only the supplied facts; do not invent findings. Keep it under six sentences.\n"
-            f"phase={state.phase.value}\n"
-            f"termination_reason={state.termination_reason}\n"
-            f"mission_status={state.mission_status.value if state.mission_status else None}\n"
-            f"actions_executed={state.actions_executed}\n"
-            f"recent_observations={json.dumps(observations, ensure_ascii=False)}"
-        )
-        try:
-            response = await self._llm.complete(
-                messages=[*self._history, {"role": "user", "content": prompt}],
-                system=(
-                    "You provide concise final answers for an authorized security-testing agent. "
-                    "Never expose private chain-of-thought and never invent evidence."
-                ),
+        Uses only the actual terminal state and recent public
+        observations. Makes zero LLM calls and has no Fake special case.
+        """
+
+        reason = state.termination_reason or state.phase.value
+        recent = state.recent_observations[-5:]
+        lines: list[str] = []
+        if self._uses_korean():
+            lines.append(
+                f"Run이 {reason} 상태로 끝났습니다. "
+                f"총 {state.actions_executed}개의 Action을 실행했습니다."
             )
-        except Exception as exc:  # noqa: BLE001 - summary must not make a completed run fail
-            logger.warning("Final response LLM failed (%s)", type(exc).__name__)
-            return deterministic
-        safe = redact_sensitive_text(response).strip()
-        return safe[:3000] or deterministic
+            for item in recent:
+                lines.append(f"- {item.summary}")
+            if state.pending_approval_id is not None:
+                lines.append(f"승인 대기: {state.pending_approval_id}")
+        else:
+            lines.append(f"Run ended as {reason} with {state.actions_executed} action(s).")
+            for item in recent:
+                lines.append(f"- {item.summary}")
+            if state.pending_approval_id is not None:
+                lines.append(f"Approval pending: {state.pending_approval_id}")
+        safe = redact_sensitive_text("\n".join(lines)).strip()
+        return safe[:3000] or reason
 
     def _remember(self, user_message: str, decision: ConversationDecision) -> None:
         self._history.extend(
@@ -194,53 +211,17 @@ class ConversationAssistant:
         )
         self._history = self._history[-16:]
 
-    @staticmethod
-    def _fallback(
-        message: str,
-        *,
-        run_active: bool,
-        prefer_execute: bool,
-        tools: list[str],
-    ) -> ConversationDecision:
-        lowered = message.lower()
-        looks_like_question = message.endswith("?") or any(
-            token in lowered for token in ("왜", "뭐", "무엇", "어떻게", "what", "why", "how")
-        )
-        if run_active:
-            if looks_like_question:
-                return ConversationDecision(
-                    mode="answer",
-                    response=(
-                        "현재 실행 상태를 기준으로 질문을 확인했습니다. "
-                        "정확한 근거는 status 또는 explain 출력에서 함께 확인할 수 있습니다."
-                    ),
-                )
-            return ConversationDecision(
-                mode="guidance",
-                response="요청을 다음 Agent 판단에 반영하겠습니다.",
-                guidance=message,
-            )
-        if looks_like_question and not prefer_execute:
-            return ConversationDecision(
-                mode="answer",
-                response="직전 Run의 상태와 관찰 결과를 기준으로 답변하겠습니다.",
-            )
-        plan = ["현재 Attack Graph와 범위를 확인합니다."]
-        if tools:
-            plan.append("사용 가능한 MCP 도구를 후보로 비교합니다.")
-        plan.extend(
-            [
-                "각 Action을 Control Plane에서 검증합니다.",
-                "관찰 결과가 부족하면 다음 안전한 행동을 다시 결정합니다.",
-            ]
-        )
-        return ConversationDecision(
-            mode="execute",
-            response="요청을 이해했습니다. 허용된 범위 안에서 조사를 시작하겠습니다.",
-            objective=message,
-            assumptions=["Engagement에 선언된 대상만 허용 범위로 간주합니다."],
-            plan=plan,
-        )
+    def _uses_korean(self) -> bool:
+        seen_user = False
+        for entry in self._history:
+            if entry.get("role") != "user":
+                continue
+            seen_user = True
+            content = str(entry.get("content") or "")
+            for ch in content:
+                if "\uAC00" <= ch <= "\uD7A3":
+                    return True
+        return True if not seen_user else False
 
 
 def catalog_tool_labels(catalog: Any) -> list[str]:

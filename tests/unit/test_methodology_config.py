@@ -65,4 +65,4 @@ def test_cli_passes_explicit_reference_configuration(tmp_path, monkeypatch):
     config = load_app_config_for_run(str(engagement))
     assert config.capability.methodology.reference_ids == ("m4vic-api",)
     assert config.capability.mcp_servers == ["workspace-read"]
-    assert config.orchestration.planning_mode == "playbook_only"
+    assert config.orchestration.llm_candidate_generation is True

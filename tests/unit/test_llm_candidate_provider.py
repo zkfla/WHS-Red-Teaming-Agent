@@ -1,11 +1,17 @@
 """RC#1: the model generates candidate drafts; the same guards still gate them."""
 
-from typing import Any
+from dataclasses import replace
+from datetime import datetime, timezone
+from typing import Any, cast
 
 from redteam.attack_graph.identity import make_node_id
 from redteam.attack_graph.observation import GraphObservation
+from redteam.attack_graph.view import AttackGraphView
+from redteam.core.contracts.graph import GraphNode
+from redteam.core.contracts.target import EndpointTarget
+from redteam.core.contracts.tool import ToolDescriptor
 from redteam.core.enums import GraphNodeType
-from redteam.core.ids import AgentId, GraphNodeId
+from redteam.core.ids import AgentId, GraphNodeId, ToolId
 from redteam.orchestration.agents.base import AgentSpec
 from redteam.orchestration.agents.llm_provider import LLMCandidateProvider
 from redteam.orchestration.agents.providers import GraphCandidateContext
@@ -14,15 +20,35 @@ ENDPOINT_KEY = "mock-bank:8080 GET /api/accounts/alice"
 ENDPOINT_ID = str(make_node_id(GraphNodeType.ENDPOINT, ENDPOINT_KEY))
 
 
+class _FakeView:
+    """Minimal AttackGraphView stand-in: returns endpoint nodes carrying the
+    ``observed_target`` fact the provider must read (never the model's word)."""
+
+    def __init__(self, observed_by_id: dict[str, str] | None = None) -> None:
+        self._observed = observed_by_id or {}
+
+    async def get_node(self, node_id: GraphNodeId) -> GraphNode | None:
+        key = str(node_id)
+        facts = {}
+        if key in self._observed:
+            facts["observed_target"] = self._observed[key]
+        now = datetime.now(timezone.utc)
+        return GraphNode(
+            id=GraphNodeId(key),
+            type=GraphNodeType.ENDPOINT,
+            properties={"facts": facts},
+            created_at=now,
+            updated_at=now,
+        )
+
+
 class _ScriptedLLM:
     def __init__(self, actions: list[dict[str, Any]]) -> None:
         self._actions = actions
         self.last_prompt = ""
-        self.last_system = ""
 
     async def complete_structured(self, **kwargs: Any) -> dict[str, Any]:
         self.last_prompt = kwargs["messages"][0]["content"]
-        self.last_system = kwargs["system"]
         return {"actions": self._actions}
 
 
@@ -33,7 +59,7 @@ def _context() -> GraphCandidateContext:
         node_ids_by_type={"endpoint": [ENDPOINT_ID]},
     )
     return GraphCandidateContext(
-        view=None,  # type: ignore[arg-type]  # unused by this provider
+        view=cast(AttackGraphView, _FakeView()),
         observation=observation,
         step=1,
         available_operations=(("web", "http_request"),),
@@ -62,51 +88,41 @@ async def test_model_generates_a_novel_action_not_in_any_playbook() -> None:
     assert step.capability == "web"
     assert step.operation == "http_request"
     assert step.arguments == {"path": "/api/accounts/bob"}
-    assert "MUST be natural Korean" in llm.last_system
 
 
-async def test_explicit_live_tool_id_is_a_hard_compatibility_preference() -> None:
-    llm = _ScriptedLLM(
-        [
-            {
-                "capability": "web",
-                "operation": "http_request",
-                "target_node_id": ENDPOINT_ID,
-                "tool_id": "web.http_request",
-            }
-        ]
+async def test_executable_target_uses_graph_observed_path_not_model_word() -> None:
+    # A node id normalises identifier segments (/api/orders/1234 ->
+    # /api/orders/{id}); the concrete path must come from the graph's
+    # observed_target fact, never the template and never a model-asserted value.
+    key = "mock-bank:8080 GET /api/orders/{id}"
+    node_id = str(make_node_id(GraphNodeType.ENDPOINT, key))
+    observation = GraphObservation(
+        step=1,
+        nodes_by_type={"endpoint": [key]},
+        node_ids_by_type={"endpoint": [node_id]},
     )
-    batch = await LLMCandidateProvider(llm).propose_graph(_spec(), _context())
-    step = batch.candidates[0].plan_step
-    assert step.compatible_tool_ids == ["web.http_request"]
-
-
-async def test_model_target_ref_is_rebound_to_the_known_graph_target() -> None:
-    context = _context()
     context = GraphCandidateContext(
-        **{
-            **context.__dict__,
-            "available_tools": (
-                {
-                    "tool_id": "web.http_request",
-                    "required_arguments": ("target_ref",),
-                },
-            ),
-        }
+        view=cast(AttackGraphView, _FakeView({node_id: "/api/orders/1234"})),
+        observation=observation,
+        step=1,
+        available_operations=(("web", "http_request"),),
     )
     llm = _ScriptedLLM(
         [
             {
                 "capability": "web",
                 "operation": "http_request",
-                "target_node_id": ENDPOINT_ID,
-                "tool_id": "web.http_request",
-                "arguments": {"target_ref": "endpoint:invented"},
+                "target_node_id": node_id,
+                # A model claim that would send the request at the template.
+                "observed": "/api/orders/{id}",
             }
         ]
     )
     batch = await LLMCandidateProvider(llm).propose_graph(_spec(), context)
-    assert batch.candidates[0].plan_step.arguments["target_ref"] == "mock-bank"
+    assert len(batch.candidates) == 1
+    target = batch.candidates[0].plan_step.target
+    assert isinstance(target, EndpointTarget)
+    assert target.path == "/api/orders/1234"
 
 
 async def test_hallucinated_target_is_dropped_not_executed() -> None:
@@ -134,12 +150,11 @@ async def test_generator_receives_and_obeys_the_assigned_task() -> None:
         node_ids_by_type={"endpoint": [ENDPOINT_ID, other]},
     )
     context = GraphCandidateContext(
-        view=None,  # type: ignore[arg-type]
+        view=cast(AttackGraphView, _FakeView()),
         observation=observation,
         step=1,
         task_id="task_authz",
         task_objective="Compare access to the account object",
-        mission_objective="Assess only the operator-requested account flow",
         task_target_node_ids=(GraphNodeId(ENDPOINT_ID),),
     )
     llm = _ScriptedLLM([
@@ -149,7 +164,6 @@ async def test_generator_receives_and_obeys_the_assigned_task() -> None:
     batch = await LLMCandidateProvider(llm).propose_graph(_spec(), context)
 
     assert "Assigned Task: Compare access to the account object" in llm.last_prompt
-    assert "Operator Mission: Assess only the operator-requested account flow" in llm.last_prompt
     assert f"  - {other}" not in llm.last_prompt
     assert batch.candidates == []
     assert [drop.reason for drop in batch.drops] == ["unknown_target_node"]
@@ -164,7 +178,7 @@ async def test_raw_outcome_is_fed_to_the_model_prompt() -> None:
         node_ids_by_type={"endpoint": [ENDPOINT_ID]},
     )
     context = GraphCandidateContext(
-        view=None,  # type: ignore[arg-type]
+        view=cast(AttackGraphView, _FakeView()),
         observation=observation,
         step=1,
         available_operations=(("web", "http_request"),),
@@ -183,6 +197,45 @@ async def test_raw_outcome_is_fed_to_the_model_prompt() -> None:
     assert "error=tool_output_schema_mismatch" in llm.last_prompt
 
 
+async def test_prompt_uses_tool_schema_required_arguments() -> None:
+    class _Catalog:
+        def get(self, tool_id: ToolId) -> ToolDescriptor | None:
+            return None
+
+        def list_by_capability(self, capability_tag: str) -> list[ToolDescriptor]:
+            return []
+
+        def list_tools_for_action(
+            self, capability: str, operation: str
+        ) -> list[ToolDescriptor]:
+            assert (capability, operation) == ("recon", "endpoint_discovery")
+            return [
+                ToolDescriptor(
+                    tool_id=ToolId("recon.html_inventory"),
+                    server_id="test",
+                    tool_name="html_inventory",
+                    input_schema={
+                        "type": "object",
+                        "required": ["target_ref", "path"],
+                        "properties": {
+                            "target_ref": {"type": "string"},
+                            "path": {"type": "string"},
+                        },
+                    },
+                )
+            ]
+
+    llm = _ScriptedLLM([])
+    context = _context()
+    context = replace(
+        context, available_operations=(("recon", "endpoint_discovery"),)
+    )
+
+    await LLMCandidateProvider(llm, _Catalog()).propose_graph(_spec(), context)
+
+    assert "required arguments from tool schema: path, target_ref" in llm.last_prompt
+
+
 async def test_generation_failure_degrades_to_empty_not_crash() -> None:
     class _Boom:
         async def complete_structured(self, **_: Any) -> dict[str, Any]:
@@ -191,27 +244,3 @@ async def test_generation_failure_degrades_to_empty_not_crash() -> None:
     batch = await LLMCandidateProvider(_Boom()).propose_graph(_spec(), _context())
     assert batch.candidates == []
     assert batch.drops == []
-
-
-async def test_one_turn_carries_public_response_summary_and_assumptions() -> None:
-    llm = _ScriptedLLM([])
-
-    async def complete_structured(**kwargs: Any) -> dict[str, Any]:
-        llm.last_prompt = kwargs["messages"][0]["content"]
-        return {
-            "intent": "finish",
-            "response": "현재 관찰로 필요한 확인을 마쳤습니다.",
-            "decision_summary": "추가 실행보다 결과 정리가 적절합니다.",
-            "assumptions": ["등록된 대상만 평가했습니다."],
-            "actions": [],
-        }
-
-    llm.complete_structured = complete_structured  # type: ignore[method-assign]
-    provider = LLMCandidateProvider(llm)
-    batch = await provider.propose_graph(_spec(), _context())
-
-    assert batch.candidates == []
-    assert provider.last_decision is not None
-    assert provider.last_decision.intent == "finish"
-    assert provider.last_decision.response.startswith("현재 관찰")
-    assert provider.last_decision.assumptions == ["등록된 대상만 평가했습니다."]

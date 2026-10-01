@@ -56,6 +56,9 @@ class TerminationReason:
     APPROVAL_PENDING = "approval_pending"
     USER_INTERRUPTED = "user_interrupted"
     EXECUTION_ERROR = "execution_error"
+    PLANNING_ERROR = "planning_error"
+    GOAL_ACHIEVED = "goal_achieved"
+    INVESTIGATION_HELD = "investigation_held"
     #: Operator asked to hold the run before the next action executes. The
     #: active Task and Mission are preserved so a RESUME intent continues
     #: the same work instead of starting a new Mission.
@@ -76,6 +79,12 @@ class RuntimeState(BaseModel):
     # checkpoints created before Mission contracts loadable.
     mission_id: MissionId | None = None
     active_task_id: TaskId | None = None
+    active_path_id: str | None = None
+    active_path_version: int | None = None
+    active_path_step_id: str | None = None
+    planning_error: str | None = None
+    planning_feedback: list[str] = Field(default_factory=list)
+    recent_observations: list[RuntimeObservation] = Field(default_factory=list)
     operator_intent_id: OperatorIntentId | None = None
     mission_status: MissionStatus | None = None
 
@@ -112,10 +121,6 @@ class RuntimeState(BaseModel):
     #: Observation fingerprint at which each agent exhausted its frontier.
     #: A relevant graph delta makes that agent eligible again.
     agent_revision_cursors: dict[str, str] = Field(default_factory=dict)
-    #: Bounded decision feedback for the next planning turn. Target/domain
-    #: truth still lives in Attack Graph/Evidence; this window carries policy,
-    #: tool and state outcomes that otherwise disappeared at REPLAN.
-    recent_observations: list[RuntimeObservation] = Field(default_factory=list)
 
     @property
     def is_terminal(self) -> bool:
@@ -169,6 +174,7 @@ def resume_graph_state(
     *,
     action_proposal: ActionProposal,
     plan_step: PlanStep | None,
+    current_work_id: str | None = None,
 ) -> GraphState:
     """Seed a resume invocation that re-enters directly at POLICY.
 
@@ -190,7 +196,7 @@ def resume_graph_state(
         "policy_decision": None,
         "tool_result": None,
         "result_evidence_id": None,
-        "current_work_id": None,
+        "current_work_id": current_work_id,
         "dispatch_items": [],
         "worker_outcomes": {},
         "last_event_id": None,

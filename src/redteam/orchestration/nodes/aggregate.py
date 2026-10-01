@@ -7,16 +7,12 @@ from datetime import datetime, timezone
 from langgraph.types import Overwrite
 
 from redteam.core.contracts.policy import PolicyDecision
-from redteam.core.contracts.target import target_display_name
 from redteam.core.enums import AgentPhase, PolicyVerdict
 from redteam.core.ids import ActionId
 from redteam.orchestration.context import RuntimeDeps
 from redteam.orchestration.nodes._support import advance
 from redteam.orchestration.nodes.policy import SEVERITY_ABORT_RUN, SEVERITY_REPLAN_GOAL
-from redteam.orchestration.runtime_observation import (
-    RuntimeObservation,
-    append_runtime_observation,
-)
+from redteam.orchestration.runtime_observation import append_runtime_observation
 from redteam.orchestration.state import GraphState, TerminationReason
 
 
@@ -57,10 +53,10 @@ async def aggregate_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
 
     executed_ids = {item.action_id for item in executed}
     actions_by_agent = dict(runtime.actions_by_agent)
-    for dispatch_item in items:
-        if str(dispatch_item.proposal.action_id) not in executed_ids:
+    for dispatch in items:
+        if str(dispatch.proposal.action_id) not in executed_ids:
             continue
-        agent_key = str(dispatch_item.proposal.agent_id)
+        agent_key = str(dispatch.proposal.agent_id)
         actions_by_agent[agent_key] = actions_by_agent.get(agent_key, 0) + 1
 
     last_with_verdict = next(
@@ -142,50 +138,14 @@ async def aggregate_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             ),
         }
     )
-    dispatch_by_action = {str(item.proposal.action_id): item for item in items}
-    for outcome in outcomes:
-        matched_dispatch = dispatch_by_action.get(outcome.action_id)
-        if matched_dispatch is None:
+    # Fold each isolated worker's own records back in dispatch order so the
+    # next decision turn sees the whole batch in a stable sequence.
+    for dispatch_item in items:
+        outcome = all_outcomes.get(str(dispatch_item.proposal.action_id))
+        if outcome is None:
             continue
-        proposal = matched_dispatch.proposal
-        if outcome.policy_verdict is not None:
-            next_runtime = append_runtime_observation(
-                next_runtime,
-                RuntimeObservation(
-                    kind="control",
-                    summary=(
-                        f"Control {outcome.policy_verdict.value.upper()} for "
-                        f"{proposal.capability}.{proposal.operation}"
-                        + (f": {outcome.policy_reason}" if outcome.policy_reason else "")
-                    )[:500],
-                    outcome=outcome.policy_verdict.value,
-                    step=runtime.step_count,
-                    action_id=outcome.action_id,
-                    capability=proposal.capability,
-                    operation=proposal.operation,
-                    target=target_display_name(proposal.target),
-                    reasons=[outcome.policy_reason] if outcome.policy_reason else [],
-                    approval_id=str(outcome.approval_id) if outcome.approval_id else None,
-                    requires_approval=(outcome.policy_verdict is PolicyVerdict.REQUIRE_APPROVAL),
-                    alternative_allowed=outcome.policy_severity != SEVERITY_ABORT_RUN,
-                ),
-            )
-        if outcome.executed:
-            next_runtime = append_runtime_observation(
-                next_runtime,
-                RuntimeObservation(
-                    kind="tool",
-                    summary=(
-                        f"Tool action {proposal.capability}.{proposal.operation} "
-                        + ("succeeded" if outcome.succeeded else "failed")
-                    ),
-                    outcome="success" if outcome.succeeded else "failed",
-                    step=runtime.step_count,
-                    action_id=outcome.action_id,
-                    capability=proposal.capability,
-                    operation=proposal.operation,
-                ),
-            )
+        for observation in outcome.runtime_observations:
+            next_runtime = append_runtime_observation(next_runtime, observation)
 
     return advance(
         state,
@@ -206,5 +166,5 @@ async def aggregate_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
         # batch into durable counters, so replace the channel explicitly.
         worker_outcomes=Overwrite(value={}),
         policy_decision=summary,
-        current_work_id=None,
+        current_work_id=pending_dispatch.work_id if pending_dispatch else None,
     )

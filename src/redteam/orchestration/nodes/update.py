@@ -7,10 +7,11 @@ nothing executed, but the attempt and the policy verdict are recorded.
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from typing import Any
 
 from redteam.attack_graph.predicates import Confidence, Provenance
 from redteam.core.contracts.events import EventType
-from redteam.core.enums import AgentPhase
+from redteam.core.enums import AgentPhase, PolicyVerdict
 from redteam.orchestration.action_naming import canonical_action_key
 from redteam.orchestration.context import RuntimeDeps
 from redteam.orchestration.events import GRAPH_MUTATION_APPLIED, RESULT_MAPPER_FAILED
@@ -43,8 +44,6 @@ async def update_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
     )
     verification_failed = bool(verification_exception)
     succeeded = tool_succeeded and not verification_failed
-    mutated_nodes = 0
-    mutated_edges = 0
 
     # PLAN records the hypothesis before the policy gate so the question is
     # auditable. A blocked action never reaches VERIFY, therefore UPDATE must
@@ -69,10 +68,11 @@ async def update_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
         confidence=Confidence.MEASURED if succeeded else Confidence.INFERRED,
     )
 
-    # Only a successful execution may assert a predicate: recording
-    # "reachable" after a failed or blocked probe would make the graph
-    # claim something nobody observed.
-    observed_attrs = dict(step.observed_attrs) if step is not None and succeeded else {}
+    # Planned attributes are never promoted into measured facts: only the
+    # result normalizers below write domain facts. What the plan hoped for
+    # stays in the plan, so a bare tool success cannot certify a predicate
+    # nobody observed.
+    observed_attrs: dict[str, Any] = {}
     facts: dict[str, object] = {
         "last_operation": operation_key,
         "last_operation_succeeded": succeeded,
@@ -80,16 +80,14 @@ async def update_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
     }
     if provenance.evidence_id:
         facts["evidence_ids"] = [provenance.evidence_id]
-    if verification_failed:
-        facts["last_verification_failed"] = True
     if blocked:
         # A policy block is a *decision*, not an execution failure: nothing ran,
         # so UPDATE must never touch ``consecutive_failures`` / retry counters
         # (it does not -- those are owned by EXECUTE/VERIFY). It only records
         # what was blocked and why, including Control's reaction hint.
         facts["last_operation_blocked"] = True
+        # Structured markers stay; the free-text reasons travel on the event below.
         facts["last_block_verdict"] = decision.verdict.value if decision else None
-        facts["last_block_reasons"] = list(decision.reasons) if decision else []
         block_severity = denial_severity(decision)
         if block_severity is not None:
             facts["last_block_severity"] = block_severity
@@ -113,18 +111,25 @@ async def update_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             "node_id": str(node.id),
             "node_type": node.type.value,
             "action_id": proposal.action_id,
+            "operation": operation_key,
             "attrs": observed_attrs,
             "blocked": blocked,
+            "block_verdict": decision.verdict.value if (blocked and decision) else None,
+            "block_reasons": list(decision.reasons) if (blocked and decision) else [],
+            "verification_failed": verification_failed,
+            "succeeded": succeeded,
         },
         correlation_id=correlation_id,
         causation_id=state.get("last_event_id"),
     )
 
     # Tool Result -> Attack Graph Mutation (SERVICE/ENDPOINT discovery, if
-    # a mapper is registered for this tool_id): purely additive, never
-    # replaces the static `observed_attrs` write above, and never raises
+    # a mapper is registered for this tool_id): the only writer of domain
+    # facts about discovered nodes, and it never raises
     # -- `ResultMapperRegistry.map_result` degrades to "nothing new" for
     # an unmapped tool_id, a failed/blocked action, or malformed output.
+    mutated_nodes = 0
+    mutated_edges = 0
     if succeeded and result is not None and step is not None:
         mutation = deps.result_mappers.map_result(
             tool_id=result.tool_id,
@@ -136,6 +141,27 @@ async def update_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
         mutated_edges = len(mutation.edges)
         mapper_failure = deps.result_mappers.last_failure
         if mapper_failure is not None:
+            try:
+                from redteam.orchestration.recovery import record_mapping_failure
+
+                await record_mapping_failure(
+                    evidence_store=deps.evidence_store,
+                    run_id=runtime.run_id,
+                    engagement_id=runtime.engagement_id,
+                    source_evidence_id=(
+                        str(state["result_evidence_id"])
+                        if state.get("result_evidence_id")
+                        else None
+                    ),
+                    tool_id=str(result.tool_id),
+                    mapper=mapper_failure.mapper,
+                    reason=mapper_failure.reason,
+                    action_id=proposal.action_id,
+                    invocation_id=result.invocation_id,
+                    hypothesis_id=proposal.hypothesis_id,
+                )
+            except Exception:  # noqa: BLE001 - the audit note must not break the update
+                pass
             failed_event = await publisher.publish(
                 RESULT_MAPPER_FAILED,
                 {
@@ -207,8 +233,22 @@ async def update_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             )
 
     work_id = state.get("current_work_id")
-    if work_id is not None:
-        if blocked:
+    approval_waiting = decision is not None and decision.verdict is PolicyVerdict.REQUIRE_APPROVAL
+    if work_id is not None and approval_waiting:
+        await deps.work_store.release(
+            work_id, owner=str(runtime.run_id), now=datetime.now(timezone.utc)
+        )
+    elif work_id is not None:
+        error_code = result.error.code if result is not None and result.error else None
+        invalidated = (
+            blocked
+            and decision is not None
+            and "orchestration:stale_or_invalid_path" in (decision.matched_rules or [])
+        ) or error_code in {"tool_binding_invalid", "lease_lost_before_execution"}
+        if invalidated:
+            work_status = WorkStatus.STALE
+            reason = "invalidated_before_execution"
+        elif blocked:
             work_status = WorkStatus.BLOCKED
             reason = decision.verdict.value if decision is not None else "blocked"
         elif succeeded:
@@ -219,7 +259,7 @@ async def update_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             if verification_failed:
                 reason = f"verification_exception:{verification_exception}"
             else:
-                reason = result.error.code if result is not None and result.error else "tool_failed"
+                reason = error_code if error_code else "tool_failed"
         await deps.work_store.complete(
             work_id,
             owner=str(runtime.run_id),
@@ -252,5 +292,5 @@ async def update_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
         state,
         next_runtime,
         last_event_id=last_event.event_id,
-        current_work_id=None,
+        current_work_id=work_id if approval_waiting else None,
     )

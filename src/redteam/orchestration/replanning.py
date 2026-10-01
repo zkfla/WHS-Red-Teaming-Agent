@@ -21,9 +21,10 @@ from redteam.attack_graph.identity import host_node_id
 from redteam.attack_graph.predicates import facts_of
 from redteam.attack_graph.service import AttackGraphService
 from redteam.core.contracts.events import EventType
+from redteam.core.contracts.evidence import EvidenceRecord
 from redteam.core.contracts.mission import MissionCriterionResult, MissionTask, Provenance
-from redteam.core.enums import GraphNodeType, MissionStatus, TaskStatus
-from redteam.core.ids import EventId, GraphNodeId, MissionId, RunId, TaskId, new_id
+from redteam.core.enums import EvidenceSourceType, GraphNodeType, MissionStatus, TaskStatus
+from redteam.core.ids import EventId, EvidenceId, GraphNodeId, MissionId, RunId, TaskId, new_id
 from redteam.core.ports.evidence_store import EvidenceStore
 from redteam.core.ports.task_graph import MissionTaskStore
 from redteam.event_bus.publisher import EventPublisher
@@ -34,6 +35,26 @@ _ACQUIRE_SOURCE = "replan:acquire_second_principal"
 _DEPENDENCY_BLOCK_REASON = "required dependency is blocked"
 
 
+def _conclusive_session_comparison(item: object) -> bool:
+    """Whether a session-comparison observation actually answers the
+    object-bound authorization question.
+
+    At least one identity must reach the object. The other must reach it or
+    receive an explicit permission denial. Unauthenticated, redirected,
+    missing-object and server-error responses leave the assessment unresolved.
+    This proves a comparison was performed, not that authorization is secure.
+    """
+
+    if not isinstance(item, dict) or item.get("kind") != "http_session_comparison":
+        return False
+    first, second = item.get("first_status"), item.get("second_status")
+    if type(first) is not int or type(second) is not int:
+        return False
+    return (200 <= first < 300 and (200 <= second < 300 or second == 403)) or (
+        200 <= second < 300 and first == 403
+    )
+
+
 async def replan_task_graph(
     store: MissionTaskStore,
     graph: AttackGraphService,
@@ -41,6 +62,8 @@ async def replan_task_graph(
     *,
     publisher: EventPublisher,
     last_event_id: EventId | None,
+    evidence_store: EvidenceStore | None = None,
+    run_id: RunId | None = None,
     now: datetime | None = None,
 ) -> EventId | None:
     """Create a Task for each newly-discovered object-bound endpoint.
@@ -71,9 +94,9 @@ async def replan_task_graph(
         target_ref = facts.get("target_ref")
         if isinstance(target_ref, str):
             principal_ref = facts.get("principal_ref")
-            if not isinstance(principal_ref, str) and "/session:" in str(principal.id):
-                # An HTTP response with a session ref does not establish that
-                # two refs represent distinct principals.
+            if "/session:" in str(principal.id):
+                # Session identities need a usable comparison from this run;
+                # cached mappings alone cannot establish available credentials.
                 continue
             principals_by_target.setdefault(target_ref, set()).add(
                 principal_ref if isinstance(principal_ref, str) else str(principal.id)
@@ -197,7 +220,14 @@ async def replan_task_graph(
             target_ref = facts_of(endpoint.properties).get("target_ref") if endpoint else None
         if not isinstance(target_ref, str):
             continue
-        if len(principals_by_target.get(target_ref, set())) < 2:
+        supporting_ids = await _comparison_evidence_ids(
+            acquisition,
+            graph,
+            evidence_store,
+            run_id,
+            mission.engagement_id if mission else None,
+        )
+        if len(principals_by_target.get(target_ref, set())) < 2 and not supporting_ids:
             continue
         if acquisition.status in {
             TaskStatus.READY,
@@ -211,7 +241,11 @@ async def replan_task_graph(
             await store.transition_task(acquisition.task_id, TaskStatus.COMPLETED, now=now)
             event = await publisher.publish(
                 EventType.TASK_COMPLETED,
-                {"task_id": acquisition.task_id, "reason": "second_principal_observed"},
+                {
+                    "task_id": acquisition.task_id,
+                    "reason": "second_principal_observed",
+                    "evidence_ids": supporting_ids,
+                },
                 causation_id=last_event_id,
             )
             last_event_id = event.event_id
@@ -224,18 +258,24 @@ async def replan_task_graph(
             TaskStatus.RUNNING,
         }:
             continue
-        endpoint = await graph.get_node(task.related_attack_graph_node_ids[0])
-        observations = facts_of(endpoint.properties).get("observations", []) if endpoint else []
-        if any(
-            isinstance(item, dict) and item.get("kind") == "http_session_comparison"
-            for item in observations
-        ):
+        supporting_ids = await _comparison_evidence_ids(
+            task,
+            graph,
+            evidence_store,
+            run_id,
+            mission.engagement_id if mission else None,
+        )
+        if supporting_ids:
             if task.status is TaskStatus.READY:
                 await store.transition_task(task.task_id, TaskStatus.RUNNING, now=now)
             await store.transition_task(task.task_id, TaskStatus.COMPLETED, now=now)
             event = await publisher.publish(
                 EventType.TASK_COMPLETED,
-                {"task_id": task.task_id, "reason": "session_comparison_observed"},
+                {
+                    "task_id": task.task_id,
+                    "reason": "session_comparison_observed",
+                    "evidence_ids": supporting_ids,
+                },
                 causation_id=last_event_id,
             )
             last_event_id = event.event_id
@@ -273,6 +313,34 @@ async def replan_task_graph(
             last_event_id = event.event_id
 
     return last_event_id
+
+
+async def _comparison_evidence_ids(
+    task: MissionTask,
+    graph: AttackGraphService,
+    store: EvidenceStore | None,
+    run_id: RunId | None,
+    engagement_id: str | None,
+) -> list[str]:
+    if store is None or run_id is None or engagement_id is None:
+        return []
+    supporting: set[str] = set()
+    for node_id in task.related_attack_graph_node_ids:
+        endpoint = await graph.get_node(node_id)
+        observations = facts_of(endpoint.properties).get("observations", []) if endpoint else []
+        for item in observations:
+            if not _conclusive_session_comparison(item):
+                continue
+            evidence_id = item.get("evidence_id")
+            record = await store.get(EvidenceId(evidence_id)) if evidence_id else None
+            if (
+                record is not None
+                and record.run_id == run_id
+                and record.engagement_id == engagement_id
+                and _authorization_evidence_matches(task, record)
+            ):
+                supporting.add(str(record.evidence_id))
+    return sorted(supporting)
 
 
 async def _publish_task_created(
@@ -316,8 +384,6 @@ async def finalize_mission(
         return last_event_id
 
     tasks = await store.list_tasks(mission_id=mission_id)
-    if not tasks:
-        return last_event_id
     now = now or datetime.now(timezone.utc)
 
     for task in tasks:
@@ -339,8 +405,10 @@ async def finalize_mission(
     ]
     if any(task.status is TaskStatus.FAILED for task in required):
         outcome = MissionStatus.FAILED
-    elif all(task.status is TaskStatus.COMPLETED for task in required) and all(
-        result.met for result in criterion_results
+    elif (
+        tasks
+        and all(task.status is TaskStatus.COMPLETED for task in required)
+        and all(result.met for result in criterion_results)
     ):
         outcome = MissionStatus.COMPLETED
     else:
@@ -370,11 +438,31 @@ async def finalize_mission(
     return event.event_id
 
 
+def _authorization_evidence_matches(task: MissionTask, item: EvidenceRecord) -> bool:
+    """Require the measured comparison from this Task or its acquisition dependency."""
+    return (
+        item.source_type is EvidenceSourceType.TOOL
+        and item.metadata.get("success") is True
+        and item.source_id == "web.http_compare_sessions"
+        and item.metadata.get("mission_task_id")
+        in {str(task.task_id), *(str(dep) for dep in task.dependency_task_ids)}
+        and item.metadata.get("target_node_id")
+        in {str(node_id) for node_id in task.related_attack_graph_node_ids}
+        and _conclusive_session_comparison(item.metadata.get("session_comparison"))
+    )
+
+
 def _evaluate_criterion(
     criterion: str,
     tasks: list[MissionTask],
-    evidence: list,
+    evidence: list[EvidenceRecord],
 ) -> MissionCriterionResult:
+    """Evaluate one mission success string. Unknown conditions never pass.
+
+    Any criterion without a supported evaluator (wrong prefix or unknown
+    workstream) returns met=False so it can never read as satisfied.
+    Caller signature is unchanged.
+    """
     prefix = "verified evidence for "
     if not criterion.startswith(prefix):
         return MissionCriterionResult(
@@ -411,30 +499,39 @@ def _evaluate_criterion(
             task_ids=[task.task_id for task in matching],
             reason="no matching Task completed",
         )
-    qualifying = []
-    for item in evidence:
-        if item.metadata.get("success") is not True:
-            continue
-        if focus == "authorization":
-            if item.source_id != "web.http_compare_sessions" or not any(
-                item.metadata.get("target_node_id")
-                in {str(node_id) for node_id in task.related_attack_graph_node_ids}
-                for task in completed
+    qualifying: set[str] = set()
+    supported_tasks: set[TaskId] = set()
+    for task in completed:
+        for item in evidence:
+            if (
+                item.source_type is not EvidenceSourceType.TOOL
+                or item.metadata.get("success") is not True
             ):
                 continue
-        elif item.metadata.get("mission_task_id") not in {str(task.task_id) for task in completed}:
-            continue
-        if focus == "authentication":
-            observation = item.metadata.get("http_observation")
-            if not (
-                isinstance(observation, dict) and isinstance(observation.get("session_ref"), str)
-            ):
+            if focus == "authorization":
+                if not _authorization_evidence_matches(task, item):
+                    continue
+            elif item.metadata.get("mission_task_id") != str(task.task_id) or item.source_id.split(
+                ".", 1
+            )[0] not in ({"web", "api"} if capability == "web" else {capability}):
                 continue
-        qualifying.append(str(item.evidence_id))
+            if focus == "authentication":
+                observation = item.metadata.get("http_observation")
+                if not (
+                    isinstance(observation, dict)
+                    and isinstance(observation.get("session_ref"), str)
+                    and type(observation.get("status_code")) is int
+                    and observation["status_code"] in {*range(200, 300), 401, 403}
+                ):
+                    continue
+            qualifying.add(str(item.evidence_id))
+            supported_tasks.add(task.task_id)
+    expected = [task for task in matching if task.required or task.status is TaskStatus.COMPLETED]
+    met = bool(expected) and all(task.task_id in supported_tasks for task in expected)
     return MissionCriterionResult(
         criterion=criterion,
-        met=bool(qualifying),
-        task_ids=[task.task_id for task in completed],
-        evidence_ids=qualifying,
-        reason=None if qualifying else "matching Task has no successful Evidence",
+        met=met,
+        task_ids=[task.task_id for task in expected],
+        evidence_ids=sorted(qualifying),
+        reason=None if met else "matching Task has no successful Evidence",
     )

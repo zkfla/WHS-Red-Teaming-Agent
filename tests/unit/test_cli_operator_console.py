@@ -17,12 +17,12 @@ import argparse
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
+from typing import cast
 from unittest.mock import AsyncMock
 
 import pytest
 
 from redteam.app.cli.commands import run as run_command
-from redteam.app.cli.conversation import ConversationAssistant
 from redteam.core.contracts.engagement import (
     ApprovalPolicy,
     Engagement,
@@ -40,6 +40,7 @@ from redteam.core.enums import (
 )
 from redteam.core.ids import AgentId, EngagementId, MissionId, RunId, TaskId
 from redteam.event_bus.memory import InMemoryEventBus
+from redteam.orchestration.context import RuntimeDeps
 from redteam.orchestration.operator_intents import (
     InMemoryOperatorIntentStore,
     IntentStatus,
@@ -135,7 +136,7 @@ async def _console(
     lines: list[str] = []
     identity = run_command.RuntimeIdentity(run_id=RUN, engagement_id=ENG, mission_id=MISSION)
     console = run_command.OperatorConsole(
-        deps, lines.append, identity=identity, resolved_by="tester"
+        cast(RuntimeDeps, deps), lines.append, identity=identity, resolved_by="tester"
     )
     return console, lines, gateway, intent_store, task_store, control_plane
 
@@ -226,32 +227,6 @@ async def test_rejected_instruction_is_reported_without_a_tool() -> None:
 
     assert gateway.calls == []
     assert any("rejected" in line for line in lines)
-
-
-async def test_arbitrary_chat_becomes_llm_guidance_without_direct_tool_execution() -> None:
-    class _GuidanceLLM:
-        async def complete_structured(self, **_kwargs):  # noqa: ANN202
-            return {
-                "mode": "guidance",
-                "response": "페이지 구조를 먼저 확인하는 방향으로 조정하겠습니다.",
-                "guidance": "Inspect the visible page structure first",
-            }
-
-        async def complete(self, **_kwargs):  # noqa: ANN202
-            return ""
-
-    console, lines, gateway, intent_store, _tasks, control_plane = await _console()
-    console._conversation = ConversationAssistant(_GuidanceLLM())
-    console._deps.tool_catalog = gateway
-
-    await console.handle_line("페이지 구조부터 보고 싶어")
-
-    records = await intent_store.list_for_mission(MISSION)
-    assert records[-1].intent.intent_type is OperatorIntentType.GUIDANCE
-    assert records[-1].status is IntentStatus.APPLIED
-    assert gateway.calls == []
-    assert control_plane.resolved == []
-    assert any("Assistant" in line for line in lines)
 
 
 # --- in-session approval identity ---------------------------------------
@@ -350,10 +325,12 @@ async def test_command_before_mission_is_known_is_a_notice_not_a_crash() -> None
 
 
 async def test_intent_channel_unavailable_when_not_wired() -> None:
-    deps = SimpleNamespace(event_bus=InMemoryEventBus(), control_plane=RecordingControlPlane())
+    deps = SimpleNamespace(
+        event_bus=InMemoryEventBus(), control_plane=RecordingControlPlane()
+    )
     lines: list[str] = []
     console = run_command.OperatorConsole(
-        deps,
+        cast(RuntimeDeps, deps),
         lines.append,
         identity=run_command.RuntimeIdentity(run_id=RUN, engagement_id=ENG, mission_id=MISSION),
     )
@@ -424,9 +401,8 @@ async def _run_with_flags(tmp_path: Path, monkeypatch, *, non_interactive: bool,
         json=json,
     )
     await run_command.run(args)
-    execute_call = execute_mock.await_args
-    assert execute_call is not None
-    return execute_call.kwargs["allow_operator_input"]
+    assert execute_mock.await_args is not None
+    return execute_mock.await_args.kwargs["allow_operator_input"]
 
 
 @pytest.mark.parametrize(

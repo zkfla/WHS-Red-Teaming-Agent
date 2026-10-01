@@ -35,9 +35,9 @@ from pydantic import ValidationError
 
 from redteam.attack_graph.identity import normalize_path
 from redteam.core.contracts.events import EventEnvelope, EventType
-from redteam.core.contracts.mission import MissionTask, OperatorIntent
+from redteam.core.contracts.mission import MissionTask, OperatorIntent, Provenance
 from redteam.core.enums import GraphNodeType, MissionStatus, OperatorIntentType, TaskStatus
-from redteam.core.ids import EventId, MissionId, OperatorIntentId, RunId, TaskId
+from redteam.core.ids import EventId, MissionId, OperatorIntentId, RunId, TaskId, new_id
 from redteam.core.ports.task_graph import MissionTaskStore
 from redteam.event_bus.publisher import EventPublisher
 from redteam.orchestration.events import CANDIDATE_REJECTED
@@ -414,6 +414,75 @@ class OperatorIntentService:
             received.intent_id,
             publisher=publisher,
             last_event_id=received.received_event_id or last_event_id,
+            run_id=run_id,
+            now=now,
+        )
+
+    async def receive_guidance_and_apply(
+        self,
+        instruction: str,
+        *,
+        mission_id: MissionId,
+        run_id: RunId | None = None,
+        publisher: EventPublisher | None = None,
+        last_event_id: EventId | None = None,
+        now: datetime | None = None,
+        source: str = "operator",
+    ) -> IntentApplication:
+        """Explicit guidance memo; same store, events and apply path."""
+        received_at = now or datetime.now(timezone.utc)
+        redacted = redact_text(instruction).strip()
+        if not redacted:
+            return IntentApplication(
+                status=IntentStatus.REJECTED,
+                applied=False,
+                outcome="rejected",
+                reason="empty operator instruction",
+            )
+        try:
+            intent = OperatorIntent(
+                intent_id=OperatorIntentId(new_id("intent")),
+                mission_id=mission_id,
+                intent_type=OperatorIntentType.GUIDANCE,
+                instruction=redacted,
+                task_ids=[],
+                parameters={},
+                provenance=Provenance(source=source),
+                created_at=received_at,
+            )
+        except ValidationError:
+            return IntentApplication(
+                status=IntentStatus.REJECTED,
+                applied=False,
+                outcome="rejected",
+                reason="instruction contained an executable or unsafe parameter",
+            )
+        correlation_id = str(intent.intent_id)
+        record = IntentRecord(
+            intent=intent,
+            status=IntentStatus.RECEIVED,
+            run_id=run_id,
+            correlation_id=correlation_id,
+        )
+        await self._store.append(record)
+        received_event_id = await self._emit(
+            publisher,
+            EventType.OPERATOR_INSTRUCTION_RECEIVED,
+            {
+                "intent_id": intent.intent_id,
+                "intent_type": intent.intent_type.value,
+                "mission_id": mission_id,
+            },
+            correlation_id=correlation_id,
+            causation_id=last_event_id,
+        )
+        if received_event_id is not None:
+            record = record.model_copy(update={"received_event_id": received_event_id})
+            await self._store.update(record)
+        return await self.apply(
+            record,
+            publisher=publisher,
+            last_event_id=received_event_id or last_event_id,
             run_id=run_id,
             now=now,
         )
