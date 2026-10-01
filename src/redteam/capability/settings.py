@@ -60,6 +60,9 @@ class MCPServerSettings:
     vdb_asset_ref: str | None = None
     page_text_config_path: str | None = None
     page_text_config_sha256: str | None = None
+    execution_asset_ref: str | None = None
+    execution_policy_path: str | None = None
+    execution_policy_sha256: str | None = None
 
     @classmethod
     def from_environment(cls, server_id: str) -> MCPServerSettings:
@@ -117,6 +120,9 @@ class MCPServerSettings:
         vdb_asset_ref = None
         page_text_config_path = None
         page_text_config_sha256 = None
+        execution_asset_ref = None
+        execution_policy_path = None
+        execution_policy_sha256 = None
         if profile in {"vdb_readonly", "vdb_readonly_extended"}:
             if kind != MCPServerKind.ANALYSIS or transport != MCPTransportKind.STDIO:
                 raise MCPConfigurationError("vdb profile requires analysis kind and stdio")
@@ -171,6 +177,55 @@ class MCPServerSettings:
             args = (
                 "-m", MODULE, "--config", page_text_config_path,
                 "--sha256", page_text_config_sha256,
+            )
+        elif profile == "execution":
+            if kind != MCPServerKind.ANALYSIS or transport != MCPTransportKind.STDIO:
+                raise MCPConfigurationError("execution profile requires analysis kind and stdio")
+            if f"{prefix}_RISK_LEVEL" not in os.environ:
+                raise MCPConfigurationError("execution profile requires an explicit risk level")
+            from redteam.capability.execution_manifest import (
+                EXECUTION_TOOLS,
+                minimum_execution_risk,
+            )
+            from redteam.capability.servers.execution import (
+                MODULE,
+                load_execution_policy,
+            )
+
+            execution_policy_path = str(
+                Path(_required_environment_value(f"{prefix}_EXECUTION_POLICY")).resolve()
+            )
+            try:
+                execution_policy, execution_policy_sha256 = load_execution_policy(
+                    execution_policy_path
+                )
+            except (OSError, ValueError):
+                raise MCPConfigurationError("invalid execution operator policy") from None
+            execution_asset_ref = execution_policy.asset_ref
+            expected_tools = tuple(EXECUTION_TOOLS)
+            expected_bindings = {
+                name: (spec.operation,) for name, spec in EXECUTION_TOOLS.items()
+            }
+            if allowed_tools is not None and allowed_tools != expected_tools:
+                raise MCPConfigurationError("execution profile requires its exact tool allowlist")
+            if tool_operations is not None and tool_operations != expected_bindings:
+                raise MCPConfigurationError(
+                    "execution profile requires its exact operation bindings"
+                )
+            if args:
+                raise MCPConfigurationError("execution profile constructs its own stdio arguments")
+            risk_order = (RiskLevel.LOW, RiskLevel.MEDIUM, RiskLevel.HIGH, RiskLevel.CRITICAL)
+            if risk_order.index(risk_level) < risk_order.index(minimum_execution_risk()):
+                raise MCPConfigurationError("execution profile risk cannot be below the minimum")
+            allowed_tools = expected_tools
+            tool_operations = expected_bindings
+            args = (
+                "-m",
+                MODULE,
+                "--policy",
+                execution_policy_path,
+                "--sha256",
+                execution_policy_sha256,
             )
         elif profile is not None:
             if profile not in {"workspace_read", "workspace_write"}:
@@ -227,6 +282,9 @@ class MCPServerSettings:
             vdb_asset_ref=vdb_asset_ref,
             page_text_config_path=page_text_config_path,
             page_text_config_sha256=page_text_config_sha256,
+            execution_asset_ref=execution_asset_ref,
+            execution_policy_path=execution_policy_path,
+            execution_policy_sha256=execution_policy_sha256,
         )
 
     def request_headers(self) -> dict[str, str]:

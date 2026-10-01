@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -102,8 +103,28 @@ class ExecutionPolicy(BaseModel):
         return self
 
     @classmethod
-    def load(cls, path: str) -> ExecutionPolicy:
-        return cls.model_validate(json.loads(Path(path).read_text(encoding="utf-8")))
+    def load(
+        cls,
+        path: str,
+        *,
+        expected_sha256: str | None = None,
+    ) -> ExecutionPolicy:
+        content = Path(path).read_bytes()
+        digest = hashlib.sha256(content).hexdigest()
+        if expected_sha256 is not None and digest != expected_sha256:
+            raise ExecutionError("execution_policy_digest_mismatch")
+        return cls.model_validate(json.loads(content))
+
+
+def load_execution_policy(
+    path: str,
+    expected_sha256: str | None = None,
+) -> tuple[ExecutionPolicy, str]:
+    content = Path(path).read_bytes()
+    digest = hashlib.sha256(content).hexdigest()
+    if expected_sha256 is not None and digest != expected_sha256:
+        raise ExecutionError("execution_policy_digest_mismatch")
+    return ExecutionPolicy.model_validate(json.loads(content)), digest
 
 
 class CommandResult(BaseModel):
@@ -427,8 +448,9 @@ def create_server(
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--policy", required=True)
+    parser.add_argument("--sha256", required=True)
     args = parser.parse_args()
-    policy = ExecutionPolicy.load(args.policy)
+    policy = ExecutionPolicy.load(args.policy, expected_sha256=args.sha256)
     ensure_runtime_available(policy)
     create_server(policy).run(transport="stdio")
 

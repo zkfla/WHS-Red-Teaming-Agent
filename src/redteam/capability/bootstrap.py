@@ -8,6 +8,7 @@ from contextlib import AsyncExitStack, asynccontextmanager
 from redteam.capability.adapters.mcp.analysis import AnalysisMCPAdapter
 from redteam.capability.adapters.mcp.base import MCPAdapter
 from redteam.capability.adapters.mcp.example import ExampleMCPAdapter
+from redteam.capability.adapters.mcp.execution import ExecutionMCPAdapter
 from redteam.capability.adapters.mcp.mobile import MobileMCPAdapter
 from redteam.capability.adapters.mcp.recon import ReconMCPAdapter
 from redteam.capability.adapters.mcp.scoped_analysis import VDBMCPAdapter
@@ -20,6 +21,7 @@ from redteam.capability.adapters.mcp.transport import (
 )
 from redteam.capability.adapters.mcp.web_api import WebAPIMCPAdapter
 from redteam.capability.adapters.mcp.workspace import WorkspaceMCPAdapter
+from redteam.capability.execution_manifest import validate_execution_descriptor
 from redteam.capability.gateway import (
     DEFAULT_HEALTH_REFRESH_INTERVAL_SECONDS,
     DEFAULT_HEALTH_REFRESH_TIMEOUT_SECONDS,
@@ -172,6 +174,16 @@ async def _build_gateway(
                         "page text discovery differs from operator configuration"
                     ) from None
                 target_types[str(descriptor.tool_id)] = "url"
+            elif settings.profile == "execution":
+                descriptor.target_types = ["asset"]
+                try:
+                    validate_execution_descriptor(
+                        descriptor,
+                        settings.execution_asset_ref or "",
+                    )
+                except ValueError as exc:
+                    raise MCPConfigurationError(str(exc)) from exc
+                target_types[str(descriptor.tool_id)] = "asset"
             elif settings.profile is not None:
                 descriptor.target_types = ["asset"]
                 try:
@@ -254,6 +266,12 @@ def _create_adapter(settings: MCPServerSettings, transport: MCPTransport) -> MCP
         transport = AllowlistedMCPTransport(transport, settings.allowed_tools)
     if settings.profile == "page_text_readonly":
         return WebAPIMCPAdapter(
+            server_id=settings.server_id,
+            risk_level=settings.risk_level,
+            transport=transport,
+        )
+    if settings.profile == "execution":
+        return ExecutionMCPAdapter(
             server_id=settings.server_id,
             risk_level=settings.risk_level,
             transport=transport,

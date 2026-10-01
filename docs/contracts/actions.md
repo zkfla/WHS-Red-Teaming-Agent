@@ -322,3 +322,14 @@ real `error` (never shaped like the tool's success schema, so it always
 failed schema validation) behind a generic `tool_output_schema_mismatch`
 naming the wrong problem; the server's own `ToolError`/message (e.g. "target
 address outside configured networks") reaches `ToolResult.error` now.
+
+## Execution Substrate 제안
+
+`analysis.command_run`은 Capability 담당자 B가 제안한 canonical action이다.
+기존 `AssetTarget`의 `asset_id`를 operator가 등록한 execution workspace의
+`asset_ref`에 바인딩한다. 이 이름은 팀 합의 전까지 **합의 필요(제안)** 상태이며,
+운영 ROE가 명시적으로 허용하고 필요한 승인을 완료하기 전에는 실행 권한을 뜻하지 않는다.
+
+실행 파일과 인자는 MCP의 `run_command` 도구가 받지만, shell 문자열·Docker 옵션·호스트
+경로는 ActionProposal 입력으로 허용하지 않는다. 컨테이너 이미지, workspace root,
+allowlist와 자원 제한은 operator 정책에서만 공급한다.
