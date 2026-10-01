@@ -69,6 +69,18 @@ def test_mobile_next_image_pins_verified_runtime() -> None:
     assert 'ENTRYPOINT ["mcp-server-mobile", "--listen", "0.0.0.0:3000"]' in dockerfile
 
 
+def test_manifest_declares_device_targets_only_for_mobile_next() -> None:
+    assert {
+        spec.target_type for spec in MOBILE_ANALYSIS_TOOLS["mobile-next"]
+    } == {"device"}
+    assert {
+        spec.target_type
+        for server_id, specs in MOBILE_ANALYSIS_TOOLS.items()
+        if server_id != "mobile-next"
+        for spec in specs
+    } == {"asset"}
+
+
 def test_mobile_analysis_app_registers_installed_candidates() -> None:
     app_path = (
         Path(__file__).resolve().parents[2]
@@ -81,6 +93,9 @@ def test_mobile_analysis_app_registers_installed_candidates() -> None:
 
     assert config.engagement.scope.allowed_assets == ["insecurebankv2"]
     assert config.engagement.metadata["asset_ref"] == "/work/InsecureBankv2.apk"
+    assert config.engagement.metadata["device_serial"] == "emulator-5554"
+    assert config.engagement.metadata["device_ref"] == "redteam_x86"
+    assert config.engagement.metadata["package_name"] == "com.android.insecurebankv2"
     assert config.engagement.rules_of_engagement[0].allowed_operations == [
         "analysis.static_analysis",
         "mobile.app_launch",

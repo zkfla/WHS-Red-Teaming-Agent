@@ -16,6 +16,7 @@ from redteam.core.contracts.engagement import (
     ExecutionBudget,
     RateLimitPolicy,
 )
+from redteam.core.contracts.target import DeviceTarget
 from redteam.core.enums import GraphNodeType
 from redteam.core.ids import AgentId, EngagementId, ToolId
 from redteam.orchestration.agents.base import AgentSpec, PlanStep, available_steps
@@ -80,6 +81,71 @@ async def test_single_asset_accepts_scalar_policy_refs() -> None:
     )
 
     assert facts_of(asset.properties)["target_ref"] == "analysis-policy-key"
+
+
+async def test_device_metadata_creates_a_device_target_and_binds_mobile_arguments() -> None:
+    service = AttackGraphService(InMemoryAttackGraphStore())
+    await seed_from_engagement(
+        service,
+        engagement(
+            allowed_assets=["insecurebankv2"],
+            metadata={
+                "device_serial": "emulator-5554",
+                "device_ref": "redteam_x86",
+                "package_name": "com.android.insecurebankv2",
+            },
+        ),
+    )
+    spec = AgentSpec(
+        agent_id=AgentId("mobile-test"),
+        name="mobile test",
+        capabilities=["mobile"],
+        playbook=[
+            PlanStep(
+                step_id="launch",
+                capability="mobile",
+                operation="app_launch",
+                tool_id=ToolId("mobile.mobile_launch_app"),
+                target_bind="asset",
+                preconditions=[NodePattern(type=GraphNodeType.ASSET, bind="asset")],
+                arguments={"device": "$device_ref", "packageName": "$package_name"},
+                reason="Launch the configured training application",
+            )
+        ],
+    )
+
+    [step] = await available_steps(spec, service.view(), GraphObservation(), step=1)
+
+    assert isinstance(step.target, DeviceTarget)
+    assert step.target.asset_id == "insecurebankv2"
+    assert step.target.device_serial == "emulator-5554"
+    assert step.target.device_ref == "redteam_x86"
+    assert step.arguments == {
+        "device": "redteam_x86",
+        "packageName": "com.android.insecurebankv2",
+    }
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {"device_ref": "emulator-5554"},
+        {"device_serial": "emulator-5554"},
+        {"package_name": "com.android.insecurebankv2"},
+        {
+            "device_serial": "emulator-5554",
+            "device_ref": "redteam_x86",
+        },
+    ],
+)
+async def test_device_metadata_requires_serial_ref_and_package_together(metadata: dict) -> None:
+    service = AttackGraphService(InMemoryAttackGraphStore())
+
+    with pytest.raises(ValueError, match="device_serial, device_ref, and package_name together"):
+        await seed_from_engagement(
+            service,
+            engagement(allowed_assets=["insecurebankv2"], metadata=metadata),
+        )
 
 
 @pytest.mark.parametrize(

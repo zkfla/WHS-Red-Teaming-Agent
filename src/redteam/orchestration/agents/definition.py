@@ -164,9 +164,9 @@ def builtin_agent_definitions() -> list[AgentDefinition]:
             agent_id=AgentId("mobile-agent"),
             role="mobile",
             name="Mobile Agent",
-            description="Activates only when a provider resolves an APK/IPA artifact.",
+            description="Launches configured mobile apps and observes runtime diagnostics.",
             activation_rules=[ActivationRule(node_types=[GraphNodeType.ASSET])],
-            capabilities=["mobile", "analysis"],
+            capabilities=["mobile"],
             provider_id="playbook:mobile",
             context_profile=ContextProfile(
                 profile_id="mobile",

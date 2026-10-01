@@ -16,6 +16,7 @@ from redteam.attack_graph.view import AttackGraphView
 from redteam.core.contracts.target import (
     AnyTarget,
     AssetTarget,
+    DeviceTarget,
     DomainTarget,
     EndpointTarget,
     HostTarget,
@@ -314,6 +315,14 @@ class CandidateCompiler:
                 asset_ref=str(target.asset_id),
                 apk_ref=str(target.asset_id),
                 artifact_ref=str(target.asset_id),
+            )
+        elif isinstance(target, DeviceTarget):
+            target_values.update(
+                device=target.device_ref,
+                device_ref=target.device_ref,
+                packageName=target.package_name,
+                package_name=target.package_name,
+                asset_ref=str(target.asset_id or target.package_name),
             )
 
         properties = tool.input_schema.get("properties", {})

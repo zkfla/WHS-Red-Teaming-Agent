@@ -26,6 +26,9 @@ engagement:
   metadata:
     asset_ref: /work/InsecureBankv2.apk
     apk_ref: insecurebankv2
+    device_serial: emulator-5554
+    device_ref: redteam_x86
+    package_name: com.android.insecurebankv2
 
 capability:
   mcp_servers: [apktool, jadx, mobile-next]

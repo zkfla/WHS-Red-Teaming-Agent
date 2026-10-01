@@ -40,6 +40,7 @@ def _spec(
     optional: tuple[str, ...] = (),
     *,
     risk: RiskLevel = RiskLevel.LOW,
+    target_type: str = "asset",
     output_schema: dict[str, Any] | None = None,
 ) -> MobileAnalysisToolSpec:
     return MobileAnalysisToolSpec(
@@ -48,7 +49,7 @@ def _spec(
         operation=operation,
         required_arguments=frozenset(required),
         optional_arguments=frozenset(optional),
-        target_type="asset",
+        target_type=target_type,
         risk_level=risk,
         output_schema=output_schema,
     )
@@ -59,13 +60,14 @@ def _spec(
 MOBILE_ANALYSIS_TOOLS: dict[str, tuple[MobileAnalysisToolSpec, ...]] = {
     "mobile-next": (
         _spec("mobile", "mobile_launch_app", "app_launch", ("device", "packageName"),
-              ("locale",), risk=RiskLevel.MEDIUM),
+              ("locale",), risk=RiskLevel.MEDIUM, target_type="device"),
         _spec("mobile", "mobile_get_device_logs", "response_analysis", ("device",),
-              ("filter", "limit", "saveTo"), risk=RiskLevel.MEDIUM),
+              ("filter", "limit", "saveTo"), risk=RiskLevel.MEDIUM,
+              target_type="device"),
         _spec("mobile", "mobile_list_crashes", "response_analysis", ("device",),
-              risk=RiskLevel.MEDIUM),
+              risk=RiskLevel.MEDIUM, target_type="device"),
         _spec("mobile", "mobile_get_crash", "response_analysis", ("device", "id"),
-              risk=RiskLevel.MEDIUM),
+              risk=RiskLevel.MEDIUM, target_type="device"),
     ),
     "mobile-local": (
         _spec("mobile", "device_shell", "device_shell", ("device_ref", "command"),

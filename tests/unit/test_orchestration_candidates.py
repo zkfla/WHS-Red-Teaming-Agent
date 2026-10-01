@@ -12,9 +12,10 @@ from redteam.attack_graph.service import AttackGraphService
 from redteam.attack_graph.stores.memory import InMemoryAttackGraphStore
 from redteam.capability.gateway import MCPToolGateway
 from redteam.capability.registry import MCPToolRegistry
+from redteam.core.contracts.target import DeviceTarget
 from redteam.core.contracts.tool import ToolDescriptor
 from redteam.core.enums import GraphNodeType, RiskLevel, ToolHealthStatus
-from redteam.core.ids import AgentId, GraphNodeId, ToolId
+from redteam.core.ids import AgentId, AssetId, GraphNodeId, ToolId
 from redteam.orchestration.agents import AgentSpec, PlanStep
 from redteam.orchestration.agents.providers import PlaybookCandidateProvider
 from redteam.orchestration.candidates.compiler import CandidateCompiler, candidate_key
@@ -290,6 +291,61 @@ async def test_required_tool_schema_fields_are_hard_constraints() -> None:
     assert not await CandidateCompiler(catalog_for(registry)).compile_playbook(
         agent(), service.view(), observation, step=1
     )
+
+
+async def test_device_target_binds_mobile_next_identity_fields() -> None:
+    service = await graph()
+    observation = await service.observe(step=1)
+    registry = MCPToolRegistry()
+    registry.register(
+        ToolDescriptor(
+            tool_id=ToolId("mobile.mobile_launch_app"),
+            server_id="mobile-next",
+            tool_name="mobile_launch_app",
+            capability_tags=["mobile"],
+            operations=["app_launch"],
+            target_types=["device"],
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "device": {"type": "string"},
+                    "packageName": {"type": "string"},
+                },
+                "required": ["device", "packageName"],
+                "additionalProperties": False,
+            },
+            health_status=ToolHealthStatus.HEALTHY,
+        )
+    )
+    spec = AgentSpec(
+        agent_id=AgentId("mobile-agent"),
+        name="mobile",
+        capabilities=["mobile"],
+        playbook=[
+            PlanStep(
+                step_id="launch",
+                capability="mobile",
+                operation="app_launch",
+                tool_id=ToolId("mobile.mobile_launch_app"),
+                target=DeviceTarget(
+                    device_serial="emulator-5554",
+                    device_ref="redteam_x86",
+                    package_name="com.android.insecurebankv2",
+                    asset_id=AssetId("insecurebankv2"),
+                ),
+                reason="launch configured app",
+            )
+        ],
+    )
+
+    [candidate] = await CandidateCompiler(
+        catalog_for(registry, operation="app_launch")
+    ).compile_playbook(spec, service.view(), observation, step=1)
+
+    assert candidate.plan_step.arguments == {
+        "device": "redteam_x86",
+        "packageName": "com.android.insecurebankv2",
+    }
 
 
 async def test_incompatible_first_tool_does_not_hide_executable_alternative() -> None:

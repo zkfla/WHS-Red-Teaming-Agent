@@ -21,6 +21,7 @@ from redteam.core.contracts.policy import Approval, ControlContext, PolicyDecisi
 from redteam.core.contracts.target import (
     AnyTarget,
     AssetTarget,
+    DeviceTarget,
     DomainTarget,
     EndpointTarget,
     GraphNodeTarget,
@@ -51,6 +52,7 @@ __all__ = [
     "ServiceTarget",
     "PrincipalTarget",
     "AssetTarget",
+    "DeviceTarget",
     "GraphNodeTarget",
     "target_graph_node_id",
     "target_display_name",

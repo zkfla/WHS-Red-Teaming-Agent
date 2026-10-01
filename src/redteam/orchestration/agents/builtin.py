@@ -5,6 +5,10 @@ from redteam.core.enums import GraphNodeType
 from redteam.core.ids import AgentId, ToolId
 from redteam.orchestration.agents.base import (
     ASSET_REF_PLACEHOLDER,
+    CRASH_ID_PLACEHOLDER,
+    DEVICE_REF_PLACEHOLDER,
+    PACKAGE_LOG_FILTERS_PLACEHOLDER,
+    PACKAGE_NAME_PLACEHOLDER,
     PATH_PLACEHOLDER,
     PROJECT_DIR_PLACEHOLDER,
     TARGET_REF_PLACEHOLDER,
@@ -72,27 +76,104 @@ WEB_API_AGENT = AgentSpec(
 MOBILE_AGENT = AgentSpec(
     agent_id=AgentId("mobile-agent"),
     name="Mobile Agent",
-    description="Analyzes discovered APK/IPA artifacts through Capability tools.",
-    capabilities=["mobile", "analysis"],
+    description="Launches authorized mobile apps and observes device logs and crashes.",
+    capabilities=["mobile"],
     planner_kind="llm",
     playbook=[
         PlanStep(
-            step_id="analyze-mobile-artifact",
-            capability="analysis",
-            operation="static_analysis",
-            tool_id=ToolId("analysis.decode_apk"),
-            compatible_tool_ids=[ToolId("analysis.decode_apk")],
+            step_id="launch-mobile-app",
+            capability="mobile",
+            operation="app_launch",
+            tool_id=ToolId("mobile.mobile_launch_app"),
+            compatible_tool_ids=[ToolId("mobile.mobile_launch_app")],
+            assessment_kind="observation",
             target_bind="asset",
-            preconditions=[NodePattern(type=GraphNodeType.ASSET, bind="asset")],
-            arguments={"apk_path": ASSET_REF_PLACEHOLDER},
-            reason="Extract security-relevant structure from the discovered mobile artifact.",
-            hypothesis=HypothesisDraft(
-                description="The artifact contains security-relevant components or endpoints.",
-                confidence=0.3,
-            ),
-            observed_attrs={"analysis_decoded": True},
-            attempt_key="analysis.static_analysis:decode_apk",
-        )
+            preconditions=[
+                NodePattern(
+                    type=GraphNodeType.ASSET,
+                    attrs={"in_scope": True},
+                    bind="asset",
+                )
+            ],
+            arguments={
+                "device": DEVICE_REF_PLACEHOLDER,
+                "packageName": PACKAGE_NAME_PLACEHOLDER,
+            },
+            reason="Launch the configured authorized application before observing runtime output.",
+            observed_attrs={"mobile_app_launched": True},
+            attempt_key="mobile.app_launch:launch",
+        ),
+        PlanStep(
+            step_id="observe-device-logs",
+            capability="mobile",
+            operation="response_analysis",
+            tool_id=ToolId("mobile.mobile_get_device_logs"),
+            compatible_tool_ids=[ToolId("mobile.mobile_get_device_logs")],
+            assessment_kind="observation",
+            target_bind="asset",
+            preconditions=[
+                NodePattern(
+                    type=GraphNodeType.ASSET,
+                    attrs={"in_scope": True, "mobile_app_launched": True},
+                    bind="asset",
+                )
+            ],
+            arguments={
+                "device": DEVICE_REF_PLACEHOLDER,
+                "filter": PACKAGE_LOG_FILTERS_PLACEHOLDER,
+                "limit": 200,
+            },
+            reason="Observe bounded package-filtered device logs after application launch.",
+            observed_attrs={"mobile_logs_observed": True},
+            attempt_key="mobile.response_analysis:get_device_logs",
+        ),
+        PlanStep(
+            step_id="list-mobile-crashes",
+            capability="mobile",
+            operation="response_analysis",
+            tool_id=ToolId("mobile.mobile_list_crashes"),
+            compatible_tool_ids=[ToolId("mobile.mobile_list_crashes")],
+            assessment_kind="observation",
+            target_bind="asset",
+            preconditions=[
+                NodePattern(
+                    type=GraphNodeType.ASSET,
+                    attrs={"in_scope": True, "mobile_app_launched": True},
+                    bind="asset",
+                )
+            ],
+            arguments={"device": DEVICE_REF_PLACEHOLDER},
+            reason="List device crash reports after application launch.",
+            observed_attrs={"mobile_crashes_listed": True},
+            attempt_key="mobile.response_analysis:list_crashes",
+        ),
+        PlanStep(
+            step_id="inspect-mobile-crash",
+            capability="mobile",
+            operation="response_analysis",
+            tool_id=ToolId("mobile.mobile_get_crash"),
+            compatible_tool_ids=[ToolId("mobile.mobile_get_crash")],
+            assessment_kind="observation",
+            target_bind="asset",
+            preconditions=[
+                NodePattern(
+                    type=GraphNodeType.ASSET,
+                    attrs={
+                        "in_scope": True,
+                        "mobile_app_launched": True,
+                        "mobile_crash_observed": True,
+                    },
+                    bind="asset",
+                )
+            ],
+            arguments={
+                "device": DEVICE_REF_PLACEHOLDER,
+                "id": CRASH_ID_PLACEHOLDER,
+            },
+            reason="Retrieve the configured application's observed crash report.",
+            observed_attrs={"mobile_crash_retrieved": True},
+            attempt_key="mobile.response_analysis:get_crash",
+        ),
     ],
 )
 

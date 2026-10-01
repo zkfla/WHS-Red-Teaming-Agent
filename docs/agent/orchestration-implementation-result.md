@@ -478,3 +478,6 @@ $env:PYTHONPATH='src'
 
 > 2026-09-30 mobile/analysis Track A result:
 > [`docs/agent/mobile-analysis-track-a-result.md`](mobile-analysis-track-a-result.md)
+
+> 2026-10-02 mobile runtime Track B result:
+> [`docs/agent/mobile-runtime-track-b-result.md`](mobile-runtime-track-b-result.md)

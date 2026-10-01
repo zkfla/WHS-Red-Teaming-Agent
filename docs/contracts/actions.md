@@ -55,8 +55,13 @@ EndpointTarget   kind="endpoint"    host, port?, path?
 ServiceTarget    kind="service"     service_name, host?
 PrincipalTarget  kind="principal"   principal_id
 AssetTarget      kind="asset"       asset_id
+DeviceTarget     kind="device"      device_serial, device_ref, package_name, asset_id?
 GraphNodeTarget  kind="graph_node"  node_id, node_type?   (escape hatch)
 ```
+
+`DeviceTarget.device_serial` is the operator-configured adb serial. `device_ref`
+is the separate operator-configured identifier accepted by the selected mobile
+MCP server; orchestration does not derive one from the other.
 
 Every variant except `PrincipalTarget`/`AssetTarget` carries an optional
 `graph_node_id` once the target has been linked into the Shared Attack

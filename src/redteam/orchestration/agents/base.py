@@ -45,16 +45,23 @@ PATH_PLACEHOLDER = "$path"
 ASSET_REF_PLACEHOLDER = "$asset_ref"
 APK_REF_PLACEHOLDER = "$apk_ref"
 PROJECT_DIR_PLACEHOLDER = "$project_dir"
+DEVICE_REF_PLACEHOLDER = "$device_ref"
+PACKAGE_NAME_PLACEHOLDER = "$package_name"
+PACKAGE_LOG_FILTERS_PLACEHOLDER = "$package_log_filters"
+CRASH_ID_PLACEHOLDER = "$crash_id"
 
 _NODE_FACT_PLACEHOLDERS = {
     ASSET_REF_PLACEHOLDER: "asset_ref",
     APK_REF_PLACEHOLDER: "apk_ref",
     PROJECT_DIR_PLACEHOLDER: "project_dir",
+    DEVICE_REF_PLACEHOLDER: "device_ref",
+    PACKAGE_NAME_PLACEHOLDER: "package_name",
+    CRASH_ID_PLACEHOLDER: "crash_id",
 }
 
 
 def _target_ref_value(target: AnyTarget) -> str | None:
-    for attribute in ("host", "domain", "service_name", "url"):
+    for attribute in ("host", "domain", "service_name", "url", "device_serial"):
         value = getattr(target, attribute, None)
         if isinstance(value, str) and value:
             return value
@@ -70,6 +77,13 @@ def _path_value(target: AnyTarget) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
+def _package_log_filters(target: AnyTarget) -> list[str] | None:
+    package_name = getattr(target, "package_name", None)
+    if not isinstance(package_name, str) or not package_name:
+        return None
+    return [f"process={package_name}"]
+
+
 #: Resolver per placeholder. ``_target_ref_value`` falls back to
 #: ``str(target)`` so it never fails (every target kind has *some*
 #: string identity); ``_path_value`` can genuinely return ``None`` when
@@ -78,6 +92,7 @@ def _path_value(target: AnyTarget) -> str | None:
 _PLACEHOLDER_RESOLVERS: dict[str, Any] = {
     TARGET_REF_PLACEHOLDER: _target_ref_value,
     PATH_PLACEHOLDER: _path_value,
+    PACKAGE_LOG_FILTERS_PLACEHOLDER: _package_log_filters,
 }
 
 
@@ -374,7 +389,12 @@ async def available_steps(
                 continue
             node_facts = facts_of(node.properties)
             target = target_for_node(
-                node.id, node.type, observed=node_facts.get("observed_target")
+                node.id,
+                node.type,
+                observed=node_facts.get("observed_target"),
+                device_serial=node_facts.get("device_serial"),
+                device_ref=node_facts.get("device_ref"),
+                package_name=node_facts.get("package_name"),
             )
             node_target_ref = node_facts.get("target_ref")
             host = getattr(target, "host", None)

@@ -112,6 +112,36 @@ async def seed_from_engagement(
         singular="apk_ref",
         plural="apk_refs",
     )
+    device_refs = _asset_ref_map(
+        engagement,
+        declared_assets,
+        singular="device_ref",
+        plural="device_refs",
+    )
+    device_serials = _asset_ref_map(
+        engagement,
+        declared_assets,
+        singular="device_serial",
+        plural="device_serials",
+    )
+    package_names = _asset_ref_map(
+        engagement,
+        declared_assets,
+        singular="package_name",
+        plural="package_names",
+    )
+    for asset in declared_assets:
+        configured = {
+            asset in device_serials,
+            asset in device_refs,
+            asset in package_names,
+        }
+        if len(configured) != 1:
+            raise ValueError(
+                "engagement metadata must supply device_serial, device_ref, and "
+                "package_name together "
+                f"for asset {asset!r}"
+            )
 
     provenance = Provenance(
         step=step,
@@ -139,16 +169,23 @@ async def seed_from_engagement(
     for asset in declared_assets:
         asset_ref = asset_refs.get(asset, asset)
         apk_ref = apk_refs.get(asset, asset_ref)
+        asset_facts = {
+            "asset_ref": asset_ref,
+            "apk_ref": apk_ref,
+            "target_ref": apk_ref,
+        }
+        if asset in device_refs:
+            asset_facts.update(
+                device_serial=device_serials[asset],
+                device_ref=device_refs[asset],
+                package_name=package_names[asset],
+            )
         seeded.append(
             await service.upsert_node(
                 GraphNodeType.ASSET,
                 key=asset,
                 attrs={"in_scope": True},
-                facts={
-                    "asset_ref": asset_ref,
-                    "apk_ref": apk_ref,
-                    "target_ref": apk_ref,
-                },
+                facts=asset_facts,
                 labels=[SCOPE_LABEL],
                 provenance=provenance,
                 step=step,

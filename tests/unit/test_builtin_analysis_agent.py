@@ -8,11 +8,90 @@ from redteam.orchestration.agents.base import available_steps
 from redteam.orchestration.agents.builtin import ANALYSIS_AGENT, MOBILE_AGENT
 
 
-def test_mobile_agent_no_longer_proposes_a_mobile_static_analysis_action() -> None:
-    assert MOBILE_AGENT.playbook
-    assert all(step.capability == "analysis" for step in MOBILE_AGENT.playbook)
-    assert all(step.operation == "static_analysis" for step in MOBILE_AGENT.playbook)
-    assert all(str(step.tool_id).startswith("analysis.") for step in MOBILE_AGENT.playbook)
+def test_mobile_agent_declares_launch_and_runtime_observation_pipeline() -> None:
+    assert MOBILE_AGENT.capabilities == ["mobile"]
+    assert [str(step.tool_id) for step in MOBILE_AGENT.playbook] == [
+        "mobile.mobile_launch_app",
+        "mobile.mobile_get_device_logs",
+        "mobile.mobile_list_crashes",
+        "mobile.mobile_get_crash",
+    ]
+    assert len({step.attempt_record_key for step in MOBILE_AGENT.playbook}) == 4
+    assert all(step.capability == "mobile" for step in MOBILE_AGENT.playbook)
+    assert all(step.assessment_kind == "observation" for step in MOBILE_AGENT.playbook)
+
+
+async def test_mobile_pipeline_binds_configured_device_package_and_observed_crash() -> None:
+    service = AttackGraphService(InMemoryAttackGraphStore())
+    asset = await service.upsert_node(
+        GraphNodeType.ASSET,
+        key="insecurebankv2",
+        attrs={"in_scope": True},
+        facts={
+            "device_serial": "emulator-5554",
+            "device_ref": "redteam_x86",
+            "package_name": "com.android.insecurebankv2",
+        },
+    )
+
+    initial = await available_steps(
+        MOBILE_AGENT,
+        service.view(),
+        GraphObservation(),
+        step=1,
+    )
+
+    assert [step.step_id for step in initial] == ["launch-mobile-app"]
+    assert initial[0].arguments == {
+        "device": "redteam_x86",
+        "packageName": "com.android.insecurebankv2",
+    }
+
+    await service.record_attempt(asset.id, initial[0].attempt_record_key, step=1)
+    await service.upsert_node(
+        GraphNodeType.ASSET,
+        node_id=asset.id,
+        attrs={"mobile_app_launched": True},
+        step=1,
+    )
+    observation = await service.observe(step=2)
+
+    followups = await available_steps(
+        MOBILE_AGENT,
+        service.view(),
+        observation,
+        step=2,
+    )
+
+    assert [step.step_id for step in followups] == [
+        "observe-device-logs",
+        "list-mobile-crashes",
+    ]
+    assert followups[0].arguments == {
+        "device": "redteam_x86",
+        "filter": ["process=com.android.insecurebankv2"],
+        "limit": 200,
+    }
+    assert followups[1].arguments == {"device": "redteam_x86"}
+
+    await service.upsert_node(
+        GraphNodeType.ASSET,
+        node_id=asset.id,
+        attrs={"mobile_crash_observed": True},
+        facts={"crash_id": "crash-17"},
+        step=2,
+    )
+    observation = await service.observe(step=3)
+
+    with_crash = await available_steps(
+        MOBILE_AGENT,
+        service.view(),
+        observation,
+        step=3,
+    )
+
+    crash_step = next(step for step in with_crash if step.step_id == "inspect-mobile-crash")
+    assert crash_step.arguments == {"device": "redteam_x86", "id": "crash-17"}
 
 
 def test_analysis_agent_declares_the_apktool_pipeline() -> None:

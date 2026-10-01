@@ -209,6 +209,11 @@ def default_result_mapper_registry() -> ResultMapperRegistry:
         map_apktool_decode,
         map_apktool_manifest,
     )
+    from redteam.orchestration.observations.mobile_runtime import (
+        map_mobile_crash_detail,
+        map_mobile_crash_list,
+        map_mobile_device_logs,
+    )
     from redteam.orchestration.observations.recon_http import map_recon_http_probe
     from redteam.orchestration.observations.recon_inventory import (
         map_recon_html_inventory,
@@ -239,6 +244,9 @@ def default_result_mapper_registry() -> ResultMapperRegistry:
     registry = ResultMapperRegistry()
     registry.register("analysis.decode_apk", map_apktool_decode)
     registry.register("analysis.get_manifest", map_apktool_manifest)
+    registry.register("mobile.mobile_get_device_logs", map_mobile_device_logs)
+    registry.register("mobile.mobile_list_crashes", map_mobile_crash_list)
+    registry.register("mobile.mobile_get_crash", map_mobile_crash_detail)
     registry.register("recon.dns_resolve", map_recon_dns_resolve)
     registry.register("recon.http_probe", map_recon_http_probe)
     registry.register("recon.tls_inspect", map_recon_tls_inspect)
