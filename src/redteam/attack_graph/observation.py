@@ -54,6 +54,7 @@ PLANNING_CONTENT_KEYS = (
     "reachable",
     "probed",
     "assessment_kind",
+    "methodology_progress",
 )
 
 #: Edge property keys that are volatile bookkeeping rather than relation

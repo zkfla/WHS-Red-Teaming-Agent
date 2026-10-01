@@ -24,6 +24,7 @@ from redteam.core.config import (
     AppConfig,
     CapabilityConfig,
     LLMConfig,
+    MethodologyConfig,
     OrchestrationConfig,
     load_engagement_config,
 )
@@ -110,7 +111,10 @@ def load_app_config_for_run(engagement_path: str, *, require_llm: bool = True) -
             planning_mode=planning_mode,
             llm_candidate_generation=planning_mode != "playbook_only",
         ),
-        capability=CapabilityConfig(mcp_servers=mcp_server_ids_from_environment()),
+        capability=CapabilityConfig(
+            mcp_servers=mcp_server_ids_from_environment(),
+            methodology=MethodologyConfig.from_environment(),
+        ),
     )
 
 
@@ -211,9 +215,7 @@ def render_table(headers: list[str], rows: list[list[str]]) -> None:
     if not rows:
         print("(none)")
         return
-    widths = [
-        max(len(headers[i]), *(len(row[i]) for row in rows)) for i in range(len(headers))
-    ]
+    widths = [max(len(headers[i]), *(len(row[i]) for row in rows)) for i in range(len(headers))]
     print("  ".join(header.ljust(widths[i]) for i, header in enumerate(headers)))
     for row in rows:
         print("  ".join(cell.ljust(widths[i]) for i, cell in enumerate(row)))

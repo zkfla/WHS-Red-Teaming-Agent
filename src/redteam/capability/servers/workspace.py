@@ -41,6 +41,7 @@ class WorkspacePolicy(BaseModel):
     run_id: str
     root: str
     writable: bool = False
+    readonly_paths: tuple[str, ...] = ()
     max_file_bytes: int = Field(default=1_048_576, ge=1, le=8_388_608)
     max_return_chars: int = Field(default=16_000, ge=1, le=64_000)
     max_entries: int = Field(default=200, ge=1, le=1000)
@@ -57,6 +58,15 @@ class WorkspacePolicy(BaseModel):
     def valid_identity(cls, value: str) -> str:
         if not _IDENTITY.fullmatch(value):
             raise ValueError("workspace identities must be bounded opaque identifiers")
+        return value
+
+    @field_validator("readonly_paths")
+    @classmethod
+    def valid_readonly_paths(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if len(value) > 32 or len(set(value)) != len(value):
+            raise ValueError("workspace readonly paths must be unique and bounded")
+        for path in value:
+            _parts(path)
         return value
 
     @classmethod
@@ -479,6 +489,7 @@ class WorkspaceIO:
         if expected_sha256 is not None and not _DIGEST.fullmatch(expected_sha256):
             raise WorkspaceError("workspace_invalid_digest: expected lowercase SHA-256")
         parts = _parts(path)
+        self._check_mutation_path(parts)
         with self._directory(parts[:-1]) as fd:
             try:
                 previous = self._read_at(fd, parts[-1])
@@ -532,6 +543,7 @@ class WorkspaceIO:
         run_id: str,
     ) -> MutationOutput:
         self._check_context(asset_ref, engagement_id, run_id)
+        self._check_mutation_path(_parts(path))
         if len(content) > self.policy.max_file_bytes:
             raise WorkspaceError("workspace_file_too_large: configured file limit exceeded")
         try:
@@ -558,6 +570,7 @@ class WorkspaceIO:
                 "workspace_invalid_patch: bounded unique text replacement required"
             )
         parts = _parts(path)
+        self._check_mutation_path(parts)
         with self._write_lock():
             with self._directory(parts[:-1]) as fd:
                 data = self._read_at(fd, parts[-1])
@@ -570,6 +583,12 @@ class WorkspaceIO:
                 raise WorkspaceError("workspace_not_text: invalid UTF-8 input") from exc
             self._decode(updated)
             return self._replace(path, updated, expected_sha256)
+
+    def _check_mutation_path(self, parts: tuple[str, ...]) -> None:
+        for path in self.policy.readonly_paths:
+            blocked = _parts(path)
+            if parts[: len(blocked)] == blocked or blocked[: len(parts)] == parts:
+                raise WorkspaceError("workspace_protected_path: read-only reference path")
 
 
 def create_server(policy: WorkspacePolicy, mode: Literal["read", "write"] = "read") -> MCPServer:

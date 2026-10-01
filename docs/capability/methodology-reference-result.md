@@ -1,5 +1,7 @@
 # A 후속 작업 — 조사 방법론 자료 제공 결과
 
+이 문서는 자료 제공 단계의 완료 기록이다. 이후 opt-in Agent 조회·본문 검증·LLM 데이터 전달 및 단일 Workspace 통합은 [후속 실행 안내](../../deploy/mcp/methodology/README.md#opt-in-agent-연결-작업공간과-자료를-함께-사용)를 참고한다. 아래 당시 검증 수치와 미구현 범위는 해당 단계 기준이다.
+
 - 작업 ID: `CAP-A-METHOD-20261001`
 - 브랜치: `capability`, 구현 commit `a2e1a16`, 사전 protocol `aedf379`.
 - 완료 범위: 검수한 방법론 인덱스·원문 bundle·보고 양식 및 기존 읽기 MCP의 실제 호출. Agent의 자율 선택/Skill loader 또는 실제 금융 시험환경 검증 완료가 아니다.

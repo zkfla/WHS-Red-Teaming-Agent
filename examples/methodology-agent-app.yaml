@@ -1,0 +1,24 @@
+# Operator-provisioned demo; replace both policy paths. No automatic setup.
+# The mock host is only seeded into the Graph; recording demo has no network tools.
+engagement:
+  name: methodology reference integration
+  scope:
+    allowed_hosts: [mock-bank.test]
+    allowed_assets: [workspace-methodology]
+  execution_budget:
+    max_actions: 30
+  rate_limit_policy:
+    max_actions_per_minute: 60
+  rules_of_engagement:
+    - name: reference data only
+      allowed_capabilities: [analysis]
+      allowed_operations: [analysis.file_read]
+capability:
+  mcp_servers: [workspace-read]
+  methodology:
+    workspace_policy_path: /absolute/path/to/workspace-policy.json
+    bundle_policy_path: /absolute/path/to/bundle-policy.json
+    prefix: methodology
+    reference_ids: [m4vic-workflow, rifteo-surface]
+    read_chars: 8192
+    max_context_chars: 12000

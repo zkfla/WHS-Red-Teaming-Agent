@@ -75,7 +75,9 @@ async def bootstrap_mission(
         # Recon seeds the surface other roles need. Among the remaining
         # workstreams, an explicit Mission priority beats registry order.
         priority = (
-            (len(mission.priorities) + 1) * count + 1
+            (len(mission.priorities) + 2) * count + 2
+            if definition.role == "reference"
+            else (len(mission.priorities) + 1) * count + 1
             if definition.role == "recon"
             else (len(mission.priorities) - focus_rank) * count + (count - index)
         )
@@ -90,9 +92,10 @@ async def bootstrap_mission(
             priority=priority,
             required=(
                 definition.role == "recon"
-                or (definition.role == "web_api" and bool(
-                    explicit_focus & {"web", "api", "authentication", "authorization"}
-                ))
+                or (
+                    definition.role == "web_api"
+                    and bool(explicit_focus & {"web", "api", "authentication", "authorization"})
+                )
                 or (definition.role == "mobile" and "mobile" in explicit_focus)
             ),
             assigned_agent=definition.agent_id,

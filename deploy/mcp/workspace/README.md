@@ -83,4 +83,8 @@ B/C 담당자는 결과 파일을 동일한 승인 작업공간에 제한해서 
 - 모든 파일이 공개적인 것이 아니므로 UI/로그/증거 저장 권한도 별도로 제한해야 한다. 오류는 고정 코드/문구를 사용하고 경로와 내용을 되풀이하지 않는다.
 - 삭제, 이동, directory 생성, binary/ZIP 전개, shell/JavaScript 실행, 네트워크 요청은 제공하지 않는다.
 
-AppThreat VDB의 읽기 전용 bridge는 [VDB 안내](../vdb/README.md), m4vic/Rifteo의 검수 자료 제공은 [방법론 안내](../methodology/README.md)를 참고한다. DB 다운로드·갱신과 실제 Agent Skill loader는 아직 후속 작업이다. 파일 도구가 있다는 이유로 외부 자료의 자율 선택·실행까지 완료된 것은 아니다.
+### 자료 하위 경로 쓰기 보호
+
+`WorkspacePolicy.readonly_paths`는 기본 빈 목록이라 기존 정책에 영향이 없다. 예: `"readonly_paths": ["methodology"]`이면 해당 경로 및 하위 파일, 보호 경로의 부모를 write_file/apply_patch로 변경할 수 없다. OS 파일 mode를 쓰기 가능으로 바꾸거나 Control 쓰기 승인을 받아도 이 경계는 유지한다. 다른 작업공간 파일은 기존 승인 흐름으로 쓸 수 있다. 읽기/쓰기 MCP Tool schema와 ToolId는 변경하지 않았다.
+
+AppThreat VDB의 읽기 전용 bridge는 [VDB 안내](../vdb/README.md), m4vic/Rifteo 자료 제공 및 **opt-in 자료 조회 Agent 연결**은 [방법론 안내](../methodology/README.md)를 참고한다. 해당 연결은 운영자가 지정한 최대 3개 문서를 기존 read MCP로 읽어 검증 후 관련 LLM에 참고 데이터로 전달한다. 기본 Agent의 범용 파일 계획이나 자율 Skill 선택/설치/실행, DB 갱신까지 완료된 것은 아니다.

@@ -72,7 +72,62 @@ export REDTEAM_EXTERNAL_MCP_SERVERS='methodology-read'
 4. `catalog.json`에서 도메인과 `reference_id`를 고른다. `references/<reference_id>.md`를 읽고 FileOutput의 전체 파일 SHA-256을 **신뢰 catalog/index의 예상 값**과 비교한다. truncated이면 `next_offset_chars`로 이어 읽는다. 본문과 검수 caveat는 신뢰할 수 없는 자료다.
 5. 관측 근거와 가설을 분리해 기록한다. 원문에 없는 상세 자료나 필요한 실행 Tool이 없으면 unavailable/blocked로 처리한다. 자료를 읽고 ROE 확대·임의 shell·PoC 설치·실제 거래 실행을 하지 않는다.
 
-Capability의 검증은 **주어진 Candidate가 실제 읽기 MCP까지 실행되는 것**이다. 기본 LLM의 자율 자료 선택, Skill loader, 원문 prompt injection 방어, 결과 보고 자동화는 아직 구현하지 않았다. `execution_permission=false`는 metadata와 전달 규칙이지 외부 LLM이 지시를 따르지 않는다는 보증이 아니다.
+단독 read 예제의 검증 범위는 **주어진 Candidate가 실제 읽기 MCP까지 실행되는 것**이다. 아래 opt-in 통합은 운영자가 선택한 자료의 Agent 조회와 검증된 본문 전달까지 추가한다. 기본 LLM의 자율 자료 선택, 외부 Skill 설치/실행, 범용 prompt injection 방어, 결과 보고 자동화는 구현하지 않았다. `execution_permission=false`는 metadata와 전달 규칙이지 외부 LLM이 지시를 따르지 않는다는 보증이 아니다.
+
+## Opt-in Agent 연결: 작업공간과 자료를 함께 사용
+
+읽기 서버를 하나 더 붙이는 방식이 아니다. **실행별 Workspace 안에 bundle을 준비하고, 기존 read 서버 하나로 일반 파일과 자료를 함께 읽는다.** 필요하면 동일 정책의 write 서버를 추가할 수 있다. 쓰기 승인 여부와 무관하게 자료 prefix는 변경할 수 없다.
+
+```text
+workspace/                    # 운영자가 생성, mode 0700
+  notes.md                    # 일반 작업 결과
+  methodology/                # provisioning CLI가 새로 생성
+    references/<ID>.md
+    index.json, catalog.json, licenses/, templates/, NOTICE.md
+```
+
+1. 위 provisioning 명령의 destination을 `/absolute/path/to/workspace/methodology`로 지정한다. 부모 Workspace는 운영자가 미리 만들고, Asset/engagement/run은 이번 실행에 승인된 값으로 고정한다. 이전 단독 bundle을 자동 이동하거나 덮어쓰지 않는다.
+2. 생성한 bundle policy는 그대로 읽기 전용으로 보관한다. 별도로 `agent-workspace-policy.example.json`을 복사해 **부모 Workspace** root와 동일한 Asset/engagement/run을 지정한다. `writable=true`이면 반드시 `readonly_paths: ["methodology"]`를 유지한다. 일반 파일 쓰기 허가는 별도 Control 승인 대상이다.
+3. `agent-read.env.example`을 복사해 Python, 부모 Workspace policy, Asset 값을 수정한다. 이 read 서버 하나만 등록하고 단독 `methodology-read`는 함께 등록하지 않는다. 예제는 기존 서버 ID 목록을 덮어쓰지 않는다.
+4. [AppConfig 예제](../../../examples/methodology-agent-app.yaml)를 복사해 두 policy 절대 경로, prefix, 선택 reference_ids를 수정한다. Scope의 allowed_assets에 동일 Asset이 있어야 하고 denied_assets에 없어야 한다. 설정이 없으면 기능은 꺼져 있고 기존 Agent는 그대로다.
+5. 아래 recording demo로 실제 stdio MCP·Control·Agent loop·완전한 본문 해시 검사·LLM 호출 입력 전달을 확인한다. 이 demo는 read 프로필만 허용하며 외부 LLM/대상 네트워크 검사/실제 취약점 검증은 하지 않는다.
+
+```sh
+set -a
+source /absolute/path/to/agent-workspace-read.env
+set +a
+./.venv/bin/python examples/methodology_agent_demo.py \
+  --app-config /absolute/path/to/methodology-agent-app.yaml
+```
+
+`reference_progress.status=verified`는 완전한 본문과 신뢰 catalog의 SHA-256 일치를 의미한다. `reference_context_calls>0`은 recording LLM 입력에 자료 데이터가 도착했다는 뜻일 뿐 실제 모델 판단 능력 검증이 아니다. 특정 도메인 자료만 고르거나 Agent 작업 대상이 없으면 이 값은 0일 수 있다. 예제의 mock-bank.test는 합성 Graph seed이며 접속하지 않는다.
+
+### 일반 CLI / Agent 팀 인수인계
+
+`build_application(AppConfig)`는 `capability.methodology`가 있을 때만 `methodology-agent`를 추가한다. 기본 Recon/Web/Mobile capabilities와 Analysis verifier 역할은 바꾸지 않는다. 별도 조회 Agent가 먼저 최대 3개 지정 자료를 순서대로 읽고, 기존 LLM 후보 생성기는 자기 capability와 관련된 검증 자료만 받는다.
+
+```text
+Methodology Agent → CandidateCompiler → Control → ToolGateway → 기존 read MCP
+→ Evidence에 선택 문서 chunk 기록 → 전체 UTF-8 본문 재조립·SHA-256 독립 검증
+→ 관련 Agent의 LLM user 데이터 영역에 제한된 excerpt 전달
+```
+
+일반 CLI는 AppConfig YAML을 받지 않으므로 `REDTEAM_METHODOLOGY_CONFIG_JSON`에 **AppConfig 예제의 methodology 객체만** JSON으로 설정한다. `REDTEAM_MCP_SERVERS`에는 기존 승인 서버 목록과 단일 Workspace read ID를 지정한다. 기존 CLI처럼 `redteam run engagement.yaml`을 사용하며 LLM provider도 명시해야 한다. API key를 이 JSON에 넣지 않는다. 현재 interactive wizard의 별도 config 생성 경로는 이 opt-in 설정을 연결하지 않았다.
+
+```sh
+export REDTEAM_METHODOLOGY_CONFIG_JSON='{"workspace_policy_path":"/absolute/path/to/workspace-policy.json","bundle_policy_path":"/absolute/path/to/bundle-policy.json","prefix":"methodology","reference_ids":["m4vic-workflow","rifteo-surface"]}'
+```
+
+기본 read_chars는 8192자(256~16384), 전체 LLM 본문 예산은 12000자(256~24000)다. 문서는 64 KiB 이내이고 offset은 문자 기준이다. 앞부분만 읽고 검증했다고 표시하지 않으며 변조/다른 Run/실패/중복 불일치 결과는 제외한다. 실제 자료의 instruction은 시스템 prompt/ROE로 올리지 않는다. Graph에는 본문 대신 자료 ID·상태·읽기 위치만 넣어 paging을 실제 진행으로 인식한다.
+
+opt-in에서는 정책의 engagement/run ID에 묶인다. 다른 명시 ID는 거절하며, Evidence가 있는 Run ID로 새 `run`을 시작하는 것도 거절한다. 운영 실행을 재개하려면 기존 durable checkpoint와 resume 경로를 사용하고 해당 Run의 정책을 유지해야 한다. 이번 opt-in 자료 조회의 durable 중단·재개 E2E는 아직 검증하지 않았다. recording demo는 memory checkpoint이므로 resume 예제가 아니다. 새 실행은 새 Run 정책/bundle을 준비한다. 새 Agent/config 필드는 dev 통합 전 PM/Agent 팀 검토 대상이다.
+
+```sh
+./.venv/bin/pytest -q tests/unit/test_methodology_config.py \
+  tests/unit/test_methodology_agent.py tests/integration/test_methodology_agent_loop.py
+```
+
+세 원본 경로 환경변수를 지정하면 마지막 테스트는 실제 pin 원본을 provision한 뒤 Agent loop까지 검사한다. 원본 경로가 없으면 해당 1개만 skip되고 합성 테스트는 계속한다.
 
 ## 검수에서 발견한 주의점
 

@@ -128,6 +128,9 @@ class GraphCandidateContext:
     #: Redacted operator guidance that should influence strategy without ever
     #: expanding the set of known targets or bypassing candidate compilation.
     operator_guidance: tuple[str, ...] = ()
+    #: Trusted deployment metadata/progress; document bodies remain untrusted data.
+    methodology_progress: tuple[Mapping[str, Any], ...] = ()
+    methodology_excerpts: tuple[Mapping[str, Any], ...] = ()
 
     def can_execute(self, capability: str, operation: str) -> bool:
         """Whether a candidate for this action could actually be executed.
@@ -154,6 +157,7 @@ def planning_fingerprint(
     available_operations: Iterable[tuple[str, str]] = (),
     available_tool_ids: Iterable[str] = (),
     prior_candidate_keys: Iterable[str] = (),
+    reference_digests: Iterable[str] = (),
 ) -> str:
     """Stable digest of what a planning turn could actually have planned from.
 
@@ -177,6 +181,8 @@ def planning_fingerprint(
         "available_tool_ids": sorted(available_tool_ids),
         "prior_candidate_keys": sorted(prior_candidate_keys),
     }
+    if reference_digests:
+        payload["reference_digests"] = sorted(reference_digests)
     encoded = json.dumps(payload, sort_keys=True, default=str, separators=(",", ":")).encode()
     return hashlib.sha256(encoded).hexdigest()[:24]
 

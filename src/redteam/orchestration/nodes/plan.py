@@ -53,6 +53,7 @@ from redteam.orchestration.events import (
     CANDIDATE_REJECTED,
     MCP_TOOL_SELECTED,
 )
+from redteam.orchestration.methodology import REFERENCE_AGENT_ID
 from redteam.orchestration.nodes._support import advance, graph_service, publisher_for
 from redteam.orchestration.operator_intents.suppression import endpoint_excluded
 from redteam.orchestration.runtime_observation import observations_for_prompt
@@ -193,9 +194,7 @@ async def _offer_role_provider(
     if callable(graph_propose):
         offered = await graph_propose(agent, context)
     elif callable(legacy_propose):
-        offered = await legacy_propose(
-            agent, context.view, context.observation, step=context.step
-        )
+        offered = await legacy_propose(agent, context.view, context.observation, step=context.step)
     else:
         raise TypeError(
             "candidate provider implements neither propose_graph(spec, context) "
@@ -282,6 +281,16 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                     f"candidate provider {definition.provider_id!r} is not registered"
                 )
             planning_mode = deps.settings.planning_mode
+            library = deps.methodology_library
+            reference_progress, reference_excerpts = (), ()
+            if library is not None:
+                library.check_context(runtime.engagement_id, runtime.run_id)
+                reference_records = await deps.evidence_store.list_for_run(runtime.run_id)
+                reference_progress = library.progress(reference_records)
+                reference_excerpts = library.excerpts(reference_records, agent.capabilities)
+                if agent.agent_id == REFERENCE_AGENT_ID:
+                    # Operator-selected read-only references, not arbitrary LLM file actions.
+                    planning_mode = "playbook_only"
             if planning_mode in {"llm_first", "hybrid"}:
                 available_operations, available_tools, operations_verified = _live_action_space(
                     deps.tool_catalog, tuple(str(item) for item in agent.capabilities)
@@ -297,6 +306,10 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                 available_operations=available_operations,
                 available_tool_ids=available_tool_ids,
                 prior_candidate_keys=terminal_keys,
+                reference_digests=[
+                    f"{item['reference_id']}:{item['status']}:{item['next_offset_chars']}"
+                    for item in reference_progress
+                ],
             )
             llm_generation = planning_mode != "playbook_only" and deps.llm_client is not None
             generation_excerpts: tuple[dict[str, object], ...] = ()
@@ -336,6 +349,8 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                 evidence_excerpts=generation_excerpts,
                 runtime_observations=tuple(runtime_observations),
                 operator_guidance=tuple(operator_guidance),
+                methodology_progress=reference_progress,
+                methodology_excerpts=reference_excerpts,
             )
 
             if planning_mode == "llm_first" and llm_generation:
@@ -353,8 +368,7 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                         "evidence_count": len(generation_excerpts),
                         "runtime_observation_count": len(runtime_observations),
                         "runtime_observation_kinds": [
-                            str(item.get("kind", "runtime"))
-                            for item in runtime_observations[-8:]
+                            str(item.get("kind", "runtime")) for item in runtime_observations[-8:]
                         ],
                         "operator_guidance": operator_guidance,
                         "planning_mode": planning_mode,
@@ -751,9 +765,7 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
         last_event_id = event.event_id
     compiled = eligible
     if planning_source == "llm_turn":
-        compiled.sort(
-            key=lambda item: llm_candidate_order.get(item.candidate_key, len(compiled))
-        )
+        compiled.sort(key=lambda item: llm_candidate_order.get(item.candidate_key, len(compiled)))
     else:
         compiled.sort(key=lambda item: (-item.priority.total, item.candidate_key))
     planning_observation = observation
@@ -856,8 +868,7 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                     "operator_guidance": operator_guidance,
                     "candidate_keys": [candidate.candidate_key for candidate in compiled],
                     "candidate_scores": {
-                        candidate.candidate_key: candidate.priority.total
-                        for candidate in compiled
+                        candidate.candidate_key: candidate.priority.total for candidate in compiled
                     },
                 },
             )
@@ -900,9 +911,7 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
     decision_rationale = (
         llm_turn.decision_summary
         if planning_source == "llm_turn" and llm_turn is not None
-        else korean_fallback_rationale
-        or getattr(planner, "last_rationale", None)
-        or step.reason
+        else korean_fallback_rationale or getattr(planner, "last_rationale", None) or step.reason
     )
     decision_event = await publisher.publish(
         AGENT_DECISION_RECORDED,
