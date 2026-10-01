@@ -62,7 +62,10 @@ class _ScriptedIntakeLLM:
 
 
 def _patch(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, answers: list[str], llm  # noqa: ANN001
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    answers: list[str],
+    llm,  # noqa: ANN001
 ) -> _FakeConsole:
     monkeypatch.chdir(tmp_path)
     # REDTEAM_LLM_PROVIDER already set (section 4/20's canonical env source)
@@ -103,7 +106,6 @@ async def test_no_config_intake_completes_preflight_and_runs(
             "127.0.0.1:5000의 VulnBank 테스트, 인증/금융 로직 위주, "
             "DoS/데이터삭제 금지, 최대 100개",
             "",  # existing-config menu -> Start (config was just created)
-            "n",  # one-time MCP auto-setup prompt -> decline
             "",  # preflight -> Start
         ],
         llm=llm,
@@ -124,15 +126,16 @@ async def test_no_config_intake_completes_preflight_and_runs(
 async def test_existing_config_accepts_one_line_mission_objective() -> None:
     from redteam.core.config import EngagementConfig
 
-    config = EngagementConfig.model_validate({
-        "name": "VulnBank", "scope": {"allowed_hosts": ["example.local"]},
-        "execution_budget": {"max_actions": 5},
-    })
+    config = EngagementConfig.model_validate(
+        {
+            "name": "VulnBank",
+            "scope": {"allowed_hosts": ["example.local"]},
+            "execution_budget": {"max_actions": 5},
+        }
+    )
     console = _FakeConsole(["VulnBank 웹 레드티밍 해줘. 인증/인가 중심으로."])
 
-    selected = await interactive._existing_config_menu(
-        console, config, _ScriptedIntakeLLM([])
-    )
+    selected = await interactive._existing_config_menu(console, config, _ScriptedIntakeLLM([]))
 
     assert selected == (config, "VulnBank 웹 레드티밍 해줘. 인증/인가 중심으로.")
 
@@ -142,16 +145,20 @@ async def test_existing_config_quick_start_needs_only_objective_input(
 ) -> None:
     from redteam.core.config import EngagementConfig
 
-    config = EngagementConfig.model_validate({
-        "name": "VulnBank", "scope": {"allowed_hosts": ["example.local"]},
-        "execution_budget": {"max_actions": 5},
-    })
+    config = EngagementConfig.model_validate(
+        {
+            "name": "VulnBank",
+            "scope": {"allowed_hosts": ["example.local"]},
+            "execution_budget": {"max_actions": 5},
+        }
+    )
     (tmp_path / "engagement.yaml").write_text(
         yaml.safe_dump(config.model_dump(mode="json")), encoding="utf-8"
     )
     console = _patch(
-        monkeypatch, tmp_path,
-        answers=["VulnBank 웹 레드티밍 해줘. 인증/인가 중심으로.", "n"],
+        monkeypatch,
+        tmp_path,
+        answers=["VulnBank 웹 레드티밍 해줘. 인증/인가 중심으로."],
         llm=_ScriptedIntakeLLM([]),
     )
 
@@ -162,14 +169,16 @@ async def test_existing_config_quick_start_needs_only_objective_input(
 async def test_guided_intake_asks_only_next_missing_question() -> None:
     from redteam.intake.assistant import IntakeAssistant, IntakeSession
 
-    llm = _ScriptedIntakeLLM([
-        {
-            "draft": {"name": "VulnBank", "allowed_hosts": ["example.local"]},
-            "follow_up_questions": ["최대 action 수는?", "이미 알려준 범위는?"],
-            "ready": False,
-        },
-        {"draft": {"max_actions": 5}, "follow_up_questions": [], "ready": True},
-    ])
+    llm = _ScriptedIntakeLLM(
+        [
+            {
+                "draft": {"name": "VulnBank", "allowed_hosts": ["example.local"]},
+                "follow_up_questions": ["최대 action 수는?", "이미 알려준 범위는?"],
+                "ready": False,
+            },
+            {"draft": {"max_actions": 5}, "follow_up_questions": [], "ready": True},
+        ]
+    )
     console = _FakeConsole(["5"])
 
     config = await interactive._intake_loop(
@@ -191,7 +200,9 @@ async def test_guided_intake_recovers_from_llm_failure_without_repeating_input()
 
     console = _FakeConsole(["5", "recon, web"])
     config = await interactive._intake_loop(
-        console, IntakeAssistant(_UnavailableLLM()), IntakeSession(),
+        console,
+        IntakeAssistant(_UnavailableLLM()),
+        IntakeSession(),
         "https://example.local:8443 테스트해줘",
     )
 
@@ -212,7 +223,6 @@ async def test_intake_llm_never_receives_a_secret(
             "127.0.0.1:5000의 VulnBank 테스트, 인증/금융 로직 위주, "
             "DoS/데이터삭제 금지, 최대 100개",
             "",  # existing-config menu -> Start
-            "n",  # one-time MCP auto-setup prompt -> decline
             "",  # preflight -> Start
         ],
         llm=llm,
@@ -278,7 +288,6 @@ async def test_edit_patches_only_the_requested_field(
             "e",  # existing-config menu -> Edit
             "최대 action을 200으로 바꿔줘",
             "",  # back at existing-config menu after the edit -> Start
-            "n",  # one-time MCP auto-setup prompt -> decline
             "",  # preflight -> Start
         ],
         llm=llm,

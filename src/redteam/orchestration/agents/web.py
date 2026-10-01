@@ -146,7 +146,9 @@ class WebCandidateProvider:
                                 "first_session_ref": first,
                                 "second_session_ref": second,
                             },
-                            reason="Validate two configured session references on the same endpoint",
+                            reason=(
+                                "Validate two configured session references on the same endpoint"
+                            ),
                         ),
                         target_node_ids=[node.id],
                         conflict_keys=[f"target:{node.id}"],

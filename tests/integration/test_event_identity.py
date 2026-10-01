@@ -5,7 +5,12 @@ from __future__ import annotations
 from redteam.app.bootstrap import build_runtime_deps, run_engagement
 from redteam.core.contracts.events import EventEnvelope, EventType
 from redteam.core.ids import RunId
-from redteam.orchestration.events import HYPOTHESIS_RESOLVED, REPLAN_TRIGGERED, REPORT_PROJECTED
+from redteam.orchestration.events import (
+    HYPOTHESIS_RESOLVED,
+    MCP_TOOL_SELECTED,
+    REPLAN_TRIGGERED,
+    REPORT_PROJECTED,
+)
 from tests.integration.test_end_to_end import _engagement
 
 
@@ -30,6 +35,7 @@ async def test_action_event_chain_keeps_correlation_and_direct_causation(tmp_pat
         if event.event_type
         in {
             EventType.HYPOTHESIS_CREATED,
+            MCP_TOOL_SELECTED,
             EventType.ACTION_PROPOSED,
             EventType.POLICY_EVALUATED,
             EventType.ACTION_APPROVED,
@@ -66,9 +72,9 @@ async def test_replan_triggered_keeps_run_identity_and_cites_its_cause(tmp_path)
         assert event.engagement_id is not None
         assert event.causation_id is not None
         assert event.causation_id in seen
-        assert all(
-            earlier.event_id != event.causation_id for earlier in events[index:]
-        ), "the cited cause must not appear after the effect"
+        assert all(earlier.event_id != event.causation_id for earlier in events[index:]), (
+            "the cited cause must not appear after the effect"
+        )
 
 
 async def test_agent_started_cites_run_started_as_causation(tmp_path) -> None:

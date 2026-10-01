@@ -137,9 +137,7 @@ async def test_non_tty_approval_fails_safe_without_blocking(
         run_command,
         "run_engagement",
         AsyncMock(
-            return_value=_runtime(
-                TerminationReason.APPROVAL_PENDING, pending_approval_id="appr_1"
-            )
+            return_value=_runtime(TerminationReason.APPROVAL_PENDING, pending_approval_id="appr_1")
         ),
     )
     lines: list[str] = []
@@ -175,15 +173,21 @@ async def test_explicit_external_approval_watch_keeps_plain_cli_alive(
     monkeypatch.setattr(run_command, "run_engagement", AsyncMock(return_value=pending))
 
     final = await run_command.execute(
-        SimpleNamespace(name="Plain CLI"), deps,
-        config=SimpleNamespace(orchestration=None), non_interactive=False,
-        on_event=_noop_event, echo=lambda _line: None,
-        allow_operator_input=True, wait_for_external_approval=True,
+        SimpleNamespace(name="Plain CLI"),
+        deps,
+        config=SimpleNamespace(orchestration=None),
+        non_interactive=False,
+        on_event=_noop_event,
+        echo=lambda _line: None,
+        allow_operator_input=True,
+        wait_for_external_approval=True,
     )
 
     assert final is resumed
     wait.assert_awaited_once()
-    assert wait.await_args.kwargs["in_session"] is False
+    wait_call = wait.await_args
+    assert wait_call is not None
+    assert wait_call.kwargs["in_session"] is False
 
 
 def test_pending_summary_is_suspended_not_finished(capsys: pytest.CaptureFixture[str]) -> None:
@@ -208,9 +212,7 @@ async def test_no_console_approval_fails_safe_without_blocking(
         run_command,
         "run_engagement",
         AsyncMock(
-            return_value=_runtime(
-                TerminationReason.APPROVAL_PENDING, pending_approval_id="appr_2"
-            )
+            return_value=_runtime(TerminationReason.APPROVAL_PENDING, pending_approval_id="appr_2")
         ),
     )
     lines: list[str] = []
@@ -403,9 +405,7 @@ async def test_wait_for_pause_resumes_the_same_mission(
                 )
             )
             return SimpleNamespace(
-                runtime=runtime.model_copy(
-                    update={"termination_reason": "no_actionable_plan"}
-                )
+                runtime=runtime.model_copy(update={"termination_reason": "no_actionable_plan"})
             )
 
         async def aclose(self) -> None:
@@ -443,9 +443,9 @@ async def test_wait_for_approval_exits_when_operator_stops_the_mission(
             calls += 1
             mission = await deps.task_graph_store.get_mission(MISSION)
             await deps.task_graph_store.update_mission(
-                mission.model_copy(update={
-                    "status": MissionStatus.CANCELLED, "revision": mission.revision + 1
-                })
+                mission.model_copy(
+                    update={"status": MissionStatus.CANCELLED, "revision": mission.revision + 1}
+                )
             )
             return SimpleNamespace(runtime=runtime)
 
@@ -535,7 +535,6 @@ async def test_lone_question_mark_still_shows_help() -> None:
     await console.handle_line("?")
 
     assert any("operator console commands" in line for line in lines)
-
 
 
 @pytest.mark.parametrize(

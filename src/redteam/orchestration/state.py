@@ -37,6 +37,7 @@ from redteam.orchestration.dispatch import (
     WorkerOutcome,
     merge_worker_outcomes,
 )
+from redteam.orchestration.runtime_observation import RuntimeObservation
 
 
 class TerminationReason:
@@ -111,6 +112,10 @@ class RuntimeState(BaseModel):
     #: Observation fingerprint at which each agent exhausted its frontier.
     #: A relevant graph delta makes that agent eligible again.
     agent_revision_cursors: dict[str, str] = Field(default_factory=dict)
+    #: Bounded decision feedback for the next planning turn. Target/domain
+    #: truth still lives in Attack Graph/Evidence; this window carries policy,
+    #: tool and state outcomes that otherwise disappeared at REPLAN.
+    recent_observations: list[RuntimeObservation] = Field(default_factory=list)
 
     @property
     def is_terminal(self) -> bool:

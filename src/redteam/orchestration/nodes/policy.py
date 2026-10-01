@@ -18,9 +18,14 @@ from datetime import datetime, timezone
 
 from redteam.core.contracts.events import EventType
 from redteam.core.contracts.policy import ControlContext, PolicyDecision
+from redteam.core.contracts.target import target_display_name
 from redteam.core.enums import AgentPhase, PolicyVerdict, Severity
 from redteam.orchestration.context import RuntimeDeps
 from redteam.orchestration.nodes._support import advance, publisher_for
+from redteam.orchestration.runtime_observation import (
+    RuntimeObservation,
+    append_runtime_observation,
+)
 from redteam.orchestration.state import GraphState, TerminationReason
 from redteam.orchestration.work.models import WorkStatus
 
@@ -81,16 +86,13 @@ async def policy_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
         in_flight += len(
             [
                 item
-                for item in await deps.work_store.list_items(
-                    status=status, run_id=runtime.run_id
-                )
+                for item in await deps.work_store.list_items(status=status, run_id=runtime.run_id)
                 if item.work_id != current_work_id
             ]
         )
 
     resuming_approval = (
-        runtime.pending_approval_id is not None
-        and runtime.pending_action_id == proposal.action_id
+        runtime.pending_approval_id is not None and runtime.pending_action_id == proposal.action_id
     )
     if resuming_approval:
         assert runtime.pending_approval_id is not None
@@ -143,7 +145,10 @@ async def policy_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
         {
             "action_id": decision.action_id,
             "verdict": decision.verdict.value,
+            "reasons": decision.reasons,
             "matched_rules": decision.matched_rules,
+            "approval_id": decision.approval_id,
+            "rate_limit_remaining": decision.rate_limit_remaining,
             "budget_remaining": decision.budget_remaining,
         },
         correlation_id=correlation_id,
@@ -156,6 +161,7 @@ async def policy_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
         {
             "action_id": decision.action_id,
             "reasons": decision.reasons,
+            "matched_rules": decision.matched_rules,
             "approval_id": decision.approval_id,
         },
         correlation_id=correlation_id,
@@ -186,9 +192,35 @@ async def policy_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             }
         )
 
+    severity = denial_severity(decision)
+    reason_text = ("; ".join(decision.reasons) or "no additional reason supplied")[:300]
+    observed_runtime = append_runtime_observation(
+        runtime.model_copy(update=runtime_update),
+        RuntimeObservation(
+            kind="control",
+            summary=(
+                f"Control {decision.verdict.value.upper()} for "
+                f"{proposal.capability}.{proposal.operation}: {reason_text}"
+            )[:500],
+            outcome=decision.verdict.value,
+            step=runtime.step_count,
+            action_id=str(proposal.action_id),
+            capability=proposal.capability,
+            operation=proposal.operation,
+            target=target_display_name(proposal.target),
+            reasons=list(decision.reasons[:8]),
+            matched_rules=list(decision.matched_rules[:12]),
+            approval_id=str(decision.approval_id) if decision.approval_id else None,
+            requires_approval=decision.verdict is PolicyVerdict.REQUIRE_APPROVAL,
+            alternative_allowed=(
+                decision.verdict is PolicyVerdict.ALLOW or severity != SEVERITY_ABORT_RUN
+            ),
+        ),
+    )
+
     return advance(
         state,
-        runtime.model_copy(update=runtime_update),
+        observed_runtime,
         last_event_id=outcome.event_id,
         policy_decision=decision,
     )

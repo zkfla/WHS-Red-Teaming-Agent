@@ -85,11 +85,13 @@ class OrchestrationSettings(BaseModel):
     #: planner can only ever return one of these.
     planner_rerank_top_k: int = Field(default=3, ge=2, le=20)
 
-    #: RC#1: when on (and an LLM client is wired), the model may *generate*
-    #: candidate drafts each turn in addition to the playbook frontier. Every
-    #: generated draft is compiled and policy-checked exactly like a playbook
-    #: draft, so this only widens what is proposed, never what may run.
-    #: Default off: the playbook-only frontier stays the baseline behaviour.
+    #: ``llm_first`` lets one observable LLM turn propose the next action and
+    #: uses role recipes only when that turn fails to produce an executable
+    #: draft. ``hybrid`` retains the older additive behaviour; ``playbook_only``
+    #: is deterministic/offline mode.
+    planning_mode: Literal["llm_first", "hybrid", "playbook_only"] = "playbook_only"
+    #: Deprecated compatibility mirror for callers/tests that still set the
+    #: old flag directly. The model validator normalizes it to hybrid mode.
     llm_candidate_generation: bool = Field(default=False)
 
     #: Overrides the value derived from ``max_steps`` when set.
@@ -97,6 +99,9 @@ class OrchestrationSettings(BaseModel):
 
     @model_validator(mode="after")
     def _checkpoint_path_is_safe(self) -> OrchestrationSettings:
+        if self.llm_candidate_generation and self.planning_mode == "playbook_only":
+            self.planning_mode = "hybrid"
+        self.llm_candidate_generation = self.planning_mode != "playbook_only"
         if self.checkpoint_backend == "sqlite" and not self.checkpoint_path.strip():
             raise ValueError("sqlite checkpointing needs a non-blank checkpoint_path")
         if self.work_backend == "sqlite" and not self.work_path.strip():
@@ -157,5 +162,8 @@ class OrchestrationSettings(BaseModel):
             base["max_steps"] = config.max_steps
             base["max_retries"] = config.max_retries
             base["llm_candidate_generation"] = config.llm_candidate_generation
+            base["planning_mode"] = config.planning_mode or (
+                "hybrid" if config.llm_candidate_generation else "playbook_only"
+            )
         base.update({key: value for key, value in overrides.items() if value is not None})
         return cls.model_validate(base)

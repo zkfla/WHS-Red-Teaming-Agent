@@ -241,6 +241,11 @@ async def test_denial_is_recorded_as_a_block_not_a_tool_failure() -> None:
     assert route_after_policy(evaluated) == "update"
     assert evaluated["policy_decision"] is not None
     assert evaluated["policy_decision"].verdict is PolicyVerdict.DENY
+    control_observation = evaluated["runtime"].recent_observations[-1]
+    assert control_observation.kind == "control"
+    assert control_observation.outcome == "deny"
+    assert "BLOCK_ACTION" not in control_observation.summary  # summary is a verdict, not CoT
+    assert "severity:block_action" in control_observation.matched_rules
 
     updated = await update_node(evaluated, deps=deps)
     rt = updated["runtime"]
@@ -266,6 +271,8 @@ async def test_denial_is_recorded_as_a_block_not_a_tool_failure() -> None:
     assert facts["last_operation_blocked"] is True
     assert facts["last_block_verdict"] == "deny"
     assert facts["last_block_severity"] == "block_action"
+    assert rt.recent_observations[-1].kind == "state"
+    assert any(item.kind == "control" for item in rt.recent_observations)
 
 
 # -- severity-driven reaction in REPLAN ----------------------------------
@@ -275,9 +282,7 @@ async def test_block_action_denial_replans_toward_the_same_goal() -> None:
     bus = InMemoryEventBus()
     task = _task("task_recon")
     deps = await _deps_with_tasks([task], bus=bus)
-    state = await observe_node(
-        initial_graph_state(runtime(mission_id=MISSION)), deps=deps
-    )
+    state = await observe_node(initial_graph_state(runtime(mission_id=MISSION)), deps=deps)
     assert state["runtime"].active_task_id == task.task_id
 
     state = {
@@ -300,9 +305,7 @@ async def test_replan_goal_denial_blocks_the_active_task_and_switches_goals() ->
     blocked = _task("task_rejected", priority=100)
     other = _task("task_other", priority=50)
     deps = await _deps_with_tasks([blocked, other], bus=bus)
-    state = await observe_node(
-        initial_graph_state(runtime(mission_id=MISSION)), deps=deps
-    )
+    state = await observe_node(initial_graph_state(runtime(mission_id=MISSION)), deps=deps)
     assert state["runtime"].active_task_id == blocked.task_id
 
     state = {
@@ -364,12 +367,8 @@ async def test_replan_goal_denial_with_a_settled_task_does_not_crash() -> None:
     bus = InMemoryEventBus()
     settled = _task("task_done")
     deps = await _deps_with_tasks([settled], bus=bus)
-    await deps.task_graph_store.transition_task(
-        settled.task_id, TaskStatus.RUNNING, now=NOW
-    )
-    await deps.task_graph_store.transition_task(
-        settled.task_id, TaskStatus.COMPLETED, now=NOW
-    )
+    await deps.task_graph_store.transition_task(settled.task_id, TaskStatus.RUNNING, now=NOW)
+    await deps.task_graph_store.transition_task(settled.task_id, TaskStatus.COMPLETED, now=NOW)
     state = {
         **initial_graph_state(runtime(mission_id=MISSION, active_task_id=settled.task_id)),
         "action_proposal": proposal(),
@@ -400,9 +399,7 @@ async def test_approval_rejection_replans_and_blocks_the_goal_task() -> None:
     task = _task("task_held")
     plane = _TaggedPlane(PolicyVerdict.REQUIRE_APPROVAL)
     deps = await _deps_with_tasks([task], plane=plane, bus=bus)
-    await deps.task_graph_store.transition_task(
-        task.task_id, TaskStatus.RUNNING, now=NOW
-    )
+    await deps.task_graph_store.transition_task(task.task_id, TaskStatus.RUNNING, now=NOW)
 
     held = proposal()
     approval_id = ApprovalId("appr_held")
@@ -425,9 +422,7 @@ async def test_approval_rejection_replans_and_blocks_the_goal_task() -> None:
         pending_action_id=held.action_id,
         pending_approval_id=approval_id,
     )
-    state: GraphState = resume_graph_state(
-        resume_runtime, action_proposal=held, plan_step=None
-    )
+    state: GraphState = resume_graph_state(resume_runtime, action_proposal=held, plan_step=None)
 
     state = await policy_node(state, deps=deps)
     state = await update_node(state, deps=deps)

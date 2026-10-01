@@ -28,8 +28,11 @@ from redteam.core.contracts.events import EventEnvelope, EventType
 from redteam.core.enums import AgentPhase, GraphNodeType, MissionStatus, TaskStatus, Verdict
 from redteam.core.ids import AgentId, EngagementId, GraphNodeId
 from redteam.orchestration.events import (
+    AGENT_CONTEXT_PREPARED,
+    AGENT_DECISION_RECORDED,
     CANDIDATE_GENERATED,
     HYPOTHESIS_RESOLVED,
+    MCP_TOOL_SELECTED,
     REPLAN_TRIGGERED,
     REPORT_PROJECTED,
 )
@@ -80,7 +83,10 @@ async def test_minimal_vertical_slice_end_to_end(tmp_path) -> None:
         EventType.TASK_STARTED,
         EventType.AGENT_STARTED,
         CANDIDATE_GENERATED,
+        AGENT_CONTEXT_PREPARED,
+        AGENT_DECISION_RECORDED,
         EventType.HYPOTHESIS_CREATED,
+        MCP_TOOL_SELECTED,
         EventType.ACTION_PROPOSED,
         EventType.POLICY_EVALUATED,
         EventType.ACTION_APPROVED,
@@ -89,6 +95,9 @@ async def test_minimal_vertical_slice_end_to_end(tmp_path) -> None:
         EventType.EVIDENCE_CREATED,
         HYPOTHESIS_RESOLVED,
         EventType.GRAPH_UPDATED,
+        # A final planning context with zero candidates explains why this
+        # Agent is exhausted instead of disappearing silently.
+        AGENT_CONTEXT_PREPARED,
         EventType.AGENT_FINISHED,
         # Task-first: the finished Agent's Task is completed in the same turn.
         EventType.TASK_COMPLETED,
@@ -105,9 +114,7 @@ async def test_minimal_vertical_slice_end_to_end(tmp_path) -> None:
     # 10. Everything from the proposal onwards shares one correlation id,
     # so the action can be reconstructed from the event log alone.
     action_id = next(
-        e.payload["action_id"]
-        for e in observed_events
-        if e.event_type == EventType.ACTION_PROPOSED
+        e.payload["action_id"] for e in observed_events if e.event_type == EventType.ACTION_PROPOSED
     )
     correlated = [e.event_type for e in observed_events if e.correlation_id == action_id]
     # From the hypothesis the action was raised for through the update that
@@ -115,6 +122,7 @@ async def test_minimal_vertical_slice_end_to_end(tmp_path) -> None:
     # (it summarises the whole compiled frontier, before a step is chosen).
     assert correlated == [
         EventType.HYPOTHESIS_CREATED,
+        MCP_TOOL_SELECTED,
         EventType.ACTION_PROPOSED,
         EventType.POLICY_EVALUATED,
         EventType.ACTION_APPROVED,
@@ -147,7 +155,8 @@ async def test_quick_start_objective_reaches_mission_without_secret(tmp_path) ->
     deps = await build_runtime_deps(engagement, evidence_dir=tmp_path)
 
     final = await run_engagement(
-        engagement, deps=deps,
+        engagement,
+        deps=deps,
         objective="VulnBank 웹 레드티밍, 인증/인가 중심. token=privatevalue",
     )
 
@@ -170,9 +179,7 @@ async def test_object_endpoint_creates_blocked_authz_dependency_in_runtime(tmp_p
         facts={"path_parameters": ["id"]},
     )
 
-    final = await run_engagement(
-        engagement, deps=deps, objective="API 인가 점검"
-    )
+    final = await run_engagement(engagement, deps=deps, objective="API 인가 점검")
 
     tasks = await deps.task_graph_store.list_tasks(mission_id=final.mission_id)
     acquire = next(t for t in tasks if t.provenance.source == "replan:acquire_second_principal")

@@ -37,10 +37,13 @@ from redteam.orchestration.agents import AgentRegistry, AgentSpec, HypothesisDra
 from redteam.orchestration.agents.registry import RECON_AGENT
 from redteam.orchestration.candidates.compiler import CandidateCompiler
 from redteam.orchestration.events import (
+    AGENT_CONTEXT_PREPARED,
+    AGENT_DECISION_RECORDED,
     CANDIDATE_GENERATED,
     CANDIDATE_REJECTED,
     GRAPH_MUTATION_APPLIED,
     HYPOTHESIS_RESOLVED,
+    MCP_TOOL_SELECTED,
     OBSERVATION_RECORDED,
     REPLAN_TRIGGERED,
 )
@@ -216,7 +219,10 @@ async def test_plan_states_a_hypothesis_before_it_acts() -> None:
     assert types == [
         EventType.AGENT_STARTED,
         CANDIDATE_GENERATED,
+        AGENT_CONTEXT_PREPARED,
+        AGENT_DECISION_RECORDED,
         EventType.HYPOTHESIS_CREATED,
+        MCP_TOOL_SELECTED,
         EventType.ACTION_PROPOSED,
     ]
 
@@ -228,6 +234,131 @@ async def test_plan_produces_nothing_when_the_frontier_is_empty() -> None:
     assert state["action_proposal"] is None
     assert state["runtime"].phase is AgentPhase.REPLAN
     assert route_after_plan(state) == "replan"
+
+
+async def test_llm_first_uses_model_action_without_calling_playbook_provider() -> None:
+    from redteam.attack_graph.identity import make_node_id
+    from redteam.core.contracts.tool import ToolDescriptor
+    from redteam.core.enums import RiskLevel, ToolHealthStatus
+    from redteam.llm.fake import FakeLLMClient
+    from redteam.orchestration.agents.providers import (
+        CandidateProviderRegistry,
+        PlaybookCandidateProvider,
+    )
+    from redteam.orchestration.events import AGENT_TURN_DECIDED
+
+    class MustNotRun:
+        async def propose_graph(self, spec, context):
+            raise AssertionError("playbook provider must be fallback-only in llm_first")
+
+    host_id = str(make_node_id(GraphNodeType.HOST, "a.local"))
+    llm = FakeLLMClient(
+        canned_structured={
+            "intent": "act",
+            "response": "HTTP 응답 여부를 확인하겠습니다.",
+            "decision_summary": "서비스 정보가 없어 수동 정찰이 먼저 필요합니다.",
+            "assumptions": ["등록된 호스트만 사용합니다."],
+            "actions": [
+                {
+                    "capability": "recon",
+                    "operation": "service_discovery",
+                    "target_node_id": host_id,
+                    "tool_id": "recon.http_probe",
+                    "arguments": {"path": "/"},
+                    "rationale": "Confirm HTTP reachability",
+                }
+            ],
+        }
+    )
+    tool = ToolDescriptor(
+        tool_id=ToolId("recon.http_probe"),
+        server_id="recon-passive",
+        tool_name="http_probe",
+        operations=["service_discovery"],
+        target_types=["host"],
+        capability_tags=["recon"],
+        risk_level=RiskLevel.LOW,
+        health_status=ToolHealthStatus.HEALTHY,
+    )
+    gateway = DummyToolGateway(tools=[tool])
+    providers = CandidateProviderRegistry(
+        [
+            ("playbook:recon", MustNotRun()),
+            ("playbook:web_api", PlaybookCandidateProvider()),
+            ("playbook:mobile", PlaybookCandidateProvider()),
+        ]
+    )
+    d = deps(
+        llm_client=llm,
+        tool_gateway=gateway,
+        tool_catalog=gateway,
+        candidate_providers=providers,
+        settings=OrchestrationSettings(planning_mode="llm_first"),
+    )
+    await seeded(d, "a.local")
+
+    planned = await plan_node(await observe_node(initial_graph_state(runtime()), deps=d), deps=d)
+
+    assert planned["action_proposal"] is not None
+    assert planned["action_proposal"].operation == "service_discovery"
+    turn = d.event_bus.history(event_type=AGENT_TURN_DECIDED)[0]
+    assert turn.payload["candidate_source"] == "llm_turn"
+    assert turn.payload["response"] == "HTTP 응답 여부를 확인하겠습니다."
+    event_types = d.event_bus.event_types()
+    assert event_types.index(AGENT_CONTEXT_PREPARED) < event_types.index(AGENT_TURN_DECIDED)
+    assert event_types.index(AGENT_TURN_DECIDED) < event_types.index(EventType.ACTION_PROPOSED)
+
+
+async def test_llm_first_falls_back_to_recipe_when_model_action_cannot_compile() -> None:
+    from redteam.llm.fake import FakeLLMClient
+    from redteam.orchestration.agents.providers import (
+        CandidateProviderRegistry,
+        PlaybookCandidateProvider,
+    )
+    from redteam.orchestration.events import AGENT_TURN_DECIDED
+
+    class CountingRecipe(PlaybookCandidateProvider):
+        calls = 0
+
+        async def propose_graph(self, spec, context):
+            self.calls += 1
+            return await super().propose_graph(spec, context)
+
+    recipe = CountingRecipe()
+    providers = CandidateProviderRegistry(
+        [
+            ("playbook:recon", recipe),
+            ("playbook:web_api", PlaybookCandidateProvider()),
+            ("playbook:mobile", PlaybookCandidateProvider()),
+        ]
+    )
+    llm = FakeLLMClient(
+        canned_structured={
+            "intent": "act",
+            "response": "새 대상을 확인하겠습니다.",
+            "decision_summary": "모델이 제안한 대상을 검증합니다.",
+            "actions": [
+                {
+                    "capability": "recon",
+                    "operation": "service_discovery",
+                    "target_node_id": "host:not-in-graph",
+                }
+            ],
+        }
+    )
+    d = deps(
+        llm_client=llm,
+        candidate_providers=providers,
+        settings=OrchestrationSettings(planning_mode="llm_first"),
+    )
+    await seeded(d, "a.local")
+
+    planned = await plan_node(await observe_node(initial_graph_state(runtime()), deps=d), deps=d)
+
+    assert recipe.calls == 1
+    assert planned["action_proposal"] is not None
+    turn = d.event_bus.history(event_type=AGENT_TURN_DECIDED)[0]
+    assert turn.payload["candidate_source"] == "recipe_fallback"
 
 
 async def test_plan_warns_when_an_activated_agent_gets_zero_executable_candidates() -> None:
@@ -449,9 +580,7 @@ async def test_execute_rejects_a_tool_binding_for_a_different_approved_intent() 
     d = deps(tool_gateway=gateway)
     state = state_with(runtime(), action_proposal=proposal())
     state = await policy_node(state, deps=d)
-    mismatched = RECON_AGENT.playbook[0].model_copy(
-        update={"operation": "endpoint_discovery"}
-    )
+    mismatched = RECON_AGENT.playbook[0].model_copy(update={"operation": "endpoint_discovery"})
     state = merged(state, plan_step=mismatched)
 
     result = await execute_node(state, deps=d)
@@ -468,9 +597,7 @@ async def test_execute_rejects_a_tool_binding_for_a_different_approved_intent() 
 async def test_verify_records_evidence_then_reaches_a_verdict() -> None:
     d = deps()
     service = AttackGraphService(d.graph_store)
-    await service.record_hypothesis(
-        Hypothesis(hypothesis_id="hyp_1", description="reachable")
-    )
+    await service.record_hypothesis(Hypothesis(hypothesis_id="hyp_1", description="reachable"))
     state = state_with(
         runtime(),
         action_proposal=proposal(hypothesis_id=HypothesisId("hyp_1")),
@@ -533,8 +660,7 @@ async def test_a_failed_execution_keeps_a_repeatable_hypothesis_open() -> None:
 
     assert await hypothesis_status(service, "hyp_1") == HYPOTHESIS_OPEN
     assert (
-        d.event_bus.history(event_type=HYPOTHESIS_RESOLVED)[0].payload["status"]
-        == HYPOTHESIS_OPEN
+        d.event_bus.history(event_type=HYPOTHESIS_RESOLVED)[0].payload["status"] == HYPOTHESIS_OPEN
     )
 
 
@@ -671,9 +797,7 @@ async def test_update_discovers_service_and_endpoint_from_a_successful_http_prob
     # holds -- the host-attrs write happens exactly as before, this is
     # additive: three more GRAPH_UPDATED events (one per discovered node)
     # plus the GraphMutationApplied summary for that batch.
-    assert d.event_bus.event_types() == [EventType.GRAPH_UPDATED] * 3 + [
-        GRAPH_MUTATION_APPLIED
-    ]
+    assert d.event_bus.event_types() == [EventType.GRAPH_UPDATED] * 3 + [GRAPH_MUTATION_APPLIED]
 
 
 async def test_update_processing_the_same_probe_result_twice_does_not_duplicate_nodes() -> None:
@@ -797,9 +921,7 @@ async def test_inventory_update_merges_nodes_and_keeps_evidence_backed_history()
         "ev_html_1",
         "ev_html_2",
     }
-    endpoints = [
-        node for node in await graph.list_nodes() if node.type is GraphNodeType.ENDPOINT
-    ]
+    endpoints = [node for node in await graph.list_nodes() if node.type is GraphNodeType.ENDPOINT]
     assert len(endpoints) == 1
     observed_edges = [
         edge for edge in await graph.list_edges() if edge.type is GraphEdgeType.OBSERVED
@@ -898,9 +1020,7 @@ async def test_replan_continues_while_work_remains() -> None:
 async def test_replan_retires_an_agent_with_nothing_left_and_hands_over() -> None:
     other = AgentSpec(agent_id=AgentId("web"), name="web")
     d = deps(agents=AgentRegistry([RECON_AGENT, other]))
-    state = initial_graph_state(
-        runtime(step_count=1, current_agent=RECON_AGENT.agent_id)
-    )
+    state = initial_graph_state(runtime(step_count=1, current_agent=RECON_AGENT.agent_id))
 
     result = await replan_node(state, deps=d)
 
@@ -1147,11 +1267,7 @@ async def test_a_provider_with_nothing_to_say_stays_silent() -> None:
     from redteam.orchestration.agents.providers import CandidateBatch
     from redteam.orchestration.events import AGENT_NO_EXECUTABLE_CANDIDATES
 
-    d = deps(
-        candidate_providers=_providers_with_web(
-            _ProviderStub(CandidateBatch(candidates=[]))
-        )
-    )
+    d = deps(candidate_providers=_providers_with_web(_ProviderStub(CandidateBatch(candidates=[]))))
     service = await seeded(d, "a.local")
     await service.upsert_node(
         GraphNodeType.SERVICE,

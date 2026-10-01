@@ -269,6 +269,24 @@ def test_unknown_and_empty_instructions_are_rejected() -> None:
             classify_instruction(instruction)
 
 
+async def test_live_channel_accepts_safe_free_form_guidance_for_next_decision() -> None:
+    task_store = await seeded_task_store(task("web"))
+    svc = service(task_store=task_store, intent_store=InMemoryOperatorIntentStore())
+
+    result = await svc.receive_and_apply(
+        "다른 허용된 방법으로 시도해",
+        mission_id=MISSION,
+        run_id=RUN,
+        allow_guidance=True,
+    )
+
+    updated = await task_store.get_mission(MISSION)
+    assert result.intent_type is OperatorIntentType.GUIDANCE
+    assert result.applied is True
+    assert updated is not None
+    assert updated.operator_preferences["guidance"] == ["다른 허용된 방법으로 시도해"]
+
+
 def test_interpreter_extracts_areas_and_priority_and_redacts() -> None:
     focus = interpret_instruction(
         "focus on web and api with token=supersecret", mission_id=MISSION, now=NOW
@@ -894,7 +912,8 @@ async def test_explanation_does_not_mix_other_runs_on_shared_event_bus() -> None
     bus = InMemoryEventBus()
     svc = service(
         task_store=await seeded_task_store(task("docs")),
-        intent_store=InMemoryOperatorIntentStore(), bus=bus,
+        intent_store=InMemoryOperatorIntentStore(),
+        bus=bus,
     )
     await publisher(bus).publish(
         CANDIDATE_REJECTED, {"operation": "this-run", "reason": "not viable"}
@@ -917,9 +936,11 @@ async def test_operator_renderer_shows_bounded_structured_reasons_without_secret
     store = await seeded_task_store(
         task("missing", objective="Probe /api/other"),
         blocked_task(
-            "blocked", reason="missing token=do-not-print",
-            depends_on="missing", objective="Probe /api/other",
-        )
+            "blocked",
+            reason="missing token=do-not-print",
+            depends_on="missing",
+            objective="Probe /api/other",
+        ),
     )
     svc = service(task_store=store, intent_store=InMemoryOperatorIntentStore())
     await svc.receive_and_apply("exclude /api/docs", mission_id=MISSION, run_id=RUN)

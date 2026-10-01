@@ -16,6 +16,10 @@ from redteam.orchestration.context import RuntimeDeps
 from redteam.orchestration.events import GRAPH_MUTATION_APPLIED, RESULT_MAPPER_FAILED
 from redteam.orchestration.nodes._support import advance, graph_service, publisher_for
 from redteam.orchestration.nodes.policy import denial_severity
+from redteam.orchestration.runtime_observation import (
+    RuntimeObservation,
+    append_runtime_observation,
+)
 from redteam.orchestration.state import GraphState
 from redteam.orchestration.work.models import WorkStatus
 
@@ -39,6 +43,8 @@ async def update_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
     )
     verification_failed = bool(verification_exception)
     succeeded = tool_succeeded and not verification_failed
+    mutated_nodes = 0
+    mutated_edges = 0
 
     # PLAN records the hypothesis before the policy gate so the question is
     # auditable. A blocked action never reaches VERIFY, therefore UPDATE must
@@ -57,7 +63,8 @@ async def update_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
         run_id=str(runtime.run_id),
         evidence_id=(
             str(state["result_evidence_id"])
-            if result is not None and state.get("result_evidence_id") else None
+            if result is not None and state.get("result_evidence_id")
+            else None
         ),
         confidence=Confidence.MEASURED if succeeded else Confidence.INFERRED,
     )
@@ -125,6 +132,8 @@ async def update_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             arguments=proposal.arguments,
             result=result,
         )
+        mutated_nodes = len(mutation.nodes)
+        mutated_edges = len(mutation.edges)
         mapper_failure = deps.result_mappers.last_failure
         if mapper_failure is not None:
             failed_event = await publisher.publish(
@@ -153,9 +162,12 @@ async def update_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                 node_mutation.node_type,
                 node_id=node_mutation.node_id,
                 attrs=node_mutation.attrs,
-                facts={**observed_facts, **(
-                    {"evidence_ids": [provenance.evidence_id]} if provenance.evidence_id else {}
-                )},
+                facts={
+                    **observed_facts,
+                    **(
+                        {"evidence_ids": [provenance.evidence_id]} if provenance.evidence_id else {}
+                    ),
+                },
                 labels=node_mutation.labels,
                 provenance=provenance,
                 step=runtime.step_count,
@@ -216,9 +228,29 @@ async def update_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             reason=reason,
         )
 
+    state_outcome = "blocked" if blocked else "updated" if succeeded else "failed"
+    next_runtime = append_runtime_observation(
+        runtime.model_copy(update={"phase": AgentPhase.REPLAN}),
+        RuntimeObservation(
+            kind="state",
+            summary=(
+                f"Attack graph {state_outcome} for {node.type.value} {node.id}; "
+                f"added {mutated_nodes} node(s) and {mutated_edges} edge(s)"
+            )[:500],
+            outcome=state_outcome,
+            step=runtime.step_count,
+            action_id=str(proposal.action_id),
+            capability=proposal.capability,
+            operation=proposal.operation,
+            target=str(node.id),
+            reasons=(list(decision.reasons[:8]) if blocked and decision is not None else []),
+            alternative_allowed=True,
+        ),
+    )
+
     return advance(
         state,
-        runtime.model_copy(update={"phase": AgentPhase.REPLAN}),
+        next_runtime,
         last_event_id=last_event.event_id,
         current_work_id=None,
     )

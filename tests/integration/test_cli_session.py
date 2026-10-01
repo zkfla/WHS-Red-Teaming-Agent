@@ -117,7 +117,6 @@ async def test_run_finished_returns_to_prompt_and_accepts_slash_commands(
         answers=[
             "127.0.0.1:5000의 VulnBank 테스트, 최대 100개",  # first message -> intake
             "",  # existing-config menu -> Start
-            "n",  # one-time MCP auto-setup prompt -> decline
             "",  # preflight -> Start
             "/help",
             "/status",
@@ -141,12 +140,9 @@ async def test_run_finished_returns_to_prompt_and_accepts_slash_commands(
     # /status (no argument) resolved against the session's own last run id --
     # never a hardcoded/faked run id.
     assert "Status: FINISHED" in stdout
-    # /tools reused the exact same Capability Gateway `redteam tools list`
-    # uses -- REDTEAM_MCP_SERVERS is unset in this fixture, so both now
-    # agree on an honest empty catalog (never a silent ExampleMCPAdapter
-    # substitute; see app.bootstrap._empty_tool_gateway).
-    assert "(none)" in stdout
-    assert "recon.ping" not in stdout
+    # A missing MCP env now gets the same safe built-in baseline the Run used.
+    assert "recon.http_probe" in stdout
+    assert "web.http_request" in stdout
 
 
 async def test_natural_language_second_request_runs_a_second_agent_run(
@@ -161,7 +157,6 @@ async def test_natural_language_second_request_runs_a_second_agent_run(
         answers=[
             "127.0.0.1:5000의 VulnBank 테스트, 최대 100개",
             "",
-            "n",  # one-time MCP auto-setup prompt -> decline
             "",
             "127.0.0.1:5000 다시 한 번 점검해줘",  # second objective, plain text
             "/exit",
@@ -178,6 +173,74 @@ async def test_natural_language_second_request_runs_a_second_agent_run(
     assert run_id_lines[0] != run_id_lines[1]
 
 
+async def test_natural_language_explanation_does_not_start_a_new_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A sentence containing ``왜`` is a query even when it is not the
+    first token; it must describe the last Run instead of becoming a Mission
+    objective."""
+    console = _patch(
+        monkeypatch,
+        tmp_path,
+        answers=[
+            "127.0.0.1:5000의 VulnBank 테스트, 최대 100개",
+            "",
+            "",
+            "방금 왜 실패했어?",
+            "/exit",
+        ],
+    )
+
+    exit_code = await interactive.run(_args())
+
+    assert exit_code == _shared.EXIT_OK
+    assert len([line for line in console.transcript if "RunId:" in line]) == 1
+    assert any(line.startswith("[Agent] Run ") and "because" in line for line in console.transcript)
+
+
+async def test_free_form_question_is_answered_without_starting_a_new_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    console = _patch(
+        monkeypatch,
+        tmp_path,
+        answers=[
+            "127.0.0.1:5000의 VulnBank 테스트, 최대 100개",
+            "",
+            "",
+            "결과에서 확인된 내용이 뭐야?",
+            "/exit",
+        ],
+    )
+
+    exit_code = await interactive.run(_args())
+
+    assert exit_code == _shared.EXIT_OK
+    assert len([line for line in console.transcript if "RunId:" in line]) == 1
+    assert console.transcript.count("\n[cyan]operator>[/cyan] ") >= 2
+
+
+async def test_bare_exit_ends_session_without_starting_a_new_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    console = _patch(
+        monkeypatch,
+        tmp_path,
+        answers=[
+            "127.0.0.1:5000의 VulnBank 테스트, 최대 100개",
+            "",
+            "",
+            "exit",
+        ],
+    )
+
+    exit_code = await interactive.run(_args())
+
+    assert exit_code == _shared.EXIT_OK
+    assert len([line for line in console.transcript if "RunId:" in line]) == 1
+    assert "[User] exit" in console.transcript
+
+
 # --- Gate I: error recovery ------------------------------------------------
 
 
@@ -190,7 +253,6 @@ async def test_unknown_slash_command_does_not_end_the_session(
         answers=[
             "127.0.0.1:5000의 VulnBank 테스트, 최대 100개",
             "",
-            "n",  # one-time MCP auto-setup prompt -> decline
             "",
             "/this-command-does-not-exist",
             "/exit",
@@ -203,7 +265,7 @@ async def test_unknown_slash_command_does_not_end_the_session(
     assert any("Unknown command" in line for line in console.transcript)
     # Reached /exit's own dispatch (not an EOF/forced fallback): the
     # prompt after the bad command was still answered and consumed.
-    assert console.transcript.count("\n[cyan]❯[/cyan] ") >= 2
+    assert console.transcript.count("\n[cyan]operator>[/cyan] ") >= 2
 
 
 # --- Gate K: clean exit on EOF while idle at the prompt --------------------
@@ -218,7 +280,6 @@ async def test_eof_at_idle_prompt_ends_the_session_cleanly(
         answers=[
             "127.0.0.1:5000의 VulnBank 테스트, 최대 100개",
             "",
-            "n",  # one-time MCP auto-setup prompt -> decline
             "",
             # nothing after the first run -- console.input() raises EOFError
         ],

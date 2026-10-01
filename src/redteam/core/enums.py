@@ -65,6 +65,7 @@ class TaskStatus(str, Enum):
 
 
 class OperatorIntentType(str, Enum):
+    GUIDANCE = "guidance"
     REPRIORITIZE = "reprioritize"
     FOCUS = "focus"
     EXCLUDE = "exclude"

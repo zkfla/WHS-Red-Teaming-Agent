@@ -1,4 +1,4 @@
-"""RC#1 prototype: LLM-driven candidate *generation*.
+"""One observable LLM turn that may propose the next runtime action.
 
 The existing :class:`PlaybookCandidateProvider` derives the frontier from
 static playbooks and the :class:`LLMPlanner` then only *selects* one of
@@ -25,10 +25,14 @@ loop -- that wiring is the reviewed integration step.
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, Literal
+
+from pydantic import BaseModel, Field, field_validator
 
 from redteam.attack_graph.identity import split_node_id, target_for_node
+from redteam.attack_graph.predicates import attrs_of, facts_of
 from redteam.core.ids import AgentId, GraphNodeId, ToolId
+from redteam.core.redaction import redact_sensitive_text
 from redteam.orchestration.agents.base import AgentSpec, PlanStep
 from redteam.orchestration.agents.providers import (
     CandidateBatch,
@@ -43,41 +47,63 @@ logger = logging.getLogger(__name__)
 #: the compiler/queue. Extra drafts are ignored, not an error.
 MAX_DRAFTS_PER_TURN = 8
 
-ACTIONS_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "properties": {
-        "actions": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "capability": {"type": "string"},
-                    "operation": {"type": "string"},
-                    "target_node_id": {
-                        "type": "string",
-                        "description": "exact node id from 'Known targets', copied verbatim",
-                    },
-                    "tool_id": {"type": "string"},
-                    "arguments": {"type": "object"},
-                    "rationale": {"type": "string"},
-                },
-                "required": ["capability", "operation", "target_node_id"],
-            },
-        }
-    },
-    "required": ["actions"],
-}
+class AgentTurnAction(BaseModel):
+    capability: str
+    operation: str
+    target_node_id: str
+    tool_id: str | None = None
+    arguments: dict[str, Any] = Field(default_factory=dict)
+    rationale: str = "model-proposed action"
 
-SYSTEM_PROMPT = (
-    "You plan the next investigation actions of an authorized security test. "
-    "Propose concrete actions -- capability, operation, one target (copied "
-    "from the Known targets list), and any arguments -- that would resolve an "
-    "open question or reveal new attack surface. You are NOT limited to a "
-    "fixed menu: propose the action you think is right. Every proposal is "
-    "independently validated against scope, the tool catalog and policy before "
-    "it can run, so an out-of-scope or unsupported proposal is simply dropped "
-    "-- propose freely, but only against the targets listed."
-)
+
+class AgentTurnDecision(BaseModel):
+    """Safe public trace plus machine-readable actions from one model call.
+
+    ``response`` and ``decision_summary`` are not chain-of-thought. They are
+    short conclusions intended for the operator and audit event stream.
+    Defaults keep older action-only structured responses compatible.
+    """
+
+    intent: Literal["act", "finish"] = "act"
+    response: str = Field(default="다음 실행 가능한 행동을 선택했습니다.", max_length=2000)
+    decision_summary: str = Field(
+        default="현재 관찰과 실행 가능한 도구를 기준으로 다음 행동을 선택했습니다.",
+        max_length=1000,
+    )
+    assumptions: list[str] = Field(default_factory=list, max_length=5)
+    actions: list[AgentTurnAction] = Field(default_factory=list, max_length=MAX_DRAFTS_PER_TURN)
+
+    @field_validator("response", "decision_summary")
+    @classmethod
+    def _safe_text(cls, value: str) -> str:
+        return redact_sensitive_text(value).strip()
+
+    @field_validator("assumptions")
+    @classmethod
+    def _safe_assumptions(cls, value: list[str]) -> list[str]:
+        return [
+            redact_sensitive_text(str(item)).strip()[:500]
+            for item in value
+            if str(item).strip()
+        ]
+
+
+ACTIONS_SCHEMA: dict[str, Any] = AgentTurnDecision.model_json_schema()
+
+SYSTEM_PROMPT = """You are the decision loop of an authorized security-testing agent.
+Return one JSON AgentTurnDecision. Give a concise operator-facing response, a short decision
+summary, explicit assumptions, and zero or more concrete actions. Never reveal private
+chain-of-thought and never claim an action already ran. Choose actions from the live MCP action
+space when possible: capability, operation, one exact known target_node_id, optional tool_id,
+arguments, and a brief rationale. The runtime independently validates every proposal against the
+tool catalog, engagement scope, approval rules and Control Plane. Control/tool outcomes from prior
+turns are observations: adapt to their exact reason instead of treating every block as a generic
+tool failure. Use intent=finish only when the assigned task is actually complete.
+
+Language contract: write response, decision_summary, assumptions, and every action rationale in
+the same language as the Operator Mission or latest operator guidance. If the operator writes in
+Korean, these public explanation fields MUST be natural Korean. Keep protocol identifiers such as
+capability, operation, tool_id, target_node_id, policy names, and error codes unchanged."""
 
 
 class LLMCandidateProvider:
@@ -85,11 +111,14 @@ class LLMCandidateProvider:
 
     def __init__(self, llm: Any) -> None:
         self._llm = llm
+        self.last_decision: AgentTurnDecision | None = None
+        self.last_error: str | None = None
 
     async def propose_graph(
         self, spec: AgentSpec, context: GraphCandidateContext
     ) -> CandidateBatch:
         if self._llm is None:
+            self.last_error = "llm_unavailable"
             return CandidateBatch(candidates=[])
         prompt = self._render(spec, context)
         try:
@@ -102,9 +131,18 @@ class LLMCandidateProvider:
             # Provider messages may carry prompt fragments or target data; keep
             # only the exception class, mirroring LLMPlanner's failure handling.
             logger.warning("LLM candidate generation failed (%s)", type(exc).__name__)
+            self.last_error = type(exc).__name__
             return CandidateBatch(candidates=[])
 
-        actions = reply.get("actions", []) if isinstance(reply, dict) else []
+        try:
+            decision = AgentTurnDecision.model_validate(reply)
+        except Exception as exc:  # noqa: BLE001 - malformed turn safely falls back
+            logger.warning("LLM candidate response invalid (%s)", type(exc).__name__)
+            self.last_error = type(exc).__name__
+            return CandidateBatch(candidates=[])
+        self.last_decision = decision
+        self.last_error = None
+        actions = [item.model_dump(mode="python") for item in decision.actions]
         # The model may only act on targets that already exist in its
         # observation -- the generation analog of LLMPlanner refusing a
         # step_id it was not offered. A node id it invents is dropped here,
@@ -116,20 +154,28 @@ class LLMCandidateProvider:
         }
         known_targets = (
             observed_targets & set(context.task_target_node_ids)
-            if context.task_target_node_ids else observed_targets
+            if context.task_target_node_ids
+            else observed_targets
         )
         drafts: list[CandidateDraft] = []
         drops: list[DraftDrop] = []
         for index, action in enumerate(actions[:MAX_DRAFTS_PER_TURN]):
-            draft, drop = self._to_draft(spec.agent_id, action, index, known_targets)
+            draft, drop = await self._to_draft(
+                spec.agent_id, action, index, known_targets, context
+            )
             if draft is not None:
                 drafts.append(draft)
             elif drop is not None:
                 drops.append(drop)
         return CandidateBatch(candidates=drafts, drops=drops)
 
-    def _to_draft(
-        self, agent_id: AgentId, action: Any, index: int, known_targets: set[str]
+    async def _to_draft(
+        self,
+        agent_id: AgentId,
+        action: Any,
+        index: int,
+        known_targets: set[str],
+        context: GraphCandidateContext,
     ) -> tuple[CandidateDraft | None, DraftDrop | None]:
         step_id = f"llm-{index}"
         if not isinstance(action, dict):
@@ -157,10 +203,49 @@ class LLMCandidateProvider:
             )
         capability = str(action.get("capability", ""))
         operation = str(action.get("operation", ""))
-        tool_id = str(action.get("tool_id") or f"{capability}.{operation}")
+        explicit_tool_id = action.get("tool_id")
+        tool_id = str(explicit_tool_id or f"{capability}.{operation}")
         arguments = action.get("arguments")
         if not isinstance(arguments, dict):
             arguments = {}
+        arguments = dict(arguments)
+        # Model-supplied identity values cannot point the tool somewhere other
+        # than the validated graph target. Prefer a graph-observed MCP alias
+        # (target_ref) where one exists; otherwise use the typed target. This
+        # normalization is intentionally confined to LLM drafts so established
+        # graph providers can retain their already-resolved aliases.
+        node = None
+        if context.view is not None:
+            try:
+                node = await context.view.get_node(GraphNodeId(node_id_str))
+            except (AttributeError, TypeError):
+                node = None
+        graph_properties = node.properties if node is not None else {}
+        graph_facts = facts_of(graph_properties)
+        graph_attrs = attrs_of(graph_properties)
+        target_ref = graph_facts.get("target_ref") or graph_attrs.get("target_ref")
+        if target_ref is None:
+            target_ref = getattr(target, "host", None) or getattr(target, "domain", None)
+            target_ref = target_ref or getattr(target, "url", None)
+        selected_tool = next(
+            (
+                item
+                for item in context.available_tools
+                if str(item.get("tool_id")) == str(explicit_tool_id or "")
+            ),
+            None,
+        )
+        required = set(selected_tool.get("required_arguments", ())) if selected_tool else set()
+        if target_ref is not None and ("target_ref" in arguments or "target_ref" in required):
+            arguments["target_ref"] = target_ref
+        typed_identity = {
+            "host": getattr(target, "host", None) or getattr(target, "domain", None),
+            "url": getattr(target, "url", None),
+            "port": getattr(target, "port", None),
+        }
+        for name, value in typed_identity.items():
+            if value is not None and (name in arguments or name in required):
+                arguments[name] = value
         rationale = str(action.get("rationale") or "model-proposed action")
         # 2) PlanStep's own validators (canonical operation, tool namespace,
         #    exactly-one-target) reject a structurally invalid proposal.
@@ -170,6 +255,7 @@ class LLMCandidateProvider:
                 capability=capability,
                 operation=operation,
                 tool_id=ToolId(tool_id),
+                compatible_tool_ids=[ToolId(tool_id)] if explicit_tool_id else [],
                 target=target,
                 arguments=arguments,
                 reason=rationale,
@@ -197,6 +283,8 @@ class LLMCandidateProvider:
             "Attack graph right now:",
             f"  {observation.summary_line()}",
         ]
+        if context.mission_objective:
+            lines.insert(2, f"Operator Mission: {context.mission_objective}")
         if context.task_objective:
             lines.insert(2, f"Assigned Task: {context.task_objective}")
         for type_name, labels in sorted(observation.nodes_by_type.items()):
@@ -208,6 +296,18 @@ class LLMCandidateProvider:
             lines.append("Executable (capability, operation) pairs:")
             for capability, operation in sorted(context.available_operations):
                 lines.append(f"  - {capability} / {operation}")
+        if context.available_tools:
+            lines.append("Live MCP action space:")
+            for item in context.available_tools:
+                lines.append(
+                    "  - "
+                    f"tool_id={item.get('tool_id')} server={item.get('server_id')} "
+                    f"capability={item.get('capability')} "
+                    f"operations={item.get('operations')} "
+                    f"targets={item.get('target_types')} "
+                    f"required_arguments={item.get('required_arguments')} "
+                    f"risk={item.get('risk_level')} health={item.get('health_status')}"
+                )
         if context.evidence_excerpts:
             # RC#2: the raw outcome per target (status/error), not just the
             # graph summary -- the material the model needs to adapt.
@@ -219,9 +319,15 @@ class LLMCandidateProvider:
                 if item.get("error_code"):
                     outcome += f" error={item['error_code']}"
                 lines.append(
-                    f"  - {item.get('target_node_id', '')}{outcome} "
-                    f"summary={item.get('summary')}"
+                    f"  - {item.get('target_node_id', '')}{outcome} summary={item.get('summary')}"
                 )
+        if context.runtime_observations:
+            lines.append("Recent runtime observations (adapt to these outcomes):")
+            for item in context.runtime_observations[-8:]:
+                lines.append(f"  - [{item.get('kind', 'runtime')}] {item.get('summary', '')}")
+        if context.operator_guidance:
+            lines.append("Latest operator guidance:")
+            lines.extend(f"  - {item}" for item in context.operator_guidance[-3:])
         lines.append("")
         lines.append("Known targets (use a target_node_id exactly as written):")
         scoped_targets = set(context.task_target_node_ids)
@@ -231,12 +337,15 @@ class LLMCandidateProvider:
                     lines.append(f"  - {node_id}")
         lines.append("")
         lines.append(
-            "Propose the next investigation actions as JSON. Each action names a "
-            "capability, an operation, one target_node_id from the list, and any "
-            "arguments the operation needs."
+            "Return one AgentTurnDecision JSON object. Explain the intended next step "
+            "briefly for the operator, then name concrete actions using exact live "
+            "capability/operation/target values and required arguments."
         )
         return "\n".join(lines)
 
 
 def spec_system_prompt(spec: AgentSpec) -> str:
-    return getattr(spec, "system_prompt", "") or SYSTEM_PROMPT
+    role_prompt = getattr(spec, "system_prompt", "")
+    if not role_prompt:
+        return SYSTEM_PROMPT
+    return f"{SYSTEM_PROMPT}\n\nRole-specific instructions:\n{role_prompt}"

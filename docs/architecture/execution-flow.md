@@ -10,6 +10,25 @@ START -> OBSERVE -> PLAN -> POLICY --ALLOW--> EXECUTE -> VERIFY -> UPDATE -> REP
 Implementation: `src/redteam/orchestration/graph.py` (`build_graph`),
 routing: `src/redteam/orchestration/router.py`.
 
+Control/tool/state outcomes are also appended to the bounded
+`RuntimeState.recent_observations` window and supplied to the next planning
+turn. See [Interactive Agent Runtime](agent-behavior.md) for the operator
+channel, Decision Trace and approval-suspension behavior.
+
+The interactive shell routes chat into a Mission objective/guidance, but the
+visible action response comes from the PLAN node's actual LLM turn. The facade
+has no ToolGateway path. Therefore natural language cannot skip PLAN, the
+candidate compiler, POLICY or MCP selection.
+
+With `planning_mode=llm_first`, PLAN receives the current Attack Graph,
+Evidence excerpts, prior Control/tool observations, operator guidance and the
+healthy live MCP action space. It returns a public decision summary plus
+structured action drafts. Executable drafts continue directly to Control; if
+the LLM call fails or all requested actions fail compilation, the registered
+role provider supplies a playbook/graph recipe fallback. A deliberate
+`intent=finish` does not trigger fallback. `hybrid` preserves the older
+additive mode and `playbook_only` supports deterministic/offline operation.
+
 ## Minimal Vertical Slice, step by step
 
 Maps to instruction.md section 16 and still holds structurally, but two
@@ -39,7 +58,11 @@ description — run `redteam run examples/engagement.yaml` (or bare
 ```text
 RunStarted
 AgentStarted
+AgentTurnDecided (LLM planning modes)
 CandidateGenerated
+AgentContextPrepared
+AgentDecisionRecorded
+MCPToolSelected
 ActionProposed
 PolicyEvaluated
 ActionApproved
@@ -102,3 +125,8 @@ If `PolicyDecision.verdict` is `DENY` or `REQUIRE_APPROVAL`,
 `route_after_policy` sends the graph straight to `REPLAN` — `execute_node`
 is never called and `ActionDenied` (not `ActionApproved`) is published
 instead.
+
+Before replanning, that exact verdict, reason, matched policy rules and
+approval id are converted into a bounded `RuntimeObservation`. The next LLM
+turn therefore sees “outside allowed paths” or “approval required”, not a
+generic tool failure.

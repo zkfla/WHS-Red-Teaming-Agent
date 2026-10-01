@@ -20,7 +20,13 @@ from typing import Any
 from pydantic import BaseModel
 
 from redteam.capability.settings import mcp_server_ids_from_environment
-from redteam.core.config import AppConfig, CapabilityConfig, LLMConfig, load_engagement_config
+from redteam.core.config import (
+    AppConfig,
+    CapabilityConfig,
+    LLMConfig,
+    OrchestrationConfig,
+    load_engagement_config,
+)
 from redteam.core.redaction import SECRET_KEY_PARTS
 
 # Exit codes (section 20): 0 success, 1 general run failure, 2 config/argument error.
@@ -94,9 +100,16 @@ def load_app_config_for_run(engagement_path: str, *, require_llm: bool = True) -
     need.
     """
     engagement_config = load_engagement_config(engagement_path)
+    llm = LLMConfig.from_environment() if require_llm else LLMConfig()
+    configured_mode = os.environ.get("REDTEAM_PLANNING_MODE")
+    planning_mode = configured_mode or ("llm_first" if llm.provider != "fake" else "playbook_only")
     return AppConfig(
         engagement=engagement_config,
-        llm=LLMConfig.from_environment() if require_llm else LLMConfig(),
+        llm=llm,
+        orchestration=OrchestrationConfig(
+            planning_mode=planning_mode,
+            llm_candidate_generation=planning_mode != "playbook_only",
+        ),
         capability=CapabilityConfig(mcp_servers=mcp_server_ids_from_environment()),
     )
 

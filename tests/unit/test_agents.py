@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 from pydantic import ValidationError
 
@@ -280,14 +282,17 @@ async def test_finished_agent_reactivates_only_after_a_graph_revision() -> None:
 
     await service.upsert_node(GraphNodeType.HOST, key="new.local", attrs={"in_scope": True})
     after = await service.observe(step=2)
-    assert scheduled(
-        registry.next_agent(
-            current=recon.agent_id,
-            finished=[recon.agent_id],
-            observation=after,
-            finished_revisions={str(recon.agent_id): cursor},
-        )
-    ).agent_id == recon.agent_id
+    assert (
+        scheduled(
+            registry.next_agent(
+                current=recon.agent_id,
+                finished=[recon.agent_id],
+                observation=after,
+                finished_revisions={str(recon.agent_id): cursor},
+            )
+        ).agent_id
+        == recon.agent_id
+    )
 
 
 def test_unrelated_graph_revision_does_not_reactivate_a_specialist() -> None:
@@ -328,9 +333,7 @@ def test_unrelated_graph_revision_does_not_reactivate_a_specialist() -> None:
 def test_rotation_prevents_one_active_agent_from_starving_another() -> None:
     registry = AgentRegistry([spec(agent_id="recon"), spec(agent_id="web")])
 
-    selected = registry.next_agent(
-        current=AgentId("recon"), finished=[], rotate=True
-    )
+    selected = registry.next_agent(current=AgentId("recon"), finished=[], rotate=True)
 
     assert scheduled(selected).agent_id == AgentId("web")
 
@@ -395,18 +398,24 @@ def test_budget_weight_allocates_parallel_slots_across_active_roles() -> None:
     )
     observation = GraphObservation()
 
-    assert registry.weighted_batch_limit(
-        small.agent_id,
-        observation=observation,
-        phase=AgentPhase.PLAN,
-        capacity=4,
-    ) == 1
-    assert registry.weighted_batch_limit(
-        large.agent_id,
-        observation=observation,
-        phase=AgentPhase.PLAN,
-        capacity=4,
-    ) == 3
+    assert (
+        registry.weighted_batch_limit(
+            small.agent_id,
+            observation=observation,
+            phase=AgentPhase.PLAN,
+            capacity=4,
+        )
+        == 1
+    )
+    assert (
+        registry.weighted_batch_limit(
+            large.agent_id,
+            observation=observation,
+            phase=AgentPhase.PLAN,
+            capacity=4,
+        )
+        == 3
+    )
 
 
 async def test_definition_activation_skips_an_irrelevant_registered_role() -> None:
@@ -545,6 +554,32 @@ async def test_the_prompt_shows_only_available_steps_and_prior_attempts() -> Non
     assert "step_id=first" in rendered
     assert "Already attempted (do not repeat)" in rendered
     assert "recon.endpoint_discovery@host:a.local" in rendered
+
+
+async def test_planner_prompt_receives_control_feedback_and_operator_guidance() -> None:
+    service = await seeded_service("a.local")
+    observation = await service.observe(step=2)
+    agent = spec(probe_step("alternate"), planner_kind="llm")
+    candidates = await available_steps(agent, service.view(), observation, step=2)
+    planning = replace(
+        context(agent, candidates, observation),
+        metadata={
+            "runtime_observations": [
+                {
+                    "kind": "control",
+                    "summary": "Control DENY for web.http_request: path outside allowed_paths",
+                }
+            ],
+            "operator_guidance": ["try a different allowed path"],
+        },
+    )
+
+    rendered = LLMPlanner._render(planning)
+
+    assert "Recent runtime observations" in rendered
+    assert "outside allowed_paths" in rendered
+    assert "Latest operator guidance" in rendered
+    assert "try a different allowed path" in rendered
 
 
 def test_planner_kind_selects_the_implementation() -> None:

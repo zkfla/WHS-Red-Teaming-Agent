@@ -130,9 +130,7 @@ def build_llm_client(config: LLMConfig) -> LLMClient:
         return LiteLLMClient(model=config.default_model, api_key=config.resolve_api_key())
     if config.provider == "fake":
         return FakeLLMClient()
-    raise ValueError(
-        f"unknown LLM provider {config.provider!r} -- expected 'fake' or 'litellm'"
-    )
+    raise ValueError(f"unknown LLM provider {config.provider!r} -- expected 'fake' or 'litellm'")
 
 
 async def _build_default_capability(
@@ -357,7 +355,12 @@ async def build_application(
     )
     resolved_event_bus = event_bus or InMemoryEventBus()
     resolved_settings = orchestration_settings or OrchestrationSettings.from_config(
-        config.orchestration
+        config.orchestration,
+        planning_mode=(
+            "llm_first"
+            if config.orchestration.planning_mode is None and config.llm.provider != "fake"
+            else None
+        ),
     )
     resolved_attack_graph = attack_graph or EngagementScopedAttackGraphStore(
         SQLiteAttackGraphStore(resolved_settings.attack_graph_path)
@@ -505,6 +508,7 @@ async def run_engagement(
         objective=objective,
         now=datetime.now(timezone.utc),
     )
+    mission = await deps.task_graph_store.get_mission(mission_id)
 
     run_started = EventEnvelope(
         event_id=EventId(new_id("evt")),
@@ -525,7 +529,11 @@ async def run_engagement(
     )
     mission_created = await lifecycle.publish(
         EventType.MISSION_CREATED,
-        {"mission_id": mission_id},
+        {
+            "mission_id": mission_id,
+            "objective": mission.objective if mission is not None else objective,
+            "priorities": mission.priorities if mission is not None else [],
+        },
         causation_id=run_started.event_id,
     )
     bootstrap_event_id = mission_created.event_id
@@ -543,7 +551,11 @@ async def run_engagement(
         started_at=datetime.now(timezone.utc),
         phase=AgentPhase.OBSERVE,
         mission_id=mission_id,
-        current_goal=f"map and probe the declared scope of {engagement.name}",
+        current_goal=(
+            mission.objective
+            if mission is not None
+            else (objective or f"map and probe the declared scope of {engagement.name}")
+        ),
         remaining_budget=engagement.execution_budget.max_actions,
     )
     runner = AgentLoopRunner(deps, settings=settings)

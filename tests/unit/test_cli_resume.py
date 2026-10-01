@@ -139,6 +139,7 @@ async def test_resume_uses_canonical_bootstrap_and_the_recovered_engagement_id(
     assert exit_code == EXIT_OK
     build.assert_awaited_once()
     build_call = build.await_args
+    assert build_call is not None
     assert build_call.kwargs["engagement_id"] == EngagementId("eng_recovered")
     called_config = build_call.args[0]
     assert called_config.engagement.name == "Resume Test"
@@ -152,9 +153,7 @@ async def test_resume_fails_closed_without_a_checkpoint(
 ) -> None:
     engagement_path = _engagement_yaml(tmp_path)
     build = AsyncMock()
-    monkeypatch.setattr(
-        resume_command, "_read_checkpoint_runtime", AsyncMock(return_value=None)
-    )
+    monkeypatch.setattr(resume_command, "_read_checkpoint_runtime", AsyncMock(return_value=None))
     monkeypatch.setattr(resume_command, "build_resume_application", build)
 
     exit_code = await resume_command.run(_args(engagement_path))
@@ -175,9 +174,7 @@ async def test_resume_fails_closed_without_a_safe_checkpoint(
     )
     _FakeRunner.recovered = None  # recover_runtime refuses an unsafe snapshot
 
-    monkeypatch.setattr(
-        resume_command, "_read_checkpoint_runtime", AsyncMock(return_value=hint)
-    )
+    monkeypatch.setattr(resume_command, "_read_checkpoint_runtime", AsyncMock(return_value=hint))
     monkeypatch.setattr(
         resume_command, "build_resume_application", AsyncMock(return_value=(object(), deps))
     )
@@ -198,9 +195,7 @@ async def test_resume_reports_bad_mcp_configuration_as_a_config_error(
         engagement_id=EngagementId("eng_recovered"),
         termination_reason=TerminationReason.APPROVAL_PENDING,
     )
-    monkeypatch.setattr(
-        resume_command, "_read_checkpoint_runtime", AsyncMock(return_value=hint)
-    )
+    monkeypatch.setattr(resume_command, "_read_checkpoint_runtime", AsyncMock(return_value=hint))
     monkeypatch.setattr(
         resume_command,
         "build_resume_application",
@@ -231,21 +226,22 @@ async def test_resume_paused_run_applies_operator_intent_before_scheduling(
         )
     )
     deps = replace(
-        build_test_application(), task_graph_store=store,
+        build_test_application(),
+        task_graph_store=store,
         operator_intent_store=InMemoryOperatorIntentStore(),
     )
     paused = RuntimeState(
-        run_id=RunId("run_resume"), engagement_id=EngagementId("eng_recovered"),
-        mission_id=mission_id, phase=AgentPhase.FINISHED,
+        run_id=RunId("run_resume"),
+        engagement_id=EngagementId("eng_recovered"),
+        mission_id=mission_id,
+        phase=AgentPhase.FINISHED,
         termination_reason=TerminationReason.OPERATOR_PAUSED,
     )
     _FakeRunner.recovered = paused
     _FakeRunner.final = paused.model_copy(
         update={"termination_reason": TerminationReason.NO_ACTIONABLE_PLAN}
     )
-    monkeypatch.setattr(
-        resume_command, "_read_checkpoint_runtime", AsyncMock(return_value=paused)
-    )
+    monkeypatch.setattr(resume_command, "_read_checkpoint_runtime", AsyncMock(return_value=paused))
     monkeypatch.setattr(
         resume_command, "build_resume_application", AsyncMock(return_value=(object(), deps))
     )
@@ -265,16 +261,16 @@ async def test_pending_approval_without_resolution_is_not_reported_as_resumed(
 ) -> None:
     path = _engagement_yaml(tmp_path)
     pending = RuntimeState(
-        run_id=RunId("run_resume"), engagement_id=EngagementId("eng_recovered"),
+        run_id=RunId("run_resume"),
+        engagement_id=EngagementId("eng_recovered"),
         termination_reason=TerminationReason.APPROVAL_PENDING,
     )
     _FakeRunner.recovered = pending
     _FakeRunner.final = pending
+    monkeypatch.setattr(resume_command, "_read_checkpoint_runtime", AsyncMock(return_value=pending))
     monkeypatch.setattr(
-        resume_command, "_read_checkpoint_runtime", AsyncMock(return_value=pending)
-    )
-    monkeypatch.setattr(
-        resume_command, "build_resume_application",
+        resume_command,
+        "build_resume_application",
         AsyncMock(return_value=(object(), build_test_application())),
     )
     monkeypatch.setattr(resume_command, "AgentLoopRunner", _FakeRunner)
@@ -290,8 +286,11 @@ async def test_resume_restores_control_counters_and_elapsed_duration(
     path = _engagement_yaml(tmp_path)
     start = datetime.now(timezone.utc)
     recovered = RuntimeState(
-        run_id=RunId("run_resume"), engagement_id=EngagementId("eng_recovered"),
-        actions_executed=3, retry_tool_calls=2, started_at=start,
+        run_id=RunId("run_resume"),
+        engagement_id=EngagementId("eng_recovered"),
+        actions_executed=3,
+        retry_tool_calls=2,
+        started_at=start,
         termination_reason=TerminationReason.APPROVAL_PENDING,
     )
     _FakeRunner.recovered = recovered

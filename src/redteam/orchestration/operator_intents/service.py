@@ -319,6 +319,7 @@ class OperatorIntentService:
         last_event_id: EventId | None = None,
         now: datetime | None = None,
         source: str = "operator",
+        allow_guidance: bool = False,
     ) -> IntentApplication:
         """Interpret and persist one operator instruction."""
         received_at = now or datetime.now(timezone.utc)
@@ -330,6 +331,7 @@ class OperatorIntentService:
                 task_ids=task_ids,
                 parameters=parameters,
                 source=source,
+                allow_guidance=allow_guidance,
             )
         except IntentInterpretationError as exc:
             return IntentApplication(
@@ -391,6 +393,7 @@ class OperatorIntentService:
         last_event_id: EventId | None = None,
         now: datetime | None = None,
         source: str = "operator",
+        allow_guidance: bool = False,
     ) -> IntentApplication:
         """``receive`` then ``apply`` — the CLI's one-shot entry point."""
         received = await self.receive(
@@ -403,6 +406,7 @@ class OperatorIntentService:
             last_event_id=last_event_id,
             now=now,
             source=source,
+            allow_guidance=allow_guidance,
         )
         if received.intent_id is None:
             return received
@@ -870,7 +874,8 @@ class OperatorIntentService:
                     operation=operation,
                     reason=(
                         redact_text(str(payload.get("reason")))
-                        if payload.get("reason") is not None else None
+                        if payload.get("reason") is not None
+                        else None
                     ),
                     field=(str(payload.get("field")) if payload.get("field") else None),
                     candidate_key=(str(candidate_key) if candidate_key else None),
@@ -879,9 +884,7 @@ class OperatorIntentService:
             )
         return explanations[-_MAX_EXPLAIN_ITEMS:]
 
-    def _chosen_actions(
-        self, run_id: RunId | None, engagement_id: str
-    ) -> list[ActionExplanation]:
+    def _chosen_actions(self, run_id: RunId | None, engagement_id: str) -> list[ActionExplanation]:
         """Proposed actions joined with their policy outcome by ``action_id``.
 
         The proposal is the source of the candidate score (``priority``); the
@@ -947,7 +950,8 @@ class OperatorIntentService:
         return explanations[-_MAX_EXPLAIN_ITEMS:]
 
     async def _work_evidence(
-        self, run_id: RunId | None,
+        self,
+        run_id: RunId | None,
     ) -> tuple[list[CandidateExplanation], list[ActionExplanation]]:
         """Work-ledger fallback when the Event Bus cannot be introspected."""
         if run_id is None:
@@ -1011,7 +1015,8 @@ class OperatorIntentService:
         except Exception:  # noqa: BLE001
             return []
         return [
-            event for event in events
+            event
+            for event in events
             if str(event.engagement_id) == str(engagement_id)
             and (run_id is None or event.run_id == run_id)
         ][-_MAX_EXPLAIN_ITEMS:]
@@ -1067,6 +1072,9 @@ class OperatorIntentService:
             return await self._resume(mission, now)
         if intent_type is OperatorIntentType.STOP:
             return await self._stop(mission, now)
+        if intent_type is OperatorIntentType.GUIDANCE:
+            await self._merge_preferences(mission, {"guidance": [intent.instruction[:500]]}, now)
+            return _MutationResult(outcome="guidance_added_for_next_decision")
 
         tasks = await self._tasks.list_tasks(mission_id=intent.mission_id)
         active = [task for task in tasks if task.status not in _TERMINAL_TASK_STATUSES]

@@ -1,6 +1,6 @@
 """``commands.interactive._ensure_mcp_config`` / ``_write_recon_policy``.
 
-Regression guard for a real bug: the auto-setup wizard wrote
+Regression guard for a real bug: the auto-setup path wrote
 ``REDTEAM_MCP_RECON_PASSIVE_*`` without ``TOOL_OPERATIONS_JSON``, so every
 discovered tool fell back to its own literal name as its "operation"
 (``capability.bootstrap``) instead of the canonical
@@ -8,8 +8,7 @@ discovered tool fell back to its own literal name as its "operation"
 actually ask for -- every candidate was then rejected as
 ``operation_unsupported`` and the Mission blocked with zero actions
 executed, even though the MCP server itself connected and discovered tools
-fine. None of the existing interactive-flow tests caught this because they
-all script a decline ("n") to this prompt.
+fine. The default now registers both safe in-repo stdio servers.
 """
 
 from __future__ import annotations
@@ -78,6 +77,12 @@ _RECON_PASSIVE_ENV_KEYS = (
     "REDTEAM_MCP_RECON_PASSIVE_ARGS_JSON",
     "REDTEAM_MCP_RECON_PASSIVE_RISK_LEVEL",
     "REDTEAM_MCP_RECON_PASSIVE_TOOL_OPERATIONS_JSON",
+    "REDTEAM_MCP_WEB_HTTP_KIND",
+    "REDTEAM_MCP_WEB_HTTP_TRANSPORT",
+    "REDTEAM_MCP_WEB_HTTP_COMMAND",
+    "REDTEAM_MCP_WEB_HTTP_ARGS_JSON",
+    "REDTEAM_MCP_WEB_HTTP_RISK_LEVEL",
+    "REDTEAM_MCP_WEB_HTTP_TOOL_OPERATIONS_JSON",
 )
 
 
@@ -106,13 +111,13 @@ async def test_recon_passive_tool_operations_cover_every_discovered_tool() -> No
 async def test_accepting_writes_a_complete_working_config(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    console = _FakeConsole(["y"])
+    console = _FakeConsole([])
     capability_config = await interactive._ensure_mcp_config(
         console, _engagement("127.0.0.1:5000"), CapabilityConfig()
     )
 
-    assert capability_config.mcp_servers == ["recon-passive"]
-    assert os.environ["REDTEAM_MCP_SERVERS"] == "recon-passive"
+    assert capability_config.mcp_servers == ["recon-passive", "web-http"]
+    assert os.environ["REDTEAM_MCP_SERVERS"] == "recon-passive,web-http"
 
     # The actual bug: this key must be present and bind every discovered
     # tool name, or `MCPServerSettings.from_environment` falls back to no
@@ -127,23 +132,14 @@ async def test_accepting_writes_a_complete_working_config(
     assert settings.tool_operations is not None
     assert settings.tool_operations["http_probe"] == ("service_discovery",)
 
+    web_settings = MCPServerSettings.from_environment("web-http")
+    assert web_settings.tool_operations is not None
+    assert web_settings.tool_operations["http_request"] == ("http_request",)
+    assert web_settings.tool_operations["http_security_posture"] == ("response_analysis",)
+
     env_text = (tmp_path / ".env").read_text(encoding="utf-8")
     assert "REDTEAM_MCP_RECON_PASSIVE_TOOL_OPERATIONS_JSON=" in env_text
-
-
-async def test_declining_leaves_capability_config_untouched(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    console = _FakeConsole(["n"])
-    original = CapabilityConfig()
-
-    result = await interactive._ensure_mcp_config(
-        console, _engagement("127.0.0.1:5000"), original
-    )
-
-    assert result is original
-    assert "REDTEAM_MCP_SERVERS" not in os.environ
-    assert not (tmp_path / ".env").exists()
+    assert "REDTEAM_MCP_WEB_HTTP_TOOL_OPERATIONS_JSON=" in env_text
 
 
 async def test_already_configured_never_prompts(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -160,6 +156,20 @@ async def test_already_configured_never_prompts(monkeypatch: pytest.MonkeyPatch)
     )
 
     assert result is already_configured
+
+
+async def test_explicit_empty_server_list_disables_default_bootstrap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("REDTEAM_MCP_SERVERS", "")
+    explicitly_empty = CapabilityConfig()
+
+    result = await interactive._ensure_mcp_config(
+        _FakeConsole([]), _engagement("127.0.0.1:5000"), explicitly_empty
+    )
+
+    assert result is explicitly_empty
+    assert not Path(".env").exists()
 
 
 async def test_no_scope_declared_is_a_no_op(monkeypatch: pytest.MonkeyPatch) -> None:

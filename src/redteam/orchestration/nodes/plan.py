@@ -42,15 +42,20 @@ from redteam.orchestration.difficulty import (
 )
 from redteam.orchestration.dispatch import DispatchItem
 from redteam.orchestration.events import (
+    AGENT_CONTEXT_PREPARED,
+    AGENT_DECISION_RECORDED,
     AGENT_NO_EXECUTABLE_CANDIDATES,
     AGENT_PROVIDER_FAILED,
+    AGENT_TURN_DECIDED,
     AUTHENTICATION_CHECK_DEFERRED,
     CANDIDATE_GENERATED,
     CANDIDATE_PRUNED,
     CANDIDATE_REJECTED,
+    MCP_TOOL_SELECTED,
 )
 from redteam.orchestration.nodes._support import advance, graph_service, publisher_for
 from redteam.orchestration.operator_intents.suppression import endpoint_excluded
+from redteam.orchestration.runtime_observation import observations_for_prompt
 from redteam.orchestration.scheduler import WorkScheduler
 from redteam.orchestration.settings import OrchestrationSettings
 from redteam.orchestration.state import GraphState, RuntimeState
@@ -71,6 +76,10 @@ def _verification_batch_capacity(runtime: RuntimeState, settings: OrchestrationS
     # Separate workers see independent budget mirrors. Reserve retry slots
     # before dispatching more than one; AGGREGATE cannot undo tool side effects.
     return max(1, available // (1 + settings.max_retries))
+
+
+def _contains_korean(value: str | None) -> bool:
+    return bool(value) and any("가" <= char <= "힣" for char in value)
 
 
 def _declared_operations(agent: AgentSpec, provider: object) -> list[tuple[str, str]]:
@@ -115,6 +124,64 @@ def _available_operations(
     return tuple(available), True
 
 
+def _live_action_space(
+    catalog: ToolCatalog | None, capabilities: tuple[str, ...]
+) -> tuple[tuple[tuple[str, str], ...], tuple[dict[str, object], ...], bool]:
+    """Project the healthy live catalog into a bounded, non-secret LLM menu."""
+
+    if catalog is None:
+        return (), (), False
+    operations: set[tuple[str, str]] = set()
+    tools: list[dict[str, object]] = []
+    seen: set[str] = set()
+    for capability in capabilities:
+        for descriptor in catalog.list_by_capability(capability):
+            if descriptor.health_status.value == "unhealthy":
+                continue
+            for operation in descriptor.operations:
+                operations.add((capability, str(operation)))
+            tool_id = str(descriptor.tool_id)
+            if tool_id in seen:
+                continue
+            seen.add(tool_id)
+            tools.append(
+                {
+                    "tool_id": tool_id,
+                    "server_id": descriptor.server_id,
+                    "tool_name": descriptor.tool_name,
+                    "capability": capability,
+                    "operations": tuple(str(item) for item in descriptor.operations),
+                    "target_types": tuple(descriptor.target_types),
+                    "required_arguments": descriptor.required_arguments,
+                    "optional_arguments": descriptor.optional_arguments,
+                    "risk_level": descriptor.risk_level.value,
+                    "health_status": descriptor.health_status.value,
+                }
+            )
+    return tuple(sorted(operations)), tuple(tools), True
+
+
+async def _offer_role_provider(
+    provider: object, agent: AgentSpec, context: GraphCandidateContext
+) -> CandidateBatch:
+    """Normalize graph-aware and legacy provider shapes at one boundary."""
+
+    graph_propose = getattr(provider, "propose_graph", None)
+    legacy_propose = getattr(provider, "propose", None)
+    if callable(graph_propose):
+        offered = await graph_propose(agent, context)
+    elif callable(legacy_propose):
+        offered = await legacy_propose(
+            agent, context.view, context.observation, step=context.step
+        )
+    else:
+        raise TypeError(
+            "candidate provider implements neither propose_graph(spec, context) "
+            "nor propose(spec, view, observation, step=)"
+        )
+    return offered if isinstance(offered, CandidateBatch) else CandidateBatch(candidates=offered)
+
+
 async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
     runtime = state["runtime"]
     observation = state.get("observation")
@@ -128,6 +195,16 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
         if runtime.active_task_id is not None
         else None
     )
+    mission = (
+        await deps.task_graph_store.get_mission(runtime.mission_id)
+        if runtime.mission_id is not None
+        else None
+    )
+    operator_guidance = [
+        str(item)[:500]
+        for item in ((mission.operator_preferences.get("guidance") or []) if mission else [])
+    ][-3:]
+    runtime_observations = observations_for_prompt(runtime.recent_observations)
     if (
         agent.max_actions is not None
         and runtime.actions_by_agent.get(str(agent.agent_id), 0) >= agent.max_actions
@@ -165,6 +242,13 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
     rejections: list[CandidateRejection] = []
     drops: list[DraftDrop] = []
     planning_digest = ""
+    planning_source = "playbook"
+    llm_turn = None
+    llm_turn_error: str | None = None
+    llm_candidate_order: dict[str, int] = {}
+    publisher = publisher_for(state, deps, "orchestration.plan")
+    last_event_id = state.get("last_event_id")
+    context_published = False
     try:
         if definition is None:
             compiled = await compiler.compile_playbook(
@@ -175,19 +259,24 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                 raise LookupError(
                     f"candidate provider {definition.provider_id!r} is not registered"
                 )
-            available_operations, operations_verified = _available_operations(
-                deps.tool_catalog, _declared_operations(agent, provider)
-            )
+            planning_mode = deps.settings.planning_mode
+            if planning_mode in {"llm_first", "hybrid"}:
+                available_operations, available_tools, operations_verified = _live_action_space(
+                    deps.tool_catalog, tuple(str(item) for item in agent.capabilities)
+                )
+            else:
+                available_operations, operations_verified = _available_operations(
+                    deps.tool_catalog, _declared_operations(agent, provider)
+                )
+                available_tools = ()
             planning_digest = planning_fingerprint(
                 observation=observation,
                 available_operations=available_operations,
                 prior_candidate_keys=terminal_keys,
             )
-            llm_generation = deps.settings.llm_candidate_generation and deps.llm_client is not None
+            llm_generation = planning_mode != "playbook_only" and deps.llm_client is not None
             generation_excerpts: tuple[dict[str, object], ...] = ()
             if llm_generation:
-                # RC#2: give the generator the raw outcome per known target so
-                # it can propose a follow-up the playbook never anticipated.
                 observation_targets = [
                     GraphNodeId(node_id)
                     for node_ids in observation.node_ids_by_type.values()
@@ -208,6 +297,7 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                 task_id=str(active_task.task_id) if active_task else None,
                 task_source=active_task.provenance.source if active_task else None,
                 task_objective=active_task.objective if active_task else None,
+                mission_objective=(mission.objective if mission else runtime.current_goal),
                 task_target_node_ids=(
                     tuple(active_task.related_attack_graph_node_ids) if active_task else ()
                 ),
@@ -215,66 +305,105 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                 open_hypotheses=tuple(observation.open_hypotheses),
                 prior_candidate_keys=frozenset(terminal_keys),
                 available_operations=available_operations,
+                available_tools=available_tools,
                 operations_verified=operations_verified,
                 planning_fingerprint=planning_digest,
                 evidence_excerpts=generation_excerpts,
+                runtime_observations=tuple(runtime_observations),
+                operator_guidance=tuple(operator_guidance),
             )
-            # `GraphCandidateProvider` (section 4 consolidation) declares
-            # only `propose_graph` -- a provider that instead implements
-            # only the narrower three-argument `propose` shape (a
-            # documented, intentional exception for simple/plugin
-            # providers; see that Protocol's docstring) is still accepted,
-            # looked up dynamically rather than through either static
-            # method name. A provider with neither is a real registration
-            # bug and must fail loudly, not with a bare AttributeError.
-            graph_propose = getattr(provider, "propose_graph", None)
-            legacy_propose = getattr(provider, "propose", None)
-            if callable(graph_propose):
-                offered = await graph_propose(agent, context)
-            elif callable(legacy_propose):
-                offered = await legacy_propose(
-                    agent, context.view, context.observation, step=context.step
+
+            if planning_mode == "llm_first" and llm_generation:
+                # Publish the observation before the model's answer so the
+                # human trace follows the same order as the actual ReAct turn.
+                prepared = await publisher.publish(
+                    AGENT_CONTEXT_PREPARED,
+                    {
+                        "agent_id": agent.agent_id,
+                        "task_id": active_task.task_id if active_task else None,
+                        "goal": mission.objective if mission else runtime.current_goal,
+                        "graph_summary": observation.summary_line(),
+                        "candidate_count": 0,
+                        "action_space_count": len(available_operations),
+                        "evidence_count": len(generation_excerpts),
+                        "runtime_observation_count": len(runtime_observations),
+                        "runtime_observation_kinds": [
+                            str(item.get("kind", "runtime"))
+                            for item in runtime_observations[-8:]
+                        ],
+                        "operator_guidance": operator_guidance,
+                        "planning_mode": planning_mode,
+                        "candidate_source": "llm_turn",
+                    },
+                    causation_id=last_event_id,
                 )
+                last_event_id = prepared.event_id
+                context_published = True
+
+            if planning_mode == "llm_first" and llm_generation:
+                # The model gets the actual observation + live tool space and
+                # owns the first proposal. Recipes are recovery knowledge, not
+                # a menu that constrains the model's initial choice.
+                generator = LLMCandidateProvider(deps.llm_client)
+                llm_batch = await generator.propose_graph(agent, context)
+                llm_turn = generator.last_decision
+                llm_turn_error = generator.last_error
+                drafts = list(llm_batch.candidates)
+                drops = list(llm_batch.drops)
+                compiled, rejections = compiler.compile_drafts_with_rejections(drafts)
+                for index, draft in enumerate(llm_batch.candidates):
+                    candidate = next((item for item in compiled if item.draft == draft), None)
+                    if candidate is not None:
+                        llm_candidate_order[candidate.candidate_key] = index
+                fallback_needed = generator.last_error is not None or (
+                    llm_turn is not None and llm_turn.intent == "act" and not compiled
+                )
+                if fallback_needed:
+                    fallback = await _offer_role_provider(provider, agent, context)
+                    fallback_compiled, fallback_rejections = (
+                        compiler.compile_drafts_with_rejections(fallback.candidates)
+                    )
+                    drafts.extend(fallback.candidates)
+                    diagnostics.extend(fallback.diagnostics)
+                    drops.extend(fallback.drops)
+                    rejections.extend(fallback_rejections)
+                    compiled.extend(fallback_compiled)
+                    planning_source = "recipe_fallback"
+                else:
+                    planning_source = "llm_turn"
             else:
-                raise TypeError(
-                    f"candidate provider {definition.provider_id!r} implements neither "
-                    f"propose_graph(spec, context) nor propose(spec, view, observation, step=)"
-                )
-            if isinstance(offered, CandidateBatch):
-                drafts, diagnostics = offered.candidates, offered.diagnostics
-                drops = offered.drops
-            else:
-                drafts = offered
-            if llm_generation:
-                # RC#1: the model may add drafts the playbook never listed.
-                # They join the same list and are compiled/policy-checked
-                # identically. Generation is kept purely *additive*: a draft
-                # whose (target, operation) the playbook already covers is
-                # dropped, so a generated variant can never crowd out the
-                # argument-bound playbook draft for the same work -- the model
-                # only fills gaps the playbook left open.
-                llm_batch = await LLMCandidateProvider(deps.llm_client).propose_graph(
-                    agent, context
-                )
-                covered = {
-                    (str(target), draft.plan_step.operation_key)
-                    for draft in drafts
-                    for target in draft.target_node_ids
-                }
-                for gen_draft in llm_batch.candidates:
-                    key = (str(gen_draft.target_node_ids[0]), gen_draft.plan_step.operation_key)
-                    if key in covered:
-                        drops.append(
-                            DraftDrop(
-                                step_id=gen_draft.plan_step.step_id,
-                                target_node_id=str(gen_draft.target_node_ids[0]),
-                                reason="covered_by_playbook",
-                            )
+                offered = await _offer_role_provider(provider, agent, context)
+                drafts = list(offered.candidates)
+                diagnostics = list(offered.diagnostics)
+                drops = list(offered.drops)
+                if planning_mode == "hybrid" and llm_generation:
+                    generator = LLMCandidateProvider(deps.llm_client)
+                    llm_batch = await generator.propose_graph(agent, context)
+                    llm_turn = generator.last_decision
+                    llm_turn_error = generator.last_error
+                    covered = {
+                        (str(target), draft.plan_step.operation_key)
+                        for draft in drafts
+                        for target in draft.target_node_ids
+                    }
+                    for generated_draft in llm_batch.candidates:
+                        key = (
+                            str(generated_draft.target_node_ids[0]),
+                            generated_draft.plan_step.operation_key,
                         )
-                    else:
-                        drafts.append(gen_draft)
-                drops = [*drops, *llm_batch.drops]
-            compiled, rejections = compiler.compile_drafts_with_rejections(drafts)
+                        if key in covered:
+                            drops.append(
+                                DraftDrop(
+                                    step_id=generated_draft.plan_step.step_id,
+                                    target_node_id=str(generated_draft.target_node_ids[0]),
+                                    reason="covered_by_playbook",
+                                )
+                            )
+                        else:
+                            drafts.append(generated_draft)
+                    drops.extend(llm_batch.drops)
+                    planning_source = "hybrid"
+                compiled, rejections = compiler.compile_drafts_with_rejections(drafts)
             for draft in drafts:
                 check = draft.plan_step.authentication_check
                 if check is not None and not any(item.draft == draft for item in compiled):
@@ -310,10 +439,35 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             compiled = [
                 item for item in compiled if targets.intersection(item.draft.target_node_ids)
             ]
-    publisher = publisher_for(state, deps, "orchestration.plan")
-    last_event_id = state.get("last_event_id")
+    if llm_turn is not None or llm_turn_error is not None:
+        turn_event = await publisher.publish(
+            AGENT_TURN_DECIDED,
+            {
+                "agent_id": agent.agent_id,
+                "intent": llm_turn.intent if llm_turn is not None else "act",
+                "response": (
+                    llm_turn.response
+                    if llm_turn is not None
+                    else "LLM 결정을 받을 수 없어 검증된 fallback recipe로 계속합니다."
+                ),
+                "decision_summary": (
+                    llm_turn.decision_summary
+                    if llm_turn is not None
+                    else (
+                        "모델 호출 실패는 실행 권한을 넓히지 않으며, "
+                        "동일한 Control 검사를 거칩니다."
+                    )
+                ),
+                "assumptions": llm_turn.assumptions if llm_turn is not None else [],
+                "proposed_action_count": len(llm_turn.actions) if llm_turn is not None else 0,
+                "planning_mode": deps.settings.planning_mode,
+                "candidate_source": planning_source,
+                "fallback_reason": "llm_call_failed" if llm_turn_error is not None else None,
+            },
+            causation_id=last_event_id,
+        )
+        last_event_id = turn_event.event_id
     if runtime.mission_id is not None:
-        mission = await deps.task_graph_store.get_mission(runtime.mission_id)
         excluded = (
             list(mission.operator_preferences.get("excluded_endpoints") or [])
             if mission is not None
@@ -353,8 +507,7 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                     )
                 )
                 task_blocked = (
-                    active_task is not None
-                    and str(active_task.task_id) in excluded_task_ids
+                    active_task is not None and str(active_task.task_id) in excluded_task_ids
                 )
                 if endpoint_blocked or area_blocked or task_blocked:
                     rejected = await publisher.publish(
@@ -367,7 +520,8 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                             "tool_id": str(candidate.tool.tool_id),
                             "reason": (
                                 "operator_excluded_endpoint"
-                                if endpoint_blocked else "operator_excluded_area_or_task"
+                                if endpoint_blocked
+                                else "operator_excluded_area_or_task"
                             ),
                             "field": "",
                             "candidate_key": candidate.candidate_key,
@@ -571,7 +725,12 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
         )
         last_event_id = event.event_id
     compiled = eligible
-    compiled.sort(key=lambda item: (-item.priority.total, item.candidate_key))
+    if planning_source == "llm_turn":
+        compiled.sort(
+            key=lambda item: llm_candidate_order.get(item.candidate_key, len(compiled))
+        )
+    else:
+        compiled.sort(key=lambda item: (-item.priority.total, item.candidate_key))
     planning_observation = observation
     if definition is not None and compiled:
         # Bound only after dedup and pruning, otherwise already-terminal or
@@ -602,43 +761,82 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             limit=evidence_limit,
         )
 
-    planner = build_planner(
-        agent.planner_kind,
-        deps.llm_client,
-        score_margin=deps.settings.planner_score_margin,
-        top_k=deps.settings.planner_rerank_top_k,
-    )
-    step = await planner.plan(
-        PlanningContext(
-            agent=agent,
-            observation=planning_observation,
-            candidates=candidates,
-            run_id=runtime.run_id,
-            engagement_id=runtime.engagement_id,
-            step=runtime.step_count,
-            llm=deps.llm_client,
-            goal=active_task.objective if active_task else runtime.current_goal,
-            metadata={
-                "context_profile": (
-                    definition.context_profile.profile_id if definition else "default"
+    if not context_published:
+        context_event = await publisher.publish(
+            AGENT_CONTEXT_PREPARED,
+            {
+                "agent_id": agent.agent_id,
+                "task_id": active_task.task_id if active_task else None,
+                "goal": (
+                    active_task.objective
+                    if active_task
+                    else (mission.objective if mission else runtime.current_goal)
                 ),
-                "projected_nodes": sum(planning_observation.node_counts.values()),
-                "source_nodes": sum(observation.node_counts.values()),
-                "evidence_excerpts": [item.model_dump(mode="json") for item in evidence_excerpts],
-                # One playbook step bound to several targets keeps the same
-                # PlanStep.step_id, so step_id is NOT a unique identity here.
-                # The compiler's candidate_key is, and these two are aligned
-                # with the candidates list handed to the planner: a hybrid
-                # planner orders and shortlists by option key, then maps the
-                # chosen key back to the PlanStep it came from. The PlanStep /
-                # PM action contract is untouched.
-                "candidate_keys": [candidate.candidate_key for candidate in compiled],
-                "candidate_scores": {
-                    candidate.candidate_key: candidate.priority.total for candidate in compiled
-                },
+                "graph_summary": planning_observation.summary_line(),
+                "candidate_count": len(candidates),
+                "evidence_count": len(evidence_excerpts),
+                "runtime_observation_count": len(runtime_observations),
+                "runtime_observation_kinds": [
+                    str(item.get("kind", "runtime")) for item in runtime_observations[-8:]
+                ],
+                "operator_guidance": operator_guidance,
+                "planning_mode": deps.settings.planning_mode,
+                "candidate_source": planning_source,
             },
+            causation_id=last_event_id,
         )
-    )
+        last_event_id = context_event.event_id
+
+    planner = None
+    selected = None
+    if planning_source == "llm_turn" and compiled:
+        # Preserve the model's explicit action order. Do not spend a second LLM
+        # call reranking the decision that was just shown to the operator.
+        selected = min(
+            compiled,
+            key=lambda item: llm_candidate_order.get(item.candidate_key, len(compiled)),
+        )
+        step = selected.plan_step
+    else:
+        planner = build_planner(
+            agent.planner_kind,
+            deps.llm_client,
+            score_margin=deps.settings.planner_score_margin,
+            top_k=deps.settings.planner_rerank_top_k,
+        )
+        step = await planner.plan(
+            PlanningContext(
+                agent=agent,
+                observation=planning_observation,
+                candidates=candidates,
+                run_id=runtime.run_id,
+                engagement_id=runtime.engagement_id,
+                step=runtime.step_count,
+                llm=deps.llm_client,
+                goal=(
+                    active_task.objective
+                    if active_task
+                    else (mission.objective if mission else runtime.current_goal)
+                ),
+                metadata={
+                    "context_profile": (
+                        definition.context_profile.profile_id if definition else "default"
+                    ),
+                    "projected_nodes": sum(planning_observation.node_counts.values()),
+                    "source_nodes": sum(observation.node_counts.values()),
+                    "evidence_excerpts": [
+                        item.model_dump(mode="json") for item in evidence_excerpts
+                    ],
+                    "runtime_observations": runtime_observations,
+                    "operator_guidance": operator_guidance,
+                    "candidate_keys": [candidate.candidate_key for candidate in compiled],
+                    "candidate_scores": {
+                        candidate.candidate_key: candidate.priority.total
+                        for candidate in compiled
+                    },
+                },
+            )
+        )
 
     if step is None:
         return advance(
@@ -650,7 +848,7 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             last_event_id=last_event_id,
         )
 
-    selected = next((item for item in compiled if item.plan_step == step), None)
+    selected = selected or next((item for item in compiled if item.plan_step == step), None)
     if selected is None:  # Defensive: a planner may only return an offered step.
         return advance(
             state,
@@ -660,6 +858,42 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             current_work_id=None,
             last_event_id=last_event_id,
         )
+
+    selection_basis = (
+        "llm_turn"
+        if planning_source == "llm_turn"
+        else getattr(planner, "last_decision", None)
+        or ("llm" if agent.planner_kind == "llm" else "playbook_order")
+    )
+    korean_fallback_rationale = None
+    if planning_source == "recipe_fallback" and _contains_korean(
+        mission.objective if mission else runtime.current_goal
+    ):
+        korean_fallback_rationale = (
+            "LLM 호출 결과를 사용할 수 없어 검증된 fallback recipe를 선택했습니다."
+        )
+    decision_rationale = (
+        llm_turn.decision_summary
+        if planning_source == "llm_turn" and llm_turn is not None
+        else korean_fallback_rationale
+        or getattr(planner, "last_rationale", None)
+        or step.reason
+    )
+    decision_event = await publisher.publish(
+        AGENT_DECISION_RECORDED,
+        {
+            "agent_id": agent.agent_id,
+            "task_id": active_task.task_id if active_task else None,
+            "selection_basis": selection_basis,
+            "candidate_count": len(candidates),
+            "capability": step.capability,
+            "operation": step.operation,
+            "target": target_display_name(step.resolved_target()),
+            "rationale": str(decision_rationale)[:500],
+        },
+        causation_id=last_event_id,
+    )
+    last_event_id = decision_event.event_id
 
     batch_limit = min(
         deps.settings.max_actions_per_turn,
@@ -845,6 +1079,21 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             expected_observation=candidate_step.expected_observation,
             created_at=datetime.now(timezone.utc),
         )
+        tool_selected = await publisher.publish(
+            MCP_TOOL_SELECTED,
+            {
+                "action_id": proposal.action_id,
+                "tool_id": str(candidate.tool.tool_id),
+                "server_id": candidate.tool.server_id,
+                "tool_name": candidate.tool.tool_name,
+                "capability": proposal.capability,
+                "operation": proposal.operation,
+                "risk_level": candidate.tool.risk_level.value,
+                "health_status": candidate.tool.health_status.value,
+            },
+            correlation_id=str(action_id),
+            causation_id=last_event_id,
+        )
         proposed = await publisher.publish(
             EventType.ACTION_PROPOSED,
             {
@@ -866,9 +1115,11 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                 ),
                 "projected_nodes": sum(planning_observation.node_counts.values()),
                 "source_nodes": sum(observation.node_counts.values()),
+                "reason": candidate_step.reason,
+                "selection_basis": selection_basis,
             },
             correlation_id=str(action_id),
-            causation_id=last_event_id,
+            causation_id=tool_selected.event_id,
         )
         last_event_id = proposed.event_id
         dispatch_items.append(

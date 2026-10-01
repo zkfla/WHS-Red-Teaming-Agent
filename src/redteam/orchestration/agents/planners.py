@@ -72,6 +72,7 @@ class LLMPlanner:
         self._llm = llm
         self._fallback = fallback or PlaybookPlanner()
         self.last_fallback_reason: str | None = None
+        self.last_rationale: str | None = None
 
     async def plan(self, context: PlanningContext) -> PlanStep | None:
         if not context.candidates:
@@ -97,15 +98,19 @@ class LLMPlanner:
 
         step_id = str(choice.get("step_id", "")) if isinstance(choice, dict) else ""
         if step_id not in by_id:
-            return await self._fall_back(
-                "llm returned a step_id which was not offered", context
-            )
+            return await self._fall_back("llm returned a step_id which was not offered", context)
 
         self.last_fallback_reason = None
+        self.last_rationale = (
+            str(choice.get("rationale", "")).strip()[:500]
+            if isinstance(choice, dict) and choice.get("rationale")
+            else None
+        )
         return by_id[step_id]
 
     async def _fall_back(self, reason: str, context: PlanningContext) -> PlanStep | None:
         self.last_fallback_reason = reason
+        self.last_rationale = None
         logger.info("LLMPlanner falling back to %s: %s", type(self._fallback).__name__, reason)
         return await self._fallback.plan(context)
 
@@ -142,10 +147,9 @@ class LLMPlanner:
                     outcome += f" error={item['error_code']}"
                 lines.append(
                     "  - evidence_id={evidence_id} target={target_node_id} "
-                    "source={source_id}{outcome} summary={summary}".format(
-                        outcome=outcome, **item
-                    )
+                    "source={source_id}{outcome} summary={summary}".format(outcome=outcome, **item)
                 )
+        _append_runtime_context(lines, context)
 
         lines.append("")
         lines.append("Available steps:")
@@ -230,9 +234,7 @@ class HybridPlanner(LLMPlanner):
         """(option_id, step) in score order, or the caller's own ranked order."""
 
         scores = context.metadata.get("candidate_scores") or {}
-        paired = list(
-            zip(self._option_ids(context), context.candidates, strict=False)
-        )
+        paired = list(zip(self._option_ids(context), context.candidates, strict=False))
         if not isinstance(scores, dict) or not scores:
             return paired
         return sorted(
@@ -279,9 +281,7 @@ class HybridPlanner(LLMPlanner):
         except Exception as exc:  # noqa: BLE001 - a planner must not abort the run
             # Provider messages may contain prompt fragments, target data or
             # credentials. Keep only the exception class.
-            return self._fall_back_to_top1(
-                f"llm call failed: {type(exc).__name__}", ordered
-            )
+            return self._fall_back_to_top1(f"llm call failed: {type(exc).__name__}", ordered)
 
         option_id = str(choice.get("option_id", "")) if isinstance(choice, dict) else ""
         if option_id not in offered:
@@ -291,12 +291,18 @@ class HybridPlanner(LLMPlanner):
         self.last_fallback_reason = None
         self.last_decision = "reranked"
         self.last_option_id = option_id
+        self.last_rationale = (
+            str(choice.get("rationale", "")).strip()[:500]
+            if isinstance(choice, dict) and choice.get("rationale")
+            else None
+        )
         return offered[option_id]
 
     def _fall_back_to_top1(
         self, reason: str, ordered: list[tuple[str, PlanStep]]
     ) -> PlanStep | None:
         self.last_fallback_reason = reason
+        self.last_rationale = None
         self.last_decision = "fallback"
         if ordered:
             self.last_option_id = ordered[0][0]
@@ -304,9 +310,7 @@ class HybridPlanner(LLMPlanner):
         return ordered[0][1] if ordered else None
 
     @staticmethod
-    def _render_options(
-        context: PlanningContext, shortlist: list[tuple[str, PlanStep]]
-    ) -> str:
+    def _render_options(context: PlanningContext, shortlist: list[tuple[str, PlanStep]]) -> str:
         """The ambiguity prompt: unique option ids, nothing else to pick from.
 
         Rendered separately from the parent's prompt because the option id is
@@ -350,10 +354,9 @@ class HybridPlanner(LLMPlanner):
                     outcome += f" error={item['error_code']}"
                 lines.append(
                     "  - evidence_id={evidence_id} target={target_node_id} "
-                    "source={source_id}{outcome} summary={summary}".format(
-                        outcome=outcome, **item
-                    )
+                    "source={source_id}{outcome} summary={summary}".format(outcome=outcome, **item)
                 )
+        _append_runtime_context(lines, context)
 
         lines.append("")
         lines.append("These options are the only ones available; each option_id is unique:")
@@ -369,6 +372,21 @@ class HybridPlanner(LLMPlanner):
         lines.append("")
         lines.append("Answer with the option_id of the single option to take next.")
         return "\n".join(lines)
+
+
+def _append_runtime_context(lines: list[str], context: PlanningContext) -> None:
+    """Append bounded non-graph feedback shared by both planner prompts."""
+
+    observations = context.metadata.get("runtime_observations", [])
+    if isinstance(observations, list) and observations:
+        lines.append("Recent runtime observations (adapt to these outcomes):")
+        for item in observations[-8:]:
+            if isinstance(item, dict):
+                lines.append(f"  - [{item.get('kind', 'runtime')}] {item.get('summary', '')}")
+    guidance = context.metadata.get("operator_guidance", [])
+    if isinstance(guidance, list) and guidance:
+        lines.append("Latest operator guidance:")
+        lines.extend(f"  - {str(item)[:500]}" for item in guidance[-3:])
 
 
 def _target_label(step: PlanStep) -> str:

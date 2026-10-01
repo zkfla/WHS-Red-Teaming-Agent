@@ -257,6 +257,16 @@ executes, and `Enter` there hands off to the *exact same*
 `build_application`/`run_engagement` path `redteam run` uses below —
 nothing is re-implemented for this mode.
 
+The terminal then stays open as a chat session. With a real LLM, the runtime's
+actual planning turn prints a concise response, explicit assumptions and the
+reason for its next concrete action; the CLI does not show a separate,
+speculative pre-run plan. During a Run, ordinary sentences are answered or
+converted into bounded Mission guidance; they no longer have to match a fixed
+command keyword. After a Run, questions are answered from the saved run
+summary instead of being mistaken for a new Mission. The displayed reasoning
+is a decision summary, not private chain-of-thought. Every concrete action
+still passes candidate compilation, Control and MCP execution.
+
 The natural-language layer is `redteam.intake` (the **Engagement Intake
 Assistant**), a distinct role from the Orchestrator:
 
@@ -295,6 +305,7 @@ application-config YAML file or `--config` flag in this CLI:
 
 ```bash
 REDTEAM_LLM_PROVIDER=litellm REDTEAM_LLM_MODEL=gpt-4o-mini \
+REDTEAM_PLANNING_MODE=llm_first \
 REDTEAM_MCP_SERVERS=recon,web-http \
   redteam run engagement.yaml
 ```
@@ -313,11 +324,23 @@ secrets still come from the process environment (`.env.example`).
 startup, best-effort (`_shared.load_dotenv_if_present`) — a real
 shell/CI-exported variable always wins over a `.env` value, so this can
 only fill in what is otherwise unset, never override an explicit choice.
+`REDTEAM_PLANNING_MODE` controls who proposes the frontier:
+
+- `llm_first` (default for a real CLI LLM): one LLM turn selects actions from
+  the live MCP catalog; the role playbook is used only if the proposal fails
+  or cannot compile.
+- `hybrid`: legacy additive behavior—playbook frontier plus novel LLM drafts.
+- `playbook_only` (default for `fake`): deterministic/offline recipes only.
+
+These modes change planning, not authorization. Scope, risk, approval, rate
+limits and budget are always decided later by the Control Plane.
 The interactive `redteam` entrypoint's one-time setup writes
-`REDTEAM_LLM_PROVIDER`/`REDTEAM_LLM_MODEL` (and, if you opt in,
-`REDTEAM_MCP_SERVERS`/`REDTEAM_MCP_RECON_PASSIVE_*` for a single
-low-risk recon-passive server against your first declared host) straight
-into `.env` for you.
+`REDTEAM_LLM_PROVIDER`/`REDTEAM_LLM_MODEL`. When no MCP configuration exists,
+it also creates a scope-pinned server policy and registers the two immediately
+usable, read-only in-repo stdio servers (`recon-passive` and `web-http`) in
+`.env`. Active scanning, proxy replay, mobile and APK-analysis servers require
+operator-owned ports, captures, devices or artifacts and are never fabricated
+by the default setup.
 
 `redteam.core.config.AppConfig`/`load_app_config()` (a YAML-loadable
 `AppConfig` shape, e.g. `examples/app.yaml`) still exist as a general

@@ -31,3 +31,18 @@ def test_recursion_limit_covers_the_whole_loop() -> None:
     settings = OrchestrationSettings(max_steps=10)
     assert settings.effective_recursion_limit == 10 * NODES_PER_TURN + RECURSION_SLACK
     assert OrchestrationSettings(max_steps=10, recursion_limit=42).effective_recursion_limit == 42
+
+
+def test_explicit_llm_first_mode_replaces_legacy_additive_planning() -> None:
+    settings = OrchestrationSettings.from_config(
+        OrchestrationConfig(planning_mode="llm_first")
+    )
+    assert settings.planning_mode == "llm_first"
+    assert settings.llm_candidate_generation is True
+
+
+def test_legacy_generation_flag_maps_to_hybrid_mode() -> None:
+    settings = OrchestrationSettings.from_config(
+        OrchestrationConfig(llm_candidate_generation=True)
+    )
+    assert settings.planning_mode == "hybrid"

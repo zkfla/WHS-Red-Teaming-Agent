@@ -60,6 +60,29 @@ async def test_action_proposed_renders_a_human_readable_line_without_ids() -> No
     assert "cand_abc123" not in output
 
 
+async def test_agent_turn_renders_public_reasoning_without_private_trace() -> None:
+    from redteam.orchestration.events import AGENT_TURN_DECIDED
+
+    console, buffer = _console()
+    renderer = RichEventRenderer(console, verbose=False)
+    await renderer(
+        _event(
+            AGENT_TURN_DECIDED,
+            {
+                "response": "HTTP 서비스를 먼저 확인하겠습니다.",
+                "decision_summary": "현재 호스트에는 서비스 정보가 없습니다.",
+                "assumptions": ["대상은 허용 범위 안입니다."],
+                "candidate_source": "llm_turn",
+            },
+        )
+    )
+
+    output = buffer.getvalue()
+    assert "[Agent] HTTP 서비스를 먼저 확인하겠습니다." in output
+    assert "[Reason] 현재 호스트에는 서비스 정보가 없습니다." in output
+    assert "[Assumption] 대상은 허용 범위 안입니다." in output
+
+
 async def test_verbose_mode_shows_the_hidden_internal_fields() -> None:
     console, buffer = _console()
     renderer = RichEventRenderer(console, verbose=True)
@@ -188,3 +211,35 @@ async def test_result_mapper_failure_renders_without_internal_payload() -> None:
     assert "Result mapper failed" in output
     assert "invalid_result_shape" in output
     assert "secret traceback" not in output
+
+
+async def test_mcp_selection_and_safe_tool_error_are_visible() -> None:
+    from redteam.orchestration.events import MCP_TOOL_SELECTED
+
+    console, buffer = _console()
+    renderer = RichEventRenderer(console, verbose=False)
+
+    await renderer(
+        _event(
+            MCP_TOOL_SELECTED,
+            {
+                "server_id": "recon-passive",
+                "tool_name": "http_probe",
+                "risk_level": "low",
+                "health_status": "healthy",
+            },
+        )
+    )
+    await renderer(
+        _event(
+            EventType.TOOL_EXECUTION_FAILED,
+            {
+                "error_code": "mcp_tool_error",
+                "error_message": "target connection failed",
+            },
+        )
+    )
+
+    output = buffer.getvalue()
+    assert "[MCP] recon-passive/http_probe selected" in output
+    assert "mcp_tool_error: target connection failed" in output

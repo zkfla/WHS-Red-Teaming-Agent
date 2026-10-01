@@ -17,7 +17,7 @@ from __future__ import annotations
 import os
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import yaml
 from pydantic import BaseModel, Field
@@ -109,9 +109,12 @@ class LLMConfig(BaseModel):
 class OrchestrationConfig(BaseModel):
     max_retries: int = Field(default=3, ge=0)
     max_steps: int = Field(default=50, ge=1)
-    #: RC#1 opt-in: let the LLM generate candidate drafts in addition to the
-    #: playbook frontier. Off by default; every generated draft is still
-    #: compiled and policy-checked like any other before it can run.
+    #: Planning authority. ``None`` preserves the legacy interpretation of
+    #: ``llm_candidate_generation``; interactive/CLI configuration resolves a
+    #: real LLM to ``llm_first`` explicitly.
+    planning_mode: Literal["llm_first", "hybrid", "playbook_only"] | None = None
+    #: Deprecated compatibility switch. New callers should use
+    #: ``planning_mode``. True maps to ``hybrid`` when no mode is supplied.
     llm_candidate_generation: bool = Field(default=False)
 
 

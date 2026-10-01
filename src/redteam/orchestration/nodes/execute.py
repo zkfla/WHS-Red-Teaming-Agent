@@ -21,6 +21,10 @@ from redteam.orchestration.action_naming import (
 )
 from redteam.orchestration.context import RuntimeDeps
 from redteam.orchestration.nodes._support import advance, publisher_for
+from redteam.orchestration.runtime_observation import (
+    RuntimeObservation,
+    append_runtime_observation,
+)
 from redteam.orchestration.state import GraphState
 
 DEFAULT_TIMEOUT_SECONDS = 10.0
@@ -44,8 +48,10 @@ def _retry_safe(proposal: ActionProposal) -> bool:
         return True
     if action == "web.http_request":
         method = proposal.arguments.get("method")
-        return isinstance(method, str) and method.upper() in {"GET", "HEAD"} and not any(
-            key in proposal.arguments for key in ("body", "data", "json", "payload")
+        return (
+            isinstance(method, str)
+            and method.upper() in {"GET", "HEAD"}
+            and not any(key in proposal.arguments for key in ("body", "data", "json", "payload"))
         )
     return False
 
@@ -283,6 +289,7 @@ async def execute_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             "action_id": result.action_id,
             "success": result.success,
             "error_code": result.error.code if result.error else None,
+            "error_message": result.error.message if result.error else None,
             "candidate_key": step.candidate_key,
             "hypothesis_id": proposal.hypothesis_id,
         },
@@ -309,8 +316,7 @@ async def execute_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
     agent_key = str(proposal.agent_id)
     actions_by_agent[agent_key] = actions_by_agent.get(agent_key, 0) + 1
 
-    return advance(
-        state,
+    next_runtime = append_runtime_observation(
         runtime.model_copy(
             update={
                 "phase": AgentPhase.VERIFY,
@@ -322,6 +328,30 @@ async def execute_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                 "actions_by_agent": actions_by_agent,
             }
         ),
+        RuntimeObservation(
+            kind="tool",
+            summary=(
+                f"Tool {result.tool_id} "
+                + ("succeeded" if result.success else "failed")
+                + (
+                    f" with {result.error.code}: {result.error.message}"
+                    if result.error is not None
+                    else ""
+                )
+            )[:500],
+            outcome="success" if result.success else "failed",
+            step=runtime.step_count,
+            action_id=str(proposal.action_id),
+            capability=proposal.capability,
+            operation=proposal.operation,
+            reasons=([result.error.code, result.error.message] if result.error is not None else []),
+            alternative_allowed=True,
+        ),
+    )
+
+    return advance(
+        state,
+        next_runtime,
         last_event_id=finished.event_id,
         tool_result=result,
     )

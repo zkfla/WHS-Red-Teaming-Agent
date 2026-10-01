@@ -121,6 +121,21 @@ _REPRIORITIZE_KEYWORDS = (
     "priority order",
 )
 _FOCUS_KEYWORDS = ("focus", "concentrate", "prioritize", "emphasis", "집중", "중점", "우선")
+_GUIDANCE_KEYWORDS = (
+    "different method",
+    "another method",
+    "different way",
+    "another way",
+    "try another",
+    "try differently",
+    "instead",
+    "alternative",
+    "다른 방법",
+    "다른",
+    "다르게",
+    "대안",
+    "우회",
+)
 
 #: Only canonical, already-understood workstreams are extractable. This is
 #: what keeps FOCUS/EXCLUDE from being an implicit scope expansion: they can
@@ -259,7 +274,7 @@ def extract_areas(text: str) -> list[str]:
     return found
 
 
-def classify_instruction(instruction: str) -> IntentClassification:
+def classify_instruction(instruction: str, *, allow_guidance: bool = False) -> IntentClassification:
     """Deterministically classify one instruction, or reject it."""
     redacted = redact_text(instruction).strip()
     if not redacted:
@@ -297,7 +312,18 @@ def classify_instruction(instruction: str) -> IntentClassification:
                 intent_type = OperatorIntentType.STATUS_QUERY
                 matched.append(status)
             else:
-                raise IntentInterpretationError(f"unrecognized operator instruction: {redacted!r}")
+                guidance = _first_match(_GUIDANCE_KEYWORDS, lowered)
+                if allow_guidance and guidance is not None:
+                    # Free-form strategy guidance is deliberately accepted only
+                    # on the live operator channel. It can influence planning,
+                    # but cannot create a target/action or bypass compilation,
+                    # Control, or MCP policy.
+                    intent_type = OperatorIntentType.GUIDANCE
+                    matched.extend(["operator_guidance", guidance])
+                else:
+                    raise IntentInterpretationError(
+                        f"unrecognized operator instruction: {redacted!r}"
+                    )
 
     endpoint_selectors = extract_endpoint_selectors(redacted)
     task_selectors = extract_task_selectors(redacted)
@@ -362,6 +388,7 @@ def interpret_instruction(
     task_ids: list[TaskId] | None = None,
     parameters: dict[str, object] | None = None,
     source: str = "operator",
+    allow_guidance: bool = False,
 ) -> OperatorIntent:
     """Build a validated, secret-free ``OperatorIntent`` from free text.
 
@@ -369,7 +396,7 @@ def interpret_instruction(
     no known instruction, and ``pydantic.ValidationError`` when a caller
     supplies an executable parameter (``tool_id``, ...) — both fail closed.
     """
-    classification = classify_instruction(instruction)
+    classification = classify_instruction(instruction, allow_guidance=allow_guidance)
     params: dict[str, object] = secret_parameters(parameters)  # type: ignore[arg-type]
 
     if classification.areas and classification.intent_type not in _QUERY_TYPES:
