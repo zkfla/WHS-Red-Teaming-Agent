@@ -20,7 +20,7 @@ from jsonschema import Draft202012Validator
 from jsonschema.exceptions import SchemaError, ValidationError
 
 from redteam.capability.adapters.mcp.base import MCPAdapter, MCPCallResult
-from redteam.capability.adapters.mcp.workspace import WorkspaceMCPAdapter
+from redteam.capability.adapters.mcp.scoped_analysis import ScopedAnalysisMCPAdapter
 from redteam.capability.catalog import MCPToolCatalog, ToolCandidateMetadata
 from redteam.capability.registry import MCPToolRegistry
 from redteam.core.contracts.tool import ToolDescriptor, ToolError, ToolInvocation, ToolResult
@@ -256,25 +256,25 @@ class MCPToolGateway:
             )
 
         arguments = invocation.arguments
-        if isinstance(adapter, WorkspaceMCPAdapter):
+        if isinstance(adapter, ScopedAnalysisMCPAdapter):
             try:
                 arguments = adapter.bind_context(invocation)
             except ValueError:
                 return self._error_result(
                     invocation,
-                    code="workspace_context_mismatch",
-                    message="workspace invocation context differs from trusted execution context",
+                    code=f"{adapter.error_prefix}_context_mismatch",
+                    message="scoped invocation context differs from trusted execution context",
                 )
             try:
                 properties = descriptor.input_schema.get("properties", {})
                 if set(arguments) - set(properties):
-                    raise ValueError("unexpected workspace arguments")
+                    raise ValueError("unexpected scoped arguments")
                 Draft202012Validator(descriptor.input_schema).validate(arguments)
             except (SchemaError, ValidationError, TypeError, ValueError):
                 return self._error_result(
                     invocation,
-                    code="workspace_invalid_arguments",
-                    message="workspace arguments do not match the registered input schema",
+                    code=f"{adapter.error_prefix}_invalid_arguments",
+                    message="scoped arguments do not match the registered input schema",
                 )
 
         try:

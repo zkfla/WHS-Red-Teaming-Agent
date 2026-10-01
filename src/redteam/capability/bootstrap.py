@@ -10,6 +10,7 @@ from redteam.capability.adapters.mcp.base import MCPAdapter
 from redteam.capability.adapters.mcp.example import ExampleMCPAdapter
 from redteam.capability.adapters.mcp.mobile import MobileMCPAdapter
 from redteam.capability.adapters.mcp.recon import ReconMCPAdapter
+from redteam.capability.adapters.mcp.scoped_analysis import VDBMCPAdapter
 from redteam.capability.adapters.mcp.streamable_http import MCPServerAdapter
 from redteam.capability.adapters.mcp.transport import (
     AllowlistedMCPTransport,
@@ -36,6 +37,7 @@ from redteam.capability.settings import (
     MCPServerSettings,
     MCPTransportKind,
 )
+from redteam.capability.vdb_manifest import validate_vdb_descriptor
 from redteam.capability.workspace_manifest import validate_workspace_descriptor
 
 
@@ -158,11 +160,14 @@ async def _build_gateway(
             if settings.profile is not None:
                 descriptor.target_types = ["asset"]
                 try:
-                    validate_workspace_descriptor(
-                        descriptor,
-                        settings.profile,
-                        settings.workspace_asset_ref or "",
-                    )
+                    if settings.profile == "vdb_readonly":
+                        validate_vdb_descriptor(descriptor, settings.vdb_asset_ref or "")
+                    else:
+                        validate_workspace_descriptor(
+                            descriptor,
+                            settings.profile,
+                            settings.workspace_asset_ref or "",
+                        )
                 except ValueError as exc:
                     raise MCPConfigurationError(str(exc)) from exc
                 target_types[str(descriptor.tool_id)] = "asset"
@@ -231,7 +236,8 @@ def _create_adapter(settings: MCPServerSettings, transport: MCPTransport) -> MCP
     if settings.allowed_tools is not None:
         transport = AllowlistedMCPTransport(transport, settings.allowed_tools)
     if settings.profile is not None:
-        return WorkspaceMCPAdapter(
+        adapter_class = VDBMCPAdapter if settings.profile == "vdb_readonly" else WorkspaceMCPAdapter
+        return adapter_class(
             server_id=settings.server_id,
             risk_level=settings.risk_level,
             transport=transport,

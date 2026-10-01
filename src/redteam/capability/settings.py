@@ -56,6 +56,7 @@ class MCPServerSettings:
     max_output_bytes: int = 1_048_576
     profile: str | None = None
     workspace_asset_ref: str | None = None
+    vdb_asset_ref: str | None = None
 
     @classmethod
     def from_environment(cls, server_id: str) -> MCPServerSettings:
@@ -110,7 +111,25 @@ class MCPServerSettings:
         max_output_bytes = _load_max_output_bytes(prefix)
         profile = os.environ.get(f"{prefix}_PROFILE")
         workspace_asset_ref = None
-        if profile is not None:
+        vdb_asset_ref = None
+        if profile == "vdb_readonly":
+            if kind != MCPServerKind.ANALYSIS or transport != MCPTransportKind.STDIO:
+                raise MCPConfigurationError("vdb profile requires analysis kind and stdio")
+            vdb_asset_ref = _required_environment_value(f"{prefix}_VDB_ASSET_REF")
+            if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", vdb_asset_ref):
+                raise MCPConfigurationError("vdb asset_ref must be an opaque identifier")
+            from redteam.capability.vdb_manifest import VDB_TOOLS
+
+            if (
+                allowed_tools is None or set(allowed_tools) != set(VDB_TOOLS)
+                or tool_operations != {
+                    name: (spec.operation,) for name, spec in VDB_TOOLS.items()
+                }
+            ):
+                raise MCPConfigurationError("vdb profile requires exact allowlist and bindings")
+            if risk_level == RiskLevel.LOW:
+                raise MCPConfigurationError("vdb profile requires at least medium risk")
+        elif profile is not None:
             if profile not in {"workspace_read", "workspace_write"}:
                 raise MCPConfigurationError(f"{prefix}_PROFILE is not a supported profile")
             if kind != MCPServerKind.ANALYSIS or transport != MCPTransportKind.STDIO:
@@ -162,6 +181,7 @@ class MCPServerSettings:
             max_output_bytes=max_output_bytes,
             profile=profile,
             workspace_asset_ref=workspace_asset_ref,
+            vdb_asset_ref=vdb_asset_ref,
         )
 
     def request_headers(self) -> dict[str, str]:
