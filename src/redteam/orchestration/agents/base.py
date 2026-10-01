@@ -230,8 +230,8 @@ class AgentSpec(BaseModel):
     capabilities: list[str] = Field(default_factory=list)
     playbook: list[PlanStep] = Field(default_factory=list)
 
-    #: ``"playbook"`` takes the first available step; ``"llm"`` asks the
-    #: LLM gateway to choose among them (falling back to the first).
+    #: One runtime mode: the model generates and reviews paths/actions.
+    #: Playbook steps remain reference material for that reasoning.
     planner_kind: Literal["llm"] = "llm"
     system_prompt: str = ""
     #: Stop offering this agent after this many executed actions.

@@ -145,6 +145,15 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
         definition = deps.agents.definition(candidate.draft.agent_id)
         if definition and role_counts[candidate.draft.agent_id] >= definition.max_concurrency:
             continue
+        agent = deps.agents.get(candidate.draft.agent_id)
+        if (
+            agent is not None
+            and agent.max_actions is not None
+            and runtime.actions_by_agent.get(candidate.draft.agent_id, 0)
+            + role_counts[candidate.draft.agent_id]
+            >= agent.max_actions
+        ):
+            continue
         if conflicts & set(candidate.draft.conflict_keys):
             continue
         if any(

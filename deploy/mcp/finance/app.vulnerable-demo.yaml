@@ -26,6 +26,12 @@ orchestration:
   max_retries: 1
   max_steps: 30
 llm:
-  provider: fake
+  # Deliberately vulnerable demo still requires a real model: provider +
+  # model/key must come from environment (REDTEAM_LLM_PROVIDER=litellm,
+  # REDTEAM_LLM_MODEL, LLM_API_KEY). 'fake' is rejected by the
+  # real-model builder; tests inject their scripted stand-in explicitly.
+  provider: litellm
+  default_model: gpt-4o-mini
+  api_key_env_var: LLM_API_KEY
 logging:
   level: WARNING
