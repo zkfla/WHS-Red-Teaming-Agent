@@ -1,9 +1,11 @@
-# Capability 팀 기본 컴퓨터 도구 개발 계획 및 3인 역할 분담
+# Capability 팀 기본 컴퓨터 도구·취약점 조사 연동 계획 및 3인 역할 분담
 
 - 작성일: 2026-10-01
 - 담당 범위: MCP Tool Registry / MCP Adapter / Execution Substrate
 - 검토 기준: `origin/dev`의 `8979cac5f73de106c7433405cdb26c69ae3b4f74`
 - 문서 성격: 구현 계획. 아래 도구 이름과 신규 분류는 제안이며, 구현 완료나 계약 확정을 뜻하지 않는다.
+- 추가 반영: 사용자가 제공한 AppThreat VDB, EIP, GitHub MCP, m4vic·Rifteo Skills, Burp MCP, MobSF MCP 참고 워크플로우
+- 외부 프로젝트 확인일: 2026-10-01. 공개 README 및 설정 문서 확인이며, 설치·코드 보안 감사·실제 실행 검증 완료를 뜻하지 않는다.
 
 ## 1. 개발 목표
 
@@ -18,6 +20,9 @@
 - 웹검색과 허용된 페이지의 텍스트 읽기
 - 기존 브라우저 도구의 등록 및 실제 호출 검증
 - Registry 메타데이터, Adapter 결과 형식, 실행 권한, 테스트의 일관성 확보
+- 취약점 지식, 공개 PoC·패치 자료, 조사 방법론, 대상 검증 도구의 단계적 연동
+
+기본 컴퓨터 도구를 취약점 조사 도구로 대체하지 않는다. 파일·명령·검색 기반을 먼저 제공하고, 지식 조회와 실제 대상 검증을 별도 단계로 확장한다. 외부 원본의 기능 목록을 우리 Agent가 이미 사용할 수 있는 기능으로 표시하지 않는다.
 
 ## 2. 현재 상태와 부족한 부분
 
@@ -54,6 +59,9 @@
 | 메타데이터 | 필수·선택 인자, 대상, 위험도, 입력·출력 schema | Capability, Agent |
 | 권한 | 읽기·쓰기·실행·외부접속의 허용 및 승인 기준 | Control, Capability |
 | 큰 결과 | 출력 제한, 잘림 표시, 파일 저장 및 참조 방식 | Capability, Evidence, Agent |
+| 지식 조회 대상 | CVE·패키지·공개 저장소를 시험 대상과 구분해서 표현 | Core/계약 담당, Control, Agent |
+| Skills 및 MCP 자원 | 방법론 제공 경로와 필요시 resources/prompts 소비 방식 | Capability, Agent |
+| 외부 전송 | 제품명·버전·저장소 정보의 외부 조회 허용 기준 | Control, Capability |
 
 현재 canonical capability는 `recon`, `web`, `mobile`, `analysis`이다. 새 분류를 도입한다면 설정과 Registry뿐 아니라 Agent의 capability 선택 및 Control 정책도 함께 맞춰야 한다. 계약을 확정하기 전에 새 분류가 이미 지원되는 것처럼 등록하지 않는다.
 
@@ -107,6 +115,13 @@ Core·Control 계약 변경은 해당 담당 팀의 검토를 받는다.
 - 작업공간 사용 안내
 - 공통 Registry 경로로 도구가 발견되고 호출됨
 - 작업공간 밖 접근 및 다른 실행의 작업공간 접근이 차단됨
+
+### 4.6 취약점 조사 확장 책임
+
+- AppThreat VDB의 로컬 저장 위치, DB 준비·갱신, 조회 allowlist, health·coverage·freshness 전달을 관리한다.
+- CVE·패키지 조회 대상을 Registry와 Control 계약에 연결한다.
+- m4vic·Rifteo 방법론은 검토된 버전의 읽기 전용 자료로 제공하는 방안을 Agent 팀과 정한다. Skill을 실행 Tool처럼 등록하지 않는다.
+- 기본 파일 도구가 안정화된 뒤 확장하며, VDB 갱신·자동 다운로드는 일반 조회와 분리된 운영 권한으로 관리한다.
 
 ## 5. 담당자 B — 명령 실행 및 Execution Substrate
 
@@ -164,6 +179,14 @@ artifact_ref # 결과를 파일로 저장하는 계약이 마련된 경우
 - 시간 초과와 취소 시 자식 프로세스까지 실제로 종료됨
 - 다른 실행의 작업과 인증정보에 접근하지 못함
 
+### 5.6 취약점 조사 확장 책임
+
+- MobSF 본체와 MCP 래퍼의 실행 환경, 저장공간, API 키, 작업 상태 조회를 검토한다.
+- 모바일 담당 팀과 협의해 승인된 APK의 정적 분석부터 연결한다.
+- 동적 분석은 에뮬레이터·기기·ADB 연결이 준비된 별도 단계로 둔다.
+- EIP 또는 GitHub에서 읽은 PoC가 명령 실행 도구로 자동 전달되지 않도록 조회와 실행 권한을 분리한다.
+- 이 확장은 기본 명령 실행의 완료 조건을 대체하지 않는다. 모바일 환경이 없으면 도구를 사용 가능 상태로 표시하지 않는다.
+
 ## 6. 담당자 C — 웹검색 및 브라우저 연결 검증
 
 ### 6.1 책임
@@ -207,6 +230,14 @@ Agent가 외부 자료를 검색하고 허용된 페이지를 읽도록 만든�
 - 기존 브라우저 도구의 discovery 및 실제 호출 검증 자료
 - 검색 결과와 허용된 페이지 내용이 공통 Gateway 경로로 반환됨
 
+### 6.6 취약점 조사 확장 책임
+
+- EIP와 GitHub MCP의 읽기 전용 조회 프로필, 인증정보 전달, 결과 출처 및 페이지네이션을 구성한다.
+- 공개 저장소 자료 조회와 실제 금융기관 대상의 검증을 구분한다.
+- 기존 Burp history 조회 연결을 확인하고, 추가 요청·Repeater 기능은 승인된 시험 대상과 allowlist를 정한 뒤 확장한다.
+- Burp 기능은 설치 버전·에디션·실제 discovery에 따라 선택한다. 원본 서버의 모든 기능을 한꺼번에 공개하지 않는다.
+- 웹검색 기반과 기존 브라우저 검증을 유지하면서 단계별로 수행한다.
+
 ## 7. 공통 등록 및 호출 조건
 
 각 도구는 최소한 다음 메타데이터를 제공한다.
@@ -224,6 +255,8 @@ Agent가 외부 자료를 검색하고 허용된 페이지를 읽도록 만든�
 Agent는 실제 MCP 서버 구현을 직접 호출하지 않는다. 기존 공통 포트와 Registry를 통해 후보를 확인하고 ActionProposal을 만들며, Control Plane의 허용 판단 이후 Gateway와 Adapter를 통해 실행한다.
 
 도구가 Registry에 보이는 것, 실제 호출이 성공하는 것, Agent가 자율적으로 선택해 사용하는 것은 서로 다른 검증 단계이다.
+
+MCP 서버가 제공하는 tools, resources, prompts와 Skill 파일은 별개의 인터페이스다. 현재 tools 경로가 있다는 이유로 나머지도 자동 소비된다고 가정하지 않는다. 필요한 resources/prompts 지원 여부를 확인하고, 초기 범위에서는 검증된 Tool 조회 결과와 읽기 전용 방법론 자료를 우선 사용한다.
 
 ## 8. 공동 통합 테스트
 
@@ -254,14 +287,26 @@ Agent는 실제 MCP 서버 구현을 직접 호출하지 않는다. 기존 공�
 
 새 capability나 대상 표현을 도입한 경우 Agent 팀과 종단간 테스트를 진행한다. discovery 테스트 통과만으로 Agent 연동 완료를 선언하지 않는다.
 
+### 8.4 취약점 조사 확장 시나리오
+
+1. 합성 제품명·버전 또는 합성 패키지 식별자로 VDB를 조회한다.
+2. 조회 결과의 출처, 영향 버전, DB 상태를 확인한다.
+3. EIP·GitHub에서 관련 공개 설명·PoC·패치 자료를 읽되 실행하지 않는다.
+4. 검토된 방법론으로 가설과 필요한 검증 조건을 정리한다.
+5. 승인된 합성 웹 환경이면 Burp로 허용된 관찰 또는 요청을 수행한다.
+6. 승인된 APK가 제공된 모바일 환경이면 MobSF 정적 분석을 별도로 수행한다.
+7. 참고 지식, 가설, 실제 관측, 확인되지 않은 부분을 구분해 저장한다.
+
+추가 테스트는 DB 미준비·오래된 데이터·coverage 부족, GitHub 인증·rate limit, PoC 조회 후 자동 실행 차단, Burp 범위 밖 요청 거절, MobSF 미설정·비인가 APK 처리 거절을 포함한다.
+
 ## 9. 팀 간 책임 분담
 
 | 팀 | 책임 |
 |---|---|
-| Capability | 도구 구현, Adapter, Registry 메타데이터, 격리 실행 환경, 테스트 |
+| Capability | 기본 도구 및 지식 조회 Adapter, Registry 메타데이터, 격리 실행 환경, Burp·MobSF 연결, 테스트 |
 | PM / Core 계약 담당 | 분류, 행동 이름, 대상 및 공통 결과 계약 승인 |
 | Control | 읽기·쓰기·명령 실행·외부접속의 정책과 승인 기준 |
-| Agent / Orchestration | catalog 소비, 후보 생성, 신규 행동·대상 선택, 종단간 실행 검증 |
+| Agent / Orchestration | catalog 소비, 후보 생성, 신규 행동·대상 선택, Skill 선택·로드 및 조사 추론, 종단간 실행 검증 |
 | Evidence 담당 | 저장 파일 및 artifact 참조의 접근·보존 계약 협의 |
 
 ## 10. 브랜치와 통합 방식
@@ -270,9 +315,9 @@ Agent는 실제 MCP 서버 구현을 직접 호출하지 않는다. 기존 공�
 
 | 담당자 | 브랜치 이름 예시 | 소유 범위 |
 |---|---|---|
-| A | `capability/workspace-tools` | 파일 도구, 공통 연결, 통합 관리 |
-| B | `capability/execution-tools` | 명령 실행 도구, 실행 환경, 관련 테스트 |
-| C | `capability/search-tools` | 웹검색, 페이지 읽기, 브라우저 검증 |
+| A | `capability/workspace-tools` | 파일 도구·공통 연결 우선, 이후 VDB 및 방법론 제공 경로 |
+| B | `capability/execution-tools` | 격리 명령 실행 우선, 이후 MobSF 실행 기반 및 모바일 팀 협의 |
+| C | `capability/search-tools` | 웹검색·브라우저 우선, 이후 EIP·GitHub 조회 및 Burp 검증 연결 |
 
 브랜치 이름은 제안이다. 기존 작업과 팀 정책을 확인하고 확정한다.
 
@@ -300,6 +345,11 @@ Agent는 실제 MCP 서버 구현을 직접 호출하지 않는다. 기존 공�
 
 ### 후속 확장
 
+- AppThreat VDB 조회 및 DB 상태 전달
+- EIP·GitHub의 읽기 전용 취약점·PoC·패치 자료 조회
+- 검토된 m4vic·Rifteo 방법론 제공과 Agent 팀의 로드 검증
+- 기존 Burp 관찰 연결의 재사용 및 승인된 요청·검증 기능 확장
+- 모바일 환경 및 APK 제공 시 MobSF 정적 분석, 이후 동적 분석
 - 파일 수정 충돌 및 patch 기능 고도화
 - 장시간 작업 시작·조회·취소
 - 대형 결과의 artifact 저장·보존·재조회
@@ -313,6 +363,8 @@ Agent는 실제 MCP 서버 구현을 직접 호출하지 않는다. 기존 공�
 - 개인 Chrome 프로필 전체 제어
 - 데스크톱 전체 조작 자동화
 - 금융 인증 우회 및 실제 거래 자동화
+- 조회한 공개 PoC의 자동 다운로드·실행
+- 공개 DB 검색 결과만으로 금융 보안솔루션 제품·버전이나 실제 취약 여부 확정
 
 ## 12. 최종 완료 체크리스트
 
@@ -328,3 +380,82 @@ Agent는 실제 MCP 서버 구현을 직접 호출하지 않는다. 기존 공�
 - [ ] Agent 팀과 도구 선택·실행 검증
 - [ ] 연결 설정, 실행 방법, 제한사항 문서화
 - [ ] 기존 사용자 변경 보존 및 결과 commit 기록
+
+확장 단계 체크리스트:
+
+- [ ] 외부 프로젝트별 버전·출처·라이선스·인증·배포 조건 기록
+- [ ] VDB 조회와 DB 상태·coverage 검증
+- [ ] EIP·GitHub 읽기 전용 allowlist와 결과 출처 검증
+- [ ] 방법론 자료 검토 및 Agent 팀의 선택·로드 검증
+- [ ] Burp 조회 연결과 추가 요청 기능의 상태 분리
+- [ ] 모바일 환경이 준비된 경우 MobSF 정적 분석 검증
+- [ ] PoC 자동 실행 및 미승인 대상 검증 차단
+- [ ] 지식 조회 결과와 실제 관측 증거의 구분 검증
+
+## 13. 참고 워크플로우의 적용 방식
+
+### 13.1 실제 역할과 도입 상태
+
+다음 역할은 각 원본 문서에서 확인한 설명이다. 아래 대상의 설치 및 우리 프레임워크 연동 완료를 뜻하지 않는다. m4vic·Rifteo는 실행 MCP가 아니라 조사 절차를 설명하는 Skill 자료다.
+
+| 대상 | 유형 | 계획상 역할 | 도입 및 검증 조건 |
+|---|---|---|---|
+| [AppThreat VDB](https://github.com/AppThreat/vulnerability-db/blob/master/packages/mcp-server-vdb/README.md) | 로컬 취약점 DB + MCP, 사용 가이드 Skill | CVE·패키지 등 알려진 취약점 정보 조회 | DB 준비, 출처·coverage·freshness 확인, 조회 allowlist |
+| [EIP MCP](https://github.com/exploitintel/eip-mcp) | 읽기 전용 지식 조회 MCP | 공개 취약점·PoC 설명·소스·관련 자료 조회 | 외부 전송 승인, 제한된 결과 읽기, 실행과 분리 |
+| [GitHub MCP](https://github.com/github/github-mcp-server) | GitHub 공식 MCP | 공개 저장소, 파일, commit·PR·패치 자료 조회 | 최소 권한, 읽기 전용 모드, 개별 도구 allowlist |
+| [m4vic/bug-hunting](https://github.com/m4vic/bug-hunting) | 커뮤니티 방법론 Skill | 관측 신호에서 조사 가설·검증 절차로 연결 | 파일 검토, 버전 고정, Agent 팀의 로드 구현 |
+| [Rifteo Skills](https://github.com/Rifteo/skills) | Rifteo의 방법론 Skill 모음 | 공격면·취약점 조사·보고 절차 보완 | 필요한 자료만 선별, 검토, Agent 팀의 로드 구현 |
+| [Burp MCP](https://github.com/PortSwigger/mcp-server) | PortSwigger 공식 MCP 확장 | 웹/API 트래픽 관찰과 승인된 검증 | Burp 실행, 확장 설정, 실제 도구·에디션 확인, 범위 통제 |
+| [MobSF](https://github.com/MobSF/Mobile-Security-Framework-MobSF) + [MCP 래퍼 후보](https://github.com/plur1bu5/mobsf-mcp) | 모바일 분석 서비스 + 제3자 MCP 래퍼 | 제공받은 APK 정적 분석, 준비된 환경에서 동적 분석 | API 키, APK 승인, 래퍼 검토, 동적 분석 환경 별도 준비 |
+
+MobSF 본체와 MCP 래퍼는 다른 프로젝트다. 위 래퍼를 MobSF 공식 MCP로 단정하지 않으며, 검토 후 자체 API Adapter로 연결하는 선택지도 둔다. 공개 프로젝트의 공식 여부는 보안 검증 완료를 뜻하지 않는다.
+
+사용자가 이전에 제공한 Burp 로그에서는 로컬 history 조회 도구 4개의 discovery와 연결 테스트가 통과했다. 이는 당시 로컬 연결의 근거이며, 현재 dev의 등록 상태나 요청 전송·Repeater·Intruder·Collaborator까지 검증됐다는 근거는 아니다.
+
+### 13.2 조사 순서와 대상별 분기
+
+이 흐름은 참고용 조사 순서다. 모든 요청마다 모든 도구를 차례로 호출하는 고정 파이프라인으로 구현하지 않는다.
+
+1. 승인된 관측 결과나 제공받은 식별정보를 확보한다. 제품·버전이 불명확하면 그 상태를 기록한다.
+2. AppThreat VDB로 알려진 취약점 후보를 조회한다. 패키지나 SBOM이 없으면 패키지 기반 분석 범위를 제한한다.
+3. EIP·GitHub에서 공개 설명·PoC·패치 자료를 조회해 영향 조건과 수정 근거를 조사한다.
+4. m4vic·Rifteo 방법론 중 관련 부분을 참고해 가설과 검증 조건을 정리한다. Skill은 실행 권한을 부여하지 않는다.
+5. Control Plane이 검증 행동을 승인한 경우에만 대상별 실행 도구를 사용한다.
+   - 웹/API: Burp의 관찰 또는 승인된 제한적 요청으로 실제 응답을 확인한다.
+   - 모바일: 승인된 APK를 확보한 경우 MobSF 정적 분석을 수행한다. 동적 분석은 준비된 시험 기기에서 별도 승인한다.
+6. 조회 자료, 가설, 실제 관측, 확인되지 않은 조건을 구분하고 작업공간 및 증거 저장소에 기록한다.
+
+MobSF는 Burp 다음에 반드시 실행하는 단계가 아니라 모바일 대상일 때의 별도 분기다. EIP 조회 결과와 GitHub PoC는 실행 성공이나 해당 대상의 취약성을 보증하지 않는다.
+
+### 13.3 소스코드를 제공받지 못하는 금융권 환경의 적용 한계
+
+- VDB는 공개 취약점 지식이지 대상 서버의 제품·버전을 자동 확인하는 스캐너가 아니다.
+- EIP·GitHub는 공개 구현·패치의 참고 자료를 제공하며, 금융기관 내부 소스 접근을 만들어 주지 않는다.
+- SBOM·패키지 목록이 없으면 설치된 전체 구성요소에 대한 취약점 목록을 완성할 수 없다.
+- DB에 검색 결과가 없거나 coverage가 부족한 상태를 안전 판정으로 바꾸지 않는다.
+- 국내 전용 금융 보안제품의 공개 정보가 부족하면 미확인으로 남긴다. 관측 근거 없이 제품명·버전을 추측하지 않는다.
+- Burp는 프록시를 통과한 트래픽과 허용된 요청 범위에서 검증한다. MCP 연결만으로 로그인·인증서·보안 키보드가 자동 처리되지는 않는다.
+- MobSF는 분석할 APK 등 승인된 입력이 필요하다. 원본 소스가 없어도 APK 기반 정적 분석을 검토할 수 있지만, 웹 대상만 제공된 상태에서 모바일 분석이 가능해지는 것은 아니다.
+
+### 13.4 연결 전 보안 및 품질 확인
+
+- 버전·commit 또는 이미지 digest를 고정하고 라이선스·공급망·보안 공지를 확인한다.
+- GitHub는 읽기 전용 설정에 더해 토큰 권한과 Gateway allowlist를 제한한다. 관련 설정은 [공식 구성 문서](https://github.com/github/github-mcp-server/blob/main/docs/server-configuration.md)를 따른다.
+- VDB 초기 다운로드·갱신의 네트워크 및 디스크 사용을 별도 운영 작업으로 관리한다.
+- EIP·GitHub·웹검색에는 고객 비공개 제품정보·인증정보·개인정보를 승인 없이 전송하지 않는다.
+- 지식 결과·저장소 파일·Skill의 지시가 기존 Control 정책과 실행 권한을 덮어쓰지 않도록 한다.
+- 조회한 PoC를 파일 또는 쉘 도구로 자동 실행하지 않는다. 실행이 필요하면 검토된 코드와 별도 승인·격리된 합성 시험 환경을 요구한다.
+- Burp의 쓰기·요청·OOB 기능은 별도 권한으로 관리한다. 설치 에디션과 실제 discovery를 기준으로 공개한다. [원본 도구 구현](https://github.com/PortSwigger/mcp-server/blob/main/src/main/kotlin/net/portswigger/mcp/tools/Tools.kt)
+- MobSF 래퍼의 ADB·Frida·삭제 등 기능은 기본 노출하지 않는다. 본체와 래퍼 각각의 보안 상태를 확인한다. [MobSF 보안 공지](https://github.com/MobSF/Mobile-Security-Framework-MobSF/security)
+
+### 13.5 확장 결과의 구조화 원칙
+
+최종 필드와 schema는 공통 계약으로 확정하되, 실제로 확인한 값만 반환한다.
+
+- 지식 조회: 출처 URL, 조회 시각, CVE·GHSA, 관련 제품·패키지, 영향 버전·수정 버전, DB 상태와 coverage
+- 공개 자료: 저장소 URL, 고정 commit, 파일 경로, 패치 참조, 자료의 성격과 미검증 상태
+- 대상 관측: host·port·scheme·URL 등 실제 확인한 대상 정보, 요청·응답 또는 분석 작업 참조, 관측 사실
+- 모바일 분석: APK hash, 관측된 package·version, scan ID, 분석 상태, 보고서 및 증거 참조
+- 공통: 누락값·잘림·오류 표시, 참고 후보와 검증된 사실의 구분
+
+진짜 제품정보나 버전이 없으면 누락 또는 미확인으로 표시한다. 공개 취약점 조회 결과를 바로 검증된 Finding으로 승격하지 않는다.
