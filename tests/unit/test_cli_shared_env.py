@@ -12,7 +12,17 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+import pytest
+
 from redteam.app.cli._shared import load_dotenv_if_present
+
+
+@pytest.fixture(autouse=True)
+def isolate_dotenv_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The loader writes directly, outside monkeypatch tracking. delenv() on
+    # an absent key alone cannot restore a key subsequently created by it.
+    # Protect all later integration tests from fixture MCP/LLM configuration.
+    monkeypatch.setattr(os, "environ", os.environ.copy())
 
 
 def test_missing_file_is_a_silent_no_op(tmp_path: Path, monkeypatch) -> None:

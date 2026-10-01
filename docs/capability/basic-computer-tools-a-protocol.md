@@ -20,12 +20,14 @@
 
 - 새 capability namespace는 임의로 추가하지 않는다. 기존 `analysis`와 AssetTarget을 활용하며 operation은 `directory_list`, `file_read`, `file_search`, `file_write`, `file_edit`로 분리한다.
 - 서버의 작업공간은 운영자 정책으로 등록하고 engagement/run에 귀속한다. Agent에게 호스트 절대 경로나 임의 root 지정 권한을 주지 않는다.
-- 등록된 workspace asset_id를 `target_ref`로 사용한다. 경로는 workspace 내부의 상대 경로다. Gateway에서 target_ref와 scope 판단의 일치를 검증한다.
+- 등록된 workspace asset_id를 `AssetTarget.asset_id` 및 실행 인자의 `asset_ref`로 사용한다. 기존 CandidateCompiler의 Asset 바인딩 규격을 따른다. 경로는 workspace 내부의 상대 경로다. Control에서 AssetTarget과 asset_ref의 일치를 검사하고, Gateway와 서버에서 engagement/run 일치를 검사한다.
+- 사전 검수에서 Asset 승인 대상과 실행 인자가 달라도 통과할 수 있는 경계를 발견했다. 이를 막기 위한 Control scope 일치 검사만 최소 변경하며, Core 계약과 승인 정책 자체는 변경하지 않는다.
 - 기본은 읽기 전용이다. 쓰기는 별도 프로필·운영자 권한으로 명시적으로 활성화한다. 대량 출력·파일 읽기는 제한한다.
 - 파일 내용은 운영자가 승인한 입력에 한해 반환한다. 범용 DLP·비밀정보 탐지가 완성됐다고 주장하지 않는다.
 - shell, 웹검색, EIP·GitHub·Burp·MobSF 연결은 B/C 역할이므로 구현하지 않는다.
 - VDB 및 m4vic·Rifteo 확장은 기본 도구 검증 뒤 검토한다. 외부 설치·DB 다운로드·새 계약은 별도 상태로 기록하며 연결 완료로 과장하지 않는다.
 - Orchestration의 Agent capability·Skill loader·자동 후보 생성 로직은 변경하지 않는다. 검증된 공통 포트 호출과 기본 Agent의 실제 사용 상태를 구분한다.
+- 통합 테스트 중 기존 `CANONICAL_OPERATIONS` 고정 목록이 파일 operation을 거절함을 확인했다. namespace와 Core schema를 유지한 채 위 5개 intent를 공통 명명 검증 목록과 actions 문서에 추가한다. 이는 capability 브랜치의 호환 확장 제안이며 dev 반영 전 PM/Agent/Control 검토가 필요하다. 기본 Agent의 자동 계획·스케줄은 변경하지 않는다.
 
 ## 종료·판정 기준
 

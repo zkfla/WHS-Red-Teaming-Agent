@@ -104,6 +104,17 @@ Examples: `port_scan`, `service_discovery`, `endpoint_discovery`,
 `app_launch`, `device_shell`, `runtime_instrumentation`,
 `static_analysis`, `response_analysis`.
 
+Workspace-tool extension on the capability branch: `directory_list`,
+`file_read`, `file_search`, `file_write`, `file_edit`, under the existing
+`analysis` capability with an approved `AssetTarget`. These describe intent;
+the corresponding MCP ToolIds are `analysis.list_directory`,
+`analysis.read_file`, `analysis.search_files`, `analysis.write_file`,
+`analysis.apply_patch`. Read and mutation permissions remain separate.
+This is an additive naming extension, not a new capability/target schema
+or permission to automatically schedule these actions. PM/Agent/Control
+owners should review it before integration into dev; deployment ROE must
+explicitly permit the workspace asset and intended operations.
+
 Rules:
 
 * `operation` need not equal any MCP `tool_name`

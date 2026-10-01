@@ -25,6 +25,13 @@ CANONICAL_OPERATIONS = frozenset(
         "runtime_instrumentation",
         "static_analysis",
         "response_analysis",
+        # Approved workspace intents are product-independent. Keep them
+        # distinct so read permission never implicitly grants mutation.
+        "directory_list",
+        "file_read",
+        "file_search",
+        "file_write",
+        "file_edit",
     }
 )
 _LOWER_SNAKE_CASE = re.compile(r"^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$")

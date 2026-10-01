@@ -18,6 +18,7 @@ from redteam.capability.adapters.mcp.transport import (
     StreamableHTTPMCPTransport,
 )
 from redteam.capability.adapters.mcp.web_api import WebAPIMCPAdapter
+from redteam.capability.adapters.mcp.workspace import WorkspaceMCPAdapter
 from redteam.capability.gateway import (
     DEFAULT_HEALTH_REFRESH_INTERVAL_SECONDS,
     DEFAULT_HEALTH_REFRESH_TIMEOUT_SECONDS,
@@ -35,6 +36,7 @@ from redteam.capability.settings import (
     MCPServerSettings,
     MCPTransportKind,
 )
+from redteam.capability.workspace_manifest import validate_workspace_descriptor
 
 
 async def build_mcp_tool_gateway(
@@ -153,6 +155,17 @@ async def _build_gateway(
                 if selected_spec is not None
                 else _default_target_types(settings.kind)
             )
+            if settings.profile is not None:
+                descriptor.target_types = ["asset"]
+                try:
+                    validate_workspace_descriptor(
+                        descriptor,
+                        settings.profile,
+                        settings.workspace_asset_ref or "",
+                    )
+                except ValueError as exc:
+                    raise MCPConfigurationError(str(exc)) from exc
+                target_types[str(descriptor.tool_id)] = "asset"
             # Validate after operator bindings are copied into the descriptor:
             # this is the exact manifest exposed to Agent/Orchestration.
             validate_tool_manifest(descriptor)
@@ -217,6 +230,12 @@ def _default_target_types(kind: MCPServerKind) -> list[str]:
 def _create_adapter(settings: MCPServerSettings, transport: MCPTransport) -> MCPAdapter:
     if settings.allowed_tools is not None:
         transport = AllowlistedMCPTransport(transport, settings.allowed_tools)
+    if settings.profile is not None:
+        return WorkspaceMCPAdapter(
+            server_id=settings.server_id,
+            risk_level=settings.risk_level,
+            transport=transport,
+        )
     if settings.kind == MCPServerKind.WEB_API:
         return WebAPIMCPAdapter(
             server_id=settings.server_id,

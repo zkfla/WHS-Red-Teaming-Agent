@@ -1,0 +1,17 @@
+{
+  "asset_ref": "workspace-demo",
+  "engagement_id": "eng-workspace-demo",
+  "run_id": "run-workspace-demo",
+  "root": "/absolute/path/to/private-run-workspace",
+  "writable": false,
+  "max_file_bytes": 1048576,
+  "max_return_chars": 16000,
+  "max_entries": 200,
+  "max_scan_entries": 2000,
+  "max_search_files": 100,
+  "max_search_bytes": 2097152,
+  "max_matches": 50,
+  "max_depth": 8,
+  "max_workspace_files": 256,
+  "max_workspace_bytes": 16777216
+}

@@ -54,6 +54,8 @@ class MCPServerSettings:
     tool_operations: dict[str, tuple[str, ...]] | None = None
     max_concurrency: int = 1
     max_output_bytes: int = 1_048_576
+    profile: str | None = None
+    workspace_asset_ref: str | None = None
 
     @classmethod
     def from_environment(cls, server_id: str) -> MCPServerSettings:
@@ -106,6 +108,34 @@ class MCPServerSettings:
         tool_operations = _load_tool_operations(prefix)
         max_concurrency = _load_max_concurrency(prefix)
         max_output_bytes = _load_max_output_bytes(prefix)
+        profile = os.environ.get(f"{prefix}_PROFILE")
+        workspace_asset_ref = None
+        if profile is not None:
+            if profile not in {"workspace_read", "workspace_write"}:
+                raise MCPConfigurationError(f"{prefix}_PROFILE is not a supported profile")
+            if kind != MCPServerKind.ANALYSIS or transport != MCPTransportKind.STDIO:
+                raise MCPConfigurationError("workspace profiles require analysis kind and stdio")
+            workspace_asset_ref = _required_environment_value(f"{prefix}_WORKSPACE_ASSET_REF")
+            if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", workspace_asset_ref):
+                raise MCPConfigurationError("workspace asset_ref must be an opaque identifier")
+            # Import here: workspace manifest imports settings-adjacent contracts.
+            from redteam.capability.workspace_manifest import (
+                minimum_workspace_risk,
+                workspace_specs,
+            )
+
+            specs = workspace_specs(profile)
+            if (
+                allowed_tools is None
+                or set(allowed_tools) != set(specs)
+                or tool_operations != {name: (spec.operation,) for name, spec in specs.items()}
+            ):
+                raise MCPConfigurationError(
+                    "workspace profile requires exact allowlist and bindings"
+                )
+            risk_order = (RiskLevel.LOW, RiskLevel.MEDIUM, RiskLevel.HIGH, RiskLevel.CRITICAL)
+            if risk_order.index(risk_level) < risk_order.index(minimum_workspace_risk(profile)):
+                raise MCPConfigurationError("workspace profile risk cannot be below the minimum")
         if allowed_tools is not None and tool_operations is not None:
             allowed_names = set(allowed_tools)
             binding_names = set(tool_operations)
@@ -130,6 +160,8 @@ class MCPServerSettings:
             tool_operations=tool_operations,
             max_concurrency=max_concurrency,
             max_output_bytes=max_output_bytes,
+            profile=profile,
+            workspace_asset_ref=workspace_asset_ref,
         )
 
     def request_headers(self) -> dict[str, str]:
