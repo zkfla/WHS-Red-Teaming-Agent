@@ -83,4 +83,4 @@ B/C 담당자는 결과 파일을 동일한 승인 작업공간에 제한해서 
 - 모든 파일이 공개적인 것이 아니므로 UI/로그/증거 저장 권한도 별도로 제한해야 한다. 오류는 고정 코드/문구를 사용하고 경로와 내용을 되풀이하지 않는다.
 - 삭제, 이동, directory 생성, binary/ZIP 전개, shell/JavaScript 실행, 네트워크 요청은 제공하지 않는다.
 
-AppThreat VDB DB 다운로드·갱신, m4vic/Rifteo 자료 검토 및 Agent Skill loader는 후속 작업이다. 파일 도구가 있다는 이유로 이 외부 연결까지 완료된 것은 아니다.
+AppThreat VDB의 읽기 전용 bridge는 [VDB 안내](../vdb/README.md), m4vic/Rifteo의 검수 자료 제공은 [방법론 안내](../methodology/README.md)를 참고한다. DB 다운로드·갱신과 실제 Agent Skill loader는 아직 후속 작업이다. 파일 도구가 있다는 이유로 외부 자료의 자율 선택·실행까지 완료된 것은 아니다.
