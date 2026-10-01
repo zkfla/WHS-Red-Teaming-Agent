@@ -6,6 +6,7 @@
 - 문서 성격: 구현 계획. 아래 도구 이름과 신규 분류는 제안이며, 구현 완료나 계약 확정을 뜻하지 않는다.
 - 추가 반영: 사용자가 제공한 AppThreat VDB, EIP, GitHub MCP, m4vic·Rifteo Skills, Burp MCP, MobSF MCP 참고 워크플로우
 - 외부 프로젝트 확인일: 2026-10-01. 공개 README 및 설정 문서 확인이며, 설치·코드 보안 감사·실제 실행 검증 완료를 뜻하지 않는다.
+- 상세 보완: 이미지의 7개 항목을 기능별 작업 ID, 담당자, 입출력, 완료 기준, 지원·연동 상태로 분리했다. 아래 표는 계획이며 완료 보고가 아니다.
 
 ## 1. 개발 목표
 
@@ -400,13 +401,13 @@ MCP 서버가 제공하는 tools, resources, prompts와 Skill 파일은 별개�
 
 | 대상 | 유형 | 계획상 역할 | 도입 및 검증 조건 |
 |---|---|---|---|
-| [AppThreat VDB](https://github.com/AppThreat/vulnerability-db/blob/master/packages/mcp-server-vdb/README.md) | 로컬 취약점 DB + MCP, 사용 가이드 Skill | CVE·패키지 등 알려진 취약점 정보 조회 | DB 준비, 출처·coverage·freshness 확인, 조회 allowlist |
-| [EIP MCP](https://github.com/exploitintel/eip-mcp) | 읽기 전용 지식 조회 MCP | 공개 취약점·PoC 설명·소스·관련 자료 조회 | 외부 전송 승인, 제한된 결과 읽기, 실행과 분리 |
-| [GitHub MCP](https://github.com/github/github-mcp-server) | GitHub 공식 MCP | 공개 저장소, 파일, commit·PR·패치 자료 조회 | 최소 권한, 읽기 전용 모드, 개별 도구 allowlist |
-| [m4vic/bug-hunting](https://github.com/m4vic/bug-hunting) | 커뮤니티 방법론 Skill | 관측 신호에서 조사 가설·검증 절차로 연결 | 파일 검토, 버전 고정, Agent 팀의 로드 구현 |
-| [Rifteo Skills](https://github.com/Rifteo/skills) | Rifteo의 방법론 Skill 모음 | 공격면·취약점 조사·보고 절차 보완 | 필요한 자료만 선별, 검토, Agent 팀의 로드 구현 |
-| [Burp MCP](https://github.com/PortSwigger/mcp-server) | PortSwigger 공식 MCP 확장 | 웹/API 트래픽 관찰과 승인된 검증 | Burp 실행, 확장 설정, 실제 도구·에디션 확인, 범위 통제 |
-| [MobSF](https://github.com/MobSF/Mobile-Security-Framework-MobSF) + [MCP 래퍼 후보](https://github.com/plur1bu5/mobsf-mcp) | 모바일 분석 서비스 + 제3자 MCP 래퍼 | 제공받은 APK 정적 분석, 준비된 환경에서 동적 분석 | API 키, APK 승인, 래퍼 검토, 동적 분석 환경 별도 준비 |
+| [AppThreat VDB](https://github.com/AppThreat/vulnerability-db/blob/master/packages/mcp-server-vdb/README.md) | 로컬 취약점 DB + MCP, 사용 가이드 Skill | NVD·OSV·GitHub/GHSA 지식 조회, CVE·URL·PURL·CPE·패키지·SBOM 처리 | 입력별 원본 대응 확인, DB 준비, coverage·freshness 확인 |
+| [EIP MCP](https://github.com/exploitintel/eip-mcp) | 읽기 전용 지식 조회 MCP | ExploitDB·Metasploit·GitHub PoC, 소스·재현 환경 자료 조회 | 패치 분석은 수집 자료와 Agent 해석 구분, 자동 실행 금지 |
+| [GitHub MCP](https://github.com/github/github-mcp-server) | GitHub 공식 MCP | 코드 검색, repository·commit·PR·Security Advisory 조회, 패치 diff·upstream 추적 | 읽기 전용·최소 권한, 실제 Tool 및 schema 확인 |
+| [m4vic/bug-hunting](https://github.com/m4vic/bug-hunting) | 커뮤니티 방법론 Skill | Web/API/Mobile/Cloud/AI 신호별 가설·검증 방법 선택 | 분야별 자료 검토, Agent 로드 및 가설 기록 검증 |
+| [Rifteo Skills](https://github.com/Rifteo/skills) | Rifteo의 방법론 Skill 모음 | check-exploit·attack-surface·vuln-diagnose, IDOR·SSRF·SSTI 및 보고 절차 | 선별·검토, 지원 도구 및 승인 정책과의 대응 확인 |
+| [Burp MCP](https://github.com/PortSwigger/mcp-server) | PortSwigger 공식 MCP 확장 | Proxy history, HTTP 요청, Repeater/Intruder 탭 전달, WebSocket history, Collaborator | 각 기능별 discovery·에디션·권한 검증, 전달과 실행 구분 |
+| [MobSF](https://github.com/MobSF/Mobile-Security-Framework-MobSF) + [MCP 래퍼 후보](https://github.com/plur1bu5/mobsf-mcp) | 모바일 분석 서비스 + 제3자 MCP 래퍼 | APK 정적·동적 분석, manifest·permission·secret·network 설정 분석 | 승인 APK, API 키, 결과 schema, 동적 환경 별도 검증 |
 
 MobSF 본체와 MCP 래퍼는 다른 프로젝트다. 위 래퍼를 MobSF 공식 MCP로 단정하지 않으며, 검토 후 자체 API Adapter로 연결하는 선택지도 둔다. 공개 프로젝트의 공식 여부는 보안 검증 완료를 뜻하지 않는다.
 
@@ -459,3 +460,203 @@ MobSF는 Burp 다음에 반드시 실행하는 단계가 아니라 모바일 대
 - 공통: 누락값·잘림·오류 표시, 참고 후보와 검증된 사실의 구분
 
 진짜 제품정보나 버전이 없으면 누락 또는 미확인으로 표시한다. 공개 취약점 조회 결과를 바로 검증된 Finding으로 승격하지 않는다.
+
+## 14. 이미지 항목별 상세 구현 작업표
+
+### 14.1 상태 표시와 공통 작성 규칙
+
+모든 기능의 상태를 세 가지 축으로 기록한다.
+
+| 상태 축 | 기록할 값 | 판정 근거 |
+|---|---|---|
+| 원본 지원 | 문서·코드 확인 / 조건부 / 미확인 / 미지원 | 버전·commit, 원본 문서, 실제 discovery |
+| 우리 프로젝트 연결 | 미검증 / 등록 확인 / 실제 호출 확인 | 기준 브랜치·commit, 환경 설정, 호출 결과 |
+| Agent 사용 | 미검증 / 후보 노출 확인 / 선택·정책·실행 확인 | Agent 및 Control 공동 테스트 |
+
+아래 신규 확장 항목은 별도 명시가 없는 한 우리 프로젝트 연결과 Agent 사용 모두 미검증이다. 계획서 수정만으로 상태를 올리지 않는다. 원본 지원은 확인일의 자료에 대한 판단이고, 채택할 고정 버전에서 다시 확인한다.
+
+작업표의 입출력은 우리 팀의 제안이다. 실제 원본 Tool명·필수 인자·출력 schema는 discovery로 확인해 manifest에 매핑한다. 원본에 없는 기능은 명시적인 Adapter 보완 작업으로 남기며, 가상의 remote ToolId를 등록하지 않는다.
+
+### 14.2 AppThreat VDB — 담당자 A
+
+원본은 NVD·OSV·GitHub 등의 데이터와 여러 식별자 검색을 설명한다. MCP의 batch/BOM·상태 응답은 문서에서 확인했으며, 각 입력을 어떤 Tool로 받을지는 고정 버전에서 검증한다. [DB 문서](https://github.com/AppThreat/vulnerability-db), [MCP 문서](https://github.com/AppThreat/vulnerability-db/blob/master/packages/mcp-server-vdb/README.md)
+
+연결 방식: 로컬 MCP 및 전용 DB 저장공간. 조회 프로필과 관리용 갱신 프로필을 분리한다.
+
+| 작업 ID | 개발할 기능 | 입력 → 출력 제안 | 완료 기준 |
+|---|---|---|---|
+| VDB-01 | NVD·OSV·GHSA/GitHub 출처 식별·필터 | 출처·필터 → 출처별 결과·참조 | 출처 보존, 지원하지 않는 필터 명시 |
+| VDB-02 | CVE·GHSA 단건 조회 | 식별자 → 설명·영향 조건·출처 | 알려진 합성 fixture와 일치, 잘못된 ID 오류 구분 |
+| VDB-03 | URL·PURL·CPE·package 조회 | 식별자·버전 → 후보·매칭 근거 | 각 입력 유형의 지원 경로·버전 비교 테스트 |
+| VDB-04 | 패키지 목록 bulk 조회 | 제한된 목록 → 항목별 결과·coverage | 부분 실패와 미조회 항목 표시 |
+| VDB-05 | SBOM bulk 조회 | 승인된 CycloneDX 파일 참조 → 구성요소별 결과 | 파일 경계·크기·지원 형식 검증 |
+| VDB-06 | DB health·metadata·갱신 관리 | 상태 요청 → 준비·갱신·coverage 정보 | DB 비어 있음·오래됨·미포함을 안전 판정과 구분 |
+| VDB-07 | VDB SKILL.md 사용 가이드 제공 | 고정 자료 ID → 검토된 안내 | 원본 출처·버전 포함, 로드 여부 Agent 팀 확인 |
+
+GHSA는 식별자이며 원본의 데이터 출처 이름은 GitHub 등으로 나타날 수 있다. 출처 문자열을 추측해서 설정하지 않는다. CPE·CVE·텍스트 검색의 DB 범위 및 metadata 조건도 확인한다. SBOM과 패키지 목록은 제공된 경우에만 사용하며, 대상의 전체 목록을 자동으로 확보한 것처럼 표시하지 않는다.
+
+### 14.3 EIP — 담당자 C, 실행 경계 검토 담당자 B
+
+원본은 ExploitDB·Metasploit·GitHub PoC, 제한된 소스 읽기, Docker 재현 환경 자료 검색을 설명한다. 읽기 전용이며 조회한 내용을 실행하는 기능과는 다르다. [원본 README](https://github.com/exploitintel/eip-mcp), [Tool 가이드](https://github.com/exploitintel/eip-mcp/blob/main/docs/user-guide.md)
+
+연결 방식: 승인된 외부 MCP 또는 로컬 stdio. 전송할 조회 정보와 허용 Tool을 먼저 정한다.
+
+| 작업 ID | 개발할 기능 | 입력 → 출력 제안 | 완료 기준 |
+|---|---|---|---|
+| EIP-01 | CVE와 ExploitDB·Metasploit·GitHub PoC 연결 조회 | CVE → 자료별 ID·URL·종류 | 서로 다른 출처와 중복·누락 구분 |
+| EIP-02 | PoC source 읽기 | 확인된 자료·파일 ID → 제한된 텍스트·출처 | 크기 제한·잘림·읽기 실패 반환, 자동 실행 없음 |
+| EIP-03 | 재현 환경 지식 조회 | CVE·자료 ID → 환경 설명·참조 | 환경 조회와 환경 실행 상태 구분 |
+| EIP-04 | 공격 조건·패치 비교 자료 수집 | CVE·제품·공개 참조 → 근거 목록 | 직접 제공값과 Agent의 해석을 구분 |
+| EIP-05 | corpus 상태·페이지네이션 처리 | 상태·cursor → 상태·다음 결과 | 불완전 자료·cursor·rate limit 처리 검증 |
+
+EIP-04의 패치 비교는 수집 자료를 바탕으로 Agent가 수행할 분석이다. 전용 패치 분석 Tool이나 신뢰도 판정 기능이 있다고 가정하지 않는다. PoC가 존재해도 현재 대상에서 성공한다고 판단하지 않는다.
+
+### 14.4 GitHub MCP — 담당자 C, schema·권한 검토 담당자 A
+
+공식 서버의 코드 검색 및 global Security Advisory 조회를 확인했다. 아래 예시 Tool은 채택 버전과 토큰 권한에서 다시 discovery한다. [원본 Tool 목록](https://github.com/github/github-mcp-server), [읽기 전용 구성](https://github.com/github/github-mcp-server/blob/main/docs/server-configuration.md)
+
+연결 방식: 공식 MCP의 읽기 전용 프로필. Tool allowlist와 최소 권한 토큰을 함께 적용한다.
+
+| 작업 ID | 개발할 기능 | 입력 → 출력 제안 | 완료 기준 |
+|---|---|---|---|
+| GH-01 | repository 및 코드 검색 | 공개 범위·검색어 → repository·파일·참조 | 검색 범위 제한, rate limit·빈 결과 구분 |
+| GH-02 | 공개 파일·commit·PR 조회 | repository·고정 ref → 본문·변경 참조 | 자료의 commit과 URL 보존 |
+| GH-03 | Security Advisory 조회 | CVE·GHSA·패키지 → advisory·버전 조건 | 미존재·권한 부족·영향 조건 구분 |
+| GH-04 | 취약 코드·patch diff 비교 자료 제공 | 비교 ref 또는 PR → diff·출처 | 크기 제한, 변경 사실과 취약성 해석 구분 |
+| GH-05 | upstream 변경 추적 | 기준 commit·범위 → 이후 변경·참조 | 기준 고정, 최신 변경 누락·실패 표시 |
+
+`search_code`, `get_global_security_advisory`, `list_global_security_advisories`는 원본 예시이며 최종 ToolId가 아니다. GH-04/05는 조회 Tool 조합이 필요할 수 있다. 조회를 위해 issue 작성·PR 수정·merge 권한을 공개하지 않는다. 반복 모니터링 스케줄러는 이 작업 범위에 포함하지 않는다.
+
+### 14.5 m4vic bug-hunting — 자료 제공 담당자 A, 사용 구현 Agent 팀
+
+원본은 분야별 router와 신호 기반 참고 자료 선택, 가설 기록, 확인 후 보고 흐름을 설명한다. MCP 서버가 아니다. [원본 방법론 구조](https://github.com/m4vic/bug-hunting)
+
+연결 방식: 검토한 고정 버전 자료를 읽기 전용으로 제공한다. Agent 팀이 분야 선택·로드·추론을 구현한다.
+
+| 작업 ID | 제공할 기능·자료 | 입력 → 출력 제안 | 완료 기준 |
+|---|---|---|---|
+| M4-01 | Web/API/Mobile/Cloud/AI 분야 인덱스 | 자료 목록 요청 → 분야·자료 ID·버전 | 모든 분야의 경로·출처 기록 |
+| M4-02 | 관측 → 가설 → 검증 방법 참조 | 분야·관측 분류 → 관련 자료 참조 | 관련 자료만 선택하는 Agent 테스트 |
+| M4-03 | 가설·확인·기각·미확인 기록 양식 | 가설·근거 → 작업공간 기록 | 중복 조사 방지·상태 보존 확인 |
+| M4-04 | 검증 후 보고 조건·양식 | 실제 근거 → 보고 초안 | 범위·재현·증거 누락 시 확인된 결과로 표시하지 않음 |
+
+Cloud·AI 자료를 제공한다고 해당 분야의 실행 capability를 새로 승인하는 것은 아니다. 현재 웹/API 중심 범위에서는 해당 router부터 적용하고 나머지는 선택 가능한 참고 자료로 둔다.
+
+### 14.6 Rifteo Security Skills — 자료 제공 담당자 A, 사용 구현 Agent 팀
+
+아래는 원본 자료에서 확인한 Skill 이름 및 조사 분야다. Skill 설치만으로 우리 Agent가 로드하거나 MCP를 실행하는 것은 아니다. [원본 Skill 목록](https://github.com/Rifteo/skills)
+
+연결 방식: 필요한 자료만 선별·검토·버전 고정하고, Agent가 사용하는 행동·도구 계약에 대응시킨다.
+
+| 작업 ID | 제공할 기능·자료 | 입력 → 출력 제안 | 완료 기준 |
+|---|---|---|---|
+| RF-01 | `attack-surface` | 승인된 관측 → 조사 체크리스트 | 실행 가능한 도구와 자료 설명을 구분 |
+| RF-02 | `check-exploit`·`vuln-diagnose` | 가설·공개 근거 → 검증 조건·미확인 목록 | PoC 존재만으로 성공·취약 확정하지 않음 |
+| RF-03 | IDOR (`idor-hunter`) | 합성 계정·객체 관측 → 권한 비교 절차 | 승인된 다계정 시험 전제·증거 양식 확인 |
+| RF-04 | SSRF (`ssrf-hunter`) | 관측·승인 범위 → 조사 절차 | 외부 callback·내부 접근은 별도 권한 처리 |
+| RF-05 | SSTI (`ssti-hunter`) | 관측 → 조사 절차·근거 양식 | 자료 읽기와 payload 실행 권한 분리 |
+| RF-06 | 보고서 Skill | 근거·미확인 조건 → 출처 포함 보고 초안 | 관측·가설·영향·수정 제안의 구분 확인 |
+
+RF-06은 `bugbounty-reporter`, `pentest-report` 등의 후보에서 실제 채택 자료를 정한다. 공격 절차를 그대로 전부 실행하도록 설정하지 않으며, 기존 Control 승인과 사용 가능한 MCP 범위가 우선한다.
+
+### 14.7 Burp MCP — 담당자 C, 정책 협의 Control 팀
+
+원본 코드에서 HTTP 전송, Repeater 탭 생성, Intruder로 전달, WebSocket history, Professional 조건의 Collaborator 도구를 확인했다. 탭 전달은 공격 시작·응답 수집 완료가 아니다. [원본 Tool 구현](https://github.com/PortSwigger/mcp-server/blob/main/src/main/kotlin/net/portswigger/mcp/tools/Tools.kt)
+
+연결 방식: 기존 로컬 Burp MCP와 stdio proxy를 재사용하되, 관찰 프로필과 요청·검증 프로필을 분리한다.
+
+| 작업 ID | 개발·검증할 기능 | 입력 → 출력 제안 | 완료 기준 |
+|---|---|---|---|
+| BURP-01 | Proxy HTTP history 및 검색 | count·offset·필터 → 흐름·참조 | 기존 4개 도구 로그와 별개로 HTTP 조회 호출·마스킹 검증 |
+| BURP-02 | 승인된 HTTP 요청·응답 비교 | 승인 대상·검토된 요청 → 응답·증거 참조 | 대상·Host·경로·세션·크기 통제, 범위 밖 거절 |
+| BURP-03 | Repeater 탭 전달 | 승인된 요청 → 탭 전달 결과 | 전달 성공과 실제 전송·응답 상태 구분 |
+| BURP-04 | Intruder 탭 전달 | 승인된 요청 → 전달 결과 | 대량 실행과 구분, 공격 자동 시작 여부 확인 |
+| BURP-05 | WebSocket history 및 검색 | offset·필터 → 메시지·참조 | 마스킹·페이지네이션·접근 거절 확인 |
+| BURP-06 | Collaborator 생성·interaction 조회 | 승인된 OOB 작업 → ID·관측 참조 | 에디션·callback 도메인·외부 통신 승인·작업 연계 검증 |
+
+BURP-01/05는 과거 로그에서 discovery가 확인됐으나 실제 데이터 조회와 Agent 선택 완료는 별도 검증이다. BURP-02/03/04/06은 현재 연결 완료로 표시하지 않는다. WebSocket history 지원을 메시지 송신 지원으로 확대 해석하지 않는다.
+
+Intruder의 payload 설정·공격 시작·진행 조회가 실제 Tool로 제공되는지는 별도 확인 대상으로 남긴다. 자동 대량 fuzzing은 이번 구현 범위가 아니다. Collaborator는 외부 서비스 사용과 민감정보 전송 가능성을 Control 팀과 합의한다.
+
+### 14.8 MobSF MCP — 담당자 B, 모바일 팀 협의
+
+래퍼 후보는 APK의 정적·동적 분석과 보고서 조회를 설명한다. 본체의 분석 결과를 우리 ToolResult에 정규화할 때 항목별 근거를 보존한다. [래퍼 기능 목록](https://github.com/plur1bu5/mobsf-mcp), [MobSF 본체](https://github.com/MobSF/Mobile-Security-Framework-MobSF)
+
+연결 방식: 격리된 MobSF 서비스 + 검토된 MCP 래퍼 또는 자체 REST API Adapter. 정적 분석부터 시작한다.
+
+| 작업 ID | 개발·검증할 기능 | 입력 → 출력 제안 | 완료 기준 |
+|---|---|---|---|
+| MOB-01 | 승인 APK 제출·정적 분석 시작 | 작업공간 artifact·hash → scan 참조·상태 | 임의 호스트 경로·비인가 파일 거절, timeout 처리 |
+| MOB-02 | manifest 분석 | scan ID → 구성·component·근거 위치 | 실제 보고서 값과 대응, 누락 표시 |
+| MOB-03 | permission 분석 | scan ID → 권한·맥락·근거 | 권한 존재만으로 취약점 확정하지 않음 |
+| MOB-04 | secret 분석 | scan ID → 마스킹된 후보·위치 | 원문 비밀정보 대신 접근 제한 증거 참조 |
+| MOB-05 | network 설정 분석 | scan ID → endpoint·설정·근거 | 설정 관측과 실제 통신 검증 구분 |
+| MOB-06 | 보고서·분석 상태 조회 | scan ID → 상태·구조화된 요약·참조 | 다른 실행의 scan 접근 차단·큰 결과 처리 |
+| MOB-07 | 준비된 모바일 환경의 동적 분석 | 승인 기기·APK → 상태·로그·네트워크 관측 | 호환성·시작·중단·정리·범위 통제 검증 |
+
+위 분석 항목은 여러 별도 원본 Tool이 아니라 하나의 보고서 조회 결과를 section별로 처리하는 방식일 수 있다. 최종 manifest는 실제 원본 schema를 따른다. Frida·임의 ADB 명령·자동 우회·분석 삭제는 기본 프로필에서 제외한다.
+
+## 15. 이미지 요구사항 추적 및 인수 기준
+
+### 15.1 이미지와 작업 ID의 대응
+
+| 이미지의 요구사항 | 상세 작업 ID | 주 담당 |
+|---|---|---|
+| NVD·OSV·GHSA, CVE·URL·PURL·CPE, package·SBOM bulk, VDB Skill | VDB-01~07 | A |
+| CVE→ExploitDB·Metasploit·GitHub PoC, source·재현 환경·패치 자료 | EIP-01~05 | C, 실행 경계 B |
+| 코드 검색, repository·commit·PR·Security Advisory, diff·upstream | GH-01~05 | C |
+| Web/API/Mobile/Cloud/AI, 관측→가설→검증 방법 | M4-01~04 | A, Agent 팀 |
+| check-exploit·attack-surface·vuln-diagnose, IDOR·SSRF·SSTI, 보고 | RF-01~06 | A, Agent 팀 |
+| Proxy history·HTTP·Repeater·Intruder·WebSocket·Collaborator | BURP-01~06 | C, Control 팀 |
+| APK 정적·동적, manifest·permission·secret·network | MOB-01~07 | B, 모바일 팀 |
+
+모든 이미지 항목을 계획 대상으로 기록했다. 원본 미지원·환경 미준비 항목은 이유와 대안을 남기며, 기록됐다는 이유만으로 구현 완료 처리하지 않는다.
+
+### 15.2 각 작업의 결과 기록 양식
+
+각 담당자는 다음 정보를 PR 또는 검증 문서에 남긴다.
+
+```text
+작업 ID:
+담당자:
+우선순위:
+기준 브랜치/commit:
+원본 프로젝트/고정 버전/출처:
+원본 지원 상태 및 제약:
+연결 방식 및 필요한 환경:
+실제 remote Tool명 또는 자료 경로:
+우리 ToolId / capability / operation / target_types:
+입력 schema / 출력 schema:
+권한 및 네트워크 경계:
+단위 테스트 / discovery / 실제 호출 근거:
+Agent 후보 노출 / 선택·승인·실행 근거:
+미구현·미검증 항목과 다음 단계:
+```
+
+Skill에는 ToolId 대신 자료 ID·버전·로드 경로를 기록한다. 메타데이터 또는 fixture 테스트만으로 live 호출과 Agent 사용을 완료 처리하지 않는다.
+
+### 15.3 추가 인수 체크리스트
+
+- [ ] 이미지의 모든 요구사항에 작업 ID와 담당자가 연결됨
+- [ ] 실제 원본 지원·우리 연결·Agent 사용 상태를 각각 기록함
+- [ ] VDB 각 식별자 및 bulk 입력의 성공·실패·coverage를 검증함
+- [ ] EIP의 자료 조회와 환경·PoC 실행을 구분함
+- [ ] GitHub 코드 검색·Advisory·diff·upstream 자료를 검증함
+- [ ] m4vic 분야별 선택 및 가설 기록 경로를 Agent 팀과 검증함
+- [ ] Rifteo 지정 Skill 및 보고 자료의 로드 경로를 검증함
+- [ ] Burp 기능별 관찰·탭 전달·요청 실행·OOB 권한을 구분함
+- [ ] MobSF 분석 항목별 출력·마스킹·scan 접근 범위를 검증함
+- [ ] 승인된 합성 시험 환경에서만 실제 대상 검증을 수행함
+
+## 16. 확장 우선순위 및 3인 협업 순서
+
+기본 도구와 취약점 지식 도구는 둘 다 필요하다. 7개 프로젝트의 모든 기능을 동시에 구현하는 것을 기본 완료 조건으로 삼지 않는다.
+
+| 단계 | A | B | C | 다음 단계로 넘어갈 조건 |
+|---|---|---|---|---|
+| 기반 | 파일 도구·Registry 계약 | 격리 명령 실행 | 웹검색·기존 브라우저 확인 | 기본 통합·정책 거절 테스트 |
+| 지식·관찰 | VDB 단건·상태, 방법론 자료 인덱스 | 결과 파일·실행 권한 경계 | EIP·GitHub 읽기 전용, Burp history | 출처·schema·실제 조회 확인 |
+| 조사 확장 | VDB bulk·SBOM, 방법론 상세 자료 | 승인 APK의 MobSF 정적 분석 | GitHub diff·upstream, 승인 HTTP·Repeater 전달 | 입력 제공·각 팀 계약·합성 환경 검증 |
+| 환경 의존 | 확장 결과 계약·통합 | MobSF 동적 분석 | Intruder 지원 검토·Collaborator 승인 | 기기·에디션·외부통신·권한 준비 |
+
+담당자 A의 방법론 책임은 자료 제공·버전 관리·계약까지다. Agent의 추론·분야 선택·Skill 로드는 Agent 팀 책임이며, 이를 Capability 팀 작업 완료로 대신하지 않는다. 담당자 C는 확장 항목이 많으므로 같은 단계 안에서도 조회 기능부터 순차 진행한다. 공통 파일은 A가 통합 관리하고 다른 담당자는 자기 모듈·테스트 중심으로 작업한다.
