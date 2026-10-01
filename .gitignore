@@ -20,9 +20,6 @@ tests/vuln-bank/
 공통 개발 시작 프롬프트.md
 변경사항.md
 
-# Local files with the no-git qualifier
-*no-git*
-
 # --- scratch / temp artifacts (defensive; no tracked file matches) ---
 *.log
 *.tmp
