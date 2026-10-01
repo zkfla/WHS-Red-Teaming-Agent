@@ -12,6 +12,7 @@ import os
 import re
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 from urllib.parse import urlparse
 
 from redteam.core.enums import RiskLevel
@@ -57,6 +58,8 @@ class MCPServerSettings:
     profile: str | None = None
     workspace_asset_ref: str | None = None
     vdb_asset_ref: str | None = None
+    page_text_config_path: str | None = None
+    page_text_config_sha256: str | None = None
 
     @classmethod
     def from_environment(cls, server_id: str) -> MCPServerSettings:
@@ -112,6 +115,8 @@ class MCPServerSettings:
         profile = os.environ.get(f"{prefix}_PROFILE")
         workspace_asset_ref = None
         vdb_asset_ref = None
+        page_text_config_path = None
+        page_text_config_sha256 = None
         if profile in {"vdb_readonly", "vdb_readonly_extended"}:
             if kind != MCPServerKind.ANALYSIS or transport != MCPTransportKind.STDIO:
                 raise MCPConfigurationError("vdb profile requires analysis kind and stdio")
@@ -130,6 +135,43 @@ class MCPServerSettings:
                 raise MCPConfigurationError("vdb profile requires exact allowlist and bindings")
             if risk_level == RiskLevel.LOW:
                 raise MCPConfigurationError("vdb profile requires at least medium risk")
+        elif profile == "page_text_readonly":
+            if kind != MCPServerKind.WEB_API or transport != MCPTransportKind.STDIO:
+                raise MCPConfigurationError("page text profile requires web_api kind and stdio")
+            if f"{prefix}_RISK_LEVEL" not in os.environ:
+                raise MCPConfigurationError("page text profile requires an explicit risk level")
+            from redteam.capability.servers.page_text_mcp import (
+                MODULE,
+                PROPOSED_OPERATION,
+                REMOTE_TOOL_NAME,
+                load_page_text_config,
+            )
+
+            page_text_config_path = str(
+                Path(_required_environment_value(f"{prefix}_PAGE_TEXT_CONFIG")).resolve()
+            )
+            try:
+                _, page_text_config_sha256 = load_page_text_config(page_text_config_path)
+            except ValueError:
+                raise MCPConfigurationError("invalid page text operator configuration") from None
+            expected_tools = (REMOTE_TOOL_NAME,)
+            expected_bindings: dict[str, tuple[str, ...]] = {
+                REMOTE_TOOL_NAME: (PROPOSED_OPERATION,)
+            }
+            if allowed_tools is not None and allowed_tools != expected_tools:
+                raise MCPConfigurationError("page text profile requires its exact tool allowlist")
+            if tool_operations is not None and tool_operations != expected_bindings:
+                raise MCPConfigurationError(
+                    "page text profile requires its exact operation binding"
+                )
+            if args:
+                raise MCPConfigurationError("page text profile constructs its own stdio arguments")
+            allowed_tools = expected_tools
+            tool_operations = expected_bindings
+            args = (
+                "-m", MODULE, "--config", page_text_config_path,
+                "--sha256", page_text_config_sha256,
+            )
         elif profile is not None:
             if profile not in {"workspace_read", "workspace_write"}:
                 raise MCPConfigurationError(f"{prefix}_PROFILE is not a supported profile")
@@ -183,6 +225,8 @@ class MCPServerSettings:
             profile=profile,
             workspace_asset_ref=workspace_asset_ref,
             vdb_asset_ref=vdb_asset_ref,
+            page_text_config_path=page_text_config_path,
+            page_text_config_sha256=page_text_config_sha256,
         )
 
     def request_headers(self) -> dict[str, str]:

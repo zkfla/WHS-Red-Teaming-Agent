@@ -6,9 +6,11 @@
 ## 목적과 구현 경계
 
 `servers/page_text.py`의 `PageTextReader.fetch_page_text()`는 운영자가 허용한
-공개 HTTPS 페이지를 읽어 실제 텍스트와 출처를 반환하는 **내부 기능**이다.
-현재 `MCPServer`나 remote Tool을 만들거나 Registry에 등록하지 않는다.
-`fetch_page_text`는 내부 함수 이름이며 확정된 canonical operation이 아니다.
+공개 HTTPS 페이지를 읽어 실제 텍스트와 출처를 반환하는 내부 기능이다.
+`servers/page_text_mcp.py`가 이 구현을 MCP `fetch_page_text` 도구로 노출한다.
+Capability profile이 명시적으로 설정되면 bootstrap이 discovery를 검증해
+Registry·Gateway에 등록한다. `page_read`는 이번 연결의 **제안 operation**이며
+최종 canonical operation이나 Control·Agent 정책으로 확정되지 않았다.
 
 JavaScript/브라우저 실행, 로그인, 파일 저장, PDF, 검색엔진, PoC 실행을 지원하지
 않는다. 본문은 불신 입력인 관측 자료다. 본문의 지시를 실행하거나 scope에 대상을
@@ -17,8 +19,39 @@ JavaScript/브라우저 실행, 로그인, 파일 저장, PDF, 검색엔진, PoC
 
 다른 팀 구현을 import하지 않는다. 시험 대상 정책과 인증 세션에 결합된 기존
 `servers/network.py`를 직접 호출하는 대신, 그 코드의 IP 고정·Host/SNI 유지 패턴을
-독립적인 공개 자료 정책에 적용했다. MCP 전용 `ToolInputError` 대신 로컬
-`PageTextError`를 사용하며, 후속 Adapter에서 기존 오류 계약으로 변환한다.
+독립적인 공개 자료 정책에 적용했다. 내부 `PageTextError`는 MCP 경계에서
+고정 코드의 SDK `ToolError`로 변환되며, 공통 Adapter·Gateway가 기존
+`ToolResult`/`ToolError`와 Action·Invocation ID를 유지한다.
+
+## MCP 설정·등록
+
+운영자 JSON 파일 하나가 허용 origin과 모든 페이지 제한값의 원본이다.
+예시 값은 다음과 같다. 빈 `allowed_origins`는 모든 접근을 거절한다.
+
+```json
+{
+  "allowed_origins": ["https://docs.example"],
+  "timeout_seconds": 5.0,
+  "max_download_bytes": 262144,
+  "max_return_chars": 20000,
+  "max_redirects": 3
+}
+```
+
+`.env.example`의 `page-text` 예시는 stdio MCP 서버를 명시적으로 활성화한다.
+`REDTEAM_MCP_PAGE_TEXT_PAGE_TEXT_CONFIG`는 운영자 파일의 절대 경로다.
+Capability 설정은 기존 `PageTextConfig`로 파일을 검사하고 SHA-256을 stdio
+인자에 고정한다. 자식 서버는 실행 직전 같은 파일을 다시 검사하며 바이트가
+변경됐으면 시작하지 않는다. 이 profile은 remote tool `fetch_page_text` 하나와
+제안 operation `page_read`를 정확히 바인딩한다. 호출 인자에는 URL과 선택적
+`max_chars`만 있고 정책·상한·인증정보는 없다. discovery의 입력 한도와 출력
+schema를 실제 MCP 응답 및 같은 설정값에 대조한 뒤 등록한다. 이 도구만
+`url` 대상 메타데이터를 가지며 기존 `web_api` 기본 target 목록은 유지한다.
+
+`web` namespace, 제안 Action Key `web.page_read`, 실행 ToolId
+`web.fetch_page_text`는 서로 의미가 다르다. 현재 Orchestration naming 검증에는
+`page_read`가 없어 Agent 후보·Control 승인 경로는 연결되지 않았다. 공개 지식
+조회에 대한 최종 operation·Target·위험도·ROE는 담당 팀과 합의해야 한다.
 
 ## 입력·설정·출력
 
@@ -144,6 +177,7 @@ Pydantic `ValidationError.errors()`에는 입력이 포함될 수 있으므로 �
 ```sh
 .venv/bin/pytest tests/unit/test_page_text.py -q
 .venv/bin/pytest tests/integration/test_page_text_transport.py -q
+.venv/bin/pytest tests/integration/test_page_text_mcp.py -q
 .venv/bin/pytest -q
 .venv/bin/ruff check src tests examples
 .venv/bin/mypy src/redteam tests
@@ -164,21 +198,29 @@ HTTPX/httpcore TCP·TLS 경로를 사용한다. 테스트 전용 소켓 경계�
 성공·HTTP 오류·본문 timeout·취소 뒤 연결 종료를 확인한다. 이 매핑은 테스트에만
 있으며 운영 배포의 라우팅·네트워크 격리 검증을 대신하지 않는다.
 
-### 이번 구현의 검증 결과
+MCP 통합 테스트는 공식 Client를 통한 in-process 성공·거절·입력 오류·timeout,
+실제 로컬 stdio 자식 프로세스의 discovery·성공·거절, Gateway의 operation·schema·
+Action/Invocation ID 보존을 확인한다. in-process 성공 페이지는 Mock HTTP
+transport로 제공한다. 별도 stdio 성공 테스트는 실제 로컬 HTTPS 서버에서 제목과
+본문을 받아 output schema로 검사한다. 테스트 전용 자식 프로세스의 최종 소켓
+경계에서만 검증된 공개 IP를 loopback으로 매핑하며, 운영 설정·제품 서버에는 이
+허용 경로가 없다. 실제 외부 사이트는 읽지 않는다. Agent 전체 실행이나 Control
+ALLOW 경로 검증은 아니다.
 
-- 신규 단위 테스트: **111 passed**.
-- 로컬 TLS 통합 테스트: **4 passed**. 외부 사이트 호출은 없었다.
-- 전체 pytest: 로컬 TLS 테스트 추가 전 **1700 passed, 5 skipped**. 외부 서비스
-  opt-in은 활성화하지 않았다. 추가한 통합 테스트는 별도로 모두 통과했다.
-- `ruff check src tests examples`: 통과.
-- 신규 모듈·테스트만 대상으로 한 mypy: 통과.
-- 전체 mypy: 기존 24개 파일의 **199개 오류**. 변경 전 HEAD를 별도 임시 경로에
-  풀어 동일 검사한 결과와 오류 목록이 정확히 일치하며 신규 오류는 없다.
-- `git diff --check` 및 미추적 신규 세 파일의 개별 whitespace 검사: 통과.
+### 2026-10-02 연결 검증 결과
 
-샌드박스에서는 기존 integration 테스트의 비동기 thread 완료 대기가 멈췄고,
-변경 전 HEAD에서도 같은 현상을 확인했다. 전체 pytest는 승인된 샌드박스 밖
-실행으로 완료했다. 테스트를 삭제하거나 외부 서비스 검사를 활성화하지 않았다.
+- 기존 페이지 읽기 단위 테스트: **111 passed**.
+- 신규 MCP 통합 테스트: 로컬 HTTPS·stdio 성공 사례 추가 후 **7 passed**.
+- 전체 pytest: 성공 사례 추가 전 **2065 passed, 32 skipped**. 새 사례는 위
+  MCP 통합 테스트 파일 전체 실행으로 검증했다. 외부 서비스 opt-in 없음.
+- `ruff check src tests examples`, 변경 파일 mypy, 공백 검사: 통과.
+- 전체 mypy: 현재 **94 errors / 15 files**. 같은 가상환경에서 병합 HEAD
+  `25846c0`을 별도 임시 경로에 풀어 검사한 결과도 **94 errors / 15 files**이며
+  오류 내용·위치가 정확히 같다. 사용자 환경에서 보고한 병합 기준 58개 오류와
+  이 실행 환경의 수치가 다르므로 이를 새로운 변경 오류로 세지 않는다.
+
+샌드박스에서 기존 통합 테스트 비동기 대기와 로컬 stdio 대기가 멈춰, 전체 pytest는
+승인된 샌드박스 밖에서 로컬 검사로 실행했다. 외부 서비스를 활성화하지 않았다.
 
 ## 후속 연결과 계약 검토
 
@@ -186,16 +228,15 @@ HTTPX/httpcore TCP·TLS 경로를 사용한다. 테스트 전용 소켓 경계�
    공개 지식 조회의 외부 전송·origin/path/query 허용 정책은 시험 대상 scope와
    구별한다. `UrlTarget` 재사용 가능성을 먼저 검토하고 검색 결과를 시험 대상으로
    자동 추가하지 않는다.
-2. A에게 MCP 노출 및 공통 settings/bootstrap/Registry/manifest 연결을 요청한다.
-   이 모듈은 공통 파일 변경 없이 완성한다. 후속 remote Tool 이름과 schema는
-   실제 discovery로 확인하고 일치 검사를 추가한다.
-3. 후속 Adapter는 결과의 `model_dump()`를 기존 `ToolResult.output`으로 옮기고
-   `PageTextError`를 `ToolError`로 변환할 수 있다. Gateway가 기존 invocation_id,
-   action_id 및 실행 context의 run/engagement correlation을 유지해야 한다.
+2. MCP 노출·Capability settings/bootstrap/Registry/Gateway 연결은 별도 독립
+   테스트로 검증한다. 실제 Agent 후보 생성이나 Control 승인을 뜻하지 않는다.
+3. 공통 Adapter·Gateway가 기존 `ToolResult`로 정규화하고 invocation_id,
+   action_id 및 실행 context의 run/engagement correlation을 유지한다.
 4. capability namespace, lower_snake_case operation,
    `capability.operation` Action Key, `namespace.remote_tool_name` ToolId를
    구별한다. Agent는 ActionProposal→Control→Gateway 경로를 사용한다.
-5. 실제 MCP 호출과 Agent 후보 노출·선택·승인·실행은 별도 검증한다.
+5. 실제 MCP 호출은 독립적으로 검증한다. Agent 후보 노출·선택·승인·실행은
+   별도 단계다.
    웹검색 공급자·Playwright·EIP/GitHub/Burp는 이번 완료 조건에 포함하지 않는다.
 6. 대형 원문 보존·Artifact/Evidence 연결과 보존/접근 권한은 A·Evidence 담당과
    후속 합의한다. 현재 원문은 메모리에서 읽고 제한된 출력만 반환한다.

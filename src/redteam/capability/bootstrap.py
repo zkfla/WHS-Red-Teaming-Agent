@@ -30,7 +30,9 @@ from redteam.capability.mobile_analysis_manifest import (
     MOBILE_ANALYSIS_TOOLS,
     validate_configured_discovery,
 )
+from redteam.capability.page_text_manifest import validate_page_text_discovery
 from redteam.capability.registry import MCPToolRegistry
+from redteam.capability.servers.page_text_mcp import load_page_text_config
 from redteam.capability.settings import (
     MCPConfigurationError,
     MCPServerKind,
@@ -157,7 +159,20 @@ async def _build_gateway(
                 if selected_spec is not None
                 else _default_target_types(settings.kind)
             )
-            if settings.profile is not None:
+            if settings.profile == "page_text_readonly":
+                descriptor.target_types = ["url"]
+                try:
+                    config, _ = load_page_text_config(
+                        settings.page_text_config_path or "",
+                        settings.page_text_config_sha256,
+                    )
+                    validate_page_text_discovery(descriptor, config)
+                except ValueError:
+                    raise MCPConfigurationError(
+                        "page text discovery differs from operator configuration"
+                    ) from None
+                target_types[str(descriptor.tool_id)] = "url"
+            elif settings.profile is not None:
                 descriptor.target_types = ["asset"]
                 try:
                     if settings.profile in {"vdb_readonly", "vdb_readonly_extended"}:
@@ -237,6 +252,12 @@ def _default_target_types(kind: MCPServerKind) -> list[str]:
 def _create_adapter(settings: MCPServerSettings, transport: MCPTransport) -> MCPAdapter:
     if settings.allowed_tools is not None:
         transport = AllowlistedMCPTransport(transport, settings.allowed_tools)
+    if settings.profile == "page_text_readonly":
+        return WebAPIMCPAdapter(
+            server_id=settings.server_id,
+            risk_level=settings.risk_level,
+            transport=transport,
+        )
     if settings.profile is not None:
         adapter_class = (
             VDBMCPAdapter
