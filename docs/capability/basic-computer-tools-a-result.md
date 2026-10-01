@@ -138,3 +138,10 @@ GHSA/alias/CPE/URL 전용 조회·bulk/SBOM·shard fan-out·실제 대량 DB·�
 
 - [후속 VDB 구현·검증 근거와 남은 작업](vdb-readonly-result.md)
 - [VDB 실행 설정·Agent 팀 연결](../../deploy/mcp/vdb/README.md)
+
+## 9. 후속 진행 기록 — 방법론 읽기 전용 자료
+
+위 6번의 첫 단계를 진행했다. m4vic·Rifteo·VDB의 문서 19개를 선별 검수하여 pin/hash/license·도메인 인덱스와 읽기 전용 bundle을 제공하고, 기존 Workspace MCP 경유로 실제 Candidate/Control/조회 경로를 확인했다. 새 실행 Tool 19개를 만든 것이 아니며 기본 LLM의 자율 선택/Skill loader는 아직 별도다.
+
+- [후속 방법론 구현·최종 검증·다음 작업](methodology-reference-result.md)
+- [방법론 실행 설정과 같은 ToolId 중복 등록 제한](../../deploy/mcp/methodology/README.md)

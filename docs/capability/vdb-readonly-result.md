@@ -54,3 +54,7 @@
 
 - [실행 설정 및 안전 경계](../../deploy/mcp/vdb/README.md)
 - [세 사람의 공통 계획과 현재 상태](basic-computer-tools-team-plan.md)
+
+## 후속 상태 — 방법론 자료 제공
+
+위 다음 작업 3번의 자료 제공 단계를 `a2e1a16`에서 진행했다. VDB 안내를 포함한 m4vic/Rifteo 문서 19개를 검수된 읽기 전용 bundle과 도메인 인덱스로 제공했다. Agent loader/자율 선택 및 VDB bulk 확장은 아직 별도다. 최신 검증과 통합 제한은 [방법론 후속 결과](methodology-reference-result.md)를 따른다.
