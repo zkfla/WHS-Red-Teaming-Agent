@@ -16,10 +16,8 @@ def _write(tmp_path: Path, name: str, text: str) -> Path:
     return path
 
 
-def _args(engagement_path: Path, *, config_path: str | None = None, json_mode: bool = False):
-    return argparse.Namespace(
-        engagement_path=str(engagement_path), config_path=config_path, json=json_mode
-    )
+def _args(engagement_path: Path, *, json_mode: bool = False):
+    return argparse.Namespace(engagement_path=str(engagement_path), json=json_mode)
 
 
 async def test_valid_engagement_passes(tmp_path: Path, capsys) -> None:
@@ -91,13 +89,35 @@ approval_policy:
   require_approval_for: []
 """,
     )
-    app_config_path = _write(
-        tmp_path, "app.yaml", 'capability:\n  mcp_servers: ["missing-server"]\n'
-    )
+    monkeypatch.setenv("REDTEAM_MCP_SERVERS", "missing-server")
     monkeypatch.delenv("REDTEAM_MCP_MISSING_SERVER_KIND", raising=False)
 
-    exit_code = await validate_command.run(_args(engagement_path, config_path=str(app_config_path)))
+    exit_code = await validate_command.run(_args(engagement_path))
     assert exit_code == EXIT_CONFIG_ERROR
+
+
+async def test_explicit_example_adapter_needs_no_external_server_settings(
+    tmp_path: Path, monkeypatch
+) -> None:
+    engagement_path = _write(
+        tmp_path,
+        "engagement.yaml",
+        """
+name: "example-adapter"
+scope:
+  allowed_hosts: ["example.local"]
+execution_budget:
+  max_actions: 1
+rate_limit_policy:
+  max_actions_per_minute: 10
+approval_policy:
+  require_approval_for: []
+""",
+    )
+    monkeypatch.setenv("REDTEAM_MCP_SERVERS", "example")
+    monkeypatch.delenv("REDTEAM_MCP_EXAMPLE_KIND", raising=False)
+
+    assert await validate_command.run(_args(engagement_path)) == EXIT_OK
 
 
 async def test_prohibited_techniques_is_flagged_as_unenforceable(tmp_path: Path, capsys) -> None:

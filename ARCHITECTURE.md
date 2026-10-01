@@ -37,10 +37,15 @@ direction, potential conflicts, and the final repository tree.
 
 4. **Capability Layer is Adapter-pattern, not tool-building.**
    `ToolGateway` -> `MCPToolRegistry` -> `MCPAdapter` -> MCP Server.
-   `ExampleMCPAdapter` (in-process, simulated) is still the zero-config
-   default when no server is configured — but real Capability-owned MCP
-   servers now exist too (`src/redteam/capability/servers/`): bounded
-   wrappers around `nmap`/ZAP/`nuclei` plus self-contained scoped
+   `ExampleMCPAdapter` (in-process, simulated) is a test/dev fixture,
+   explicitly opt-in only (`REDTEAM_MCP_SERVERS=example`) — production
+   `build_application()` no longer substitutes it when no server is
+   configured; an unconfigured deployment gets an honest empty tool
+   catalog instead (a later architecture-consolidation pass removed that
+   fallback: a misconfigured/unconfigured MCP connection must never look
+   like a real tool executed). Real Capability-owned MCP servers exist
+   (`src/redteam/capability/servers/`): bounded wrappers around
+   `nmap`/ZAP/`nuclei` plus self-contained scoped
    HTTP/recon/proxy/mobile-shell/APK-inspection tools, all
    policy-allowlisted per target, not general attack tooling (still
    respects instruction.md section 21 — no payload databases, no

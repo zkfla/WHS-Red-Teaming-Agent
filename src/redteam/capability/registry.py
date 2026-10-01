@@ -1,4 +1,16 @@
-"""In-memory MCP Tool Registry. Owned by Capability Team."""
+"""In-memory MCP Tool Registry. Owned by Capability Team.
+
+Responsibility boundary with ``MCPToolCatalog`` (``capability/catalog.py``):
+this Registry is the authoritative store of *what was discovered* --
+plain ``register``/``get``/``all``/``list_by_capability``/health bookkeeping,
+with no operation-binding or candidate-metadata policy of its own. Which
+canonical ``capability.operation`` a discovered tool actually answers to
+(``list_tools_for_action``, ``list_candidate_metadata``) is a bound,
+per-Gateway *view* over one discovery snapshot -- ``MCPToolCatalog``'s job,
+not duplicated here. A tool's discovery snapshot legitimately needs both:
+this class does not know or care about operation bindings; the Catalog
+never itself stores a tool.
+"""
 
 from __future__ import annotations
 
@@ -32,28 +44,6 @@ class MCPToolRegistry:
             tool.model_copy(deep=True)
             for tool in self._sorted_tools()
             if capability_tag in tool.capability_tags
-        ]
-
-    def list_tools_for_action(
-        self,
-        capability: str,
-        operation: str,
-        *,
-        include_unhealthy: bool = False,
-    ) -> list[ToolDescriptor]:
-        """Compatibility catalog for registry-only test and bootstrap callers.
-
-        The full operation binding policy lives in ``MCPToolCatalog``. A raw
-        Registry can still answer safely for descriptors that carry their own
-        operation metadata, or for legacy descriptors whose remote name is the
-        operation.
-        """
-        return [
-            descriptor
-            for descriptor in self._sorted_tools()
-            if str(descriptor.tool_id).partition(".")[0] == capability
-            and operation in (descriptor.operations or [descriptor.tool_name])
-            and (include_unhealthy or descriptor.health_status != ToolHealthStatus.UNHEALTHY)
         ]
 
     def list_by_server(self, server_id: str) -> list[ToolDescriptor]:
@@ -96,10 +86,36 @@ class MCPToolRegistry:
         }
         self._tools = {**retained, **replacements}
 
-    def update_server_health(self, server_id: str, status: ToolHealthStatus) -> None:
+    def update_server_health(self, server_id: str, status: ToolHealthStatus) -> bool:
+        """Refresh the health status of every tool owned by one MCP server.
+
+        Returns ``True`` when at least one descriptor actually changed. An
+        unknown server is a no-op so a stale server list can never mutate the
+        Registry. Health is the only field this method touches — it is a
+        liveness signal, never an authorization decision.
+        """
+
+        changed = False
         for tool_id, descriptor in tuple(self._tools.items()):
+            if descriptor.server_id != server_id:
+                continue
+            if descriptor.health_status == status:
+                continue
+            self._tools[tool_id] = descriptor.model_copy(update={"health_status": status})
+            changed = True
+        return changed
+
+    def server_health(self, server_id: str) -> ToolHealthStatus | None:
+        """Current health for one server, or ``None`` when it owns no tools.
+
+        The server's descriptors are refreshed in unison, so the first matching
+        descriptor is representative.
+        """
+
+        for descriptor in self._sorted_tools():
             if descriptor.server_id == server_id:
-                self._tools[tool_id] = descriptor.model_copy(update={"health_status": status})
+                return descriptor.health_status
+        return None
 
     def _sorted_tools(self) -> list[ToolDescriptor]:
         return sorted(self._tools.values(), key=lambda descriptor: str(descriptor.tool_id))

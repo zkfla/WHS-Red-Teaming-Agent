@@ -2,7 +2,7 @@
 
 Canonical path, no CLI-only shortcut:
 
-    engagement.yaml (+ --config app.yaml) -> AppConfig
+    engagement.yaml + environment (REDTEAM_LLM_*/REDTEAM_MCP_*) -> AppConfig
         -> app.bootstrap.build_application(config)   (real LLM, real MCP, real Control)
         -> app.bootstrap.run_engagement(engagement, deps=deps)
         -> Orchestration -> ActionProposal -> Control -> Tool Selection
@@ -10,7 +10,7 @@ Canonical path, no CLI-only shortcut:
 
 This module never decides ROE/Scope/Tool-selection/Approval policy — it
 only builds the config, starts the run, prints the events it's handed,
-and (interactive mode only) polls for a resolved Approval using
+and (interactive or plain CLI external-approval-watch mode) polls for a resolved Approval using
 ``AgentLoopRunner.reconcile_once`` — the same reconciliation primitive
 built for exactly this, not a bespoke wait loop.
 
@@ -26,15 +26,24 @@ split (section 23: this explicit command stays script/CI-safe).
 from __future__ import annotations
 
 import argparse
+import asyncio
+import contextlib
 import json
 import logging
+import os
+import sys
 from collections.abc import Callable
 from contextlib import AsyncExitStack
-from typing import Any
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
 
 from pydantic import ValidationError
 
-from redteam.app.bootstrap import build_application, run_engagement
+if TYPE_CHECKING:
+    from prompt_toolkit import PromptSession
+
+from redteam.app.bootstrap import build_application, run_engagement, settle_engagement
+from redteam.app.cli import renderer
 from redteam.app.cli._shared import (
     EXIT_CONFIG_ERROR,
     EXIT_FAILURE,
@@ -43,22 +52,31 @@ from redteam.app.cli._shared import (
     load_app_config_for_run,
     mask_secrets,
 )
+from redteam.app.cli.conversation import ConversationAssistant, catalog_tool_labels
 from redteam.capability.settings import MCPConfigurationError
 from redteam.core.config import AppConfig
 from redteam.core.contracts.events import EventEnvelope, EventType
+from redteam.core.enums import ApprovalStatus, OperatorIntentType
+from redteam.core.ids import EngagementId, MissionId, RunId
 from redteam.core.ports.event_bus import EventHandler
+from redteam.event_bus.publisher import EventPublisher
 from redteam.orchestration.context import RuntimeDeps
 from redteam.orchestration.events import (
+    AGENT_CONTEXT_PREPARED,
+    AGENT_DECISION_RECORDED,
     AGENT_NO_EXECUTABLE_CANDIDATES,
+    AGENT_TURN_DECIDED,
     AUTHENTICATION_CHECK_DEFERRED,
     AUTHENTICATION_CHECKED,
     CANDIDATE_GENERATED,
     CANDIDATE_REJECTED,
     GRAPH_MUTATION_APPLIED,
     HYPOTHESIS_RESOLVED,
+    MCP_TOOL_SELECTED,
     REPLAN_TRIGGERED,
     RESULT_MAPPER_FAILED,
 )
+from redteam.orchestration.operator_intents import OperatorIntentService, redact_text
 from redteam.orchestration.runner import AgentLoopRunner
 from redteam.orchestration.settings import OrchestrationSettings
 from redteam.orchestration.state import RuntimeState, TerminationReason
@@ -87,6 +105,7 @@ _RENDERED_EVENTS = frozenset(
         # agent silently producing zero executable candidates is visible
         # by default, not only under --verbose (section 10).
         AGENT_NO_EXECUTABLE_CANDIDATES,
+        AGENT_TURN_DECIDED,
         CANDIDATE_GENERATED,
         CANDIDATE_REJECTED,
         GRAPH_MUTATION_APPLIED,
@@ -95,22 +114,28 @@ _RENDERED_EVENTS = frozenset(
         RESULT_MAPPER_FAILED,
         AUTHENTICATION_CHECK_DEFERRED,
         AUTHENTICATION_CHECKED,
+        MCP_TOOL_SELECTED,
+        AGENT_CONTEXT_PREPARED,
+        AGENT_DECISION_RECORDED,
     }
 )
 
 #: How often the interactive wait re-checks whether a pending Approval
 #: has been resolved -- also the cap on how stale "still waiting" looks.
 _APPROVAL_POLL_SECONDS = 5.0
+#: When an in-session operator console is live, approve/deny should resume
+#: the run promptly instead of waiting out the full cross-terminal poll.
+_APPROVAL_POLL_SECONDS_IN_SESSION = 1.0
 
 
 def add_parser(subparsers: argparse._SubParsersAction) -> None:
     parser = subparsers.add_parser("run", help="Run an Engagement end-to-end")
     parser.add_argument("engagement_path")
-    parser.add_argument("--config", dest="config_path", default=None)
     parser.add_argument("--non-interactive", action="store_true")
     parser.add_argument("--max-steps", type=int, default=None)
     parser.add_argument("--log-level", default=None)
     parser.add_argument("--json", action="store_true")
+    parser.add_argument("--objective", default=None, help="Natural-language Mission objective")
     parser.set_defaults(handler=run)
 
 
@@ -159,14 +184,472 @@ def _render_event(event: EventEnvelope, *, json_mode: bool) -> None:
             if not isinstance(item, dict):
                 continue
             field = f"({item['field']})" if item.get("field") else ""
-            print(
-                "  - "
-                f"{item.get('operation', 'unknown')}: "
-                f"{item.get('reason', 'unknown')}{field}"
-            )
+            print(f"  - {item.get('operation', 'unknown')}: {item.get('reason', 'unknown')}{field}")
+        return
+    if event.event_type == AGENT_TURN_DECIDED:
+        payload = mask_secrets(event.payload)
+        print(f"[Agent] {payload.get('response', '')}")
+        if payload.get("decision_summary"):
+            print(f"[Reason] {payload['decision_summary']}")
+        for item in (payload.get("assumptions") or [])[:3]:
+            print(f"[Assumption] {item}")
+        if payload.get("candidate_source") == "recipe_fallback":
+            print("[Fallback] LLM proposal was not executable; using a safe recipe.")
         return
     fields = " ".join(f"{k}={v}" for k, v in mask_secrets(event.payload).items() if v is not None)
     print(f"[{event.event_type}] {fields}")
+
+
+# --- Operator console (PROMPT 4+5) ----------------------------------------
+#
+# A run is a long-lived single asyncio process. The operator needs to keep
+# typing while it runs -- pause/resume/stop/focus/exclude/status and, when
+# the run suspends on an Approval, approve/deny *in the same session* --
+# without a Textual rewrite and without a cursor fight with the event
+# renderer.
+#
+# Mechanism, deliberately dependency-free:
+#   * one daemon thread blocks on ``sys.stdin.readline`` and hands each line
+#     to the loop with ``call_soon_threadsafe`` (the only thread-safe way to
+#     touch an ``asyncio.Queue``);
+#   * one consumer task, on the same loop as the event renderer, drains that
+#     queue and dispatches each line. PromptToolkit redraws the user's
+#     unfinished input after event output, preserving cursor and focus.
+#
+# The channel routes through ``OperatorIntentService`` (never a tool, never
+# the Control Plane's policy path): the same service OBSERVE already drains,
+# so PAUSE/STOP take effect before the next scheduled action. Approval
+# resolution deliberately calls ``DefaultControlPlane.resolve_approval`` --
+# the *same* Approval the runner is already reconciling against -- and never
+# replans or mints a new proposal.
+
+_APPROVE_COMMANDS = frozenset({"approve", "a", "y", "yes"})
+_DENY_COMMANDS = frozenset({"deny", "d", "n", "no", "reject"})
+_QUERY_COMMANDS = frozenset({"status", "query", "현황", "상태", "진행", "요약"})
+_EXPLAIN_COMMANDS = frozenset({"explain", "why", "설명", "이유", "왜"})
+_HELP_COMMANDS = frozenset({"help", "?", "h"})
+
+
+def _default_resolved_by() -> str:
+    return os.environ.get("USER") or os.environ.get("USERNAME") or "cli-operator"
+
+
+def _stdin_is_interactive() -> bool:
+    stream = sys.stdin
+    if stream is None or getattr(stream, "closed", False):
+        return False
+    isatty = getattr(stream, "isatty", None)
+    return bool(isatty()) if callable(isatty) else False
+
+
+@dataclass
+class RuntimeIdentity:
+    """Run/engagement/mission ids learned from the live event stream.
+
+    ``execute`` cannot know the run/mission before ``run_engagement`` mints
+    them, so the wrapped subscriber records them off the envelopes it is
+    already delivering. The operator channel answers "mission still
+    starting" until the mission id has been seen.
+    """
+
+    run_id: RunId | None = None
+    engagement_id: EngagementId | None = None
+    mission_id: MissionId | None = None
+
+    def observe(self, event: EventEnvelope) -> None:
+        self.run_id = event.run_id
+        self.engagement_id = event.engagement_id
+        if event.event_type == EventType.MISSION_CREATED:
+            mission_id = event.payload.get("mission_id")
+            if mission_id is not None:
+                self.mission_id = MissionId(str(mission_id))
+
+
+class OperatorConsole:
+    """Persistent, in-session operator input for one run.
+
+    Construction is cheap and side-effect free (so it is unit-testable
+    without a thread or a loop): call :meth:`start` to attach the reader
+    thread + consumer task, and :meth:`handle_line` directly from a test.
+    """
+
+    def __init__(
+        self,
+        deps: RuntimeDeps,
+        echo: Echo,
+        *,
+        identity: RuntimeIdentity,
+        resolved_by: str | None = None,
+        conversation: ConversationAssistant | None = None,
+        engagement_name: str = "active engagement",
+        scope: list[str] | None = None,
+    ) -> None:
+        self._deps = deps
+        self._echo = echo
+        self._identity = identity
+        self._resolved_by = resolved_by or _default_resolved_by()
+        self._service = OperatorIntentService.from_deps(deps)
+        self._conversation = conversation
+        self._engagement_name = engagement_name
+        self._scope = list(scope or [])
+        self._pending_approval_id: str | None = None
+        self._queue: asyncio.Queue[str] | None = None
+        self._consumer: asyncio.Task[None] | None = None
+        self._stop = asyncio.Event()
+        # Live-input plumbing. Declared up front (not only assigned in
+        # ``start``) so the attribute types are stable and ``input_available``
+        # is answerable before the console is ever started.
+        self._input_live = False
+        self._prompt_session: PromptSession[str] | None = None
+        self._prompt_context: Any | None = None
+        self._reader_task: asyncio.Task[None] | None = None
+        self._fallback_loop: asyncio.AbstractEventLoop | None = None
+        self._fallback_fd: int | None = None
+
+    @property
+    def input_available(self) -> bool:
+        """Whether a live, in-session input channel is actually attached.
+
+        False for ``--non-interactive``/``--json`` and for any non-TTY stdin
+        (a pipe/CI), where claiming "live input" or blocking at an Approval
+        would be a lie/hang.
+        """
+        return self._input_live and not self._stop.is_set()
+
+    # -- lifecycle ------------------------------------------------------
+
+    def start(self) -> None:
+        loop = asyncio.get_running_loop()
+        self._queue = asyncio.Queue()
+        self._consumer = loop.create_task(self._consume())
+        if not _stdin_is_interactive():
+            # Script/CI or a redirected stdin: there is no operator to read
+            # from. The consumer stays attached (the run still needs the
+            # event observer), but nothing may claim live input.
+            return
+        # PromptToolkit preserves the line being edited (and its cursor)
+        # while Rich streams event output from the same event loop. It is an
+        # optional-at-runtime convenience: if it cannot attach, the run must
+        # still proceed with input marked unavailable rather than crash.
+        try:
+            from prompt_toolkit import PromptSession
+            from prompt_toolkit.patch_stdout import patch_stdout
+        except Exception as exc:  # noqa: BLE001 - never let input setup kill the run
+            logging.getLogger(__name__).debug(
+                "PromptToolkit unavailable; using the basic terminal reader",
+                exc_info=exc,
+            )
+            self._start_basic_reader(loop)
+            return
+        try:
+            # `raw=True`: every event line printed here comes from our own
+            # Rich renderer, never from untrusted/user-controlled text, so
+            # it is safe to let its ANSI codes through unmangled.
+            # `patch_stdout()`'s default (`raw=False`) calls
+            # `Output.write()`, whose vt100/Windows10 backends do
+            # ``data.replace("\x1b", "?")`` to neutralize *arbitrary*
+            # escape sequences -- turning every `\x1b[32m` into a literal
+            # `?[32m` on screen. macOS/Linux terminals happened to still
+            # look fine whenever stdin wasn't a live TTY (patch_stdout
+            # never engaged at all, so nothing was ever mangled there);
+            # Windows makes the corruption visible on any real terminal
+            # session. `raw=True` uses `Output.write_raw()` instead, which
+            # passes escape sequences straight through on every platform.
+            self._prompt_context = patch_stdout(raw=True)
+            self._prompt_context.__enter__()
+            self._prompt_session = PromptSession()
+            self._input_live = True
+            self._reader_task = loop.create_task(self._read_prompt())
+        except Exception as exc:  # noqa: BLE001 - same fail-safe contract
+            self._input_live = False
+            if self._prompt_context is not None:
+                self._prompt_context.__exit__(None, None, None)
+                self._prompt_context = None
+            logging.getLogger(__name__).debug(
+                "PromptToolkit could not attach; using the basic terminal reader",
+                exc_info=exc,
+            )
+            self._start_basic_reader(loop)
+
+    def _start_basic_reader(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Attach a dependency-free TTY reader when PromptToolkit is absent.
+
+        POSIX ``add_reader`` is cancellable, so handing stdin back to the
+        post-run session prompt cannot lose a line to a blocked worker. A
+        background ``readline`` thread is deliberately not used when fd
+        readers are unavailable: it cannot be cancelled safely and could
+        steal the first line entered at the post-run prompt.
+        """
+
+        try:
+            fd = sys.stdin.fileno()
+            loop.add_reader(fd, self._read_stdin_ready)
+        except (AttributeError, NotImplementedError, OSError, RuntimeError, ValueError) as exc:
+            self._input_live = False
+            self._echo(
+                renderer.operator_notice_text(
+                    f"live operator input unavailable ({type(exc).__name__}); "
+                    "resolve approvals from another terminal"
+                )
+            )
+            return
+        self._fallback_loop = loop
+        self._fallback_fd = fd
+        self._input_live = True
+
+    def _read_stdin_ready(self) -> None:
+        if self._stop.is_set():
+            return
+        line = sys.stdin.readline()
+        if not line:
+            self._input_live = False
+            return
+        if self._queue is not None:
+            self._queue.put_nowait(line.rstrip("\r\n"))
+
+    async def _read_prompt(self) -> None:
+        try:
+            while not self._stop.is_set():
+                session = self._prompt_session
+                if session is None:
+                    return
+                try:
+                    line = await session.prompt_async("operator> ")
+                except (EOFError, KeyboardInterrupt):
+                    return
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001 - surface, don't die silently
+                    # A dead reader must be visible: otherwise the console
+                    # keeps looking alive while silently dropping all input.
+                    self._echo(
+                        renderer.operator_notice_text(
+                            f"operator input stopped: {redact_text(str(exc))}; "
+                            "resolve approvals from another terminal"
+                        )
+                    )
+                    return
+                if self._queue is not None:
+                    self._queue.put_nowait(line)
+        finally:
+            self._input_live = False
+
+    async def aclose(self) -> None:
+        self._stop.set()
+        self._input_live = False
+        fallback_loop = self._fallback_loop
+        fallback_fd = self._fallback_fd
+        self._fallback_loop = None
+        self._fallback_fd = None
+        if fallback_loop is not None and fallback_fd is not None:
+            fallback_loop.remove_reader(fallback_fd)
+        reader = self._reader_task
+        self._reader_task = None
+        if reader is not None:
+            reader.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await reader
+        prompt_context = self._prompt_context
+        self._prompt_context = None
+        if prompt_context is not None:
+            prompt_context.__exit__(None, None, None)
+        consumer = self._consumer
+        self._consumer = None
+        if consumer is not None:
+            consumer.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await consumer
+
+    async def _consume(self) -> None:
+        assert self._queue is not None
+        while True:
+            line = await self._queue.get()
+            try:
+                await self.handle_line(line)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - one bad command must not kill the run
+                self._echo(
+                    renderer.operator_notice_text(f"command failed: {redact_text(str(exc))}")
+                )
+
+    # -- approval identity ---------------------------------------------
+
+    def set_pending_approval(self, approval_id: object | None) -> None:
+        self._pending_approval_id = str(approval_id) if approval_id else None
+
+    def clear_pending_approval(self) -> None:
+        self._pending_approval_id = None
+
+    # -- dispatch -------------------------------------------------------
+
+    async def handle_line(self, text: str) -> None:
+        text = (text or "").strip()
+        if not text:
+            return
+        self._echo(renderer.operator_user_text(redact_text(text)))
+        head, _, rest = text.partition(" ")
+        # Natural-language punctuation ("status?", "pause!") must not defeat
+        # the console aliases. Anything that is *not* a known console command
+        # is handed to the interpreter as the full sentence, so multi-word
+        # English/Korean phrasing routes the same as the bare keyword. A lone
+        # "?" is itself the help alias, so only strip when something remains.
+        command = head.lower()
+        stripped = command.strip("?!.,:;")
+        if stripped:
+            command = stripped
+
+        if command in _HELP_COMMANDS:
+            self._echo(renderer.operator_help_text())
+            return
+        if command in _APPROVE_COMMANDS:
+            await self._resolve_approval(ApprovalStatus.APPROVED, rest.strip())
+            return
+        if command in _DENY_COMMANDS:
+            await self._resolve_approval(ApprovalStatus.REJECTED, rest.strip())
+            return
+        if command in _QUERY_COMMANDS:
+            # "query" is a CLI alias; the interpreter's own status vocabulary
+            # is used for everything else so Korean phrasing keeps working.
+            await self._apply_intent("status" if command == "query" else text)
+            return
+        if command in _EXPLAIN_COMMANDS:
+            await self._apply_intent(text)
+            return
+        await self._apply_intent(text)
+
+    # -- intent path (no tool, no policy) -------------------------------
+
+    async def _apply_intent(self, text: str) -> None:
+        if self._service is None:
+            self._echo(
+                renderer.operator_notice_text("operator intent channel is not wired in this run")
+            )
+            return
+        if self._identity.mission_id is None:
+            self._echo(
+                renderer.operator_notice_text("mission is still starting; try again shortly")
+            )
+            return
+
+        application = await self._service.receive_and_apply(
+            text,
+            mission_id=self._identity.mission_id,
+            run_id=self._identity.run_id,
+            publisher=self._publisher(),
+            allow_guidance=True,
+        )
+        if not application.applied and self._conversation is not None:
+            await self._handle_chat_fallback(text)
+            return
+
+        self._echo(renderer.operator_intent_text(application))
+
+        if application.intent_type is OperatorIntentType.STATUS_QUERY:
+            await self._show_status()
+        elif application.intent_type is OperatorIntentType.EXPLANATION_QUERY:
+            await self._show_explanation()
+
+    async def _handle_chat_fallback(self, text: str) -> None:
+        """Let the configured LLM answer or turn arbitrary chat into guidance.
+
+        The returned text never selects or invokes a tool. Execution-shaped
+        replies are persisted only as Mission guidance and therefore still
+        pass through OBSERVE -> PLAN -> compiler -> Control -> MCP.
+        """
+
+        service = self._service
+        mission_id = self._identity.mission_id
+        conversation = self._conversation
+        if service is None or mission_id is None or conversation is None:
+            return
+        status = await service.status(mission_id=mission_id)
+        explanation = await service.explain(mission_id=mission_id, run_id=self._identity.run_id)
+        decision = await conversation.decide(
+            text,
+            engagement_name=self._engagement_name,
+            scope=self._scope,
+            tools=catalog_tool_labels(self._deps.tool_catalog),
+            session_context=f"{status.summary} {explanation.summary}",
+            run_active=True,
+        )
+        self._echo(renderer.operator_assistant_text(decision))
+        if decision.mode not in {"guidance", "execute"}:
+            return
+        guidance = decision.guidance or decision.objective or text
+        guided = await service.receive_and_apply(
+            f"alternative method requested: {guidance}",
+            mission_id=mission_id,
+            run_id=self._identity.run_id,
+            publisher=self._publisher(),
+            source="operator_chat",
+            allow_guidance=True,
+        )
+        self._echo(renderer.operator_intent_text(guided))
+
+    async def _show_status(self) -> None:
+        service = self._service
+        mission_id = self._identity.mission_id
+        if service is None or mission_id is None:
+            return
+        report = await service.status(mission_id=mission_id)
+        self._echo(renderer.operator_status_text(report))
+
+    async def _show_explanation(self) -> None:
+        service = self._service
+        mission_id = self._identity.mission_id
+        if service is None or mission_id is None:
+            return
+        explanation = await service.explain(mission_id=mission_id, run_id=self._identity.run_id)
+        self._echo(renderer.operator_explanation_text(explanation))
+
+    def _publisher(self) -> EventPublisher | None:
+        if self._identity.run_id is None or self._identity.engagement_id is None:
+            return None
+        return EventPublisher(
+            self._deps.event_bus,
+            run_id=self._identity.run_id,
+            engagement_id=self._identity.engagement_id,
+            source="cli.operator",
+        )
+
+    # -- approval path (same DefaultControlPlane resolution) ------------
+
+    async def _resolve_approval(self, status: ApprovalStatus, explicit_id: str) -> None:
+        pending = self._pending_approval_id
+        if not pending:
+            self._echo(renderer.operator_notice_text("no action is awaiting approval"))
+            return
+        if explicit_id and explicit_id != pending:
+            # Never resolve a different Approval than the one this run is
+            # actually suspended on -- that would break the resume identity.
+            self._echo(
+                renderer.operator_notice_text(
+                    f"approval '{explicit_id}' does not match the pending approval '{pending}'"
+                )
+            )
+            return
+
+        resolver = getattr(self._deps.control_plane, "resolve_approval", None)
+        if resolver is None:
+            self._echo(
+                renderer.operator_notice_text(
+                    "this control plane cannot resolve approvals in-session; "
+                    f"use: redteam approvals approve|deny {pending}"
+                )
+            )
+            return
+        try:
+            await resolver(pending, status, self._resolved_by)
+        except Exception as exc:  # noqa: BLE001 - report, keep the run suspended
+            self._echo(
+                renderer.operator_notice_text(
+                    f"could not resolve approval {pending}: {redact_text(str(exc))}"
+                )
+            )
+            return
+        self._pending_approval_id = None
+        self._echo(renderer.operator_approval_resolved_text(pending, status))
 
 
 async def build(
@@ -182,17 +665,13 @@ async def build(
     """
     if not config.capability.mcp_servers:
         eprint(
-            "WARNING: no MCP servers configured (capability.mcp_servers is empty) -- "
-            "using the in-process ExampleMCPAdapter (development/test only; no real "
-            "tool execution). Configure --config app.yaml capability.mcp_servers for "
-            "a production run."
+            "WARNING: no MCP servers configured -- this run has an empty tool catalog "
+            "and cannot execute any Action. Set REDTEAM_MCP_SERVERS (comma-separated "
+            "server ids) and each server's REDTEAM_MCP_<ID>_* environment variables."
         )
 
-    orchestration_settings = OrchestrationSettings.from_config(
-        config.orchestration,
-        max_steps=max_steps,
-        checkpointing=True,
-        checkpoint_backend="sqlite",
+    orchestration_settings = OrchestrationSettings.for_durable_run(
+        config.orchestration, max_steps=max_steps
     )
 
     return await build_application(
@@ -208,6 +687,10 @@ async def execute(
     non_interactive: bool,
     on_event: EventHandler,
     echo: Echo,
+    objective: str | None = None,
+    allow_operator_input: bool = False,
+    wait_for_external_approval: bool = False,
+    conversation: ConversationAssistant | None = None,
 ) -> RuntimeState:
     """Phase 2 of the shared core: subscribe -> run -> approval wait.
     Callers own exception handling/exit codes and choose the renderer
@@ -215,26 +698,99 @@ async def execute(
     neither decision itself. Used by both this module's own ``run()``
     (plain renderer, ``echo=print``) and ``commands.interactive`` (Rich
     renderer/echo).
+
+    ``allow_operator_input`` (interactive sessions only; never
+    ``--non-interactive``/``--json``) attaches a persistent operator
+    channel for the whole run, including the approval suspension -- see
+    ``OperatorConsole``. Defaults off so every existing caller is
+    unchanged and script/CI invocations never block on stdin.
+
+    ``wait_for_external_approval`` preserves the plain CLI's original
+    approval-watch behavior when stdin is redirected: a separate approval CLI
+    can resolve the durable Approval while this process watches. It is opt-in
+    so direct/programmatic callers and JSON/non-interactive runs still return
+    a pending checkpoint instead of waiting without a known operator channel.
     """
-    await deps.event_bus.subscribe("*", on_event)
+    identity = RuntimeIdentity()
+    operator_console: OperatorConsole | None = None
+
+    if allow_operator_input:
+        engagement_scope = getattr(engagement, "scope", None)
+        scope_values = (
+            [
+                *engagement_scope.allowed_hosts,
+                *engagement_scope.allowed_domains,
+                *engagement_scope.allowed_networks,
+                *engagement_scope.allowed_assets,
+            ]
+            if engagement_scope is not None
+            else []
+        )
+        operator_console = OperatorConsole(
+            deps,
+            echo,
+            identity=identity,
+            conversation=conversation,
+            engagement_name=engagement.name,
+            scope=scope_values,
+        )
+
+        async def _observing_handler(event: EventEnvelope) -> None:
+            identity.observe(event)
+            await on_event(event)
+
+        await deps.event_bus.subscribe("*", _observing_handler)
+    else:
+        await deps.event_bus.subscribe("*", on_event)
     echo(f"Engagement: {engagement.name}")
 
-    final = await run_engagement(
-        engagement, deps=deps, orchestration_config=config.orchestration
-    )
+    if operator_console is not None:
+        operator_console.start()
+        echo(renderer.operator_welcome_text(live=operator_console.input_available))
 
-    if final.termination_reason == TerminationReason.APPROVAL_PENDING:
-        if non_interactive:
-            echo(
-                f"\nAction pending approval: {final.pending_approval_id} "
-                f"-- --non-interactive never auto-approves, so this run stops here. "
-                f"`redteam approvals approve {final.pending_approval_id}` will mark "
-                f"it resolved, but this v1 CLI has no way to resume THIS specific "
-                f"run afterwards (that needs a still-live interactive `redteam run` "
-                f"process watching it, which --non-interactive deliberately isn't)."
-            )
-        else:
-            final = await _wait_for_approval(deps, final, echo=echo)
+    try:
+        final = await run_engagement(
+            engagement,
+            deps=deps,
+            orchestration_config=config.orchestration,
+            objective=objective,
+        )
+
+        while final.termination_reason in {
+            TerminationReason.APPROVAL_PENDING,
+            TerminationReason.OPERATOR_PAUSED,
+        }:
+            if final.termination_reason == TerminationReason.OPERATOR_PAUSED:
+                live = operator_console is not None and operator_console.input_available
+                echo(renderer.operator_paused_text(str(final.run_id), live=live))
+                if not live:
+                    # No in-session channel: never block waiting for a
+                    # 'resume' that can never arrive. The Mission stays
+                    # paused and resumable from a real interactive session.
+                    break
+                final = await _wait_for_pause(deps, final, echo=echo)
+                continue
+            console = operator_console
+            live = console is not None and console.input_available
+            if non_interactive or (not live and not wait_for_external_approval):
+                # Without an explicit external-approval watch, a script/CI
+                # or JSON session returns its durable pending checkpoint.
+                echo(
+                    renderer.operator_approval_pending_text(
+                        str(final.pending_approval_id), str(final.run_id)
+                    )
+                )
+                break
+            if live and console is not None:
+                console.set_pending_approval(final.pending_approval_id)
+            try:
+                final = await _wait_for_approval(deps, final, echo=echo, in_session=live)
+            finally:
+                if live and console is not None:
+                    console.clear_pending_approval()
+    finally:
+        if operator_console is not None:
+            await operator_console.aclose()
 
     return final
 
@@ -246,7 +802,7 @@ async def run(args: argparse.Namespace) -> int:
 
 async def _run(args: argparse.Namespace, *, mcp_stack: AsyncExitStack) -> int:
     try:
-        config = load_app_config_for_run(args.engagement_path, args.config_path)
+        config = load_app_config_for_run(args.engagement_path)
     except (OSError, ValidationError, ValueError) as exc:
         eprint(f"ERROR: {exc}")
         return EXIT_CONFIG_ERROR
@@ -267,6 +823,7 @@ async def _run(args: argparse.Namespace, *, mcp_stack: AsyncExitStack) -> int:
 
     echo: Echo = (lambda _line: None) if args.json else print
 
+    allow_operator_input = not args.non_interactive and not getattr(args, "json", False)
     try:
         final = await execute(
             engagement,
@@ -275,6 +832,9 @@ async def _run(args: argparse.Namespace, *, mcp_stack: AsyncExitStack) -> int:
             non_interactive=args.non_interactive,
             on_event=_event_subscriber(json_mode=args.json),
             echo=echo,
+            objective=getattr(args, "objective", None),
+            allow_operator_input=allow_operator_input,
+            wait_for_external_approval=allow_operator_input,
         )
     except Exception as exc:  # noqa: BLE001 - same fail-closed contract as bootstrap
         if logging.getLogger().isEnabledFor(logging.DEBUG):
@@ -288,15 +848,15 @@ async def _run(args: argparse.Namespace, *, mcp_stack: AsyncExitStack) -> int:
 
 
 async def _wait_for_approval(
-    deps: RuntimeDeps, final: RuntimeState, *, echo: Echo
+    deps: RuntimeDeps, final: RuntimeState, *, echo: Echo, in_session: bool = False
 ) -> RuntimeState:
-    echo(f"\nAction pending approval: {final.pending_approval_id}")
-    echo(
-        f"Resolve from another terminal: "
-        f"redteam approvals approve {final.pending_approval_id}"
-    )
-    echo(f"                           or: redteam approvals deny {final.pending_approval_id}")
-    echo("Waiting for resolution (Ctrl+C to stop watching -- the Run stays pending)...")
+    approval_id = str(final.pending_approval_id)
+    echo(renderer.operator_approval_pending_text(approval_id, str(final.run_id)))
+    if in_session:
+        # The same-session operator console is live; approving here resolves
+        # the *exact* Approval this run is already suspended on (no replan).
+        echo(renderer.operator_approval_prompt_text(approval_id))
+    echo("Waiting for resolution (Ctrl+C stops watching; the Run stays pending)...")
 
     resume_settings = deps.settings.model_copy(update={"thread_id": str(final.run_id)})
     resume_runner = AgentLoopRunner(deps, settings=resume_settings)
@@ -304,33 +864,87 @@ async def _wait_for_approval(
     # the first run_engagement() call -- it's the same bus for the whole
     # process, subscribing again here would print every event twice.
     current = final
+    poll_seconds = _APPROVAL_POLL_SECONDS_IN_SESSION if in_session else _APPROVAL_POLL_SECONDS
     try:
         while current.termination_reason == TerminationReason.APPROVAL_PENDING:
-            result = await resume_runner.reconcile_once(
-                current, timeout_seconds=_APPROVAL_POLL_SECONDS
-            )
+            result = await resume_runner.reconcile_once(current, timeout_seconds=poll_seconds)
             current = result.runtime
+            mission = (
+                await deps.task_graph_store.get_mission(current.mission_id)
+                if current.mission_id is not None
+                else None
+            )
+            if mission is not None and mission.status.value == "cancelled":
+                current = current.model_copy(
+                    update={
+                        "termination_reason": TerminationReason.OPERATOR_STOPPED,
+                        "pending_approval_id": None,
+                        "pending_action_id": None,
+                    }
+                )
+                break
     except KeyboardInterrupt:
         echo(
             f"\nStopped watching. Run {current.run_id} is still pending approval "
-            f"{current.pending_approval_id}. This CLI does not resume a run across "
-            f"separate invocations in v1 -- keep a `redteam run` watching, or "
-            f"inspect it later with `redteam status {current.run_id}`."
+            f"{current.pending_approval_id} -- resume it later with "
+            f"`redteam resume {current.run_id} <engagement.yaml>`."
         )
         raise  # let main()'s top-level handler set the conventional SIGINT exit code
     finally:
         await resume_runner.aclose()
+    if current.termination_reason != TerminationReason.APPROVAL_PENDING:
+        current = await settle_engagement(current, deps, last_event_id=resume_runner.last_event_id)
+    return current
+
+
+async def _wait_for_pause(deps: RuntimeDeps, paused: RuntimeState, *, echo: Echo) -> RuntimeState:
+    settings = deps.settings.model_copy(update={"thread_id": str(paused.run_id)})
+    runner = AgentLoopRunner(deps, settings=settings)
+    current = paused
+    try:
+        while current.termination_reason == TerminationReason.OPERATOR_PAUSED:
+            result = await runner.reconcile_once(
+                current, timeout_seconds=_APPROVAL_POLL_SECONDS_IN_SESSION
+            )
+            current = result.runtime
+            mission = (
+                await deps.task_graph_store.get_mission(current.mission_id)
+                if current.mission_id is not None
+                else None
+            )
+            if mission is not None and mission.status.value == "cancelled":
+                current = current.model_copy(
+                    update={"termination_reason": TerminationReason.OPERATOR_STOPPED}
+                )
+                break
+    finally:
+        await runner.aclose()
+    if current.termination_reason not in {
+        TerminationReason.OPERATOR_PAUSED,
+        TerminationReason.APPROVAL_PENDING,
+    }:
+        return await settle_engagement(current, deps, last_event_id=runner.last_event_id)
     return current
 
 
 def _print_summary(final: RuntimeState) -> None:
+    suspended = final.termination_reason in {
+        TerminationReason.OPERATOR_PAUSED,
+        TerminationReason.APPROVAL_PENDING,
+    }
     print(
-        f"\nRun finished: phase={final.phase.value} "
+        f"\nRun {'suspended' if suspended else 'finished'}: phase={final.phase.value} "
         f"termination_reason={final.termination_reason}"
     )
     print(f"RunId: {final.run_id}")
+    if final.mission_status is not None:
+        print(f"Mission: {final.mission_status.value}")
     print(f"Actions executed: {final.actions_executed}")
-    print(f"Report: redteam report generate {final.run_id}")
+    if final.termination_reason not in {
+        TerminationReason.OPERATOR_PAUSED,
+        TerminationReason.APPROVAL_PENDING,
+    }:
+        print(f"Report: redteam report generate {final.run_id}")
 
 
 def _exit_code_for(final: RuntimeState) -> int:

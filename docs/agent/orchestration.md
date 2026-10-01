@@ -289,7 +289,7 @@ reason and counters.
 ## Specialist extension and terminal roles
 
 An executable specialist is registered as an `AgentDefinition`, `AgentSpec`
-and `CandidateProvider`. The provider owns role/domain meaning and emits typed
+and `GraphCandidateProvider`. The provider owns role/domain meaning and emits typed
 `CandidateDraft` values; the common compiler still enforces Tool Catalog
 binding, schema, health, stable identity and scoring. The default registry now
 contains Recon, Web/API and Mobile executable specs. Web/API and Mobile consume

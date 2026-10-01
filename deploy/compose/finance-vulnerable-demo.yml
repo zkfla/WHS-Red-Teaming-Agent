@@ -1,0 +1,68 @@
+services:
+  mock-bank:
+    environment:
+      VULNERABLE_DEMO: "1"
+
+  web-http:
+    ports:
+      - "127.0.0.1:18001:8000"
+
+  recon-passive:
+    ports:
+      - "127.0.0.1:18002:8000"
+
+  agent-demo:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/finance-tools/Dockerfile
+      target: base
+    entrypoint: [python, /app/finance_agent_demo.py]
+    env_file: ../mcp/finance/framework.env.example
+    environment:
+      LAB_ALICE_TOKEN: synthetic-alice
+      LAB_BOB_TOKEN: synthetic-bob
+      REDTEAM_MCP_RECON_PASSIVE_ALLOWED_TOOLS_JSON: '["http_probe"]'
+      REDTEAM_MCP_RECON_PASSIVE_TOOL_OPERATIONS_JSON: '{"http_probe":["service_discovery"]}'
+    volumes:
+      - ../../examples/finance_agent_demo.py:/app/finance_agent_demo.py:ro
+      - ../mcp/finance/app.vulnerable-demo.yaml:/app/demo.yaml:ro
+    networks: [lab]
+    depends_on:
+      web-http:
+        condition: service_healthy
+      recon-passive:
+        condition: service_healthy
+
+  redteam-cli:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/finance-tools/Dockerfile
+      target: base
+    profiles: [demo]
+    entrypoint: [redteam]
+    user: "0:0"
+    working_dir: /workspace
+    env_file: ../mcp/finance/framework.env.example
+    environment:
+      LAB_ALICE_TOKEN: synthetic-alice
+      LAB_BOB_TOKEN: synthetic-bob
+      REDTEAM_MCP_RECON_PASSIVE_ALLOWED_TOOLS_JSON: '["http_probe"]'
+      REDTEAM_MCP_RECON_PASSIVE_TOOL_OPERATIONS_JSON: '{"http_probe":["service_discovery"]}'
+      # No --config/app.yaml in the CLI: the vulnerable-demo AppConfig's
+      # llm/capability sections (app.vulnerable-demo.yaml) live here instead.
+      REDTEAM_LLM_PROVIDER: fake
+      REDTEAM_MCP_SERVERS: web-http,recon-passive
+    volumes:
+      - ../mcp/finance/engagement-vulnerable-demo.yaml:/config/engagement.yaml:ro
+      - finance-demo-data:/workspace/data
+      - finance-demo-reports:/workspace/reports
+    networks: [lab]
+    depends_on:
+      web-http:
+        condition: service_healthy
+      recon-passive:
+        condition: service_healthy
+
+volumes:
+  finance-demo-data:
+  finance-demo-reports:

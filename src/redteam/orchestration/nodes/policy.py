@@ -18,9 +18,14 @@ from datetime import datetime, timezone
 
 from redteam.core.contracts.events import EventType
 from redteam.core.contracts.policy import ControlContext, PolicyDecision
-from redteam.core.enums import AgentPhase, PolicyVerdict
+from redteam.core.contracts.target import target_display_name
+from redteam.core.enums import AgentPhase, PolicyVerdict, Severity
 from redteam.orchestration.context import RuntimeDeps
 from redteam.orchestration.nodes._support import advance, publisher_for
+from redteam.orchestration.runtime_observation import (
+    RuntimeObservation,
+    append_runtime_observation,
+)
 from redteam.orchestration.state import GraphState, TerminationReason
 from redteam.orchestration.work.models import WorkStatus
 
@@ -29,6 +34,38 @@ _OUTCOME = {
     PolicyVerdict.REQUIRE_APPROVAL: (EventType.APPROVAL_REQUIRED, AgentPhase.REPLAN),
     PolicyVerdict.DENY: (EventType.ACTION_DENIED, AgentPhase.REPLAN),
 }
+
+#: Control's machine-readable reaction hint rides in
+#: ``PolicyDecision.matched_rules`` as ``severity:<value>`` because the frozen
+#: ``PolicyDecision`` contract has no dedicated field (see
+#: ``redteam.control.severity``). Orchestration may not import Control's
+#: concrete package (dependency rules), so the documented tag string is read
+#: back here rather than through ``redteam.control.severity`` directly --
+#: but the *definition* of what each level means is not re-declared: these
+#: three constants derive from the one shared ``core.enums.Severity`` (see
+#: its docstring for the three levels), not independent string literals.
+_SEVERITY_TAG_PREFIX = "severity:"
+SEVERITY_BLOCK_ACTION = Severity.BLOCK_ACTION.value
+SEVERITY_REPLAN_GOAL = Severity.REPLAN_GOAL.value
+SEVERITY_ABORT_RUN = Severity.ABORT_RUN.value
+
+
+def denial_severity(decision: PolicyDecision | None) -> str | None:
+    """Read the Control-supplied reaction hint out of a decision.
+
+    Returns the raw level string (``"block_action"`` / ``"replan_goal"`` /
+    ``"abort_run"``), or ``None`` when the decision is untagged or malformed.
+    Untagged denials keep the historical behavior: block this action and
+    replan.
+    """
+
+    if decision is None or decision.verdict is not PolicyVerdict.DENY:
+        return None
+    for rule in decision.matched_rules:
+        if rule.startswith(_SEVERITY_TAG_PREFIX):
+            value = rule[len(_SEVERITY_TAG_PREFIX) :]
+            return value or None
+    return None
 
 
 async def policy_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
@@ -49,16 +86,13 @@ async def policy_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
         in_flight += len(
             [
                 item
-                for item in await deps.work_store.list_items(
-                    status=status, run_id=runtime.run_id
-                )
+                for item in await deps.work_store.list_items(status=status, run_id=runtime.run_id)
                 if item.work_id != current_work_id
             ]
         )
 
     resuming_approval = (
-        runtime.pending_approval_id is not None
-        and runtime.pending_action_id == proposal.action_id
+        runtime.pending_approval_id is not None and runtime.pending_action_id == proposal.action_id
     )
     if resuming_approval:
         assert runtime.pending_approval_id is not None
@@ -111,7 +145,10 @@ async def policy_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
         {
             "action_id": decision.action_id,
             "verdict": decision.verdict.value,
+            "reasons": decision.reasons,
             "matched_rules": decision.matched_rules,
+            "approval_id": decision.approval_id,
+            "rate_limit_remaining": decision.rate_limit_remaining,
             "budget_remaining": decision.budget_remaining,
         },
         correlation_id=correlation_id,
@@ -124,6 +161,7 @@ async def policy_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
         {
             "action_id": decision.action_id,
             "reasons": decision.reasons,
+            "matched_rules": decision.matched_rules,
             "approval_id": decision.approval_id,
         },
         correlation_id=correlation_id,
@@ -141,12 +179,48 @@ async def policy_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
     elif resuming_approval:
         # The approval cycle is fully resolved now (ALLOW or DENY) --
         # clear the markers so a later, unrelated action is never
-        # mistaken for a resume of this one.
-        runtime_update.update({"pending_approval_id": None, "pending_action_id": None})
+        # mistaken for a resume of this one. Also clear the terminal
+        # ``APPROVAL_PENDING`` marker: it is no longer pending, and leaving
+        # it set would make REPLAN re-enter its terminal branch (a rejected
+        # approval would never replan, and an approved one would stop right
+        # after executing). The run resumes/replans from the resolved verdict.
+        runtime_update.update(
+            {
+                "pending_approval_id": None,
+                "pending_action_id": None,
+                "termination_reason": None,
+            }
+        )
+
+    severity = denial_severity(decision)
+    reason_text = ("; ".join(decision.reasons) or "no additional reason supplied")[:300]
+    observed_runtime = append_runtime_observation(
+        runtime.model_copy(update=runtime_update),
+        RuntimeObservation(
+            kind="control",
+            summary=(
+                f"Control {decision.verdict.value.upper()} for "
+                f"{proposal.capability}.{proposal.operation}: {reason_text}"
+            )[:500],
+            outcome=decision.verdict.value,
+            step=runtime.step_count,
+            action_id=str(proposal.action_id),
+            capability=proposal.capability,
+            operation=proposal.operation,
+            target=target_display_name(proposal.target),
+            reasons=list(decision.reasons[:8]),
+            matched_rules=list(decision.matched_rules[:12]),
+            approval_id=str(decision.approval_id) if decision.approval_id else None,
+            requires_approval=decision.verdict is PolicyVerdict.REQUIRE_APPROVAL,
+            alternative_allowed=(
+                decision.verdict is PolicyVerdict.ALLOW or severity != SEVERITY_ABORT_RUN
+            ),
+        ),
+    )
 
     return advance(
         state,
-        runtime.model_copy(update=runtime_update),
+        observed_runtime,
         last_event_id=outcome.event_id,
         policy_decision=decision,
     )

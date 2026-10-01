@@ -18,6 +18,8 @@ vulnerability, so no candidate and no finding is derived from it.
 
 from __future__ import annotations
 
+from itertools import combinations, islice
+
 from redteam.attack_graph.identity import endpoint_node_id, host_node_id
 from redteam.attack_graph.observation import GraphObservation
 from redteam.attack_graph.predicates import attrs_of, facts_of
@@ -91,6 +93,9 @@ class WebCandidateProvider:
     ) -> CandidateBatch:
         """The authoritative path: plan from the graph, not just the playbook."""
 
+        if context.task_source == "replan:acquire_second_principal":
+            return await self._acquisition_candidates(spec, context)
+
         return await self._build(
             spec,
             context.view,
@@ -98,6 +103,61 @@ class WebCandidateProvider:
             step=context.step,
             context=context,
         )
+
+    async def _acquisition_candidates(
+        self, spec: AgentSpec, context: GraphCandidateContext
+    ) -> CandidateBatch:
+        """Use registered opaque refs through the normal Control/MCP path.
+
+        The comparison tool checks that the refs belong to distinct principals
+        on the same target. No principal is inferred from configuration alone.
+        """
+        if not context.can_execute("web", _RESPONSE_ANALYSIS_OPERATION):
+            return CandidateBatch(candidates=[])
+        drafts: list[CandidateDraft] = []
+        for node_id in context.task_target_node_ids:
+            node = await context.view.get_node(node_id)
+            if node is None or node.type is not GraphNodeType.ENDPOINT:
+                continue
+            facts = facts_of(node.properties)
+            host, path = facts.get("host"), facts.get("path")
+            if not isinstance(host, str) or not isinstance(path, str):
+                continue
+            host_node = await context.view.get_node(host_node_id(host))
+            host_facts = facts_of(host_node.properties) if host_node else {}
+            sessions = self._sessions_for_host(host_facts)
+            refs = sorted({item.session_ref for item in sessions if path in item.paths})
+            if len(refs) < 2:
+                continue
+            for first, second in islice(combinations(refs, 2), 10):
+                drafts.append(
+                    CandidateDraft(
+                        agent_id=spec.agent_id,
+                        plan_step=PlanStep(
+                            step_id=f"acquire-principal:{node.id}:{first}:{second}",
+                            capability="web",
+                            operation=_RESPONSE_ANALYSIS_OPERATION,
+                            tool_id=WEB_COMPARE_SESSIONS,
+                            compatible_tool_ids=[WEB_COMPARE_SESSIONS],
+                            assessment_kind="observation",
+                            target=EndpointTarget(
+                                host=host, path=path, port=facts.get("port"), graph_node_id=node.id
+                            ),
+                            arguments={
+                                "target_ref": host_facts.get("target_ref", host),
+                                "path": path,
+                                "first_session_ref": first,
+                                "second_session_ref": second,
+                            },
+                            reason=(
+                                "Validate two configured session references on the same endpoint"
+                            ),
+                        ),
+                        target_node_ids=[node.id],
+                        conflict_keys=[f"target:{node.id}"],
+                    )
+                )
+        return CandidateBatch(candidates=drafts)
 
     async def _build(
         self,
@@ -241,12 +301,14 @@ class WebCandidateProvider:
         permitted: list[CandidateDraft] = []
         for candidate in candidates:
             if any(str(node_id) in disallowed_ids for node_id in candidate.target_node_ids):
-                drops.append(DraftDrop(
-                    step_id=candidate.plan_step.step_id,
-                    target_node_id=str(candidate.target_node_ids[0]),
-                    reason="path_not_allowlisted",
-                    field="path",
-                ))
+                drops.append(
+                    DraftDrop(
+                        step_id=candidate.plan_step.step_id,
+                        target_node_id=str(candidate.target_node_ids[0]),
+                        reason="path_not_allowlisted",
+                        field="path",
+                    )
+                )
             else:
                 permitted.append(candidate)
         return CandidateBatch(candidates=permitted, diagnostics=diagnostics, drops=drops)
@@ -493,9 +555,7 @@ class WebCandidateProvider:
             }
             if isinstance(session_ref, str):
                 arguments["session_ref"] = session_ref
-            redirect_node_id = endpoint_node_id(
-                "GET", location, host=host, port=facts.get("port")
-            )
+            redirect_node_id = endpoint_node_id("GET", location, host=host, port=facts.get("port"))
             drafts.append(
                 CandidateDraft(
                     agent_id=spec.agent_id,
@@ -516,8 +576,7 @@ class WebCandidateProvider:
                         reason="Probe an observed redirect target on the same host",
                         hypothesis=HypothesisDraft(
                             description=(
-                                f"The observed redirect from {item['path']} leads to "
-                                f"{location}"
+                                f"The observed redirect from {item['path']} leads to {location}"
                             ),
                             metadata={
                                 "kind": "redirect_followup",
@@ -598,9 +657,7 @@ class WebCandidateProvider:
                         session=session,
                         baseline=item,
                         validation_hypothesis_id=(
-                            validation_hypothesis_id
-                            if session.expected_access == "deny"
-                            else None
+                            validation_hypothesis_id if session.expected_access == "deny" else None
                         ),
                     )
                 )
@@ -640,9 +697,7 @@ class WebCandidateProvider:
                 continue
             if item["method"] != "GET":
                 continue
-            session = next(
-                (entry for entry in sessions if entry.session_ref == session_ref), None
-            )
+            session = next((entry for entry in sessions if entry.session_ref == session_ref), None)
             if session is None or item["path"] not in session.paths:
                 continue
             anonymous_key = request_key("GET", item["path"], None)
@@ -687,9 +742,7 @@ class WebCandidateProvider:
                         ),
                         target_node_ids=[node.id],
                         conflict_keys=[f"target:{node.id}"],
-                        signals=PrioritySignals(
-                            source_refs=[f"evidence:{item['evidence_id']}"]
-                        ),
+                        signals=PrioritySignals(source_refs=[f"evidence:{item['evidence_id']}"]),
                     )
                 )
                 continue
@@ -731,9 +784,7 @@ class WebCandidateProvider:
                     ),
                     target_node_ids=[node.id],
                     conflict_keys=[f"target:{node.id}"],
-                    signals=PrioritySignals(
-                        source_refs=[f"evidence:{item['evidence_id']}"]
-                    ),
+                    signals=PrioritySignals(source_refs=[f"evidence:{item['evidence_id']}"]),
                 )
             )
         return drafts
@@ -814,10 +865,7 @@ class WebCandidateProvider:
                                 "method": "GET",
                                 "session_ref": session.session_ref,
                             },
-                            reason=(
-                                "Compare a 403 with a different operator-registered "
-                                "identity"
-                            ),
+                            reason=("Compare a 403 with a different operator-registered identity"),
                             hypothesis=HypothesisDraft(
                                 description=(
                                     f"{item['path']} is not uniformly refused across "
@@ -831,9 +879,7 @@ class WebCandidateProvider:
                         ),
                         target_node_ids=[node.id],
                         conflict_keys=[f"target:{node.id}"],
-                        signals=PrioritySignals(
-                            source_refs=[f"evidence:{item['evidence_id']}"]
-                        ),
+                        signals=PrioritySignals(source_refs=[f"evidence:{item['evidence_id']}"]),
                     )
                 )
         return drafts
@@ -924,9 +970,7 @@ class WebCandidateProvider:
         carries no principal -- and remains the Capability tool's own check.)
         """
 
-        if context is None or not context.can_execute(
-            "web", _RESPONSE_ANALYSIS_OPERATION
-        ):
+        if context is None or not context.can_execute("web", _RESPONSE_ANALYSIS_OPERATION):
             return []
         registered = {item.session_ref: set(item.paths) for item in sessions}
         observed: dict[str, set[str]] = {}
@@ -984,9 +1028,7 @@ class WebCandidateProvider:
                             "their statuses and bodies can be compared directly"
                         ),
                         hypothesis=HypothesisDraft(
-                            description=(
-                                f"{path} answers differently for {first} and {second}"
-                            ),
+                            description=(f"{path} answers differently for {first} and {second}"),
                             metadata={
                                 "kind": "session_comparison",
                                 "first_session_ref": first,
@@ -1023,9 +1065,7 @@ class WebCandidateProvider:
         observation: the tool would return the same flags again.
         """
 
-        if context is None or not context.can_execute(
-            "web", _RESPONSE_ANALYSIS_OPERATION
-        ):
+        if context is None or not context.can_execute("web", _RESPONSE_ANALYSIS_OPERATION):
             return []
         if not latest:
             return []

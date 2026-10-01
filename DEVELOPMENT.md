@@ -16,10 +16,11 @@ a Python-version requirement; `litellm` installs and imports fine on 3.10
 too (verified directly) — see `docs/adr/0002-litellm-gateway.md`.
 Everything else, including all tests, runs fine on 3.10 with just `.[dev]`.
 
-`.env` is **not** auto-loaded by the CLI (`redteam.app.cli` does not parse
-it) — `source .env` (or `set -a; source .env; set +a` for values containing
-JSON, e.g. `REDTEAM_MCP_<ID>_ARGS_JSON`) before running, every new shell.
-See `.env.example`.
+`redteam` loads a `.env` in the current directory into its own process
+environment automatically at startup, best-effort
+(`redteam.app.cli._shared.load_dotenv_if_present`) — a real shell/CI-exported
+variable always wins over a `.env` value, so a manual `source .env` is
+optional, not required. See `.env.example`.
 
 ## Running things
 
@@ -86,14 +87,18 @@ docker compose up mcp-example
 ```
 
 The container exposes a harmless `ping` tool at
-`http://localhost:8765/mcp` over MCP Streamable HTTP. The default
-vertical slice still uses `ExampleMCPAdapter` in-process; use
-one of the Web/API, Mobile, Recon, or Analysis adapters to exercise a real
-server.
+`http://localhost:8765/mcp` over MCP Streamable HTTP. Use one of the
+Web/API, Mobile, Recon, or Analysis adapters to exercise a real server.
 See `deploy/mcp/README.md` for registration and deployment conventions.
 
-Configured server IDs in `AppConfig.capability.mcp_servers` are resolved
-from `REDTEAM_MCP_<SERVER_ID>_KIND`, `_TRANSPORT`, and the corresponding
-HTTP `_ENDPOINT` or stdio `_COMMAND`. Bootstrap fails fast when a configured
-server is missing settings, is unreachable, or discovers no tools. Empty
-configuration continues to use the deterministic in-process example.
+Which servers are active comes from `REDTEAM_MCP_SERVERS` (a
+comma-separated list of server ids), never from a config file; each
+listed id's own settings are resolved from `REDTEAM_MCP_<SERVER_ID>_KIND`,
+`_TRANSPORT`, and the corresponding HTTP `_ENDPOINT` or stdio `_COMMAND`.
+Bootstrap fails fast when a configured server is missing settings, is
+unreachable, or discovers no tools. `REDTEAM_MCP_SERVERS` unset or empty
+is not an error: `run`/`tools list`/`tools health` get an honest empty
+tool catalog and a `WARNING` on stderr, never a silent
+`ExampleMCPAdapter` substitute. The literal value
+`REDTEAM_MCP_SERVERS=example` is the one explicit, deliberate way to opt
+into that in-process fixture instead.

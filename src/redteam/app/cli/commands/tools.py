@@ -1,28 +1,25 @@
 """``redteam tools list`` / ``redteam tools health`` — read the live Registry.
 
-Builds the same `MCPToolGateway` the canonical bootstrap
-(`app.bootstrap.build_application`) would, via
-`capability.bootstrap.build_mcp_tool_gateway` -- no separate health
-subsystem, no separate catalog model. An empty `capability.mcp_servers`
-list is not an error: it is the documented in-process-example path (see
-`ExampleMCPAdapter`), surfaced here as an explicit warning rather than a
-silent difference from `run`.
+Mirrors the same tool-gateway resolution ``app.bootstrap.build_application``
+uses for ``redteam run`` -- no separate health subsystem, no separate
+catalog model, and no separate answer to "what MCP servers are active."
+An empty ``capability.mcp_servers`` is not an error: it is an honest empty
+catalog (surfaced as a warning), never a silent ExampleMCPAdapter
+substitute. ``capability.mcp_servers == ["example"]`` is the one explicit,
+deliberate way to see that in-process test fixture here too (see
+``app.bootstrap.EXAMPLE_MCP_SENTINEL``).
 """
 
 from __future__ import annotations
 
 import argparse
 
-from redteam.app.cli._shared import (
-    EXIT_FAILURE,
-    EXIT_OK,
-    eprint,
-    load_app_config_for_run,
-    print_json,
-    render_table,
-)
+from redteam.app.bootstrap import EXAMPLE_MCP_SENTINEL
+from redteam.app.cli._shared import EXIT_FAILURE, EXIT_OK, eprint, print_json, render_table
 from redteam.capability.bootstrap import build_mcp_tool_gateway
-from redteam.capability.settings import MCPConfigurationError
+from redteam.capability.gateway import MCPToolGateway
+from redteam.capability.registry import MCPToolRegistry
+from redteam.capability.settings import MCPConfigurationError, mcp_server_ids_from_environment
 
 
 def add_parser(subparsers: argparse._SubParsersAction) -> None:
@@ -30,40 +27,33 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
     tools_sub = parser.add_subparsers(dest="tools_command", required=True)
 
     list_parser = tools_sub.add_parser("list", help="List every registered tool")
-    list_parser.add_argument("--config", dest="config_path", default=None)
-    list_parser.add_argument("engagement_path", nargs="?", default=None)
     list_parser.add_argument("--json", action="store_true")
     list_parser.set_defaults(handler=run_list)
 
     health_parser = tools_sub.add_parser("health", help="Show per-server health")
-    health_parser.add_argument("--config", dest="config_path", default=None)
-    health_parser.add_argument("engagement_path", nargs="?", default=None)
     health_parser.add_argument("--json", action="store_true")
     health_parser.set_defaults(handler=run_health)
 
 
-async def _build_gateway(args: argparse.Namespace):  # noqa: ANN202
-    server_ids = _configured_server_ids(args)
+async def _build_gateway():  # noqa: ANN202
+    # Same source `redteam run` uses: REDTEAM_MCP_SERVERS, not an automatic
+    # empty/Example default.
+    server_ids = mcp_server_ids_from_environment()
     if not server_ids:
-        eprint(
-            "WARNING: no MCP servers configured -- using the in-process "
-            "ExampleMCPAdapter (development/test only; no real tool execution)."
-        )
+        # Same reality `redteam run` sees for the same configuration (empty
+        # catalog, no adapters) -- never the in-process ExampleMCPAdapter,
+        # which would show a tool here that `run` could never actually use.
+        eprint("WARNING: no MCP servers configured -- the tool catalog is empty.")
+        return MCPToolGateway(MCPToolRegistry(), {})
+    if server_ids == [EXAMPLE_MCP_SENTINEL]:
+        # Same explicit, deliberate opt-in `build_application` recognizes.
+        return await build_mcp_tool_gateway([])
     return await build_mcp_tool_gateway(server_ids)
-
-
-def _configured_server_ids(args: argparse.Namespace) -> list[str]:
-    if args.config_path is None:
-        return []
-    if args.engagement_path is None:
-        raise ValueError("--config requires an engagement_path to build a full AppConfig")
-    config = load_app_config_for_run(args.engagement_path, args.config_path)
-    return list(config.capability.mcp_servers)
 
 
 async def run_list(args: argparse.Namespace) -> int:
     try:
-        gateway = await _build_gateway(args)
+        gateway = await _build_gateway()
     except (MCPConfigurationError, ValueError) as exc:
         eprint(f"ERROR: {exc}")
         return EXIT_FAILURE
@@ -88,7 +78,7 @@ async def run_list(args: argparse.Namespace) -> int:
 
 async def run_health(args: argparse.Namespace) -> int:
     try:
-        gateway = await _build_gateway(args)
+        gateway = await _build_gateway()
     except (MCPConfigurationError, ValueError) as exc:
         eprint(f"ERROR: {exc}")
         return EXIT_FAILURE

@@ -10,6 +10,25 @@ START -> OBSERVE -> PLAN -> POLICY --ALLOW--> EXECUTE -> VERIFY -> UPDATE -> REP
 Implementation: `src/redteam/orchestration/graph.py` (`build_graph`),
 routing: `src/redteam/orchestration/router.py`.
 
+Control/tool/state outcomes are also appended to the bounded
+`RuntimeState.recent_observations` window and supplied to the next planning
+turn. See [Interactive Agent Runtime](agent-behavior.md) for the operator
+channel, Decision Trace and approval-suspension behavior.
+
+The interactive shell routes chat into a Mission objective/guidance, but the
+visible action response comes from the PLAN node's actual LLM turn. The facade
+has no ToolGateway path. Therefore natural language cannot skip PLAN, the
+candidate compiler, POLICY or MCP selection.
+
+With `planning_mode=llm_first`, PLAN receives the current Attack Graph,
+Evidence excerpts, prior Control/tool observations, operator guidance and the
+healthy live MCP action space. It returns a public decision summary plus
+structured action drafts. Executable drafts continue directly to Control; if
+the LLM call fails or all requested actions fail compilation, the registered
+role provider supplies a playbook/graph recipe fallback. A deliberate
+`intent=finish` does not trigger fallback. `hybrid` preserves the older
+additive mode and `playbook_only` supports deterministic/offline operation.
+
 ## Minimal Vertical Slice, step by step
 
 Maps to instruction.md section 16 and still holds structurally, but two
@@ -26,7 +45,7 @@ description — run `redteam run examples/engagement.yaml` (or bare
 | 4 | Control Plane evaluates | `orchestration.nodes.policy.policy_node` calls `deps.control_plane.evaluate(...)` |
 | 5 | ALLOW decision | `control.service.DefaultControlPlane.evaluate` (Scope -> Policy -> RateLimit -> Budget -> Approval) |
 | 6 | ToolGateway called | `orchestration.nodes.execute.execute_node` calls `deps.tool_gateway.invoke(...)` — only reachable on ALLOW |
-| 7 | MCP Adapter runs | `capability.gateway.MCPToolGateway` routes to whichever adapter is configured. **Current status**: `capability.adapters.mcp.example.ExampleMCPAdapter` is still the zero-config default (`capability.mcp_servers: []`), but real adapters exist and run in production configs — see `deploy/mcp/README.md`. |
+| 7 | MCP Adapter runs | `capability.gateway.MCPToolGateway` routes to whichever adapter is configured. **Current status**: an empty/unset `capability.mcp_servers` (`REDTEAM_MCP_SERVERS` unset, no CLI config file at all) now gets an honest empty tool catalog (`app.bootstrap._empty_tool_gateway`) — no Action can execute, but nothing pretends a fake tool ran. `capability.adapters.mcp.example.ExampleMCPAdapter` only appears via the explicit, literal opt-in `REDTEAM_MCP_SERVERS=example`; real adapters exist and run in production configs — see `deploy/mcp/README.md`. |
 | 8 | `ToolResult` returned | Normalized shape, regardless of adapter |
 | 9 | Evidence created | `orchestration.nodes.verify.verify_node` writes an `EvidenceRecord` via `deps.evidence_store` |
 | 10 | Events published | `EventEnvelope`s at every step via `deps.event_bus` — see the full list below |
@@ -39,7 +58,11 @@ description — run `redteam run examples/engagement.yaml` (or bare
 ```text
 RunStarted
 AgentStarted
+AgentTurnDecided (LLM planning modes)
 CandidateGenerated
+AgentContextPrepared
+AgentDecisionRecorded
+MCPToolSelected
 ActionProposed
 PolicyEvaluated
 ActionApproved
@@ -102,3 +125,8 @@ If `PolicyDecision.verdict` is `DENY` or `REQUIRE_APPROVAL`,
 `route_after_policy` sends the graph straight to `REPLAN` — `execute_node`
 is never called and `ActionDenied` (not `ActionApproved`) is published
 instead.
+
+Before replanning, that exact verdict, reason, matched policy rules and
+approval id are converted into a bounded `RuntimeObservation`. The next LLM
+turn therefore sees “outside allowed paths” or “approval required”, not a
+generic tool failure.

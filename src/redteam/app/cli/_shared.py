@@ -11,15 +11,23 @@ from __future__ import annotations
 
 import getpass
 import json
+import os
 import re
 import sys
 from pathlib import Path
 from typing import Any
 
-import yaml
 from pydantic import BaseModel
 
-from redteam.core.config import AppConfig, load_engagement_config
+from redteam.capability.settings import mcp_server_ids_from_environment
+from redteam.core.config import (
+    AppConfig,
+    CapabilityConfig,
+    LLMConfig,
+    OrchestrationConfig,
+    load_engagement_config,
+)
+from redteam.core.redaction import SECRET_KEY_PARTS
 
 # Exit codes (section 20): 0 success, 1 general run failure, 2 config/argument error.
 EXIT_OK = 0
@@ -31,13 +39,20 @@ EXIT_CONFIG_ERROR = 2
 # convention `redteam init`'s `--output engagement.yaml` default and
 # every existing example/doc already use. No new `.redteam/` directory:
 # section 8 says prefer the existing convention when one already exists,
-# and this repo's is "flat files in cwd".
+# and this repo's is "flat files in cwd". There is no application-config
+# YAML file (``app.yaml``) in this CLI -- everything besides the
+# engagement lives in the environment (``REDTEAM_LLM_*``/``REDTEAM_MCP_*``).
 DEFAULT_ENGAGEMENT_PATH = Path("engagement.yaml")
-DEFAULT_APP_CONFIG_PATH = Path("app.yaml")
 DEFAULT_ENV_PATH = Path(".env")
 
+# Built from the one shared vocabulary (core.redaction.SECRET_KEY_PARTS,
+# also used by core.contracts.events/mission and
+# orchestration.operator_intents.redaction) plus "auth" as an
+# additional, deliberately broader CLI-only substring match (output
+# masking is one-way and fail-safe here, so over-matching is cheap and
+# under-matching a printed secret is not).
 _SECRET_KEY_PATTERN = re.compile(
-    r"(token|password|passwd|secret|api[_-]?key|credential|auth|bearer|cookie)",
+    "(" + "|".join(re.escape(part) for part in (*SECRET_KEY_PARTS, "auth")) + ")",
     re.IGNORECASE,
 )
 
@@ -64,27 +79,39 @@ def mask_secrets(value: Any) -> Any:
     return value
 
 
-def load_app_config_for_run(
-    engagement_path: str, config_path: str | None
-) -> AppConfig:
-    """The one place ``engagement.yaml`` (+ optional ``--config app.yaml``)
-    becomes an ``AppConfig`` — every command that needs one goes through
-    this, never a bespoke loader.
+def load_app_config_for_run(engagement_path: str, *, require_llm: bool = True) -> AppConfig:
+    """The one place ``engagement.yaml`` + environment becomes an
+    ``AppConfig`` — every command that needs one goes through this, never
+    a bespoke loader.
 
     The positional engagement file is always authoritative for
-    ``engagement:``; an app-level ``--config`` file only supplies
-    ``llm``/``orchestration``/``capability``/``logging`` (any
-    ``engagement:`` key inside it is ignored — the CLI argument wins, so
-    there is exactly one place a user looks for scope/ROE).
+    ``engagement:``. Everything else -- ``llm``, ``capability.mcp_servers``,
+    each MCP server's own connection details -- comes from the environment
+    (``REDTEAM_LLM_*`` / ``REDTEAM_MCP_*``), never from a YAML application
+    config file: there is no ``app.yaml``/``--config`` path in this CLI.
+
+    ``require_llm`` gates whether an unset ``REDTEAM_LLM_PROVIDER`` is a
+    hard error (``LLMConfig.from_environment()``) or the plain, unused
+    ``LLMConfig()`` default. ``redteam run``/``redteam resume`` (they
+    actually build an ``LLMClient`` and execute an Action) pass the
+    default ``True``; ``redteam validate`` -- which, by its own module
+    docstring, never calls an LLM at all -- passes ``False`` so a pure
+    config-inspection command is never blocked on a decision it does not
+    need.
     """
     engagement_config = load_engagement_config(engagement_path)
-    if config_path is None:
-        return AppConfig(engagement=engagement_config)
-    raw = yaml.safe_load(Path(config_path).read_text(encoding="utf-8")) or {}
-    if not isinstance(raw, dict):
-        raise ValueError(f"{config_path}: application config must be a YAML mapping")
-    raw = {**raw, "engagement": engagement_config.model_dump()}
-    return AppConfig.model_validate(raw)
+    llm = LLMConfig.from_environment() if require_llm else LLMConfig()
+    configured_mode = os.environ.get("REDTEAM_PLANNING_MODE")
+    planning_mode = configured_mode or ("llm_first" if llm.provider != "fake" else "playbook_only")
+    return AppConfig(
+        engagement=engagement_config,
+        llm=llm,
+        orchestration=OrchestrationConfig(
+            planning_mode=planning_mode,
+            llm_candidate_generation=planning_mode != "playbook_only",
+        ),
+        capability=CapabilityConfig(mcp_servers=mcp_server_ids_from_environment()),
+    )
 
 
 def print_json(payload: BaseModel | dict[str, Any] | list[Any]) -> None:
@@ -147,6 +174,37 @@ def write_env_var(env_path: Path, key: str, value: str) -> None:
     else:
         lines.append(f"{prefix}{value}")
     env_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def load_dotenv_if_present(env_path: Path = DEFAULT_ENV_PATH) -> None:
+    """Best-effort ``.env`` loader for this process's own environment.
+
+    A real shell/CI export always wins -- this only fills in what is
+    otherwise unset, so it can never override an operator's explicit
+    environment with a stale ``.env`` value. Not a config source of truth
+    by itself: it exists purely so a value ``write_env_var`` (or an
+    operator by hand) put in ``.env`` takes effect without a separate
+    manual ``export``/`source`` step before every ``redteam`` invocation.
+    A missing file, unreadable file, or malformed line is silently
+    skipped -- never fatal, and never a reason to block the CLI.
+    """
+    if not env_path.exists():
+        return
+    try:
+        lines = env_path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        key, _, value = stripped.partition("=")
+        key = key.strip()
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        if key and key not in os.environ:
+            os.environ[key] = value
 
 
 def render_table(headers: list[str], rows: list[list[str]]) -> None:

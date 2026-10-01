@@ -32,6 +32,34 @@ class DuplicateAgentError(ValueError):
     pass
 
 
+class AgentCapabilityDriftError(ValueError):
+    """Raised when an ``AgentSpec`` and its ``AgentDefinition`` (same
+    ``agent_id``) declare different ``capabilities``.
+
+    Both models legitimately exist for different consumers (the Planner
+    reads ``AgentSpec.capabilities``; scheduling/activation reads
+    ``AgentDefinition.capabilities`` -- see ``mission_bootstrap.py``,
+    ``nodes/observe.py``), so this is not itself the duplication to
+    remove. What must never happen is the *value* diverging between them
+    for the same agent -- that already happened once (web-api-agent was
+    ``["web"]`` here and ``["web", "api"]`` there) with the drift
+    completely silent, since ``GraphCandidateContext.available_capabilities``
+    is populated from ``AgentSpec.capabilities`` but not read by anything
+    (yet). Caught at registration time instead of trusting both call
+    sites to be hand-kept in sync forever.
+    """
+
+
+def _check_capabilities_agree(
+    agent_id: AgentId, spec_capabilities: list[str], definition_capabilities: list[str]
+) -> None:
+    if set(spec_capabilities) != set(definition_capabilities):
+        raise AgentCapabilityDriftError(
+            f"agent {agent_id!r}: AgentSpec.capabilities={spec_capabilities!r} does not "
+            f"match AgentDefinition.capabilities={definition_capabilities!r}"
+        )
+
+
 class AgentRegistry:
     """An ordered set of agents, addressable by id."""
 
@@ -51,6 +79,9 @@ class AgentRegistry:
     def register(self, spec: AgentSpec) -> AgentSpec:
         if any(existing.agent_id == spec.agent_id for existing in self._specs):
             raise DuplicateAgentError(f"agent {spec.agent_id!r} is already registered")
+        definition = self._definitions.get(spec.agent_id)
+        if definition is not None:
+            _check_capabilities_agree(spec.agent_id, spec.capabilities, definition.capabilities)
         self._specs.append(spec)
         return spec
 
@@ -62,6 +93,9 @@ class AgentRegistry:
             raise DuplicateAgentError(
                 f"agent definition {definition.agent_id!r} is already registered"
             )
+        spec = self.get(definition.agent_id)
+        if spec is not None:
+            _check_capabilities_agree(spec.agent_id, spec.capabilities, definition.capabilities)
         self._definitions[definition.agent_id] = definition
         return definition
 

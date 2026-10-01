@@ -19,7 +19,11 @@ WEB_API_AGENT = AgentSpec(
     agent_id=AgentId("web-api-agent"),
     name="Web/API Agent",
     description="Inspects discovered HTTP services and endpoints with catalog-bound tools.",
-    capabilities=["web"],
+    # Must match AgentDefinition("web-api-agent").capabilities
+    # (orchestration.agents.definition.builtin_agent_definitions) exactly --
+    # AgentRegistry.register/register_definition enforce this at
+    # registration time so the two can never silently drift again.
+    capabilities=["web", "api"],
     planner_kind="llm",
     playbook=[
         PlanStep(

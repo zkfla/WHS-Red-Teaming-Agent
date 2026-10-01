@@ -9,10 +9,12 @@ brief).
 from __future__ import annotations
 
 from redteam.app.bootstrap import build_application, run_engagement
+from redteam.capability.bootstrap import build_mcp_tool_gateway
 from redteam.core.config import load_app_config
 from redteam.core.enums import AgentPhase, PolicyVerdict, Verdict
 from redteam.core.ids import ToolId
 from redteam.orchestration.settings import OrchestrationSettings
+from redteam.orchestration.task_graph.sqlite import SQLiteTaskGraphStore
 from redteam.orchestration.work.sqlite import SQLiteWorkStore
 from tests.fakes import DummyToolGateway, FakeControlPlane, FakeEventBus, FakeEvidenceStore
 
@@ -23,8 +25,19 @@ async def test_build_application_from_app_config_runs_end_to_end(tmp_path) -> No
     for rule in config.engagement.rules_of_engagement:
         rule.allowed_time_windows = []
 
+    # examples/app.yaml deliberately ships `capability.mcp_servers: []`, and
+    # build_application() itself no longer substitutes ExampleMCPAdapter for
+    # an empty list (production must never do that silently -- see
+    # `app.bootstrap._empty_tool_gateway`). This end-to-end wiring test
+    # still wants one real, executable tool, so it asks for the same
+    # in-process example adapter explicitly, the same way any other caller
+    # now has to.
+    example_gateway = await build_mcp_tool_gateway([])
+
     engagement, deps = await build_application(
         config,
+        tool_gateway=example_gateway,
+        tool_catalog=example_gateway,
         evidence_dir=tmp_path / "evidence",
         audit_dir=tmp_path / "audit",
         approval_dir=tmp_path / "approvals",
@@ -86,6 +99,23 @@ async def test_build_application_accepts_fake_overrides_for_every_port(tmp_path)
     assert final_state.last_verdict == Verdict.PASS
     assert len(fake_control_plane.evaluated) == 1
     assert len(fake_tool_gateway.invocations) == 1
+
+
+async def test_build_application_can_wire_the_durable_task_graph(tmp_path) -> None:
+    config = load_app_config("examples/app.yaml")
+    settings = OrchestrationSettings(
+        checkpointing=False,
+        task_graph_backend="sqlite",
+        task_graph_path=str(tmp_path / "task-graph.sqlite3"),
+    )
+
+    _, deps = await build_application(
+        config,
+        evidence_dir=tmp_path / "evidence",
+        orchestration_settings=settings,
+    )
+
+    assert isinstance(deps.task_graph_store, SQLiteTaskGraphStore)
 
 
 async def test_build_application_can_wire_the_durable_work_ledger(tmp_path) -> None:

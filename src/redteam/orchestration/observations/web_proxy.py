@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
 import re
 from typing import Any
 
@@ -16,6 +14,7 @@ from redteam.attack_graph.identity import (
 from redteam.core.contracts.target import AnyTarget
 from redteam.core.contracts.tool import ToolResult
 from redteam.core.enums import GraphEdgeType, GraphNodeType
+from redteam.orchestration.observations._shared import deterministic_key, is_hex64, safe_path
 from redteam.orchestration.observations.mapper import (
     EdgeMutation,
     GraphMutation,
@@ -26,7 +25,6 @@ from redteam.orchestration.observations.web_http import _session_identity_mutati
 
 _FLOW_REF = re.compile(r"^flow_[0-9a-f]{16}$")
 _REFERENCE = re.compile(r"^[A-Za-z0-9_.:@/-]{1,128}$")
-_HEX_64 = re.compile(r"^[0-9a-fA-F]{64}$")
 _METHODS = frozenset({"GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH", "DELETE"})
 _SUMMARY_HEADERS = frozenset(
     {
@@ -39,25 +37,10 @@ _SUMMARY_HEADERS = frozenset(
 _NUCLEI_CHECKS = frozenset({"missing-csp", "missing-nosniff-header"})
 
 
-def _context_key(kind: str, *parts: object) -> str:
-    encoded = json.dumps([kind, *parts], sort_keys=True, separators=(",", ":")).encode()
-    return hashlib.sha256(encoded).hexdigest()[:24]
-
-
 def _safe_reference(value: Any) -> str | None:
     if not isinstance(value, str) or _REFERENCE.fullmatch(value) is None:
         return None
     if value.isdigit() and len(value) >= 9:
-        return None
-    return value
-
-
-def _safe_path(value: Any) -> str | None:
-    if not isinstance(value, str) or not value.startswith("/") or len(value) > 512:
-        return None
-    if any(ord(char) < 32 or char in "?#%\\" for char in value):
-        return None
-    if "//" in value or any(part in {".", ".."} for part in value.split("/")):
         return None
     return value
 
@@ -74,8 +57,7 @@ def _response_summary(value: Any) -> dict[str, Any] | None:
         not is_http_status(status)
         or type(body_bytes) is not int
         or body_bytes < 0
-        or not isinstance(digest, str)
-        or _HEX_64.fullmatch(digest) is None
+        or not is_hex64(digest)
         or type(redirect) is not bool
         or redirect != (300 <= status < 400)
         or not isinstance(headers, dict)
@@ -100,7 +82,7 @@ def _flow_summary(value: Any, *, expected_target_ref: str | None) -> dict[str, A
     flow_ref = value.get("flow_ref")
     target_ref = _safe_reference(value.get("target_ref"))
     method = value.get("method")
-    path = _safe_path(value.get("path"))
+    path = safe_path(value.get("path"))
     fields = value.get("request_json_fields")
     response = _response_summary(value.get("captured_response"))
     if (
@@ -158,7 +140,7 @@ def _flow_mutation(
     params = path_parameters(path)
     observation = {
         "kind": "captured_http_flow",
-        "context_key": _context_key(source_tool, target_ref, flow_ref),
+        "context_key": deterministic_key(source_tool, target_ref, flow_ref),
         "source_tool": source_tool,
         "flow_ref": flow_ref,
         "target_ref": target_ref,
@@ -296,7 +278,7 @@ def map_web_proxy_get_flow(
     resource_id = flow_resource_node_id(target_ref, flow_ref)
     observation = {
         "kind": "captured_http_flow_detail",
-        "context_key": _context_key("web.proxy_get_flow", target_ref, flow_ref),
+        "context_key": deterministic_key("web.proxy_get_flow", target_ref, flow_ref),
         "source_tool": "web.proxy_get_flow",
         **flow,
         "source_untrusted": True,
@@ -408,7 +390,7 @@ def _flow_execution_mutation(
             return GraphMutation()
     observation = {
         "kind": "proxy_flow_execution",
-        "context_key": _context_key(
+        "context_key": deterministic_key(
             source_tool, target_ref, flow_ref, session_ref, mutated_fields
         ),
         "source_tool": source_tool,
@@ -518,7 +500,9 @@ def map_web_proxy_compare_sessions(
     resource_id = flow_resource_node_id(target_scope, flow_ref)
     observation = {
         "kind": "proxy_session_comparison",
-        "context_key": _context_key("proxy-compare", target_scope, flow_ref, first_ref, second_ref),
+        "context_key": deterministic_key(
+            "proxy-compare", target_scope, flow_ref, first_ref, second_ref
+        ),
         "source_tool": "web.proxy_compare_sessions",
         "flow_ref": flow_ref,
         "first_session_ref": first_ref,
@@ -555,7 +539,7 @@ def map_web_nuclei_response_check(
         return GraphMutation()
     output = result.output
     host = getattr(target, "host", None)
-    path = _safe_path(arguments.get("path"))
+    path = safe_path(arguments.get("path"))
     target_ref = _safe_reference(arguments.get("target_ref"))
     check_id = arguments.get("check_id")
     status = output.get("status_code")
@@ -580,7 +564,7 @@ def map_web_nuclei_response_check(
     )
     observation = {
         "kind": "passive_response_check",
-        "context_key": _context_key("nuclei", target_ref, path, check_id),
+        "context_key": deterministic_key("nuclei", target_ref, path, check_id),
         "source_tool": "web.nuclei_response_check",
         "target_ref": target_ref,
         "path": path,

@@ -33,3 +33,34 @@ def test_remaining_reflects_current_window() -> None:
     rl.allow(now=0.0)
     rl.allow(now=1.0)
     assert rl.remaining == 1
+
+
+# --- max_concurrent_actions admission signal ---------------------------
+
+
+def _concurrency_limiter(limit: int) -> RateLimiter:
+    return RateLimiter(
+        RateLimitPolicy(max_actions_per_minute=30, max_concurrent_actions=limit)
+    )
+
+
+def test_concurrency_bound_is_exposed() -> None:
+    assert _concurrency_limiter(1).max_concurrent_actions == 1
+    assert _concurrency_limiter(4).max_concurrent_actions == 4
+
+
+def test_concurrency_exceeded_only_when_in_flight_known() -> None:
+    rl = _concurrency_limiter(2)
+    # No feedback (legacy/serial path) -> bound not applied.
+    assert rl.concurrency_exceeded(None) is False
+    assert rl.concurrency_exceeded(0) is False
+    assert rl.concurrency_exceeded(1) is False
+    assert rl.concurrency_exceeded(2) is True
+    assert rl.concurrency_exceeded(5) is True
+
+
+def test_concurrency_check_does_not_consume_window() -> None:
+    rl = _concurrency_limiter(1)
+    assert rl.concurrency_exceeded(1) is True
+    # A concurrency denial must not have recorded a rate-limit event.
+    assert rl.remaining == 30

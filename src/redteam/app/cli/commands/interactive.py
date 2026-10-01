@@ -21,18 +21,19 @@ or executes any of this.
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
+import socket
+import sys
 from contextlib import AsyncExitStack
 from pathlib import Path
 
-import yaml
 from rich.console import Console
 
 from redteam.app.bootstrap import build_llm_client
-from redteam.app.cli import renderer
+from redteam.app.cli import interactive_commands, renderer
 from redteam.app.cli._shared import (
-    DEFAULT_APP_CONFIG_PATH,
     DEFAULT_ENGAGEMENT_PATH,
     DEFAULT_ENV_PATH,
     EXIT_CONFIG_ERROR,
@@ -42,9 +43,16 @@ from redteam.app.cli._shared import (
     prompt_secret,
     write_env_var,
 )
+from redteam.app.cli.commands import approvals as approvals_command
 from redteam.app.cli.commands import run as run_command
 from redteam.app.cli.commands.validate import check_capability, check_roe, check_scope
-from redteam.capability.settings import MCPConfigurationError
+from redteam.app.cli.conversation import (
+    ConversationAssistant,
+    ConversationDecision,
+    catalog_tool_labels,
+)
+from redteam.app.cli.interactive_commands import InteractiveSession
+from redteam.capability.settings import MCPConfigurationError, mcp_server_ids_from_environment
 from redteam.core.config import (
     AppConfig,
     CapabilityConfig,
@@ -54,8 +62,10 @@ from redteam.core.config import (
     OrchestrationConfig,
     load_engagement_config,
 )
+from redteam.core.enums import OperatorIntentType
 from redteam.core.ports.llm import LLMClient
 from redteam.intake.assistant import IntakeAssistant, IntakeAssistantError, IntakeSession
+from redteam.intake.fallback import deterministic_intake_turn
 from redteam.intake.models import missing_required_fields
 from redteam.intake.serializer import (
     DraftIncompleteError,
@@ -66,6 +76,13 @@ from redteam.intake.serializer import (
     merge_draft,
     scope_diff,
 )
+from redteam.llm.fake import FakeLLMClient
+from redteam.orchestration.engagement_planner import sanitize_objective
+from redteam.orchestration.operator_intents import (
+    IntentInterpretationError,
+    classify_instruction,
+)
+from redteam.orchestration.state import RuntimeState, TerminationReason
 
 logger = logging.getLogger(__name__)
 
@@ -80,11 +97,12 @@ async def run(args: argparse.Namespace) -> int:
     except EOFError:
         # No more input to read (section 23): a script/CI piped this
         # process no stdin at all. The explicit, automation-friendly
-        # command is `redteam run <engagement> --config <app>`.
+        # command is `redteam run <engagement>` (+ REDTEAM_LLM_*/REDTEAM_MCP_*
+        # environment variables).
         console.print(
             "\n[dim]No input available -- this is the interactive setup. "
             "Non-interactive environments should use "
-            "`redteam run <engagement.yaml> --config <app.yaml> --non-interactive` "
+            "`redteam run <engagement.yaml> --non-interactive` "
             "instead.[/dim]"
         )
         return EXIT_CONFIG_ERROR
@@ -94,10 +112,14 @@ async def run(args: argparse.Namespace) -> int:
 
 
 async def _run(console: Console, *, verbose: bool) -> int:
-    llm_config, orchestration_config, capability_config, logging_config = (
-        await _ensure_runtime_config(console, DEFAULT_APP_CONFIG_PATH)
-    )
+    (
+        llm_config,
+        orchestration_config,
+        capability_config,
+        logging_config,
+    ) = await _ensure_runtime_config(console)
     llm_client = build_llm_client(llm_config)
+    conversation = ConversationAssistant(llm_client)
 
     if not DEFAULT_ENGAGEMENT_PATH.exists():
         console.print("\nNo engagement configuration found.\n")
@@ -109,12 +131,20 @@ async def _run(console: Console, *, verbose: bool) -> int:
     else:
         engagement_config = load_engagement_config(DEFAULT_ENGAGEMENT_PATH)
 
-    engagement_config = await _existing_config_menu(console, engagement_config, llm_client)
-    if engagement_config is None:
+    selected = await _existing_config_menu(console, engagement_config, llm_client)
+    if selected is None:
         return EXIT_OK
+    engagement_config, objective = selected
+
+    capability_config = await _ensure_mcp_config(console, engagement_config, capability_config)
 
     engagement_config = await _preflight_loop(
-        console, engagement_config, llm_client, llm_config, capability_config
+        console,
+        engagement_config,
+        llm_client,
+        llm_config,
+        capability_config,
+        auto_start=objective is not None,
     )
     if engagement_config is None:
         return EXIT_OK
@@ -128,7 +158,28 @@ async def _run(console: Console, *, verbose: bool) -> int:
         logging=logging_config,
     )
     logging.basicConfig(level=logging_config.level, force=True)
-    return await _execute(console, full_config, verbose=verbose)
+    _exit_code, final = await _execute(
+        console,
+        full_config,
+        verbose=verbose,
+        objective=objective,
+        conversation=conversation,
+    )
+
+    # RunFinished ends this Run, not the CLI Session (sections 4-5, 19):
+    # return to a persistent prompt instead of exiting the process here.
+    session = InteractiveSession(engagement_config=engagement_config, llm_config=llm_config)
+    session.record_run(final)
+    return await _session_loop(
+        console,
+        session,
+        llm_config=llm_config,
+        orchestration_config=orchestration_config,
+        capability_config=capability_config,
+        logging_config=logging_config,
+        verbose=verbose,
+        conversation=conversation,
+    )
 
 
 # --- runtime (LLM/capability) config: a short one-time prompt, never an ----
@@ -137,23 +188,40 @@ async def _run(console: Console, *, verbose: bool) -> int:
 
 
 async def _ensure_runtime_config(
-    console: Console, path: Path
+    console: Console,
 ) -> tuple[LLMConfig, OrchestrationConfig, CapabilityConfig, LoggingConfig]:
-    if path.exists():
-        raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    """One-time interactive LLM setup, persisted to ``.env`` -- never a
+    ``app.yaml``/application-config file (there is no such file in this
+    CLI; see ``_shared.load_app_config_for_run``).
+
+    ``REDTEAM_LLM_PROVIDER`` already set (this process's environment, or a
+    previous run's ``.env`` the shell already sourced) means setup already
+    happened -- read the same way ``redteam run`` does
+    (``LLMConfig.from_environment()``), no prompt.
+    """
+    if os.environ.get("REDTEAM_LLM_PROVIDER"):
+        llm = LLMConfig.from_environment()
+        planning_mode = os.environ.get("REDTEAM_PLANNING_MODE") or (
+            "llm_first" if llm.provider != "fake" else "playbook_only"
+        )
         return (
-            LLMConfig.model_validate(raw.get("llm", {})),
-            OrchestrationConfig.model_validate(raw.get("orchestration", {})),
-            CapabilityConfig.model_validate(raw.get("capability", {})),
-            LoggingConfig.model_validate(raw.get("logging", {})),
+            llm,
+            OrchestrationConfig(
+                planning_mode=planning_mode,
+                llm_candidate_generation=planning_mode != "playbook_only",
+            ),
+            CapabilityConfig(mcp_servers=mcp_server_ids_from_environment()),
+            LoggingConfig(),
         )
 
-    console.print(f"\n[dim]No {path} found -- one-time runtime setup.[/dim]")
+    console.print("\n[dim]No REDTEAM_LLM_PROVIDER set -- one-time runtime setup.[/dim]")
     model = console.input(
         "LLM model (e.g. chatgpt/gpt-5.5, gpt-4o-mini) [blank = offline/fake]: "
     ).strip()
-    llm_config = LLMConfig(provider="fake") if not model else LLMConfig(
-        provider="litellm", default_model=model
+    llm_config = (
+        LLMConfig(provider="fake")
+        if not model
+        else LLMConfig(provider="litellm", default_model=model)
     )
     if llm_config.provider == "litellm" and not llm_config.resolve_api_key():
         # A `chatgpt/...` model authenticates via the OAuth device flow
@@ -169,30 +237,199 @@ async def _ensure_runtime_config(
                 write_env_var(DEFAULT_ENV_PATH, llm_config.api_key_env_var, key)
                 os.environ[llm_config.api_key_env_var] = key
 
-    orchestration_config = OrchestrationConfig()
-    capability_config = CapabilityConfig()
-    logging_config = LoggingConfig()
-    path.write_text(
-        yaml.safe_dump(
-            {
-                "llm": llm_config.model_dump(),
-                "orchestration": orchestration_config.model_dump(),
-                "capability": capability_config.model_dump(),
-                "logging": logging_config.model_dump(),
-            },
-            sort_keys=False,
-        ),
-        encoding="utf-8",
+    write_env_var(DEFAULT_ENV_PATH, "REDTEAM_LLM_PROVIDER", llm_config.provider)
+    os.environ["REDTEAM_LLM_PROVIDER"] = llm_config.provider
+    if model:
+        write_env_var(DEFAULT_ENV_PATH, "REDTEAM_LLM_MODEL", llm_config.default_model)
+        os.environ["REDTEAM_LLM_MODEL"] = llm_config.default_model
+    planning_mode = "llm_first" if llm_config.provider != "fake" else "playbook_only"
+    write_env_var(DEFAULT_ENV_PATH, "REDTEAM_PLANNING_MODE", planning_mode)
+    os.environ["REDTEAM_PLANNING_MODE"] = planning_mode
+    console.print(f"[dim]Wrote REDTEAM_LLM_PROVIDER to {DEFAULT_ENV_PATH}.[/dim]")
+
+    orchestration_config = OrchestrationConfig(
+        planning_mode=planning_mode,
+        llm_candidate_generation=llm_config.provider != "fake",
     )
-    console.print(f"[dim]Wrote {path}.[/dim]")
+    capability_config = CapabilityConfig(mcp_servers=mcp_server_ids_from_environment())
+    logging_config = LoggingConfig()
     return llm_config, orchestration_config, capability_config, logging_config
+
+
+# Every tool `recon.py`'s `recon-passive` server discovers (servers/recon.py's
+# `@server.tool()` list) must appear here -- `build_mcp_tool_gateway` rejects
+# a binding whose keys don't exactly match the server's discovered tool
+# names. Same canonical operations `deploy/mcp/finance/framework.env.example`
+# already uses for this server in production, not a one-off invention.
+_RECON_PASSIVE_TOOL_OPERATIONS = {
+    "dns_resolve": ["service_discovery"],
+    "http_probe": ["service_discovery"],
+    "tls_inspect": ["service_discovery"],
+    "openapi_inventory": ["endpoint_discovery"],
+    "oidc_inventory": ["endpoint_discovery"],
+    "html_inventory": ["endpoint_discovery"],
+}
+
+_WEB_HTTP_TOOL_OPERATIONS = {
+    "session_list": [],
+    "http_request": ["http_request"],
+    "http_compare_sessions": ["response_analysis"],
+    "http_security_posture": ["response_analysis"],
+    "http_compare_anonymous": ["response_analysis"],
+}
+
+_BUILTIN_MCP_SERVERS = ("recon-passive", "web-http")
+
+
+async def _ensure_mcp_config(
+    console: Console, engagement_config: EngagementConfig, capability_config: CapabilityConfig
+) -> CapabilityConfig:
+    """Create the safe built-in MCP baseline for a brand-new environment.
+
+    ``REDTEAM_MCP_SERVERS`` already set means an operator already made this
+    choice -- never overridden or re-prompted. With nothing set and no
+    scope to point at yet either, this stays a no-op: `run`/`tools` already
+    print an honest "no MCP servers configured" warning for that case, and
+    there is nothing safe to default to without a real host.
+
+    The generated baseline attaches both in-repo, read-only stdio servers:
+    passive reconnaissance and GET/HEAD/OPTIONS-only web inspection. Their
+    server-side policy is pinned to the first declared host and its resolved
+    addresses. Active scanning, proxy replay, mobile and analysis servers
+    need additional operator-owned inputs and are therefore not fabricated.
+    """
+    if "REDTEAM_MCP_SERVERS" in os.environ:
+        return capability_config
+    if not engagement_config.scope.allowed_hosts:
+        return capability_config
+
+    host = engagement_config.scope.allowed_hosts[0].strip().lower()
+    console.print(
+        "\n[dim]No MCP configuration found. Registering the built-in, "
+        f"read-only recon and web servers for {host!r}.[/dim]"
+    )
+
+    try:
+        policy_path = _write_recon_policy(host)
+    except (OSError, ValueError) as exc:
+        console.print(
+            f"[yellow]{renderer.theme.ICON_WARNING} could not auto-configure MCP: {exc}[/yellow]"
+        )
+        return capability_config
+
+    server_settings = {
+        "RECON_PASSIVE": {
+            "KIND": "recon",
+            "TRANSPORT": "stdio",
+            "COMMAND": sys.executable,
+            "ARGS_JSON": json.dumps(
+                [
+                    "-m",
+                    "redteam.capability.servers",
+                    "recon-passive",
+                    "--policy",
+                    str(policy_path),
+                ]
+            ),
+            "RISK_LEVEL": "low",
+            "TOOL_OPERATIONS_JSON": json.dumps(_RECON_PASSIVE_TOOL_OPERATIONS),
+        },
+        "WEB_HTTP": {
+            "KIND": "web_api",
+            "TRANSPORT": "stdio",
+            "COMMAND": sys.executable,
+            "ARGS_JSON": json.dumps(
+                [
+                    "-m",
+                    "redteam.capability.servers",
+                    "web-http",
+                    "--policy",
+                    str(policy_path),
+                ]
+            ),
+            "RISK_LEVEL": "medium",
+            "TOOL_OPERATIONS_JSON": json.dumps(_WEB_HTTP_TOOL_OPERATIONS),
+        },
+    }
+    server_list = ",".join(_BUILTIN_MCP_SERVERS)
+    write_env_var(DEFAULT_ENV_PATH, "REDTEAM_MCP_SERVERS", server_list)
+    os.environ["REDTEAM_MCP_SERVERS"] = server_list
+    for prefix, settings in server_settings.items():
+        for suffix, value in settings.items():
+            key = f"REDTEAM_MCP_{prefix}_{suffix}"
+            write_env_var(DEFAULT_ENV_PATH, key, value)
+            os.environ[key] = value
+    console.print(
+        f"[dim]Registered {server_list} in {DEFAULT_ENV_PATH} (policy: {policy_path}).[/dim]"
+    )
+    return CapabilityConfig(mcp_servers=list(_BUILTIN_MCP_SERVERS))
+
+
+def _write_recon_policy(host: str) -> Path:
+    """A minimal, tightly-scoped ``recon-passive`` policy for exactly one
+    host: read-only paths, and ``allowed_networks`` pinned to that host's
+    own resolved addresses (a /32 or /128 each, not an open range) --
+    never a broader default than the single host the operator just
+    declared in scope.
+
+    Resolves via ``socket.getaddrinfo`` -- the same dual-stack lookup
+    ``servers/network.py``'s ``resolve_target`` actually validates every
+    real request against, and which requires *every* resolved address to
+    fall inside an allowed network. ``socket.gethostbyname`` (IPv4-only)
+    previously missed a host's IPv6 address -- "localhost" resolves to
+    both ``127.0.0.1`` and ``::1`` on Windows -- so a real, reachable
+    request to that same host still failed "target address outside
+    configured networks" the moment resolution returned the IPv6 entry.
+    """
+    hostname = host.rsplit(":", 1)[0] if ":" in host and not host.startswith("[") else host
+    port_text = host.rsplit(":", 1)[1] if ":" in host and not host.startswith("[") else None
+    port = int(port_text) if port_text else 80
+    try:
+        infos = socket.getaddrinfo(hostname, port, type=socket.SOCK_STREAM)
+    except OSError as exc:
+        raise ValueError(f"could not resolve {hostname!r}: {exc}") from exc
+    addresses = sorted({str(info[4][0]) for info in infos})
+    if not addresses:
+        raise ValueError(f"could not resolve {hostname!r} to any address")
+    networks = [
+        f"{address}/32" if ":" not in address else f"{address}/128" for address in addresses
+    ]
+
+    policy = {
+        "targets": {host: {"origin": f"http://{host}", "allowed_paths": ["/"]}},
+        "allowed_networks": networks,
+    }
+    path = Path("mcp-recon-policy.json")
+    path.write_text(json.dumps(policy, indent=2) + "\n", encoding="utf-8")
+    return path.resolve()
 
 
 # --- Engagement Intake (sections 9, 12) ------------------------------------
 
 
+def _build_intake_assistant(llm_client: LLMClient) -> IntakeAssistant | None:
+    """``None`` when there is no real model to talk to.
+
+    ``FakeLLMClient.complete_structured`` returns ``{}`` by default, which
+    validates as a syntactically-valid but empty ``IntakeTurn`` rather than
+    raising -- so ``IntakeAssistant.step`` never raises
+    ``IntakeAssistantError`` for it, and the deterministic regex fallback
+    (``redteam.intake.fallback.deterministic_intake_turn``, which *can*
+    read something like "127.0.0.1 대상으로 분석 시작해줘") never engages.
+    Left unguarded, the zero-config offline default (blank LLM model at
+    first-run setup -> ``build_llm_client`` -> ``FakeLLMClient``) makes the
+    natural-language Intake conversation repeat the same generic "more
+    info needed" prompt forever, no matter what the user types. Skipping
+    the LLM round trip entirely for this one known stand-in avoids that
+    without changing ``FakeLLMClient``/``IntakeAssistant`` themselves --
+    both are relied on elsewhere (tests, other Protocol callers) exactly
+    as documented.
+    """
+    return None if isinstance(llm_client, FakeLLMClient) else IntakeAssistant(llm_client)
+
+
 async def _new_engagement(console: Console, llm_client: LLMClient) -> EngagementConfig | None:
-    assistant = IntakeAssistant(llm_client)
+    assistant = _build_intake_assistant(llm_client)
     session = IntakeSession()
     first_message = console.input("[cyan]>[/cyan] 어떤 대상을 테스트하려고 하나요? ")
     if not first_message.strip():
@@ -209,7 +446,7 @@ async def _edit_engagement(
         console.print(f"\n[red]{exc}[/red]")
         return None
 
-    assistant = IntakeAssistant(llm_client)
+    assistant = _build_intake_assistant(llm_client)
     session = IntakeSession(draft=draft, editing=True)
     message = console.input("[cyan]>[/cyan] 뭘 바꿀까요? ")
     if not message.strip():
@@ -232,18 +469,26 @@ async def _edit_engagement(
 
 
 async def _intake_loop(
-    console: Console, assistant: IntakeAssistant, session: IntakeSession, first_message: str
+    console: Console,
+    assistant: IntakeAssistant | None,
+    session: IntakeSession,
+    first_message: str,
 ) -> EngagementConfig | None:
     message = first_message
     while True:
-        try:
-            turn = await assistant.step(session, message)
-        except IntakeAssistantError as exc:
-            console.print(f"[red]{renderer.theme.ICON_FAILURE} {exc}[/red]")
-            message = console.input("[cyan]>[/cyan] ")
-            if not message.strip():
-                return None
-            continue
+        if assistant is None:
+            # No real model configured (see _build_intake_assistant) -- go
+            # straight to the deterministic parser every turn instead of
+            # round-tripping a canned, unhelpful structured response.
+            turn = deterministic_intake_turn(session.draft, sanitize_objective(message))
+        else:
+            try:
+                turn = await assistant.step(session, sanitize_objective(message))
+            except IntakeAssistantError as exc:
+                if session.editing:
+                    console.print(f"[red]{renderer.theme.ICON_FAILURE} {exc}[/red]")
+                    return None
+                turn = deterministic_intake_turn(session.draft, sanitize_objective(message))
 
         session.draft = merge_draft(session.draft, turn.draft)
         if turn.acknowledgement:
@@ -263,8 +508,8 @@ async def _intake_loop(
             questions = [f"확인이 더 필요합니다: {', '.join(missing) or 'unspecified'}"]
 
         console.print("\n테스트 범위를 조금 더 확인하겠습니다.\n")
-        for index, question in enumerate(questions, start=1):
-            console.print(f"  {index}. {question}")
+        # Recheck the draft after each answer; ask only the next missing item.
+        console.print(f"  1. {questions[0]}")
         message = console.input("\n[cyan]>[/cyan] ")
         if not message.strip() or message.strip().lower() in {"q", "quit"}:
             return None
@@ -288,7 +533,7 @@ async def _intake_loop(
 
 async def _existing_config_menu(
     console: Console, engagement_config: EngagementConfig, llm_client: LLMClient
-) -> EngagementConfig | None:
+) -> tuple[EngagementConfig, str | None] | None:
     while True:
         renderer.render_engagement_panel(
             console,
@@ -299,23 +544,29 @@ async def _existing_config_menu(
             focus=" · ".join(engagement_config.metadata.get("focus_areas", [])) or None,
         )
         choice = renderer.prompt_choice(
-            console, "", "[ Enter ] Start   [ E ] Edit   [ N ] New   [ Q ] Quit"
+            console,
+            "",
+            "[ Enter ] Start   [ E ] Edit   [ N ] New   [ Q ] Quit\nOr type a Mission objective:",
+            normalize=False,
         )
-        if choice in ("", "start", "s"):
-            return engagement_config
-        if choice in ("e", "edit"):
+        command = choice.lower()
+        if command in ("", "start", "s"):
+            return engagement_config, None
+        if command in ("e", "edit"):
             updated = await _edit_engagement(console, llm_client, engagement_config)
             if updated is not None:
                 engagement_config = updated
                 _write_engagement(DEFAULT_ENGAGEMENT_PATH, engagement_config)
             continue
-        if choice in ("n", "new"):
+        if command in ("n", "new"):
             fresh = await _new_engagement(console, llm_client)
             if fresh is not None:
                 engagement_config = fresh
                 _write_engagement(DEFAULT_ENGAGEMENT_PATH, engagement_config)
             continue
-        return None
+        if command in ("q", "quit"):
+            return None
+        return engagement_config, choice
 
 
 # --- Preflight (section 10, 21) --------------------------------------------
@@ -327,6 +578,8 @@ async def _preflight_loop(
     llm_client: LLMClient,
     llm_config: LLMConfig,
     capability_config: CapabilityConfig,
+    *,
+    auto_start: bool = False,
 ) -> EngagementConfig | None:
     while True:
         scope_problems = check_scope(engagement_config)
@@ -372,7 +625,7 @@ async def _preflight_loop(
                 target=engagement_config.name,
                 problem="; ".join(problems),
                 suggested_fix="Choose [E] Edit to fix this through the assistant, "
-                "or edit engagement.yaml/app.yaml directly.",
+                "or edit engagement.yaml directly.",
             )
             choice = renderer.prompt_choice(console, "", "[ E ] Edit   [ Q ] Quit")
             if choice in ("e", "edit"):
@@ -382,6 +635,8 @@ async def _preflight_loop(
                 continue
             return None
 
+        if auto_start:
+            return engagement_config
         choice = renderer.prompt_choice(
             console, "Ready to start?", "[ Enter ] Start   [ E ] Edit   [ Q ] Quit"
         )
@@ -408,14 +663,50 @@ def _write_engagement(path: Path, engagement_config: EngagementConfig) -> None:
 # --- Execution (section 18/19, via commands.run's shared core) ------------
 
 
-async def _execute(console: Console, full_config: AppConfig, *, verbose: bool) -> int:
+async def _execute(
+    console: Console,
+    full_config: AppConfig,
+    *,
+    verbose: bool,
+    objective: str | None = None,
+    conversation: ConversationAssistant | None = None,
+    prepared_decision: ConversationDecision | None = None,
+    user_message: str | None = None,
+) -> tuple[int, RuntimeState | None]:
+    """Runs one Engagement to a terminal/suspended state and returns
+    ``(exit_code, final_runtime_state)``.
+
+    The ``RuntimeState`` is returned (not just the exit code) so a caller
+    that keeps the CLI process alive after this -- see ``_session_loop``,
+    section 4/19: ``RunFinished`` ends the *Run*, not the CLI Session --
+    can project it into ``InteractiveSession`` (``run_id``, phase,
+    termination reason) for ``/status``/``/findings`` to default against,
+    without re-deriving it from event-renderer side effects.
+    """
     async with AsyncExitStack() as stack:
-        return await _execute_scoped(console, full_config, verbose=verbose, mcp_stack=stack)
+        return await _execute_scoped(
+            console,
+            full_config,
+            verbose=verbose,
+            mcp_stack=stack,
+            objective=objective,
+            conversation=conversation,
+            prepared_decision=prepared_decision,
+            user_message=user_message,
+        )
 
 
 async def _execute_scoped(
-    console: Console, full_config: AppConfig, *, verbose: bool, mcp_stack: AsyncExitStack
-) -> int:
+    console: Console,
+    full_config: AppConfig,
+    *,
+    verbose: bool,
+    mcp_stack: AsyncExitStack,
+    objective: str | None = None,
+    conversation: ConversationAssistant | None = None,
+    prepared_decision: ConversationDecision | None = None,
+    user_message: str | None = None,
+) -> tuple[int, RuntimeState | None]:
     with console.status("Starting engagement...", spinner="dots"):
         try:
             engagement, deps = await run_command.build(
@@ -429,7 +720,7 @@ async def _execute_scoped(
                 suggested_fix="Fix the REDTEAM_MCP_<ID>_* environment variables for the "
                 "configured server(s).",
             )
-            return EXIT_CONFIG_ERROR
+            return EXIT_CONFIG_ERROR, None
         except Exception as exc:  # noqa: BLE001 - fail closed with a readable message
             if logging.getLogger().isEnabledFor(logging.DEBUG):
                 logging.exception("Application bootstrap failed")
@@ -439,9 +730,79 @@ async def _execute_scoped(
                 problem=f"failed to start application: {exc}",
                 suggested_fix=None,
             )
-            return EXIT_FAILURE
+            return EXIT_FAILURE, None
 
-    console.print()
+    effective_objective = sanitize_objective(objective or "").strip() or (
+        f"Assess the declared scope of {full_config.engagement.name}"
+    )
+    runtime_owns_decision = (
+        full_config.orchestration.planning_mode == "llm_first"
+        and full_config.llm.provider != "fake"
+    )
+    if conversation is not None and runtime_owns_decision:
+        shown_message = sanitize_objective(user_message or objective or "")
+        if shown_message:
+            renderer.render_user_message(console, shown_message)
+        # A session-level conversational turn may have normalized the request
+        # into an objective, but the PLAN node now owns the visible response,
+        # assumptions and concrete action. Avoid displaying a speculative plan
+        # that could disagree with the actual runtime decision.
+        if prepared_decision is not None and prepared_decision.objective:
+            effective_objective = prepared_decision.objective
+    elif conversation is not None:
+        scope = [
+            *full_config.engagement.scope.allowed_hosts,
+            *full_config.engagement.scope.allowed_domains,
+            *full_config.engagement.scope.allowed_networks,
+            *full_config.engagement.scope.allowed_assets,
+        ]
+        tools = catalog_tool_labels(deps.tool_catalog)
+        decision = prepared_decision
+        if decision is None:
+            with console.status("Understanding your request...", spinner="dots"):
+                decision = await conversation.decide(
+                    effective_objective,
+                    engagement_name=full_config.engagement.name,
+                    scope=scope,
+                    tools=tools,
+                    prefer_execute=True,
+                )
+        shown_message = sanitize_objective(user_message or objective or "")
+        if shown_message:
+            renderer.render_user_message(console, shown_message)
+        renderer.render_assistant_decision(console, decision)
+
+        # A model may need one or two concrete details before it can safely
+        # turn chat into a Mission.  Keep that exchange in the same terminal
+        # session instead of either guessing or silently running the fallback
+        # objective.  The eventual execution still enters the normal
+        # compiler -> Control -> MCP path.
+        clarification_count = 0
+        while decision.mode == "clarify" and clarification_count < 2:
+            reply = sanitize_objective(console.input("\n[cyan]operator>[/cyan] ")).strip()
+            if not reply:
+                console.print("[dim]No action started; more detail is required.[/dim]")
+                return EXIT_OK, None
+            renderer.render_user_message(console, reply)
+            clarification_count += 1
+            with console.status("Updating the plan...", spinner="dots"):
+                decision = await conversation.decide(
+                    f"Clarification for the current request: {reply}",
+                    engagement_name=full_config.engagement.name,
+                    scope=scope,
+                    tools=tools,
+                    prefer_execute=True,
+                )
+            renderer.render_assistant_decision(console, decision)
+
+        if decision.mode == "clarify":
+            console.print("[dim]No action started; the request still needs clarification.[/dim]")
+            return EXIT_OK, None
+        effective_objective = decision.objective or effective_objective
+    else:
+        console.print()
+        if objective:
+            console.print(renderer.operator_user_text(sanitize_objective(objective)))
     event_renderer = renderer.RichEventRenderer(console, verbose=verbose)
     try:
         final = await run_command.execute(
@@ -451,12 +812,20 @@ async def _execute_scoped(
             non_interactive=False,
             on_event=event_renderer,
             echo=lambda line: console.print(line),
+            objective=effective_objective,
+            # PROMPT 4+5: keep a persistent operator channel live for the
+            # whole run (pause/resume/stop/focus/exclude/status and in-session
+            # approve/deny at the approval suspension). This is the
+            # interactive entrypoint by definition; the explicit
+            # `redteam run --non-interactive`/`--json` paths never set it.
+            allow_operator_input=True,
+            conversation=conversation,
         )
     except Exception as exc:  # noqa: BLE001 - same fail-closed contract as commands.run
         if logging.getLogger().isEnabledFor(logging.DEBUG):
             logging.exception("Run failed")
         console.print(f"\n[red]{renderer.theme.ICON_FAILURE} run failed: {exc}[/red]")
-        return EXIT_FAILURE
+        return EXIT_FAILURE, None
 
     console.print()
     renderer.render_run_summary(
@@ -467,6 +836,150 @@ async def _execute_scoped(
         tool_calls=event_renderer.tool_calls,
         violations=event_renderer.violations,
     )
+    if final.mission_status is not None:
+        console.print(f"Mission: {final.mission_status.value}")
     console.print(f"\n[dim]RunId: {final.run_id}[/dim]")
-    console.print(f"[dim]Report: redteam report generate {final.run_id}[/dim]")
-    return EXIT_FAILURE if final.phase.value == "failed" else EXIT_OK
+    if final.termination_reason not in {
+        TerminationReason.OPERATOR_PAUSED,
+        TerminationReason.APPROVAL_PENDING,
+    }:
+        console.print(f"[dim]Report: redteam report generate {final.run_id}[/dim]")
+    if conversation is not None:
+        with console.status("Preparing the answer...", spinner="dots"):
+            answer = await conversation.final_response(final)
+        renderer.render_final_answer(console, answer)
+    exit_code = EXIT_FAILURE if final.phase.value == "failed" else EXIT_OK
+    return exit_code, final
+
+
+async def _session_loop(
+    console: Console,
+    session: InteractiveSession,
+    *,
+    llm_config: LLMConfig,
+    orchestration_config: OrchestrationConfig,
+    capability_config: CapabilityConfig,
+    logging_config: LoggingConfig,
+    verbose: bool,
+    conversation: ConversationAssistant,
+) -> int:
+    """Keeps the CLI process alive after ``RunFinished`` (sections 4-5,
+    19): a Run ending is not the same as the CLI Session ending. Reads one
+    line at a time -- ``/...`` dispatches through the Command Registry
+    (``interactive_commands.dispatch``, never the Agent Runtime; sections
+    3, 13-15), anything else becomes a new Mission objective run through
+    the exact same ``_execute`` core the first run used (Gate D: no
+    duplicated Runtime-invocation path for the "next" request).
+
+    A recoverable condition here -- an unknown slash command, a command
+    handler raising, ``KeyboardInterrupt`` while idle at the prompt --
+    prints a message and returns to the prompt (section 21). Only
+    ``/exit``/``EOFError`` (Ctrl+D) end the loop.
+    """
+    while True:
+        try:
+            text = console.input("\n[cyan]operator>[/cyan] ")
+        except EOFError:
+            console.print("\n[dim]Session ended.[/dim]")
+            return EXIT_OK
+        except KeyboardInterrupt:
+            console.print("\n[dim](Ctrl+C -- type /exit or press Ctrl+D to end the session)[/dim]")
+            continue
+
+        text = text.strip()
+        if not text:
+            continue
+        if text.startswith("/"):
+            should_continue = await interactive_commands.dispatch(console, session, text)
+            if not should_continue:
+                return EXIT_OK
+            continue
+
+        # Match conversational coding-agent ergonomics: the slash form stays
+        # canonical and discoverable, while the obvious bare words also end
+        # an idle session instead of accidentally creating a Mission.
+        if text.lower().strip("?!.,:;") in {"exit", "quit", "q", "종료", "끝"}:
+            console.print(renderer.operator_user_text(sanitize_objective(text)))
+            return EXIT_OK
+
+        head = text.partition(" ")[0].lower().strip("?!.,:;")
+        try:
+            idle_intent = classify_instruction(text).intent_type
+        except IntentInterpretationError:
+            idle_intent = None
+
+        # Explanation questions are naturally phrased (for example,
+        # "방금 왜 실패했어?") and the interrogative is rarely the first
+        # token. Reuse the same deterministic intent classifier as the live
+        # operator channel so an ended Run cannot turn a diagnostic question
+        # into a brand-new Mission by accident.
+        if idle_intent is OperatorIntentType.EXPLANATION_QUERY:
+            console.print(renderer.operator_user_text(sanitize_objective(text)))
+            console.print(session.explain_last_run())
+            continue
+        if head in {"status", "query", "현황", "상태", "진행", "요약"}:
+            console.print(renderer.operator_user_text(sanitize_objective(text)))
+            await interactive_commands.dispatch(console, session, "/status")
+            continue
+        if head in {"stop", "중지", "정지", "중단", "그만"}:
+            console.print(renderer.operator_user_text(sanitize_objective(text)))
+            console.print(
+                "[Agent] No run is active; the interactive session remains open. "
+                "Use /exit to close it."
+            )
+            continue
+        if head in {"approve", "deny", "reject", "승인", "거부"}:
+            console.print(renderer.operator_user_text(sanitize_objective(text)))
+            pending = session.last_pending_approval_id
+            if pending is None:
+                console.print("[Agent] No action is awaiting approval.")
+                continue
+            command = (
+                approvals_command.run_approve
+                if head in {"approve", "승인"}
+                else approvals_command.run_deny
+            )
+            await command(
+                argparse.Namespace(
+                    approval_id=pending,
+                    resolved_by=None,
+                    approval_dir="data/approvals",
+                    audit_dir="data/audit",
+                )
+            )
+            continue
+
+        with console.status("Thinking...", spinner="dots"):
+            decision = await conversation.decide(
+                text,
+                engagement_name=session.engagement_config.name,
+                scope=[
+                    *session.engagement_config.scope.allowed_hosts,
+                    *session.engagement_config.scope.allowed_domains,
+                    *session.engagement_config.scope.allowed_networks,
+                    *session.engagement_config.scope.allowed_assets,
+                ],
+                session_context=session.explain_last_run(),
+            )
+        if decision.mode != "execute":
+            renderer.render_user_message(console, sanitize_objective(text))
+            renderer.render_assistant_decision(console, decision)
+            continue
+
+        full_config = AppConfig(
+            engagement=session.engagement_config,
+            llm=llm_config,
+            orchestration=orchestration_config,
+            capability=capability_config,
+            logging=logging_config,
+        )
+        _exit_code, final = await _execute(
+            console,
+            full_config,
+            verbose=verbose,
+            objective=decision.objective or text,
+            conversation=conversation,
+            prepared_decision=decision,
+            user_message=text,
+        )
+        session.record_run(final)
