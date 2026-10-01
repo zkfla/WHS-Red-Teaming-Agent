@@ -476,18 +476,26 @@ async def test_compiler_rejects_a_draft_whose_execution_target_is_not_referenced
     assert compiler.compile_drafts([mismatched]) == []
 
 
-async def test_endpoint_discovery_defaults_missing_path_before_validation() -> None:
+async def test_endpoint_discovery_missing_path_is_rejected_without_inventing_path() -> None:
+    from redteam.orchestration.agents.providers import PlaybookCandidateProvider
+
     service = await graph()
     registry = MCPToolRegistry()
     registry.register(schema_tool())
     compiler = CandidateCompiler(catalog_for(registry, operation="endpoint_discovery"))
-
-    candidates = await compiler.compile_playbook(
-        endpoint_agent(), service.view(), await service.observe(step=1), step=1
+    observation = await service.observe(step=1)
+    drafts = await PlaybookCandidateProvider().propose(
+        endpoint_agent(), service.view(), observation, step=1
     )
 
-    assert candidates
-    assert all(candidate.plan_step.arguments["path"] == "/" for candidate in candidates)
+    candidates, rejections = compiler.compile_drafts_with_rejections(drafts)
+
+    assert candidates == []
+    assert rejections
+    assert all(
+        rejection.reason == "missing_required_argument" and rejection.field == "path"
+        for rejection in rejections
+    )
 
 
 async def test_endpoint_discovery_preserves_explicit_path() -> None:

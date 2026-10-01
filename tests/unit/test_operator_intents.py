@@ -16,6 +16,7 @@ import json
 from dataclasses import dataclass, fields, replace
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -50,6 +51,7 @@ from redteam.orchestration.operator_intents import (
     IntentRecord,
     IntentStatus,
     OperatorIntentService,
+    OperatorIntentStore,
     SQLiteOperatorIntentStore,
     classify_instruction,
     interpret_instruction,
@@ -126,6 +128,18 @@ async def seeded_task_store(*tasks: MissionTask) -> InMemoryTaskGraphStore:
     return store
 
 
+async def _require_task(store: InMemoryTaskGraphStore, task_id: TaskId) -> MissionTask:
+    found = await store.get_task(task_id)
+    assert found is not None
+    return found
+
+
+async def _require_mission(store: InMemoryTaskGraphStore) -> MissionPlan:
+    found = await store.get_mission(MISSION)
+    assert found is not None
+    return found
+
+
 def publisher(bus: InMemoryEventBus, source: str = "test.operator") -> EventPublisher:
     return EventPublisher(bus, run_id=RUN, engagement_id=ENG, source=source)
 
@@ -196,7 +210,9 @@ async def test_store_round_trip_update_and_status_filter(intent_store) -> None:
     assert stored.intent.intent_type is OperatorIntentType.FOCUS
 
     await intent_store.update(record.model_copy(update={"status": IntentStatus.APPLIED}))
-    assert (await intent_store.get(record.intent.intent_id)).status is IntentStatus.APPLIED
+    applied_record = await intent_store.get(record.intent.intent_id)
+    assert applied_record is not None
+    assert applied_record.status is IntentStatus.APPLIED
     assert await intent_store.list_for_mission(MISSION, status=IntentStatus.RECEIVED) == []
     assert len(await intent_store.list_for_mission(MISSION, status=IntentStatus.APPLIED)) == 1
 
@@ -223,7 +239,9 @@ async def test_sqlite_store_never_persists_spaced_password(tmp_path: Path) -> No
     store = SQLiteOperatorIntentStore(path)
     await store.append(record)
     assert "hunter2" not in path.read_bytes().decode("utf-8", errors="ignore")
-    assert "hunter2" not in (await store.get(record.intent.intent_id)).model_dump_json()
+    stored = await store.get(record.intent.intent_id)
+    assert stored is not None
+    assert "hunter2" not in stored.model_dump_json()
 
 
 # --- deterministic interpretation ---------------------------------------
@@ -356,6 +374,7 @@ async def test_receive_apply_publishes_correlated_causation_chain() -> None:
     assert received.status is IntentStatus.RECEIVED
     assert received.received_event_id is not None
 
+    assert received.intent_id is not None
     applied = await svc.apply(received.intent_id, publisher=pub)
     assert applied.applied is True
     assert applied.applied_event_id is not None
@@ -370,11 +389,11 @@ async def test_receive_apply_publishes_correlated_causation_chain() -> None:
     assert chain[2].causation_id == chain[1].event_id
 
     # Only the web task moved; mobile is untouched and no task was created.
-    assert (await task_store.get_task(TaskId("web"))).priority == 500
-    assert (await task_store.get_task(TaskId("mobile"))).priority == 10
+    assert (await _require_task(task_store, TaskId("web"))).priority == 500
+    assert (await _require_task(task_store, TaskId("mobile"))).priority == 10
     assert len(await task_store.list_tasks(mission_id=MISSION)) == 2
 
-    focus_mission = await task_store.get_mission(MISSION)
+    focus_mission = await _require_mission(task_store)
     assert focus_mission.operator_preferences["focus_areas"] == ["web"]
 
 
@@ -383,6 +402,7 @@ async def test_apply_is_idempotent() -> None:
     svc = service(task_store=task_store, intent_store=InMemoryOperatorIntentStore())
     received = await svc.receive("focus web", mission_id=MISSION, run_id=RUN)
 
+    assert received.intent_id is not None
     await svc.apply(received.intent_id)
     second = await svc.apply(received.intent_id)
     assert second.applied is True and second.outcome == "focused 1 task(s)"
@@ -411,10 +431,10 @@ async def test_exclude_cancels_pending_work_but_not_a_running_task() -> None:
         publisher=pub,
     )
 
-    assert (await task_store.get_task(TaskId("web-ready"))).status is TaskStatus.CANCELLED
+    assert (await _require_task(task_store, TaskId("web-ready"))).status is TaskStatus.CANCELLED
     # web also matches the RUNNING api task? No: area "web" is not in its text.
-    assert (await task_store.get_task(TaskId("api-running"))).status is TaskStatus.RUNNING
-    assert (await task_store.get_task(TaskId("mobile"))).status is TaskStatus.READY
+    assert (await _require_task(task_store, TaskId("api-running"))).status is TaskStatus.RUNNING
+    assert (await _require_task(task_store, TaskId("mobile"))).status is TaskStatus.READY
     assert bus.history(event_type=EventType.TASK_CANCELLED)
 
 
@@ -427,9 +447,9 @@ async def test_stop_cancels_work_and_marks_the_mission_cancelled() -> None:
     result = await svc.receive_and_apply("stop", mission_id=MISSION, run_id=RUN)
 
     assert result.applied is True
-    assert (await task_store.get_mission(MISSION)).status is MissionStatus.CANCELLED
-    assert (await task_store.get_task(TaskId("web"))).status is TaskStatus.CANCELLED
-    assert (await task_store.get_task(TaskId("api"))).status is TaskStatus.CANCELLED
+    assert (await _require_mission(task_store)).status is MissionStatus.CANCELLED
+    assert (await _require_task(task_store, TaskId("web"))).status is TaskStatus.CANCELLED
+    assert (await _require_task(task_store, TaskId("api"))).status is TaskStatus.CANCELLED
 
 
 async def test_rejected_intent_reason_never_echoes_a_caller_parameter() -> None:
@@ -451,6 +471,7 @@ async def test_rejected_intent_reason_never_echoes_a_caller_parameter() -> None:
 
     assert result.status is IntentStatus.REJECTED
     assert result.reason == "intent_validation_failed:ValueError"
+    assert result.intent_id is not None
     record = await intents.get(result.intent_id)
     assert record is not None and record.reason == "intent_validation_failed:ValueError"
     # The failure path must not add raw text anywhere new: the event carries
@@ -502,7 +523,7 @@ async def test_query_intent_is_applied_without_touching_state() -> None:
 class _IntentDeps(RuntimeDeps):
     """Test-only shim: the composition root adds this field to RuntimeDeps."""
 
-    operator_intent_store: object | None = None
+    operator_intent_store: OperatorIntentStore | None = None
 
 
 def deps_with_intents(intent_store, task_store) -> RuntimeDeps:
@@ -554,9 +575,9 @@ async def test_observe_pauses_before_execution_and_resumes_same_task() -> None:
     assert paused["runtime"].termination_reason == TerminationReason.OPERATOR_PAUSED
     assert paused["runtime"].active_task_id == TaskId("recon-task")
     assert paused["runtime"].current_agent is None
-    assert (await task_store.get_mission(MISSION)).status is MissionStatus.PAUSED
+    assert (await _require_mission(task_store)).status is MissionStatus.PAUSED
     # The active Task is preserved, not completed.
-    assert (await task_store.get_task(TaskId("recon-task"))).status is TaskStatus.RUNNING
+    assert (await _require_task(task_store, TaskId("recon-task"))).status is TaskStatus.RUNNING
 
     chain = deps.event_bus.correlated(  # type: ignore[attr-defined]
         (await intent_store.list_for_mission(MISSION))[0].correlation_id
@@ -575,8 +596,8 @@ async def test_observe_pauses_before_execution_and_resumes_same_task() -> None:
     )
     resumed = await observe_node(initial_graph_state(resumed_runtime), deps=deps)
 
-    assert (await task_store.get_mission(MISSION)).status is MissionStatus.ACTIVE
-    assert (await task_store.get_task(TaskId("recon-task"))).status is TaskStatus.RUNNING
+    assert (await _require_mission(task_store)).status is MissionStatus.ACTIVE
+    assert (await _require_task(task_store, TaskId("recon-task"))).status is TaskStatus.RUNNING
     assert resumed["runtime"].active_task_id == TaskId("recon-task")
     assert resumed["runtime"].termination_reason is None
 
@@ -699,8 +720,8 @@ async def test_excluding_an_endpoint_does_not_widen_to_the_whole_api_area() -> N
 
     await svc.receive_and_apply("exclude /api/docs", mission_id=MISSION, run_id=RUN)
 
-    assert (await task_store.get_task(TaskId("docs"))).status is TaskStatus.CANCELLED
-    assert (await task_store.get_task(TaskId("api-other"))).status is TaskStatus.READY
+    assert (await _require_task(task_store, TaskId("docs"))).status is TaskStatus.CANCELLED
+    assert (await _require_task(task_store, TaskId("api-other"))).status is TaskStatus.READY
 
 
 async def test_excluding_endpoint_does_not_cancel_a_prefix_neighbor() -> None:
@@ -712,8 +733,8 @@ async def test_excluding_endpoint_does_not_cancel_a_prefix_neighbor() -> None:
 
     await svc.receive_and_apply("exclude /api/docs", mission_id=MISSION, run_id=RUN)
 
-    assert (await task_store.get_task(TaskId("docs"))).status is TaskStatus.CANCELLED
-    assert (await task_store.get_task(TaskId("docs-old"))).status is TaskStatus.READY
+    assert (await _require_task(task_store, TaskId("docs"))).status is TaskStatus.CANCELLED
+    assert (await _require_task(task_store, TaskId("docs-old"))).status is TaskStatus.READY
 
 
 async def test_exclude_endpoint_cancels_matching_task_and_records_suppression() -> None:
@@ -726,9 +747,9 @@ async def test_exclude_endpoint_cancels_matching_task_and_records_suppression() 
 
     await svc.receive_and_apply("exclude /api/docs", mission_id=MISSION, run_id=RUN)
 
-    assert (await task_store.get_task(TaskId("docs"))).status is TaskStatus.CANCELLED
-    assert (await task_store.get_task(TaskId("other"))).status is TaskStatus.READY
-    mission = await task_store.get_mission(MISSION)
+    assert (await _require_task(task_store, TaskId("docs"))).status is TaskStatus.CANCELLED
+    assert (await _require_task(task_store, TaskId("other"))).status is TaskStatus.READY
+    mission = await _require_mission(task_store)
     assert mission.operator_preferences["excluded_endpoints"] == ["/api/docs"]
 
 
@@ -747,13 +768,13 @@ async def test_suppression_prevents_refocusing_an_excluded_running_task() -> Non
 
     # A RUNNING task is not yanked, but the endpoint is recorded as excluded.
     await svc.receive_and_apply("exclude /api/docs", mission_id=MISSION, run_id=RUN)
-    assert (await task_store.get_task(TaskId("docs"))).status is TaskStatus.RUNNING
+    assert (await _require_task(task_store, TaskId("docs"))).status is TaskStatus.RUNNING
 
     result = await svc.receive_and_apply("focus /api/docs", mission_id=MISSION, run_id=RUN)
 
     assert "suppressed" in (result.outcome or "")
-    assert (await task_store.get_task(TaskId("docs"))).priority == 10  # not re-raised
-    assert (await task_store.get_task(TaskId("other"))).priority == 10
+    assert (await _require_task(task_store, TaskId("docs"))).priority == 10  # not re-raised
+    assert (await _require_task(task_store, TaskId("other"))).priority == 10
 
 
 async def test_status_query_includes_blocked_tasks_and_excluded_endpoints() -> None:
@@ -935,7 +956,7 @@ async def test_operator_renderer_shows_bounded_structured_reasons_without_secret
 
 async def test_explain_falls_back_to_the_work_ledger_without_events() -> None:
     work_store = InMemoryWorkStore()
-    common = dict(
+    common: dict[str, Any] = dict(
         run_id=RUN,
         agent_id=AgentId("web-api-agent"),
         target_node_ids=[GraphNodeId("endpoint:a.local GET /api/docs")],

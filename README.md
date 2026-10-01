@@ -66,7 +66,7 @@ pytest -q
 
 # Lint / types
 ruff check src tests examples
-mypy src/redteam
+mypy src/redteam tests
 ```
 
 `redteam` is the installed console script (`pyproject.toml`

@@ -16,12 +16,14 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timezone
 from types import SimpleNamespace
+from typing import cast
 from unittest.mock import AsyncMock
 
 import pytest
 
 from redteam.app.cli import renderer
 from redteam.app.cli.commands import run as run_command
+from redteam.core.config import AppConfig
 from redteam.core.contracts.mission import MissionPlan, MissionTask, Provenance
 from redteam.core.enums import (
     AgentPhase,
@@ -30,8 +32,9 @@ from redteam.core.enums import (
     OperatorIntentType,
     TaskStatus,
 )
-from redteam.core.ids import AgentId, EngagementId, MissionId, RunId, TaskId
+from redteam.core.ids import AgentId, ApprovalId, EngagementId, MissionId, RunId, TaskId
 from redteam.event_bus.memory import InMemoryEventBus
+from redteam.orchestration.context import RuntimeDeps
 from redteam.orchestration.operator_intents import (
     InMemoryOperatorIntentStore,
     IntentStatus,
@@ -78,7 +81,7 @@ def _task() -> MissionTask:
 def _runtime(
     reason: str,
     *,
-    pending_approval_id: str | None = None,
+    pending_approval_id: ApprovalId | None = None,
     mission_id: MissionId | None = MISSION,
 ) -> RuntimeState:
     return RuntimeState(
@@ -113,7 +116,7 @@ async def test_non_tty_start_does_not_claim_live_input() -> None:
     deps = await _deps()
     lines: list[str] = []
     console = run_command.OperatorConsole(
-        deps, lines.append, identity=run_command.RuntimeIdentity()
+        cast(RuntimeDeps, deps), lines.append, identity=run_command.RuntimeIdentity()
     )
 
     assert console.input_available is False  # answerable before start()
@@ -138,7 +141,7 @@ async def test_non_tty_approval_fails_safe_without_blocking(
         "run_engagement",
         AsyncMock(
             return_value=_runtime(
-                TerminationReason.APPROVAL_PENDING, pending_approval_id="appr_1"
+                TerminationReason.APPROVAL_PENDING, pending_approval_id=ApprovalId("appr_1")
             )
         ),
     )
@@ -146,8 +149,8 @@ async def test_non_tty_approval_fails_safe_without_blocking(
 
     final = await run_command.execute(
         SimpleNamespace(name="Hardening"),
-        deps,
-        config=SimpleNamespace(orchestration=None),
+        cast(RuntimeDeps, deps),
+        config=cast(AppConfig, SimpleNamespace(orchestration=None)),
         non_interactive=False,
         on_event=_noop_event,
         echo=lines.append,
@@ -166,7 +169,9 @@ async def test_explicit_external_approval_watch_keeps_plain_cli_alive(
 ) -> None:
     deps = await _deps()
     monkeypatch.setattr(run_command, "_stdin_is_interactive", lambda: False)
-    pending = _runtime(TerminationReason.APPROVAL_PENDING, pending_approval_id="appr_external")
+    pending = _runtime(
+        TerminationReason.APPROVAL_PENDING, pending_approval_id=ApprovalId("appr_external")
+    )
     resumed = pending.model_copy(
         update={"termination_reason": TerminationReason.NO_ACTIONABLE_PLAN}
     )
@@ -175,20 +180,24 @@ async def test_explicit_external_approval_watch_keeps_plain_cli_alive(
     monkeypatch.setattr(run_command, "run_engagement", AsyncMock(return_value=pending))
 
     final = await run_command.execute(
-        SimpleNamespace(name="Plain CLI"), deps,
-        config=SimpleNamespace(orchestration=None), non_interactive=False,
+        SimpleNamespace(name="Plain CLI"), cast(RuntimeDeps, deps),
+        config=cast(AppConfig, SimpleNamespace(orchestration=None)), non_interactive=False,
         on_event=_noop_event, echo=lambda _line: None,
         allow_operator_input=True, wait_for_external_approval=True,
     )
 
     assert final is resumed
     wait.assert_awaited_once()
+    assert wait.await_args is not None
     assert wait.await_args.kwargs["in_session"] is False
 
 
 def test_pending_summary_is_suspended_not_finished(capsys: pytest.CaptureFixture[str]) -> None:
     run_command._print_summary(
-        _runtime(TerminationReason.APPROVAL_PENDING, pending_approval_id="appr_suspended")
+        _runtime(
+            TerminationReason.APPROVAL_PENDING,
+            pending_approval_id=ApprovalId("appr_suspended"),
+        )
     )
     out = capsys.readouterr().out
     assert "Run suspended:" in out
@@ -209,7 +218,7 @@ async def test_no_console_approval_fails_safe_without_blocking(
         "run_engagement",
         AsyncMock(
             return_value=_runtime(
-                TerminationReason.APPROVAL_PENDING, pending_approval_id="appr_2"
+                TerminationReason.APPROVAL_PENDING, pending_approval_id=ApprovalId("appr_2")
             )
         ),
     )
@@ -217,8 +226,8 @@ async def test_no_console_approval_fails_safe_without_blocking(
 
     final = await run_command.execute(
         SimpleNamespace(name="Hardening"),
-        deps,
-        config=SimpleNamespace(orchestration=None),
+        cast(RuntimeDeps, deps),
+        config=cast(AppConfig, SimpleNamespace(orchestration=None)),
         non_interactive=False,
         on_event=_noop_event,
         echo=lines.append,
@@ -244,8 +253,8 @@ async def test_non_tty_pause_does_not_block(monkeypatch: pytest.MonkeyPatch) -> 
 
     final = await run_command.execute(
         SimpleNamespace(name="Hardening"),
-        deps,
-        config=SimpleNamespace(orchestration=None),
+        cast(RuntimeDeps, deps),
+        config=cast(AppConfig, SimpleNamespace(orchestration=None)),
         non_interactive=False,
         on_event=_noop_event,
         echo=lines.append,
@@ -274,8 +283,8 @@ async def test_live_console_pause_is_handled_in_session(
 
     final = await run_command.execute(
         SimpleNamespace(name="Hardening"),
-        deps,
-        config=SimpleNamespace(orchestration=None),
+        cast(RuntimeDeps, deps),
+        config=cast(AppConfig, SimpleNamespace(orchestration=None)),
         non_interactive=False,
         on_event=_noop_event,
         echo=lambda _line: None,
@@ -332,7 +341,7 @@ class _RaisingSession:
 def _reader_console(lines: list[str]) -> run_command.OperatorConsole:
     deps = SimpleNamespace(event_bus=InMemoryEventBus())
     console = run_command.OperatorConsole(
-        deps, lines.append, identity=run_command.RuntimeIdentity()
+        cast(RuntimeDeps, deps), lines.append, identity=run_command.RuntimeIdentity()
     )
     console._queue = asyncio.Queue()
     console._input_live = True
@@ -415,7 +424,9 @@ async def test_wait_for_pause_resumes_the_same_mission(
     settle = AsyncMock(side_effect=lambda runtime, _deps, **kw: runtime)
     monkeypatch.setattr(run_command, "settle_engagement", settle)
 
-    result = await run_command._wait_for_pause(deps, paused, echo=lambda _line: None)
+    result = await run_command._wait_for_pause(
+        cast(RuntimeDeps, deps), paused, echo=lambda _line: None
+    )
 
     assert result.termination_reason == "no_actionable_plan"
     assert calls == [run_command._APPROVAL_POLL_SECONDS_IN_SESSION]
@@ -429,7 +440,9 @@ async def test_wait_for_approval_exits_when_operator_stops_the_mission(
 ) -> None:
     deps = await _deps()
     deps.settings = OrchestrationSettings()
-    pending = _runtime(TerminationReason.APPROVAL_PENDING, pending_approval_id="appr_stop")
+    pending = _runtime(
+        TerminationReason.APPROVAL_PENDING, pending_approval_id=ApprovalId("appr_stop")
+    )
     calls = 0
 
     class _Runner:
@@ -457,7 +470,9 @@ async def test_wait_for_approval_exits_when_operator_stops_the_mission(
     monkeypatch.setattr(run_command, "settle_engagement", settle)
 
     result = await asyncio.wait_for(
-        run_command._wait_for_approval(deps, pending, echo=lambda _line: None, in_session=True),
+        run_command._wait_for_approval(
+            cast(RuntimeDeps, deps), pending, echo=lambda _line: None, in_session=True
+        ),
         timeout=2,
     )
 
@@ -512,7 +527,9 @@ async def _nl_console() -> tuple[run_command.OperatorConsole, list[str]]:
     lines: list[str] = []
     identity = run_command.RuntimeIdentity(run_id=RUN, engagement_id=ENG, mission_id=MISSION)
     return (
-        run_command.OperatorConsole(deps, lines.append, identity=identity, resolved_by="tester"),
+        run_command.OperatorConsole(
+            cast(RuntimeDeps, deps), lines.append, identity=identity, resolved_by="tester"
+        ),
         lines,
     )
 
@@ -564,7 +581,7 @@ async def test_full_sentences_route_to_the_intended_intent(
 
 async def test_bar_approval_shortcut_still_resolves_exact_approval() -> None:
     console, _lines = await _nl_console()
-    control_plane = console._deps.control_plane
+    control_plane = cast(_RecordingControlPlane, console._deps.control_plane)
     console.set_pending_approval("appr_exact")
 
     await console.handle_line("approve!")

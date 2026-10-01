@@ -13,6 +13,7 @@ from redteam.core.contracts.target import HostTarget
 from redteam.core.convert import NonAllowDecisionError, build_tool_invocation
 from redteam.core.enums import PolicyVerdict
 from redteam.core.ids import ActionId, AgentId, RunId, ToolId
+from redteam.llm.fake import FakeLLMClient
 from tests.fakes.tool_gateway import DummyToolGateway
 
 
@@ -22,6 +23,7 @@ async def test_finance_config_blocks_unapproved_port_scan(tmp_path: Path) -> Non
         config,
         evidence_dir=tmp_path,
         tool_gateway=DummyToolGateway(),
+        llm=FakeLLMClient(),
     )
     proposal = ActionProposal(
         action_id=ActionId("scan"),

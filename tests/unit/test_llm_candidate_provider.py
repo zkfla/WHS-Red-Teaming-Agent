@@ -2,11 +2,13 @@
 
 from dataclasses import replace
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, cast
 
 from redteam.attack_graph.identity import make_node_id
 from redteam.attack_graph.observation import GraphObservation
+from redteam.attack_graph.view import AttackGraphView
 from redteam.core.contracts.graph import GraphNode
+from redteam.core.contracts.target import EndpointTarget
 from redteam.core.contracts.tool import ToolDescriptor
 from redteam.core.enums import GraphNodeType
 from redteam.core.ids import AgentId, GraphNodeId, ToolId
@@ -57,7 +59,7 @@ def _context() -> GraphCandidateContext:
         node_ids_by_type={"endpoint": [ENDPOINT_ID]},
     )
     return GraphCandidateContext(
-        view=_FakeView(),
+        view=cast(AttackGraphView, _FakeView()),
         observation=observation,
         step=1,
         available_operations=(("web", "http_request"),),
@@ -100,7 +102,7 @@ async def test_executable_target_uses_graph_observed_path_not_model_word() -> No
         node_ids_by_type={"endpoint": [node_id]},
     )
     context = GraphCandidateContext(
-        view=_FakeView({node_id: "/api/orders/1234"}),
+        view=cast(AttackGraphView, _FakeView({node_id: "/api/orders/1234"})),
         observation=observation,
         step=1,
         available_operations=(("web", "http_request"),),
@@ -118,7 +120,9 @@ async def test_executable_target_uses_graph_observed_path_not_model_word() -> No
     )
     batch = await LLMCandidateProvider(llm).propose_graph(_spec(), context)
     assert len(batch.candidates) == 1
-    assert batch.candidates[0].plan_step.target.path == "/api/orders/1234"
+    target = batch.candidates[0].plan_step.target
+    assert isinstance(target, EndpointTarget)
+    assert target.path == "/api/orders/1234"
 
 
 async def test_hallucinated_target_is_dropped_not_executed() -> None:
@@ -146,7 +150,7 @@ async def test_generator_receives_and_obeys_the_assigned_task() -> None:
         node_ids_by_type={"endpoint": [ENDPOINT_ID, other]},
     )
     context = GraphCandidateContext(
-        view=_FakeView(),
+        view=cast(AttackGraphView, _FakeView()),
         observation=observation,
         step=1,
         task_id="task_authz",
@@ -174,7 +178,7 @@ async def test_raw_outcome_is_fed_to_the_model_prompt() -> None:
         node_ids_by_type={"endpoint": [ENDPOINT_ID]},
     )
     context = GraphCandidateContext(
-        view=_FakeView(),
+        view=cast(AttackGraphView, _FakeView()),
         observation=observation,
         step=1,
         available_operations=(("web", "http_request"),),
@@ -195,6 +199,12 @@ async def test_raw_outcome_is_fed_to_the_model_prompt() -> None:
 
 async def test_prompt_uses_tool_schema_required_arguments() -> None:
     class _Catalog:
+        def get(self, tool_id: ToolId) -> ToolDescriptor | None:
+            return None
+
+        def list_by_capability(self, capability_tag: str) -> list[ToolDescriptor]:
+            return []
+
         def list_tools_for_action(
             self, capability: str, operation: str
         ) -> list[ToolDescriptor]:

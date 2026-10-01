@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Literal
+
 import pytest
 from pydantic import ValidationError
 
@@ -28,6 +30,7 @@ from redteam.orchestration.agents import (
     build_planner,
     default_registry,
 )
+from redteam.orchestration.cognition import DecisionFailure
 from redteam.orchestration.progress import observation_fingerprint
 
 HOST_PATTERN = NodePattern(type=GraphNodeType.HOST, attrs={"in_scope": True}, bind="host")
@@ -46,7 +49,9 @@ def probe_step(step_id: str = "probe", repeatable: bool = False) -> PlanStep:
     )
 
 
-def spec(*steps: PlanStep, agent_id: str = "recon", planner_kind: str = "playbook") -> AgentSpec:
+def spec(
+    *steps: PlanStep, agent_id: str = "recon", planner_kind: Literal["llm"] = "llm"
+) -> AgentSpec:
     return AgentSpec(
         agent_id=AgentId(agent_id),
         name=agent_id,
@@ -467,20 +472,21 @@ def test_the_default_registry_ships_executable_specialists() -> None:
 # -- planners -------------------------------------------------------------
 
 
-async def test_playbook_planner_takes_the_first_candidate() -> None:
+async def test_playbook_planner_is_retired() -> None:
     service = await seeded_service("a.local")
     observation = await service.observe(step=1)
     agent = spec(probe_step("first"), probe_step("second"))
     candidates = await available_steps(agent, service.view(), observation, step=1)
 
-    picked = chosen(await PlaybookPlanner().plan(context(agent, candidates, observation)))
-    assert picked.step_id == "first"
+    with pytest.raises(ValueError, match="retired"):
+        await PlaybookPlanner().plan(context(agent, candidates, observation))
 
 
 async def test_a_planner_with_no_candidates_declines() -> None:
     service = await seeded_service()
     observation = await service.observe(step=1)
-    assert await PlaybookPlanner().plan(context(spec(), [], observation)) is None
+    with pytest.raises(ValueError, match="retired"):
+        await PlaybookPlanner().plan(context(spec(), [], observation))
     assert await LLMPlanner(FakeLLMClient()).plan(context(spec(), [], observation)) is None
 
 
@@ -500,7 +506,8 @@ async def test_the_llm_choice_is_honoured_when_it_was_offered() -> None:
 
 async def test_a_step_that_was_never_offered_is_refused() -> None:
     # The model chooses from what it was shown; it cannot conjure a tool
-    # call that was never declared.
+    # call that was never declared. Refusal raises instead of silently
+    # falling back to a rule-based pick.
     service = await seeded_service("a.local")
     observation = await service.observe(step=1)
     agent = spec(probe_step("first"), planner_kind="llm")
@@ -508,13 +515,11 @@ async def test_a_step_that_was_never_offered_is_refused() -> None:
     llm = FakeLLMClient(canned_structured={"step_id": "rm -rf /"})
 
     planner = LLMPlanner(llm)
-    picked = chosen(await planner.plan(context(agent, candidates, observation, llm=llm)))
-
-    assert picked.step_id == "first"
-    assert "was not offered" in (planner.last_fallback_reason or "")
+    with pytest.raises(DecisionFailure, match="was not offered"):
+        await planner.plan(context(agent, candidates, observation, llm=llm))
 
 
-async def test_an_llm_failure_falls_back_instead_of_aborting_the_run() -> None:
+async def test_an_llm_failure_raises_instead_of_a_rule_fallback() -> None:
     class ExplodingLLM(FakeLLMClient):
         async def complete_structured(self, **kwargs):
             raise RuntimeError("gateway down with secret-token")
@@ -525,11 +530,11 @@ async def test_an_llm_failure_falls_back_instead_of_aborting_the_run() -> None:
     candidates = await available_steps(agent, service.view(), observation, step=1)
 
     planner = LLMPlanner(ExplodingLLM())
-    picked = chosen(await planner.plan(context(agent, candidates, observation, llm=ExplodingLLM())))
+    with pytest.raises(DecisionFailure) as exc_info:
+        await planner.plan(context(agent, candidates, observation, llm=ExplodingLLM()))
 
-    assert picked.step_id == "first"
-    assert "RuntimeError" in (planner.last_fallback_reason or "")
-    assert "secret-token" not in (planner.last_fallback_reason or "")
+    assert "RuntimeError" in str(exc_info.value)
+    assert "secret-token" not in str(exc_info.value)
 
 
 async def test_the_prompt_shows_only_available_steps_and_prior_attempts() -> None:
@@ -549,5 +554,7 @@ async def test_the_prompt_shows_only_available_steps_and_prior_attempts() -> Non
 
 def test_planner_kind_selects_the_implementation() -> None:
     assert isinstance(build_planner("llm", FakeLLMClient()), LLMPlanner)
-    assert isinstance(build_planner("playbook", None), PlaybookPlanner)
-    assert isinstance(build_planner("unknown", None), PlaybookPlanner)
+    with pytest.raises(ValueError, match="only an explicitly configured LLM"):
+        build_planner("playbook", None)
+    with pytest.raises(ValueError, match="only an explicitly configured LLM"):
+        build_planner("unknown", None)

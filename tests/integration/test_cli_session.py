@@ -7,8 +7,10 @@ same Runtime path as the first -- all through the real
 ``tests/integration/test_cli_interactive.py`` (same in-process
 ``_FakeConsole``/``_ScriptedIntakeLLM`` doubles; only the Intake
 Assistant's LLM client and the terminal are test doubles -- the Agent
-Runtime, Control Plane, and Capability Gateway run for real against the
-``ExampleMCPAdapter``, same as ``test_cli_smoke.py``).
+Runtime, Control Plane, and Capability Gateway run for real against an
+honest empty catalog (no MCP servers configured). The execution model is
+an explicitly injected hold plan and the Intake Assistant uses its own
+explicit scripted double; the production LLM builder is never patched).
 
 Covers section 29's "Integration"/"CLI E2E" requirements for this
 feature: Interactive -> Application, Slash command -> Shared Service,
@@ -26,6 +28,7 @@ import pytest
 
 from redteam.app.cli import _shared
 from redteam.app.cli.commands import interactive
+from redteam.app.cli.commands import run as run_command
 
 pytestmark = pytest.mark.asyncio
 
@@ -83,19 +86,128 @@ class _ScriptedIntakeLLM:
         return self._turns.pop(0)
 
 
+class _HoldLLM:
+    """Execution model: valid draft/review, then hold forever (no tools)."""
+    def __init__(self):
+        self.calls = []
+    async def complete(self, *, messages, system=None, **kwargs):
+        return ""
+    @staticmethod
+    def _route_key(schema):
+        props = schema.get("properties", {})
+        if "path_id" in props and "steps" in props:
+            return "path_draft"
+        if "decision" in props:
+            return "path_review"
+        if "mode" in props:
+            return "next_action"
+        if "criteria" in props:
+            return "goal_completion_review"
+        if "accepted" in props:
+            return "completion_review"
+        if "claim_supported" in props:
+            return "analysis_verify"
+        return "unknown"
+    @staticmethod
+    def _find_host(messages):
+        import re
+        blob = str([m.get("content") if isinstance(m, dict) else "" for m in (messages or [])])
+        found = re.search(r"host:[A-Za-z0-9.\-_:]+", blob)
+        if found:
+            return found.group(0).rstrip(".,;:")
+        return "host:127.0.0.1:5000"
+    def _draft(self, node_id):
+        return {
+            "path_id": "path-session-hold",
+            "run_id": "run-x",
+            "mission_id": None,
+            "version": 1,
+            "parent_version": None,
+            "status": "draft",
+            "reason": "session hold plan",
+            "goal": "hold with no tools configured",
+            "steps": [
+                {
+                    "step_id": "step-1",
+                    "objective": "hold",
+                    "agent_id": "recon-agent",
+                    "target_node_ids": [node_id],
+                    "principal_refs": [],
+                    "allowed_operations": ["recon.service_discovery"],
+                    "depends_on": [],
+                    "required_fact_refs": [],
+                    "unknowns": [],
+                    "completion_criteria": [
+                        {"kind": "evidence", "description": "hold", "min_evidence": 1}
+                    ],
+                    "required": True,
+                    "status": "pending",
+                    "outcome": None,
+                    "evidence_ids": [],
+                }
+            ],
+            "hypothesis_ids": [],
+            "evidence_ids": [],
+            "changed_step_ids": [],
+            "review_records": {},
+        }
+    @staticmethod
+    def _hold():
+        return {
+            "mode": "hold",
+            "reason": "no tools configured",
+            "actions": [],
+            "path": None,
+            "path_step_id": None,
+            "completion": {},
+            "evidence_request": {},
+            "hypothesis_update": {},
+        }
+    async def complete_structured(self, *, messages, response_schema, system=None, **kwargs):
+        route = self._route_key(response_schema)
+        self.calls.append(route)
+        if route == "path_draft":
+            return self._draft(self._find_host(messages))
+        if route == "path_review":
+            return {"decision": "accept", "reason": "session hold", "path": None}
+        if route == "next_action":
+            return self._hold()
+        if route == "completion_review":
+            return {"accepted": True, "reason": "session hold"}
+        if route == "goal_completion_review":
+            return {"accepted": True, "reason": "session hold", "criteria": []}
+        if route == "analysis_verify":
+            return {
+                "meaning": "hold",
+                "outcome": "success",
+                "reason": "hold",
+                "confidence": 0.8,
+                "claim_supported": True,
+            }
+        raise AssertionError(route)
+
+
 def _patch(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, answers: list[str]) -> _FakeConsole:
     monkeypatch.chdir(tmp_path)
     # REDTEAM_LLM_PROVIDER already set (section 4/20's canonical env source)
     # means `_ensure_runtime_config` skips its one-time prompt entirely --
     # no application-config file involved.
-    monkeypatch.setenv("REDTEAM_LLM_PROVIDER", "fake")
+    monkeypatch.setenv("REDTEAM_LLM_PROVIDER", "litellm")
     monkeypatch.setenv("REDTEAM_LLM_MODEL", "gpt-4o-mini")
     monkeypatch.delenv("REDTEAM_MCP_SERVERS", raising=False)
     console = _FakeConsole(answers)
     monkeypatch.setattr(interactive, "Console", lambda: console)
-    monkeypatch.setattr(
-        interactive, "build_llm_client", lambda config: _ScriptedIntakeLLM([dict(_COMPLETE_TURN)])
-    )
+    from redteam.intake.assistant import IntakeAssistant
+    intake_llm = _ScriptedIntakeLLM([dict(_COMPLETE_TURN)])
+    def _intake_for_test(client):
+        return IntakeAssistant(intake_llm)
+    monkeypatch.setattr(interactive, "_build_intake_assistant", _intake_for_test)
+    hold_llm = _HoldLLM()
+    original_build = run_command.build_application
+    async def _build_with_explicit_llm(config, **kwargs):
+        kwargs.setdefault("llm", hold_llm)
+        return await original_build(config, **kwargs)
+    monkeypatch.setattr(run_command, "build_application", _build_with_explicit_llm)
     return console
 
 

@@ -1,25 +1,20 @@
-"""End to end: one HOST in scope -> Recon runs -> Attack Graph gains a
-SERVICE/ENDPOINT -> Web/API Agent activates -> its playbook resolves
-real ``target_ref``/``path`` arguments from that ENDPOINT's own graph
-context -> a real (schema-enforced) ``web.http_request``-shaped tool is
-actually invoked.
+"""End to end: one HOST in scope -> explicit model runs Recon -> Attack Graph
+gains SERVICE/ENDPOINT -> explicit model runs Web/API with real
+``target_ref``/``path`` arguments -> real ``web.http_request``-shaped
+tool is invoked.
 
-Closes the structural gap where a run used to stop at
-``no_actionable_plan`` right after Recon's single probe, first because
-SERVICE/ENDPOINT were never created (fixed earlier), and then because
-``WEB_API_AGENT``'s own playbook had empty ``arguments={}`` that could
-never satisfy a real ``web.http_request`` tool's required
-``target_ref``/``path`` (fixed here). The fake web tool below uses the
-*real*, required-field schema
-(``redteam.capability.servers.web_http.http_request``'s MCP-declared
-schema, verified directly: ``required: ["target_ref", "path"]``) --
-this test would fail if candidate compilation ever again produced
-unresolved/guessed arguments.
+Migration: retired the auto-planner assumption (no implicit frontier).
+The plan is supplied by an explicit scripted model (harness route answers);
+automatic rule/planner restoration and execution-guard monkeypatches are
+not used. Preserved contract: graph-derived required fields, both roles
+act, web call really happens.
 """
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
+from typing import Any
 
 import pytest
 
@@ -32,10 +27,11 @@ from redteam.core.contracts.engagement import (
     RateLimitPolicy,
 )
 from redteam.core.contracts.tool import ToolDescriptor
-from redteam.core.enums import RiskLevel, ToolHealthStatus
+from redteam.core.enums import GraphNodeType, RiskLevel, ToolHealthStatus
 from redteam.core.ids import EngagementId, ToolId
 from redteam.orchestration.settings import OrchestrationSettings
 from tests.fakes import DummyToolGateway, build_test_application
+from tests.integration import _engine_llm_harness as h
 
 pytestmark = pytest.mark.asyncio
 
@@ -60,6 +56,192 @@ _REAL_WEB_HTTP_REQUEST_SCHEMA = {
     },
     "required": ["target_ref", "path"],
 }
+
+
+class _HandoffLLM(h.ScriptedLLM):
+    """Explicit model: recon then web, then step completions, then goal."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._graph: Any = None
+        self._evidence: Any = None
+        self._next_calls = 0
+
+    async def _host_id(self) -> str:
+        nodes = await self._graph.list_nodes()
+        for n in nodes:
+            if n.type is GraphNodeType.HOST and str(n.id) == "host:a.local":
+                return str(n.id)
+        host = next(n for n in nodes if n.type is GraphNodeType.HOST)
+        return str(host.id)
+
+    @staticmethod
+    def _payload(messages: list[dict[str, Any]]) -> dict[str, Any]:
+        return json.loads(messages[0]["content"])
+
+    def _draft_two_steps(self, host_id: str) -> dict[str, Any]:
+        def _crit() -> dict[str, Any]:
+            return {"kind": "evidence", "description": "result", "min_evidence": 1}
+
+        return {
+            "path_id": "path-draft-handoff",
+            "run_id": "run-x",
+            "mission_id": None,
+            "version": 1,
+            "parent_version": None,
+            "status": "draft",
+            "reason": "scripted handoff draft",
+            "goal": "map host then inspect endpoint",
+            "steps": [
+                {
+                    "step_id": "step-1",
+                    "objective": "probe the host",
+                    "agent_id": "recon-agent",
+                    "target_node_ids": [host_id],
+                    "principal_refs": [],
+                    "allowed_operations": ["recon.service_discovery"],
+                    "depends_on": [],
+                    "required_fact_refs": [],
+                    "unknowns": [],
+                    "completion_criteria": [_crit()],
+                    "required": True,
+                    "status": "pending",
+                    "outcome": None,
+                    "evidence_ids": [],
+                },
+                {
+                    "step_id": "step-2",
+                    "objective": "inspect discovered surface",
+                    "agent_id": "web-api-agent",
+                    "target_node_ids": [host_id],
+                    "principal_refs": [],
+                    "allowed_operations": ["web.http_request"],
+                    "depends_on": ["step-1"],
+                    "required_fact_refs": [],
+                    "unknowns": [],
+                    "completion_criteria": [_crit()],
+                    "required": True,
+                    "status": "pending",
+                    "outcome": None,
+                    "evidence_ids": [],
+                },
+            ],
+            "hypothesis_ids": [],
+            "evidence_ids": [],
+            "changed_step_ids": [],
+            "review_records": {},
+        }
+
+    async def complete_structured(
+        self, *, messages: Any, response_schema: dict[str, Any], system: Any = None, **_: Any
+    ) -> dict[str, Any]:
+        route = self._route_key(response_schema)
+        self.calls.append({"route": route, "messages": messages, "system": system})
+        if route == "path_draft":
+            return self._draft_two_steps(await self._host_id())
+        if route == "path_review":
+            return h.review_accept()
+        if route == "analysis_verify":
+            return h.meaning("success", True)
+        if route == "completion_review":
+            return h.completion_accept()
+        if route == "goal_completion_review":
+            payload = self._payload(messages)
+            criteria = payload["mission"]["success_criteria"]
+            receipts: list[str] = []
+            for step in payload["path"]["steps"]:
+                receipts.extend(step.get("evidence_ids", []))
+            return h.goal_accept(
+                [{"criterion": c, "met": True, "evidence_ids": list(receipts)} for c in criteria]
+            )
+        if route == "next_action":
+            self._next_calls += 1
+            host_id = await self._host_id()
+            if self._next_calls == 1:
+                return {
+                    "mode": "actions",
+                    "reason": "scripted recon",
+                    "actions": [
+                        {
+                            "path_step_id": "step-1",
+                            "agent_id": "recon-agent",
+                            "target_node_id": host_id,
+                            "principal_ref": None,
+                            "capability": "recon",
+                            "operation": "service_discovery",
+                            "tool_id": "recon.http_probe",
+                            "arguments": {"target_ref": "a.local"},
+                            "reason": "probe host",
+                            "expected_observation": "host answers",
+                            "hypothesis": None,
+                            "existing_hypothesis_id": None,
+                            "expectation": None,
+                            "authentication_check": None,
+                            "availability_impact": False,
+                        }
+                    ],
+                    "path": None,
+                    "path_step_id": None,
+                    "completion": {},
+                    "evidence_request": {},
+                    "hypothesis_update": {},
+                }
+            if self._next_calls == 2:
+                payload = self._payload(messages)
+                run_id = payload["active_path"]["run_id"]
+                records = await self._evidence.list_for_run(run_id)
+                tool_ids = [
+                    str(r.evidence_id)
+                    for r in records
+                    if isinstance(getattr(r, "metadata", {}).get("tool_result"), dict)
+                ]
+                assert tool_ids, "step-1 completion needs recon evidence"
+                return {**h.turn_complete_step([tool_ids[0]]), "path_step_id": "step-1"}
+            if self._next_calls == 3:
+                return {
+                    "mode": "actions",
+                    "reason": "scripted web",
+                    "actions": [
+                        {
+                            "path_step_id": "step-2",
+                            "agent_id": "web-api-agent",
+                            "target_node_id": host_id,
+                            "principal_ref": None,
+                            "capability": "web",
+                            "operation": "http_request",
+                            "tool_id": "web.http_request",
+                            "arguments": {"target_ref": "a.local", "path": "/"},
+                            "reason": "inspect endpoint",
+                            "expected_observation": "http answers",
+                            "hypothesis": None,
+                            "existing_hypothesis_id": None,
+                            "expectation": None,
+                            "authentication_check": None,
+                            "availability_impact": False,
+                        }
+                    ],
+                    "path": None,
+                    "path_step_id": None,
+                    "completion": {},
+                    "evidence_request": {},
+                    "hypothesis_update": {},
+                }
+            payload = self._payload(messages)
+            run_id = payload["active_path"]["run_id"]
+            records = await self._evidence.list_for_run(run_id)
+            tool_ids = [
+                str(r.evidence_id)
+                for r in records
+                if isinstance(getattr(r, "metadata", {}).get("tool_result"), dict)
+            ]
+            if self._next_calls == 4:
+                assert len(tool_ids) >= 2, "step-2 completion needs web evidence"
+                return {**h.turn_complete_step([tool_ids[1]]), "path_step_id": "step-2"}
+            return h.turn_complete_goal()
+        raise AssertionError(f"no handoff answer for route {route!r}")
+
+    async def complete(self, *, messages: Any, system: Any = None, **_: Any) -> str:
+        return ""
 
 
 def _engagement(*hosts: str) -> Engagement:
@@ -100,19 +282,31 @@ async def test_recon_discovery_unlocks_a_real_web_http_request_call(with_browser
     )
     tools = [recon_tool, web_tool]
     if with_browser:
-        tools.append(ToolDescriptor(
-            tool_id=ToolId("web.browser_navigate"), server_id="browser",
-            tool_name="browser_navigate", capability_tags=["web"],
-            input_schema={"type": "object", "properties": {"url": {"type": "string"}},
-                          "required": ["url"]},
-            risk_level=RiskLevel.LOW, health_status=ToolHealthStatus.HEALTHY,
-        ))
+        tools.append(
+            ToolDescriptor(
+                tool_id=ToolId("web.browser_navigate"),
+                server_id="browser",
+                tool_name="browser_navigate",
+                capability_tags=["web"],
+                input_schema={
+                    "type": "object",
+                    "properties": {"url": {"type": "string"}},
+                    "required": ["url"],
+                },
+                risk_level=RiskLevel.LOW,
+                health_status=ToolHealthStatus.HEALTHY,
+            )
+        )
     gateway = DummyToolGateway(output=_HTTP_PROBE_OUTPUT, tools=tools)
+    llm = _HandoffLLM()
     deps = build_test_application(
         tool_gateway=gateway,
         tool_catalog=gateway,
+        llm_client=llm,
         settings=OrchestrationSettings(max_steps=20),
     )
+    llm._graph = deps.graph_store
+    llm._evidence = deps.evidence_store
 
     final = await run_engagement(_engagement("a.local"), deps=deps)
 

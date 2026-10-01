@@ -28,12 +28,21 @@ from datetime import datetime, timezone
 
 from langgraph.types import Overwrite
 
+from redteam.attack_graph.predicates import Confidence, Provenance
 from redteam.attack_graph.service import AttackGraphService
 from redteam.core.contracts.action import ActionProposal
 from redteam.core.contracts.events import EventType
 from redteam.core.contracts.policy import PolicyDecision
 from redteam.core.contracts.target import HostTarget
-from redteam.core.enums import AgentPhase, GraphNodeType, PolicyVerdict, Verdict
+from redteam.core.contracts.tool import ToolDescriptor
+from redteam.core.enums import (
+    AgentPhase,
+    GraphNodeType,
+    PolicyVerdict,
+    RiskLevel,
+    ToolHealthStatus,
+    Verdict,
+)
 from redteam.core.ids import (
     ActionId,
     AgentId,
@@ -57,6 +66,7 @@ from redteam.orchestration.state import (
     TerminationReason,
     initial_graph_state,
 )
+from redteam.orchestration.work.models import WorkStatus
 from tests.fakes import DummyToolGateway, FakeControlPlane, build_test_application
 
 RUN = RunId("run_fanout")
@@ -76,7 +86,7 @@ def test_fanout_admission_keeps_verification_and_retry_slots_available() -> None
 
 
 def runtime(**overrides: object) -> RuntimeState:
-    return RuntimeState(run_id=RUN, engagement_id=ENGAGEMENT, **overrides)
+    return RuntimeState.model_validate({"run_id": RUN, "engagement_id": ENGAGEMENT, **overrides})
 
 
 def plan_step(step_id: str, host: str) -> PlanStep:
@@ -466,25 +476,204 @@ class _SecondProposalApprovalPlane(FakeControlPlane):
         )
 
 
+class _HostApprovalPlane(FakeControlPlane):
+    async def evaluate(self, proposal, context):  # noqa: ANN001, ANN201
+        self.evaluated.append(proposal)
+        host = getattr(proposal.target, "host", None)
+        if host == "b.local":
+            return PolicyDecision(
+                action_id=proposal.action_id,
+                verdict=PolicyVerdict.REQUIRE_APPROVAL,
+                reasons=["b-host-approval"],
+                matched_rules=[],
+                approval_id=ApprovalId(f"appr_{proposal.action_id}"),
+                evaluated_at=NOW,
+            )
+        return PolicyDecision(
+            action_id=proposal.action_id,
+            verdict=PolicyVerdict.ALLOW,
+            reasons=["fake-allow"],
+            matched_rules=[],
+            evaluated_at=NOW,
+        )
+
+
+class _ScriptedLLM:
+    def __init__(self) -> None:
+        self._routes: dict[str, list[object]] = {}
+        self.calls: list[dict[str, object]] = []
+
+    def add(self, route: str, response: object) -> None:
+        self._routes.setdefault(route, []).append(response)
+
+    @staticmethod
+    def _route_key(schema: dict) -> str:
+        props = schema.get("properties", {})
+        if "path_id" in props and "steps" in props:
+            return "path_draft"
+        if "decision" in props:
+            return "path_review"
+        if "mode" in props:
+            return "next_action"
+        if "criteria" in props:
+            return "goal_completion_review"
+        if "accepted" in props:
+            return "completion_review"
+        if "claim_supported" in props:
+            return "analysis_verify"
+        return "unknown"
+
+    async def complete_structured(self, *, messages, response_schema, system=None, **_: object):
+        route = self._route_key(response_schema)
+        self.calls.append({"route": route, "messages": messages, "system": system})
+        queue = self._routes.get(route, [])
+        if not queue:
+            raise AssertionError(f"no scripted response left for route {route!r}")
+        response = queue.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+    async def complete(self, *, messages, system=None, **_: object) -> str:
+        return ""
+
+
+def _fanout_probe_descriptor() -> ToolDescriptor:
+    return ToolDescriptor(
+        tool_id=ToolId("recon.probe"),
+        server_id="fanout-test",
+        tool_name="probe",
+        description="fanout approval test probe",
+        input_schema={"type": "object", "properties": {}, "additionalProperties": True},
+        operations=["service_discovery"],
+        capability_tags=["recon"],
+        target_types=[],
+        risk_level=RiskLevel.LOW,
+        health_status=ToolHealthStatus.UNKNOWN,
+    )
+
+
+def _fanout_path_draft(node_a: str, node_b: str) -> dict:
+    return {
+        "path_id": "path-draft-fanout",
+        "run_id": "run-x",
+        "mission_id": None,
+        "version": 1,
+        "parent_version": None,
+        "status": "draft",
+        "reason": "scripted fanout draft",
+        "goal": "probe both hosts",
+        "steps": [
+            {
+                "step_id": "step-1",
+                "objective": "probe both fanout hosts",
+                "agent_id": "recon-agent",
+                "target_node_ids": [node_a, node_b],
+                "principal_refs": [],
+                "allowed_operations": ["recon.service_discovery"],
+                "depends_on": [],
+                "required_fact_refs": [],
+                "unknowns": [],
+                "completion_criteria": [
+                    {"kind": "evidence", "description": "fanout probe", "min_evidence": 1}
+                ],
+                "required": True,
+                "status": "pending",
+                "outcome": None,
+                "evidence_ids": [],
+            }
+        ],
+        "hypothesis_ids": [],
+        "evidence_ids": [],
+        "changed_step_ids": [],
+        "review_records": {},
+    }
+
+
+def _fanout_two_actions(node_a: str, node_b: str) -> dict:
+    def _intent(node_id: str) -> dict:
+        return {
+            "path_step_id": "step-1",
+            "agent_id": "recon-agent",
+            "target_node_id": node_id,
+            "principal_ref": None,
+            "capability": "recon",
+            "operation": "service_discovery",
+            "tool_id": "recon.probe",
+            "arguments": {},
+            "reason": "fan-out probe",
+            "expected_observation": "probe returns",
+            "hypothesis": None,
+            "existing_hypothesis_id": None,
+            "expectation": None,
+            "authentication_check": None,
+            "availability_impact": False,
+        }
+    return {
+        "mode": "actions",
+        "reason": "scripted fan-out pair",
+        "actions": [_intent(node_a), _intent(node_b)],
+        "path": None,
+        "path_step_id": None,
+        "completion": {},
+        "evidence_request": {},
+        "hypothesis_update": {},
+    }
+
+
+def _fanout_hold() -> dict:
+    return {
+        "mode": "hold",
+        "reason": "scripted hold after resume",
+        "actions": [],
+        "path": None,
+        "path_step_id": None,
+        "completion": {},
+        "evidence_request": {},
+        "hypothesis_update": {},
+    }
+
+
 async def test_fanout_second_item_approval_resumes_that_exact_action() -> None:
     bus = InMemoryEventBus()
-    plane = _SecondProposalApprovalPlane(bus)
+    llm = _ScriptedLLM()
+    node_a = "host:a.local"
+    node_b = "host:b.local"
+    llm.add("path_draft", _fanout_path_draft(node_a, node_b))
+    llm.add("path_review", {"decision": "accept", "reason": "scripted accept", "path": None})
+    llm.add("next_action", _fanout_two_actions(node_a, node_b))
+    llm.add("next_action", _fanout_hold())
+    plane = _HostApprovalPlane()
     settings = OrchestrationSettings(
         checkpointing=True,
         max_steps=10,
         global_concurrency=2,
         max_actions_per_turn=2,
     )
-    gateway = DummyToolGateway()
+    gateway = DummyToolGateway(tools=[_fanout_probe_descriptor()])
     deps = build_test_application(
         control_plane=plane,
         tool_gateway=gateway,
+        tool_catalog=gateway,
         event_bus=bus,
+        llm_client=llm,
         settings=settings,
     )
     graph = AttackGraphService(deps.graph_store)
     for host in ("a.local", "b.local"):
-        await graph.upsert_node(GraphNodeType.HOST, key=host, attrs={"in_scope": True})
+        await graph.upsert_node(
+            GraphNodeType.HOST,
+            key=host,
+            attrs={"in_scope": True},
+            labels=["engagement-scope"],
+            provenance=Provenance(
+                step=0,
+                source="engagement:test",
+                run_id="run_fanout_resume",
+                confidence=Confidence.SERVER_DECLARED,
+            ),
+            step=0,
+        )
 
     runner = AgentLoopRunner(deps, settings=settings)
     try:
@@ -493,6 +682,7 @@ async def test_fanout_second_item_approval_resumes_that_exact_action() -> None:
                 run_id=RunId("run_fanout_resume"),
                 engagement_id=ENGAGEMENT,
                 remaining_budget=4,
+                current_goal="probe both hosts",
             )
         )
         assert stopped.termination_reason == TerminationReason.APPROVAL_PENDING
@@ -508,6 +698,14 @@ async def test_fanout_second_item_approval_resumes_that_exact_action() -> None:
         assert proposed[1] == str(stopped.pending_action_id)
         assert stopped.actions_executed == 1
 
+        rows = await deps.work_store.list_items(run_id=RunId("run_fanout_resume"))
+        assert len(rows) == 2
+        assert len({item.work_id for item in rows}) == 2
+        by_target = {
+            (item.target_node_ids[0] if item.target_node_ids else ""): item for item in rows
+        }
+        assert by_target[node_a].status is WorkStatus.SUCCEEDED
+        assert by_target[node_b].status is WorkStatus.PENDING
         snapshot = await runner._latest_snapshot()  # noqa: SLF001 - focused checkpoint check
         assert snapshot is not None
         proposal_in_checkpoint = snapshot.values.get("action_proposal")
@@ -518,6 +716,7 @@ async def test_fanout_second_item_approval_resumes_that_exact_action() -> None:
         # ``recover_runtime`` is the durable-resume entry point and refuses a
         # snapshot whose next super-step would replay execution.
         assert await runner.recover_runtime("run_fanout_resume") is not None
+        assert snapshot.values.get("current_work_id") == by_target[node_b].work_id
 
         plane.resolve_approval(
             stopped.pending_approval_id,
@@ -541,3 +740,9 @@ async def test_fanout_second_item_approval_resumes_that_exact_action() -> None:
     assert final.pending_approval_id is None
     invoked = {str(invocation.action_id) for invocation in gateway.invocations}
     assert str(stopped.pending_action_id) in invoked
+    assert set(proposed) <= invoked
+    assert len(gateway.invocations) == 2
+    settled = await deps.work_store.list_items(run_id=RunId("run_fanout_resume"))
+    assert len(settled) == 2
+    assert {item.status for item in settled} == {WorkStatus.SUCCEEDED}
+    assert {item.work_id for item in rows} == {item.work_id for item in settled}

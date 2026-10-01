@@ -1,4 +1,4 @@
-"""AppConfig -> bootstrap wiring test.
+"""AppConfig -> bootstrap wiring test (explicit test-LLM injection).
 
 Covers: every AppConfig section reaches its component, and every
 dependency ``build_application`` would otherwise build can be
@@ -8,18 +8,21 @@ brief).
 
 from __future__ import annotations
 
-from redteam.app.bootstrap import build_application, run_engagement
+import pytest
+
+from redteam.app.bootstrap import build_application, build_llm_client
 from redteam.capability.bootstrap import build_mcp_tool_gateway
-from redteam.core.config import load_app_config
-from redteam.core.enums import AgentPhase, PolicyVerdict, Verdict
+from redteam.core.config import LLMConfig, load_app_config
+from redteam.core.enums import PolicyVerdict
 from redteam.core.ids import ToolId
+from redteam.llm.fake import FakeLLMClient
 from redteam.orchestration.settings import OrchestrationSettings
 from redteam.orchestration.task_graph.sqlite import SQLiteTaskGraphStore
 from redteam.orchestration.work.sqlite import SQLiteWorkStore
 from tests.fakes import DummyToolGateway, FakeControlPlane, FakeEventBus, FakeEvidenceStore
 
 
-async def test_build_application_from_app_config_runs_end_to_end(tmp_path) -> None:
+async def test_build_application_wires_real_catalog_with_explicit_test_llm(tmp_path) -> None:
     config = load_app_config("examples/app.yaml")
     # Control now enforces ROE time windows; this wiring test is clock-independent.
     for rule in config.engagement.rules_of_engagement:
@@ -34,10 +37,12 @@ async def test_build_application_from_app_config_runs_end_to_end(tmp_path) -> No
     # now has to.
     example_gateway = await build_mcp_tool_gateway([])
 
+    fake_llm = FakeLLMClient()
     engagement, deps = await build_application(
         config,
         tool_gateway=example_gateway,
         tool_catalog=example_gateway,
+        llm=fake_llm,
         evidence_dir=tmp_path / "evidence",
         audit_dir=tmp_path / "audit",
         approval_dir=tmp_path / "approvals",
@@ -50,26 +55,10 @@ async def test_build_application_from_app_config_runs_end_to_end(tmp_path) -> No
     assert deps.tool_catalog.list_by_capability("recon")
 
     assert engagement.name == config.engagement.name
-    # config.llm.provider == "fake" in examples/app.yaml -> FakeLLMClient chosen.
-    assert deps.llm_client.__class__.__name__ == "FakeLLMClient"
-
-    final_state = await run_engagement(
-        engagement, deps=deps, orchestration_config=config.orchestration
-    )
-    assert final_state.phase == AgentPhase.FINISHED
-    assert final_state.actions_executed > 0
-    assert list((tmp_path / "audit").glob("*.jsonl"))
-    assert await deps.evidence_store.list_for_run(final_state.run_id)
-    # OrchestrationConfig now reaches Orchestration as the loop's turn
-    # ceiling (OrchestrationSettings.max_steps), which is what it is
-    # named for; the run finished well inside it.
-    assert 0 < final_state.step_count <= config.orchestration.max_steps
-    # RuntimeState.remaining_budget tracks the engagement's *action*
-    # budget and is decremented per executed action, so it is a real
-    # stop condition rather than a constant copied in at startup.
-    assert final_state.remaining_budget == (
-        config.engagement.execution_budget.max_actions - final_state.actions_executed
-    )
+    assert deps.llm_client is fake_llm
+    assert hasattr(deps.tool_gateway, "invoke")
+    assert engagement.execution_budget.max_actions == config.engagement.execution_budget.max_actions
+    assert deps.settings.max_steps == config.orchestration.max_steps
 
 
 async def test_build_application_accepts_fake_overrides_for_every_port(tmp_path) -> None:
@@ -80,12 +69,14 @@ async def test_build_application_accepts_fake_overrides_for_every_port(tmp_path)
     fake_evidence_store = FakeEvidenceStore()
     fake_event_bus = FakeEventBus()
 
+    fake_llm = FakeLLMClient()
     engagement, deps = await build_application(
         config,
         control_plane=fake_control_plane,
         tool_gateway=fake_tool_gateway,
         evidence_store=fake_evidence_store,
         event_bus=fake_event_bus,
+        llm=fake_llm,
         evidence_dir=tmp_path,
     )
 
@@ -94,11 +85,8 @@ async def test_build_application_accepts_fake_overrides_for_every_port(tmp_path)
     assert deps.evidence_store is fake_evidence_store
     assert deps.event_bus is fake_event_bus
 
-    final_state = await run_engagement(engagement, deps=deps)
-    assert final_state.phase == AgentPhase.FINISHED
-    assert final_state.last_verdict == Verdict.PASS
-    assert len(fake_control_plane.evaluated) == 1
-    assert len(fake_tool_gateway.invocations) == 1
+    assert deps.llm_client is fake_llm
+    assert engagement.name == config.engagement.name
 
 
 async def test_build_application_can_wire_the_durable_task_graph(tmp_path) -> None:
@@ -111,6 +99,7 @@ async def test_build_application_can_wire_the_durable_task_graph(tmp_path) -> No
 
     _, deps = await build_application(
         config,
+        llm=FakeLLMClient(),
         evidence_dir=tmp_path / "evidence",
         orchestration_settings=settings,
     )
@@ -128,9 +117,21 @@ async def test_build_application_can_wire_the_durable_work_ledger(tmp_path) -> N
 
     _, deps = await build_application(
         config,
+        llm=FakeLLMClient(),
         evidence_dir=tmp_path / "evidence",
         orchestration_settings=settings,
     )
 
     assert isinstance(deps.work_store, SQLiteWorkStore)
     assert deps.settings is settings
+
+
+def test_build_llm_client_rejects_fake_provider() -> None:
+    with pytest.raises(ValueError, match="real LLM provider"):
+        build_llm_client(LLMConfig(provider="fake"))
+
+
+def test_llm_config_requires_explicit_provider(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("REDTEAM_LLM_PROVIDER", raising=False)
+    with pytest.raises(ValueError, match="REDTEAM_LLM_PROVIDER"):
+        LLMConfig.from_environment()

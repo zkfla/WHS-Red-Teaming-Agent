@@ -41,19 +41,12 @@ async def test_bootstrap_creates_active_mission_and_ready_tasks() -> None:
     assert mission.objective  # non-blank
 
     tasks = await store.list_tasks(mission_id=mission_id)
-    schedulable = [d for d in agents.definitions() if d.schedulable]
-    assert len(tasks) == len(schedulable)
+    assert len(tasks) == 1
     assert all(task.status is TaskStatus.READY for task in tasks)
-
-    # Every schedulable role is represented and bound to its agent/capability.
-    by_agent = {task.assigned_agent: task for task in tasks}
-    for definition in schedulable:
-        task = by_agent[definition.agent_id]
-        assert task.required_capability == (definition.capabilities[0] or None)
-
-    # Registry order sets priority: recon runs before web before mobile.
-    ordered = [task.assigned_agent for task in tasks]  # list_tasks sorts by -priority
-    assert ordered[0] == schedulable[0].agent_id
+    assert tasks[0].objective == mission.objective
+    # The operator goal is seeded before the model chooses investigation roles.
+    assert tasks[0].assigned_agent is None
+    assert tasks[0].required_capability is None
 
 
 async def test_bootstrap_carries_no_secret_material() -> None:
@@ -68,7 +61,7 @@ async def test_bootstrap_carries_no_secret_material() -> None:
         assert secret not in dumped
 
 
-async def test_explicit_mobile_focus_changes_post_recon_task_priority() -> None:
+async def test_mobile_goal_is_preserved_for_llm_role_selection() -> None:
     store = InMemoryTaskGraphStore()
     mission_id = await bootstrap_mission(
         store, default_registry(), _engagement(),
@@ -77,6 +70,9 @@ async def test_explicit_mobile_focus_changes_post_recon_task_priority() -> None:
     )
 
     tasks = await store.list_tasks(mission_id=mission_id)
-    assert [str(task.assigned_agent) for task in tasks] == [
-        "recon-agent", "mobile-agent", "web-api-agent",
-    ]
+    mission = await store.get_mission(mission_id)
+    assert mission is not None
+    assert mission.objective == "모바일 앱 점검을 우선해줘"
+    assert len(tasks) == 1
+    assert tasks[0].objective == mission.objective
+    assert tasks[0].assigned_agent is None

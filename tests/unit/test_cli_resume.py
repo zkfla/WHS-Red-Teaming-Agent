@@ -21,7 +21,7 @@ from redteam.app.cli.commands import resume as resume_command
 from redteam.capability.settings import MCPConfigurationError
 from redteam.core.contracts.mission import MissionPlan, Provenance
 from redteam.core.enums import AgentPhase, MissionStatus
-from redteam.core.ids import EngagementId, MissionId, RunId
+from redteam.core.ids import ActionId, ApprovalId, EngagementId, MissionId, RunId
 from redteam.orchestration.operator_intents import InMemoryOperatorIntentStore
 from redteam.orchestration.state import RuntimeState, TerminationReason
 from redteam.orchestration.task_graph.memory import InMemoryTaskGraphStore
@@ -82,8 +82,9 @@ class _FakeRunner:
 
     async def resume_recovered(self, runtime: RuntimeState) -> RuntimeState:
         type(self).resumed_with = runtime
-        assert type(self).final is not None
-        return type(self).final
+        final = type(self).final
+        assert final is not None
+        return final
 
     async def aclose(self) -> None:
         type(self).closed = True
@@ -118,8 +119,8 @@ async def test_resume_uses_canonical_bootstrap_and_the_recovered_engagement_id(
         run_id=RunId("run_resume"),
         engagement_id=EngagementId("eng_recovered"),
         termination_reason=TerminationReason.APPROVAL_PENDING,
-        pending_approval_id="appr_1",
-        pending_action_id="action_1",
+        pending_approval_id=ApprovalId("appr_1"),
+        pending_action_id=ActionId("action_1"),
     )
     _FakeRunner.recovered = recovered
     _FakeRunner.final = _finished()
@@ -139,6 +140,7 @@ async def test_resume_uses_canonical_bootstrap_and_the_recovered_engagement_id(
     assert exit_code == EXIT_OK
     build.assert_awaited_once()
     build_call = build.await_args
+    assert build_call is not None
     assert build_call.kwargs["engagement_id"] == EngagementId("eng_recovered")
     called_config = build_call.args[0]
     assert called_config.engagement.name == "Resume Test"
@@ -255,7 +257,10 @@ async def test_resume_paused_run_applies_operator_intent_before_scheduling(
     )
 
     assert await resume_command.run(_args(path)) == EXIT_OK
-    assert (await store.get_mission(mission_id)).status is MissionStatus.ACTIVE
+    mission = await store.get_mission(mission_id)
+    assert mission is not None
+    assert mission.status is MissionStatus.ACTIVE
+    assert deps.operator_intent_store is not None
     intents = await deps.operator_intent_store.list_for_mission(mission_id)
     assert len(intents) == 1 and intents[0].intent.intent_type.value == "resume"
 

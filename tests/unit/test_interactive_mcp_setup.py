@@ -17,8 +17,10 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+from typing import cast
 
 import pytest
+from rich.console import Console
 
 from redteam.app.cli.commands import interactive
 from redteam.capability.servers.config import ServerPolicy
@@ -108,7 +110,7 @@ async def test_accepting_writes_a_complete_working_config(
 ) -> None:
     console = _FakeConsole(["y"])
     capability_config = await interactive._ensure_mcp_config(
-        console, _engagement("127.0.0.1:5000"), CapabilityConfig()
+        cast(Console, console), _engagement("127.0.0.1:5000"), CapabilityConfig()
     )
 
     assert capability_config.mcp_servers == ["recon-passive"]
@@ -138,7 +140,7 @@ async def test_declining_leaves_capability_config_untouched(
     original = CapabilityConfig()
 
     result = await interactive._ensure_mcp_config(
-        console, _engagement("127.0.0.1:5000"), original
+        cast(Console, console), _engagement("127.0.0.1:5000"), original
     )
 
     assert result is original
@@ -156,7 +158,7 @@ async def test_already_configured_never_prompts(monkeypatch: pytest.MonkeyPatch)
     console = _FakeConsole([])  # any console.input() call would raise EOFError here
 
     result = await interactive._ensure_mcp_config(
-        console, _engagement("127.0.0.1:5000"), already_configured
+        cast(Console, console), _engagement("127.0.0.1:5000"), already_configured
     )
 
     assert result is already_configured
@@ -169,6 +171,8 @@ async def test_no_scope_declared_is_a_no_op(monkeypatch: pytest.MonkeyPatch) -> 
         {"name": "no-scope", "execution_budget": {"max_actions": 1}}
     )
 
-    result = await interactive._ensure_mcp_config(console, no_scope, original)
+    result = await interactive._ensure_mcp_config(
+        cast(Console, console), no_scope, original
+    )
 
     assert result is original

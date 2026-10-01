@@ -95,6 +95,7 @@ def _engine_runtime(run_id="run-eng-1"):
     return SimpleNamespace(
         run_id=run_id,
         mission_id=None,
+        active_task_id=None,
         step_count=0,
         current_goal="goal",
         remaining_budget=None,

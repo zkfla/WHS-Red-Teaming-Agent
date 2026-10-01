@@ -17,6 +17,7 @@ import argparse
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
+from typing import cast
 from unittest.mock import AsyncMock
 
 import pytest
@@ -39,6 +40,7 @@ from redteam.core.enums import (
 )
 from redteam.core.ids import AgentId, EngagementId, MissionId, RunId, TaskId
 from redteam.event_bus.memory import InMemoryEventBus
+from redteam.orchestration.context import RuntimeDeps
 from redteam.orchestration.operator_intents import (
     InMemoryOperatorIntentStore,
     IntentStatus,
@@ -134,7 +136,7 @@ async def _console(
     lines: list[str] = []
     identity = run_command.RuntimeIdentity(run_id=RUN, engagement_id=ENG, mission_id=MISSION)
     console = run_command.OperatorConsole(
-        deps, lines.append, identity=identity, resolved_by="tester"
+        cast(RuntimeDeps, deps), lines.append, identity=identity, resolved_by="tester"
     )
     return console, lines, gateway, intent_store, task_store, control_plane
 
@@ -328,7 +330,7 @@ async def test_intent_channel_unavailable_when_not_wired() -> None:
     )
     lines: list[str] = []
     console = run_command.OperatorConsole(
-        deps,
+        cast(RuntimeDeps, deps),
         lines.append,
         identity=run_command.RuntimeIdentity(run_id=RUN, engagement_id=ENG, mission_id=MISSION),
     )
@@ -399,6 +401,7 @@ async def _run_with_flags(tmp_path: Path, monkeypatch, *, non_interactive: bool,
         json=json,
     )
     await run_command.run(args)
+    assert execute_mock.await_args is not None
     return execute_mock.await_args.kwargs["allow_operator_input"]
 
 

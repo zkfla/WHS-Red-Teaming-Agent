@@ -1,17 +1,19 @@
 """Phase 3 (Slice B): dynamic replanning grows the Task Graph from knowledge."""
 
 from datetime import datetime, timezone
-from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
 from redteam.attack_graph.service import AttackGraphService
 from redteam.attack_graph.stores.memory import InMemoryAttackGraphStore
+from redteam.core.contracts.events import EventEnvelope
 from redteam.core.contracts.evidence import EvidenceRecord
 from redteam.core.contracts.mission import MissionPlan, MissionTask, Provenance
 from redteam.core.enums import EvidenceSourceType, GraphNodeType, MissionStatus, TaskStatus
-from redteam.core.ids import EngagementId, EventId, EvidenceId, MissionId, RunId, TaskId
+from redteam.core.ids import EngagementId, EvidenceId, MissionId, RunId, TaskId
+from redteam.event_bus.memory import InMemoryEventBus
+from redteam.event_bus.publisher import EventPublisher
 from redteam.orchestration.replanning import (
     _evaluate_criterion,
     finalize_mission,
@@ -23,13 +25,43 @@ from tests.fakes import FakeEvidenceStore
 MISSION = MissionId("m_replan")
 
 
-class _Publisher:
-    def __init__(self) -> None:
+class _Publisher(EventPublisher):
+    """Boundary-compatible recorder: a real publisher that keeps the old event log."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(
+            InMemoryEventBus(),
+            run_id=RunId("run_replan"),
+            engagement_id=EngagementId("eng"),
+            source="test.replan",
+        )
         self.events: list[tuple[str, dict[str, Any]]] = []
 
-    async def publish(self, event_type: str, payload: dict[str, Any], *, causation_id: Any = None):
-        self.events.append((event_type, payload))
-        return SimpleNamespace(event_id=EventId(f"evt_{len(self.events)}"))
+    async def publish(
+        self,
+        event_type: str,
+        payload: dict[str, Any] | None = None,
+        *,
+        correlation_id: str | None = None,
+        causation_id: str | None = None,
+    ) -> EventEnvelope:
+        event = await super().publish(
+            event_type, payload, correlation_id=correlation_id, causation_id=causation_id
+        )
+        self.events.append((event_type, dict(payload or {})))
+        return event
+
+
+async def _required_task(store: InMemoryTaskGraphStore, task_id: TaskId) -> MissionTask:
+    found = await store.get_task(task_id)
+    assert found is not None
+    return found
+
+
+async def _required_mission(store: InMemoryTaskGraphStore) -> MissionPlan:
+    found = await store.get_mission(MISSION)
+    assert found is not None
+    return found
 
 
 def _now() -> datetime:
@@ -173,8 +205,8 @@ async def test_blocked_dependency_blocks_authz_then_observation_recovers_it() ->
         facts={"target_ref": "bank", "principal_ref": "principal-2"},
     )
     await replan_task_graph(store, graph, MISSION, publisher=publisher, last_event_id=None)
-    assert (await store.get_task(acquire.task_id)).status is TaskStatus.COMPLETED
-    assert (await store.get_task(auth.task_id)).status is TaskStatus.READY
+    assert (await _required_task(store, acquire.task_id)).status is TaskStatus.COMPLETED
+    assert (await _required_task(store, auth.task_id)).status is TaskStatus.READY
     assert "TaskUnblocked" in [event[0] for event in publisher.events]
 
 
@@ -295,7 +327,7 @@ async def test_finalize_preserves_unfinished_required_tasks_and_blocks_mission()
     tasks = {t.task_id: t.status for t in await store.list_tasks(mission_id=MISSION)}
     assert tasks[TaskId("ran")] is TaskStatus.RUNNING
     assert tasks[TaskId("never")] is TaskStatus.READY
-    assert (await store.get_mission(MISSION)).status is MissionStatus.BLOCKED
+    assert (await _required_mission(store)).status is MissionStatus.BLOCKED
     assert [event[0] for event in publisher.events] == ["MissionUpdated"]
 
 
@@ -306,7 +338,7 @@ async def test_finalize_marks_mission_failed_when_a_task_failed() -> None:
     await store.transition_task(TaskId("boom"), TaskStatus.FAILED, now=_now())
 
     await finalize_mission(store, MISSION, publisher=_Publisher(), last_event_id=None)
-    assert (await store.get_mission(MISSION)).status is MissionStatus.FAILED
+    assert (await _required_mission(store)).status is MissionStatus.FAILED
 
 
 async def test_finalize_completes_only_when_required_tasks_complete() -> None:
@@ -320,13 +352,13 @@ async def test_finalize_completes_only_when_required_tasks_complete() -> None:
 
     await finalize_mission(store, MISSION, publisher=_Publisher(), last_event_id=None)
 
-    assert (await store.get_mission(MISSION)).status is MissionStatus.COMPLETED
-    assert (await store.get_task(optional.task_id)).status is TaskStatus.CANCELLED
+    assert (await _required_mission(store)).status is MissionStatus.COMPLETED
+    assert (await _required_task(store, optional.task_id)).status is TaskStatus.CANCELLED
 
 
 async def test_criterion_requires_evidence_from_its_completed_task() -> None:
     store = await _store_with_mission()
-    mission = await store.get_mission(MISSION)
+    mission = await _required_mission(store)
     await store.update_mission(
         mission.model_copy(
             update={
@@ -367,14 +399,14 @@ async def test_criterion_requires_evidence_from_its_completed_task() -> None:
         evidence_store=records,
         run_id=run_id,
     )
-    blocked = await store.get_mission(MISSION)
+    blocked = await _required_mission(store)
     assert blocked.status is MissionStatus.BLOCKED
     assert blocked.criterion_results[0].met is False
     assert blocked.criterion_results[0].reason == "matching Task has no successful Evidence"
 
     # A second active Mission with evidence tied to its own Task can complete.
     store = await _store_with_mission()
-    mission = await store.get_mission(MISSION)
+    mission = await _required_mission(store)
     await store.update_mission(
         mission.model_copy(
             update={
@@ -407,7 +439,7 @@ async def test_criterion_requires_evidence_from_its_completed_task() -> None:
         evidence_store=records,
         run_id=run_id,
     )
-    completed = await store.get_mission(MISSION)
+    completed = await _required_mission(store)
     assert completed.status is MissionStatus.COMPLETED
     assert completed.criterion_results[0].evidence_ids == ["ev_right"]
 
@@ -415,7 +447,7 @@ async def test_criterion_requires_evidence_from_its_completed_task() -> None:
 async def test_no_tasks_cannot_complete_a_mission() -> None:
     store = await _store_with_mission()
     await finalize_mission(store, MISSION, publisher=_Publisher(), last_event_id=None)
-    assert (await store.get_mission(MISSION)).status is MissionStatus.BLOCKED
+    assert (await _required_mission(store)).status is MissionStatus.BLOCKED
 
 
 def test_each_required_task_needs_its_own_evidence() -> None:
