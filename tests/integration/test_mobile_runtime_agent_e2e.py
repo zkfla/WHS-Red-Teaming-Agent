@@ -20,8 +20,8 @@ from redteam.core.contracts.engagement import (
     RateLimitPolicy,
 )
 from redteam.core.contracts.tool import ToolDescriptor
-from redteam.core.enums import GraphNodeType, RiskLevel, ToolHealthStatus
-from redteam.core.ids import AgentId, EngagementId, ToolId
+from redteam.core.enums import EvidenceSourceType, GraphNodeType, RiskLevel, ToolHealthStatus
+from redteam.core.ids import EngagementId, ToolId
 from redteam.orchestration.agents import (
     MOBILE_AGENT,
     AgentRegistry,
@@ -30,10 +30,124 @@ from redteam.orchestration.agents import (
 from redteam.orchestration.runner import TerminationReason
 from redteam.orchestration.settings import OrchestrationSettings
 from tests.fakes import build_test_application
+from tests.integration._engine_llm_harness import ScriptedLLM, review_accept
 
 PACKAGE = "com.android.insecurebankv2"
 DEVICE_SERIAL = "emulator-5554"
 DEVICE_REF = "redteam_x86"
+ASSET_NODE_ID = "asset:insecurebankv2"
+PATH_STEP_ID = "observe-mobile-runtime"
+
+
+def _draft_path() -> dict:
+    return {
+        "path_id": "path-mobile-runtime",
+        "run_id": "run-scripted",
+        "mission_id": None,
+        "version": 1,
+        "parent_version": None,
+        "status": "draft",
+        "reason": "scripted mobile runtime path",
+        "goal": "launch the authorized app and observe logs and crashes",
+        "steps": [
+            {
+                "step_id": PATH_STEP_ID,
+                "objective": "launch the app and collect bounded runtime observations",
+                "agent_id": "mobile-agent",
+                "target_node_ids": [ASSET_NODE_ID],
+                "principal_refs": [],
+                "allowed_operations": ["mobile.app_launch", "mobile.response_analysis"],
+                "depends_on": [],
+                "required_fact_refs": [],
+                "unknowns": [],
+                "completion_criteria": [
+                    {
+                        "kind": "evidence",
+                        "description": "mobile runtime evidence recorded",
+                        "min_evidence": 1,
+                    }
+                ],
+                "required": True,
+                "status": "pending",
+                "outcome": None,
+                "evidence_ids": [],
+            }
+        ],
+        "hypothesis_ids": [],
+        "evidence_ids": [],
+        "changed_step_ids": [],
+        "review_records": {},
+    }
+
+
+def _turn_action(tool_id: str, operation: str, arguments: dict | None = None) -> dict:
+    return {
+        "mode": "actions",
+        "reason": f"scripted {tool_id} action",
+        "actions": [
+            {
+                "path_step_id": PATH_STEP_ID,
+                "agent_id": "mobile-agent",
+                "target_node_id": ASSET_NODE_ID,
+                "principal_ref": None,
+                "capability": "mobile",
+                "operation": operation,
+                "tool_id": tool_id,
+                "arguments": arguments or {},
+                "reason": f"run {tool_id} against the configured device",
+                "expected_observation": "bounded app runtime observation",
+                "hypothesis": None,
+                "existing_hypothesis_id": None,
+                "expectation": None,
+                "authentication_check": None,
+                "availability_impact": False,
+            }
+        ],
+        "path": None,
+        "path_step_id": None,
+        "completion": {},
+        "evidence_request": {},
+        "hypothesis_update": {},
+    }
+
+
+def _turn_hold() -> dict:
+    return {
+        "mode": "hold",
+        "reason": "scripted hold after runtime observations",
+        "actions": [],
+        "path": None,
+        "path_step_id": None,
+        "completion": {},
+        "evidence_request": {},
+        "hypothesis_update": {},
+    }
+
+
+def _runtime_llm() -> ScriptedLLM:
+    llm = ScriptedLLM()
+    llm.add("path_draft", _draft_path())
+    llm.add("path_review", review_accept())
+    llm.add("next_action", _turn_action("mobile.mobile_launch_app", "app_launch"))
+    llm.add(
+        "next_action",
+        _turn_action(
+            "mobile.mobile_get_device_logs",
+            "response_analysis",
+            {"filter": [f"process={PACKAGE}"], "limit": 200},
+        ),
+    )
+    llm.add("next_action", _turn_action("mobile.mobile_list_crashes", "response_analysis"))
+    llm.add(
+        "next_action",
+        _turn_action(
+            "mobile.mobile_get_crash",
+            "response_analysis",
+            {"id": "bank-crash-1"},
+        ),
+    )
+    llm.add("next_action", _turn_hold())
+    return llm
 
 
 class ScriptedMobileNextAdapter:
@@ -164,15 +278,15 @@ async def test_mobile_agent_reaches_runtime_finding_and_crash_followup() -> None
         control_plane=control,
         tool_gateway=gateway,
         tool_catalog=gateway,
+        llm_client=_runtime_llm(),
         agents=AgentRegistry([MOBILE_AGENT], definitions=[mobile_definition]),
         settings=OrchestrationSettings(checkpointing=True, max_steps=40),
     )
 
     final = await run_engagement(engagement, deps=deps)
 
-    assert final.termination_reason == TerminationReason.NO_ACTIONABLE_PLAN
+    assert final.termination_reason == TerminationReason.INVESTIGATION_HELD
     assert final.actions_executed == 4
-    assert final.finished_agents == [AgentId("mobile-agent")]
     call_names = [name for name, _ in adapter.calls]
     assert call_names[0] == "mobile_launch_app"
     assert set(call_names[1:]) == {
@@ -191,17 +305,14 @@ async def test_mobile_agent_reaches_runtime_finding_and_crash_followup() -> None
     assert calls["mobile_get_crash"] == {"device": DEVICE_REF, "id": "bank-crash-1"}
 
     evidence = await deps.evidence_store.list_for_run(final.run_id)
-    assert len(evidence) == 4
-    assert all(item.metadata["success"] is True for item in evidence)
+    tool_evidence = [item for item in evidence if item.source_type is EvidenceSourceType.TOOL]
+    assert len(tool_evidence) == 4
+    assert all(item.metadata["success"] is True for item in tool_evidence)
 
     graph = AttackGraphService(deps.graph_store)
     [asset] = await graph.query(node_type=GraphNodeType.ASSET)
     expected_attrs = {
-        "mobile_app_launched": True,
-        "mobile_logs_observed": True,
-        "mobile_crashes_listed": True,
         "mobile_crash_observed": True,
-        "mobile_crash_retrieved": True,
         "mobile_runtime_crash_observed": True,
     }
     assert attrs_of(asset.properties).items() >= expected_attrs.items()

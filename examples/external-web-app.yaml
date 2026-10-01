@@ -1,0 +1,35 @@
+# Operator example only. Remove every server whose local product is not
+# installed. Pair this with a separate, authorized engagement definition.
+engagement:
+  name: External web MCP operator profile
+  scope:
+    allowed_hosts: []
+  execution_budget:
+    max_actions: 50
+    max_tool_calls: 50
+    max_duration_seconds: 900
+  rate_limit_policy:
+    max_actions_per_minute: 5
+    max_concurrent_actions: 1
+  approval_policy:
+    auto_approve: false
+    require_approval_for:
+      - recon.endpoint_discovery
+      - web.http_request
+      - web.auth_attempt
+      - web.parameter_fuzz
+      - web.response_analysis
+capability:
+  mcp_servers:
+    - zap-recon
+    - zap-web
+    - burp-observe
+    # Burp Professional only:
+    # - burp-oast
+    - chrome-use
+    - cua-driver
+llm:
+  provider: fake
+logging:
+  level: WARNING
+

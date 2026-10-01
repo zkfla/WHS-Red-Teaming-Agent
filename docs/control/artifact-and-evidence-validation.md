@@ -1,5 +1,12 @@
 # Track B 내부 Artifact 저장과 Evidence 연결 검증
 
+> **Update:** 이 문서의 "기존 Evidence 문맥 검증" 절이 가리키던
+> `redteam.evidence.validation.EvidenceLinkValidator`는 실제 runtime/CLI
+> caller가 없는 것으로 확인되어 제거되었다(대응 테스트도 함께 제거).
+> 아래 "내부 ArtifactBackend" 절(`redteam.evidence.artifacts`)은 계속
+> 유효하다 — 이 문서는 두 기능을 함께 다뤘던 원본 그대로 남겨두되, 삭제된
+> 부분을 복구하지 않기 위해 이 표시만 추가한다.
+
 ## 상태와 범위
 
 PM이 확정한 Raw Artifact는 `ToolResult` envelope 전체가 아니라 HTTP 응답,

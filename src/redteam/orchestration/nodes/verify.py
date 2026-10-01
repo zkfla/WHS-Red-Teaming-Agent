@@ -5,6 +5,8 @@ verified ``Finding`` carrying the ``EvidenceId`` behind it.
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 from redteam.attack_graph.identity import (
     hypothesis_node_id,
     node_id_for_target,
@@ -14,9 +16,18 @@ from redteam.attack_graph.identity import (
 from redteam.attack_graph.predicates import Confidence, Provenance
 from redteam.attack_graph.service import HYPOTHESIS_INCONCLUSIVE, HYPOTHESIS_OPEN
 from redteam.core.contracts.events import EventType
-from redteam.core.convert import tool_result_to_evidence
-from redteam.core.enums import AgentPhase, GraphEdgeType, GraphNodeType, Verdict
-from redteam.orchestration.analysis import VerificationAssessment, VerificationRequest
+from redteam.core.contracts.evidence import EvidenceRecord
+from redteam.core.convert import digest_payload, tool_result_to_evidence
+from redteam.core.enums import AgentPhase, EvidenceSourceType, GraphEdgeType, GraphNodeType, Verdict
+from redteam.core.ids import EvidenceId, new_id
+from redteam.orchestration.action_naming import canonical_action_key
+from redteam.orchestration.analysis import (
+    VerificationAssessment,
+    VerificationRequest,
+    append_review_receipt,
+    hypothesis_status_for_assessment,
+    resolve_claim_for_review,
+)
 from redteam.orchestration.authentication import (
     ACCESS_CONTROL_VIOLATION,
     assess_authentication,
@@ -30,8 +41,8 @@ from redteam.orchestration.events import (
 )
 from redteam.orchestration.findings import FindingPromoter, PromotionRequest
 from redteam.orchestration.nodes._support import advance, graph_service, publisher_for
+from redteam.orchestration.observations.web_http import map_web_compare_sessions
 from redteam.orchestration.service_status import (
-    HYPOTHESIS_STATUS_BY_VERDICT,
     severity_for,
 )
 from redteam.orchestration.state import GraphState
@@ -65,7 +76,7 @@ async def verify_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
         run_id=runtime.run_id,
         engagement_id=runtime.engagement_id,
         hypothesis_id=proposal.hypothesis_id,
-        summary=proposal.expected_observation,
+        summary=_summarize_result(result),
     )
     evidence = evidence.model_copy(
         update={
@@ -76,12 +87,36 @@ async def verify_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                 "capability": proposal.capability,
                 "operation": proposal.operation,
                 "candidate_key": step.candidate_key if step is not None else "",
+                **_evidence_metadata(proposal, result, step, runtime),
             }
         }
     )
     response_observation = http_observation(proposal.arguments, result)
     if response_observation is not None:
         evidence.metadata["http_observation"] = response_observation
+    if result.tool_id == "web.http_compare_sessions":
+        mutation = map_web_compare_sessions(
+            target=proposal.target, arguments=proposal.arguments, result=result
+        )
+        comparisons = [
+            item
+            for node in mutation.nodes
+            for item in node.observations
+            if item.get("kind") == "http_session_comparison"
+        ]
+        if comparisons:
+            evidence.metadata["session_comparison"] = comparisons[0]
+    if not result.success and result.error is not None:
+        # RC#2: keep the non-secret failure code so a later planning turn can
+        # read *why* a step failed and adapt. The free-text message and
+        # details may carry target data, so only the code/retryable flag --
+        # both bounded and non-secret -- are recorded here.
+        evidence.metadata["error"] = {
+            "code": result.error.code,
+            "retryable": result.error.retryable,
+        }
+    if deps.methodology_library is not None:
+        evidence.metadata.update(deps.methodology_library.capture(proposal, result))
     await deps.evidence_store.append(evidence)
 
     created = await publisher.publish(
@@ -101,12 +136,22 @@ async def verify_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
     expectation = step.expectation if step is not None else None
     verification_failed = False
     try:
+        hypothesis_claim_text, violation_flag = await resolve_claim_for_review(
+            service, proposal.hypothesis_id, step
+        )
+    except Exception:
+        hypothesis_claim_text, violation_flag = (None, None)
+    try:
+        assert deps.verifier is not None
         assessment = await deps.verifier.verify(
             VerificationRequest(
                 proposal=proposal,
                 result=result,
                 expectation=expectation,
                 source_refs=[str(evidence.evidence_id), str(result.invocation_id)],
+                hypothesis_claim=hypothesis_claim_text,
+                violation_if_confirmed=violation_flag,
+                principal_ref=getattr(step, "principal_ref", None) if step is not None else None,
             )
         )
     except Exception as exc:  # noqa: BLE001 - preserve evidence and close work safely
@@ -124,8 +169,16 @@ async def verify_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             reason="analysis verifier failed before reaching a verdict",
             reviewer_id=f"analysis:error:{type(exc).__name__}",
             source_refs=[str(evidence.evidence_id), str(result.invocation_id)],
+            outcome="unknown",
+            claim_supported=False,
         )
     verdict, reason = assessment.verdict, assessment.reason
+
+    # The public receipt is appended once below as the final admission,
+    # after contradiction/observation/failure downgrades. The verifier may
+    # already have left an interim receipt; the final one supersedes it so a
+    # stale positive can never count as approval.
+    prior_record_stage = getattr(assessment, "last_record_stage", None)
 
     provenance = Provenance(
         step=runtime.step_count,
@@ -134,13 +187,31 @@ async def verify_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
         run_id=str(runtime.run_id),
         confidence=Confidence.MEASURED,
     )
+    if deps.methodology_library is not None and (
+        "methodology_chunk" in evidence.metadata or "methodology_rejected" in evidence.metadata
+    ):
+        # Paging changes evidence even when the same operation/Asset is reused.
+        # Publish only bounded progress, never document bodies or permission.
+        progress = deps.methodology_library.progress(
+            await deps.evidence_store.list_for_run(runtime.run_id)
+        )
+        await service.observe_target(
+            proposal.target,
+            facts={"methodology_progress": list(progress)},
+            provenance=provenance,
+            step=runtime.step_count,
+        )
 
     auth_assessment = None
+    auth_contradiction = False
     if step is not None and step.authentication_check is not None:
         auth_assessment = await assess_authentication(
-            step.authentication_check, proposal, result, evidence, deps.evidence_store,
+            step.authentication_check,
+            proposal,
+            result,
+            evidence,
+            deps.evidence_store,
         )
-        is_violation = auth_assessment.outcome == ACCESS_CONTROL_VIOLATION
         comparison = {
             **auth_assessment.model_dump(),
             "session_ref": step.authentication_check.session_ref,
@@ -148,16 +219,21 @@ async def verify_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             "expected_access": step.authentication_check.expected_access,
         }
         await service.observe_target(
-            proposal.target, facts={"authentication_checks": [comparison]},
-            provenance=provenance, step=runtime.step_count,
+            proposal.target,
+            facts={"authentication_checks": [comparison]},
+            provenance=provenance,
+            step=runtime.step_count,
         )
         if proposal.hypothesis_id is not None:
             await service.upsert_node(
                 GraphNodeType.HYPOTHESIS,
                 node_id=hypothesis_node_id(str(proposal.hypothesis_id)),
-                facts={"evidence_ids": auth_assessment.evidence_ids,
-                       "authentication_outcome": auth_assessment.outcome},
-                provenance=provenance, step=runtime.step_count,
+                facts={
+                    "evidence_ids": auth_assessment.evidence_ids,
+                    "authentication_outcome": auth_assessment.outcome,
+                },
+                provenance=provenance,
+                step=runtime.step_count,
             )
         if auth_assessment.outcome in {"session_access_observed", ACCESS_CONTROL_VIOLATION}:
             target_ref = str(
@@ -169,7 +245,8 @@ async def verify_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                 node_id=session_principal_node_id(target_ref, session_ref),
                 attrs={"authenticated": True, "operator_managed_session": True},
                 facts={"target_ref": target_ref, "session_refs": [session_ref]},
-                provenance=provenance, step=runtime.step_count,
+                provenance=provenance,
+                step=runtime.step_count,
             )
             credential = await service.upsert_node(
                 GraphNodeType.CREDENTIAL,
@@ -202,51 +279,138 @@ async def verify_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             )
         compared = await publisher.publish(
             AUTHENTICATION_CHECKED,
-            {**comparison, "action_id": proposal.action_id,
-             "hypothesis_id": proposal.hypothesis_id,
-             # The step's own declaration, not the outcome. A security_check
-             # whose deny expectation was *enforced* is still a security
-             # check -- labelling it "observation" would misreport what was
-             # under test, and the label is what downstream consumers use to
-             # decide whether a conclusion was claimed at all.
-             "assessment_kind": step.assessment_kind},
-            correlation_id=correlation_id, causation_id=last_event_id,
+            {
+                **comparison,
+                "action_id": proposal.action_id,
+                "hypothesis_id": proposal.hypothesis_id,
+                # The step's own declaration, not the outcome. A security_check
+                # whose deny expectation was *enforced* is still a security
+                # check -- labelling it "observation" would misreport what was
+                # under test, and the label is what downstream consumers use to
+                # decide whether a conclusion was claimed at all.
+                "assessment_kind": step.assessment_kind,
+            },
+            correlation_id=correlation_id,
+            causation_id=last_event_id,
         )
         last_event_id = compared.event_id
-        if is_violation:
-            verdict = Verdict.VIOLATION
-            reason = (
-                "registered session reached an operator-declared deny path "
-                f"(status {auth_assessment.session_status}); access-control "
-                "violation confirmed against the anonymous 401 baseline"
-            )
-        elif (
-            step is not None
-            and step.assessment_kind == "security_check"
-            and step.authentication_check.expected_access == "deny"
-            and auth_assessment.outcome in {"session_not_accepted", "access_denied"}
-        ):
-            verdict = Verdict.PASS
-            reason = "the operator-declared deny expectation was enforced"
+        # Code never raises a verdict. The comparison above stays mapped as
+        # physical observations; the semantic verdict comes only from the LLM.
+        # A comparison that contradicts a positive LLM judgment on the same
+        # hypothesis falls back to UNKNOWN with feedback for replan.
+        llm_outcome = getattr(assessment, "outcome", None)
+        llm_dir: str | None = None
+        if not verification_failed and assessment.verdict is not Verdict.UNKNOWN:
+            if llm_outcome == "success":
+                llm_dir = "confirm"
+            elif llm_outcome == "refuted":
+                llm_dir = "reject"
+        auth_outcome = auth_assessment.outcome
+        auth_dir: str | None = None
+        if auth_outcome in {ACCESS_CONTROL_VIOLATION, "session_access_observed"}:
+            auth_dir = "confirm"
+        elif auth_outcome in {"session_not_accepted", "access_denied"}:
+            auth_dir = "reject"
+        auth_contradiction = llm_dir is not None and auth_dir is not None and llm_dir != auth_dir
 
     observation_only = step is not None and step.assessment_kind == "observation"
     if observation_only:
-        verdict = Verdict.UNKNOWN
-        reason = "response recorded as an observation; no security claim was verified"
         observed = await publisher.publish(
             OBSERVATION_RECORDED,
-            {"evidence_id": evidence.evidence_id, "action_id": proposal.action_id,
-             "target_node_id": str(node_id_for_target(proposal.target)),
-             "assessment_kind": "observation", "tool_success": result.success},
+            {
+                "evidence_id": evidence.evidence_id,
+                "action_id": proposal.action_id,
+                "target_node_id": str(node_id_for_target(proposal.target)),
+                "assessment_kind": "observation",
+                "tool_success": result.success,
+            },
             correlation_id=correlation_id,
             causation_id=last_event_id,
         )
         last_event_id = observed.event_id
 
+    # Final admission: contradiction, observation-only, or verification failure
+    # downgrades the code-approved assessment itself to outcome=unknown. The
+    # auth branch below can never re-raise it (no re-promotion), and support
+    # evidence plus the final receipt derive from this admitted assessment.
+    downgrade_cause: str | None = None
+    if verification_failed:
+        downgrade_cause = "verification_failed"
+    elif observation_only:
+        downgrade_cause = "observation_only"
+    elif auth_contradiction:
+        downgrade_cause = "auth_contradiction"
+    if downgrade_cause is not None:
+        admitted = VerificationAssessment(
+            verdict=Verdict.UNKNOWN,
+            reason=(
+                "admitted UNKNOWN ("
+                + downgrade_cause
+                + "); original "
+                + str(
+                    assessment.verdict.value
+                    if hasattr(assessment.verdict, "value")
+                    else assessment.verdict
+                )
+                + "/"
+                + str(getattr(assessment, "outcome", None) or "unknown")
+                + ": "
+                + str(assessment.reason)
+            )[:1000],
+            reviewer_id=assessment.reviewer_id,
+            source_refs=list(assessment.source_refs),
+            outcome="unknown",
+            last_record_stage=getattr(assessment, "last_record_stage", None),
+            claim_supported=False,
+        )
+    else:
+        admitted = assessment
+    verdict, reason = admitted.verdict, admitted.reason
+
+    # Final admission receipt: supersedes any interim receipt so a stale
+    # positive can never count as approval. Completion consumers must require
+    # admission == "final" (see is_final_admission_receipt in analysis).
+    superseded_stages: list[str] = []
+    if prior_record_stage is not None:
+        superseded_stages.append(str(prior_record_stage))
+    try:
+        await append_review_receipt(
+            evidence_store=deps.evidence_store,
+            proposal=proposal,
+            result=result,
+            assessment=admitted,
+            admission="final",
+            supersedes=superseded_stages,
+        )
+        try:
+            admitted.last_record_stage = "verify_node_final"
+        except Exception:
+            pass
+    except Exception:
+        result = result.model_copy(
+            update={
+                "metadata": {
+                    **result.metadata,
+                    "verification_exception": "review_receipt_write_failed",
+                }
+            }
+        )
+        verification_failed = True
+        admitted = VerificationAssessment(
+            verdict=Verdict.UNKNOWN,
+            reason="review_receipt_write_failed; evidence preserved, no verdict reached",
+            reviewer_id=admitted.reviewer_id,
+            source_refs=list(admitted.source_refs),
+            outcome="unknown",
+            last_record_stage=None,
+            claim_supported=False,
+        )
+        verdict, reason = admitted.verdict, admitted.reason
+
     hypothesis_status = ""
     resolution_reason = ""
     if proposal.hypothesis_id is not None:
-        hypothesis_status = HYPOTHESIS_STATUS_BY_VERDICT[verdict]
+        hypothesis_status = hypothesis_status_for_assessment(admitted)
         if (
             observation_only
             or result.metadata.get("orchestration_exception")
@@ -254,7 +418,29 @@ async def verify_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
         ):
             hypothesis_status = "inconclusive"
         if auth_assessment is not None:
-            hypothesis_status = auth_assessment.hypothesis_status
+            # Guarded adoption: same hypothesis and same outcome direction only.
+            # Anything else stays inconclusive; code never confirms via override.
+            auth_status = auth_assessment.hypothesis_status
+            auth_dir = None
+            if auth_status == "confirmed":
+                auth_dir = "confirm"
+            elif auth_status == "rejected":
+                auth_dir = "reject"
+            if admitted.verdict is Verdict.UNKNOWN or observation_only:
+                hypothesis_status = "inconclusive"
+                auth_dir = None
+            base_outcome = getattr(admitted, "outcome", None)
+            base_dir: str | None = None
+            if not verification_failed and base_outcome == "success":
+                base_dir = "confirm"
+            elif not verification_failed and base_outcome == "refuted":
+                base_dir = "reject"
+            if auth_dir is not None and auth_dir == base_dir and base_dir is not None:
+                hypothesis_status = auth_status
+            elif auth_dir is not None and base_dir is not None and auth_dir != base_dir:
+                hypothesis_status = "inconclusive"
+            if expectation is None and not observation_only and not resolution_reason:
+                resolution_reason = "needs_test_expectation_for_claim"
         if hypothesis_status == HYPOTHESIS_OPEN and not _follow_up_possible(step):
             hypothesis_status = HYPOTHESIS_INCONCLUSIVE
             resolution_reason = "no_follow_up_verification_available"
@@ -263,6 +449,65 @@ async def verify_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             status=hypothesis_status,
             step=runtime.step_count,
         )
+        try:
+            outcome_name = getattr(admitted, "outcome", None)
+            supporting_ids: list[str] = []
+            refuting_ids: list[str] = []
+            if outcome_name == "success":
+                supporting_ids = [str(evidence.evidence_id)]
+            elif outcome_name == "refuted":
+                refuting_ids = [str(evidence.evidence_id)]
+            await service.upsert_node(
+                GraphNodeType.HYPOTHESIS,
+                node_id=hypothesis_node_id(str(proposal.hypothesis_id)),
+                facts={
+                    "supporting_evidence_ids": supporting_ids,
+                    "refuting_evidence_ids": refuting_ids,
+                    "verification_outcome": outcome_name,
+                    "verification_verdict": verdict.value,
+                },
+                provenance=provenance,
+                step=runtime.step_count,
+            )
+        except Exception as exc:
+            try:
+                audit_payload: dict = {
+                    "record_kind": "hypothesis_support_audit",
+                    "status": "failed",
+                    "hypothesis_id": str(proposal.hypothesis_id),
+                    "verification_outcome": outcome_name,
+                    "verification_verdict": verdict.value,
+                    "error": type(exc).__name__,
+                    "source_evidence_id": str(evidence.evidence_id),
+                }
+                audit_record = EvidenceRecord(
+                    evidence_id=EvidenceId(new_id("ev")),
+                    run_id=runtime.run_id,
+                    engagement_id=runtime.engagement_id,
+                    source_type=EvidenceSourceType.SYSTEM,
+                    source_id="orchestration.verify",
+                    action_id=proposal.action_id,
+                    invocation_id=result.invocation_id,
+                    hypothesis_id=proposal.hypothesis_id,
+                    content_type="application/json",
+                    artifact_ref=None,
+                    digest=digest_payload(audit_payload),
+                    summary=("hypothesis support audit failed for " + str(proposal.hypothesis_id))[
+                        :280
+                    ],
+                    created_at=datetime.now(timezone.utc),
+                    metadata=audit_payload,
+                )
+                await deps.evidence_store.append(audit_record)
+            except Exception:
+                result = result.model_copy(
+                    update={
+                        "metadata": {
+                            **result.metadata,
+                            "support_audit_write_failed": "hypothesis_support_audit",
+                        }
+                    }
+                )
         if resolved is not None:
             settled = await publisher.publish(
                 HYPOTHESIS_RESOLVED,
@@ -300,8 +545,8 @@ async def verify_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             operation=proposal.operation,
             agent_id=str(proposal.agent_id),
             action_id=str(proposal.action_id),
-            reviewer_id=assessment.reviewer_id,
-            source_refs=list(assessment.source_refs),
+            reviewer_id=admitted.reviewer_id,
+            source_refs=list(admitted.source_refs),
             severity=severity_for(step),
             assessment_kind=(step.assessment_kind if step is not None else "observation"),
         ),
@@ -375,3 +620,82 @@ async def verify_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
         tool_result=result,
         result_evidence_id=evidence.evidence_id,
     )
+
+
+def _summarize_result(result) -> str:
+    """One line on what actually happened -- output shape or error code.
+
+    Never the expected text: the plan's hope is stored separately under
+    "expected_observation". Values stay out on purpose (keys and counts
+    only), so the summary cannot leak payload data into reports.
+    """
+    tool = str(result.tool_id)
+    if result.success:
+        output = result.output
+        if isinstance(output, dict):
+            status = output.get("status_code")
+            if type(status) is int:
+                return tool + " succeeded (status " + str(status) + ")"
+            keys = sorted(str(key) for key in list(output)[:5])
+            if keys:
+                return tool + " succeeded (output keys: " + ",".join(keys) + ")"
+            return tool + " succeeded (empty output)"
+        if isinstance(output, str):
+            if output.strip():
+                return tool + " succeeded (text output, " + str(len(output)) + " chars)"
+            return tool + " succeeded (empty output)"
+        return tool + " succeeded (no output)"
+    code = result.error.code if result.error is not None else "unknown_error"
+    return tool + " failed (" + code + ")"
+
+
+def _evidence_metadata(proposal, result, step, runtime) -> dict:
+    """Metadata for the evidence record: raw payload, split expectation, path refs.
+
+    The summary already carries what happened; here the full raw result is
+    preserved for later reprocessing, the plan's expected observation is
+    kept as its own entry (never as the summary), and the path position
+    (path/version/step/account) is recorded when known -- missing refs are
+    left out, never invented.
+    """
+    metadata: dict = {}
+    if proposal.expected_observation is not None:
+        metadata["expected_observation"] = proposal.expected_observation
+    metadata["tool_result"] = result.model_dump(mode="json")
+    metadata["action_id"] = str(proposal.action_id)
+    metadata["invocation_id"] = str(result.invocation_id)
+    metadata["tool_id"] = str(result.tool_id)
+    try:
+        canonical_operation = canonical_action_key(proposal.capability, proposal.operation)
+    except ValueError:
+        canonical_operation = proposal.capability + "." + proposal.operation
+    metadata["canonical_operation"] = canonical_operation
+    metadata["proposal"] = proposal.model_dump(mode="json")
+    if step is not None:
+        metadata["plan_step"] = step.model_dump(mode="json")
+    if runtime.active_task_id is not None:
+        metadata["mission_task_id"] = str(runtime.active_task_id)
+    path_id = getattr(step, "path_id", None)
+    if path_id is None:
+        path_id = getattr(runtime, "active_path_id", None)
+    path_version = getattr(step, "path_version", None)
+    if path_version is None:
+        path_version = getattr(runtime, "active_path_version", None)
+    path_step_id = getattr(step, "path_step_id", None)
+    if path_step_id is None:
+        path_step_id = getattr(runtime, "active_path_step_id", None)
+    principal_ref = getattr(step, "principal_ref", None)
+    operator_intent_id = getattr(step, "operator_intent_id", None)
+    if operator_intent_id is None:
+        operator_intent_id = getattr(runtime, "operator_intent_id", None)
+    if path_id is not None:
+        metadata["path_id"] = path_id
+    if path_version is not None:
+        metadata["path_version"] = path_version
+    if path_step_id is not None:
+        metadata["path_step_id"] = path_step_id
+    if principal_ref is not None:
+        metadata["principal_ref"] = principal_ref
+    if operator_intent_id is not None:
+        metadata["operator_intent_id"] = str(operator_intent_id)
+    return metadata

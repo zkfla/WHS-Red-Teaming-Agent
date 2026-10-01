@@ -18,7 +18,9 @@ single tuple constant so it is not re-typed in the LLM prompt.
 
 from __future__ import annotations
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+from redteam.core.redaction import redact_sensitive_text
 
 #: Canonical capability namespaces (docs/contracts/actions.md). Not
 #: re-declared in `redteam.core` — that vocabulary is fixed by PM there;
@@ -73,6 +75,23 @@ class EngagementDraft(BaseModel):
     max_tool_calls: int | None = None
     max_duration_seconds: int | None = None
 
+    @field_validator("name", "description")
+    @classmethod
+    def _redact_text(cls, value: str | None) -> str | None:
+        return redact_sensitive_text(value) if value is not None else None
+
+    @field_validator("focus_areas", "notes")
+    @classmethod
+    def _redact_text_items(cls, values: list[str]) -> list[str]:
+        return [redact_sensitive_text(value) for value in values]
+
+    @field_validator("allowed_hosts", "allowed_domains", "allowed_networks")
+    @classmethod
+    def _scope_has_no_embedded_credentials(cls, values: list[str]) -> list[str]:
+        if any("@" in value or "?" in value or "#" in value for value in values):
+            raise ValueError("scope entries must be host/domain/network references")
+        return values
+
 
 class IntakeTurn(BaseModel):
     """One Intake Assistant reply: a structured draft update plus the
@@ -95,6 +114,16 @@ class IntakeTurn(BaseModel):
     #: ``serializer.missing_required_fields`` for the code-side check
     #: that actually gates moving on to Preflight.
     ready: bool = False
+
+    @field_validator("acknowledgement")
+    @classmethod
+    def _redact_acknowledgement(cls, value: str) -> str:
+        return redact_sensitive_text(value)
+
+    @field_validator("follow_up_questions")
+    @classmethod
+    def _redact_questions(cls, values: list[str]) -> list[str]:
+        return [redact_sensitive_text(value) for value in values]
 
 
 def missing_required_fields(draft: EngagementDraft) -> list[str]:

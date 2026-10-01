@@ -7,20 +7,58 @@ accounting (budget, consecutive failures).
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 from contextlib import suppress
 from datetime import datetime, timedelta, timezone
 
+from redteam.attack_graph.identity import node_id_for_target
+from redteam.core.contracts.action import ActionProposal
 from redteam.core.contracts.events import EventType
-from redteam.core.contracts.tool import ToolError, ToolResult
+from redteam.core.contracts.evidence import EvidenceRecord
+from redteam.core.contracts.tool import ToolError, ToolInvocation, ToolResult
 from redteam.core.convert import build_tool_invocation
-from redteam.core.enums import AgentPhase, ToolHealthStatus
+from redteam.core.enums import AgentPhase, EvidenceSourceType, RiskLevel, ToolHealthStatus
+from redteam.core.ids import EvidenceId, new_id
 from redteam.orchestration.action_naming import (
     canonical_action_key,
     tool_matches_action_namespace,
 )
 from redteam.orchestration.context import RuntimeDeps
+from redteam.orchestration.engine import validate_current_action
+from redteam.orchestration.long_jobs import LongJobManager, LongJobState
 from redteam.orchestration.nodes._support import advance, publisher_for
+from redteam.orchestration.runtime_observation import (
+    RuntimeObservation,
+    append_runtime_observation,
+)
 from redteam.orchestration.state import GraphState
+
+# Risk LOW alone says nothing about idempotency (a low-risk auth attempt or
+# upload can still mutate state). Until Capability has an explicit retry-safe
+# descriptor contract, only known observation operations may be repeated.
+_RETRY_SAFE_ACTIONS = frozenset(
+    {
+        "recon.service_discovery",
+        "recon.endpoint_discovery",
+        "analysis.response_analysis",
+        "mobile.static_analysis",
+    }
+)
+
+
+def _retry_safe(proposal: ActionProposal) -> bool:
+    action = f"{proposal.capability}.{proposal.operation}"
+    if action in _RETRY_SAFE_ACTIONS:
+        return True
+    if action == "web.http_request":
+        method = proposal.arguments.get("method")
+        return (
+            isinstance(method, str)
+            and method.upper() in {"GET", "HEAD"}
+            and not any(key in proposal.arguments for key in ("body", "data", "json", "payload"))
+        )
+    return False
 
 
 async def _renew_lease_until_stopped(
@@ -56,6 +94,76 @@ async def _renew_lease_until_stopped(
         if renewed is None:
             lease_lost.set()
             return
+
+
+async def _invoke_with_semaphore(
+    deps: RuntimeDeps,
+    invocation: ToolInvocation,
+    *,
+    runtime=None,
+    step=None,
+    work_id=None,
+    proposal=None,
+) -> ToolResult:
+    """Invoke the tool, honoring the run-wide execution bound.
+
+    The semaphore is the *actual* ``RateLimitPolicy.max_concurrent_actions``
+    gate: policy admission may be serialized, but approved tool calls can
+    otherwise run in parallel across fan-out workers. ``None`` leaves
+    execution unbounded (legacy).
+    """
+
+    async def invoke():
+        problems = await validate_current_action(deps, runtime, step, proposal)
+        if problems:
+            raise ValueError("action changed before invocation")
+        if deps.long_job_adapter is None:
+            return await deps.tool_gateway.invoke(invocation)
+        if work_id is None:
+            raise ValueError("long jobs require a durable execution record")
+        manager = LongJobManager(deps.long_job_adapter)
+        work = await deps.work_store.get(work_id)
+        job_id = work.job_id if work else None
+        if job_id is None:
+            job_id = await manager.submit(invocation)
+            if not await deps.work_store.bind_job(
+                work_id, owner=str(runtime.run_id), job_id=job_id
+            ):
+                raise RuntimeError("submitted job could not be recorded; reconcile before retry")
+        try:
+            deadline = asyncio.get_running_loop().time() + invocation.timeout_seconds
+            while True:
+                status = await manager.status(job_id)
+                if status.job_id != job_id:
+                    raise RuntimeError("backend returned another job status")
+                if status.state in {
+                    LongJobState.SUCCEEDED,
+                    LongJobState.FAILED,
+                    LongJobState.CANCELLED,
+                }:
+                    result = (await manager.result(job_id)).require_result()
+                    if (
+                        result.action_id != invocation.action_id
+                        or result.tool_id != invocation.tool_id
+                    ):
+                        raise RuntimeError("long job returned an unrelated result")
+                    return result
+                if status.state is LongJobState.UNKNOWN:
+                    raise RuntimeError("long job execution state is unknown; do not resubmit")
+                if asyncio.get_running_loop().time() >= deadline:
+                    raise TimeoutError("registered job is still running; collect its result later")
+                await asyncio.sleep(0.5)
+        except asyncio.CancelledError:
+            # Keep the registered identity even if cancellation is unconfirmed.
+            with suppress(Exception):
+                await asyncio.shield(manager.cancel(job_id))
+            raise
+
+    semaphore = deps.tool_semaphore
+    if semaphore is None:
+        return await invoke()
+    async with semaphore:
+        return await invoke()
 
 
 async def execute_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
@@ -103,6 +211,7 @@ async def execute_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
         )
     except ValueError:
         binding_ready = False
+    descriptor = None
     if binding_ready and deps.tool_catalog is not None:
         descriptor = deps.tool_catalog.get(step.tool_id)
         binding_ready = bool(
@@ -110,6 +219,18 @@ async def execute_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             and proposal.capability in descriptor.capability_tags
             and descriptor.health_status is not ToolHealthStatus.UNHEALTHY
         )
+    # A bounded retry needs a retryable gateway error, a known LOW-risk
+    # descriptor *and* an explicitly read-only operation; LOW alone cannot
+    # establish idempotency (for example, a login attempt mutates state).
+    retry_enabled = bool(
+        deps.settings.retry_retryable_tool_failures
+        and deps.settings.max_retries > 0
+        and descriptor is not None
+        and descriptor.risk_level is RiskLevel.LOW
+        and _retry_safe(proposal)
+        and deps.long_job_adapter is None
+    )
+    max_retries = deps.settings.max_retries
     if work_id is not None:
         try:
             lease_ready = (
@@ -124,11 +245,44 @@ async def execute_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
         except Exception:  # noqa: BLE001 - fail closed when lease state is unknown
             lease_ready = False
 
+    retry_attempts = 0
     try:
+        path_problems = await validate_current_action(deps, runtime, step, proposal)
+        if path_problems:
+            binding_ready = False
         if not binding_ready:
             raise RuntimeError("tool binding is no longer valid for the approved action")
         if not lease_ready:
             raise RuntimeError("work lease was lost before tool execution")
+        # Persist the original invocation before submission, so an uncertain
+        # job can be collected later without reconstructing or repeating it.
+        if deps.long_job_adapter is not None:
+            receipt = {
+                "proposal": proposal.model_dump(mode="json"),
+                "plan_step": step.model_dump(mode="json"),
+                "invocation": invocation.model_dump(mode="json"),
+                "candidate_key": step.candidate_key,
+                "target_node_id": str(node_id_for_target(proposal.target)),
+                "work_id": work_id,
+                "receipt_kind": "execution_submission",
+            }
+            await deps.evidence_store.append(
+                EvidenceRecord(
+                    evidence_id=EvidenceId(new_id("evidence")),
+                    run_id=runtime.run_id,
+                    engagement_id=runtime.engagement_id,
+                    source_type=EvidenceSourceType.AGENT,
+                    source_id="orchestration.execute",
+                    action_id=proposal.action_id,
+                    invocation_id=invocation.invocation_id,
+                    hypothesis_id=proposal.hypothesis_id,
+                    content_type="application/json",
+                    digest=hashlib.sha256(json.dumps(receipt, sort_keys=True).encode()).hexdigest(),
+                    summary="Registered original execution for job reconciliation",
+                    created_at=datetime.now(timezone.utc),
+                    metadata=receipt,
+                )
+            )
         if work_id is not None:
             stop_heartbeat = asyncio.Event()
             heartbeat_task = asyncio.create_task(
@@ -140,7 +294,39 @@ async def execute_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                     lease_lost=lease_lost,
                 )
             )
-        result = await deps.tool_gateway.invoke(invocation)
+        while True:
+            result = await _invoke_with_semaphore(
+                deps,
+                invocation,
+                runtime=runtime,
+                step=step,
+                work_id=work_id,
+                proposal=proposal,
+            )
+            error = result.error
+            if (
+                result.success
+                or not retry_enabled
+                or retry_attempts >= max_retries
+                or error is None
+                or not error.retryable
+            ):
+                break
+            # Each extra call needs an authoritative Control budget slot. The
+            # policy lock serializes this reservation with fan-out admissions;
+            # a missing optional extension keeps injected test doubles usable.
+            reserve = getattr(deps.control_plane, "has_tool_call_capacity", None)
+            charge = getattr(deps.control_plane, "record_tool_calls", None)
+            if runtime.remaining_budget is not None and (
+                runtime.remaining_budget <= 1 + retry_attempts
+            ):
+                break
+            if callable(reserve) and callable(charge):
+                async with deps.policy_lock:
+                    if not await reserve(proposal.engagement_id):
+                        break
+                    await charge(proposal.engagement_id, 1)
+            retry_attempts += 1
     except Exception as exc:  # noqa: BLE001 - normalize adapter/transport failure
         now = datetime.now(timezone.utc)
         if not binding_ready:
@@ -188,6 +374,12 @@ async def execute_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                 },
             }
         )
+    if retry_attempts:
+        # Bounded-retry observability: how many extra attempts this action
+        # consumed (the final ToolResult is the one recorded as Evidence).
+        result = result.model_copy(
+            update={"metadata": {**result.metadata, "retry_attempts": retry_attempts}}
+        )
 
     finished = await publisher.publish(
         EventType.TOOL_EXECUTION_FINISHED if result.success else EventType.TOOL_EXECUTION_FAILED,
@@ -203,24 +395,61 @@ async def execute_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
         causation_id=started.event_id,
     )
 
-    remaining_budget = (
-        None if runtime.remaining_budget is None else max(runtime.remaining_budget - 1, 0)
-    )
+    # An action consumes one budget slot; each retry attempt consumes an
+    # extra slot so a bounded retry cannot silently exceed the run budget
+    # (the Control Plane's own budget is charged once per admitted action).
+    consumed = 1 + retry_attempts
+    if runtime.remaining_budget is None:
+        remaining_budget = None
+    else:
+        total_budget = runtime.actions_executed + runtime.remaining_budget
+        remaining_budget = max(runtime.remaining_budget - consumed, 0)
+        if deps.settings.enforce_verification_reserve:
+            reserve = deps.settings.verification_reserve(total_budget)
+            if remaining_budget <= reserve:
+                # Leave the reserved slice for verification; the loop stops
+                # with that headroom untouched.
+                remaining_budget = 0
     actions_by_agent = dict(runtime.actions_by_agent)
     agent_key = str(proposal.agent_id)
     actions_by_agent[agent_key] = actions_by_agent.get(agent_key, 0) + 1
 
-    return advance(
-        state,
+    next_runtime = append_runtime_observation(
         runtime.model_copy(
             update={
                 "phase": AgentPhase.VERIFY,
                 "actions_executed": runtime.actions_executed + 1,
                 "consecutive_failures": 0 if result.success else runtime.consecutive_failures + 1,
                 "remaining_budget": remaining_budget,
+                "retry_count": retry_attempts,
+                "retry_tool_calls": runtime.retry_tool_calls + retry_attempts,
                 "actions_by_agent": actions_by_agent,
             }
         ),
+        RuntimeObservation(
+            kind="tool",
+            summary=(
+                f"Tool {result.tool_id} "
+                + ("succeeded" if result.success else "failed")
+                + (
+                    f" with {result.error.code}: {result.error.message}"
+                    if result.error is not None
+                    else ""
+                )
+            )[:500],
+            outcome="success" if result.success else "failed",
+            step=runtime.step_count,
+            action_id=str(proposal.action_id),
+            capability=proposal.capability,
+            operation=proposal.operation,
+            reasons=([result.error.code, result.error.message] if result.error is not None else []),
+            alternative_allowed=True,
+        ),
+    )
+
+    return advance(
+        state,
+        next_runtime,
         last_event_id=finished.event_id,
         tool_result=result,
     )

@@ -2,9 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
-import re
 from typing import Any
 
 from redteam.attack_graph.identity import (
@@ -17,27 +14,22 @@ from redteam.core.contracts.target import AnyTarget
 from redteam.core.contracts.tool import ToolResult
 from redteam.core.enums import GraphEdgeType, GraphNodeType
 from redteam.core.ids import GraphNodeId
+from redteam.orchestration.observations._shared import (
+    deterministic_key,
+    is_hex64,
+    safe_path,
+)
 from redteam.orchestration.observations.mapper import EdgeMutation, GraphMutation, NodeMutation
 
 _METHODS = frozenset({"GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH", "DELETE"})
-_HEX_64 = re.compile(r"^[0-9a-fA-F]{64}$")
-
-
-def _safe_path(value: Any) -> str | None:
-    if not isinstance(value, str) or not value.startswith("/") or len(value) > 512:
-        return None
-    if any(ord(char) < 32 or char in "?#%\\" for char in value):
-        return None
-    if "//" in value or any(part in {".", ".."} for part in value.split("/")):
-        return None
-    return value
 
 
 def _context_key(kind: str, host: str, method: str, path: str, source_path: str) -> str:
-    payload = json.dumps(
-        [kind, host.lower(), method, path, source_path], separators=(",", ":")
-    ).encode()
-    return hashlib.sha256(payload).hexdigest()[:24]
+    """Same content-hash core as every other mapper's ``deterministic_key``,
+    with this mapper's own normalization (case-insensitive host) applied
+    before hashing -- kept as a thin, named wrapper rather than inlined at
+    every call site below."""
+    return deterministic_key(kind, host.lower(), method, path, source_path)
 
 
 def _common_context(
@@ -46,7 +38,7 @@ def _common_context(
     if not result.success or not isinstance(result.output, dict):
         return None
     host = getattr(target, "host", None)
-    source_path = _safe_path(arguments.get("path"))
+    source_path = safe_path(arguments.get("path"))
     target_ref = arguments.get("target_ref")
     if (
         not isinstance(host, str)
@@ -97,8 +89,7 @@ def map_recon_html_inventory(
         or output.get("source_untrusted") is not True
         or output.get("verdict") != "observation_only"
         or output.get("request_count") != 1
-        or not isinstance(output.get("source_sha256"), str)
-        or _HEX_64.fullmatch(output["source_sha256"]) is None
+        or not is_hex64(output.get("source_sha256"))
         or type(output.get("omitted_references")) is not int
         or output["omitted_references"] < 0
         or (output["references_truncated"] and len(references) != 200)
@@ -111,7 +102,7 @@ def map_recon_html_inventory(
     for item in references:
         if not isinstance(item, dict):
             continue
-        path = _safe_path(item.get("path"))
+        path = safe_path(item.get("path"))
         method = item.get("method")
         kind = item.get("kind")
         if (
@@ -207,7 +198,7 @@ def map_recon_openapi_inventory(
     ):
         return GraphMutation()
     source_sha256 = output.get("source_sha256")
-    if not isinstance(source_sha256, str) or _HEX_64.fullmatch(source_sha256) is None:
+    if not is_hex64(source_sha256):
         return GraphMutation()
 
     source_id = node_id_for_target(target)
@@ -216,7 +207,7 @@ def map_recon_openapi_inventory(
     for item in operations:
         if not isinstance(item, dict):
             continue
-        path = _safe_path(item.get("path"))
+        path = safe_path(item.get("path"))
         method = item.get("method")
         if (
             path is None

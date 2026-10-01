@@ -15,6 +15,7 @@ from redteam.app.bootstrap import build_application
 from redteam.core.config import load_app_config
 from redteam.core.contracts.tool import ExecutionContext, ToolInvocation
 from redteam.core.ids import ActionId, EngagementId, InvocationId, RunId, ToolId
+from redteam.llm.fake import FakeLLMClient
 
 
 def _unused_local_port() -> int:
@@ -68,7 +69,7 @@ async def test_real_streamable_http_discovery_and_invocation(
         )
         config = load_app_config(repository_root / "examples/app.yaml")
         config.capability.mcp_servers = ["web-example"]
-        _, deps = await build_application(config, evidence_dir=tmp_path)
+        _, deps = await build_application(config, llm=FakeLLMClient(), evidence_dir=tmp_path)
         run_id = RunId("run_mcp_integration")
         result = await deps.tool_gateway.invoke(
             ToolInvocation(

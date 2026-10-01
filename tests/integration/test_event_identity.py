@@ -2,16 +2,15 @@
 
 from __future__ import annotations
 
-from redteam.app.bootstrap import build_runtime_deps, run_engagement
+from redteam.app.bootstrap import run_engagement
 from redteam.core.contracts.events import EventEnvelope, EventType
 from redteam.core.ids import RunId
-from redteam.orchestration.events import HYPOTHESIS_RESOLVED, REPLAN_TRIGGERED
-from tests.integration.test_end_to_end import _engagement
+from redteam.orchestration.events import HYPOTHESIS_RESOLVED, REPLAN_TRIGGERED, REPORT_PROJECTED
+from tests.integration.test_end_to_end import _world
 
 
 async def _run_with_events(tmp_path) -> tuple[list[EventEnvelope], RunId]:
-    engagement = _engagement()
-    deps = await build_runtime_deps(engagement, evidence_dir=tmp_path)
+    engagement, deps, _gateway = _world()
     events: list[EventEnvelope] = []
 
     async def collect(event: EventEnvelope) -> None:
@@ -36,6 +35,7 @@ async def test_action_event_chain_keeps_correlation_and_direct_causation(tmp_pat
             EventType.TOOL_EXECUTION_STARTED,
             EventType.TOOL_EXECUTION_FINISHED,
             EventType.EVIDENCE_CREATED,
+            "ObservationRecorded",
             HYPOTHESIS_RESOLVED,
             EventType.GRAPH_UPDATED,
         }
@@ -66,26 +66,44 @@ async def test_replan_triggered_keeps_run_identity_and_cites_its_cause(tmp_path)
         assert event.engagement_id is not None
         assert event.causation_id is not None
         assert event.causation_id in seen
-        assert all(
-            earlier.event_id != event.causation_id for earlier in events[index:]
-        ), "the cited cause must not appear after the effect"
+        assert all(earlier.event_id != event.causation_id for earlier in events[index:]), (
+            "the cited cause must not appear after the effect"
+        )
 
 
 async def test_agent_started_cites_run_started_as_causation(tmp_path) -> None:
     events, _run_id = await _run_with_events(tmp_path)
     run_started = next(event for event in events if event.event_type == EventType.RUN_STARTED)
+    mission_created = next(
+        event for event in events if event.event_type == EventType.MISSION_CREATED
+    )
+    task_created = [event for event in events if event.event_type == EventType.TASK_CREATED]
+    task_started = next(event for event in events if event.event_type == EventType.TASK_STARTED)
     agent_started = next(event for event in events if event.event_type == EventType.AGENT_STARTED)
 
     assert run_started.correlation_id == str(run_started.run_id)
     assert agent_started.correlation_id == run_started.correlation_id
-    assert agent_started.causation_id == run_started.event_id
+    # The initial Mission/Task creation chain precedes Task dispatch.
+    assert mission_created.causation_id == run_started.event_id
+    assert task_created[0].causation_id == mission_created.event_id
+    for parent, child in zip(task_created, task_created[1:], strict=False):
+        assert child.causation_id == parent.event_id
+    assert task_started.causation_id == task_created[-1].event_id
+    assert agent_started.causation_id == task_started.event_id
 
 
 async def test_run_finished_cites_the_last_event_and_keeps_run_correlation(tmp_path) -> None:
     events, run_id = await _run_with_events(tmp_path)
     run_started = next(event for event in events if event.event_type == EventType.RUN_STARTED)
     run_finished = next(event for event in events if event.event_type == EventType.RUN_FINISHED)
+    mission_updated = next(
+        event for event in events if event.event_type == EventType.MISSION_UPDATED
+    )
+    report_projected = next(event for event in events if event.event_type == REPORT_PROJECTED)
 
     assert run_started.correlation_id == str(run_id)
     assert run_finished.correlation_id == str(run_id)
     assert run_finished.causation_id == events[-2].event_id
+    report_index = events.index(report_projected)
+    assert report_projected.causation_id == events[report_index - 1].event_id
+    assert events.index(mission_updated) < report_index

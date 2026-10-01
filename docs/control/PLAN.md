@@ -186,8 +186,9 @@ DENY할 때 **왜 막혔는지에 따라 에이전트의 다음 행동이 달라
 - 스테이지별 매핑: scope→BLOCK / roe(능력)→REPLAN / roe(작업)→BLOCK / roe(시간)→ABORT /
   policy→REPLAN / rate_limit→BLOCK / budget→ABORT.
 
+**업데이트 (완료됨):** Agent 팀이 이 태그를 실제 라우팅에 반영했다. `orchestration/nodes/policy.py`의 `denial_severity()`가 `matched_rules`의 `severity:<value>` 태그를 직접 읽고(의존성 규칙상 `redteam.control.severity`를 임포트할 수 없어 태그 문자열만 재해석 — 값의 정의 자체는 여전히 `core.enums.Severity`가 유일한 출처), `orchestration/nodes/replan.py`(`SEVERITY_ABORT_RUN`/`SEVERITY_REPLAN_GOAL` 분기)와 `orchestration/nodes/aggregate.py`(`item.policy_severity` 비교)가 실제로 이 값에 따라 ABORT/REPLAN을 가른다. `severity_from_matched_rules` 함수 자체는 (의존성 규칙상) orchestration에서 직접 호출되지 않지만, 동일한 태그 형식을 읽는 자체 리더(`denial_severity`)로 소비된다.
+
 **남은 것 (Control 범위 밖):**
-- Agent 팀(orchestration `router`/`replan`)이 이 태그를 **실제 라우팅에 반영**해야 한다. 현재 `orchestration/`에는 `severity_from_matched_rules` 사용처가 없어서, 태그는 붙어 있지만 아직 소비되지 않는다.
 - (선택) **방법 B**: `PolicyDecision.severity` 1급 필드 승격 → PM Issue. 지금은 태그 규약으로 충분.
 
 ---
@@ -212,10 +213,9 @@ DENY할 때 **왜 막혔는지에 따라 에이전트의 다음 행동이 달라
 
 | 항목 | 필요할 때 | 대안 (변경 없음) / 상태 |
 |---|---|---|
-| **`ApprovalPolicy`에 risk 승인 임계값 필드** | Engagement마다 "어느 risk부터 승인"을 다르게 하고 싶을 때 | 지금은 코드의 임시 global 기본값 `HIGH` (`control/risk.py:DEFAULT_APPROVAL_RISK_THRESHOLD`). **설계 논의 필요**: (1) 이 threshold를 `ApprovalPolicy` Contract 필드로 둘지, (2) 지금처럼 global 기본값으로 유지할지, (3) 그 둘을 병행해 Engagement가 override 안 하면 global 기본값을 쓰게 할지. 참고로만: 개념적으로 passive/active/intrusive 같은 등급을 논의하더라도 `RiskLevel`(LOW/MEDIUM/HIGH/CRITICAL) 하나를 단일 기준으로 유지하고 새 enum은 만들지 않는다. |
 | **`ArtifactStore`/`ArtifactBackend` 공통 Port 추가** | Capability가 만든 Raw Artifact를 팀 경계 너머로 저장 요청할 표준 인터페이스가 필요할 때 | Track B 내부 `ArtifactBackend`(`redteam.evidence.artifacts`)는 완료했지만 Track B 내부 타입일 뿐 공통 Core Port가 아니다. Capability/Orchestration이 호출할 수 있는 공통 Port로 승격할지는 PM 결정 대기. |
 | **`ToolResult`에 artifact reference/digest 전달 방식** | Tool 실행이 만든 Raw Artifact(HTTP 응답/HAR/stdout/screenshot)를 `ToolResult`를 통해 Control까지 흘려보내야 할 때 | 지금은 `ToolResult`에 그런 필드가 없다. `output` 전체를 Raw Evidence로 간주하지 않는다 — Raw Artifact는 Tool 실행에서 실제 관측한 원본 데이터만을 가리키는 더 좁은 개념. |
-| **`EvidenceRecord` ↔ Artifact lineage 정의** | Finding/Reporter가 검증된 결과의 원본 Artifact까지 추적해야 할 때 | 지금은 `EvidenceRecord`에 Artifact 참조 필드가 없다. `redteam.evidence.validation.EvidenceLinkValidator`는 이미 있는 Evidence 문맥(engagement/run/action/invocation/hypothesis/target)만 검증하며, Artifact lineage는 다루지 않는다. |
+| **`EvidenceRecord` ↔ Artifact lineage 정의** | Finding/Reporter가 검증된 결과의 원본 Artifact까지 추적해야 할 때 | 지금은 `EvidenceRecord`에 Artifact 참조 필드가 없다. (`redteam.evidence.validation.EvidenceLinkValidator`는 실제 runtime caller가 없어 제거됨 — 이 항목이 가리키던 Evidence 문맥 검증은 현재 별도 구현이 없다.) |
 | `PolicyVerdict`에 `ABORT`/`severity` | 심각도로 Run 종료 구분 | reasons/matched_rules 규약 사용 (권장) |
 | `ControlPlane` 포트에 `resolve_approval` | 오케스트레이션이 승인 해소 | control 모듈 내부 + CLI로 해소 |
 | `EvidenceStore` 포트에 조회 메서드 | hypothesis별 조회 등 | concrete store에만 추가 |
@@ -223,6 +223,8 @@ DENY할 때 **왜 막혔는지에 따라 에이전트의 다음 행동이 달라
 | Evidence Target 저장 규격 | Finding의 Target 연결 검증 시 | 공통 Target dict만 비교하고 표시 문자열은 검증 불가 처리 |
 
 **해결됨:** `ActionProposal.risk_level` 추가 요청은 필요 없어졌다. dev에 추가된 read-only `ToolGateway.list_tools_for_action`으로 Registry의 `risk_level`을 Contract 변경 없이 읽을 수 있다 (§2.1).
+
+**해결됨:** `ApprovalPolicy`에 risk 승인 임계값 필드도 추가됐다. `ApprovalPolicy.risk_threshold: RiskLevel | None`이 Contract에 있고, `control/policy.py`가 설정되어 있으면 이 값을 `DEFAULT_APPROVAL_RISK_THRESHOLD`(`HIGH`) 대신 사용한다 — Engagement가 override하지 않으면 global 기본값을 쓰는 (3)번 방식으로 정리됨.
 
 ---
 

@@ -105,6 +105,16 @@ class MCPToolCatalog:
     def list_by_capability(self, capability_tag: str) -> list[ToolDescriptor]:
         return self._registry.list_by_capability(capability_tag)
 
+    def health_snapshot(self) -> dict[str, ToolHealthStatus]:
+        """Read-only per-server health view straight from the live Registry.
+
+        This never probes a server, never mutates state, and never decides
+        policy. It is the synchronous companion to
+        ``MCPToolGateway.refresh_health``: refresh first, then read this.
+        """
+
+        return server_health_snapshot(self._registry)
+
     def list_tools_for_action(
         self,
         capability: str,
@@ -187,6 +197,22 @@ class MCPToolCatalog:
         if self._operation_bindings is None:
             return frozenset((*descriptor.operations, descriptor.tool_name))
         return self._operation_bindings.get(descriptor.tool_id, frozenset())
+
+
+def server_health_snapshot(registry: MCPToolRegistry) -> dict[str, ToolHealthStatus]:
+    """Aggregate a Registry snapshot into one status per MCP server.
+
+    Descriptors belonging to one server are refreshed in unison, so mixed
+    results normally cannot happen; if they ever do, ``UNHEALTHY`` wins so the
+    view errs toward caution.
+    """
+
+    snapshot: dict[str, ToolHealthStatus] = {}
+    for descriptor in registry.all():
+        current = snapshot.get(descriptor.server_id)
+        if current is None or descriptor.health_status == ToolHealthStatus.UNHEALTHY:
+            snapshot[descriptor.server_id] = descriptor.health_status
+    return snapshot
 
 
 def _argument_names(

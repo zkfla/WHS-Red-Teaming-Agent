@@ -33,9 +33,9 @@ from redteam.orchestration.agents.planners import (
     build_planner,
 )
 from redteam.orchestration.agents.providers import (
-    CandidateProvider,
     CandidateProviderRegistry,
     DuplicateProviderError,
+    GraphCandidateProvider,
     PlaybookCandidateProvider,
     default_provider_registry,
 )
@@ -73,7 +73,7 @@ __all__ = [
     "WEB_API_AGENT",
     "MOBILE_AGENT",
     "ANALYSIS_AGENT",
-    "CandidateProvider",
+    "GraphCandidateProvider",
     "CandidateProviderRegistry",
     "DuplicateProviderError",
     "PlaybookCandidateProvider",

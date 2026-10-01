@@ -66,21 +66,22 @@ pytest -q
 
 # Lint / types
 ruff check src tests examples
-mypy src/redteam
+mypy src/redteam tests
 ```
 
 `redteam` is the installed console script (`pyproject.toml`
 `[project.scripts]`); `python -m redteam.app.cli ...` works identically.
 See "CLI" below for the full command reference, including
-`--config app.yaml` (real LLM provider + real MCP servers) and the
-Approval workflow (`redteam approvals approve/deny`).
+`REDTEAM_LLM_*`/`REDTEAM_MCP_*` (real LLM provider + real MCP servers) and
+the Approval workflow (`redteam approvals approve/deny`).
 
 `LiteLLMClient` (`redteam.llm.litellm`) needs the optional `llm` extra
 (`pip install -e ".[llm]"`) to use a real LLM provider — it installs and
 imports fine on this project's 3.10+ floor (verified directly; an older
 `litellm` release once needed 3.11+, current ones don't). The base
-install and everything else works on 3.10+ using `FakeLLMClient` by
-default without it.
+install and everything else works on 3.10+ without it, but an operational
+run always needs a real provider: `FakeLLMClient` is a test-only injection
+and is rejected for real runs.
 
 ## Repository Structure
 
@@ -93,7 +94,7 @@ src/redteam/
   control/         Control Team — Engagement Control Plane.
   evidence/        Control Team — Evidence Store.
   capability/      Capability Team — ToolGateway, MCPToolRegistry, MCPAdapters.
-  llm/             LLM Gateway implementations (LiteLLM + Fake).
+  llm/             LLM Gateway implementations (LiteLLM for runs, Fake for tests).
   app/             Composition root (bootstrap.py) + CLI.
 
 deploy/            Capability Team — docker-compose, MCP server images.
@@ -226,14 +227,13 @@ pytest tests/integration -q  # end-to-end vertical slice
 
 ## CLI
 
-`redteam` (`src/redteam/app/cli/`) is a thin interface: argument parsing,
-one call into `redteam.app.bootstrap`/`redteam.control`/`redteam.capability`,
-then rendering + exit code. No ROE/Scope/Tool-selection/Approval decision
-is made in this package — `redteam run` is the only command that reaches
-the domain layer, and it always goes through the canonical
+`redteam` (`src/redteam/app/cli/`) owns terminal interaction, request routing,
+and session lifetimes, but not domain policy. No ROE/Scope/Tool-selection/Approval
+policy decision is made in this package. New investigations go through the canonical
 `app.bootstrap.build_application(AppConfig)` path (real configured LLM
 provider, real configured MCP servers, real Control Plane) — never a
-CLI-only shortcut. Every other command reads durable state directly
+CLI-only shortcut. Resume and approval operations use their existing public APIs;
+read-only commands read durable state directly
 (Approval/Audit/Evidence stores, or the persisted terminal report — see
 `redteam.app.report_store`).
 
@@ -243,16 +243,60 @@ CLI-only shortcut. Every other command reads durable state directly
 redteam
 ```
 
-No YAML, no flags: this reads `engagement.yaml`/`app.yaml` from the
-current directory if they exist (offering `Start`/`Edit`/`New`/`Quit`),
-or starts a natural-language setup ("어떤 대상을 테스트하려고 하나요?")
-if they don't. `Edit` re-opens the same conversation on the existing
-config and patches only what you ask to change — it never regenerates
-scope/ROE from scratch. Either way you land on a Preflight screen
-(target/scope/focus/budget, enforced ROE vs. documented-only notes,
-LLM/config/scope/MCP status) before anything executes, and `Enter`
-there hands off to the *exact same* `build_application`/`run_engagement`
-path `redteam run` uses below — nothing is re-implemented for this mode.
+No YAML, no flags: this reads `engagement.yaml` from the current
+directory if it exists (offering `Start`/`Edit`/`New`/`Quit`), or starts
+a natural-language setup ("어떤 대상을 테스트하려고 하나요?") if it
+doesn't. The first run also does a one-time LLM setup prompt (skipped
+once `REDTEAM_LLM_PROVIDER` is set — see Config below), persisting the
+answer to `.env`, never to a YAML file. `Edit` re-opens the same
+conversation on the existing config and patches only what you ask to
+change — it never regenerates scope/ROE from scratch. Either way you
+land on a Preflight screen (target/scope/focus/budget, enforced ROE vs.
+documented-only notes, LLM/config/scope/MCP status) before anything
+executes, and `Enter` there hands off to the *exact same*
+`build_application`/`run_engagement` path `redteam run` uses below —
+nothing is re-implemented for this mode.
+
+The terminal stays open with one editor across Runs. Public Agent decisions,
+correlated action/policy/tool results, and a persistent activity/status area
+replace the event-per-line panel layout. Ordinary chat is classified **before**
+any mutation: read-only question, guidance for the original Run, explicit new
+investigation, or clarification. A new investigation waits behind the current
+one; it is not silently turned into guidance. Typing across a Run's end keeps
+the draft, cursor and original Run attachment. Expired guidance is reported as
+undelivered, never redirected to the next Run. Displayed reasoning is a public
+decision summary, not private chain-of-thought; detailed assumptions/events are
+available in the bounded trace. All actions still pass the existing Control
+Plane and MCP path.
+
+| Input | Meaning |
+|---|---|
+| Natural-language chat | Question / current guidance / new investigation, classified by the LLM |
+| `/new <objective>` | Explicit new investigation within the existing validated scope |
+| `/status`, `/explain` | Read-only state for the input's Run context |
+| `/stop`, `/pause`, `/resume` | Existing Run control APIs; not session exit |
+| `approve <ID>`, `deny <ID>` | Explicit decision for the captured pending approval, revalidated against its Run |
+| `/pending`, `/cancel <input_id>` | Inspect queued/uncertain requests; cancel only undispatched requests |
+| Ctrl+O, `/trace` | Recent redacted details; at most 300 display-history entries |
+| Enter / Ctrl+J | Submit / newline (Shift+Enter is not assumed portable) |
+| Ctrl+C / Ctrl+D | Clear draft / exit on an empty draft |
+| `/exit` | Stop intake, request Run stop, drain outstanding work and close the session |
+
+`/` + Tab completes actual commands. Approval and stop use a separate worker,
+so a slow chat classification does not block them. Service acceptance does not
+claim that the Agent has already consumed guidance. Uncertain writes are not
+automatically retried. `phase`, termination reason, and Mission status are
+shown separately; the CLI does **not** reinterpret `completed` as proof of a
+successful or exhaustive assessment.
+
+`REDTEAM_CLI_PLAIN=1 redteam` (also selected with `TERM=dumb`) uses a static,
+sequential transcript with simple status markers. It does not accept live
+steering during execution; suspended Runs remain available for explicit
+approval/resume. Redirected stdin uses a sequential fallback. JSON and
+`--non-interactive` retain their existing output contracts. The TTY
+`redteam run ...` entrypoint uses the same editor but exits after its single Run.
+See [CLI session architecture](docs/architecture/cli-session.md) for lifecycle,
+race handling, verification, and known boundaries.
 
 The natural-language layer is `redteam.intake` (the **Engagement Intake
 Assistant**), a distinct role from the Orchestrator:
@@ -277,33 +321,76 @@ Secrets (API keys) are collected by the CLI directly (`getpass`, stored
 in `.env`) — the Intake Assistant's schema has no field that could carry
 one, by construction.
 
-`--verbose` shows internal ids/metadata (`action_id`, `candidate_key`,
-`priority_components`, ...) alongside each human-readable event line;
-the default view hides them. This mode is purely additive: every
-`redteam run ...` invocation below is completely unchanged and remains
-the automation/CI-safe, non-interactive entrypoint.
+`--verbose` adds diagnostic event details; `/trace` and Ctrl+O expose recent
+safe details without changing policy or execution. For automation, use
+`redteam run ... --non-interactive` (and optionally `--json`).
 
 ### Config
 
+`engagement.yaml` (target/scope/ROE/budget) is always required.
+Everything else — which LLM, which MCP servers — is environment-specific
+and comes **only** from the process environment; there is no
+application-config YAML file or `--config` flag in this CLI:
+
 ```bash
-redteam run engagement.yaml                    # AppConfig = engagement only, FakeLLMClient, no MCP servers
-redteam run engagement.yaml --config app.yaml   # AppConfig = engagement + app.yaml's llm/orchestration/capability/logging
+REDTEAM_LLM_PROVIDER=litellm REDTEAM_LLM_MODEL=gpt-4o-mini \
+REDTEAM_MCP_SERVERS=recon,web-http \
+  redteam run engagement.yaml
 ```
 
-`app.yaml` is the `AppConfig` shape (`examples/app.yaml`) minus its own
-`engagement:` key — the positional `engagement.yaml` is always
-authoritative for scope/ROE, so there is exactly one place to look for
-it. `LLM_API_KEY`/MCP secrets still come from the process environment
-(`.env.example`) — this CLI does not parse `.env` itself, matching the
-"copy to `.env` and source it before running" convention that file
-already documents. Using `llm.provider: litellm` needs the `agent`
-extra installed (`pip install -e ".[agent]"`) — see Quick Start.
+`REDTEAM_LLM_PROVIDER` has **no implicit default** — unset is a
+configuration error, not a silent `FakeLLMClient`. Set it explicitly:
+`REDTEAM_LLM_PROVIDER=litellm` with `REDTEAM_LLM_MODEL` for a real provider.
+Offline clients must be explicitly injected by tests; `fake` is rejected
+for an operational run. LLM reasoning drives investigation paths and actions;
+rule candidates provide review context only. `redteam validate` never calls
+an LLM at all (see its own `--help`), so this requirement does not apply
+to it. Using `litellm` needs the `agent` extra installed
+(`pip install -e ".[agent]"`) — see Quick Start. `LLM_API_KEY`/MCP
+secrets still come from the process environment (`.env.example`).
+`redteam` (every subcommand, not just the interactive entrypoint) loads a
+`.env` in the current directory into its own process environment at
+startup, best-effort (`_shared.load_dotenv_if_present`) — a real
+shell/CI-exported variable always wins over a `.env` value, so this can
+only fill in what is otherwise unset, never override an explicit choice.
+There are no planning modes: one mandatory LLM flow (path draft, path review,
+next action) always proposes from the live MCP catalog, and a failed model
+call or an uncompilable draft returns errors for model correction instead of
+executing any rule or playbook fallback. Planning never authorizes. Scope,
+risk, approval, rate limits and budget are always decided later by the
+Control Plane.
+The interactive `redteam` entrypoint's one-time setup writes
+`REDTEAM_LLM_PROVIDER`/`REDTEAM_LLM_MODEL` and, if you opt in,
+`REDTEAM_MCP_SERVERS`/`REDTEAM_MCP_RECON_PASSIVE_*` for a single low-risk
+recon-passive server against your first declared host. An explicitly empty
+MCP configuration stays empty. Other servers require explicit configuration
+and their corresponding devices, captures or artifacts.
 
-An empty (or omitted) `capability.mcp_servers` is not an error: `run`,
-`tools list` and `tools health` all fall back to the in-process
-`ExampleMCPAdapter` and print an explicit `WARNING` to stderr every time
-they do — development/test only, never a silent difference from a real
-MCP-backed run. A *configured but broken* MCP server (bad/missing
+`redteam.core.config.AppConfig`/`load_app_config()` (a YAML-loadable
+`AppConfig` shape, e.g. `examples/app.yaml`) still exist as a general
+library capability for code that calls
+`redteam.app.bootstrap.build_application()` directly, outside this CLI
+(see `examples/finance_agent_demo.py`) — the CLI itself never reads one.
+
+Runtime settings also have a shared environment path for interactive, `run`, and
+`resume`: `REDTEAM_ORCHESTRATION_MAX_STEPS` (default `50`),
+`REDTEAM_ORCHESTRATION_MAX_RETRIES` (default `3`), and
+`REDTEAM_ORCHESTRATION_LLM_CANDIDATE_GENERATION` (default `true`; LLM reasoning
+is mandatory and `false` is rejected). Invalid values fail configuration validation.
+The `--max-steps` option overrides the environment value.
+
+Before starting another Mission in an interactive session, the CLI reloads and
+validates `engagement.yaml`, including scope, ROE, and budget. A missing or invalid
+file prevents that Mission from starting; the previous configuration is not reused.
+
+An empty (or unset) `REDTEAM_MCP_SERVERS`/`capability.mcp_servers` is not
+an error: `run`, `tools list` and `tools health` all get an honest empty
+tool catalog and print an explicit `WARNING` to stderr — no Action can
+execute, but nothing pretends a fake tool ran either. The literal value
+`REDTEAM_MCP_SERVERS=example` (or `capability.mcp_servers: ["example"]`)
+is the one explicit way to opt into the harmless in-process
+`ExampleMCPAdapter` test/dev fixture instead — never chosen
+automatically. A *configured but broken* MCP server (bad/missing
 `REDTEAM_MCP_<ID>_*` env vars) fails the command instead
 (`MCPConfigurationError`, exit 2) — see `redteam validate` to catch this
 before `run`.
@@ -313,13 +400,14 @@ before `run`.
 ```bash
 redteam [--verbose]                               # interactive setup/Preflight/run -- see above
 redteam init [--output engagement.yaml]          # write a starter Engagement config (from examples/engagement.yaml)
-redteam validate engagement.yaml [--config app.yaml] [--json]
+redteam validate engagement.yaml [--json]
                                                    # schema/scope/ROE/capability checks -- never touches a target
-redteam run engagement.yaml [--config app.yaml] [--non-interactive] [--max-steps N] [--json]
+redteam run engagement.yaml [--non-interactive] [--max-steps N] [--json]
+redteam resume <run-id> engagement.yaml          # reconnect a safe durable checkpoint
 redteam status <run-id> [--json]                  # from the persisted terminal report; "unknown" if still running elsewhere
 redteam roe show engagement.yaml [--json]
-redteam tools list [--config app.yaml engagement.yaml] [--json]
-redteam tools health [--config app.yaml engagement.yaml] [--json]
+redteam tools list [--json]
+redteam tools health [--json]
 redteam approvals list [--run <run-id>] [--json]
 redteam approvals approve <approval-id> [--by <name>]
 redteam approvals deny <approval-id> [--by <name>]
@@ -338,16 +426,16 @@ not. The difference is what happens next:
 
 - **default (interactive):** `run` prints the pending Approval, then
   polls (`AgentLoopRunner.reconcile_once`, the same reconciliation
-  primitive a host loop would use) until a human resolves it from
-  another terminal, then resumes **the same Run** — no new Run, no new
-  Action, `RunId`/`ActionId`/`ApprovalId` all unchanged. Ctrl+C stops
-  watching (exit 130) without losing the pending Approval; there is no
-  `resume` command in this v1 to reconnect afterwards — keep the
-  interactive `run` alive, or check back with `redteam status`.
+  primitive a host loop would use) until a human resolves it with explicit
+  `approve`/`deny` in the live session or from another terminal. It resumes
+  **the same Run**, preserving the pending action identity. In the new TTY
+  editor Ctrl+C clears the draft; `/stop` requests Run stop and `/exit`
+  closes the session. Durable safe checkpoints can be reconnected with
+  `redteam resume <run-id> engagement.yaml`.
 - **`--non-interactive`:** stops at `APPROVAL_PENDING` immediately and
   exits 0 (a correct policy outcome, not a CLI failure — see Exit codes
   below). `redteam approvals approve/deny` still resolves the Approval
-  durably, but nothing resumes that specific Run afterward in v1.
+  durably; use the explicit `resume` command to continue the safe checkpoint.
 
 ```bash
 redteam approvals approve appr_abc123

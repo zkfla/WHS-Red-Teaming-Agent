@@ -109,6 +109,17 @@ Examples: `port_scan`, `service_discovery`, `endpoint_discovery`,
 `app_launch`, `device_shell`, `runtime_instrumentation`,
 `static_analysis`, `response_analysis`.
 
+Workspace-tool extension on the capability branch: `directory_list`,
+`file_read`, `file_search`, `file_write`, `file_edit`, under the existing
+`analysis` capability with an approved `AssetTarget`. These describe intent;
+the corresponding MCP ToolIds are `analysis.list_directory`,
+`analysis.read_file`, `analysis.search_files`, `analysis.write_file`,
+`analysis.apply_patch`. Read and mutation permissions remain separate.
+This is an additive naming extension, not a new capability/target schema
+or permission to automatically schedule these actions. PM/Agent/Control
+owners should review it before integration into dev; deployment ROE must
+explicitly permit the workspace asset and intended operations.
+
 Rules:
 
 * `operation` need not equal any MCP `tool_name`
@@ -302,3 +313,12 @@ Every MCP adapter's output is normalized into this shape by
 framework sees it — including filling in `action_id`/`invocation_id`,
 which adapters don't know about (see
 `redteam.capability.adapters.mcp.example.ExampleMCPAdapter`).
+
+A failed adapter call (`success=False`, a populated `error`) is returned
+as-is, before the output-size and output-schema checks below it in
+`MCPToolGateway.execute` — those two only ever validate a *successful*
+call's `output`. Running them unconditionally used to mask the adapter's
+real `error` (never shaped like the tool's success schema, so it always
+failed schema validation) behind a generic `tool_output_schema_mismatch`
+naming the wrong problem; the server's own `ToolError`/message (e.g. "target
+address outside configured networks") reaches `ToolResult.error` now.

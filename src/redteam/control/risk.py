@@ -12,10 +12,11 @@ executing anything. This module reads that snapshot and reduces the
 eligible tools to a single risk level (the highest — conservative, since
 Orchestration may pick any eligible tool after ALLOW).
 
-The **threshold** ("risk >= X requires approval") is intentionally a
-placeholder default here (``DEFAULT_APPROVAL_RISK_THRESHOLD``). Making it
-per-engagement configurable (a field on ``ApprovalPolicy``) is a
-deliberate follow-up design decision — deferred, not settled yet.
+The **threshold** ("risk >= X requires approval") defaults to
+``DEFAULT_APPROVAL_RISK_THRESHOLD`` here, but is per-engagement
+configurable: ``ApprovalPolicy.risk_threshold`` (see
+``control.policy.resolve_risk_threshold``) overrides this default when
+an engagement sets it.
 """
 
 from __future__ import annotations
@@ -41,6 +42,15 @@ DEFAULT_APPROVAL_RISK_THRESHOLD = RiskLevel.HIGH
 def risk_meets_threshold(risk: RiskLevel, threshold: RiskLevel) -> bool:
     """True if ``risk`` is at least as severe as ``threshold``."""
     return _RISK_ORDER[risk] >= _RISK_ORDER[threshold]
+
+
+def risk_at_or_below(risk: RiskLevel, ceiling: RiskLevel) -> bool:
+    """True if ``risk`` is no more severe than ``ceiling``.
+
+    The inverse direction of ``risk_meets_threshold``; used by bounded
+    auto-approval (``ApprovalPolicy.auto_approve_up_to``).
+    """
+    return _RISK_ORDER[risk] <= _RISK_ORDER[ceiling]
 
 
 class RiskResolver(Protocol):

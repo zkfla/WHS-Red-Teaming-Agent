@@ -9,12 +9,15 @@ dependencies = [
     "pydantic>=2.6",
     "jsonschema>=4.20,<5.0",
     "langgraph>=0.2",
+    "networkx==3.4.2",
+    "tenacity>=9.1,<10",
     "mcp>=2,<3",
     "pyyaml>=6.0",
     "httpx>=0.28,<1",
     "anyio>=4,<5",
     # CLI output only (redteam.app.cli.*) -- never imported by core/orchestration/agents.
     "rich>=13.7,<15",
+    "prompt-toolkit>=3.0,<4",
 ]
 
 [project.optional-dependencies]
@@ -22,7 +25,6 @@ orchestration = [
     "langgraph>=1.2,<2.0",
     "langchain>=1.4,<2.0",
     "langchain-litellm>=0.7,<1.0",
-    "langchain-mcp-adapters>=0.3,<1.0",
     "langgraph-checkpoint-sqlite>=3.1,<4.0",
     "aiosqlite>=0.22,<1.0",
 ]
@@ -61,6 +63,9 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+redteam = ["capability/reference_data/*.json", "capability/reference_data/templates/*.md"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

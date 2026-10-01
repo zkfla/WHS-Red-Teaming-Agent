@@ -60,6 +60,11 @@ def _finished_runtime() -> RuntimeState:
 async def test_run_command_calls_build_application_not_build_runtime_deps(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # build_application itself is mocked below, but the real
+    # load_app_config_for_run() still runs first and now requires an
+    # explicit provider (section 4/20) -- there is no --config app.yaml
+    # path any more.
+    monkeypatch.setenv("REDTEAM_LLM_PROVIDER", "fake")
     engagement_path = _engagement_yaml(tmp_path)
     engagement = Engagement(
         engagement_id=EngagementId("eng_wiring"),
@@ -85,7 +90,6 @@ async def test_run_command_calls_build_application_not_build_runtime_deps(
 
     args = argparse.Namespace(
         engagement_path=str(engagement_path),
-        config_path=None,
         non_interactive=True,
         max_steps=None,
         log_level=None,
@@ -104,20 +108,12 @@ async def test_run_command_calls_build_application_not_build_runtime_deps(
 async def test_run_command_propagates_configured_llm_and_mcp_settings(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A `--config app.yaml` with real llm/capability sections must reach
-    `build_application` unchanged -- not silently dropped/defaulted."""
+    """Real ``REDTEAM_LLM_*``/``REDTEAM_MCP_SERVERS`` environment values must
+    reach `build_application` unchanged -- not silently dropped/defaulted."""
     engagement_path = _engagement_yaml(tmp_path)
-    app_config_path = tmp_path / "app.yaml"
-    app_config_path.write_text(
-        """
-llm:
-  provider: "litellm"
-  default_model: "gpt-4o-mini"
-capability:
-  mcp_servers: ["web-example"]
-""",
-        encoding="utf-8",
-    )
+    monkeypatch.setenv("REDTEAM_LLM_PROVIDER", "litellm")
+    monkeypatch.setenv("REDTEAM_LLM_MODEL", "gpt-4o-mini")
+    monkeypatch.setenv("REDTEAM_MCP_SERVERS", "web-example")
 
     engagement = Engagement(
         engagement_id=EngagementId("eng_wiring"),
@@ -137,7 +133,6 @@ capability:
 
     args = argparse.Namespace(
         engagement_path=str(engagement_path),
-        config_path=str(app_config_path),
         non_interactive=True,
         max_steps=None,
         log_level=None,
@@ -161,8 +156,8 @@ async def test_run_command_fails_fast_on_bad_mcp_configuration(
     from redteam.capability.settings import MCPConfigurationError
 
     engagement_path = _engagement_yaml(tmp_path)
-    app_config_path = tmp_path / "app.yaml"
-    app_config_path.write_text('capability:\n  mcp_servers: ["broken-server"]\n', encoding="utf-8")
+    monkeypatch.setenv("REDTEAM_LLM_PROVIDER", "fake")
+    monkeypatch.setenv("REDTEAM_MCP_SERVERS", "broken-server")
 
     monkeypatch.setattr(
         run_command,
@@ -176,7 +171,6 @@ async def test_run_command_fails_fast_on_bad_mcp_configuration(
 
     args = argparse.Namespace(
         engagement_path=str(engagement_path),
-        config_path=str(app_config_path),
         non_interactive=True,
         max_steps=None,
         log_level=None,

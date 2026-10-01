@@ -14,13 +14,25 @@ from urllib.parse import urlsplit
 
 import anyio
 import httpx
+from mcp.server.mcpserver.exceptions import ToolError
 
 from redteam.capability.servers.config import ServerPolicy, TargetProfile
 from redteam.capability.servers.session_state import cookie_header
 
 
-class ToolInputError(ValueError):
-    """Messages contain only fixed explanations, never credentials or target responses."""
+class ToolInputError(ToolError, ValueError):
+    """Messages contain only fixed explanations, never credentials or target responses.
+
+    Also a ``ToolError`` (the MCP SDK's own "anticipated failure" type): the
+    SDK treats any other exception as a crash and withholds its message from
+    the client (``UnexpectedToolError`` -- see
+    ``mcp.server.mcpserver.tools.base``), which used to leave an operator
+    looking at an opaque "tool call failed" with no reason. A ``ToolError``
+    is instead returned to the caller as ``is_error=True`` with this
+    exception's own message intact -- exactly right for a deliberate,
+    already-safe-to-share rejection like "target address outside configured
+    networks", never a secret or a raw target response.
+    """
 
 
 @dataclass(frozen=True)
@@ -79,6 +91,8 @@ def session_header(
     session = policy.sessions.get(session_ref)
     if session is None or session.target_ref != target_ref:
         raise ToolInputError("session_ref is not bound to this target")
+    if session.allowed_paths is not None and path not in session.allowed_paths:
+        raise ToolInputError("path outside configured session allowlist")
     if session.storage_state_path:
         return {"Cookie": cookie_header(session, policy.targets[target_ref].origin, path)}
     assert session.bearer_env is not None

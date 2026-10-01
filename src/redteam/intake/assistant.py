@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from redteam.core.ports.llm import LLMClient
+from redteam.core.redaction import redact_sensitive_text
 from redteam.intake.models import EngagementDraft, IntakeTurn
 from redteam.intake.prompts import build_edit_context, build_system_prompt
 
@@ -52,6 +53,7 @@ class IntakeAssistant:
         section 12's "patch, don't overwrite" requirement.
         """
 
+        user_message = redact_sensitive_text(user_message)
         system = self._system_prompt
         if session.editing:
             system = f"{system}\n\n{build_edit_context()}"
@@ -86,6 +88,6 @@ class IntakeAssistant:
 
         session.history = [
             *messages,
-            {"role": "assistant", "content": json.dumps(raw)},
+            {"role": "assistant", "content": json.dumps(turn.model_dump())},
         ]
         return turn

@@ -198,6 +198,36 @@ def test_evidence_projection_requires_an_explicit_target_association() -> None:
     assert [item.evidence_id for item in projected] == ["ev-related"]
 
 
+def test_evidence_excerpt_carries_status_and_error_for_replanning() -> None:
+    # RC#2: the raw outcome (HTTP status, failure code) must reach the excerpt
+    # so a later planning turn can adapt -- but only non-secret codes.
+    record = EvidenceRecord(
+        evidence_id=EvidenceId("ev-outcome"),
+        run_id=RunId("run"),
+        engagement_id=EngagementId("eng"),
+        source_type=EvidenceSourceType.TOOL,
+        source_id="web.http_request",
+        content_type="application/json",
+        digest="digest",
+        summary="probe",
+        created_at=datetime.now(timezone.utc),
+        metadata={
+            "target_node_id": "endpoint:mock-bank:8080 GET /api/accounts/alice",
+            "http_observation": {"status_code": 401},
+            "error": {"code": "tool_output_schema_mismatch", "retryable": False},
+        },
+    )
+
+    excerpt = project_evidence_excerpts(
+        [record],
+        target_node_ids=[GraphNodeId("endpoint:mock-bank:8080 GET /api/accounts/alice")],
+        limit=1,
+    )[0]
+
+    assert excerpt.status_code == 401
+    assert excerpt.error_code == "tool_output_schema_mismatch"
+
+
 def test_evidence_excerpt_summary_is_bounded() -> None:
     record = EvidenceRecord(
         evidence_id=EvidenceId("ev-long"),

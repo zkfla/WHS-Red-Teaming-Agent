@@ -16,6 +16,9 @@ def _cli(*args: str) -> subprocess.CompletedProcess:
         [sys.executable, "-m", "redteam.app.cli", *args],
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        input="",
+        timeout=20,
         check=False,
     )
 

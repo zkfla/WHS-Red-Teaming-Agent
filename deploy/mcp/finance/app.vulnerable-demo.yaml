@@ -1,0 +1,37 @@
+engagement:
+  name: Synthetic bank access-control demo
+  description: Deliberately vulnerable local-only mentoring demonstration
+  scope:
+    allowed_hosts: [mock-bank]
+  metadata:
+    target_refs:
+      mock-bank: bank-lab
+    auth_sessions:
+      mock-bank:
+        - session_ref: bob
+          paths: [/]
+          expected_access: deny
+  execution_budget:
+    max_actions: 12
+    max_tool_calls: 12
+    max_duration_seconds: 120
+  rate_limit_policy:
+    max_actions_per_minute: 60
+    max_concurrent_actions: 1
+  approval_policy:
+    auto_approve: true
+capability:
+  mcp_servers: [web-http, recon-passive]
+orchestration:
+  max_retries: 1
+  max_steps: 30
+llm:
+  # Deliberately vulnerable demo still requires a real model: provider +
+  # model/key must come from environment (REDTEAM_LLM_PROVIDER=litellm,
+  # REDTEAM_LLM_MODEL, LLM_API_KEY). 'fake' is rejected by the
+  # real-model builder; tests inject their scripted stand-in explicitly.
+  provider: litellm
+  default_model: gpt-4o-mini
+  api_key_env_var: LLM_API_KEY
+logging:
+  level: WARNING

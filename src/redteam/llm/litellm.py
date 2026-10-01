@@ -39,15 +39,75 @@ Responses API.
 from __future__ import annotations
 
 import json
-from typing import Any
+from collections.abc import AsyncIterator
+from typing import Any, cast
 
 _CHATGPT_PROVIDER = "chatgpt"
 
 
+_NATIVE_JSON_SCHEMA_PROVIDERS = frozenset({"openai", "azure", "azure_ai", "chatgpt"})
+
+
+def _supports_native_json_schema(model: str) -> bool:
+    """Native-schema support from the model string only, no network.
+
+    With a slash, the provider prefix before the first slash must be
+    openai, azure, azure_ai, or chatgpt. Without a slash, a bare
+    OpenAI-family id starting with gpt-, o1, o3, or o4 qualifies.
+    Everything else uses JSON object mode plus validation. Conservative
+    by design: unknown providers fall back to json_object.
+    """
+    lowered = model.lower()
+    if "/" in lowered:
+        provider = lowered.split("/", 1)[0]
+        return provider in _NATIVE_JSON_SCHEMA_PROVIDERS
+    return lowered.startswith(("gpt-", "o1", "o3", "o4"))
+
+
+def _native_chat_completion_format(response_schema: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "structured_decision",
+            "schema": response_schema,
+            "strict": False,
+        },
+    }
+
+
+def _native_responses_format(response_schema: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "type": "json_schema",
+        "name": "structured_decision",
+        "schema": response_schema,
+        "strict": False,
+    }
+
+
+def _parse_json_dict(text: str) -> dict[str, Any]:
+    body = (text or "{}").strip()
+    fence = chr(96) * 3
+    if body.startswith(fence):
+        lines = body.splitlines()
+        if lines and lines[0].startswith(fence):
+            lines = lines[1:]
+        if lines and lines[-1].strip().startswith(fence):
+            lines = lines[:-1]
+        body = chr(10).join(lines).strip() or "{}"
+    parsed = json.loads(body)
+    if not isinstance(parsed, dict):
+        raise ValueError("expected JSON object")
+    return parsed
+
+
 class LiteLLMClient:
-    def __init__(self, model: str, api_key: str | None = None, **default_kwargs: Any) -> None:
+    def __init__(
+        self, model: str, api_key: str | None = None, num_retries: int = 0,
+        **default_kwargs: Any,
+    ) -> None:
         self._model = model
         self._api_key = api_key
+        self._num_retries = num_retries
         self._default_kwargs = default_kwargs
 
         import litellm
@@ -59,6 +119,11 @@ class LiteLLMClient:
         # from the local device-flow cache.
         _, provider, _, _ = litellm.get_llm_provider(model)
         self._is_chatgpt_subscription = provider == _CHATGPT_PROVIDER
+
+    def _call_kwargs(self, kwargs: dict[str, Any]) -> dict[str, Any]:
+        merged: dict[str, Any] = {**self._default_kwargs, **kwargs}
+        merged.setdefault("num_retries", self._num_retries)
+        return merged
 
     async def complete(
         self,
@@ -77,7 +142,7 @@ class LiteLLMClient:
             model=self._model,
             messages=full_messages,
             api_key=self._api_key,
-            **{**self._default_kwargs, **kwargs},
+            **self._call_kwargs(kwargs),
         )
         return response.choices[0].message.content or ""
 
@@ -109,22 +174,27 @@ class LiteLLMClient:
                 messages,
                 system=augmented_system,
                 kwargs=kwargs,
-                text_format={"type": "json_object"},
+                text_format=_native_responses_format(response_schema),
             )
-            return json.loads(text or "{}")
+            return _parse_json_dict(text)
 
         import litellm
 
         full_messages = ([{"role": "system", "content": system}] if system else []) + messages
+        call_kwargs = self._call_kwargs(kwargs)
+        if "response_format" not in call_kwargs:
+            if _supports_native_json_schema(self._model):
+                call_kwargs["response_format"] = _native_chat_completion_format(response_schema)
+            else:
+                call_kwargs["response_format"] = {"type": "json_object"}
         response = await litellm.acompletion(
             model=self._model,
             messages=full_messages,
             api_key=self._api_key,
-            response_format={"type": "json_object"},
-            **{**self._default_kwargs, **kwargs},
+            **call_kwargs,
         )
         content = response.choices[0].message.content or "{}"
-        return json.loads(content)
+        return _parse_json_dict(content)
 
     async def _chatgpt_stream_text(
         self,
@@ -143,7 +213,7 @@ class LiteLLMClient:
         """
         import litellm
 
-        call_kwargs: dict[str, Any] = {**self._default_kwargs, **kwargs}
+        call_kwargs: dict[str, Any] = self._call_kwargs(kwargs)
         call_kwargs.pop("messages", None)
         if text_format is not None:
             call_kwargs["text"] = {"format": text_format}
@@ -157,7 +227,7 @@ class LiteLLMClient:
         )
 
         text_parts: list[str] = []
-        async for chunk in response:
+        async for chunk in cast(AsyncIterator[Any], response):
             delta = getattr(chunk, "delta", None)
             if delta:
                 text_parts.append(delta)

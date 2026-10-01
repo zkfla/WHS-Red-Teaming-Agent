@@ -10,6 +10,12 @@ from redteam.orchestration.work.models import TaskLease, WorkItem, WorkStatus
 
 
 class WorkStore(Protocol):
+    async def invalidate_pending(
+        self, *, run_id: RunId, path_id: str, step_ids: set[str], now: datetime,
+    ) -> list[str]: ...
+
+    async def bind_job(self, work_id: str, *, owner: str, job_id: str) -> bool: ...
+
     async def add(self, item: WorkItem) -> bool: ...
 
     async def get(self, work_id: str) -> WorkItem | None: ...
@@ -49,6 +55,8 @@ class WorkStore(Protocol):
         reason: str | None = None,
     ) -> bool: ...
 
+    async def release(self, work_id: str, *, owner: str, now: datetime) -> bool: ...
+
     async def reclaim_expired(self, *, now: datetime) -> list[str]: ...
 
     async def abandon_run(
@@ -59,3 +67,7 @@ class WorkStore(Protocol):
         now: datetime,
         reason: str,
     ) -> list[str]: ...
+
+    async def reconcile_job(
+        self, work_id: str, *, job_id: str, status: str, now: datetime
+    ) -> bool: ...

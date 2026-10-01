@@ -63,6 +63,15 @@ async def test_nonrepeatable_candidate_stays_deduplicated_after_completion(store
     assert await store.add(item("w3", candidate="same", repeatable=True))
 
 
+async def test_releasing_deferred_approval_work_keeps_it_runnable(store) -> None:
+    assert await store.add(item("w1"))
+    assert await store.acquire("w1", owner="worker", now=NOW, ttl=timedelta(seconds=10))
+    assert not await store.release("w1", owner="other", now=NOW)
+    assert await store.release("w1", owner="worker", now=NOW)
+    assert (await store.get("w1")).status is WorkStatus.PENDING
+    assert await store.acquire("w1", owner="worker", now=NOW, ttl=timedelta(seconds=10))
+
+
 async def test_candidate_history_and_listing_are_isolated_by_run(store) -> None:
     assert await store.add(item("w1", candidate="same", run_id="run-1"))
     assert await store.add(item("w2", candidate="same", run_id="run-2"))

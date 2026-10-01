@@ -14,19 +14,34 @@ lists, time windows, availability impact, and max_parallel_actions
 supplies it; Control never imports the Work Ledger). ``prohibited_techniques``
 has no enforcement path yet and fails the run closed rather than being
 silently ignored — see ``roe.UnsupportedRoePolicyError``.
+
+Accounting boundaries: ``BudgetTracker`` / ``RateLimiter`` are per-process
+and in-memory, so a rebuilt plane (durable resume) starts empty. ``rehydrate``
+is the explicit, bounded, monotonic restore of those counters from the
+counters a caller read off the durable checkpoint; ``record_tool_calls`` is
+the seam a bounded retry must debit so retries cannot exceed the
+authoritative budget. A rate slot and a budget action are each charged
+exactly once per admitted action — a ``REQUIRE_APPROVAL`` decision charges
+nothing, and ``approval_outcome`` charges once if/when approved.
 """
 
 from __future__ import annotations
 
 import logging
+import math
+from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from redteam.control.approval import ApprovalService
 from redteam.control.audit import AuditLog
 from redteam.control.budget import BudgetTracker
-from redteam.control.policy import evaluate_policy
+from redteam.control.policy import (
+    evaluate_policy,
+    may_auto_approve,
+    resolve_risk_threshold,
+)
 from redteam.control.rate_limit import RateLimiter
-from redteam.control.risk import DEFAULT_APPROVAL_RISK_THRESHOLD, RiskResolver
+from redteam.control.risk import RiskResolver
 from redteam.control.roe import UnsupportedRoePolicyError, check_roe
 from redteam.control.scope import check_scope
 from redteam.control.severity import Severity, to_tag
@@ -38,6 +53,30 @@ from redteam.core.ids import ApprovalId, EngagementId
 from redteam.evidence.service import EvidenceService
 
 logger = logging.getLogger(__name__)
+
+#: Upper bound on the number of counters ``rehydrate`` accepts. Counters are
+#: clamped to the engagement's own caps anyway; this is a defensive ceiling
+#: against an absurd value (e.g. a corrupt checkpoint) ever being materialised
+#: as a deque/list. It is far above any realistic engagement budget.
+_MAX_REHYDRATABLE_COUNT = 1_000_000
+
+
+@dataclass(frozen=True)
+class RehydratedAccounting:
+    """The authoritative counters a fresh process restored via ``rehydrate``.
+
+    Returned so a durable-resume caller can log/verify what was restored
+    (and what remains) without reaching into Control internals. Contains
+    only bounded integer counters and ids -- no proposal contents, tool
+    output, or secrets.
+    """
+
+    engagement_id: EngagementId
+    actions_consumed: int
+    tool_calls_consumed: int
+    rate_actions_in_window: int
+    budget_remaining: int
+    rate_remaining: int
 
 
 class DefaultControlPlane:
@@ -79,8 +118,10 @@ class DefaultControlPlane:
         # and approval_outcome() can re-evaluate rate-limit/budget against
         # the original proposal once a human resolves it. In-memory only
         # -- not a durable store -- so this does not survive a process
-        # restart; see approval_outcome()'s "stale approval" handling.
-        # Popped by approval_outcome() once consumed.
+        # restart on its own; a durable resume re-establishes it from the
+        # checkpoint with register_pending_proposal() (never by guessing a
+        # proposal back from Audit). See approval_outcome()'s "stale
+        # approval" handling. Popped by approval_outcome() once consumed.
         self._pending_proposals: dict[ApprovalId, ActionProposal] = {}
         # Cached so approval_outcome() is idempotent: a second call after
         # the first resolved one returns the same PolicyDecision instead
@@ -116,11 +157,13 @@ class DefaultControlPlane:
             )
 
         risk, risk_unresolved = self._resolve_risk(proposal)
+        approval_policy = engagement.approval_policy
         verdict, policy_reasons, matched_rules = evaluate_policy(
             proposal,
-            engagement.approval_policy,
+            approval_policy,
             risk=risk,
-            risk_threshold=DEFAULT_APPROVAL_RISK_THRESHOLD,
+            # Engagement-configured threshold, else the Engine default.
+            risk_threshold=resolve_risk_threshold(approval_policy),
         )
         if risk_unresolved and verdict == PolicyVerdict.ALLOW:
             # Manual escalation, not a fail-closed DENY: risk-tiered
@@ -141,7 +184,11 @@ class DefaultControlPlane:
         rate_limiter = self._rate_limiters.setdefault(
             engagement_id, RateLimiter(engagement.rate_limit_policy)
         )
-        if not rate_limiter.allow():
+        # Non-consuming admission check. The rate slot is charged exactly
+        # once, at the point the action is actually admitted (below for
+        # ALLOW, or in ``approval_outcome`` once a human approves). Charging
+        # here as well would charge a REQUIRE_APPROVAL action twice.
+        if not rate_limiter.would_allow():
             # Transient — retry a (later) action; don't end the run.
             return await self._finalize(
                 proposal,
@@ -167,7 +214,10 @@ class DefaultControlPlane:
             )
 
         requires_approval = verdict == PolicyVerdict.REQUIRE_APPROVAL
-        if requires_approval and not engagement.approval_policy.auto_approve:
+        # Bounded auto-approval: legacy ``auto_approve`` maps to LOW;
+        # ``auto_approve_up_to`` configures an explicit ceiling. Unknown
+        # risk never qualifies.
+        if requires_approval and not may_auto_approve(approval_policy, risk):
             approval = await self._approvals.request(proposal.action_id)
             self._pending_proposals[approval.approval_id] = proposal
             decision = PolicyDecision(
@@ -182,8 +232,20 @@ class DefaultControlPlane:
             )
             await self._audit.record(proposal, decision)
             await self._record_blocked_action(proposal, decision)
+            # No rate slot and no budget action charged: nothing executed.
+            # ``approval_outcome`` charges both once, if/when approved.
             return decision
 
+        # Admitted: charge exactly one rate slot and one budget action.
+        if not rate_limiter.allow():  # defensive: would_allow already checked
+            return await self._finalize(
+                proposal,
+                PolicyVerdict.DENY,
+                ["rate limit exceeded"],
+                ["rate_limit"],
+                rate_limit_remaining=rate_limiter.remaining,
+                severity=Severity.BLOCK_ACTION,
+            )
         budget.consume()
         return await self._finalize(
             proposal,
@@ -218,6 +280,50 @@ class DefaultControlPlane:
         proposal = self._pending_proposals.get(normalized_id)
         if proposal is not None:
             await self._audit.record_approval_resolution(proposal, approval)
+        return approval
+
+    async def register_pending_proposal(
+        self, approval_id: ApprovalId | str, proposal: ActionProposal
+    ) -> Approval:
+        """Re-link the checkpointed proposal a pending Approval belongs to.
+
+        Durable-resume counterpart to the in-memory bookkeeping ``evaluate``
+        does when it mints an Approval: a fresh process has the Approval
+        (durable ``ApprovalStore``) and the original ``ActionProposal``
+        (durable checkpoint) but no process-local link between them. This
+        restores exactly that link so ``approval_outcome`` re-checks rate
+        limit/budget against the *original* proposal instead of failing
+        closed as a stale approval.
+
+        The proposal is never reconstructed from the (redacted, lossy) Audit
+        snapshot -- the caller must supply the checkpointed proposal, and it
+        must match the Approval's own ``action_id`` exactly. A mismatch
+        raises rather than ever linking a different action. Idempotent:
+        repeating the same registration is a no-op; a conflicting proposal
+        already linked to this Approval raises.
+        """
+        normalized_id = ApprovalId(str(approval_id))
+        approval = await self._approvals.get(normalized_id)
+        if approval is None:
+            raise KeyError(f"no such approval: {approval_id}")
+        if approval.action_id != proposal.action_id:
+            raise ValueError(
+                f"approval {normalized_id} is for action {approval.action_id}; "
+                f"refusing to link proposal {proposal.action_id}"
+            )
+        if proposal.engagement_id not in self._engagements:
+            raise KeyError(
+                f"proposal {proposal.action_id} references unregistered "
+                f"engagement {proposal.engagement_id}"
+            )
+        existing = self._pending_proposals.get(normalized_id)
+        if existing is not None:
+            if existing != proposal:
+                raise ValueError(
+                    f"approval {normalized_id} is already linked to a different proposal"
+                )
+            return approval
+        self._pending_proposals[normalized_id] = proposal
         return approval
 
     async def approval_outcome(self, approval_id: ApprovalId | str) -> PolicyDecision | None:
@@ -274,7 +380,11 @@ class DefaultControlPlane:
         rate_limiter = self._rate_limiters.setdefault(
             proposal.engagement_id, RateLimiter(engagement.rate_limit_policy)
         )
-        if not rate_limiter.allow():
+        # Charge the rate slot exactly once, on actual admission -- the
+        # original REQUIRE_APPROVAL evaluation only *checked* the window
+        # (would_allow) and charged nothing, so charging here is the single
+        # charge for this action, not a second one.
+        if not rate_limiter.would_allow():
             decision = await self._finalize(
                 proposal,
                 PolicyVerdict.DENY,
@@ -303,6 +413,18 @@ class DefaultControlPlane:
             self._resolved_outcomes[normalized_id] = decision
             return decision
 
+        if not rate_limiter.allow():  # defensive: would_allow already checked
+            decision = await self._finalize(
+                proposal,
+                PolicyVerdict.DENY,
+                [f"approval {approval_id} was approved, but rate limit is exceeded now"],
+                ["approval", "rate_limit"],
+                rate_limit_remaining=rate_limiter.remaining,
+                severity=Severity.BLOCK_ACTION,
+                approval_id=normalized_id,
+            )
+            self._resolved_outcomes[normalized_id] = decision
+            return decision
         budget.consume()
         decision = await self._finalize(
             proposal,
@@ -315,6 +437,194 @@ class DefaultControlPlane:
         )
         self._resolved_outcomes[normalized_id] = decision
         return decision
+
+    async def rehydrate(
+        self,
+        engagement_id: EngagementId | str,
+        *,
+        actions_consumed: int,
+        tool_calls_consumed: int | None = None,
+        rate_actions_in_window: int | None = None,
+        elapsed_duration_seconds: float | None = None,
+    ) -> RehydratedAccounting:
+        """Restore a fresh process's accounting for an already-running run.
+
+        A new ``DefaultControlPlane`` (e.g. one rebuilt by ``redteam resume``)
+        starts with empty rate/budget counters, so without this it would hand
+        a resumed run a *fresh* full budget and window. This explicit method
+        re-seeds those counters from the counters the caller read off the
+        durable checkpoint/``RuntimeState``.
+
+        Contract (all enforced here, so a bad caller cannot widen budget):
+
+        - ``engagement_id`` must be one this plane was built for; the
+          original run's id (from the checkpoint) is what ``redteam resume``
+          already passes to ``build_application``. Unknown -> ``KeyError``.
+        - Only bounded integer *counters* are accepted -- never proposal
+          contents, tool output, audit snapshots, or secrets. Values are
+          clamped to the engagement's own limits
+          (``ExecutionBudget.max_actions`` / ``max_tool_calls`` and
+          ``RateLimitPolicy.max_actions_per_minute``) and additionally to a
+          defensive ceiling.
+        - The restore is monotonic: counters are only ever raised, never
+          lowered, so calling this again (or with smaller numbers) can never
+          return already-consumed capacity.
+        - ``actions_consumed`` is the run's executed-action count;
+          ``tool_calls_consumed`` defaults to it and, when supplied, lets a
+          run that used bounded retries restore the extra tool calls the
+          authoritative budget must also account for. ``max_tool_calls`` and
+          the action cap therefore still bind after a restart.
+        - ``rate_actions_in_window`` defaults to ``actions_consumed``
+          (conservative: assume the whole run fell in the trailing window).
+          The sliding window itself is not durable, so restored events are
+          placed at "now" and age out one window later.
+        - ``elapsed_duration_seconds`` is the wall-clock time the original
+          run already spent, persisted by the resume caller (e.g. derived
+          from the checkpointed run's start instant). It is validated
+          (finite, non-negative) and clamped to the engagement's
+          ``max_duration_seconds`` before restore. When a duration cap is
+          configured and no elapsed value is supplied, the restore fails
+          closed -- the duration is treated as already spent instead of
+          restarting the full window on resume. It has no effect on an
+          engagement with no duration cap.
+
+        Scope/ROE/Policy are not touched: they are deterministic against the
+        immutable engagement config and need no restoration.
+        """
+        normalized_id = EngagementId(str(engagement_id))
+        engagement = self._engagements.get(normalized_id)
+        if engagement is None:
+            raise KeyError(f"unregistered engagement: {engagement_id}")
+
+        def _bounded(value: int, *, name: str, ceiling: int) -> int:
+            if value < 0:
+                raise ValueError(f"{name} must be non-negative, got {value}")
+            if value > _MAX_REHYDRATABLE_COUNT:
+                raise ValueError(
+                    f"{name}={value} exceeds the maximum rehydratable count "
+                    f"({_MAX_REHYDRATABLE_COUNT})"
+                )
+            return min(value, ceiling)
+
+        actions = _bounded(
+            actions_consumed,
+            name="actions_consumed",
+            ceiling=engagement.execution_budget.max_actions,
+        )
+        tool_calls = None
+        if tool_calls_consumed is not None:
+            tool_calls = _bounded(
+                tool_calls_consumed,
+                name="tool_calls_consumed",
+                ceiling=(
+                    engagement.execution_budget.max_tool_calls
+                    if engagement.execution_budget.max_tool_calls is not None
+                    else engagement.execution_budget.max_actions
+                ),
+            )
+        window_actions = (
+            actions
+            if rate_actions_in_window is None
+            else _bounded(
+                rate_actions_in_window,
+                name="rate_actions_in_window",
+                ceiling=engagement.rate_limit_policy.max_actions_per_minute,
+            )
+        )
+
+        elapsed = elapsed_duration_seconds
+        if elapsed is not None:
+            if not math.isfinite(elapsed):
+                raise ValueError(
+                    f"elapsed_duration_seconds must be finite, got {elapsed!r}"
+                )
+            if elapsed < 0:
+                raise ValueError(
+                    f"elapsed_duration_seconds must be non-negative, got {elapsed}"
+                )
+            max_duration = engagement.execution_budget.max_duration_seconds
+            if max_duration is not None:
+                elapsed = min(elapsed, float(max_duration))
+
+        budget = self._budgets.setdefault(
+            normalized_id, BudgetTracker(engagement.execution_budget)
+        )
+        budget.rehydrate(
+            actions_consumed=actions,
+            tool_calls_consumed=tool_calls,
+            elapsed_duration_seconds=elapsed,
+        )
+        rate_limiter = self._rate_limiters.setdefault(
+            normalized_id, RateLimiter(engagement.rate_limit_policy)
+        )
+        rate_limiter.rehydrate(window_actions)
+
+        logger.info(
+            "rehydrated control accounting for engagement %s: actions=%d tool_calls=%d",
+            normalized_id,
+            budget.consumed,
+            budget.tool_calls_consumed,
+            extra={"engagement_id": str(normalized_id), "run_restart": True},
+        )
+        return RehydratedAccounting(
+            engagement_id=normalized_id,
+            actions_consumed=budget.consumed,
+            tool_calls_consumed=budget.tool_calls_consumed,
+            rate_actions_in_window=rate_limiter.in_window,
+            budget_remaining=budget.remaining,
+            rate_remaining=rate_limiter.remaining,
+        )
+
+    async def record_tool_calls(
+        self, engagement_id: EngagementId | str, count: int = 1
+    ) -> int:
+        """Charge ``count`` extra tool calls against the authoritative budget.
+
+        Bounded-retry counterpart to ``BudgetTracker.consume_tool_calls``:
+        one admitted action already charged one action + one tool call at
+        ``evaluate`` time, and every retry attempt re-invokes the tool, so
+        the retry must be debited here too or it would exceed the
+        engagement's ``max_tool_calls``/``max_actions`` at the Control Plane
+        (the only authoritative budget; ``RuntimeState.remaining_budget`` is
+        a local mirror).
+
+        Returns the remaining budget after the charge. Raises ``KeyError``
+        for an unknown engagement and ``ValueError`` for a negative count.
+        The tracker must already exist (``evaluate`` creates it on
+        admission, and ``rehydrate`` restores it on resume); if it does not,
+        this creates a fresh one so the charge is still counted, but callers
+        should treat a missing tracker as a resume bug and rehydrate first.
+        """
+        normalized_id = EngagementId(str(engagement_id))
+        engagement = self._engagements.get(normalized_id)
+        if engagement is None:
+            raise KeyError(f"unregistered engagement: {engagement_id}")
+        if count < 0:
+            raise ValueError(f"tool-call count must be non-negative, got {count}")
+        budget = self._budgets.setdefault(
+            normalized_id, BudgetTracker(engagement.execution_budget)
+        )
+        budget.consume_tool_calls(count)
+        return budget.remaining
+
+    async def has_tool_call_capacity(self, engagement_id: EngagementId | str) -> bool:
+        """Whether the authoritative budget still permits one more tool call.
+
+        Bounded-retry callers should check this *before* re-invoking a tool
+        so a retry is never attempted once the engagement's
+        ``max_tool_calls`` / ``max_actions`` (whichever binds first) is
+        exhausted. A missing tracker (no action admitted yet, no rehydrate
+        needed) reports capacity, matching a fresh tracker's initial state;
+        an unknown engagement raises ``KeyError``.
+        """
+        normalized_id = EngagementId(str(engagement_id))
+        engagement = self._engagements.get(normalized_id)
+        if engagement is None:
+            raise KeyError(f"unregistered engagement: {engagement_id}")
+        budget = self._budgets.get(normalized_id)
+        if budget is None:
+            return True
+        return budget.tool_calls_remaining > 0
 
     async def _finalize(
         self,

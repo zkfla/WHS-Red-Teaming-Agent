@@ -20,19 +20,24 @@ from redteam.core.contracts.engagement import (
     RateLimitPolicy,
 )
 from redteam.core.contracts.tool import ToolDescriptor, ToolError
-from redteam.core.enums import ApprovalStatus, GraphNodeType, ToolHealthStatus
-from redteam.core.ids import AgentId, EngagementId, ToolId
+from redteam.core.enums import (
+    ApprovalStatus,
+    EvidenceSourceType,
+    GraphNodeType,
+    ToolHealthStatus,
+)
+from redteam.core.ids import EngagementId, ToolId
 from redteam.orchestration.agents import (
     ANALYSIS_AGENT,
     AgentRegistry,
     builtin_agent_definitions,
 )
-from redteam.orchestration.events import CANDIDATE_REJECTED
 from redteam.orchestration.runner import AgentLoopRunner
 from redteam.orchestration.settings import OrchestrationSettings
 from redteam.orchestration.state import TerminationReason
 from redteam.orchestration.work.models import WorkStatus
 from tests.fakes import build_test_application
+from tests.integration._engine_llm_harness import ScriptedLLM, review_accept
 
 MANIFEST = """<manifest xmlns:android="http://schemas.android.com/apk/res/android"
   package="com.android.insecurebankv2">
@@ -41,6 +46,105 @@ MANIFEST = """<manifest xmlns:android="http://schemas.android.com/apk/res/androi
     <activity android:name=".PostLogin" android:exported="true" />
   </application>
 </manifest>"""
+
+ASSET_NODE_ID = "asset:insecurebankv2"
+PATH_STEP_ID = "analyze-apk"
+PROJECT_DIR = "/work/output/InsecureBankv2"
+
+
+def _draft_path() -> dict:
+    return {
+        "path_id": "path-mobile-analysis",
+        "run_id": "run-scripted",
+        "mission_id": None,
+        "version": 1,
+        "parent_version": None,
+        "status": "draft",
+        "reason": "scripted mobile analysis path",
+        "goal": "analyze the authorized APK",
+        "steps": [
+            {
+                "step_id": PATH_STEP_ID,
+                "objective": "decode and inspect the authorized APK",
+                "agent_id": "analysis-agent",
+                "target_node_ids": [ASSET_NODE_ID],
+                "principal_refs": [],
+                "allowed_operations": ["analysis.static_analysis"],
+                "depends_on": [],
+                "required_fact_refs": [],
+                "unknowns": [],
+                "completion_criteria": [
+                    {
+                        "kind": "evidence",
+                        "description": "APK analysis evidence recorded",
+                        "min_evidence": 1,
+                    }
+                ],
+                "required": True,
+                "status": "pending",
+                "outcome": None,
+                "evidence_ids": [],
+            }
+        ],
+        "hypothesis_ids": [],
+        "evidence_ids": [],
+        "changed_step_ids": [],
+        "review_records": {},
+    }
+
+
+def _turn_action(tool_id: str, arguments: dict | None = None) -> dict:
+    return {
+        "mode": "actions",
+        "reason": f"scripted {tool_id} action",
+        "actions": [
+            {
+                "path_step_id": PATH_STEP_ID,
+                "agent_id": "analysis-agent",
+                "target_node_id": ASSET_NODE_ID,
+                "principal_ref": None,
+                "capability": "analysis",
+                "operation": "static_analysis",
+                "tool_id": tool_id,
+                "arguments": arguments or {},
+                "reason": f"run {tool_id} on the authorized APK",
+                "expected_observation": "bounded static analysis output",
+                "hypothesis": None,
+                "existing_hypothesis_id": None,
+                "expectation": None,
+                "authentication_check": None,
+                "availability_impact": False,
+            }
+        ],
+        "path": None,
+        "path_step_id": None,
+        "completion": {},
+        "evidence_request": {},
+        "hypothesis_update": {},
+    }
+
+
+def _turn_hold() -> dict:
+    return {
+        "mode": "hold",
+        "reason": "scripted hold after the requested analysis actions",
+        "actions": [],
+        "path": None,
+        "path_step_id": None,
+        "completion": {},
+        "evidence_request": {},
+        "hypothesis_update": {},
+    }
+
+
+def _llm_for(*actions: tuple[str, dict]) -> ScriptedLLM:
+    llm = ScriptedLLM()
+    llm.add("path_draft", _draft_path())
+    llm.add("path_review", review_accept())
+    for tool_id, arguments in actions:
+        llm.add("next_action", _turn_action(tool_id, arguments))
+    llm.add("next_action", _turn_hold())
+    return llm
 
 
 class ScriptedApktoolAdapter:
@@ -146,6 +250,7 @@ def _deps(
     engagement: Engagement,
     gateway: MCPToolGateway,
     *,
+    llm: ScriptedLLM,
     settings: OrchestrationSettings | None = None,
 ):
     control = DefaultControlPlane({engagement.engagement_id: engagement})
@@ -158,6 +263,7 @@ def _deps(
         control_plane=control,
         tool_gateway=gateway,
         tool_catalog=gateway,
+        llm_client=llm,
         agents=AgentRegistry(
             [ANALYSIS_AGENT],
             definitions=[analysis_definition],
@@ -171,13 +277,21 @@ async def test_analysis_agent_autonomously_reaches_manifest_findings() -> None:
     engagement = _engagement()
     adapter = ScriptedApktoolAdapter()
     gateway = _gateway(adapter)
-    _, deps = _deps(engagement, gateway)
+    llm = _llm_for(
+        ("analysis.decode_apk", {"apk_path": "/work/input/InsecureBankv2.apk"}),
+        ("analysis.get_manifest", {"project_dir": PROJECT_DIR}),
+        ("analysis.list_smali_files", {"project_dir": PROJECT_DIR}),
+        (
+            "analysis.search_in_files",
+            {"project_dir": PROJECT_DIR, "search_pattern": "password"},
+        ),
+    )
+    _, deps = _deps(engagement, gateway, llm=llm)
 
     final = await run_engagement(engagement, deps=deps)
 
-    assert final.termination_reason == TerminationReason.NO_ACTIONABLE_PLAN
+    assert final.termination_reason == TerminationReason.INVESTIGATION_HELD
     assert final.actions_executed == 4
-    assert final.finished_agents == [AgentId("analysis-agent")]
     assert adapter.calls[0][0] == "decode_apk"
     assert {name for name, _ in adapter.calls[1:]} == {
         "get_manifest",
@@ -185,7 +299,8 @@ async def test_analysis_agent_autonomously_reaches_manifest_findings() -> None:
         "search_in_files",
     }
     evidence = await deps.evidence_store.list_for_run(final.run_id)
-    assert len(evidence) == 4
+    tool_evidence = [item for item in evidence if item.source_type is EvidenceSourceType.TOOL]
+    assert len(tool_evidence) == 4
     service = AttackGraphService(deps.graph_store)
     findings = await service.list_findings(verified=True)
     assert {item.metadata["check_id"] for item in findings} == {
@@ -202,12 +317,16 @@ async def test_analysis_failure_keeps_evidence_without_a_finding() -> None:
     engagement = _engagement()
     adapter = ScriptedApktoolAdapter(fail_decode=True)
     gateway = _gateway(adapter)
-    _, deps = _deps(engagement, gateway)
+    llm = _llm_for(
+        ("analysis.decode_apk", {"apk_path": "/work/input/InsecureBankv2.apk"}),
+    )
+    _, deps = _deps(engagement, gateway, llm=llm)
 
     final = await run_engagement(engagement, deps=deps)
 
     assert final.actions_executed == 1
-    assert len(await deps.evidence_store.list_for_run(final.run_id)) == 1
+    evidence = await deps.evidence_store.list_for_run(final.run_id)
+    assert sum(item.source_type is EvidenceSourceType.TOOL for item in evidence) == 1
     assert await AttackGraphService(deps.graph_store).list_findings() == []
     work = await deps.work_store.list_items(run_id=final.run_id)
     assert [item.status for item in work] == [WorkStatus.FAILED]
@@ -225,7 +344,14 @@ async def test_analysis_approval_resumes_the_same_run_without_bypassing_control(
         checkpoint_path=str(tmp_path / "mobile-analysis-approval.sqlite3"),
         max_steps=30,
     )
-    control, deps = _deps(engagement, gateway, settings=settings)
+    control, deps = _deps(
+        engagement,
+        gateway,
+        llm=_llm_for(
+            ("analysis.decode_apk", {"apk_path": "/work/input/InsecureBankv2.apk"}),
+        ),
+        settings=settings,
+    )
 
     stopped = await run_engagement(engagement, deps=deps)
     assert stopped.termination_reason == TerminationReason.APPROVAL_PENDING
@@ -246,26 +372,29 @@ async def test_analysis_approval_resumes_the_same_run_without_bypassing_control(
     assert resumed.runtime.run_id == stopped.run_id
     assert resumed.runtime.actions_executed == 1
     assert [name for name, _ in adapter.calls] == ["decode_apk"]
-    assert resumed.runtime.pending_approval_id != stopped.pending_approval_id
+    assert resumed.runtime.pending_approval_id is None
 
 
-async def test_analysis_gateway_timeout_is_evidence_not_a_finding(
-) -> None:
+async def test_analysis_gateway_timeout_is_evidence_not_a_finding() -> None:
     engagement = _engagement()
     adapter = ScriptedApktoolAdapter(delay=0.05)
     gateway = _gateway(adapter)
     _, deps = _deps(
         engagement,
         gateway,
+        llm=_llm_for(
+            ("analysis.decode_apk", {"apk_path": "/work/input/InsecureBankv2.apk"}),
+        ),
         settings=OrchestrationSettings(tool_timeout_seconds=0.01, max_steps=30),
     )
 
     final = await run_engagement(engagement, deps=deps)
 
     evidence = await deps.evidence_store.list_for_run(final.run_id)
+    tool_evidence = [item for item in evidence if item.source_type is EvidenceSourceType.TOOL]
     assert final.actions_executed == 1
-    assert len(evidence) == 1
-    assert evidence[0].metadata["success"] is False
+    assert len(tool_evidence) == 1
+    assert tool_evidence[0].metadata["success"] is False
     assert await AttackGraphService(deps.graph_store).list_findings() == []
 
 
@@ -273,13 +402,16 @@ async def test_analysis_schema_drift_rejects_candidate_before_gateway_call() -> 
     engagement = _engagement()
     adapter = ScriptedApktoolAdapter()
     gateway = _gateway(adapter, decode_required=["apk_path", "new_required_field"])
-    _, deps = _deps(engagement, gateway)
+    invalid_action = (
+        "analysis.decode_apk",
+        {"apk_path": "/work/input/InsecureBankv2.apk"},
+    )
+    llm = _llm_for(invalid_action, invalid_action, invalid_action)
+    _, deps = _deps(engagement, gateway, llm=llm)
 
     final = await run_engagement(engagement, deps=deps)
 
     assert final.actions_executed == 0
+    assert final.termination_reason == TerminationReason.PLANNING_ERROR
     assert adapter.calls == []
-    rejected = deps.event_bus.history(event_type=CANDIDATE_REJECTED)
-    assert rejected
-    assert rejected[-1].payload["reason"] == "missing_required_argument"
-    assert rejected[-1].payload["field"] == "new_required_field"
+    assert [call["route"] for call in llm.calls].count("next_action") == 3

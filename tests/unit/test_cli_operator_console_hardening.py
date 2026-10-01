@@ -1,0 +1,589 @@
+"""Operator-console hardening: non-TTY fail-safe, reader stability, concise
+approval notices, same-session pause/resume, and full natural-language routes.
+
+These complement ``test_cli_operator_console.py`` (which covers the tool/policy
+boundary and approval identity) by pinning the failure modes a non-interactive
+or half-broken input channel would otherwise hide:
+
+- stdin is not a TTY -> never claim live input, never block at APPROVAL_PENDING;
+- the prompt reader raising must be *visible* and must disable input;
+- pause must resume through the *same* session's console, not require a restart;
+- operator notices stay one line and ASCII-safe for the plain renderer.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from datetime import datetime, timezone
+from types import SimpleNamespace
+from typing import cast
+from unittest.mock import AsyncMock
+
+import pytest
+
+from redteam.app.cli import renderer
+from redteam.app.cli.commands import run as run_command
+from redteam.core.config import AppConfig
+from redteam.core.contracts.mission import MissionPlan, MissionTask, Provenance
+from redteam.core.enums import (
+    AgentPhase,
+    ApprovalStatus,
+    MissionStatus,
+    OperatorIntentType,
+    TaskStatus,
+)
+from redteam.core.ids import AgentId, ApprovalId, EngagementId, MissionId, RunId, TaskId
+from redteam.event_bus.memory import InMemoryEventBus
+from redteam.orchestration.context import RuntimeDeps
+from redteam.orchestration.operator_intents import (
+    InMemoryOperatorIntentStore,
+    IntentStatus,
+)
+from redteam.orchestration.settings import OrchestrationSettings
+from redteam.orchestration.state import RuntimeState, TerminationReason
+from redteam.orchestration.task_graph.memory import InMemoryTaskGraphStore
+
+NOW = datetime(2026, 1, 1, tzinfo=timezone.utc)
+RUN = RunId("run_hardening")
+ENG = EngagementId("eng_hardening")
+MISSION = MissionId("mission_hardening")
+
+
+def _mission(status: MissionStatus = MissionStatus.ACTIVE) -> MissionPlan:
+    return MissionPlan(
+        mission_id=MISSION,
+        engagement_id=ENG,
+        objective="Assess the declared scope",
+        success_criteria=["evidence-backed result"],
+        status=status,
+        created_at=NOW,
+        updated_at=NOW,
+        provenance=Provenance(source="test"),
+    )
+
+
+def _task() -> MissionTask:
+    return MissionTask(
+        task_id=TaskId("task_web"),
+        mission_id=MISSION,
+        title="task_web",
+        objective="Investigate web surface",
+        status=TaskStatus.READY,
+        priority=10,
+        required_capability="web",
+        assigned_agent=AgentId("web-api-agent"),
+        provenance=Provenance(source="engagement:bootstrap"),
+        created_at=NOW,
+        updated_at=NOW,
+    )
+
+
+def _runtime(
+    reason: str,
+    *,
+    pending_approval_id: ApprovalId | None = None,
+    mission_id: MissionId | None = MISSION,
+) -> RuntimeState:
+    return RuntimeState(
+        run_id=RUN,
+        engagement_id=ENG,
+        phase=AgentPhase.FINISHED,
+        termination_reason=reason,
+        pending_approval_id=pending_approval_id,
+        mission_id=mission_id,
+    )
+
+
+async def _deps(*, with_mission: bool = True) -> SimpleNamespace:
+    task_store = InMemoryTaskGraphStore()
+    if with_mission:
+        await task_store.create_mission(_mission())
+        await task_store.create_task(_task())
+    return SimpleNamespace(
+        operator_intent_store=InMemoryOperatorIntentStore(),
+        task_graph_store=task_store,
+        event_bus=InMemoryEventBus(),
+        control_plane=SimpleNamespace(),
+        tool_gateway=SimpleNamespace(),
+        settings=SimpleNamespace(),
+    )
+
+
+# --- non-TTY: no false "live input", no approval hang ----------------------
+
+
+async def test_non_tty_start_does_not_claim_live_input() -> None:
+    deps = await _deps()
+    lines: list[str] = []
+    console = run_command.OperatorConsole(
+        cast(RuntimeDeps, deps), lines.append, identity=run_command.RuntimeIdentity()
+    )
+
+    assert console.input_available is False  # answerable before start()
+
+    console.start()
+
+    assert console.input_available is False
+    assert console._reader_task is None
+    await console.aclose()
+
+
+async def test_non_tty_approval_fails_safe_without_blocking(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    deps = await _deps()
+    monkeypatch.setattr(run_command, "_stdin_is_interactive", lambda: False)
+    # A real wait would poll forever in a script/CI session.
+    wait = AsyncMock(side_effect=AssertionError("must not block on an unresolvable approval"))
+    monkeypatch.setattr(run_command, "_wait_for_approval", wait)
+    monkeypatch.setattr(
+        run_command,
+        "run_engagement",
+        AsyncMock(
+            return_value=_runtime(
+                TerminationReason.APPROVAL_PENDING, pending_approval_id=ApprovalId("appr_1")
+            )
+        ),
+    )
+    lines: list[str] = []
+
+    final = await run_command.execute(
+        SimpleNamespace(name="Hardening"),
+        cast(RuntimeDeps, deps),
+        config=cast(AppConfig, SimpleNamespace(orchestration=None)),
+        non_interactive=False,
+        on_event=_noop_event,
+        echo=lines.append,
+        allow_operator_input=True,
+    )
+
+    assert final.termination_reason == TerminationReason.APPROVAL_PENDING
+    wait.assert_not_awaited()
+    joined = "\n".join(lines)
+    assert "no interactive input" in joined  # did not claim a live channel
+    assert "appr_1" in joined and "redteam resume" in joined
+
+
+async def test_explicit_external_approval_watch_keeps_plain_cli_alive(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    deps = await _deps()
+    monkeypatch.setattr(run_command, "_stdin_is_interactive", lambda: False)
+    pending = _runtime(
+        TerminationReason.APPROVAL_PENDING, pending_approval_id=ApprovalId("appr_external")
+    )
+    resumed = pending.model_copy(
+        update={"termination_reason": TerminationReason.NO_ACTIONABLE_PLAN}
+    )
+    wait = AsyncMock(return_value=resumed)
+    monkeypatch.setattr(run_command, "_wait_for_approval", wait)
+    monkeypatch.setattr(run_command, "run_engagement", AsyncMock(return_value=pending))
+
+    final = await run_command.execute(
+        SimpleNamespace(name="Plain CLI"), cast(RuntimeDeps, deps),
+        config=cast(AppConfig, SimpleNamespace(orchestration=None)), non_interactive=False,
+        on_event=_noop_event, echo=lambda _line: None,
+        allow_operator_input=True, wait_for_external_approval=True,
+    )
+
+    assert final is resumed
+    wait.assert_awaited_once()
+    assert wait.await_args is not None
+    assert wait.await_args.kwargs["in_session"] is False
+
+
+def test_pending_summary_is_suspended_not_finished(capsys: pytest.CaptureFixture[str]) -> None:
+    run_command._print_summary(
+        _runtime(
+            TerminationReason.APPROVAL_PENDING,
+            pending_approval_id=ApprovalId("appr_suspended"),
+        )
+    )
+    out = capsys.readouterr().out
+    assert "Run suspended:" in out
+    assert "Run finished:" not in out
+
+
+async def test_no_console_approval_fails_safe_without_blocking(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Mirrors `redteam run --json`: operator input is off, but the caller did
+    # not pass --non-interactive. The run must not block on an Approval no one
+    # can resolve through this process.
+    deps = await _deps()
+    wait = AsyncMock(side_effect=AssertionError("must not block without an input channel"))
+    monkeypatch.setattr(run_command, "_wait_for_approval", wait)
+    monkeypatch.setattr(
+        run_command,
+        "run_engagement",
+        AsyncMock(
+            return_value=_runtime(
+                TerminationReason.APPROVAL_PENDING, pending_approval_id=ApprovalId("appr_2")
+            )
+        ),
+    )
+    lines: list[str] = []
+
+    final = await run_command.execute(
+        SimpleNamespace(name="Hardening"),
+        cast(RuntimeDeps, deps),
+        config=cast(AppConfig, SimpleNamespace(orchestration=None)),
+        non_interactive=False,
+        on_event=_noop_event,
+        echo=lines.append,
+        allow_operator_input=False,
+    )
+
+    assert final.termination_reason == TerminationReason.APPROVAL_PENDING
+    wait.assert_not_awaited()
+    assert any("appr_2" in line for line in lines)
+
+
+async def test_non_tty_pause_does_not_block(monkeypatch: pytest.MonkeyPatch) -> None:
+    deps = await _deps()
+    monkeypatch.setattr(run_command, "_stdin_is_interactive", lambda: False)
+    wait = AsyncMock(side_effect=AssertionError("must not wait for an input that is absent"))
+    monkeypatch.setattr(run_command, "_wait_for_pause", wait)
+    monkeypatch.setattr(
+        run_command,
+        "run_engagement",
+        AsyncMock(return_value=_runtime(TerminationReason.OPERATOR_PAUSED)),
+    )
+    lines: list[str] = []
+
+    final = await run_command.execute(
+        SimpleNamespace(name="Hardening"),
+        cast(RuntimeDeps, deps),
+        config=cast(AppConfig, SimpleNamespace(orchestration=None)),
+        non_interactive=False,
+        on_event=_noop_event,
+        echo=lines.append,
+        allow_operator_input=True,
+    )
+
+    assert final.termination_reason == TerminationReason.OPERATOR_PAUSED
+    wait.assert_not_awaited()
+    assert any("paused" in line and "no interactive input" in line for line in lines)
+
+
+async def test_live_console_pause_is_handled_in_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    deps = await _deps()
+    fake = _FakeOperatorConsole(input_available=True)
+    monkeypatch.setattr(run_command, "OperatorConsole", lambda *a, **k: fake)
+    resumed = _runtime("no_actionable_plan")
+    wait = AsyncMock(return_value=resumed)
+    monkeypatch.setattr(run_command, "_wait_for_pause", wait)
+    monkeypatch.setattr(
+        run_command,
+        "run_engagement",
+        AsyncMock(return_value=_runtime(TerminationReason.OPERATOR_PAUSED)),
+    )
+
+    final = await run_command.execute(
+        SimpleNamespace(name="Hardening"),
+        cast(RuntimeDeps, deps),
+        config=cast(AppConfig, SimpleNamespace(orchestration=None)),
+        non_interactive=False,
+        on_event=_noop_event,
+        echo=lambda _line: None,
+        allow_operator_input=True,
+    )
+
+    assert final is resumed
+    wait.assert_awaited_once()
+    assert fake.started and fake.closed
+
+
+async def _noop_event(event: object) -> None:  # noqa: ANN401
+    return None
+
+
+class _FakeOperatorConsole:
+    """Duck-typed console: input availability is explicit so the test does
+    not depend on the host terminal."""
+
+    def __init__(self, *, input_available: bool) -> None:
+        self._input_available = input_available
+        self.started = False
+        self.closed = False
+        self.pending: str | None = None
+
+    def start(self) -> None:
+        self.started = True
+
+    def set_pending_approval(self, value: object) -> None:
+        self.pending = str(value)
+
+    def clear_pending_approval(self) -> None:
+        self.pending = None
+
+    @property
+    def input_available(self) -> bool:
+        return self._input_available
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+# --- reader exceptions: visible and fail-safe ------------------------------
+
+
+class _RaisingSession:
+    def __init__(self, exc: BaseException) -> None:
+        self._exc = exc
+
+    async def prompt_async(self, _prompt: str = "") -> str:
+        raise self._exc
+
+
+def _reader_console(lines: list[str]) -> run_command.OperatorConsole:
+    deps = SimpleNamespace(event_bus=InMemoryEventBus())
+    console = run_command.OperatorConsole(
+        cast(RuntimeDeps, deps), lines.append, identity=run_command.RuntimeIdentity()
+    )
+    console._queue = asyncio.Queue()
+    console._input_live = True
+    return console
+
+
+async def test_reader_exception_is_surfaced_and_disables_input() -> None:
+    lines: list[str] = []
+    console = _reader_console(lines)
+    console._prompt_session = _RaisingSession(RuntimeError("tty went away"))  # type: ignore[assignment]
+
+    await console._read_prompt()
+
+    assert any("operator input stopped" in line for line in lines)
+    assert console.input_available is False
+
+
+async def test_reader_exception_never_prints_a_raw_token() -> None:
+    lines: list[str] = []
+    console = _reader_console(lines)
+    console._prompt_session = _RaisingSession(  # type: ignore[assignment]
+        RuntimeError("prompt failed token=private-value")
+    )
+
+    await console._read_prompt()
+
+    assert "private-value" not in "\n".join(lines)
+    assert "REDACTED" in "\n".join(lines)
+
+
+async def test_reader_eof_is_quiet_and_disables_input() -> None:
+    lines: list[str] = []
+    console = _reader_console(lines)
+    console._prompt_session = _RaisingSession(EOFError())  # type: ignore[assignment]
+
+    await console._read_prompt()
+
+    assert lines == []
+    assert console.input_available is False
+
+
+# --- same-session pause/resume ---------------------------------------------
+
+
+async def test_wait_for_pause_resumes_the_same_mission(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    deps = await _deps()
+    deps.settings = OrchestrationSettings()
+    paused = _runtime(TerminationReason.OPERATOR_PAUSED)
+    calls: list[float] = []
+
+    class _Runner:
+        last_event_id = None
+
+        def __init__(self, _deps: object, *, settings: object = None) -> None:
+            self._settings = settings
+
+        async def reconcile_once(self, runtime, *, timeout_seconds: float):  # noqa: ANN001
+            calls.append(timeout_seconds)
+            mission = await deps.task_graph_store.get_mission(MISSION)
+            await deps.task_graph_store.update_mission(
+                mission.model_copy(
+                    update={
+                        "status": MissionStatus.ACTIVE,
+                        "revision": mission.revision + 1,
+                    }
+                )
+            )
+            return SimpleNamespace(
+                runtime=runtime.model_copy(
+                    update={"termination_reason": "no_actionable_plan"}
+                )
+            )
+
+        async def aclose(self) -> None:
+            return None
+
+    monkeypatch.setattr(run_command, "AgentLoopRunner", _Runner)
+    settle = AsyncMock(side_effect=lambda runtime, _deps, **kw: runtime)
+    monkeypatch.setattr(run_command, "settle_engagement", settle)
+
+    result = await run_command._wait_for_pause(
+        cast(RuntimeDeps, deps), paused, echo=lambda _line: None
+    )
+
+    assert result.termination_reason == "no_actionable_plan"
+    assert calls == [run_command._APPROVAL_POLL_SECONDS_IN_SESSION]
+    settle.assert_awaited_once()
+    mission = await deps.task_graph_store.get_mission(MISSION)
+    assert mission.status is MissionStatus.ACTIVE
+
+
+async def test_wait_for_approval_exits_when_operator_stops_the_mission(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    deps = await _deps()
+    deps.settings = OrchestrationSettings()
+    pending = _runtime(
+        TerminationReason.APPROVAL_PENDING, pending_approval_id=ApprovalId("appr_stop")
+    )
+    calls = 0
+
+    class _Runner:
+        last_event_id = None
+
+        def __init__(self, _deps: object, *, settings: object = None) -> None:
+            pass
+
+        async def reconcile_once(self, runtime, *, timeout_seconds: float):  # noqa: ANN001
+            nonlocal calls
+            calls += 1
+            mission = await deps.task_graph_store.get_mission(MISSION)
+            await deps.task_graph_store.update_mission(
+                mission.model_copy(update={
+                    "status": MissionStatus.CANCELLED, "revision": mission.revision + 1
+                })
+            )
+            return SimpleNamespace(runtime=runtime)
+
+        async def aclose(self) -> None:
+            return None
+
+    monkeypatch.setattr(run_command, "AgentLoopRunner", _Runner)
+    settle = AsyncMock(side_effect=lambda runtime, _deps, **kw: runtime)
+    monkeypatch.setattr(run_command, "settle_engagement", settle)
+
+    result = await asyncio.wait_for(
+        run_command._wait_for_approval(
+            cast(RuntimeDeps, deps), pending, echo=lambda _line: None, in_session=True
+        ),
+        timeout=2,
+    )
+
+    assert calls == 1
+    assert result.termination_reason == TerminationReason.OPERATOR_STOPPED
+    assert result.pending_approval_id is None
+    settle.assert_awaited_once()
+
+
+# --- concise, honest notices ----------------------------------------------
+
+
+def test_welcome_text_is_honest_about_live_input() -> None:
+    live = renderer.operator_welcome_text(live=True)
+    offline = renderer.operator_welcome_text(live=False)
+
+    assert "live input enabled" in live
+    assert "no interactive input" in offline
+    assert "live input" not in offline
+
+
+def test_approval_and_pause_notices_are_single_line_and_actionable() -> None:
+    approval = renderer.operator_approval_prompt_text("appr_9")
+    pending = renderer.operator_approval_pending_text("appr_9", "run_9")
+    paused_live = renderer.operator_paused_text("run_9", live=True)
+    paused_offline = renderer.operator_paused_text("run_9", live=False)
+
+    assert "\n" not in approval
+    assert "\n" not in pending
+    assert "approve" in approval and "deny" in approval
+    assert "redteam approvals approve|deny appr_9" in pending
+    assert "redteam resume run_9" in pending
+    assert "resume" in paused_live
+    assert "no interactive input" in paused_offline
+
+
+# --- full natural-language routes -----------------------------------------
+
+
+class _RecordingControlPlane:
+    def __init__(self) -> None:
+        self.resolved: list[tuple[str, ApprovalStatus, str]] = []
+
+    async def resolve_approval(self, approval_id: object, status: ApprovalStatus, resolved_by: str):
+        self.resolved.append((str(approval_id), status, resolved_by))
+        return SimpleNamespace(approval_id=str(approval_id), status=status)
+
+
+async def _nl_console() -> tuple[run_command.OperatorConsole, list[str]]:
+    deps = await _deps()
+    deps.control_plane = _RecordingControlPlane()
+    lines: list[str] = []
+    identity = run_command.RuntimeIdentity(run_id=RUN, engagement_id=ENG, mission_id=MISSION)
+    return (
+        run_command.OperatorConsole(
+            cast(RuntimeDeps, deps), lines.append, identity=identity, resolved_by="tester"
+        ),
+        lines,
+    )
+
+
+async def test_punctuation_does_not_defeat_console_aliases() -> None:
+    console, _lines = await _nl_console()
+
+    await console.handle_line("status?")
+    await console.handle_line("pause!")
+
+    records = await console._deps.operator_intent_store.list_for_mission(MISSION)  # type: ignore[union-attr]
+    types = [record.intent.intent_type for record in records]
+    assert OperatorIntentType.STATUS_QUERY in types
+    assert OperatorIntentType.PAUSE in types
+
+
+async def test_lone_question_mark_still_shows_help() -> None:
+    console, lines = await _nl_console()
+
+    await console.handle_line("?")
+
+    assert any("operator console commands" in line for line in lines)
+
+
+
+@pytest.mark.parametrize(
+    ("line", "expected"),
+    [
+        ("please pause for a moment", OperatorIntentType.PAUSE),
+        ("stop the mission now", OperatorIntentType.STOP),
+        ("focus on the web surface", OperatorIntentType.FOCUS),
+        ("what is the current status?", OperatorIntentType.STATUS_QUERY),
+        ("why did you stop?", OperatorIntentType.EXPLANATION_QUERY),
+        ("잠시 멈춰줘", OperatorIntentType.PAUSE),
+        ("현재 상태 알려줘", OperatorIntentType.STATUS_QUERY),
+    ],
+)
+async def test_full_sentences_route_to_the_intended_intent(
+    line: str, expected: OperatorIntentType
+) -> None:
+    console, _lines = await _nl_console()
+
+    await console.handle_line(line)
+
+    records = await console._deps.operator_intent_store.list_for_mission(MISSION)  # type: ignore[union-attr]
+    assert records[-1].status is IntentStatus.APPLIED
+    assert records[-1].intent.intent_type is expected
+
+
+async def test_bar_approval_shortcut_still_resolves_exact_approval() -> None:
+    console, _lines = await _nl_console()
+    control_plane = cast(_RecordingControlPlane, console._deps.control_plane)
+    console.set_pending_approval("appr_exact")
+
+    await console.handle_line("approve!")
+
+    assert control_plane.resolved == [("appr_exact", ApprovalStatus.APPROVED, "tester")]

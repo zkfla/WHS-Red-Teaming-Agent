@@ -146,7 +146,20 @@ def check_scope(
     """Returns ``(allowed, reasons, severity)``. Every scope denial is
     ``BLOCK_ACTION``: the agent should try a different (in-scope) target,
     not abandon the goal or the whole run."""
-    if isinstance(action.target, (AssetTarget, DeviceTarget)):
+    if isinstance(action.target, AssetTarget):
+        # asset_ref is the schema-declared identity used by workspace tools.
+        # Authorizing one asset must never allow arguments to select another.
+        if "asset_ref" in action.arguments and action.arguments["asset_ref"] != str(
+            action.target.asset_id
+        ):
+            return (
+                False,
+                ["asset_ref does not match the action's asset target"],
+                Severity.BLOCK_ACTION,
+            )
+        return _check_asset_scope(action.target, scope)
+
+    if isinstance(action.target, DeviceTarget):
         return _check_asset_scope(action.target, scope)
 
     hosts = _target_hosts(action.target)

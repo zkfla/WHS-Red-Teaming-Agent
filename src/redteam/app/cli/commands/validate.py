@@ -29,7 +29,6 @@ from redteam.orchestration.action_naming import canonical_action_key
 def add_parser(subparsers: argparse._SubParsersAction) -> None:
     parser = subparsers.add_parser("validate", help="Validate an Engagement/App config")
     parser.add_argument("engagement_path")
-    parser.add_argument("--config", dest="config_path", default=None)
     parser.add_argument("--json", action="store_true")
     parser.set_defaults(handler=run)
 
@@ -44,11 +43,12 @@ async def run(args: argparse.Namespace) -> int:
     checks.append(("Engagement", True, []))
 
     try:
-        app_config = load_app_config_for_run(args.engagement_path, args.config_path)
+        # This command never calls an LLM (see module docstring) -- an
+        # unset REDTEAM_LLM_PROVIDER must not block a pure config check.
+        app_config = load_app_config_for_run(args.engagement_path, require_llm=False)
     except (OSError, ValidationError, ValueError) as exc:
         return _fail(args, [*checks, ("Application configuration", False, [str(exc)])])
-    if args.config_path is not None:
-        checks.append(("Application configuration", True, []))
+    checks.append(("Application configuration", True, []))
 
     scope_problems = check_scope(engagement_config)
     checks.append(("Scope", not scope_problems, scope_problems))
@@ -74,7 +74,9 @@ async def run(args: argparse.Namespace) -> int:
 
     if ok:
         for name, _, _ in checks:
-            print(f"✓ {name}")
+            # stdout may be a cp949 pipe/console on Windows. A Unicode
+            # checkmark can make a valid legacy YAML exit with code 2.
+            print(f"[OK] {name}")
         print("\nConfiguration valid.")
         return EXIT_OK
     return _fail(args, checks)
@@ -159,6 +161,12 @@ def check_capability(app_config: AppConfig) -> list[str]:
     if len(app_config.capability.mcp_servers) != len(set(app_config.capability.mcp_servers)):
         problems.append("capability.mcp_servers contains duplicate server ids")
     for server_id in app_config.capability.mcp_servers:
+        # The explicit in-process example adapter is a sentinel consumed by
+        # app.bootstrap, not a configured external MCP server. Requiring
+        # REDTEAM_MCP_EXAMPLE_* here made the interactive Preflight reject the
+        # same configuration that `redteam run` correctly accepts.
+        if server_id == "example":
+            continue
         try:
             MCPServerSettings.from_environment(server_id)
         except MCPConfigurationError as exc:

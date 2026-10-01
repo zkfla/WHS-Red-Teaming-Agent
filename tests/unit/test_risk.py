@@ -13,6 +13,7 @@ from redteam.control.policy import evaluate_policy
 from redteam.control.risk import (
     DEFAULT_APPROVAL_RISK_THRESHOLD,
     RegistryRiskResolver,
+    risk_at_or_below,
     risk_meets_threshold,
 )
 from redteam.control.service import DefaultControlPlane
@@ -90,6 +91,12 @@ def test_risk_meets_threshold() -> None:
     assert risk_meets_threshold(RiskLevel.CRITICAL, RiskLevel.HIGH) is True
     assert risk_meets_threshold(RiskLevel.MEDIUM, RiskLevel.HIGH) is False
     assert risk_meets_threshold(RiskLevel.LOW, RiskLevel.LOW) is True
+
+
+def test_risk_at_or_below() -> None:
+    assert risk_at_or_below(RiskLevel.LOW, RiskLevel.HIGH) is True
+    assert risk_at_or_below(RiskLevel.HIGH, RiskLevel.HIGH) is True
+    assert risk_at_or_below(RiskLevel.CRITICAL, RiskLevel.HIGH) is False
 
 
 def test_registry_resolver_takes_highest_risk() -> None:
@@ -193,3 +200,47 @@ async def test_pipeline_risk_resolution_failure_escalates_to_manual_approval() -
 
 def test_default_threshold_is_high() -> None:
     assert DEFAULT_APPROVAL_RISK_THRESHOLD is RiskLevel.HIGH
+
+
+# --- pipeline: engagement-configured threshold -------------------------
+
+
+def _engagement_with(policy: ApprovalPolicy) -> Engagement:
+    return Engagement(
+        engagement_id=EngagementId("eng_risk"),
+        name="risk",
+        scope=EngagementScope(allowed_hosts=["good.local"]),
+        execution_budget=ExecutionBudget(max_actions=5),
+        rate_limit_policy=RateLimitPolicy(max_actions_per_minute=30),
+        approval_policy=policy,
+        created_at=datetime.now(timezone.utc),
+    )
+
+
+async def _evaluate_with(policy: ApprovalPolicy, risk: RiskLevel):
+    engagement = _engagement_with(policy)
+    plane = DefaultControlPlane(
+        {engagement.engagement_id: engagement}, risk_resolver=_FixedRiskResolver(risk)
+    )
+    return await plane.evaluate(
+        _proposal(), ControlContext(engagement_id=engagement.engagement_id)
+    )
+
+
+async def test_pipeline_configured_low_threshold_requires_approval_for_medium() -> None:
+    decision = await _evaluate_with(ApprovalPolicy(risk_threshold=RiskLevel.LOW), RiskLevel.MEDIUM)
+    assert decision.verdict == PolicyVerdict.REQUIRE_APPROVAL
+    assert decision.matched_rules == ["risk:medium"]
+
+
+async def test_pipeline_configured_critical_threshold_allows_medium() -> None:
+    decision = await _evaluate_with(
+        ApprovalPolicy(risk_threshold=RiskLevel.CRITICAL), RiskLevel.MEDIUM
+    )
+    assert decision.verdict == PolicyVerdict.ALLOW
+
+
+async def test_pipeline_unset_threshold_keeps_high_default() -> None:
+    # Medium is below the implicit HIGH default -> allowed, unchanged.
+    decision = await _evaluate_with(ApprovalPolicy(), RiskLevel.MEDIUM)
+    assert decision.verdict == PolicyVerdict.ALLOW

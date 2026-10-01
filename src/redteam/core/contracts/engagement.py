@@ -13,6 +13,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+from redteam.core.enums import RiskLevel
 from redteam.core.ids import ApprovalId, EngagementId
 
 
@@ -68,7 +69,22 @@ class RateLimitPolicy(BaseModel):
 class ApprovalPolicy(BaseModel):
     require_approval_for: list[str] = Field(default_factory=list)
     default_approval_id: ApprovalId | None = None
+    #: Legacy YAML compatibility: ``True`` allows auto-approval of *known LOW*
+    #: risk only. HIGH/CRITICAL and unknown risk always require a human.
     auto_approve: bool = False
+
+    #: Risk level at or above which an otherwise-permitted action needs
+    #: human approval. ``None`` falls back to the Engine default
+    #: (``control.risk.DEFAULT_APPROVAL_RISK_THRESHOLD``), preserving the
+    #: pre-configurable behaviour.
+    risk_threshold: RiskLevel | None = None
+
+    #: Bounded auto-approval: auto-approve an action whose resolved risk is
+    #: at or below this level, and require approval above it. ``None`` means
+    #: no bounded auto-approval. When set, it takes precedence over the
+    #: legacy ``auto_approve`` flag. Unknown (unresolvable) risk is never
+    #: auto-approved under a bounded ceiling, since it may exceed it.
+    auto_approve_up_to: RiskLevel | None = None
 
 
 class Engagement(BaseModel):

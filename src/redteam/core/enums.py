@@ -44,10 +44,65 @@ class RunStatus(str, Enum):
     CANCELLED = "cancelled"
 
 
+class MissionStatus(str, Enum):
+    DRAFT = "draft"
+    ACTIVE = "active"
+    PAUSED = "paused"
+    BLOCKED = "blocked"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+class TaskStatus(str, Enum):
+    PENDING = "pending"
+    READY = "ready"
+    RUNNING = "running"
+    BLOCKED = "blocked"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+class OperatorIntentType(str, Enum):
+    GUIDANCE = "guidance"
+    REPRIORITIZE = "reprioritize"
+    FOCUS = "focus"
+    EXCLUDE = "exclude"
+    PAUSE = "pause"
+    RESUME = "resume"
+    STOP = "stop"
+    EXPLANATION_QUERY = "explanation_query"
+    STATUS_QUERY = "status_query"
+
+
 class PolicyVerdict(str, Enum):
     ALLOW = "allow"
     DENY = "deny"
     REQUIRE_APPROVAL = "require_approval"
+
+
+class Severity(str, Enum):
+    """A Control-side hint about how the orchestrator should react to a
+    non-ALLOW ``PolicyDecision`` (enforcement is Orchestration's, not
+    decided here). Lives in ``core`` -- not ``redteam.control`` -- because
+    ``orchestration`` must read it (``nodes/policy.py``) without importing
+    Control's concrete package (dependency rules; see
+    ``tests/unit/test_control_plane_bypass.py``). ``redteam.control.severity``
+    re-exports this name so existing callers are unaffected.
+
+      - ``BLOCK_ACTION`` -- block only this action; retry a *different
+        action* toward the same goal (one target out of scope, one
+        operation denied, rate limit hit).
+      - ``REPLAN_GOAL`` -- this goal/capability is not viable at all;
+        switch to a *different goal* (a whole capability is ROE-forbidden).
+      - ``ABORT_RUN`` -- nothing more can proceed; end the run (outside
+        the allowed time window, execution budget exhausted).
+    """
+
+    BLOCK_ACTION = "block_action"
+    REPLAN_GOAL = "replan_goal"
+    ABORT_RUN = "abort_run"
 
 
 class Verdict(str, Enum):

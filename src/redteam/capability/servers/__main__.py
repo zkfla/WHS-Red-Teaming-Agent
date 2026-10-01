@@ -12,6 +12,7 @@ def main() -> None:
         "web-http", "web-proxy", "recon-passive", "recon-active", "web-zap", "web-nuclei",
     ])
     parser.add_argument("--policy", required=True)
+    parser.add_argument("--policy-sha256", help="Require exact operator-generated policy bytes")
     parser.add_argument("--capture-path")
     parser.add_argument("--zap-api-origin")
     parser.add_argument("--zap-api-key-env", default="ZAP_API_KEY")
@@ -20,7 +21,7 @@ def main() -> None:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     args = parser.parse_args()
-    policy = ServerPolicy.load(args.policy)
+    policy = ServerPolicy.load(args.policy, expected_sha256=args.policy_sha256)
     if args.role == "web-proxy":
         if not args.capture_path:
             parser.error("web-proxy requires --capture-path")

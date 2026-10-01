@@ -35,6 +35,7 @@ from redteam.core.contracts.action import ActionProposal
 from redteam.core.contracts.policy import Approval, PolicyDecision
 from redteam.core.enums import PolicyVerdict
 from redteam.core.ids import ActionId, ApprovalId, EngagementId, RunId, new_id
+from redteam.core.redaction import redact_sensitive_text
 
 AuditId = NewType("AuditId", str)
 
@@ -49,30 +50,6 @@ _SENSITIVE_KEY_PATTERN = re.compile(
     r"session|csrf|cookie)",
     re.IGNORECASE,
 )
-_SENSITIVE_TEXT_VALUE_PATTERN = re.compile(
-    r"\b(api[_-]?key|access[_-]?token|refresh[_-]?token|session(?:[_-]?(?:id|token))?|"
-    r"csrf(?:[_-]?token)?|token|password|passwd|secret|credential|account|card|ssn|"
-    r"authorization|auth)(\s*[:=]\s*)(\"[^\"]*\"|'[^']*'|[^\s,;]+)",
-    re.IGNORECASE,
-)
-_SENSITIVE_HEADER_PATTERN = re.compile(
-    r"\b(set-cookie|cookie|authorization)(\s*:\s*)[^\r\n]*",
-    re.IGNORECASE,
-)
-
-
-def redact_sensitive_text(value: str) -> str:
-    """Redact credential headers and common key/value secrets in free text."""
-    value = _SENSITIVE_HEADER_PATTERN.sub(
-        lambda match: f"{match.group(1)}{match.group(2)}***REDACTED***",
-        value,
-    )
-    return _SENSITIVE_TEXT_VALUE_PATTERN.sub(
-        lambda match: f"{match.group(1)}{match.group(2)}***REDACTED***",
-        value,
-    )
-
-
 def redact_arguments(value: Any) -> Any:
     """Best-effort redaction of likely-sensitive values before persisting.
 

@@ -1,52 +1,35 @@
-"""CLI smoke tests: real subprocesses, real `build_application()` path,
-the harmless in-process `ExampleMCPAdapter` as the "MCP ping server"
-(section 27 -- no real exploit tooling is exercised by this CLI's own
-tests). Each test runs in its own `tmp_path` so the filesystem-backed
-Approval/Audit/Evidence/report stores never collide across tests.
-"""
+"""CLI persistence and mandatory-model contracts through real commands."""
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import json
+import os
 import sys
 from pathlib import Path
 
 import pytest
 
-pytestmark = pytest.mark.asyncio
+from redteam.app.bootstrap import run_engagement
+from redteam.app.cli.commands import run as run_command
+from redteam.control.approval import ApprovalService
+from redteam.control.audit import AuditLog
+from redteam.control.service import DefaultControlPlane
+from redteam.control.stores.filesystem import FilesystemApprovalStore, FilesystemAuditStore
+from redteam.core.contracts.action import ActionProposal
+from redteam.core.contracts.engagement import ApprovalPolicy
+from redteam.core.contracts.policy import ControlContext
+from redteam.core.contracts.target import HostTarget
+from redteam.core.enums import ApprovalStatus, PolicyVerdict
+from redteam.core.ids import ActionId, AgentId, RunId
+from tests.integration import _engine_llm_harness as h
+from tests.integration.test_end_to_end import _world
 
-_OPEN_ENGAGEMENT = """
-name: "CLI Smoke"
+_ENGAGEMENT = """
+name: CLI Smoke
 scope:
-  allowed_hosts: ["a.local"]
-execution_budget:
-  max_actions: 5
-rate_limit_policy:
-  max_actions_per_minute: 30
-approval_policy:
-  require_approval_for: []
-"""
-
-_APPROVAL_ENGAGEMENT = """
-name: "CLI Smoke Approval"
-scope:
-  allowed_hosts: ["a.local"]
-execution_budget:
-  max_actions: 5
-rate_limit_policy:
-  max_actions_per_minute: 30
-approval_policy:
-  require_approval_for: ["recon"]
-"""
-
-_DENY_ENGAGEMENT = """
-name: "CLI Smoke Deny"
-scope:
-  allowed_hosts: ["a.local"]
-rules_of_engagement:
-  - name: "no-recon"
-    denied_capabilities: ["recon"]
+  allowed_hosts: [host-01]
 execution_budget:
   max_actions: 5
 rate_limit_policy:
@@ -57,165 +40,140 @@ approval_policy:
 
 
 async def _run_cli(*args: str, cwd: Path) -> tuple[int, str, str]:
+    environment = {
+        key: value for key, value in os.environ.items() if not key.startswith("REDTEAM_")
+    }
+    environment["REDTEAM_LLM_PROVIDER"] = "fake"
     proc = await asyncio.create_subprocess_exec(
         sys.executable,
         "-m",
         "redteam.app.cli",
         *args,
         cwd=str(cwd),
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
-    assert proc.returncode is not None
-    return proc.returncode, stdout.decode(), stderr.decode()
-
-
-async def test_full_lifecycle_init_validate_run_status_findings_report(
-    tmp_path: Path,
-) -> None:
-    code, out, _ = await _run_cli("init", "--output", "engagement.yaml", cwd=tmp_path)
-    assert code == 0
-    assert "Created engagement config" in out
-
-    code, out, _ = await _run_cli("validate", "engagement.yaml", cwd=tmp_path)
-    assert code == 0
-    assert "Configuration valid." in out
-
-    code, out, _ = await _run_cli("run", "engagement.yaml", "--non-interactive", cwd=tmp_path)
-    assert code == 0, out
-    run_id = next(line.split("RunId: ")[1].strip() for line in out.splitlines() if "RunId:" in line)
-
-    code, out, _ = await _run_cli("status", run_id, cwd=tmp_path)
-    assert code == 0
-    assert "FINISHED" in out
-
-    code, out, _ = await _run_cli("findings", "list", run_id, cwd=tmp_path)
-    assert code == 0
-
-    code, out, _ = await _run_cli("report", "generate", run_id, cwd=tmp_path)
-    assert code == 0
-    assert "Report generated" in out
-    assert (tmp_path / "reports" / run_id / "report.md").exists()
-
-
-async def test_run_with_json_flag_streams_valid_json_lines(tmp_path: Path) -> None:
-    (tmp_path / "engagement.yaml").write_text(_OPEN_ENGAGEMENT, encoding="utf-8")
-    code, out, _ = await _run_cli(
-        "run", "engagement.yaml", "--non-interactive", "--json", cwd=tmp_path
-    )
-    assert code == 0
-    lines = [line for line in out.splitlines() if line.strip()]
-    assert lines
-    for line in lines:
-        json.loads(line)  # every line is a standalone valid JSON object
-
-
-async def test_roe_denied_engagement_denies_and_still_exits_zero(tmp_path: Path) -> None:
-    """A policy DENY is a correct outcome, not a CLI failure (section 20)."""
-    (tmp_path / "engagement.yaml").write_text(_DENY_ENGAGEMENT, encoding="utf-8")
-    code, out, _ = await _run_cli("run", "engagement.yaml", "--non-interactive", cwd=tmp_path)
-    assert code == 0
-    assert "Actions executed: 0" in out
-
-
-async def test_require_approval_then_approve_resumes_the_same_run(tmp_path: Path) -> None:
-    (tmp_path / "engagement.yaml").write_text(_APPROVAL_ENGAGEMENT, encoding="utf-8")
-
-    proc = await asyncio.create_subprocess_exec(
-        sys.executable,
-        "-m",
-        "redteam.app.cli",
-        "run",
-        "engagement.yaml",
-        cwd=str(tmp_path),
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    try:
-        approval_id = await _wait_for_pending_approval(tmp_path)
-
-        code, out, err = await _run_cli("approvals", "approve", approval_id, cwd=tmp_path)
-        assert code == 0, err
-        assert "-> approved" in out
-
-        stdout, _stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
-        assert proc.returncode == 0
-        text = stdout.decode()
-        assert "ActionApproved" in text
-        assert "Actions executed: 1" in text
-    finally:
-        if proc.returncode is None:
-            proc.kill()
-            await proc.wait()
-
-
-async def test_require_approval_then_deny_never_executes(tmp_path: Path) -> None:
-    (tmp_path / "engagement.yaml").write_text(_APPROVAL_ENGAGEMENT, encoding="utf-8")
-
-    proc = await asyncio.create_subprocess_exec(
-        sys.executable,
-        "-m",
-        "redteam.app.cli",
-        "run",
-        "engagement.yaml",
-        cwd=str(tmp_path),
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    try:
-        approval_id = await _wait_for_pending_approval(tmp_path)
-
-        code, out, err = await _run_cli("approvals", "deny", approval_id, cwd=tmp_path)
-        assert code == 0, err
-        assert "-> rejected" in out
-
-        stdout, _stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
-        assert proc.returncode == 0
-        text = stdout.decode()
-        assert "ActionDenied" in text
-        assert "Actions executed: 0" in text
-    finally:
-        if proc.returncode is None:
-            proc.kill()
-            await proc.wait()
-
-
-async def test_no_subcommand_dispatches_to_interactive_not_run(tmp_path: Path) -> None:
-    """Section 23/26 backward compatibility: bare ``redteam`` takes the
-    new interactive path (banner, then a config-error exit once stdin is
-    immediately closed/empty) -- it must never resolve to `run`'s own
-    argparse-required-subcommand error, and `redteam run ...` itself
-    (exercised by every other test in this file) never goes near this
-    path at all."""
-
-    proc = await asyncio.create_subprocess_exec(
-        sys.executable,
-        "-m",
-        "redteam.app.cli",
-        cwd=str(tmp_path),
+        env=environment,
         stdin=asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    stdout, _stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
-    out = stdout.decode()
+    try:
+        out, err = await asyncio.wait_for(proc.communicate(), timeout=20)
+    finally:
+        if proc.returncode is None:
+            proc.kill()
+            await proc.wait()
+    assert proc.returncode is not None
+    return proc.returncode, out.decode(), err.decode()
 
+
+async def test_init_validate_and_persisted_status_findings_report(tmp_path, monkeypatch):
+    code, out, err = await _run_cli("init", "--output", "engagement.yaml", cwd=tmp_path)
+    assert code == 0, err
+    assert "Created engagement config" in out
+    code, out, err = await _run_cli("validate", "engagement.yaml", cwd=tmp_path)
+    assert code == 0, err
+    assert "Configuration valid." in out
+    monkeypatch.chdir(tmp_path)
+    engagement, deps, gateway = _world()
+    final = await run_engagement(engagement, deps)
+    assert len(gateway.calls) == 1
+    code, out, err = await _run_cli("status", str(final.run_id), cwd=tmp_path)
+    assert code == 0, err
+    assert "FINISHED" in out
+    code, _, err = await _run_cli("findings", "list", str(final.run_id), cwd=tmp_path)
+    assert code == 0, err
+    code, out, err = await _run_cli("report", "generate", str(final.run_id), cwd=tmp_path)
+    assert code == 0, err
+    assert "Report generated" in out
+    assert (tmp_path / "reports" / str(final.run_id) / "report.md").exists()
+
+
+@pytest.mark.parametrize("json_mode", [False, True])
+async def test_fake_provider_is_rejected_before_run(tmp_path, json_mode):
+    (tmp_path / "engagement.yaml").write_text(_ENGAGEMENT, encoding="utf-8")
+    options = ["--json"] if json_mode else []
+    code, out, err = await _run_cli(
+        "run", "engagement.yaml", "--non-interactive", *options, cwd=tmp_path
+    )
+    assert code != 0
+    assert "fake" in err and "Traceback" not in err
+    assert "ToolExecutionStarted" not in out
+    assert not (tmp_path / "data" / "reports").exists()
+
+
+async def test_json_command_streams_actual_events(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("REDTEAM_LLM_PROVIDER", "litellm")
+    monkeypatch.delenv("REDTEAM_MCP_SERVERS", raising=False)
+    path = tmp_path / "engagement.yaml"
+    path.write_text(_ENGAGEMENT, encoding="utf-8")
+    engagement, deps, gateway = _world()
+
+    async def build(config, **kwargs):
+        return engagement, deps
+
+    monkeypatch.setattr(run_command, "build_application", build)
+    code = await run_command.run(
+        argparse.Namespace(
+            engagement_path=str(path),
+            non_interactive=True,
+            json=True,
+            max_steps=None,
+            log_level=None,
+            objective=None,
+        )
+    )
+    assert code == 0 and len(gateway.calls) == 1
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.strip()]
+    assert events and events[-1]["event_type"] == "RunFinished"
+    assert any(event["event_type"] == "ToolExecutionFinished" for event in events)
+
+
+@pytest.mark.parametrize(
+    "command,status",
+    [
+        ("approve", ApprovalStatus.APPROVED),
+        ("deny", ApprovalStatus.REJECTED),
+    ],
+)
+async def test_approval_command_resolves_durable_policy_request(tmp_path, command, status):
+    engagement = h.make_engagement().model_copy(
+        update={
+            "approval_policy": ApprovalPolicy(require_approval_for=["recon"]),
+        }
+    )
+    approvals = ApprovalService(FilesystemApprovalStore(tmp_path / "data" / "approvals"))
+    control = DefaultControlPlane(
+        {engagement.engagement_id: engagement},
+        approvals=approvals,
+        audit_log=AuditLog(FilesystemAuditStore(tmp_path / "data" / "audit")),
+    )
+    proposal = ActionProposal(
+        action_id=ActionId("action-cli"),
+        run_id=RunId("run-cli"),
+        engagement_id=engagement.engagement_id,
+        agent_id=AgentId(h.RECON_AGENT),
+        capability="recon",
+        operation="service_discovery",
+        target=HostTarget(host=h.HOST),
+        arguments={},
+        reason="inspect declared target",
+        created_at=h.utcnow(),
+    )
+    decision = await control.evaluate(
+        proposal, ControlContext(engagement_id=engagement.engagement_id)
+    )
+    assert decision.verdict is PolicyVerdict.REQUIRE_APPROVAL
+    code, out, err = await _run_cli("approvals", command, str(decision.approval_id), cwd=tmp_path)
+    assert code == 0, err
+    assert status.value in out
+    saved = await approvals.get(decision.approval_id)
+    assert saved is not None and saved.status is status
+    code, _, _ = await _run_cli("approvals", command, str(decision.approval_id), cwd=tmp_path)
+    assert code != 0
+
+
+async def test_no_subcommand_dispatches_to_interactive_not_run(tmp_path):
+    code, out, _ = await _run_cli(cwd=tmp_path)
     assert "REDTEAM" in out
-    assert "AI-Powered Security Assessment Framework" in out
     assert "no command handler registered" not in out
-    assert proc.returncode == 2  # EXIT_CONFIG_ERROR, not argparse's usage error
-
-
-async def _wait_for_pending_approval(cwd: Path, *, timeout_seconds: float = 20.0) -> str:
-    deadline = asyncio.get_event_loop().time() + timeout_seconds
-    approvals_dir = cwd / "data" / "approvals"
-    while asyncio.get_event_loop().time() < deadline:
-        if approvals_dir.exists():
-            files = list(approvals_dir.glob("appr_*.json"))
-            if files:
-                payload = json.loads(files[0].read_text(encoding="utf-8"))
-                if payload.get("status") == "pending":
-                    return payload["approval_id"]
-        await asyncio.sleep(0.2)
-    raise TimeoutError("no pending approval appeared in time")
+    assert code == 2

@@ -22,10 +22,8 @@ Two entry points build a ``RuntimeDeps``:
   ``redteam.app.cli`` uses this path exclusively — a real configured LLM
   provider or MCP server reaches a `run` invocation only through here.
 - ``build_runtime_deps(engagement, ...)`` — the original, ``Engagement``-only
-  entry point (always fake LLM, always the in-process dummy adapter
-  unless a caller works around it). Kept for callers that only have a
-  bare ``Engagement`` and no ``AppConfig`` (``examples/minimal_run.py``,
-  most unit/integration tests) — never the CLI.
+  composition helper. It requires an explicitly supplied LLM client;
+  test doubles are injected by tests, never selected automatically.
 """
 
 from __future__ import annotations
@@ -36,11 +34,15 @@ from contextlib import AsyncExitStack
 from datetime import datetime, timezone
 from pathlib import Path
 
+from redteam.app.methodology import load_reference_library, wire_reference_agent
 from redteam.app.report_store import save_terminal_report
 from redteam.attack_graph.service import AttackGraphService
 from redteam.attack_graph.stores.memory import InMemoryAttackGraphStore
 from redteam.attack_graph.stores.namespaced import EngagementScopedAttackGraphStore
+from redteam.attack_graph.stores.sqlite import SQLiteAttackGraphStore
 from redteam.capability.bootstrap import build_mcp_tool_gateway, open_mcp_tool_gateway
+from redteam.capability.gateway import MCPToolGateway
+from redteam.capability.registry import MCPToolRegistry
 from redteam.control.approval import ApprovalService
 from redteam.control.audit import AuditLog
 from redteam.control.risk import RegistryRiskResolver
@@ -56,19 +58,20 @@ from redteam.core.config import (
 )
 from redteam.core.contracts.engagement import Engagement
 from redteam.core.contracts.events import EventEnvelope, EventType
-from redteam.core.enums import AgentPhase
+from redteam.core.enums import AgentPhase, GraphNodeType, MissionStatus, TaskStatus
 from redteam.core.ids import EngagementId, EventId, RunId, new_id
 from redteam.core.ports.attack_graph import AttackGraphStore
 from redteam.core.ports.control_plane import ControlPlane
 from redteam.core.ports.event_bus import EventBus
 from redteam.core.ports.evidence_store import EvidenceStore
 from redteam.core.ports.llm import LLMClient
+from redteam.core.ports.task_graph import MissionTaskStore
 from redteam.core.ports.tool_catalog import ToolCatalog
 from redteam.core.ports.tool_gateway import ToolGateway
 from redteam.event_bus.memory import InMemoryEventBus
+from redteam.event_bus.publisher import EventPublisher
 from redteam.evidence.service import EvidenceService
 from redteam.evidence.stores.filesystem import FilesystemEvidenceStore
-from redteam.llm.fake import FakeLLMClient
 from redteam.orchestration.agents.providers import (
     CandidateProviderRegistry,
     default_provider_registry,
@@ -76,16 +79,27 @@ from redteam.orchestration.agents.providers import (
 from redteam.orchestration.agents.registry import AgentRegistry, default_registry
 from redteam.orchestration.context import RuntimeDeps
 from redteam.orchestration.events import REPORT_PROJECTED
+from redteam.orchestration.mission_bootstrap import bootstrap_mission
+from redteam.orchestration.operator_intents import build_operator_intent_store
+from redteam.orchestration.replanning import finalize_mission
 from redteam.orchestration.reporting import ReportingAgent
 from redteam.orchestration.runner import AgentLoopRunner
 from redteam.orchestration.seed import seed_from_engagement
 from redteam.orchestration.settings import OrchestrationSettings
 from redteam.orchestration.state import RuntimeState, TerminationReason
+from redteam.orchestration.task_graph.memory import InMemoryTaskGraphStore
+from redteam.orchestration.task_graph.sqlite import SQLiteTaskGraphStore
 from redteam.orchestration.work.memory import InMemoryWorkStore
 from redteam.orchestration.work.sqlite import SQLiteWorkStore
 from redteam.orchestration.work.store import WorkStore
 
 logger = logging.getLogger(__name__)
+
+#: The one, explicit, self-documenting way to request the in-process
+#: ExampleMCPAdapter test/dev fixture from `capability.mcp_servers` --
+#: never chosen automatically (see `build_application`'s tool-gateway
+#: resolution and `_empty_tool_gateway`).
+EXAMPLE_MCP_SENTINEL = "example"
 
 
 def load_engagement(path: str | Path) -> Engagement:
@@ -100,11 +114,15 @@ def load_engagement(path: str | Path) -> Engagement:
 
 
 def build_llm_client(config: LLMConfig) -> LLMClient:
+    """Build the mandatory real model; test clients require explicit injection."""
     if config.provider == "litellm":
         from redteam.llm.litellm import LiteLLMClient
 
         return LiteLLMClient(model=config.default_model, api_key=config.resolve_api_key())
-    return FakeLLMClient()
+    raise ValueError(
+        f"production requires a real LLM provider, received {config.provider!r}; "
+        "configure 'litellm' (test clients must be explicitly injected)"
+    )
 
 
 async def _build_default_capability(
@@ -121,18 +139,44 @@ async def _build_default_tool_gateway(config: CapabilityConfig) -> ToolGateway:
     return gateway
 
 
+def _empty_tool_gateway() -> MCPToolGateway:
+    """A real, zero-tool ``MCPToolGateway`` -- no adapters, nothing to invoke.
+
+    ``build_application`` (the real ``redteam run``/CLI production path)
+    uses this instead of ``capability.bootstrap.build_mcp_tool_gateway([])``
+    when no MCP server is configured, so an unconfigured deployment gets an
+    honest empty catalog (visible via ``redteam tools list`` / the
+    ``AGENT_NO_EXECUTABLE_CANDIDATES`` event) rather than the harmless
+    in-process ``ExampleMCPAdapter`` silently standing in as if a real
+    tool had run. ``ExampleMCPAdapter`` itself is unchanged and remains
+    available exactly as before via an explicit
+    ``build_mcp_tool_gateway([])``/``build_runtime_deps`` call -- both are
+    test/example fixtures, never something this function reaches for.
+    """
+    return MCPToolGateway(MCPToolRegistry(), {})
+
+
 async def build_runtime_deps(
     engagement: Engagement,
     evidence_dir: str | Path = "data/evidence",
     audit_dir: str | Path = "data/audit",
     approval_dir: str | Path = "data/approvals",
     *,
+    llm: LLMClient,
     orchestration_settings: OrchestrationSettings | None = None,
     agents: AgentRegistry | None = None,
     candidate_providers: CandidateProviderRegistry | None = None,
     tool_catalog: ToolCatalog | None = None,
+    task_graph_store: MissionTaskStore | None = None,
 ) -> RuntimeDeps:
     """Wire in-memory/dummy backends for every port, from an ``Engagement`` alone.
+
+    A **test/example-only composition helper** -- never a second
+    production entry point, and never conflated with ``build_application``
+    (the sole production path, used by every CLI command that executes an
+    Engagement). It exists for callers that only have a bare ``Engagement``
+    and no ``AppConfig`` at all: ``examples/minimal_run.py`` and most
+    unit/integration test fixtures. The CLI never calls this function.
 
     TODO(each-team): swap in your real backend here once it's ready —
     e.g. Capability Team adds real ``MCPAdapter``s to
@@ -147,6 +191,8 @@ async def build_runtime_deps(
     full ``AppConfig`` available — it reads the LLM/Capability/Logging
     sections this function doesn't.
     """
+    if llm is None:
+        raise ValueError("an explicit LLM client is required")
     event_bus = InMemoryEventBus()
     # Namespaced even though this builds one fresh store per call, so an
     # Engagement never silently depends on being the store's only tenant —
@@ -168,7 +214,6 @@ async def build_runtime_deps(
         # Risk-tiered approval reads tool risk_level from the Registry.
         risk_resolver=RegistryRiskResolver(discovered_catalog),
     )
-    llm_client = FakeLLMClient()
     settings = orchestration_settings or OrchestrationSettings()
 
     return RuntimeDeps(
@@ -177,17 +222,36 @@ async def build_runtime_deps(
         event_bus=event_bus,
         graph_store=graph_store,
         evidence_store=evidence_store,
-        llm_client=llm_client,
+        llm_client=llm,
+        engagement=engagement,
         agents=agents if agents is not None else default_registry(),
         candidate_providers=(
-            candidate_providers
-            if candidate_providers is not None
-            else default_provider_registry()
+            candidate_providers if candidate_providers is not None else default_provider_registry()
         ),
         tool_catalog=(tool_catalog if tool_catalog is not None else discovered_catalog),
         work_store=_build_work_store(settings),
+        task_graph_store=(task_graph_store or _build_task_graph_store(settings)),
+        path_store=_build_path_store(settings),
+        operator_intent_store=build_operator_intent_store(
+            settings.operator_intent_backend, settings.operator_intent_path
+        ),
+        tool_semaphore=asyncio.Semaphore(engagement.rate_limit_policy.max_concurrent_actions),
         settings=settings,
     )
+
+
+def _build_task_graph_store(settings: OrchestrationSettings) -> MissionTaskStore:
+    if settings.task_graph_backend == "sqlite":
+        return SQLiteTaskGraphStore(settings.task_graph_path)
+    return InMemoryTaskGraphStore()
+
+
+def _build_path_store(settings: OrchestrationSettings):
+    from redteam.orchestration.paths import InMemoryPathStore, SQLitePathStore
+
+    if settings.path_backend == "sqlite" or settings.task_graph_backend == "sqlite":
+        return SQLitePathStore(settings.task_graph_path)
+    return InMemoryPathStore()
 
 
 def _build_work_store(settings: OrchestrationSettings) -> WorkStore:
@@ -213,6 +277,9 @@ async def build_application(
     agents: AgentRegistry | None = None,
     candidate_providers: CandidateProviderRegistry | None = None,
     tool_catalog: ToolCatalog | None = None,
+    task_graph_store: MissionTaskStore | None = None,
+    engagement_id: EngagementId | None = None,
+    long_job_adapter=None,
 ) -> tuple[Engagement, RuntimeDeps]:
     """``AppConfig``-aware composition root. Every dependency is overridable.
 
@@ -221,8 +288,7 @@ async def build_application(
     - ``config.engagement`` -> ``Engagement`` handed to the default
       ``ControlPlane`` (and returned alongside ``RuntimeDeps`` — callers
       pass it to ``run_engagement``).
-    - ``config.llm`` -> ``build_llm_client`` (``FakeLLMClient`` unless
-      ``provider: "litellm"``).
+    - ``config.llm`` -> ``build_llm_client`` (requires ``provider: "litellm"``).
     - ``config.capability`` -> ``_build_default_tool_gateway``.
     - ``config.orchestration`` -> ``OrchestrationSettings.from_config``;
       an explicit ``orchestration_settings`` may additionally select durable
@@ -236,7 +302,23 @@ async def build_application(
     """
     logging.basicConfig(level=config.logging.level)
 
-    engagement = config.engagement.to_engagement(engagement_id=EngagementId(new_id("eng")))
+    from redteam.app.mcp_deployment import synchronize_deployment
+
+    config = config.model_copy(update={
+        "engagement": synchronize_deployment(config.engagement, config.capability.mcp_servers)
+    })
+
+    library = (
+        load_reference_library(config.capability.methodology)
+        if config.capability.methodology is not None
+        else None
+    )
+    resolved_engagement_id = engagement_id or (
+        EngagementId(library.engagement_id) if library is not None else EngagementId(new_id("eng"))
+    )
+    if library is not None and str(resolved_engagement_id) != library.engagement_id:
+        raise ValueError("methodology_engagement_mismatch")
+    engagement = config.engagement.to_engagement(engagement_id=resolved_engagement_id)
 
     # Build the evidence store first so both the Control Plane (blocked
     # actions) and Orchestration (executed results) share one store.
@@ -244,8 +326,26 @@ async def build_application(
     # Resolve the tool gateway before the Control Plane so the latter can
     # read tool risk_level from the Registry for risk-tiered approval.
     resolved_tool_catalog = tool_catalog
+    resolved_tool_gateway: ToolGateway
+    discovered_catalog: ToolCatalog
     if tool_gateway is None:
-        if mcp_stack is None:
+        if not config.capability.mcp_servers:
+            # No MCP server configured for this run: an honest empty
+            # catalog, never the in-process ExampleMCPAdapter (that fallback
+            # made a misconfigured/unconfigured deployment look like a real
+            # tool had executed -- see `_empty_tool_gateway`).
+            discovered_catalog = _empty_tool_gateway()
+            resolved_tool_gateway = discovered_catalog
+        elif config.capability.mcp_servers == [EXAMPLE_MCP_SENTINEL]:
+            # Explicit, deliberate opt-in to the harmless in-process test
+            # fixture (never automatic -- see `_empty_tool_gateway`'s
+            # docstring). The only way to reach this from a `redteam`
+            # subprocess is to actually write this exact value, e.g.
+            # `REDTEAM_MCP_SERVERS=example` or `capability.mcp_servers:
+            # ["example"]` -- there is no default path that produces it.
+            discovered_catalog = await build_mcp_tool_gateway([])
+            resolved_tool_gateway = discovered_catalog
+        elif mcp_stack is None:
             resolved_tool_gateway, discovered_catalog = await _build_default_capability(
                 config.capability
             )
@@ -272,14 +372,30 @@ async def build_application(
         ),
     )
     resolved_event_bus = event_bus or InMemoryEventBus()
-    resolved_attack_graph = attack_graph or EngagementScopedAttackGraphStore(
-        InMemoryAttackGraphStore(), engagement_id=engagement.engagement_id
-    )
-    resolved_llm = llm or build_llm_client(config.llm)
     resolved_settings = orchestration_settings or OrchestrationSettings.from_config(
         config.orchestration
     )
+    resolved_attack_graph = attack_graph or EngagementScopedAttackGraphStore(
+        SQLiteAttackGraphStore(resolved_settings.attack_graph_path)
+        if resolved_settings.attack_graph_backend == "sqlite"
+        else InMemoryAttackGraphStore(),
+        engagement_id=engagement.engagement_id,
+    )
+    resolved_llm = llm or build_llm_client(config.llm)
 
+    resolved_agents = agents if agents is not None else default_registry()
+    resolved_providers = (
+        candidate_providers if candidate_providers is not None else default_provider_registry()
+    )
+    if library is not None:
+        if (
+            library.asset_ref not in engagement.scope.allowed_assets
+            or library.asset_ref in engagement.scope.denied_assets
+        ):
+            raise ValueError("methodology_asset_not_in_approved_scope")
+        resolved_agents, resolved_providers = wire_reference_agent(
+            library, resolved_tool_catalog, resolved_agents, resolved_providers
+        )
     deps = RuntimeDeps(
         control_plane=resolved_control_plane,
         tool_gateway=resolved_tool_gateway,
@@ -287,14 +403,19 @@ async def build_application(
         graph_store=resolved_attack_graph,
         evidence_store=resolved_evidence_store,
         llm_client=resolved_llm,
-        agents=agents if agents is not None else default_registry(),
-        candidate_providers=(
-            candidate_providers
-            if candidate_providers is not None
-            else default_provider_registry()
-        ),
+        engagement=engagement,
+        agents=resolved_agents,
+        candidate_providers=resolved_providers,
+        methodology_library=library,
         tool_catalog=resolved_tool_catalog,
         work_store=_build_work_store(resolved_settings),
+        task_graph_store=(task_graph_store or _build_task_graph_store(resolved_settings)),
+        path_store=_build_path_store(resolved_settings),
+        long_job_adapter=long_job_adapter,
+        operator_intent_store=build_operator_intent_store(
+            resolved_settings.operator_intent_backend, resolved_settings.operator_intent_path
+        ),
+        tool_semaphore=asyncio.Semaphore(engagement.rate_limit_policy.max_concurrent_actions),
         settings=resolved_settings,
     )
     return engagement, deps
@@ -306,14 +427,22 @@ async def _publish_terminal_artifacts(
     *,
     error_type: str | None = None,
     causation_id: str | None = None,
+    publish_run_finished: bool = True,
 ) -> None:
     """Project and publish a report for every terminal outcome."""
 
+    path = await deps.path_store.get_active(str(runtime.run_id))
+    required_hypotheses = {
+        criterion.hypothesis_id for step in path.steps if step.required
+        for criterion in step.completion_criteria if criterion.hypothesis_id
+    } if path else set()
     report = await ReportingAgent().project(
         runtime,
         graph=AttackGraphService(deps.graph_store),
         evidence_store=deps.evidence_store,
         work_store=deps.work_store,
+        task_store=deps.task_graph_store,
+        required_hypothesis_ids=required_hypotheses,
     )
     try:
         # The only thing that makes `redteam status`/`findings`/`report`
@@ -343,6 +472,10 @@ async def _publish_terminal_artifacts(
         },
     )
     await deps.event_bus.publish(report_event)
+    if not publish_run_finished:
+        # Approval is a suspension: the partial projection remains inspectable,
+        # but a RUN_FINISHED event would falsely end the same resumable run.
+        return
     run_finished = EventEnvelope(
         event_id=EventId(new_id("evt")),
         event_type=EventType.RUN_FINISHED,
@@ -368,6 +501,9 @@ async def run_engagement(
     engagement: Engagement,
     deps: RuntimeDeps | None = None,
     orchestration_config: OrchestrationConfig | None = None,
+    *,
+    objective: str | None = None,
+    run_id: RunId | None = None,
 ) -> RuntimeState:
     """Runs one engagement: OBSERVE -> ... -> REPLAN, looping until a
     terminal phase (instruction.md section 16, now with real re-planning).
@@ -383,7 +519,8 @@ async def run_engagement(
     frontier, so without this the planner would have nothing to choose
     from on the first turn.
     """
-    deps = deps if deps is not None else await build_runtime_deps(engagement)
+    if deps is None:
+        raise ValueError("run_engagement requires dependencies with an explicitly configured LLM")
     settings = deps.settings
     if orchestration_config is not None:
         settings = settings.model_copy(
@@ -392,9 +529,45 @@ async def run_engagement(
                 "max_retries": orchestration_config.max_retries,
             }
         )
-    run_id = RunId(new_id("run"))
+    library = deps.methodology_library
+    run_id = run_id or (RunId(library.run_id) if library is not None else RunId(new_id("run")))
+    if library is not None:
+        library.check_context(engagement.engagement_id, run_id)
+        if (
+            library.asset_ref not in engagement.scope.allowed_assets
+            or library.asset_ref in engagement.scope.denied_assets
+        ):
+            raise ValueError("methodology_asset_not_in_approved_scope")
+        if await deps.evidence_store.list_for_run(run_id):
+            raise ValueError("methodology_run_already_has_evidence_use_resume")
 
     await seed_from_engagement(AttackGraphService(deps.graph_store), engagement, run_id=run_id)
+    if library is not None:
+        from redteam.attack_graph.predicates import Confidence, Provenance
+
+        await AttackGraphService(deps.graph_store).upsert_node(
+            GraphNodeType.ASSET,
+            key=library.asset_ref,
+            attrs={"in_scope": True},
+            facts={"methodology_reference_ids": [e.reference_id for e in library.entries]},
+            provenance=Provenance(
+                source="operator:methodology",
+                run_id=str(run_id),
+                confidence=Confidence.SERVER_DECLARED,
+            ),
+        )
+
+    # Task-first runtime: open a Mission and seed its initial Task Graph so the
+    # Orchestrator schedules Task -> Agent, not Agent first. Additive — a run
+    # without this still schedules via agent rotation (the mission_id is then
+    # None). Secret-free: only scope metadata and role names are used.
+    mission_id = await bootstrap_mission(
+        deps.task_graph_store,
+        deps.agents,
+        engagement,
+        objective=objective,
+        now=datetime.now(timezone.utc),
+    )
 
     run_started = EventEnvelope(
         event_id=EventId(new_id("evt")),
@@ -407,18 +580,42 @@ async def run_engagement(
         payload={"engagement_id": engagement.engagement_id},
     )
     await deps.event_bus.publish(run_started)
+    lifecycle = EventPublisher(
+        deps.event_bus,
+        run_id=run_id,
+        engagement_id=engagement.engagement_id,
+        source="app.bootstrap",
+    )
+    mission_created = await lifecycle.publish(
+        EventType.MISSION_CREATED,
+        {"mission_id": mission_id},
+        causation_id=run_started.event_id,
+    )
+    bootstrap_event_id = mission_created.event_id
+    for task in await deps.task_graph_store.list_tasks(mission_id=mission_id):
+        task_created = await lifecycle.publish(
+            EventType.TASK_CREATED,
+            {"mission_id": mission_id, "task_id": task.task_id},
+            causation_id=bootstrap_event_id,
+        )
+        bootstrap_event_id = task_created.event_id
 
+    saved_mission = await deps.task_graph_store.get_mission(mission_id)
+    if saved_mission is None:
+        raise RuntimeError("created mission is missing from the task store")
     initial_runtime = RuntimeState(
         run_id=run_id,
         engagement_id=engagement.engagement_id,
+        started_at=datetime.now(timezone.utc),
         phase=AgentPhase.OBSERVE,
-        current_goal=f"map and probe the declared scope of {engagement.name}",
+        mission_id=mission_id,
+        current_goal=saved_mission.objective,
         remaining_budget=engagement.execution_budget.max_actions,
     )
     runner = AgentLoopRunner(deps, settings=settings)
     try:
         try:
-            runtime = await runner.run(initial_runtime, initial_event_id=run_started.event_id)
+            runtime = await runner.run(initial_runtime, initial_event_id=bootstrap_event_id)
         except BaseException as exc:
             recovered_runtime = runner.failure_runtime or initial_runtime
             failed_runtime = recovered_runtime.model_copy(
@@ -446,11 +643,63 @@ async def run_engagement(
             except Exception:  # noqa: BLE001 - never mask the run failure
                 pass
             raise
-        await _publish_terminal_artifacts(
-            runtime,
-            deps,
-            causation_id=str(runner.last_event_id) if runner.last_event_id else None,
-        )
-        return runtime
+        return await settle_engagement(runtime, deps, last_event_id=runner.last_event_id)
     finally:
         await runner.aclose()
+
+
+async def settle_engagement(
+    runtime: RuntimeState,
+    deps: RuntimeDeps,
+    *,
+    last_event_id: EventId | None = None,
+) -> RuntimeState:
+    """Project a run outcome, including one resumed after human approval."""
+    if runtime.termination_reason == TerminationReason.OPERATOR_PAUSED:
+        # A pause is a checkpointed suspension, not a terminal result/report.
+        # Leave required Tasks, Mission status and pending Action linkage intact.
+        return runtime.model_copy(update={"mission_status": MissionStatus.PAUSED})
+    # A pending approval is a suspended run. Settling its active Task would
+    # break the exact proposal's resume path.
+    if (
+        runtime.mission_id is not None
+        and runtime.termination_reason != TerminationReason.APPROVAL_PENDING
+    ):
+        last_event_id = await finalize_mission(
+            deps.task_graph_store,
+            runtime.mission_id,
+            publisher=EventPublisher(
+                deps.event_bus,
+                run_id=runtime.run_id,
+                engagement_id=runtime.engagement_id,
+                source="app.bootstrap",
+            ),
+            last_event_id=last_event_id,
+            evidence_store=deps.evidence_store,
+            run_id=runtime.run_id,
+        )
+        mission = await deps.task_graph_store.get_mission(runtime.mission_id)
+        if mission is not None:
+            updates: dict[str, object] = {"mission_status": mission.status}
+            # A Mission can end BLOCKED with no blocked Task: an unmet success
+            # criterion (for example a target that returned no usable
+            # evidence) is not the same as work the plan itself could not
+            # reach. Only the latter -- an actual BLOCKED Task -- is reported
+            # as MISSION_BLOCKED; otherwise the historical run-level reason
+            # (no_actionable_plan) stands and the Mission status/report carry
+            # the unmet criteria.
+            if (
+                mission.status is MissionStatus.BLOCKED
+                and runtime.termination_reason == TerminationReason.NO_ACTIONABLE_PLAN
+            ):
+                tasks = await deps.task_graph_store.list_tasks(mission_id=runtime.mission_id)
+                if any(task.status is TaskStatus.BLOCKED for task in tasks):
+                    updates["termination_reason"] = TerminationReason.MISSION_BLOCKED
+            runtime = runtime.model_copy(update=updates)
+    await _publish_terminal_artifacts(
+        runtime,
+        deps,
+        causation_id=str(last_event_id) if last_event_id else None,
+        publish_run_finished=runtime.termination_reason != TerminationReason.APPROVAL_PENDING,
+    )
+    return runtime

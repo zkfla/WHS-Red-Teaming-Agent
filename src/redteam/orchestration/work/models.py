@@ -47,6 +47,11 @@ class WorkItem(BaseModel):
     candidate_key: str
     agent_id: AgentId
     graph_revision: int = Field(default=0, ge=0)
+    path_id: str | None = None
+    path_version: int | None = None
+    path_step_id: str | None = None
+    mission_task_id: str | None = None
+    job_id: str | None = None
     target_node_ids: list[GraphNodeId]
     hypothesis_id: HypothesisId | None = None
     prerequisite_ids: list[str] = Field(default_factory=list)
@@ -79,3 +84,11 @@ class TaskLease(BaseModel):
     issued_at: datetime
     expires_at: datetime
     heartbeat_at: datetime
+
+
+def is_unexecuted_stale(item: WorkItem) -> bool:
+    if item.status is not WorkStatus.STALE:
+        return False
+    if item.job_id:
+        return False
+    return item.attempt == 0 or item.outcome_reason == "invalidated_before_execution"

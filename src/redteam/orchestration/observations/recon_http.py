@@ -22,7 +22,6 @@ request, and GET is fixed by this tool.
 
 from __future__ import annotations
 
-import re
 from typing import Any
 
 from redteam.attack_graph.identity import endpoint_node_id, host_node_id, service_node_id
@@ -30,6 +29,7 @@ from redteam.core.contracts.target import AnyTarget, HostTarget
 from redteam.core.contracts.tool import ToolResult
 from redteam.core.enums import GraphEdgeType, GraphNodeType
 from redteam.orchestration.authentication import request_key
+from redteam.orchestration.observations._shared import is_hex64
 from redteam.orchestration.observations.mapper import (
     EdgeMutation,
     GraphMutation,
@@ -39,7 +39,6 @@ from redteam.orchestration.observations.mapper import (
 
 _APPLICATION_PROTOCOL = "http"
 _METHOD = "GET"
-_HEX_64 = re.compile(r"^[0-9a-fA-F]{64}$")
 
 
 def map_recon_http_probe(
@@ -89,8 +88,7 @@ def map_recon_http_probe(
             "x-content-type-options",
             "cache-control",
         }
-        or not isinstance(digest, str)
-        or _HEX_64.fullmatch(digest) is None
+        or not is_hex64(digest)
         or output.get("body_omitted") is not True
         or type(output.get("body_bytes")) is not int
         or output["body_bytes"] < 0

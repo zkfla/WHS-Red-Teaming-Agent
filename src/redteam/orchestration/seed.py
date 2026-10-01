@@ -6,7 +6,13 @@ planner; the Control Plane still decides whether acting on it is allowed.
 
 from __future__ import annotations
 
-from redteam.attack_graph.predicates import Confidence, Provenance
+from redteam.attack_graph.predicates import (
+    Confidence,
+    Provenance,
+    attrs_of,
+    facts_of,
+    provenance_of,
+)
 from redteam.attack_graph.service import AttackGraphService
 from redteam.core.contracts.engagement import Engagement
 from redteam.core.contracts.graph import GraphNode
@@ -61,8 +67,7 @@ async def seed_from_engagement(
 ) -> list[GraphNode]:
     """Create one in-scope node per allowed host/domain and mobile asset."""
     denied = {
-        host.lower()
-        for host in (*engagement.scope.denied_hosts, *engagement.scope.denied_domains)
+        host.lower() for host in (*engagement.scope.denied_hosts, *engagement.scope.denied_domains)
     }
     declared = [
         value
@@ -82,8 +87,7 @@ async def seed_from_engagement(
 
     target_refs = engagement.metadata.get("target_refs", {})
     if not isinstance(target_refs, dict) or any(
-        not isinstance(host, str) or not host.strip()
-        or not isinstance(ref, str) or not ref.strip()
+        not isinstance(host, str) or not host.strip() or not isinstance(ref, str) or not ref.strip()
         for host, ref in target_refs.items()
     ):
         raise ValueError(
@@ -159,8 +163,10 @@ async def seed_from_engagement(
                 GraphNodeType.HOST,
                 key=value,
                 attrs={"in_scope": True},
-                facts={"target_ref": target_refs.get(value, value),
-                       "auth_session_config": {"sessions": auth_sessions.get(value, [])}},
+                facts={
+                    "target_ref": target_refs.get(value, value),
+                    "auth_session_config": {"sessions": auth_sessions.get(value, [])},
+                },
                 labels=[SCOPE_LABEL],
                 provenance=provenance,
                 step=step,
@@ -192,3 +198,49 @@ async def seed_from_engagement(
             )
         )
     return seeded
+
+
+def is_provided_node(node: GraphNode) -> bool:
+    if SCOPE_LABEL in list(node.labels or []):
+        return True
+    attrs = attrs_of(node.properties or {})
+    if attrs.get("in_scope") is True:
+        for entry in provenance_of(node.properties or {}):
+            if not isinstance(entry, dict):
+                continue
+            if str(entry.get("confidence", "")) == "server_declared":
+                return True
+            if str(entry.get("source", "")).startswith("engagement:"):
+                return True
+    return False
+
+
+def provided_target_ref(node: GraphNode) -> str | None:
+    ref = facts_of(node.properties or {}).get("target_ref", None)
+    return ref if isinstance(ref, str) and ref else None
+
+
+def provided_auth_session_refs(node: GraphNode) -> list[str]:
+    cfg = facts_of(node.properties or {}).get("auth_session_config", {})
+    if not isinstance(cfg, dict):
+        return []
+    raw = cfg.get("sessions", [])
+    if not isinstance(raw, list):
+        return []
+    refs: list[str] = []
+    for item in raw:
+        if isinstance(item, dict) and item.get("session_ref") is not None:
+            refs.append(str(item.get("session_ref")))
+        elif isinstance(item, str) and item:
+            refs.append(item)
+    return sorted(set(refs))
+
+
+async def list_provided_nodes(service: AttackGraphService) -> list[GraphNode]:
+    try:
+        nodes = await service.list_nodes()
+    except Exception:
+        return []
+    provided = [n for n in (nodes or []) if is_provided_node(n)]
+    provided.sort(key=lambda n: str(n.id))
+    return provided

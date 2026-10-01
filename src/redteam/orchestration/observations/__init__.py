@@ -14,9 +14,9 @@
 Deliberately separate from ``orchestration.nodes.update`` so that module
 never grows a ``if tool_id == "...": ...`` ladder: adding a new tool's
 graph-enrichment logic means registering one more mapper here, not
-editing UPDATE. A tool with no registered mapper changes nothing about
-today's behavior (only the static ``PlanStep.observed_attrs`` on the
-directly-targeted node, as before).
+editing UPDATE. A tool with no registered mapper keeps its raw evidence
+available for review. Planning hints and expected observations never
+become measured facts.
 """
 
 from __future__ import annotations

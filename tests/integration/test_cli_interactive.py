@@ -12,28 +12,17 @@ from __future__ import annotations
 
 import contextlib
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 import yaml
+from rich.console import Console
 
 from redteam.app.cli import _shared
 from redteam.app.cli.commands import interactive
 from redteam.core.config import load_engagement_config
 
 pytestmark = pytest.mark.asyncio
-
-_APP_YAML = """
-llm:
-  provider: fake
-  default_model: gpt-4o-mini
-orchestration:
-  max_retries: 3
-  max_steps: 20
-capability:
-  mcp_servers: []
-logging:
-  level: INFO
-"""
 
 
 class _FakeConsole:
@@ -75,13 +64,38 @@ class _ScriptedIntakeLLM:
 
 
 def _patch(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, answers: list[str], llm  # noqa: ANN001
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    answers: list[str],
+    llm,  # noqa: ANN001
 ) -> _FakeConsole:
     monkeypatch.chdir(tmp_path)
-    (tmp_path / "app.yaml").write_text(_APP_YAML, encoding="utf-8")
+    # REDTEAM_LLM_PROVIDER already set (section 4/20's canonical env source)
+    # means `_ensure_runtime_config` skips its one-time prompt entirely --
+    # no application-config file involved.
+    monkeypatch.setenv("REDTEAM_LLM_PROVIDER", "litellm")
+    monkeypatch.setenv("REDTEAM_LLM_MODEL", "gpt-4o-mini")
+    monkeypatch.delenv("REDTEAM_MCP_SERVERS", raising=False)
     console = _FakeConsole(answers)
     monkeypatch.setattr(interactive, "Console", lambda: console)
-    monkeypatch.setattr(interactive, "build_llm_client", lambda config: llm)  # noqa: ARG005
+    from tests.integration.test_cli_session import _ConversationLLM
+
+    monkeypatch.setattr(interactive, "build_llm_client", lambda config: _ConversationLLM())
+    from redteam.intake.assistant import IntakeAssistant
+
+    monkeypatch.setattr(interactive, "_build_intake_assistant", lambda client: IntakeAssistant(llm))
+    # Setup/UI tests must not call a real provider. Exercise the canonical
+    # application runtime with the same explicit hold model as session tests.
+    from redteam.app.cli.commands import run as run_command
+    from tests.integration.test_cli_session import _HoldLLM
+
+    original_build = run_command.build_application
+
+    async def build_with_model(config, **kwargs):
+        kwargs.setdefault("llm", _HoldLLM())
+        return await original_build(config, **kwargs)
+
+    monkeypatch.setattr(run_command, "build_application", build_with_model)
     return console
 
 
@@ -111,6 +125,7 @@ async def test_no_config_intake_completes_preflight_and_runs(
             "127.0.0.1:5000의 VulnBank 테스트, 인증/금융 로직 위주, "
             "DoS/데이터삭제 금지, 최대 100개",
             "",  # existing-config menu -> Start (config was just created)
+            "n",  # one-time MCP auto-setup prompt -> decline
             "",  # preflight -> Start
         ],
         llm=llm,
@@ -128,6 +143,106 @@ async def test_no_config_intake_completes_preflight_and_runs(
     assert saved.metadata["source"] == "intake-assistant"
 
 
+async def test_existing_config_accepts_one_line_mission_objective() -> None:
+    from redteam.core.config import EngagementConfig
+
+    config = EngagementConfig.model_validate(
+        {
+            "name": "VulnBank",
+            "scope": {"allowed_hosts": ["example.local"]},
+            "execution_budget": {"max_actions": 5},
+        }
+    )
+    console = _FakeConsole(["VulnBank 웹 레드티밍 해줘. 인증/인가 중심으로."])
+
+    selected = await interactive._existing_config_menu(
+        cast(Console, console), config, _ScriptedIntakeLLM([])
+    )
+
+    assert selected == (config, "VulnBank 웹 레드티밍 해줘. 인증/인가 중심으로.")
+
+
+async def test_existing_config_quick_start_needs_only_objective_input(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from redteam.core.config import EngagementConfig
+
+    config = EngagementConfig.model_validate(
+        {
+            "name": "VulnBank",
+            "scope": {"allowed_hosts": ["example.local"]},
+            "execution_budget": {"max_actions": 5},
+        }
+    )
+    (tmp_path / "engagement.yaml").write_text(
+        yaml.safe_dump(config.model_dump(mode="json")), encoding="utf-8"
+    )
+    console = _patch(
+        monkeypatch,
+        tmp_path,
+        answers=["VulnBank 웹 레드티밍 해줘. 인증/인가 중심으로.", "n"],
+        llm=_ScriptedIntakeLLM([]),
+    )
+
+    assert await interactive.run(_args()) == _shared.EXIT_OK
+    assert any("RunId:" in line for line in console.transcript)
+
+
+async def test_guided_intake_asks_only_next_missing_question() -> None:
+    from redteam.intake.assistant import IntakeAssistant, IntakeSession
+
+    llm = _ScriptedIntakeLLM(
+        [
+            {
+                "draft": {"name": "VulnBank", "allowed_hosts": ["example.local"]},
+                "follow_up_questions": ["최대 action 수는?", "이미 알려준 범위는?"],
+                "ready": False,
+            },
+            {"draft": {"max_actions": 5}, "follow_up_questions": [], "ready": True},
+        ]
+    )
+    console = _FakeConsole(["5"])
+
+    config = await interactive._intake_loop(
+        cast(Console, console), IntakeAssistant(llm), IntakeSession(), "VulnBank 점검"
+    )
+
+    assert config is not None
+    assert config.execution_budget.max_actions == 5
+    assert any("최대 action 수는?" in line for line in console.transcript)
+    assert not any("이미 알려준 범위는?" in line for line in console.transcript)
+
+
+async def test_guided_intake_recovers_from_llm_failure_without_repeating_input() -> None:
+    from redteam.intake.assistant import IntakeAssistant, IntakeSession
+
+    class _UnavailableLLM:
+        async def complete(
+            self,
+            *,
+            messages: list[dict[str, Any]],
+            system: str | None = None,
+            **kwargs: Any,
+        ) -> str:
+            raise RuntimeError("unavailable")
+
+        async def complete_structured(self, **_kwargs):  # noqa: ANN202
+            raise RuntimeError("unavailable")
+
+    console = _FakeConsole(["5", "recon, web"])
+    config = await interactive._intake_loop(
+        cast(Console, console),
+        IntakeAssistant(_UnavailableLLM()),
+        IntakeSession(),
+        "https://example.local:8443 테스트해줘",
+    )
+
+    assert config is not None
+    assert config.scope.allowed_hosts == ["example.local:8443"]
+    assert config.execution_budget.max_actions == 5
+    assert config.rules_of_engagement[0].allowed_capabilities == ["recon", "web"]
+
+
 async def test_intake_llm_never_receives_a_secret(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -138,8 +253,9 @@ async def test_intake_llm_never_receives_a_secret(
         answers=[
             "127.0.0.1:5000의 VulnBank 테스트, 인증/금융 로직 위주, "
             "DoS/데이터삭제 금지, 최대 100개",
-            "",
-            "",
+            "",  # existing-config menu -> Start
+            "n",  # one-time MCP auto-setup prompt -> decline
+            "",  # preflight -> Start
         ],
         llm=llm,
     )
@@ -204,6 +320,7 @@ async def test_edit_patches_only_the_requested_field(
             "e",  # existing-config menu -> Edit
             "최대 action을 200으로 바꿔줘",
             "",  # back at existing-config menu after the edit -> Start
+            "n",  # one-time MCP auto-setup prompt -> decline
             "",  # preflight -> Start
         ],
         llm=llm,
@@ -248,6 +365,16 @@ async def test_edit_refuses_a_hand_authored_engagement(
     unchanged = load_engagement_config(tmp_path / "engagement.yaml")
     assert unchanged.name == "Hand Written"  # never overwritten
     assert any("not generated by the Intake Assistant" in line for line in console.transcript)
+
+
+async def test_fake_provider_is_rejected_by_production_builder() -> None:
+    import pytest
+
+    from redteam.app.bootstrap import build_llm_client
+    from redteam.core.config import LLMConfig
+
+    with pytest.raises(ValueError, match="real LLM provider"):
+        build_llm_client(LLMConfig(provider="fake"))
 
 
 def _args():  # noqa: ANN202

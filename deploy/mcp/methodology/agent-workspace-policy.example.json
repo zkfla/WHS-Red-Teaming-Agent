@@ -1,0 +1,8 @@
+{
+  "root": "/absolute/path/to/workspace",
+  "asset_ref": "workspace-methodology",
+  "engagement_id": "eng-methodology-agent",
+  "run_id": "run-methodology-agent",
+  "writable": true,
+  "readonly_paths": ["methodology"]
+}

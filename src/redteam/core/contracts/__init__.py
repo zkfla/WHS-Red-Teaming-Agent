@@ -17,6 +17,7 @@ from redteam.core.contracts.engagement import (
 from redteam.core.contracts.events import EventEnvelope, EventType
 from redteam.core.contracts.evidence import EvidenceRecord
 from redteam.core.contracts.graph import Finding, GraphEdge, GraphNode, Hypothesis
+from redteam.core.contracts.mission import MissionPlan, MissionTask, OperatorIntent, Provenance
 from redteam.core.contracts.policy import Approval, ControlContext, PolicyDecision
 from redteam.core.contracts.target import (
     AnyTarget,
@@ -69,6 +70,10 @@ __all__ = [
     "GraphEdge",
     "Hypothesis",
     "Finding",
+    "MissionPlan",
+    "MissionTask",
+    "OperatorIntent",
+    "Provenance",
     "ControlContext",
     "PolicyDecision",
     "Approval",

@@ -7,6 +7,8 @@ domain objects: a role-specific candidate provider owns those semantics.
 
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import BaseModel, Field, model_validator
 
 from redteam.attack_graph.observation import GraphObservation
@@ -82,7 +84,7 @@ class AgentDefinition(BaseModel):
     capabilities: list[str] = Field(default_factory=list)
     provider_id: str
     context_profile: ContextProfile
-    planner_kind: str = "playbook"
+    planner_kind: Literal["llm"] = "llm"
     max_concurrency: int = Field(default=1, ge=1)
     budget_weight: float = Field(default=1.0, gt=0)
     priority_band: int = Field(default=100, ge=0)

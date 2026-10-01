@@ -1,121 +1,106 @@
-"""End-to-End Test: Agent -> Control Plane -> Capability -> Evidence -> Event -> Attack Graph.
-
-Exercises the Minimal Vertical Slice from instruction.md section 16
-using every real skeleton component except the LLM (FakeLLMClient) and
-the MCP server (ExampleMCPAdapter, simulated in-process).
-
-Two expectations changed with the real re-plan loop (see
-docs/agent/orchestration.md): ``HypothesisCreated``/``AgentFinished`` are
-now emitted, and node ids follow ``<type>:<key>``. The assertions below are
-stronger than before, not looser.
-"""
+"""Production loop and event chain, with explicit model and gateway test doubles."""
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+import pytest
 
 from redteam.app.bootstrap import build_runtime_deps, run_engagement
-from redteam.attack_graph.predicates import attrs_of, facts_of
-from redteam.core.contracts.engagement import (
-    ApprovalPolicy,
-    Engagement,
-    EngagementScope,
-    ExecutionBudget,
-    RateLimitPolicy,
-)
+from redteam.attack_graph.predicates import facts_of
+from redteam.attack_graph.stores.memory import InMemoryAttackGraphStore
 from redteam.core.contracts.events import EventEnvelope, EventType
-from redteam.core.enums import AgentPhase, Verdict
-from redteam.core.ids import AgentId, EngagementId, GraphNodeId
-from redteam.orchestration.events import (
-    CANDIDATE_GENERATED,
-    HYPOTHESIS_RESOLVED,
-    REPLAN_TRIGGERED,
-    REPORT_PROJECTED,
-)
+from redteam.core.enums import AgentPhase, MissionStatus, Verdict
+from redteam.core.ids import GraphNodeId
+from redteam.orchestration.events import REPLAN_TRIGGERED, REPORT_PROJECTED
 from redteam.orchestration.state import TerminationReason
+from tests.integration import _engine_llm_harness as h
+from tests.integration.test_engine_live_run_flow import CountingGateway, LiveScriptedLLM, _live_deps
 
 
-def _engagement() -> Engagement:
-    return Engagement(
-        engagement_id=EngagementId("eng_e2e"),
-        name="e2e",
-        scope=EngagementScope(allowed_hosts=["example.local"]),
-        execution_budget=ExecutionBudget(max_actions=5),
-        rate_limit_policy=RateLimitPolicy(max_actions_per_minute=30),
-        approval_policy=ApprovalPolicy(),
-        created_at=datetime.now(timezone.utc),
-    )
+def _engagement():
+    return h.make_engagement(engagement_id="eng_e2e")
 
 
-async def test_minimal_vertical_slice_end_to_end(tmp_path) -> None:
+def _world():
     engagement = _engagement()
-    deps = await build_runtime_deps(engagement, evidence_dir=tmp_path)
+    llm = LiveScriptedLLM(
+        graph_store=InMemoryAttackGraphStore(), evidence_store=h.FakeEvidenceStore()
+    )
+    gateway = CountingGateway()
+    return engagement, _live_deps(llm, gateway, engagement), gateway
 
-    observed_events: list[EventEnvelope] = []
 
-    async def _collect(event: EventEnvelope) -> None:
-        observed_events.append(event)
+async def test_minimal_vertical_slice_end_to_end(tmp_path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    engagement, deps, gateway = _world()
+    events: list[EventEnvelope] = []
 
-    await deps.event_bus.subscribe("*", _collect)
+    async def collect(event: EventEnvelope) -> None:
+        events.append(event)
 
-    final_state = await run_engagement(engagement, deps=deps)
-
-    # 13. Run ends in a terminal phase, with a verdict and a named reason.
-    assert final_state.phase == AgentPhase.FINISHED
-    assert final_state.last_verdict == Verdict.PASS
-    assert final_state.termination_reason == TerminationReason.NO_ACTIONABLE_PLAN
-    assert final_state.actions_executed == 1
-    assert final_state.finished_agents == [AgentId("recon-agent")]
-
-    # 3-11. The full chain of events fired, in order, all tagged with
-    # the right run/engagement.
-    expected_in_order = [
+    await deps.event_bus.subscribe("*", collect)
+    final = await run_engagement(engagement, deps)
+    assert final.phase is AgentPhase.FINISHED
+    assert final.termination_reason == TerminationReason.GOAL_ACHIEVED
+    assert final.last_verdict is Verdict.UNKNOWN
+    assert final.actions_executed == len(gateway.calls) == 1
+    mission = await deps.task_graph_store.get_mission(final.mission_id)
+    assert mission is not None and mission.status is MissionStatus.COMPLETED
+    types = [event.event_type for event in events]
+    required_order = [
         EventType.RUN_STARTED,
+        EventType.MISSION_CREATED,
+        EventType.TASK_CREATED,
+        EventType.TASK_STARTED,
         EventType.AGENT_STARTED,
-        CANDIDATE_GENERATED,
-        EventType.HYPOTHESIS_CREATED,
         EventType.ACTION_PROPOSED,
         EventType.POLICY_EVALUATED,
         EventType.ACTION_APPROVED,
         EventType.TOOL_EXECUTION_STARTED,
         EventType.TOOL_EXECUTION_FINISHED,
         EventType.EVIDENCE_CREATED,
-        HYPOTHESIS_RESOLVED,
+        "ObservationRecorded",
         EventType.GRAPH_UPDATED,
-        EventType.AGENT_FINISHED,
         REPLAN_TRIGGERED,
+        EventType.TASK_COMPLETED,
+        EventType.MISSION_UPDATED,
         REPORT_PROJECTED,
         EventType.RUN_FINISHED,
     ]
-    assert [e.event_type for e in observed_events] == expected_in_order
-    assert all(e.run_id == final_state.run_id for e in observed_events)
-    assert all(e.engagement_id == engagement.engagement_id for e in observed_events)
-
-    # 10. Everything from the proposal onwards shares one correlation id,
-    # so the action can be reconstructed from the event log alone.
-    action_id = next(
-        e.payload["action_id"]
-        for e in observed_events
-        if e.event_type == EventType.ACTION_PROPOSED
-    )
-    correlated = [e.event_type for e in observed_events if e.correlation_id == action_id]
-    # From the hypothesis the action was raised for through the update that
-    # settled it -- CandidateGenerated is not part of this action's chain
-    # (it summarises the whole compiled frontier, before a step is chosen).
-    assert correlated == expected_in_order[3:12]
-
-    # 9. Evidence was recorded for the run, correlated to the action.
-    evidence = await deps.evidence_store.list_for_run(final_state.run_id)
-    assert len(evidence) == final_state.actions_executed
-    assert evidence[0].action_id == action_id
-    assert evidence[0].invocation_id is not None
-    assert evidence[0].engagement_id == engagement.engagement_id
-
-    # 11. Attack Graph was updated with the target, under its stable id.
-    node = await deps.graph_store.get_node(GraphNodeId("host:example.local"))
+    cursor = 0
+    for kind in required_order:
+        cursor = types.index(kind, cursor) + 1
+    assert all(event.run_id == final.run_id for event in events)
+    assert all(event.engagement_id == engagement.engagement_id for event in events)
+    proposal = next(event for event in events if event.event_type == EventType.ACTION_PROPOSED)
+    evidence = await deps.evidence_store.list_for_run(final.run_id)
+    raw = [record for record in evidence if isinstance(record.metadata.get("tool_result"), dict)]
+    assert len(raw) == 1 and raw[0].action_id == proposal.payload["action_id"]
+    assert raw[0].invocation_id == gateway.calls[0].invocation_id
+    path = await deps.path_store.get_active(str(final.run_id))
+    assert path is not None and path.steps[0].evidence_ids
+    node = await deps.graph_store.get_node(GraphNodeId(f"host:{h.HOST}"))
     assert node is not None
-    assert node.type.value == "host"
-    assert attrs_of(node.properties)["reachable"] is True
-    # ...and the attempt is recorded, which is what stops the planner
-    # proposing the same probe again.
-    assert facts_of(node.properties)["attempted_operations"] == ["recon.service_discovery"]
+    assert h.CANONICAL_OP in facts_of(node.properties)["attempted_operations"]
+    assert (tmp_path / "data" / "reports" / f"{final.run_id}.json").exists()
+
+
+async def test_quick_start_objective_reaches_mission_without_secret(tmp_path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    engagement, deps, gateway = _world()
+    final = await run_engagement(
+        engagement, deps, objective="VulnBank 웹 레드티밍, 인증/인가 중심. token=privatevalue"
+    )
+    mission = await deps.task_graph_store.get_mission(final.mission_id)
+    assert mission is not None
+    assert mission.priorities[:2] == ["authentication", "authorization"]
+    assert "privatevalue" not in mission.model_dump_json()
+    assert len(gateway.calls) == 1
+    path = await deps.path_store.get_active(str(final.run_id))
+    assert path is not None and path.goal == mission.objective
+
+
+async def test_bare_composition_requires_explicit_llm(tmp_path) -> None:
+    with pytest.raises(TypeError, match="llm"):
+        await build_runtime_deps(_engagement(), evidence_dir=tmp_path)  # type: ignore[call-arg]
+    with pytest.raises(ValueError, match="LLM"):
+        await build_runtime_deps(_engagement(), evidence_dir=tmp_path, llm=None)  # type: ignore[arg-type]

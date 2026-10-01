@@ -62,7 +62,7 @@ class PlaybookPlanner:
     """Takes the first available step. No LLM, fully deterministic."""
 
     async def plan(self, context: PlanningContext) -> PlanStep | None:
-        return context.candidates[0] if context.candidates else None
+        raise ValueError("retired; use LLM investigation engine")
 
 
 class LLMPlanner:
@@ -70,7 +70,7 @@ class LLMPlanner:
 
     def __init__(self, llm: Any, *, fallback: Any | None = None) -> None:
         self._llm = llm
-        self._fallback = fallback or PlaybookPlanner()
+        self._fallback = fallback
         self.last_fallback_reason: str | None = None
 
     async def plan(self, context: PlanningContext) -> PlanStep | None:
@@ -105,9 +105,9 @@ class LLMPlanner:
         return by_id[step_id]
 
     async def _fall_back(self, reason: str, context: PlanningContext) -> PlanStep | None:
-        self.last_fallback_reason = reason
-        logger.info("LLMPlanner falling back to %s: %s", type(self._fallback).__name__, reason)
-        return await self._fallback.plan(context)
+        from redteam.orchestration.cognition import DecisionFailure
+
+        raise DecisionFailure("legacy_candidate_selection", "format", 1, reason)
 
     @staticmethod
     def _render(context: PlanningContext) -> str:
@@ -135,9 +135,16 @@ class LLMPlanner:
         if evidence_excerpts:
             lines.append("Target-linked evidence excerpts:")
             for item in evidence_excerpts:
+                outcome = ""
+                if item.get("status_code") is not None:
+                    outcome += f" status={item['status_code']}"
+                if item.get("error_code"):
+                    outcome += f" error={item['error_code']}"
                 lines.append(
                     "  - evidence_id={evidence_id} target={target_node_id} "
-                    "source={source_id} summary={summary}".format(**item)
+                    "source={source_id}{outcome} summary={summary}".format(
+                        outcome=outcome, **item
+                    )
                 )
 
         lines.append("")
@@ -189,20 +196,7 @@ class HybridPlanner(LLMPlanner):
         self.last_option_id: str | None = None
 
     async def plan(self, context: PlanningContext) -> PlanStep | None:
-        if not context.candidates:
-            self.last_decision = None
-            self.last_option_id = None
-            return None
-        ordered = self._ordered(context)
-        if len(ordered) == 1:
-            self.last_decision = "single"
-            self.last_option_id = ordered[0][0]
-            return ordered[0][1]
-        if self._has_a_clear_winner(context, ordered):
-            self.last_decision = "clear_margin"
-            self.last_option_id = ordered[0][0]
-            return ordered[0][1]
-        return await self._rerank(context, ordered)
+        raise ValueError("retired; use LLM investigation engine")
 
     def _option_ids(self, context: PlanningContext) -> list[str]:
         """The unique identity of each candidate, aligned with the candidates.
@@ -289,12 +283,7 @@ class HybridPlanner(LLMPlanner):
     def _fall_back_to_top1(
         self, reason: str, ordered: list[tuple[str, PlanStep]]
     ) -> PlanStep | None:
-        self.last_fallback_reason = reason
-        self.last_decision = "fallback"
-        if ordered:
-            self.last_option_id = ordered[0][0]
-        logger.info("HybridPlanner keeping the deterministic top-1: %s", reason)
-        return ordered[0][1] if ordered else None
+        raise ValueError("retired; use LLM investigation engine")
 
     @staticmethod
     def _render_options(
@@ -336,9 +325,16 @@ class HybridPlanner(LLMPlanner):
         if evidence_excerpts:
             lines.append("Target-linked evidence excerpts:")
             for item in evidence_excerpts:
+                outcome = ""
+                if item.get("status_code") is not None:
+                    outcome += f" status={item['status_code']}"
+                if item.get("error_code"):
+                    outcome += f" error={item['error_code']}"
                 lines.append(
                     "  - evidence_id={evidence_id} target={target_node_id} "
-                    "source={source_id} summary={summary}".format(**item)
+                    "source={source_id}{outcome} summary={summary}".format(
+                        outcome=outcome, **item
+                    )
                 )
 
         lines.append("")
@@ -383,12 +379,7 @@ def build_planner(
     score_margin: float = 0.15,
     top_k: int = 3,
 ) -> Any:
-    """Map AgentSpec.planner_kind to a planner instance.
-
-    "llm" means "the LLM may assist", not "the LLM is always asked": the
-    returned planner keeps the deterministic choice whenever scoring already
-    decided the turn.
-    """
-    if planner_kind == "llm":
-        return HybridPlanner(llm, score_margin=score_margin, top_k=top_k)
-    return PlaybookPlanner()
+    """Legacy reference chooser; production planning uses InvestigationEngine."""
+    if planner_kind != "llm" or llm is None:
+        raise ValueError("only an explicitly configured LLM planner is supported")
+    return LLMPlanner(llm)

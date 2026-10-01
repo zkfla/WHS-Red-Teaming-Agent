@@ -26,11 +26,21 @@ Framework 설정은 `framework.env.example`에 `extensions.env.example`을 함�
 AppConfig의 `capability.mcp_servers`에 `web-zap`, `web-nuclei`를 추가한다.
 공통 Core 계약 변경 없이 기존 `web.response_analysis`에 매핑한다.
 
+`web-nuclei`를 AppConfig에 추가하면 Web/API Agent는 실제 HTTP 응답이 Graph에 있는
+경우 `web.nuclei_response_check`를 하나의 bounded 후보로 만들 수 있다. 이 후보는
+Control을 통과한 뒤에만 실행되고, 실행 결과는 `observation_only`로 Graph에 기록된다.
+같은 방식으로 기본 `web-browser`와 `web-proxy`가 healthy하면 Agent는 각각 관찰된
+URL의 `web.browser_navigate`와 대상별 `web.proxy_list_flows` 후보를 만들 수 있다.
+Browser는 HTTPX 요청보다 낮은 우선순위의 렌더링 fallback이고, Proxy 후보는 history
+조회만 자동 제안한다. 전체 경로의 합성 검증표는
+`docs/capability/agent-mcp-readonly-integration.md`에 있다.
+
 | ToolId | operation | 입력 | 지원 범위 |
 |---|---|---|---|
 | `web.http_request` (확장) | `http_request` | 기존 입력 + `query`, `request_headers` | 경로별 허용 key와 허용 header를 사용한 단일 요청 |
 | `web.zap_capture_snapshot` (신규) | `response_analysis` | `target_ref` | 실행 중 ZAP의 HAR 첫 페이지를 즉시 읽고 승인 범위 flow 요약 반환 |
 | `web.nuclei_response_check` (신규) | `response_analysis` | `target_ref`, `path`, `check_id`, 선택 `session_ref` | scoped GET 1회 후 Nuclei passive 엔진으로 헤더 존재 검사 |
+| `web.nuclei_active_query_probe` (선택) | `parameter_fuzz` | `target_ref`, `path`, `query_key`, 고정 `check_id` | 검증 IP에 직접 연결해 허용 query key에 marker를 넣는 GET 1회; reflection 관찰만 반환 |
 
 ## HTTP query/header
 
@@ -111,9 +121,16 @@ path·method 제한을 적용해 GET 한 번을 수행한다. 검사 엔진에�
 전달한다. timeout/취소/출력 초과 시 자식 프로세스를 종료하고 일시 파일을 정리한다.
 
 이는 **Nuclei 연결과 결과 정규화의 첫 구현**이다. 기존 http_security_posture와 일부
-관찰이 중복되며, 아직 CVE 스캔·대량 검사·임의 템플릿·Active Scan을 지원하지 않는다.
-미탐/매칭 없음은 안전하다는 판정이 아니다. Active 확장은 템플릿별 예상 요청,
-별도 scanner egress 강제, 작업 ID와 취소, Control 승인 계약이 정해진 뒤 구현한다.
+관찰이 중복되며, CVE 스캔·대량 검사·임의 템플릿은 지원하지 않는다.
+미탐/매칭 없음은 안전하다는 판정이 아니다.
+
+선택적 `web-nuclei-active` 프로필은 같은 MCP 서버에서
+`nuclei_active_query_probe` 하나만 노출한다. `active_enabled=true`, 정확한 path와
+`allowed_query_keys`가 모두 필요하다. 서버가 먼저 DNS 결과 전부를 CIDR로 검증하고 첫
+검증 IP를 Nuclei target으로 사용하며 원래 Host와 HTTPS SNI를 보존한다. 생성 템플릿은
+고정 marker의 반사 여부만 1회 확인하고 redirect·retry·Interactsh·update를 비활성화한다.
+이는 XSS 증명이 아니며 `observation_only`다. 인증 세션, community/CVE template,
+headless/code/file/network/workflow template은 지원하지 않는다.
 
 ## 남은 범위
 
