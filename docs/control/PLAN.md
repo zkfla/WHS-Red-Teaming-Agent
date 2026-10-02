@@ -61,30 +61,26 @@
 | 9 | Audit → 실행 Tool·Invocation·생성 Evidence 연결 및 검증 | ⏳ 실행 후 연결 규격과 책임 계층 협의 필요 |
 
 Scope DENY 기록 회귀 검증(2026-10-03, 기준 `dev-control` / `2dcdede`):
-11개 요청·설정 사례의 Audit/차단 Evidence 연결, 두 severity의 파일 재조회 및
-Evidence 저장 실패 시 판단 유지 검증 완료. 기존 대상 테스트 결과는
-`93 passed in 4.04s`이며, 기존 `ruff check src tests examples`와
-`mypy src/redteam`(192개 소스 파일)도 통과했다. 이번 문서 갱신에서 재실행하지 않았다.
 
-추가 전체 pytest 결과는 **사용자가 WSL에서 직접 실행해 제공한 값**이다.
-실행 환경은 `/home/user/WHS-Red-Teaming-Agent`의 `.venv`와 현재 프로젝트의
-editable 설치다.
+- 11개 요청·설정 사례의 PolicyDecision → Audit → 차단 Evidence 연결 검증 완료.
+- `BLOCK_ACTION`과 `ABORT_RUN` 태그 보존, 파일 저장 후 재조회,
+  Evidence 저장 실패 시 DENY·severity 유지 검증 완료.
+- 관련 테스트 93개 통과.
+- `ruff check src tests examples` 및 `mypy src/redteam`
+  (192개 소스 파일) 통과.
+- 운영 코드 수정 없음.
 
-```text
-python -m pytest -q
-1213 passed, 4 skipped in 122.92s (0:02:02)
-```
+추가 전체 테스트는 작업자가 WSL의 프로젝트 전용 가상환경에서
+실행한 결과를 반영했다.
 
-초기 collection 중단은 `WHS-Red-Teaming-Agent-search`의 가상환경과 editable
-설치를 사용하면서 발생한 두 내부 모듈의 import 오류였다. 현재 프로젝트 환경으로
-전환한 뒤 전체 테스트를 통과했으며, 이를 제품 코드 결함으로 기록하지 않는다.
-4개 skipped의 사유는 제공되지 않아 추정하지 않는다. 운영 코드 수정 없음.
+- 실행 명령: `python -m pytest -q`
+- 결과: `1213 passed, 4 skipped in 122.92s`
+- skipped 4개의 사유는 미확인.
+- 이번 문서 갱신에서는 검사를 재실행하지 않음.
 
-BLOCK_ACTION/ABORT_RUN의 판단·Audit·Evidence 기록 보존을 검증한 것이며,
-실제 CLI·MCP 실행과 Orchestration의 `severity:abort_run` 소비에 따른 즉시 Run
-종료까지 위 결과로 확인한 것은 아니다. 해당 통합 동작은 관련 팀의 후속 확인 대상이다.
-상세 사례는 로컬 인수인계 문서 `pr-handoff-scope-port.md`에 정리되어 있으며,
-이 파일은 커밋 대상에서 제외한다.
+위 검증은 판단과 기록 보존을 대상으로 한다.
+실제 CLI·MCP 실행 및 Orchestration의 `severity:abort_run` 소비에 따른
+즉시 Run 종료는 별도 통합 검증이 필요하다.
 
 Raw Artifact와 Evidence 연결 검증의 상세 규약은
 [`artifact-and-evidence-validation.md`](./artifact-and-evidence-validation.md)를 따른다.
