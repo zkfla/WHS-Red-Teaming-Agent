@@ -4,9 +4,13 @@
 # https://github.com/mobile-next/mobile-mcp). Needs host networking (see
 # docker-compose.yml's `mobile-next-mcp` service) to reach adb/Xcode
 # simulators already running on the host.
-FROM node:20-slim
+FROM node:22-slim
+ARG MOBILE_MCP_VERSION=1.0.4
 WORKDIR /app
+RUN npm install --global "@mobilenext/mobile-mcp@${MOBILE_MCP_VERSION}" \
+    && npm cache clean --force
 RUN useradd --create-home --uid 10001 mcp
 USER mcp
+ENV MOBILECLI_HOME=/tmp/mobilecli
 EXPOSE 3000
-ENTRYPOINT ["npx", "-y", "@mobilenext/mobile-mcp@latest", "--listen", "3000"]
+ENTRYPOINT ["mcp-server-mobile", "--listen", "0.0.0.0:3000"]

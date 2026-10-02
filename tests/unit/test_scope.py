@@ -16,6 +16,7 @@ from redteam.core.contracts.engagement import EngagementScope
 from redteam.core.contracts.target import (
     AnyTarget,
     AssetTarget,
+    DeviceTarget,
     DomainTarget,
     HostTarget,
     PrincipalTarget,
@@ -210,3 +211,14 @@ def test_asset_scope_does_not_use_host_allow_lists() -> None:
     scope = EngagementScope(allowed_hosts=["com.example.bank"])
     target = AssetTarget(asset_id=AssetId("com.example.bank"))
     assert check_scope(_proposal_for(target), scope)[0] is False
+
+
+def test_device_target_uses_its_linked_asset_scope() -> None:
+    scope = EngagementScope(allowed_assets=["insecurebankv2"])
+    target = DeviceTarget(
+        device_serial="emulator-5554",
+        device_ref="redteam_x86",
+        package_name="com.android.insecurebankv2",
+        asset_id=AssetId("insecurebankv2"),
+    )
+    assert check_scope(_proposal_for(target), scope)[0] is True

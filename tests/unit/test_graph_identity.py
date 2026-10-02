@@ -21,6 +21,7 @@ from redteam.attack_graph.identity import (
 )
 from redteam.core.contracts.target import (
     AssetTarget,
+    DeviceTarget,
     DomainTarget,
     EndpointTarget,
     HostTarget,
@@ -118,6 +119,16 @@ def test_explicit_graph_node_id_on_a_target_wins() -> None:
             GraphNodeType.PRINCIPAL,
         ),
         (AssetTarget(asset_id=AssetId("db-1")), "asset:db-1", GraphNodeType.ASSET),
+        (
+            DeviceTarget(
+                device_serial="emulator-5554",
+                device_ref="redteam_x86",
+                package_name="com.example.bank",
+                asset_id=AssetId("bank-apk"),
+            ),
+            "asset:bank-apk",
+            GraphNodeType.ASSET,
+        ),
     ],
 )
 def test_every_target_kind_resolves_to_a_node(target, expected_id, expected_type) -> None:
@@ -146,6 +157,17 @@ def test_target_for_node_produces_a_scope_checkable_target() -> None:
     )
     assert isinstance(endpoint, EndpointTarget)
     assert (endpoint.host, endpoint.path) == ("a.local", "/orders/{id}")
+
+    device = target_for_node(
+        GraphNodeId("asset:bank-apk"),
+        GraphNodeType.ASSET,
+        device_serial="emulator-5554",
+        device_ref="redteam_x86",
+        package_name="com.example.bank",
+    )
+    assert isinstance(device, DeviceTarget)
+    assert device.asset_id == "bank-apk"
+    assert device.device_ref == "redteam_x86"
 
 
 def test_target_for_node_round_trips_the_node_id() -> None:

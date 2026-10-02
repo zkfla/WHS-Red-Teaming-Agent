@@ -113,6 +113,7 @@ class OrchestrationConfig(BaseModel):
     """
     max_retries: int = Field(default=3, ge=0)
     max_steps: int = Field(default=50, ge=1)
+    tool_timeout_seconds: float = Field(default=10.0, gt=0, le=600)
     #: Legacy opt-in name retained for compatibility; not a mode switch.
     #: Planning is always LLM-led — False (or "false") fails validation
     #: instead of selecting a rule path.

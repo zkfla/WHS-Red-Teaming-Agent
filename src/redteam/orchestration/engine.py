@@ -933,8 +933,14 @@ class InvestigationEngine:
                 node = await service.get_node(GraphNodeId(intent.target_node_id))
                 if node is None:
                     raise ValueError("referenced action target disappeared")
+                node_facts = facts_of(node.properties)
                 target = target_for_node(
-                    node.id, node.type, observed=facts_of(node.properties).get("observed_target")
+                    node.id,
+                    node.type,
+                    observed=node_facts.get("observed_target"),
+                    device_serial=node_facts.get("device_serial"),
+                    device_ref=node_facts.get("device_ref"),
+                    package_name=node_facts.get("package_name"),
                 )
                 if self.deps.tool_catalog is None:
                     raise ValueError("a real tool catalog is required for action compilation")

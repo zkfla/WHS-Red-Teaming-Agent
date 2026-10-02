@@ -11,6 +11,7 @@ from urllib.parse import quote
 from redteam.core.contracts.target import (
     AnyTarget,
     AssetTarget,
+    DeviceTarget,
     DomainTarget,
     EndpointTarget,
     GraphNodeTarget,
@@ -209,6 +210,11 @@ def node_id_for_target(target: AnyTarget) -> GraphNodeId:
         return principal_node_id(str(target.principal_id))
     if isinstance(target, AssetTarget):
         return asset_node_id(str(target.asset_id))
+    if isinstance(target, DeviceTarget):
+        identity = target.asset_id or AssetId(
+            f"{target.package_name}@{target.device_serial}"
+        )
+        return asset_node_id(str(identity))
     if isinstance(target, GraphNodeTarget):  # pragma: no cover - covered by `explicit`
         return target.node_id
     raise TypeError(f"unknown target kind: {target!r}")  # pragma: no cover
@@ -224,7 +230,7 @@ def node_type_for_target(target: AnyTarget) -> GraphNodeType:
         return GraphNodeType.SERVICE
     if isinstance(target, PrincipalTarget):
         return GraphNodeType.PRINCIPAL
-    if isinstance(target, AssetTarget):
+    if isinstance(target, (AssetTarget, DeviceTarget)):
         return GraphNodeType.ASSET
     if isinstance(target, GraphNodeTarget):
         return target.node_type or GraphNodeType.RESOURCE
@@ -241,6 +247,9 @@ def target_for_node(
     node_type: GraphNodeType,
     *,
     observed: str | None = None,
+    device_serial: str | None = None,
+    device_ref: str | None = None,
+    package_name: str | None = None,
 ) -> AnyTarget:
     """Inverse of :func:`node_id_for_target`. Returns a concrete,
     scope-checkable target — scope checking cannot match a ``GraphNodeTarget``.
@@ -282,6 +291,14 @@ def target_for_node(
     if node_type is GraphNodeType.PRINCIPAL:
         return PrincipalTarget(principal_id=PrincipalId(key), display_name=key)
     if node_type is GraphNodeType.ASSET:
+        if device_serial and device_ref and package_name:
+            return DeviceTarget(
+                device_serial=device_serial,
+                device_ref=device_ref,
+                package_name=package_name,
+                asset_id=AssetId(key),
+                graph_node_id=node_id,
+            )
         return AssetTarget(asset_id=AssetId(key), display_name=key)
 
     return GraphNodeTarget(node_id=node_id, node_type=node_type, display_name=key)

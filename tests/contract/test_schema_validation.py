@@ -19,11 +19,13 @@ from redteam.core.contracts.engagement import (
 from redteam.core.contracts.events import EventEnvelope, EventType
 from redteam.core.contracts.target import (
     AssetTarget,
+    DeviceTarget,
     DomainTarget,
     GraphNodeTarget,
     HostTarget,
     PrincipalTarget,
     TargetRef,
+    target_display_name,
 )
 from redteam.core.contracts.tool import ExecutionContext, ToolInvocation, ToolResult
 from redteam.core.ids import (
@@ -81,6 +83,12 @@ def test_action_proposal_requires_reason() -> None:
         DomainTarget(domain="a.local"),
         PrincipalTarget(principal_id=PrincipalId("p_1")),
         AssetTarget(asset_id=AssetId("asset_1")),
+        DeviceTarget(
+            device_serial="emulator-5554",
+            device_ref="redteam_x86",
+            package_name="com.example.app",
+            asset_id=AssetId("asset_1"),
+        ),
         GraphNodeTarget(node_id=GraphNodeId("node_1")),
     ],
 )
@@ -94,6 +102,32 @@ def test_target_ref_rejects_unknown_kind() -> None:
     adapter: TypeAdapter = TypeAdapter(TargetRef)
     with pytest.raises(ValidationError):
         adapter.validate_python({"kind": "spaceship", "value": "nope"})
+
+
+def test_device_target_requires_operator_supplied_serial_ref_and_package() -> None:
+    adapter: TypeAdapter = TypeAdapter(TargetRef)
+
+    with pytest.raises(ValidationError):
+        adapter.validate_python({"kind": "device", "device_serial": "emulator-5554"})
+    with pytest.raises(ValidationError):
+        adapter.validate_python({"kind": "device", "package_name": "com.example.app"})
+    with pytest.raises(ValidationError):
+        adapter.validate_python(
+            {
+                "kind": "device",
+                "device_serial": "emulator-5554",
+                "package_name": "com.example.app",
+            }
+        )
+
+    target = DeviceTarget(
+        device_serial="emulator-5554",
+        device_ref="redteam_x86",
+        package_name="com.android.insecurebankv2",
+    )
+    assert target_display_name(target) == (
+        "com.android.insecurebankv2@emulator-5554"
+    )
 
 
 def test_engagement_schema() -> None:

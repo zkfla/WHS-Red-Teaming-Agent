@@ -47,7 +47,7 @@ services:
     security_opt:
       - no-new-privileges:true
     healthcheck:
-      test: ["CMD", "node", "-e", "require('net').connect(process.env.MOBILE_NEXT_MCP_PORT||3000,'127.0.0.1').on('connect',s=>{}).on('error',()=>process.exit(1))"]
+      test: ["CMD", "node", "-e", "const s=require('net').connect(process.env.MOBILE_NEXT_MCP_PORT||3000,'127.0.0.1');s.on('connect',()=>{s.destroy();process.exit(0)}).on('error',()=>process.exit(1))"]
       interval: 10s
       timeout: 3s
       retries: 3
@@ -65,6 +65,8 @@ services:
     container_name: redteam-mcp-apktool
     networks:
       - redteam-net
+    environment:
+      APKTOOL_WORKSPACE: /work
     volumes:
       - ${APKTOOL_MCP_WORKDIR:-./apktool-workdir}:/work
     stdin_open: true

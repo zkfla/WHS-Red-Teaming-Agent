@@ -33,6 +33,7 @@ class OrchestrationSettings(BaseModel):
     #: see ``execute_node``. Set ``retry_retryable_tool_failures=False`` to
     #: disable retries entirely.
     max_retries: int = Field(default=3, ge=0)
+    tool_timeout_seconds: float = Field(default=10.0, gt=0, le=600)
     retry_retryable_tool_failures: bool = Field(default=True)
     #: Stop after this many tool executions fail back to back — a target
     #: that keeps erroring should not be hammered for the whole budget.
@@ -152,5 +153,6 @@ class OrchestrationSettings(BaseModel):
         if config is not None:
             base["max_steps"] = config.max_steps
             base["max_retries"] = config.max_retries
+            base["tool_timeout_seconds"] = config.tool_timeout_seconds
         base.update({key: value for key, value in overrides.items() if value is not None})
         return cls.model_validate(base)
