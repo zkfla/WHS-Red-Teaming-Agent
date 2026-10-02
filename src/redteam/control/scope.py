@@ -19,15 +19,17 @@ default is DENY (safer for a red-team gate).
 
 Port semantics (host entries only — the model is host-centric):
   - A bare host entry (``127.0.0.1``) matches that host on *any* port.
-    Domain- and network-level allow/deny are likewise port-agnostic.
+    Domain- and network-level allow/deny are likewise port-agnostic; any
+    ``:port`` written on a domain entry is ignored.
   - A ``host:port`` entry (``127.0.0.1:8080``) matches only that port.
   - If an *allow* entry pins a port but the request target carries no
     port, we do NOT assume the port matches — that is an explicit DENY
     with a reason, not a silent pass. A port must come from the target
     (``EndpointTarget.port``, a URL, or a ``host:port`` string), never be
     inferred by Control.
-  - A port-pinned *deny* entry only blocks that exact port; a bare-host
-    deny blocks every port.
+  - A port-pinned *deny* entry blocks that port; a bare-host deny blocks
+    every port. When a target matches a port-pinned deny host but carries
+    no port, we cannot prove it is a *different* port, so we fail closed.
 
 The ``host:port`` expression lives inside the existing ``list[str]``
 fields — this is a string-content convention, NOT a contract change, so
@@ -46,6 +48,12 @@ Notes / limitations:
     handled separately, by ``allowed_assets``/``denied_assets``.
   - Address parsing is IPv6-aware (bracketed ``[::1]:8080`` and bare
     ``::1`` literals) — a naive ``split(":")`` would corrupt them.
+  - A malformed *deny* entry (host or domain) is a fatal config error
+    (``ABORT_RUN``), never silently skipped — that would fail open. A
+    malformed *allow* entry is dropped (it would only ever grant access)
+    but surfaced in the denial reason so a typo is not mistaken for a
+    mysterious "everything denied". Port ``0`` and an empty port
+    (``host:``) are rejected as malformed.
 """
 
 from __future__ import annotations
@@ -70,6 +78,8 @@ from redteam.core.contracts.target import (
 # means "no port information" — not "any port".
 HostPort = tuple[str, int | None]
 
+_IpNetwork = ipaddress.IPv4Network | ipaddress.IPv6Network
+
 # Well-known default ports, so a scheme-only URL ("http://host/") carries
 # the port a host:port scope rule expects (fixes port-scoped deny bypass).
 _DEFAULT_SCHEME_PORTS: dict[str, int] = {
@@ -93,8 +103,8 @@ def _split_host_port(raw: str) -> tuple[str | None, int | None, bool]:
     """Split an address string into ``(host, port, ok)``.
 
     ``ok=False`` means the input is malformed / ambiguous and the caller
-    should treat it as a scope DENY (for a target) or skip it (for a
-    config entry). IPv6 is handled explicitly: bracketed forms go through
+    should treat it as a scope DENY (for a target) or a config error (for a
+    deny entry). IPv6 is handled explicitly: bracketed forms go through
     ``urlsplit``; a bare ``::1`` literal is recognised before any
     colon-splitting so it is never mistaken for ``host:port``.
     """
@@ -128,6 +138,9 @@ def _split_host_port(raw: str) -> tuple[str | None, int | None, bool]:
     # would mean "all ports".
     if port is None and parts.netloc.endswith(":"):
         return None, None, False
+    # Port 0 is the "unspecified" port — never a real target; reject it.
+    if port == 0:
+        return None, None, False
     # Infer the well-known default port from the URL scheme so a scheme-only
     # URL carries the port a host:port rule expects.
     if port is None and parts.scheme in _DEFAULT_SCHEME_PORTS:
@@ -136,7 +149,8 @@ def _split_host_port(raw: str) -> tuple[str | None, int | None, bool]:
 
 
 def _valid_port(port: int | None) -> bool:
-    return port is None or 0 <= port <= 65535
+    # Port 0 is the "unspecified" port, never a connectable target.
+    return port is None or 1 <= port <= 65535
 
 
 def _resolve_target(target: AnyTarget) -> tuple[list[HostPort], str | None]:
@@ -220,6 +234,38 @@ def _host_entries(entries: list[str]) -> tuple[list[HostPort], list[str]]:
     return parsed, malformed
 
 
+def _domain_entries(entries: list[str]) -> tuple[list[str], list[str]]:
+    """Parse domain allow/deny entries into ``(bases, malformed)``.
+
+    Domains are port-agnostic: any ``:port`` written on a domain entry is
+    ignored (a domain rule covers every port). Entries that fail to parse are
+    reported in ``malformed`` so a malformed *deny* domain is never silently
+    skipped — that would fail open, exactly like a malformed deny host."""
+    bases: list[str] = []
+    malformed: list[str] = []
+    for entry in entries:
+        host, _, ok = _split_host_port(entry)
+        if ok and host is not None:
+            bases.append(host.lower().rstrip("."))
+        else:
+            malformed.append(entry)
+    return bases, malformed
+
+
+def _network_entries(cidrs: list[str]) -> tuple[list[_IpNetwork], list[str]]:
+    """Parse CIDR allow entries into ``(networks, malformed)``. Networks are
+    allow-only (there is no ``denied_networks``), so a malformed entry is safe
+    to drop, but it is still surfaced so an operator sees the typo."""
+    nets: list[_IpNetwork] = []
+    malformed: list[str] = []
+    for cidr in cidrs:
+        try:
+            nets.append(ipaddress.ip_network(cidr, strict=False))
+        except ValueError:
+            malformed.append(cidr)
+    return nets, malformed
+
+
 def _matches_host_entry(
     cand: HostPort, entries: list[HostPort]
 ) -> tuple[bool, bool]:
@@ -227,8 +273,8 @@ def _matches_host_entry(
 
     Returns ``(matched, port_required)``. ``port_required`` is True when an
     entry matched the host and pinned a port, but the target carried no
-    port — an ambiguity the caller surfaces as an explicit DENY on the
-    allow side rather than guessing.
+    port — an ambiguity the caller surfaces as an explicit DENY (fail
+    closed) rather than guessing.
     """
     cand_host, cand_port = cand
     port_required = False
@@ -242,29 +288,21 @@ def _matches_host_entry(
     return False, port_required
 
 
-def _matches_domain(candidate: str, domains: list[str]) -> bool:
+def _matches_domain(candidate: str, bases: list[str]) -> bool:
     if _as_ip(candidate) is not None:
         return False  # an IP literal is never a domain-suffix match
     cand = candidate.lower().rstrip(".")
-    for domain in domains:
-        host, _, ok = _split_host_port(domain)
-        if not ok or host is None:
-            continue
-        base = host.lower().rstrip(".")
+    for base in bases:
         if cand == base or cand.endswith("." + base):
             return True
     return False
 
 
-def _matches_network(candidate: str, networks: list[str]) -> bool:
+def _matches_network(candidate: str, nets: list[_IpNetwork]) -> bool:
     ip = _as_ip(candidate)
     if ip is None:
         return False
-    for cidr in networks:
-        try:
-            net = ipaddress.ip_network(cidr, strict=False)
-        except ValueError:
-            continue  # malformed CIDR in config — skip, don't crash the gate
+    for net in nets:
         if ip.version == net.version and ip in net:
             return True
     return False
@@ -309,9 +347,12 @@ def _label(cand: HostPort) -> str:
 def check_scope(
     action: ActionProposal, scope: EngagementScope
 ) -> tuple[bool, list[str], Severity | None]:
-    """Returns ``(allowed, reasons, severity)``. Every scope denial is
-    ``BLOCK_ACTION``: the agent should try a different (in-scope) target,
-    not abandon the goal or the whole run."""
+    """Returns ``(allowed, reasons, severity)``.
+
+    A scope denial is normally ``BLOCK_ACTION`` (try a different in-scope
+    target). The exception is a malformed deny-list config, which is
+    non-recoverable — every action hits the same error — so it is
+    ``ABORT_RUN``."""
     if isinstance(action.target, AssetTarget):
         return _check_asset_scope(action.target, scope)
 
@@ -325,20 +366,25 @@ def check_scope(
             Severity.BLOCK_ACTION,
         )
 
-    denied_hosts, denied_malformed = _host_entries(scope.denied_hosts)
-    allowed_hosts, _allowed_malformed = _host_entries(scope.allowed_hosts)
+    denied_hosts, denied_host_bad = _host_entries(scope.denied_hosts)
+    allowed_hosts, allowed_host_bad = _host_entries(scope.allowed_hosts)
+    denied_domains, denied_domain_bad = _domain_entries(scope.denied_domains)
+    allowed_domains, allowed_domain_bad = _domain_entries(scope.allowed_domains)
+    allowed_nets, allowed_net_bad = _network_entries(scope.allowed_networks)
 
-    # A malformed deny entry would otherwise be silently skipped, leaving a
-    # deny rule with zero effect (fail-open). For a safety gate we fail closed:
-    # refuse until the operator fixes the config.
-    if denied_malformed:
+    # Malformed DENY entries (host or domain) must never be silently skipped:
+    # that leaves a deny rule with zero effect (fail-open). A broken scope
+    # config is also non-recoverable — every action hits the same error — so
+    # ABORT_RUN rather than BLOCK_ACTION (which would retry every target).
+    deny_malformed = denied_host_bad + denied_domain_bad
+    if deny_malformed:
         return (
             False,
             [
-                f"engagement scope has malformed denied_hosts entries "
-                f"{denied_malformed} — refusing to evaluate (fix config)"
+                f"engagement scope has malformed deny entries {deny_malformed} "
+                "— refusing to evaluate (fix config)"
             ],
-            Severity.BLOCK_ACTION,
+            Severity.ABORT_RUN,
         )
 
     # Deny lists win outright. A bare-host deny blocks every port; a
@@ -361,7 +407,7 @@ def check_scope(
                 ],
                 Severity.BLOCK_ACTION,
             )
-        if _matches_domain(cand[0], scope.denied_domains):
+        if _matches_domain(cand[0], denied_domains):
             return (
                 False,
                 [f"target '{_label(cand)}' is explicitly denied (denied_domains)"],
@@ -383,9 +429,9 @@ def check_scope(
         if matched:
             return True, [], None
         port_required = port_required or needs_port
-        if _matches_domain(cand[0], scope.allowed_domains):
+        if _matches_domain(cand[0], allowed_domains):
             return True, [], None
-        if _matches_network(cand[0], scope.allowed_networks):
+        if _matches_network(cand[0], allowed_nets):
             return True, [], None
 
     labels = [_label(c) for c in resolved]
@@ -398,4 +444,10 @@ def check_scope(
             ],
             Severity.BLOCK_ACTION,
         )
-    return False, [f"target {labels} is not within engagement scope"], Severity.BLOCK_ACTION
+    # Surface ignored malformed ALLOW entries: safe to drop, but a silent typo
+    # here otherwise looks like a mysterious "everything denied".
+    allow_malformed = allowed_host_bad + allowed_domain_bad + allowed_net_bad
+    reason = f"target {labels} is not within engagement scope"
+    if allow_malformed:
+        reason += f" (ignored malformed allow entries: {allow_malformed})"
+    return False, [reason], Severity.BLOCK_ACTION
