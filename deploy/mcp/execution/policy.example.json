@@ -17,6 +17,7 @@
   "writable": false,
   "max_timeout_seconds": 30,
   "max_output_bytes": 65536,
+  "max_output_file_bytes": 8388608,
   "tmpfs_bytes": 16777216,
   "pids_limit": 64,
   "memory": "256m",

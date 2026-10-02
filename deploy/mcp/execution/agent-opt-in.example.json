@@ -1,0 +1,29 @@
+{
+  "metadata": {
+    "execution_agent": {
+      "enabled": true,
+      "assets": {
+        "workspace-test": {
+          "recipe": "line_count",
+          "path": "input.txt"
+        }
+      }
+    }
+  },
+  "rules_of_engagement": [
+    {
+      "name": "execution Agent opt-in",
+      "allowed_capabilities": [
+        "analysis"
+      ],
+      "allowed_operations": [
+        "analysis.command_run"
+      ]
+    }
+  ],
+  "gateway_allowlist": {
+    "analysis.run_command": [
+      "command_run"
+    ]
+  }
+}
