@@ -60,6 +60,28 @@
 | 8 | 실제 Tool 실행 → Artifact → Evidence 생성 및 Finding/Reporter 연결 | ⏳ PM의 공통 포트·전달 책임 결정 후 타 팀과 통합 |
 | 9 | Audit → 실행 Tool·Invocation·생성 Evidence 연결 및 검증 | ⏳ 실행 후 연결 규격과 책임 계층 협의 필요 |
 
+Scope DENY 기록 회귀 검증(2026-10-03, 기준 `dev-control` / `2dcdede`):
+
+- 11개 요청·설정 사례의 PolicyDecision → Audit → 차단 Evidence 연결 검증 완료.
+- `BLOCK_ACTION`과 `ABORT_RUN` 태그 보존, 파일 저장 후 재조회,
+  Evidence 저장 실패 시 DENY·severity 유지 검증 완료.
+- 관련 테스트 93개 통과.
+- `ruff check src tests examples` 및 `mypy src/redteam`
+  (192개 소스 파일) 통과.
+- 운영 코드 수정 없음.
+
+추가 전체 테스트는 작업자가 WSL의 프로젝트 전용 가상환경에서
+실행한 결과를 반영했다.
+
+- 실행 명령: `python -m pytest -q`
+- 결과: `1213 passed, 4 skipped in 122.92s`
+- skipped 4개의 사유는 미확인.
+- 이번 문서 갱신에서는 검사를 재실행하지 않음.
+
+위 검증은 판단과 기록 보존을 대상으로 한다.
+실제 CLI·MCP 실행 및 Orchestration의 `severity:abort_run` 소비에 따른
+즉시 Run 종료는 별도 통합 검증이 필요하다.
+
 Raw Artifact와 Evidence 연결 검증의 상세 규약은
 [`artifact-and-evidence-validation.md`](./artifact-and-evidence-validation.md)를 따른다.
 
@@ -185,6 +207,7 @@ DENY할 때 **왜 막혔는지에 따라 에이전트의 다음 행동이 달라
   Agent 라우터는 `severity_from_matched_rules(decision.matched_rules)`로 읽어 라우팅.
 - 스테이지별 매핑: scope→BLOCK / roe(능력)→REPLAN / roe(작업)→BLOCK / roe(시간)→ABORT /
   policy→REPLAN / rate_limit→BLOCK / budget→ABORT.
+- Scope의 잘못된 `denied_hosts`/`denied_domains` 설정은 예외적으로 `ABORT_RUN`이다.
 
 **업데이트 (완료됨):** Agent 팀이 이 태그를 실제 라우팅에 반영했다. `orchestration/nodes/policy.py`의 `denial_severity()`가 `matched_rules`의 `severity:<value>` 태그를 직접 읽고(의존성 규칙상 `redteam.control.severity`를 임포트할 수 없어 태그 문자열만 재해석 — 값의 정의 자체는 여전히 `core.enums.Severity`가 유일한 출처), `orchestration/nodes/replan.py`(`SEVERITY_ABORT_RUN`/`SEVERITY_REPLAN_GOAL` 분기)와 `orchestration/nodes/aggregate.py`(`item.policy_severity` 비교)가 실제로 이 값에 따라 ABORT/REPLAN을 가른다. `severity_from_matched_rules` 함수 자체는 (의존성 규칙상) orchestration에서 직접 호출되지 않지만, 동일한 태그 형식을 읽는 자체 리더(`denial_severity`)로 소비된다.
 
@@ -221,6 +244,7 @@ DENY할 때 **왜 막혔는지에 따라 에이전트의 다음 행동이 달라
 | `EvidenceStore` 포트에 조회 메서드 | hypothesis별 조회 등 | concrete store에만 추가 |
 | `EvidenceRecord.digest` 원본 재검증 규격 | 원본 payload 보존·검증이 필요할 때 | 현재는 저장 JSONL 줄의 해시만 인덱스와 대조. 원본 보존 방식은 PM과 결정 |
 | Evidence Target 저장 규격 | Finding의 Target 연결 검증 시 | 공통 Target dict만 비교하고 표시 문자열은 검증 불가 처리 |
+| **`EngagementScope` 전용 포트/origin/경로 필드 승격** | Scope를 host 중심이 아니라 port·origin·path 단위로 1급 표현해야 할 때 (예: `allowed_ports`, origin/path 제한) | **결정됨(2026-10-02): 하지 않음.** 포트 제한은 기존 `allowed_hosts`/`denied_hosts`의 `host:port` 문자열 규약으로 지원하는 것을 **최종 방식으로 확정**했다 (`control/scope.py`, Contract 변경 0, 타 팀 영향 0). 전용 필드 승격은 지금 하지 않으며, 추후 host 중심 모델을 벗어나야 할 실제 요구가 생길 때에만 PM Issue로 재검토한다. 그때도 `scope.py`의 `_split_host_port`/`_resolve_target` 입력만 교체하면 되도록 로직을 분리해 둠. |
 
 **해결됨:** `ActionProposal.risk_level` 추가 요청은 필요 없어졌다. dev에 추가된 read-only `ToolGateway.list_tools_for_action`으로 Registry의 `risk_level`을 Contract 변경 없이 읽을 수 있다 (§2.1).
 
