@@ -104,7 +104,7 @@ set +a
 
 ### 일반 CLI / Agent 팀 인수인계
 
-`build_application(AppConfig)`는 `capability.methodology`가 있을 때만 `methodology-agent`를 추가한다. 기본 Recon/Web/Mobile capabilities와 Analysis verifier 역할은 바꾸지 않는다. 별도 조회 Agent가 먼저 최대 3개 지정 자료를 순서대로 읽고, 기존 LLM 후보 생성기는 자기 capability와 관련된 검증 자료만 받는다.
+`build_application(AppConfig)`는 `capability.methodology`가 있을 때만 `methodology-agent`를 추가한다. 현재 기본 Agent 정의와 capabilities를 보존하며 모바일 통합에서 실행 가능한 Analysis Agent를 비활성화하지 않는다. 최대 3개 지정 자료의 조회 옵션을 제공하지만 자동 실행하지 않는다. accepted path와 LLM action 선택 후 별도 조회 Agent가 읽고, 기존 LLM 후보 생성기는 자기 capability와 관련된 검증 자료만 받는다.
 
 ```text
 Methodology Agent → CandidateCompiler → Control → ToolGateway → 기존 read MCP
@@ -120,7 +120,7 @@ export REDTEAM_METHODOLOGY_CONFIG_JSON='{"workspace_policy_path":"/absolute/path
 
 기본 read_chars는 8192자(256~16384), 전체 LLM 본문 예산은 12000자(256~24000)다. 문서는 64 KiB 이내이고 offset은 문자 기준이다. 앞부분만 읽고 검증했다고 표시하지 않으며 변조/다른 Run/실패/중복 불일치 결과는 제외한다. 실제 자료의 instruction은 시스템 prompt/ROE로 올리지 않는다. Graph에는 본문 대신 자료 ID·상태·읽기 위치만 넣어 paging을 실제 진행으로 인식한다.
 
-opt-in에서는 정책의 engagement/run ID에 묶인다. 다른 명시 ID는 거절하며, Evidence가 있는 Run ID로 새 `run`을 시작하는 것도 거절한다. 운영 실행을 재개하려면 기존 durable checkpoint와 resume 경로를 사용하고 해당 Run의 정책을 유지해야 한다. 이번 opt-in 자료 조회의 durable 중단·재개 E2E는 아직 검증하지 않았다. recording demo는 memory checkpoint이므로 resume 예제가 아니다. 새 실행은 새 Run 정책/bundle을 준비한다. 새 Agent/config 필드는 dev 통합 전 PM/Agent 팀 검토 대상이다.
+opt-in에서는 정책의 engagement/run ID에 묶인다. 다른 명시 ID는 거절하며, Evidence가 있는 Run ID로 새 `run`을 시작하는 것도 거절한다. 운영 실행을 재개하려면 기존 durable checkpoint와 resume 경로를 사용하고 해당 Run의 정책을 유지해야 한다. 2026-10-02 후속에서는 실제 MCP와 SQLite 저장소를 이용해 일부 페이지 읽기 후 새 실행 객체 구성·승인 대기/승인/거절·이어 읽기를 로컬 테스트 모델로 검증했다. 실제 외부 LLM/전체 프로세스 장애 복구 검증은 아니며 자세한 범위는 [A 최신 상태](../../../docs/capability/a-current-status.md)를 참고한다. recording demo는 memory checkpoint이므로 resume 예제가 아니다. 새 실행은 새 Run 정책/bundle을 준비한다. 새 Agent/config 필드는 dev 통합 전 PM/Agent 팀 검토 대상이다.
 
 ```sh
 ./.venv/bin/pytest -q tests/unit/test_methodology_config.py \

@@ -1,0 +1,33 @@
+{
+  "policy": {
+    "root": "/absolute/operator/staging-vdb",
+    "asset_ref": "vdb-operating-candidate",
+    "engagement_id": "eng-operator-audit",
+    "run_id": "run-operator-audit",
+    "synthetic": false,
+    "max_age_days": 7,
+    "max_results": 20,
+    "query_timeout_seconds": 5
+  },
+  "expected_sha256": {
+    "data.vdb7": "0000000000000000000000000000000000000000000000000000000000000000",
+    "data.index.vdb7": "0000000000000000000000000000000000000000000000000000000000000000",
+    "vdb.meta": "0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "checks": [
+    {
+      "kind": "cve",
+      "query": "CVE-2021-44228",
+      "expected_advisory_ids": ["CVE-2021-44228"]
+    },
+    {
+      "kind": "cve",
+      "query": "CVE-1900-0000",
+      "expected_advisory_ids": []
+    }
+  ],
+  "max_snapshot_bytes": 2147483648,
+  "max_audit_seconds": 300,
+  "max_lookup_seconds": 5,
+  "allow_synthetic": false
+}

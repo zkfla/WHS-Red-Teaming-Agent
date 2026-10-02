@@ -39,7 +39,9 @@ from redteam.core.enums import ApprovalStatus, GraphNodeType, PolicyVerdict
 from redteam.core.ids import ActionId, AgentId, AssetId, EngagementId, RunId, ToolId
 from redteam.orchestration.agents.registry import default_registry
 from redteam.orchestration.methodology import REFERENCE_AGENT_ID
+from redteam.orchestration.runner import AgentLoopRunner
 from redteam.orchestration.settings import OrchestrationSettings
+from redteam.orchestration.state import TerminationReason
 from tests.integration.test_methodology_workspace import configure
 from tests.unit.test_methodology import (  # noqa: F401
     fixture_source,
@@ -127,8 +129,18 @@ def deployment(tmp_path, monkeypatch, *, real=False):
     ), workspace
 
 
-async def application(tmp_path, monkeypatch, stack, *, real=False, denied=False):
-    method, workspace = deployment(tmp_path, monkeypatch, real=real)
+async def application(
+    tmp_path,
+    monkeypatch,
+    stack,
+    *,
+    real=False,
+    denied=False,
+    prepared=None,
+    settings=None,
+    require_approval=False,
+):
+    method, workspace = prepared or deployment(tmp_path, monkeypatch, real=real)
     config = AppConfig.model_validate(
         {
             "engagement": {
@@ -139,6 +151,9 @@ async def application(tmp_path, monkeypatch, stack, *, real=False, denied=False)
                 },
                 "execution_budget": {"max_actions": 80},
                 "rate_limit_policy": {"max_actions_per_minute": 200},
+                "approval_policy": {
+                    "require_approval_for": ["analysis.file_read"] if require_approval else []
+                },
             },
             "capability": {"mcp_servers": ["method-test"], "methodology": method.model_dump()},
         }
@@ -151,7 +166,8 @@ async def application(tmp_path, monkeypatch, stack, *, real=False, denied=False)
         evidence_dir=tmp_path / "evidence",
         audit_dir=tmp_path / "audit",
         approval_dir=tmp_path / "approvals",
-        orchestration_settings=OrchestrationSettings(
+        orchestration_settings=settings
+        or OrchestrationSettings(
             max_steps=250,
             checkpoint_backend="memory",
             enforce_verification_reserve=False,
@@ -180,7 +196,11 @@ async def test_agent_loads_reference_via_mcp_then_passes_data_to_web_llm(
         builtin = default_registry()
         for spec in builtin.all():
             assert deps.agents.get(spec.agent_id).capabilities == spec.capabilities
-        assert deps.agents.definition("analysis-agent").schedulable is False
+        # Methodology composition must preserve today's built-in definitions,
+        # including the executable Analysis Agent introduced by mobile analysis.
+        # A historical schedulable=False assertion rejected that valid integration.
+        for definition in builtin.definitions():
+            assert deps.agents.definition(definition.agent_id) == definition
         assert REFERENCE_AGENT_ID in deps.agents.agent_ids
         final = await run_engagement(engagement, deps, objective="합성 API 방법론 자료만 확인")
         records = await deps.evidence_store.list_for_run(final.run_id)
@@ -207,6 +227,108 @@ async def test_agent_loads_reference_via_mcp_then_passes_data_to_web_llm(
 
         output = await read_through_control(deps.tool_gateway, workspace, "notes.md")
         assert output["content"] == "ordinary synthetic workspace notes"
+
+
+@pytest.mark.parametrize("approved", [False, True])
+async def test_reference_partial_read_survives_durable_rebuild_and_human_decision(
+    tmp_path, monkeypatch, approved
+):
+    """Real MCP + disk stores; test-only human/model, no live provider or target."""
+    monkeypatch.setattr("redteam.app.bootstrap.save_terminal_report", lambda report: None)
+    prepared = deployment(tmp_path, monkeypatch)
+    settings = OrchestrationSettings(
+        max_steps=250,
+        checkpoint_backend="sqlite",
+        checkpoint_path=str(tmp_path / "checkpoint.sqlite3"),
+        work_backend="sqlite",
+        work_path=str(tmp_path / "work.sqlite3"),
+        task_graph_backend="sqlite",
+        path_backend="sqlite",
+        task_graph_path=str(tmp_path / "tasks.sqlite3"),
+        attack_graph_backend="sqlite",
+        attack_graph_path=str(tmp_path / "graph.sqlite3"),
+        operator_intent_backend="sqlite",
+        operator_intent_path=str(tmp_path / "intent.sqlite3"),
+    )
+    async with AsyncExitStack() as stack:
+        engagement, deps, _, _ = await application(
+            tmp_path,
+            monkeypatch,
+            stack,
+            prepared=prepared,
+            settings=settings,
+            require_approval=True,
+        )
+        stopped = await run_engagement(engagement, deps, objective="승인된 자료만 이어 읽기")
+        assert stopped.termination_reason == TerminationReason.APPROVAL_PENDING
+        assert stopped.actions_executed == 0
+        before = await deps.evidence_store.list_for_run(stopped.run_id)
+        assert not [r for r in before if r.metadata.get("tool_result")]
+        assert not deps.methodology_library.excerpts(before, ["web"])
+        await deps.control_plane.resolve_approval(
+            stopped.pending_approval_id, ApprovalStatus.APPROVED, "fixture-human"
+        )
+        runner = AgentLoopRunner(deps, settings=settings)
+        recovered = await runner.recover_runtime(stopped.run_id)
+        assert recovered is not None
+        partial = await runner.resume_recovered(recovered)
+        assert partial.termination_reason == TerminationReason.APPROVAL_PENDING
+        assert partial.actions_executed == 1
+        records = await deps.evidence_store.list_for_run(partial.run_id)
+        library = deps.methodology_library
+        assert library.inspect(records, library.entries[0]) == ("pending", 256, "")
+        assert not library.excerpts(records, ["web"])
+
+    # New composition, Control Plane, MCP process, LLM instance and disk-backed
+    # domain stores: only persisted artifacts survive the first stack's exit.
+    async with AsyncExitStack() as stack:
+        _, rebuilt, llm, _ = await application(
+            tmp_path,
+            monkeypatch,
+            stack,
+            prepared=prepared,
+            settings=settings,
+            require_approval=True,
+        )
+        runner = AgentLoopRunner(rebuilt, settings=settings)
+        recovered = await runner.recover_runtime(partial.run_id)
+        assert recovered is not None
+        assert recovered.pending_approval_id == partial.pending_approval_id
+        waiting = await runner.resume_recovered(recovered)
+        assert waiting.actions_executed == 1  # unresolved approval cannot execute
+        status = ApprovalStatus.APPROVED if approved else ApprovalStatus.REJECTED
+        await rebuilt.control_plane.resolve_approval(
+            waiting.pending_approval_id, status, "fixture-human"
+        )
+        current = await runner.resume_recovered(waiting)
+        if not approved:
+            assert current.actions_executed == 1
+            records = await rebuilt.evidence_store.list_for_run(current.run_id)
+            lib = rebuilt.methodology_library
+            assert lib.inspect(records, lib.entries[0]) == ("pending", 256, "")
+            assert not lib.excerpts(records, ["web"])
+            assert llm.reference_context_calls == 0
+            return
+        # Each remaining page has its own human decision; no global auto-approval.
+        for _ in range(8):
+            if current.termination_reason != TerminationReason.APPROVAL_PENDING:
+                break
+            await rebuilt.control_plane.resolve_approval(
+                current.pending_approval_id, ApprovalStatus.APPROVED, "fixture-human"
+            )
+            current = await runner.resume_recovered(current)
+        records = await rebuilt.evidence_store.list_for_run(current.run_id)
+        lib = rebuilt.methodology_library
+        assert current.run_id == partial.run_id
+        assert lib.inspect(records, lib.entries[0])[0] == "verified"
+        chunks = [
+            r.metadata["methodology_chunk"] for r in records if "methodology_chunk" in r.metadata
+        ]
+        assert len({c["offset_chars"] for c in chunks}) == len(chunks)
+        assert llm.reference_context_calls > 0
+        assert all(
+            r.source_id == "analysis.read_file" for r in records if r.metadata.get("tool_result")
+        )
 
 
 async def test_no_automatic_asset_scope_expansion(tmp_path, monkeypatch):

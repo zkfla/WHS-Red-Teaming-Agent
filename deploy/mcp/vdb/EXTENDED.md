@@ -126,3 +126,6 @@ export REDTEAM_VDB_TEST_PYTHON='/absolute/runtime/vdb/venv/bin/python'
 
 아직 별도: 일반 URL/OSV alias/fulltext 검색, shard fan-out, fix/patch 근거 추출,
 대규모 실 DB 성능 검증, 실제 외부 LLM 활용, B/C 통합, dev 반영.
+
+준비된 snapshot의 오프라인 해시/상태/알려진 조회/시간 제한 점검 명령은
+[운영 DB 사전 점검](SNAPSHOT-AUDIT.md)을 참고한다. 다운로드·교체·활성화 기능은 아니다.
