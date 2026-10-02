@@ -376,12 +376,13 @@ def test_empty_port_target_is_reasoned_deny() -> None:
 
 def test_malformed_deny_entry_fails_closed() -> None:
     # A broken deny rule must not silently give zero protection: refuse until
-    # the config is fixed, rather than letting the target through.
+    # the config is fixed. A malformed deny config is non-recoverable (every
+    # action hits it), so it is ABORT_RUN, not BLOCK_ACTION.
     scope = EngagementScope(allowed_hosts=["10.0.0.5"], denied_hosts=["10.0.0.5:abc"])
     ok, reasons, severity = check_scope(_proposal("10.0.0.5:8080"), scope)
     assert ok is False
-    assert "malformed denied_hosts" in reasons[0]
-    assert severity is Severity.BLOCK_ACTION
+    assert "malformed deny entries" in reasons[0]
+    assert severity is Severity.ABORT_RUN
 
 
 def test_valid_deny_still_works_alongside_check() -> None:
@@ -413,3 +414,68 @@ def test_portless_target_under_port_scoped_deny_fails_closed() -> None:
     assert ok is False
     assert "port-scoped deny" in reasons[0]
     assert severity is Severity.BLOCK_ACTION
+
+
+
+# --- deeper review hardening (self-audit, 2026-10-02) ----------------------
+#
+# Fixes found reviewing the first hardening pass:
+#   P1  denied_domains malformed was still silently skipped (fail-open)
+#   P2  malformed deny config must be ABORT_RUN, not BLOCK_ACTION
+#   P3  surface malformed allow entries; reject port 0
+
+
+def test_malformed_denied_domain_fails_closed_abort() -> None:
+    # The domain deny list must harden like the host deny list: a malformed
+    # entry fails closed (and aborts), never silently skipped.
+    scope = EngagementScope(
+        allowed_domains=["example.com"], denied_domains=["sub.example.com:abc"]
+    )
+    ok, reasons, severity = check_scope(_proposal("sub.example.com"), scope)
+    assert ok is False
+    assert "malformed deny entries" in reasons[0]
+    assert severity is Severity.ABORT_RUN
+
+
+def test_valid_denied_domain_still_blocks_without_abort() -> None:
+    # Sanity: a well-formed domain deny still blocks the target as BLOCK_ACTION.
+    scope = EngagementScope(
+        allowed_domains=["example.com"], denied_domains=["internal.example.com"]
+    )
+    ok, reasons, severity = check_scope(_proposal("db.internal.example.com"), scope)
+    assert ok is False
+    assert "denied_domains" in reasons[0]
+    assert severity is Severity.BLOCK_ACTION
+
+
+def test_domain_entry_with_port_is_not_malformed() -> None:
+    # A :port on a domain entry is ignored (domains are port-agnostic), NOT
+    # treated as malformed — so it must not trigger the abort path.
+    scope = EngagementScope(denied_domains=["example.com:443"], allowed_hosts=["x"])
+    ok, _, severity = check_scope(_proposal("api.example.com"), scope)
+    assert ok is False
+    assert severity is Severity.BLOCK_ACTION  # denied by domain, not aborted
+
+
+def test_malformed_allow_entry_surfaced_in_reason() -> None:
+    # A malformed allow entry is dropped (safe) but surfaced so a typo is not
+    # mistaken for a mysterious "everything denied".
+    scope = EngagementScope(allowed_hosts=["good.host", "bad:entry:x"])
+    ok, reasons, severity = check_scope(_proposal("9.9.9.9"), scope)
+    assert ok is False
+    assert "malformed allow entries" in reasons[0]
+    assert "bad:entry:x" in reasons[0]
+    assert severity is Severity.BLOCK_ACTION  # allow typo is recoverable
+
+
+def test_port_zero_is_rejected() -> None:
+    scope = EngagementScope(allowed_hosts=["127.0.0.1"])
+    ok, reasons, _ = check_scope(_proposal("127.0.0.1:0"), scope)
+    assert ok is False
+    assert "malformed" in reasons[0]
+
+
+def test_port_zero_allow_entry_is_dropped_not_all_ports() -> None:
+    # "host:0" is malformed, not a bare host — must not allow every port.
+    scope = EngagementScope(allowed_hosts=["127.0.0.1:0"])
+    assert check_scope(_proposal("127.0.0.1:8080"), scope)[0] is False
