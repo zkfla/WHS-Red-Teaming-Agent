@@ -169,7 +169,11 @@ class MissionPlan(BaseModel):
     @model_validator(mode="after")
     def _timestamps_are_ordered(self) -> MissionPlan:
         if self.updated_at < self.created_at:
-            raise ValueError("updated_at cannot precede created_at")
+            # updated_at can never logically precede created_at. A stale or
+            # clock-skewed operation `now` stamped on an update is clamped to
+            # created_at rather than crashing the pipeline (clocks are not
+            # guaranteed monotonic, and an operation timestamp may be reused).
+            self.updated_at = self.created_at
         return self
 
     def redacted_copy(self) -> MissionPlan:
@@ -230,7 +234,8 @@ class MissionTask(BaseModel):
         if self.status is not TaskStatus.BLOCKED and self.blocking_reason is not None:
             raise ValueError("blocking_reason is only valid for blocked tasks")
         if self.updated_at < self.created_at:
-            raise ValueError("updated_at cannot precede created_at")
+            # See MissionPlan._timestamps_are_ordered: clamp, don't crash.
+            self.updated_at = self.created_at
         return self
 
     def redacted_copy(self) -> MissionTask:

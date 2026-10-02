@@ -240,7 +240,9 @@ async def run_session(
 
     if isinstance(console, Console):
         controller.output.console = Console(
-            file=console.file, width=console.width, color_system=console.color_system
+            file=console.file,
+            width=console.width,
+            color_system=console.color_system,  # type: ignore[arg-type]
         )
 
     class SessionStream:

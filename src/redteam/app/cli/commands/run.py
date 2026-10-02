@@ -651,18 +651,25 @@ class OperatorConsole:
             )
         if self._service is None or self._identity.mission_id is None:
             return False, "현재 Mission 입력 채널이 없습니다."
-        kwargs = dict(
-            mission_id=self._identity.mission_id,
-            run_id=self._identity.run_id,
-            publisher=self._publisher(),
-        )
+        service = self._service
+        mission_id = self._identity.mission_id
+        run_id = self._identity.run_id
+        publisher = self._publisher()
         if kind == "guidance":
-            application = await self._service.receive_guidance_and_apply(
-                value, **kwargs, source="operator_chat"
+            application = await service.receive_guidance_and_apply(
+                value,
+                mission_id=mission_id,
+                run_id=run_id,
+                publisher=publisher,
+                source="operator_chat",
             )
         else:
-            application = await self._service.receive_and_apply(
-                (kind + " " + value).strip(), **kwargs, allow_guidance=False
+            application = await service.receive_and_apply(
+                (kind + " " + value).strip(),
+                mission_id=mission_id,
+                run_id=run_id,
+                publisher=publisher,
+                allow_guidance=False,
             )
         return application.applied, (
             f"{application.outcome} — 지시 수락과 Agent의 실제 반영은 별개입니다."

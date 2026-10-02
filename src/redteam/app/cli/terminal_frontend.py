@@ -125,7 +125,7 @@ class TerminalFrontend:
         root = FloatContainer(
             body, floats=[Float(xcursor=True, ycursor=True, content=CompletionsMenu(max_height=6))]
         )
-        self.app = Application(
+        self.app: Application[Any] = Application(
             layout=Layout(root),
             key_bindings=keys,
             full_screen=False,
@@ -222,7 +222,8 @@ class TerminalFrontend:
 
     def emergency(self, text: str) -> None:
         # Last-resort failure path only, never execute control sequences.
-        sys.__stderr__.write(safe_text(text) + "\n")
+        if sys.__stderr__ is not None:
+            sys.__stderr__.write(safe_text(text) + "\n")
 
 
 class ConsoleFrontend:
@@ -232,7 +233,7 @@ class ConsoleFrontend:
 
     def __init__(self, console) -> None:
         self.console = console
-        self.controller = None
+        self.controller: Any = None
         self.details = False
 
     def bind(self, controller) -> None:
@@ -275,7 +276,7 @@ class PlainFrontend(ConsoleFrontend):
 
     def __init__(self, console) -> None:
         super().__init__(console)
-        self.prompt = PromptSession()
+        self.prompt: PromptSession[Any] = PromptSession()
 
     async def read_line(self) -> str:
         return await self.prompt.prompt_async(
@@ -285,17 +286,14 @@ class PlainFrontend(ConsoleFrontend):
     async def write(self, content, console) -> None:
         lines = console.render_lines(content, console.options, pad=False)
         text = "\n".join("".join(segment.text for segment in line) for line in lines)
-        text = safe_text(text).translate(
-            str.maketrans(
-                {
-                    "❯": ">",
-                    "✓": "+",
-                    "✗": "x",
-                    "●": "*",
-                    "○": "o",
-                    "→": ">",
-                    "─": "-",
-                }
-            )
-        )
+        replacements: dict[str, str | int | None] = {
+            "❯": ">",
+            "✓": "+",
+            "✗": "x",
+            "●": "*",
+            "○": "o",
+            "→": ">",
+            "─": "-",
+        }
+        text = safe_text(text).translate(str.maketrans(replacements))
         console.print(text, markup=False, highlight=False, style="default")
