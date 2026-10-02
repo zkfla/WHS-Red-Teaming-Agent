@@ -32,6 +32,7 @@ from redteam.orchestration.completion import validate_completion
 from redteam.orchestration.events import AGENT_CONTEXT_PREPARED, AGENT_TURN_DECIDED
 from redteam.orchestration.evidence_access import EvidenceReader
 from redteam.orchestration.execution_bridge import (
+    EXECUTION_OPERATIONS,
     agent_tool_visible,
     bind_execution_arguments,
     execution_agent_options,
@@ -924,27 +925,32 @@ class InvestigationEngine:
                     raise ValueError("action role/capability is unavailable")
                 if step.agent_id and step.agent_id != intent.agent_id:
                     raise ValueError("action role is outside accepted step")
-                node = await service.get_node(GraphNodeId(intent.target_node_id))
-                if node is None:
-                    raise ValueError("referenced action target disappeared")
-                if self.deps.tool_catalog is None:
-                    raise ValueError("a real tool catalog is required for action compilation")
-                tool = self.deps.tool_catalog.get(intent.tool_id)
-                if tool is None:
-                    raise ValueError("requested tool is absent from catalog")
-                intent = intent.model_copy(
-                    update={
-                        "arguments": bind_execution_arguments(
-                            engagement=self.deps.engagement,
-                            run_id=runtime.run_id,
-                            node=node,
-                            tool=tool,
-                            capability=intent.capability,
-                            operation=intent.operation,
-                            arguments=intent.arguments,
-                        )
-                    }
-                )
+                execution_node = None
+                execution_tool = None
+                if intent.operation in EXECUTION_OPERATIONS:
+                    execution_node = await service.get_node(
+                        GraphNodeId(intent.target_node_id)
+                    )
+                    if execution_node is None:
+                        raise ValueError("referenced action target disappeared")
+                    if self.deps.tool_catalog is None:
+                        raise ValueError("a real tool catalog is required for action compilation")
+                    execution_tool = self.deps.tool_catalog.get(intent.tool_id)
+                    if execution_tool is None:
+                        raise ValueError("requested tool is absent from catalog")
+                    intent = intent.model_copy(
+                        update={
+                            "arguments": bind_execution_arguments(
+                                engagement=self.deps.engagement,
+                                run_id=runtime.run_id,
+                                node=execution_node,
+                                tool=execution_tool,
+                                capability=intent.capability,
+                                operation=intent.operation,
+                                arguments=intent.arguments,
+                            )
+                        }
+                    )
                 operation = f"{intent.capability}.{intent.operation}"
                 exclusions = await operator_exclusions(
                     self.deps,
@@ -965,6 +971,11 @@ class InvestigationEngine:
                 validate_principal_arguments(
                     step, intent.principal_ref, intent.arguments, context["knowledge"]
                 )
+                node = execution_node or await service.get_node(
+                    GraphNodeId(intent.target_node_id)
+                )
+                if node is None:
+                    raise ValueError("referenced action target disappeared")
                 node_facts = facts_of(node.properties)
                 target = target_for_node(
                     node.id,
@@ -977,6 +988,11 @@ class InvestigationEngine:
                 validate_argument_target(
                     target, intent.arguments, target_aliases(self.deps, target)
                 )
+                if self.deps.tool_catalog is None:
+                    raise ValueError("a real tool catalog is required for action compilation")
+                tool = execution_tool or self.deps.tool_catalog.get(intent.tool_id)
+                if tool is None:
+                    raise ValueError("requested tool is absent from catalog")
                 if await self.has_ambiguous_execution(intent, runtime):
                     raise ValueError(
                         "matching execution is uncertain; reconcile its stored result/job"
