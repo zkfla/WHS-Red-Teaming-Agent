@@ -38,11 +38,15 @@ latest message. If the user writes in Korean, these fields MUST be natural Korea
 tool, policy, target and error identifiers unchanged where translating them would alter meaning.
 
 Choose mode:
-- execute: a concrete request that should start or continue an assessment;
+- execute: a concrete request for a NEW investigation; set investigation="new";
 - answer: a question that can be answered from the supplied session context;
 - clarify: essential target or intent information is missing;
 - guidance: advice that should influence the currently running agent without
-  directly invoking a tool.
+  directly invoking a tool; set investigation="current".
+Do not combine a request for a different investigation with current guidance.
+Questions are read-only. If an instruction refers to an ended investigation,
+clarify whether a follow-up is wanted; do not silently start a new investigation.
+The supplied input binding is authoritative; never invent or change a run ID.
 """
 
 
@@ -50,6 +54,7 @@ class ConversationDecision(BaseModel):
     """Safe, displayable result of interpreting one chat message."""
 
     mode: Literal["execute", "answer", "clarify", "guidance"]
+    investigation: Literal["current", "new"] | None = None
     response: str = Field(min_length=1, max_length=2000)
     objective: str | None = Field(default=None, max_length=1000)
     guidance: str | None = Field(default=None, max_length=1000)

@@ -134,8 +134,52 @@ async def test_tallies_tool_calls_findings_and_hypotheses() -> None:
 
     assert renderer.hypotheses == 1
     assert renderer.tool_calls == 2
-    assert renderer.findings == 1
-    assert renderer.violations == 1
+    # An unidentified event is not a unique finding or a policy violation.
+    assert renderer.findings == 0
+    assert renderer.finding_events == 1
+    assert renderer.violations == 0
+
+
+async def test_correlated_display_preserves_control_result_and_safe_details():
+    from types import SimpleNamespace
+
+    from redteam.app.cli.display import safe_text
+    from redteam.app.cli.output_coordinator import OutputCoordinator
+    from redteam.app.cli.terminal_frontend import ConsoleFrontend
+    from redteam.app.cli.view_models import SessionProjection
+
+    console, buffer = _console()
+    frontend = ConsoleFrontend(console)
+    output = OutputCoordinator(console, frontend)
+    output.start()
+    controller = SimpleNamespace(output=output, frontend=frontend, activity="")
+    projection = SessionProjection(controller)
+    events = [
+        (
+            EventType.ACTION_PROPOSED,
+            {"action_id": "a", "operation": "http_request", "target": "/login"},
+        ),
+        (
+            EventType.POLICY_EVALUATED,
+            {"action_id": "a", "verdict": "allow", "matched_rules": ["scope"]},
+        ),
+        (
+            EventType.TOOL_EXECUTION_FINISHED,
+            {"action_id": "a", "success": True, "summary": "HTTP 200"},
+        ),
+        (EventType.ACTION_DENIED, {"action_id": "b", "reasons": ["outside allowed_paths"]}),
+    ]
+    try:
+        for index, (kind, payload) in enumerate(events):
+            await projection(_event(kind, payload).model_copy(update={"event_id": f"evt_{index}"}))
+        await output.fence()
+        text = buffer.getvalue()
+        assert "/login" in text and "HTTP 200" in text and "ALLOW" in text
+        assert "outside allowed_paths" in text
+        assert projection.policy_blocks == 1
+        assert safe_text("x\x1b[2Jy\x1b]52;c;secret\x07") == "xy"
+    finally:
+        await output.close()
 
 
 async def test_unrendered_event_type_produces_no_line_but_still_tallies() -> None:
@@ -304,9 +348,7 @@ async def test_run_finished_marks_the_actual_end_of_run() -> None:
     console, buffer = _console()
     renderer = RichEventRenderer(console, verbose=False)
 
-    await renderer(
-        _event(EventType.RUN_FINISHED, {"termination_reason": "goal_achieved"})
-    )
+    await renderer(_event(EventType.RUN_FINISHED, {"termination_reason": "goal_achieved"}))
 
     output = buffer.getvalue()
     assert "goal_achieved" in output

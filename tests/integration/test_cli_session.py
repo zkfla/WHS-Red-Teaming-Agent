@@ -283,7 +283,7 @@ async def test_run_finished_returns_to_prompt_and_accepts_slash_commands(
     # `commands.tools.run_list` the standalone subcommands use (Gate D) --
     # those print via plain `print()`, captured by pytest's `capsys`, not
     # `console.print` (the Rich-rendered event/panel output).
-    stdout = capsys.readouterr().out
+    capsys.readouterr()
 
     assert exit_code == _shared.EXIT_OK
     # RunFinished happened (a report/summary was rendered)...
@@ -292,10 +292,12 @@ async def test_run_finished_returns_to_prompt_and_accepts_slash_commands(
     assert any("Commands" in line for line in console.transcript)
     # /status (no argument) resolved against the session's own last run id --
     # never a hardcoded/faked run id.
-    assert "Status: FINISHED" in stdout
+    assert any("Phase: finished" in line for line in console.transcript)
     # A missing MCP env now gets the same safe built-in baseline the Run used.
-    assert "recon.ping" in stdout
-    assert "web.http_request" not in stdout  # no implicit web server registration
+    assert "recon.ping" in "\n".join(console.transcript)
+    assert "web.http_request" not in "\n".join(
+        console.transcript
+    )  # no implicit web server registration
 
 
 async def test_natural_language_second_request_runs_a_second_agent_run(
@@ -319,7 +321,7 @@ async def test_natural_language_second_request_runs_a_second_agent_run(
     exit_code = await interactive.run(_args())
 
     assert exit_code == _shared.EXIT_OK
-    run_id_lines = [line for line in console.transcript if "RunId:" in line]
+    run_id_lines = [line for line in console.transcript if line.startswith("실행 종료 · RunId:")]
     # Two separate Agent Runs actually executed through the Runtime --
     # not one Run reused/replayed for the second request.
     assert len(run_id_lines) == 2
@@ -347,7 +349,7 @@ async def test_natural_language_explanation_does_not_start_a_new_run(
     exit_code = await interactive.run(_args())
 
     assert exit_code == _shared.EXIT_OK
-    assert len([line for line in console.transcript if "RunId:" in line]) == 1
+    assert len([line for line in console.transcript if line.startswith("실행 종료 · RunId:")]) == 1
     assert any("Run summary because" in line for line in console.transcript)
 
 
@@ -369,7 +371,7 @@ async def test_free_form_question_is_answered_without_starting_a_new_run(
     exit_code = await interactive.run(_args())
 
     assert exit_code == _shared.EXIT_OK
-    assert len([line for line in console.transcript if "RunId:" in line]) == 1
+    assert len([line for line in console.transcript if line.startswith("실행 종료 · RunId:")]) == 1
     assert console.transcript.count("\n[cyan]❯[/cyan] ") >= 2
 
 
@@ -390,8 +392,8 @@ async def test_bare_exit_ends_session_without_starting_a_new_run(
     exit_code = await interactive.run(_args())
 
     assert exit_code == _shared.EXIT_OK
-    assert len([line for line in console.transcript if "RunId:" in line]) == 1
-    assert "[User] exit" in console.transcript
+    assert len([line for line in console.transcript if line.startswith("실행 종료 · RunId:")]) == 1
+    assert any(line.strip() == "❯ exit" for line in console.transcript)
 
 
 # --- Gate I: error recovery ------------------------------------------------

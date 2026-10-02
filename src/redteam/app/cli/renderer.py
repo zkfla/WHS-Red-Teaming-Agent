@@ -18,6 +18,7 @@ from datetime import datetime
 from typing import Any
 
 from rich.console import Console
+from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
@@ -25,6 +26,7 @@ from rich.text import Text
 from redteam.app.cli import theme
 from redteam.app.cli._shared import mask_secrets
 from redteam.app.cli.conversation import ConversationDecision
+from redteam.app.cli.display import safe_text
 from redteam.core.contracts.events import EventEnvelope, EventType
 from redteam.core.enums import ApprovalStatus
 from redteam.orchestration.events import (
@@ -138,6 +140,8 @@ class RichEventRenderer:
         self.findings = 0
         self.violations = 0
         self.hypotheses = 0
+        self._finding_ids: set[str] = set()
+        self.finding_events = 0
 
     async def __call__(self, event: EventEnvelope) -> None:
         self._tally(event)
@@ -154,9 +158,14 @@ class RichEventRenderer:
         if event.event_type in (EventType.TOOL_EXECUTION_FINISHED, EventType.TOOL_EXECUTION_FAILED):
             self.tool_calls += 1
         elif event.event_type in (EventType.FINDING_CREATED, EventType.FINDING_VERIFIED):
-            self.findings += 1
-            if event.payload.get("severity") in {"high", "critical"}:
-                self.violations += 1
+            finding_id = event.payload.get("finding_id")
+            if finding_id and str(finding_id) not in self._finding_ids:
+                self._finding_ids.add(str(finding_id))
+                self.findings += 1
+            elif not finding_id:
+                self.finding_events += 1
+        elif event.event_type == EventType.ACTION_DENIED:
+            self.violations += 1
         elif event.event_type == EventType.HYPOTHESIS_CREATED:
             self.hypotheses += 1
 
@@ -413,16 +422,19 @@ def render_conversation_decision(console: Console, decision: ConversationDecisio
     Single LLM-path flow only: no fallback-recipe line is ever shown.
     """
 
-    body = Text(decision.response)
+    console.print()
+    console.print(Markdown(safe_text(decision.response), hyperlinks=False))
+    body = Text()
     if decision.assumptions:
         body.append("\n\nAssumptions\n", style=f"bold {theme.WARNING}")
         for item in decision.assumptions:
-            body.append(f"  • {item}\n", style=theme.MUTED)
+            body.append(f"  • {safe_text(item)}\n", style=theme.MUTED)
     if decision.plan:
         body.append("\nPlan\n", style=f"bold {theme.EMPHASIS}")
         for index, item in enumerate(decision.plan, start=1):
-            body.append(f"  {index}. {item}\n", style=theme.MUTED)
-    console.print(Panel(body, title="Assistant", border_style=theme.EMPHASIS, padding=(1, 2)))
+            body.append(f"  {index}. {safe_text(item)}\n", style=theme.MUTED)
+    if body.plain:
+        console.print(body)
 
 
 def render_assistant_decision(console: Console, decision: ConversationDecision) -> None:
@@ -432,14 +444,8 @@ def render_assistant_decision(console: Console, decision: ConversationDecision) 
 
 
 def render_final_answer(console: Console, text: str) -> None:
-    console.print(
-        Panel(
-            Text(text),
-            title="Result",
-            border_style=theme.SUCCESS,
-            padding=(1, 2),
-        )
-    )
+    # A textual summary is not proof of success; no unconditional green frame.
+    console.print(Markdown(safe_text(text), hyperlinks=False))
 
 
 def elapsed_since(started_at: datetime) -> str:
@@ -460,14 +466,14 @@ def render_engagement_panel(
     brand-new draft and an existing config. Never shows a YAML key or
     internal id -- only what a human decided (target/scope/focus/budget).
     """
-    lines = [f"[bold]{name}[/bold]", ""]
-    lines.append(f"Scope    {scope}")
+    body = Text(safe_text(name), style="bold")
+    body.append("\n\nScope    " + safe_text(scope), style="default")
     if focus:
-        lines.append(f"Focus    {focus}")
-    lines.append(f"Budget   {budget}")
+        body.append("\nFocus    " + safe_text(focus), style="default")
+    body.append("\nBudget   " + safe_text(budget), style="default")
     console.print(
         Panel(
-            Text.from_markup("\n".join(lines)),
+            body,
             title=title,
             border_style=theme.EMPHASIS,
             expand=False,
@@ -496,15 +502,21 @@ def render_roe_checklist(
         )
 
 
-def render_runtime_checklist(console: Console, *, checks: list[tuple[str, bool, str]]) -> None:
+def render_runtime_checklist(
+    console: Console, *, checks: list[tuple[str, bool | None, str]]
+) -> None:
     """``checks``: ``(label, ok, detail)``. section 20/21."""
 
     console.print("\n[bold]Runtime[/bold]\n")
     for label, ok, detail in checks:
-        style = theme.SUCCESS if ok else theme.DANGER
-        icon = theme.ICON_SUCCESS if ok else theme.ICON_FAILURE
+        style = theme.MUTED if ok is None else theme.SUCCESS if ok else theme.DANGER
+        icon = (
+            theme.ICON_PENDING if ok is None else theme.ICON_SUCCESS if ok else theme.ICON_FAILURE
+        )
         suffix = f"   {detail}" if detail else ""
-        console.print(f"  [{style}]{icon}[/{style}] {label}{suffix}")
+        line = Text(f"  {icon}", style=style)
+        line.append(safe_text(f" {label}{suffix}"), style="default")
+        console.print(line)
 
 
 def render_capability_warning(console: Console) -> None:
