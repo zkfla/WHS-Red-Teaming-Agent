@@ -17,8 +17,10 @@ from redteam.core.contracts.target import (
     AnyTarget,
     AssetTarget,
     DomainTarget,
+    EndpointTarget,
     HostTarget,
     PrincipalTarget,
+    ServiceTarget,
     UrlTarget,
 )
 from redteam.core.ids import ActionId, AgentId, AssetId, EngagementId, PrincipalId, RunId
@@ -210,3 +212,139 @@ def test_asset_scope_does_not_use_host_allow_lists() -> None:
     scope = EngagementScope(allowed_hosts=["com.example.bank"])
     target = AssetTarget(asset_id=AssetId("com.example.bank"))
     assert check_scope(_proposal_for(target), scope)[0] is False
+
+
+# --- port-aware host:port scoping --------------------------------------
+#
+# Regression for the Control-team report (2026-10-01): the same target,
+# expressed differently, used to flip ALLOW/DENY, and a port-suffixed host
+# could slip past a bare-host deny entry. Scope entries carry an optional
+# ``host:port`` convention inside the existing ``list[str]`` fields.
+
+
+def test_host_with_port_matches_same_host_port_entry() -> None:
+    # Report row 1 (was: pass) — stays a pass.
+    scope = EngagementScope(allowed_hosts=["127.0.0.1:8080"])
+    assert check_scope(_proposal("127.0.0.1:8080"), scope)[0] is True
+
+
+def test_url_with_port_matches_host_port_entry() -> None:
+    # Report row 2 (was: wrongly DENIED) — URL port must be honoured.
+    scope = EngagementScope(allowed_hosts=["127.0.0.1:8080"])
+    target = UrlTarget(url="http://127.0.0.1:8080/")
+    assert check_scope(_proposal_for(target), scope)[0] is True
+
+
+def test_endpoint_port_field_matches_host_port_entry() -> None:
+    # Report row 3 (was: wrongly DENIED) — EndpointTarget.port must count.
+    scope = EngagementScope(allowed_hosts=["127.0.0.1:8080"])
+    target = EndpointTarget(host="127.0.0.1", port=8080)
+    assert check_scope(_proposal_for(target), scope)[0] is True
+
+
+def test_bare_host_allow_accepts_any_port() -> None:
+    # Report row 4 (was: wrongly DENIED) — a bare host allows every port.
+    scope = EngagementScope(allowed_hosts=["127.0.0.1"])
+    assert check_scope(_proposal("127.0.0.1:8080"), scope)[0] is True
+    endpoint = EndpointTarget(host="127.0.0.1", port=9090)
+    assert check_scope(_proposal_for(endpoint), scope)[0] is True
+
+
+def test_port_suffix_cannot_bypass_bare_host_deny() -> None:
+    # Report row 5 (was: wrongly PASSED) — a bare-host deny blocks all
+    # ports; adding :8080 must not dodge the deny rule.
+    scope = EngagementScope(
+        allowed_hosts=["127.0.0.1:8080"], denied_hosts=["127.0.0.1"]
+    )
+    ok, reasons, severity = check_scope(_proposal("127.0.0.1:8080"), scope)
+    assert ok is False
+    assert "denied_hosts" in reasons[0]
+    assert severity is Severity.BLOCK_ACTION
+
+
+def test_wrong_port_is_denied_when_entry_pins_port() -> None:
+    scope = EngagementScope(allowed_hosts=["127.0.0.1:8080"])
+    assert check_scope(_proposal("127.0.0.1:9090"), scope)[0] is False
+
+
+def test_port_pinned_deny_blocks_only_that_port() -> None:
+    scope = EngagementScope(
+        allowed_hosts=["127.0.0.1"], denied_hosts=["127.0.0.1:22"]
+    )
+    # The pinned deny port is blocked...
+    assert check_scope(_proposal("127.0.0.1:22"), scope)[0] is False
+    # ...but other ports on the bare-allowed host still pass.
+    assert check_scope(_proposal("127.0.0.1:8080"), scope)[0] is True
+
+
+def test_allow_pins_port_but_target_has_none_is_explicit_deny() -> None:
+    # Control must not infer the port: host matches, port unknown -> DENY
+    # with a port-specific reason (not a silent default-deny).
+    scope = EngagementScope(allowed_hosts=["127.0.0.1:8080"])
+    ok, reasons, severity = check_scope(_proposal("127.0.0.1"), scope)
+    assert ok is False
+    assert "port cannot be inferred" in reasons[0]
+    assert severity is Severity.BLOCK_ACTION
+
+
+def test_endpoint_port_conflict_is_denied() -> None:
+    # host string and the explicit port field disagree -> reasoned DENY.
+    scope = EngagementScope(allowed_hosts=["127.0.0.1"])
+    target = EndpointTarget(host="127.0.0.1:8080", port=9090)
+    ok, reasons, _ = check_scope(_proposal_for(target), scope)
+    assert ok is False
+    assert "conflict" in reasons[0]
+
+
+def test_endpoint_host_string_port_is_used_when_field_absent() -> None:
+    scope = EngagementScope(allowed_hosts=["127.0.0.1:8080"])
+    target = EndpointTarget(host="127.0.0.1:8080")
+    assert check_scope(_proposal_for(target), scope)[0] is True
+
+
+def test_malformed_port_is_reasoned_deny() -> None:
+    scope = EngagementScope(allowed_hosts=["127.0.0.1"])
+    ok, reasons, severity = check_scope(_proposal("127.0.0.1:notaport"), scope)
+    assert ok is False
+    assert "malformed" in reasons[0]
+    assert severity is Severity.BLOCK_ACTION
+
+
+def test_out_of_range_endpoint_port_is_reasoned_deny() -> None:
+    scope = EngagementScope(allowed_hosts=["127.0.0.1"])
+    target = EndpointTarget(host="127.0.0.1", port=99999)
+    ok, reasons, _ = check_scope(_proposal_for(target), scope)
+    assert ok is False
+    assert "invalid endpoint port" in reasons[0]
+
+
+# --- IPv6 is not corrupted by naive colon-splitting --------------------
+
+
+def test_bracketed_ipv6_with_port_matches() -> None:
+    scope = EngagementScope(allowed_hosts=["[::1]:8080"])
+    target = UrlTarget(url="http://[::1]:8080/")
+    assert check_scope(_proposal_for(target), scope)[0] is True
+
+
+def test_bare_ipv6_literal_allowed_on_any_port() -> None:
+    scope = EngagementScope(allowed_hosts=["::1"])
+    assert check_scope(_proposal("::1"), scope)[0] is True
+    # Same address, bracketed+port form, must still match the bare allow.
+    assert check_scope(_proposal_for(UrlTarget(url="http://[::1]:8080/")), scope)[0] is True
+
+
+def test_bare_ipv6_deny_blocks_ported_request() -> None:
+    scope = EngagementScope(allowed_hosts=["[::1]:8080"], denied_hosts=["::1"])
+    assert check_scope(_proposal_for(UrlTarget(url="http://[::1]:8080/")), scope)[0] is False
+
+
+# --- service target without host still denies --------------------------
+
+
+def test_service_target_without_host_is_denied() -> None:
+    scope = EngagementScope(allowed_hosts=["127.0.0.1"])
+    target = ServiceTarget(service_name="smtp")
+    ok, reasons, _ = check_scope(_proposal_for(target), scope)
+    assert ok is False
+    assert "no scope-checkable" in reasons[0]
