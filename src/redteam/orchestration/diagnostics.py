@@ -162,6 +162,22 @@ def diagnostic_for_exception(exc: BaseException, *, stage: str) -> DecisionDiagn
         # include_input=False is mandatory even though messages are not copied.
         errors = exc.errors(include_input=False, include_url=False, include_context=False)
         first: dict[str, Any] = dict(errors[0]) if errors else {}
+        action_rules = {
+            "unknown_operation": "Use a supported action capability and operation.",
+            "tool_outside_capability_namespace": (
+                "Choose a tool from the action's capability namespace."
+            ),
+        }
+        rule = first.get("type")
+        if rule in action_rules:
+            return DecisionDiagnostic(
+                code=rule,
+                stage=_identifier(stage, "decision"),
+                kind="format",
+                location=known_location(first.get("loc", ())),
+                summary=action_rules[rule],
+                retryable=True,
+            )
         return DecisionDiagnostic(
             code="model_validation",
             stage=_identifier(stage, "decision"),

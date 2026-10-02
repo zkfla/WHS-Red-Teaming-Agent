@@ -44,12 +44,14 @@ from redteam.core.ids import (
     ToolId,
 )
 from redteam.event_bus.memory import InMemoryEventBus
+from redteam.orchestration.agents.providers import default_provider_registry
 from redteam.orchestration.agents.registry import default_registry
 from redteam.orchestration.analysis import (
     VerificationAssessment,
     VerificationOutcome,
     append_review_receipt,
 )
+from redteam.orchestration.context_projection import ContextProjectionCache
 from redteam.orchestration.observations import default_result_mapper_registry
 from redteam.orchestration.paths import InMemoryPathStore
 from redteam.orchestration.seed import seed_from_engagement
@@ -241,6 +243,8 @@ def make_world(
         path_store=paths,
         tool_catalog=catalog,
         agents=default_registry(),
+        candidate_providers=default_provider_registry(),
+        context_cache=ContextProjectionCache(),
         work_store=work,
         task_graph_store=tasks,
         engagement=None,

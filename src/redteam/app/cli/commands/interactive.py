@@ -550,7 +550,7 @@ async def _preflight_loop(
             denied=[cap.capitalize() for cap in (rule.denied_capabilities if rule else [])],
             documented_only=[rule.notes] if rule and rule.notes else [],
         )
-        runtime_checks = [
+        runtime_checks: list[tuple[str, bool | None, str]] = [
             ("LLM", llm_client is not None, llm_config.default_model),
             ("Config", not problems, "Valid" if not problems else f"{len(problems)} problem(s)"),
             ("Scope", not scope_problems, "Valid" if not scope_problems else "Invalid"),

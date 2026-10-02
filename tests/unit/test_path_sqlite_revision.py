@@ -7,6 +7,8 @@ from types import SimpleNamespace
 import pytest
 
 from redteam.attack_graph.stores.memory import InMemoryAttackGraphStore
+from redteam.orchestration.agents.providers import default_provider_registry
+from redteam.orchestration.context import ContextProjectionCache
 from redteam.orchestration.engine import InvestigationEngine
 from redteam.orchestration.paths import (
     CompletionCriterion,
@@ -86,6 +88,8 @@ def _engine_deps(path_store):
         graph_store=InMemoryAttackGraphStore(),
         evidence_store=_Evidence(),
         agents=_Agents(),
+        candidate_providers=default_provider_registry(),
+        context_cache=ContextProjectionCache(),
         llm_client=_AcceptLLM(),
         settings=OrchestrationSettings(),
         engagement=None,

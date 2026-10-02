@@ -7,6 +7,7 @@ import logging
 import os
 import sys
 from contextlib import AsyncExitStack, redirect_stderr, redirect_stdout
+from typing import Literal, cast
 
 from redteam.app.cli import interactive_commands
 from redteam.app.cli.commands.validate import check_roe, check_scope
@@ -40,6 +41,8 @@ async def run_session(
     frontend=None,
     built=None,
     single_run: bool = False,
+    component_registry=None,
+    component_profile=None,
 ) -> RunResult:
     from redteam.app.cli.commands import run as run_command
 
@@ -77,8 +80,15 @@ async def run_session(
         controller.scope = scope_values(current)
         controller.engagement_name = current.engagement.name
         async with AsyncExitStack() as stack:
+            # Optional profile wiring only: unset means the builtin default,
+            # and existing build() test doubles keep working unpatched.
+            build_options: dict = {}
+            if component_profile is not None:
+                build_options["component_profile"] = component_profile
+            if component_registry is not None:
+                build_options["component_registry"] = component_registry
             engagement, deps = built or await run_command.build(
-                current, max_steps=None, mcp_stack=stack
+                current, max_steps=None, mcp_stack=stack, **build_options
             )
             # Do not dispatch using a configuration changed during bootstrap.
             if (
@@ -166,6 +176,11 @@ async def run_session(
         finals = []
         projection = SessionProjection(controller, verbose=verbose)
         try:
+            # Same-registry resume: only forwarded when set, so the
+            # builtin-default path stays compatible with existing callers.
+            resume_options: dict = {}
+            if component_registry is not None:
+                resume_options["component_registry"] = component_registry
             code = await resume.run(
                 argparse.Namespace(
                     run_id=run_id,
@@ -177,6 +192,7 @@ async def run_session(
                 on_finished=finals.append,
                 session_channel=controller,
                 on_event=projection,
+                **resume_options,
             )
             return RunResult(
                 finals[-1] if finals else previous,
@@ -240,7 +256,12 @@ async def run_session(
 
     if isinstance(console, Console):
         controller.output.console = Console(
-            file=console.file, width=console.width, color_system=console.color_system
+            file=console.file,
+            width=console.width,
+            color_system=cast(
+                Literal["auto", "standard", "256", "truecolor", "windows"] | None,
+                console.color_system,
+            ),
         )
 
     class SessionStream:

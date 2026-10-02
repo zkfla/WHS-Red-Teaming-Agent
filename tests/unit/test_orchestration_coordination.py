@@ -375,10 +375,12 @@ async def test_two_processes_apply_one_sqlite_effect(tmp_path):
     with ProcessPoolExecutor(
         max_workers=2, mp_context=multiprocessing.get_context("spawn")
     ) as pool:
-        async with asyncio.timeout(15):
-            results = await asyncio.gather(
+        results = await asyncio.wait_for(
+            asyncio.gather(
                 *(loop.run_in_executor(pool, _apply_in_process, *args) for _ in range(2))
-            )
+            ),
+            timeout=15,
+        )
     assert results == [True, True]
     assert (await w.tasks.get_mission(MISSION)).revision == before.revision + 1
     assert (await w.history.get(received.intent_id)).status is IntentStatus.APPLIED

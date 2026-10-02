@@ -6,42 +6,23 @@ describes an execution mechanism and is deliberately validated separately.
 
 from __future__ import annotations
 
-import re
-
+from redteam.core.action_semantics import (
+    CANONICAL_CAPABILITIES,
+    CANONICAL_OPERATIONS,
+    canonical_action_key,
+)
 from redteam.core.ids import ToolId
 
-CANONICAL_CAPABILITIES = frozenset({"recon", "web", "mobile", "analysis"})
-CANONICAL_OPERATIONS = frozenset(
-    {
-        "port_scan",
-        "service_discovery",
-        "endpoint_discovery",
-        "http_request",
-        "auth_attempt",
-        "parameter_fuzz",
-        "file_upload",
-        "app_launch",
-        "device_shell",
-        "runtime_instrumentation",
-        "static_analysis",
-        "response_analysis",
-    }
-)
-_LOWER_SNAKE_CASE = re.compile(r"^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$")
+# Intent validation lives in redteam.core.action_semantics (single source of
+# truth); this module re-exports it so existing import paths keep working.
 
-
-def canonical_action_key(capability: str, operation: str) -> str:
-    """Validate and return the ROE key ``<capability>.<operation>``."""
-
-    if capability not in CANONICAL_CAPABILITIES:
-        raise ValueError(
-            f"capability {capability!r} is not a canonical v1 namespace"
-        )
-    if not _LOWER_SNAKE_CASE.fullmatch(operation):
-        raise ValueError(f"operation {operation!r} must be lower_snake_case")
-    if operation not in CANONICAL_OPERATIONS:
-        raise ValueError(f"operation {operation!r} is not in the canonical v1 contract")
-    return f"{capability}.{operation}"
+__all__ = [
+    "CANONICAL_CAPABILITIES",
+    "CANONICAL_OPERATIONS",
+    "canonical_action_key",
+    "tool_namespace",
+    "tool_matches_action_namespace",
+]
 
 
 def tool_namespace(tool_id: ToolId) -> str:

@@ -15,6 +15,7 @@ from jsonschema import Draft202012Validator
 from jsonschema.exceptions import SchemaError
 
 from redteam.capability.settings import MCPConfigurationError
+from redteam.core.action_semantics import CANONICAL_CAPABILITIES, CANONICAL_OPERATIONS
 from redteam.core.contracts.tool import ToolDescriptor
 
 _CANONICAL_OPERATION = re.compile(r"^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$")
@@ -61,7 +62,7 @@ def validate_tool_manifest(descriptor: ToolDescriptor) -> None:
 def _validate_identity(descriptor: ToolDescriptor, prefix: str) -> None:
     tool_id = str(descriptor.tool_id)
     namespace, separator, _remote_name = tool_id.partition(".")
-    if not separator or not namespace or not _remote_name:
+    if not separator or not namespace or not _remote_name or "." in _remote_name:
         raise MCPConfigurationError(
             f"{prefix} must use <namespace>.<remote_tool_name> tool_id format"
         )
@@ -72,6 +73,10 @@ def _validate_identity(descriptor: ToolDescriptor, prefix: str) -> None:
     if namespace not in descriptor.capability_tags:
         raise MCPConfigurationError(
             f"{prefix} namespace {namespace!r} is missing from capability_tags"
+        )
+    if namespace not in CANONICAL_CAPABILITIES:
+        raise MCPConfigurationError(
+            f"{prefix} namespace {namespace!r} is not a canonical capability"
         )
 
 
@@ -107,6 +112,11 @@ def _validate_operations(operations: list[str], prefix: str) -> None:
     ):
         raise MCPConfigurationError(
             f"{prefix} operations must be unique lower_snake_case values"
+        )
+    unknown = [operation for operation in operations if operation not in CANONICAL_OPERATIONS]
+    if unknown:
+        raise MCPConfigurationError(
+            f"{prefix} operations are not canonical actions: {', '.join(unknown)}"
         )
 
 

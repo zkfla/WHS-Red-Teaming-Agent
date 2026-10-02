@@ -94,15 +94,15 @@ class MCPToolGateway:
 
     def get(self, tool_id: ToolId) -> ToolDescriptor | None:
         """Expose a defensive catalog snapshot to the application composition root."""
-        return self._registry.get(tool_id)
+        return self._catalog.get(tool_id)
 
     def list_by_capability(self, capability_tag: str) -> list[ToolDescriptor]:
-        return self._registry.list_by_capability(capability_tag)
+        return self._catalog.list_by_capability(capability_tag)
 
     def all(self) -> list[ToolDescriptor]:
         """Every registered tool, regardless of capability — read-only
         catalog enumeration for callers like `redteam tools list`."""
-        return self._registry.all()
+        return [self._catalog.finalized(item) for item in self._registry.all()]
 
     def health_snapshot(self) -> dict[str, ToolHealthStatus]:
         """Current per-server health from the live Registry (no probing)."""

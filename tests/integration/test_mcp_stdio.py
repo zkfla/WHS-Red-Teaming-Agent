@@ -19,9 +19,9 @@ from redteam.core.ids import ActionId, EngagementId, InvocationId, RunId, ToolId
     ("server_id", "kind", "tool_id"),
     [
         ("web-local", "web_api", ToolId("web.ping")),
-        ("mobile-local", "mobile", ToolId("mobile.ping")),
+        ("mobile-transport-test", "mobile", ToolId("mobile.ping")),
         ("recon-local", "recon", ToolId("recon.ping")),
-        ("analysis-local", "analysis", ToolId("analysis.ping")),
+        ("analysis-transport-test", "analysis", ToolId("analysis.ping")),
     ],
 )
 async def test_all_adapter_kinds_support_real_stdio_discovery_and_invocation(
@@ -38,6 +38,7 @@ async def test_all_adapter_kinds_support_real_stdio_discovery_and_invocation(
     monkeypatch.setenv(f"{prefix}_COMMAND", sys.executable)
     monkeypatch.setenv(f"{prefix}_ARGS_JSON", json.dumps([str(server_path)]))
     monkeypatch.setenv(f"{prefix}_PASSTHROUGH_ENV", "MCP_EXAMPLE_TRANSPORT")
+    monkeypatch.setenv(f"{prefix}_TOOL_OPERATIONS_JSON", '{"ping": ["service_discovery"]}')
     monkeypatch.setenv("MCP_EXAMPLE_TRANSPORT", "stdio")
 
     gateway = await build_mcp_tool_gateway([server_id])
@@ -48,7 +49,7 @@ async def test_all_adapter_kinds_support_real_stdio_discovery_and_invocation(
             action_id=ActionId("action_mcp_stdio"),
             run_id=run_id,
             tool_id=tool_id,
-            operation="ping",
+            operation="service_discovery",
             arguments={"message": "stdio-ready"},
             execution_context=ExecutionContext(
                 engagement_id=EngagementId("eng_mcp_stdio"),

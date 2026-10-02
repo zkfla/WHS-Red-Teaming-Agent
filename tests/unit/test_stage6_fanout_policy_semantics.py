@@ -24,6 +24,27 @@ async def _register_active_path_for_items(deps, items):
     path_id = "path_fanout_active"
     version = 1
     run_id = str(items[0].proposal.run_id)
+    # SAME-run supplied provenance: declare each worker target so the fresh
+    # InternalAssessment admits it (declared scope, not a measured fact).
+    from redteam.attack_graph.identity import node_id_for_target, node_type_for_target
+    from redteam.attack_graph.predicates import Confidence, Provenance
+    from redteam.attack_graph.service import AttackGraphService
+
+    _svc = AttackGraphService(deps.graph_store)
+    for _item in items:
+        _tgt = _item.proposal.target
+        await _svc.upsert_node(
+            node_type_for_target(_tgt),
+            node_id=node_id_for_target(_tgt),
+            attrs={"in_scope": True},
+            provenance=Provenance(
+                step=0,
+                source="engagement:scope",
+                run_id=run_id,
+                confidence=Confidence.SERVER_DECLARED,
+            ),
+            step=0,
+        )
     steps = []
     for index, item in enumerate(items):
         host = item.proposal.target.host

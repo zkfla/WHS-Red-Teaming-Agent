@@ -66,6 +66,7 @@ def test_manifest_preserves_agent_visible_metadata() -> None:
         {"target_types": ["unknown_target"]},
         {"output_schema": {"type": "not-a-json-schema-type"}},
         {"tool_id": ToolId("recon.http_request")},
+        {"tool_id": ToolId("web.api.fetch")},
     ],
 )
 def test_manifest_rejects_metadata_or_schema_drift(updates: dict[str, Any]) -> None:

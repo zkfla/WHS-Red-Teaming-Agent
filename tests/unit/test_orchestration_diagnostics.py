@@ -129,6 +129,34 @@ def test_pydantic_validation_excludes_input_and_message():
     assert "secret-input" not in diagnostic.model_dump_json()
 
 
+@pytest.mark.parametrize(
+    ("operation", "tool_id", "code"),
+    [
+        ("opaque-unsupported-action", "web.request", "unknown_operation"),
+        ("http_request", "recon.probe", "tool_outside_capability_namespace"),
+    ],
+)
+def test_action_validation_preserves_safe_correction_code(operation, tool_id, code):
+    from redteam.orchestration.agents.base import PlanStep
+
+    with pytest.raises(ValidationError) as caught:
+        PlanStep.model_validate(
+            {
+                "step_id": "safe-step",
+                "capability": "web",
+                "operation": operation,
+                "tool_id": tool_id,
+                "target": {"kind": "host", "host": "localhost"},
+                "arguments": {"password": "secret-input"},
+                "reason": "Authorized local inspection",
+            }
+        )
+    diagnostic = diagnostic_for_exception(caught.value, stage="action_compilation")
+    assert diagnostic.code == code
+    assert "secret-input" not in diagnostic.model_dump_json()
+    assert "opaque-unsupported-action" not in diagnostic.model_dump_json()
+
+
 def test_legacy_checkpoint_defaults_and_diagnostic_roundtrip():
     runtime = RuntimeState(run_id="run-safe", engagement_id="eng-safe")
     assert runtime.planning_diagnostic is None

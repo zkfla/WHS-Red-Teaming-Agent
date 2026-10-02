@@ -150,6 +150,9 @@ class _A6Catalog:
 
 
 async def _ensure_a6_path(d, *, host: str = "a.local") -> _FixturePathPlan:
+    # SAME-run supplied provenance: fresh InternalAssessment only admits
+    # declared (engagement scope) targets. Production seeding path, not a mock.
+    await _seed_known(d, host)
     existing = await d.path_store.get_active(str(RUN))
     if existing is not None:
         return existing

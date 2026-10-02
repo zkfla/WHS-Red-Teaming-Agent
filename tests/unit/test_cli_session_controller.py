@@ -270,3 +270,114 @@ async def test_suspension_and_resume_share_run_but_not_attachment():
         await s.c.output.fence()
         assert "실행 대기" in s.buffer.getvalue()
         assert "실행 종료" in s.buffer.getvalue()
+
+
+class _ScriptFrontend(ConsoleFrontend):
+    """C1: sequential reader with scripted termination (boom/eof/hang)."""
+
+    interactive = False
+
+    def __init__(self, console, behavior="hang", close_error=None):
+        super().__init__(console)
+        self.behavior = behavior
+        self.close_error = close_error
+        self.closed = False
+        self.run_finished = asyncio.Event()
+
+    async def run(self):
+        try:
+            if self.behavior == "boom":
+                raise OSError("input gone")
+            if self.behavior == "boom_after_run":
+                while self.controller.run_task is None:
+                    await asyncio.sleep(0.01)
+                raise OSError("input gone")
+            if self.behavior == "eof":
+                self.controller.output.emit("Session ended. 세션 종료 요청됨.")
+                self.controller.request_close()
+                return
+            await self.controller.closing.wait()
+        finally:
+            self.run_finished.set()
+
+    def close(self):
+        self.closed = True
+        if self.close_error is not None:
+            raise self.close_error
+
+
+def _run_controller(frontend):
+    buffer = io.StringIO()
+    console = Console(file=buffer, width=80, color_system=None)
+
+    async def runner(objective, controller):
+        return RunResult()
+
+    return SessionController(
+        console=console,
+        frontend=frontend,
+        conversation=Conversation(),
+        runner=runner,
+        engagement_name="test",
+        scope=["localhost"],
+    )
+
+
+async def test_sequential_input_failure_records_error_and_closes():
+    frontend = _ScriptFrontend(Console(file=io.StringIO(), width=80), behavior="boom")
+    c = _run_controller(frontend)
+    result = await asyncio.wait_for(c.run(), 10)
+    assert result.exit_code == 1
+    assert "CLI 입력 실패(OSError)" in (result.error or "")
+    assert c.phase == SessionPhase.CLOSED
+    assert frontend.run_finished.is_set()
+
+
+async def test_frontend_close_failure_still_reaps_reader():
+    frontend = _ScriptFrontend(
+        Console(file=io.StringIO(), width=80),
+        behavior="hang",
+        close_error=RuntimeError("tui gone"),
+    )
+    c = _run_controller(frontend)
+    run_task = asyncio.create_task(c.run())
+    await asyncio.sleep(0.2)
+    c.submit("exit")
+    result = await asyncio.wait_for(run_task, 10)
+    assert result.exit_code == 1
+    assert "CLI 화면 정리 실패" in (result.error or "")
+    assert c.phase == SessionPhase.CLOSED
+    assert frontend.closed
+    assert frontend.run_finished.is_set()
+
+
+async def test_clean_reader_return_keeps_clean_result():
+    frontend = _ScriptFrontend(Console(file=io.StringIO(), width=80), behavior="eof")
+    c = _run_controller(frontend)
+    result = await asyncio.wait_for(c.run(), 10)
+    assert result.exit_code == 0
+    assert result.error is None
+    assert c.phase == SessionPhase.CLOSED
+
+
+async def test_input_failure_survives_clean_run_finish_during_close():
+    frontend = _ScriptFrontend(
+        Console(file=io.StringIO(), width=80), behavior="boom_after_run"
+    )
+    c = _run_controller(frontend)
+    release = asyncio.Event()
+
+    async def blocking_runner(objective, controller):
+        await release.wait()
+        return RunResult()
+
+    c.runner = blocking_runner
+    run_task = asyncio.create_task(c.run())
+    await asyncio.sleep(0.2)
+    c.submit("/new localhost 조사")
+    await asyncio.wait_for(c.closing.wait(), 10)
+    release.set()
+    result = await asyncio.wait_for(run_task, 10)
+    assert result.exit_code == 1
+    assert "CLI 입력 실패(OSError)" in (result.error or "")
+    assert c.phase == SessionPhase.CLOSED

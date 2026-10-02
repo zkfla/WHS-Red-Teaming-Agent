@@ -112,6 +112,9 @@ class CandidateCompiler:
             return None, self._reject(draft, "non_json_arguments")
         try:
             canonical_action_key(plan_step.capability, plan_step.operation)
+        except ValueError:
+            return None, self._reject(draft, "unknown_operation")
+        try:
             execution_target_id = node_id_for_target(plan_step.resolved_target())
         except ValueError:
             return None, self._reject(draft, "unresolved_target")
@@ -215,9 +218,12 @@ class CandidateCompiler:
             # all-unhealthy namespace presents as "nothing serves this
             # action". Reporting that as an unsupported operation would send
             # the operator looking for a binding that is already there.
-            if all(
+            operation_tools = [
+                tool for tool in capability_tools if operation in tool.operations
+            ]
+            if operation_tools and all(
                 tool.health_status is ToolHealthStatus.UNHEALTHY
-                for tool in capability_tools
+                for tool in operation_tools
             ):
                 return None, ("tool_unhealthy", "")
             return None, ("operation_unsupported", "")
