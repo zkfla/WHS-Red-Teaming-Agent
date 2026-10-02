@@ -67,6 +67,7 @@ class CandidateDraft(BaseModel):
     plan_step: PlanStep
     target_node_ids: list[GraphNodeId]
     prerequisite_fingerprint: str = ""
+    execution_identity_version: int = Field(default=0, ge=0)
     prerequisite_ids: list[str] = Field(default_factory=list)
     conflict_keys: list[str] = Field(default_factory=list)
     signals: PrioritySignals = Field(default_factory=PrioritySignals)

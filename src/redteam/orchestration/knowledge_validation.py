@@ -55,6 +55,7 @@ class InternalAssessment:
     evidence_error: str | None = None
     historical_targets: list[dict[str, Any]] = field(default_factory=list)
     historical_fact_count: int = 0
+    fact_fingerprint: str = ""
 
 
 def assessment_blocked(material: InternalAssessment) -> str | None:

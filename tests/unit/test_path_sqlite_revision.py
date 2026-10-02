@@ -101,6 +101,7 @@ def _engine_deps(path_store):
 def _engine_runtime(run_id="run-eng-1"):
     return SimpleNamespace(
         run_id=run_id,
+        engagement_id="eng-path-1",
         mission_id=None,
         active_task_id=None,
         step_count=0,
