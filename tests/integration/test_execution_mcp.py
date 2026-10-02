@@ -694,6 +694,35 @@ async def test_real_stdio_docker_execution_hardening(
                 action_id="action-live-job-cancel",
             )
         )
+        completed_job = await gateway.invoke(
+            job_invocation(
+                "job_start",
+                {
+                    "asset_ref": "workspace-test",
+                    "executable": "wc",
+                    "args": ["-l", "input.txt"],
+                },
+                action_id="action-live-completed-job-start",
+            )
+        )
+        assert completed_job.success, completed_job.error
+        for index in range(100):
+            completed_status = await gateway.invoke(
+                job_invocation(
+                    "job_status",
+                    {
+                        "asset_ref": "workspace-test",
+                        "job_id": completed_job.output["job_id"],
+                    },
+                    action_id=f"action-live-completed-job-status-{index}",
+                )
+            )
+            assert completed_status.success, completed_status.error
+            if completed_status.output["status"] != "running":
+                break
+            await asyncio.sleep(0.05)
+        assert completed_status.output["status"] == "completed"
+        assert completed_status.output["result"]["exit_code"] == 0
         server_timed_out = await gateway.invoke(
             invocation(
                 {
@@ -705,6 +734,15 @@ async def test_real_stdio_docker_execution_hardening(
             )
         )
         assert await wait_for_managed_containers(0) == []
+        recovered_after_server_timeout = await gateway.invoke(
+            invocation(
+                {
+                    "asset_ref": "workspace-test",
+                    "executable": "sort",
+                    "args": ["input.txt"],
+                }
+            )
+        )
         gateway_timed_out = await gateway.invoke(
             invocation(
                 {
@@ -717,6 +755,15 @@ async def test_real_stdio_docker_execution_hardening(
             )
         )
         assert await wait_for_managed_containers(0) == []
+        recovered_after_gateway_timeout = await gateway.invoke(
+            invocation(
+                {
+                    "asset_ref": "workspace-test",
+                    "executable": "sort",
+                    "args": ["input.txt"],
+                }
+            )
+        )
 
     assert listed.success and before.output["content"] == "b\na\n"
     assert sorted_result.success and sorted_result.output["exit_code"] == 0
@@ -732,6 +779,10 @@ async def test_real_stdio_docker_execution_hardening(
     assert gateway_timed_out.error is not None
     assert gateway_timed_out.error.code == "tool_timeout"
     assert cancelled.success and cancelled.output["status"] == "cancelled"
+    assert recovered_after_server_timeout.success
+    assert recovered_after_server_timeout.output["stdout"] == "a\nb\n"
+    assert recovered_after_gateway_timeout.success
+    assert recovered_after_gateway_timeout.output["stdout"] == "a\nb\n"
     assert await wait_for_managed_containers(0) == []
 
     async with open_mcp_tool_gateway(
@@ -755,6 +806,17 @@ async def test_real_stdio_docker_execution_hardening(
         with pytest.raises(asyncio.CancelledError):
             await cancel_task
         assert await wait_for_managed_containers(0) == []
+        recovered_after_caller_cancel = await cancellation_gateway.invoke(
+            invocation(
+                {
+                    "asset_ref": "workspace-test",
+                    "executable": "sort",
+                    "args": ["input.txt"],
+                }
+            )
+        )
+        assert recovered_after_caller_cancel.success
+        assert recovered_after_caller_cancel.output["stdout"] == "a\nb\n"
 
     direct_engine = DockerExecutionEngine(execution_policy)
     direct_output = await direct_engine.run_command(
