@@ -32,6 +32,7 @@ class WorkScheduler:
                 run_id=run_id,
                 mission_task_id=mission_task_id,
                 candidate_key=candidate.candidate_key,
+                execution_identity_version=draft.execution_identity_version,
                 agent_id=draft.agent_id,
                 graph_revision=graph_revision,
                 path_id=draft.plan_step.path_id,

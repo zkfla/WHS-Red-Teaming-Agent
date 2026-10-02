@@ -5,9 +5,47 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Iterable
+from typing import Any
 
 from redteam.attack_graph.observation import GraphObservation
 from redteam.core.enums import GraphEdgeType, GraphNodeType
+
+
+async def canonical_progress_fingerprint(deps: Any, runtime: Any, *, step: int) -> str | None:
+    """Shared OBSERVE/resume signal from uncapped, same-run original records.
+
+    None means the read failed, not that progress occurred or stopped.
+    """
+    from redteam.attack_graph.service import AttackGraphService
+    from redteam.orchestration.knowledge import collect_progress_content
+
+    content = await collect_progress_content(
+        AttackGraphService(deps.graph_store),
+        deps.evidence_store,
+        str(runtime.run_id),
+        step=step,
+        engagement_id=str(runtime.engagement_id),
+    )
+    if content is None:
+        return None
+    try:
+        path = await deps.path_store.get_active(str(runtime.run_id))
+    except Exception:  # noqa: BLE001 - failed reads cannot wake or stall a run
+        return None
+    completed = (
+        [
+            (item.step_id, item.objective, item.outcome)
+            for item in path.steps
+            if item.status == "completed" and item.evidence_ids
+        ]
+        if path
+        else []
+    )
+    payload = [content, sorted(completed)]
+    return (
+        "original-v1:"
+        + hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()
+    )
 
 
 def knowledge_fingerprint(knowledge: dict) -> str:

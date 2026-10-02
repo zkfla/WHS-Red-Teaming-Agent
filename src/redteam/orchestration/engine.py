@@ -68,7 +68,6 @@ from redteam.orchestration.paths.writing import (
     validate_written_criteria,
     writing_schema,
 )
-from redteam.orchestration.progress import knowledge_fingerprint
 from redteam.orchestration.runtime_observation import observations_for_prompt
 from redteam.orchestration.work.models import WorkStatus, is_unexecuted_stale
 
@@ -260,9 +259,7 @@ def ready_step(path, step, knowledge) -> list[str]:
 class DecisionRuleError(ValueError):
     """A code-owned validation rule, safe to carry into correction feedback."""
 
-    def __init__(
-        self, summary: str, *, code: str = "decision_rule_violation", location: str = ""
-    ):
+    def __init__(self, summary: str, *, code: str = "decision_rule_violation", location: str = ""):
         self.diagnostic = DecisionDiagnostic(
             code=code,
             stage="validation",
@@ -290,6 +287,7 @@ async def _collect_check_assessment(deps, runtime, *, service=None, target_node_
         str(runtime.run_id),
         step=int(getattr(runtime, "step_count", 0) or 0),
         target_node_ids=target_node_ids,
+        engagement_id=str(runtime.engagement_id),
     )
     # Strict same-run binding: unknown shapes and run-less material admit nothing.
     if (
@@ -306,9 +304,7 @@ def _principal_check(step, principal, arguments, material, location) -> None:
     try:
         check_principal_arguments(step, principal, arguments, material)
     except AssessmentError as exc:
-        raise DecisionRuleError(
-            str(exc), code="invalid_arguments", location=location
-        ) from exc
+        raise DecisionRuleError(str(exc), code="invalid_arguments", location=location) from exc
 
 
 def _action_location(intent_index: int, field: str) -> str:
@@ -344,9 +340,7 @@ _REJECTION_CODES = {
 def _rejection_feedback(reason: str, field: str) -> str:
     """Canonical compiler feedback: code-owned code, known location, safe summary."""
     code = _REJECTION_CODES.get(reason, reason)
-    summary = _REJECTION_SUMMARIES.get(
-        reason, "The candidate did not satisfy a compilation rule."
-    )
+    summary = _REJECTION_SUMMARIES.get(reason, "The candidate did not satisfy a compilation rule.")
     return DecisionDiagnostic(
         code=code,
         stage="action_compilation",
@@ -644,8 +638,7 @@ class InvestigationEngine:
             except Exception:
                 diagnostics.append(
                     self._reference_diagnostic(
-                        "The role candidate provider failed; no reference candidates "
-                        "were built."
+                        "The role candidate provider failed; no reference candidates were built."
                     )
                 )
                 continue
@@ -735,9 +728,7 @@ class InvestigationEngine:
         targets = list(getattr(task, "related_attack_graph_node_ids", None) or ())
         if not targets:
             targets = await self._reference_task_targets(runtime)
-        objective = getattr(mission, "objective", None) or getattr(
-            runtime, "current_goal", None
-        )
+        objective = getattr(mission, "objective", None) or getattr(runtime, "current_goal", None)
         return {
             "task_id": task_id,
             "task_source": str(source) if source else None,
@@ -774,9 +765,7 @@ class InvestigationEngine:
         pairs unknown, never empty.
         """
         task_targets = task_context["task_target_node_ids"]
-        verified, operations, tool_docs = self._reference_live_operations(
-            agent, task_context
-        )
+        verified, operations, tool_docs = self._reference_live_operations(agent, task_context)
         hypotheses = getattr(role_observation, "open_hypotheses", None)
         open_hypotheses = (
             tuple(str(item) for item in hypotheses[:20])
@@ -790,9 +779,7 @@ class InvestigationEngine:
             task_id=str(task_id) if task_id is not None else None,
             task_source=task_context.get("task_source"),
             task_objective=task_context.get("task_objective"),
-            mission_objective=str(mission_objective)
-            if mission_objective is not None
-            else None,
+            mission_objective=str(mission_objective) if mission_objective is not None else None,
             task_target_node_ids=tuple(task_targets),
             available_capabilities=tuple(getattr(agent, "capabilities", None) or ()),
             open_hypotheses=open_hypotheses,
@@ -825,9 +812,7 @@ class InvestigationEngine:
                         continue
                     seen.add(pair)
                     try:
-                        usable = self.deps.tool_catalog.list_tools_for_action(
-                            pair[0], pair[1]
-                        )
+                        usable = self.deps.tool_catalog.list_tools_for_action(pair[0], pair[1])
                     except Exception:
                         catalog_failed = True
                         continue
@@ -980,8 +965,7 @@ class InvestigationEngine:
             runtime,
         )
         reference_notes = [
-            item.model_dump(mode="json")
-            for item in self.last_reference_diagnostics[:10]
+            item.model_dump(mode="json") for item in self.last_reference_diagnostics[:10]
         ]
         review = ReviewDecision.model_validate(
             await self._ask(
@@ -993,8 +977,7 @@ class InvestigationEngine:
                     "code_checks": (
                         "structure passed; references unavailable: "
                         + "; ".join(
-                            f"{item['code']}: {item['summary']}"
-                            for item in reference_notes
+                            f"{item['code']}: {item['summary']}" for item in reference_notes
                         )
                         if reference_notes
                         else "structure and references passed"
@@ -1009,6 +992,12 @@ class InvestigationEngine:
         if review.decision == "revise":
             if review.path is None:
                 raise DecisionRuleError("revision review requires a replacement path")
+            assessment = await _collect_check_assessment(self.deps, runtime, service=service)
+            blocked = assessment_blocked(assessment)
+            if blocked is not None:
+                raise DecisionRuleError(blocked)
+            known = known_target_ids(assessment)
+            registered_principals = known_principals(assessment)
             replacement = review.path.model_dump(mode="json")
             replacement.update(
                 {
@@ -1066,6 +1055,16 @@ class InvestigationEngine:
             await self._commit_review(runtime, token, save_history)
             return None
         accepted = path.model_dump(mode="json")
+        latest = await _collect_check_assessment(self.deps, runtime, service=service)
+        blocked = assessment_blocked(latest)
+        if blocked is not None:
+            raise DecisionRuleError(blocked)
+        if any(
+            set(step.target_node_ids) - known_target_ids(latest)
+            or set(step.principal_refs) - known_principals(latest)
+            for step in path.steps
+        ):
+            raise DecisionRuleError("path references changed during review")
         accepted.update(status="accepted", reason=review.reason)
         if active:
             accepted["changed_step_ids"] = changed_steps_and_descendants(
@@ -1601,9 +1600,8 @@ class InvestigationEngine:
                         agent_id=intent.agent_id,
                         plan_step=plan,
                         target_node_ids=[node_id_for_target(target)],
-                        prerequisite_fingerprint=knowledge_fingerprint(
-                            {"facts": context["knowledge"]["facts"]}
-                        ),
+                        prerequisite_fingerprint=assessment.fact_fingerprint,
+                        execution_identity_version=2,
                         conflict_keys=[f"target:{node.id}"],
                     )
                 )
@@ -1620,9 +1618,7 @@ class InvestigationEngine:
         )
         # Canonical compiler verdicts stay distinct: unsupported operations,
         # unresolvable targets, and bad arguments each keep their own code.
-        errors.extend(
-            _rejection_feedback(item.reason, item.field) for item in rejected
-        )
+        errors.extend(_rejection_feedback(item.reason, item.field) for item in rejected)
         # Scores are telemetry. Preserve the LLM's order exactly.
         compiled.sort(key=lambda item: item.plan_step.intent_index)
         # Execution identity does not change when a claim, role or path is renamed.
@@ -1670,7 +1666,66 @@ class InvestigationEngine:
                 for work in history
             ):
                 errors.append("identical action already recorded; choose an evidenced new action")
+            elif await self._legacy_identity_conflict(item, history, runtime):
+                # A legacy hash cannot reveal its original inputs. Do not
+                # silently repeat work on upgrade or infer novelty from a
+                # different hash; require reconciliation of the old execution.
+                errors.append("legacy execution identity requires reconciliation before retry")
         return compiled, errors
+
+    async def _legacy_identity_conflict(self, candidate, history, runtime) -> bool:
+        legacy = [
+            work
+            for work in history
+            if work.execution_identity_version < 2
+            and work.candidate_key.startswith("cand_")
+            and set(work.target_node_ids) & set(candidate.draft.target_node_ids)
+            and not is_unexecuted_stale(work)
+        ]
+        if not legacy:
+            return False
+        try:
+            records = await self.deps.evidence_store.list_for_run(runtime.run_id)
+        except Exception:  # noqa: BLE001 - unknown execution is not permission to retry
+            return True
+        for work in legacy:
+            originals = [
+                record
+                for record in records
+                if record.run_id == runtime.run_id
+                and record.engagement_id == runtime.engagement_id
+                and record.metadata.get("candidate_key") == work.candidate_key
+                and (
+                    record.metadata.get("tool_result") is not None
+                    or record.metadata.get("raw_tool_result") is not None
+                )
+            ]
+            if not originals:
+                return True
+            for original in originals:
+                try:
+                    previous = PlanStep.model_validate(original.metadata.get("plan_step"))
+                    target_id = node_id_for_target(previous.resolved_target())
+                except (ValueError, TypeError):
+                    return True
+                raw = original.metadata.get("tool_result")
+                if raw is None:
+                    raw = original.metadata.get("raw_tool_result")
+                if (
+                    target_id not in work.target_node_ids
+                    or not isinstance(raw, dict)
+                    or raw.get("tool_id") != previous.tool_id
+                ):
+                    return True
+                current = candidate.plan_step
+                if (
+                    previous.tool_id == current.tool_id
+                    and previous.operation_key == current.operation_key
+                    and previous.arguments == current.arguments
+                    and previous.principal_ref == current.principal_ref
+                ):
+                    return True
+        return False
 
     async def has_ambiguous_execution(self, intent, runtime) -> bool:
         for record in await self.deps.evidence_store.list_for_run(runtime.run_id):
@@ -2152,9 +2207,7 @@ class InvestigationEngine:
 def validate_principal_arguments(step, principal, arguments, knowledge) -> None:
     """Principal wiring; accepts the internal material or the legacy display dict."""
     if isinstance(knowledge, InternalAssessment):
-        _principal_check(
-            step, principal, arguments, knowledge, known_location(("arguments",))
-        )
+        _principal_check(step, principal, arguments, knowledge, known_location(("arguments",)))
         return
     bindings = principal_bindings(knowledge)
     session_refs = [

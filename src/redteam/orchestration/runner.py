@@ -23,7 +23,7 @@ from redteam.orchestration.context import RuntimeDeps
 from redteam.orchestration.coordination import CLOSED, ChangeSet, CoordinationError, coordinator_for
 from redteam.orchestration.graph import build_graph
 from redteam.orchestration.outbox import deliver_pending
-from redteam.orchestration.progress import observation_fingerprint
+from redteam.orchestration.progress import canonical_progress_fingerprint
 from redteam.orchestration.settings import OrchestrationSettings
 from redteam.orchestration.state import (
     GraphState,
@@ -884,12 +884,16 @@ class AgentLoopRunner:
             return None
 
     async def _canonical_graph_changed(self, runtime: RuntimeState) -> bool:
-        observation = await AttackGraphService(self._deps.graph_store).observe(
-            step=runtime.step_count,
-            max_per_type=self._settings.observation_max_per_type,
-            max_total=self._settings.observation_max_total,
+        fingerprint = await canonical_progress_fingerprint(
+            self._deps, runtime, step=runtime.step_count
         )
-        return observation_fingerprint(observation) != runtime.last_progress_fingerprint
+        # Old checkpoints used incompatible, bounded hashes. They need an
+        # explicit wakeup; comparing different formats cannot prove change.
+        return (
+            fingerprint is not None
+            and str(runtime.last_progress_fingerprint or "").startswith("original-v1:")
+            and fingerprint != runtime.last_progress_fingerprint
+        )
 
     async def resume_from(self, checkpoint_id: str) -> RuntimeState:
         """Re-run from an earlier checkpoint of the same thread.
