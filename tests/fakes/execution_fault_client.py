@@ -13,7 +13,7 @@ from redteam.core.contracts.tool import ExecutionContext, ToolInvocation
 from redteam.core.ids import ActionId, EngagementId, InvocationId, RunId, ToolId
 
 
-async def run(marker: Path) -> None:
+async def run(marker: Path, timeout_seconds: float) -> None:
     run_id = RunId("run-test")
     invocation = ToolInvocation(
         invocation_id=InvocationId("inv-fault-job-start"),
@@ -25,7 +25,7 @@ async def run(marker: Path) -> None:
             "asset_ref": "workspace-test",
             "executable": "tail",
             "args": ["-f", "input.txt"],
-            "timeout_seconds": 20,
+            "timeout_seconds": timeout_seconds,
         },
         execution_context=ExecutionContext(
             engagement_id=EngagementId("eng-test"),
@@ -47,8 +47,9 @@ async def run(marker: Path) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("marker", type=Path)
+    parser.add_argument("--timeout-seconds", type=float, default=20)
     args = parser.parse_args()
-    asyncio.run(run(args.marker))
+    asyncio.run(run(args.marker, args.timeout_seconds))
 
 
 if __name__ == "__main__":

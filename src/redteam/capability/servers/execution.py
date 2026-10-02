@@ -40,6 +40,7 @@ _MANAGED_LABEL = "io.whs-redteam.execution.managed=true"
 _CONTEXT_LABEL_KEY = "io.whs-redteam.execution.context"
 _OUTPUT_DIRECTORY = ".command_outputs"
 _BINARY = getattr(os, "O_BINARY", 0)
+_CONTAINER_TIMEOUT_GRACE_SECONDS = 2.0
 
 # Options are deliberately enumerated.  Values following options such as
 # ``head -c 1024`` are still validated by the generic argument/path checks.
@@ -583,6 +584,7 @@ class DockerExecutionEngine:
         container_name: str,
         executable: str,
         args: Sequence[str],
+        timeout_seconds: float,
     ) -> tuple[str, ...]:
         container_executable = self.policy.allowed_executables.get(executable)
         if container_executable is None:
@@ -597,6 +599,7 @@ class DockerExecutionEngine:
             f"type=bind,src={self.policy.workspace_root},dst=/workspace"
             + ("" if self.policy.writable else ",readonly")
         )
+        hard_timeout = f"{timeout_seconds + _CONTAINER_TIMEOUT_GRACE_SECONDS:g}s"
         return (
             "run",
             "--rm",
@@ -632,6 +635,9 @@ class DockerExecutionEngine:
             "--env",
             "LANG=C.UTF-8",
             self.policy.image,
+            "/usr/bin/timeout",
+            "--signal=KILL",
+            hard_timeout,
             container_executable,
             *args,
         )
@@ -655,6 +661,7 @@ class DockerExecutionEngine:
             container_name=container_name,
             executable=executable,
             args=args,
+            timeout_seconds=timeout_seconds,
         )
         started = time.monotonic()
         capture = _OutputCapture(
@@ -750,6 +757,7 @@ class DockerExecutionEngine:
             container_name="redteam-exec-validation",
             executable=executable,
             args=args,
+            timeout_seconds=timeout_seconds,
         )
         job_id = f"job-{uuid.uuid4().hex}"
         async with self._jobs_lock:

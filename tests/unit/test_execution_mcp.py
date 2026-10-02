@@ -114,7 +114,15 @@ async def test_run_command_builds_locked_down_docker_argv_and_minimal_environmen
     assert "--pids-limit" in argv and "--memory" in argv and "--cpus" in argv
     mount = argv[argv.index("--mount") + 1]
     assert mount == f"type=bind,src={policy.workspace_root},dst=/workspace,readonly"
-    assert argv[-4:] == (policy.image, "/usr/bin/grep", "needle", "input.txt")
+    assert argv[-7:] == (
+        policy.image,
+        "/usr/bin/timeout",
+        "--signal=KILL",
+        "5s",
+        "/usr/bin/grep",
+        "needle",
+        "input.txt",
+    )
     assert captured["kwargs"]["env"] == {
         "PATH": os.environ.get("PATH", ""),
         "LANG": os.environ.get("LANG", "C.UTF-8"),

@@ -8,6 +8,7 @@ import os
 import signal
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -367,8 +368,11 @@ def managed_container_ids() -> list[str]:
     return result.stdout.split()
 
 
-async def wait_for_managed_containers(count: int) -> list[str]:
-    for _ in range(100):
+async def wait_for_managed_containers(
+    count: int, *, timeout_seconds: float = 5
+) -> list[str]:
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
         identifiers = managed_container_ids()
         if len(identifiers) == count:
             return identifiers
@@ -381,6 +385,7 @@ def configure_live_execution(
     policy_path: Path,
 ) -> None:
     prefix = "REDTEAM_MCP_EXECUTION"
+    monkeypatch.setenv("PYTHONPATH", str(Path(__file__).resolve().parents[2] / "src"))
     for suffix, value in {
         "KIND": "analysis",
         "TRANSPORT": "stdio",
@@ -388,6 +393,7 @@ def configure_live_execution(
         "PROFILE": "execution",
         "RISK_LEVEL": "high",
         "EXECUTION_POLICY": str(policy_path),
+        "PASSTHROUGH_ENV": "PYTHONPATH",
     }.items():
         monkeypatch.setenv(f"{prefix}_{suffix}", value)
 
@@ -821,7 +827,13 @@ async def test_stdio_server_restart_cleans_fault_injected_orphan(
     helper = Path(__file__).parents[1] / "fakes" / "execution_fault_client.py"
     with client_log.open("wb") as output:
         client = subprocess.Popen(
-            [sys.executable, str(helper), str(marker)],
+            [
+                sys.executable,
+                str(helper),
+                str(marker),
+                "--timeout-seconds",
+                "1",
+            ],
             stdin=subprocess.DEVNULL,
             stdout=output,
             stderr=subprocess.STDOUT,
@@ -836,6 +848,17 @@ async def test_stdio_server_restart_cleans_fault_injected_orphan(
                 await asyncio.sleep(0.05)
             else:
                 pytest.fail("fault client did not start a managed container")
+            [container_id] = managed_container_ids()
+            command = json.loads(
+                subprocess.run(
+                    ["docker", "inspect", container_id, "--format", "{{json .Config.Cmd}}"],
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                    env=_DOCKER_ENV,
+                ).stdout
+            )
+            assert command[:3] == ["/usr/bin/timeout", "--signal=KILL", "3s"]
 
             processes = subprocess.run(
                 ["ps", "-ww", "-eo", "pid=,args="],
@@ -855,6 +878,7 @@ async def test_stdio_server_restart_cleans_fault_injected_orphan(
                 if "redteam.capability.servers.execution" in line
             ]
             assert len(server_pids) == 1, "\n".join(execution_processes)
+            killed_at = time.monotonic()
             os.kill(server_pids[0], signal.SIGKILL)
             await asyncio.sleep(0.2)
         finally:
@@ -866,6 +890,8 @@ async def test_stdio_server_restart_cleans_fault_injected_orphan(
                     client.kill()
                     client.wait(timeout=5)
 
+    assert await wait_for_managed_containers(0, timeout_seconds=15) == []
+    assert time.monotonic() - killed_at < 15
     async with open_mcp_tool_gateway(
         ["execution"],
         health_refresh_enabled=False,
