@@ -101,17 +101,18 @@ endpoint suppression 회귀 복원 후에는 이 묶음에 해당 파일 전체�
 - WSL2 실제 Docker: Agent loop→실제 execution MCP→Evidence `1 passed`
 - ROE에서 operation 제외: Control Plane DENY, Docker 시작 0
 - 허용하지 않은 executable: 서버의 `execution_executable_not_allowed`, Docker 시작 0
-- 최신 WSL2 전체 회귀: `2162 passed, 42 skipped, 1 failed`
+- `ecde5dd` 병합 뒤 최종 WSL2 전체 회귀: `2230 passed, 47 skipped, 0 failed`
+- 기준선 passed nodeid 2172개 누락 0, 비활성 후보 snapshot hash 동일
 
-전체 회귀의 1건 실패는 기존 `test_methodology_agent_loop.py`가 Track A 이후에도
-`analysis-agent.schedulable is False`를 기대하는 항목이다. B 작업 전 기준선과 실패 수가
-같다. 원인과 제안 diff는 `basic-computer-tools-b-gap-notes.md`에 기록했고 테스트는
-수정하지 않았다.
+`test_methodology_agent_loop.py` 충돌은 incoming의 built-in definition 동등성 검증을
+유지하고 Track A의 런타임 activation reason assertion만 추가하는 방식으로 해결했다.
+scripted Agent의 적대적
+인자가 고정 recipe로 교체되는 실제 Docker 경로는 통과했다. 실 provider 테스트 진입점도
+추가했지만 현재 환경에는 provider/model/API key가 없어 실제 자유 선택은 미검증이다.
 
 ## 팀 합의가 필요한 항목
 
 - `command_run` 및 `command_job_*` canonical operation 이름
 - execution 도구가 임시로 사용하는 `analysis` capability 유지 여부
 - Agent workflow 재설계 시 metadata bridge를 유지·대체할 방식
-- 실제 LLM 자유 선택과 비동기 job poll/cancel 전략
-
+- 실제 LLM 자유 선택; 비동기 job poll/cancel 실동작은 검증 완료

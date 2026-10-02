@@ -24,14 +24,14 @@
 | 항목 | 결과 | 근거 |
 | --- | --- | --- |
 | G1 네트워크 차단 | 완료 | 실행 중 container의 `NetworkMode=none` inspect와 test-only Python image의 `1.1.1.1:53` 연결 실패 확인 |
-| G2 연결 종료 정리 | 완료 | stdio MCP 서버 SIGKILL fault injection 후 새 서버 시작 시 동일 context label의 고아 container 제거, 최종 0개 |
+| G2 연결 종료 정리 | 완료 | 컨테이너 내부 고정 hard lifetime과 `--rm`을 적용하고 stdio MCP 서버 SIGKILL 뒤 서버 재시작 없이 32초 bound 안에 label container가 0개가 되는 것을 확인 |
 | G3 인자 범위 | 완료 | executable별 `allowed_options`, 위험 옵션 전용 오류와 일반 미허용 옵션 오류 분리, 기존 정책 기본값 호환 |
-| G4 출력 제한 | 완료 | 실제 Docker stdout/stderr 각각 초과, `truncated=true`, 합산 retained buffer 1,024 bytes, 명령 종료 확인 |
-| G5 자원 제한 | 완료 | inspect로 memory 64 MiB, 0.5 CPU, PID 64 확인; 16 MiB에서 `jq -s` OOM을 nonzero/non-timeout으로 구분 |
-| G6 Gateway timeout | 완료 | 서버 timeout보다 먼저 발생한 Gateway timeout과 caller task cancel 모두 container 0개 확인 |
+| G4 출력 제한 | 완료 | 실제 Docker stdout/stderr 초과와 `truncated=true`; 16 MiB 출력·동시 job 4개 중 MCP RSS peak 83,570,688 bytes로 256 MiB 상한 이내 |
+| G5 자원 제한 | 완료 | inspect로 memory 64 MiB, CPU 0.5, PID 64 확인; OOM 구분 및 최종 반복에서 `nr_throttled +30`, `throttled_usec +1,948,618` 실측 |
+| G6 Gateway timeout | 완료 | server/Gateway timeout과 caller cancel 뒤 같은 MCP SDK session의 후속 호출 성공 및 매 경로 container 0개 확인 |
 | G7 통합 거절 | 완료 | Registry→CandidateCompiler→Control→Gateway→실제 stdio에서 executable/shell/path/위험 옵션 거절; 다른 asset/run job 접근 거절 |
 | G8 실행 이미지 | 완료 | digest-pinned Debian base, 고정 package version, non-root image 추가; Windows와 WSL에서 build 성공 |
-| G9 WSL2 회귀 | 완료 | 최신 전체 suite `2162 passed, 42 skipped, 1 failed, 0 errors`; 기준선 대비 실패 증가 0 |
+| G9 WSL2 회귀 | 완료 | 최신 `ecde5dd` 기준선 `2172 passed, 37 skipped, 0 failed` 대비 최종 `2230 passed, 47 skipped, 0 failed`; baseline passed nodeid 누락 0 |
 | G10 `artifact_ref` | 보류 | 공통 계약을 만들지 않고 A `write_file` 연계 가능 범위와 Evidence 협의 사항만 기록 |
 
 ## Agent 최소 연결 및 3A~3F 추가 보강
@@ -49,10 +49,14 @@
 | 3D 환경 비누출 | 완료 | 전달 PATH/LANG 고정, Docker 생성 HOME/HOSTNAME 외 키 없음, host secret·민감 키 없음 |
 | 3E 다른 run/asset 격리 | 완료 | 실제 Gateway의 job status/cancel 거절과 원 job 유지·정상 cleanup 확인 |
 | 3F manifest 필드 | 완료 | Pydantic `output_schema` 고정 검증 및 discovery health check의 `health_status` 확인 |
+| 실제 provider 선택 | opt-in 미검증 | 실 LiteLLM+Docker 테스트를 추가했으나 현재 세션에 provider/model/API key가 없어 `1 skipped`; 실행 명령은 아래 기록 |
 
 이 연결은 정해진 Agent 응답으로 후보 노출, 스케줄, 정책 경유 실행과 Evidence 기록까지
-증명한다. 실제 LLM이 자유 판단으로 후보를 선택하는지는 Agent 팀의 별도 종단 검증이
-필요하다. 현재 bridge는 팀의 Agent workflow 재설계 때 교체할 수 있는 임시 최소 연결이다.
+증명한다. scripted Agent가 제안한 적대적 `python -c` 인자는 graph-bound
+`wc -l input.txt`로 교체되어 실제 Docker Evidence를 남겼다. 실제 LLM이 자유 판단으로
+후보를 선택하는지는 opt-in 테스트 진입점만 마련했고 자격 정보가 있는 Agent 팀 환경에서
+별도 실행해야 한다. 현재 bridge는 팀의 Agent workflow 재설계 때 교체할 수 있는 임시
+최소 연결이다.
 
 ## 변경 파일
 
@@ -68,6 +72,7 @@
 - `tests/integration/test_execution_agent_e2e.py`
 - `tests/integration/test_execution_output_files.py`
 - `tests/integration/test_execution_runtime_boundaries.py`
+- `tests/integration/test_execution_agent_provider_live.py`
 - `tests/fakes/execution_fault_client.py`
 - `deploy/mcp/execution/README.md`
 - `deploy/mcp/execution/policy.example.json`
@@ -153,17 +158,27 @@ whs-redteam/execution-tools@sha256:638bb00b5e38cf55700b73e2ffc2edc62ef75e865eb8e
 python@sha256:9f6ef439f51f4b36dc5c6bb265c2d3dd810bde94c5bbec77ae86b6650c488cf9  # test-only outbound probe
 ```
 
-최신 WSL2 전체 pytest:
+최종 WSL2 전체 pytest, execution/LLM opt-in off:
 
 ```text
-2162 passed, 42 skipped, 1 failed, 0 errors in 224.28s
+2230 passed, 47 skipped, 0 failed in 448.36s
 ```
 
-직전 WSL2 기준선 `2146 passed, 37 skipped, 1 failed`와 비교하면 passed +16,
-skipped +5, failed +0이다. 유일 실패는 기존
-`test_agent_loads_reference_via_mcp_then_passes_data_to_web_llm[False]`이며 단독 재현됐다.
-이 테스트는 `analysis-agent.schedulable is False`를 기대하지만 Track A 등록 상태는 이미
-`True`다. 이번 B 변경은 Agent Registry를 수정하지 않았고 execution 관련 실패는 0이다.
+동일한 `origin/capability@ecde5dd` 기준선은
+`2172 passed, 37 skipped, 0 failed in 476.51s`였다. 기준선의 2172개 passed nodeid는
+현재 결과에 모두 남아 있고 누락은 0개다. 신규 passed는 58개, skip 증가는 10개,
+새 failed는 0개다. merge 충돌에서는 incoming의 built-in definition 동등성 검증을
+유지하고 Track A의 런타임 activation reason assertion만 추가했다.
+
+WSL2/Docker B 선택 묶음 최종 반복:
+
+```text
+18 passed, 1 skipped in 204.90s
+```
+
+skip 1건은 provider/model/API key가 없는 실제 LiteLLM opt-in 테스트다. SIGKILL 자율 정리,
+동일 SDK session 복구, job polling/cancel, CPU/RSS, process tree, workspace/env 경계를 포함한
+나머지 실환경 테스트는 모두 통과했다.
 
 전체 Ruff는 기존 `deploy/docker/apktool-mcp/entrypoint.py` import 정렬 2건 때문에 실패한다.
 담당자 B가 변경한 Python 파일은 Ruff를 통과했다. 기존 파일은 수정하지 않았다.
@@ -174,15 +189,15 @@ skipped +5, failed +0이다. 유일 실패는 기존
 | --- | --- | --- | --- | --- |
 | `run_command` | 완료 | 완료 | 완료 | 없음 |
 | timeout 상한 | 완료 | 완료 | server/Gateway timeout 완료 | 없음 |
-| stdout/stderr 상한·`truncated` | 완료 | 합산 buffer·파일 상한 완료 | stdout/stderr 초과와 host output file 완료 | 전체 MCP process RSS는 측정하지 않음 |
-| task/연결 취소 cleanup | 완료 | mock 잔여 0 | caller cancel, stdio SIGKILL+restart 완료 | 죽은 SDK session 자체의 재사용은 지원하지 않음 |
+| stdout/stderr 상한·`truncated` | 완료 | 합산 buffer·파일 상한 완료 | stdout/stderr 초과, host output file, MCP RSS peak 83,570,688 bytes 완료 | 없음 |
+| task/연결 취소 cleanup | 완료 | mock 잔여 0 | 동일 SDK session에서 server/Gateway timeout·caller cancel 뒤 후속 호출 성공; stdio SIGKILL 뒤 자율 정리 | OS가 종료한 stdio transport 자체는 재사용 대상이 아님 |
 | 상태 조회와 `job_id` | 완료 | ownership/TTL 완료 | start/status/cancel 완료 | 재시작 후 job 복구는 설계상 미지원 |
 | Docker 격리 옵션 | 완료 | argv 검증 | 실제 container inspect 완료 | 없음 |
 | `--network none` | 완료 | argv 검증 | inspect와 outbound 실패 완료 | 운영 allowlist에는 probe 도구 없음 |
 | workspace 하나·기본 ro | 완료 | mount 검증 | ro execution + A write 흐름 완료 | 없음 |
 | shell 금지·executable/option allowlist | 완료 | 오류 코드별 완료 | 전체 stdio 거절 완료 | 없음 |
 | 환경변수 비누출 | 완료 | host env/Docker argv 검증 | container 내부 env dump 완료 | Docker 자체 HOME/HOSTNAME은 존재 |
-| CPU·memory·PID 제한 | 완료 | argv 검증 | inspect, memory OOM 완료 | CPU throttling 부하 측정은 없음 |
+| CPU·memory·PID 제한 | 완료 | argv 검증 | inspect, memory OOM, cgroup CPU throttling 수치 증가 완료 | 없음 |
 | timeout/cancel 정리 | 완료 | 잔여 mock 0 | 매 fault 후 label container 0 | 없음 |
 | structured 반환/오류 | 완료 | manifest와 `error_code` 완료 | 정상/timeout/거절 완료 | 없음 |
 | 다른 run/asset job 접근 | 완료 | 완료 | 실제 Gateway 거절 완료 | 없음 |
@@ -212,7 +227,7 @@ Evidence 담당과 다음 계약을 합의하기 전에는 Execution MCP가 arti
 - [x] 작업공간 및 실행 격리 검증
 - [x] 정책 거절과 실패·취소·시간 초과 검증
 - [x] 파일·명령 통합 시나리오 통과
-- [ ] Agent 팀과 실제 LLM 자유 선택 검증 — 고정 응답 기반 후보·스케줄·실행은 완료
+- [ ] Agent 팀과 실제 LLM 자유 선택 검증 — opt-in 테스트는 추가, provider 자격 정보 부재로 실제 호출 미검증
 - [x] 연결 설정, 실행 방법, 제한사항 문서화
 - [x] 기존 사용자 변경 보존 및 결과 commit 기록
 
@@ -222,13 +237,15 @@ Evidence 담당과 다음 계약을 합의하기 전에는 Execution MCP가 arti
 
 - PM·Control·Agent·A·Evidence 팀이 네 canonical operation과 승인 정책을 확정해야 한다.
 - 상태 조회 위험도를 MEDIUM으로 분리하려면 server/profile별 risk 표현 방식을 합의해야 한다.
-- Agent의 실제 LLM 자유 선택과 job poll/cancel 전략은 Agent 팀 검증이 필요하다.
+- Agent의 실제 LLM 자유 선택은 자격 정보가 있는 환경에서 opt-in 테스트를 실행해야 한다.
+  실제 job poll→완료와 mid-job cancel은 같은 MCP session의 Docker 경로로 검증했다.
 - 공통 artifact 계약 후 잘린 전체 출력의 `artifact_ref` 저장을 추가해야 한다.
-- 전체 MCP process RSS와 CPU throttling 부하는 이번 라운드에서 측정하지 않았다. 출력
-  retained buffer, CPU 설정값, host/Docker argv 및 container 내부 환경 경계는 검증했다.
+- MCP process RSS와 CPU throttling은 test-only workload로 실측했으며 운영 장기 부하의
+  용량 계획을 대신하지 않는다.
 - 운영 image는 내부 registry에 push한 뒤 registry가 발급한 RepoDigest를 operator policy에
   넣어야 한다. 로컬 build digest는 테스트 증거일 뿐 배포 식별자가 아니다.
-- WSL 전체 회귀의 기존 Analysis Agent schedulable 기대 불일치는 해당 소유 팀 정리가 필요하다.
+- `CandidateCompiler`의 generic Asset→`apk_ref` 암시 결합 제거는 팀원 소유 승인 재개 fixture
+  5건이 explicit APK metadata 없이 기존 동작을 기대해 보류했다. 자세한 내용은 gap notes에 있다.
 
 ## 재현 명령
 
@@ -256,6 +273,20 @@ python -m pytest tests/integration/test_execution_agent_e2e.py -q
 python -m pytest tests/integration/test_execution_output_files.py -q
 python -m pytest tests/integration/test_execution_runtime_boundaries.py -q
 python -m pytest -q --tb=no
+```
+
+실제 LiteLLM provider 선택 검증은 자격 정보를 출력하지 않고 다음처럼 별도 opt-in한다.
+
+```bash
+export REDTEAM_TEST_EXECUTION_LLM=1
+export REDTEAM_TEST_EXECUTION_DOCKER=1
+export REDTEAM_TEST_EXECUTION_IMAGE='whs-redteam/execution-tools@sha256:<local-repodigest>'
+export REDTEAM_LLM_PROVIDER=litellm
+export REDTEAM_LLM_MODEL='<provider/model>'
+export REDTEAM_LLM_API_KEY_ENV_VAR='<KEY_ENV_NAME>'
+export <KEY_ENV_NAME>='<secret>'
+PYTHONPATH=src .venv/bin/python -m pytest \
+  tests/integration/test_execution_agent_provider_live.py -q -s
 ```
 
 실제 배포에서는 test-only Python image를 채택하지 않는다. text-tools image를 내부

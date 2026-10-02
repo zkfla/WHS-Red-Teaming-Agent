@@ -43,7 +43,7 @@ execution 도구는 `analysis` capability로 등록되고 `analysis-agent`도 `a
 | `orchestration/agents/providers.py` | mobile/analysis는 공용 playbook provider 사용 | 현재 LLM 주 실행 경로의 강제 연결 지점은 아님 |
 | `orchestration/engine.py` | live catalog 도구를 Agent capability 기준으로 LLM에 노출 | execution은 `analysis`라 현재 자동 노출 가능 |
 | `orchestration/engine.py` | ActionIntent를 Path, Agent capability, ROE, catalog, target에 대조 | opt-in 및 고정 인자 검사를 넣을 최소 경계 |
-| `orchestration/seed.py` | Asset에 `asset_ref`, `apk_ref`, `target_ref`를 선언 사실로 기록 | workspace 상대 입력 경로 사실은 아직 없음 |
+| `orchestration/seed.py` | 모든 Asset에 `asset_ref`/`target_ref`, 명시된 APK에만 `apk_ref`를 기록 | workspace 상대 입력 경로 사실은 아직 없음 |
 | `core/contracts/engagement.py` | `Engagement.metadata` 확장점이 이미 있음 | Core 계약 변경 없이 opt-in 설정 가능 |
 | `core/contracts/engagement.py` | ROE에 `allowed_operations`가 있음 | `analysis.command_run`을 명시적으로 허용/제외 가능 |
 | execution profile | 도구 이름과 operation binding을 정확히 고정 | MCP tool allowlist는 이미 fail-closed |
@@ -124,7 +124,7 @@ AgentSpec, AgentDefinition, provider, activation rule, registry, mission bootstr
 `settings.py`, `bootstrap.py`, `action_naming.py`, Core/Control 계약, Agent registry,
 Agent definition은 수정하지 않는 안이다.
 
-## 6. 기존 테스트와 analysis schedulable 불일치
+## 6. 기존 테스트와 analysis schedulable 불일치 해결
 
 변경 전 Windows 선택 묶음은 최초 병렬 타이밍 실행에서
 `146 passed, 1 failed`였다. 실패한
@@ -139,18 +139,22 @@ execution 연결 변경 전의 lease 타이밍 변동으로 확인했다.
 `{"reporting-agent"}`이다. Track A가 Analysis Agent를 실제 schedulable role로 만든
 현재 설계와 일치하므로 이 파일은 수정하지 않는다.
 
-별도로 `tests/integration/test_methodology_agent_loop.py`에는 아직 다음 오래된 기대가
-남아 있다.
+`tests/integration/test_methodology_agent_loop.py`의 오래된 전역 schedulable 기대는 Track A
+수정에서 런타임 활성화 기대와 함께 갱신했다. 이후 `origin/capability@ecde5dd` 병합에서는
+incoming의 더 일반적인 built-in definition 동등성 검증을 그대로 유지했다.
 
 ```diff
-- assert deps.agents.definition("analysis-agent").schedulable is False
-+ assert deps.agents.definition("analysis-agent").schedulable is True
++ from redteam.orchestration.analysis_activation import analysis_activation
++ activation = await analysis_activation(...)
++ assert activation.active is False
++ assert activation.reason == "no_explicit_apk_asset"
 ```
 
-WSL2 전체 회귀의 알려진 1건 실패가 이 줄이다. 담당 팀에는 위 diff를 제안하되 이번 B
-작업에서는 기존 테스트를 수정하지 않는다. Windows에서 이 파일 전체를 실행하면 해당
-assert 전에 CP949로 emoji를 쓰는 fixture 11건이 실패하므로 schedulable 불일치를
-Windows 결과로 재판정할 수 없다.
+incoming의 `for definition in builtin.definitions()` 검증이 전역
+`analysis-agent.schedulable=True`까지 포함해 확인한다. Track A는 실제 활성 상태만
+`analysis_activation()`의 `no_explicit_apk_asset` reason으로 추가 검증한다. 병합 뒤 최종
+WSL2 전체 회귀는 `2230 passed, 47 skipped, 0 failed`였고 `ecde5dd` 기준 passed nodeid
+2172개 중 누락은 0개였다.
 
 ## 7. execution 매니페스트 필드
 
@@ -172,3 +176,41 @@ Windows 결과로 재판정할 수 없다.
 노출되고, 기존 Control Plane 및 Gateway를 거쳐 실행되어 Evidence가 남는 경로까지다.
 정해진 fake LLM 응답으로 scheduling 경계를 검증한다. 실제 LLM이 상황을 해석하여 이
 도구를 자유 판단으로 선택하는지는 Agent 팀의 별도 종단간 검증 대상이다.
+
+## 9. Track A 런타임 활성화 보강 결과
+
+Analysis Agent 정의는 전역으로 `schedulable=True`를 유지한다. 실제 run에서 역할과
+`static_analysis` 도구가 보이는 조건은 다음 두 조건을 모두 만족할 때다.
+
+1. Attack Graph의 Asset 중 하나에 operator metadata에서 온 비어 있지 않은 `apk_ref`가 있다.
+2. Registry에 capability `analysis`, operation `static_analysis`, health `HEALTHY`, target type
+   미지정 또는 `asset`인 도구가 있다.
+
+둘 중 하나라도 없으면 activation reason은 각각 `no_explicit_apk_asset` 또는
+`no_healthy_static_analysis_tool`이다. 이유와 APK node/tool ID는 Agent context와
+`AgentContextPrepared` event의 `role_activation.analysis-agent`에 남는다. 고정 execution
+recipe가 있으면 같은 Analysis Agent 역할은 보이지만 `static_analysis` 도구는 계속 숨기고
+`command_run`만 노출한다. 이 조건은 Agent 팀의 workflow 재설계 때 교체 가능한 임시
+활성화 경계다.
+
+`seed_from_engagement()`는 generic Asset에 더 이상 자동 `apk_ref`를 만들지 않는다.
+호환 입력은 engagement metadata의 `apk_ref` 또는 asset별 `apk_refs`를 명시해야 한다.
+명시하지 않은 Asset은 `asset_ref`와 같은 `target_ref`만 가진다.
+
+남은 충돌은 `CandidateCompiler`의 generic Asset binding이다. 현재
+`src/redteam/orchestration/candidates/compiler.py`는 AssetTarget을 만들 때
+`apk_ref=str(target.asset_id)`를 아직 넣는다. 이 줄을 제거하는 재현 수정 자체는 새 guard
+test를 통과했지만, 팀원 소유 `tests/integration/test_approval_resume.py`의 다섯 시나리오가
+explicit APK metadata 없이 이 암시 결합에 의존해 모두 `investigation_held`로 바뀌었다.
+기존 테스트를 수정하지 말라는 보호 규칙에 따라 compiler 수정과 임시 test를 되돌렸고
+다섯 테스트는 다시 통과했다. 완전한 제거에는 해당 fixture에 explicit `apk_ref`를 넣는
+소유 팀 합의가 필요하다.
+
+보호 결과는 다음과 같다.
+
+- exact origin `ecde5dd` 기준선: `2172 passed, 37 skipped, 0 failed`
+- 현재 최종 전체 회귀: `2230 passed, 47 skipped, 0 failed`
+- 기준선 passed nodeid 누락: 0
+- execution 비활성 Recon/Web/Mobile/Analysis 후보 snapshot SHA-256:
+  `E9CD8E06FD9EC8F6C79968723AC0A8586315146E86BE6AF0C4F7B1BA64F063DD`
+  (origin/current 동일)
