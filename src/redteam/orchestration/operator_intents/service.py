@@ -40,6 +40,14 @@ from redteam.core.enums import GraphNodeType, MissionStatus, OperatorIntentType,
 from redteam.core.ids import EventId, MissionId, OperatorIntentId, RunId, TaskId, new_id
 from redteam.core.ports.task_graph import MissionTaskStore
 from redteam.event_bus.publisher import EventPublisher
+from redteam.orchestration.coordination import (
+    BLOCKING_INTENTS,
+    CLOSED,
+    ChangeSet,
+    CoordinationError,
+    content_hash,
+    coordinator_for,
+)
 from redteam.orchestration.events import CANDIDATE_REJECTED
 from redteam.orchestration.operator_intents.interpreter import (
     classify_instruction,
@@ -61,6 +69,7 @@ from redteam.orchestration.operator_intents.models import (
 from redteam.orchestration.operator_intents.redaction import redact_text
 from redteam.orchestration.operator_intents.store import OperatorIntentStore
 from redteam.orchestration.operator_intents.suppression import endpoint_excluded
+from redteam.orchestration.outbox import deliver_pending
 from redteam.orchestration.task_graph.rules import TaskGraphError
 from redteam.orchestration.work.models import ACTIVE_STATUSES, WorkStatus
 
@@ -80,6 +89,12 @@ _MAX_ENDPOINT_MATCHES = 5
 #: Ceiling on each recorded suppression list so a long run cannot grow
 #: ``mission.operator_preferences`` without bound. The newest entries win.
 _MAX_PREFERENCE_ENTRIES = 100
+
+
+class _ClosedMissionInstruction(ValueError):
+    """A late investigation change has no decision left to influence."""
+
+
 #: Ceiling on the numeric scheduler-score components exposed in an explanation.
 _MAX_PRIORITY_COMPONENTS = 20
 
@@ -275,15 +290,23 @@ class OperatorIntentService:
         event_bus: object | None = None,
         graph_store: object | None = None,
         work_store: object | None = None,
+        path_store: object | None = None,
     ) -> None:
         self._store = store
         self._tasks = task_graph_store
+        self._path_store = path_store
         self._event_bus = event_bus
         # Optional, read-only evidence sources for ``explain``. Absent in a
         # bare/legacy deps bundle, in which case the projection degrades to
         # Task-only evidence rather than failing.
         self._graph_store = graph_store
         self._work_store = work_store
+
+    @property
+    def _coordinator(self):
+        # Custom injected stores remain usable for read-only projections;
+        # operational calls require the supported atomic implementation.
+        return coordinator_for(self._tasks, self._path_store)
 
     @classmethod
     def from_deps(cls, deps: object) -> OperatorIntentService | None:
@@ -303,6 +326,7 @@ class OperatorIntentService:
             event_bus=getattr(deps, "event_bus", None),
             graph_store=getattr(deps, "graph_store", None),
             work_store=getattr(deps, "work_store", None),
+            path_store=getattr(deps, "path_store", None),
         )
 
     # -- receive --------------------------------------------------------
@@ -355,31 +379,15 @@ class OperatorIntentService:
             run_id=run_id,
             correlation_id=correlation_id,
         )
-        await self._store.append(record)
-
-        received_event_id = await self._emit(
-            publisher,
-            EventType.OPERATOR_INSTRUCTION_RECEIVED,
-            {
-                "intent_id": intent.intent_id,
-                "intent_type": intent.intent_type.value,
-                "mission_id": mission_id,
-            },
-            correlation_id=correlation_id,
-            causation_id=last_event_id,
-        )
-        if received_event_id is not None:
-            record = record.model_copy(update={"received_event_id": received_event_id})
-            await self._store.update(record)
-
-        return IntentApplication(
-            status=IntentStatus.RECEIVED,
-            applied=False,
-            outcome="received",
-            intent_id=intent.intent_id,
-            intent_type=intent.intent_type,
-            received_event_id=received_event_id,
-        )
+        try:
+            saved = await self._register(record, publisher, last_event_id)
+        except CoordinationError as exc:
+            return IntentApplication(
+                status=IntentStatus.REJECTED, applied=False, outcome="rejected", reason=str(exc)
+            )
+        await self._recover_projection(saved)
+        await self._deliver(saved.run_id)
+        return self._application(saved, applied=saved.status is IntentStatus.APPLIED)
 
     async def receive_and_apply(
         self,
@@ -464,25 +472,18 @@ class OperatorIntentService:
             run_id=run_id,
             correlation_id=correlation_id,
         )
-        await self._store.append(record)
-        received_event_id = await self._emit(
-            publisher,
-            EventType.OPERATOR_INSTRUCTION_RECEIVED,
-            {
-                "intent_id": intent.intent_id,
-                "intent_type": intent.intent_type.value,
-                "mission_id": mission_id,
-            },
-            correlation_id=correlation_id,
-            causation_id=last_event_id,
-        )
-        if received_event_id is not None:
-            record = record.model_copy(update={"received_event_id": received_event_id})
-            await self._store.update(record)
+        try:
+            saved = await self._register(record, publisher, last_event_id)
+        except CoordinationError as exc:
+            return IntentApplication(
+                status=IntentStatus.REJECTED, applied=False, outcome="rejected", reason=str(exc)
+            )
+        await self._recover_projection(saved)
+        await self._deliver(saved.run_id)
         return await self.apply(
-            record,
+            saved.intent_id,
             publisher=publisher,
-            last_event_id=received_event_id or last_event_id,
+            last_event_id=saved.received_event_id or last_event_id,
             run_id=run_id,
             now=now,
         )
@@ -507,12 +508,19 @@ class OperatorIntentService:
                 outcome="not_found",
                 reason="intent not found",
             )
-        if record.status is IntentStatus.APPLIED:
-            return self._application(record, applied=True)
-        if record.status is IntentStatus.REJECTED:
-            return self._application(record, applied=False)
-        if run_id is not None and record.run_id is None:
-            record = record.model_copy(update={"run_id": run_id})
+        if run_id is not None and record.run_id != run_id:
+            return IntentApplication(
+                status=IntentStatus.REJECTED,
+                applied=False,
+                outcome="rejected",
+                reason="run_binding_mismatched",
+            )
+        try:
+            record = await self._register(record, publisher, last_event_id, legacy=True)
+        except CoordinationError as exc:
+            return IntentApplication(
+                status=IntentStatus.REJECTED, applied=False, outcome="rejected", reason=str(exc)
+            )
         application, _ = await self._apply_record(
             record, publisher=publisher, last_event_id=last_event_id, now=now
         )
@@ -527,43 +535,193 @@ class OperatorIntentService:
         last_event_id: EventId | None = None,
         now: datetime | None = None,
     ) -> IntentDrainResult:
-        """Apply every ``received`` intent for a mission, oldest first."""
-        records = await self._store.list_for_mission(mission_id, status=IntentStatus.RECEIVED)
+        async def read(change: ChangeSet) -> list[IntentRecord]:
+            if run_id is None:
+                raise CoordinationError("run_binding_missing_or_mismatched")
+            change.binding(str(run_id), str(mission_id))
+            return sorted(
+                (
+                    IntentRecord.model_validate(raw)
+                    for (kind, _), raw in change.records.items()
+                    if kind == "intent"
+                    and raw["run_id"] == str(run_id)
+                    and raw["intent"]["mission_id"] == str(mission_id)
+                    and raw["status"] == "received"
+                ),
+                key=lambda item: (item.intent.created_at, str(item.intent_id)),
+            )
+
+        # Import old received audit rows only against the already trusted binding.
+        for old in await self._store.list_for_mission(mission_id):
+            if old.run_id == run_id and run_id is not None:
+                try:
+                    await self._register(old, publisher, last_event_id, legacy=True)
+                except CoordinationError:
+                    continue
         applications: list[IntentApplication] = []
-        current_event = last_event_id
-        for record in records:
-            if record.run_id is None and run_id is not None:
-                record = record.model_copy(update={"run_id": run_id})
-            if record.received_event_id is None:
-                received_event_id = await self._emit(
-                    publisher,
-                    EventType.OPERATOR_INSTRUCTION_RECEIVED,
-                    {
-                        "intent_id": record.intent.intent_id,
-                        "intent_type": record.intent.intent_type.value,
-                        "mission_id": mission_id,
-                    },
-                    correlation_id=record.correlation_id,
-                    causation_id=current_event,
-                )
-                if received_event_id is not None:
-                    record = record.model_copy(update={"received_event_id": received_event_id})
-                    await self._store.update(record)
-                    current_event = received_event_id
-            application, current_event = await self._apply_record(
-                record, publisher=publisher, last_event_id=current_event, now=now
+        current = last_event_id
+        for record in await self._coordinator.change(read):
+            application, current = await self._apply_record(
+                record, publisher=publisher, last_event_id=current, now=now
             )
             applications.append(application)
-
+        await self._deliver(run_id)
         mission = await self._tasks.get_mission(mission_id)
-        status = mission.status if mission is not None else None
+        status = mission.status if mission else None
         return IntentDrainResult(
-            last_event_id=current_event,
+            last_event_id=current,
             applications=applications,
             last_intent_id=applications[-1].intent_id if applications else None,
             paused=status is MissionStatus.PAUSED,
             stopped=status is MissionStatus.CANCELLED,
             mission_status=status,
+        )
+
+    def _envelope(
+        self,
+        change: ChangeSet,
+        record: IntentRecord,
+        publisher: EventPublisher | None,
+        event_type: str,
+        payload: dict,
+        causation_id: EventId | None,
+    ) -> EventId | None:
+        if publisher is None:
+            return None
+        envelope = publisher.build(
+            event_type, payload, correlation_id=record.correlation_id, causation_id=causation_id
+        )
+        mission = change.tasks._missions.get(record.intent.mission_id)
+        if (
+            mission is None
+            or str(envelope.run_id) != str(record.run_id)
+            or envelope.engagement_id != mission.engagement_id
+        ):
+            raise CoordinationError("publisher_binding_mismatched")
+        change.binding(
+            str(record.run_id), str(record.intent.mission_id), str(envelope.engagement_id)
+        )
+        change.queue(envelope)
+        return envelope.event_id
+
+    async def _register(
+        self,
+        record: IntentRecord,
+        publisher: EventPublisher | None,
+        last_event_id: EventId | None,
+        *,
+        legacy: bool = False,
+    ) -> IntentRecord:
+        async def register(change: ChangeSet) -> IntentRecord:
+            key = ("intent", str(record.intent_id))
+            stored = change.records.get(key)
+            if stored is not None:
+                if content_hash(stored["intent"]) != content_hash(record.intent):
+                    raise CoordinationError("intent_content_conflict")
+                if stored["run_id"] != record.run_id:
+                    raise CoordinationError("run_binding_mismatched")
+                saved = IntentRecord.model_validate(stored)
+                if (
+                    saved.status is IntentStatus.RECEIVED
+                    and saved.received_event_id is None
+                    and publisher is not None
+                ):
+                    saved.received_event_id = self._envelope(
+                        change,
+                        saved,
+                        publisher,
+                        EventType.OPERATOR_INSTRUCTION_RECEIVED,
+                        {
+                            "intent_id": saved.intent_id,
+                            "intent_type": saved.intent.intent_type.value,
+                            "mission_id": saved.intent.mission_id,
+                        },
+                        last_event_id,
+                    )
+                    change.records[key] = saved.model_dump(mode="json")
+                return saved
+            if record.run_id is None:
+                raise CoordinationError("run_binding_missing_or_mismatched")
+            bound = change.binding(str(record.run_id), str(record.intent.mission_id))
+            mission = change.tasks._missions.get(record.intent.mission_id)
+            if mission is None:
+                raise CoordinationError("mission_missing")
+            saved = record.model_copy(deep=True)
+            if legacy and saved.status is not IntentStatus.RECEIVED:
+                change.records[key] = saved.model_dump(mode="json")
+                return saved
+            if saved.intent.intent_type not in _QUERY_TYPES and (
+                bound["closed"] or mission.status in CLOSED
+            ):
+                saved.status, saved.reason, saved.outcome = (
+                    IntentStatus.REJECTED,
+                    "mission_closed",
+                    "rejected",
+                )
+            elif saved.intent.intent_type not in _QUERY_TYPES and mission.status in {
+                MissionStatus.DRAFT,
+                MissionStatus.BLOCKED,
+            }:
+                saved.status, saved.reason, saved.outcome = (
+                    IntentStatus.REJECTED,
+                    "mission_not_mutable",
+                    "rejected",
+                )
+            saved.received_event_id = self._envelope(
+                change,
+                saved,
+                publisher,
+                EventType.OPERATOR_INSTRUCTION_RECEIVED,
+                {
+                    "intent_id": saved.intent_id,
+                    "intent_type": saved.intent.intent_type.value,
+                    "mission_id": saved.intent.mission_id,
+                },
+                last_event_id,
+            )
+            if saved.status is IntentStatus.REJECTED:
+                saved.applied_event_id = self._envelope(
+                    change,
+                    saved,
+                    publisher,
+                    EventType.OPERATOR_INTENT_REJECTED,
+                    {"intent_id": saved.intent_id, "reason": saved.reason},
+                    saved.received_event_id or last_event_id,
+                )
+            elif saved.intent.intent_type.value in BLOCKING_INTENTS:
+                generation_key = ("generation", f"{saved.run_id}:{saved.intent.mission_id}")
+                change.records[generation_key] = change.records.get(generation_key, 0) + 1
+            change.records[key] = saved.model_dump(mode="json")
+            return saved
+
+        return await self._coordinator.change(register)
+
+    async def _recover_projection(self, record: IntentRecord) -> None:
+        # A failed audit mirror must not undo or repeat a committed effect.
+        try:
+            existing = await self._store.get(record.intent_id)
+            if existing is None:
+                await self._store.append(record)
+            else:
+                await self._store.update(record)
+        except Exception:  # noqa: BLE001 - canonical data is durable
+            return
+
+    async def _deliver(self, run_id: RunId | None) -> int:
+        if run_id is None:
+            return 0
+
+        async def binding(change: ChangeSet):
+            return change.records.get(("binding", str(run_id)))
+
+        bound = await self._coordinator.change(binding)
+        if bound is None:
+            return 0
+        return await deliver_pending(
+            self._coordinator,
+            run_id=str(run_id),
+            engagement_id=bound["engagement_id"],
+            event_bus=self._event_bus,
         )
 
     async def _apply_record(
@@ -575,90 +733,116 @@ class OperatorIntentService:
         now: datetime | None,
     ) -> tuple[IntentApplication, EventId | None]:
         applied_at = now or datetime.now(timezone.utc)
-        try:
-            mutation = await self._mutate(record.intent, now=applied_at)
-        except (TaskGraphError, ValueError) as exc:
-            # ValueError may echo a caller-supplied parameter (e.g. int() of
-            # an invalid priority). Keyword-based redaction cannot recognize
-            # an unlabelled credential in that exception text.
-            rejection_reason = f"intent_validation_failed:{type(exc).__name__}"
-            rejected = record.model_copy(
-                update={
-                    "status": IntentStatus.REJECTED,
-                    "reason": rejection_reason,
-                    "applied_at": applied_at,
-                }
-            )
-            await self._store.update(rejected)
-            current_event = await self._emit(
-                publisher,
-                EventType.OPERATOR_INTENT_REJECTED,
-                {"intent_id": record.intent.intent_id, "reason": rejection_reason},
-                correlation_id=record.correlation_id,
-                causation_id=record.received_event_id or last_event_id,
-            )
-            return (
-                IntentApplication(
-                    status=IntentStatus.REJECTED,
-                    applied=False,
-                    outcome="rejected",
-                    intent_id=record.intent.intent_id,
-                    intent_type=record.intent.intent_type,
-                    reason=rejection_reason,
-                ),
-                current_event or last_event_id,
-            )
 
-        applied_event_id = await self._emit(
-            publisher,
-            EventType.OPERATOR_INTENT_APPLIED,
-            {
-                "intent_id": record.intent.intent_id,
-                "intent_type": record.intent.intent_type.value,
-                "outcome": mutation.outcome,
-                "affected_task_ids": mutation.affected,
-            },
-            correlation_id=record.correlation_id,
-            causation_id=record.received_event_id or last_event_id,
-        )
-        current_event = applied_event_id or last_event_id
-
-        for task_id, previous, new in mutation.priority_changes:
-            event_id = await self._emit(
-                publisher,
-                EventType.TASK_PRIORITY_CHANGED,
-                {
-                    "task_id": task_id,
-                    "intent_id": record.intent.intent_id,
-                    "previous_priority": previous,
-                    "priority": new,
-                },
-                correlation_id=record.correlation_id,
-                causation_id=applied_event_id,
-            )
-            current_event = event_id or current_event
-        for task_id in mutation.cancelled:
-            event_id = await self._emit(
-                publisher,
-                EventType.TASK_CANCELLED,
-                {"task_id": task_id, "intent_id": record.intent.intent_id},
-                correlation_id=record.correlation_id,
-                causation_id=applied_event_id,
-            )
-            current_event = event_id or current_event
-
-        applied = record.model_copy(
-            update={
-                "status": IntentStatus.APPLIED,
-                "applied_event_id": applied_event_id,
-                "applied_at": applied_at,
-                "outcome": mutation.outcome,
-                "affected_task_ids": mutation.affected,
-                "reason": None,
+        async def apply(change: ChangeSet) -> IntentRecord:
+            raw = change.records.get(("intent", str(record.intent_id)))
+            if raw is None:
+                raise CoordinationError("intent_not_registered")
+            saved = IntentRecord.model_validate(raw)
+            change.binding(str(saved.run_id), str(saved.intent.mission_id))
+            # Verify publisher even on a replay; never deliver another run's events.
+            if publisher is not None:
+                probe = publisher.build(EventType.OPERATOR_INTENT_APPLIED, {})
+                bound = change.binding(str(saved.run_id), str(saved.intent.mission_id))
+                if (
+                    str(probe.run_id) != str(saved.run_id)
+                    or str(probe.engagement_id) != bound["engagement_id"]
+                ):
+                    raise CoordinationError("publisher_binding_mismatched")
+            if saved.status is not IntentStatus.RECEIVED:
+                return saved
+            staged_service = object.__new__(OperatorIntentService)
+            staged_service._tasks = change.tasks
+            # Compute against a detached store: validation failure cannot leak
+            # task/preference changes into the transaction being committed.
+            original_missions = {
+                key: item.model_copy(deep=True) for key, item in change.tasks._missions.items()
             }
-        )
-        await self._store.update(applied)
-        return self._application(applied, applied=True), current_event
+            original_tasks = {
+                key: item.model_copy(deep=True) for key, item in change.tasks._tasks.items()
+            }
+            mutation: _MutationResult | None = None
+            payload: dict[str, object]
+            try:
+                bound = change.binding(str(saved.run_id), str(saved.intent.mission_id))
+                if bound["closed"] and saved.intent.intent_type not in _QUERY_TYPES:
+                    raise _ClosedMissionInstruction("instruction cannot change a closed run")
+                mutation = await staged_service._mutate(saved.intent, now=applied_at)
+            except (TaskGraphError, ValueError) as exc:
+                change.tasks._missions, change.tasks._tasks = original_missions, original_tasks
+                saved.status, saved.outcome = IntentStatus.REJECTED, "rejected"
+                saved.reason = (
+                    "mission_closed"
+                    if isinstance(exc, _ClosedMissionInstruction)
+                    else f"intent_validation_failed:{type(exc).__name__}"
+                )
+                event_type = EventType.OPERATOR_INTENT_REJECTED
+                payload = {"intent_id": saved.intent_id, "reason": saved.reason}
+                mutation = None
+            else:
+                assert mutation is not None
+                saved.status, saved.outcome, saved.reason = (
+                    IntentStatus.APPLIED,
+                    mutation.outcome,
+                    None,
+                )
+                saved.affected_task_ids = mutation.affected
+                event_type = EventType.OPERATOR_INTENT_APPLIED
+                payload = {
+                    "intent_id": saved.intent_id,
+                    "intent_type": saved.intent.intent_type.value,
+                    "outcome": mutation.outcome,
+                    "affected_task_ids": mutation.affected,
+                }
+                if mutation.stopped:
+                    change.binding(str(saved.run_id), str(saved.intent.mission_id))["closed"] = True
+            saved.applied_at = applied_at
+            saved.applied_event_id = self._envelope(
+                change,
+                saved,
+                publisher,
+                event_type,
+                payload,
+                saved.received_event_id or last_event_id,
+            )
+            if mutation:
+                for task_id, previous, priority in mutation.priority_changes:
+                    self._envelope(
+                        change,
+                        saved,
+                        publisher,
+                        EventType.TASK_PRIORITY_CHANGED,
+                        {
+                            "task_id": task_id,
+                            "intent_id": saved.intent_id,
+                            "previous_priority": previous,
+                            "priority": priority,
+                        },
+                        saved.applied_event_id,
+                    )
+                for task_id in mutation.cancelled:
+                    self._envelope(
+                        change,
+                        saved,
+                        publisher,
+                        EventType.TASK_CANCELLED,
+                        {"task_id": task_id, "intent_id": saved.intent_id},
+                        saved.applied_event_id,
+                    )
+            change.records[("intent", str(saved.intent_id))] = saved.model_dump(mode="json")
+            return saved
+
+        try:
+            saved = await self._coordinator.change(apply)
+        except CoordinationError as exc:
+            return IntentApplication(
+                status=IntentStatus.REJECTED, applied=False, outcome="rejected", reason=str(exc)
+            ), last_event_id
+        await self._recover_projection(saved)
+        await self._deliver(saved.run_id)
+        return self._application(
+            saved, applied=saved.status is IntentStatus.APPLIED
+        ), saved.applied_event_id or last_event_id
 
     def _application(self, record: IntentRecord, *, applied: bool) -> IntentApplication:
         return IntentApplication(
@@ -1095,10 +1279,24 @@ class OperatorIntentService:
     async def _resolve(
         self, intent: OperatorIntentId | OperatorIntent | IntentRecord
     ) -> IntentRecord | None:
-        if isinstance(intent, IntentRecord):
-            return intent
-        intent_id = intent.intent_id if isinstance(intent, OperatorIntent) else intent
-        return await self._store.get(intent_id)
+        intent_id = (
+            intent.intent_id if isinstance(intent, (OperatorIntent, IntentRecord)) else intent
+        )
+
+        async def read(change: ChangeSet):
+            raw = change.records.get(("intent", str(intent_id)))
+            return IntentRecord.model_validate(raw) if raw else None
+
+        canonical = await self._coordinator.change(read)
+        if canonical is not None:
+            return canonical
+        legacy = await self._store.get(intent_id)
+        if legacy is None:
+            return None
+        try:
+            return await self._register(legacy, None, None, legacy=True)
+        except CoordinationError:
+            return None
 
     async def _emit(
         self,
@@ -1134,6 +1332,12 @@ class OperatorIntentService:
         if mission is None:
             raise ValueError(f"mission not found: {intent.mission_id}")
         intent_type = intent.intent_type
+
+        if intent_type not in _QUERY_TYPES:
+            if mission.status in CLOSED:
+                raise _ClosedMissionInstruction("instruction cannot change a closed mission")
+            if mission.status in {MissionStatus.DRAFT, MissionStatus.BLOCKED}:
+                raise ValueError("mission_not_mutable")
 
         if intent_type is OperatorIntentType.PAUSE:
             return await self._pause(mission, now)
@@ -1183,7 +1387,7 @@ class OperatorIntentService:
             await self._set_mission_status(mission, MissionStatus.CANCELLED, now)
         cancelled: list[TaskId] = []
         for task in await self._tasks.list_tasks(mission_id=mission.mission_id):
-            if task.status in _TERMINAL_TASK_STATUSES:
+            if task.status not in _CANCELLABLE_TASK_STATUSES:
                 continue
             await self._tasks.transition_task(task.task_id, TaskStatus.CANCELLED, now=now)
             cancelled.append(task.task_id)

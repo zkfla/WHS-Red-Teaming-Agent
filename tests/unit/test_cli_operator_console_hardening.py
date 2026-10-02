@@ -35,6 +35,7 @@ from redteam.core.enums import (
 from redteam.core.ids import AgentId, ApprovalId, EngagementId, MissionId, RunId, TaskId
 from redteam.event_bus.memory import InMemoryEventBus
 from redteam.orchestration.context import RuntimeDeps
+from redteam.orchestration.coordination import coordinator_for
 from redteam.orchestration.operator_intents import (
     InMemoryOperatorIntentStore,
     IntentStatus,
@@ -99,6 +100,7 @@ async def _deps(*, with_mission: bool = True) -> SimpleNamespace:
     if with_mission:
         await task_store.create_mission(_mission())
         await task_store.create_task(_task())
+        await coordinator_for(task_store).bind(str(RUN), str(MISSION), str(ENG))
     return SimpleNamespace(
         operator_intent_store=InMemoryOperatorIntentStore(),
         task_graph_store=task_store,

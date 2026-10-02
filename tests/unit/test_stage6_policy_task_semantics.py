@@ -240,6 +240,9 @@ async def _deps_with_tasks(
         ),
         task_graph_store=store,
     )
+    from redteam.orchestration.coordination import coordinator_for
+
+    await coordinator_for(store, deps.path_store).bind(str(RUN), str(MISSION), str(ENG))
     # ``observe_node`` only surfaces an agent when the role can see something.
     await AttackGraphService(deps.graph_store).upsert_node(
         GraphNodeType.HOST, key="a.local", attrs={"in_scope": True}
@@ -341,9 +344,7 @@ async def test_denial_is_recorded_as_a_block_not_a_tool_failure() -> None:
     assert denied.payload["reasons"]
 
     graph_updates = [
-        e
-        for e in bus.history(event_type=EventType.GRAPH_UPDATED)
-        if e.payload.get("blocked")
+        e for e in bus.history(event_type=EventType.GRAPH_UPDATED) if e.payload.get("blocked")
     ]
     assert graph_updates
     assert graph_updates[-1].payload["block_verdict"] == "deny"
@@ -357,9 +358,7 @@ async def test_block_action_denial_replans_toward_the_same_goal() -> None:
     bus = InMemoryEventBus()
     task = _task("task_recon")
     deps = await _deps_with_tasks([task], bus=bus)
-    state = await observe_node(
-        initial_graph_state(runtime(mission_id=MISSION)), deps=deps
-    )
+    state = await observe_node(initial_graph_state(runtime(mission_id=MISSION)), deps=deps)
     assert state["runtime"].active_task_id == task.task_id
 
     state = {
@@ -382,9 +381,7 @@ async def test_replan_goal_denial_keeps_task_running_for_llm_replan() -> None:
     blocked = _task("task_rejected", priority=100)
     other = _task("task_other", priority=50)
     deps = await _deps_with_tasks([blocked, other], bus=bus)
-    state = await observe_node(
-        initial_graph_state(runtime(mission_id=MISSION)), deps=deps
-    )
+    state = await observe_node(initial_graph_state(runtime(mission_id=MISSION)), deps=deps)
     assert state["runtime"].active_task_id == blocked.task_id
 
     state = {
@@ -443,12 +440,8 @@ async def test_replan_goal_denial_with_a_settled_task_does_not_crash() -> None:
     bus = InMemoryEventBus()
     settled = _task("task_done")
     deps = await _deps_with_tasks([settled], bus=bus)
-    await deps.task_graph_store.transition_task(
-        settled.task_id, TaskStatus.RUNNING, now=NOW
-    )
-    await deps.task_graph_store.transition_task(
-        settled.task_id, TaskStatus.COMPLETED, now=NOW
-    )
+    await deps.task_graph_store.transition_task(settled.task_id, TaskStatus.RUNNING, now=NOW)
+    await deps.task_graph_store.transition_task(settled.task_id, TaskStatus.COMPLETED, now=NOW)
     state = {
         **initial_graph_state(runtime(mission_id=MISSION, active_task_id=settled.task_id)),
         "action_proposal": proposal(),
@@ -479,9 +472,7 @@ async def test_approval_rejection_replans_and_keeps_task_running() -> None:
     task = _task("task_held")
     plane = _TaggedPlane(PolicyVerdict.REQUIRE_APPROVAL)
     deps = await _deps_with_tasks([task], plane=plane, bus=bus)
-    await deps.task_graph_store.transition_task(
-        task.task_id, TaskStatus.RUNNING, now=NOW
-    )
+    await deps.task_graph_store.transition_task(task.task_id, TaskStatus.RUNNING, now=NOW)
 
     path_id, version = await _register_active_path(deps, RUN, {"pstep_held": "a.local"})
     step = _bound_plan_step(path_id=path_id, version=version, path_step_id="pstep_held")
@@ -507,9 +498,7 @@ async def test_approval_rejection_replans_and_keeps_task_running() -> None:
         pending_action_id=held.action_id,
         pending_approval_id=approval_id,
     )
-    state: GraphState = resume_graph_state(
-        resume_runtime, action_proposal=held, plan_step=step
-    )
+    state: GraphState = resume_graph_state(resume_runtime, action_proposal=held, plan_step=step)
 
     state = await policy_node(state, deps=deps)
     state = await update_node(state, deps=deps)

@@ -41,6 +41,7 @@ from redteam.core.enums import (
 from redteam.core.ids import AgentId, EngagementId, MissionId, RunId, TaskId
 from redteam.event_bus.memory import InMemoryEventBus
 from redteam.orchestration.context import RuntimeDeps
+from redteam.orchestration.coordination import coordinator_for
 from redteam.orchestration.operator_intents import (
     InMemoryOperatorIntentStore,
     IntentStatus,
@@ -123,6 +124,7 @@ async def _console(
         await task_store.create_mission(_mission(mission_status))
         if task is not None:
             await task_store.create_task(task)
+        await coordinator_for(task_store).bind(str(RUN), str(MISSION), str(ENG))
     intent_store = InMemoryOperatorIntentStore()
     gateway = RecordingToolGateway()
     control_plane = RecordingControlPlane()

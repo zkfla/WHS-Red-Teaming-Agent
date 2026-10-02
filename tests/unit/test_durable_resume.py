@@ -266,11 +266,11 @@ def _mobile_catalog() -> MCPToolGateway:
 
 
 def _files(directory) -> dict[str, str]:  # noqa: ANN001
-    """One SQLite file per durable store, all next to each other."""
+    """Task and path state share one transaction; other durable stores are adjacent."""
     directory = Path(directory)
     return {
         "checkpoint": str(directory / "checkpoints.sqlite3"),
-        "paths": str(directory / "paths.sqlite3"),
+        "paths": str(directory / "task_graph.sqlite3"),
         "work": str(directory / "work.sqlite3"),
         "tasks": str(directory / "task_graph.sqlite3"),
         "graph": str(directory / "attack_graph.sqlite3"),

@@ -22,6 +22,7 @@ from redteam.capability.settings import MCPConfigurationError
 from redteam.core.contracts.mission import MissionPlan, Provenance
 from redteam.core.enums import AgentPhase, MissionStatus
 from redteam.core.ids import ActionId, ApprovalId, EngagementId, MissionId, RunId
+from redteam.orchestration.coordination import coordinator_for
 from redteam.orchestration.operator_intents import InMemoryOperatorIntentStore
 from redteam.orchestration.state import RuntimeState, TerminationReason
 from redteam.orchestration.task_graph.memory import InMemoryTaskGraphStore
@@ -230,6 +231,9 @@ async def test_resume_paused_run_applies_operator_intent_before_scheduling(
         build_test_application(),
         task_graph_store=store,
         operator_intent_store=InMemoryOperatorIntentStore(),
+    )
+    await coordinator_for(store, deps.path_store).bind(
+        "run_resume", str(mission_id), "eng_recovered"
     )
     paused = RuntimeState(
         run_id=RunId("run_resume"),

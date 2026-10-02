@@ -78,8 +78,11 @@ class _Evidence:
 
 
 def _engine_deps(path_store):
+    from redteam.orchestration.task_graph.sqlite import SQLiteTaskGraphStore
+
     return SimpleNamespace(
         path_store=path_store,
+        task_graph_store=SQLiteTaskGraphStore(path_store._path),
         graph_store=InMemoryAttackGraphStore(),
         evidence_store=_Evidence(),
         agents=_Agents(),
