@@ -75,7 +75,7 @@ class SessionController:
         self.resume_runner = resume_runner
         self.context_loader = context_loader
         self.approval_verifier = approval_verifier
-        self.active_receipt = None
+        self.active_receipt: InputReceipt | None = None
         self.commands = sorted(
             set(commands)
             | {
@@ -467,6 +467,7 @@ class SessionController:
 
     async def _execute(self, objective: str, receipt: InputReceipt) -> None:
         binding = self.binding
+        assert binding is not None  # _execute is only started with an active binding
         try:
             if isinstance(objective, tuple):
                 result = await self.resume_runner(*objective, self)
