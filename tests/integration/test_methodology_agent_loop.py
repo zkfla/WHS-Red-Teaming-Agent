@@ -38,6 +38,7 @@ from redteam.core.convert import build_tool_invocation
 from redteam.core.enums import ApprovalStatus, GraphNodeType, PolicyVerdict
 from redteam.core.ids import ActionId, AgentId, AssetId, EngagementId, RunId, ToolId
 from redteam.orchestration.agents.registry import default_registry
+from redteam.orchestration.analysis_activation import analysis_activation
 from redteam.orchestration.methodology import REFERENCE_AGENT_ID
 from redteam.orchestration.settings import OrchestrationSettings
 from tests.integration.test_methodology_workspace import configure
@@ -180,9 +181,14 @@ async def test_agent_loads_reference_via_mcp_then_passes_data_to_web_llm(
         builtin = default_registry()
         for spec in builtin.all():
             assert deps.agents.get(spec.agent_id).capabilities == spec.capabilities
-        assert deps.agents.definition("analysis-agent").schedulable is False
+        assert deps.agents.definition("analysis-agent").schedulable is True
         assert REFERENCE_AGENT_ID in deps.agents.agent_ids
         final = await run_engagement(engagement, deps, objective="합성 API 방법론 자료만 확인")
+        activation = await analysis_activation(
+            AttackGraphService(deps.graph_store), deps.tool_catalog
+        )
+        assert activation.active is False
+        assert activation.reason == "no_explicit_apk_asset"
         records = await deps.evidence_store.list_for_run(final.run_id)
         library = deps.methodology_library
         status, _, text = library.inspect(records, library.entries[0])

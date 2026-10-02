@@ -20,6 +20,13 @@ from redteam.core.ids import EventId, GraphNodeId, new_id
 from redteam.event_bus.publisher import EventPublisher
 from redteam.orchestration.agents.base import HypothesisDraft, PlanStep
 from redteam.orchestration.agents.providers import PlaybookCandidateProvider
+from redteam.orchestration.analysis_activation import (
+    ANALYSIS_AGENT_ID,
+    STATIC_ANALYSIS_OPERATION,
+    analysis_activation,
+    analysis_role_visible,
+    analysis_tool_visible,
+)
 from redteam.orchestration.authentication import AuthenticationCheck
 from redteam.orchestration.candidates.compiler import CandidateCompiler
 from redteam.orchestration.candidates.models import CandidateDraft
@@ -258,6 +265,9 @@ class InvestigationEngine:
                 **refs,
                 "graph_summary": "Current provided claims, observations and hypotheses prepared",
                 "runtime_observation_count": len(payload.get("runtime_observations", [])),
+                "role_activation": redact_secret_material(
+                    payload.get("role_activation", {})
+                ),
             },
             causation_id=self.last_event_id,
         )
@@ -353,12 +363,21 @@ class InvestigationEngine:
         execution_options = await execution_agent_options(
             service, self.deps.engagement, runtime.run_id
         )
+        analysis_status = await analysis_activation(service, self.deps.tool_catalog)
+        visible_agents = [
+            agent
+            for agent in self.deps.agents.all()
+            if analysis_role_visible(
+                agent, analysis_status, execution_ready=bool(execution_options)
+            )
+        ]
         if self.deps.tool_catalog is not None:
             capabilities = {cap for agent in self.deps.agents.all() for cap in agent.capabilities}
             for capability in sorted(capabilities):
                 for tool in self.deps.tool_catalog.list_by_capability(capability):
                     if (
                         tool.health_status is not ToolHealthStatus.UNHEALTHY
+                        and analysis_tool_visible(tool, analysis_status)
                         and agent_tool_visible(
                             tool, execution_ready=bool(execution_options)
                         )
@@ -424,6 +443,7 @@ class InvestigationEngine:
         return {
             **reference_context,
             **({"execution_options": execution_options} if execution_options else {}),
+            "role_activation": {ANALYSIS_AGENT_ID: analysis_status.as_dict()},
             "goal": mission.objective if mission else runtime.current_goal,
             "success_criteria": mission.success_criteria if mission else [runtime.current_goal],
             "mission": mission.model_dump(mode="json") if mission else None,
@@ -445,7 +465,7 @@ class InvestigationEngine:
             "completed_task_paths": completed_task_paths,
             "roles": [
                 {"agent_id": str(agent.agent_id), "capabilities": agent.capabilities}
-                for agent in self.deps.agents.all()
+                for agent in visible_agents
             ],
             "tools": list(tools.values()),
             "evidence": evidence,
@@ -462,8 +482,11 @@ class InvestigationEngine:
 
     async def reference_paths(self, observation, service, runtime) -> list[dict]:
         references = []
+        analysis_status = await analysis_activation(service, self.deps.tool_catalog)
         # These drafts never enter the executable pool.
         for agent in self.deps.agents.all():
+            if not analysis_role_visible(agent, analysis_status):
+                continue
             try:
                 drafts = await PlaybookCandidateProvider().propose(
                     agent,
@@ -905,6 +928,7 @@ class InvestigationEngine:
         from redteam.attack_graph.service import AttackGraphService
 
         service = AttackGraphService(self.deps.graph_store)
+        analysis_status = await analysis_activation(service, self.deps.tool_catalog)
         steps = {step.step_id: step for step in path.steps}
         drafts = []
         errors = []
@@ -923,6 +947,14 @@ class InvestigationEngine:
                 agent = self.deps.agents.get(intent.agent_id)
                 if agent is None or intent.capability not in agent.capabilities:
                     raise ValueError("action role/capability is unavailable")
+                if (
+                    str(intent.agent_id) == ANALYSIS_AGENT_ID
+                    and intent.operation == STATIC_ANALYSIS_OPERATION
+                    and not analysis_status.active
+                ):
+                    raise ValueError(
+                        f"analysis_agent_inactive:{analysis_status.reason}"
+                    )
                 if step.agent_id and step.agent_id != intent.agent_id:
                     raise ValueError("action role is outside accepted step")
                 execution_node = None

@@ -17,6 +17,7 @@ from redteam.core.contracts.tool import ToolDescriptor
 from redteam.core.enums import GraphNodeType, ToolHealthStatus
 from redteam.core.ids import EngagementId, RunId, ToolId
 from redteam.orchestration.engine import InvestigationEngine
+from redteam.orchestration.events import AGENT_CONTEXT_PREPARED
 from redteam.orchestration.seed import seed_from_engagement
 from redteam.orchestration.state import RuntimeState
 from tests.fakes import build_test_application
@@ -67,7 +68,7 @@ def descriptor(
 async def prepared_context(
     configured: Engagement,
     tools: list[ToolDescriptor],
-) -> tuple[dict, list[dict], list[object]]:
+) -> tuple[dict, list[dict], list[object], InvestigationEngine, RuntimeState, object]:
     catalog = MCPToolRegistry()
     for tool in tools:
         catalog.register(tool)
@@ -87,7 +88,7 @@ async def prepared_context(
     context = await engine.context(runtime, observation)
     references = await engine.reference_paths(observation, service.view(), runtime)
     assets = await service.query(node_type=GraphNodeType.ASSET)
-    return context, references, assets
+    return context, references, assets, engine, runtime, deps
 
 
 def role_ids(context: dict) -> set[str]:
@@ -95,7 +96,7 @@ def role_ids(context: dict) -> set[str]:
 
 
 async def test_workspace_asset_does_not_activate_static_analysis() -> None:
-    context, references, assets = await prepared_context(
+    context, references, assets, _, _, _ = await prepared_context(
         engagement(),
         [descriptor("analysis.decode_apk", operation="static_analysis")],
     )
@@ -110,7 +111,7 @@ async def test_workspace_asset_does_not_activate_static_analysis() -> None:
 
 
 async def test_apk_without_healthy_static_tool_records_inactive_reason() -> None:
-    context, references, _ = await prepared_context(
+    context, references, _, _, _, _ = await prepared_context(
         engagement(apk_ref="insecurebankv2"),
         [
             descriptor(
@@ -129,7 +130,7 @@ async def test_apk_without_healthy_static_tool_records_inactive_reason() -> None
 
 
 async def test_explicit_apk_and_healthy_static_tool_activate_analysis() -> None:
-    context, references, assets = await prepared_context(
+    context, references, assets, _, _, _ = await prepared_context(
         engagement(apk_ref="insecurebankv2"),
         [descriptor("analysis.decode_apk", operation="static_analysis")],
     )
@@ -141,12 +142,13 @@ async def test_explicit_apk_and_healthy_static_tool_activate_analysis() -> None:
 
 
 async def test_execution_workspace_exposes_only_command_recipe_without_mobile_analysis() -> None:
-    context, references, _ = await prepared_context(
+    context, references, _, _, _, _ = await prepared_context(
         engagement(execution=True),
         [descriptor("analysis.run_command", operation="command_run")],
     )
 
     assert context["role_activation"]["analysis-agent"]["reason"] == "no_explicit_apk_asset"
+    assert "analysis-agent" in role_ids(context)
     assert [item["tool_name"] for item in context["tools"]] == ["run_command"]
     assert len(context["execution_options"]) == 1
     assert context["execution_options"][0]["operation"] == "command_run"
@@ -154,3 +156,39 @@ async def test_execution_workspace_exposes_only_command_recipe_without_mobile_an
         item["operation"] not in {"analysis.static_analysis", "mobile.app_launch"}
         for item in references
     )
+
+
+async def test_health_transition_keeps_each_activation_reason_in_event_history() -> None:
+    tool = descriptor(
+        "analysis.decode_apk",
+        operation="static_analysis",
+        health=ToolHealthStatus.UNHEALTHY,
+    )
+    context, _, _, engine, runtime, deps = await prepared_context(
+        engagement(apk_ref="insecurebankv2"),
+        [tool],
+    )
+    engine._event_runtime = runtime
+    await engine._ask(
+        stage="activation_probe",
+        payload=context,
+        response_schema={"type": "object"},
+    )
+
+    assert deps.tool_catalog.update_server_health(
+        tool.server_id, ToolHealthStatus.HEALTHY
+    )
+    service = AttackGraphService(deps.graph_store)
+    recovered = await engine.context(runtime, await service.observe(step=2))
+    await engine._ask(
+        stage="activation_probe",
+        payload=recovered,
+        response_schema={"type": "object"},
+    )
+
+    reasons = [
+        event.payload["role_activation"]["analysis-agent"]["reason"]
+        for event in deps.event_bus.history()
+        if event.event_type == AGENT_CONTEXT_PREPARED
+    ]
+    assert reasons == ["no_healthy_static_analysis_tool", "active"]

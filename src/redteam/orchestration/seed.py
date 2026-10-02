@@ -176,13 +176,16 @@ async def seed_from_engagement(
         )
     for asset in declared_assets:
         asset_ref = asset_refs.get(asset, asset)
-        apk_ref = apk_refs.get(asset, asset_ref)
+        apk_ref = apk_refs.get(asset)
         asset_facts = {
             "asset_ref": asset_ref,
-            "apk_ref": apk_ref,
-            "target_ref": apk_ref,
+            # Generic Asset tools still need a stable operator-owned target
+            # alias.  APK identity is a separate, explicit declaration.
+            "target_ref": apk_ref or asset_ref,
             **execution_facts.get(asset, {}),
         }
+        if apk_ref is not None:
+            asset_facts["apk_ref"] = apk_ref
         if asset in device_refs:
             asset_facts.update(
                 device_serial=device_serials[asset],

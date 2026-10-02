@@ -32,8 +32,12 @@ from redteam.orchestration.state import RuntimeState
 from tests.fakes import build_test_application
 
 
-def engagement(*, execution_agent: dict | None = None) -> Engagement:
+def engagement(
+    *, execution_agent: dict | None = None, apk_ref: str | None = None
+) -> Engagement:
     metadata = {"asset_ref": "workspace-test"}
+    if apk_ref is not None:
+        metadata["apk_ref"] = apk_ref
     if execution_agent is not None:
         metadata["execution_agent"] = execution_agent
     return Engagement(
@@ -167,7 +171,7 @@ def test_bridge_exposes_only_synchronous_fixed_execution_operation() -> None:
 
 
 async def test_disabled_execution_catalog_does_not_change_agent_context() -> None:
-    configured = engagement()
+    configured = engagement(apk_ref="insecurebankv2")
     graph_store = InMemoryAttackGraphStore()
     service = AttackGraphService(graph_store)
     await seed_from_engagement(service, configured, run_id=RunId("run-test"))
