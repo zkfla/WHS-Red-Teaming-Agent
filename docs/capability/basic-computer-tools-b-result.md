@@ -31,8 +31,28 @@
 | G6 Gateway timeout | 완료 | 서버 timeout보다 먼저 발생한 Gateway timeout과 caller task cancel 모두 container 0개 확인 |
 | G7 통합 거절 | 완료 | Registry→CandidateCompiler→Control→Gateway→실제 stdio에서 executable/shell/path/위험 옵션 거절; 다른 asset/run job 접근 거절 |
 | G8 실행 이미지 | 완료 | digest-pinned Debian base, 고정 package version, non-root image 추가; Windows와 WSL에서 build 성공 |
-| G9 WSL2 회귀 | 완료 | 전체 suite `2146 passed, 37 skipped, 1 failed, 0 errors`; B execution 신규 실패 0 |
+| G9 WSL2 회귀 | 완료 | 최신 전체 suite `2162 passed, 42 skipped, 1 failed, 0 errors`; 기준선 대비 실패 증가 0 |
 | G10 `artifact_ref` | 보류 | 공통 계약을 만들지 않고 A `write_file` 연계 가능 범위와 Evidence 협의 사항만 기록 |
+
+## Agent 최소 연결 및 3A~3F 추가 보강
+
+| 항목 | 상태 | 검증 근거 |
+| --- | --- | --- |
+| Agent 기본 비활성 | 완료 | 변경 전·후 동일 기존 묶음 각각 `146 passed, 1 deselected`; lease 단독 전·후 각각 `1 passed` |
+| opt-in 후보 노출·스케줄 | 완료 | `execution_agent.enabled=true`와 graph-bound Asset recipe가 있을 때만 `command_run` 노출 |
+| 고정 인자 바인딩 | 완료 | 모델 입력을 버리고 graph 사실에서 `wc -l <relative path>`와 context identity 재생성 |
+| Agent→Control→Gateway→MCP→Evidence | 완료 | Windows fake Docker 경로와 WSL2 실제 Docker 경로 모두 통과; 실제 경로 `1 passed` |
+| ROE·서버 거절 | 완료 | ROE 제외 시 Control 거절·Docker 미실행, 미허용 executable은 안정 오류 코드로 서버 거절 |
+| 3A 큰 출력 파일 | 완료 | host가 `.command_outputs/<id>.txt`를 독점 생성하고 `output_path` 반환; WSL2 `6 passed` |
+| 3B 취소·timeout 후손 정리 | 완료 | outer/child/grandchild를 `docker top`으로 확인한 뒤 두 경로 모두 label container 0 |
+| 3C workdir/workspace 격리 | 완료 | `/workspace` 고정, 두 workspace 내용 분리, `../` 접근 거절 |
+| 3D 환경 비누출 | 완료 | 전달 PATH/LANG 고정, Docker 생성 HOME/HOSTNAME 외 키 없음, host secret·민감 키 없음 |
+| 3E 다른 run/asset 격리 | 완료 | 실제 Gateway의 job status/cancel 거절과 원 job 유지·정상 cleanup 확인 |
+| 3F manifest 필드 | 완료 | Pydantic `output_schema` 고정 검증 및 discovery health check의 `health_status` 확인 |
+
+이 연결은 정해진 Agent 응답으로 후보 노출, 스케줄, 정책 경유 실행과 Evidence 기록까지
+증명한다. 실제 LLM이 자유 판단으로 후보를 선택하는지는 Agent 팀의 별도 종단 검증이
+필요하다. 현재 bridge는 팀의 Agent workflow 재설계 때 교체할 수 있는 임시 최소 연결이다.
 
 ## 변경 파일
 
@@ -44,15 +64,30 @@
 - `tests/unit/test_execution_mcp.py`
 - `tests/unit/test_execution_manifest.py`
 - `tests/integration/test_execution_mcp.py`
+- `tests/unit/test_execution_agent_bridge.py`
+- `tests/integration/test_execution_agent_e2e.py`
+- `tests/integration/test_execution_output_files.py`
+- `tests/integration/test_execution_runtime_boundaries.py`
 - `tests/fakes/execution_fault_client.py`
 - `deploy/mcp/execution/README.md`
 - `deploy/mcp/execution/policy.example.json`
+- `deploy/mcp/execution/agent-opt-in.example.json`
 - `deploy/mcp/execution/read.env.example`
 - `deploy/docker/execution-tools/Dockerfile`
 - `deploy/docker/execution-tools/README.md`
 - `docs/capability/basic-computer-tools-b-contract-proposal.md`
 - `docs/capability/basic-computer-tools-b-protocol.md`
 - `docs/capability/basic-computer-tools-b-result.md`
+- `docs/capability/basic-computer-tools-b-gap-notes.md`
+- `docs/capability/basic-computer-tools-b-orchestration-change-note.md`
+
+Agent 최소 연결을 위해 수정·추가한 orchestration 파일:
+
+| 파일 | 누적 diff | 내용 |
+| --- | ---: | --- |
+| `src/redteam/orchestration/execution_bridge.py` | `+209/-0` | opt-in schema, 도구 필터, graph-bound recipe·인자 |
+| `src/redteam/orchestration/seed.py` | `+3/-0` | 검증한 Asset execution 사실 seed |
+| `src/redteam/orchestration/engine.py` | `+50/-6` | context 필터와 execution 전용 조기 바인딩; 비-execution 검사 순서 보존 |
 
 승인받은 공통 파일 추가:
 
@@ -118,14 +153,14 @@ whs-redteam/execution-tools@sha256:638bb00b5e38cf55700b73e2ffc2edc62ef75e865eb8e
 python@sha256:9f6ef439f51f4b36dc5c6bb265c2d3dd810bde94c5bbec77ae86b6650c488cf9  # test-only outbound probe
 ```
 
-WSL2 전체 pytest:
+최신 WSL2 전체 pytest:
 
 ```text
-2146 passed, 37 skipped, 1 failed, 0 errors in 218.28s
+2162 passed, 42 skipped, 1 failed, 0 errors in 224.28s
 ```
 
-Windows 기준선 `1985 passed, 43 skipped, 100 failed, 41 errors`와 비교하면 passed +161,
-skipped -6, failed -99, errors -41이다. 유일 실패는 기존
+직전 WSL2 기준선 `2146 passed, 37 skipped, 1 failed`와 비교하면 passed +16,
+skipped +5, failed +0이다. 유일 실패는 기존
 `test_agent_loads_reference_via_mcp_then_passes_data_to_web_llm[False]`이며 단독 재현됐다.
 이 테스트는 `analysis-agent.schedulable is False`를 기대하지만 Track A 등록 상태는 이미
 `True`다. 이번 B 변경은 Agent Registry를 수정하지 않았고 execution 관련 실패는 0이다.
@@ -139,26 +174,27 @@ skipped -6, failed -99, errors -41이다. 유일 실패는 기존
 | --- | --- | --- | --- | --- |
 | `run_command` | 완료 | 완료 | 완료 | 없음 |
 | timeout 상한 | 완료 | 완료 | server/Gateway timeout 완료 | 없음 |
-| stdout/stderr 상한·`truncated` | 완료 | 합산 buffer 상한 완료 | stdout/stderr 초과 완료 | 전체 MCP process RSS는 측정하지 않음 |
+| stdout/stderr 상한·`truncated` | 완료 | 합산 buffer·파일 상한 완료 | stdout/stderr 초과와 host output file 완료 | 전체 MCP process RSS는 측정하지 않음 |
 | task/연결 취소 cleanup | 완료 | mock 잔여 0 | caller cancel, stdio SIGKILL+restart 완료 | 죽은 SDK session 자체의 재사용은 지원하지 않음 |
 | 상태 조회와 `job_id` | 완료 | ownership/TTL 완료 | start/status/cancel 완료 | 재시작 후 job 복구는 설계상 미지원 |
 | Docker 격리 옵션 | 완료 | argv 검증 | 실제 container inspect 완료 | 없음 |
 | `--network none` | 완료 | argv 검증 | inspect와 outbound 실패 완료 | 운영 allowlist에는 probe 도구 없음 |
 | workspace 하나·기본 ro | 완료 | mount 검증 | ro execution + A write 흐름 완료 | 없음 |
 | shell 금지·executable/option allowlist | 완료 | 오류 코드별 완료 | 전체 stdio 거절 완료 | 없음 |
-| 환경변수 비누출 | 완료 | host env/Docker argv 검증 | image 실행 완료 | container 내부 env dump assertion은 없음 |
+| 환경변수 비누출 | 완료 | host env/Docker argv 검증 | container 내부 env dump 완료 | Docker 자체 HOME/HOSTNAME은 존재 |
 | CPU·memory·PID 제한 | 완료 | argv 검증 | inspect, memory OOM 완료 | CPU throttling 부하 측정은 없음 |
 | timeout/cancel 정리 | 완료 | 잔여 mock 0 | 매 fault 후 label container 0 | 없음 |
 | structured 반환/오류 | 완료 | manifest와 `error_code` 완료 | 정상/timeout/거절 완료 | 없음 |
 | 다른 run/asset job 접근 | 완료 | 완료 | 실제 Gateway 거절 완료 | 없음 |
-| `artifact_ref` | 보류 | 해당 없음 | 해당 없음 | 공통 Evidence 계약 부재 |
+| `artifact_ref` | 보류 | `output_path` 경계 완료 | Workspace `read_file` 재읽기 완료 | canonical Evidence artifact 계약 부재 |
 
 ## G10 보류 항목: `artifact_ref`
 
-실제 8.1 흐름에서 `sort`의 bounded stdout을 A의 `write_file`로 저장하고 다시 읽는 것은
-검증했다. 따라서 `truncated=false`인 작은 결과는 Agent가 별도의 승인된 `write_file`
-action으로 저장할 수 있다. `truncated=true`이면 Agent에게 전달되지 않은 뒷부분을 복원할
-수 없으므로 이 흐름은 큰 출력 전체를 보존하는 `artifact_ref` 대체가 아니다.
+Execution 서버는 반환 buffer와 별도로 큰 출력을 승인된 workspace의 B 전용
+`.command_outputs/<job-or-command-id>.txt`에 상한까지 저장하고 상대 `output_path`를
+반환한다. 경로 이탈, symlink, 덮어쓰기, context 혼합을 차단하고 mode 0700/0600을
+적용했다. A의 기존 `read_file`로 이 경로를 다시 읽는 흐름도 검증했다. 다만
+`output_path`는 workspace 상대 경로일 뿐 canonical Evidence `artifact_ref`는 아니다.
 
 Evidence 담당과 다음 계약을 합의하기 전에는 Execution MCP가 artifact를 직접 만들지 않는다.
 
@@ -176,7 +212,7 @@ Evidence 담당과 다음 계약을 합의하기 전에는 Execution MCP가 arti
 - [x] 작업공간 및 실행 격리 검증
 - [x] 정책 거절과 실패·취소·시간 초과 검증
 - [x] 파일·명령 통합 시나리오 통과
-- [ ] Agent 팀과 도구 선택·실행 검증 — 후보 컴파일은 확인, 자율 선택은 미검증
+- [ ] Agent 팀과 실제 LLM 자유 선택 검증 — 고정 응답 기반 후보·스케줄·실행은 완료
 - [x] 연결 설정, 실행 방법, 제한사항 문서화
 - [x] 기존 사용자 변경 보존 및 결과 commit 기록
 
@@ -186,10 +222,10 @@ Evidence 담당과 다음 계약을 합의하기 전에는 Execution MCP가 arti
 
 - PM·Control·Agent·A·Evidence 팀이 네 canonical operation과 승인 정책을 확정해야 한다.
 - 상태 조회 위험도를 MEDIUM으로 분리하려면 server/profile별 risk 표현 방식을 합의해야 한다.
-- Agent의 자율 후보 선택→승인 요청→job poll/cancel 전략은 Agent 팀 검증이 필요하다.
+- Agent의 실제 LLM 자유 선택과 job poll/cancel 전략은 Agent 팀 검증이 필요하다.
 - 공통 artifact 계약 후 잘린 전체 출력의 `artifact_ref` 저장을 추가해야 한다.
-- 전체 MCP process RSS, CPU throttling 부하, container 내부 environment dump는 이번 라운드에서
-  측정하지 않았다. 출력 retained buffer, CPU 설정값, host/Docker argv 환경 경계는 검증했다.
+- 전체 MCP process RSS와 CPU throttling 부하는 이번 라운드에서 측정하지 않았다. 출력
+  retained buffer, CPU 설정값, host/Docker argv 및 container 내부 환경 경계는 검증했다.
 - 운영 image는 내부 registry에 push한 뒤 registry가 발급한 RepoDigest를 operator policy에
   넣어야 한다. 로컬 build digest는 테스트 증거일 뿐 배포 식별자가 아니다.
 - WSL 전체 회귀의 기존 Analysis Agent schedulable 기대 불일치는 해당 소유 팀 정리가 필요하다.
@@ -214,8 +250,11 @@ cd /path/to/WHS-Red-Teaming-Agent
 docker build -t whs-redteam/execution-tools:local deploy/docker/execution-tools
 export REDTEAM_TEST_EXECUTION_DOCKER=1
 export REDTEAM_TEST_EXECUTION_IMAGE='whs-redteam/execution-tools@sha256:<local-repodigest>'
-export REDTEAM_TEST_EXECUTION_NETWORK_IMAGE='python@sha256:<test-only-repodigest>'
+export REDTEAM_TEST_EXECUTION_PROCESS_IMAGE='python@sha256:<test-only-repodigest>'
 python -m pytest tests/integration/test_execution_mcp.py -q
+python -m pytest tests/integration/test_execution_agent_e2e.py -q
+python -m pytest tests/integration/test_execution_output_files.py -q
+python -m pytest tests/integration/test_execution_runtime_boundaries.py -q
 python -m pytest -q --tb=no
 ```
 
