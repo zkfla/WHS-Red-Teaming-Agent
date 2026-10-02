@@ -476,6 +476,71 @@ async def test_real_stdio_docker_execution_hardening(
     ) as gateway:
         tool = gateway.get(ToolId("analysis.run_command"))
         validate_execution_descriptor(tool, "workspace-test")
+        live_engagement = Engagement(
+            engagement_id=EngagementId("eng-test"),
+            name="live synthetic execution workspace",
+            scope=EngagementScope(allowed_assets=["workspace-test"]),
+            execution_budget=ExecutionBudget(max_actions=20),
+            rate_limit_policy=RateLimitPolicy(max_actions_per_minute=60),
+            approval_policy=ApprovalPolicy(),
+            created_at=datetime.now(timezone.utc),
+        )
+        live_plane = DefaultControlPlane(
+            {live_engagement.engagement_id: live_engagement},
+            risk_resolver=RegistryRiskResolver(gateway),
+        )
+        live_compiler = CandidateCompiler(gateway)
+
+        async def approved_stdio_call(
+            tool_name: str,
+            arguments: dict[str, Any],
+            action_id: str,
+        ) -> Any:
+            target = AssetTarget(asset_id=AssetId("workspace-test"))
+            draft = CandidateDraft(
+                agent_id=AgentId("execution-live-agent"),
+                target_node_ids=[node_id_for_target(target)],
+                plan_step=PlanStep(
+                    step_id=action_id,
+                    capability="analysis",
+                    operation=EXECUTION_TOOLS[tool_name].operation,
+                    tool_id=ToolId(f"analysis.{tool_name}"),
+                    target=target,
+                    arguments=arguments,
+                    reason="exercise the approved execution rejection path",
+                    assessment_kind="observation",
+                ),
+            )
+            compiled, rejected = live_compiler.compile_drafts_with_rejections([draft])
+            assert len(compiled) == 1 and not rejected
+            step = compiled[0].plan_step
+            proposal = ActionProposal(
+                action_id=ActionId(action_id),
+                run_id=RunId("run-test"),
+                engagement_id=live_engagement.engagement_id,
+                agent_id=draft.agent_id,
+                capability=step.capability,
+                operation=step.operation,
+                target=step.resolved_target(),
+                arguments=step.arguments,
+                reason=step.reason,
+                created_at=datetime.now(timezone.utc),
+            )
+            decision = await live_plane.evaluate(
+                proposal,
+                ControlContext(engagement_id=live_engagement.engagement_id),
+            )
+            assert decision.verdict == PolicyVerdict.REQUIRE_APPROVAL
+            await live_plane.resolve_approval(
+                decision.approval_id,
+                ApprovalStatus.APPROVED,
+                "fixture-operator",
+            )
+            allowed = await live_plane.approval_outcome(decision.approval_id)
+            return await gateway.invoke(
+                build_tool_invocation(proposal, allowed, tool_id=step.tool_id)
+            )
+
         listed = await gateway.invoke(workspace_invocation("list_directory", {}))
         before = await gateway.invoke(
             workspace_invocation("read_file", {"path": "input.txt"})
@@ -501,48 +566,32 @@ async def test_real_stdio_docker_execution_hardening(
 
         rejection_cases = [
             (
-                invocation(
-                    {
-                        "asset_ref": "workspace-test",
-                        "executable": "python",
-                        "args": ["input.txt"],
-                    }
-                ),
+                {"executable": "python", "args": ["input.txt"]},
                 "execution_executable_not_allowed",
+                "action-live-reject-executable",
             ),
             (
-                invocation(
-                    {
-                        "asset_ref": "workspace-test",
-                        "executable": "grep",
-                        "args": ["needle;cat", "input.txt"],
-                    }
-                ),
+                {"executable": "grep", "args": ["needle;cat", "input.txt"]},
                 "execution_shell_syntax_forbidden",
+                "action-live-reject-shell",
             ),
             (
-                invocation(
-                    {
-                        "asset_ref": "workspace-test",
-                        "executable": "grep",
-                        "args": ["needle", "../outside.txt"],
-                    }
-                ),
+                {"executable": "grep", "args": ["needle", "../outside.txt"]},
                 "execution_invalid_path",
+                "action-live-reject-path",
             ),
             (
-                invocation(
-                    {
-                        "asset_ref": "workspace-test",
-                        "executable": "sort",
-                        "args": ["-o", "result.txt", "input.txt"],
-                    }
-                ),
+                {"executable": "sort", "args": ["-o", "result.txt", "input.txt"]},
                 "execution_dangerous_option_forbidden",
+                "action-live-reject-option",
             ),
         ]
-        for rejected_invocation, expected_code in rejection_cases:
-            rejected = await gateway.invoke(rejected_invocation)
+        for rejected_arguments, expected_code, action_id in rejection_cases:
+            rejected = await approved_stdio_call(
+                "run_command",
+                rejected_arguments,
+                action_id,
+            )
             assert rejected.success is False
             assert rejected.error is not None and rejected.error.code == expected_code
             assert managed_container_ids() == []
