@@ -25,10 +25,12 @@ class SearchErrorCode(str, Enum):
     SENSITIVE_QUERY = "sensitive_query"
     AUTHENTICATION_FAILED = "authentication_failed"
     RATE_LIMITED = "rate_limited"
+    CREDITS_EXHAUSTED = "credits_exhausted"
     TIMEOUT = "timeout"
     NETWORK_ERROR = "network_error"
     INVALID_PROVIDER_RESPONSE = "invalid_provider_response"
     OUTPUT_TOO_LARGE = "output_too_large"
+    PROVIDER_RESPONSE_TOO_LARGE = "provider_response_too_large"
     PROVIDER_ERROR = "provider_error"
 
 
@@ -47,8 +49,11 @@ class ProviderFailure(Exception):
         if code not in {
             SearchErrorCode.AUTHENTICATION_FAILED,
             SearchErrorCode.RATE_LIMITED,
+            SearchErrorCode.CREDITS_EXHAUSTED,
+            SearchErrorCode.TIMEOUT,
             SearchErrorCode.NETWORK_ERROR,
             SearchErrorCode.INVALID_PROVIDER_RESPONSE,
+            SearchErrorCode.PROVIDER_RESPONSE_TOO_LARGE,
             SearchErrorCode.PROVIDER_ERROR,
         }:
             raise ValueError("invalid provider failure code")
@@ -197,6 +202,14 @@ def _text(value: str | None, limit: int | None = None) -> tuple[str | None, bool
     return cleaned, False
 
 
+def _snippet_text(value: str | None, limit: int) -> tuple[str | None, bool]:
+    if value is None:
+        return None, False
+    # Search excerpts commonly include line breaks. Fold only ordinary line
+    # whitespace, then let _text reject every other prohibited control.
+    return _text(re.sub(r"[ \t\r\n]+", " ", value), limit)
+
+
 def _normalize(
     response: ProviderSearchResponse, request: SearchRequest, config: SearchConfig, provider_id: str
 ) -> SearchResult:
@@ -205,7 +218,7 @@ def _normalize(
     for raw in response.items:
         url = _provider_url(raw.url)
         title, title_cut = _text(raw.title, config.max_title_chars)
-        snippet, snippet_cut = _text(raw.snippet, config.max_snippet_chars)
+        snippet, snippet_cut = _snippet_text(raw.snippet, config.max_snippet_chars)
         source, _ = _text(raw.source)
         text_truncated |= title_cut or snippet_cut
         items.append(SearchItem(title=title, url=url, snippet=snippet, source=source))

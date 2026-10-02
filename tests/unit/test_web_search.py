@@ -274,6 +274,83 @@ async def test_invalid_provider_text_is_rejected() -> None:
     assert failure.value.code is SearchErrorCode.INVALID_PROVIDER_RESPONSE
 
 
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        (
+            "#FinancialWellness [...] None  \nView Post [...] ## People Also Viewed\nN/A",
+            "#FinancialWellness [...] None View Post [...] ## People Also Viewed N/A",
+        ),
+        ("first\r\nsecond", "first second"),
+        ("first\rsecond", "first second"),
+        ("first\tsecond", "first second"),
+        ("  first \t\r\n second  ", "first second"),
+    ],
+)
+async def test_provider_snippet_normalizes_common_line_whitespace(
+    raw: str, expected: str
+) -> None:
+    provider = FakeProvider(ProviderSearchResponse(items=(item(snippet=raw),)))
+    result = await WebSearchReader(provider, enabled()).search(SearchRequest(query="docs"))
+    assert result.items[0].snippet == expected
+    assert not result.truncated
+
+
+@pytest.mark.parametrize("bad", ["\x00", "\x1b", "\u200b", "\u2028"])
+async def test_other_forbidden_snippet_controls_still_fail(bad: str) -> None:
+    provider = FakeProvider(ProviderSearchResponse(items=(item(snippet=f"before{bad}after"),)))
+    with pytest.raises(SearchError) as failure:
+        await WebSearchReader(provider, enabled()).search(SearchRequest(query="docs"))
+    assert failure.value.code is SearchErrorCode.INVALID_PROVIDER_RESPONSE
+
+
+def test_surrogate_snippet_is_rejected_by_provider_schema() -> None:
+    with pytest.raises(ValidationError):
+        item(snippet="before\ud800after")
+
+
+@pytest.mark.parametrize("field", ["title", "source"])
+async def test_other_result_fields_still_reject_line_controls(field: str) -> None:
+    provider = FakeProvider(ProviderSearchResponse(items=(item(**{field: "before\nafter"}),)))
+    with pytest.raises(SearchError) as failure:
+        await WebSearchReader(provider, enabled()).search(SearchRequest(query="docs"))
+    assert failure.value.code is SearchErrorCode.INVALID_PROVIDER_RESPONSE
+
+
+async def test_whitespace_only_snippet_is_none() -> None:
+    provider = FakeProvider(ProviderSearchResponse(items=(item(snippet=" \t\r\n "),)))
+    result = await WebSearchReader(provider, enabled()).search(SearchRequest(query="docs"))
+    assert result.items[0].snippet is None
+    assert not result.truncated
+
+
+async def test_snippet_limit_applies_after_whitespace_normalization() -> None:
+    provider = FakeProvider(ProviderSearchResponse(items=(item(snippet="alpha\r\n  beta"),)))
+    result = await WebSearchReader(provider, enabled(max_snippet_chars=7)).search(
+        SearchRequest(query="docs")
+    )
+    assert result.items[0].snippet == "alpha b"
+    assert result.truncated
+
+
+async def test_json_byte_limit_applies_after_snippet_normalization() -> None:
+    response = ProviderSearchResponse(items=(
+        item(snippet="한글\n" * 20),
+        item(snippet="두번째\t" * 20),
+    ))
+    full = await WebSearchReader(FakeProvider(response), enabled()).search(
+        SearchRequest(query="docs")
+    )
+    assert len(full.items) == 2
+    full_bytes = len(full.model_dump_json().encode("utf-8"))
+    bounded = await WebSearchReader(
+        FakeProvider(response), enabled(max_output_bytes=full_bytes - 1)
+    ).search(SearchRequest(query="docs"))
+    assert len(bounded.model_dump_json().encode("utf-8")) <= full_bytes - 1
+    assert len(bounded.items) == 1
+    assert bounded.truncated
+
+
 def test_invalid_query_validation_message_hides_input() -> None:
     secret = "private-secret"
     with pytest.raises(ValidationError) as failure:
