@@ -22,6 +22,7 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Annotated, Any, Literal
 
 from mcp.server import MCPServer
+from mcp_types import CallToolResult, TextContent
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 PROPOSED_OPERATION = "command_run"
@@ -31,8 +32,180 @@ MODULE = "redteam.capability.servers.execution"
 _IDENTITY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 _IMAGE_DIGEST = re.compile(r"^[a-z0-9][a-z0-9._/-]*@sha256:[a-f0-9]{64}$")
 _EXECUTABLE = re.compile(r"^[a-z0-9][a-z0-9._+-]{0,63}$")
+_ERROR_CODE = re.compile(r"^execution_[a-z0-9_]+$")
 _SHELL_META = frozenset(";&|`$><\r\n\x00")
 _CONTAINER_PATH = "/usr/local/bin:/usr/bin:/bin"
+_MANAGED_LABEL = "io.whs-redteam.execution.managed=true"
+_CONTEXT_LABEL_KEY = "io.whs-redteam.execution.context"
+
+# Options are deliberately enumerated.  Values following options such as
+# ``head -c 1024`` are still validated by the generic argument/path checks.
+_DEFAULT_ALLOWED_OPTIONS: dict[str, frozenset[str]] = {
+    "grep": frozenset(
+        {
+            "--",
+            "-E",
+            "-F",
+            "-H",
+            "-h",
+            "-i",
+            "-l",
+            "-L",
+            "-n",
+            "-q",
+            "-s",
+            "-v",
+            "-w",
+            "-x",
+            "--count",
+            "--extended-regexp",
+            "--fixed-strings",
+            "--ignore-case",
+            "--invert-match",
+            "--line-number",
+            "--no-messages",
+            "--quiet",
+            "--regexp",
+            "--word-regexp",
+        }
+    ),
+    "sort": frozenset(
+        {
+            "--",
+            "-b",
+            "-d",
+            "-f",
+            "-g",
+            "-i",
+            "-M",
+            "-n",
+            "-R",
+            "-r",
+            "-s",
+            "-u",
+            "-V",
+            "-z",
+            "--dictionary-order",
+            "--general-numeric-sort",
+            "--ignore-case",
+            "--ignore-leading-blanks",
+            "--month-sort",
+            "--numeric-sort",
+            "--random-sort",
+            "--reverse",
+            "--stable",
+            "--unique",
+            "--version-sort",
+            "--zero-terminated",
+        }
+    ),
+    "uniq": frozenset(
+        {
+            "--",
+            "-c",
+            "-d",
+            "-D",
+            "-i",
+            "-u",
+            "-z",
+            "--all-repeated",
+            "--count",
+            "--ignore-case",
+            "--repeated",
+            "--unique",
+            "--zero-terminated",
+        }
+    ),
+    "wc": frozenset(
+        {
+            "--",
+            "-c",
+            "-L",
+            "-l",
+            "-m",
+            "-w",
+            "--bytes",
+            "--chars",
+            "--lines",
+            "--max-line-length",
+            "--words",
+        }
+    ),
+    "head": frozenset({"--", "-c", "-n", "-q", "-v", "--bytes", "--lines", "--quiet", "--verbose"}),
+    "tail": frozenset(
+        {
+            "--",
+            "-c",
+            "-f",
+            "-n",
+            "-q",
+            "-v",
+            "--bytes",
+            "--follow",
+            "--lines",
+            "--quiet",
+            "--verbose",
+        }
+    ),
+    "cut": frozenset(
+        {
+            "--",
+            "-b",
+            "-c",
+            "-d",
+            "-f",
+            "-s",
+            "-z",
+            "--bytes",
+            "--characters",
+            "--delimiter",
+            "--fields",
+            "--only-delimited",
+            "--output-delimiter",
+            "--zero-terminated",
+        }
+    ),
+    "jq": frozenset(
+        {
+            "--",
+            "-c",
+            "-e",
+            "-j",
+            "-M",
+            "-n",
+            "-R",
+            "-r",
+            "-S",
+            "-s",
+            "--ascii-output",
+            "--compact-output",
+            "--exit-status",
+            "--join-output",
+            "--monochrome-output",
+            "--null-input",
+            "--raw-input",
+            "--raw-output",
+            "--slurp",
+            "--sort-keys",
+            "--tab",
+        }
+    ),
+}
+_DANGEROUS_OPTIONS: dict[str, frozenset[str]] = {
+    "sort": frozenset({"-o", "--output", "--compress-program", "--files0-from"}),
+    "jq": frozenset(
+        {
+            "-f",
+            "-L",
+            "--argfile",
+            "--from-file",
+            "--library-path",
+            "--rawfile",
+            "--slurpfile",
+        }
+    ),
+    "grep": frozenset({"-f", "--file"}),
+}
 
 
 class ExecutionError(ValueError):
@@ -50,6 +223,7 @@ class ExecutionPolicy(BaseModel):
     workspace_root: str
     image: str
     allowed_executables: dict[str, str] = Field(min_length=1)
+    allowed_options: dict[str, tuple[str, ...]] = Field(default_factory=dict)
     writable: bool = False
     max_timeout_seconds: float = Field(default=30.0, gt=0, le=300.0)
     max_output_bytes: int = Field(default=65_536, ge=1024, le=1_048_576)
@@ -91,6 +265,18 @@ class ExecutionPolicy(BaseModel):
                 raise ValueError("execution allowlist contains an unsafe executable mapping")
         return dict(value)
 
+    @field_validator("allowed_options")
+    @classmethod
+    def valid_option_allowlist(
+        cls,
+        value: dict[str, tuple[str, ...]],
+    ) -> dict[str, tuple[str, ...]]:
+        for executable, options in value.items():
+            safe = _DEFAULT_ALLOWED_OPTIONS.get(executable)
+            if safe is None or any(option not in safe for option in options):
+                raise ValueError("execution option allowlist contains an unsafe option")
+        return {name: tuple(options) for name, options in value.items()}
+
     @field_validator("docker_binary")
     @classmethod
     def valid_docker_binary(cls, value: str) -> str:
@@ -103,7 +289,15 @@ class ExecutionPolicy(BaseModel):
         root = Path(self.workspace_root)
         if not root.is_absolute() or root == Path(root.anchor) or root == Path.home():
             raise ValueError("workspace_root must be a narrow absolute path")
+        if set(self.allowed_options) - set(self.allowed_executables):
+            raise ValueError("execution option allowlist names an unavailable executable")
         return self
+
+    def options_for(self, executable: str) -> frozenset[str]:
+        configured = self.allowed_options.get(executable)
+        if configured is not None:
+            return frozenset(configured)
+        return _DEFAULT_ALLOWED_OPTIONS.get(executable, frozenset())
 
     @classmethod
     def load(
@@ -172,6 +366,13 @@ class _JobRecord:
 ProcessFactory = Callable[..., Awaitable[Any]]
 
 
+@dataclass
+class _OutputBudget:
+    remaining: int
+    peak_buffered: int = 0
+    truncated: bool = False
+
+
 def _safe_host_environment() -> dict[str, str]:
     environment = {"PATH": os.environ.get("PATH", "")}
     environment["LANG"] = os.environ.get("LANG", "C.UTF-8")
@@ -190,6 +391,45 @@ def _validate_argument(argument: str) -> None:
         raise ExecutionError("execution_invalid_path: traversal is forbidden")
 
 
+def _option_name(argument: str) -> str:
+    return argument.split("=", 1)[0]
+
+
+def _validate_options(policy: ExecutionPolicy, executable: str, args: Sequence[str]) -> None:
+    allowed = policy.options_for(executable)
+    dangerous = _DANGEROUS_OPTIONS.get(executable, frozenset())
+    options_ended = False
+    for argument in args:
+        if options_ended or not argument.startswith("-") or argument == "-":
+            continue
+        option = _option_name(argument)
+        if option == "--":
+            options_ended = True
+            continue
+        if option in dangerous:
+            raise ExecutionError("execution_dangerous_option_forbidden")
+        if option not in allowed:
+            raise ExecutionError("execution_option_not_allowed")
+
+
+def _context_label(policy: ExecutionPolicy) -> str:
+    identity = "\0".join(
+        (policy.asset_ref, policy.engagement_id, policy.run_id, policy.workspace_root)
+    )
+    return f"{_CONTEXT_LABEL_KEY}={hashlib.sha256(identity.encode()).hexdigest()}"
+
+
+def _execution_failure(exc: ExecutionError) -> Any:
+    code = str(exc).partition(":")[0]
+    if not _ERROR_CODE.fullmatch(code):
+        code = "execution_request_rejected"
+    return CallToolResult(
+        content=[TextContent(type="text", text="execution request rejected")],
+        structured_content={"error_code": code},
+        is_error=True,
+    )
+
+
 class DockerExecutionEngine:
     def __init__(
         self,
@@ -203,6 +443,13 @@ class DockerExecutionEngine:
         self._cleanup_process_factory = cleanup_process_factory or process_factory
         self._jobs: dict[str, _JobRecord] = {}
         self._jobs_lock = asyncio.Lock()
+        self._last_peak_output_bytes = 0
+
+    @property
+    def last_peak_output_bytes(self) -> int:
+        """Largest retained stdout/stderr byte total for the last command."""
+
+        return self._last_peak_output_bytes
 
     def _check_context(
         self,
@@ -231,6 +478,7 @@ class DockerExecutionEngine:
             raise ExecutionError("execution_invalid_argument: too many arguments")
         for argument in args:
             _validate_argument(argument)
+        _validate_options(self.policy, executable, args)
 
         mount = (
             f"type=bind,src={self.policy.workspace_root},dst=/workspace"
@@ -241,6 +489,10 @@ class DockerExecutionEngine:
             "--rm",
             "--name",
             container_name,
+            "--label",
+            _MANAGED_LABEL,
+            "--label",
+            _context_label(self.policy),
             "--network",
             "none",
             "--read-only",
@@ -301,9 +553,10 @@ class DockerExecutionEngine:
         stderr_buffer = bytearray()
         stdout_truncated = False
         stderr_truncated = False
+        budget = _OutputBudget(remaining=self.policy.max_output_bytes)
         try:
             stdout_truncated, stderr_truncated = await asyncio.wait_for(
-                self._collect_output(process, stdout_buffer, stderr_buffer),
+                self._collect_output(process, stdout_buffer, stderr_buffer, budget),
                 timeout=timeout_seconds,
             )
         except TimeoutError:
@@ -326,6 +579,8 @@ class DockerExecutionEngine:
             cleanup = asyncio.create_task(self._cleanup_container(process, container_name))
             await asyncio.shield(cleanup)
             raise
+        finally:
+            self._last_peak_output_bytes = budget.peak_buffered
         duration_ms = max(0, round((time.monotonic() - started) * 1000))
         stdout, stderr, truncated = self._bounded_result(
             stdout_buffer,
@@ -508,14 +763,15 @@ class DockerExecutionEngine:
         process: Any,
         stdout_buffer: bytearray,
         stderr_buffer: bytearray,
+        budget: _OutputBudget,
     ) -> tuple[bool, bool]:
         if process.stdout is None or process.stderr is None:
             raise ExecutionError("execution_process_stream_unavailable")
         stdout_task = asyncio.create_task(
-            self._read_bounded(process.stdout, stdout_buffer)
+            self._read_bounded(process.stdout, stdout_buffer, budget)
         )
         stderr_task = asyncio.create_task(
-            self._read_bounded(process.stderr, stderr_buffer)
+            self._read_bounded(process.stderr, stderr_buffer, budget)
         )
         try:
             stdout_truncated, stderr_truncated, _ = await asyncio.gather(
@@ -529,17 +785,28 @@ class DockerExecutionEngine:
                     task.cancel()
         return bool(stdout_truncated), bool(stderr_truncated)
 
-    async def _read_bounded(self, stream: Any, output: bytearray) -> bool:
+    async def _read_bounded(
+        self,
+        stream: Any,
+        output: bytearray,
+        budget: _OutputBudget,
+    ) -> bool:
         truncated = False
         while True:
             chunk = await stream.read(8192)
             if not chunk:
                 return truncated
-            remaining = self.policy.max_output_bytes - len(output)
-            if remaining > 0:
-                output.extend(chunk[:remaining])
-            if len(chunk) > remaining:
+            accepted = min(len(chunk), budget.remaining)
+            if accepted:
+                output.extend(chunk[:accepted])
+                budget.remaining -= accepted
+                budget.peak_buffered = max(
+                    budget.peak_buffered,
+                    self.policy.max_output_bytes - budget.remaining,
+                )
+            if accepted < len(chunk):
                 truncated = True
+                budget.truncated = True
 
     def _bounded_result(
         self,
@@ -605,6 +872,45 @@ def ensure_runtime_available(policy: ExecutionPolicy) -> None:
         raise ExecutionError("execution_docker_unavailable")
 
 
+def cleanup_orphaned_containers(policy: ExecutionPolicy) -> None:
+    """Remove containers left by a dead server for this exact run context."""
+
+    filters = [
+        "--filter",
+        f"label={_MANAGED_LABEL}",
+        "--filter",
+        f"label={_context_label(policy)}",
+    ]
+    try:
+        listed = subprocess.run(
+            [policy.docker_binary, "ps", "-aq", *filters],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            env=_safe_host_environment(),
+            timeout=5,
+            check=False,
+        )
+        identifiers = listed.stdout.decode("ascii", errors="ignore").split()
+        if listed.returncode != 0:
+            raise ExecutionError("execution_orphan_cleanup_failed")
+        if not identifiers:
+            return
+        removed = subprocess.run(
+            [policy.docker_binary, "rm", "--force", *identifiers],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=_safe_host_environment(),
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ExecutionError("execution_orphan_cleanup_failed") from exc
+    if removed.returncode != 0:
+        raise ExecutionError("execution_orphan_cleanup_failed")
+
+
 def create_server(
     policy: ExecutionPolicy,
     *,
@@ -623,14 +929,17 @@ def create_server(
     ) -> CommandResult:
         """Proposed: run one allowlisted argv command in a locked-down Docker container."""
 
-        return await executor.run_command(
-            asset_ref,
-            executable,
-            args,
-            timeout_seconds,
-            engagement_id,
-            run_id,
-        )
+        try:
+            return await executor.run_command(
+                asset_ref,
+                executable,
+                args,
+                timeout_seconds,
+                engagement_id,
+                run_id,
+            )
+        except ExecutionError as exc:
+            return _execution_failure(exc)
 
     async def job_start(
         asset_ref: str,
@@ -642,14 +951,17 @@ def create_server(
     ) -> JobStartResult:
         """Proposed: start one allowlisted Docker command and return its job ID."""
 
-        return await executor.job_start(
-            asset_ref,
-            executable,
-            args,
-            timeout_seconds,
-            engagement_id,
-            run_id,
-        )
+        try:
+            return await executor.job_start(
+                asset_ref,
+                executable,
+                args,
+                timeout_seconds,
+                engagement_id,
+                run_id,
+            )
+        except ExecutionError as exc:
+            return _execution_failure(exc)
 
     async def job_status(
         asset_ref: str,
@@ -659,7 +971,10 @@ def create_server(
     ) -> JobStatusResult:
         """Proposed: inspect one job owned by the trusted asset and run context."""
 
-        return await executor.job_status(asset_ref, job_id, engagement_id, run_id)
+        try:
+            return await executor.job_status(asset_ref, job_id, engagement_id, run_id)
+        except ExecutionError as exc:
+            return _execution_failure(exc)
 
     async def job_cancel(
         asset_ref: str,
@@ -669,7 +984,10 @@ def create_server(
     ) -> JobCancelResult:
         """Proposed: cancel one running job and wait for container cleanup."""
 
-        return await executor.job_cancel(asset_ref, job_id, engagement_id, run_id)
+        try:
+            return await executor.job_cancel(asset_ref, job_id, engagement_id, run_id)
+        except ExecutionError as exc:
+            return _execution_failure(exc)
 
     run_command.__annotations__["asset_ref"] = Literal[policy.asset_ref]
     run_command.__annotations__["args"] = Annotated[list[str], Field(max_length=64)]
@@ -697,6 +1015,7 @@ def main() -> None:
     args = parser.parse_args()
     policy = ExecutionPolicy.load(args.policy, expected_sha256=args.sha256)
     ensure_runtime_available(policy)
+    cleanup_orphaned_containers(policy)
     create_server(policy).run(transport="stdio")
 
 

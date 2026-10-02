@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import signal
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -106,16 +107,26 @@ def policy(tmp_path: Path, *, writable: bool = False) -> ExecutionPolicy:
         workspace_root=str(tmp_path.resolve()),
         image="example/text-tools@sha256:" + "1" * 64,
         allowed_executables={
+            "cut": "/usr/bin/cut",
+            "grep": "/usr/bin/grep",
+            "head": "/usr/bin/head",
+            "jq": "/usr/bin/jq",
             "wc": "/usr/bin/wc",
             "sort": "/usr/bin/sort",
             "tail": "/usr/bin/tail",
+            "uniq": "/usr/bin/uniq",
         },
         writable=writable,
     )
 
 
-def invocation(arguments: dict[str, Any]) -> ToolInvocation:
-    run_id = RunId("run-test")
+def invocation(
+    arguments: dict[str, Any],
+    *,
+    timeout_seconds: float = 30,
+    run_id_value: str = "run-test",
+) -> ToolInvocation:
+    run_id = RunId(run_id_value)
     return ToolInvocation(
         invocation_id=InvocationId("inv-execution"),
         action_id=ActionId("action-execution"),
@@ -128,6 +139,7 @@ def invocation(arguments: dict[str, Any]) -> ToolInvocation:
             run_id=run_id,
         ),
         created_at=datetime.now(timezone.utc),
+        timeout_seconds=timeout_seconds,
     )
 
 
@@ -136,8 +148,9 @@ def job_invocation(
     arguments: dict[str, Any],
     *,
     action_id: str,
+    run_id_value: str = "run-test",
 ) -> ToolInvocation:
-    run_id = RunId("run-test")
+    run_id = RunId(run_id_value)
     return ToolInvocation(
         invocation_id=InvocationId(f"inv-{action_id}"),
         action_id=ActionId(action_id),
@@ -331,42 +344,42 @@ async def test_registry_candidate_control_gateway_and_real_mcp_tool(
     assert starts == 2
 
 
-@pytest.mark.skipif(
-    os.environ.get("REDTEAM_TEST_EXECUTION_DOCKER") != "1",
-    reason="set REDTEAM_TEST_EXECUTION_DOCKER=1 under WSL2/Linux with Docker",
-)
-async def test_real_stdio_docker_execution(
+_DOCKER_ENV = {
+    "PATH": os.environ.get("PATH", ""),
+    "LANG": os.environ.get("LANG", "C.UTF-8"),
+}
+
+
+def managed_container_ids() -> list[str]:
+    result = subprocess.run(
+        [
+            "docker",
+            "ps",
+            "-aq",
+            "--filter",
+            "label=io.whs-redteam.execution.managed=true",
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+        env=_DOCKER_ENV,
+    )
+    return result.stdout.split()
+
+
+async def wait_for_managed_containers(count: int) -> list[str]:
+    for _ in range(100):
+        identifiers = managed_container_ids()
+        if len(identifiers) == count:
+            return identifiers
+        await asyncio.sleep(0.05)
+    pytest.fail(f"expected {count} managed execution containers")
+
+
+def configure_live_execution(
     monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
+    policy_path: Path,
 ) -> None:
-    image = os.environ["REDTEAM_TEST_EXECUTION_IMAGE"]
-    workspace = tmp_path / "workspace"
-    workspace.mkdir(mode=0o700)
-    (workspace / "input.txt").write_text("b\na\n", encoding="utf-8")
-    execution_policy = policy(workspace, writable=True).model_copy(
-        update={
-            "image": image,
-            "container_user": f"{os.getuid()}:{os.getgid()}",
-        }
-    )
-    policy_path = tmp_path / "execution.json"
-    policy_path.write_text(
-        json.dumps(execution_policy.model_dump()),
-        encoding="utf-8",
-    )
-    workspace_policy_path = tmp_path / "workspace.json"
-    workspace_policy_path.write_text(
-        json.dumps(
-            {
-                "asset_ref": "workspace-test",
-                "engagement_id": "eng-test",
-                "run_id": "run-test",
-                "root": str(workspace),
-                "writable": True,
-            }
-        ),
-        encoding="utf-8",
-    )
     prefix = "REDTEAM_MCP_EXECUTION"
     for suffix, value in {
         "KIND": "analysis",
@@ -378,13 +391,18 @@ async def test_real_stdio_docker_execution(
     }.items():
         monkeypatch.setenv(f"{prefix}_{suffix}", value)
 
+
+def configure_live_workspace(
+    monkeypatch: pytest.MonkeyPatch,
+    workspace_policy_path: Path,
+) -> None:
     for server_id, mode in (
         ("workspace-read-test", "read"),
         ("workspace-write-test", "write"),
     ):
         profile = f"workspace_{mode}"
         specs = workspace_specs(profile)
-        workspace_prefix = f"REDTEAM_MCP_{server_id.upper().replace('-', '_')}"
+        prefix = f"REDTEAM_MCP_{server_id.upper().replace('-', '_')}"
         for suffix, value in {
             "KIND": "analysis",
             "TRANSPORT": "stdio",
@@ -407,7 +425,50 @@ async def test_real_stdio_docker_execution(
                 {name: [spec.operation] for name, spec in specs.items()}
             ),
         }.items():
-            monkeypatch.setenv(f"{workspace_prefix}_{suffix}", value)
+            monkeypatch.setenv(f"{prefix}_{suffix}", value)
+
+
+@pytest.mark.skipif(
+    os.environ.get("REDTEAM_TEST_EXECUTION_DOCKER") != "1",
+    reason="set REDTEAM_TEST_EXECUTION_DOCKER=1 under WSL2/Linux with Docker",
+)
+async def test_real_stdio_docker_execution_hardening(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    image = os.environ["REDTEAM_TEST_EXECUTION_IMAGE"]
+    network_probe_image = os.environ["REDTEAM_TEST_EXECUTION_NETWORK_IMAGE"]
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(mode=0o700)
+    (workspace / "input.txt").write_text("b\na\n", encoding="utf-8")
+    (workspace / "large.txt").write_bytes(b"output-line\n" * 200_000)
+    (workspace / "huge.json").write_bytes(b"{}\n" * 2_000_000)
+    execution_policy = policy(workspace).model_copy(
+        update={
+            "image": image,
+            "container_user": f"{os.getuid()}:{os.getgid()}",
+            "max_output_bytes": 1024,
+            "memory": "64m",
+        }
+    )
+    policy_path = tmp_path / "execution.json"
+    policy_path.write_text(json.dumps(execution_policy.model_dump()), encoding="utf-8")
+    workspace_policy_path = tmp_path / "workspace.json"
+    workspace_policy_path.write_text(
+        json.dumps(
+            {
+                "asset_ref": "workspace-test",
+                "engagement_id": "eng-test",
+                "run_id": "run-test",
+                "root": str(workspace),
+                "writable": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+    configure_live_execution(monkeypatch, policy_path)
+    configure_live_workspace(monkeypatch, workspace_policy_path)
+    assert await wait_for_managed_containers(0) == []
 
     async with open_mcp_tool_gateway(
         ["workspace-read-test", "workspace-write-test", "execution"],
@@ -419,25 +480,89 @@ async def test_real_stdio_docker_execution(
         before = await gateway.invoke(
             workspace_invocation("read_file", {"path": "input.txt"})
         )
-        result = await gateway.invoke(
+        sorted_result = await gateway.invoke(
             invocation(
                 {
                     "asset_ref": "workspace-test",
                     "executable": "sort",
-                    "args": ["input.txt", "-o", "result.txt"],
+                    "args": ["input.txt"],
                 }
+            )
+        )
+        written = await gateway.invoke(
+            workspace_invocation(
+                "write_file",
+                {"path": "result.txt", "content": sorted_result.output["stdout"]},
             )
         )
         after = await gateway.invoke(
             workspace_invocation("read_file", {"path": "result.txt"})
         )
-        timed_out = await gateway.invoke(
+
+        rejection_cases = [
+            (
+                invocation(
+                    {
+                        "asset_ref": "workspace-test",
+                        "executable": "python",
+                        "args": ["input.txt"],
+                    }
+                ),
+                "execution_executable_not_allowed",
+            ),
+            (
+                invocation(
+                    {
+                        "asset_ref": "workspace-test",
+                        "executable": "grep",
+                        "args": ["needle;cat", "input.txt"],
+                    }
+                ),
+                "execution_shell_syntax_forbidden",
+            ),
+            (
+                invocation(
+                    {
+                        "asset_ref": "workspace-test",
+                        "executable": "grep",
+                        "args": ["needle", "../outside.txt"],
+                    }
+                ),
+                "execution_invalid_path",
+            ),
+            (
+                invocation(
+                    {
+                        "asset_ref": "workspace-test",
+                        "executable": "sort",
+                        "args": ["-o", "result.txt", "input.txt"],
+                    }
+                ),
+                "execution_dangerous_option_forbidden",
+            ),
+        ]
+        for rejected_invocation, expected_code in rejection_cases:
+            rejected = await gateway.invoke(rejected_invocation)
+            assert rejected.success is False
+            assert rejected.error is not None and rejected.error.code == expected_code
+            assert managed_container_ids() == []
+
+        stdout_limited = await gateway.invoke(
             invocation(
                 {
                     "asset_ref": "workspace-test",
-                    "executable": "tail",
-                    "args": ["-f", "input.txt"],
-                    "timeout_seconds": 0.2,
+                    "executable": "head",
+                    "args": ["-c", "1048576", "large.txt"],
+                }
+            )
+        )
+        missing_files = [f"missing-{index:02}.txt" for index in range(63)]
+        stderr_limited = await gateway.invoke(
+            invocation(
+                {
+                    "asset_ref": "workspace-test",
+                    "executable": "grep",
+                    "args": ["needle", *missing_files],
                 }
             )
         )
@@ -453,38 +578,248 @@ async def test_real_stdio_docker_execution(
                 action_id="action-live-job-start",
             )
         )
+        assert started.success, started.error
         await asyncio.sleep(0.2)
-        cancelled = await gateway.invoke(
+        live_status = await gateway.invoke(
             job_invocation(
-                "job_cancel",
+                "job_status",
                 {
                     "asset_ref": "workspace-test",
                     "job_id": started.output["job_id"],
                 },
+                action_id="action-live-job-status",
+            )
+        )
+        assert live_status.success, live_status.error
+        assert live_status.output["status"] == "running", live_status.output
+        container_id = (await wait_for_managed_containers(1))[0]
+        inspected = json.loads(
+            subprocess.run(
+                ["docker", "inspect", container_id],
+                capture_output=True,
+                text=True,
+                check=True,
+                env=_DOCKER_ENV,
+            ).stdout
+        )[0]
+        assert inspected["HostConfig"]["NetworkMode"] == "none"
+        assert inspected["HostConfig"]["Memory"] == 64 * 1024 * 1024
+        assert inspected["HostConfig"]["NanoCpus"] == 500_000_000
+        assert inspected["HostConfig"]["PidsLimit"] == 64
+        assert inspected["Config"]["Labels"]["io.whs-redteam.execution.managed"] == "true"
+
+        job_id = started.output["job_id"]
+        cross_asset = await gateway.invoke(
+            job_invocation(
+                "job_status",
+                {"asset_ref": "workspace-other", "job_id": job_id},
+                action_id="action-cross-asset-status",
+            )
+        )
+        cross_run = await gateway.invoke(
+            job_invocation(
+                "job_cancel",
+                {"asset_ref": "workspace-test", "job_id": job_id},
+                action_id="action-cross-run-cancel",
+                run_id_value="run-other",
+            )
+        )
+        assert cross_asset.success is False
+        assert cross_asset.error is not None
+        assert cross_asset.error.code == "execution_invalid_arguments"
+        assert cross_run.success is False
+        assert cross_run.error is not None
+        assert cross_run.error.code == "execution_context_mismatch"
+        assert managed_container_ids() == [container_id]
+
+        cancelled = await gateway.invoke(
+            job_invocation(
+                "job_cancel",
+                {"asset_ref": "workspace-test", "job_id": job_id},
                 action_id="action-live-job-cancel",
             )
         )
+        server_timed_out = await gateway.invoke(
+            invocation(
+                {
+                    "asset_ref": "workspace-test",
+                    "executable": "tail",
+                    "args": ["-f", "input.txt"],
+                    "timeout_seconds": 0.2,
+                }
+            )
+        )
+        assert await wait_for_managed_containers(0) == []
+        gateway_timed_out = await gateway.invoke(
+            invocation(
+                {
+                    "asset_ref": "workspace-test",
+                    "executable": "tail",
+                    "args": ["-f", "input.txt"],
+                    "timeout_seconds": 10,
+                },
+                timeout_seconds=0.2,
+            )
+        )
+        assert await wait_for_managed_containers(0) == []
+
     assert listed.success and before.output["content"] == "b\na\n"
-    assert result.success
-    assert result.output["exit_code"] == 0
-    assert after.success and after.output["content"] == "a\nb\n"
-    assert timed_out.success and timed_out.output["timed_out"] is True
+    assert sorted_result.success and sorted_result.output["exit_code"] == 0
+    assert written.success and after.output["content"] == "a\nb\n"
+    assert stdout_limited.success
+    assert len(stdout_limited.output["stdout"].encode()) == 1024
+    assert stdout_limited.output["truncated"] is True
+    assert stderr_limited.success
+    assert len(stderr_limited.output["stderr"].encode()) == 1024
+    assert stderr_limited.output["truncated"] is True
+    assert server_timed_out.success and server_timed_out.output["timed_out"] is True
+    assert gateway_timed_out.success is False
+    assert gateway_timed_out.error is not None
+    assert gateway_timed_out.error.code == "tool_timeout"
     assert cancelled.success and cancelled.output["status"] == "cancelled"
-    remaining = subprocess.run(
-        [
-            "docker",
-            "ps",
-            "--filter",
-            "name=redteam-exec-",
-            "--format",
-            "{{.Names}}",
-        ],
-        capture_output=True,
-        text=True,
-        check=True,
-        env={
-            "PATH": os.environ.get("PATH", ""),
-            "LANG": os.environ.get("LANG", "C.UTF-8"),
-        },
+    assert await wait_for_managed_containers(0) == []
+
+    async with open_mcp_tool_gateway(
+        ["execution"],
+        health_refresh_enabled=False,
+    ) as cancellation_gateway:
+        cancel_task = asyncio.create_task(
+            cancellation_gateway.invoke(
+                invocation(
+                    {
+                        "asset_ref": "workspace-test",
+                        "executable": "tail",
+                        "args": ["-f", "input.txt"],
+                        "timeout_seconds": 10,
+                    }
+                )
+            )
+        )
+        await wait_for_managed_containers(1)
+        cancel_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await cancel_task
+        assert await wait_for_managed_containers(0) == []
+
+    direct_engine = DockerExecutionEngine(execution_policy)
+    direct_output = await direct_engine.run_command(
+        "workspace-test",
+        "head",
+        ["-c", "1048576", "large.txt"],
+        10,
+        "eng-test",
+        "run-test",
     )
-    assert remaining.stdout.strip() == ""
+    assert direct_output.exit_code == 0 and direct_output.truncated is True
+    assert direct_engine.last_peak_output_bytes == execution_policy.max_output_bytes
+
+    probe_values = execution_policy.model_dump()
+    probe_values.update(
+        image=network_probe_image,
+        allowed_executables={"python": "/usr/local/bin/python"},
+        allowed_options={"python": ("-c",)},
+    )
+    network_probe_policy = ExecutionPolicy.model_construct(**probe_values)
+    network_probe = await DockerExecutionEngine(network_probe_policy).run_command(
+        "workspace-test",
+        "python",
+        ["-c", "__import__('socket').create_connection(('1.1.1.1',53),1)"],
+        5,
+        "eng-test",
+        "run-test",
+    )
+    assert network_probe.exit_code not in (None, 0)
+    assert network_probe.timed_out is False
+
+    oom_policy = execution_policy.model_copy(update={"memory": "16m"})
+    oom_result = await DockerExecutionEngine(oom_policy).run_command(
+        "workspace-test",
+        "jq",
+        ["-s", ".", "huge.json"],
+        20,
+        "eng-test",
+        "run-test",
+    )
+    assert oom_result.exit_code not in (None, 0)
+    assert oom_result.timed_out is False
+    assert await wait_for_managed_containers(0) == []
+
+
+@pytest.mark.skipif(
+    os.environ.get("REDTEAM_TEST_EXECUTION_DOCKER") != "1",
+    reason="set REDTEAM_TEST_EXECUTION_DOCKER=1 under WSL2/Linux with Docker",
+)
+async def test_stdio_server_restart_cleans_fault_injected_orphan(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(mode=0o700)
+    (workspace / "input.txt").write_text("line\n", encoding="utf-8")
+    execution_policy = policy(workspace).model_copy(
+        update={
+            "image": os.environ["REDTEAM_TEST_EXECUTION_IMAGE"],
+            "container_user": f"{os.getuid()}:{os.getgid()}",
+        }
+    )
+    policy_path = tmp_path / "fault-policy.json"
+    policy_path.write_text(json.dumps(execution_policy.model_dump()), encoding="utf-8")
+    configure_live_execution(monkeypatch, policy_path)
+    assert await wait_for_managed_containers(0) == []
+
+    marker = tmp_path / "fault-client-ready"
+    client_log = tmp_path / "fault-client.log"
+    helper = Path(__file__).parents[1] / "fakes" / "execution_fault_client.py"
+    with client_log.open("wb") as output:
+        client = subprocess.Popen(
+            [sys.executable, str(helper), str(marker)],
+            stdin=subprocess.DEVNULL,
+            stdout=output,
+            stderr=subprocess.STDOUT,
+            env=os.environ.copy(),
+        )
+        try:
+            for _ in range(200):
+                if client.poll() is not None:
+                    pytest.fail(client_log.read_text(encoding="utf-8", errors="replace"))
+                if marker.exists() and managed_container_ids():
+                    break
+                await asyncio.sleep(0.05)
+            else:
+                pytest.fail("fault client did not start a managed container")
+
+            processes = subprocess.run(
+                ["ps", "-ww", "-eo", "pid=,args="],
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout.splitlines()
+            server_pids = [
+                int(line.strip().split(maxsplit=1)[0])
+                for line in processes
+                if "redteam.capability.servers.execution" in line
+                and str(policy_path) in line
+            ]
+            execution_processes = [
+                line
+                for line in processes
+                if "redteam.capability.servers.execution" in line
+            ]
+            assert len(server_pids) == 1, "\n".join(execution_processes)
+            os.kill(server_pids[0], signal.SIGKILL)
+            await asyncio.sleep(0.2)
+        finally:
+            if client.poll() is None:
+                client.terminate()
+                try:
+                    client.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    client.kill()
+                    client.wait(timeout=5)
+
+    async with open_mcp_tool_gateway(
+        ["execution"],
+        health_refresh_enabled=False,
+    ):
+        assert await wait_for_managed_containers(0) == []
+    assert await wait_for_managed_containers(0) == []

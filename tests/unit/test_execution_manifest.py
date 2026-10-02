@@ -8,6 +8,8 @@ from typing import Any
 import pytest
 from mcp import Client
 
+from redteam.capability.adapters.mcp.execution import ExecutionMCPAdapter
+from redteam.capability.adapters.mcp.transport import RemoteCallResult
 from redteam.capability.execution_manifest import (
     EXECUTION_TOOLS,
     validate_execution_descriptor,
@@ -66,6 +68,14 @@ def configure(monkeypatch: pytest.MonkeyPatch, policy_path: Path) -> None:
     monkeypatch.setenv("REDTEAM_MCP_EXECUTION_PROFILE", "execution")
     monkeypatch.setenv("REDTEAM_MCP_EXECUTION_RISK_LEVEL", "high")
     monkeypatch.setenv("REDTEAM_MCP_EXECUTION_EXECUTION_POLICY", str(policy_path))
+
+
+class ErrorTransport:
+    async def call_tool(self, tool_name: str, arguments: dict[str, Any]) -> RemoteCallResult:
+        return RemoteCallResult(
+            is_error=True,
+            output={"error_code": "execution_option_not_allowed"},
+        )
 
 
 def test_execution_profile_pins_policy_tools_operations_and_asset(
@@ -142,3 +152,56 @@ async def test_real_mcp_discovery_matches_pinned_manifest(tmp_path: Path) -> Non
     changed.input_schema["required"].remove("args")
     with pytest.raises(ValueError, match="manifest"):
         validate_execution_descriptor(changed, "workspace-test")
+
+
+async def test_execution_adapter_preserves_stable_server_error_code() -> None:
+    descriptor = ToolDescriptor(
+        tool_id=ToolId("analysis.run_command"),
+        server_id="execution",
+        tool_name="run_command",
+        description="proposed execution",
+        input_schema={"type": "object"},
+        output_schema={"type": "object"},
+        operations=["command_run"],
+        target_types=["asset"],
+        capability_tags=["analysis"],
+        risk_level=RiskLevel.HIGH,
+        health_status=ToolHealthStatus.HEALTHY,
+    )
+    result = await ExecutionMCPAdapter(
+        server_id="execution",
+        risk_level=RiskLevel.HIGH,
+        transport=ErrorTransport(),
+    ).invoke(descriptor, {})
+    assert result.success is False
+    assert result.error is not None
+    assert result.error.code == "execution_option_not_allowed"
+
+
+async def test_server_returns_execution_error_as_structured_tool_failure(
+    tmp_path: Path,
+) -> None:
+    policy = make_policy(tmp_path)
+
+    async def fail(*args: Any, **kwargs: Any) -> CompletedProcess:
+        pytest.fail("rejected executable must not start Docker")
+
+    server = create_server(
+        policy,
+        engine=DockerExecutionEngine(policy, process_factory=fail),
+    )
+    async with Client(server) as client:
+        result = await client.call_tool(
+            "run_command",
+            {
+                "asset_ref": "workspace-test",
+                "executable": "python",
+                "args": ["input.txt"],
+                "engagement_id": "eng-test",
+                "run_id": "run-test",
+            },
+        )
+    assert result.is_error is True
+    assert result.structured_content == {
+        "error_code": "execution_executable_not_allowed"
+    }

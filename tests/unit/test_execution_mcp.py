@@ -13,6 +13,7 @@ from redteam.capability.servers.execution import (
     DockerExecutionEngine,
     ExecutionError,
     ExecutionPolicy,
+    cleanup_orphaned_containers,
     ensure_runtime_available,
 )
 
@@ -104,6 +105,9 @@ async def test_run_command_builds_locked_down_docker_argv_and_minimal_environmen
     argv = captured["argv"]
     assert argv[0] == "docker"
     assert ("--network", "none") == argv[argv.index("--network") : argv.index("--network") + 2]
+    labels = [argv[index + 1] for index, value in enumerate(argv) if value == "--label"]
+    assert "io.whs-redteam.execution.managed=true" in labels
+    assert any(label.startswith("io.whs-redteam.execution.context=") for label in labels)
     assert "--read-only" in argv
     assert ("--cap-drop", "ALL") == argv[argv.index("--cap-drop") : argv.index("--cap-drop") + 2]
     assert "no-new-privileges" in argv
@@ -146,6 +150,71 @@ async def test_command_policy_rejects_unsafe_inputs_before_spawn(
         await engine.run_command(
             "workspace-test", executable, args, 3, "eng-test", "run-test"
         )
+
+
+@pytest.mark.parametrize(
+    ("executable", "arguments"),
+    [
+        ("sort", ["-o", "result.txt", "input.txt"]),
+        ("sort", ["--compress-program=gzip", "input.txt"]),
+        ("sort", ["--files0-from=input.txt"]),
+        ("jq", ["-f", "filter.jq", "input.json"]),
+        ("jq", ["--from-file=filter.jq", "input.json"]),
+        ("jq", ["--rawfile", "name", "input.txt"]),
+        ("jq", ["--slurpfile", "name", "input.json"]),
+        ("grep", ["-f", "patterns.txt", "input.txt"]),
+        ("grep", ["--file=patterns.txt", "input.txt"]),
+    ],
+)
+async def test_dangerous_tool_options_have_a_distinct_error_code(
+    policy: ExecutionPolicy,
+    executable: str,
+    arguments: list[str],
+) -> None:
+    expanded = policy.model_dump()
+    expanded["allowed_executables"]["jq"] = "/usr/bin/jq"
+    guarded_policy = ExecutionPolicy.model_validate(expanded)
+
+    async def fail(*args: Any, **kwargs: Any) -> CompletedProcess:
+        pytest.fail("dangerous options must be rejected before Docker starts")
+
+    with pytest.raises(ExecutionError, match="^execution_dangerous_option_forbidden$"):
+        await DockerExecutionEngine(guarded_policy, process_factory=fail).run_command(
+            "workspace-test", executable, arguments, 3, "eng-test", "run-test"
+        )
+
+
+async def test_policy_option_allowlist_can_narrow_defaults_and_rejects_unknown_options(
+    policy: ExecutionPolicy,
+) -> None:
+    values = policy.model_dump()
+    values["allowed_options"] = {"grep": ["-n"]}
+    narrowed = ExecutionPolicy.model_validate(values)
+
+    async def fail(*args: Any, **kwargs: Any) -> CompletedProcess:
+        pytest.fail("unlisted options must be rejected before Docker starts")
+
+    with pytest.raises(ExecutionError, match="^execution_option_not_allowed$"):
+        await DockerExecutionEngine(narrowed, process_factory=fail).run_command(
+            "workspace-test",
+            "grep",
+            ["-i", "needle", "input.txt"],
+            3,
+            "eng-test",
+            "run-test",
+        )
+    with pytest.raises(ValueError, match="unsafe option"):
+        ExecutionPolicy.model_validate(
+            {**policy.model_dump(), "allowed_options": {"grep": ["-f"]}}
+        )
+
+
+def test_existing_policy_without_allowed_options_keeps_safe_defaults(
+    policy: ExecutionPolicy,
+) -> None:
+    values = policy.model_dump(exclude={"allowed_options"})
+    loaded = ExecutionPolicy.model_validate(values)
+    assert "-n" in loaded.options_for("grep")
 
 
 async def test_context_and_timeout_are_checked_before_spawn(policy: ExecutionPolicy) -> None:
@@ -222,12 +291,37 @@ async def test_output_is_bounded_and_reports_truncation(policy: ExecutionPolicy)
     async def spawn(*args: Any, **kwargs: Any) -> CompletedProcess:
         return process
 
-    result = await DockerExecutionEngine(policy, process_factory=spawn).run_command(
+    engine = DockerExecutionEngine(policy, process_factory=spawn)
+    result = await engine.run_command(
         "workspace-test", "sort", ["input.txt"], 3, "eng-test", "run-test"
     )
     assert len(result.stdout.encode()) == policy.max_output_bytes
     assert result.stderr == ""
     assert result.truncated is True
+    assert engine.last_peak_output_bytes == policy.max_output_bytes
+    assert len(result.stdout.encode()) + len(result.stderr.encode()) <= policy.max_output_bytes
+
+
+def test_startup_cleanup_targets_only_managed_containers_for_exact_context(
+    policy: ExecutionPolicy,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[list[str]] = []
+
+    def run(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[bytes]:
+        calls.append(argv)
+        if argv[1:3] == ["ps", "-aq"]:
+            return subprocess.CompletedProcess(argv, 0, b"container-a\ncontainer-b\n", b"")
+        return subprocess.CompletedProcess(argv, 0, b"", b"")
+
+    monkeypatch.setattr(execution.subprocess, "run", run)
+    cleanup_orphaned_containers(policy)
+
+    listing = calls[0]
+    assert "label=io.whs-redteam.execution.managed=true" in listing
+    context_filters = [value for value in listing if "execution.context=" in value]
+    assert len(context_filters) == 1
+    assert calls[1] == ["docker", "rm", "--force", "container-a", "container-b"]
 
 
 async def test_timeout_forces_container_and_process_cleanup(policy: ExecutionPolicy) -> None:
