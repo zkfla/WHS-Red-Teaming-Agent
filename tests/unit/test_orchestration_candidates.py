@@ -643,7 +643,26 @@ async def test_compiler_reports_an_unhealthy_only_tool_set_as_such() -> None:
             health_status=ToolHealthStatus.UNHEALTHY,
         )
     )
-    compiler = CandidateCompiler(catalog_for(registry))
+    registry.register(
+        ToolDescriptor(
+            tool_id=ToolId("recon.healthy_other_action"),
+            server_id="test",
+            tool_name="healthy_other_action",
+            capability_tags=["recon"],
+            operations=["port_scan"],
+            health_status=ToolHealthStatus.HEALTHY,
+        )
+    )
+    compiler = CandidateCompiler(
+        MCPToolGateway(
+            registry,
+            {},
+            {
+                "recon.ping": ["service_discovery"],
+                "recon.healthy_other_action": ["port_scan"],
+            },
+        )
+    )
     drafts = await PlaybookCandidateProvider().propose(
         agent(), service.view(), observation, step=1
     )

@@ -45,10 +45,17 @@ from redteam.app.cli._shared import (
     eprint,
     load_app_config_for_run,
 )
+from redteam.app.runtime_components import binding_for_resume
 from redteam.capability.settings import MCPConfigurationError
 from redteam.core.config import AppConfig
 from redteam.event_bus.publisher import EventPublisher
 from redteam.orchestration.checkpointing import open_checkpointer
+from redteam.orchestration.component_binding import (
+    ComponentBindingError,
+    ComponentProfile,
+    ComponentRegistry,
+    selection_of,
+)
 from redteam.orchestration.context import RuntimeDeps
 from redteam.orchestration.operator_intents import OperatorIntentService
 from redteam.orchestration.runner import AgentLoopRunner, CheckpointingDisabledError
@@ -74,6 +81,7 @@ async def run(
     on_finished: Callable[[RuntimeState], None] | None = None,
     session_channel: Any | None = None,
     on_event: Any | None = None,
+    component_registry: ComponentRegistry | None = None,
 ) -> int:
     """Resume args.run_id; when the resumed run settles, on_finished runs.
 
@@ -90,6 +98,7 @@ async def run(
             on_finished=on_finished,
             session_channel=session_channel,
             on_event=on_event,
+            component_registry=component_registry,
         )
 
 
@@ -100,6 +109,7 @@ async def _run(
     on_finished: Callable[[RuntimeState], None] | None = None,
     session_channel: Any | None = None,
     on_event: Any | None = None,
+    component_registry: ComponentRegistry | None = None,
 ) -> int:
     try:
         config = load_app_config_for_run(args.engagement_path)
@@ -125,9 +135,26 @@ async def _run(
         )
         return EXIT_FAILURE
 
+    # Stored selection check before any MCP transport is opened: unknown
+    # profile id/version or changed component ids fail here. A missing
+    # record is a legacy checkpoint and resumes as builtin.
+    try:
+        stored_binding = binding_for_resume(hint.component_binding, registry=component_registry)
+    except ComponentBindingError as exc:
+        eprint(
+            f"ERROR: stored component profile for run {args.run_id} is not "
+            f"registered: {exc} -- refusing to resume."
+        )
+        return EXIT_FAILURE
+
     try:
         engagement, deps = await build_resume_application(
-            config, engagement_id=hint.engagement_id, settings=settings, mcp_stack=mcp_stack
+            config,
+            engagement_id=hint.engagement_id,
+            settings=settings,
+            mcp_stack=mcp_stack,
+            component_profile=selection_of(stored_binding),
+            component_registry=component_registry,
         )
     except MCPConfigurationError as exc:
         eprint(f"ERROR: MCP configuration invalid: {exc}")
@@ -266,6 +293,8 @@ async def build_resume_application(
     engagement_id: Any,
     settings: OrchestrationSettings,
     mcp_stack: AsyncExitStack | None = None,
+    component_profile: ComponentProfile | None = None,
+    component_registry: ComponentRegistry | None = None,
 ) -> tuple[Any, RuntimeDeps]:
     """Rebuild the canonical runtime for a durable resume.
 
@@ -279,11 +308,19 @@ async def build_resume_application(
             "using the in-process ExampleMCPAdapter (development/test only; no real "
             "tool execution)."
         )
+    # Same conditional wiring as run.build: omit when unset so the current
+    # composition root takes its builtin default.
+    component_options: dict[str, Any] = {}
+    if component_profile is not None:
+        component_options["component_profile"] = component_profile
+    if component_registry is not None:
+        component_options["component_registry"] = component_registry
     return await build_application(
         config,
         engagement_id=engagement_id,
         orchestration_settings=settings,
         mcp_stack=mcp_stack,
+        **component_options,
     )
 
 

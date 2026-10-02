@@ -36,6 +36,14 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from redteam.app.report_store import save_terminal_report
+from redteam.app.runtime_components import (
+    ComponentFactoryContext,
+    ComponentProfile,
+    ComponentRegistry,
+    ensure_durable_binding,
+    instantiate,
+    resolve_selection,
+)
 from redteam.attack_graph.service import AttackGraphService
 from redteam.attack_graph.stores.memory import InMemoryAttackGraphStore
 from redteam.attack_graph.stores.namespaced import EngagementScopedAttackGraphStore
@@ -74,9 +82,10 @@ from redteam.evidence.service import EvidenceService
 from redteam.evidence.stores.filesystem import FilesystemEvidenceStore
 from redteam.orchestration.agents.providers import (
     CandidateProviderRegistry,
-    default_provider_registry,
 )
-from redteam.orchestration.agents.registry import AgentRegistry, default_registry
+from redteam.orchestration.agents.registry import AgentRegistry
+from redteam.orchestration.analysis import AnalysisVerifier
+from redteam.orchestration.component_binding import binding_for_registration
 from redteam.orchestration.context import RuntimeDeps
 from redteam.orchestration.coordination import (
     ChangeSet,
@@ -86,6 +95,7 @@ from redteam.orchestration.coordination import (
 )
 from redteam.orchestration.events import REPORT_PROJECTED
 from redteam.orchestration.mission_bootstrap import bootstrap_mission
+from redteam.orchestration.observations import ResultMapperRegistry
 from redteam.orchestration.operator_intents import build_operator_intent_store
 from redteam.orchestration.outbox import deliver_pending
 from redteam.orchestration.replanning import finalize_mission
@@ -173,6 +183,10 @@ async def build_runtime_deps(
     orchestration_settings: OrchestrationSettings | None = None,
     agents: AgentRegistry | None = None,
     candidate_providers: CandidateProviderRegistry | None = None,
+    component_profile: ComponentProfile | None = None,
+    component_registry: ComponentRegistry | None = None,
+    verifier: AnalysisVerifier | None = None,
+    result_mappers: ResultMapperRegistry | None = None,
     tool_catalog: ToolCatalog | None = None,
     task_graph_store: MissionTaskStore | None = None,
 ) -> RuntimeDeps:
@@ -200,6 +214,19 @@ async def build_runtime_deps(
     """
     if llm is None:
         raise ValueError("an explicit LLM client is required")
+    component_registration = resolve_selection(
+        component_profile, registry=component_registry
+    )
+    settings = orchestration_settings or OrchestrationSettings()
+    component_binding = ensure_durable_binding(
+        binding_for_registration(component_registration),
+        durable=settings.checkpointing and settings.checkpoint_backend == "sqlite",
+        agents=agents,
+        candidate_providers=candidate_providers,
+        verifier=verifier,
+        result_mappers=result_mappers,
+        registry=component_registry,
+    )
     event_bus = InMemoryEventBus()
     # Namespaced even though this builds one fresh store per call, so an
     # Engagement never silently depends on being the store's only tenant —
@@ -208,6 +235,14 @@ async def build_runtime_deps(
         InMemoryAttackGraphStore(), engagement_id=engagement.engagement_id
     )
     evidence_store = FilesystemEvidenceStore(evidence_dir)
+    profile_components, _ = instantiate(
+        component_registration,
+        ComponentFactoryContext(
+            llm_client=llm,
+            evidence_store=evidence_store,
+            graph_store=graph_store,
+        ),
+    )
     tool_gateway, discovered_catalog = await _build_default_capability(CapabilityConfig())
     audit_log = AuditLog(FilesystemAuditStore(audit_dir))
     approvals = ApprovalService(FilesystemApprovalStore(approval_dir))
@@ -221,7 +256,6 @@ async def build_runtime_deps(
         # Risk-tiered approval reads tool risk_level from the Registry.
         risk_resolver=RegistryRiskResolver(discovered_catalog),
     )
-    settings = orchestration_settings or OrchestrationSettings()
 
     return RuntimeDeps(
         control_plane=control_plane,
@@ -231,10 +265,19 @@ async def build_runtime_deps(
         evidence_store=evidence_store,
         llm_client=llm,
         engagement=engagement,
-        agents=agents if agents is not None else default_registry(),
+        agents=agents if agents is not None else profile_components.agents,
         candidate_providers=(
-            candidate_providers if candidate_providers is not None else default_provider_registry()
+            candidate_providers
+            if candidate_providers is not None
+            else profile_components.candidate_providers
         ),
+        verifier=verifier if verifier is not None else profile_components.verifier,
+        result_mappers=(
+            result_mappers
+            if result_mappers is not None
+            else profile_components.result_mappers
+        ),
+        component_binding=component_binding,
         tool_catalog=(tool_catalog if tool_catalog is not None else discovered_catalog),
         work_store=_build_work_store(settings),
         task_graph_store=(task_graph_store or _build_task_graph_store(settings)),
@@ -283,6 +326,10 @@ async def build_application(
     orchestration_settings: OrchestrationSettings | None = None,
     agents: AgentRegistry | None = None,
     candidate_providers: CandidateProviderRegistry | None = None,
+    component_profile: ComponentProfile | None = None,
+    component_registry: ComponentRegistry | None = None,
+    verifier: AnalysisVerifier | None = None,
+    result_mappers: ResultMapperRegistry | None = None,
     tool_catalog: ToolCatalog | None = None,
     task_graph_store: MissionTaskStore | None = None,
     engagement_id: EngagementId | None = None,
@@ -333,6 +380,19 @@ async def build_application(
 
     engagement = config.engagement.to_engagement(
         engagement_id=engagement_id or EngagementId(new_id("eng"))
+    )
+    component_registration = resolve_selection(
+        component_profile, registry=component_registry
+    )
+    component_binding = ensure_durable_binding(
+        binding_for_registration(component_registration),
+        durable=resolved_settings.checkpointing
+        and resolved_settings.checkpoint_backend == "sqlite",
+        agents=agents,
+        candidate_providers=candidate_providers,
+        verifier=verifier,
+        result_mappers=result_mappers,
+        registry=component_registry,
     )
 
     # Build the evidence store first so both the Control Plane (blocked
@@ -397,6 +457,14 @@ async def build_application(
         engagement_id=engagement.engagement_id,
     )
     resolved_llm = llm or build_llm_client(config.llm)
+    profile_components, _ = instantiate(
+        component_registration,
+        ComponentFactoryContext(
+            llm_client=resolved_llm,
+            evidence_store=resolved_evidence_store,
+            graph_store=resolved_attack_graph,
+        ),
+    )
 
     deps = RuntimeDeps(
         control_plane=resolved_control_plane,
@@ -406,10 +474,19 @@ async def build_application(
         evidence_store=resolved_evidence_store,
         llm_client=resolved_llm,
         engagement=engagement,
-        agents=agents if agents is not None else default_registry(),
+        agents=agents if agents is not None else profile_components.agents,
         candidate_providers=(
-            candidate_providers if candidate_providers is not None else default_provider_registry()
+            candidate_providers
+            if candidate_providers is not None
+            else profile_components.candidate_providers
         ),
+        verifier=verifier if verifier is not None else profile_components.verifier,
+        result_mappers=(
+            result_mappers
+            if result_mappers is not None
+            else profile_components.result_mappers
+        ),
+        component_binding=component_binding,
         tool_catalog=resolved_tool_catalog,
         work_store=_build_work_store(resolved_settings),
         task_graph_store=resolved_tasks,
@@ -604,6 +681,7 @@ async def run_engagement(
         mission_id=mission_id,
         current_goal=saved_mission.objective,
         remaining_budget=engagement.execution_budget.max_actions,
+        component_binding=deps.component_binding,
     )
     runner = AgentLoopRunner(deps, settings=settings)
     try:

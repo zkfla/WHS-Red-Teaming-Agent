@@ -60,6 +60,7 @@ from redteam.core.enums import ApprovalStatus, OperatorIntentType
 from redteam.core.ids import EngagementId, MissionId, RunId
 from redteam.core.ports.event_bus import EventHandler
 from redteam.event_bus.publisher import EventPublisher
+from redteam.orchestration.component_binding import ComponentProfile, ComponentRegistry
 from redteam.orchestration.context import RuntimeDeps
 from redteam.orchestration.events import (
     AGENT_CONTEXT_PREPARED,
@@ -735,7 +736,12 @@ class OperatorConsole:
 
 
 async def build(
-    config: AppConfig, *, max_steps: int | None, mcp_stack: AsyncExitStack | None = None
+    config: AppConfig,
+    *,
+    max_steps: int | None,
+    mcp_stack: AsyncExitStack | None = None,
+    component_profile: ComponentProfile | None = None,
+    component_registry: ComponentRegistry | None = None,
 ) -> tuple[Any, RuntimeDeps]:
     """Phase 1 of the shared core (section 17): config -> live
     ``(Engagement, RuntimeDeps)``, via the canonical
@@ -756,8 +762,17 @@ async def build(
         config.orchestration, max_steps=max_steps
     )
 
+    # Omit unset selections so the composition root uses its builtin profile.
+    component_options: dict[str, Any] = {}
+    if component_profile is not None:
+        component_options["component_profile"] = component_profile
+    if component_registry is not None:
+        component_options["component_registry"] = component_registry
     return await build_application(
-        config, orchestration_settings=orchestration_settings, mcp_stack=mcp_stack
+        config,
+        orchestration_settings=orchestration_settings,
+        mcp_stack=mcp_stack,
+        **component_options,
     )
 
 
@@ -935,12 +950,28 @@ async def wait_for_suspensions(
     return final
 
 
-async def run(args: argparse.Namespace) -> int:
+async def run(
+    args: argparse.Namespace,
+    *,
+    component_profile: ComponentProfile | None = None,
+    component_registry: ComponentRegistry | None = None,
+) -> int:
     async with AsyncExitStack() as stack:
-        return await _run(args, mcp_stack=stack)
+        return await _run(
+            args,
+            mcp_stack=stack,
+            component_profile=component_profile,
+            component_registry=component_registry,
+        )
 
 
-async def _run(args: argparse.Namespace, *, mcp_stack: AsyncExitStack) -> int:
+async def _run(
+    args: argparse.Namespace,
+    *,
+    mcp_stack: AsyncExitStack,
+    component_profile: ComponentProfile | None = None,
+    component_registry: ComponentRegistry | None = None,
+) -> int:
     try:
         config = load_app_config_for_run(args.engagement_path)
     except (OSError, ValidationError, ValueError) as exc:
@@ -951,7 +982,16 @@ async def _run(args: argparse.Namespace, *, mcp_stack: AsyncExitStack) -> int:
     logging.basicConfig(level=log_level, force=True)
 
     try:
-        engagement, deps = await build(config, max_steps=args.max_steps, mcp_stack=mcp_stack)
+        # Same conditional wiring: unset means the builtin default, and
+        # existing build() test doubles keep working unpatched.
+        build_options: dict[str, Any] = {}
+        if component_profile is not None:
+            build_options["component_profile"] = component_profile
+        if component_registry is not None:
+            build_options["component_registry"] = component_registry
+        engagement, deps = await build(
+            config, max_steps=args.max_steps, mcp_stack=mcp_stack, **build_options
+        )
     except MCPConfigurationError as exc:
         eprint(f"ERROR: MCP configuration invalid: {exc}")
         return EXIT_CONFIG_ERROR

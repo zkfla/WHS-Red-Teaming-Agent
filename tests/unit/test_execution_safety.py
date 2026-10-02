@@ -40,6 +40,35 @@ _PATH_ID = "path-exec-safety"
 _PATH_STEP_ID = "probe-host"
 
 
+async def _seed_exec_target(deps, host: str = "a.local") -> None:
+    """Seed the actual same-run supplied target so policy knows it."""
+    from redteam.attack_graph.service import AttackGraphService
+    from redteam.core.contracts.engagement import (
+        ApprovalPolicy,
+        Engagement,
+        EngagementScope,
+        ExecutionBudget,
+        RateLimitPolicy,
+    )
+    from redteam.orchestration.seed import seed_from_engagement
+
+    eng = Engagement(
+        engagement_id=ENGAGEMENT,
+        name="exec safety fixture",
+        scope=EngagementScope(allowed_hosts=[host]),
+        rules_of_engagement=[],
+        execution_budget=ExecutionBudget(max_actions=10),
+        rate_limit_policy=RateLimitPolicy(
+            max_actions_per_minute=30, max_concurrent_actions=2
+        ),
+        approval_policy=ApprovalPolicy(),
+        created_at=NOW,
+        metadata={"target_refs": {host: host}},
+    )
+    svc = AttackGraphService(deps.graph_store)
+    await seed_from_engagement(svc, eng, run_id=RUN, step=0)
+
+
 def runtime(**overrides) -> RuntimeState:
     return RuntimeState(run_id=RUN, engagement_id=ENGAGEMENT, **overrides)
 
@@ -69,6 +98,7 @@ def descriptor(risk: RiskLevel) -> ToolDescriptor:
 
 
 async def _ensure_exec_path(deps) -> None:
+    await _seed_exec_target(deps)
     existing = await deps.path_store.get_active(str(RUN))
     if existing is not None:
         return

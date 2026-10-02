@@ -32,6 +32,7 @@ from redteam.core.ids import (
     TaskId,
 )
 from redteam.orchestration.agents.base import PlanStep
+from redteam.orchestration.component_binding import RuntimeComponentBinding
 from redteam.orchestration.diagnostics import DecisionDiagnostic, safe_feedback
 from redteam.orchestration.dispatch import (
     DispatchItem,
@@ -126,6 +127,8 @@ class RuntimeState(BaseModel):
     #: Observation fingerprint at which each agent exhausted its frontier.
     #: A relevant graph delta makes that agent eligible again.
     agent_revision_cursors: dict[str, str] = Field(default_factory=dict)
+    #: Which registered component set this run was built from. None is legacy.
+    component_binding: RuntimeComponentBinding | None = None
 
     @field_validator("planning_feedback", mode="before")
     @classmethod

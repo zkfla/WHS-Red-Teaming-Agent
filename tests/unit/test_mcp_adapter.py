@@ -54,7 +54,7 @@ class FakeTransport:
 def _invocation(
     *,
     tool_id: ToolId | None = None,
-    operation: str = "ping",
+    operation: str = "service_discovery",
     timeout_seconds: float = 30.0,
 ) -> ToolInvocation:
     return ToolInvocation(

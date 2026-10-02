@@ -18,8 +18,9 @@ from redteam.core.contracts.mission import MissionCriterionResult, redact_secret
 from redteam.core.enums import EvidenceSourceType, MissionStatus, TaskStatus, ToolHealthStatus
 from redteam.core.ids import EventId, GraphNodeId, TaskId, new_id
 from redteam.event_bus.publisher import EventPublisher
+from redteam.orchestration.action_naming import canonical_action_key
 from redteam.orchestration.agents.base import HypothesisDraft, PlanStep
-from redteam.orchestration.agents.providers import PlaybookCandidateProvider
+from redteam.orchestration.agents.providers import CandidateBatch, GraphCandidateContext
 from redteam.orchestration.authentication import AuthenticationCheck
 from redteam.orchestration.candidates.compiler import CandidateCompiler
 from redteam.orchestration.candidates.models import CandidateDraft
@@ -35,11 +36,27 @@ from redteam.orchestration.coordination import (
     content_hash,
     coordinator_for,
 )
-from redteam.orchestration.diagnostics import DecisionDiagnostic, diagnostic_for_exception
+from redteam.orchestration.diagnostics import (
+    DecisionDiagnostic,
+    diagnostic_for_exception,
+    known_location,
+)
 from redteam.orchestration.events import AGENT_CONTEXT_PREPARED, AGENT_TURN_DECIDED
 from redteam.orchestration.evidence_access import EvidenceReader
 from redteam.orchestration.expectations import Expectation
-from redteam.orchestration.knowledge import project_knowledge
+from redteam.orchestration.knowledge import (
+    collect_assessment,
+    collect_knowledge,
+)
+from redteam.orchestration.knowledge_validation import (
+    AssessmentError,
+    InternalAssessment,
+    assessment_blocked,
+    check_principal_arguments,
+    check_ready_step,
+    known_principals,
+    known_target_ids,
+)
 from redteam.orchestration.paths import PathError, PathPlan, is_active_status, is_known_criterion
 from redteam.orchestration.paths.models import (
     ALLOWED_CRITERION_KINDS,
@@ -222,7 +239,10 @@ def principal_bindings(knowledge: dict) -> dict[str, set[str]]:
     return bindings
 
 
-def ready_step(path, step, knowledge: dict) -> list[str]:
+def ready_step(path, step, knowledge) -> list[str]:
+    """Step gates; accepts the internal material or the legacy display dict."""
+    if isinstance(knowledge, InternalAssessment):
+        return check_ready_step(path, step, knowledge)
     problems = []
     steps = {item.step_id: item for item in path.steps}
     if _text(step.status) not in {"pending", "running"}:
@@ -240,15 +260,101 @@ def ready_step(path, step, knowledge: dict) -> list[str]:
 class DecisionRuleError(ValueError):
     """A code-owned validation rule, safe to carry into correction feedback."""
 
-    def __init__(self, summary: str):
+    def __init__(
+        self, summary: str, *, code: str = "decision_rule_violation", location: str = ""
+    ):
         self.diagnostic = DecisionDiagnostic(
-            code="decision_rule_violation",
+            code=code,
             stage="validation",
             kind="format",
             summary=summary,
             retryable=True,
+            location=location,
         )
         super().__init__(summary)
+
+
+async def _collect_check_assessment(deps, runtime, *, service=None, target_node_ids=None):
+    """Fresh internal material for one execution check; never cached or stored.
+
+    Callers keep the result in a local and never put it into the LLM context,
+    events, or checkpoints. A failed store read stays visible through
+    assessment_blocked instead of collapsing into an empty list.
+    """
+    from redteam.attack_graph.service import AttackGraphService
+
+    svc = service if service is not None else AttackGraphService(deps.graph_store)
+    material = await collect_assessment(
+        svc,
+        deps.evidence_store,
+        str(runtime.run_id),
+        step=int(getattr(runtime, "step_count", 0) or 0),
+        target_node_ids=target_node_ids,
+    )
+    # Strict same-run binding: unknown shapes and run-less material admit nothing.
+    if (
+        not isinstance(material, InternalAssessment)
+        or not material.run_id
+        or str(material.run_id) != str(runtime.run_id)
+    ):
+        raise DecisionRuleError("internal assessment is not bound to this run")
+    return material
+
+
+def _principal_check(step, principal, arguments, material, location) -> None:
+    """Principal/session wiring against the internal material."""
+    try:
+        check_principal_arguments(step, principal, arguments, material)
+    except AssessmentError as exc:
+        raise DecisionRuleError(
+            str(exc), code="invalid_arguments", location=location
+        ) from exc
+
+
+def _action_location(intent_index: int, field: str) -> str:
+    """Known-safe location for one proposed action field."""
+    return known_location(("actions", intent_index, field))
+
+
+_REJECTION_SUMMARIES = {
+    "unknown_operation": "Use a supported action capability and operation.",
+    "tool_outside_capability_namespace": "Choose a tool from the action's capability namespace.",
+    "unresolved_target": "Bind the action to a supplied or observed target.",
+    "target_mismatch": "Bind the action to the accepted step target.",
+    "missing_required_argument": "Provide the tool arguments the schema requires.",
+    "non_json_arguments": "Provide tool arguments as JSON values.",
+    "schema_mismatch": "Match the tool argument schema.",
+    "invalid_tool_schema": "The tool schema is unusable; choose another tool.",
+    "no_input_schema": "The tool declares no usable input schema.",
+}
+
+_REJECTION_CODES = {
+    "unknown_operation": "unknown_operation",
+    "tool_outside_capability_namespace": "tool_outside_capability_namespace",
+    "unresolved_target": "unresolved_target",
+    "target_mismatch": "unresolved_target",
+    "missing_required_argument": "invalid_arguments",
+    "non_json_arguments": "invalid_arguments",
+    "schema_mismatch": "invalid_arguments",
+    "invalid_tool_schema": "invalid_arguments",
+    "no_input_schema": "invalid_arguments",
+}
+
+
+def _rejection_feedback(reason: str, field: str) -> str:
+    """Canonical compiler feedback: code-owned code, known location, safe summary."""
+    code = _REJECTION_CODES.get(reason, reason)
+    summary = _REJECTION_SUMMARIES.get(
+        reason, "The candidate did not satisfy a compilation rule."
+    )
+    return DecisionDiagnostic(
+        code=code,
+        stage="action_compilation",
+        kind="format",
+        location=known_location((field,)) if field else "",
+        summary=summary,
+        retryable=True,
+    ).feedback()
 
 
 class InvestigationEngine:
@@ -260,6 +366,9 @@ class InvestigationEngine:
         self.last_event_id: EventId | None = None
         self._event_runtime: Any = None
         self.planning_diagnostic: DecisionDiagnostic | None = None
+        # Reference-absence notes from the last reference_paths call. Plain
+        # diagnostics only, never internal assessment material.
+        self.last_reference_diagnostics: list[DecisionDiagnostic] = []
 
     async def _ask(self, *, stage, payload, **kwargs):
         # Raw writing validation occurs before permissive storage models can
@@ -353,7 +462,9 @@ class InvestigationEngine:
         from redteam.attack_graph.service import AttackGraphService
 
         service = AttackGraphService(self.deps.graph_store)
-        knowledge = await project_knowledge(
+        # One shared read feeds both the capped LLM display and the full
+        # internal material; only the display enters the context dict.
+        knowledge, _ = await collect_knowledge(
             service, self.deps.evidence_store, str(runtime.run_id), step=runtime.step_count
         )
         mission = (
@@ -468,18 +579,97 @@ class InvestigationEngine:
         }
 
     async def reference_paths(self, observation, service, runtime) -> list[dict]:
-        references = []
-        # These drafts never enter the executable pool.
+        from redteam.attack_graph.view import AttackGraphView
+        from redteam.orchestration.context_projection import ContextProjector
+
+        references: list[dict] = []
+        diagnostics: list[DecisionDiagnostic] = []
+        self.last_reference_diagnostics = diagnostics
+        # Reference drafts never enter the executable pool, and provider
+        # order is preserved exactly.
+        view = AttackGraphView(self.deps.graph_store)
+        projector = ContextProjector(service, self.deps.context_cache)
+        task_context = await self._reference_task_context(runtime)
+        task_targets = task_context["task_target_node_ids"]
+        mission_objective = task_context["mission_objective"]
+        task_id = task_context["task_id"]
         for agent in self.deps.agents.all():
-            try:
-                drafts = await PlaybookCandidateProvider().propose(
-                    agent,
-                    service,
-                    observation,
-                    step=runtime.step_count,
+            definition = self.deps.agents.definition(agent.agent_id)
+            if definition is None:
+                diagnostics.append(
+                    self._reference_diagnostic(
+                        "The role has no registered definition; no reference candidates were built."
+                    )
                 )
-            except (ValueError, KeyError):
                 continue
+            provider = self.deps.candidate_providers.get(definition.provider_id)
+            if provider is None:
+                diagnostics.append(
+                    self._reference_diagnostic(
+                        "The role candidate provider is not registered; no reference "
+                        "candidates were built."
+                    )
+                )
+                continue
+            try:
+                role_observation = await projector.project(
+                    definition.context_profile,
+                    step=int(getattr(runtime, "step_count", 0) or 0),
+                    target_node_ids=list(task_targets),
+                    fallback=observation,
+                    cache_namespace=str(getattr(runtime, "run_id", "")),
+                )
+                candidate_context = self._reference_candidate_context(
+                    agent,
+                    view,
+                    role_observation,
+                    runtime,
+                    task_id,
+                    mission_objective,
+                    task_context,
+                )
+                propose_graph = getattr(provider, "propose_graph", None)
+                if callable(propose_graph):
+                    result = await propose_graph(agent, candidate_context)
+                else:
+                    legacy_propose = getattr(provider, "propose", None)
+                    if not callable(legacy_propose):
+                        raise KeyError("candidate provider has no propose entrypoint")
+                    result = await legacy_propose(
+                        agent,
+                        view,
+                        role_observation,
+                        step=int(getattr(runtime, "step_count", 0) or 0),
+                    )
+            except Exception:
+                diagnostics.append(
+                    self._reference_diagnostic(
+                        "The role candidate provider failed; no reference candidates "
+                        "were built."
+                    )
+                )
+                continue
+            if isinstance(result, CandidateBatch):
+                drafts = list(result.candidates)
+            elif isinstance(result, (list, tuple)):
+                drafts = list(result)
+            else:
+                diagnostics.append(
+                    self._reference_diagnostic(
+                        "The role candidate provider returned an unusable shape; no "
+                        "reference candidates were kept."
+                    )
+                )
+                continue
+            kept = [draft for draft in drafts if self._reference_draft_shape(draft)]
+            if len(kept) != len(drafts):
+                diagnostics.append(
+                    self._reference_diagnostic(
+                        "The role candidate provider returned an unusable shape; no "
+                        "reference candidates were kept."
+                    )
+                )
+            drafts = kept
             for draft in drafts:
                 references.append(
                     {
@@ -489,7 +679,180 @@ class InvestigationEngine:
                         "prerequisites": draft.prerequisite_ids,
                     }
                 )
+        self.last_reference_diagnostics = diagnostics
         return references
+
+    @staticmethod
+    def _reference_diagnostic(summary: str) -> DecisionDiagnostic:
+        """Reference-absence note; code-owned text only, never provider output."""
+        return DecisionDiagnostic(
+            code="reference_unavailable",
+            stage="reference_paths",
+            kind="reference",
+            location=known_location(("agent_id",)),
+            summary=summary,
+            retryable=False,
+        )
+
+    async def _reference_task_targets(self, runtime) -> list[str]:
+        """Fallback targets from the accepted path when the task names none."""
+        try:
+            active = await self.deps.path_store.get_active(str(runtime.run_id))
+        except Exception:
+            return []
+        if active is None:
+            return []
+        try:
+            return [
+                GraphNodeId(node_id)
+                for node_id in sorted(
+                    {str(item) for step in active.steps for item in step.target_node_ids}
+                )
+            ]
+        except Exception:
+            return []
+
+    async def _reference_task_context(self, runtime) -> dict:
+        """Live task/mission scope; path targets are fallback only.
+
+        Task objective, source, and target ids come from the task store and
+        the mission record, not from model-held runtime text.
+        """
+        task_id = getattr(runtime, "active_task_id", None)
+        task = None
+        try:
+            if task_id is not None:
+                task = await self.deps.task_graph_store.get_task(task_id)
+        except Exception:
+            task = None
+        mission = None
+        try:
+            if getattr(runtime, "mission_id", None) is not None:
+                mission = await self.deps.task_graph_store.get_mission(runtime.mission_id)
+        except Exception:
+            mission = None
+        source = getattr(getattr(task, "provenance", None), "source", None)
+        targets = list(getattr(task, "related_attack_graph_node_ids", None) or ())
+        if not targets:
+            targets = await self._reference_task_targets(runtime)
+        objective = getattr(mission, "objective", None) or getattr(
+            runtime, "current_goal", None
+        )
+        return {
+            "task_id": task_id,
+            "task_source": str(source) if source else None,
+            "task_objective": getattr(task, "objective", None),
+            "mission_objective": str(objective) if objective else None,
+            "task_target_node_ids": tuple(targets),
+        }
+
+    @staticmethod
+    def _reference_draft_shape(draft) -> bool:
+        """Whether a provider draft has the reference shape; no raw copying."""
+        plan_step = getattr(draft, "plan_step", None)
+        targets = getattr(draft, "target_node_ids", None)
+        prerequisites = getattr(draft, "prerequisite_ids", None)
+        if plan_step is None or targets is None or prerequisites is None:
+            return False
+        try:
+            _ = plan_step.operation_key
+            str(plan_step.reason)
+            list(map(str, targets))
+            list(prerequisites)
+        except Exception:
+            return False
+        return True
+
+    def _reference_candidate_context(
+        self, agent, view, role_observation, runtime, task_id, mission_objective, task_context
+    ):
+        """Graph context from the live run: role view, task targets, real tools.
+
+        Pairs come from every capability the agent owns, not its playbook:
+        each pair is usable only when the live catalog binds a healthy tool
+        to it. An unknown catalog or a failed catalog lookup leaves the
+        pairs unknown, never empty.
+        """
+        task_targets = task_context["task_target_node_ids"]
+        verified, operations, tool_docs = self._reference_live_operations(
+            agent, task_context
+        )
+        hypotheses = getattr(role_observation, "open_hypotheses", None)
+        open_hypotheses = (
+            tuple(str(item) for item in hypotheses[:20])
+            if isinstance(hypotheses, (list, tuple))
+            else ()
+        )
+        return GraphCandidateContext(
+            view=view,
+            observation=role_observation,
+            step=int(getattr(runtime, "step_count", 0) or 0),
+            task_id=str(task_id) if task_id is not None else None,
+            task_source=task_context.get("task_source"),
+            task_objective=task_context.get("task_objective"),
+            mission_objective=str(mission_objective)
+            if mission_objective is not None
+            else None,
+            task_target_node_ids=tuple(task_targets),
+            available_capabilities=tuple(getattr(agent, "capabilities", None) or ()),
+            open_hypotheses=open_hypotheses,
+            available_operations=tuple(operations),
+            available_tools=tuple(tool_docs),
+            operations_verified=verified,
+        )
+
+    def _reference_live_operations(self, agent, task_context):
+        """Catalog pairs across all agent capabilities; failures stay unknown."""
+        if self.deps.tool_catalog is None:
+            return False, [], []
+        catalog_failed = False
+        operations: list[tuple[str, str]] = []
+        tool_docs: list[dict] = []
+        seen: set[tuple[str, str]] = set()
+        for capability in getattr(agent, "capabilities", None) or ():
+            cap = str(capability)
+            try:
+                tools = self.deps.tool_catalog.list_by_capability(cap) or []
+            except Exception:
+                catalog_failed = True
+                continue
+            for tool in tools:
+                if tool.health_status is ToolHealthStatus.UNHEALTHY:
+                    continue
+                for operation in tool.operations or []:
+                    pair = (cap, str(operation))
+                    if pair in seen:
+                        continue
+                    seen.add(pair)
+                    try:
+                        usable = self.deps.tool_catalog.list_tools_for_action(
+                            pair[0], pair[1]
+                        )
+                    except Exception:
+                        catalog_failed = True
+                        continue
+                    healthy = [
+                        item
+                        for item in usable or []
+                        if item.health_status is not ToolHealthStatus.UNHEALTHY
+                    ]
+                    if not healthy:
+                        continue
+                    operations.append(pair)
+                    if len(tool_docs) < 20:
+                        tool_docs.append(
+                            redact_secret_material(
+                                healthy[0].model_dump(mode="json"), drop_secret_keys=False
+                            )
+                        )
+        if catalog_failed:
+            self.last_reference_diagnostics.append(
+                self._reference_diagnostic(
+                    "The tool catalog lookup failed; executable operations are unknown."
+                )
+            )
+            return False, [], []
+        return True, operations, tool_docs
 
     async def repair_references(self, observation, service, runtime, attempted_intents):
         targets = {intent.target_node_id for intent in attempted_intents}
@@ -584,13 +947,27 @@ class InvestigationEngine:
         # Progress and receipts are code-owned, never accepted from a model draft.
         for step in path.steps:
             step.status, step.outcome, step.evidence_ids = "pending", None, []
-        known = _known_ids(context["knowledge"])
-        known_principals = set(principal_bindings(context["knowledge"]))
+        # Registration judges references against fresh internal material, never
+        # the capped LLM display. A failed read admits nothing.
+        assessment = await _collect_check_assessment(self.deps, runtime, service=service)
+        blocked = assessment_blocked(assessment)
+        if blocked is not None:
+            raise DecisionRuleError(blocked)
+        known = known_target_ids(assessment)
+        registered_principals = known_principals(assessment)
         for step in path.steps:
             if set(step.target_node_ids) - known:
-                raise DecisionRuleError("path references unknown target(s)")
-            if set(step.principal_refs) - known_principals:
-                raise DecisionRuleError("path references unregistered principal(s)")
+                raise DecisionRuleError(
+                    "path references unknown target(s)",
+                    code="unresolved_target",
+                    location=known_location(("steps", "target_node_ids")),
+                )
+            if set(step.principal_refs) - registered_principals:
+                raise DecisionRuleError(
+                    "path references unregistered principal(s)",
+                    code="invalid_arguments",
+                    location=known_location(("steps", "principal_refs")),
+                )
             if step.agent_id and self.deps.agents.get(step.agent_id) is None:
                 raise DecisionRuleError("path references unknown role")
             if not step.completion_criteria or any(
@@ -602,6 +979,10 @@ class InvestigationEngine:
             AttackGraphService(self.deps.graph_store),
             runtime,
         )
+        reference_notes = [
+            item.model_dump(mode="json")
+            for item in self.last_reference_diagnostics[:10]
+        ]
         review = ReviewDecision.model_validate(
             await self._ask(
                 stage="path_review",
@@ -609,7 +990,16 @@ class InvestigationEngine:
                     **context,
                     "draft_path": path.model_dump(mode="json"),
                     "code_references": references,
-                    "code_checks": "structure and references passed",
+                    "code_checks": (
+                        "structure passed; references unavailable: "
+                        + "; ".join(
+                            f"{item['code']}: {item['summary']}"
+                            for item in reference_notes
+                        )
+                        if reference_notes
+                        else "structure and references passed"
+                    ),
+                    "reference_diagnostics": reference_notes,
                 },
                 response_schema=writing_schema(ReviewDecision),
                 system=SYSTEM,
@@ -648,7 +1038,7 @@ class InvestigationEngine:
                 step.status, step.outcome, step.evidence_ids = "pending", None, []
                 if (
                     set(step.target_node_ids) - known
-                    or set(step.principal_refs) - known_principals
+                    or set(step.principal_refs) - registered_principals
                     or (step.agent_id and self.deps.agents.get(step.agent_id) is None)
                     or not step.completion_criteria
                     or any(not is_known_criterion(item) for item in step.completion_criteria)
@@ -855,8 +1245,18 @@ class InvestigationEngine:
                     service = AttackGraphService(self.deps.graph_store)
                     suggestion = decision.hypothesis_update
                     target_id = str(suggestion.get("target_node_id", ""))
-                    if target_id not in _known_ids(context["knowledge"]):
-                        raise DecisionRuleError("hypothesis target is unknown")
+                    hypothesis_assessment = await _collect_check_assessment(
+                        self.deps, runtime, service=service
+                    )
+                    hypothesis_blocked = assessment_blocked(hypothesis_assessment)
+                    if hypothesis_blocked is not None:
+                        raise DecisionRuleError(hypothesis_blocked)
+                    if target_id not in known_target_ids(hypothesis_assessment):
+                        raise DecisionRuleError(
+                            "hypothesis target is unknown",
+                            code="unresolved_target",
+                            location=known_location(("target_node_id",)),
+                        )
                     description = suggestion.get("description")
                     if not isinstance(description, str) or not description.strip():
                         raise DecisionRuleError("hypothesis needs a claim")
@@ -1061,6 +1461,12 @@ class InvestigationEngine:
         from redteam.attack_graph.service import AttackGraphService
 
         service = AttackGraphService(self.deps.graph_store)
+        # One fresh read shared by every candidate in this batch; the
+        # plan-time display is never used for execution judgment.
+        assessment = await _collect_check_assessment(self.deps, runtime, service=service)
+        blocked = assessment_blocked(assessment)
+        if blocked is not None:
+            return [], [blocked]
         steps = {step.step_id: step for step in path.steps}
         drafts = []
         errors = []
@@ -1069,13 +1475,21 @@ class InvestigationEngine:
                 step = steps.get(intent.path_step_id)
                 if step is None:
                     raise DecisionRuleError("action is outside accepted path")
-                checks = ready_step(path, step, context["knowledge"])
+                checks = check_ready_step(path, step, assessment)
                 if checks:
                     raise DecisionRuleError("accepted step prerequisites are not satisfied")
                 if intent.target_node_id not in step.target_node_ids:
-                    raise DecisionRuleError("action target is outside step envelope")
-                if intent.target_node_id not in _known_ids(context["knowledge"]):
-                    raise DecisionRuleError("action target is not supplied or observed")
+                    raise DecisionRuleError(
+                        "action target is outside step envelope",
+                        code="unresolved_target",
+                        location=_action_location(intent_index, "target_node_id"),
+                    )
+                if intent.target_node_id not in known_target_ids(assessment):
+                    raise DecisionRuleError(
+                        "action target is not supplied or observed",
+                        code="unresolved_target",
+                        location=_action_location(intent_index, "target_node_id"),
+                    )
                 agent = self.deps.agents.get(intent.agent_id)
                 if agent is None or intent.capability not in agent.capabilities:
                     raise DecisionRuleError("action role/capability is unavailable")
@@ -1092,18 +1506,34 @@ class InvestigationEngine:
                 )
                 if exclusions:
                     raise DecisionRuleError("; ".join(exclusions))
+                try:
+                    canonical_action_key(intent.capability, intent.operation)
+                except ValueError:
+                    raise DecisionRuleError(
+                        "action operation is not a supported action",
+                        code="unknown_operation",
+                        location=_action_location(intent_index, "operation"),
+                    ) from None
                 if operation not in step.allowed_operations:
                     raise DecisionRuleError("action operation is outside step envelope")
                 if intent.principal_ref and intent.principal_ref not in step.principal_refs:
                     raise DecisionRuleError("action principal is outside step envelope")
                 if step.principal_refs and not intent.principal_ref:
                     raise DecisionRuleError("step requires a principal reference")
-                validate_principal_arguments(
-                    step, intent.principal_ref, intent.arguments, context["knowledge"]
+                _principal_check(
+                    step,
+                    intent.principal_ref,
+                    intent.arguments,
+                    assessment,
+                    _action_location(intent_index, "arguments"),
                 )
                 node = await service.get_node(GraphNodeId(intent.target_node_id))
                 if node is None:
-                    raise DecisionRuleError("referenced action target disappeared")
+                    raise DecisionRuleError(
+                        "referenced action target disappeared",
+                        code="unresolved_target",
+                        location=_action_location(intent_index, "target_node_id"),
+                    )
                 target = target_for_node(
                     node.id, node.type, observed=facts_of(node.properties).get("observed_target")
                 )
@@ -1188,7 +1618,11 @@ class InvestigationEngine:
         ).compile_drafts_with_rejections(
             drafts,
         )
-        errors.extend(f"{item.reason}: {item.field}" for item in rejected)
+        # Canonical compiler verdicts stay distinct: unsupported operations,
+        # unresolvable targets, and bad arguments each keep their own code.
+        errors.extend(
+            _rejection_feedback(item.reason, item.field) for item in rejected
+        )
         # Scores are telemetry. Preserve the LLM's order exactly.
         compiled.sort(key=lambda item: item.plan_step.intent_index)
         # Execution identity does not change when a claim, role or path is renamed.
@@ -1215,11 +1649,12 @@ class InvestigationEngine:
                     item.plan_step.arguments,
                     target_aliases(self.deps, item.plan_step.resolved_target()),
                 )
-                validate_principal_arguments(
+                _principal_check(
                     steps[item.plan_step.path_step_id],
                     item.plan_step.principal_ref,
                     item.plan_step.arguments,
-                    context["knowledge"],
+                    assessment,
+                    known_location(("arguments",)),
                 )
             except (ValueError, TypeError) as exc:
                 errors.append(
@@ -1715,6 +2150,12 @@ class InvestigationEngine:
 
 
 def validate_principal_arguments(step, principal, arguments, knowledge) -> None:
+    """Principal wiring; accepts the internal material or the legacy display dict."""
+    if isinstance(knowledge, InternalAssessment):
+        _principal_check(
+            step, principal, arguments, knowledge, known_location(("arguments",))
+        )
+        return
     bindings = principal_bindings(knowledge)
     session_refs = [
         str(arguments[name])
@@ -1760,6 +2201,7 @@ def target_aliases(deps, target) -> set[str]:
 
 def validate_argument_target(target, arguments: dict, aliases: set[str] | None = None) -> None:
     """A claimed in-scope target cannot hide a different remote address in arguments."""
+    location = known_location(("arguments",))
     target_host = getattr(target, "host", None) or getattr(target, "domain", None)
     target_url = getattr(target, "url", None)
     if target_url:
@@ -1767,7 +2209,11 @@ def validate_argument_target(target, arguments: dict, aliases: set[str] | None =
     if arguments.get("target_ref") is not None:
         allowed = aliases if aliases is not None else {str(target_host), str(target_url)}
         if str(arguments["target_ref"]) not in allowed:
-            raise DecisionRuleError("tool target reference differs from proposal target binding")
+            raise DecisionRuleError(
+                "tool target reference differs from proposal target binding",
+                code="unresolved_target",
+                location=location,
+            )
     target_port = getattr(target, "port", None)
     if target_url:
         parsed_target = urlsplit(target_url)
@@ -1778,7 +2224,11 @@ def validate_argument_target(target, arguments: dict, aliases: set[str] | None =
             and target_host
             and str(arguments[name]).lower() != str(target_host).lower()
         ):
-            raise DecisionRuleError("tool argument address differs from proposal target")
+            raise DecisionRuleError(
+                "tool argument address differs from proposal target",
+                code="unresolved_target",
+                location=location,
+            )
     for name in ("url", "base_url", "target_url"):
         value = arguments.get(name)
         if isinstance(value, str) and target_host:
@@ -1786,15 +2236,31 @@ def validate_argument_target(target, arguments: dict, aliases: set[str] | None =
                 continue
             parsed = urlsplit(value if "://" in value or value.startswith("//") else "//" + value)
             if parsed.hostname != str(target_host).lower():
-                raise DecisionRuleError("tool argument URL differs from proposal target")
+                raise DecisionRuleError(
+                    "tool argument URL differs from proposal target",
+                    code="unresolved_target",
+                    location=location,
+                )
             actual_port = parsed.port or (443 if parsed.scheme == "https" else 80)
             if target_port is not None and actual_port != target_port:
-                raise DecisionRuleError("tool argument port differs from proposal target")
+                raise DecisionRuleError(
+                    "tool argument port differs from proposal target",
+                    code="unresolved_target",
+                    location=location,
+                )
             if target_url and parsed.scheme and parsed.scheme != urlsplit(target_url).scheme:
-                raise DecisionRuleError("tool argument scheme differs from proposal target")
+                raise DecisionRuleError(
+                    "tool argument scheme differs from proposal target",
+                    code="unresolved_target",
+                    location=location,
+                )
     if arguments.get("port") is not None and target_port is not None:
         if int(arguments["port"]) != target_port:
-            raise DecisionRuleError("tool argument port differs from proposal target")
+            raise DecisionRuleError(
+                "tool argument port differs from proposal target",
+                code="unresolved_target",
+                location=location,
+            )
 
 
 async def operator_epoch(deps, runtime) -> str | None:
@@ -1951,13 +2417,15 @@ async def validate_current_action(deps, runtime, step, proposal=None) -> list[st
     current = next((item for item in path.steps if item.step_id == step.path_step_id), None)
     if current is None:
         return ["accepted path step is missing"]
-    knowledge = await project_knowledge(
-        AttackGraphService(deps.graph_store),
-        deps.evidence_store,
-        str(runtime.run_id),
-        step=runtime.step_count,
+    # Execution admission re-collects fresh internal material every time; the
+    # plan-time read is never reused here.
+    assessment = await _collect_check_assessment(
+        deps, runtime, service=AttackGraphService(deps.graph_store)
     )
-    problems = ready_step(path, current, knowledge)
+    blocked = assessment_blocked(assessment)
+    if blocked is not None:
+        return [blocked]
+    problems = check_ready_step(path, current, assessment)
     problems.extend(
         await operator_exclusions(
             deps,
@@ -1970,6 +2438,8 @@ async def validate_current_action(deps, runtime, step, proposal=None) -> list[st
     )
     if str(node_id_for_target(step.resolved_target())) not in current.target_node_ids:
         problems.append("action target left the step envelope")
+    if str(node_id_for_target(step.resolved_target())) not in known_target_ids(assessment):
+        problems.append("action target is not supplied or observed")
     if step.operation_key not in current.allowed_operations:
         problems.append("action operation left the step envelope")
     if step.principal_ref and step.principal_ref not in current.principal_refs:
@@ -1994,7 +2464,7 @@ async def validate_current_action(deps, runtime, step, proposal=None) -> list[st
         validate_argument_target(
             step.resolved_target(), step.arguments, target_aliases(deps, step.resolved_target())
         )
-        validate_principal_arguments(current, step.principal_ref, step.arguments, knowledge)
+        validate_principal_arguments(current, step.principal_ref, step.arguments, assessment)
     except ValueError as exc:
         problems.append(
             exc.diagnostic.summary

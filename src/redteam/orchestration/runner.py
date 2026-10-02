@@ -18,6 +18,7 @@ from redteam.attack_graph.service import AttackGraphService
 from redteam.core.enums import AgentPhase, MissionStatus
 from redteam.core.ids import EventId, MissionId, RunId
 from redteam.orchestration.checkpointing import build_checkpointer, open_checkpointer
+from redteam.orchestration.component_binding import builtin_component_binding
 from redteam.orchestration.context import RuntimeDeps
 from redteam.orchestration.coordination import CLOSED, ChangeSet, CoordinationError, coordinator_for
 from redteam.orchestration.graph import build_graph
@@ -181,6 +182,15 @@ class AgentLoopRunner:
         }
 
     async def _binding_for(self, runtime: RuntimeState, *, checkpoint=None, fresh=False) -> bool:
+        selected = self._deps.component_binding
+        recorded = runtime.component_binding
+        if recorded is None:
+            # Old checkpoints only describe the built-in assembly. They
+            # cannot recover a custom assembly that was never recorded.
+            if selected is not None and selected != builtin_component_binding():
+                return False
+        elif recorded != selected:
+            return False
         if checkpoint is not None:
             saved = checkpoint.values.get("runtime") if checkpoint.values else None
             fields = (
@@ -198,6 +208,7 @@ class AgentLoopRunner:
                 "step_count",
                 "actions_executed",
                 "retry_tool_calls",
+                "component_binding",
             )
             if not isinstance(saved, RuntimeState) or self._snapshot_replays_execution(checkpoint):
                 return False
@@ -619,7 +630,8 @@ class AgentLoopRunner:
             return None
         if self._snapshot_replays_execution(snapshot):
             return None
-        await self._binding_for(runtime, checkpoint=snapshot)
+        if not await self._binding_for(runtime, checkpoint=snapshot):
+            return None
         return runtime
 
     async def resume_recovered(self, runtime: RuntimeState) -> RuntimeState:

@@ -201,6 +201,29 @@ def _bound_plan_step(
 async def _register_active_path(
     deps, run_id, step_hosts: dict, *, path_id: str = "path_stage6_active"
 ):
+    # SAME-run supplied provenance: declare each path target so the fresh
+    # InternalAssessment admits it (declared scope, not a measured fact).
+    from redteam.attack_graph.identity import node_id_for_target, node_type_for_target
+    from redteam.attack_graph.predicates import Confidence, Provenance
+    from redteam.attack_graph.service import AttackGraphService
+    from redteam.core.contracts.target import HostTarget
+
+    _svc = AttackGraphService(deps.graph_store)
+    _run = str(run_id)
+    for _host in step_hosts.values():
+        _tgt = HostTarget(host=_host)
+        await _svc.upsert_node(
+            node_type_for_target(_tgt),
+            node_id=node_id_for_target(_tgt),
+            attrs={"in_scope": True},
+            provenance=Provenance(
+                step=0,
+                source="engagement:scope",
+                run_id=_run,
+                confidence=Confidence.SERVER_DECLARED,
+            ),
+            step=0,
+        )
     steps = [
         PathStep(
             step_id=step_id,

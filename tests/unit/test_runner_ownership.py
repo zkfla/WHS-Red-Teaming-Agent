@@ -7,6 +7,7 @@ import pytest
 
 from redteam.core.contracts.mission import MissionPlan, Provenance
 from redteam.core.enums import AgentPhase, MissionStatus
+from redteam.orchestration.component_binding import builtin_component_binding
 from redteam.orchestration.coordination import CoordinationError, coordinator_for
 from redteam.orchestration.runner import AgentLoopRunner
 from redteam.orchestration.state import RuntimeState, TerminationReason
@@ -133,6 +134,52 @@ async def test_foreign_engagement_checkpoint_cannot_use_existing_run_binding():
     foreign = runtime.model_copy(update={"engagement_id": "foreign-engagement"})
     assert await runner.resume_recovered(foreign) is foreign
     assert graph.calls == 0
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+async def test_resume_refuses_a_different_component_assembly(legacy):
+    deps, runner, graph, runtime, _ = await setup(
+        MissionStatus.ACTIVE, TerminationReason.NO_ACTIONABLE_PLAN
+    )
+    selected = builtin_component_binding().model_copy(update={"profile_id": "custom"})
+    object.__setattr__(deps, "component_binding", selected)
+    if not legacy:
+        runtime.component_binding = builtin_component_binding()
+    assert await runner.resume_recovered(runtime) is runtime
+    assert graph.calls == 0
+
+
+async def test_resume_refuses_changed_checkpoint_component_selection():
+    deps, runner, graph, runtime, _ = await setup(
+        MissionStatus.ACTIVE, TerminationReason.NO_ACTIONABLE_PLAN
+    )
+    selected = builtin_component_binding()
+    object.__setattr__(deps, "component_binding", selected)
+    runtime.component_binding = selected.model_copy(update={"profile_id": "old"})
+    incoming = runtime.model_copy(update={"component_binding": selected})
+    assert await runner.resume_recovered(incoming) is incoming
+    assert graph.calls == 0
+
+
+async def test_recorded_builtin_cannot_resume_with_unidentified_components():
+    deps, runner, graph, runtime, _ = await setup(
+        MissionStatus.ACTIVE, TerminationReason.INCOMPLETE_ACTIVE_WORK
+    )
+    assert deps.component_binding is None
+    runtime.component_binding = builtin_component_binding()
+    assert await runner.resume_recovered(runtime) is runtime
+    assert graph.calls == 0
+
+
+async def test_recorded_builtin_resumes_with_matching_registered_components():
+    deps, runner, graph, runtime, _ = await setup(
+        MissionStatus.BLOCKED, TerminationReason.INCOMPLETE_ACTIVE_WORK
+    )
+    binding = builtin_component_binding()
+    object.__setattr__(deps, "component_binding", binding)
+    runtime.component_binding = binding
+    await runner.resume_recovered(runtime)
+    assert graph.calls == 1
 
 
 async def test_reconcilable_blocked_mission_reactivates_atomically_before_graph():

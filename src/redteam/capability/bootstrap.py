@@ -35,6 +35,7 @@ from redteam.capability.settings import (
     MCPServerSettings,
     MCPTransportKind,
 )
+from redteam.core.action_semantics import CANONICAL_OPERATIONS
 
 
 async def build_mcp_tool_gateway(
@@ -138,11 +139,22 @@ async def _build_gateway(
             spec.tool_id: spec for spec in MOBILE_ANALYSIS_TOOLS.get(server_id, ())
         }
         for descriptor in descriptors:
-            operations = (
-                settings.tool_operations[descriptor.tool_name]
-                if settings.tool_operations is not None
-                else (descriptor.tool_name,)
-            )
+            if settings.tool_operations is not None:
+                operations = tuple(settings.tool_operations[descriptor.tool_name])
+                if descriptor.operations and set(operations) != set(descriptor.operations):
+                    raise MCPConfigurationError(
+                        f"MCP server {server_id!r} tool {descriptor.tool_name!r} explicit "
+                        "operation bindings conflict with discovered operations"
+                    )
+            elif descriptor.operations:
+                operations = tuple(descriptor.operations)
+            elif descriptor.tool_name in CANONICAL_OPERATIONS:
+                operations = (descriptor.tool_name,)
+            else:
+                raise MCPConfigurationError(
+                    f"MCP server {server_id!r} tool {descriptor.tool_name!r} needs "
+                    "explicit operation bindings to a canonical action"
+                )
             # The operation binding is part of the Registry snapshot exposed
             # to Agent/Orchestration; it must not remain only in a private
             # Gateway map.

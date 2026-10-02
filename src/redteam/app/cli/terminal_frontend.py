@@ -276,7 +276,7 @@ class PlainFrontend(ConsoleFrontend):
 
     def __init__(self, console) -> None:
         super().__init__(console)
-        self.prompt: PromptSession[Any] = PromptSession()
+        self.prompt: PromptSession[str] = PromptSession()
 
     async def read_line(self) -> str:
         return await self.prompt.prompt_async(
