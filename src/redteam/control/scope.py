@@ -1,9 +1,10 @@
 """Scope Check — the first pipeline stage in ``DefaultControlPlane.evaluate``.
 
-Resolves each target to a host identity and matches it against the
-engagement's allow/deny lists:
+Resolves each target to a ``(host, port)`` identity and matches it against
+the engagement's allow/deny lists:
 
-  - ``allowed_hosts`` / ``denied_hosts``   — exact host or IP-literal match
+  - ``allowed_hosts`` / ``denied_hosts``   — exact host or IP-literal match,
+    with optional ``host:port`` scoping (see "Port semantics" below)
   - ``allowed_domains`` / ``denied_domains`` — domain-suffix match
     (``api.example.com`` is within ``example.com``; ``notexample.com`` is
     NOT — a plain ``str.endswith`` would wrongly allow it)
@@ -16,12 +17,35 @@ engagement's allow/deny lists:
 Deny lists win over allow lists; with no allow-list configured the
 default is DENY (safer for a red-team gate).
 
+Port semantics (host entries only — the model is host-centric):
+  - A bare host entry (``127.0.0.1``) matches that host on *any* port.
+    Domain- and network-level allow/deny are likewise port-agnostic.
+  - A ``host:port`` entry (``127.0.0.1:8080``) matches only that port.
+  - If an *allow* entry pins a port but the request target carries no
+    port, we do NOT assume the port matches — that is an explicit DENY
+    with a reason, not a silent pass. A port must come from the target
+    (``EndpointTarget.port``, a URL, or a ``host:port`` string), never be
+    inferred by Control.
+  - A port-pinned *deny* entry only blocks that exact port; a bare-host
+    deny blocks every port.
+
+The ``host:port`` expression lives inside the existing ``list[str]``
+fields — this is a string-content convention, NOT a contract change, so
+no ``core/contracts`` edit / PM Issue is required. This string convention
+is the *final, chosen* design for port scoping (decided 2026-10-02);
+promoting ports to a dedicated ``EngagementScope`` field was considered
+and declined — it would be a PM-owned contract change, revisited only if
+a real need to leave the host-centric model arises (see
+docs/control/PLAN.md §5).
+
 Notes / limitations:
   - No DNS resolution: ``allowed_networks`` only matches targets that are
     already IP literals, not hostnames that would resolve into the range.
   - ``principal`` / ``graph_node`` targets have no host identity and
     therefore fall through to DENY (scope is host-based). ``asset`` is
     handled separately, by ``allowed_assets``/``denied_assets``.
+  - Address parsing is IPv6-aware (bracketed ``[::1]:8080`` and bare
+    ``::1`` literals) — a naive ``split(":")`` would corrupt them.
 """
 
 from __future__ import annotations
@@ -42,27 +66,9 @@ from redteam.core.contracts.target import (
     UrlTarget,
 )
 
-
-def _url_host(url: str) -> str | None:
-    parts = urlsplit(url if "://" in url else "//" + url)
-    return parts.hostname
-
-
-def _target_hosts(target: AnyTarget) -> list[str]:
-    """Host-like identity strings to match against scope, or [] if the
-    target kind has none (principal/asset/graph_node)."""
-    if isinstance(target, HostTarget):
-        return [target.host]
-    if isinstance(target, DomainTarget):
-        return [target.domain]
-    if isinstance(target, UrlTarget):
-        host = _url_host(target.url)
-        return [host] if host else []
-    if isinstance(target, EndpointTarget):
-        return [target.host]
-    if isinstance(target, ServiceTarget):
-        return [target.host] if target.host else []
-    return []
+# A resolved host identity: hostname plus an optional port. ``None`` port
+# means "no port information" — not "any port".
+HostPort = tuple[str, int | None]
 
 
 def _as_ip(value: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
@@ -72,15 +78,141 @@ def _as_ip(value: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
         return None
 
 
-def _matches_host(candidate: str, entries: list[str]) -> bool:
-    cand_ip = _as_ip(candidate)
+def _split_host_port(raw: str) -> tuple[str | None, int | None, bool]:
+    """Split an address string into ``(host, port, ok)``.
+
+    ``ok=False`` means the input is malformed / ambiguous and the caller
+    should treat it as a scope DENY (for a target) or skip it (for a
+    config entry). IPv6 is handled explicitly: bracketed forms go through
+    ``urlsplit``; a bare ``::1`` literal is recognised before any
+    colon-splitting so it is never mistaken for ``host:port``.
+    """
+    s = raw.strip()
+    if not s:
+        return None, None, False
+
+    has_scheme = "://" in s
+
+    # Bare (unbracketed) IPv6 literal, e.g. "::1" / "fe80::1". It has many
+    # colons but is not host:port — recognise it before urlsplit. A URL
+    # (scheme present) is never a bare literal, so skip this branch for it.
+    if not has_scheme and "[" not in s and s.count(":") >= 2:
+        ip = _as_ip(s)
+        if ip is not None:
+            return str(ip), None, True
+        # Many colons, not a valid IPv6 literal, not bracketed: ambiguous.
+        return None, None, False
+
+    target = s if has_scheme else "//" + s
+    try:
+        parts = urlsplit(target)
+        host = parts.hostname
+        port = parts.port  # raises ValueError on non-numeric / out-of-range
+    except ValueError:
+        return None, None, False
+    if not host:
+        return None, None, False
+    return host, port, True
+
+
+def _valid_port(port: int | None) -> bool:
+    return port is None or 0 <= port <= 65535
+
+
+def _resolve_target(target: AnyTarget) -> tuple[list[HostPort], str | None]:
+    """Resolve a target to ``(host, port)`` identities.
+
+    Returns ``(resolved, error)``. A non-empty ``error`` means the target
+    is malformed/ambiguous and must be DENY'd with that reason. An empty
+    ``resolved`` with no error means the target kind has no host identity
+    (principal/asset/graph_node, or a service with no host).
+    """
+    if isinstance(target, HostTarget):
+        host, port, ok = _split_host_port(target.host)
+        if not ok or host is None:
+            return [], f"malformed host target '{target.host}'"
+        return [(host, port)], None
+
+    if isinstance(target, DomainTarget):
+        host, port, ok = _split_host_port(target.domain)
+        if not ok or host is None:
+            return [], f"malformed domain target '{target.domain}'"
+        return [(host, port)], None
+
+    if isinstance(target, UrlTarget):
+        host, port, ok = _split_host_port(target.url)
+        if not ok or host is None:
+            return [], f"malformed url target '{target.url}'"
+        return [(host, port)], None
+
+    if isinstance(target, EndpointTarget):
+        host, parsed_port, ok = _split_host_port(target.host)
+        if not ok or host is None:
+            return [], f"malformed endpoint host '{target.host}'"
+        if not _valid_port(target.port):
+            return [], f"invalid endpoint port {target.port}"
+        if (
+            target.port is not None
+            and parsed_port is not None
+            and target.port != parsed_port
+        ):
+            return [], (
+                f"endpoint port conflict: host string '{target.host}' "
+                f"vs port field {target.port}"
+            )
+        port = target.port if target.port is not None else parsed_port
+        return [(host, port)], None
+
+    if isinstance(target, ServiceTarget):
+        if not target.host:
+            return [], None  # no host identity — falls through to DENY
+        host, port, ok = _split_host_port(target.host)
+        if not ok or host is None:
+            return [], f"malformed service host '{target.host}'"
+        return [(host, port)], None
+
+    return [], None
+
+
+def _host_eq(a: str, b: str) -> bool:
+    if a.lower() == b.lower():
+        return True
+    a_ip, b_ip = _as_ip(a), _as_ip(b)
+    return a_ip is not None and b_ip is not None and a_ip == b_ip
+
+
+def _host_entries(entries: list[str]) -> list[HostPort]:
+    """Parse ``host`` / ``host:port`` config entries, skipping malformed
+    ones (a bad entry must not crash the gate; an unmatched allow entry is
+    safe, and a skipped deny entry still can't be bypassed by expression)."""
+    out: list[HostPort] = []
     for entry in entries:
-        if candidate.lower() == entry.lower():
-            return True
-        entry_ip = _as_ip(entry)
-        if cand_ip is not None and entry_ip is not None and cand_ip == entry_ip:
-            return True
-    return False
+        host, port, ok = _split_host_port(entry)
+        if ok and host is not None:
+            out.append((host, port))
+    return out
+
+
+def _matches_host_entry(
+    cand: HostPort, entries: list[HostPort]
+) -> tuple[bool, bool]:
+    """Match a resolved target against host entries.
+
+    Returns ``(matched, port_required)``. ``port_required`` is True when an
+    entry matched the host and pinned a port, but the target carried no
+    port — an ambiguity the caller surfaces as an explicit DENY on the
+    allow side rather than guessing.
+    """
+    cand_host, cand_port = cand
+    port_required = False
+    for ehost, eport in entries:
+        if not _host_eq(cand_host, ehost):
+            continue
+        if eport is None or eport == cand_port:
+            return True, False
+        if cand_port is None:
+            port_required = True  # host matches but port can't be confirmed
+    return False, port_required
 
 
 def _matches_domain(candidate: str, domains: list[str]) -> bool:
@@ -88,7 +220,10 @@ def _matches_domain(candidate: str, domains: list[str]) -> bool:
         return False  # an IP literal is never a domain-suffix match
     cand = candidate.lower().rstrip(".")
     for domain in domains:
-        base = domain.lower().rstrip(".")
+        host, _, ok = _split_host_port(domain)
+        if not ok or host is None:
+            continue
+        base = host.lower().rstrip(".")
         if cand == base or cand.endswith("." + base):
             return True
     return False
@@ -139,6 +274,11 @@ def _check_asset_scope(
     return False, [f"asset '{asset_id}' is not within engagement scope"], Severity.BLOCK_ACTION
 
 
+def _label(cand: HostPort) -> str:
+    host, port = cand
+    return f"{host}:{port}" if port is not None else host
+
+
 def check_scope(
     action: ActionProposal, scope: EngagementScope
 ) -> tuple[bool, list[str], Severity | None]:
@@ -148,26 +288,33 @@ def check_scope(
     if isinstance(action.target, AssetTarget):
         return _check_asset_scope(action.target, scope)
 
-    hosts = _target_hosts(action.target)
-    if not hosts:
+    resolved, error = _resolve_target(action.target)
+    if error is not None:
+        return False, [f"target rejected: {error}"], Severity.BLOCK_ACTION
+    if not resolved:
         return (
             False,
             [f"target kind '{action.target.kind}' has no scope-checkable host identity"],
             Severity.BLOCK_ACTION,
         )
 
-    # Deny lists win outright.
-    for host in hosts:
-        if _matches_host(host, scope.denied_hosts):
+    denied_hosts = _host_entries(scope.denied_hosts)
+    allowed_hosts = _host_entries(scope.allowed_hosts)
+
+    # Deny lists win outright. A bare-host deny blocks every port; a
+    # port-pinned deny blocks only that port.
+    for cand in resolved:
+        matched, _ = _matches_host_entry(cand, denied_hosts)
+        if matched:
             return (
                 False,
-                [f"target '{host}' is explicitly denied (denied_hosts)"],
+                [f"target '{_label(cand)}' is explicitly denied (denied_hosts)"],
                 Severity.BLOCK_ACTION,
             )
-        if _matches_domain(host, scope.denied_domains):
+        if _matches_domain(cand[0], scope.denied_domains):
             return (
                 False,
-                [f"target '{host}' is explicitly denied (denied_domains)"],
+                [f"target '{_label(cand)}' is explicitly denied (denied_domains)"],
                 Severity.BLOCK_ACTION,
             )
 
@@ -180,12 +327,25 @@ def check_scope(
             Severity.BLOCK_ACTION,
         )
 
-    for host in hosts:
-        if (
-            _matches_host(host, scope.allowed_hosts)
-            or _matches_domain(host, scope.allowed_domains)
-            or _matches_network(host, scope.allowed_networks)
-        ):
+    port_required = False
+    for cand in resolved:
+        matched, needs_port = _matches_host_entry(cand, allowed_hosts)
+        if matched:
+            return True, [], None
+        port_required = port_required or needs_port
+        if _matches_domain(cand[0], scope.allowed_domains):
+            return True, [], None
+        if _matches_network(cand[0], scope.allowed_networks):
             return True, [], None
 
-    return False, [f"target {hosts} is not within engagement scope"], Severity.BLOCK_ACTION
+    labels = [_label(c) for c in resolved]
+    if port_required:
+        return (
+            False,
+            [
+                f"target {labels} matches an allowed host but carries no port, "
+                "while the allow-list pins a specific port — port cannot be inferred"
+            ],
+            Severity.BLOCK_ACTION,
+        )
+    return False, [f"target {labels} is not within engagement scope"], Severity.BLOCK_ACTION

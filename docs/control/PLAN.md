@@ -221,6 +221,7 @@ DENY할 때 **왜 막혔는지에 따라 에이전트의 다음 행동이 달라
 | `EvidenceStore` 포트에 조회 메서드 | hypothesis별 조회 등 | concrete store에만 추가 |
 | `EvidenceRecord.digest` 원본 재검증 규격 | 원본 payload 보존·검증이 필요할 때 | 현재는 저장 JSONL 줄의 해시만 인덱스와 대조. 원본 보존 방식은 PM과 결정 |
 | Evidence Target 저장 규격 | Finding의 Target 연결 검증 시 | 공통 Target dict만 비교하고 표시 문자열은 검증 불가 처리 |
+| **`EngagementScope` 전용 포트/origin/경로 필드 승격** | Scope를 host 중심이 아니라 port·origin·path 단위로 1급 표현해야 할 때 (예: `allowed_ports`, origin/path 제한) | **결정됨(2026-10-02): 하지 않음.** 포트 제한은 기존 `allowed_hosts`/`denied_hosts`의 `host:port` 문자열 규약으로 지원하는 것을 **최종 방식으로 확정**했다 (`control/scope.py`, Contract 변경 0, 타 팀 영향 0). 전용 필드 승격은 지금 하지 않으며, 추후 host 중심 모델을 벗어나야 할 실제 요구가 생길 때에만 PM Issue로 재검토한다. 그때도 `scope.py`의 `_split_host_port`/`_resolve_target` 입력만 교체하면 되도록 로직을 분리해 둠. |
 
 **해결됨:** `ActionProposal.risk_level` 추가 요청은 필요 없어졌다. dev에 추가된 read-only `ToolGateway.list_tools_for_action`으로 Registry의 `risk_level`을 Contract 변경 없이 읽을 수 있다 (§2.1).
 
