@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 import subprocess
 import time
 import uuid
@@ -37,6 +38,8 @@ _SHELL_META = frozenset(";&|`$><\r\n\x00")
 _CONTAINER_PATH = "/usr/local/bin:/usr/bin:/bin"
 _MANAGED_LABEL = "io.whs-redteam.execution.managed=true"
 _CONTEXT_LABEL_KEY = "io.whs-redteam.execution.context"
+_OUTPUT_DIRECTORY = ".command_outputs"
+_BINARY = getattr(os, "O_BINARY", 0)
 
 # Options are deliberately enumerated.  Values following options such as
 # ``head -c 1024`` are still validated by the generic argument/path checks.
@@ -227,6 +230,7 @@ class ExecutionPolicy(BaseModel):
     writable: bool = False
     max_timeout_seconds: float = Field(default=30.0, gt=0, le=300.0)
     max_output_bytes: int = Field(default=65_536, ge=1024, le=1_048_576)
+    max_output_file_bytes: int = Field(default=8_388_608, ge=1024, le=67_108_864)
     tmpfs_bytes: int = Field(default=16_777_216, ge=1_048_576, le=67_108_864)
     pids_limit: int = Field(default=64, ge=8, le=256)
     memory: str = Field(default="256m", pattern=r"^[1-9][0-9]{0,3}[mMgG]$")
@@ -291,6 +295,8 @@ class ExecutionPolicy(BaseModel):
             raise ValueError("workspace_root must be a narrow absolute path")
         if set(self.allowed_options) - set(self.allowed_executables):
             raise ValueError("execution option allowlist names an unavailable executable")
+        if self.max_output_file_bytes < self.max_output_bytes:
+            raise ValueError("execution output file limit cannot be below the return limit")
         return self
 
     def options_for(self, executable: str) -> frozenset[str]:
@@ -331,6 +337,8 @@ class CommandResult(BaseModel):
     timed_out: bool
     truncated: bool
     duration_ms: int
+    output_path: str
+    output_file_truncated: bool
 
 
 class JobStartResult(BaseModel):
@@ -371,6 +379,111 @@ class _OutputBudget:
     remaining: int
     peak_buffered: int = 0
     truncated: bool = False
+
+
+class _OutputCapture:
+    """Exclusive, no-follow host-side capture inside one policy workspace."""
+
+    def __init__(self, policy: ExecutionPolicy, output_id: str) -> None:
+        if not _IDENTITY.fullmatch(output_id):
+            raise ExecutionError("execution_invalid_output_identity")
+        self._policy = policy
+        self.relative_path = f"{_OUTPUT_DIRECTORY}/{output_id}.txt"
+        self._remaining = policy.max_output_file_bytes
+        self._fd = self._open_exclusive()
+        self._started: set[str] = set()
+        self.truncated = False
+        self._closed = False
+
+    def _open_exclusive(self) -> int:
+        root = Path(self._policy.workspace_root)
+        if not root.is_dir() or root.is_symlink():
+            raise ExecutionError("execution_workspace_unavailable")
+        if os.name != "posix" or not hasattr(os, "O_NOFOLLOW"):
+            directory = root / _OUTPUT_DIRECTORY
+            if directory.is_symlink():
+                raise ExecutionError("execution_output_path_unsafe")
+            directory.mkdir(mode=0o700, exist_ok=True)
+            os.chmod(directory, 0o700)
+            path = directory / f"{Path(self.relative_path).name}"
+            try:
+                return os.open(
+                    path,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | _BINARY,
+                    0o600,
+                )
+            except FileExistsError as exc:
+                raise ExecutionError("execution_output_exists") from exc
+        root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        directory_fd: int | None = None
+        try:
+            try:
+                os.mkdir(_OUTPUT_DIRECTORY, 0o700, dir_fd=root_fd)
+            except FileExistsError:
+                pass
+            directory_fd = os.open(
+                _OUTPUT_DIRECTORY,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=root_fd,
+            )
+            info = os.fstat(directory_fd)
+            if (
+                not stat.S_ISDIR(info.st_mode)
+                or info.st_uid != os.getuid()
+                or info.st_mode & 0o077
+            ):
+                raise ExecutionError("execution_output_path_unsafe")
+            try:
+                fd = os.open(
+                    f"{Path(self.relative_path).name}",
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | _BINARY,
+                    0o600,
+                    dir_fd=directory_fd,
+                )
+            except FileExistsError as exc:
+                raise ExecutionError("execution_output_exists") from exc
+            file_info = os.fstat(fd)
+            if (
+                not stat.S_ISREG(file_info.st_mode)
+                or file_info.st_nlink != 1
+                or file_info.st_uid != os.getuid()
+                or file_info.st_mode & 0o077
+            ):
+                os.close(fd)
+                raise ExecutionError("execution_output_path_unsafe")
+            return fd
+        except OSError as exc:
+            raise ExecutionError("execution_output_path_unsafe") from exc
+        finally:
+            if directory_fd is not None:
+                os.close(directory_fd)
+            os.close(root_fd)
+
+    def write(self, stream_name: str, chunk: bytes) -> None:
+        text = chunk.decode("utf-8", errors="replace").encode("utf-8")
+        if stream_name not in self._started:
+            self._started.add(stream_name)
+            text = f"[{stream_name}]\n".encode() + text
+        accepted = min(len(text), self._remaining)
+        view = memoryview(text)[:accepted]
+        while view:
+            written = os.write(self._fd, view)
+            view = view[written:]
+        self._remaining -= accepted
+        if accepted < len(text):
+            self.truncated = True
+
+    def close(self) -> None:
+        if not self._closed:
+            os.close(self._fd)
+            self._closed = True
+
+    def abort(self) -> None:
+        self.close()
+        try:
+            (Path(self._policy.workspace_root) / self.relative_path).unlink()
+        except FileNotFoundError:
+            pass
 
 
 def _safe_host_environment() -> dict[str, str]:
@@ -531,6 +644,8 @@ class DockerExecutionEngine:
         timeout_seconds: float,
         engagement_id: str,
         run_id: str,
+        *,
+        output_id: str | None = None,
     ) -> CommandResult:
         self._check_context(asset_ref, engagement_id, run_id)
         if not 0 < timeout_seconds <= self.policy.max_timeout_seconds:
@@ -542,13 +657,21 @@ class DockerExecutionEngine:
             args=args,
         )
         started = time.monotonic()
-        process = await self._process_factory(
-            self.policy.docker_binary,
-            *docker_args,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=_safe_host_environment(),
+        capture = _OutputCapture(
+            self.policy,
+            output_id or f"command-{uuid.uuid4().hex}",
         )
+        try:
+            process = await self._process_factory(
+                self.policy.docker_binary,
+                *docker_args,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=_safe_host_environment(),
+            )
+        except BaseException:
+            capture.abort()
+            raise
         stdout_buffer = bytearray()
         stderr_buffer = bytearray()
         stdout_truncated = False
@@ -556,7 +679,13 @@ class DockerExecutionEngine:
         budget = _OutputBudget(remaining=self.policy.max_output_bytes)
         try:
             stdout_truncated, stderr_truncated = await asyncio.wait_for(
-                self._collect_output(process, stdout_buffer, stderr_buffer, budget),
+                self._collect_output(
+                    process,
+                    stdout_buffer,
+                    stderr_buffer,
+                    budget,
+                    capture,
+                ),
                 timeout=timeout_seconds,
             )
         except TimeoutError:
@@ -574,13 +703,20 @@ class DockerExecutionEngine:
                 timed_out=True,
                 truncated=truncated,
                 duration_ms=duration_ms,
+                output_path=capture.relative_path,
+                output_file_truncated=capture.truncated,
             )
         except asyncio.CancelledError:
             cleanup = asyncio.create_task(self._cleanup_container(process, container_name))
             await asyncio.shield(cleanup)
+            capture.abort()
+            raise
+        except BaseException:
+            capture.abort()
             raise
         finally:
             self._last_peak_output_bytes = budget.peak_buffered
+            capture.close()
         duration_ms = max(0, round((time.monotonic() - started) * 1000))
         stdout, stderr, truncated = self._bounded_result(
             stdout_buffer,
@@ -594,6 +730,8 @@ class DockerExecutionEngine:
             timed_out=False,
             truncated=truncated,
             duration_ms=duration_ms,
+            output_path=capture.relative_path,
+            output_file_truncated=capture.truncated,
         )
 
     async def job_start(
@@ -697,6 +835,7 @@ class DockerExecutionEngine:
                 timeout_seconds,
                 engagement_id,
                 run_id,
+                output_id=job_id,
             )
         except asyncio.CancelledError:
             async with self._jobs_lock:
@@ -764,14 +903,15 @@ class DockerExecutionEngine:
         stdout_buffer: bytearray,
         stderr_buffer: bytearray,
         budget: _OutputBudget,
+        capture: _OutputCapture,
     ) -> tuple[bool, bool]:
         if process.stdout is None or process.stderr is None:
             raise ExecutionError("execution_process_stream_unavailable")
         stdout_task = asyncio.create_task(
-            self._read_bounded(process.stdout, stdout_buffer, budget)
+            self._read_bounded(process.stdout, stdout_buffer, budget, capture, "stdout")
         )
         stderr_task = asyncio.create_task(
-            self._read_bounded(process.stderr, stderr_buffer, budget)
+            self._read_bounded(process.stderr, stderr_buffer, budget, capture, "stderr")
         )
         try:
             stdout_truncated, stderr_truncated, _ = await asyncio.gather(
@@ -790,12 +930,15 @@ class DockerExecutionEngine:
         stream: Any,
         output: bytearray,
         budget: _OutputBudget,
+        capture: _OutputCapture,
+        stream_name: str,
     ) -> bool:
         truncated = False
         while True:
             chunk = await stream.read(8192)
             if not chunk:
                 return truncated
+            capture.write(stream_name, chunk)
             accepted = min(len(chunk), budget.remaining)
             if accepted:
                 output.extend(chunk[:accepted])
