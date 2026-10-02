@@ -63,6 +63,8 @@ class MCPServerSettings:
     execution_asset_ref: str | None = None
     execution_policy_path: str | None = None
     execution_policy_sha256: str | None = None
+    web_search_config_path: str | None = None
+    web_search_config_sha256: str | None = None
 
     @classmethod
     def from_environment(cls, server_id: str) -> MCPServerSettings:
@@ -123,6 +125,8 @@ class MCPServerSettings:
         execution_asset_ref = None
         execution_policy_path = None
         execution_policy_sha256 = None
+        web_search_config_path = None
+        web_search_config_sha256 = None
         if profile in {"vdb_readonly", "vdb_readonly_extended"}:
             if kind != MCPServerKind.ANALYSIS or transport != MCPTransportKind.STDIO:
                 raise MCPConfigurationError("vdb profile requires analysis kind and stdio")
@@ -227,6 +231,51 @@ class MCPServerSettings:
                 "--sha256",
                 execution_policy_sha256,
             )
+        elif profile == "web_search_tavily":
+            if kind != MCPServerKind.WEB_API or transport != MCPTransportKind.STDIO:
+                raise MCPConfigurationError("web search profile requires web_api kind and stdio")
+            if f"{prefix}_RISK_LEVEL" not in os.environ:
+                raise MCPConfigurationError("web search profile requires an explicit risk level")
+            if process_environment:
+                raise MCPConfigurationError("web search profile manages its own secret environment")
+            from redteam.capability.servers.web_search_mcp import (
+                MODULE,
+                PROPOSED_OPERATION,
+                REMOTE_TOOL_NAME,
+                load_web_search_config,
+            )
+
+            web_search_config_path = str(
+                Path(_required_environment_value(f"{prefix}_SEARCH_CONFIG")).resolve()
+            )
+            try:
+                search_config, web_search_config_sha256 = load_web_search_config(
+                    web_search_config_path
+                )
+            except ValueError:
+                raise MCPConfigurationError("invalid web search operator configuration") from None
+            key = os.environ.get("TAVILY_API_KEY", "")
+            if search_config.external_search_enabled and not key:
+                raise MCPConfigurationError("TAVILY_API_KEY is required for enabled web search")
+            process_environment = (
+                {"TAVILY_API_KEY": key} if search_config.external_search_enabled else {}
+            )
+            expected_tools = (REMOTE_TOOL_NAME,)
+            expected_bindings = {REMOTE_TOOL_NAME: (PROPOSED_OPERATION,)}
+            if allowed_tools is not None and allowed_tools != expected_tools:
+                raise MCPConfigurationError("web search profile requires its exact tool allowlist")
+            if tool_operations is not None and tool_operations != expected_bindings:
+                raise MCPConfigurationError(
+                    "web search profile requires its exact operation binding"
+                )
+            if args:
+                raise MCPConfigurationError("web search profile constructs its own stdio arguments")
+            allowed_tools = expected_tools
+            tool_operations = expected_bindings
+            args = (
+                "-m", MODULE, "--config", web_search_config_path,
+                "--sha256", web_search_config_sha256,
+            )
         elif profile is not None:
             if profile not in {"workspace_read", "workspace_write"}:
                 raise MCPConfigurationError(f"{prefix}_PROFILE is not a supported profile")
@@ -285,6 +334,8 @@ class MCPServerSettings:
             execution_asset_ref=execution_asset_ref,
             execution_policy_path=execution_policy_path,
             execution_policy_sha256=execution_policy_sha256,
+            web_search_config_path=web_search_config_path,
+            web_search_config_sha256=web_search_config_sha256,
         )
 
     def request_headers(self) -> dict[str, str]:
