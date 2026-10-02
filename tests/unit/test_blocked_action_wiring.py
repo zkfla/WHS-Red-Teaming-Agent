@@ -8,8 +8,12 @@ an Evidence-store failure never changes the verdict or blocks the return
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timezone
 
+import pytest
+
+from redteam.control.audit import AuditEntry, AuditLog
 from redteam.control.service import DefaultControlPlane
 from redteam.core.contracts.action import ActionProposal
 from redteam.core.contracts.engagement import (
@@ -26,6 +30,13 @@ from redteam.core.enums import PolicyVerdict
 from redteam.core.ids import ActionId, AgentId, EngagementId, RunId
 from redteam.evidence.service import EvidenceService
 from tests.fakes.evidence_store import FakeEvidenceStore
+from tests.fakes.scope_denials import (
+    PERSISTENCE_CASES,
+    SCOPE_DENY_CASES,
+    ScopeDenyCase,
+    assert_scope_audit,
+    assert_scope_evidence,
+)
 
 
 def _engagement(*, approval: ApprovalPolicy | None = None) -> Engagement:
@@ -120,17 +131,63 @@ async def test_no_evidence_service_is_fine() -> None:
 
 
 class _ExplodingStore(FakeEvidenceStore):
+    def __init__(self, audit: AuditLog) -> None:
+        super().__init__()
+        self.audit = audit
+        self.audit_at_append: list[AuditEntry] = []
+
     async def append(self, evidence: EvidenceRecord) -> None:
-        raise RuntimeError("disk on fire")
+        self.audit_at_append = await self.audit.entries_for_run(evidence.run_id)
+        raise RuntimeError("synthetic evidence write failure")
 
 
-async def test_evidence_failure_does_not_break_the_decision() -> None:
-    engagement = _engagement()
-    plane = _plane(_ExplodingStore(), engagement)
-
-    # Must not raise, and the DENY verdict must be returned unchanged.
-    decision = await plane.evaluate(
-        _proposal(host="evil.example"),
-        ControlContext(engagement_id=engagement.engagement_id),
+@pytest.mark.parametrize("case", PERSISTENCE_CASES, ids=lambda case: case.name)
+async def test_evidence_failure_does_not_break_the_decision(
+    case: ScopeDenyCase, caplog: pytest.LogCaptureFixture
+) -> None:
+    engagement = _engagement().model_copy(update={"scope": case.scope})
+    proposal = _proposal().model_copy(update={"target": case.target})
+    audit = AuditLog()
+    store = _ExplodingStore(audit)
+    plane = DefaultControlPlane(
+        {engagement.engagement_id: engagement},
+        audit_log=audit,
+        evidence_service=EvidenceService(store),
     )
-    assert decision.verdict == PolicyVerdict.DENY
+    with caplog.at_level(logging.ERROR, logger="redteam.control.service"):
+        decision = await plane.evaluate(
+            proposal, ControlContext(engagement_id=engagement.engagement_id)
+        )
+
+    entries = await audit.entries_for_run(proposal.run_id)
+    assert len(entries) == 1
+    assert_scope_audit(proposal, decision, entries[0], case)
+    assert store.audit_at_append == entries
+    assert store.records == []
+    errors = [record for record in caplog.records if record.name == "redteam.control.service"]
+    assert len(errors) == 1
+    assert errors[0].getMessage() == "Failed to record blocked action evidence"
+    assert errors[0].exc_info is not None
+    assert errors[0].action_id == str(proposal.action_id)
+    assert errors[0].verdict == "deny"
+
+
+@pytest.mark.parametrize("case", SCOPE_DENY_CASES, ids=lambda case: case.name)
+async def test_scope_deny_records_audit_and_blocked_evidence(case: ScopeDenyCase) -> None:
+    engagement = _engagement().model_copy(update={"scope": case.scope})
+    proposal = _proposal().model_copy(update={"target": case.target})
+    audit = AuditLog()
+    store = FakeEvidenceStore()
+    plane = DefaultControlPlane(
+        {engagement.engagement_id: engagement},
+        audit_log=audit,
+        evidence_service=EvidenceService(store),
+    )
+    decision = await plane.evaluate(
+        proposal, ControlContext(engagement_id=engagement.engagement_id)
+    )
+    entries = await audit.entries_for_action(proposal.action_id)
+    assert len(entries) == 1
+    assert len(store.records) == 1
+    assert_scope_audit(proposal, decision, entries[0], case)
+    assert_scope_evidence(proposal, decision, store.records[0])

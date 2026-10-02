@@ -60,6 +60,12 @@
 | 8 | 실제 Tool 실행 → Artifact → Evidence 생성 및 Finding/Reporter 연결 | ⏳ PM의 공통 포트·전달 책임 결정 후 타 팀과 통합 |
 | 9 | Audit → 실행 Tool·Invocation·생성 Evidence 연결 및 검증 | ⏳ 실행 후 연결 규격과 책임 계층 협의 필요 |
 
+Scope DENY 기록 회귀 검증(2026-10-03, 기준 `dev-control` / `2dcdede`):
+11개 요청·설정 사례의 Audit/차단 Evidence 연결, 두 severity의 파일 재조회 및
+Evidence 저장 실패 시 판단 유지 검증 완료. 대상 테스트 93개 통과, ruff/mypy 통과.
+운영 코드 수정 없음. 상세 사례와 검증 범위는
+[`pr-handoff-scope-port.md`](../../pr-handoff-scope-port.md#7-track-b-기록-회귀-검증-결과-2026-10-03)를 따른다.
+
 Raw Artifact와 Evidence 연결 검증의 상세 규약은
 [`artifact-and-evidence-validation.md`](./artifact-and-evidence-validation.md)를 따른다.
 
@@ -185,6 +191,7 @@ DENY할 때 **왜 막혔는지에 따라 에이전트의 다음 행동이 달라
   Agent 라우터는 `severity_from_matched_rules(decision.matched_rules)`로 읽어 라우팅.
 - 스테이지별 매핑: scope→BLOCK / roe(능력)→REPLAN / roe(작업)→BLOCK / roe(시간)→ABORT /
   policy→REPLAN / rate_limit→BLOCK / budget→ABORT.
+- Scope의 잘못된 `denied_hosts`/`denied_domains` 설정은 예외적으로 `ABORT_RUN`이다.
 
 **남은 것 (Control 범위 밖):**
 - Agent 팀(orchestration `router`/`replan`)이 이 태그를 **실제 라우팅에 반영**해야 한다. 현재 `orchestration/`에는 `severity_from_matched_rules` 사용처가 없어서, 태그는 붙어 있지만 아직 소비되지 않는다.

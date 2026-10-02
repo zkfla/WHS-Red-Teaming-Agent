@@ -12,13 +12,28 @@ from pathlib import Path
 
 import pytest
 
+from redteam.control.audit import AuditLog
+from redteam.control.service import DefaultControlPlane
+from redteam.control.stores.filesystem import FilesystemAuditStore
 from redteam.core.contracts.action import ActionProposal
-from redteam.core.contracts.policy import PolicyDecision
+from redteam.core.contracts.engagement import (
+    ApprovalPolicy,
+    Engagement,
+    ExecutionBudget,
+    RateLimitPolicy,
+)
+from redteam.core.contracts.policy import ControlContext, PolicyDecision
 from redteam.core.contracts.target import HostTarget
 from redteam.core.enums import EvidenceSourceType, PolicyVerdict
 from redteam.core.ids import ActionId, AgentId, ApprovalId, EngagementId, RunId
 from redteam.evidence.service import EvidenceService
 from redteam.evidence.stores.filesystem import FilesystemEvidenceStore
+from tests.fakes.scope_denials import (
+    PERSISTENCE_CASES,
+    ScopeDenyCase,
+    assert_scope_audit,
+    assert_scope_evidence,
+)
 
 
 def _proposal() -> ActionProposal:
@@ -338,3 +353,48 @@ async def test_purge_rejects_invalid_retention_without_deleting(
 
     assert (tmp_path / "run_1.jsonl").exists()
     assert len(await store.list_for_run(proposal.run_id)) == 1
+
+
+@pytest.mark.parametrize("case", PERSISTENCE_CASES, ids=lambda case: case.name)
+async def test_scope_deny_survives_filesystem_store_reopen(
+    tmp_path: Path, case: ScopeDenyCase
+) -> None:
+    proposal = _proposal().model_copy(update={"target": case.target, "arguments": {}})
+    engagement = Engagement(
+        engagement_id=proposal.engagement_id,
+        name="scope recording regression",
+        scope=case.scope,
+        execution_budget=ExecutionBudget(max_actions=5),
+        rate_limit_policy=RateLimitPolicy(max_actions_per_minute=30),
+        approval_policy=ApprovalPolicy(),
+        created_at=datetime.now(timezone.utc),
+    )
+    audit_dir = tmp_path / "audit"
+    evidence_dir = tmp_path / "evidence"
+    audit = AuditLog(FilesystemAuditStore(audit_dir))
+    evidence = FilesystemEvidenceStore(evidence_dir)
+    plane = DefaultControlPlane(
+        {engagement.engagement_id: engagement},
+        audit_log=audit,
+        evidence_service=EvidenceService(evidence),
+    )
+    decision = await plane.evaluate(
+        proposal, ControlContext(engagement_id=engagement.engagement_id)
+    )
+    initial_audit = await audit.entries_for_run(proposal.run_id)
+    initial_evidence = await evidence.list_for_run(proposal.run_id)
+    assert len(initial_audit) == len(initial_evidence) == 1
+
+    reopened_audit = FilesystemAuditStore(audit_dir)
+    reopened_evidence = FilesystemEvidenceStore(evidence_dir)
+    audit_by_run = await reopened_audit.list_for_run(proposal.run_id)
+    audit_by_action = await reopened_audit.list_for_action(proposal.action_id)
+    evidence_by_run = await reopened_evidence.list_for_run(proposal.run_id)
+    evidence_by_action = await reopened_evidence.list_for_action(proposal.action_id)
+    assert audit_by_run == audit_by_action == initial_audit
+    assert evidence_by_run == evidence_by_action == initial_evidence
+    record = evidence_by_run[0]
+    assert await reopened_evidence.get(record.evidence_id) == record
+    assert_scope_audit(proposal, decision, audit_by_run[0], case)
+    assert_scope_evidence(proposal, decision, record)
+    assert await reopened_evidence.verify_run_integrity(proposal.run_id) == []
