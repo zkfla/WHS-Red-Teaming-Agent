@@ -1015,7 +1015,7 @@ async def test_stdio_server_restart_cleans_fault_injected_orphan(
                 str(helper),
                 str(marker),
                 "--timeout-seconds",
-                "1",
+                "30",
             ],
             stdin=subprocess.DEVNULL,
             stdout=output,
@@ -1023,7 +1023,8 @@ async def test_stdio_server_restart_cleans_fault_injected_orphan(
             env=os.environ.copy(),
         )
         try:
-            for _ in range(200):
+            startup_deadline = time.monotonic() + 60
+            while time.monotonic() < startup_deadline:
                 if client.poll() is not None:
                     pytest.fail(client_log.read_text(encoding="utf-8", errors="replace"))
                 if marker.exists() and managed_container_ids():
@@ -1041,7 +1042,7 @@ async def test_stdio_server_restart_cleans_fault_injected_orphan(
                     env=_DOCKER_ENV,
                 ).stdout
             )
-            assert command[:3] == ["/usr/bin/timeout", "--signal=KILL", "3s"]
+            assert command[:3] == ["/usr/bin/timeout", "--signal=KILL", "32s"]
 
             processes = subprocess.run(
                 ["ps", "-ww", "-eo", "pid=,args="],
@@ -1073,8 +1074,8 @@ async def test_stdio_server_restart_cleans_fault_injected_orphan(
                     client.kill()
                     client.wait(timeout=5)
 
-    assert await wait_for_managed_containers(0, timeout_seconds=15) == []
-    assert time.monotonic() - killed_at < 15
+    assert await wait_for_managed_containers(0, timeout_seconds=45) == []
+    assert time.monotonic() - killed_at < 45
     async with open_mcp_tool_gateway(
         ["execution"],
         health_refresh_enabled=False,

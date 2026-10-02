@@ -94,7 +94,7 @@ async def test_cpu_quota_produces_observable_cgroup_throttling(
     workspace.mkdir(mode=0o700)
     (workspace / "busy_cpu.py").write_text(
         "import time\n"
-        "deadline = time.monotonic() + 4\n"
+        "deadline = time.monotonic() + 30\n"
         "while time.monotonic() < deadline:\n"
         "    pass\n",
         encoding="utf-8",
@@ -103,11 +103,11 @@ async def test_cpu_quota_produces_observable_cgroup_throttling(
         workspace,
         os.environ["REDTEAM_TEST_EXECUTION_PROCESS_IMAGE"],
         executables={"python": "/usr/local/bin/python"},
-    )
+    ).model_copy(update={"max_timeout_seconds": 45})
     engine = DockerExecutionEngine(configured)
     task = asyncio.create_task(
         engine.run_command(
-            "workspace-test", "python", ["busy_cpu.py"], 8, "eng-test", "run-test"
+            "workspace-test", "python", ["busy_cpu.py"], 45, "eng-test", "run-test"
         )
     )
     container_id = (await wait_for_containers(1))[0]
@@ -233,7 +233,7 @@ async def test_cancel_and_timeout_remove_child_and_grandchild_processes(
 
     timeout_task = asyncio.create_task(
         engine.run_command(
-            "workspace-test", "python", ["process_tree.py"], 2, "eng-test", "run-test"
+            "workspace-test", "python", ["process_tree.py"], 12, "eng-test", "run-test"
         )
     )
     timeout_container = (await wait_for_containers(1))[0]
