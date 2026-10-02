@@ -120,6 +120,7 @@ class SessionController:
         self.in_flight: dict[asyncio.Task, InputReceipt] = {}
         self.workers: list[asyncio.Task] = []
         self.final_result = RunResult()
+        self.output_error: str | None = None
         self.sequence = 0
         self.clarification: InputReceipt | None = None
         self.frontend.bind(self)
@@ -198,8 +199,27 @@ class SessionController:
     def request_close(self) -> None:
         self.closing.set()
 
+    def _output_failed(self, exc: BaseException) -> None:
+        self.output_error = self.output_error or f"CLI 출력 실패: {type(exc).__name__}"
+        self.final_result.exit_code = 1
+        self.final_result.error = self.final_result.error or self.output_error
+        self.request_close()
+
+    def _output_stopped(self, task: asyncio.Task) -> None:
+        if task.cancelled():
+            if not self.closing.is_set():
+                self._output_failed(RuntimeError("출력 작업이 취소되었습니다."))
+            return
+        error = task.exception()
+        if error is not None:
+            self._output_failed(error)
+        elif not self.closing.is_set():
+            self._output_failed(RuntimeError("출력 작업이 종료되었습니다."))
+
     async def run(self, initial_objective: str | None = None) -> RunResult:
         self.output.start()
+        if self.output.task is not None:
+            self.output.task.add_done_callback(self._output_stopped)
         self.workers = [
             asyncio.create_task(self._consume(self.queue), name="cli-chat"),
             asyncio.create_task(self._consume(self.controls), name="cli-control"),
@@ -227,7 +247,11 @@ class SessionController:
                 self.frontend.close()
                 reader.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
-                    await reader
+                    try:
+                        await reader
+                    except Exception:
+                        if not self.output_error:
+                            raise
         return self.final_result
 
     async def _consume(self, queue: asyncio.Queue) -> None:
@@ -464,6 +488,9 @@ class SessionController:
                     result.exit_code = 1
                     result.error = f"CLI 결과 projection 갱신 실패: {type(exc).__name__}"
         self.final_result = result
+        if self.output_error:
+            result.exit_code = 1
+            result.error = result.error or self.output_error
         view = RunCompletionView.from_result(binding, result)
         if self.terminal_event_reason and self.terminal_event_reason != view.reason:
             self.output.emit(
@@ -491,11 +518,14 @@ class SessionController:
         self.snapshots[binding.attachment_id] = summary
         while len(self.snapshots) > 64:
             self.snapshots.popitem(last=False)
-        await self.output.fence()
-        self.output.emit(
-            Text(safe_text(summary), style="red" if view.outcome == "failed" else "default")
-        )
-        await self.output.fence()
+        try:
+            await self.output.fence()
+            self.output.emit(
+                Text(safe_text(summary), style="red" if view.outcome == "failed" else "default")
+            )
+            await self.output.fence()
+        except Exception as exc:
+            self._output_failed(exc)
         self.last_binding = binding
         self.binding = None
         self.run_task = None
@@ -709,6 +739,11 @@ class SessionController:
                 running.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await running
+            except Exception as exc:
+                shutdown_failed = True
+                self.final_result.error = self.final_result.error or (
+                    f"CLI 실행 정리 실패: {type(exc).__name__}"
+                )
         if shutdown_failed:
             self.final_result.exit_code = 1
         for task in self.workers:
@@ -722,7 +757,8 @@ class SessionController:
         try:
             await self.output.close()
         except Exception as exc:
-            self.final_result.exit_code = 1
-            self.frontend.emergency(f"최종 출력 정리 실패: {type(exc).__name__}")
+            self._output_failed(exc)
+            with contextlib.suppress(Exception):
+                self.frontend.emergency(f"최종 출력 정리 실패: {type(exc).__name__}")
         finally:
             self.set_phase(SessionPhase.CLOSED)

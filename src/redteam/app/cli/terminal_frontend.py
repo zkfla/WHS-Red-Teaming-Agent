@@ -57,7 +57,7 @@ class TerminalFrontend:
                 self.buffer.text, binding=self.draft_binding, approval_id=self.draft_approval
             ):
                 self.buffer.append_to_history()
-                self.buffer.reset()
+                self._reset_input()
 
         @keys.add("c-j")
         def newline(event):
@@ -65,7 +65,7 @@ class TerminalFrontend:
 
         @keys.add("c-c")
         def clear(event):
-            self.buffer.reset()
+            self._reset_input()
 
         @keys.add("c-d")
         def exit_session(event):
@@ -149,6 +149,11 @@ class TerminalFrontend:
         if self.controller and self.controller.phase.value == "paused":
             return "/resume 재개 · /stop 중단 · Ctrl+O 상세"
         return "/ + Tab 명령 · Ctrl+J 줄바꿈 · Ctrl+O 상세 · /stop 중단"
+
+    def _reset_input(self) -> None:
+        self.buffer.reset()
+        self._draft_started = False
+        self.draft_binding = self.draft_approval = None
 
     def _edited(self, buffer) -> None:
         if not buffer.text:
