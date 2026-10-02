@@ -60,6 +60,22 @@ def process_rows(container_id: str) -> list[str]:
     return [line for line in result.stdout.splitlines()[1:] if line.strip()]
 
 
+def container_cpu_stat(container_id: str) -> dict[str, int]:
+    result = subprocess.run(
+        ["docker", "exec", container_id, "/usr/bin/cat", "/sys/fs/cgroup/cpu.stat"],
+        capture_output=True,
+        text=True,
+        check=True,
+        env=_DOCKER_ENV,
+    )
+    return {
+        name: int(value)
+        for line in result.stdout.splitlines()
+        if len(parts := line.split()) == 2
+        for name, value in [parts]
+    }
+
+
 async def wait_for_process_tree(container_id: str) -> list[str]:
     for _ in range(100):
         rows = process_rows(container_id)
@@ -69,6 +85,60 @@ async def wait_for_process_tree(container_id: str) -> list[str]:
             return rows
         await asyncio.sleep(0.05)
     pytest.fail("child and grandchild processes did not become observable")
+
+
+async def test_cpu_quota_produces_observable_cgroup_throttling(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(mode=0o700)
+    (workspace / "busy_cpu.py").write_text(
+        "import time\n"
+        "deadline = time.monotonic() + 4\n"
+        "while time.monotonic() < deadline:\n"
+        "    pass\n",
+        encoding="utf-8",
+    )
+    configured = runtime_policy(
+        workspace,
+        os.environ["REDTEAM_TEST_EXECUTION_PROCESS_IMAGE"],
+        executables={"python": "/usr/local/bin/python"},
+    )
+    engine = DockerExecutionEngine(configured)
+    task = asyncio.create_task(
+        engine.run_command(
+            "workspace-test", "python", ["busy_cpu.py"], 8, "eng-test", "run-test"
+        )
+    )
+    container_id = (await wait_for_containers(1))[0]
+    nano_cpus = subprocess.run(
+        [
+            "docker",
+            "inspect",
+            container_id,
+            "--format",
+            "{{.HostConfig.NanoCpus}}",
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+        env=_DOCKER_ENV,
+    )
+    assert int(nano_cpus.stdout.strip()) == 500_000_000
+    before = container_cpu_stat(container_id)
+    await asyncio.sleep(2)
+    after = container_cpu_stat(container_id)
+    result = await task
+
+    assert result.exit_code == 0
+    print(
+        "execution_cpu_throttling "
+        f"nr_throttled_delta={after['nr_throttled'] - before['nr_throttled']} "
+        f"throttled_usec_delta={after['throttled_usec'] - before['throttled_usec']}"
+    )
+    assert after["nr_throttled"] > before["nr_throttled"]
+    assert after["throttled_usec"] > before["throttled_usec"]
+    assert await wait_for_containers(0) == []
 
 
 def base_policy(workspace: Path, image: str) -> ExecutionPolicy:
