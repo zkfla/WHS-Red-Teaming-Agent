@@ -1,5 +1,8 @@
 # A 후속 결과 — 검수 자료의 Agent 조회·LLM 데이터 전달
 
+이 문서는 2026-10-01 구현 기록이다. 2026-10-02의 Analysis Agent 호환 검수 및
+SQLite 기반 승인·부분 읽기 재개 검증은 [A 최신 상태](a-current-status.md)를 참고한다.
+
 - 날짜: 2026-10-01
 - branch: `capability`
 - 사전 protocol: `1f778a8`, 구현: `4d40c15`
