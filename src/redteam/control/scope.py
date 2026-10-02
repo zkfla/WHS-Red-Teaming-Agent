@@ -70,6 +70,17 @@ from redteam.core.contracts.target import (
 # means "no port information" — not "any port".
 HostPort = tuple[str, int | None]
 
+# Well-known default ports, so a scheme-only URL ("http://host/") carries
+# the port a host:port scope rule expects (fixes port-scoped deny bypass).
+_DEFAULT_SCHEME_PORTS: dict[str, int] = {
+    "http": 80,
+    "https": 443,
+    "ws": 80,
+    "wss": 443,
+    "ftp": 21,
+    "ssh": 22,
+}
+
 
 def _as_ip(value: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
     try:
@@ -112,6 +123,15 @@ def _split_host_port(raw: str) -> tuple[str | None, int | None, bool]:
         return None, None, False
     if not host:
         return None, None, False
+    # An explicit-but-empty port ("host:", "[::1]:", "http://host:/") is a
+    # typo — reject it rather than silently treating it as a bare host, which
+    # would mean "all ports".
+    if port is None and parts.netloc.endswith(":"):
+        return None, None, False
+    # Infer the well-known default port from the URL scheme so a scheme-only
+    # URL carries the port a host:port rule expects.
+    if port is None and parts.scheme in _DEFAULT_SCHEME_PORTS:
+        port = _DEFAULT_SCHEME_PORTS[parts.scheme]
     return host, port, True
 
 
@@ -181,16 +201,23 @@ def _host_eq(a: str, b: str) -> bool:
     return a_ip is not None and b_ip is not None and a_ip == b_ip
 
 
-def _host_entries(entries: list[str]) -> list[HostPort]:
-    """Parse ``host`` / ``host:port`` config entries, skipping malformed
-    ones (a bad entry must not crash the gate; an unmatched allow entry is
-    safe, and a skipped deny entry still can't be bypassed by expression)."""
-    out: list[HostPort] = []
+def _host_entries(entries: list[str]) -> tuple[list[HostPort], list[str]]:
+    """Parse ``host`` / ``host:port`` config entries into ``(parsed,
+    malformed)``. ``malformed`` holds raw strings that failed to parse.
+
+    A malformed *allow* entry is safe to drop (it just grants nothing), but a
+    malformed *deny* entry must NOT be silently dropped: that would fail open,
+    leaving a deny rule with zero effect. ``check_scope`` fails closed when any
+    deny entry is malformed."""
+    parsed: list[HostPort] = []
+    malformed: list[str] = []
     for entry in entries:
         host, port, ok = _split_host_port(entry)
         if ok and host is not None:
-            out.append((host, port))
-    return out
+            parsed.append((host, port))
+        else:
+            malformed.append(entry)
+    return parsed, malformed
 
 
 def _matches_host_entry(
@@ -298,17 +325,40 @@ def check_scope(
             Severity.BLOCK_ACTION,
         )
 
-    denied_hosts = _host_entries(scope.denied_hosts)
-    allowed_hosts = _host_entries(scope.allowed_hosts)
+    denied_hosts, denied_malformed = _host_entries(scope.denied_hosts)
+    allowed_hosts, _allowed_malformed = _host_entries(scope.allowed_hosts)
+
+    # A malformed deny entry would otherwise be silently skipped, leaving a
+    # deny rule with zero effect (fail-open). For a safety gate we fail closed:
+    # refuse until the operator fixes the config.
+    if denied_malformed:
+        return (
+            False,
+            [
+                f"engagement scope has malformed denied_hosts entries "
+                f"{denied_malformed} — refusing to evaluate (fix config)"
+            ],
+            Severity.BLOCK_ACTION,
+        )
 
     # Deny lists win outright. A bare-host deny blocks every port; a
-    # port-pinned deny blocks only that port.
+    # port-pinned deny blocks its port, and when the target carries no port we
+    # cannot prove it is a *different* port, so we fail closed.
     for cand in resolved:
-        matched, _ = _matches_host_entry(cand, denied_hosts)
+        matched, deny_port_ambiguous = _matches_host_entry(cand, denied_hosts)
         if matched:
             return (
                 False,
                 [f"target '{_label(cand)}' is explicitly denied (denied_hosts)"],
+                Severity.BLOCK_ACTION,
+            )
+        if deny_port_ambiguous:
+            return (
+                False,
+                [
+                    f"target '{_label(cand)}' may fall under a port-scoped deny "
+                    "(denied_hosts) but carries no port — refusing"
+                ],
                 Severity.BLOCK_ACTION,
             )
         if _matches_domain(cand[0], scope.denied_domains):
