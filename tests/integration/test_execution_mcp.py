@@ -380,6 +380,33 @@ async def wait_for_managed_containers(
     pytest.fail(f"expected {count} managed execution containers")
 
 
+def execution_server_pid(policy_path: Path) -> int:
+    processes = subprocess.run(
+        ["ps", "-ww", "-eo", "pid=,args="],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.splitlines()
+    matches = [
+        int(line.strip().split(maxsplit=1)[0])
+        for line in processes
+        if "redteam.capability.servers.execution" in line
+        and str(policy_path) in line
+    ]
+    assert len(matches) == 1, "\n".join(
+        line
+        for line in processes
+        if "redteam.capability.servers.execution" in line
+    )
+    return matches[0]
+
+
+def process_rss_bytes(pid: int) -> int:
+    status = Path(f"/proc/{pid}/status").read_text(encoding="utf-8")
+    rss_line = next(line for line in status.splitlines() if line.startswith("VmRSS:"))
+    return int(rss_line.split()[1]) * 1024
+
+
 def configure_live_execution(
     monkeypatch: pytest.MonkeyPatch,
     policy_path: Path,
@@ -396,6 +423,100 @@ def configure_live_execution(
         "PASSTHROUGH_ENV": "PYTHONPATH",
     }.items():
         monkeypatch.setenv(f"{prefix}_{suffix}", value)
+
+
+@pytest.mark.skipif(
+    os.environ.get("REDTEAM_TEST_EXECUTION_DOCKER") != "1",
+    reason="set REDTEAM_TEST_EXECUTION_DOCKER=1 under WSL2/Linux with Docker",
+)
+async def test_stdio_server_rss_is_bounded_during_large_output_and_concurrent_jobs(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(mode=0o700)
+    (workspace / "input.txt").write_text("line\n", encoding="utf-8")
+    (workspace / "large.txt").write_bytes(b"output-line\n" * 1_400_000)
+    execution_policy = policy(workspace).model_copy(
+        update={
+            "image": os.environ["REDTEAM_TEST_EXECUTION_IMAGE"],
+            "container_user": f"{os.getuid()}:{os.getgid()}",
+            "max_output_bytes": 1024,
+        }
+    )
+    policy_path = tmp_path / "rss-policy.json"
+    policy_path.write_text(json.dumps(execution_policy.model_dump()), encoding="utf-8")
+    configure_live_execution(monkeypatch, policy_path)
+    assert await wait_for_managed_containers(0) == []
+
+    async with open_mcp_tool_gateway(
+        ["execution"],
+        health_refresh_enabled=False,
+    ) as gateway:
+        server_pid = execution_server_pid(policy_path)
+        baseline_rss = process_rss_bytes(server_pid)
+        rss_samples = [baseline_rss]
+        stop_sampling = asyncio.Event()
+
+        async def sample_rss() -> None:
+            while not stop_sampling.is_set():
+                rss_samples.append(process_rss_bytes(server_pid))
+                await asyncio.sleep(0.01)
+
+        sampler = asyncio.create_task(sample_rss())
+        job_ids: list[str] = []
+        try:
+            large_output = await gateway.invoke(
+                invocation(
+                    {
+                        "asset_ref": "workspace-test",
+                        "executable": "head",
+                        "args": ["-c", "16777216", "large.txt"],
+                    }
+                )
+            )
+            for index in range(4):
+                started = await gateway.invoke(
+                    job_invocation(
+                        "job_start",
+                        {
+                            "asset_ref": "workspace-test",
+                            "executable": "tail",
+                            "args": ["-f", "input.txt"],
+                            "timeout_seconds": 20,
+                        },
+                        action_id=f"action-rss-job-start-{index}",
+                    )
+                )
+                assert started.success, started.error
+                job_ids.append(started.output["job_id"])
+            await wait_for_managed_containers(4)
+            await asyncio.sleep(0.5)
+        finally:
+            for index, job_id in enumerate(job_ids):
+                cancelled = await gateway.invoke(
+                    job_invocation(
+                        "job_cancel",
+                        {"asset_ref": "workspace-test", "job_id": job_id},
+                        action_id=f"action-rss-job-cancel-{index}",
+                    )
+                )
+                assert cancelled.success, cancelled.error
+            assert await wait_for_managed_containers(0) == []
+            stop_sampling.set()
+            await sampler
+
+    peak_rss = max(rss_samples)
+    rss_limit = 256 * 1024 * 1024
+    print(
+        "execution_server_rss "
+        f"baseline_bytes={baseline_rss} peak_bytes={peak_rss} "
+        f"delta_bytes={peak_rss - baseline_rss} limit_bytes={rss_limit}"
+    )
+    assert large_output.success
+    assert large_output.output["truncated"] is True
+    assert large_output.output["output_file_truncated"] is True
+    assert peak_rss <= rss_limit
 
 
 def configure_live_workspace(
