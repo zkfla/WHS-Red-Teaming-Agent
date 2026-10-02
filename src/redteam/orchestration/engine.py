@@ -31,6 +31,11 @@ from redteam.orchestration.cognition import (
 from redteam.orchestration.completion import validate_completion
 from redteam.orchestration.events import AGENT_CONTEXT_PREPARED, AGENT_TURN_DECIDED
 from redteam.orchestration.evidence_access import EvidenceReader
+from redteam.orchestration.execution_bridge import (
+    agent_tool_visible,
+    bind_execution_arguments,
+    execution_agent_options,
+)
 from redteam.orchestration.expectations import Expectation
 from redteam.orchestration.knowledge import project_knowledge
 from redteam.orchestration.paths import PathError, PathPlan, is_active_status, is_known_criterion
@@ -344,11 +349,19 @@ class InvestigationEngine:
                     latest[saved.mission_task_id] = saved
             completed_task_paths = [item.model_dump(mode="json") for item in latest.values()]
         tools = {}
+        execution_options = await execution_agent_options(
+            service, self.deps.engagement, runtime.run_id
+        )
         if self.deps.tool_catalog is not None:
             capabilities = {cap for agent in self.deps.agents.all() for cap in agent.capabilities}
             for capability in sorted(capabilities):
                 for tool in self.deps.tool_catalog.list_by_capability(capability):
-                    if tool.health_status is not ToolHealthStatus.UNHEALTHY:
+                    if (
+                        tool.health_status is not ToolHealthStatus.UNHEALTHY
+                        and agent_tool_visible(
+                            tool, execution_ready=bool(execution_options)
+                        )
+                    ):
                         tools[str(tool.tool_id)] = redact_secret_material(
                             tool.model_dump(mode="json"), drop_secret_keys=False
                         )
@@ -409,6 +422,7 @@ class InvestigationEngine:
             ]
         return {
             **reference_context,
+            **({"execution_options": execution_options} if execution_options else {}),
             "goal": mission.objective if mission else runtime.current_goal,
             "success_criteria": mission.success_criteria if mission else [runtime.current_goal],
             "mission": mission.model_dump(mode="json") if mission else None,
@@ -910,6 +924,27 @@ class InvestigationEngine:
                     raise ValueError("action role/capability is unavailable")
                 if step.agent_id and step.agent_id != intent.agent_id:
                     raise ValueError("action role is outside accepted step")
+                node = await service.get_node(GraphNodeId(intent.target_node_id))
+                if node is None:
+                    raise ValueError("referenced action target disappeared")
+                if self.deps.tool_catalog is None:
+                    raise ValueError("a real tool catalog is required for action compilation")
+                tool = self.deps.tool_catalog.get(intent.tool_id)
+                if tool is None:
+                    raise ValueError("requested tool is absent from catalog")
+                intent = intent.model_copy(
+                    update={
+                        "arguments": bind_execution_arguments(
+                            engagement=self.deps.engagement,
+                            run_id=runtime.run_id,
+                            node=node,
+                            tool=tool,
+                            capability=intent.capability,
+                            operation=intent.operation,
+                            arguments=intent.arguments,
+                        )
+                    }
+                )
                 operation = f"{intent.capability}.{intent.operation}"
                 exclusions = await operator_exclusions(
                     self.deps,
@@ -930,9 +965,6 @@ class InvestigationEngine:
                 validate_principal_arguments(
                     step, intent.principal_ref, intent.arguments, context["knowledge"]
                 )
-                node = await service.get_node(GraphNodeId(intent.target_node_id))
-                if node is None:
-                    raise ValueError("referenced action target disappeared")
                 node_facts = facts_of(node.properties)
                 target = target_for_node(
                     node.id,
@@ -942,10 +974,6 @@ class InvestigationEngine:
                     device_ref=node_facts.get("device_ref"),
                     package_name=node_facts.get("package_name"),
                 )
-                if self.deps.tool_catalog is None:
-                    raise ValueError("a real tool catalog is required for action compilation")
-                if self.deps.tool_catalog.get(intent.tool_id) is None:
-                    raise ValueError("requested tool is absent from catalog")
                 validate_argument_target(
                     target, intent.arguments, target_aliases(self.deps, target)
                 )

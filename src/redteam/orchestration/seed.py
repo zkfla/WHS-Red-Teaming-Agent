@@ -19,6 +19,7 @@ from redteam.core.contracts.graph import GraphNode
 from redteam.core.enums import GraphNodeType
 from redteam.core.ids import RunId
 from redteam.orchestration.authentication import AuthSession
+from redteam.orchestration.execution_bridge import execution_facts_by_asset
 
 SCOPE_LABEL = "engagement-scope"
 
@@ -134,6 +135,7 @@ async def seed_from_engagement(
         singular="package_name",
         plural="package_names",
     )
+    execution_facts = execution_facts_by_asset(engagement, declared_assets)
     for asset in declared_assets:
         configured = {
             asset in device_serials,
@@ -179,6 +181,7 @@ async def seed_from_engagement(
             "asset_ref": asset_ref,
             "apk_ref": apk_ref,
             "target_ref": apk_ref,
+            **execution_facts.get(asset, {}),
         }
         if asset in device_refs:
             asset_facts.update(
