@@ -348,3 +348,68 @@ def test_service_target_without_host_is_denied() -> None:
     ok, reasons, _ = check_scope(_proposal_for(target), scope)
     assert ok is False
     assert "no scope-checkable" in reasons[0]
+
+
+# --- fail-safe hardening (teammate review, 2026-10-02) ---------------------
+#
+# Three fail-open holes in the first port-aware cut, fixed to fail closed:
+#   1. an empty port ("host:") was read as a bare host = all ports
+#   2. a malformed deny entry was silently skipped (deny rule with no effect)
+#   3. a port-scoped deny was bypassed by a scheme-only URL / a portless target
+
+
+def test_empty_port_entry_is_rejected_not_all_ports() -> None:
+    # "127.0.0.1:" must NOT be read as a bare host (which would allow every
+    # port); it is a malformed allow entry and grants nothing.
+    scope = EngagementScope(allowed_hosts=["127.0.0.1:"])
+    ok, _, _ = check_scope(_proposal("127.0.0.1:9999"), scope)
+    assert ok is False
+
+
+def test_empty_port_target_is_reasoned_deny() -> None:
+    scope = EngagementScope(allowed_hosts=["127.0.0.1"])
+    ok, reasons, severity = check_scope(_proposal("127.0.0.1:"), scope)
+    assert ok is False
+    assert "malformed" in reasons[0]
+    assert severity is Severity.BLOCK_ACTION
+
+
+def test_malformed_deny_entry_fails_closed() -> None:
+    # A broken deny rule must not silently give zero protection: refuse until
+    # the config is fixed, rather than letting the target through.
+    scope = EngagementScope(allowed_hosts=["10.0.0.5"], denied_hosts=["10.0.0.5:abc"])
+    ok, reasons, severity = check_scope(_proposal("10.0.0.5:8080"), scope)
+    assert ok is False
+    assert "malformed denied_hosts" in reasons[0]
+    assert severity is Severity.BLOCK_ACTION
+
+
+def test_valid_deny_still_works_alongside_check() -> None:
+    # Sanity: with only well-formed deny entries nothing fails closed spuriously.
+    scope = EngagementScope(allowed_hosts=["10.0.0.5"], denied_hosts=["10.0.0.6"])
+    assert check_scope(_proposal("10.0.0.5:8080"), scope)[0] is True
+
+
+def test_scheme_only_url_infers_default_port() -> None:
+    # http:// -> 80, so a host:80 rule applies to a URL with no explicit port.
+    scope = EngagementScope(allowed_hosts=["example.com:80"])
+    assert check_scope(_proposal_for(UrlTarget(url="http://example.com/")), scope)[0] is True
+    https = EngagementScope(allowed_hosts=["example.com:443"])
+    assert check_scope(_proposal_for(UrlTarget(url="https://example.com/")), https)[0] is True
+
+
+def test_port_scoped_deny_not_bypassed_by_scheme_only_url() -> None:
+    scope = EngagementScope(allowed_hosts=["example.com"], denied_hosts=["example.com:80"])
+    ok, reasons, _ = check_scope(_proposal_for(UrlTarget(url="http://example.com/")), scope)
+    assert ok is False
+    assert "denied_hosts" in reasons[0]
+
+
+def test_portless_target_under_port_scoped_deny_fails_closed() -> None:
+    # Host matches a port-scoped deny but carries no port: we cannot prove it
+    # is a *different* port, so refuse.
+    scope = EngagementScope(allowed_hosts=["10.0.0.5"], denied_hosts=["10.0.0.5:22"])
+    ok, reasons, severity = check_scope(_proposal("10.0.0.5"), scope)
+    assert ok is False
+    assert "port-scoped deny" in reasons[0]
+    assert severity is Severity.BLOCK_ACTION
