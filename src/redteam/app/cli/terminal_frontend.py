@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import sys
 import time
-from typing import Any, TextIO, cast
+from typing import Any
 
 from prompt_toolkit.application import Application
 from prompt_toolkit.buffer import Buffer
@@ -222,7 +222,8 @@ class TerminalFrontend:
 
     def emergency(self, text: str) -> None:
         # Last-resort failure path only, never execute control sequences.
-        cast(TextIO, sys.__stderr__).write(safe_text(text) + "\n")
+        if sys.__stderr__ is not None:
+            sys.__stderr__.write(safe_text(text) + "\n")
 
 
 class ConsoleFrontend:
@@ -285,20 +286,14 @@ class PlainFrontend(ConsoleFrontend):
     async def write(self, content, console) -> None:
         lines = console.render_lines(content, console.options, pad=False)
         text = "\n".join("".join(segment.text for segment in line) for line in lines)
-        text = safe_text(text).translate(
-            str.maketrans(
-                cast(
-                    dict[str | int, str | int | None],
-                    {
-                        "❯": ">",
-                        "✓": "+",
-                        "✗": "x",
-                        "●": "*",
-                        "○": "o",
-                        "→": ">",
-                        "─": "-",
-                    },
-                )
-            )
-        )
+        replacements: dict[str, str | int | None] = {
+            "❯": ">",
+            "✓": "+",
+            "✗": "x",
+            "●": "*",
+            "○": "o",
+            "→": ">",
+            "─": "-",
+        }
+        text = safe_text(text).translate(str.maketrans(replacements))
         console.print(text, markup=False, highlight=False, style="default")

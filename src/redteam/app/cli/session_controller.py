@@ -535,7 +535,8 @@ class SessionController:
             self.run_task = asyncio.create_task(self._execute(objective, receipt), name="cli-run")
 
     async def _execute(self, objective: str, receipt: InputReceipt) -> None:
-        binding = cast(BindingRef, self.binding)
+        binding = self.binding
+        assert binding is not None  # _execute is only started with an active binding
         try:
             if isinstance(objective, tuple):
                 result = await self.resume_runner(*objective, self)

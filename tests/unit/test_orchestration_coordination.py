@@ -375,6 +375,7 @@ async def test_two_processes_apply_one_sqlite_effect(tmp_path):
     with ProcessPoolExecutor(
         max_workers=2, mp_context=multiprocessing.get_context("spawn")
     ) as pool:
+        # asyncio.timeout() is 3.11+; wait_for keeps this test runnable on 3.10.
         results = await asyncio.wait_for(
             asyncio.gather(
                 *(loop.run_in_executor(pool, _apply_in_process, *args) for _ in range(2))
