@@ -1,10 +1,12 @@
 # 웹검색 내부 경계
 
 `redteam.capability.servers.web_search`는 공개 기술 자료를 찾기 위한 검색어의
-외부 전송 전 검사와 공급자 결과 정규화를 수행한다. 내부 Tavily 공급자 Adapter는
-`redteam.capability.servers.tavily_search`에 구현했지만, 실제 API 호출은 opt-in
-테스트 외에는 실행하지 않았다. MCP·Registry·Bootstrap 연결은 없다. `WebSearchReader.search()`는
-내부 메서드 이름이며 최종 canonical operation이나 Agent 권한을 확정하지 않는다.
+외부 전송 전 검사와 공급자 결과 정규화를 수행한다. 내부 Tavily 공급자는
+`redteam.capability.servers.tavily_search`에 있다. opt-in stdio MCP 서버와
+Capability Registry·Gateway 연결도 구현했다. 이 연결을 통한 실제 Tavily API
+호출은 아직 검증하지 않았으며, Control·Agent 연결도 완료되지 않았다.
+`WebSearchReader.search()`는 내부 메서드 이름이고, `web_search` operation은
+이번 Capability 연결의 **제안 바인딩**이지 확정된 canonical operation이 아니다.
 
 ## 입력과 설정
 
@@ -15,8 +17,10 @@ Unicode 텍스트는 허용한다. 개행·탭, C0/C1 제어문자, Unicode form
 거절한다. 외부 입력 경계에서는 `parse_search_request()`가 Pydantic 검증 실패를
 입력값 없는 `invalid_input` 오류로 바꾼다. 원문 검색어는 최종 결과에 반복하지 않는다.
 
-`SearchConfig`는 서버 소유 생성자 인자로 주입한다. 환경변수·공통 settings와
-연결하지 않았으며 요청 인자로 허용 범위나 상한을 변경할 수 없다.
+`SearchConfig`는 서버 소유 설정이다. 독립 Reader 사용 시 생성자로 주입하고,
+MCP 프로필 사용 시 운영자 JSON 파일 하나를 설정 검증과 서버 실행 양쪽에서
+읽어 SHA-256으로 동일한 내용을 확인한다. 요청 인자로 활성화 여부나 상한을
+변경할 수 없다.
 
 | 설정 | 내부 기본값 | 검증 범위 |
 |---|---:|---:|
@@ -37,8 +41,8 @@ Capability 내부 `SearchProvider` Protocol은 `provider_id`와
 `async search(query, max_results) -> ProviderSearchResponse`만 요구한다. Reader는
 공급자와 설정을 주입받고, 검사된 검색어 및 요청·서버 상한 중 작은 결과 수만
 전달한다. 자동 공급자 선택, 재시도, fallback, 캐시, 페이지네이션은 없다.
-Fake 공급자는 `tests/unit/test_web_search.py`에만 있고 운영 등록은 없다.
-Tavily 공급자도 생성자 주입으로만 사용하며 공통 설정이나 운영 초기화에는 등록하지 않았다.
+Fake 공급자는 테스트 코드에만 있고 운영 등록은 없다. MCP 서버는 테스트에서
+Fake를 주입할 수 있으며 운영 stdio 프로세스에서는 Tavily 공급자를 주입한다.
 
 ### Tavily 공급자 Adapter
 
@@ -49,7 +53,8 @@ Tavily 공급자도 생성자 주입으로만 사용하며 공통 설정이나 �
 `include_images=false`는 코드에서 고정한다. `max_results`는 Reader가 요청값과
 서버 상한 중 작은 값을 넘기며, 공급자도 서버 상한을 다시 확인한다. 검색어만
 검증된 `SearchRequest`에서 전달된다. API 키는 `TavilySearchProvider(api_key=..., config=...)`
-생성자에 주입하고, 환경변수 `TAVILY_API_KEY`는 opt-in 테스트에서만 읽는다.
+생성자에 주입한다. 운영 MCP 프로필은 부모 시작 환경의 `TAVILY_API_KEY`만
+자식 stdio 프로세스에 전달한다. 기존 공급자 직접 호출 opt-in 테스트도 이 변수를 읽는다.
 키가 없으면 요청을 보내지 않는다. 키나 endpoint를 Agent 인자로 받는 경로는 없다.
 
 HTTPX client는 호출마다 새로 만들고 닫는다. 환경 proxy·인증 설정을 사용하지
@@ -138,6 +143,76 @@ HTTPX 예외 문자열은 사용자 오류에 싣지 않는다. timeout과 취�
 
 ## 테스트와 후속 연결
 
+### opt-in MCP 및 Gateway 연결
+
+`web-search` 서버 ID는 기본 등록되지 않는다. 운영자가 `.env.example`의 주석
+예시를 실제 시작 환경에 적용하고 `REDTEAM_MCP_SERVERS=web-search`를 지정해야
+한다. 절대 경로의 JSON 파일(`REDTEAM_MCP_WEB_SEARCH_SEARCH_CONFIG`)은
+`SearchConfig` 필드만 가지며, 다음 최소 예시는 외부 전송을 **명시적으로** 켠다.
+파일이 없거나 `external_search_enabled`가 기본값 `false`이면 공급자 호출은
+거절된다. 키는 JSON 파일에 넣지 않고 서버 시작 환경의 `TAVILY_API_KEY`로만
+전달한다. 활성 설정에 키가 없으면 bootstrap 단계에서 거절한다.
+
+```json
+{"external_search_enabled": true, "max_results": 5}
+```
+
+`MCPServerSettings.from_environment("web-search")`는 `web_search_tavily` 프로필의
+stdio·`web_api` kind·명시적 risk level·도구 allowlist·operation 바인딩을
+검사한다. 운영 설정 파일 하나를 읽고 해시를 자식 서버 실행 인자로 전달하므로
+discovery와 서버 실행의 설정이 달라지면 실패한다. 자식 프로세스에는 키 변수만
+추가 전달하며 일반 환경의 proxy·인증값을 그대로 전달하지 않는다. stdio
+stdout은 MCP 프로토콜 전용이고 SDK 진단 로그는 stderr로 보낸다.
+
+등록 흐름은 `web_search_mcp.create_server()` → MCP discovery →
+`web_search_manifest.validate_web_search_discovery()` → `MCPToolRegistry` →
+기존 `WebAPIMCPAdapter` → `MCPToolGateway.invoke()`다. 원격 도구 이름은
+`web_search`, ToolId는 `web.web_search`다. 제안 operation도 `web_search`지만
+operation은 의도, ToolId는 실행 도구를 가리키는 별개 식별자다. 이 바인딩은
+현재 Agent naming 검증이나 Control 승인 정책의 합의를 대신하지 않는다.
+검색어는 기존 TargetRef 종류로 표현하지 않았고 descriptor의 target_types는
+빈 목록이다. 공급자 API endpoint를 시험 대상 Target으로 간주하지 않는다.
+
+MCP 입력은 `query`(1–500자 문자열, 필수), `max_results`(1부터 운영자
+`SearchConfig.max_results`까지의 정수, 기본 5 또는 더 작은 서버 상한)다.
+SDK의 기본 도구 모델이 추가 필드를 무시할 수 있어 서버 호출 경계에서 기존
+`SearchRequest`로 다시 검증하고, discovery schema에도 추가 필드 금지를
+표시한다. 나머지 설정, 키, endpoint, 유료 옵션은 도구 입력에 없다. 출력은 기존
+`SearchResult` JSON schema 그대로 `provider`, UTC `retrieved_at`,
+`items[{title,url,snippet,source}]`, `truncated`다. `snippet`은 Tavily가
+반환한 설명이며 페이지 원문이 아니다. 입력·전송·공급자 오류는 기존 고정
+`SearchError.code`를 MCP `ToolError`에 싣고, Gateway에서는 실패한
+`ToolResult`가 된다. 원문 검색어·키·원격 오류 본문은 오류 메시지에 담지 않는다.
+
+독립 Fake 검증에는 외부 검색 계정이 필요 없다. 다음 명령은 in-process
+discovery/call, Registry·Gateway의 schema와 ID 유지, 로컬 stdio 자식
+프로세스 호출을 검증한다. 운영 서버의 실제 stdio 진입점도 비활성 설정·키 없음
+상태로 실행해 외부 호출 전에 거절되는지 확인한다. stdio 테스트는 환경의
+프로세스 실행 권한이 필요하다.
+
+```sh
+.venv/bin/pytest -q tests/integration/test_web_search_mcp.py
+```
+
+운영자가 실제 Tavily 경로를 **한 번** 검증할 때만 키를 사전에 비공개 시작
+환경에 설정하고 아래 명령을 실행한다. 이 opt-in 테스트는 임시 운영 설정을
+만들어 실제 stdio MCP 서버 → Adapter/Gateway → Tavily → ToolResult를
+호출한다. 공개 검색어 `OWASP API1:2023 "Broken Object Level Authorization"`로
+최대 5개를 요청하고, discovery 출력 schema·ID·결과 개수·JSON 크기를 검사한다.
+키나 opt-in이 없으면 skip하며 일반 pytest에서 외부 호출하지 않는다. 이 문서
+작성 및 Capability 연결 작업에서는 실제 Tavily MCP 요청을 실행하지 않았다.
+
+```sh
+REDTEAM_TAVILY_MCP_LIVE=1 .venv/bin/pytest -q tests/integration/test_web_search_mcp_live.py
+```
+
+서버를 독립 실행해 MCP 클라이언트로 discovery할 때는 같은 JSON 파일의 SHA-256
+값을 `--sha256`에 전달한다. stdout을 사람이 읽는 로그로 취급하지 않는다.
+
+```sh
+.venv/bin/python -m redteam.capability.servers.web_search_mcp --config /absolute/path/to/web-search-policy.json --sha256 CONFIG_SHA256_HEX
+```
+
 ### 검색 품질 확인 CLI
 
 `TAVILY_API_KEY`가 이미 환경변수로 설정된 환경에서 다음 명령으로 공개 검색어
@@ -176,8 +251,8 @@ Agent 실행 경로도 아니다.
 검색어를 구체화한 뒤 **이번 사례에서는** 관련성이 개선됐다. 이 관찰만으로
 최초 결과의 원인을 확정하거나 Tavily의 전체 검색 품질을 보장하지 않는다.
 공급자는 관련성이 낮은 결과를 코드에서 임의 교체하지 않는다. 검색어 재구성,
-출처·언어·버전 선택과 관련성 평가는 후속 Agent 책임이다. MCP·Control·Agent
-연결은 아직 완료되지 않았다.
+출처·언어·버전 선택과 관련성 평가는 후속 Agent 책임이다. 검색 품질 관찰 당시
+MCP 연결은 없었으며 현재도 Control·Agent 연결은 완료되지 않았다.
 
 ### 테스트
 
@@ -203,8 +278,9 @@ URL·텍스트 검증, 설명의 줄 공백 정규화와 기존 제어문자 거
 제한, 추가 DNS 조회 부재를 확인한다.
 Mock 기반 테스트 성공은 실제 외부 검색·인증·MCP 호출 검증이 아니다.
 
-운영 연결 전 API 키의 서버 보관 방식, endpoint egress, 계정 요금·rate limit,
-개인정보 처리 조건을 검토해야 한다. MCP 연결 시에는
-최종 capability·operation·ToolId·Target·위험도와 공개 지식 조회의 Control
-정책을 PM/Core·Control·Agent와 합의한다. 현재 Core Contract/Port를 바꾸지
-않았으며, 이번 내부 구현을 이유로 검색 결과에 실행 권한을 주지 않는다.
+운영에서 API 키 보관 방식, endpoint egress, 계정 요금·rate limit,
+개인정보 처리 조건을 검토해야 한다. Control·Agent 연결 전에는 제안
+operation·Target 표현·위험도와 공개 지식 조회 승인 정책을 PM/Core·Control·Agent와
+합의한다. 현재 Core Contract/Port를 바꾸지 않았으며, 검색 결과에 실행 권한을
+주지 않는다. Agent 실행에는 기존 ActionProposal → Control ALLOW →
+ToolInvocation → Gateway 경로가 필요하다.

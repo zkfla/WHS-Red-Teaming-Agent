@@ -33,6 +33,7 @@ from redteam.capability.mobile_analysis_manifest import (
 from redteam.capability.page_text_manifest import validate_page_text_discovery
 from redteam.capability.registry import MCPToolRegistry
 from redteam.capability.servers.page_text_mcp import load_page_text_config
+from redteam.capability.servers.web_search_mcp import load_web_search_config
 from redteam.capability.settings import (
     MCPConfigurationError,
     MCPServerKind,
@@ -40,6 +41,7 @@ from redteam.capability.settings import (
     MCPTransportKind,
 )
 from redteam.capability.vdb_manifest import validate_vdb_descriptor
+from redteam.capability.web_search_manifest import validate_web_search_discovery
 from redteam.capability.workspace_manifest import validate_workspace_descriptor
 
 
@@ -172,6 +174,19 @@ async def _build_gateway(
                         "page text discovery differs from operator configuration"
                     ) from None
                 target_types[str(descriptor.tool_id)] = "url"
+            elif settings.profile == "web_search_tavily":
+                descriptor.target_types = []
+                try:
+                    search_config, _ = load_web_search_config(
+                        settings.web_search_config_path or "",
+                        settings.web_search_config_sha256,
+                    )
+                    validate_web_search_discovery(descriptor, search_config)
+                except ValueError:
+                    raise MCPConfigurationError(
+                        "web search discovery differs from operator configuration"
+                    ) from None
+                target_types[str(descriptor.tool_id)] = None
             elif settings.profile is not None:
                 descriptor.target_types = ["asset"]
                 try:
@@ -252,7 +267,7 @@ def _default_target_types(kind: MCPServerKind) -> list[str]:
 def _create_adapter(settings: MCPServerSettings, transport: MCPTransport) -> MCPAdapter:
     if settings.allowed_tools is not None:
         transport = AllowlistedMCPTransport(transport, settings.allowed_tools)
-    if settings.profile == "page_text_readonly":
+    if settings.profile in {"page_text_readonly", "web_search_tavily"}:
         return WebAPIMCPAdapter(
             server_id=settings.server_id,
             risk_level=settings.risk_level,
