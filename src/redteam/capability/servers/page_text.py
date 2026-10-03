@@ -210,7 +210,7 @@ class PageTextReader:
             result = await asyncio.wait_for(
                 self._fetch(request.url, limit), timeout=self._config.timeout_seconds
             )
-        except (asyncio.TimeoutError, httpx.TimeoutException):
+        except (asyncio.TimeoutError, TimeoutError, httpx.TimeoutException):
             raise PageTextError(PageTextErrorCode.TIMEOUT) from None
         except (httpx.HTTPError, OSError):
             raise PageTextError(PageTextErrorCode.CONNECTION_ERROR) from None
@@ -230,7 +230,7 @@ class PageTextReader:
             return _public_ip(str(literal))
         try:
             addresses = await self._resolver(host, port)
-        except asyncio.TimeoutError:
+        except (asyncio.TimeoutError, TimeoutError):
             raise PageTextError(PageTextErrorCode.TIMEOUT) from None
         except (OSError, ValueError):
             raise PageTextError(PageTextErrorCode.DNS_ERROR) from None

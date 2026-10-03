@@ -43,6 +43,7 @@ from redteam.event_bus.memory import InMemoryEventBus
 from redteam.event_bus.publisher import EventPublisher
 from redteam.orchestration.candidates.models import PriorityScore
 from redteam.orchestration.context import RuntimeDeps
+from redteam.orchestration.coordination import coordinator_for
 from redteam.orchestration.events import CANDIDATE_REJECTED
 from redteam.orchestration.nodes import observe_node
 from redteam.orchestration.operator_intents import (
@@ -123,9 +124,64 @@ def task(
 async def seeded_task_store(*tasks: MissionTask) -> InMemoryTaskGraphStore:
     store = InMemoryTaskGraphStore()
     await store.create_mission(mission())
+    await coordinator_for(store).bind(str(RUN), str(MISSION), str(ENG))
     for item in tasks:
         await store.create_task(item)
     return store
+
+
+@pytest.mark.parametrize(
+    "status", [MissionStatus.COMPLETED, MissionStatus.FAILED, MissionStatus.CANCELLED]
+)
+@pytest.mark.parametrize("instruction", ["focus web", "exclude web", "다른 허용된 방법으로 시도해"])
+async def test_late_instruction_cannot_change_closed_mission(status, instruction) -> None:
+    tasks = InMemoryTaskGraphStore()
+    original = mission(status)
+    await tasks.create_mission(original)
+    await coordinator_for(tasks).bind(str(RUN), str(MISSION), str(ENG))
+    intents = InMemoryOperatorIntentStore()
+    svc = service(task_store=tasks, intent_store=intents)
+    result = await svc.receive_and_apply(
+        instruction,
+        mission_id=MISSION,
+        run_id=RUN,
+        allow_guidance=True,
+    )
+    assert not result.applied and result.status is IntentStatus.REJECTED
+    assert result.reason == "mission_closed"
+    assert await tasks.get_mission(MISSION) == original
+    records = await intents.list_for_mission(MISSION)
+    assert len(records) == 1 and records[0].run_id == RUN
+    assert records[0].status is IntentStatus.REJECTED
+    query = await svc.receive_and_apply("status", mission_id=MISSION, run_id=RUN)
+    assert query.applied and query.intent_type is OperatorIntentType.STATUS_QUERY
+
+
+async def test_delayed_explicit_chat_guidance_retains_original_mission_and_is_rejected() -> None:
+    tasks = await seeded_task_store()
+    intents = InMemoryOperatorIntentStore()
+    svc = service(task_store=tasks, intent_store=intents)
+    original = await tasks.get_mission(MISSION)
+    assert original is not None
+    closed = original.model_copy(
+        update={
+            "status": MissionStatus.COMPLETED,
+            "revision": original.revision + 1,
+        }
+    )
+    await tasks.update_mission(closed)
+    result = await svc.receive_guidance_and_apply(
+        "계속해서 추가 확인해줘",
+        mission_id=MISSION,
+        run_id=RUN,
+        source="operator_chat",
+    )
+    assert not result.applied and result.status is IntentStatus.REJECTED
+    assert result.reason == "mission_closed"
+    assert await tasks.get_mission(MISSION) == closed
+    records = await intents.list_for_mission(MISSION)
+    assert records[0].intent.mission_id == MISSION and records[0].run_id == RUN
+    assert records[0].intent.provenance.source == "operator_chat"
 
 
 async def _require_task(store: InMemoryTaskGraphStore, task_id: TaskId) -> MissionTask:
@@ -312,7 +368,7 @@ async def test_explicit_guidance_with_stop_word_is_memo_only() -> None:
     )
     intents = InMemoryOperatorIntentStore()
     bus = InMemoryEventBus()
-    svc = service(task_store=task_store, intent_store=intents)
+    svc = service(task_store=task_store, intent_store=intents, bus=bus)
     pub = publisher(bus)
 
     result = await svc.receive_guidance_and_apply(
@@ -480,7 +536,7 @@ async def test_receive_apply_publishes_correlated_causation_chain() -> None:
         task("mobile", capability="mobile", objective="Investigate mobile surface"),
     )
     bus = InMemoryEventBus()
-    svc = service(task_store=task_store, intent_store=InMemoryOperatorIntentStore())
+    svc = service(task_store=task_store, intent_store=InMemoryOperatorIntentStore(), bus=bus)
     pub = publisher(bus)
 
     received = await svc.receive("focus web", mission_id=MISSION, run_id=RUN, publisher=pub)
@@ -534,7 +590,7 @@ async def test_exclude_cancels_pending_work_but_not_a_running_task() -> None:
         task("mobile", priority=30, capability="mobile", objective="Investigate mobile surface"),
     )
     bus = InMemoryEventBus()
-    svc = service(task_store=task_store, intent_store=InMemoryOperatorIntentStore())
+    svc = service(task_store=task_store, intent_store=InMemoryOperatorIntentStore(), bus=bus)
     pub = publisher(bus)
 
     await svc.receive_and_apply(
@@ -562,7 +618,8 @@ async def test_stop_cancels_work_and_marks_the_mission_cancelled() -> None:
     assert result.applied is True
     assert (await _require_mission(task_store)).status is MissionStatus.CANCELLED
     assert (await _require_task(task_store, TaskId("web"))).status is TaskStatus.CANCELLED
-    assert (await _require_task(task_store, TaskId("api"))).status is TaskStatus.CANCELLED
+    # Already executing work must still collect its real result after STOP.
+    assert (await _require_task(task_store, TaskId("api"))).status is TaskStatus.RUNNING
 
 
 async def test_rejected_intent_reason_never_echoes_a_caller_parameter() -> None:
@@ -572,7 +629,7 @@ async def test_rejected_intent_reason_never_echoes_a_caller_parameter() -> None:
     task_store = await seeded_task_store(task("web", priority=10))
     intents = InMemoryOperatorIntentStore()
     bus = InMemoryEventBus()
-    svc = service(task_store=task_store, intent_store=intents)
+    svc = service(task_store=task_store, intent_store=intents, bus=bus)
 
     result = await svc.receive_and_apply(
         "reprioritize task:web",
@@ -654,6 +711,7 @@ def deps_with_intents(intent_store, task_store) -> RuntimeDeps:
 async def test_observe_pauses_before_execution_and_resumes_same_task() -> None:
     task_store = InMemoryTaskGraphStore()
     await task_store.create_mission(mission())
+    await coordinator_for(task_store).bind(str(RUN), str(MISSION), str(ENG))
     await task_store.create_task(
         task(
             "recon-task",

@@ -90,9 +90,12 @@ def wire_reference_agent(
         raise ValueError("methodology_workspace_read_tool_required")
     # Preserve caller-owned registries and the built-in Analysis verifier seam.
     scoped_agents = AgentRegistry(agents.all(), definitions=agents.definitions())
-    scoped_providers = CandidateProviderRegistry(
-        (key, providers.get(key)) for key in providers.provider_ids
-    )
+    scoped_providers = CandidateProviderRegistry()
+    for key in providers.provider_ids:
+        provider = providers.get(key)
+        if provider is None:
+            raise ValueError("methodology_provider_registry_inconsistent")
+        scoped_providers.register(key, provider)
     spec, definition = reference_agent()
     scoped_agents.register_definition(definition)
     scoped_agents.register(spec)

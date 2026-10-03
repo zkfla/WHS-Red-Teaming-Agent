@@ -8,8 +8,9 @@ hypothesis that happens to appear in a generic listing is not a fact.
 
 This module is the single read path that enforces that split. It only
 reads through the existing graph schema (no new DB, no new store).
-Return shape (engine and LLM consumers share this projection, never the
-raw graph): provided and hypotheses and findings stay grouped dicts;
+The LLM receives a bounded projection; execution checks receive fresh,
+uncapped internal assessment material from the same provenance rules.
+In the projection, provided, hypotheses and findings stay grouped dicts;
 facts is a list where every item carries node_id, id and fact_ref plus
 the granular fact_refs list; fact_refs is the merged measured-only
 reference list; known_targets is a list where every item carries node_id
@@ -36,6 +37,8 @@ from redteam.attack_graph.predicates import (
 )
 from redteam.core.contracts.graph import Hypothesis
 from redteam.core.enums import GraphNodeType
+from redteam.orchestration.knowledge_validation import InternalAssessment, InternalTarget
+from redteam.orchestration.progress import knowledge_fingerprint
 
 SCOPE_LABEL = "engagement-scope"
 
@@ -74,6 +77,7 @@ DECLARED_ATTR_KEYS = frozenset({"in_scope"})
 DECLARED_FACT_KEYS = frozenset(
     {
         "auth_session_config",
+        "auth_session_registrations",
         "display_name",
     }
 )
@@ -305,7 +309,7 @@ def _record_has_raw(record: Any) -> bool:
 
 
 async def _build_evidence_index(
-    evidence_store: Any, run_id: str
+    evidence_store: Any, run_id: str, *, engagement_id: str | None = None
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Same-run evidence by id, plus explicit lookup diagnostics.
 
@@ -336,6 +340,15 @@ async def _build_evidence_index(
     for rec in records or []:
         eid = str(getattr(rec, "evidence_id", "") or "")
         if not eid:
+            continue
+        # list_for_run already scopes by run; verify each record anyway so
+        # a mis-scoped store can never promote another run's evidence.
+        rec_run = getattr(rec, "run_id", None)
+        if rec_run is None or str(rec_run) != str(run_id):
+            diagnostics["run_mismatch"].append(eid)
+            continue
+        if engagement_id is not None and str(getattr(rec, "engagement_id", "")) != engagement_id:
+            diagnostics["run_mismatch"].append(eid)
             continue
         by_id[eid] = rec
         if not _record_has_raw(rec):
@@ -477,9 +490,7 @@ class HypothesisService:
             kwargs["confidence"] = confidence
         return await func(str(hypothesis_id), **kwargs)
 
-    async def relations_for(
-        self, hypothesis_id: str
-    ) -> builtins.list[dict[str, Any]]:
+    async def relations_for(self, hypothesis_id: str) -> builtins.list[dict[str, Any]]:
         node_id = str(hypothesis_node_id(str(hypothesis_id)))
         try:
             edges = await self._graph.list_edges()
@@ -539,16 +550,7 @@ def _provided_claim(
     first, last = _steps_of(props)
     prov = _provenance_summary(props)
     source = str(prov[0]["source"]) if prov else ""
-    sessions: list[str] = []
-    auth_cfg = facts.get("auth_session_config", {})
-    if isinstance(auth_cfg, dict):
-        raw_sessions = auth_cfg.get("sessions", [])
-        if isinstance(raw_sessions, list):
-            for item in raw_sessions:
-                if isinstance(item, dict) and item.get("session_ref") is not None:
-                    sessions.append(str(item.get("session_ref")))
-                elif isinstance(item, str):
-                    sessions.append(item)
+    sessions = _declared_session_refs(props, run_id)
     target_ref = facts.get("target_ref", None)
     # Declared scope is never self-confirming: confirmed needs a grounded
     # measured write (an actual tool run with same-run raw evidence) behind
@@ -576,6 +578,73 @@ def _provided_claim(
     )
 
 
+def _declared_session_refs(props: dict[str, Any], run_id: str) -> list[str]:
+    """Resolve declarations from their value snapshots, not merged node ownership."""
+    facts = facts_of(props)
+    claims = claim_provenance_of(props)
+    current = facts.get("auth_session_config", {})
+    current_sessions = current.get("sessions", []) if isinstance(current, dict) else []
+    if not isinstance(current_sessions, list):
+        return []
+    current_refs = {
+        str(item.get("session_ref")) if isinstance(item, dict) else item
+        for item in current_sessions
+        if ((isinstance(item, dict) and item.get("session_ref")) or isinstance(item, str))
+    }
+    registrations = facts.get("auth_session_registrations")
+    if isinstance(registrations, list):
+        claim = claims.get("facts:auth_session_registrations", {})
+        elements = claim.get("elements", [])
+        if not isinstance(elements, list):
+            return []
+        return sorted(
+            {
+                str(item["session_ref"])
+                for item in registrations
+                if isinstance(item, dict)
+                and item.get("session_ref")
+                and str(item["session_ref"]) in current_refs
+                and (item.get("run_id") is None or str(item["run_id"]) == run_id)
+                and any(
+                    isinstance(entry, dict)
+                    and values_equal(entry.get("value"), item)
+                    and (entry.get("run_id") is None or str(entry["run_id"]) == run_id)
+                    and entry.get("confidence") == "server_declared"
+                    for entry in elements
+                )
+            }
+        )
+    # Older seeds used one nested dictionary. Its claim snapshot may be a
+    # strict subset of the merged config; only the asserted subset is usable.
+    claim = claims.get("facts:auth_session_config", {})
+    if claim:
+        if claim.get("run_id") is not None and str(claim["run_id"]) != run_id:
+            return []
+        if claim.get("confidence") != "server_declared":
+            return []
+        config = claim.get("value", {})
+    else:
+        owners = {
+            str(entry["run_id"])
+            for entry in provenance_of(props)
+            if isinstance(entry, dict) and entry.get("run_id") is not None
+        }
+        if owners and owners != {run_id}:
+            return []
+        config = facts.get("auth_session_config", {})
+    raw = config.get("sessions", []) if isinstance(config, dict) else []
+    if not isinstance(raw, list):
+        return []
+    return sorted(
+        {
+            str(item.get("session_ref")) if isinstance(item, dict) else item
+            for item in raw
+            if ((isinstance(item, dict) and item.get("session_ref")) or isinstance(item, str))
+            and item in current_sessions
+        }
+    )
+
+
 def _node_evidence_ids(node: Any) -> list[str]:
     props = getattr(node, "properties", {}) or {}
     facts = facts_of(props)
@@ -589,7 +658,9 @@ def _node_evidence_ids(node: Any) -> list[str]:
     return _sorted_str(ids)
 
 
-def _node_observations(node: Any) -> list[dict[str, Any]]:
+def _node_observations(
+    node: Any, limit: int | None = MAX_OBSERVATIONS_PER_NODE
+) -> list[dict[str, Any]]:
     props = getattr(node, "properties", {}) or {}
     facts = facts_of(props)
     raw = facts.get("observations", [])
@@ -603,7 +674,9 @@ def _node_observations(node: Any) -> list[dict[str, Any]]:
             continue
         out.append(_jsonable(item))
     out.sort(key=lambda d: str(d.get("context_key", "")))
-    return out[:MAX_OBSERVATIONS_PER_NODE]
+    if limit is None:
+        return out
+    return out[:limit]
 
 
 def _is_provided_node(node: Any) -> bool:
@@ -628,6 +701,8 @@ def _fact_view(
     run_id: str,
     evidence_index: dict[str, Any] | None = None,
     diagnostics: dict[str, Any] | None = None,
+    observation_limit: int | None = MAX_OBSERVATIONS_PER_NODE,
+    evidence_limit: int | None = MAX_EVIDENCE_IDS_PER_ITEM,
 ) -> tuple:
     """Claim-level fact projection for one node.
 
@@ -884,7 +959,7 @@ def _fact_view(
                 "evidence_id": eid,
             }
     kept_observations: list[dict[str, Any]] = []
-    for obs in _node_observations(node):
+    for obs in _node_observations(node, observation_limit):
         obs_eid = obs.get("evidence_id") if isinstance(obs, dict) else None
         context_key = str(obs.get("context_key", "")) if isinstance(obs, dict) else ""
         if not obs_eid or str(obs_eid) not in index or not _record_has_raw(index.get(str(obs_eid))):
@@ -903,22 +978,20 @@ def _fact_view(
         kept_observations.append(obs)
         grounded_ids.add(str(obs_eid))
     all_ids = _node_evidence_ids(node)
-    if len(all_ids) > MAX_EVIDENCE_IDS_PER_ITEM and diagnostics is not None:
+    if evidence_limit is not None and len(all_ids) > evidence_limit and diagnostics is not None:
         diag.setdefault("truncated", []).append(
             {
                 "node_id": node_id,
-                "omitted_evidence_ids": all_ids[MAX_EVIDENCE_IDS_PER_ITEM:],
+                "omitted_evidence_ids": all_ids[evidence_limit:],
             }
         )
-    evidence_ids = all_ids[:MAX_EVIDENCE_IDS_PER_ITEM]
+    evidence_ids = all_ids[:evidence_limit] if evidence_limit is not None else list(all_ids)
     if not kept_attrs and not kept_facts and not kept_observations:
         return None, excluded, historical
     item = FactItem(
         node_id=node_id,
         node_type=str(
-            node_type.value
-            if node_type is not None and hasattr(node_type, "value")
-            else node_type
+            node_type.value if node_type is not None and hasattr(node_type, "value") else node_type
         ),
         observed_attrs=kept_attrs,
         observed_facts=kept_facts,
@@ -1203,6 +1276,7 @@ async def _known_targets(
     evidence_index: dict[str, Any] | None = None,
     diagnostics: dict[str, Any] | None = None,
     grounded_node_ids: set[str] | None = None,
+    provided_node_ids: set[str] | None = None,
 ) -> tuple:
     """Provided targets plus actually observed ones (grounded only).
 
@@ -1222,7 +1296,11 @@ async def _known_targets(
         if ntype not in USABLE_TARGET_TYPES:
             continue
         props = getattr(node, "properties", {}) or {}
-        provided = _is_provided_node(node)
+        provided = (
+            _is_provided_node(node)
+            if provided_node_ids is None
+            else str(node.id) in provided_node_ids
+        )
         if provided:
             origin = "declared"
             confirmed = _node_has_grounded_presence(
@@ -1288,7 +1366,9 @@ def _fact_refs_for_item(item: FactItem) -> list[str]:
     for obs in item.observations or []:
         if isinstance(obs, dict) and obs.get("context_key"):
             refs.append(str(item.node_id) + "#obs:" + str(obs.get("context_key")))
-    for eid in item.evidence_ids or []:
+    # fact refs admit only grounded same-run evidence; the raw node
+    # evidence-id list stays on the item as metadata, never as refs.
+    for eid in _sorted_str(item.grounded_evidence_ids or [])[:MAX_EVIDENCE_IDS_PER_ITEM]:
         refs.append("evidence:" + str(eid))
     out: list[str] = []
     for r in refs:
@@ -1303,15 +1383,16 @@ async def project_knowledge(
     run_id: str,
     step: int = 0,
     target_node_ids: list[str] | None = None,
+    _inputs: tuple | None = None,
 ) -> dict:
     run = str(run_id)
     targets: set[str] = set([str(v) for v in (target_node_ids or [])])
-    try:
-        nodes = await graph_service.list_nodes()
-    except Exception:
-        nodes = []
-    node_list = list(nodes or [])
-    evidence_index, evidence_diagnostics = await _build_evidence_index(evidence_store, run)
+    if _inputs is None:
+        node_list, graph_error, evidence_index, evidence_diagnostics = await _collect_inputs(
+            graph_service, evidence_store, run
+        )
+    else:
+        node_list, graph_error, evidence_index, evidence_diagnostics = _inputs
     index_failed = bool(evidence_diagnostics.get("lookup_failed"))
     provided_all: list[ProvidedClaim] = []
     for node in sorted(node_list, key=lambda n: str(n.id)):
@@ -1394,6 +1475,10 @@ async def project_knowledge(
             "note": "other-run claims are listed here, never merged into facts/known_targets",
         },
         "evidence_diagnostics": _finalize_diagnostics(evidence_diagnostics),
+        "graph_diagnostics": {
+            "lookup_failed": graph_error is not None,
+            "lookup_error": graph_error,
+        },
     }
 
 
@@ -1434,4 +1519,301 @@ __all__ = [
     "DECLARED_FACT_KEYS",
     "AUDIT_FACT_KEYS",
     "project_knowledge",
+    "collect_assessment",
+    "collect_knowledge",
 ]
+
+
+async def _collect_inputs(
+    graph_service: Any, evidence_store: Any, run: str, *, engagement_id: str | None = None
+) -> tuple[list, str | None, dict[str, Any], dict[str, Any]]:
+    """One shared store read: nodes plus same-run evidence.
+    A node-listing failure is returned as an error name, never folded
+    into an empty list, so checks can tell failure apart from emptiness."""
+    try:
+        nodes = await graph_service.list_nodes()
+    except Exception as exc:
+        graph_error: str | None = type(exc).__name__
+        nodes = []
+    else:
+        graph_error = None
+    node_list = list(nodes or [])
+    evidence_index, evidence_diagnostics = await _build_evidence_index(
+        evidence_store, run, engagement_id=engagement_id
+    )
+    return node_list, graph_error, evidence_index, evidence_diagnostics
+
+
+def _snapshot_bindings(
+    fact_items: list[FactItem], provided_claims: list[ProvidedClaim]
+) -> dict[str, set[str]]:
+    """Principal and session wiring from full items, refs only, never secrets.
+    Same rules as the display-side binding read, over untruncated items."""
+    bindings: dict[str, set[str]] = {"anonymous": set()}
+    items: list[FactItem | ProvidedClaim] = [*fact_items, *provided_claims]
+    for obj in items:
+        if isinstance(obj, FactItem):
+            facts = obj.observed_facts or {}
+            node_type = obj.node_type
+            node_id = obj.node_id
+        else:
+            facts = {}
+            node_type = obj.node_type
+            node_id = obj.node_id
+            declared = [str(reference) for reference in obj.auth_session_refs or []]
+            for reference in declared:
+                bindings.setdefault(reference, set()).add(reference)
+            if node_type in {"principal", "credential"}:
+                bindings.setdefault(str(node_id), set()).update(declared)
+        if not isinstance(facts, dict):
+            continue
+        config = facts.get("auth_session_config", {})
+        sessions = config.get("sessions", []) if isinstance(config, dict) else []
+        for session in sessions or []:
+            if isinstance(session, dict) and session.get("session_ref"):
+                reference = str(session["session_ref"])
+                bindings.setdefault(reference, set()).add(reference)
+        refs = facts.get("session_refs", [])
+        if facts.get("session_ref"):
+            refs = [*refs, facts["session_ref"]]
+        if facts.get("principal_ref"):
+            bindings.setdefault(str(facts["principal_ref"]), set()).update(map(str, refs))
+        if node_type in {"principal", "credential"}:
+            bindings.setdefault(str(node_id), set()).update(map(str, refs))
+    return bindings
+
+
+async def _build_snapshot_from_inputs(
+    node_list: list,
+    evidence_index: dict[str, Any],
+    evidence_diagnostics: dict[str, Any],
+    graph_error: str | None,
+    run: str,
+    step: int,
+    selected: set[str],
+) -> InternalAssessment:
+    """Full pre-truncation material from one shared read."""
+    if graph_error is not None:
+        return InternalAssessment(
+            run_id=run,
+            graph_lookup_failed=True,
+            graph_error=graph_error,
+            evidence_lookup_failed=bool(evidence_diagnostics.get("lookup_failed")),
+            evidence_error=evidence_diagnostics.get("lookup_error"),
+            principal_bindings={"anonymous": set()},
+        )
+    index_failed = bool(evidence_diagnostics.get("lookup_failed"))
+    snap_diag: dict[str, Any] = {
+        "lookup_failed": index_failed,
+        "lookup_error": evidence_diagnostics.get("lookup_error"),
+        "not_found": [],
+        "no_raw": [],
+        "run_mismatch": [],
+        "truncated": [],
+        "excluded_elements": [],
+    }
+    provided_all: list[ProvidedClaim] = []
+    provided_ids: set[str] = set()
+    for node in sorted(node_list, key=lambda n: str(n.id)):
+        if _is_provided_node(node):
+            # Legacy declarations without run ids remain readable; explicitly
+            # foreign registrations cannot authorize this run's targets/sessions.
+            registrations = [
+                entry
+                for entry in provenance_of(getattr(node, "properties", {}) or {})
+                if isinstance(entry, dict)
+                and (
+                    entry.get("confidence") == "server_declared"
+                    or str(entry.get("source", "")).startswith("engagement:")
+                )
+                and entry.get("run_id") is not None
+            ]
+            if registrations and not any(str(entry["run_id"]) == run for entry in registrations):
+                continue
+            provided_ids.add(str(node.id))
+            provided_all.append(_provided_claim(node, run, evidence_index, index_failed))
+    fact_all: list[FactItem] = []
+    historical_fact_count = 0
+    for node in sorted(node_list, key=lambda n: str(n.id)):
+        item, _, hist = _fact_view(
+            node,
+            run,
+            evidence_index,
+            snap_diag,
+            observation_limit=None,
+            evidence_limit=None,
+        )
+        historical_fact_count += len(hist)
+        if item is not None:
+            fact_all.append(item)
+    grounded_nodes = {item.node_id for item in fact_all}
+    known_all, historical_targets = await _known_targets(
+        node_list, run, selected, step, evidence_index, snap_diag, grounded_nodes, provided_ids
+    )
+    targets = {
+        item.node_id: InternalTarget(
+            node_id=item.node_id,
+            node_type=item.node_type,
+            origin=item.origin,
+            verification=item.verification,
+            address=item.address,
+            target_ref=item.target_ref,
+        )
+        for item in known_all
+    }
+    refs: set[str] = set()
+    for item in fact_all:
+        refs.add(str(item.node_id))
+        for key in item.observed_attrs or {}:
+            refs.add(str(item.node_id) + "#attr:" + str(key))
+        for key in item.observed_facts or {}:
+            refs.add(str(item.node_id) + "#fact:" + str(key))
+        for obs in item.observations or []:
+            if isinstance(obs, dict) and obs.get("context_key"):
+                refs.add(str(item.node_id) + "#obs:" + str(obs.get("context_key")))
+        for eid in item.grounded_evidence_ids or []:
+            refs.add("evidence:" + str(eid))
+    return InternalAssessment(
+        run_id=run,
+        targets=targets,
+        fact_refs=refs,
+        principal_bindings=_snapshot_bindings(fact_all, provided_all),
+        evidence_lookup_failed=index_failed,
+        evidence_error=evidence_diagnostics.get("lookup_error"),
+        historical_targets=[dict(h) for h in (historical_targets or [])],
+        historical_fact_count=historical_fact_count,
+        # Execution deduplication follows full measured content, never prompt
+        # selection, receipt names or evidence bookkeeping.
+        fact_fingerprint=knowledge_fingerprint(
+            {
+                "facts": [
+                    item.model_dump(
+                        include={
+                            "node_id",
+                            "node_type",
+                            "observed_attrs",
+                            "observed_facts",
+                            "observations",
+                        }
+                    )
+                    for item in fact_all
+                ]
+            }
+        ),
+    )
+
+
+async def collect_assessment(
+    graph_service: Any,
+    evidence_store: Any,
+    run_id: str,
+    step: int = 0,
+    target_node_ids: list[str] | None = None,
+    *,
+    engagement_id: str | None = None,
+) -> InternalAssessment:
+    """Build the full pre-truncation material for one check.
+    Same claim-level grounding as the display projection, but nothing is
+    cut. Callers collect fresh per check and never cache the result."""
+    run = str(run_id)
+    selected: set[str] = {str(v) for v in (target_node_ids or [])}
+    node_list, graph_error, evidence_index, evidence_diagnostics = await _collect_inputs(
+        graph_service, evidence_store, run, engagement_id=engagement_id
+    )
+    return await _build_snapshot_from_inputs(
+        node_list, evidence_index, evidence_diagnostics, graph_error, run, step, selected
+    )
+
+
+async def collect_progress_content(
+    graph_service: Any,
+    evidence_store: Any,
+    run_id: str,
+    *,
+    step: int,
+    engagement_id: str | None = None,
+) -> str | None:
+    """Full grounded facts, supported conclusions and usable declarations."""
+    nodes, graph_error, index, diagnostics = await _collect_inputs(
+        graph_service, evidence_store, run_id, engagement_id=engagement_id
+    )
+    if graph_error is not None or diagnostics.get("lookup_failed"):
+        return None
+    material = await _build_snapshot_from_inputs(
+        nodes, index, diagnostics, graph_error, run_id, step, set()
+    )
+    try:
+        hypotheses = await HypothesisService(graph_service).list()
+    except Exception:  # noqa: BLE001 - not a changed or empty investigation
+        return None
+    conclusions = []
+    for hyp in hypotheses:
+        if hyp.status not in {"confirmed", "refuted", "rejected"}:
+            continue
+        meta = hyp.metadata or {}
+        refs = {
+            str(eid)
+            for key in ("evidence_ids", "supporting_evidence_ids", "refuting_evidence_ids")
+            for eid in (meta.get(key, []) if isinstance(meta.get(key, []), list) else [])
+        }
+        supported = any(
+            _record_has_raw(record)
+            and (eid in refs or str(record.hypothesis_id or "") == str(hyp.hypothesis_id))
+            for eid, record in index.items()
+        )
+        if supported:
+            conclusions.append(
+                {
+                    "claim": hyp.description,
+                    "status": hyp.status,
+                    "target_node_id": meta.get("target_node_id"),
+                    "expectation": meta.get("expectation"),
+                    # Used only as a grounding gate by knowledge_fingerprint.
+                    "evidence_ids": ["grounded"],
+                }
+            )
+    return knowledge_fingerprint(
+        {
+            "facts": [
+                {
+                    "measured": material.fact_fingerprint,
+                    "targets": [vars(item) for item in material.targets.values()],
+                    "principal_bindings": {
+                        key: sorted(value) for key, value in material.principal_bindings.items()
+                    },
+                }
+            ],
+            "hypotheses": conclusions,
+        }
+    )
+
+
+async def collect_knowledge(
+    graph_service: Any,
+    evidence_store: Any,
+    run_id: str,
+    step: int = 0,
+    target_node_ids: list[str] | None = None,
+    *,
+    engagement_id: str | None = None,
+) -> tuple[dict, InternalAssessment]:
+    """One shared read feeding both the display dict and the material.
+    The capped projection keeps its exact shape for model consumers;
+    the assessment carries the full refs for execution checks."""
+    run = str(run_id)
+    selected: set[str] = {str(v) for v in (target_node_ids or [])}
+    node_list, graph_error, evidence_index, evidence_diagnostics = await _collect_inputs(
+        graph_service, evidence_store, run, engagement_id=engagement_id
+    )
+    snapshot = await _build_snapshot_from_inputs(
+        node_list, evidence_index, evidence_diagnostics, graph_error, run, step, selected
+    )
+    display = await project_knowledge(
+        graph_service,
+        evidence_store,
+        run_id,
+        step=step,
+        target_node_ids=target_node_ids,
+        _inputs=(node_list, graph_error, evidence_index, evidence_diagnostics),
+    )
+    return display, snapshot

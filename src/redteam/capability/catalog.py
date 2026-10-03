@@ -9,7 +9,8 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from redteam.capability.registry import MCPToolRegistry
-from redteam.core.contracts.action_naming import (
+from redteam.core.action_semantics import (
+    CANONICAL_CAPABILITIES,
     ActionNamingError,
     canonical_action_key,
     validate_capability_name,
@@ -66,17 +67,60 @@ class MCPToolCatalog:
             if operation_bindings is not None
             else None
         )
+        registered = {descriptor.tool_id for descriptor in registry.all()}
+        self._resolved_operations: dict[ToolId, frozenset[str]] = {}
         if self._operation_bindings is not None:
-            for tool_id, operations in self._operation_bindings.items():
-                self._validate_bindings(tool_id, operations)
-            registered = {descriptor.tool_id for descriptor in registry.all()}
             unknown = set(self._operation_bindings) - registered
             if unknown:
                 names = ", ".join(sorted(str(tool_id) for tool_id in unknown))
                 raise ValueError(f"operation bindings reference unknown tools: {names}")
+            for tool_id in registered:
+                descriptor = registry.get(tool_id)
+                if descriptor is None:
+                    continue
+                namespace, separator, _remote = str(descriptor.tool_id).partition(".")
+                if separator != "." or not _remote or "." in _remote:
+                    raise ValueError(f"operation bindings reference malformed tool id: {tool_id}")
+                if namespace not in CANONICAL_CAPABILITIES:
+                    raise ValueError(f"tool {tool_id} uses unsupported namespace {namespace!r}")
+                if tool_id not in self._operation_bindings:
+                    raise ValueError(
+                        f"operation bindings are missing an explicit mapping for {tool_id}"
+                    )
+                declared = list(self._operation_bindings[tool_id])
+                if descriptor.operations and set(declared) != set(descriptor.operations):
+                    raise ValueError(
+                        f"operation bindings conflict with declared operations: {tool_id}"
+                    )
+                resolved = set()
+                for operation in declared:
+                    try:
+                        resolved.add(canonical_action_key(namespace, operation).split(".", 1)[1])
+                    except ActionNamingError as exc:
+                        raise ValueError(
+                            f"operation bindings contain noncanonical names: {exc.reason}"
+                        ) from exc
+                self._resolved_operations[tool_id] = frozenset(resolved)
         else:
-            for descriptor in registry.all():
-                self._validate_bindings(descriptor.tool_id, descriptor.operations)
+            for tool_id in registered:
+                descriptor = registry.get(tool_id)
+                if descriptor is None:
+                    continue
+                namespace, separator, _remote = str(descriptor.tool_id).partition(".")
+                if separator != "." or not _remote or "." in _remote:
+                    raise ValueError(f"registry holds malformed tool id: {tool_id}")
+                if namespace not in CANONICAL_CAPABILITIES:
+                    raise ValueError(f"tool {tool_id} uses unsupported namespace {namespace!r}")
+                candidates = list(descriptor.operations)
+                resolved = set()
+                for operation in candidates:
+                    try:
+                        resolved.add(canonical_action_key(namespace, operation).split(".", 1)[1])
+                    except ActionNamingError as exc:
+                        raise ValueError(
+                            f"tool {tool_id} has noncanonical names: {exc.reason}"
+                        ) from exc
+                self._resolved_operations[tool_id] = frozenset(resolved)
         registered = {descriptor.tool_id for descriptor in registry.all()}
         self._output_schemas = {
             ToolId(str(tool_id)): deepcopy(schema)
@@ -97,23 +141,37 @@ class MCPToolCatalog:
             return False
         return operation in self._operations_for(descriptor)
 
-    @staticmethod
-    def _validate_bindings(tool_id: ToolId, operations: Collection[str]) -> None:
-        namespace = str(tool_id).partition(".")[0]
-        for operation in operations:
-            try:
-                canonical_action_key(namespace, operation)
-            except ActionNamingError as exc:
-                raise ValueError(
-                    f"tool {tool_id!r} operation bindings contain noncanonical names: "
-                    f"{exc.reason}: {exc}"
-                ) from exc
-
     def get(self, tool_id: ToolId) -> ToolDescriptor | None:
-        return self._registry.get(tool_id)
+        descriptor = self._registry.get(tool_id)
+        if descriptor is None:
+            return None
+        return self.finalized(descriptor)
 
     def list_by_capability(self, capability_tag: str) -> list[ToolDescriptor]:
-        return self._registry.list_by_capability(capability_tag)
+        return [self.finalized(item) for item in self._registry.list_by_capability(capability_tag)]
+
+    def finalized(self, descriptor: ToolDescriptor) -> ToolDescriptor:
+        """Copy of ``descriptor`` carrying the resolved canonical operations.
+
+        Individual lookups show the same finalized operation list as the
+        action queries; a tool whose binding cannot be resolved is shown
+        with no operations rather than as a registered operation.
+        """
+        return descriptor.model_copy(
+            update={
+                "operations": sorted(self._operations_for(descriptor)),
+                "output_schema": deepcopy(
+                    self._output_schemas.get(descriptor.tool_id, descriptor.output_schema)
+                ),
+                "target_types": (
+                    [self._target_types[descriptor.tool_id]]
+                    if self._target_types.get(descriptor.tool_id) is not None
+                    else []
+                    if descriptor.tool_id in self._target_types
+                    else list(descriptor.target_types)
+                ),
+            }
+        )
 
     def health_snapshot(self) -> dict[str, ToolHealthStatus]:
         """Read-only per-server health view straight from the live Registry.
@@ -145,7 +203,7 @@ class MCPToolCatalog:
                 continue
             if not include_unhealthy and descriptor.health_status == ToolHealthStatus.UNHEALTHY:
                 continue
-            candidates.append(descriptor)
+            candidates.append(self.finalized(descriptor))
         return candidates
 
     def list_candidate_metadata(
@@ -164,6 +222,7 @@ class MCPToolCatalog:
 
         candidates: list[ToolCandidateMetadata] = []
         for descriptor in self._registry.all():
+            descriptor = self.finalized(descriptor)
             namespace, separator, _ = str(descriptor.tool_id).partition(".")
             if separator != "." or (capability is not None and namespace != capability):
                 continue
@@ -180,9 +239,13 @@ class MCPToolCatalog:
                         operation=bound_operation,
                         required_arguments=required,
                         optional_arguments=optional,
-                        target_type=self._target_types.get(descriptor.tool_id),
+                        target_type=(
+                            descriptor.target_types[0]
+                            if len(descriptor.target_types) == 1
+                            else None
+                        ),
                         risk_level=descriptor.risk_level,
-                        output_schema=deepcopy(self._output_schemas.get(descriptor.tool_id)),
+                        output_schema=deepcopy(descriptor.output_schema),
                         server_id=descriptor.server_id,
                         tool_name=descriptor.tool_name,
                         description=descriptor.description,
@@ -193,9 +256,7 @@ class MCPToolCatalog:
         return candidates
 
     def _operations_for(self, descriptor: ToolDescriptor) -> frozenset[str]:
-        if self._operation_bindings is None:
-            return frozenset(descriptor.operations)
-        return self._operation_bindings.get(descriptor.tool_id, frozenset())
+        return self._resolved_operations.get(descriptor.tool_id, frozenset())
 
 
 def server_health_snapshot(registry: MCPToolRegistry) -> dict[str, ToolHealthStatus]:
@@ -230,4 +291,4 @@ def _argument_names(
         or not set(required).issubset(properties)
     ):
         raise ValueError("MCP input schema has invalid required/properties fields")
-    return tuple(sorted(set(required))), tuple(sorted(set(properties) - set(required)))
+    return tuple(required), tuple(name for name in properties if name not in required)

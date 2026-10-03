@@ -16,6 +16,7 @@ from redteam.core.ids import ActionId, new_id
 from redteam.orchestration.candidates.models import ExecutableCandidate
 from redteam.orchestration.cognition import DecisionFailure
 from redteam.orchestration.context import RuntimeDeps
+from redteam.orchestration.diagnostics import diagnostic_for_exception
 from redteam.orchestration.dispatch import DispatchItem
 from redteam.orchestration.engine import InvestigationEngine
 from redteam.orchestration.events import AGENT_DECISION_RECORDED, MCP_TOOL_SELECTED
@@ -60,12 +61,14 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             runtime, observation, last_event_id=state.get("last_event_id")
         )
     except (DecisionFailure, PathError, ValueError, TypeError) as exc:
+        diagnostic = diagnostic_for_exception(exc, stage="path_or_action")
         event = await publisher.publish(
             "PlanningFailed",
             {
-                "kind": getattr(exc, "kind", "invalid_decision"),
-                "stage": getattr(exc, "stage", "path_or_action"),
+                "kind": diagnostic.kind,
+                "stage": diagnostic.stage,
                 "error_type": type(exc).__name__,
+                "diagnostic": diagnostic.model_dump(mode="json"),
             },
             causation_id=engine.last_event_id,
         )
@@ -76,6 +79,11 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                     "phase": AgentPhase.REPLAN,
                     "termination_reason": TerminationReason.PLANNING_ERROR,
                     "planning_error": type(exc).__name__,
+                    "planning_diagnostic": diagnostic,
+                    "planning_diagnostic_history": [
+                        *runtime.planning_diagnostic_history,
+                        diagnostic,
+                    ][-10:],
                 }
             ),
             last_event_id=event.event_id,
@@ -83,12 +91,30 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             action_proposal=None,
             dispatch_items=[],
         )
-    updates: dict[str, Any] = {"planning_error": None}
+    updates: dict[str, Any] = {"planning_error": None, "planning_diagnostic": None}
     state = {**state, "last_event_id": engine.last_event_id}
     if path:
         updates.update(active_path_id=path.path_id, active_path_version=path.version)
     if outcome is not None:
         if outcome == "continue_planning":
+            review_diagnostic = getattr(engine, "planning_diagnostic", None)
+            if review_diagnostic is not None:
+                updates["planning_diagnostic"] = review_diagnostic
+                updates["planning_diagnostic_history"] = [
+                    *runtime.planning_diagnostic_history,
+                    review_diagnostic,
+                ][-10:]
+                exhausted = await publisher.publish(
+                    "PlanningFailed",
+                    {
+                        "kind": review_diagnostic.kind,
+                        "stage": review_diagnostic.stage,
+                        "error_type": "DecisionFailure",
+                        "diagnostic": review_diagnostic.model_dump(mode="json"),
+                    },
+                    causation_id=engine.last_event_id,
+                )
+                state = {**state, "last_event_id": exhausted.event_id}
             updates.update(phase=AgentPhase.REPLAN, termination_reason=None)
             return advance(
                 state,

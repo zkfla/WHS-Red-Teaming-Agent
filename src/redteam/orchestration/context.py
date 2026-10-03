@@ -27,6 +27,7 @@ from redteam.orchestration.agents.providers import (
 )
 from redteam.orchestration.agents.registry import AgentRegistry, default_registry
 from redteam.orchestration.analysis import AnalysisVerifier, StructuredLLMAnalysisVerifier
+from redteam.orchestration.component_binding import RuntimeComponentBinding
 from redteam.orchestration.context_projection import ContextProjectionCache
 from redteam.orchestration.long_jobs import LongJobAdapter
 from redteam.orchestration.methodology import ReferenceLibrary
@@ -83,6 +84,8 @@ class RuntimeDeps:
     #: enforced. The bound is applied at the tool call site (EXECUTE), not at
     #: policy admission, so a bounded fan-out batch still executes fully.
     tool_semaphore: asyncio.Semaphore | None = field(default=None, compare=False)
+    #: Which registered component set this run was built from.
+    component_binding: RuntimeComponentBinding | None = field(default=None, compare=False)
 
     def __post_init__(self) -> None:
         if self.verifier is None:

@@ -27,10 +27,12 @@ MCP 자식 프로세스도 실제로 읽은 정책 바이트의 해시를 검사
 5. 그 경로에서 A/B 각각 허용/차단돼야 한다는 운영자의 기준. 모르면 `unspecified`.
 
 대상마다 origin hostname과 동일한 `host_bindings` 키가 필요하다. origin은 HTTPS도 지원한다.
-현재 Graph 초기화와 일치시키기 위해 구체적인 hostname/IP가 기존 allowed_hosts 또는
-allowed_domains에도 있어야 한다. 포트가 붙은 allowed_hosts만으로는 현재 Control 검사가
-일치하지 않을 수 있으며 이 기능은 포트를 제거하거나 Scope를 자동 확장하지 않는다.
-이 경우 Control 팀이 포트 포함 범위 계약을 먼저 해결해야 한다.
+Graph 초기화와 일치시키기 위해 구체적인 hostname/IP 또는 정확한 host:port seed가
+기존 allowed_hosts/allowed_domains에 있어야 한다. 최신 dev의 Control 포트 검사를 사용한다.
+예를 들어 origin이 `https://127.0.0.1:8443`, scope가 `127.0.0.1:8443`이면
+target_refs/auth_sessions도 **그 port-pinned seed**에 연결한다. bare host를 추가하지 않는다.
+다른 포트 또는 deny 정책이면 생성 전에 거부한다. HTTPS 기본 포트 443과
+대괄호 IPv6 `[::1]:8443`도 같은 규칙이다. 서브도메인/CIDR 자동 seed 생성은 하지 않는다.
 
 `session_access`는 MCP의 각 세션과 1:1 대응하며 paths는 target.allowed_paths의 부분집합이다.
 생성된 정책에서는 해당 세션을 다른 승인 경로에 쓰는 것도 막는다.

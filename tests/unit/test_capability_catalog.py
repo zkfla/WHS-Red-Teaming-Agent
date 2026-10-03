@@ -101,4 +101,13 @@ def test_catalog_rejects_bindings_for_unknown_tool() -> None:
 
 def test_catalog_rejects_noncanonical_operation_binding() -> None:
     with pytest.raises(ValueError, match="noncanonical"):
-        MCPToolCatalog(_registry(), {"web.http_client": ("HTTP Request",)})
+        MCPToolCatalog(
+            _registry(),
+            {
+                "web.http_client": ("HTTP Request",),
+                "web.proxy_replay": (),
+                "web.operator_status": (),
+                "recon.http_probe": ("service_discovery",),
+                "web.unhealthy_client": ("http_request",),
+            },
+        )

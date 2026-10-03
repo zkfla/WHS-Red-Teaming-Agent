@@ -1,5 +1,9 @@
 # Capability 공통 코드 최종 통합 — 2026-10-03
 
+이 문서는 `d973b36`의 **dev 병합 전 기록**이다.
+최신 dev 통합 후 정의 경로·오류 구분·검증 결과는
+[dev–Capability 후속 통합 결과](dev-capability-integration-result.md)를 따른다.
+
 ## 기준과 결정
 
 - 작업 브랜치: `capability`. 원격 B·C 반영 기준 `02d8b5c`를 fast-forward했다.
@@ -13,8 +17,8 @@
 ## 바뀐 계약
 
 지원 작업 이름 23개의 유일한 정의와 검사 함수는
-`src/redteam/core/contracts/action_naming.py`에 있다.
-기존 `orchestration.action_naming` 경로는 호환 재-export를 유지한다.
+`src/redteam/core/action_semantics.py`로 후속 dev 통합에서 모았다.
+`core.contracts.action_naming`과 `orchestration.action_naming`은 호환 재-export다.
 Capability가 Orchestration 내부를 import하지 않는다. 기존 ActionProposal,
 TargetRef, ToolInvocation schema와 Core Port는 변경하지 않는다.
 
@@ -38,8 +42,8 @@ profile 관리 도구 중 빈 연결은 그대로 유지하며 임의 작업에 
 
 - `capability_unsupported`: 미지원 namespace.
 - `operation_invalid_format`: lower_snake_case 형식 오류.
-- `operation_unsupported`: 공통 목록 밖 작업; 목록 안이지만 연결 도구가 없을 때도
-  Compiler의 기존 연결 부재 코드가 동일하므로 도구 등록 상태와 함께 확인한다.
+- `operation_unsupported`: 공통 목록 밖 작업.
+- `no_tool_for_operation`: 후속 통합에서 분리한, 지원 작업의 도구 연결 부재.
 - `unknown_target_node` / `unresolved_target` / `target_type_mismatch`: 대상 관련 오류.
 
 Settings·Manifest의 실패에는 서버·도구·operation 정보가 포함된다. 원격 응답 본문,

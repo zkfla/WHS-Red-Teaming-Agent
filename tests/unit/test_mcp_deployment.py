@@ -121,7 +121,7 @@ def test_drift_is_rejected_before_discovery(tmp_path, monkeypatch, mutation):
         synchronize_deployment(config, servers)
 
 
-@pytest.mark.parametrize("mutation", ["outside", "denied", "host_port"])
+@pytest.mark.parametrize("mutation", ["outside", "denied", "wrong_port"])
 def test_scope_is_checked_by_control_without_port_stripping(tmp_path, mutation):
     spec = DeploymentSpec.model_validate(source())
     config = engagement()
@@ -130,10 +130,38 @@ def test_scope_is_checked_by_control_without_port_stripping(tmp_path, mutation):
     elif mutation == "denied":
         config.scope.denied_hosts = ["127.0.0.1"]
     else:
-        config.scope.allowed_hosts = ["127.0.0.1:8443"]
+        config.scope.allowed_hosts = ["127.0.0.1:9443"]
     with pytest.raises(ValueError, match="outside_control_scope"):
         provision(spec, config, tmp_path / "unused")
     assert not (tmp_path / "unused").exists()
+
+
+@pytest.mark.parametrize(
+    ("origin", "seed"),
+    [
+        ("https://127.0.0.1:8443", "127.0.0.1:8443"),
+        ("https://127.0.0.1", "127.0.0.1:443"),
+        ("https://[::1]:8443", "[::1]:8443"),
+    ],
+)
+def test_port_pinned_deployment_preserves_exact_scope_seed(tmp_path, origin, seed):
+    from urllib.parse import urlsplit
+
+    value = source(origin)
+    host = urlsplit(origin).hostname
+    value["host_bindings"] = {host: "bank-test"}
+    spec = DeploymentSpec.model_validate(value)
+    config = engagement()
+    config.scope.allowed_hosts = [seed]
+    path = provision(spec, config, tmp_path / "port-deployment")
+    loaded = load_engagement_config(path)
+    resolved = synchronize_deployment(loaded, list(spec.roles), check_environment=False)
+    assert resolved.scope == config.scope
+    assert resolved.approval_policy == config.approval_policy
+    assert resolved.metadata["target_refs"] == {seed: "bank-test"}
+    assert set(resolved.metadata["auth_sessions"]) == {seed}
+    assert resolved.metadata["mcp_targets"]["bank-test"]["origin"] == origin
+    assert set(spec.host_bindings) == {host}  # Policy hosts retain their real identity.
 
 
 @pytest.mark.parametrize(

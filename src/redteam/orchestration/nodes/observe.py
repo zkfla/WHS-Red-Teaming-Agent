@@ -2,18 +2,15 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
 from datetime import datetime, timezone
 
 from redteam.attack_graph.observation import GraphObservation
 from redteam.core.contracts.events import EventType
 from redteam.core.enums import AgentPhase, TaskStatus
 from redteam.orchestration.context import RuntimeDeps
-from redteam.orchestration.knowledge import project_knowledge
 from redteam.orchestration.nodes._support import advance, graph_service, publisher_for
 from redteam.orchestration.operator_intents import OperatorIntentService
-from redteam.orchestration.progress import knowledge_fingerprint
+from redteam.orchestration.progress import canonical_progress_fingerprint
 from redteam.orchestration.state import GraphState, TerminationReason
 
 
@@ -66,27 +63,12 @@ async def observe_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                 action_proposal=None,
                 dispatch_items=[],
             )
-    knowledge = await project_knowledge(
-        service,
-        deps.evidence_store,
-        str(runtime.run_id),
-        step=runtime.step_count + 1,
-    )
-    fingerprint = knowledge_fingerprint(knowledge)
-    path = await deps.path_store.get_active(str(runtime.run_id))
-    completed = (
-        [
-            (item.step_id, item.objective, item.outcome)
-            for item in path.steps
-            if item.status == "completed" and item.evidence_ids
-        ]
-        if path
-        else []
-    )
-    fingerprint = hashlib.sha256(json.dumps([fingerprint, sorted(completed)]).encode()).hexdigest()
-    no_progress = (
-        runtime.no_progress_turns + 1 if runtime.last_progress_fingerprint == fingerprint else 0
-    )
+    fingerprint = await canonical_progress_fingerprint(deps, runtime, step=runtime.step_count + 1)
+    no_progress = runtime.no_progress_turns
+    if fingerprint is not None:
+        no_progress = no_progress + 1 if runtime.last_progress_fingerprint == fingerprint else 0
+    else:
+        fingerprint = runtime.last_progress_fingerprint
     task_id = runtime.active_task_id
     if runtime.mission_id is not None:
         from redteam.orchestration.operator_intents.service import _is_suppressed

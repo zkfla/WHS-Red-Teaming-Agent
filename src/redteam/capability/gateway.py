@@ -66,8 +66,7 @@ class MCPToolGateway:
         if any(limit < 1 for limit in concurrency.values()):
             raise ValueError("MCP server concurrency must be at least 1")
         self._server_semaphores = {
-            server_id: asyncio.Semaphore(concurrency.get(server_id, 1))
-            for server_id in adapters
+            server_id: asyncio.Semaphore(concurrency.get(server_id, 1)) for server_id in adapters
         }
         output_limits = server_output_limits or {}
         unknown_output_servers = set(output_limits) - set(adapters)
@@ -95,15 +94,15 @@ class MCPToolGateway:
 
     def get(self, tool_id: ToolId) -> ToolDescriptor | None:
         """Expose a defensive catalog snapshot to the application composition root."""
-        return self._registry.get(tool_id)
+        return self._catalog.get(tool_id)
 
     def list_by_capability(self, capability_tag: str) -> list[ToolDescriptor]:
-        return self._registry.list_by_capability(capability_tag)
+        return self._catalog.list_by_capability(capability_tag)
 
     def all(self) -> list[ToolDescriptor]:
         """Every registered tool, regardless of capability — read-only
         catalog enumeration for callers like `redteam tools list`."""
-        return self._registry.all()
+        return [self._catalog.finalized(item) for item in self._registry.all()]
 
     def health_snapshot(self) -> dict[str, ToolHealthStatus]:
         """Current per-server health from the live Registry (no probing)."""
@@ -186,7 +185,7 @@ class MCPToolGateway:
         return status
 
     async def invoke(self, invocation: ToolInvocation) -> ToolResult:
-        descriptor = self._registry.get(invocation.tool_id)
+        descriptor = self._catalog.get(invocation.tool_id)
         if descriptor is None:
             return ToolResult(
                 invocation_id=invocation.invocation_id,
@@ -228,10 +227,13 @@ class MCPToolGateway:
         if invocation.execution_context.dry_run:
             occurred_at = datetime.now(timezone.utc)
             return ToolResult(
-                invocation_id=invocation.invocation_id, action_id=invocation.action_id,
-                tool_id=invocation.tool_id, success=True,
+                invocation_id=invocation.invocation_id,
+                action_id=invocation.action_id,
+                tool_id=invocation.tool_id,
+                success=True,
                 output={"dry_run": True, "executed": False},
-                started_at=occurred_at, finished_at=occurred_at,
+                started_at=occurred_at,
+                finished_at=occurred_at,
                 metadata={"dry_run": True},
             )
 
@@ -243,7 +245,7 @@ class MCPToolGateway:
             now = datetime.now(timezone.utc)
             if self._needs_health_refresh(descriptor.server_id, now):
                 await self._refresh_server_health(descriptor.server_id)
-                refreshed = self._registry.get(invocation.tool_id)
+                refreshed = self._catalog.get(invocation.tool_id)
                 if refreshed is not None:
                     descriptor = refreshed
 

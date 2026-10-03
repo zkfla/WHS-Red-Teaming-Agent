@@ -16,6 +16,7 @@ from redteam.capability.mobile_analysis_manifest import MOBILE_ANALYSIS_TOOLS
 from redteam.core.config import load_app_config
 from redteam.core.contracts.events import EventType
 from redteam.core.enums import GraphNodeType
+from redteam.event_bus.memory import InMemoryEventBus
 from redteam.orchestration.events import AGENT_NO_EXECUTABLE_CANDIDATES, CANDIDATE_REJECTED
 from redteam.orchestration.settings import OrchestrationSettings
 from redteam.orchestration.state import TerminationReason
@@ -91,6 +92,7 @@ async def test_real_apktool_mcp_completes_the_analysis_agent_engagement(
         )
         final = await run_engagement(engagement, deps=deps)
 
+        assert isinstance(deps.event_bus, InMemoryEventBus)
         diagnostics = [
             event.model_dump(mode="json")
             for event in deps.event_bus.history()

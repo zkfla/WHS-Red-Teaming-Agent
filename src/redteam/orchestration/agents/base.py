@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol
 
 from pydantic import BaseModel, Field, model_validator
+from pydantic_core import PydanticCustomError
 
 from redteam.attack_graph.identity import host_node_id, node_id_for_target, target_for_node
 from redteam.attack_graph.observation import GraphObservation
@@ -159,11 +160,21 @@ class PlanStep(BaseModel):
 
     @model_validator(mode="after")
     def _has_exactly_one_target_source(self) -> PlanStep:
-        canonical_action_key(self.capability, self.operation)
+        try:
+            canonical_action_key(self.capability, self.operation)
+        except ValueError as exc:
+            raise PydanticCustomError(
+                "unknown_operation", "Use a supported action meaning."
+            ) from exc
         if not tool_matches_action_namespace(self.tool_id, self.capability):
-            raise ValueError(
-                f"step {self.step_id!r} binds tool {self.tool_id!r} outside "
-                f"capability namespace {self.capability!r}"
+            raise PydanticCustomError(
+                "tool_outside_capability_namespace",
+                "step {step_id} binds tool {tool_id} outside capability namespace {capability}",
+                {
+                    "step_id": repr(self.step_id),
+                    "tool_id": repr(str(self.tool_id)),
+                    "capability": repr(self.capability),
+                },
             )
         if (self.target is None) == (not self.target_bind):
             raise ValueError(

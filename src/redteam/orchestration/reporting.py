@@ -13,6 +13,7 @@ from redteam.core.enums import AgentPhase, MissionStatus, TaskStatus
 from redteam.core.ids import ApprovalId, EvidenceId, FindingId, MissionId, RunId, TaskId
 from redteam.core.ports.evidence_store import EvidenceStore
 from redteam.core.ports.task_graph import MissionTaskStore
+from redteam.orchestration.diagnostics import DecisionDiagnostic
 from redteam.orchestration.operator_intents.redaction import redact_text
 from redteam.orchestration.state import RuntimeState, TerminationReason
 from redteam.orchestration.work.store import WorkStore
@@ -113,6 +114,9 @@ class TerminalReportProjection(BaseModel):
     run_id: RunId
     phase: AgentPhase
     termination_reason: str | None
+    planning_diagnostic: DecisionDiagnostic | None = None
+    pending_event_count: int = 0
+    event_delivery_pending: bool = False
     pending_approval_id: ApprovalId | None = None
     ready_for_release: bool
     actions_executed: int
@@ -217,6 +221,9 @@ class ReportingAgent:
             run_id=runtime.run_id,
             phase=runtime.phase,
             termination_reason=runtime.termination_reason,
+            planning_diagnostic=runtime.planning_diagnostic,
+            pending_event_count=runtime.pending_event_count,
+            event_delivery_pending=runtime.event_delivery_pending,
             pending_approval_id=runtime.pending_approval_id,
             ready_for_release=(
                 runtime.phase is AgentPhase.FINISHED

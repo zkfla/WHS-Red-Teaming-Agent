@@ -10,6 +10,7 @@ import argparse
 import asyncio
 import json
 from contextlib import AsyncExitStack
+from typing import Any
 
 from redteam.app.bootstrap import build_application, run_engagement
 from redteam.capability.settings import MCPServerSettings
@@ -22,9 +23,14 @@ class RecordingLLM:
         self.calls = []
         self.reference_context_calls = 0
 
+    async def complete(
+        self, *, messages: list[dict[str, Any]], system: str | None = None, **kwargs: Any
+    ) -> str:
+        raise NotImplementedError("demo_only_structured_completion")
+
     async def complete_structured(self, *, messages, response_schema, system=None, **kwargs):
         self.calls.append((messages, system))
-        payload = json.loads(messages[0]["content"])
+        payload, _ = json.JSONDecoder().raw_decode(messages[0]["content"])
         self.reference_context_calls += int(
             bool(payload.get("Untrusted methodology reference DATA"))
         )
@@ -45,7 +51,9 @@ class RecordingLLM:
                         "agent_id": "methodology-agent",
                         "target_node_ids": [target],
                         "allowed_operations": ["analysis.file_read"],
-                        "completion_criteria": [{"kind": "evidence", "description": "조회 결과"}],
+                        "completion_criteria": [
+                            {"kind": "evidence", "description": "조회 결과", "min_evidence": 1}
+                        ],
                     }
                 ],
             }
@@ -114,6 +122,7 @@ async def main(config_path: str):
             engagement, deps, objective="승인된 자료 조회·데이터 전달만 확인"
         )
         records = await deps.evidence_store.list_for_run(final.run_id)
+        assert deps.methodology_library is not None
         progress = deps.methodology_library.progress(records)
         print(
             json.dumps(

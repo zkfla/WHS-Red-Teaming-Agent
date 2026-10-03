@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
+import pytest
+
 from redteam.attack_graph.predicates import (
     Confidence,
     Provenance,
@@ -248,3 +250,149 @@ async def test_measured_fact_refs_only():
     joined = " ".join(proj["fact_refs"])
     assert "good_val" in joined
     assert "bad_guess" not in joined
+
+
+#
+async def test_collect_knowledge_matches_display_and_carries_full_refs():
+    from redteam.orchestration.knowledge import collect_assessment, collect_knowledge
+    from redteam.orchestration.knowledge_validation import assessment_blocked
+
+    good = build_properties(
+        facts={"good_val": "keep"},
+        provenance=Provenance(
+            step=1,
+            source="tool:probe",
+            evidence_id="ev-good",
+            run_id=RUN,
+            confidence=Confidence.MEASURED,
+        ),
+        step=1,
+    )
+    graph = _Graph([_node("host:good-1", good)])
+    ev = _Evidence([_record("ev-good", RUN, {"good_val": "keep"})])
+    display, snapshot = await collect_knowledge(graph, ev, RUN, step=1)
+    assert len(display["facts"]) == 1
+    assert "host:good-1#fact:good_val" in snapshot.fact_refs
+    assert "evidence:ev-good" in snapshot.fact_refs
+    assert assessment_blocked(snapshot) is None
+    only = await collect_assessment(graph, ev, RUN, step=1)
+    assert only.fact_refs == snapshot.fact_refs
+
+
+#
+async def test_snapshot_marks_failed_reads_not_empty():
+    from redteam.orchestration.knowledge import collect_assessment
+    from redteam.orchestration.knowledge_validation import assessment_blocked
+
+    class _BadEvidence:
+        async def list_for_run(self, run_id):
+            raise RuntimeError("store down")
+
+    class _BadGraph(_Graph):
+        async def list_nodes(self):
+            raise RuntimeError("graph down")
+
+    failed = await collect_assessment(_Graph([]), _BadEvidence(), RUN)
+    assert failed.evidence_lookup_failed is True
+    assert assessment_blocked(failed) is not None
+    failed_graph = await collect_assessment(_BadGraph([]), _Evidence([]), RUN)
+    assert failed_graph.graph_lookup_failed is True
+    assert assessment_blocked(failed_graph) is not None
+
+
+#
+async def test_mis_scoped_record_never_grounds():
+    from redteam.orchestration.knowledge import collect_assessment
+
+    good = build_properties(
+        facts={"good_val": "keep"},
+        provenance=Provenance(
+            step=1,
+            source="tool:probe",
+            evidence_id="ev-good",
+            run_id=RUN,
+            confidence=Confidence.MEASURED,
+        ),
+        step=1,
+    )
+
+    class _LeakyEvidence(_Evidence):
+        async def list_for_run(self, run_id):
+            return list(self._records)
+
+    graph = _Graph([_node("host:good-1", good)])
+    leaky = _LeakyEvidence([_record("ev-good", OTHER_RUN, {"good_val": "keep"})])
+    snapshot = await collect_assessment(graph, leaky, RUN, step=1)
+    assert "evidence:ev-good" not in snapshot.fact_refs
+    assert "host:good-1#fact:good_val" not in snapshot.fact_refs
+
+
+#
+@pytest.mark.parametrize("kind", ["bare_evidence_id", "target_cap", "evidence_cap"])
+async def test_display_and_snapshot_ref_rules(kind):
+    from redteam.orchestration.knowledge import collect_knowledge
+
+    if kind == "bare_evidence_id":
+        props = build_properties(
+            facts={"good_val": "keep", "evidence_ids": ["ev-bare"]},
+            provenance=Provenance(
+                step=1,
+                source="tool:probe",
+                evidence_id="ev-good",
+                run_id=RUN,
+                confidence=Confidence.MEASURED,
+            ),
+            step=1,
+        )
+        graph = _Graph([_node("host:bare-1", props)])
+        ev = _Evidence([_record("ev-good", RUN, {"good_val": "keep"})])
+        display, snapshot = await collect_knowledge(graph, ev, RUN, step=1)
+        assert len(display["facts"]) == 1
+        assert "evidence:ev-bare" not in display["fact_refs"]
+        assert "evidence:ev-good" in display["fact_refs"]
+        assert "ev-bare" in display["facts"][0]["evidence_ids"]
+        assert "evidence:ev-bare" not in snapshot.fact_refs
+        return
+    if kind == "target_cap":
+        nodes = []
+        for i in range(101):
+            props = build_properties(
+                attrs={"in_scope": True},
+                provenance=Provenance(
+                    step=0,
+                    source="engagement:scope",
+                    run_id=RUN,
+                    confidence=Confidence.SERVER_DECLARED,
+                ),
+                step=0,
+            )
+            nodes.append(_node("host:scope-" + str(i), props))
+        graph = _Graph(nodes)
+        display, snapshot = await collect_knowledge(graph, _Evidence([]), RUN)
+        assert len(display["provided"]["claims"]) == 50
+        assert len(display["provided"]["omitted_node_ids"]) == 51
+        assert len(snapshot.targets) == 101
+        assert "host:scope-100" in snapshot.targets
+        return
+    merged = None
+    records = []
+    for i in range(25):
+        part = build_properties(
+            facts={"val-" + str(i): i},
+            provenance=Provenance(
+                step=1,
+                source="tool:probe",
+                evidence_id="ev-" + str(i),
+                run_id=RUN,
+                confidence=Confidence.MEASURED,
+            ),
+            step=1,
+        )
+        merged = part if merged is None else merge_properties(merged, part)
+        records.append(_record("ev-" + str(i), RUN, {"val": i}))
+    graph = _Graph([_node("host:many-1", merged)])
+    display, snapshot = await collect_knowledge(graph, _Evidence(records), RUN, step=1)
+    shown = [r for r in display["fact_refs"] if r.startswith("evidence:")]
+    taken = [r for r in snapshot.fact_refs if r.startswith("evidence:")]
+    assert len(shown) == 20
+    assert len(taken) == 25

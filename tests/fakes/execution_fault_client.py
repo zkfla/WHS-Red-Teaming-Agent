@@ -40,6 +40,7 @@ async def run(marker: Path, timeout_seconds: float) -> None:
         result = await gateway.invoke(invocation)
         if not result.success:
             raise RuntimeError(f"fault client job start failed: {result.error}")
+        assert isinstance(result.output, dict)
         marker.write_text(result.output["job_id"], encoding="utf-8")
         await asyncio.Event().wait()
 

@@ -14,7 +14,7 @@ from jsonschema.exceptions import SchemaError, ValidationError
 from redteam.attack_graph.identity import node_id_for_target
 from redteam.attack_graph.observation import GraphObservation
 from redteam.attack_graph.view import AttackGraphView
-from redteam.core.contracts.action_naming import ActionNamingError
+from redteam.core.action_semantics import ActionNamingError
 from redteam.core.contracts.target import (
     AnyTarget,
     AssetTarget,
@@ -233,21 +233,24 @@ class CandidateCompiler:
             # "Nothing in this namespace at all" and "the namespace exists
             # but no tool is bound to this intent" are different operator
             # problems: the first is a missing capability, the second an
-            # unsupported operation. Collapsing them into one reason hides
+            # missing intent binding. Collapsing them into one reason hides
             # which configuration is actually missing.
             capability_tools = self._catalog.list_by_capability(capability)
             if not capability_tools:
                 return None, ("capability_unavailable", "")
             # list_tools_for_action hides unhealthy tools, so an
             # all-unhealthy namespace presents as "nothing serves this
-            # action". Reporting that as an unsupported operation would send
+            # action". Reporting that as a missing binding would send
             # the operator looking for a binding that is already there.
-            if all(
+            operation_tools = [
+                tool for tool in capability_tools if operation in tool.operations
+            ]
+            if operation_tools and all(
                 tool.health_status is ToolHealthStatus.UNHEALTHY
-                for tool in capability_tools
+                for tool in operation_tools
             ):
                 return None, ("tool_unhealthy", "")
-            return None, ("operation_unsupported", "")
+            return None, ("no_tool_for_operation", "operation")
         usable = [
             tool
             for tool in action_tools

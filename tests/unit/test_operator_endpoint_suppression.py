@@ -42,6 +42,11 @@ async def _mission(deps, excluded: list[str]) -> MissionId:
             updated_at=now,
         )
     )
+    from redteam.orchestration.coordination import coordinator_for
+
+    await coordinator_for(deps.task_graph_store, deps.path_store).bind(
+        "run_operator_excluded", str(mission_id), "eng_operator_excluded"
+    )
     return mission_id
 
 

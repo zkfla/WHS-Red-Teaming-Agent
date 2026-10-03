@@ -168,6 +168,15 @@ async def seed_from_engagement(
                 facts={
                     "target_ref": target_refs.get(value, value),
                     "auth_session_config": {"sessions": auth_sessions.get(value, [])},
+                    # Top-level list claims retain provenance for each element
+                    # when hosts are shared by multiple runs.
+                    "auth_session_registrations": [
+                        {
+                            "session_ref": item["session_ref"],
+                            "run_id": str(run_id) if run_id else None,
+                        }
+                        for item in auth_sessions.get(value, [])
+                    ],
                 },
                 labels=[SCOPE_LABEL],
                 provenance=provenance,

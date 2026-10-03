@@ -339,6 +339,7 @@ async def test_gateway_blocks_cross_run_and_cross_asset_job_access(
         )
     )
     assert started.success is True
+    assert isinstance(started.output, dict)
     job_id = started.output["job_id"]
     await wait_for_containers(1)
     try:
@@ -358,8 +359,10 @@ async def test_gateway_blocks_cross_run_and_cross_asset_job_access(
             )
         )
         assert cross_run.success is False
+        assert cross_run.error is not None
         assert cross_run.error.code == "execution_context_mismatch"
         assert cross_asset.success is False
+        assert cross_asset.error is not None
         assert cross_asset.error.code == "execution_invalid_arguments"
         assert len(managed_container_ids()) == 1
     finally:

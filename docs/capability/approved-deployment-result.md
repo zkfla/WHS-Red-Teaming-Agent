@@ -1,5 +1,9 @@
 # 승인 경로·시험 세션 연결 결과 — 2026-10-01
 
+아래는 당시 검증 기록이다. 2026-10-03 최신 dev 통합 후 포트 규격·검증 상태는
+[후속 통합 결과](dev-capability-integration-result.md) 및
+[최신 사용 안내](../../deploy/mcp/approved/README.md)를 따른다.
+
 작업 브랜치: capability. 최신 origin/dev `e1fc3945d4332d9d7e5f22cbfe3025e42cf2ea25`를
 capability에 로컬 병합했다. dev 브랜치 변경/push/PR 생성/원격 merge는 하지 않았다.
 

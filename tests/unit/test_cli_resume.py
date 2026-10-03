@@ -22,6 +22,12 @@ from redteam.capability.settings import MCPConfigurationError
 from redteam.core.contracts.mission import MissionPlan, Provenance
 from redteam.core.enums import AgentPhase, MissionStatus
 from redteam.core.ids import ActionId, ApprovalId, EngagementId, MissionId, RunId
+from redteam.orchestration.component_binding import (
+    BUILTIN_COMPONENT_IDS,
+    ComponentProfile,
+    RuntimeComponentBinding,
+)
+from redteam.orchestration.coordination import coordinator_for
 from redteam.orchestration.operator_intents import InMemoryOperatorIntentStore
 from redteam.orchestration.state import RuntimeState, TerminationReason
 from redteam.orchestration.task_graph.memory import InMemoryTaskGraphStore
@@ -231,6 +237,9 @@ async def test_resume_paused_run_applies_operator_intent_before_scheduling(
         task_graph_store=store,
         operator_intent_store=InMemoryOperatorIntentStore(),
     )
+    await coordinator_for(store, deps.path_store).bind(
+        "run_resume", str(mission_id), "eng_recovered"
+    )
     paused = RuntimeState(
         run_id=RunId("run_resume"),
         engagement_id=EngagementId("eng_recovered"),
@@ -315,3 +324,80 @@ async def test_resume_restores_control_counters_and_elapsed_duration(
     assert call.kwargs["actions_consumed"] == 3
     assert call.kwargs["tool_calls_consumed"] == 5
     assert 0 <= call.kwargs["elapsed_duration_seconds"] < 5
+
+
+def _hint_with_binding(tmp_path: Path, binding) -> tuple:
+    return _engagement_yaml(tmp_path), RuntimeState(
+        run_id=RunId("run_resume"),
+        engagement_id=EngagementId("eng_recovered"),
+        termination_reason=TerminationReason.APPROVAL_PENDING,
+        component_binding=binding,
+    )
+
+
+async def test_resume_rejects_unregistered_profile_before_bootstrap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engagement_path, hint = _hint_with_binding(
+        tmp_path,
+        RuntimeComponentBinding(
+            profile_id="custom",
+            version="9",
+            component_ids=dict(BUILTIN_COMPONENT_IDS),
+        ),
+    )
+    build = AsyncMock()
+    monkeypatch.setattr(resume_command, "_read_checkpoint_runtime", AsyncMock(return_value=hint))
+    monkeypatch.setattr(resume_command, "build_resume_application", build)
+
+    assert await resume_command.run(_args(engagement_path)) == EXIT_FAILURE
+    build.assert_not_awaited()
+
+
+async def test_resume_rejects_changed_component_ids_before_bootstrap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engagement_path, hint = _hint_with_binding(
+        tmp_path,
+        RuntimeComponentBinding(
+            profile_id="builtin",
+            version="1",
+            component_ids=dict(BUILTIN_COMPONENT_IDS, agents="custom-agents-v9"),
+        ),
+    )
+    build = AsyncMock()
+    monkeypatch.setattr(resume_command, "_read_checkpoint_runtime", AsyncMock(return_value=hint))
+    monkeypatch.setattr(resume_command, "build_resume_application", build)
+
+    assert await resume_command.run(_args(engagement_path)) == EXIT_FAILURE
+    build.assert_not_awaited()
+
+
+async def test_resume_forwards_stored_builtin_selection_to_build(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engagement_path, hint = _hint_with_binding(
+        tmp_path,
+        RuntimeComponentBinding(
+            profile_id="builtin",
+            version="1",
+            component_ids=dict(BUILTIN_COMPONENT_IDS),
+        ),
+    )
+    deps = build_test_application()
+    _FakeRunner.recovered = hint
+    _FakeRunner.final = _finished()
+    _FakeRunner.resumed_with = None
+    _FakeRunner.closed = False
+    build = AsyncMock(return_value=(object(), deps))
+    monkeypatch.setattr(resume_command, "_read_checkpoint_runtime", AsyncMock(return_value=hint))
+    monkeypatch.setattr(resume_command, "build_resume_application", build)
+    monkeypatch.setattr(resume_command, "AgentLoopRunner", _FakeRunner)
+    monkeypatch.setattr(resume_command, "settle_engagement", AsyncMock(return_value=_finished()))
+
+    assert await resume_command.run(_args(engagement_path)) == EXIT_OK
+    build.assert_awaited_once()
+    assert build.await_args is not None
+    assert build.await_args.kwargs["component_profile"] == ComponentProfile(
+        profile_id="builtin", version="1"
+    )

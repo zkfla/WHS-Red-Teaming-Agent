@@ -9,7 +9,7 @@ import pytest
 from mcp import Client
 
 from redteam.capability.adapters.mcp.execution import ExecutionMCPAdapter
-from redteam.capability.adapters.mcp.transport import RemoteCallResult
+from redteam.capability.adapters.mcp.transport import RemoteCallResult, RemoteTool
 from redteam.capability.execution_manifest import (
     EXECUTION_TOOLS,
     validate_execution_descriptor,
@@ -71,6 +71,12 @@ def configure(monkeypatch: pytest.MonkeyPatch, policy_path: Path) -> None:
 
 
 class ErrorTransport:
+    async def list_tools(self) -> list[RemoteTool]:
+        return []
+
+    async def health_check(self) -> bool:
+        return True
+
     async def call_tool(self, tool_name: str, arguments: dict[str, Any]) -> RemoteCallResult:
         return RemoteCallResult(
             is_error=True,

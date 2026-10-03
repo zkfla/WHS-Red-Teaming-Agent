@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import datetime, timezone
+from typing import Any
 
 import pytest
 
@@ -35,7 +36,7 @@ from tests.fakes import build_test_application
 def engagement(
     *, execution_agent: dict | None = None, apk_ref: str | None = None
 ) -> Engagement:
-    metadata = {"asset_ref": "workspace-test"}
+    metadata: dict[str, Any] = {"asset_ref": "workspace-test"}
     if apk_ref is not None:
         metadata["apk_ref"] = apk_ref
     if execution_agent is not None:

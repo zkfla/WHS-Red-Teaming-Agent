@@ -4,6 +4,7 @@ import json
 import threading
 from contextlib import AsyncExitStack
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlsplit
 
 import pytest
 from mcp import Client
@@ -25,16 +26,17 @@ from tests.unit.test_mcp_deployment import engagement, source
 class SessionLLM(h.ScriptedLLM):
     """Explicit fixture chooses from actual deployment context; never a production model."""
 
-    def __init__(self):
+    def __init__(self, seed="127.0.0.1"):
         super().__init__()
         self.turns = 0
+        self.node_id = "host:" + seed
 
     async def complete_structured(self, *, messages, response_schema, system=None, **kwargs):
         route = self._route_key(response_schema)
         self.calls.append({"messages": messages, "system": system, "route": route})
         payload = json.loads(messages[0]["content"])
         if route == "path_draft":
-            path = h.draft_path("host:127.0.0.1")
+            path = h.draft_path(self.node_id)
             step = path["steps"][0]
             step.update(
                 agent_id="web-api-agent",
@@ -64,7 +66,7 @@ class SessionLLM(h.ScriptedLLM):
                     {
                         "agent_id": "web-api-agent",
                         "path_step_id": "step-1",
-                        "target_node_id": "host:127.0.0.1",
+                        "target_node_id": self.node_id,
                         "principal_ref": "alice",
                         "capability": "web",
                         "operation": "response_analysis",
@@ -84,9 +86,11 @@ class SessionLLM(h.ScriptedLLM):
         raise AssertionError(route)
 
 
-def install(tmp_path, monkeypatch, origin, *, require_approval=False):
+def install(tmp_path, monkeypatch, origin, *, require_approval=False, port_pinned=False):
     spec = DeploymentSpec.model_validate(source(origin))
     config = engagement()
+    if port_pinned:
+        config.scope.allowed_hosts = [urlsplit(origin).netloc]
     config.approval_policy.require_approval_for = []
     # Explicit fixture policy only; production generator preserves the input policy.
     config.approval_policy.risk_threshold = (
@@ -135,13 +139,16 @@ def bank():
         thread.join(timeout=2)
 
 
-async def test_agent_uses_inventory_and_two_users_through_real_mcp(tmp_path, monkeypatch, bank):
+@pytest.mark.parametrize("port_pinned", [False, True])
+async def test_agent_uses_inventory_and_two_users_through_real_mcp(
+    tmp_path, monkeypatch, bank, port_pinned
+):
     origin, requests = bank
-    config, path = install(tmp_path, monkeypatch, origin)
+    config, path = install(tmp_path, monkeypatch, origin, port_pinned=port_pinned)
     cli_config = load_app_config_for_run(str(path), require_llm=False)
     assert cli_config.engagement == config.engagement
     monkeypatch.setattr("redteam.app.bootstrap.save_terminal_report", lambda report: None)
-    llm = SessionLLM()
+    llm = SessionLLM(config.engagement.scope.allowed_hosts[0])
     async with AsyncExitStack() as stack:
         eng, deps = await build_application(
             config,

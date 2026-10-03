@@ -30,7 +30,7 @@ from typing import Any
 
 from redteam.attack_graph.identity import split_node_id, target_for_node
 from redteam.attack_graph.predicates import facts_of
-from redteam.core.contracts.action_naming import ActionNamingError, canonical_action_key
+from redteam.core.action_semantics import ActionNamingError, canonical_action_key
 from redteam.core.ids import AgentId, GraphNodeId, ToolId
 from redteam.core.ports.tool_catalog import ToolCatalog
 from redteam.orchestration.agents.base import AgentSpec, PlanStep

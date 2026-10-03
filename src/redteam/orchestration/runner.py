@@ -16,11 +16,14 @@ from pydantic import BaseModel, Field
 
 from redteam.attack_graph.service import AttackGraphService
 from redteam.core.enums import AgentPhase, MissionStatus
-from redteam.core.ids import EventId, RunId
+from redteam.core.ids import EventId, MissionId, RunId
 from redteam.orchestration.checkpointing import build_checkpointer, open_checkpointer
+from redteam.orchestration.component_binding import builtin_component_binding
 from redteam.orchestration.context import RuntimeDeps
+from redteam.orchestration.coordination import CLOSED, ChangeSet, CoordinationError, coordinator_for
 from redteam.orchestration.graph import build_graph
-from redteam.orchestration.progress import observation_fingerprint
+from redteam.orchestration.outbox import deliver_pending
+from redteam.orchestration.progress import canonical_progress_fingerprint
 from redteam.orchestration.settings import OrchestrationSettings
 from redteam.orchestration.state import (
     GraphState,
@@ -178,10 +181,170 @@ class AgentLoopRunner:
             "recursion_limit": self._settings.effective_recursion_limit,
         }
 
+    async def _binding_for(self, runtime: RuntimeState, *, checkpoint=None, fresh=False) -> bool:
+        selected = self._deps.component_binding
+        recorded = runtime.component_binding
+        if recorded is None:
+            # Old checkpoints only describe the built-in assembly. They
+            # cannot recover a custom assembly that was never recorded.
+            if selected is not None and selected != builtin_component_binding():
+                return False
+        elif recorded != selected:
+            return False
+        if checkpoint is not None:
+            saved = checkpoint.values.get("runtime") if checkpoint.values else None
+            fields = (
+                "run_id",
+                "phase",
+                "mission_id",
+                "engagement_id",
+                "active_task_id",
+                "termination_reason",
+                "pending_action_id",
+                "pending_approval_id",
+                "active_path_id",
+                "active_path_version",
+                "last_progress_fingerprint",
+                "step_count",
+                "actions_executed",
+                "retry_tool_calls",
+                "component_binding",
+            )
+            if not isinstance(saved, RuntimeState) or self._snapshot_replays_execution(checkpoint):
+                return False
+            if any(getattr(saved, name) != getattr(runtime, name) for name in fields):
+                return False
+        if runtime.mission_id is None:
+            coordinator = coordinator_for(self._deps.task_graph_store, self._deps.path_store)
+
+            async def legacy(change: ChangeSet):
+                return ("binding", str(runtime.run_id)) not in change.records
+
+            return await coordinator.change(legacy)
+        coordinator = coordinator_for(self._deps.task_graph_store, self._deps.path_store)
+
+        async def read(change: ChangeSet):
+            return change.records.get(("binding", str(runtime.run_id)))
+
+        bound = await coordinator.change(read)
+        if bound is None:
+            saved = checkpoint.values.get("runtime") if checkpoint and checkpoint.values else None
+            trusted_checkpoint = (
+                isinstance(saved, RuntimeState)
+                and not self._snapshot_replays_execution(checkpoint)
+                and saved.run_id == runtime.run_id
+                and saved.mission_id == runtime.mission_id
+                and saved.engagement_id == runtime.engagement_id
+            )
+            mission = await self._deps.task_graph_store.get_mission(runtime.mission_id)
+            trusted_start = (
+                fresh
+                and runtime.step_count == 0
+                and runtime.termination_reason is None
+                and runtime.phase is AgentPhase.OBSERVE
+                and mission is not None
+                and mission.status is MissionStatus.ACTIVE
+            )
+            if not (trusted_checkpoint or trusted_start):
+                return False
+            if runtime.active_task_id:
+                task = await self._deps.task_graph_store.get_task(runtime.active_task_id)
+                if task is None or task.mission_id != runtime.mission_id:
+                    return False
+            try:
+                await coordinator.bind(
+                    str(runtime.run_id), str(runtime.mission_id), str(runtime.engagement_id)
+                )
+            except CoordinationError:
+                return False
+
+        async def validate(change: ChangeSet):
+            try:
+                bound = change.binding(
+                    str(runtime.run_id), str(runtime.mission_id), str(runtime.engagement_id)
+                )
+            except CoordinationError:
+                return False
+            return not bound["closed"]
+
+        return await coordinator.change(validate)
+
+    async def recover_delivery(self, runtime: RuntimeState) -> int:
+        """Recover committed same-run events without reviving investigation work."""
+        if runtime.mission_id is None:
+            return 0
+        coordinator = coordinator_for(self._deps.task_graph_store, self._deps.path_store)
+        try:
+            return await deliver_pending(
+                coordinator,
+                run_id=str(runtime.run_id),
+                engagement_id=str(runtime.engagement_id),
+                event_bus=self._deps.event_bus,
+            )
+        except CoordinationError:
+            return 0
+
+    async def _latest_allows_execution(self, runtime: RuntimeState, *, blocked=False) -> bool:
+        if runtime.mission_id is None:
+            return await self._binding_for(runtime)
+        if not await self._binding_for(runtime):
+            return False
+        coordinator = coordinator_for(self._deps.task_graph_store, self._deps.path_store)
+
+        async def check(change: ChangeSet):
+            mission = change.tasks._missions.get(MissionId(str(runtime.mission_id)))
+            if mission is None or mission.status in CLOSED:
+                return False
+            if mission.status is MissionStatus.BLOCKED:
+                return (
+                    blocked
+                    and runtime.termination_reason in _RECONCILABLE_REASONS
+                    and runtime.termination_reason != TerminationReason.APPROVAL_PENDING
+                )
+            return mission.status is MissionStatus.ACTIVE
+
+        return await coordinator.change(check)
+
+    async def _reactivate(self, runtime: RuntimeState) -> bool:
+        if runtime.mission_id is None:
+            return True
+        coordinator = coordinator_for(self._deps.task_graph_store, self._deps.path_store)
+
+        async def activate(change: ChangeSet):
+            bound = change.binding(
+                str(runtime.run_id), str(runtime.mission_id), str(runtime.engagement_id)
+            )
+            mission = change.tasks._missions.get(MissionId(str(runtime.mission_id)))
+            if bound["closed"] or mission is None or mission.status in CLOSED:
+                return False
+            if change.pending(str(runtime.run_id), str(runtime.mission_id)):
+                return False
+            if (
+                mission.status is MissionStatus.BLOCKED
+                and runtime.termination_reason in _RECONCILABLE_REASONS
+                and runtime.termination_reason != TerminationReason.APPROVAL_PENDING
+            ):
+                await change.tasks.update_mission(
+                    mission.model_copy(
+                        update={
+                            "status": MissionStatus.ACTIVE,
+                            "revision": mission.revision + 1,
+                            "updated_at": datetime.now(timezone.utc),
+                        }
+                    )
+                )
+            elif mission.status is not MissionStatus.ACTIVE:
+                return False
+            return True
+
+        return await coordinator.change(activate)
+
     async def run(
         self, runtime: RuntimeState, *, initial_event_id: EventId | None = None
     ) -> RuntimeState:
         """Run the OBSERVE..REPLAN loop until a terminal phase."""
+        if not await self._binding_for(runtime, fresh=True):
+            raise CoordinationError("run_binding_missing_or_mismatched")
         return await self._run_state(
             runtime, initial_graph_state(runtime, last_event_id=initial_event_id)
         )
@@ -192,6 +355,8 @@ class AgentLoopRunner:
         instead of ``initial_graph_state`` for the latter) — same task
         tracking, cancellation and failure handling either way.
         """
+        if not await self._latest_allows_execution(runtime):
+            raise CoordinationError("mission_not_active")
         run_key = str(runtime.run_id)
         if self._bound_run_id is not None and self._bound_run_id != run_key:
             raise ValueError("one AgentLoopRunner may execute only one run")
@@ -210,6 +375,7 @@ class AgentLoopRunner:
             latest = await self._latest_runtime(runtime)
             reason = TerminationReason.USER_INTERRUPTED
             await self._cleanup_after_failure(latest, reason=reason)
+            await self._close_finished_binding(latest, reason=reason)
             if self._stop_requested:
                 return latest.model_copy(
                     update={
@@ -232,6 +398,7 @@ class AgentLoopRunner:
             latest = await self._latest_runtime(runtime)
             reason = f"runner_error:{type(exc).__name__}"
             await self._cleanup_after_failure(latest, reason=reason)
+            await self._close_finished_binding(latest, reason=TerminationReason.EXECUTION_ERROR)
             self._failure_runtime = latest.model_copy(
                 update={
                     "phase": AgentPhase.FAILED,
@@ -244,7 +411,22 @@ class AgentLoopRunner:
         finally:
             self._active_graph_task = None
             self._stop_requested = False
-        return final["runtime"]
+        finished = final["runtime"]
+        await self._close_finished_binding(finished, reason=finished.termination_reason)
+        return finished
+
+    async def _close_finished_binding(self, runtime: RuntimeState, *, reason: str | None) -> None:
+        """Persist hard termination before returning control to app settlement."""
+        if runtime.mission_id is None or reason is None or reason in RECONCILABLE_REASONS:
+            return
+        coordinator = coordinator_for(self._deps.task_graph_store, self._deps.path_store)
+
+        async def close(change: ChangeSet):
+            change.binding(
+                str(runtime.run_id), str(runtime.mission_id), str(runtime.engagement_id)
+            )["closed"] = True
+
+        await coordinator.change(close)
 
     def request_stop(self) -> bool:
         """Gracefully classify and stop the currently running graph invocation.
@@ -378,6 +560,11 @@ class AgentLoopRunner:
         # state needed to resume an approval.
         self._thread_id = self._thread_id or str(runtime.run_id)
 
+        await self.recover_delivery(runtime)
+        if not await self._latest_allows_execution(runtime, blocked=True):
+            return ReconciliationResult(
+                runtime=runtime, wakeup=WakeupBatch(triggered=False, reason="mission_not_active")
+            )
         wakeup = await self.wait_for_change(runtime, timeout_seconds=timeout_seconds)
         if runtime.termination_reason == TerminationReason.APPROVAL_PENDING:
             resumed = await self._resume_pending_approval(runtime)
@@ -401,13 +588,15 @@ class AgentLoopRunner:
         ):
             return ReconciliationResult(runtime=runtime, wakeup=wakeup)
 
+        if not await self._reactivate(runtime):
+            return ReconciliationResult(runtime=runtime, wakeup=wakeup)
         resumed = runtime.model_copy(
             update={
                 "phase": AgentPhase.OBSERVE,
                 "termination_reason": None,
                 "no_progress_turns": 0,
                 "mission_status": MissionStatus.ACTIVE
-                if runtime.termination_reason == TerminationReason.OPERATOR_PAUSED
+                if runtime.mission_id
                 else runtime.mission_status,
             }
         )
@@ -447,6 +636,8 @@ class AgentLoopRunner:
             return None
         if self._snapshot_replays_execution(snapshot):
             return None
+        if not await self._binding_for(runtime, checkpoint=snapshot):
+            return None
         return runtime
 
     async def resume_recovered(self, runtime: RuntimeState) -> RuntimeState:
@@ -461,6 +652,13 @@ class AgentLoopRunner:
         mismatched action. Other reconcilable terminal reasons re-enter at
         OBSERVE; a hard stop is returned unchanged.
         """
+        snapshot = await self._latest_snapshot()
+        if snapshot is None or not await self._binding_for(runtime, checkpoint=snapshot):
+            await self.recover_delivery(runtime)
+            return runtime
+        await self.recover_delivery(runtime)
+        if not await self._latest_allows_execution(runtime, blocked=True):
+            return runtime
         if runtime.termination_reason == TerminationReason.APPROVAL_PENDING:
             # A control plane that exposes the durable-resume extension must
             # link the checkpointed proposal successfully before we re-enter;
@@ -481,13 +679,20 @@ class AgentLoopRunner:
             )
             if mission is None or mission.status is not MissionStatus.ACTIVE:
                 return runtime
+        if (
+            runtime.termination_reason in _REVISION_GATED_REASONS
+            and not await self._canonical_graph_changed(runtime)
+        ):
+            return runtime
+        if not await self._reactivate(runtime):
+            return runtime
         resume_runtime = runtime.model_copy(
             update={
                 "phase": AgentPhase.OBSERVE,
                 "termination_reason": None,
                 "no_progress_turns": 0,
                 "mission_status": MissionStatus.ACTIVE
-                if runtime.termination_reason == TerminationReason.OPERATOR_PAUSED
+                if runtime.mission_id
                 else runtime.mission_status,
             }
         )
@@ -501,6 +706,8 @@ class AgentLoopRunner:
         snapshot, a control plane without the durable-resume extension, or a
         registration that itself rejects the pairing.
         """
+        if not await self._latest_allows_execution(runtime):
+            return False
         if runtime.pending_approval_id is None or runtime.pending_action_id is None:
             return False
         snapshot = await self._latest_snapshot()
@@ -535,6 +742,8 @@ class AgentLoopRunner:
         the existing terminal ``runtime`` unchanged, exactly like an
         un-triggered reconciliation tick for any other reason.
         """
+        if not await self._latest_allows_execution(runtime):
+            return None
         if runtime.pending_approval_id is None or runtime.pending_action_id is None:
             return None  # defensive: nothing to resume
         if runtime.mission_id is not None:
@@ -579,6 +788,7 @@ class AgentLoopRunner:
             not isinstance(checkpoint_runtime, RuntimeState)
             or checkpoint_runtime.run_id != runtime.run_id
             or checkpoint_runtime.engagement_id != runtime.engagement_id
+            or checkpoint_runtime.mission_id != runtime.mission_id
             or checkpoint_runtime.termination_reason != TerminationReason.APPROVAL_PENDING
             or checkpoint_runtime.pending_approval_id != runtime.pending_approval_id
         ):
@@ -680,12 +890,16 @@ class AgentLoopRunner:
             return None
 
     async def _canonical_graph_changed(self, runtime: RuntimeState) -> bool:
-        observation = await AttackGraphService(self._deps.graph_store).observe(
-            step=runtime.step_count,
-            max_per_type=self._settings.observation_max_per_type,
-            max_total=self._settings.observation_max_total,
+        fingerprint = await canonical_progress_fingerprint(
+            self._deps, runtime, step=runtime.step_count
         )
-        return observation_fingerprint(observation) != runtime.last_progress_fingerprint
+        # Old checkpoints used incompatible, bounded hashes. They need an
+        # explicit wakeup; comparing different formats cannot prove change.
+        return (
+            fingerprint is not None
+            and str(runtime.last_progress_fingerprint or "").startswith("original-v1:")
+            and fingerprint != runtime.last_progress_fingerprint
+        )
 
     async def resume_from(self, checkpoint_id: str) -> RuntimeState:
         """Re-run from an earlier checkpoint of the same thread.
@@ -701,6 +915,14 @@ class AgentLoopRunner:
             raise ValueError(
                 "checkpoint would repeat an execution; collect its stored result first"
             )
+        saved = snapshot.values.get("runtime") if snapshot.values else None
+        if not isinstance(saved, RuntimeState) or not await self._binding_for(
+            saved, checkpoint=snapshot
+        ):
+            raise CoordinationError("checkpoint_binding_mismatched")
+        await self.recover_delivery(saved)
+        if not await self._latest_allows_execution(saved):
+            raise CoordinationError("mission_not_active")
         final: GraphState = await self._graph.ainvoke(
             None, config=self.config(checkpoint_id=checkpoint_id)
         )

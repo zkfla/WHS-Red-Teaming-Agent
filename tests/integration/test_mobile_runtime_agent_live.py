@@ -17,6 +17,7 @@ from redteam.capability.mobile_analysis_manifest import MOBILE_ANALYSIS_TOOLS
 from redteam.core.config import load_app_config
 from redteam.core.contracts.events import EventType
 from redteam.core.enums import GraphNodeType
+from redteam.event_bus.memory import InMemoryEventBus
 from redteam.orchestration.agents import (
     MOBILE_AGENT,
     AgentRegistry,
@@ -108,6 +109,7 @@ async def test_real_mobile_next_observes_runtime_and_maps_a_crash_when_present(
         )
         final = await run_engagement(engagement, deps=deps)
 
+        assert isinstance(deps.event_bus, InMemoryEventBus)
         diagnostics = [
             event.model_dump(mode="json")
             for event in deps.event_bus.history()

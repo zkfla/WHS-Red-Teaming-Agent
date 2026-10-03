@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 from collections import OrderedDict, deque
 from dataclasses import replace
+from typing import cast
 from uuid import uuid4
 
 from rich.markdown import Markdown
@@ -75,7 +76,7 @@ class SessionController:
         self.resume_runner = resume_runner
         self.context_loader = context_loader
         self.approval_verifier = approval_verifier
-        self.active_receipt = None
+        self.active_receipt: InputReceipt | None = None
         self.commands = sorted(
             set(commands)
             | {
@@ -120,6 +121,7 @@ class SessionController:
         self.in_flight: dict[asyncio.Task, InputReceipt] = {}
         self.workers: list[asyncio.Task] = []
         self.final_result = RunResult()
+        self.output_error: str | None = None
         self.sequence = 0
         self.clarification: InputReceipt | None = None
         self.frontend.bind(self)
@@ -198,13 +200,37 @@ class SessionController:
     def request_close(self) -> None:
         self.closing.set()
 
+    def _output_failed(self, exc: BaseException) -> None:
+        self.output_error = self.output_error or f"CLI 출력 실패: {type(exc).__name__}"
+        self.final_result.exit_code = 1
+        self.final_result.error = self.final_result.error or self.output_error
+        self.request_close()
+
+    def _output_stopped(self, task: asyncio.Task) -> None:
+        if task.cancelled():
+            if not self.closing.is_set():
+                self._output_failed(RuntimeError("출력 작업이 취소되었습니다."))
+            return
+        error = task.exception()
+        if error is not None:
+            self._output_failed(error)
+        elif not self.closing.is_set():
+            self._output_failed(RuntimeError("출력 작업이 종료되었습니다."))
+
     async def run(self, initial_objective: str | None = None) -> RunResult:
         self.output.start()
+        if self.output.task is not None:
+            self.output.task.add_done_callback(self._output_stopped)
         self.workers = [
             asyncio.create_task(self._consume(self.queue), name="cli-chat"),
             asyncio.create_task(self._consume(self.controls), name="cli-control"),
         ]
         reader = asyncio.create_task(self.frontend.run(), name="cli-reader")
+        reader_error: BaseException | None = None
+        reader_reported = False
+        # close() waits for the active run, and its finalize overwrites
+        # final_result; keep the input failure text to re-apply at the end.
+        reader_failure: str | None = None
         try:
             self.output.emit(
                 f"REDTEAM · {safe_text(self.engagement_name)} · "
@@ -219,15 +245,82 @@ class SessionController:
                 self.submit(initial_objective)
                 # Non-TTY compatibility must not read the next line before the initial request.
                 self.idle.clear()
-            await self.closing.wait()
+            closing_waiter = asyncio.create_task(self.closing.wait(), name="cli-closing")
+            try:
+                await asyncio.wait(
+                    {closing_waiter, reader}, return_when=asyncio.FIRST_COMPLETED
+                )
+            finally:
+                if not closing_waiter.done():
+                    closing_waiter.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await closing_waiter
+            if reader.done():
+                if reader.cancelled():
+                    if not self.closing.is_set():
+                        reader_failure = (
+                            "CLI 입력 작업 취소됨 — 세션 종료 중, 처리 여부는 별도 확인 필요"
+                        )
+                        self.final_result.exit_code = 1
+                        self.final_result.error = (
+                            self.final_result.error or reader_failure
+                        )
+                        reader_reported = True
+                        self.request_close()
+                else:
+                    reader_error = reader.exception()
+                    if reader_error is not None:
+                        reader_failure = (
+                            f"CLI 입력 실패({type(reader_error).__name__})"
+                            " — 세션 종료 중, backend 처리 여부는 별도 확인 필요"
+                        )
+                        self.final_result.exit_code = 1
+                        self.final_result.error = (
+                            self.final_result.error or reader_failure
+                        )
+                        reader_reported = True
+                        self.request_close()
+                    elif not self.closing.is_set():
+                        reader_failure = (
+                            "CLI 입력 작업이 종료 신호 없이 끝났습니다"
+                            " — 세션 종료 중, 처리 여부는 별도 확인 필요"
+                        )
+                        self.final_result.exit_code = 1
+                        self.final_result.error = (
+                            self.final_result.error or reader_failure
+                        )
+                        reader_reported = True
+                        self.request_close()
         finally:
             try:
                 await self.close()
-            finally:
+            except Exception as exc:
+                self.final_result.exit_code = 1
+                self.final_result.error = (
+                    self.final_result.error or f"CLI 세션 정리 실패: {type(exc).__name__}"
+                )
+            try:
                 self.frontend.close()
-                reader.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
+            except Exception as exc:
+                self.final_result.exit_code = 1
+                self.final_result.error = (
+                    self.final_result.error or f"CLI 화면 정리 실패: {type(exc).__name__}"
+                )
+            reader.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                try:
                     await reader
+                except Exception as exc:
+                    if reader_reported and exc is reader_error:
+                        pass
+                    elif not self.output_error:
+                        raise
+            # The active run may have finished cleanly while closing and
+            # overwritten the input failure above; restore it without
+            # touching the backend final itself.
+            if reader_reported and reader_failure is not None:
+                self.final_result.exit_code = 1
+                self.final_result.error = self.final_result.error or reader_failure
         return self.final_result
 
     async def _consume(self, queue: asyncio.Queue) -> None:
@@ -443,6 +536,7 @@ class SessionController:
 
     async def _execute(self, objective: str, receipt: InputReceipt) -> None:
         binding = self.binding
+        assert binding is not None  # _execute is only started with an active binding
         try:
             if isinstance(objective, tuple):
                 result = await self.resume_runner(*objective, self)
@@ -453,7 +547,7 @@ class SessionController:
         except Exception as exc:
             result = RunResult(exit_code=1, error=safe_text(f"{type(exc).__name__}: {exc}"))
         await self.detach()
-        binding = self.binding or binding
+        binding = cast(BindingRef, self.binding or binding)
         final = result.final
         if final is not None:
             binding = replace(binding, run_id=str(final.run_id))
@@ -464,6 +558,9 @@ class SessionController:
                     result.exit_code = 1
                     result.error = f"CLI 결과 projection 갱신 실패: {type(exc).__name__}"
         self.final_result = result
+        if self.output_error:
+            result.exit_code = 1
+            result.error = result.error or self.output_error
         view = RunCompletionView.from_result(binding, result)
         if self.terminal_event_reason and self.terminal_event_reason != view.reason:
             self.output.emit(
@@ -491,11 +588,14 @@ class SessionController:
         self.snapshots[binding.attachment_id] = summary
         while len(self.snapshots) > 64:
             self.snapshots.popitem(last=False)
-        await self.output.fence()
-        self.output.emit(
-            Text(safe_text(summary), style="red" if view.outcome == "failed" else "default")
-        )
-        await self.output.fence()
+        try:
+            await self.output.fence()
+            self.output.emit(
+                Text(safe_text(summary), style="red" if view.outcome == "failed" else "default")
+            )
+            await self.output.fence()
+        except Exception as exc:
+            self._output_failed(exc)
         self.last_binding = binding
         self.binding = None
         self.run_task = None
@@ -709,6 +809,11 @@ class SessionController:
                 running.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await running
+            except Exception as exc:
+                shutdown_failed = True
+                self.final_result.error = self.final_result.error or (
+                    f"CLI 실행 정리 실패: {type(exc).__name__}"
+                )
         if shutdown_failed:
             self.final_result.exit_code = 1
         for task in self.workers:
@@ -722,7 +827,8 @@ class SessionController:
         try:
             await self.output.close()
         except Exception as exc:
-            self.final_result.exit_code = 1
-            self.frontend.emergency(f"최종 출력 정리 실패: {type(exc).__name__}")
+            self._output_failed(exc)
+            with contextlib.suppress(Exception):
+                self.frontend.emergency(f"최종 출력 정리 실패: {type(exc).__name__}")
         finally:
             self.set_phase(SessionPhase.CLOSED)

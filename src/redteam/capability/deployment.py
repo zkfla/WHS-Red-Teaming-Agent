@@ -199,10 +199,9 @@ def connection_environment(spec: DeploymentSpec, policy_path: str, policy_digest
 
 def provision(spec: DeploymentSpec, engagement: EngagementConfig, output: Path) -> Path:
     """Create a NEW private directory; never overwrite an existing engagement/.env."""
-    from redteam.app.mcp_deployment import check_deployment_scope
+    from redteam.app.mcp_deployment import deployment_metadata
 
-    check_deployment_scope(spec, engagement.scope)
-    public = spec.public_metadata()
+    public = deployment_metadata(spec, engagement.scope)
     for key in public:
         if key in engagement.metadata and engagement.metadata[key] != public[key]:
             raise ValueError("deployment_existing_metadata_conflicts:" + key)

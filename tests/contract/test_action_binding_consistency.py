@@ -6,7 +6,7 @@ from redteam.capability.catalog import MCPToolCatalog
 from redteam.capability.manifest import validate_tool_manifest
 from redteam.capability.registry import MCPToolRegistry
 from redteam.capability.settings import MCPConfigurationError, MCPServerSettings
-from redteam.core.contracts.action_naming import (
+from redteam.core.action_semantics import (
     CANONICAL_OPERATIONS,
     canonical_action_key,
 )

@@ -170,6 +170,7 @@ def _crash_items(output: str) -> list[dict[str, Any]] | None:
         decoded = json.loads(output)
     except (json.JSONDecodeError, UnicodeError):
         return None
+    items: list[Any] | None
     if isinstance(decoded, list):
         items = decoded
     elif isinstance(decoded, dict):

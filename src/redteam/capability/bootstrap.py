@@ -148,11 +148,19 @@ async def _build_gateway(
             spec.tool_id: spec for spec in MOBILE_ANALYSIS_TOOLS.get(server_id, ())
         }
         for descriptor in descriptors:
-            operations = (
-                settings.tool_operations[descriptor.tool_name]
-                if settings.tool_operations is not None
-                else ()  # Discovery alone is not an operator-approved intent binding.
-            )
+            if settings.tool_operations is not None:
+                operations = tuple(settings.tool_operations[descriptor.tool_name])
+                if descriptor.operations and set(operations) != set(descriptor.operations):
+                    raise MCPConfigurationError(
+                        f"MCP server {server_id!r} tool {descriptor.tool_name!r} explicit "
+                        "operation bindings conflict with discovered operations"
+                    )
+            elif descriptor.operations:
+                operations = tuple(descriptor.operations)
+            else:
+                # Discovery is not permission to promote a tool name to an intent.
+                # Unbound tools can be inspected but are never executable candidates.
+                operations = ()
             # The operation binding is part of the Registry snapshot exposed
             # to Agent/Orchestration; it must not remain only in a private
             # Gateway map.

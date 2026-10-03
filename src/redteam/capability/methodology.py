@@ -197,7 +197,7 @@ def _local_data(catalog: ReferenceCatalog) -> dict[str, bytes]:
     payload = {"catalog.json": catalog.model_dump_json(indent=2).encode("utf-8")}
     for name in _TEMPLATES:
         path = "NOTICE.md" if name == "NOTICE.md" else f"templates/{name}"
-        payload[path] = _DATA.joinpath("templates", name).read_bytes()
+        payload[path] = _DATA.joinpath("templates").joinpath(name).read_bytes()
     return payload
 
 

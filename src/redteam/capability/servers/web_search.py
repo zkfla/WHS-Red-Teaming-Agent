@@ -272,7 +272,7 @@ class WebSearchReader:
             )
         except asyncio.CancelledError:
             raise
-        except TimeoutError:
+        except (asyncio.TimeoutError, TimeoutError):
             code = SearchErrorCode.TIMEOUT
         except ProviderFailure as exc:
             code = exc.code

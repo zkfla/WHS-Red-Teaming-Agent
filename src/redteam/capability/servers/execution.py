@@ -695,7 +695,7 @@ class DockerExecutionEngine:
                 ),
                 timeout=timeout_seconds,
             )
-        except TimeoutError:
+        except (asyncio.TimeoutError, TimeoutError):
             await self._cleanup_container(process, container_name)
             duration_ms = max(0, round((time.monotonic() - started) * 1000))
             stdout, stderr, truncated = self._bounded_result(
@@ -989,7 +989,7 @@ class DockerExecutionEngine:
                 env=_safe_host_environment(),
             )
             cleanup_succeeded = await asyncio.wait_for(cleanup.wait(), timeout=5) == 0
-        except (OSError, TimeoutError):
+        except (OSError, asyncio.TimeoutError, TimeoutError):
             cleanup_succeeded = False
         finally:
             if process.returncode is None:

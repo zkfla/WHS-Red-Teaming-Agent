@@ -11,7 +11,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Annotated, TypedDict
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from redteam.attack_graph.observation import GraphObservation
 from redteam.core.contracts.action import ActionProposal
@@ -32,6 +32,8 @@ from redteam.core.ids import (
     TaskId,
 )
 from redteam.orchestration.agents.base import PlanStep
+from redteam.orchestration.component_binding import RuntimeComponentBinding
+from redteam.orchestration.diagnostics import DecisionDiagnostic, safe_feedback
 from redteam.orchestration.dispatch import (
     DispatchItem,
     WorkerOutcome,
@@ -83,6 +85,10 @@ class RuntimeState(BaseModel):
     active_path_version: int | None = None
     active_path_step_id: str | None = None
     planning_error: str | None = None
+    pending_event_count: int = Field(default=0, ge=0)
+    event_delivery_pending: bool = False
+    planning_diagnostic: DecisionDiagnostic | None = None
+    planning_diagnostic_history: list[DecisionDiagnostic] = Field(default_factory=list)
     planning_feedback: list[str] = Field(default_factory=list)
     recent_observations: list[RuntimeObservation] = Field(default_factory=list)
     operator_intent_id: OperatorIntentId | None = None
@@ -121,6 +127,20 @@ class RuntimeState(BaseModel):
     #: Observation fingerprint at which each agent exhausted its frontier.
     #: A relevant graph delta makes that agent eligible again.
     agent_revision_cursors: dict[str, str] = Field(default_factory=dict)
+    #: Which registered component set this run was built from. None is legacy.
+    component_binding: RuntimeComponentBinding | None = None
+
+    @field_validator("planning_feedback", mode="before")
+    @classmethod
+    def _safe_feedback(cls, values: list[str]) -> list[str]:
+        return [safe_feedback(value) for value in values[-10:]]
+
+    @field_validator("planning_diagnostic_history", mode="before")
+    @classmethod
+    def _bounded_diagnostic_history(
+        cls, values: list[DecisionDiagnostic]
+    ) -> list[DecisionDiagnostic]:
+        return values[-10:]
 
     @property
     def is_terminal(self) -> bool:

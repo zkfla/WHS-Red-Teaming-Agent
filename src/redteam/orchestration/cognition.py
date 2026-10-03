@@ -36,7 +36,15 @@ from typing import Any
 
 from jsonschema import ValidationError
 from jsonschema import validate as _validate_schema
+from pydantic import ValidationError as ModelValidationError
 from tenacity import AsyncRetrying, retry_if_exception_type, stop_after_attempt
+
+from redteam.orchestration.diagnostics import (
+    DecisionDiagnostic,
+    diagnostic_for_exception,
+    safe_feedback,
+    schema_diagnostic,
+)
 
 DECISION_KINDS = ("transport", "format", "budget", "unknown")
 
@@ -54,15 +62,30 @@ class DecisionFailure(Exception):
     last transport/format failure and the max/used counters.
     """
 
-    def __init__(self, stage: str, kind: str, attempts: int, detail: str = "") -> None:
+    def __init__(
+        self,
+        stage: str,
+        kind: str,
+        attempts: int,
+        detail: str = "",
+        *,
+        diagnostic: DecisionDiagnostic | None = None,
+    ) -> None:
         self.stage = stage
         self.kind = kind
         self.attempts = attempts
-        self.detail = detail
-        message = f"{stage} decision failed (kind={kind}) after {attempts} attempts"
-        if detail:
-            message += f": {detail}"
-        super().__init__(message)
+        self.diagnostic = diagnostic or DecisionDiagnostic(
+            code="decision_budget_exhausted" if kind == "budget" else "decision_failed",
+            stage=stage,
+            kind=kind,
+            attempts=attempts,
+            summary=safe_feedback(detail or "The model decision failed."),
+            retryable=kind in {"transport", "format"},
+        )
+        self.detail = self.diagnostic.feedback()
+        super().__init__(
+            f"{stage} decision failed (kind={kind}) after {attempts} attempts: {self.detail}"
+        )
 
 
 class DecisionBudget:
@@ -85,6 +108,7 @@ class DecisionBudget:
             raise ValueError("max_attempts must be >= 1")
         self._max_attempts = int(max_attempts)
         self._used = 0
+        self.last_failure: DecisionDiagnostic | None = None
 
     @property
     def max_attempts(self) -> int:
@@ -121,24 +145,15 @@ class DecisionBudget:
 
 
 class _RetryableDecisionError(Exception):
-    def __init__(self, kind: str, feedback: str) -> None:
-        self.kind = kind
-        self.feedback = feedback
-        super().__init__(feedback)
+    def __init__(self, diagnostic: DecisionDiagnostic) -> None:
+        self.diagnostic = diagnostic
+        self.kind = diagnostic.kind
+        self.feedback = diagnostic.feedback()
+        super().__init__(self.feedback)
 
 
-def _truncate(text: object, limit: int = _MAX_FEEDBACK_CHARS) -> str:
-    text = " ".join(str(text).split())
-    return text if len(text) <= limit else text[:limit] + "..."
-
-
-def _looks_like_format_error(exc: BaseException) -> bool:
-    if isinstance(exc, (ValidationError, json.JSONDecodeError, UnicodeDecodeError)):
-        return True
-    if isinstance(exc, (ValueError, TypeError, AttributeError)):
-        lowered = str(exc).lower()
-        return any(key in lowered for key in ("json", "schema", "valid", "object"))
-    return False
+class _NonObjectDecision(ValueError):
+    """The model returned a non-object JSON value."""
 
 
 def _parse_text_result(raw: Any) -> dict[str, Any]:
@@ -156,9 +171,9 @@ def _parse_text_result(raw: Any) -> dict[str, Any]:
             text = chr(10).join(lines).strip()
         parsed = json.loads(text or "{}")
         if not isinstance(parsed, dict):
-            raise ValueError(f"expected JSON object, got {type(parsed).__name__}")
+            raise _NonObjectDecision("Return a JSON object.")
         return parsed
-    raise ValueError(f"expected JSON object, got {type(raw).__name__}")
+    raise _NonObjectDecision("Return a JSON object.")
 
 
 class StructuredDecisionClient:
@@ -260,18 +275,44 @@ class StructuredDecisionClient:
                 num_retries=0,
             )
         except Exception as exc:
-            if _looks_like_format_error(exc):
-                raise _RetryableDecisionError("format", _truncate(exc)) from exc
-            raise _RetryableDecisionError("transport", _truncate(exc)) from exc
+            if isinstance(exc, ValidationError):
+                diagnostic = schema_diagnostic(exc, response_schema, stage=stage)
+            elif isinstance(exc, ModelValidationError):
+                diagnostic = diagnostic_for_exception(exc, stage=stage)
+            elif isinstance(exc, (json.JSONDecodeError, UnicodeDecodeError)):
+                diagnostic = DecisionDiagnostic(
+                    code="invalid_json",
+                    stage=stage,
+                    kind="format",
+                    summary="Return a valid JSON object.",
+                    retryable=True,
+                )
+            else:
+                diagnostic = DecisionDiagnostic(
+                    code="llm_transport_failed",
+                    stage=stage,
+                    kind="transport",
+                    summary="The LLM request failed before a validated response was received.",
+                    retryable=True,
+                )
+            raise _RetryableDecisionError(diagnostic) from exc
         try:
             candidate = _parse_text_result(raw)
             _validate_schema(instance=candidate, schema=response_schema)
         except ValidationError as exc:
-            raise _RetryableDecisionError("format", _truncate(exc.message)) from exc
-        except Exception as exc:
-            if _looks_like_format_error(exc):
-                raise _RetryableDecisionError("format", _truncate(exc)) from exc
-            raise _RetryableDecisionError("unknown", _truncate(exc)) from exc
+            raise _RetryableDecisionError(
+                schema_diagnostic(exc, response_schema, stage=stage)
+            ) from exc
+        except (json.JSONDecodeError, UnicodeDecodeError, _NonObjectDecision) as exc:
+            raise _RetryableDecisionError(
+                DecisionDiagnostic(
+                    code="invalid_json",
+                    stage=stage,
+                    kind="format",
+                    summary="Return a valid JSON object.",
+                    retryable=True,
+                )
+            ) from exc
         return candidate
 
     async def _ask_with_tenacity(
@@ -282,16 +323,24 @@ class StructuredDecisionClient:
         system: str,
         budget: DecisionBudget,
     ) -> dict[str, Any]:
-        if budget.remaining <= 0:
-            raise DecisionFailure(
-                stage,
-                "budget",
-                budget.used,
-                f"decision budget exhausted before first attempt "
-                f"(max_attempts={budget.max_attempts}, used={budget.used})",
+        def exhausted() -> DecisionFailure:
+            diagnostic = DecisionDiagnostic(
+                code="decision_budget_exhausted",
+                stage=stage,
+                kind="budget",
+                attempts=budget.used,
+                summary="The shared decision attempt budget is exhausted.",
+                retryable=False,
+                last_cause=budget.last_failure,
+                location=budget.last_failure.location if budget.last_failure else "",
             )
+            return DecisionFailure(stage, "budget", budget.used, diagnostic=diagnostic)
+
+        if budget.remaining <= 0:
+            raise exhausted()
         allowed = budget.remaining
-        state: dict[str, str] = {"feedback": "", "kind": "unknown"}
+        feedback = ""
+        kind = "unknown"
         try:
             async for attempt in AsyncRetrying(
                 stop=stop_after_attempt(allowed),
@@ -299,14 +348,7 @@ class StructuredDecisionClient:
                 reraise=True,
             ):
                 if budget.remaining <= 0:
-                    raise DecisionFailure(
-                        stage,
-                        "budget",
-                        budget.used,
-                        f"decision budget exhausted during retries "
-                        f"(max_attempts={budget.max_attempts}, used={budget.used}); "
-                        f"last failure ({state['kind']}): {state['feedback']}",
-                    )
+                    raise exhausted()
                 budget.consume()
                 with attempt:
                     try:
@@ -315,27 +357,16 @@ class StructuredDecisionClient:
                             working=working,
                             response_schema=response_schema,
                             system=system,
-                            feedback=state["feedback"],
-                            kind=state["kind"],
+                            feedback=feedback,
+                            kind=kind,
                         )
                     except _RetryableDecisionError as exc:
-                        state["feedback"] = exc.feedback
-                        state["kind"] = exc.kind
+                        budget.last_failure = exc.diagnostic.model_copy(
+                            update={"attempts": budget.used}
+                        )
+                        feedback = exc.feedback
+                        kind = exc.kind
                         raise
         except _RetryableDecisionError as exc:
-            raise DecisionFailure(
-                stage,
-                "budget",
-                budget.used,
-                f"decision budget exhausted (max_attempts={budget.max_attempts}, "
-                f"used={budget.used}); last failure "
-                f"({state['kind']}): {state['feedback']}",
-            ) from exc
-        raise DecisionFailure(
-            stage,
-            "budget",
-            budget.used,
-            f"decision budget exhausted (max_attempts={budget.max_attempts}, "
-            f"used={budget.used}); last failure "
-            f"({state['kind']}): {state['feedback']}",
-        )
+            raise exhausted() from exc
+        raise exhausted()

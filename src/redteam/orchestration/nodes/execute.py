@@ -25,7 +25,7 @@ from redteam.orchestration.action_naming import (
     tool_matches_action_namespace,
 )
 from redteam.orchestration.context import RuntimeDeps
-from redteam.orchestration.engine import validate_current_action
+from redteam.orchestration.engine import claim_action_admission, validate_current_action
 from redteam.orchestration.long_jobs import LongJobManager, LongJobState
 from redteam.orchestration.nodes._support import advance, publisher_for
 from redteam.orchestration.runtime_observation import (
@@ -117,6 +117,7 @@ async def _invoke_with_semaphore(
         problems = await validate_current_action(deps, runtime, step, proposal)
         if problems:
             raise ValueError("action changed before invocation")
+        await claim_action_admission(deps, runtime, step, proposal)
         if deps.long_job_adapter is None:
             return await deps.tool_gateway.invoke(invocation)
         if work_id is None:

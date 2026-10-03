@@ -15,7 +15,7 @@ from enum import Enum
 from pathlib import Path
 from urllib.parse import urlparse
 
-from redteam.core.contracts.action_naming import (
+from redteam.core.action_semantics import (
     ActionNamingError,
     canonical_action_key,
     validate_operation_format,
@@ -168,7 +168,7 @@ class MCPServerSettings:
                 _, page_text_config_sha256 = load_page_text_config(page_text_config_path)
             except ValueError:
                 raise MCPConfigurationError("invalid page text operator configuration") from None
-            expected_tools = (REMOTE_TOOL_NAME,)
+            expected_tools: tuple[str, ...] = (REMOTE_TOOL_NAME,)
             expected_bindings: dict[str, tuple[str, ...]] = {
                 REMOTE_TOOL_NAME: (PROPOSED_OPERATION,)
             }

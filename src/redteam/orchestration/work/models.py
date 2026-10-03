@@ -45,6 +45,8 @@ class WorkItem(BaseModel):
     #: None exists only for deserializing pre-run-isolation ledger rows.
     run_id: RunId | None = None
     candidate_key: str
+    #: Legacy rows used bounded summaries and cannot prove original-state equality.
+    execution_identity_version: int = Field(default=0, ge=0)
     agent_id: AgentId
     graph_revision: int = Field(default=0, ge=0)
     path_id: str | None = None

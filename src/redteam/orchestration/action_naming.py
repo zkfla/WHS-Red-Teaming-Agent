@@ -6,12 +6,15 @@ describes an execution mechanism and is deliberately validated separately.
 
 from __future__ import annotations
 
-from redteam.core.contracts.action_naming import (
+from redteam.core.action_semantics import (
     CANONICAL_CAPABILITIES,
     CANONICAL_OPERATIONS,
     canonical_action_key,
 )
 from redteam.core.ids import ToolId
+
+# Intent validation lives in redteam.core.action_semantics (single source of
+# truth); this module re-exports it so existing import paths keep working.
 
 __all__ = [
     "CANONICAL_CAPABILITIES",

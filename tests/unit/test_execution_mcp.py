@@ -248,15 +248,15 @@ def test_policy_rejects_unpinned_image_shells_and_broad_workspace(tmp_path: Path
         "allowed_executables": {"grep": "/usr/bin/grep"},
     }
     with pytest.raises(ValueError, match="pinned by sha256"):
-        ExecutionPolicy(**values)
+        ExecutionPolicy.model_validate(values)
     values["image"] = "example/text-tools@sha256:" + "1" * 64
     values["allowed_executables"] = {"sh": "/usr/bin/sh"}
     with pytest.raises(ValueError, match="unsafe executable"):
-        ExecutionPolicy(**values)
+        ExecutionPolicy.model_validate(values)
     values["allowed_executables"] = {"grep": "/usr/bin/grep"}
     values["workspace_root"] = str(Path(Path.cwd().anchor))
     with pytest.raises(ValueError, match="narrow absolute path"):
-        ExecutionPolicy(**values)
+        ExecutionPolicy.model_validate(values)
 
 
 def test_server_start_refuses_windows_or_missing_docker(

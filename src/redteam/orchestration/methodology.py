@@ -95,8 +95,10 @@ class ReferenceLibrary(BaseModel):
             or not result.success
         ):
             return rejected
+        if not isinstance(result.output, dict):
+            return rejected
         try:
-            raw = dict(result.output or {})
+            raw = dict(result.output)
             if raw.pop("encoding", None) != "utf-8":
                 return rejected
             chunk = ReferenceChunk.model_validate({**raw, "reference_id": entry.reference_id})
@@ -139,19 +141,22 @@ class ReferenceLibrary(BaseModel):
             if not isinstance(raw, dict) or raw.get("reference_id") != entry.reference_id:
                 continue
             try:
-                page = ReferenceChunk.model_validate(raw)
+                cached_page = ReferenceChunk.model_validate(raw)
             except ValidationError:
                 return "invalid", 0, ""
             if (
                 record.metadata.get("success") is not True
-                or page.path != entry.path
-                or page.asset_ref != self.asset_ref
-                or page.sha256 != entry.sha256
-                or len(page.content) > self.read_chars
-                or (page.offset_chars in pages and pages[page.offset_chars] != page)
+                or cached_page.path != entry.path
+                or cached_page.asset_ref != self.asset_ref
+                or cached_page.sha256 != entry.sha256
+                or len(cached_page.content) > self.read_chars
+                or (
+                    cached_page.offset_chars in pages
+                    and pages[cached_page.offset_chars] != cached_page
+                )
             ):
                 return "invalid", 0, ""
-            pages[page.offset_chars] = page
+            pages[cached_page.offset_chars] = cached_page
         if not pages:
             return "pending", 0, ""
         offset, text = 0, ""

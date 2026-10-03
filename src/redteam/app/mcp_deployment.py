@@ -5,6 +5,7 @@ from __future__ import annotations
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -21,6 +22,7 @@ from redteam.core.config import EngagementConfig
 from redteam.core.contracts.action import ActionProposal
 from redteam.core.contracts.engagement import EngagementScope
 from redteam.core.contracts.target import UrlTarget
+from redteam.core.ids import ActionId, AgentId, EngagementId, RunId
 
 
 class DeploymentBinding(BaseModel):
@@ -38,15 +40,12 @@ class DeploymentBinding(BaseModel):
 
 
 def check_deployment_scope(spec: DeploymentSpec, scope: EngagementScope) -> None:
-    declared = {item.strip().lower() for item in (*scope.allowed_hosts, *scope.allowed_domains)}
-    if set(spec.host_bindings) - declared:
-        raise ValueError("deployment_origin_outside_control_scope_or_explicit_host_seed")
     for target in spec.policy.targets.values():
         proposal = ActionProposal(
-            action_id="deployment-check",
-            run_id="deployment-check",
-            engagement_id="deployment-check",
-            agent_id="deployment-check",
+            action_id=ActionId("deployment-check"),
+            run_id=RunId("deployment-check"),
+            engagement_id=EngagementId("deployment-check"),
+            agent_id=AgentId("deployment-check"),
             capability="web",
             operation="http_request",
             target=UrlTarget(url=target.origin),
@@ -56,8 +55,55 @@ def check_deployment_scope(spec: DeploymentSpec, scope: EngagementScope) -> None
         )
         allowed, _, _ = check_scope(proposal, scope)
         if not allowed:
-            # Includes current Control host:port limitation. Never strip ports to broaden scope.
+            # Never strip ports to broaden scope; retain the current Control semantics.
             raise ValueError("deployment_origin_outside_control_scope")
+    _declared_host_seeds(spec, scope)
+
+
+def _declared_host_seeds(spec: DeploymentSpec, scope: EngagementScope) -> dict[str, list[str]]:
+    """Map policy hostnames to existing scope seeds without adding a bare host."""
+    declared = {entry.strip().lower() for entry in (*scope.allowed_hosts, *scope.allowed_domains)}
+    seeds: dict[str, list[str]] = {}
+    for host, ref in spec.host_bindings.items():
+        origin = urlsplit(spec.policy.targets[ref].origin)
+        port = origin.port or (443 if origin.scheme == "https" else 80)
+        matches = []
+        for entry in sorted(declared):
+            if entry == host:
+                matches.append(entry)
+                continue
+            try:
+                parsed = urlsplit("//" + entry)
+                if (
+                    parsed.hostname == host
+                    and parsed.port == port
+                    and not parsed.username
+                    and not parsed.password
+                    and not parsed.path
+                    and not parsed.query
+                    and not parsed.fragment
+                ):
+                    matches.append(entry)
+            except ValueError:
+                continue  # Malformed entries never create a seed binding.
+        if not matches:
+            raise ValueError("deployment_origin_outside_control_scope_or_explicit_host_seed")
+        seeds[host] = matches
+    return seeds
+
+
+def deployment_metadata(spec: DeploymentSpec, scope: EngagementScope) -> dict:
+    """Keep target/session aliases on the exact approved Graph seed identities."""
+    check_deployment_scope(spec, scope)
+    public = spec.public_metadata()
+    seeds = _declared_host_seeds(spec, scope)
+    public["target_refs"] = {
+        seed: ref for host, ref in spec.host_bindings.items() for seed in seeds[host]
+    }
+    public["auth_sessions"] = {
+        seed: public["auth_sessions"][host] for host in spec.host_bindings for seed in seeds[host]
+    }
+    return public
 
 
 def synchronize_deployment(
@@ -78,8 +124,7 @@ def synchronize_deployment(
         spec = DeploymentSpec.model_validate_json(source_bytes)
         if encoded(spec.server_policy().model_dump(mode="json")) != policy_bytes:
             raise ValueError("deployment_policy_source_mismatch")
-        check_deployment_scope(spec, engagement.scope)
-        public = spec.public_metadata()
+        public = deployment_metadata(spec, engagement.scope)
         for key, value in public.items():
             if key in engagement.metadata and engagement.metadata[key] != value:
                 raise ValueError("deployment_agent_metadata_mismatch")

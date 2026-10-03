@@ -50,14 +50,14 @@ async def test_installed_external_mcp_profiles_discover_only_allowlisted_tools()
             if descriptor.server_id == server_id
         }
         assert discovered == expected[server_id]
+        settings = MCPServerSettings.from_environment(server_id)
+        assert settings.tool_operations is not None
         for descriptor in descriptors:
             if descriptor.server_id != server_id:
                 continue
             assert descriptor.health_status.value == "healthy"
             assert descriptor.operations == list(
-                MCPServerSettings.from_environment(server_id).tool_operations[
-                    descriptor.tool_name
-                ]
+                settings.tool_operations[descriptor.tool_name]
             )
             assert descriptor.required_arguments == tuple(
                 descriptor.input_schema.get("required", [])

@@ -279,15 +279,18 @@ async def test_registry_candidate_control_gateway_and_real_mcp_tool(
         build_tool_invocation(proposal, decision, tool_id=step.tool_id)
     assert starts == 0
 
+    assert decision.approval_id is not None
     await plane.resolve_approval(
         decision.approval_id,
         ApprovalStatus.APPROVED,
         "fixture-operator",
     )
     allowed = await plane.approval_outcome(decision.approval_id)
+    assert allowed is not None
     result = await gateway.invoke(
         build_tool_invocation(proposal, allowed, tool_id=step.tool_id)
     )
+    assert isinstance(result.output, dict)
     assert result.success and result.output["exit_code"] == 0
     assert starts == 1
 
@@ -302,6 +305,7 @@ async def test_registry_candidate_control_gateway_and_real_mcp_tool(
             action_id="action-job-start",
         )
     )
+    assert isinstance(started.output, dict)
     assert started.success and started.output["job_id"].startswith("job-")
     job_id = started.output["job_id"]
     for index in range(20):
@@ -313,9 +317,11 @@ async def test_registry_candidate_control_gateway_and_real_mcp_tool(
             )
         )
         assert status.success
+        assert isinstance(status.output, dict)
         if status.output["status"] != "running":
             break
         await asyncio.sleep(0)
+    assert isinstance(status.output, dict)
     assert status.output["status"] == "completed"
     cancelled = await gateway.invoke(
         job_invocation(
@@ -489,6 +495,7 @@ async def test_stdio_server_rss_is_bounded_during_large_output_and_concurrent_jo
                     )
                 )
                 assert started.success, started.error
+                assert isinstance(started.output, dict)
                 job_ids.append(started.output["job_id"])
             await wait_for_managed_containers(4)
             await asyncio.sleep(0.5)
@@ -514,6 +521,7 @@ async def test_stdio_server_rss_is_bounded_during_large_output_and_concurrent_jo
         f"delta_bytes={peak_rss - baseline_rss} limit_bytes={rss_limit}"
     )
     assert large_output.success
+    assert isinstance(large_output.output, dict)
     assert large_output.output["truncated"] is True
     assert large_output.output["output_file_truncated"] is True
     assert peak_rss <= rss_limit
@@ -602,6 +610,7 @@ async def test_real_stdio_docker_execution_hardening(
         health_refresh_enabled=False,
     ) as gateway:
         tool = gateway.get(ToolId("analysis.run_command"))
+        assert tool is not None
         validate_execution_descriptor(tool, "workspace-test")
         live_engagement = Engagement(
             engagement_id=EngagementId("eng-test"),
@@ -658,12 +667,14 @@ async def test_real_stdio_docker_execution_hardening(
                 ControlContext(engagement_id=live_engagement.engagement_id),
             )
             assert decision.verdict == PolicyVerdict.REQUIRE_APPROVAL
+            assert decision.approval_id is not None
             await live_plane.resolve_approval(
                 decision.approval_id,
                 ApprovalStatus.APPROVED,
                 "fixture-operator",
             )
             allowed = await live_plane.approval_outcome(decision.approval_id)
+            assert allowed is not None
             return await gateway.invoke(
                 build_tool_invocation(proposal, allowed, tool_id=step.tool_id)
             )
@@ -681,6 +692,7 @@ async def test_real_stdio_docker_execution_hardening(
                 }
             )
         )
+        assert isinstance(sorted_result.output, dict)
         written = await gateway.invoke(
             workspace_invocation(
                 "write_file",
@@ -755,6 +767,7 @@ async def test_real_stdio_docker_execution_hardening(
             )
         )
         assert started.success, started.error
+        assert isinstance(started.output, dict)
         await asyncio.sleep(0.2)
         live_status = await gateway.invoke(
             job_invocation(
@@ -766,6 +779,7 @@ async def test_real_stdio_docker_execution_hardening(
                 action_id="action-live-job-status",
             )
         )
+        assert isinstance(live_status.output, dict)
         assert live_status.success, live_status.error
         assert live_status.output["status"] == "running", live_status.output
         container_id = (await wait_for_managed_containers(1))[0]
@@ -827,6 +841,7 @@ async def test_real_stdio_docker_execution_hardening(
             )
         )
         assert completed_job.success, completed_job.error
+        assert isinstance(completed_job.output, dict)
         for index in range(100):
             completed_status = await gateway.invoke(
                 job_invocation(
@@ -839,9 +854,11 @@ async def test_real_stdio_docker_execution_hardening(
                 )
             )
             assert completed_status.success, completed_status.error
+            assert isinstance(completed_status.output, dict)
             if completed_status.output["status"] != "running":
                 break
             await asyncio.sleep(0.05)
+        assert isinstance(completed_status.output, dict)
         assert completed_status.output["status"] == "completed"
         assert completed_status.output["result"]["exit_code"] == 0
         server_timed_out = await gateway.invoke(
@@ -886,6 +903,14 @@ async def test_real_stdio_docker_execution_hardening(
             )
         )
 
+    assert isinstance(before.output, dict)
+    assert isinstance(after.output, dict)
+    assert isinstance(stdout_limited.output, dict)
+    assert isinstance(stderr_limited.output, dict)
+    assert isinstance(server_timed_out.output, dict)
+    assert isinstance(cancelled.output, dict)
+    assert isinstance(recovered_after_server_timeout.output, dict)
+    assert isinstance(recovered_after_gateway_timeout.output, dict)
     assert listed.success and before.output["content"] == "b\na\n"
     assert sorted_result.success and sorted_result.output["exit_code"] == 0
     assert written.success and after.output["content"] == "a\nb\n"
@@ -937,6 +962,7 @@ async def test_real_stdio_docker_execution_hardening(
             )
         )
         assert recovered_after_caller_cancel.success
+        assert isinstance(recovered_after_caller_cancel.output, dict)
         assert recovered_after_caller_cancel.output["stdout"] == "a\nb\n"
 
     direct_engine = DockerExecutionEngine(execution_policy)

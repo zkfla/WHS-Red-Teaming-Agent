@@ -18,12 +18,19 @@ Capability Registry는 MCP discovery 결과를 다음 메타데이터 묶음으�
 않는다. 실제 MCP `input_schema`의 `required`와 `properties`가 원본이다. 시작 시
 input/output schema가 유효한 JSON Schema인지 검사하고, required 인자가 properties에
 실제로 존재하는지도 확인한다. `operations`는 중복 없는 lower_snake_case이며
-`core.contracts.action_naming`의 공통 지원 목록에 포함되어야 한다.
+`core.action_semantics`의 공통 지원 목록에 포함되어야 한다.
 형식만 맞는 미지원 연결은 서버·도구·작업 이름을 명시한 설정 오류로 등록 전에 거부한다.
-환경 설정의 `TOOL_OPERATIONS_JSON` 또는 profile이 명시한 연결만 Agent에 노출한다.
+환경 설정의 `TOOL_OPERATIONS_JSON`/profile 또는 discovery가 명시한 연결만 Agent에 노출한다.
+운영자 연결이 discovery의 비어 있지 않은 operations와 다르면 등록을 거부한다.
 설정이 없는 일반 discovery 도구와 빈 연결 `[]`의 관리용 도구는 저장 가능하지만
 실행 후보가 아니며 Gateway 호출도 operation binding 검사에서 거부한다.
 실제 원격 tool_name을 operation으로 자동 승격하지 않는다.
+
+`get`, `all`, `list_by_capability`, `list_tools_for_action`과 내부 후보 view는
+확정된 operation·output schema·target type을 동일하게 제공하며 방어적 복사본을 반환한다.
+Gateway 실행·출력 검증도 같은 확정 descriptor를 사용한다. 운영자 metadata override가
+있더라도 raw Registry만 검사하여 Agent에게 보여준 schema와 다르게 실행하지 않는다.
+대상 종류가 여러 개이면 단일 대상 편의 view는 `None`을 유지하고 원본 목록을 확인한다.
 `target_types`는 Core가 이해하는 Graph target 종류만 허용한다. 검증에 실패한
 discovery 결과는 Registry에 등록하지 않는다. 실행 후 output이 등록된 schema를
 만족하지 않으면 결과를 실패로 기록한다. MCP discovery에 `outputSchema`가 없으면

@@ -6,6 +6,7 @@ import hashlib
 import os
 import shlex
 from pathlib import Path
+from typing import TypedDict
 
 import pytest
 
@@ -23,7 +24,18 @@ from redteam.core.ids import AssetId
 from redteam.orchestration.action_naming import canonical_action_key
 from tests.unit.test_scope import _proposal_for
 
-_CONTEXT = {"asset_ref": "workspace-test", "engagement_id": "eng-test", "run_id": "run-test"}
+
+class WorkspaceContext(TypedDict):
+    asset_ref: str
+    engagement_id: str
+    run_id: str
+
+
+_CONTEXT: WorkspaceContext = {
+    "asset_ref": "workspace-test",
+    "engagement_id": "eng-test",
+    "run_id": "run-test",
+}
 
 
 @pytest.fixture
@@ -172,7 +184,17 @@ def test_root_permissions_rechecked(workspace: WorkspaceIO) -> None:
 
 @pytest.mark.parametrize("field", ["asset_ref", "engagement_id", "run_id"])
 def test_context_cannot_select_another_workspace(workspace: WorkspaceIO, field: str) -> None:
-    context = {**_CONTEXT, field: "other"}
+    context: WorkspaceContext = {
+        "asset_ref": _CONTEXT["asset_ref"],
+        "engagement_id": _CONTEXT["engagement_id"],
+        "run_id": _CONTEXT["run_id"],
+    }
+    if field == "asset_ref":
+        context["asset_ref"] = "other"
+    elif field == "engagement_id":
+        context["engagement_id"] = "other"
+    else:
+        context["run_id"] = "other"
     with pytest.raises(WorkspaceError, match="workspace_context_mismatch"):
         workspace.list_directory(path=".", **context)
 
@@ -300,6 +322,8 @@ def test_documented_profile_has_exact_contract(
             monkeypatch.setenv(name, shlex.split(value)[0])
     settings = MCPServerSettings.from_environment(f"workspace-{mode}")
     assert settings.profile == f"workspace_{mode}"
+    assert settings.allowed_tools is not None
+    assert settings.tool_operations is not None
     assert set(settings.allowed_tools) == set(settings.tool_operations)
     for operations in settings.tool_operations.values():
         for operation in operations:

@@ -105,9 +105,10 @@ intends to do — not which tool implements it.
 Format: `lower_snake_case`.
 
 The shared executable vocabulary and typed validation errors live in
-`redteam.core.contracts.action_naming`. Capability registration and Agent
-planning use this one contract; `redteam.orchestration.action_naming` retains
-compatible exports. A well-formatted name outside this vocabulary is not a
+`redteam.core.action_semantics`. Capability registration and Agent
+planning use this one contract; `redteam.core.contracts.action_naming` and
+`redteam.orchestration.action_naming` retain compatible re-exports, not
+separate vocabularies. A well-formatted name outside this vocabulary is not a
 supported intent. This contract does not grant execution permission or define
 new capability/target schemas.
 
@@ -135,6 +136,18 @@ This is an additive naming extension, not a new capability/target schema
 or permission to automatically schedule these actions. PM/Agent/Control
 owners should review it before integration into dev; deployment ROE must
 explicitly permit the workspace asset and intended operations.
+
+Execution names already implemented on capability remain `command_run`,
+`command_job_start`, `command_job_status`, and `command_job_cancel`.
+Their presence in this vocabulary does not enable arbitrary shell use:
+the Agent bridge stays off by default and exposes only the explicitly
+configured fixed `line_count` recipe. Job lifecycle automation and operational
+permission remain separate reviews.
+
+Admission errors distinguish name validity from configuration:
+`operation_unsupported` means a name outside this shared vocabulary;
+`no_tool_for_operation` means a supported name with no registered binding
+in an available capability. Neither authorizes a replacement action.
 
 Rules:
 

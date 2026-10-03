@@ -16,11 +16,12 @@ import stat
 import tempfile
 import threading
 import time
+from collections.abc import Callable
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import Annotated, Literal, Protocol, cast
 
 from mcp.server import MCPServer
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -34,6 +35,24 @@ _LOCK = threading.Lock()  # upstream connection globals belong to one process
 
 class VDBError(ValueError):
     """Fixed codes only; never return host paths or raw backend exception text."""
+
+
+class _BackendConfig(Protocol):
+    """Global configuration exposed by the pinned upstream version."""
+
+    DATA_DIR: str
+    VDB_AUTO_FETCH: bool
+    VDB_INCLUDE_METADATA: bool
+
+
+class _BackendDatabase(Protocol):
+    """Upstream connection globals bound only inside our serialized read scope."""
+
+    db_conn: object | None
+    index_conn: object | None
+    bound_paths: tuple[str, str] | None
+    tables_created: bool
+    vers_compare: Callable[..., int]
 
 
 class VDBPolicy(BaseModel):
@@ -251,6 +270,7 @@ class VDBReader:
                 conn.close()
 
     def status(self, *, deadline: float | None = None) -> VDBStatus:
+        state: DataState
         with _LOCK:
             try:
                 with self._connections(deadline) as (data, index):
@@ -318,12 +338,12 @@ class VDBReader:
                             VDB_AUTO_FETCH="false",
                             VDB_INCLUDE_METADATA="false",
                         )
-                        config = importlib.import_module("vdb.lib.config")
+                        config = cast(_BackendConfig, importlib.import_module("vdb.lib.config"))
                         if Path(config.DATA_DIR) != self.root:
                             raise VDBError("vdb_backend_binding_mismatch")
                         config.VDB_AUTO_FETCH = False
                         config.VDB_INCLUDE_METADATA = False
-                        db = importlib.import_module("vdb.lib.db")
+                        db = cast(_BackendDatabase, importlib.import_module("vdb.lib.db"))
                         search = importlib.import_module("vdb.lib.search")
                         if db.db_conn is not None or db.index_conn is not None:
                             raise VDBError("vdb_backend_binding_mismatch")
@@ -389,7 +409,8 @@ class VDBReader:
                                     # Never silently accept a near-ID or call it clean.
                                     raise VDBError("vdb_alias_match_inexact")
                         finally:
-                            db.db_conn = db.index_conn = db.bound_paths = None
+                            db.db_conn = db.index_conn = None
+                            db.bound_paths = None
                             db.tables_created = False
                     matches = [self._match(hit) for hit in raw[:limit]]
                     for match in matches:

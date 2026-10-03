@@ -139,6 +139,9 @@ async def test_real_stdio_manifest_and_file_lifecycle(
         ]
         results = [await gateway.invoke(call) for call in calls]
         assert all(result.success for result in results), results
+        assert isinstance(results[1].output, dict)
+        assert isinstance(results[2].output, dict)
+        assert isinstance(results[3].output, dict)
         assert results[1].output["content"] == "synthetic marker\n금융 시험"
         assert results[2].output["matches"][0]["path"] == "source.txt"
         assert "run_id" not in calls[0].arguments  # context injection never mutates the proposal
@@ -156,6 +159,7 @@ async def test_real_stdio_manifest_and_file_lifecycle(
         )
         assert patched.success, patched
         reread = await gateway.invoke(invocation("read_file", {"path": "notes.md"}))
+        assert isinstance(reread.output, dict)
         assert reread.success and reread.output["content"] == "reviewed marker"
         stale = await gateway.invoke(
             invocation(
@@ -181,21 +185,26 @@ async def test_real_stdio_context_and_operation_rejections(
             bad = await gateway.invoke(
                 invocation("read_file", {"path": "source.txt", field: "other"})
             )
+            assert bad.error is not None
             assert not bad.success and bad.error.code == "workspace_context_mismatch"
         forged_context = invocation("read_file", {"path": "source.txt"})
         forged_context.execution_context.engagement_id = EngagementId("other-engagement")
         refused = await gateway.invoke(forged_context)
+        assert refused.error is not None
         assert not refused.success and refused.error.code == "mcp_tool_error"
         wrong_run = invocation("read_file", {"path": "source.txt"})
         wrong_run.run_id = RunId("other-run")
-        assert (await gateway.invoke(wrong_run)).error.code == "workspace_context_mismatch"
+        wrong_run_result = await gateway.invoke(wrong_run)
+        assert wrong_run_result.error is not None
+        assert wrong_run_result.error.code == "workspace_context_mismatch"
         bad_operation = invocation("read_file", {"path": "source.txt"})
         bad_operation.operation = "file_write"
         assert not (await gateway.invoke(bad_operation)).success
         for args in ({"path": "../policy.json"}, {"asset_ref": "other", "path": "source.txt"}):
             assert not (await gateway.invoke(invocation("read_file", args))).success
-        for args in ({"path": 123}, {"path": "source.txt", "shell": "no"}):
-            bad = await gateway.invoke(invocation("read_file", args))
+        for invalid_args in ({"path": 123}, {"path": "source.txt", "shell": "no"}):
+            bad = await gateway.invoke(invocation("read_file", invalid_args))
+            assert bad.error is not None
             assert not bad.success and bad.error.code == "workspace_invalid_arguments"
 
 
@@ -263,10 +272,13 @@ async def test_candidate_compiler_control_approval_and_real_mcp(
                     build_tool_invocation(proposal, decision, tool_id=step.tool_id)
                 assert not (tmp_path / "workspace" / "approved.md").exists()
                 # Simulated human response for this synthetic fixture, NOT production auto-approval.
+                assert decision.approval_id is not None
                 await plane.resolve_approval(
                     decision.approval_id, ApprovalStatus.APPROVED, "fixture-operator"
                 )
-                decision = await plane.approval_outcome(decision.approval_id)
+                outcome = await plane.approval_outcome(decision.approval_id)
+                assert outcome is not None
+                decision = outcome
             assert decision.verdict == PolicyVerdict.ALLOW
             result = await gateway.invoke(
                 build_tool_invocation(proposal, decision, tool_id=step.tool_id)
@@ -288,6 +300,7 @@ async def test_registry_manifest_rejects_mutated_input_and_output_schema(
     servers = configure_workspace(monkeypatch, tmp_path, writable=False)
     async with open_mcp_tool_gateway(servers, health_refresh_enabled=False) as gateway:
         original = gateway.get(ToolId("analysis.read_file"))
+        assert original is not None
         for part in ("input", "required", "output", "operation"):
             changed = original.model_copy(deep=True)
             if part == "input":
@@ -295,6 +308,7 @@ async def test_registry_manifest_rejects_mutated_input_and_output_schema(
             elif part == "required":
                 changed.input_schema["required"].remove("path")
             elif part == "output":
+                assert changed.output_schema is not None
                 changed.output_schema["properties"].pop("sha256")
             else:
                 changed.operations = ["http_request"]
@@ -315,12 +329,15 @@ async def test_read_default_and_discovery_follow_operator_limits(
     (tmp_path / "workspace" / "source.txt").write_text("가나다라마", encoding="utf-8")
     async with open_mcp_tool_gateway(servers, health_refresh_enabled=False) as gateway:
         tool = gateway.get(ToolId("analysis.read_file"))
+        assert tool is not None
         assert tool.input_schema["properties"]["max_chars"]["default"] == 4
         assert tool.input_schema["properties"]["max_chars"]["maximum"] == 4
         result = await gateway.invoke(invocation("read_file", {"path": "source.txt"}))
+        assert isinstance(result.output, dict)
         assert result.success and result.output["content"] == "가나다라"
         assert result.output["next_offset_chars"] == 4 and result.output["size_bytes"] == 15
         bad = await gateway.invoke(invocation("read_file", {"path": "source.txt", "max_chars": 5}))
+        assert bad.error is not None
         assert not bad.success and bad.error.code == "workspace_invalid_arguments"
 
 

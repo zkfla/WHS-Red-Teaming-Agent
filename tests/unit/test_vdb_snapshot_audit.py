@@ -42,7 +42,7 @@ def spec_for(root, **changes):
 
 
 class FakeReader:
-    changes = {}
+    changes: dict[str, object] = {}
     calls = 0
 
     def __init__(self, policy):

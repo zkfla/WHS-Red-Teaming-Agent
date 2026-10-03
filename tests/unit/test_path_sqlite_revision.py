@@ -7,6 +7,8 @@ from types import SimpleNamespace
 import pytest
 
 from redteam.attack_graph.stores.memory import InMemoryAttackGraphStore
+from redteam.orchestration.agents.providers import default_provider_registry
+from redteam.orchestration.context import ContextProjectionCache
 from redteam.orchestration.engine import InvestigationEngine
 from redteam.orchestration.paths import (
     CompletionCriterion,
@@ -78,11 +80,16 @@ class _Evidence:
 
 
 def _engine_deps(path_store):
+    from redteam.orchestration.task_graph.sqlite import SQLiteTaskGraphStore
+
     return SimpleNamespace(
         path_store=path_store,
+        task_graph_store=SQLiteTaskGraphStore(path_store._path),
         graph_store=InMemoryAttackGraphStore(),
         evidence_store=_Evidence(),
         agents=_Agents(),
+        candidate_providers=default_provider_registry(),
+        context_cache=ContextProjectionCache(),
         llm_client=_AcceptLLM(),
         settings=OrchestrationSettings(),
         engagement=None,
@@ -94,6 +101,7 @@ def _engine_deps(path_store):
 def _engine_runtime(run_id="run-eng-1"):
     return SimpleNamespace(
         run_id=run_id,
+        engagement_id="eng-path-1",
         mission_id=None,
         active_task_id=None,
         step_count=0,

@@ -29,6 +29,8 @@ from redteam.core.contracts.engagement import (
 from redteam.core.contracts.tool import ToolDescriptor, ToolError
 from redteam.core.enums import GraphNodeType, MissionStatus, ToolHealthStatus
 from redteam.core.ids import EngagementId, ToolId
+from redteam.orchestration.operator_intents.store import SQLiteOperatorIntentStore
+from redteam.orchestration.paths.sqlite import SQLitePathStore
 from redteam.orchestration.settings import OrchestrationSettings
 from redteam.orchestration.state import TerminationReason
 from redteam.orchestration.task_graph.sqlite import SQLiteTaskGraphStore
@@ -380,7 +382,12 @@ async def _exercise(case="success", task_db=None):
     llm._graph = deps.graph_store
     llm._evidence = deps.evidence_store
     if task_db is not None:
-        deps = replace(deps, task_graph_store=SQLiteTaskGraphStore(task_db))
+        deps = replace(
+            deps,
+            task_graph_store=SQLiteTaskGraphStore(task_db),
+            path_store=SQLitePathStore(task_db),
+            operator_intent_store=SQLiteOperatorIntentStore(task_db),
+        )
     graph = AttackGraphService(deps.graph_store)
     endpoint_id = endpoint_node_id("GET", "/orders/1234", host="bank.local")
     await graph.upsert_node(

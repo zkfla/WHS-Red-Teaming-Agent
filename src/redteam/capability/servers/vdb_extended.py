@@ -6,7 +6,7 @@ import json
 import re
 import time
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
 from mcp.server import MCPServer
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -225,14 +225,14 @@ class VDBExtendedReader(VDBReader):
         # matching rows fit. Consumers must honor lookup.truncated.
         while len(output.model_dump_json().encode("utf-8")) > MAX_OUTPUT_BYTES - 1024:
             largest = max(
-                (item for item in items if item.lookup and item.lookup.matches),
-                key=lambda item: len(item.lookup.model_dump_json().encode("utf-8")),
+                (item.lookup for item in items if item.lookup is not None and item.lookup.matches),
+                key=lambda lookup: len(lookup.model_dump_json().encode("utf-8")),
                 default=None,
             )
             if largest is None:
                 raise VDBError("vdb_output_limit")
-            largest.lookup.matches.pop()
-            largest.lookup.truncated = output.truncated = True
+            largest.matches.pop()
+            largest.truncated = output.truncated = True
         return output
 
     def sbom(
@@ -282,7 +282,7 @@ class VDBExtendedReader(VDBReader):
                 raise VDBError("vdb_invalid_sbom")
             if "component" in metadata:
                 pending.append(metadata["component"])
-            components = []
+            components: list[dict[str, Any]] = []
             while pending:
                 if len(components) + len(pending) > policy.max_sbom_components:
                     raise VDBError("vdb_sbom_component_limit")
@@ -364,7 +364,7 @@ def register_extended_tools(server: MCPServer, policy: VDBPolicy) -> None:
     ) -> VDBBatch:
         """Bounded versioned PURL list; per-item errors/NOT CHECKED, no network or safe verdict."""
         reader.bind(asset_ref, engagement_id, run_id)
-        return reader.batch(purls, limit, list(sources))
+        return reader.batch(list(purls), limit, list(sources))
 
     def search_sbom(
         asset_ref: str,

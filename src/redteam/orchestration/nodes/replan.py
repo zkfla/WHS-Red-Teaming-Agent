@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from redteam.core.enums import AgentPhase
 from redteam.orchestration.context import RuntimeDeps
+from redteam.orchestration.diagnostics import safe_feedback
 from redteam.orchestration.events import REPLAN_TRIGGERED
 from redteam.orchestration.nodes._support import advance, publisher_for
 from redteam.orchestration.nodes.policy import SEVERITY_ABORT_RUN, denial_severity
@@ -41,16 +42,25 @@ async def replan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             "step": runtime.step_count,
             "path_id": runtime.active_path_id,
             "path_version": runtime.active_path_version,
+            "diagnostic": (
+                runtime.planning_diagnostic.model_dump(mode="json")
+                if runtime.planning_diagnostic
+                else None
+            ),
         },
         causation_id=state.get("last_event_id"),
     )
     preserve = reason == TerminationReason.APPROVAL_PENDING
-    feedback = list(runtime.planning_feedback)
+    feedback = [safe_feedback(item) for item in runtime.planning_feedback[-10:]]
+    if runtime.planning_diagnostic is not None:
+        feedback.append(runtime.planning_diagnostic.feedback())
     result = state.get("tool_result")
     if result is not None and not result.success:
-        feedback.append("tool_failed:" + (result.error.code if result.error else "unknown"))
+        feedback.append(
+            safe_feedback("tool_failed:" + (result.error.code if result.error else "unknown"))
+        )
     if decision is not None and decision.reasons:
-        feedback.extend(decision.reasons)
+        feedback.extend(safe_feedback(item) for item in decision.reasons)
     if reason:
         failed = reason in {
             TerminationReason.PLANNING_ERROR,
