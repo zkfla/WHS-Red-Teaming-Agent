@@ -192,6 +192,17 @@ _DECODED_ASSET = NodePattern(
     attrs={"in_scope": True, "analysis_decoded": True},
     bind="asset",
 )
+_APKTOOL_ANALYZED_ASSET = NodePattern(
+    type=GraphNodeType.ASSET,
+    attrs={
+        "in_scope": True,
+        "analysis_decoded": True,
+        "manifest_analyzed": True,
+        "smali_inventoried": True,
+        "sensitive_strings_searched": True,
+    },
+    bind="asset",
+)
 
 
 ANALYSIS_AGENT = AgentSpec(
@@ -258,6 +269,21 @@ ANALYSIS_AGENT = AgentSpec(
             reason="Search decoded files for password-related hard-coded strings.",
             observed_attrs={"sensitive_strings_searched": True},
             attempt_key="analysis.static_analysis:search_in_files",
+        ),
+        PlanStep(
+            step_id="inspect-jadx-manifest",
+            capability="analysis",
+            operation="static_analysis",
+            tool_id=ToolId("analysis.get_android_manifest"),
+            compatible_tool_ids=[ToolId("analysis.get_android_manifest")],
+            require_healthy_tool=True,
+            assessment_kind="observation",
+            target_bind="asset",
+            preconditions=[_APKTOOL_ANALYZED_ASSET.model_copy(deep=True)],
+            arguments={},
+            reason="Cross-check the analyzed APK manifest through the optional JADX bridge.",
+            observed_attrs={"jadx_manifest_analyzed": True},
+            attempt_key="analysis.static_analysis:get_android_manifest",
         ),
     ],
 )

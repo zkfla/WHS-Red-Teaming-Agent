@@ -523,6 +523,8 @@ async def build_application(
         tool_semaphore=asyncio.Semaphore(engagement.rate_limit_policy.max_concurrent_actions),
         settings=resolved_settings,
     )
+    from redteam.orchestration.mobile_mcp_binding import wire_mobile_mcp
+    deps = wire_mobile_mcp(deps)
     return engagement, deps
 
 
@@ -640,6 +642,8 @@ async def run_engagement(
     """
     if deps is None:
         raise ValueError("run_engagement requires dependencies with an explicitly configured LLM")
+    from redteam.orchestration.mobile_mcp_binding import wire_mobile_mcp
+    deps = wire_mobile_mcp(deps, engagement)
     coordinator = validate_configuration(deps)
     settings = deps.settings
     if orchestration_config is not None:

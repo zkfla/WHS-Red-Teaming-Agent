@@ -1,0 +1,114 @@
+{
+  "success": true,
+  "apk_ref": "insecurebankv2",
+  "scan_ref": "scan_b6dd693734372515951af361316bfad8",
+  "sha256": "b18af2a0e44d7634bbcdf93664d9c78a2695e050393fcfbb5e8b91f902d194a4",
+  "status": "completed",
+  "image": "opensecurity/mobile-security-framework-mobsf:v4.4.6@sha256:72311e3553ca2c21043923cace27ed99f800cd641e9368160406779516dd774e",
+  "sections": {
+    "manifest": {
+      "findings": [
+        {
+          "rule": "vulnerable_os_version",
+          "severity": "high",
+          "source": "manifest_analysis/0"
+        },
+        {
+          "rule": "app_is_debuggable",
+          "severity": "high",
+          "source": "manifest_analysis/1"
+        },
+        {
+          "rule": "app_allowbackup",
+          "severity": "warning",
+          "source": "manifest_analysis/2"
+        },
+        {
+          "rule": "task_hijacking2",
+          "severity": "high",
+          "source": "manifest_analysis/3"
+        },
+        {
+          "rule": "explicitly_exported",
+          "severity": "warning",
+          "source": "manifest_analysis/4"
+        },
+        {
+          "rule": "task_hijacking2",
+          "severity": "high",
+          "source": "manifest_analysis/5"
+        },
+        {
+          "rule": "explicitly_exported",
+          "severity": "warning",
+          "source": "manifest_analysis/6"
+        },
+        {
+          "rule": "task_hijacking2",
+          "severity": "high",
+          "source": "manifest_analysis/7"
+        },
+        {
+          "rule": "explicitly_exported",
+          "severity": "warning",
+          "source": "manifest_analysis/8"
+        },
+        {
+          "rule": "explicitly_exported",
+          "severity": "warning",
+          "source": "manifest_analysis/9"
+        },
+        {
+          "rule": "explicitly_exported",
+          "severity": "warning",
+          "source": "manifest_analysis/10"
+        },
+        {
+          "rule": "task_hijacking2",
+          "severity": "high",
+          "source": "manifest_analysis/11"
+        },
+        {
+          "rule": "explicitly_exported",
+          "severity": "warning",
+          "source": "manifest_analysis/12"
+        }
+      ],
+      "count": 13
+    },
+    "permission": {
+      "names": [
+        "android.permission.INTERNET",
+        "android.permission.WRITE_EXTERNAL_STORAGE",
+        "android.permission.SEND_SMS",
+        "android.permission.USE_CREDENTIALS",
+        "android.permission.GET_ACCOUNTS",
+        "android.permission.READ_PROFILE",
+        "android.permission.READ_CONTACTS",
+        "android.permission.ACCESS_NETWORK_STATE",
+        "android.permission.ACCESS_COARSE_LOCATION"
+      ],
+      "count": 9,
+      "source": "permissions"
+    },
+    "secret": {
+      "count": 2,
+      "candidates": [
+        {
+          "value": "[REDACTED]",
+          "source": "secrets/0"
+        },
+        {
+          "value": "[REDACTED]",
+          "source": "secrets/1"
+        }
+      ]
+    },
+    "network": {
+      "findings": [],
+      "count": 0
+    }
+  },
+  "missing_sections": [],
+  "truncated": false
+}

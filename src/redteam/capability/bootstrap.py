@@ -287,6 +287,10 @@ def _default_target_types(kind: MCPServerKind) -> list[str]:
 def _create_adapter(settings: MCPServerSettings, transport: MCPTransport) -> MCPAdapter:
     if settings.allowed_tools is not None:
         transport = AllowlistedMCPTransport(transport, settings.allowed_tools)
+    if settings.server_id == "mobsf":
+        from redteam.capability.adapters.mcp.mobsf import MobSFMCPAdapter
+        return MobSFMCPAdapter.from_settings(settings, transport)
+
     if settings.profile in {"page_text_readonly", "web_search_tavily"}:
         return WebAPIMCPAdapter(
             server_id=settings.server_id,

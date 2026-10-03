@@ -1,0 +1,20 @@
+{
+  "image": "opensecurity/mobile-security-framework-mobsf:v4.4.6@sha256:72311e3553ca2c21043923cace27ed99f800cd641e9368160406779516dd774e",
+  "running": true,
+  "user": "9901:9901",
+  "dropped_caps": [
+    "ALL"
+  ],
+  "internal_network": true,
+  "mounts": [
+    "/run/secrets/mobsf-api-key"
+  ],
+  "log_driver": "none",
+  "relay_user": "9901:9901",
+  "port": [
+    {
+      "HostIp": "127.0.0.1",
+      "HostPort": "18000"
+    }
+  ]
+}

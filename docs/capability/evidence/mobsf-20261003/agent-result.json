@@ -1,0 +1,9 @@
+{
+  "seconds": 1.68,
+  "actions": 4,
+  "tool_evidence": 4,
+  "findings": 1,
+  "termination": "investigation_held",
+  "policy_events": 4,
+  "llm": "scripted choices; real tools and Control"
+}

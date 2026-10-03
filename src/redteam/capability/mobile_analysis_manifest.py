@@ -16,6 +16,7 @@ from redteam.capability.servers.analysis import (
     ApkStringSearchOutput,
 )
 from redteam.capability.servers.mobile import DeviceShellOutput
+from redteam.capability.servers.mobsf import MobSFOutput
 from redteam.core.contracts.tool import ToolDescriptor
 from redteam.core.enums import RiskLevel
 
@@ -58,6 +59,22 @@ def _spec(
 # Server IDs match the candidate examples in .env.example. External output
 # schemas are None because those MCP servers do not advertise one.
 MOBILE_ANALYSIS_TOOLS: dict[str, tuple[MobileAnalysisToolSpec, ...]] = {
+    # Conservative single-server risk tier: even report access retains HIGH.
+    "mobsf": (
+        _spec("analysis", "mobsf_submit_apk", "static_analysis", ("apk_ref", "expected_sha256"),
+              ("engagement_id", "run_id"), risk=RiskLevel.HIGH,
+              output_schema=MobSFOutput.model_json_schema()),
+        _spec("analysis", "mobsf_start_scan", "static_analysis", ("apk_ref", "scan_ref"),
+              ("engagement_id", "run_id"), risk=RiskLevel.HIGH,
+              output_schema=MobSFOutput.model_json_schema()),
+        _spec("analysis", "mobsf_scan_status", "static_analysis", ("apk_ref", "scan_ref"),
+              ("engagement_id", "run_id"), risk=RiskLevel.HIGH,
+              output_schema=MobSFOutput.model_json_schema()),
+        _spec("analysis", "mobsf_report_summary", "static_analysis",
+              ("apk_ref", "scan_ref", "sections"),
+              ("engagement_id", "run_id"), risk=RiskLevel.HIGH,
+              output_schema=MobSFOutput.model_json_schema()),
+    ),
     "mobile-next": (
         _spec("mobile", "mobile_launch_app", "app_launch", ("device", "packageName"),
               ("locale",), risk=RiskLevel.MEDIUM, target_type="device"),

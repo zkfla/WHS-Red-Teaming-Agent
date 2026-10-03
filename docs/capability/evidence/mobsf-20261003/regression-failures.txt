@@ -1,0 +1,161 @@
+FAILED tests/integration/test_methodology_agent_loop.py::test_agent_loads_reference_via_mcp_then_passes_data_to_web_llm[False]
+FAILED tests/integration/test_methodology_agent_loop.py::test_reference_partial_read_survives_durable_rebuild_and_human_decision[False]
+FAILED tests/integration/test_methodology_agent_loop.py::test_reference_partial_read_survives_durable_rebuild_and_human_decision[True]
+FAILED tests/integration/test_methodology_agent_loop.py::test_no_automatic_asset_scope_expansion
+FAILED tests/integration/test_methodology_agent_loop.py::test_wrong_explicit_run_rejected_before_tool_execution
+FAILED tests/integration/test_methodology_agent_loop.py::test_fresh_run_cannot_reuse_reference_evidence
+FAILED tests/integration/test_methodology_agent_loop.py::test_invalid_operator_reference_binding_rejected[readonly]
+FAILED tests/integration/test_methodology_agent_loop.py::test_invalid_operator_reference_binding_rejected[binding]
+FAILED tests/integration/test_methodology_agent_loop.py::test_invalid_operator_reference_binding_rejected[context]
+FAILED tests/integration/test_methodology_agent_loop.py::test_invalid_operator_reference_binding_rejected[unknown]
+FAILED tests/integration/test_methodology_agent_loop.py::test_invalid_operator_reference_binding_rejected[duplicate]
+FAILED tests/integration/test_methodology_agent_loop.py::test_invalid_operator_reference_binding_rejected[hash]
+FAILED tests/integration/test_methodology_agent_loop.py::test_shared_workspace_writes_keep_reference_protected_after_control_approval
+FAILED tests/integration/test_methodology_workspace.py::test_reference_data_actual_mcp_and_candidate_control
+FAILED tests/integration/test_vdb_extended_mcp.py::test_extended_real_stdio_discovery_and_nested_schema_drift
+FAILED tests/integration/test_workspace_mcp.py::test_real_stdio_manifest_and_file_lifecycle
+FAILED tests/integration/test_workspace_mcp.py::test_real_stdio_context_and_operation_rejections
+FAILED tests/integration/test_workspace_mcp.py::test_candidate_compiler_control_approval_and_real_mcp
+FAILED tests/integration/test_workspace_mcp.py::test_registry_manifest_rejects_mutated_input_and_output_schema
+FAILED tests/integration/test_workspace_mcp.py::test_read_default_and_discovery_follow_operator_limits
+FAILED tests/integration/test_workspace_mcp.py::test_real_discovery_rejects_changed_workspace_asset
+FAILED tests/unit/test_artifact_backend.py::test_put_get_and_verify_exact_bytes
+FAILED tests/unit/test_artifact_backend.py::test_missing_and_tampered_artifact_are_distinguished
+FAILED tests/unit/test_artifact_backend.py::test_symlink_to_file_outside_root_is_rejected
+FAILED tests/unit/test_artifact_backend.py::test_artifact_permissions_are_private
+FAILED tests/unit/test_finance_extensions.py::test_snapshot_reloaded_without_exposing_cookie
+FAILED tests/unit/test_finance_extensions.py::test_cookie_boundaries[override0]
+FAILED tests/unit/test_finance_extensions.py::test_cookie_boundaries[override1]
+FAILED tests/unit/test_finance_extensions.py::test_cookie_boundaries[override2]
+FAILED tests/unit/test_finance_extensions.py::test_cookie_boundaries[override3]
+FAILED tests/unit/test_finance_extensions.py::test_cookie_boundaries[override4]
+FAILED tests/unit/test_finance_extensions.py::test_cookie_boundaries[override5]
+FAILED tests/unit/test_finance_extensions.py::test_cookie_snapshot_requires_private_fresh_regular_file
+FAILED tests/unit/test_finance_extensions.py::test_cookie_request_sends_cookie_not_bearer
+FAILED tests/unit/test_finance_extensions.py::test_secure_cookie_not_sent_to_http_or_symlink
+FAILED tests/unit/test_mcp_deployment.py::test_generated_settings_preserve_scope_approval_and_secret_indirection
+FAILED tests/unit/test_methodology.py::test_bundle_contains_only_allowlisted_data_licenses_and_no_auto_skill
+FAILED tests/unit/test_methodology.py::test_existing_destination_is_preserved
+FAILED tests/unit/test_methodology.py::test_git_external_drivers_or_included_configuration_are_rejected[include.path]
+FAILED tests/unit/test_methodology.py::test_bad_source_never_publishes_output[digest]
+FAILED tests/unit/test_methodology.py::test_bad_source_never_publishes_output[license]
+FAILED tests/unit/test_methodology.py::test_unsafe_source_not_read[symlink]
+FAILED tests/unit/test_methodology.py::test_unsafe_source_not_read[hardlink]
+FAILED tests/unit/test_methodology.py::test_unsafe_source_not_read[fifo] - At...
+FAILED tests/unit/test_methodology.py::test_unsafe_source_not_read[large] - A...
+FAILED tests/unit/test_methodology.py::test_unsafe_source_not_read[parent_symlink]
+FAILED tests/unit/test_methodology.py::test_bundle_drift_and_scope_are_rejected[content]
+FAILED tests/unit/test_methodology.py::test_bundle_drift_and_scope_are_rejected[index]
+FAILED tests/unit/test_methodology.py::test_bundle_drift_and_scope_are_rejected[extra_file]
+FAILED tests/unit/test_methodology.py::test_bundle_drift_and_scope_are_rejected[extra_dir]
+FAILED tests/unit/test_methodology.py::test_bundle_drift_and_scope_are_rejected[writable]
+FAILED tests/unit/test_methodology.py::test_bundle_drift_and_scope_are_rejected[context]
+FAILED tests/unit/test_methodology_agent.py::test_readonly_prefix_blocks_mutation_even_if_os_modes_are_writable[methodology-write]
+FAILED tests/unit/test_methodology_agent.py::test_readonly_prefix_blocks_mutation_even_if_os_modes_are_writable[methodology-patch]
+FAILED tests/unit/test_methodology_agent.py::test_readonly_prefix_blocks_mutation_even_if_os_modes_are_writable[methodology/file.md-write]
+FAILED tests/unit/test_methodology_agent.py::test_readonly_prefix_blocks_mutation_even_if_os_modes_are_writable[methodology/file.md-patch]
+FAILED tests/unit/test_methodology_agent.py::test_readonly_prefix_blocks_mutation_even_if_os_modes_are_writable[methodology/references/new.md-write]
+FAILED tests/unit/test_methodology_agent.py::test_readonly_prefix_blocks_mutation_even_if_os_modes_are_writable[methodology/references/new.md-patch]
+FAILED tests/unit/test_proxy_capture_connector.py::test_normalization_removes_credentials_and_unsupported_or_out_of_scope_flows
+FAILED tests/unit/test_proxy_capture_connector.py::test_empty_or_symlink_output_does_not_replace_catalog
+FAILED tests/unit/test_vdb_extended.py::test_batch_partial_failures_and_duplicate_inputs_preserve_positions
+FAILED tests/unit/test_vdb_extended.py::test_missing_db_and_deadline_are_not_checked
+FAILED tests/unit/test_vdb_extended.py::test_batch_size_bounds[queries0] - re...
+FAILED tests/unit/test_vdb_extended.py::test_batch_size_bounds[queries1] - re...
+FAILED tests/unit/test_vdb_extended.py::test_invalid_source_filter_is_not_silently_ignored[sources0]
+FAILED tests/unit/test_vdb_extended.py::test_invalid_source_filter_is_not_silently_ignored[sources1]
+FAILED tests/unit/test_vdb_extended.py::test_invalid_source_filter_is_not_silently_ignored[sources2]
+FAILED tests/unit/test_vdb_extended.py::test_invalid_source_filter_is_not_silently_ignored[sources3]
+FAILED tests/unit/test_vdb_extended.py::test_sbom_paging_records_unobserved_and_unqueried_components
+FAILED tests/unit/test_vdb_extended.py::test_sbom_only_operator_refs[other]
+FAILED tests/unit/test_vdb_extended.py::test_sbom_only_operator_refs[../approved.json]
+FAILED tests/unit/test_vdb_extended.py::test_sbom_only_operator_refs[/etc/passwd]
+FAILED tests/unit/test_vdb_extended.py::test_sbom_only_operator_refs[https://invalid]
+FAILED tests/unit/test_vdb_extended.py::test_sbom_changed_linked_and_oversize_files_blocked[digest]
+FAILED tests/unit/test_vdb_extended.py::test_sbom_changed_linked_and_oversize_files_blocked[symlink]
+FAILED tests/unit/test_vdb_extended.py::test_sbom_changed_linked_and_oversize_files_blocked[hardlink]
+FAILED tests/unit/test_vdb_extended.py::test_sbom_changed_linked_and_oversize_files_blocked[large]
+FAILED tests/unit/test_vdb_extended.py::test_sbom_page_bounds[-1-1] - redteam...
+FAILED tests/unit/test_vdb_extended.py::test_sbom_page_bounds[True-1] - redte...
+FAILED tests/unit/test_vdb_extended.py::test_sbom_page_bounds[2-1] - redteam....
+FAILED tests/unit/test_vdb_extended.py::test_sbom_page_bounds[0-0] - redteam....
+FAILED tests/unit/test_vdb_extended.py::test_sbom_page_bounds[0-26] - redteam...
+FAILED tests/unit/test_vdb_extended.py::test_nested_components_and_metadata_component_are_counted
+FAILED tests/unit/test_vdb_extended.py::test_policy_approval_boundaries[traversal]
+FAILED tests/unit/test_vdb_extended.py::test_policy_approval_boundaries[duplicate]
+FAILED tests/unit/test_vdb_extended.py::test_policy_approval_boundaries[shared_root]
+FAILED tests/unit/test_vdb_extended.py::test_policy_approval_boundaries[no_root]
+FAILED tests/unit/test_vdb_extended.py::test_aggregate_output_keeps_item_status_and_signals_evidence_truncation
+FAILED tests/unit/test_vdb_extended.py::test_query_deadline_is_passed_to_readonly_connections
+FAILED tests/unit/test_vdb_extended.py::test_batch_stops_new_queries_after_first_consumes_deadline
+FAILED tests/unit/test_vdb_extended.py::test_ghsa_input_is_exact_not_wildcard_or_suffix[GHSA-%]
+FAILED tests/unit/test_vdb_extended.py::test_ghsa_input_is_exact_not_wildcard_or_suffix[GHSA-2345-6789-cfgh-extra]
+FAILED tests/unit/test_vdb_extended.py::test_ghsa_input_is_exact_not_wildcard_or_suffix[ghsa-2345-6789-cfgh]
+FAILED tests/unit/test_vdb_extended.py::test_sbom_structure_and_count_fail_closed[format]
+FAILED tests/unit/test_vdb_extended.py::test_sbom_structure_and_count_fail_closed[components]
+FAILED tests/unit/test_vdb_extended.py::test_sbom_structure_and_count_fail_closed[component_limit]
+FAILED tests/unit/test_vdb_extended.py::test_sbom_structure_and_count_fail_closed[version]
+FAILED tests/unit/test_vdb_readonly.py::test_root_symlink_blocked - OSError: ...
+FAILED tests/unit/test_vdb_readonly.py::test_snapshot_links_blocked - OSError...
+FAILED tests/unit/test_vdb_snapshot_audit.py::test_synthetic_pass_cannot_claim_operational_activation
+FAILED tests/unit/test_vdb_snapshot_audit.py::test_unready_snapshot_does_not_query_or_pass[changes0]
+FAILED tests/unit/test_vdb_snapshot_audit.py::test_unready_snapshot_does_not_query_or_pass[changes1]
+FAILED tests/unit/test_vdb_snapshot_audit.py::test_unready_snapshot_does_not_query_or_pass[changes2]
+FAILED tests/unit/test_vdb_snapshot_audit.py::test_unready_snapshot_does_not_query_or_pass[changes3]
+FAILED tests/unit/test_vdb_snapshot_audit.py::test_unready_snapshot_does_not_query_or_pass[changes4]
+FAILED tests/unit/test_vdb_snapshot_audit.py::test_observed_synthetic_source_cannot_be_relabelled_operating[False]
+FAILED tests/unit/test_vdb_snapshot_audit.py::test_observed_synthetic_source_cannot_be_relabelled_operating[True]
+FAILED tests/unit/test_vdb_snapshot_audit.py::test_rejects_artifact_boundary_before_backend[digest]
+FAILED tests/unit/test_vdb_snapshot_audit.py::test_rejects_artifact_boundary_before_backend[size]
+FAILED tests/unit/test_vdb_snapshot_audit.py::test_rejects_artifact_boundary_before_backend[symlink]
+FAILED tests/unit/test_vdb_snapshot_audit.py::test_rejects_artifact_boundary_before_backend[hardlink]
+FAILED tests/unit/test_vdb_snapshot_audit.py::test_rejects_artifact_boundary_before_backend[fifo]
+FAILED tests/unit/test_vdb_snapshot_audit.py::test_rejects_artifact_boundary_before_backend[wal]
+FAILED tests/unit/test_vdb_snapshot_audit.py::test_digest_rechecked_after_query
+FAILED tests/unit/test_vdb_snapshot_audit.py::test_actual_empty_answer_is_not_a_pass_for_positive_control
+FAILED tests/unit/test_vdb_snapshot_audit.py::test_latency_budget_and_truncation_are_failure
+FAILED tests/unit/test_vdb_snapshot_audit.py::test_global_hash_deadline_is_bounded
+FAILED tests/unit/test_workspace_mcp.py::test_public_root_rejected[493] - Ass...
+FAILED tests/unit/test_workspace_mcp.py::test_public_root_rejected[504] - Ass...
+FAILED tests/unit/test_workspace_mcp.py::test_public_root_rejected[511] - Ass...
+ERROR tests/unit/test_workspace_mcp.py::test_create_read_patch_and_digest_conflict
+ERROR tests/unit/test_workspace_mcp.py::test_unicode_character_pagination - r...
+ERROR tests/unit/test_workspace_mcp.py::test_read_and_write_refuse_ambiguous_paths[../outside]
+ERROR tests/unit/test_workspace_mcp.py::test_read_and_write_refuse_ambiguous_paths[a/../b]
+ERROR tests/unit/test_workspace_mcp.py::test_read_and_write_refuse_ambiguous_paths[/etc/passwd]
+ERROR tests/unit/test_workspace_mcp.py::test_read_and_write_refuse_ambiguous_paths[a//b]
+ERROR tests/unit/test_workspace_mcp.py::test_read_and_write_refuse_ambiguous_paths[./a]
+ERROR tests/unit/test_workspace_mcp.py::test_read_and_write_refuse_ambiguous_paths[a/]
+ERROR tests/unit/test_workspace_mcp.py::test_read_and_write_refuse_ambiguous_paths[a\\b]
+ERROR tests/unit/test_workspace_mcp.py::test_read_and_write_refuse_ambiguous_paths[C:secrets]
+ERROR tests/unit/test_workspace_mcp.py::test_read_and_write_refuse_ambiguous_paths[a\x00b]
+ERROR tests/unit/test_workspace_mcp.py::test_read_and_write_refuse_ambiguous_paths[a\nb]
+ERROR tests/unit/test_workspace_mcp.py::test_read_and_write_refuse_ambiguous_paths[.redteam-lock]
+ERROR tests/unit/test_workspace_mcp.py::test_read_and_write_refuse_ambiguous_paths[a/.redteam-temp]
+ERROR tests/unit/test_workspace_mcp.py::test_read_and_write_refuse_ambiguous_paths[aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa]
+ERROR tests/unit/test_workspace_mcp.py::test_unsafe_files_cannot_be_read_or_replaced[symlink]
+ERROR tests/unit/test_workspace_mcp.py::test_unsafe_files_cannot_be_read_or_replaced[hardlink]
+ERROR tests/unit/test_workspace_mcp.py::test_unsafe_files_cannot_be_read_or_replaced[fifo]
+ERROR tests/unit/test_workspace_mcp.py::test_unsafe_files_cannot_be_read_or_replaced[directory]
+ERROR tests/unit/test_workspace_mcp.py::test_symlink_parent_and_replaced_root_are_refused
+ERROR tests/unit/test_workspace_mcp.py::test_root_permissions_rechecked - red...
+ERROR tests/unit/test_workspace_mcp.py::test_context_cannot_select_another_workspace[asset_ref]
+ERROR tests/unit/test_workspace_mcp.py::test_context_cannot_select_another_workspace[engagement_id]
+ERROR tests/unit/test_workspace_mcp.py::test_context_cannot_select_another_workspace[run_id]
+ERROR tests/unit/test_workspace_mcp.py::test_read_only_policy_refuses_both_mutations
+ERROR tests/unit/test_workspace_mcp.py::test_binary_read_rejected[\xff\xfe]
+ERROR tests/unit/test_workspace_mcp.py::test_binary_read_rejected[a\x00b] - r...
+ERROR tests/unit/test_workspace_mcp.py::test_bad_range_rejected[-1-10] - redt...
+ERROR tests/unit/test_workspace_mcp.py::test_bad_range_rejected[0-0] - redtea...
+ERROR tests/unit/test_workspace_mcp.py::test_bad_range_rejected[0-16001] - re...
+ERROR tests/unit/test_workspace_mcp.py::test_bad_range_rejected[10-1] - redte...
+ERROR tests/unit/test_workspace_mcp.py::test_bounded_search_and_listing - red...
+ERROR tests/unit/test_workspace_mcp.py::test_limits_fail_closed_and_preserve_files
+ERROR tests/unit/test_workspace_mcp.py::test_unknown_quota_and_concurrent_writer_fail_closed
+ERROR tests/unit/test_workspace_mcp.py::test_invalid_entry_prevents_partial_quota_approval
+ERROR tests/unit/test_workspace_mcp.py::test_search_byte_and_file_budget - re...
+ERROR tests/unit/test_workspace_mcp.py::test_invalid_digest_preserves_existing_file[bad]
+ERROR tests/unit/test_workspace_mcp.py::test_invalid_digest_preserves_existing_file[AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA]
+ERROR tests/unit/test_workspace_mcp.py::test_patch_requires_unique_match[-b]
+ERROR tests/unit/test_workspace_mcp.py::test_patch_requires_unique_match[missing-b]
+ERROR tests/unit/test_workspace_mcp.py::test_patch_requires_unique_match[a-b]
