@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 import pytest
 
 from redteam.attack_graph.identity import node_id_for_target
+from redteam.capability.adapters.mcp.naming import build_canonical_mcp_tool_id
 from redteam.capability.bootstrap import open_mcp_tool_gateway
 from redteam.capability.manifest import validate_tool_manifest
 from redteam.control.risk import RegistryRiskResolver
@@ -45,11 +46,11 @@ async def test_all_twelve_a_tools_compose_without_scope_or_risk_leakage(
             assert descriptor.output_schema
             assert descriptor.target_types == ["asset"]
             assert descriptor.required_arguments
-        assert {str(d.tool_id) for d in gateway.list_tools_for_action("analysis", "file_read")} == {
-            "analysis.read_file"
-        }
+        assert {
+            str(d.tool_id) for d in gateway.list_tools_for_action("analysis", "file_read")
+        } == {build_canonical_mcp_tool_id("analysis", "workspace-read-test", "read_file")}
         assert all(
-            str(d.tool_id).startswith("analysis.search_")
+            d.tool_name.startswith("search_")
             for d in gateway.list_tools_for_action("analysis", "static_analysis")
         )
         engagement = Engagement(

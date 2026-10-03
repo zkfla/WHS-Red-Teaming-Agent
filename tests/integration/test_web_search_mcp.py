@@ -151,7 +151,7 @@ async def test_gateway_registration_ids_schema_allowlist_and_mismatch(
     with pytest.raises(ValueError, match="discovery differs"):
         validate_web_search_discovery(altered, config)
     assert [tool.tool_id for tool in gateway.list_tools_for_action("web", "web_search")] == [
-        ToolId("web.web_search")
+        descriptor.tool_id
     ]
     result = await gateway.invoke(_invocation(max_results=2))
     assert result.success and isinstance(result.output, dict)

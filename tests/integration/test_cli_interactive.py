@@ -91,8 +91,16 @@ def _patch(
 
     original_build = run_command.build_application
 
+    class NoToolsHoldLLM(_HoldLLM):
+        def _draft(self, node_id):
+            draft = super()._draft(node_id)
+            # Intake/UI fixtures deliberately have no executable tools. Holding
+            # is valid, but the model must not invent a required execution step.
+            draft["steps"][0]["required"] = False
+            return draft
+
     async def build_with_model(config, **kwargs):
-        kwargs.setdefault("llm", _HoldLLM())
+        kwargs.setdefault("llm", NoToolsHoldLLM())
         return await original_build(config, **kwargs)
 
     monkeypatch.setattr(run_command, "build_application", build_with_model)

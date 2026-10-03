@@ -616,10 +616,14 @@ class InvestigationEngine:
         eligibility_context = EligibilityContext(
             service, self.deps.tool_catalog, bool(execution_options)
         )
+        role_decisions = {
+            str(agent.agent_id): await self.deps.eligibility.role(agent, eligibility_context)
+            for agent in self.deps.agents.all()
+        }
         visible_agents = [
             agent
             for agent in self.deps.agents.all()
-            if (await self.deps.eligibility.role(agent, eligibility_context)).eligible
+            if role_decisions[str(agent.agent_id)].eligible
         ]
         if self.deps.tool_catalog is not None:
             capabilities = {cap for agent in self.deps.agents.all() for cap in agent.capabilities}
@@ -713,8 +717,8 @@ class InvestigationEngine:
             **({"execution_options": execution_options} if execution_options else {}),
             "role_activation": {
                 str(agent.agent_id): {
-                    "active": str(agent.agent_id)
-                    in {str(item.agent_id) for item in visible_agents},
+                    "active": role_decisions[str(agent.agent_id)].eligible,
+                    "reason": role_decisions[str(agent.agent_id)].reason,
                 }
                 for agent in self.deps.agents.all()
             },

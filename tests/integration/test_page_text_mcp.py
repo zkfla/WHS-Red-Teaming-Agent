@@ -259,7 +259,7 @@ async def test_settings_discovery_gateway_ids_and_output_schema(
     assert descriptor.target_types == ["url"]
     assert descriptor.input_schema["properties"]["max_chars"]["anyOf"][0]["maximum"] == 7
     assert [tool.tool_id for tool in gateway.list_tools_for_action("web", "page_read")] == [
-        ToolId("web.fetch_page_text")
+        descriptor.tool_id
     ]
     result = await gateway.invoke(_invocation())
     assert isinstance(result.output, dict)

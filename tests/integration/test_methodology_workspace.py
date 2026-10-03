@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 
 from redteam.attack_graph.identity import node_id_for_target
+from redteam.capability.adapters.mcp.naming import build_canonical_mcp_tool_id
 from redteam.capability.bootstrap import open_mcp_tool_gateway
 from redteam.capability.methodology import provision_bundle, verify_bundle
 from redteam.capability.workspace_manifest import WORKSPACE_READ_TOOLS
@@ -130,9 +131,8 @@ async def test_reference_data_actual_mcp_and_candidate_control(monkeypatch, tmp_
     configure(monkeypatch, tmp_path, policy)
     async with open_mcp_tool_gateway(["method-test"], health_refresh_enabled=False) as gateway:
         assert {str(t.tool_id) for t in gateway.all()} == {
-            "analysis.list_directory",
-            "analysis.read_file",
-            "analysis.search_files",
+            build_canonical_mcp_tool_id("analysis", "method-test", name)
+            for name in ("list_directory", "read_file", "search_files")
         }
         assert gateway.get(ToolId("analysis.write_file")) is None
         output = await read_through_control(gateway, policy, "references/test-entry.md")

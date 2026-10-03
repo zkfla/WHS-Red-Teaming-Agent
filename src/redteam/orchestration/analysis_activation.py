@@ -124,11 +124,7 @@ class StaticAnalysisEligibilityProvider:
         activation = await analysis_activation(context.graph, context.catalog)
         if role_id != ANALYSIS_AGENT_ID:
             return EligibilityDecision(True, "provider_does_not_constrain_role")
-        if activation.active:
-            return EligibilityDecision(True, "active")
-        if context.execution_ready:
-            return EligibilityDecision(True, "execution_ready")
-        return EligibilityDecision(False, activation.reason)
+        return EligibilityDecision(activation.active or context.execution_ready, activation.reason)
 
     async def tool_eligible(self, tool: Any, context: EligibilityContext) -> EligibilityDecision:
         activation = await analysis_activation(context.graph, context.catalog)

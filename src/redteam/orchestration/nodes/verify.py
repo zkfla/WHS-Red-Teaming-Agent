@@ -41,7 +41,6 @@ from redteam.orchestration.events import (
 )
 from redteam.orchestration.findings import FindingPromoter, PromotionRequest
 from redteam.orchestration.nodes._support import advance, graph_service, publisher_for
-from redteam.orchestration.observations.web_http import map_web_compare_sessions
 from redteam.orchestration.service_status import (
     severity_for,
 )
@@ -94,18 +93,22 @@ async def verify_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
     response_observation = http_observation(proposal.arguments, result)
     if response_observation is not None:
         evidence.metadata["http_observation"] = response_observation
-    if result.tool_id == "web.http_compare_sessions":
-        mutation = map_web_compare_sessions(
-            target=proposal.target, arguments=proposal.arguments, result=result
-        )
-        comparisons = [
-            item
-            for node in mutation.nodes
-            for item in node.observations
-            if item.get("kind") == "http_session_comparison"
-        ]
-        if comparisons:
-            evidence.metadata["session_comparison"] = comparisons[0]
+    # Read the selected mapper's validated observations. Physical tool ids
+    # and tools sharing the comparison mapper use the same evidence path.
+    mutation = deps.result_mappers.map_result(
+        tool_id=result.tool_id,
+        target=proposal.target,
+        arguments=proposal.arguments,
+        result=result,
+    )
+    comparisons = [
+        item
+        for node in mutation.nodes
+        for item in node.observations
+        if item.get("kind") == "http_session_comparison"
+    ]
+    if comparisons:
+        evidence.metadata["session_comparison"] = comparisons[0]
     if not result.success and result.error is not None:
         # RC#2: keep the non-secret failure code so a later planning turn can
         # read *why* a step failed and adapt. The free-text message and

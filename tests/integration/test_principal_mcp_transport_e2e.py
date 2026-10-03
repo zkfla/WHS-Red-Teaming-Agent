@@ -30,6 +30,8 @@ from redteam.core.contracts.engagement import (
 )
 from redteam.core.contracts.events import EventEnvelope, EventType
 from redteam.core.enums import GraphNodeType, MissionStatus
+from redteam.core.ids import ToolId
+from redteam.core.ports.tool_catalog import ToolCatalog
 from redteam.orchestration.paths.sqlite import SQLitePathStore
 from redteam.orchestration.settings import OrchestrationSettings
 from redteam.orchestration.state import TerminationReason
@@ -40,6 +42,8 @@ from tests.integration.test_second_principal_mission import _CompareLLM
 
 class _TransportLLM(_CompareLLM):
     """Discover registered references, revise, then decide from real receipts."""
+
+    _catalog: ToolCatalog
 
     def _draft(self, host_id: str) -> dict[str, Any]:
         draft = super()._draft(host_id)
@@ -65,17 +69,24 @@ class _TransportLLM(_CompareLLM):
         host_id = await self._host_id()
 
         def receipts(step_id: str, tool_id: str) -> list[str]:
+            descriptor = self._catalog.get(ToolId(tool_id))
+            assert descriptor is not None
             return [
-                str(r.evidence_id) for r in records
+                str(r.evidence_id)
+                for r in records
                 if r.metadata.get("path_step_id") == step_id
-                and r.source_id == tool_id and isinstance(r.metadata.get("tool_result"), dict)
+                and r.source_id == str(descriptor.tool_id)
+                and isinstance(r.metadata.get("tool_result"), dict)
             ]
 
         if self._next_calls == 1:
             turn = h.turn_actions(host_id)
             turn["actions"][0].update(
-                agent_id="web-api-agent", capability="web", operation="response_analysis",
-                tool_id="web.session_list", arguments={},
+                agent_id="web-api-agent",
+                capability="web",
+                operation="response_analysis",
+                tool_id="web.session_list",
+                arguments={},
                 reason="discover supplied opaque sessions",
             )
             return turn
@@ -94,12 +105,17 @@ class _TransportLLM(_CompareLLM):
         if self._next_calls == 4:
             turn = h.turn_actions(host_id)
             turn["actions"][0].update(
-                path_step_id="step-2", agent_id="web-api-agent", principal_ref="alice",
-                capability="web", operation="response_analysis",
+                path_step_id="step-2",
+                agent_id="web-api-agent",
+                principal_ref="alice",
+                capability="web",
+                operation="response_analysis",
                 tool_id="web.http_compare_sessions",
                 arguments={
-                    "target_ref": "bank", "path": "/orders/1234",
-                    "first_session_ref": "alice", "second_session_ref": "bob",
+                    "target_ref": "bank",
+                    "path": "/orders/1234",
+                    "first_session_ref": "alice",
+                    "second_session_ref": "bob",
                 },
                 reason="compare discovered principals on the approved object",
             )
@@ -117,7 +133,9 @@ class _TransportLLM(_CompareLLM):
 
 @pytest.mark.parametrize("case", ["success", "unauthenticated", "missing_credential"])
 async def test_principal_discovery_revision_and_completion_over_real_mcp(
-    case: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    case: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     requests: list[tuple[str, str, int]] = []
 
@@ -125,17 +143,22 @@ async def test_principal_discovery_revision_and_completion_over_real_mcp(
         try:
             headers = (await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), 5)).decode()
             method, path, _ = headers.split("\r\n", 1)[0].split()
-            bearer = next((
-                line.split(":", 1)[1].strip() for line in headers.split("\r\n")[1:]
-                if line.lower().startswith("authorization:")
-            ), "")
+            bearer = next(
+                (
+                    line.split(":", 1)[1].strip()
+                    for line in headers.split("\r\n")[1:]
+                    if line.lower().startswith("authorization:")
+                ),
+                "",
+            )
             principal = "alice" if bearer == "Bearer e2e-synthetic-alice" else "bob"
             status = 401 if case == "unauthenticated" else (200 if principal == "alice" else 403)
             requests.append((method, path, status))
-            body = b'{"account":"synthetic-alice","balance":1000}' if status == 200 else b'{}'
+            body = b'{"account":"synthetic-alice","balance":1000}' if status == 200 else b"{}"
             writer.write(
                 f"HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\n"
-                f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode() + body
+                f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode()
+                + body
             )
             await writer.drain()
         finally:
@@ -150,31 +173,53 @@ async def test_principal_discovery_revision_and_completion_over_real_mcp(
         port = server.sockets[0].getsockname()[1]
         monkeypatch.chdir(tmp_path)
         policy = tmp_path / "policy.json"
-        policy.write_text(json.dumps({
-            "targets": {"bank": {
-                "origin": f"http://127.0.0.1:{port}", "allowed_paths": ["/orders/1234"],
-            }},
-            "allowed_networks": ["127.0.0.1/32"],
-            "sessions": {ref: {
-                "target_ref": "bank", "principal_ref": f"{ref}-principal",
-                "bearer_env": f"E2E_SYNTHETIC_{ref.upper()}",
-            } for ref in ("alice", "bob")},
-        }))
+        policy.write_text(
+            json.dumps(
+                {
+                    "targets": {
+                        "bank": {
+                            "origin": f"http://127.0.0.1:{port}",
+                            "allowed_paths": ["/orders/1234"],
+                        }
+                    },
+                    "allowed_networks": ["127.0.0.1/32"],
+                    "sessions": {
+                        ref: {
+                            "target_ref": "bank",
+                            "principal_ref": f"{ref}-principal",
+                            "bearer_env": f"E2E_SYNTHETIC_{ref.upper()}",
+                        }
+                        for ref in ("alice", "bob")
+                    },
+                }
+            )
+        )
         prefix = "REDTEAM_MCP_PRINCIPAL_E2E"
         for key, value in {
-            "KIND": "web_api", "TRANSPORT": "stdio", "COMMAND": sys.executable,
-            "ARGS_JSON": json.dumps([
-                "-m", "redteam.capability.servers", "web-http", "--policy", str(policy),
-            ]),
+            "KIND": "web_api",
+            "TRANSPORT": "stdio",
+            "COMMAND": sys.executable,
+            "ARGS_JSON": json.dumps(
+                [
+                    "-m",
+                    "redteam.capability.servers",
+                    "web-http",
+                    "--policy",
+                    str(policy),
+                ]
+            ),
             "PASSTHROUGH_ENV": (
-                "E2E_SYNTHETIC_ALICE" if case == "missing_credential"
+                "E2E_SYNTHETIC_ALICE"
+                if case == "missing_credential"
                 else "E2E_SYNTHETIC_ALICE,E2E_SYNTHETIC_BOB"
             ),
             "ALLOWED_TOOLS_JSON": json.dumps(["session_list", "http_compare_sessions"]),
-            "TOOL_OPERATIONS_JSON": json.dumps({
-                "session_list": ["response_analysis"],
-                "http_compare_sessions": ["response_analysis"],
-            }),
+            "TOOL_OPERATIONS_JSON": json.dumps(
+                {
+                    "session_list": ["response_analysis"],
+                    "http_compare_sessions": ["response_analysis"],
+                }
+            ),
         }.items():
             monkeypatch.setenv(f"{prefix}_{key}", value)
         monkeypatch.setenv("E2E_SYNTHETIC_ALICE", "e2e-synthetic-alice")
@@ -196,36 +241,52 @@ async def test_principal_discovery_revision_and_completion_over_real_mcp(
                         "두 principal 비교 결과가 종료 보고서에 포함된다",
                     ],
                     "target_refs": {"127.0.0.1": "bank"},
-                    "auth_sessions": {"127.0.0.1": [
-                        {"session_ref": ref, "paths": ["/orders/1234"]}
-                        for ref in ("alice", "bob")
-                    ]},
+                    "auth_sessions": {
+                        "127.0.0.1": [
+                            {"session_ref": ref, "paths": ["/orders/1234"]}
+                            for ref in ("alice", "bob")
+                        ]
+                    },
                 },
             ),
             capability=CapabilityConfig(mcp_servers=["principal-e2e"]),
         )
         task_db = tmp_path / "tasks.sqlite3"
         settings = OrchestrationSettings(
-            max_steps=30, decision_max_attempts=6,
-            task_graph_backend="sqlite", task_graph_path=str(task_db), path_backend="sqlite",
+            max_steps=30,
+            decision_max_attempts=6,
+            task_graph_backend="sqlite",
+            task_graph_path=str(task_db),
+            path_backend="sqlite",
             operator_intent_backend="sqlite",
             operator_intent_path=str(tmp_path / "intents.sqlite3"),
-            attack_graph_backend="sqlite", attack_graph_path=str(tmp_path / "graph.sqlite3"),
+            attack_graph_backend="sqlite",
+            attack_graph_path=str(tmp_path / "graph.sqlite3"),
         )
         llm = _TransportLLM()
         engagement, deps = await build_application(
-            config, mcp_stack=stack, llm=llm, orchestration_settings=settings,
-            evidence_dir=tmp_path / "evidence", audit_dir=tmp_path / "audit",
+            config,
+            mcp_stack=stack,
+            llm=llm,
+            orchestration_settings=settings,
+            evidence_dir=tmp_path / "evidence",
+            audit_dir=tmp_path / "audit",
             approval_dir=tmp_path / "approvals",
         )
         llm._graph, llm._evidence = deps.graph_store, deps.evidence_store
+        assert deps.tool_catalog is not None
+        llm._catalog = deps.tool_catalog
         graph = AttackGraphService(deps.graph_store)
         await graph.upsert_node(
             GraphNodeType.ENDPOINT,
             node_id=endpoint_node_id("GET", "/orders/1234", host="127.0.0.1"),
             facts={
-                "host": "127.0.0.1", "port": port, "path": "/orders/1234", "method": "GET",
-                "target_ref": "bank", "path_parameters": ["orders_id"],
+                "host": "127.0.0.1",
+                "port": port,
+                "path": "/orders/1234",
+                "method": "GET",
+                "target_ref": "bank",
+                "path_parameters": ["orders_id"],
             },
         )
         objective = "Compare operator-provided principals on the synthetic account"
@@ -254,7 +315,9 @@ async def test_principal_discovery_revision_and_completion_over_real_mcp(
         assert finished.payload["termination_reason"] == final.termination_reason
         assert finished.payload["actions_executed"] == final.actions_executed
         records = await deps.evidence_store.list_for_run(final.run_id)
-        comparisons = [r for r in records if r.source_id == "web.http_compare_sessions"]
+        compare_tool = deps.tool_catalog.get(ToolId("web.http_compare_sessions"))
+        assert compare_tool is not None
+        comparisons = [r for r in records if r.source_id == str(compare_tool.tool_id)]
         assert comparisons and comparisons[0].metadata["path_version"] == 2
         assert comparisons[0].metadata["path_step_id"] == "step-2"
         serialized = (
@@ -266,7 +329,13 @@ async def test_principal_discovery_revision_and_completion_over_real_mcp(
         assert all(method == "GET" and target == "/orders/1234" for method, target, _ in requests)
         if case == "success":
             assert requests == [("GET", "/orders/1234", 200), ("GET", "/orders/1234", 403)]
-            assert final.termination_reason is TerminationReason.GOAL_ACHIEVED
+            assert final.termination_reason is TerminationReason.GOAL_ACHIEVED, json.dumps(
+                [
+                    llm._payload(call["messages"]).get("feedback")
+                    for call in llm.calls
+                    if call["route"] == "next_action"
+                ]
+            )
             assert mission.status is MissionStatus.COMPLETED
             assert mission.criterion_results and all(
                 r.met and r.evidence_ids for r in mission.criterion_results

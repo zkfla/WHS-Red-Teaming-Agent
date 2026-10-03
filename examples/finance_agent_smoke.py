@@ -22,6 +22,7 @@ from redteam.attack_graph.service import AttackGraphService
 from redteam.core.config import load_app_config
 from redteam.core.contracts.events import EventEnvelope, EventType
 from redteam.core.enums import RiskLevel
+from redteam.core.ids import ToolId
 from redteam.orchestration.settings import OrchestrationSettings
 from redteam.orchestration.state import TerminationReason
 
@@ -46,26 +47,43 @@ class _ScriptedLabModel:
         self.calls: list[dict[str, Any]] = []
         self._actions: list[dict[str, Any]] = [
             self._action(
-                step="step-1", agent="recon-agent", tool="recon.http_probe",
-                capability="recon", operation="service_discovery",
+                step="step-1",
+                agent="recon-agent",
+                tool="recon.http_probe",
+                capability="recon",
+                operation="service_discovery",
             ),
             self._action(
-                step="step-2", agent="web-api-agent", tool="web.http_request",
-                capability="web", operation="http_request",
+                step="step-2",
+                agent="web-api-agent",
+                tool="web.http_request",
+                capability="web",
+                operation="http_request",
             ),
             self._action(
-                step="step-3", agent="recon-agent", tool="recon.html_inventory",
-                capability="recon", operation="endpoint_discovery",
+                step="step-3",
+                agent="recon-agent",
+                tool="recon.html_inventory",
+                capability="recon",
+                operation="endpoint_discovery",
             ),
             self._action(
-                step="step-4", agent="web-api-agent", tool="web.http_security_posture",
-                capability="web", operation="response_analysis",
+                step="step-4",
+                agent="web-api-agent",
+                tool="web.http_security_posture",
+                capability="web",
+                operation="response_analysis",
             ),
         ]
 
     @staticmethod
     def _action(
-        *, step: str, agent: str, tool: str, capability: str, operation: str,
+        *,
+        step: str,
+        agent: str,
+        tool: str,
+        capability: str,
+        operation: str,
     ) -> dict[str, Any]:
         return {
             "path_step_id": step,
@@ -122,6 +140,7 @@ class _ScriptedLabModel:
                 "outcome": None,
                 "evidence_ids": [],
             }
+
         return {
             "path_id": "path-lab-1",
             "run_id": "run-lab",
@@ -144,8 +163,12 @@ class _ScriptedLabModel:
         }
 
     async def complete_structured(
-        self, *, messages: list[dict[str, Any]], response_schema: dict[str, Any],
-        system: str | None = None, **_: Any,
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        response_schema: dict[str, Any],
+        system: str | None = None,
+        **_: Any,
     ) -> dict[str, Any]:
         route = self._route_key(response_schema)
         self.calls.append({"route": route, "messages": messages, "system": system})
@@ -161,7 +184,8 @@ class _ScriptedLabModel:
                     continue
                 action = next(a for a in self._actions if a["path_step_id"] == step["step_id"])
                 receipts = [
-                    record["evidence_id"] for record in payload["evidence"]
+                    record["evidence_id"]
+                    for record in payload["evidence"]
                     if record["metadata"].get("path_id") == active_path["path_id"]
                     and record["metadata"].get("path_version") == active_path["version"]
                     and record["metadata"].get("path_step_id") == step["step_id"]
@@ -179,18 +203,20 @@ class _ScriptedLabModel:
                     "hypothesis_update": {},
                 }
                 if receipts:
-                    turn.update({
-                        "mode": "complete_step",
-                        "reason": "synthetic tool result received",
-                        "actions": [],
-                        "path_step_id": step["step_id"],
-                        "completion": {
-                            "evidence_ids": receipts,
-                            "outcome": "success",
+                    turn.update(
+                        {
+                            "mode": "complete_step",
                             "reason": "synthetic tool result received",
-                            "criterion_results": [],
-                        },
-                    })
+                            "actions": [],
+                            "path_step_id": step["step_id"],
+                            "completion": {
+                                "evidence_ids": receipts,
+                                "outcome": "success",
+                                "reason": "synthetic tool result received",
+                                "criterion_results": [],
+                            },
+                        }
+                    )
                 return turn
             return {
                 "mode": "complete_goal",
@@ -204,8 +230,9 @@ class _ScriptedLabModel:
             }
         if route == "goal_completion_review":
             payload = json.loads(messages[0]["content"])
-            receipts = [identity for step in payload["path"]["steps"]
-                        for identity in step["evidence_ids"]]
+            receipts = [
+                identity for step in payload["path"]["steps"] for identity in step["evidence_ids"]
+            ]
             return {
                 "accepted": True,
                 "reason": "lab goal done",
@@ -227,7 +254,11 @@ class _ScriptedLabModel:
         raise AssertionError(f"no lab answer for {route!r}")
 
     async def complete(
-        self, *, messages: list[dict[str, Any]], system: str | None = None, **_: Any,
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        system: str | None = None,
+        **_: Any,
     ) -> str:
         return ""
 
@@ -252,13 +283,13 @@ async def exercise(*, require_approval: bool) -> None:
         async with AsyncExitStack() as stack:
             lab_model = _ScriptedLabModel()
             engagement, deps = await build_application(
-                config, mcp_stack=stack, llm=lab_model,
+                config,
+                mcp_stack=stack,
+                llm=lab_model,
                 evidence_dir=Path(directory) / "evidence",
                 audit_dir=Path(directory) / "audit",
                 approval_dir=Path(directory) / "approvals",
-                orchestration_settings=OrchestrationSettings(
-                    checkpointing=False, max_steps=20
-                ),
+                orchestration_settings=OrchestrationSettings(checkpointing=False, max_steps=20),
             )
             events: list[EventEnvelope] = []
 
@@ -266,9 +297,22 @@ async def exercise(*, require_approval: bool) -> None:
                 events.append(event)
 
             await deps.event_bus.subscribe("*", collect)
+            expected_tools = {}
+            for alias in (
+                "recon.http_probe",
+                "recon.html_inventory",
+                "web.http_request",
+                "web.http_security_posture",
+            ):
+                descriptor = deps.tool_catalog.get(ToolId(alias))
+                assert descriptor is not None, f"missing lab tool: {alias}"
+                expected_tools[alias] = str(descriptor.tool_id)
             final = await run_engagement(engagement, deps=deps)
-            started = [e.payload["tool_id"] for e in events
-                       if e.event_type == EventType.TOOL_EXECUTION_STARTED]
+            started = [
+                e.payload["tool_id"]
+                for e in events
+                if e.event_type == EventType.TOOL_EXECUTION_STARTED
+            ]
             nodes = await AttackGraphService(deps.graph_store).list_nodes()
             print(
                 f"TRACE: approval={require_approval} termination={final.termination_reason} "
@@ -276,25 +320,25 @@ async def exercise(*, require_approval: bool) -> None:
                 f"nodes={[(str(node.id), node.type.value) for node in nodes]}",
                 flush=True,
             )
-            assert "recon.http_probe" in started, started
+            assert expected_tools["recon.http_probe"] in started, started
             assert not [e for e in events if e.event_type == EventType.TOOL_EXECUTION_FAILED]
             if require_approval:
                 assert final.termination_reason == TerminationReason.APPROVAL_PENDING, final
-                assert "web.http_request" not in started, started
+                assert expected_tools["web.http_request"] not in started, started
             else:
                 assert final.termination_reason == TerminationReason.GOAL_ACHIEVED, final
-                assert "web.http_request" in started, started
-                assert "recon.html_inventory" in started, started
-                assert "web.http_security_posture" in started, started
+                assert expected_tools["web.http_request"] in started, started
+                assert expected_tools["recon.html_inventory"] in started, started
+                assert expected_tools["web.http_security_posture"] in started, started
                 disallowed = [
-                    node for node in nodes
+                    node
+                    for node in nodes
                     if attrs_of(node.properties).get("path_allowlisted") is False
                 ]
                 assert disallowed, "HTML inventory must surface an unallowlisted test path"
                 assert all(
-                    "web.http_request" not in facts_of(node.properties).get(
-                        "attempted_operations", []
-                    )
+                    "web.http_request"
+                    not in facts_of(node.properties).get("attempted_operations", [])
                     for node in disallowed
                 ), "Agent must not visit an explicitly unallowlisted endpoint"
                 assert final.actions_by_agent.get("web-api-agent", 0) >= 1

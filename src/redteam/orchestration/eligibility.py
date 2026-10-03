@@ -102,11 +102,13 @@ class EligibilityRegistry:
         ]
 
     async def role(self, agent, context):
+        current = EligibilityDecision(True, "eligible")
         for provider in self._for_capabilities(agent.capabilities):
             decision = await provider.role_eligible(str(agent.agent_id), context)
             if not decision.eligible:
                 return decision
-        return EligibilityDecision(True, "eligible")
+            current = decision
+        return current
 
     async def tool(self, tool, context):
         for provider in self._for_tool(tool):

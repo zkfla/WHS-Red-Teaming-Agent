@@ -8,6 +8,7 @@ here touches the network, the clock, or the existing tests/fakes.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -43,6 +44,7 @@ from redteam.core.ids import (
     TaskId,
     ToolId,
 )
+from redteam.core.provider_contracts import LEGACY_OPERATION_BINDINGS
 from redteam.event_bus.memory import InMemoryEventBus
 from redteam.orchestration.agents.providers import default_provider_registry
 from redteam.orchestration.agents.registry import default_registry
@@ -52,6 +54,8 @@ from redteam.orchestration.analysis import (
     append_review_receipt,
 )
 from redteam.orchestration.context_projection import ContextProjectionCache
+from redteam.orchestration.coordination import coordinator_for
+from redteam.orchestration.eligibility import default_eligibility_registry
 from redteam.orchestration.observations import default_result_mapper_registry
 from redteam.orchestration.paths import InMemoryPathStore
 from redteam.orchestration.seed import seed_from_engagement
@@ -251,6 +255,25 @@ def make_world(
         operator_intent_store=None,
         verifier=None,
         result_mappers=default_result_mapper_registry(),
+        # Public RuntimeDeps fields every real run carries. Product code reads
+        # them directly, so the harness supplies the same values bootstrap
+        # does instead of relying on any getattr fallback.
+        long_job_adapter=None,
+        methodology_library=None,
+        policy_lock=asyncio.Lock(),
+        batch_pending_approvals=set(),
+        tool_semaphore=None,
+        component_binding=None,
+        planning_provider=None,
+        state_codecs=None,
+        # Strong coordinator bound to the same task/path stores this world
+        # hands to the engine; one owner, real store lifetime.
+        coordinator=coordinator_for(tasks, paths),
+        event_history=None,
+        eligibility=default_eligibility_registry(),
+        operation_bindings={item.operation: item for item in LEGACY_OPERATION_BINDINGS},
+        execution_recipes={},
+        retry_policy=None,
     )
     return SimpleNamespace(
         deps=deps,

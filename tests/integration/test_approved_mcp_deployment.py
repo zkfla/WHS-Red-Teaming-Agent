@@ -170,7 +170,9 @@ async def test_agent_uses_inventory_and_two_users_through_real_mcp(
         assert final.actions_executed == 2, (final.termination_reason, final.planning_feedback)
         assert requests == ["/accounts/123", "/accounts/123"]
         records = await deps.evidence_store.list_for_run(final.run_id)
-        comparison = next(r for r in records if r.source_id == "web.http_compare_sessions")
+        compare_tool = deps.tool_catalog.get("web.http_compare_sessions")
+        assert compare_tool is not None
+        comparison = next(r for r in records if r.source_id == str(compare_tool.tool_id))
         output = comparison.metadata["tool_result"]["output"]
         assert output["first"]["status_code"] == 200 and output["second"]["status_code"] == 403
         assert output["verdict"] == "observation_only"

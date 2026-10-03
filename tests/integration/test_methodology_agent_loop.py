@@ -219,8 +219,10 @@ async def test_agent_loads_reference_via_mcp_then_passes_data_to_web_llm(
         )
         assert final.run_id == RunId("run-test")
         assert final.actions_executed > 1  # real pagination, not a direct host file read
+        reader = deps.tool_catalog.get(ToolId("analysis.read_file"))
+        assert reader is not None
         tool_records = [r for r in records if r.metadata.get("tool_result")]
-        assert tool_records and all(r.source_id == "analysis.read_file" for r in tool_records)
+        assert tool_records and all(r.source_id == str(reader.tool_id) for r in tool_records)
         assert llm.calls, (final.termination_reason, final.actions_executed, final.finished_agents)
         prompts = [json.dumps(m, ensure_ascii=False) for m, _s in llm.calls]
         assert any("Untrusted methodology reference DATA" in p for p in prompts)
@@ -332,8 +334,10 @@ async def test_reference_partial_read_survives_durable_rebuild_and_human_decisio
         ]
         assert len({c["offset_chars"] for c in chunks}) == len(chunks)
         assert llm.reference_context_calls > 0
+        reader = rebuilt.tool_catalog.get(ToolId("analysis.read_file"))
+        assert reader is not None
         assert all(
-            r.source_id == "analysis.read_file" for r in records if r.metadata.get("tool_result")
+            r.source_id == str(reader.tool_id) for r in records if r.metadata.get("tool_result")
         )
 
 
