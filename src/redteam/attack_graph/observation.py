@@ -42,6 +42,9 @@ PLANNING_CONTENT_KEYS = (
     "application_protocol",
     "service_name",
     "target_ref",
+    "asset_ref",
+    "apk_ref",
+    "project_dir",
     "in_scope",
     "authenticated",
     "auth_session_config",
@@ -50,10 +53,15 @@ PLANNING_CONTENT_KEYS = (
     "redirect",
     "object_scoped",
     "web_inspected",
+    "analysis_decoded",
+    "manifest_analyzed",
+    "smali_inventoried",
+    "sensitive_strings_searched",
     "responded",
     "reachable",
     "probed",
     "assessment_kind",
+    "methodology_progress",
 )
 
 #: Edge property keys that are volatile bookkeeping rather than relation

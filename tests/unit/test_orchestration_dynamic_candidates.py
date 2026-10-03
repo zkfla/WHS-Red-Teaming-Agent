@@ -301,12 +301,12 @@ def test_http_status_validation_rejects_booleans() -> None:
 # -- analysis / reporting are seams, not scheduled roles -------------------
 
 
-def test_analysis_and_reporting_are_declared_as_non_schedulable_seams() -> None:
+def test_only_reporting_is_declared_as_a_non_schedulable_seam() -> None:
     seams = {
         str(item.agent_id) for item in builtin_agent_definitions() if not item.schedulable
     }
 
-    assert seams == {"analysis-agent", "reporting-agent"}
+    assert seams == {"reporting-agent"}
 
 
 def test_the_default_registry_schedules_only_executable_roles() -> None:
@@ -316,6 +316,7 @@ def test_the_default_registry_schedules_only_executable_roles() -> None:
         "recon-agent",
         "web-api-agent",
         "mobile-agent",
+        "analysis-agent",
     }
     assert {str(item) for item in registry.definition_ids} >= {
         "analysis-agent",
@@ -323,10 +324,10 @@ def test_the_default_registry_schedules_only_executable_roles() -> None:
     }
 
 
-def test_analysis_and_reporting_have_no_executable_agent_spec() -> None:
+def test_analysis_has_an_executable_spec_and_reporting_does_not() -> None:
     registry = default_registry()
 
-    assert registry.get(AgentId("analysis-agent")) is None
+    assert registry.get(AgentId("analysis-agent")) is not None
     assert registry.get(AgentId("reporting-agent")) is None
     # Retirement of every executable role must not promote a seam role into a
     # scheduled one -- there is simply nothing left to choose.

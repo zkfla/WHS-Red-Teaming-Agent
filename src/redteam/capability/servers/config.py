@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import ipaddress
 import json
 import re
@@ -14,10 +15,24 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 HTTPMethod = Literal["GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH", "DELETE"]
 
 PROTECTED_HEADERS = {
-    "host", "authorization", "proxy-authorization", "cookie", "content-length",
-    "transfer-encoding", "connection", "upgrade", "te", "trailer", "accept-encoding",
-    "content-type", "forwarded", "x-forwarded-host", "x-forwarded-for",
-    "proxy-connection", "x-original-url", "x-rewrite-url",
+    "host",
+    "authorization",
+    "proxy-authorization",
+    "cookie",
+    "content-length",
+    "transfer-encoding",
+    "connection",
+    "upgrade",
+    "te",
+    "trailer",
+    "accept-encoding",
+    "content-type",
+    "forwarded",
+    "x-forwarded-host",
+    "x-forwarded-for",
+    "proxy-connection",
+    "x-original-url",
+    "x-rewrite-url",
 }
 
 
@@ -43,7 +58,8 @@ class TargetProfile(BaseModel):
         lowered = [name.lower() for name in values]
         if any(
             not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,63}", name)
-            or name in PROTECTED_HEADERS or name.startswith(("proxy-", "x-forwarded-"))
+            or name in PROTECTED_HEADERS
+            or name.startswith(("proxy-", "x-forwarded-"))
             for name in lowered
         ) or len(set(lowered)) != len(lowered):
             raise ValueError("invalid, protected or duplicate request header")
@@ -113,6 +129,8 @@ class SessionProfile(BaseModel):
     bearer_env: str | None = Field(default=None, pattern=r"^[A-Za-z_][A-Za-z0-9_]*$")
     storage_state_path: str | None = None
     storage_state_max_age_seconds: int = Field(default=3600, ge=1, le=86400)
+    # None preserves existing operator profiles. Generated deployments always set this.
+    allowed_paths: list[str] | None = Field(default=None, min_length=1)
 
     @model_validator(mode="after")
     def exactly_one_credential(self) -> SessionProfile:
@@ -154,8 +172,17 @@ class ServerPolicy(BaseModel):
     def session_targets_exist(self) -> ServerPolicy:
         if any(session.target_ref not in self.targets for session in self.sessions.values()):
             raise ValueError("session target_ref does not exist")
+        for session in self.sessions.values():
+            if session.allowed_paths is not None and (
+                len(set(session.allowed_paths)) != len(session.allowed_paths)
+                or set(session.allowed_paths) - set(self.targets[session.target_ref].allowed_paths)
+            ):
+                raise ValueError("session paths must be unique allowed target paths")
         return self
 
     @classmethod
-    def load(cls, path: str) -> ServerPolicy:
-        return cls.model_validate(json.loads(Path(path).read_text(encoding="utf-8")))
+    def load(cls, path: str, *, expected_sha256: str | None = None) -> ServerPolicy:
+        content = Path(path).read_bytes()
+        if expected_sha256 is not None and hashlib.sha256(content).hexdigest() != expected_sha256:
+            raise ValueError("MCP policy digest mismatch")
+        return cls.model_validate(json.loads(content))

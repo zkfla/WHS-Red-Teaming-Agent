@@ -115,6 +115,8 @@ async def verify_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             "code": result.error.code,
             "retryable": result.error.retryable,
         }
+    if deps.methodology_library is not None:
+        evidence.metadata.update(deps.methodology_library.capture(proposal, result))
     await deps.evidence_store.append(evidence)
 
     created = await publisher.publish(
@@ -185,6 +187,20 @@ async def verify_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
         run_id=str(runtime.run_id),
         confidence=Confidence.MEASURED,
     )
+    if deps.methodology_library is not None and (
+        "methodology_chunk" in evidence.metadata or "methodology_rejected" in evidence.metadata
+    ):
+        # Paging changes evidence even when the same operation/Asset is reused.
+        # Publish only bounded progress, never document bodies or permission.
+        progress = deps.methodology_library.progress(
+            await deps.evidence_store.list_for_run(runtime.run_id)
+        )
+        await service.observe_target(
+            proposal.target,
+            facts={"methodology_progress": list(progress)},
+            provenance=provenance,
+            step=runtime.step_count,
+        )
 
     auth_assessment = None
     auth_contradiction = False

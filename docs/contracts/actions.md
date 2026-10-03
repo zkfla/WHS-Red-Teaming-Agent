@@ -55,8 +55,13 @@ EndpointTarget   kind="endpoint"    host, port?, path?
 ServiceTarget    kind="service"     service_name, host?
 PrincipalTarget  kind="principal"   principal_id
 AssetTarget      kind="asset"       asset_id
+DeviceTarget     kind="device"      device_serial, device_ref, package_name, asset_id?
 GraphNodeTarget  kind="graph_node"  node_id, node_type?   (escape hatch)
 ```
+
+`DeviceTarget.device_serial` is the operator-configured adb serial. `device_ref`
+is the separate operator-configured identifier accepted by the selected mobile
+MCP server; orchestration does not derive one from the other.
 
 Every variant except `PrincipalTarget`/`AssetTarget` carries an optional
 `graph_node_id` once the target has been linked into the Shared Attack
@@ -99,10 +104,50 @@ intends to do — not which tool implements it.
 
 Format: `lower_snake_case`.
 
+The shared executable vocabulary and typed validation errors live in
+`redteam.core.action_semantics`. Capability registration and Agent
+planning use this one contract; `redteam.core.contracts.action_naming` and
+`redteam.orchestration.action_naming` retain compatible re-exports, not
+separate vocabularies. A well-formatted name outside this vocabulary is not a
+supported intent. This contract does not grant execution permission or define
+new capability/target schemas.
+
+Public-reference intents confirmed for capability integration on 2026-10-03:
+`web.page_read` (read bounded text from operator-allowlisted public HTTPS pages)
+and `web.web_search` (query public references through an operator-enabled search
+provider). ToolIds remain `web.fetch_page_text` and `web.web_search` respectively.
+Even when spellings coincide, a ToolId is not an implicit intent binding.
+Agent proposals still need an existing known TargetRef and Control ALLOW.
+Search's target is the approved planning context, not a query string or the
+provider endpoint; search results do not extend scope or authorize navigation.
+
 Examples: `port_scan`, `service_discovery`, `endpoint_discovery`,
 `http_request`, `auth_attempt`, `parameter_fuzz`, `file_upload`,
 `app_launch`, `device_shell`, `runtime_instrumentation`,
 `static_analysis`, `response_analysis`.
+
+Workspace-tool extension on the capability branch: `directory_list`,
+`file_read`, `file_search`, `file_write`, `file_edit`, under the existing
+`analysis` capability with an approved `AssetTarget`. These describe intent;
+the corresponding MCP ToolIds are `analysis.list_directory`,
+`analysis.read_file`, `analysis.search_files`, `analysis.write_file`,
+`analysis.apply_patch`. Read and mutation permissions remain separate.
+This is an additive naming extension, not a new capability/target schema
+or permission to automatically schedule these actions. PM/Agent/Control
+owners should review it before integration into dev; deployment ROE must
+explicitly permit the workspace asset and intended operations.
+
+Execution names already implemented on capability remain `command_run`,
+`command_job_start`, `command_job_status`, and `command_job_cancel`.
+Their presence in this vocabulary does not enable arbitrary shell use:
+the Agent bridge stays off by default and exposes only the explicitly
+configured fixed `line_count` recipe. Job lifecycle automation and operational
+permission remain separate reviews.
+
+Admission errors distinguish name validity from configuration:
+`operation_unsupported` means a name outside this shared vocabulary;
+`no_tool_for_operation` means a supported name with no registered binding
+in an available capability. Neither authorizes a replacement action.
 
 Rules:
 
@@ -306,3 +351,19 @@ real `error` (never shaped like the tool's success schema, so it always
 failed schema validation) behind a generic `tool_output_schema_mismatch`
 naming the wrong problem; the server's own `ToolError`/message (e.g. "target
 address outside configured networks") reaches `ToolResult.error` now.
+
+## Execution Substrate 제안
+
+`analysis.command_run`은 Capability 담당자 B가 제안한 canonical action이다.
+기존 `AssetTarget`의 `asset_id`를 operator가 등록한 execution workspace의
+`asset_ref`에 바인딩한다. 이 이름은 팀 합의 전까지 **합의 필요(제안)** 상태이며,
+운영 ROE가 명시적으로 허용하고 필요한 승인을 완료하기 전에는 실행 권한을 뜻하지 않는다.
+
+실행 파일과 인자는 MCP의 `run_command` 도구가 받지만, shell 문자열·Docker 옵션·호스트
+경로는 ActionProposal 입력으로 허용하지 않는다. 컨테이너 이미지, workspace root,
+allowlist와 자원 제한은 operator 정책에서만 공급한다.
+
+비동기 확장 제안은 `analysis.command_job_start`,
+`analysis.command_job_status`, `analysis.command_job_cancel`이다. `job_id`는 서버가
+생성하며 asset·engagement·run에 귀속된다. 세 operation 역시 팀 합의 전까지
+**합의 필요(제안)** 상태이고, 현재 profile은 보수적으로 모두 HIGH 위험도로 노출한다.

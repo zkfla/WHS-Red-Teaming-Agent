@@ -20,6 +20,7 @@ from jsonschema import Draft202012Validator
 from jsonschema.exceptions import SchemaError, ValidationError
 
 from redteam.capability.adapters.mcp.base import MCPAdapter, MCPCallResult
+from redteam.capability.adapters.mcp.scoped_analysis import ScopedAnalysisMCPAdapter
 from redteam.capability.catalog import MCPToolCatalog, ToolCandidateMetadata
 from redteam.capability.registry import MCPToolRegistry
 from redteam.core.contracts.tool import ToolDescriptor, ToolError, ToolInvocation, ToolResult
@@ -65,8 +66,7 @@ class MCPToolGateway:
         if any(limit < 1 for limit in concurrency.values()):
             raise ValueError("MCP server concurrency must be at least 1")
         self._server_semaphores = {
-            server_id: asyncio.Semaphore(concurrency.get(server_id, 1))
-            for server_id in adapters
+            server_id: asyncio.Semaphore(concurrency.get(server_id, 1)) for server_id in adapters
         }
         output_limits = server_output_limits or {}
         unknown_output_servers = set(output_limits) - set(adapters)
@@ -185,7 +185,7 @@ class MCPToolGateway:
         return status
 
     async def invoke(self, invocation: ToolInvocation) -> ToolResult:
-        descriptor = self._registry.get(invocation.tool_id)
+        descriptor = self._catalog.get(invocation.tool_id)
         if descriptor is None:
             return ToolResult(
                 invocation_id=invocation.invocation_id,
@@ -227,10 +227,13 @@ class MCPToolGateway:
         if invocation.execution_context.dry_run:
             occurred_at = datetime.now(timezone.utc)
             return ToolResult(
-                invocation_id=invocation.invocation_id, action_id=invocation.action_id,
-                tool_id=invocation.tool_id, success=True,
+                invocation_id=invocation.invocation_id,
+                action_id=invocation.action_id,
+                tool_id=invocation.tool_id,
+                success=True,
                 output={"dry_run": True, "executed": False},
-                started_at=occurred_at, finished_at=occurred_at,
+                started_at=occurred_at,
+                finished_at=occurred_at,
                 metadata={"dry_run": True},
             )
 
@@ -242,7 +245,7 @@ class MCPToolGateway:
             now = datetime.now(timezone.utc)
             if self._needs_health_refresh(descriptor.server_id, now):
                 await self._refresh_server_health(descriptor.server_id)
-                refreshed = self._registry.get(invocation.tool_id)
+                refreshed = self._catalog.get(invocation.tool_id)
                 if refreshed is not None:
                     descriptor = refreshed
 
@@ -254,12 +257,34 @@ class MCPToolGateway:
                 retryable=True,
             )
 
+        arguments = invocation.arguments
+        if isinstance(adapter, ScopedAnalysisMCPAdapter):
+            try:
+                arguments = adapter.bind_context(invocation)
+            except ValueError:
+                return self._error_result(
+                    invocation,
+                    code=f"{adapter.error_prefix}_context_mismatch",
+                    message="scoped invocation context differs from trusted execution context",
+                )
+            try:
+                properties = descriptor.input_schema.get("properties", {})
+                if set(arguments) - set(properties):
+                    raise ValueError("unexpected scoped arguments")
+                Draft202012Validator(descriptor.input_schema).validate(arguments)
+            except (SchemaError, ValidationError, TypeError, ValueError):
+                return self._error_result(
+                    invocation,
+                    code=f"{adapter.error_prefix}_invalid_arguments",
+                    message="scoped arguments do not match the registered input schema",
+                )
+
         try:
             adapter_result = await asyncio.wait_for(
                 _invoke_with_limit(
                     adapter,
                     descriptor,
-                    invocation.arguments,
+                    arguments,
                     self._server_semaphores[descriptor.server_id],
                 ),
                 timeout=invocation.timeout_seconds,

@@ -11,6 +11,7 @@ from typing import Any
 from jsonschema import ValidationError as SchemaValidationError
 from pydantic import BaseModel, Field, ValidationError, field_validator
 
+from redteam.core.action_semantics import ActionNamingError
 from redteam.core.redaction import redact_sensitive_text
 
 _KNOWN_FIELDS = frozenset(
@@ -158,6 +159,20 @@ def diagnostic_for_exception(exc: BaseException, *, stage: str) -> DecisionDiagn
     attached = getattr(exc, "diagnostic", None)
     if isinstance(attached, DecisionDiagnostic):
         return attached
+    if isinstance(exc, ActionNamingError):
+        summaries = {
+            "capability_unsupported": "Use a supported capability namespace.",
+            "operation_invalid_format": "Use a lower_snake_case action name.",
+            "operation_unsupported": "Use a supported action meaning.",
+        }
+        return DecisionDiagnostic(
+            code=exc.reason,
+            stage=_identifier(stage, "decision"),
+            kind="format",
+            location=known_location((exc.field,)),
+            summary=summaries.get(exc.reason, "Use a supported action name."),
+            retryable=True,
+        )
     if isinstance(exc, ValidationError):
         # include_input=False is mandatory even though messages are not copied.
         errors = exc.errors(include_input=False, include_url=False, include_context=False)

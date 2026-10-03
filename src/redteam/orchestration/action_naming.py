@@ -1,4 +1,4 @@
-"""Canonical ActionProposal naming owned by the orchestration boundary.
+"""Compatibility exports for shared intent naming, plus ToolId helpers.
 
 An action key describes intent (``capability.operation``).  A ``ToolId``
 describes an execution mechanism and is deliberately validated separately.
@@ -30,9 +30,7 @@ def tool_namespace(tool_id: ToolId) -> str:
 
     namespace, separator, remote_name = str(tool_id).partition(".")
     if not separator or not namespace or not remote_name or "." in remote_name:
-        raise ValueError(
-            f"tool_id {tool_id!r} must use <namespace>.<remote_tool_name>"
-        )
+        raise ValueError(f"tool_id {tool_id!r} must use <namespace>.<remote_tool_name>")
     return namespace
 
 

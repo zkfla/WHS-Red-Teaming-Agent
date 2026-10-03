@@ -1,7 +1,7 @@
-"""Shared, tool-independent action meanings used at team boundaries.
+"""Shared intent vocabulary; names are not tool bindings or permission grants.
 
-New meanings are explicit Core changes. Remote tools and model responses
-cannot add to this vocabulary.
+Capability validates operator-approved bindings against this contract, and
+Orchestration validates proposed actions against the very same contract.
 """
 
 from __future__ import annotations
@@ -23,17 +23,66 @@ CANONICAL_OPERATIONS = frozenset(
         "runtime_instrumentation",
         "static_analysis",
         "response_analysis",
+        "directory_list",
+        "file_read",
+        "file_search",
+        "file_write",
+        "file_edit",
+        "command_run",
+        "command_job_start",
+        "command_job_status",
+        "command_job_cancel",
+        "page_read",
+        "web_search",
     }
 )
 _LOWER_SNAKE_CASE = re.compile(r"^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$")
 
 
-def canonical_action_key(capability: str, operation: str) -> str:
-    """Validate an action meaning and return its exact ROE identity."""
+class ActionNamingError(ValueError):
+    """A stable, non-target rejection reason shared across team boundaries."""
+
+    reason = "invalid_action_name"
+    field = ""
+
+
+class UnsupportedCapabilityError(ActionNamingError):
+    reason = "capability_unsupported"
+    field = "capability"
+
+
+class InvalidOperationFormatError(ActionNamingError):
+    reason = "operation_invalid_format"
+    field = "operation"
+
+
+class UnsupportedOperationError(ActionNamingError):
+    reason = "operation_unsupported"
+    field = "operation"
+
+
+def validate_capability_name(capability: str) -> None:
     if capability not in CANONICAL_CAPABILITIES:
-        raise ValueError(f"capability {capability!r} is not a canonical v1 namespace")
-    if not _LOWER_SNAKE_CASE.fullmatch(operation):
-        raise ValueError(f"operation {operation!r} must be lower_snake_case")
+        raise UnsupportedCapabilityError(
+            f"capability {capability!r} is not a canonical v1 namespace"
+        )
+
+
+def validate_operation_format(operation: str) -> None:
+    if not isinstance(operation, str) or not _LOWER_SNAKE_CASE.fullmatch(operation):
+        raise InvalidOperationFormatError(f"operation {operation!r} must be lower_snake_case")
+
+
+def validate_operation_name(operation: str) -> None:
+    validate_operation_format(operation)
     if operation not in CANONICAL_OPERATIONS:
-        raise ValueError(f"operation {operation!r} is not in the canonical v1 contract")
+        raise UnsupportedOperationError(
+            f"operation {operation!r} is not in the canonical v1 contract"
+        )
+
+
+def canonical_action_key(capability: str, operation: str) -> str:
+    """Validate an intent, independently of any ToolId or ROE decision."""
+    validate_capability_name(capability)
+    validate_operation_name(operation)
     return f"{capability}.{operation}"

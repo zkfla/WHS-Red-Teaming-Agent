@@ -8,8 +8,10 @@ from contextlib import AsyncExitStack, asynccontextmanager
 from redteam.capability.adapters.mcp.analysis import AnalysisMCPAdapter
 from redteam.capability.adapters.mcp.base import MCPAdapter
 from redteam.capability.adapters.mcp.example import ExampleMCPAdapter
+from redteam.capability.adapters.mcp.execution import ExecutionMCPAdapter
 from redteam.capability.adapters.mcp.mobile import MobileMCPAdapter
 from redteam.capability.adapters.mcp.recon import ReconMCPAdapter
+from redteam.capability.adapters.mcp.scoped_analysis import VDBMCPAdapter
 from redteam.capability.adapters.mcp.streamable_http import MCPServerAdapter
 from redteam.capability.adapters.mcp.transport import (
     AllowlistedMCPTransport,
@@ -18,6 +20,8 @@ from redteam.capability.adapters.mcp.transport import (
     StreamableHTTPMCPTransport,
 )
 from redteam.capability.adapters.mcp.web_api import WebAPIMCPAdapter
+from redteam.capability.adapters.mcp.workspace import WorkspaceMCPAdapter
+from redteam.capability.execution_manifest import validate_execution_descriptor
 from redteam.capability.gateway import (
     DEFAULT_HEALTH_REFRESH_INTERVAL_SECONDS,
     DEFAULT_HEALTH_REFRESH_TIMEOUT_SECONDS,
@@ -28,14 +32,19 @@ from redteam.capability.mobile_analysis_manifest import (
     MOBILE_ANALYSIS_TOOLS,
     validate_configured_discovery,
 )
+from redteam.capability.page_text_manifest import validate_page_text_discovery
 from redteam.capability.registry import MCPToolRegistry
+from redteam.capability.servers.page_text_mcp import load_page_text_config
+from redteam.capability.servers.web_search_mcp import load_web_search_config
 from redteam.capability.settings import (
     MCPConfigurationError,
     MCPServerKind,
     MCPServerSettings,
     MCPTransportKind,
 )
-from redteam.core.action_semantics import CANONICAL_OPERATIONS
+from redteam.capability.vdb_manifest import validate_vdb_descriptor
+from redteam.capability.web_search_manifest import validate_web_search_discovery
+from redteam.capability.workspace_manifest import validate_workspace_descriptor
 
 
 async def build_mcp_tool_gateway(
@@ -148,13 +157,10 @@ async def _build_gateway(
                     )
             elif descriptor.operations:
                 operations = tuple(descriptor.operations)
-            elif descriptor.tool_name in CANONICAL_OPERATIONS:
-                operations = (descriptor.tool_name,)
             else:
-                raise MCPConfigurationError(
-                    f"MCP server {server_id!r} tool {descriptor.tool_name!r} needs "
-                    "explicit operation bindings to a canonical action"
-                )
+                # Discovery is not permission to promote a tool name to an intent.
+                # Unbound tools can be inspected but are never executable candidates.
+                operations = ()
             # The operation binding is part of the Registry snapshot exposed
             # to Agent/Orchestration; it must not remain only in a private
             # Gateway map.
@@ -165,6 +171,58 @@ async def _build_gateway(
                 if selected_spec is not None
                 else _default_target_types(settings.kind)
             )
+            if settings.profile == "page_text_readonly":
+                descriptor.target_types = ["url"]
+                try:
+                    config, _ = load_page_text_config(
+                        settings.page_text_config_path or "",
+                        settings.page_text_config_sha256,
+                    )
+                    validate_page_text_discovery(descriptor, config)
+                except ValueError:
+                    raise MCPConfigurationError(
+                        "page text discovery differs from operator configuration"
+                    ) from None
+                target_types[str(descriptor.tool_id)] = "url"
+            elif settings.profile == "execution":
+                descriptor.target_types = ["asset"]
+                try:
+                    validate_execution_descriptor(
+                        descriptor,
+                        settings.execution_asset_ref or "",
+                    )
+                except ValueError as exc:
+                    raise MCPConfigurationError(str(exc)) from exc
+                target_types[str(descriptor.tool_id)] = "asset"
+            elif settings.profile == "web_search_tavily":
+                descriptor.target_types = []
+                try:
+                    search_config, _ = load_web_search_config(
+                        settings.web_search_config_path or "",
+                        settings.web_search_config_sha256,
+                    )
+                    validate_web_search_discovery(descriptor, search_config)
+                except ValueError:
+                    raise MCPConfigurationError(
+                        "web search discovery differs from operator configuration"
+                    ) from None
+                target_types[str(descriptor.tool_id)] = None
+            elif settings.profile is not None:
+                descriptor.target_types = ["asset"]
+                try:
+                    if settings.profile in {"vdb_readonly", "vdb_readonly_extended"}:
+                        validate_vdb_descriptor(
+                            descriptor, settings.vdb_asset_ref or "", settings.profile
+                        )
+                    else:
+                        validate_workspace_descriptor(
+                            descriptor,
+                            settings.profile,
+                            settings.workspace_asset_ref or "",
+                        )
+                except ValueError as exc:
+                    raise MCPConfigurationError(str(exc)) from exc
+                target_types[str(descriptor.tool_id)] = "asset"
             # Validate after operator bindings are copied into the descriptor:
             # this is the exact manifest exposed to Agent/Orchestration.
             validate_tool_manifest(descriptor)
@@ -229,6 +287,29 @@ def _default_target_types(kind: MCPServerKind) -> list[str]:
 def _create_adapter(settings: MCPServerSettings, transport: MCPTransport) -> MCPAdapter:
     if settings.allowed_tools is not None:
         transport = AllowlistedMCPTransport(transport, settings.allowed_tools)
+    if settings.profile in {"page_text_readonly", "web_search_tavily"}:
+        return WebAPIMCPAdapter(
+            server_id=settings.server_id,
+            risk_level=settings.risk_level,
+            transport=transport,
+        )
+    if settings.profile == "execution":
+        return ExecutionMCPAdapter(
+            server_id=settings.server_id,
+            risk_level=settings.risk_level,
+            transport=transport,
+        )
+    if settings.profile is not None:
+        adapter_class = (
+            VDBMCPAdapter
+            if settings.profile in {"vdb_readonly", "vdb_readonly_extended"}
+            else WorkspaceMCPAdapter
+        )
+        return adapter_class(
+            server_id=settings.server_id,
+            risk_level=settings.risk_level,
+            transport=transport,
+        )
     if settings.kind == MCPServerKind.WEB_API:
         return WebAPIMCPAdapter(
             server_id=settings.server_id,

@@ -35,6 +35,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
+from redteam.app.methodology import load_reference_library, wire_reference_agent
 from redteam.app.report_store import save_terminal_report
 from redteam.app.runtime_components import (
     ComponentFactoryContext,
@@ -66,7 +67,7 @@ from redteam.core.config import (
 )
 from redteam.core.contracts.engagement import Engagement
 from redteam.core.contracts.events import EventEnvelope, EventType
-from redteam.core.enums import AgentPhase, MissionStatus, TaskStatus
+from redteam.core.enums import AgentPhase, GraphNodeType, MissionStatus, TaskStatus
 from redteam.core.ids import EngagementId, EventId, RunId, new_id
 from redteam.core.ports.attack_graph import AttackGraphStore
 from redteam.core.ports.control_plane import ControlPlane
@@ -356,6 +357,17 @@ async def build_application(
     """
     logging.basicConfig(level=config.logging.level)
 
+    from redteam.app.mcp_deployment import synchronize_deployment
+
+    config = config.model_copy(update={
+        "engagement": synchronize_deployment(config.engagement, config.capability.mcp_servers)
+    })
+    library = (
+        load_reference_library(config.capability.methodology)
+        if config.capability.methodology is not None
+        else None
+    )
+
     # Inspect actual stores before opening any MCP transport or creating a mission.
     resolved_settings = orchestration_settings or OrchestrationSettings.from_config(
         config.orchestration
@@ -378,9 +390,12 @@ async def build_application(
 
     await coordinator.change(initialize)
 
-    engagement = config.engagement.to_engagement(
-        engagement_id=engagement_id or EngagementId(new_id("eng"))
+    resolved_engagement_id = engagement_id or (
+        EngagementId(library.engagement_id) if library is not None else EngagementId(new_id("eng"))
     )
+    if library is not None and str(resolved_engagement_id) != library.engagement_id:
+        raise ValueError("methodology_engagement_mismatch")
+    engagement = config.engagement.to_engagement(engagement_id=resolved_engagement_id)
     component_registration = resolve_selection(
         component_profile, registry=component_registry
     )
@@ -466,6 +481,21 @@ async def build_application(
         ),
     )
 
+    resolved_agents = agents if agents is not None else profile_components.agents
+    resolved_providers = (
+        candidate_providers
+        if candidate_providers is not None
+        else profile_components.candidate_providers
+    )
+    if library is not None:
+        if (
+            library.asset_ref not in engagement.scope.allowed_assets
+            or library.asset_ref in engagement.scope.denied_assets
+        ):
+            raise ValueError("methodology_asset_not_in_approved_scope")
+        resolved_agents, resolved_providers = wire_reference_agent(
+            library, resolved_tool_catalog, resolved_agents, resolved_providers
+        )
     deps = RuntimeDeps(
         control_plane=resolved_control_plane,
         tool_gateway=resolved_tool_gateway,
@@ -474,12 +504,9 @@ async def build_application(
         evidence_store=resolved_evidence_store,
         llm_client=resolved_llm,
         engagement=engagement,
-        agents=agents if agents is not None else profile_components.agents,
-        candidate_providers=(
-            candidate_providers
-            if candidate_providers is not None
-            else profile_components.candidate_providers
-        ),
+        agents=resolved_agents,
+        candidate_providers=resolved_providers,
+        methodology_library=library,
         verifier=verifier if verifier is not None else profile_components.verifier,
         result_mappers=(
             result_mappers
@@ -595,6 +622,7 @@ async def run_engagement(
     orchestration_config: OrchestrationConfig | None = None,
     *,
     objective: str | None = None,
+    run_id: RunId | None = None,
 ) -> RuntimeState:
     """Runs one engagement: OBSERVE -> ... -> REPLAN, looping until a
     terminal phase (instruction.md section 16, now with real re-planning).
@@ -621,9 +649,33 @@ async def run_engagement(
                 "max_retries": orchestration_config.max_retries,
             }
         )
-    run_id = RunId(new_id("run"))
+    library = deps.methodology_library
+    run_id = run_id or (RunId(library.run_id) if library is not None else RunId(new_id("run")))
+    if library is not None:
+        library.check_context(engagement.engagement_id, run_id)
+        if (
+            library.asset_ref not in engagement.scope.allowed_assets
+            or library.asset_ref in engagement.scope.denied_assets
+        ):
+            raise ValueError("methodology_asset_not_in_approved_scope")
+        if await deps.evidence_store.list_for_run(run_id):
+            raise ValueError("methodology_run_already_has_evidence_use_resume")
 
     await seed_from_engagement(AttackGraphService(deps.graph_store), engagement, run_id=run_id)
+    if library is not None:
+        from redteam.attack_graph.predicates import Confidence, Provenance
+
+        await AttackGraphService(deps.graph_store).upsert_node(
+            GraphNodeType.ASSET,
+            key=library.asset_ref,
+            attrs={"in_scope": True},
+            facts={"methodology_reference_ids": [e.reference_id for e in library.entries]},
+            provenance=Provenance(
+                source="operator:methodology",
+                run_id=str(run_id),
+                confidence=Confidence.SERVER_DECLARED,
+            ),
+        )
 
     # Task-first runtime: open a Mission and seed its initial Task Graph so the
     # Orchestrator schedules Task -> Agent, not Agent first. Additive — a run

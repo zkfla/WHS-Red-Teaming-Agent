@@ -1,0 +1,10 @@
+{
+  "asset_ref": "vdb-knowledge",
+  "engagement_id": "eng-replace-me",
+  "run_id": "run-replace-me",
+  "root": "/absolute/operator-owned/vdb-snapshot",
+  "synthetic": false,
+  "max_age_days": 7,
+  "max_results": 20,
+  "query_timeout_seconds": 5
+}

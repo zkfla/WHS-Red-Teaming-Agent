@@ -91,6 +91,8 @@ def session_header(
     session = policy.sessions.get(session_ref)
     if session is None or session.target_ref != target_ref:
         raise ToolInputError("session_ref is not bound to this target")
+    if session.allowed_paths is not None and path not in session.allowed_paths:
+        raise ToolInputError("path outside configured session allowlist")
     if session.storage_state_path:
         return {"Cookie": cookie_header(session, policy.targets[target_ref].origin, path)}
     assert session.bearer_env is not None

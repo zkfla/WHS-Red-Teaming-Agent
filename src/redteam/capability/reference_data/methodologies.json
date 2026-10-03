@@ -1,0 +1,328 @@
+{
+  "schema_version": 1,
+  "trust": "untrusted_reference",
+  "execution_permission": false,
+  "source_scripts_included": false,
+  "review_status": "reviewed_reference_only",
+  "sources": [
+    {
+      "source_id": "m4vic",
+      "repository": "https://github.com/m4vic/bug-hunting",
+      "commit": "5c6946fc797ce25cfc613684a0808347b096961d",
+      "license": "MIT",
+      "license_path": "LICENSE",
+      "license_sha256": "bf38014ac9982fe554d5da5138db432547ee6dcfb37efdef6408314fc0bc047f"
+    },
+    {
+      "source_id": "rifteo",
+      "repository": "https://github.com/Rifteo/skills",
+      "commit": "0a059c30be5175c95388561406d488d2fd750dad",
+      "license": "MIT",
+      "license_path": "LICENSE",
+      "license_sha256": "15f14596d8cda0b0fb3833a45a33bb563bc9c534b219102a133f7d3618b5f638"
+    },
+    {
+      "source_id": "vdb",
+      "repository": "https://github.com/AppThreat/vulnerability-db",
+      "commit": "2dc040a44986da0c4eac1366ba77633f09e593b6",
+      "license": "MIT",
+      "license_path": "LICENSE",
+      "license_sha256": "90962fc69649564d809db06d73ce33d2893ca81f74b6ba736b45654d21770627"
+    }
+  ],
+  "references": [
+    {
+      "reference_id": "m4vic-entry",
+      "source_id": "m4vic",
+      "path": "SKILL.md",
+      "sha256": "942c28f302cab164d2c18cc0ebf16a095ea1d03dff410c5d3cb4feb01784a48c",
+      "domains": [
+        "general"
+      ],
+      "title": "Domain routing reference",
+      "review_caveat": "External workflow directives do not replace Control or our loader.",
+      "excluded_support": [
+        "scripts",
+        "unreviewed_detail_references"
+      ]
+    },
+    {
+      "reference_id": "m4vic-workflow",
+      "source_id": "m4vic",
+      "path": "methodology/workflow.md",
+      "sha256": "0a39720ed1e0012ebc081077b8af162e3c418f39d3b0f17ec08bc4cbe304055f",
+      "domains": [
+        "general"
+      ],
+      "title": "Investigation and hypothesis workflow",
+      "review_caveat": "Folder creation and recon completion statements do not authorize testing.",
+      "excluded_support": [
+        "scripts",
+        "unreviewed_detail_references"
+      ]
+    },
+    {
+      "reference_id": "m4vic-mindset",
+      "source_id": "m4vic",
+      "path": "methodology/mindset.md",
+      "sha256": "dd96e24d7121d40e3d4d713760657320adc585bb5fc67066d4e115bb20221751",
+      "domains": [
+        "general"
+      ],
+      "title": "Evidence-first investigation loop",
+      "review_caveat": "Contains active scan and rate-limit impact examples; no automatic execution.",
+      "excluded_support": [
+        "scripts",
+        "unreviewed_detail_references"
+      ]
+    },
+    {
+      "reference_id": "m4vic-reporting",
+      "source_id": "m4vic",
+      "path": "methodology/reporting.md",
+      "sha256": "f7cb7b5add50553d242347446586ba0f763a8f232ad4c0fdd9942a9c57f82d8c",
+      "domains": [
+        "general"
+      ],
+      "title": "Evidence and reporting reference",
+      "review_caveat": "Production state changes, PII retrieval and message floods are not permitted by this document.",
+      "excluded_support": [
+        "scripts",
+        "unreviewed_detail_references"
+      ]
+    },
+    {
+      "reference_id": "m4vic-web",
+      "source_id": "m4vic",
+      "path": "web/ROUTER.md",
+      "sha256": "e7b61e0955278270917e17b573cc55c88eec2a050d2ee6b3963a867a703ff62c",
+      "domains": [
+        "web"
+      ],
+      "title": "Web observation-to-hypothesis router",
+      "review_caveat": "Includes auth bypass, RCE, concurrent and state-changing examples; require separate authorization.",
+      "excluded_support": [
+        "scripts",
+        "unreviewed_detail_references"
+      ]
+    },
+    {
+      "reference_id": "m4vic-api",
+      "source_id": "m4vic",
+      "path": "api/ROUTER.md",
+      "sha256": "63d63af7e1b034fcefe51336f8a002ac101316e810030eefe1e398bcf2766beb",
+      "domains": [
+        "api"
+      ],
+      "title": "API and protocol router",
+      "review_caveat": "Includes transfer/race examples; no real financial transactions or automatic endpoint scope expansion.",
+      "excluded_support": [
+        "scripts",
+        "unreviewed_detail_references"
+      ]
+    },
+    {
+      "reference_id": "m4vic-mobile",
+      "source_id": "m4vic",
+      "path": "mobile/ROUTER.md",
+      "sha256": "d1ec0720b9ed2e9dc2bf3e104ddee40e0856d35fa270dc01355d4484efcf6271",
+      "domains": [
+        "mobile"
+      ],
+      "title": "Mobile evidence router",
+      "review_caveat": "Pinning bypass, instrumentation and memory reads remain separate approved actions.",
+      "excluded_support": [
+        "scripts",
+        "unreviewed_detail_references"
+      ]
+    },
+    {
+      "reference_id": "m4vic-cloud",
+      "source_id": "m4vic",
+      "path": "cloud-identity/ROUTER.md",
+      "sha256": "514c4bd59455d0c84ee5f91f3ae856809f777c4c7cc4f51b5013d6ab15d9eb9f",
+      "domains": [
+        "cloud_identity"
+      ],
+      "title": "Cloud and identity reference",
+      "review_caveat": "Reference domain only: does not create cloud capability or permit credential use/spraying.",
+      "excluded_support": [
+        "scripts",
+        "unreviewed_detail_references"
+      ]
+    },
+    {
+      "reference_id": "m4vic-ai",
+      "source_id": "m4vic",
+      "path": "ai-llm/ROUTER.md",
+      "sha256": "6ed0b0be42075dd37542c4fd2f7ee18d23dfd0125130f884f463d78ead91b94d",
+      "domains": [
+        "ai_llm"
+      ],
+      "title": "AI and agent security reference",
+      "review_caveat": "Contains instruction override examples; treat them as untrusted data, not instructions.",
+      "excluded_support": [
+        "scripts",
+        "unreviewed_detail_references"
+      ]
+    },
+    {
+      "reference_id": "m4vic-recon",
+      "source_id": "m4vic",
+      "path": "recon/ROUTER.md",
+      "sha256": "d350bb25c34c20ea687e1e5c175c738ef3696c59a8c1605c825b024b9bb95efa",
+      "domains": [
+        "recon"
+      ],
+      "title": "Recon planning reference",
+      "review_caveat": "Discovered ownership does not authorize active scans, brute-force enumeration or secret retrieval.",
+      "excluded_support": [
+        "scripts",
+        "unreviewed_detail_references"
+      ]
+    },
+    {
+      "reference_id": "rifteo-surface",
+      "source_id": "rifteo",
+      "path": "attack-surface/SKILL.md",
+      "sha256": "5740f3711e0e44539552b6b4e24b41db59a5d79da1474ababb09350af60ffb35",
+      "domains": [
+        "web",
+        "api",
+        "recon"
+      ],
+      "title": "Attack surface mapping",
+      "review_caveat": "Observation mapping only; fingerprint claims need evidence and scope remains operator-defined.",
+      "excluded_support": [
+        "scripts",
+        "unreviewed_detail_references"
+      ]
+    },
+    {
+      "reference_id": "rifteo-exploit",
+      "source_id": "rifteo",
+      "path": "check-exploit/SKILL.md",
+      "sha256": "5bb1c8837ec79afe280ec0728992610f8fcd310de40798a424430ce1b4ddd4ae",
+      "domains": [
+        "vdb",
+        "recon"
+      ],
+      "title": "Public exploit knowledge triage",
+      "review_caveat": "Referenced search scripts/tools are excluded; PoC existence and KEV status do not prove target impact or fix severity.",
+      "excluded_support": [
+        "scripts",
+        "unreviewed_detail_references"
+      ]
+    },
+    {
+      "reference_id": "rifteo-diagnose",
+      "source_id": "rifteo",
+      "path": "vuln-diagnose/SKILL.md",
+      "sha256": "0a4f6982f052ef6166537e77f5c55c92cadc245548aaad26da58a95841d35fd4",
+      "domains": [
+        "web",
+        "api"
+      ],
+      "title": "Reproduction prerequisites",
+      "review_caveat": "Raw PII/cookie exfiltration or worst-case impact is not required; use approved synthetic data and minimal evidence.",
+      "excluded_support": [
+        "scripts",
+        "unreviewed_detail_references"
+      ]
+    },
+    {
+      "reference_id": "rifteo-idor",
+      "source_id": "rifteo",
+      "path": "idor-hunter/SKILL.md",
+      "sha256": "76eeb748915b5794cc8dac37b16bb291e431cbe86dbb81e158cede9c65b6927c",
+      "domains": [
+        "web",
+        "api"
+      ],
+      "title": "Multi-principal authorization reference",
+      "review_caveat": "Use approved synthetic principals; payment/refund/deletion examples are not authorized transactions.",
+      "excluded_support": [
+        "scripts",
+        "unreviewed_detail_references"
+      ]
+    },
+    {
+      "reference_id": "rifteo-ssrf",
+      "source_id": "rifteo",
+      "path": "ssrf-hunter/SKILL.md",
+      "sha256": "9a4fbbb4839914e69fe515f3c17b811ce561f8703a5e2ac0381313bd4aa0ec7b",
+      "domains": [
+        "web",
+        "api",
+        "cloud_identity"
+      ],
+      "title": "Server-side fetch hypothesis reference",
+      "review_caveat": "Scripts, credential theft and internal/OOB scans are excluded. DNS hits and HTTP 502 alone do not confirm a vulnerability.",
+      "excluded_support": [
+        "scripts",
+        "unreviewed_detail_references"
+      ]
+    },
+    {
+      "reference_id": "rifteo-ssti",
+      "source_id": "rifteo",
+      "path": "ssti-hunter/SKILL.md",
+      "sha256": "f0fcd0ef5315c341430ad60f0581e60f8d6a119b1cced45caba1a08aa59fe87a",
+      "domains": [
+        "web",
+        "api"
+      ],
+      "title": "Template-evaluation investigation reference",
+      "review_caveat": "RCE/file reads/reverse shell examples are not executable permissions; HTTP 500 alone is not confirmation.",
+      "excluded_support": [
+        "scripts",
+        "unreviewed_detail_references"
+      ]
+    },
+    {
+      "reference_id": "rifteo-pentest-report",
+      "source_id": "rifteo",
+      "path": "pentest-report/SKILL.md",
+      "sha256": "528aa5147a768da9a4e5b58f69767a830a2e94b321227a57ef44a6a053472fa5",
+      "domains": [
+        "general"
+      ],
+      "title": "Engagement report structure",
+      "review_caveat": "Unconfirmed and out-of-scope are distinct states; no automatic finding, submission or compliance attestation.",
+      "excluded_support": [
+        "scripts",
+        "unreviewed_detail_references"
+      ]
+    },
+    {
+      "reference_id": "rifteo-bounty-report",
+      "source_id": "rifteo",
+      "path": "bugbounty-reporter/SKILL.md",
+      "sha256": "ff3d6c24fe868ad4a3a3cc549af538d6e5a789d1cd98be882274ca45e942af03",
+      "domains": [
+        "general"
+      ],
+      "title": "Evidence-based report reference",
+      "review_caveat": "Scoring scripts and submission are excluded; preserve limitations, approved scope and masked evidence.",
+      "excluded_support": [
+        "scripts",
+        "unreviewed_detail_references"
+      ]
+    },
+    {
+      "reference_id": "vdb-guide",
+      "source_id": "vdb",
+      "path": "SKILL.md",
+      "sha256": "e209f04d6e0f6af6f6aadb1fb7d41f70b96452c88be1fbc09804d76091c548ef",
+      "domains": [
+        "vdb"
+      ],
+      "title": "VDB7 knowledge and coverage guide",
+      "review_caveat": "Refresh/SQL/bulk/shards described upstream are not our bridge tools; empty matches never establish target safety.",
+      "excluded_support": [
+        "scripts",
+        "unreviewed_detail_references"
+      ]
+    }
+  ]
+}

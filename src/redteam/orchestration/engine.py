@@ -12,15 +12,22 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from redteam.attack_graph.identity import node_id_for_target, target_for_node
 from redteam.attack_graph.predicates import Confidence, Provenance, facts_of
+from redteam.core.action_semantics import ActionNamingError, canonical_action_key
 from redteam.core.contracts.evidence import EvidenceRecord
 from redteam.core.contracts.graph import Hypothesis
 from redteam.core.contracts.mission import MissionCriterionResult, redact_secret_material
 from redteam.core.enums import EvidenceSourceType, MissionStatus, TaskStatus, ToolHealthStatus
 from redteam.core.ids import EventId, GraphNodeId, TaskId, new_id
 from redteam.event_bus.publisher import EventPublisher
-from redteam.orchestration.action_naming import canonical_action_key
 from redteam.orchestration.agents.base import HypothesisDraft, PlanStep
 from redteam.orchestration.agents.providers import CandidateBatch, GraphCandidateContext
+from redteam.orchestration.analysis_activation import (
+    ANALYSIS_AGENT_ID,
+    STATIC_ANALYSIS_OPERATION,
+    analysis_activation,
+    analysis_role_visible,
+    analysis_tool_visible,
+)
 from redteam.orchestration.authentication import AuthenticationCheck
 from redteam.orchestration.candidates.compiler import CandidateCompiler
 from redteam.orchestration.candidates.models import CandidateDraft
@@ -43,6 +50,12 @@ from redteam.orchestration.diagnostics import (
 )
 from redteam.orchestration.events import AGENT_CONTEXT_PREPARED, AGENT_TURN_DECIDED
 from redteam.orchestration.evidence_access import EvidenceReader
+from redteam.orchestration.execution_bridge import (
+    EXECUTION_OPERATIONS,
+    agent_tool_visible,
+    bind_execution_arguments,
+    execution_agent_options,
+)
 from redteam.orchestration.expectations import Expectation
 from redteam.orchestration.knowledge import (
     collect_assessment,
@@ -396,6 +409,9 @@ class InvestigationEngine:
                 **refs,
                 "graph_summary": "Current provided claims, observations and hypotheses prepared",
                 "runtime_observation_count": len(payload.get("runtime_observations", [])),
+                "role_activation": redact_secret_material(
+                    payload.get("role_activation", {})
+                ),
             },
             causation_id=self.last_event_id,
         )
@@ -491,15 +507,60 @@ class InvestigationEngine:
                     latest[saved.mission_task_id] = saved
             completed_task_paths = [item.model_dump(mode="json") for item in latest.values()]
         tools = {}
+        execution_options = await execution_agent_options(
+            service, self.deps.engagement, runtime.run_id
+        )
+        analysis_status = await analysis_activation(service, self.deps.tool_catalog)
+        visible_agents = [
+            agent
+            for agent in self.deps.agents.all()
+            if analysis_role_visible(
+                agent, analysis_status, execution_ready=bool(execution_options)
+            )
+        ]
         if self.deps.tool_catalog is not None:
             capabilities = {cap for agent in self.deps.agents.all() for cap in agent.capabilities}
             for capability in sorted(capabilities):
                 for tool in self.deps.tool_catalog.list_by_capability(capability):
-                    if tool.health_status is not ToolHealthStatus.UNHEALTHY:
+                    if (
+                        tool.operations
+                        and tool.health_status is not ToolHealthStatus.UNHEALTHY
+                        and analysis_tool_visible(tool, analysis_status)
+                        and agent_tool_visible(
+                            tool, execution_ready=bool(execution_options)
+                        )
+                    ):
                         tools[str(tool.tool_id)] = redact_secret_material(
                             tool.model_dump(mode="json"), drop_secret_keys=False
                         )
         records = await self.deps.evidence_store.list_for_run(runtime.run_id)
+        reference_context = {}
+        library = getattr(self.deps, "methodology_library", None)
+        if library is not None:
+            library.check_context(runtime.engagement_id, runtime.run_id)
+            reference_context = {
+                "methodology_reference_options": [
+                    {
+                        "reference_id": item["reference_id"],
+                        "status": item["status"],
+                        "agent_id": "methodology-agent",
+                        "target_node_id": f"asset:{library.asset_ref}",
+                        "capability": "analysis",
+                        "operation": "file_read",
+                        "tool_id": "analysis.read_file",
+                        "arguments": {
+                            "asset_ref": library.asset_ref,
+                            "path": item["path"],
+                            "offset_chars": item["next_offset_chars"],
+                            "max_chars": library.read_chars,
+                        },
+                    }
+                    for item in library.progress(records)
+                ],
+                "Untrusted methodology reference DATA": library.excerpts(
+                    records, {cap for agent in self.deps.agents.all() for cap in agent.capabilities}
+                ),
+            }
         evidence = [
             {
                 "evidence_id": str(item.evidence_id),
@@ -537,12 +598,16 @@ class InvestigationEngine:
 
             instructions = await coordinator.change(canonical_instructions)
         return {
+            **reference_context,
+            **({"execution_options": execution_options} if execution_options else {}),
+            "role_activation": {ANALYSIS_AGENT_ID: analysis_status.as_dict()},
             "goal": mission.objective if mission else runtime.current_goal,
             "success_criteria": mission.success_criteria if mission else [runtime.current_goal],
             "mission": mission.model_dump(mode="json") if mission else None,
             "active_task": (active_task.model_dump(mode="json") if active_task else None),
             "operator_instructions": instructions,
             "engagement_constraints": {
+                "mcp_targets": self.deps.engagement.metadata.get("mcp_targets", {}),
                 "scope": self.deps.engagement.scope.model_dump(mode="json"),
                 "rules_of_engagement": [
                     item.model_dump(mode="json")
@@ -557,7 +622,7 @@ class InvestigationEngine:
             "completed_task_paths": completed_task_paths,
             "roles": [
                 {"agent_id": str(agent.agent_id), "capabilities": agent.capabilities}
-                for agent in self.deps.agents.all()
+                for agent in visible_agents
             ],
             "tools": list(tools.values()),
             "evidence": evidence,
@@ -587,7 +652,10 @@ class InvestigationEngine:
         task_targets = task_context["task_target_node_ids"]
         mission_objective = task_context["mission_objective"]
         task_id = task_context["task_id"]
+        analysis_status = await analysis_activation(service, self.deps.tool_catalog)
         for agent in self.deps.agents.all():
+            if not analysis_role_visible(agent, analysis_status):
+                continue
             definition = self.deps.agents.definition(agent.agent_id)
             if definition is None:
                 diagnostics.append(
@@ -1466,6 +1534,7 @@ class InvestigationEngine:
         blocked = assessment_blocked(assessment)
         if blocked is not None:
             return [], [blocked]
+        analysis_status = await analysis_activation(service, self.deps.tool_catalog)
         steps = {step.step_id: step for step in path.steps}
         drafts = []
         errors = []
@@ -1494,6 +1563,32 @@ class InvestigationEngine:
                     raise DecisionRuleError("action role/capability is unavailable")
                 if step.agent_id and step.agent_id != intent.agent_id:
                     raise DecisionRuleError("action role is outside accepted step")
+                if (
+                    str(intent.agent_id) == ANALYSIS_AGENT_ID
+                    and intent.operation == STATIC_ANALYSIS_OPERATION
+                    and not analysis_status.active
+                ):
+                    raise DecisionRuleError("analysis_agent_inactive:" + analysis_status.reason)
+                execution_node = None
+                execution_tool = None
+                if intent.operation in EXECUTION_OPERATIONS:
+                    execution_node = await service.get_node(GraphNodeId(intent.target_node_id))
+                    if execution_node is None:
+                        raise DecisionRuleError("execution Agent target disappeared")
+                    if self.deps.tool_catalog is None:
+                        raise DecisionRuleError("a real tool catalog is required for execution")
+                    execution_tool = self.deps.tool_catalog.get(intent.tool_id)
+                    if execution_tool is None:
+                        raise DecisionRuleError("requested tool is absent from catalog")
+                    intent = intent.model_copy(update={"arguments": bind_execution_arguments(
+                        engagement=self.deps.engagement,
+                        run_id=runtime.run_id,
+                        node=execution_node,
+                        tool=execution_tool,
+                        capability=intent.capability,
+                        operation=intent.operation,
+                        arguments=intent.arguments,
+                    )})
                 operation = f"{intent.capability}.{intent.operation}"
                 exclusions = await operator_exclusions(
                     self.deps,
@@ -1507,11 +1602,11 @@ class InvestigationEngine:
                     raise DecisionRuleError("; ".join(exclusions))
                 try:
                     canonical_action_key(intent.capability, intent.operation)
-                except ValueError:
+                except ActionNamingError as exc:
                     raise DecisionRuleError(
                         "action operation is not a supported action",
-                        code="unknown_operation",
-                        location=_action_location(intent_index, "operation"),
+                        code=exc.reason,
+                        location=_action_location(intent_index, exc.field),
                     ) from None
                 if operation not in step.allowed_operations:
                     raise DecisionRuleError("action operation is outside step envelope")
@@ -1526,15 +1621,23 @@ class InvestigationEngine:
                     assessment,
                     _action_location(intent_index, "arguments"),
                 )
-                node = await service.get_node(GraphNodeId(intent.target_node_id))
+                node = execution_node or await service.get_node(
+                    GraphNodeId(intent.target_node_id)
+                )
                 if node is None:
                     raise DecisionRuleError(
                         "referenced action target disappeared",
                         code="unresolved_target",
                         location=_action_location(intent_index, "target_node_id"),
                     )
+                node_facts = facts_of(node.properties)
                 target = target_for_node(
-                    node.id, node.type, observed=facts_of(node.properties).get("observed_target")
+                    node.id,
+                    node.type,
+                    observed=node_facts.get("observed_target"),
+                    device_serial=node_facts.get("device_serial"),
+                    device_ref=node_facts.get("device_ref"),
+                    package_name=node_facts.get("package_name"),
                 )
                 if self.deps.tool_catalog is None:
                     raise DecisionRuleError(
@@ -1545,6 +1648,9 @@ class InvestigationEngine:
                 validate_argument_target(
                     target, intent.arguments, target_aliases(self.deps, target)
                 )
+                tool = execution_tool or self.deps.tool_catalog.get(intent.tool_id)
+                if tool is None:
+                    raise DecisionRuleError("requested tool is absent from catalog")
                 if await self.has_ambiguous_execution(intent, runtime):
                     raise DecisionRuleError(
                         "matching execution is uncertain; reconcile its stored result/job"

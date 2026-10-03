@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 from mcp import Client
 
+from redteam.app.cli.commands.validate import check_roe
 from redteam.capability.adapters.mcp.transport import StdioMCPTransport
 from redteam.capability.mobile_analysis_manifest import (
     MOBILE_ANALYSIS_TOOLS,
@@ -20,9 +21,11 @@ from redteam.capability.servers.analysis import AnalysisServerPolicy
 from redteam.capability.servers.analysis import create_server as create_analysis_server
 from redteam.capability.servers.mobile import MobileDiagnosticsPolicy
 from redteam.capability.servers.mobile import create_server as create_mobile_server
+from redteam.core.config import load_app_config
 from redteam.core.contracts.tool import ToolDescriptor
 from redteam.core.enums import RiskLevel
 from redteam.core.ids import ToolId
+from redteam.orchestration.settings import OrchestrationSettings
 
 
 def test_example_bindings_match_manifest() -> None:
@@ -49,6 +52,62 @@ def test_example_bindings_match_manifest() -> None:
         }
         if f"{prefix}_ALLOWED_TOOLS_JSON" in settings:
             assert set(json.loads(settings[f"{prefix}_ALLOWED_TOOLS_JSON"])) == set(bindings)
+
+
+def test_mobile_next_image_pins_verified_runtime() -> None:
+    dockerfile = (
+        Path(__file__).resolve().parents[2]
+        / "deploy"
+        / "docker"
+        / "mobile-next-mcp"
+        / "Dockerfile"
+    ).read_text(encoding="utf-8")
+
+    assert "FROM node:22-slim" in dockerfile
+    assert "ARG MOBILE_MCP_VERSION=1.0.4" in dockerfile
+    assert '@mobilenext/mobile-mcp@latest' not in dockerfile
+    assert 'ENTRYPOINT ["mcp-server-mobile", "--listen", "0.0.0.0:3000"]' in dockerfile
+
+
+def test_manifest_declares_device_targets_only_for_mobile_next() -> None:
+    assert {
+        spec.target_type for spec in MOBILE_ANALYSIS_TOOLS["mobile-next"]
+    } == {"device"}
+    assert {
+        spec.target_type
+        for server_id, specs in MOBILE_ANALYSIS_TOOLS.items()
+        if server_id != "mobile-next"
+        for spec in specs
+    } == {"asset"}
+
+
+def test_mobile_analysis_app_registers_installed_candidates() -> None:
+    app_path = (
+        Path(__file__).resolve().parents[2]
+        / "deploy"
+        / "mcp"
+        / "mobile-analysis"
+        / "app.yaml"
+    )
+    config = load_app_config(app_path)
+
+    assert config.engagement.scope.allowed_assets == ["insecurebankv2"]
+    assert config.engagement.metadata["asset_ref"] == "/work/InsecureBankv2.apk"
+    assert config.engagement.metadata["device_serial"] == "emulator-5554"
+    assert config.engagement.metadata["device_ref"] == "redteam_x86"
+    assert config.engagement.metadata["package_name"] == "com.android.insecurebankv2"
+    assert config.engagement.rules_of_engagement[0].allowed_operations == [
+        "analysis.static_analysis",
+        "mobile.app_launch",
+        "mobile.response_analysis",
+    ]
+    assert check_roe(config.engagement) == []
+    assert config.capability.mcp_servers == ["apktool", "jadx", "mobile-next"]
+    assert config.orchestration.tool_timeout_seconds == 180
+    assert (
+        OrchestrationSettings.from_config(config.orchestration).tool_timeout_seconds
+        == 180
+    )
 
 
 @pytest.mark.parametrize("server_id", ["mobile-local", "analysis-local"])
@@ -78,7 +137,7 @@ async def test_local_manifest_matches_mcp_discovery(server_id: str, tmp_path: Pa
         validate_discovered_schema(spec, tool.input_schema, tool.output_schema)
 
 
-@pytest.mark.parametrize("server_id", ["mobile-next", "apktool"])
+@pytest.mark.parametrize("server_id", ["mobile-next", "apktool", "jadx"])
 async def test_external_manifest_matches_live_mcp_discovery(server_id: str) -> None:
     """Opt-in check against an installed external candidate, without a device/APK call."""
 

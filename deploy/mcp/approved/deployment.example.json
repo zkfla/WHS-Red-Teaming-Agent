@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "policy": {
+    "targets": {
+      "bank-test": {
+        "origin": "http://127.0.0.1:8080",
+        "allowed_paths": ["/", "/api/accounts/test-alice", "/openapi.json"],
+        "allowed_methods": ["GET", "HEAD", "OPTIONS"]
+      }
+    },
+    "allowed_networks": ["127.0.0.1/32"],
+    "sessions": {
+      "alice": {"target_ref": "bank-test", "principal_ref": "test-alice", "bearer_env": "TEST_ALICE"},
+      "bob": {"target_ref": "bank-test", "principal_ref": "test-bob", "bearer_env": "TEST_BOB"}
+    }
+  },
+  "host_bindings": {"127.0.0.1": "bank-test"},
+  "session_access": {
+    "alice": {"paths": ["/api/accounts/test-alice"], "expected_access": "allow"},
+    "bob": {"paths": ["/api/accounts/test-alice"], "expected_access": "deny"}
+  },
+  "roles": ["web-http", "recon-passive"]
+}

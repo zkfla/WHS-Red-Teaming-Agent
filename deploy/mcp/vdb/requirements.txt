@@ -1,0 +1,2 @@
+# Read-only backend source pin; no upstream MCP startup/lifespan used.
+appthreat-vulnerability-db @ git+https://github.com/AppThreat/vulnerability-db.git@2dc040a44986da0c4eac1366ba77633f09e593b6

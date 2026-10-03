@@ -34,8 +34,6 @@ from redteam.orchestration.runtime_observation import (
 )
 from redteam.orchestration.state import GraphState
 
-DEFAULT_TIMEOUT_SECONDS = 10.0
-
 # Risk LOW alone says nothing about idempotency (a low-risk auth attempt or
 # upload can still mutate state). Until Capability has an explicit retry-safe
 # descriptor contract, only known observation operations may be repeated.
@@ -183,7 +181,7 @@ async def execute_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
         proposal,
         decision,
         tool_id=step.tool_id,
-        timeout_seconds=DEFAULT_TIMEOUT_SECONDS,
+        timeout_seconds=deps.settings.tool_timeout_seconds,
         correlation_id=correlation_id,
     )
 

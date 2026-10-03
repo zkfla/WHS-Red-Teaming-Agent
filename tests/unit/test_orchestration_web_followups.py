@@ -16,7 +16,13 @@ from redteam.core.contracts.graph import Hypothesis
 from redteam.core.enums import GraphNodeType
 from redteam.orchestration.agents.builtin import WEB_API_AGENT
 from redteam.orchestration.agents.providers import GraphCandidateContext
-from redteam.orchestration.agents.web import WEB_COMPARE_ANONYMOUS, WebCandidateProvider
+from redteam.orchestration.agents.web import (
+    WEB_BROWSER_NAVIGATE,
+    WEB_COMPARE_ANONYMOUS,
+    WEB_NUCLEI_RESPONSE_CHECK,
+    WEB_PROXY_LIST_FLOWS,
+    WebCandidateProvider,
+)
 from redteam.orchestration.authentication import request_key
 from redteam.orchestration.candidates.compiler import candidate_key
 
@@ -80,6 +86,8 @@ async def endpoint_graph(*, observations=(), sessions=()):
             "host": HOST,
             "path": PATH,
             "method": "GET",
+            "scheme": "http",
+            "port": 80,
             "observed_target": PATH,
             "observations": list(observations),
         },
@@ -87,7 +95,7 @@ async def endpoint_graph(*, observations=(), sessions=()):
     return service
 
 
-async def propose(service, *, operations=(), verified=False):
+async def propose(service, *, operations=(), tool_ids=(), verified=False):
     view = service.view()
     observation = await service.observe(step=1)
     context = GraphCandidateContext(
@@ -95,6 +103,7 @@ async def propose(service, *, operations=(), verified=False):
         observation=observation,
         step=1,
         available_operations=tuple(operations),
+        available_tool_ids=tuple(tool_ids),
         operations_verified=verified,
     )
     return await WebCandidateProvider().propose_graph(WEB_API_AGENT, context)
@@ -357,3 +366,48 @@ async def test_without_a_catalog_the_declared_binding_is_still_trusted() -> None
     batch = await propose(service, operations=(), verified=False)
 
     assert followups(batch, step_prefix="compare-anonymous:")
+
+
+async def test_browser_navigation_is_offered_only_for_an_observed_http_url() -> None:
+    service = await endpoint_graph(observations=[http_observation(200)])
+
+    batch = await propose(
+        service,
+        tool_ids=(str(WEB_BROWSER_NAVIGATE),),
+        verified=True,
+    )
+
+    navigation = followups(batch, step_prefix="browser-navigate:")
+    assert len(navigation) == 1
+    assert navigation[0].plan_step.arguments == {"url": "http://a.local/orders/1"}
+    assert navigation[0].plan_step.tool_id == WEB_BROWSER_NAVIGATE
+
+
+async def test_proxy_history_is_a_read_only_host_observation_candidate() -> None:
+    service = await endpoint_graph()
+
+    batch = await propose(
+        service,
+        tool_ids=(str(WEB_PROXY_LIST_FLOWS),),
+        verified=True,
+    )
+
+    history = followups(batch, step_prefix="proxy-history:")
+    assert len(history) == 1
+    assert history[0].plan_step.arguments == {"target_ref": HOST, "limit": 50}
+    assert history[0].plan_step.operation == "response_analysis"
+
+
+async def test_nuclei_passive_check_is_offered_after_an_observed_response() -> None:
+    service = await endpoint_graph(observations=[http_observation(200)])
+
+    batch = await propose(
+        service,
+        tool_ids=(str(WEB_NUCLEI_RESPONSE_CHECK),),
+        verified=True,
+    )
+
+    checks = followups(batch, step_prefix="nuclei-passive:")
+    assert len(checks) == 1
+    assert checks[0].plan_step.arguments["check_id"] == "missing-csp"
+    assert checks[0].plan_step.tool_id == WEB_NUCLEI_RESPONSE_CHECK

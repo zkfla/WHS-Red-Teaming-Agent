@@ -6,11 +6,12 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import yaml
 from mcp import Client
 
 from redteam.capability.servers import nuclei, zap
 from redteam.capability.servers.config import ServerPolicy
-from redteam.capability.servers.network import CapturedResponse
+from redteam.capability.servers.network import CapturedResponse, ResolvedTarget
 
 
 def policy() -> ServerPolicy:
@@ -106,3 +107,140 @@ async def test_nuclei_cancellation_kills_engine(monkeypatch: pytest.MonkeyPatch,
     with pytest.raises(asyncio.CancelledError):
         await task
     assert process.killed
+
+
+async def test_nuclei_active_probe_uses_allowlisted_path_query_and_pinned_address(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    active_policy = ServerPolicy.model_validate({
+        "targets": {
+            "bank": {
+                "origin": "https://bank.test:8443",
+                "allowed_paths": ["/search"],
+                "allowed_query_keys": {"/search": ["term"]},
+            }
+        },
+        "allowed_networks": ["192.0.2.0/24"],
+        "active_enabled": True,
+    })
+    profile = active_policy.targets["bank"]
+    calls: list[dict[str, Any]] = []
+
+    async def resolve(_policy: ServerPolicy, target_ref: str) -> ResolvedTarget:
+        assert target_ref == "bank"
+        return ResolvedTarget(profile, "bank.test", 8443, ("192.0.2.10",))
+
+    async def engine(
+        binary: str,
+        directory: Path,
+        **kwargs: Any,
+    ) -> bytes:
+        calls.append(kwargs)
+        template = yaml.safe_load((directory / "active-check.yaml").read_text())
+        assert template["http"][0]["path"] == [
+            "{{BaseURL}}?term=redteam_capability_reflection_probe_7f3a"
+        ]
+        assert binary == "/test/nuclei"
+        return b'{"template-id":"bounded-reflected-query-marker"}\n'
+
+    monkeypatch.setattr(nuclei.shutil, "which", lambda _: "/test/nuclei")
+    monkeypatch.setattr(nuclei, "resolve_target", resolve)
+    monkeypatch.setattr(nuclei, "_run_active_engine", engine)
+    async with Client(nuclei.create_server(active_policy)) as client:
+        result = await client.call_tool("nuclei_active_query_probe", {
+            "target_ref": "bank",
+            "path": "/search",
+            "query_key": "term",
+        })
+
+    assert result.structured_content is not None
+    assert result.structured_content["matched"] is True
+    assert result.structured_content["request_count"] == 1
+    assert result.structured_content["verdict"] == "observation_only"
+    assert calls == [{
+        "target_url": "https://192.0.2.10:8443/search",
+        "host_header": "bank.test:8443",
+        "sni_hostname": "bank.test",
+        "timeout": 15.0,
+    }]
+
+
+async def test_nuclei_active_engine_disables_redirect_retry_oast_and_updates(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    class Process:
+        returncode: int | None = None
+        stdout: Any
+
+        def __init__(self) -> None:
+            self.chunks = [b'{"template-id":"bounded-reflected-query-marker"}\n', b""]
+
+        async def read(self, count: int) -> bytes:
+            return self.chunks.pop(0)
+
+        async def wait(self) -> None:
+            self.returncode = 0
+
+        def kill(self) -> None:
+            self.returncode = -9
+
+    process = Process()
+    process.stdout = process
+    captured: dict[str, Any] = {}
+
+    async def spawn(*args: Any, **kwargs: Any) -> Process:
+        captured["args"] = args
+        captured["env"] = kwargs["env"]
+        return process
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
+    output = await nuclei._run_active_engine(
+        "nuclei",
+        tmp_path,
+        target_url="https://192.0.2.10:8443/search",
+        host_header="bank.test:8443",
+        sni_hostname="bank.test",
+        timeout=1,
+    )
+
+    args = captured["args"]
+    assert output.startswith(b'{"template-id"')
+    assert ("-u", "https://192.0.2.10:8443/search") == args[1:3]
+    assert "Host: bank.test:8443" in args
+    assert all(flag in args for flag in ("-dr", "-ni", "-duc", "-retries", "-sni"))
+    assert args[args.index("-retries") + 1] == "0"
+    assert args[args.index("-rate-limit") + 1] == "1"
+    assert captured["env"]["DISABLE_NUCLEI_TEMPLATES_PUBLIC_DOWNLOAD"] == "true"
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        {"target_ref": "bank", "path": "/", "query_key": "probe"},
+        {
+            "target_ref": "bank",
+            "path": "/",
+            "query_key": "probe",
+            "check_id": "community-template",
+        },
+    ],
+)
+async def test_nuclei_active_probe_fails_before_engine_when_disabled_or_unreviewed(
+    monkeypatch: pytest.MonkeyPatch,
+    arguments: dict[str, str],
+) -> None:
+    called = False
+
+    async def engine(*args: Any, **kwargs: Any) -> bytes:
+        nonlocal called
+        called = True
+        return b""
+
+    monkeypatch.setattr(nuclei.shutil, "which", lambda _: "/test/nuclei")
+    monkeypatch.setattr(nuclei, "_run_active_engine", engine)
+    async with Client(nuclei.create_server(policy())) as client:
+        result = await client.call_tool("nuclei_active_query_probe", arguments)
+
+    assert result.is_error
+    assert called is False

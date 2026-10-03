@@ -98,6 +98,10 @@ class GraphCandidateContext:
     #: them in the live catalog. Only meaningful together with
     #: operations_verified.
     available_operations: tuple[tuple[str, str], ...] = ()
+    #: Concrete healthy ToolIds in the live catalog.  Operations alone are
+    #: intentionally not enough when several adapters implement the same
+    #: intent (for example HTTPX and a browser navigator).
+    available_tool_ids: tuple[str, ...] = ()
     #: Redacted, bounded metadata for the live MCP tools behind
     #: ``available_operations``. This lets an LLM choose arguments/tool ids
     #: from reality instead of guessing from an operation name.
@@ -124,6 +128,9 @@ class GraphCandidateContext:
     #: Redacted operator guidance that should influence strategy without ever
     #: expanding the set of known targets or bypassing candidate compilation.
     operator_guidance: tuple[str, ...] = ()
+    #: Trusted deployment metadata/progress; document bodies remain untrusted data.
+    methodology_progress: tuple[Mapping[str, Any], ...] = ()
+    methodology_excerpts: tuple[Mapping[str, Any], ...] = ()
 
     def can_execute(self, capability: str, operation: str) -> bool:
         """Whether a candidate for this action could actually be executed.
@@ -138,12 +145,19 @@ class GraphCandidateContext:
             return True
         return (capability, operation) in self.available_operations
 
+    def has_tool(self, tool_id: str) -> bool:
+        """Whether a concrete tool is available in a verified live catalog."""
+
+        return self.operations_verified and tool_id in self.available_tool_ids
+
 
 def planning_fingerprint(
     *,
     observation: GraphObservation,
     available_operations: Iterable[tuple[str, str]] = (),
+    available_tool_ids: Iterable[str] = (),
     prior_candidate_keys: Iterable[str] = (),
+    reference_digests: Iterable[str] = (),
 ) -> str:
     """Stable digest of what a planning turn could actually have planned from.
 
@@ -164,8 +178,11 @@ def planning_fingerprint(
         "findings": observation.findings,
         "attempted": observation.attempted,
         "available_operations": sorted([list(item) for item in available_operations]),
+        "available_tool_ids": sorted(available_tool_ids),
         "prior_candidate_keys": sorted(prior_candidate_keys),
     }
+    if reference_digests:
+        payload["reference_digests"] = sorted(reference_digests)
     encoded = json.dumps(payload, sort_keys=True, default=str, separators=(",", ":")).encode()
     return hashlib.sha256(encoded).hexdigest()[:24]
 

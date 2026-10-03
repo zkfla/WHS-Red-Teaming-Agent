@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import yaml
-from pydantic import BaseModel, Field, TypeAdapter
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 
 from redteam.core.contracts.engagement import (
     ApprovalPolicy,
@@ -113,6 +113,7 @@ class OrchestrationConfig(BaseModel):
     """
     max_retries: int = Field(default=3, ge=0)
     max_steps: int = Field(default=50, ge=1)
+    tool_timeout_seconds: float = Field(default=10.0, gt=0, le=600)
     #: Legacy opt-in name retained for compatibility; not a mode switch.
     #: Planning is always LLM-led — False (or "false") fails validation
     #: instead of selecting a rule path.
@@ -133,8 +134,33 @@ class OrchestrationConfig(BaseModel):
         return cls.model_validate(values)
 
 
+class MethodologyConfig(BaseModel):
+    """Explicit operator-owned reference deployment, never Agent input."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    workspace_policy_path: str = Field(min_length=1, max_length=4096)
+    bundle_policy_path: str = Field(min_length=1, max_length=4096)
+    prefix: str = Field(min_length=1, max_length=256)
+    reference_ids: tuple[str, ...] = Field(min_length=1, max_length=3)
+    read_chars: int = Field(default=8192, ge=256, le=16384)
+    max_context_chars: int = Field(default=12000, ge=256, le=24000)
+
+    @classmethod
+    def from_environment(cls) -> MethodologyConfig | None:
+        value = os.environ.get("REDTEAM_METHODOLOGY_CONFIG_JSON")
+        if value is None:
+            return None
+        if not value.strip() or len(value) > 16384:
+            raise ValueError("methodology_config_invalid")
+        try:
+            return cls.model_validate_json(value)
+        except ValueError:
+            raise ValueError("methodology_config_invalid") from None
+
+
 class CapabilityConfig(BaseModel):
     mcp_servers: list[str] = Field(default_factory=list)
+    methodology: MethodologyConfig | None = None
 
 
 class LoggingConfig(BaseModel):

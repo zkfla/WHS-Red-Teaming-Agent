@@ -65,12 +65,9 @@ async def test_real_streamable_http_discovery_and_invocation(
         await _wait_for_server(process, port)
         monkeypatch.setenv("REDTEAM_MCP_WEB_EXAMPLE_KIND", "web_api")
         monkeypatch.setenv(
-            "REDTEAM_MCP_WEB_EXAMPLE_TOOL_OPERATIONS_JSON",
-            '{"ping": ["service_discovery"]}',
+            "REDTEAM_MCP_WEB_EXAMPLE_TOOL_OPERATIONS_JSON", '{"ping":["service_discovery"]}'
         )
-        monkeypatch.setenv(
-            "REDTEAM_MCP_WEB_EXAMPLE_ENDPOINT", f"http://127.0.0.1:{port}/mcp"
-        )
+        monkeypatch.setenv("REDTEAM_MCP_WEB_EXAMPLE_ENDPOINT", f"http://127.0.0.1:{port}/mcp")
         config = load_app_config(repository_root / "examples/app.yaml")
         config.capability.mcp_servers = ["web-example"]
         _, deps = await build_application(config, llm=FakeLLMClient(), evidence_dir=tmp_path)

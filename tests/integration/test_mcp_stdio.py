@@ -37,6 +37,7 @@ async def test_all_adapter_kinds_support_real_stdio_discovery_and_invocation(
     monkeypatch.setenv(f"{prefix}_TRANSPORT", "stdio")
     monkeypatch.setenv(f"{prefix}_COMMAND", sys.executable)
     monkeypatch.setenv(f"{prefix}_ARGS_JSON", json.dumps([str(server_path)]))
+    monkeypatch.setenv(f"{prefix}_TOOL_OPERATIONS_JSON", '{"ping":["service_discovery"]}')
     monkeypatch.setenv(f"{prefix}_PASSTHROUGH_ENV", "MCP_EXAMPLE_TRANSPORT")
     monkeypatch.setenv(f"{prefix}_TOOL_OPERATIONS_JSON", '{"ping": ["service_discovery"]}')
     monkeypatch.setenv("MCP_EXAMPLE_TRANSPORT", "stdio")

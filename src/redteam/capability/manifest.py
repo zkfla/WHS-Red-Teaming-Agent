@@ -8,17 +8,18 @@ does not execute a tool or decide whether an action is allowed.
 
 from __future__ import annotations
 
-import re
 from typing import Any
 
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import SchemaError
 
 from redteam.capability.settings import MCPConfigurationError
-from redteam.core.action_semantics import CANONICAL_CAPABILITIES, CANONICAL_OPERATIONS
+from redteam.core.action_semantics import (
+    CANONICAL_CAPABILITIES,
+    ActionNamingError,
+    canonical_action_key,
+)
 from redteam.core.contracts.tool import ToolDescriptor
-
-_CANONICAL_OPERATION = re.compile(r"^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$")
 
 # These are graph/target kinds understood by the shared Core contracts.  A
 # server may advertise fewer kinds, but an unknown kind would be invisible to
@@ -56,6 +57,14 @@ def validate_tool_manifest(descriptor: ToolDescriptor) -> None:
         _validate_schema(descriptor.output_schema, f"{prefix} output schema")
     _validate_required_arguments(descriptor.input_schema, prefix)
     _validate_operations(descriptor.operations, prefix)
+    namespace = str(descriptor.tool_id).partition(".")[0]
+    for operation in descriptor.operations:
+        try:
+            canonical_action_key(namespace, operation)
+        except ActionNamingError as exc:
+            raise MCPConfigurationError(
+                f"{prefix} (server {descriptor.server_id!r}): {exc.reason}: {exc}"
+            ) from exc
     _validate_target_types(descriptor.target_types, prefix)
 
 
@@ -107,16 +116,10 @@ def _validate_required_arguments(schema: dict[str, Any], prefix: str) -> None:
 
 def _validate_operations(operations: list[str], prefix: str) -> None:
     if len(operations) != len(set(operations)) or any(
-        not isinstance(operation, str) or not _CANONICAL_OPERATION.fullmatch(operation)
-        for operation in operations
+        not isinstance(operation, str) for operation in operations
     ):
         raise MCPConfigurationError(
             f"{prefix} operations must be unique lower_snake_case values"
-        )
-    unknown = [operation for operation in operations if operation not in CANONICAL_OPERATIONS]
-    if unknown:
-        raise MCPConfigurationError(
-            f"{prefix} operations are not canonical actions: {', '.join(unknown)}"
         )
 
 

@@ -4,6 +4,9 @@
 
 HTTP query/header, 브라우저 cookie snapshot 재사용, 선택적인 ZAP 실시간 캡처 조회와
 Nuclei passive 검사 연동은 [확장 실행 및 인수인계](EXTENSIONS.md)를 참고한다.
+운영자 데스크톱의 공식 ZAP/Burp MCP, chrome-use, Cua Driver 연결은
+[외부 Web MCP 프로필](../external/README.md)을 참고한다. 해당 프로필은 기본 합성 랩에
+자동으로 포함되지 않는다.
 
 MCP 서버는 프로그램이다. 개발·통합 모두 동일 컴퓨터에서 stdio로 실행할 수 있다.
 HTTP는 별도 프로세스/호스트에 연결하는 선택지이며 GCP가 필수는 아니다.
@@ -43,9 +46,11 @@ add-on의 `exportHar` API, Burp는 `Save items`가 만든 XML을 connector가 �
   사용한다. 호출마다 연결하는 기존 `build_mcp_tool_gateway()`로는 페이지가
   사라지므로 브라우저 워크플로에 사용하지 않는다. 실행/테스트 계정별 전용
   lifecycle을 사용하며 계정 A/B 비교는 HTTP 도구로 검증한다.
-- Nuclei 직접 Active Scan, ZAP/Burp scan 제어, httpx CLI, 대량 fuzzing,
+- Nuclei 범용/CVE Active Scan, ZAP/Burp scan 제어, httpx CLI, 대량 fuzzing,
   거래 재전송·경쟁 상태 검사는 후속이다. ZAP 실시간 캡처 조회와 Nuclei passive 검사는
   선택적인 [확장 구성](EXTENSIONS.md)으로 제공한다.
+  Nuclei의 단일 allowlisted query reflection probe는 별도 high-risk 프로필로 제공하지만
+  임의 template이나 URL을 받지 않으며 취약점으로 확정하지 않는다.
   지금 HTTPX 기반 저부하 조회와 기능이 겹치는 엔진들을 함께 설치하지 않는다.
 
 ## 빠른 시작 (저장소 루트)
@@ -64,6 +69,61 @@ Web 요청이 대기하는지 확인하고, 다음으로 합성 대상만 자동
 engagement에서 Recon → Graph → Web GET, HTML inventory, security posture를
 확인한다. 대상 별칭은 `app.yaml`의
 engagement metadata에 명시하며, 승인 없이 실제 금융기관에 요청하는 설정은 없다.
+
+## Playwright 브라우저 전용 연결 검증
+
+`browser-smoke`는 `mock-bank`와 `web-browser`만 필요한 별도 검증 경로다.
+저장소 루트에서 실행한다. 기존 랩이 실행 중이면 첫 명령은 생략한다.
+
+```sh
+docker compose -f deploy/compose/finance-lab.yml up --build -d --wait mock-bank web-browser
+docker compose -f deploy/compose/finance-lab.yml run --build --rm --no-deps browser-smoke
+docker compose -f deploy/compose/finance-lab.yml logs --tail=80 web-browser mock-bank
+```
+
+전용 runner의 환경값은 `browser.env.example`을 Compose `env_file`로 읽는다.
+호스트에서 `web-browser`나 `mock-bank` 주소 또는 MCP 포트로 접속하지 않는다.
+`--no-deps`는 이미 healthy인 두 서비스를 재시작하지 않고 one-off 검증 컨테이너만
+실행할 때 쓴다. 새 환경에서는 첫 명령으로 두 서비스를 시작한다. 기존 전체
+`smoke`와 `agent-smoke`는 유지되며 HTTP·Proxy·Recon 서비스는 이 경로에 필요 없다.
+Compose `lab` 네트워크는 `internal: true`이고 MCP 포트는 호스트에 공개하지 않는다.
+
+성공하면 `REMOTE TOOLS`, 허용 도구 5개의 실제 입력 JSON schema, 비허용 원격
+`browser_run_code_unsafe`, 각 단계의 구분된 Action/Invocation ID 및 최종
+`PASS: browser discovery, Registry, UI session continuity, IDs, allowlist`가 출력된다.
+runner는 원격 discovery와 Registry의 ToolId·operation·입력 schema가 일치하는지
+검사한다. `browser_close`는 등록되지만 operation 목록이 비어 있으므로 Agent 실행
+권한으로 해석하지 않고, MCP 연결 종료는 context manager에 맡긴다.
+`browser_navigate` → `http_request`, `browser_snapshot` → `response_analysis`,
+`browser_fill_form`·`browser_click` → `auth_attempt`은 이 예제 설정의 매핑이다.
+
+페이지는 `http://mock-bank:8080`으로 제한한다. 첫 snapshot에서 `Synthetic bank`,
+`Test alias`, `Preview alias`를 확인한 뒤 mock-bank의 `#alias` 입력창에
+`Synthetic Alice`를 채우고 `#confirm`을 클릭한다. 두 번째 snapshot에 그 값이
+나타나야 같은 owner task의 지속 Gateway/MCP 세션이 브라우저 상태를 유지한 것이다.
+각 `ToolResult`의 성공 여부와 원래 ToolInvocation의 Action·Invocation·Tool ID도
+검사한다. 비허용 도구는 실제 원격 discovery에 존재해야 하며 Registry에 없어야 한다.
+Gateway의 `unknown_tool`이 adapter 호출보다 먼저 반환되는 것은 오프라인
+`test_browser_smoke_checks_session_and_does_not_call_denied_remote_tool`에서
+transport 호출 기록으로 확인한다. Docker 결과만으로 네트워크 패킷 부재를 직접
+증명한 것은 아니다.
+
+Dockerfile은 `@playwright/mcp@0.0.81`과 Chromium을 고정한다. 현재 원격
+discovery에는 26개 도구가 있었고, `browser_fill_form.fields[].target`과
+`browser_click.target`이 실제 schema의 필수 필드다. 이는 해당 실행 환경의
+관찰 결과이며 다른 버전에서는 runner가 discovery/schema 불일치를 실패로
+표시한다. `browser_run_code_unsafe`는 비허용 대상으로만 사용하며 실행하지 않는다.
+명시적인 Docker 실행만 실제 MCP·브라우저를 호출한다. 일반 pytest는 Docker를
+시작하지 않으며 `pytest -q tests/unit/test_finance_browser_smoke.py`는 Fake transport로
+검증한다. 직접 Gateway 호출은 Control 승인·Agent 자율 선택이나 전체 Agent
+실행 검증이 아니다.
+
+독립적으로 띄운 전용 랩만 사용했고 다른 검증이 두 서비스에 의존하지 않을 때
+종료하려면 다음 명령을 사용한다. 공유 실행 중인 finance-lab에서는 중지하지 않는다.
+
+```sh
+docker compose -f deploy/compose/finance-lab.yml stop web-browser mock-bank
+```
 
 ## 현재 금융권 웹 접근 가능 여부
 
@@ -280,7 +340,8 @@ TLS는 검증된 한 번의 handshake이며 전체 프로토콜/암호군 스캐
 
 1. ZAP 증분 동기화: engagement별 cursor와 승인 Context 매핑이 정해진 뒤 polling 추가.
 2. Burp 실시간 연결: 팀 Burp edition과 공식 MCP 사용 여부가 정해지면 saved-items 변환과 역할 중복 검토.
-3. Nuclei Active: passive 연동 위에 검토된 template·egress·요청 수·취소 계약을 추가.
+3. Nuclei Active 확장: 현재 단일 reflection probe 위에 hash가 고정된 검토 template,
+   template별 요청 수·취소 계약과 합성 positive/negative fixture를 추가.
 4. 거래 재전송/멱등성/경쟁 상태: 합성 계좌·거래 한도·정합성 oracle·복구 계약이 있는 후속 PR.
 
 출처: [Playwright MCP](https://github.com/microsoft/playwright-mcp),

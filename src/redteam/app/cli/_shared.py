@@ -24,6 +24,7 @@ from redteam.core.config import (
     AppConfig,
     CapabilityConfig,
     LLMConfig,
+    MethodologyConfig,
     OrchestrationConfig,
     load_engagement_config,
 )
@@ -100,11 +101,18 @@ def load_app_config_for_run(engagement_path: str, *, require_llm: bool = True) -
     need.
     """
     engagement_config = load_engagement_config(engagement_path)
+    from redteam.app.mcp_deployment import synchronize_deployment
+
+    server_ids = mcp_server_ids_from_environment()
+    engagement_config = synchronize_deployment(engagement_config, server_ids)
     return AppConfig(
         engagement=engagement_config,
         llm=LLMConfig.from_environment() if require_llm else LLMConfig(),
         orchestration=OrchestrationConfig.from_environment(),
-        capability=CapabilityConfig(mcp_servers=mcp_server_ids_from_environment()),
+        capability=CapabilityConfig(
+            mcp_servers=server_ids,
+            methodology=MethodologyConfig.from_environment(),
+        ),
     )
 
 

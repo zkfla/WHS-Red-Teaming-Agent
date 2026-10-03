@@ -274,8 +274,12 @@ async def test_principal_discovery_revision_and_completion_over_real_mcp(
             assert path.steps[1].status == "completed" and path.steps[1].evidence_ids
             assert all(c.met and c.evidence_count for c in report.mission.success_criteria)
         else:
-            expected_count = 2 if case == "unauthenticated" else 1
+            # Capability preflights BOTH credentials before either HTTP request.
+            # Missing Bob's credential must not leave a partial Alice-only probe.
+            expected_count = 2 if case == "unauthenticated" else 0
             assert len(requests) == expected_count
+            if case == "missing_credential":
+                assert comparisons[0].metadata["tool_result"]["success"] is False
             assert final.termination_reason is TerminationReason.INVESTIGATION_HELD
             assert mission.status is MissionStatus.BLOCKED
             assert mission.criterion_results and not all(r.met for r in mission.criterion_results)

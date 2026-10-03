@@ -1,0 +1,27 @@
+{
+  "asset_ref": "workspace-test",
+  "engagement_id": "eng-test",
+  "run_id": "run-test",
+  "workspace_root": "/home/operator/redteam-workspaces/eng-test/run-test",
+  "image": "example.invalid/redteam/text-tools@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+  "allowed_executables": {
+    "grep": "/usr/bin/grep",
+    "sort": "/usr/bin/sort",
+    "uniq": "/usr/bin/uniq",
+    "wc": "/usr/bin/wc",
+    "head": "/usr/bin/head",
+    "tail": "/usr/bin/tail",
+    "cut": "/usr/bin/cut",
+    "jq": "/usr/bin/jq"
+  },
+  "writable": false,
+  "max_timeout_seconds": 30,
+  "max_output_bytes": 65536,
+  "max_output_file_bytes": 8388608,
+  "tmpfs_bytes": 16777216,
+  "pids_limit": 64,
+  "memory": "256m",
+  "cpus": 0.5,
+  "container_user": "1000:1000",
+  "docker_binary": "docker"
+}

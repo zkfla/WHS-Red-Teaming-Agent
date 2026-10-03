@@ -67,6 +67,7 @@ from redteam.core.contracts.engagement import EngagementScope
 from redteam.core.contracts.target import (
     AnyTarget,
     AssetTarget,
+    DeviceTarget,
     DomainTarget,
     EndpointTarget,
     HostTarget,
@@ -309,7 +310,7 @@ def _matches_network(candidate: str, nets: list[_IpNetwork]) -> bool:
 
 
 def _check_asset_scope(
-    target: AssetTarget, scope: EngagementScope
+    target: AssetTarget | DeviceTarget, scope: EngagementScope
 ) -> tuple[bool, list[str], Severity | None]:
     """Exact-match scope check for mobile artifacts.
 
@@ -320,7 +321,11 @@ def _check_asset_scope(
     convention that makes two differently-cased identifiers the same
     artifact.
     """
-    asset_id = str(target.asset_id)
+    asset_id = str(
+        target.asset_id
+        if isinstance(target, AssetTarget)
+        else target.asset_id or target.package_name
+    )
 
     if asset_id in scope.denied_assets:
         return (
@@ -354,6 +359,19 @@ def check_scope(
     non-recoverable — every action hits the same error — so it is
     ``ABORT_RUN``."""
     if isinstance(action.target, AssetTarget):
+        # asset_ref is the schema-declared identity used by workspace tools.
+        # Authorizing one asset must never allow arguments to select another.
+        if "asset_ref" in action.arguments and action.arguments["asset_ref"] != str(
+            action.target.asset_id
+        ):
+            return (
+                False,
+                ["asset_ref does not match the action's asset target"],
+                Severity.BLOCK_ACTION,
+            )
+        return _check_asset_scope(action.target, scope)
+
+    if isinstance(action.target, DeviceTarget):
         return _check_asset_scope(action.target, scope)
 
     resolved, error = _resolve_target(action.target)

@@ -98,10 +98,9 @@ class AgentDefinition(BaseModel):
 def builtin_agent_definitions() -> list[AgentDefinition]:
     """The five agreed roles and their scheduler-facing metadata.
 
-    Recon, Web/API and Mobile have executable specs/providers. Analysis is the
-    verifier seam and Reporting is the terminal read-only projector, so neither
-    consumes ordinary action-loop turns — both carry ``schedulable=False`` to
-    say so in the model, matching the fact that they have no ``AgentSpec``.
+    Recon, Web/API, Mobile and Analysis have executable specs/providers.
+    Reporting is the terminal read-only projector and does not consume
+    ordinary action-loop turns.
     """
 
     return [
@@ -167,7 +166,7 @@ def builtin_agent_definitions() -> list[AgentDefinition]:
             agent_id=AgentId("mobile-agent"),
             role="mobile",
             name="Mobile Agent",
-            description="Activates only when a provider resolves an APK/IPA artifact.",
+            description="Launches configured mobile apps and observes runtime diagnostics.",
             activation_rules=[ActivationRule(node_types=[GraphNodeType.ASSET])],
             capabilities=["mobile"],
             provider_id="playbook:mobile",
@@ -187,22 +186,18 @@ def builtin_agent_definitions() -> list[AgentDefinition]:
             agent_id=AgentId("analysis-agent"),
             role="analysis",
             name="Analysis Agent",
-            description="Independently validates evidence and hypotheses.",
-            schedulable=False,
-            activation_rules=[
-                ActivationRule(requires_open_hypothesis=True),
-                ActivationRule(requires_finding=True),
-            ],
+            description="Decodes authorized APKs and inspects their static surface.",
+            activation_rules=[ActivationRule(node_types=[GraphNodeType.ASSET])],
             capabilities=["analysis"],
             provider_id="playbook:analysis",
             context_profile=ContextProfile(
                 profile_id="analysis",
                 max_evidence=40,
                 include_node_types=[
+                    GraphNodeType.ASSET,
                     GraphNodeType.HYPOTHESIS,
                     GraphNodeType.FINDING,
                 ],
-                include_attempted=False,
             ),
             max_concurrency=4,
             priority_band=40,

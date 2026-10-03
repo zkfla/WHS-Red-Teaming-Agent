@@ -1,6 +1,6 @@
 """Plants the engagement scope as the first Attack Graph nodes.
 
-An empty graph is an empty frontier. Seeding makes a host *visible* to a
+An empty graph is an empty frontier. Seeding makes a target *visible* to a
 planner; the Control Plane still decides whether acting on it is allowed.
 """
 
@@ -19,8 +19,44 @@ from redteam.core.contracts.graph import GraphNode
 from redteam.core.enums import GraphNodeType
 from redteam.core.ids import RunId
 from redteam.orchestration.authentication import AuthSession
+from redteam.orchestration.execution_bridge import execution_facts_by_asset
 
 SCOPE_LABEL = "engagement-scope"
+
+
+def _asset_ref_map(
+    engagement: Engagement,
+    assets: list[str],
+    *,
+    singular: str,
+    plural: str,
+) -> dict[str, str]:
+    """Validate scalar/map metadata forms and return refs by asset id."""
+
+    raw = engagement.metadata.get(plural, {})
+    if not isinstance(raw, dict) or any(
+        not isinstance(asset, str)
+        or not asset.strip()
+        or not isinstance(ref, str)
+        or not ref.strip()
+        for asset, ref in raw.items()
+    ):
+        raise ValueError(
+            f"engagement.metadata.{plural} must map assets to non-empty MCP policy refs"
+        )
+    refs = {asset.strip(): ref.strip() for asset, ref in raw.items()}
+
+    scalar = engagement.metadata.get(singular)
+    if scalar is None:
+        return refs
+    if not isinstance(scalar, str) or not scalar.strip():
+        raise ValueError(f"engagement.metadata.{singular} must be a non-empty MCP policy ref")
+    if len(assets) != 1:
+        raise ValueError(
+            f"engagement.metadata.{singular} is only valid with exactly one allowed asset"
+        )
+    refs[assets[0]] = scalar.strip()
+    return refs
 
 
 async def seed_from_engagement(
@@ -30,7 +66,7 @@ async def seed_from_engagement(
     run_id: RunId | None = None,
     step: int = 0,
 ) -> list[GraphNode]:
-    """Create one in-scope Host node per allowed host/domain."""
+    """Create one in-scope node per allowed host/domain and mobile asset."""
     denied = {
         host.lower() for host in (*engagement.scope.denied_hosts, *engagement.scope.denied_domains)
     }
@@ -39,6 +75,16 @@ async def seed_from_engagement(
         for value in (*engagement.scope.allowed_hosts, *engagement.scope.allowed_domains)
         if value and value.lower() not in denied
     ]
+    denied_assets = {
+        asset.strip() for asset in engagement.scope.denied_assets if asset.strip()
+    }
+    declared_assets = list(
+        dict.fromkeys(
+            asset.strip()
+            for asset in engagement.scope.allowed_assets
+            if asset.strip() and asset.strip() not in denied_assets
+        )
+    )
 
     target_refs = engagement.metadata.get("target_refs", {})
     if not isinstance(target_refs, dict) or any(
@@ -59,6 +105,49 @@ async def seed_from_engagement(
         host.strip().lower(): [AuthSession.model_validate(item).model_dump() for item in items]
         for host, items in raw_sessions.items()
     }
+    asset_refs = _asset_ref_map(
+        engagement,
+        declared_assets,
+        singular="asset_ref",
+        plural="asset_refs",
+    )
+    apk_refs = _asset_ref_map(
+        engagement,
+        declared_assets,
+        singular="apk_ref",
+        plural="apk_refs",
+    )
+    device_refs = _asset_ref_map(
+        engagement,
+        declared_assets,
+        singular="device_ref",
+        plural="device_refs",
+    )
+    device_serials = _asset_ref_map(
+        engagement,
+        declared_assets,
+        singular="device_serial",
+        plural="device_serials",
+    )
+    package_names = _asset_ref_map(
+        engagement,
+        declared_assets,
+        singular="package_name",
+        plural="package_names",
+    )
+    execution_facts = execution_facts_by_asset(engagement, declared_assets)
+    for asset in declared_assets:
+        configured = {
+            asset in device_serials,
+            asset in device_refs,
+            asset in package_names,
+        }
+        if len(configured) != 1:
+            raise ValueError(
+                "engagement metadata must supply device_serial, device_ref, and "
+                "package_name together "
+                f"for asset {asset!r}"
+            )
 
     provenance = Provenance(
         step=step,
@@ -89,6 +178,35 @@ async def seed_from_engagement(
                         for item in auth_sessions.get(value, [])
                     ],
                 },
+                labels=[SCOPE_LABEL],
+                provenance=provenance,
+                step=step,
+            )
+        )
+    for asset in declared_assets:
+        asset_ref = asset_refs.get(asset, asset)
+        apk_ref = apk_refs.get(asset)
+        asset_facts = {
+            "asset_ref": asset_ref,
+            # Generic Asset tools still need a stable operator-owned target
+            # alias.  APK identity is a separate, explicit declaration.
+            "target_ref": apk_ref or asset_ref,
+            **execution_facts.get(asset, {}),
+        }
+        if apk_ref is not None:
+            asset_facts["apk_ref"] = apk_ref
+        if asset in device_refs:
+            asset_facts.update(
+                device_serial=device_serials[asset],
+                device_ref=device_refs[asset],
+                package_name=package_names[asset],
+            )
+        seeded.append(
+            await service.upsert_node(
+                GraphNodeType.ASSET,
+                key=asset,
+                attrs={"in_scope": True},
+                facts=asset_facts,
                 labels=[SCOPE_LABEL],
                 provenance=provenance,
                 step=step,

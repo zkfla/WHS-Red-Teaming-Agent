@@ -61,6 +61,17 @@ class AssetTarget(BaseModel):
     display_name: str | None = None
 
 
+class DeviceTarget(BaseModel):
+    """One operator-configured application installation on a device."""
+
+    kind: Literal["device"] = "device"
+    device_serial: str
+    device_ref: str
+    package_name: str
+    asset_id: AssetId | None = None
+    graph_node_id: GraphNodeId | None = None
+
+
 class GraphNodeTarget(BaseModel):
     """Escape hatch: point directly at an existing Attack Graph node
     when none of the other kinds fit (or the node type is one this
@@ -80,6 +91,7 @@ AnyTarget = (
     | ServiceTarget
     | PrincipalTarget
     | AssetTarget
+    | DeviceTarget
     | GraphNodeTarget
 )
 
@@ -111,6 +123,8 @@ def target_display_name(target: AnyTarget) -> str:
         return target.display_name or str(target.principal_id)
     if isinstance(target, AssetTarget):
         return target.display_name or str(target.asset_id)
+    if isinstance(target, DeviceTarget):
+        return f"{target.package_name}@{target.device_serial}"
     if isinstance(target, GraphNodeTarget):
         return target.display_name or str(target.node_id)
     raise TypeError(f"unknown target kind: {target!r}")  # pragma: no cover

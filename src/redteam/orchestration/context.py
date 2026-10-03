@@ -30,6 +30,7 @@ from redteam.orchestration.analysis import AnalysisVerifier, StructuredLLMAnalys
 from redteam.orchestration.component_binding import RuntimeComponentBinding
 from redteam.orchestration.context_projection import ContextProjectionCache
 from redteam.orchestration.long_jobs import LongJobAdapter
+from redteam.orchestration.methodology import ReferenceLibrary
 from redteam.orchestration.observations import ResultMapperRegistry, default_result_mapper_registry
 from redteam.orchestration.operator_intents.store import OperatorIntentStore
 from redteam.orchestration.paths import InMemoryPathStore, PathStore
@@ -59,6 +60,7 @@ class RuntimeDeps:
     # The actual tool registry is mandatory when compiling actions.
     # None supports read-only projections and explicit error scenarios.
     tool_catalog: ToolCatalog | None = None
+    methodology_library: ReferenceLibrary | None = None
     # Tool Result -> Attack Graph Mutation (SERVICE/ENDPOINT discovery from
     # a successful execution's real output) -- see `orchestration.observations`.
     result_mappers: ResultMapperRegistry = field(default_factory=default_result_mapper_registry)
