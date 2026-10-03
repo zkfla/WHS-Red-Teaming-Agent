@@ -41,7 +41,7 @@ from redteam.orchestration.cognition import (
     DecisionFailure,
     StructuredDecisionClient,
 )
-from redteam.orchestration.coordination import StateConflict, coordinator_for
+from redteam.orchestration.coordination import Coordinator, StateConflict, coordinator_for
 from redteam.orchestration.diagnostics import DecisionDiagnostic, safe_feedback
 from redteam.orchestration.operator_intents.suppression import endpoint_excluded
 
@@ -573,13 +573,16 @@ async def finalize_mission(
     llm_client: Any | None = None,
     decision_max_attempts: int = 3,
     path_store: Any | None = None,
+    coordinator: Coordinator | None = None,
 ) -> EventId | None:
     """Evaluate every criterion and atomically settle the current mission snapshot.
 
     LLM review runs outside coordination. Closed stop/failure states retain their
     outcome; engine-validated completion results need no additional model call.
     """
-    coordinator = coordinator_for(store, path_store) if path_store is not None else None
+    coordinator = coordinator or (
+        coordinator_for(store, path_store) if path_store is not None else None
+    )
     budget = DecisionBudget(decision_max_attempts)
     now = now or datetime.now(timezone.utc)
     for _ in range(3):

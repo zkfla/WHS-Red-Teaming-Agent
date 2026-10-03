@@ -12,7 +12,10 @@ from redteam.capability.adapters.mcp.analysis import AnalysisMCPAdapter
 from redteam.capability.adapters.mcp.base import MCPCallResult
 from redteam.capability.adapters.mcp.example import ExampleMCPAdapter
 from redteam.capability.adapters.mcp.mobile import MobileMCPAdapter
-from redteam.capability.adapters.mcp.naming import build_mcp_tool_id
+from redteam.capability.adapters.mcp.naming import (
+    build_canonical_mcp_tool_id,
+    build_mcp_tool_id,
+)
 from redteam.capability.adapters.mcp.recon import ReconMCPAdapter
 from redteam.capability.adapters.mcp.transport import (
     AllowlistedMCPTransport,
@@ -210,7 +213,9 @@ async def test_web_api_adapter_discovers_and_invokes_independently() -> None:
     )
 
     tools = await adapter.discover_tools()
-    assert tools[0].tool_id == ToolId("web.send_http_request")
+    assert tools[0].tool_id == build_canonical_mcp_tool_id(
+        "web", "web-server", "Send HTTP Request"
+    )
     assert tools[0].capability_tags == ["web", "api"]
     assert tools[0].health_status == ToolHealthStatus.HEALTHY
 
@@ -231,7 +236,9 @@ async def test_recon_adapter_has_separate_namespace() -> None:
     )
 
     tools = await adapter.discover_tools()
-    assert tools[0].tool_id == ToolId("recon.probe_http")
+    assert tools[0].tool_id == build_canonical_mcp_tool_id(
+        "recon", "recon-server", "Probe HTTP"
+    )
     assert tools[0].capability_tags == ["recon"]
 
 
@@ -242,14 +249,16 @@ async def test_recon_adapter_has_separate_namespace() -> None:
             MobileMCPAdapter,
             "mobile-server",
             "Inspect APK",
-            ToolId("mobile.inspect_apk"),
+            build_canonical_mcp_tool_id("mobile", "mobile-server", "Inspect APK"),
             ["mobile"],
         ),
         (
             AnalysisMCPAdapter,
             "analysis-server",
             "Compare Response",
-            ToolId("analysis.compare_response"),
+            build_canonical_mcp_tool_id(
+                "analysis", "analysis-server", "Compare Response"
+            ),
             ["analysis"],
         ),
     ],
@@ -359,7 +368,7 @@ async def test_gateway_routes_tool_when_intent_differs_from_remote_tool_name() -
     assert backend.calls == [("http_request", {"message": "hi"})]
     assert [
         tool.tool_id for tool in gateway.list_tools_for_action("web", "response_analysis")
-    ] == [ToolId("web.http_request")]
+    ] == [build_canonical_mcp_tool_id("web", "http", "http_request")]
 
 
 async def test_gateway_blocks_tool_substitution_outside_operation_binding() -> None:

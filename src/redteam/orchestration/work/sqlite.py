@@ -10,15 +10,37 @@ import asyncio
 import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import cast
 
 from redteam.core.ids import RunId
 from redteam.orchestration.work.models import (
-    ACTIVE_STATUSES,
-    TERMINAL_STATUSES,
     TaskLease,
     WorkItem,
     WorkStatus,
-    is_unexecuted_stale,
+)
+from redteam.orchestration.work.rules import (
+    abandon_candidate,
+    blocked_for_dependency,
+    can_bind,
+    decide_add,
+    decide_reconcile,
+    expired_lease_ids,
+    failed_item,
+    finished_item,
+    has_conflict,
+    is_expired,
+    leased_item,
+    new_lease,
+    pending_item,
+    prereqs_succeeded,
+    refresh_pending_item,
+    renewed_lease,
+    require_terminal,
+    running_item,
+    should_invalidate,
+    stale_item,
+    terminal_failure_in,
+    validate_lease_ttl,
 )
 
 
@@ -98,42 +120,15 @@ class SQLiteWorkStore:
                     "SELECT payload FROM work_items WHERE run_id=? AND candidate_key=?",
                     (_run_key(item.run_id), item.candidate_key),
                 )
-                same_candidate = [
-                    _item_from_payload(row[0]) for row in await cursor.fetchall()
-                ]
+                same_candidate = [_item_from_payload(row[0]) for row in await cursor.fetchall()]
                 await cursor.close()
-                if any(
-                    entry.status in {WorkStatus.LEASED, WorkStatus.RUNNING}
-                    for entry in same_candidate
-                ):
+                verdict, target = decide_add(item, same_candidate)
+                if verdict == "reject":
                     await db.rollback()
                     return False
-                pending = [
-                    entry
-                    for entry in same_candidate
-                    if entry.status is WorkStatus.PENDING
-                ]
-                if pending:
-                    target = sorted(pending, key=lambda entry: entry.work_id)[0]
-                    refreshed = item.model_copy(deep=True).model_copy(
-                        update={
-                            "work_id": target.work_id,
-                            "created_at": target.created_at,
-                            "attempt": target.attempt,
-                            "hypothesis_id": target.hypothesis_id or item.hypothesis_id,
-                            "job_id": target.job_id,
-                            "status": WorkStatus.PENDING,
-                            "outcome_reason": None,
-                        }
-                    )
-                    await _save_item(db, refreshed)
+                if target is not None:
+                    await _save_item(db, refresh_pending_item(target, item))
                     await db.commit()
-                    return False
-                blocking = [
-                    entry for entry in same_candidate if not is_unexecuted_stale(entry)
-                ]
-                if blocking and not item.repeatable:
-                    await db.rollback()
                     return False
                 await db.execute(
                     "INSERT INTO work_items(work_id,run_id,candidate_key,status,priority,payload) "
@@ -165,11 +160,8 @@ class SQLiteWorkStore:
             )
             for row in await cursor.fetchall():
                 item = _item_from_payload(row[0])
-                if item.path_id == path_id and item.path_step_id in step_ids:
-                    await _save_item(db, item.model_copy(update={
-                        "status": WorkStatus.STALE, "updated_at": now,
-                        "outcome_reason": "path_step_changed",
-                    }))
+                if should_invalidate(item, run_id, path_id, step_ids):
+                    await _save_item(db, stale_item(item, now, "path_step_changed"))
                     changed.append(item.work_id)
             await cursor.close()
             await db.commit()
@@ -180,22 +172,29 @@ class SQLiteWorkStore:
         async with _aiosqlite().connect(self._path) as db:
             await db.execute("BEGIN IMMEDIATE")
             cursor = await db.execute(
-                "SELECT owner, expires_at FROM work_leases WHERE work_id=?", (work_id,),
+                "SELECT owner, expires_at FROM work_leases WHERE work_id=?",
+                (work_id,),
             )
             lease = await cursor.fetchone()
             await cursor.close()
             item = await _load_item(db, work_id)
-            if (lease is None or lease[0] != owner or item is None
-                or (item.job_id and item.job_id != job_id)):
+            if lease is None:
                 await db.rollback()
                 return False
-            expires_at = datetime.fromisoformat(lease[1])
-            if expires_at.tzinfo is None:
-                expires_at = expires_at.replace(tzinfo=timezone.utc)
-            if expires_at <= datetime.now(timezone.utc):
+            parsed_expiry = datetime.fromisoformat(lease[1])
+            candidate = TaskLease(
+                work_id=work_id,
+                owner=lease[0],
+                issued_at=parsed_expiry,
+                heartbeat_at=parsed_expiry,
+                expires_at=parsed_expiry,
+            )
+            if not can_bind(
+                candidate, item, owner=owner, job_id=job_id, now=datetime.now(timezone.utc)
+            ):
                 await db.rollback()
                 return False
-            await _save_item(db, item.model_copy(update={"job_id": job_id}))
+            await _save_item(db, cast(WorkItem, item).model_copy(update={"job_id": job_id}))
             await db.commit()
         return True
 
@@ -233,8 +232,7 @@ class SQLiteWorkStore:
         now: datetime,
         ttl: timedelta,
     ) -> TaskLease | None:
-        if ttl.total_seconds() <= 0:
-            raise ValueError("lease ttl must be positive")
+        validate_lease_ttl(ttl)
         await self.setup()
         aiosqlite = _aiosqlite()
         async with aiosqlite.connect(self._path) as db:
@@ -247,18 +245,9 @@ class SQLiteWorkStore:
                 failed_dependency = await _terminal_dependency_failure(db, item)
                 if failed_dependency is not None:
                     dependency_id, dependency_status = failed_dependency
+                    dependency_id, dependency_status = failed_dependency
                     await _save_item(
-                        db,
-                        item.model_copy(
-                            update={
-                                "status": WorkStatus.BLOCKED,
-                                "updated_at": now,
-                                "outcome_reason": (
-                                    f"prerequisite_not_succeeded:{dependency_id}:"
-                                    f"{dependency_status.value}"
-                                ),
-                            }
-                        ),
+                        db, blocked_for_dependency(item, dependency_id, dependency_status, now)
                     )
                     await db.commit()
                     return None
@@ -268,20 +257,8 @@ class SQLiteWorkStore:
                 if await _has_conflict(db, item):
                     await db.rollback()
                     return None
-                lease = TaskLease(
-                    work_id=work_id,
-                    owner=owner,
-                    issued_at=now,
-                    heartbeat_at=now,
-                    expires_at=now + ttl,
-                )
-                updated = item.model_copy(
-                    update={
-                        "status": WorkStatus.LEASED,
-                        "attempt": item.attempt + 1,
-                        "updated_at": now,
-                    }
-                )
+                lease = new_lease(work_id, owner, now, ttl)
+                updated = leased_item(item, now)
                 await _save_item(db, updated)
                 await db.execute(
                     "INSERT INTO work_leases VALUES(?,?,?,?,?)",
@@ -307,8 +284,7 @@ class SQLiteWorkStore:
         now: datetime,
         ttl: timedelta,
     ) -> TaskLease | None:
-        if ttl.total_seconds() <= 0:
-            raise ValueError("lease ttl must be positive")
+        validate_lease_ttl(ttl)
         await self.setup()
         aiosqlite = _aiosqlite()
         async with aiosqlite.connect(self._path) as db:
@@ -319,24 +295,25 @@ class SQLiteWorkStore:
             )
             row = await cursor.fetchone()
             await cursor.close()
-            if row is None or datetime.fromisoformat(row[1]) <= now:
+            if row is None or is_expired(datetime.fromisoformat(row[1]), now):
                 await db.rollback()
                 return None
-            lease = TaskLease(
-                work_id=work_id,
-                owner=owner,
-                issued_at=datetime.fromisoformat(row[0]),
-                heartbeat_at=now,
-                expires_at=now + ttl,
+            lease = renewed_lease(
+                TaskLease(
+                    work_id=work_id,
+                    owner=owner,
+                    issued_at=datetime.fromisoformat(row[0]),
+                    heartbeat_at=datetime.fromisoformat(row[0]),
+                    expires_at=datetime.fromisoformat(row[1]),
+                ),
+                now,
+                ttl,
             )
             item = await _load_item(db, work_id)
             if item is None:
                 await db.rollback()
                 return None
-            await _save_item(
-                db,
-                item.model_copy(update={"status": WorkStatus.RUNNING, "updated_at": now}),
-            )
+            await _save_item(db, running_item(item, now))
             await db.execute(
                 "UPDATE work_leases SET heartbeat_at=?,expires_at=? WHERE work_id=?",
                 (now.isoformat(), (now + ttl).isoformat(), work_id),
@@ -353,8 +330,7 @@ class SQLiteWorkStore:
         now: datetime,
         reason: str | None = None,
     ) -> bool:
-        if status not in TERMINAL_STATUSES:
-            raise ValueError("complete requires a terminal status")
+        require_terminal(status)
         await self.setup()
         aiosqlite = _aiosqlite()
         async with aiosqlite.connect(self._path) as db:
@@ -369,30 +345,12 @@ class SQLiteWorkStore:
             if lease_row is None or item is None:
                 await db.rollback()
                 return False
-            if datetime.fromisoformat(lease_row[0]) <= now:
-                await _save_item(
-                    db,
-                    item.model_copy(
-                        update={
-                            "status": WorkStatus.STALE,
-                            "updated_at": now,
-                            "outcome_reason": "lease_expired",
-                        }
-                    ),
-                )
+            if is_expired(datetime.fromisoformat(lease_row[0]), now):
+                await _save_item(db, stale_item(item, now, "lease_expired"))
                 await db.execute("DELETE FROM work_leases WHERE work_id=?", (work_id,))
                 await db.commit()
                 return False
-            await _save_item(
-                db,
-                item.model_copy(
-                    update={
-                        "status": status,
-                        "updated_at": now,
-                        "outcome_reason": reason,
-                    }
-                ),
-            )
+            await _save_item(db, finished_item(item, status, now, reason))
             await db.execute("DELETE FROM work_leases WHERE work_id=?", (work_id,))
             await db.commit()
             return True
@@ -410,12 +368,10 @@ class SQLiteWorkStore:
             row = await cursor.fetchone()
             await cursor.close()
             item = await _load_item(db, work_id)
-            if row is None or item is None or datetime.fromisoformat(row[0]) <= now:
+            if row is None or item is None or is_expired(datetime.fromisoformat(row[0]), now):
                 await db.rollback()
                 return False
-            await _save_item(
-                db, item.model_copy(update={"status": WorkStatus.PENDING, "updated_at": now})
-            )
+            await _save_item(db, pending_item(item, now))
             await db.execute("DELETE FROM work_leases WHERE work_id=?", (work_id,))
             await db.commit()
             return True
@@ -426,24 +382,20 @@ class SQLiteWorkStore:
         async with aiosqlite.connect(self._path) as db:
             await db.execute("BEGIN IMMEDIATE")
             cursor = await db.execute(
-                "SELECT work_id FROM work_leases WHERE expires_at<=? ORDER BY work_id",
-                (now.isoformat(),),
+                "SELECT work_id,expires_at FROM work_leases ORDER BY work_id",
             )
-            expired = [row[0] for row in await cursor.fetchall()]
+            leases = {}
+            for row in await cursor.fetchall():
+                try:
+                    leases[row[0]] = datetime.fromisoformat(row[1])
+                except (ValueError, TypeError):
+                    continue
             await cursor.close()
+            expired = expired_lease_ids(leases, now)
             for work_id in expired:
                 item = await _load_item(db, work_id)
                 if item is not None:
-                    await _save_item(
-                        db,
-                        item.model_copy(
-                            update={
-                                "status": WorkStatus.STALE,
-                                "updated_at": now,
-                                "outcome_reason": "lease_expired",
-                            }
-                        ),
-                    )
+                    await _save_item(db, stale_item(item, now, "lease_expired"))
             if expired:
                 placeholders = ",".join("?" for _ in expired)
                 await db.execute(
@@ -481,18 +433,11 @@ class SQLiteWorkStore:
                     )
                     lease_row = await lease_cursor.fetchone()
                     await lease_cursor.close()
-                    if lease_row is not None and lease_row[0] != owner:
+                    if not abandon_candidate(
+                        item, run_id, owner, lease_row[0] if lease_row else None
+                    ):
                         continue
-                    await _save_item(
-                        db,
-                        item.model_copy(
-                            update={
-                                "status": WorkStatus.FAILED,
-                                "updated_at": now,
-                                "outcome_reason": reason,
-                            }
-                        ),
-                    )
+                    await _save_item(db, failed_item(item, now, reason))
                     await db.execute(
                         "DELETE FROM work_leases WHERE work_id=?",
                         (item.work_id,),
@@ -504,91 +449,19 @@ class SQLiteWorkStore:
                 await db.rollback()
                 raise
 
-    async def reconcile_job(
-        self, work_id: str, *, job_id: str, status: str, now: datetime
-    ) -> bool:
-        try:
-            target = WorkStatus(status)
-        except (ValueError, TypeError):
-            return False
-        if target not in {
-            WorkStatus.SUCCEEDED,
-            WorkStatus.FAILED,
-            WorkStatus.CANCELLED,
-        }:
-            return False
+    async def reconcile_job(self, work_id: str, *, job_id: str, status: str, now: datetime) -> bool:
         await self.setup()
         aiosqlite = _aiosqlite()
         async with aiosqlite.connect(self._path) as db:
             await db.execute("BEGIN IMMEDIATE")
             try:
                 item = await _load_item(db, work_id)
-                if item is None:
+                applied, decided = decide_reconcile(item, job_id, status, now)
+                if not applied:
                     await db.rollback()
                     return False
-                if not item.job_id or item.job_id != job_id:
-                    await db.rollback()
-                    return False
-                if item.status is target:
-                    previous = item.outcome_reason
-                    if previous and "job_reconciled" in previous:
-                        await db.execute(
-                            "DELETE FROM work_leases WHERE work_id=?", (work_id,)
-                        )
-                        await db.commit()
-                        return True
-                    marker = f"job_reconciled:{target.value}"
-                    reason = marker if not previous else f"{marker}:{previous}"
-                    await _save_item(
-                        db,
-                        item.model_copy(
-                            update={
-                                "status": target,
-                                "updated_at": now,
-                                "outcome_reason": reason,
-                            }
-                        ),
-                    )
-                    await db.execute(
-                        "DELETE FROM work_leases WHERE work_id=?", (work_id,)
-                    )
-                    await db.commit()
-                    return True
-                if item.status in {WorkStatus.FAILED, WorkStatus.STALE}:
-                    previous = item.outcome_reason
-                    marker = f"job_reconciled:{target.value}"
-                    reason = marker if not previous else f"{marker}:{previous}"
-                    await _save_item(
-                        db,
-                        item.model_copy(
-                            update={
-                                "status": target,
-                                "updated_at": now,
-                                "outcome_reason": reason,
-                            }
-                        ),
-                    )
-                    await db.execute(
-                        "DELETE FROM work_leases WHERE work_id=?", (work_id,)
-                    )
-                    await db.commit()
-                    return True
-                if item.status not in ACTIVE_STATUSES:
-                    await db.rollback()
-                    return False
-                previous = item.outcome_reason
-                marker = f"job_reconciled:{target.value}"
-                reason = marker if not previous else f"{marker}:{previous}"
-                await _save_item(
-                    db,
-                    item.model_copy(
-                        update={
-                            "status": target,
-                            "updated_at": now,
-                            "outcome_reason": reason,
-                        }
-                    ),
-                )
+                if decided is not None:
+                    await _save_item(db, decided)
                 await db.execute("DELETE FROM work_leases WHERE work_id=?", (work_id,))
                 await db.commit()
                 return True
@@ -639,36 +512,27 @@ async def _save_item(db, item: WorkItem) -> None:
 
 
 async def _dependencies_succeeded(db, item: WorkItem) -> bool:
+    states: dict[str, WorkStatus | None] = {}
     for dependency in item.prerequisite_ids:
         depended = await _load_item(db, dependency)
-        if depended is None or depended.status is not WorkStatus.SUCCEEDED:
-            return False
-    return True
+        states[dependency] = depended.status if depended is not None else None
+    return prereqs_succeeded(states)
 
 
-async def _terminal_dependency_failure(
-    db, item: WorkItem
-) -> tuple[str, WorkStatus] | None:
+async def _terminal_dependency_failure(db, item: WorkItem) -> tuple[str, WorkStatus] | None:
+    states: dict[str, WorkStatus] = {}
     for dependency_id in item.prerequisite_ids:
         dependency = await _load_item(db, dependency_id)
-        if (
-            dependency is not None
-            and dependency.status in TERMINAL_STATUSES
-            and dependency.status is not WorkStatus.SUCCEEDED
-        ):
-            return dependency_id, dependency.status
-    return None
+        if dependency is not None:
+            states[dependency_id] = dependency.status
+    return terminal_failure_in(states)
 
 
 async def _has_conflict(db, item: WorkItem) -> bool:
-    keys = set(item.conflict_keys)
-    if not keys:
-        return False
     cursor = await db.execute(
-        "SELECT payload FROM work_items "
-        "WHERE status IN ('leased','running') AND work_id<>?",
+        "SELECT payload FROM work_items WHERE status IN ('leased','running') AND work_id<>?",
         (item.work_id,),
     )
     rows = await cursor.fetchall()
     await cursor.close()
-    return any(not keys.isdisjoint(_item_from_payload(row[0]).conflict_keys) for row in rows)
+    return has_conflict(item, (_item_from_payload(row[0]) for row in rows))

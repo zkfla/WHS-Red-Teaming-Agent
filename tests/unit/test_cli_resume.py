@@ -8,12 +8,15 @@ CLI-only runtime), and fails closed whenever the run cannot be recovered.
 from __future__ import annotations
 
 import argparse
+import json
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
+from pydantic import BaseModel
 
 from redteam.app.cli import _build_parser
 from redteam.app.cli._shared import EXIT_CONFIG_ERROR, EXIT_FAILURE, EXIT_OK
@@ -22,6 +25,14 @@ from redteam.capability.settings import MCPConfigurationError
 from redteam.core.contracts.mission import MissionPlan, Provenance
 from redteam.core.enums import AgentPhase, MissionStatus
 from redteam.core.ids import ActionId, ApprovalId, EngagementId, MissionId, RunId
+from redteam.orchestration.checkpointing import (
+    CheckpointIdentity,
+    StateCodecRegistry,
+    build_checkpointer,
+    open_checkpointer,
+    open_identity_reader,
+    read_checkpoint_identity,
+)
 from redteam.orchestration.component_binding import (
     BUILTIN_COMPONENT_IDS,
     ComponentProfile,
@@ -32,6 +43,28 @@ from redteam.orchestration.operator_intents import InMemoryOperatorIntentStore
 from redteam.orchestration.state import RuntimeState, TerminationReason
 from redteam.orchestration.task_graph.memory import InMemoryTaskGraphStore
 from tests.fakes import build_test_application
+
+_CONSTRUCTED: list[str] = []
+
+
+class _IdentityProbe(BaseModel):
+    label: str = "probe"
+
+    def __init__(self, **data: Any) -> None:
+        _CONSTRUCTED.append("probe")
+        super().__init__(**data)
+
+
+def _identity(
+    engagement_id: str = "eng_recovered",
+    mission_id: str | None = None,
+    binding: RuntimeComponentBinding | None = None,
+) -> CheckpointIdentity:
+    return CheckpointIdentity(
+        engagement_id=EngagementId(engagement_id),
+        mission_id=mission_id,
+        component_binding=binding,
+    )
 
 
 def _engagement_yaml(tmp_path: Path) -> Path:
@@ -55,10 +88,7 @@ approval_policy:
 
 @pytest.fixture(autouse=True)
 def _explicit_fake_llm_provider(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Every test here calls the real ``load_app_config_for_run()``, which
-    now requires an explicit provider (section 4/20) before
-    ``resume_command``'s own mocks ever take over -- there is no
-    ``--config app.yaml`` path any more."""
+    """Real config loader needs an explicit provider."""
     monkeypatch.setenv("REDTEAM_LLM_PROVIDER", "fake")
 
 
@@ -133,9 +163,9 @@ async def test_resume_uses_canonical_bootstrap_and_the_recovered_engagement_id(
     _FakeRunner.resumed_with = None
     _FakeRunner.closed = False
 
-    hint = AsyncMock(return_value=recovered)
+    hint = AsyncMock(return_value=_identity("eng_recovered"))
     build = AsyncMock(return_value=(object(), deps))
-    monkeypatch.setattr(resume_command, "_read_checkpoint_runtime", hint)
+    monkeypatch.setattr(resume_command, "_read_checkpoint_identity", hint)
     monkeypatch.setattr(resume_command, "build_resume_application", build)
     monkeypatch.setattr(resume_command, "AgentLoopRunner", _FakeRunner)
     settle = AsyncMock(return_value=_finished())
@@ -160,7 +190,7 @@ async def test_resume_fails_closed_without_a_checkpoint(
 ) -> None:
     engagement_path = _engagement_yaml(tmp_path)
     build = AsyncMock()
-    monkeypatch.setattr(resume_command, "_read_checkpoint_runtime", AsyncMock(return_value=None))
+    monkeypatch.setattr(resume_command, "_read_checkpoint_identity", AsyncMock(return_value=None))
     monkeypatch.setattr(resume_command, "build_resume_application", build)
 
     exit_code = await resume_command.run(_args(engagement_path))
@@ -174,14 +204,10 @@ async def test_resume_fails_closed_without_a_safe_checkpoint(
 ) -> None:
     engagement_path = _engagement_yaml(tmp_path)
     deps = build_test_application()
-    hint = RuntimeState(
-        run_id=RunId("run_resume"),
-        engagement_id=EngagementId("eng_recovered"),
-        termination_reason=TerminationReason.APPROVAL_PENDING,
-    )
+    hint = _identity("eng_recovered")
     _FakeRunner.recovered = None  # recover_runtime refuses an unsafe snapshot
 
-    monkeypatch.setattr(resume_command, "_read_checkpoint_runtime", AsyncMock(return_value=hint))
+    monkeypatch.setattr(resume_command, "_read_checkpoint_identity", AsyncMock(return_value=hint))
     monkeypatch.setattr(
         resume_command, "build_resume_application", AsyncMock(return_value=(object(), deps))
     )
@@ -197,12 +223,8 @@ async def test_resume_reports_bad_mcp_configuration_as_a_config_error(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     engagement_path = _engagement_yaml(tmp_path)
-    hint = RuntimeState(
-        run_id=RunId("run_resume"),
-        engagement_id=EngagementId("eng_recovered"),
-        termination_reason=TerminationReason.APPROVAL_PENDING,
-    )
-    monkeypatch.setattr(resume_command, "_read_checkpoint_runtime", AsyncMock(return_value=hint))
+    hint = _identity("eng_recovered")
+    monkeypatch.setattr(resume_command, "_read_checkpoint_identity", AsyncMock(return_value=hint))
     monkeypatch.setattr(
         resume_command,
         "build_resume_application",
@@ -251,7 +273,8 @@ async def test_resume_paused_run_applies_operator_intent_before_scheduling(
     _FakeRunner.final = paused.model_copy(
         update={"termination_reason": TerminationReason.NO_ACTIONABLE_PLAN}
     )
-    monkeypatch.setattr(resume_command, "_read_checkpoint_runtime", AsyncMock(return_value=paused))
+    hint = _identity("eng_recovered", mission_id=str(mission_id))
+    monkeypatch.setattr(resume_command, "_read_checkpoint_identity", AsyncMock(return_value=hint))
     monkeypatch.setattr(
         resume_command, "build_resume_application", AsyncMock(return_value=(object(), deps))
     )
@@ -280,7 +303,8 @@ async def test_pending_approval_without_resolution_is_not_reported_as_resumed(
     )
     _FakeRunner.recovered = pending
     _FakeRunner.final = pending
-    monkeypatch.setattr(resume_command, "_read_checkpoint_runtime", AsyncMock(return_value=pending))
+    hint = _identity("eng_recovered")
+    monkeypatch.setattr(resume_command, "_read_checkpoint_identity", AsyncMock(return_value=hint))
     monkeypatch.setattr(
         resume_command,
         "build_resume_application",
@@ -310,9 +334,8 @@ async def test_resume_restores_control_counters_and_elapsed_duration(
     _FakeRunner.final = recovered
     control = type("RecordingControl", (), {"rehydrate": AsyncMock()})()
     deps = replace(build_test_application(), control_plane=control)
-    monkeypatch.setattr(
-        resume_command, "_read_checkpoint_runtime", AsyncMock(return_value=recovered)
-    )
+    hint = _identity("eng_recovered")
+    monkeypatch.setattr(resume_command, "_read_checkpoint_identity", AsyncMock(return_value=hint))
     monkeypatch.setattr(
         resume_command, "build_resume_application", AsyncMock(return_value=(object(), deps))
     )
@@ -327,12 +350,7 @@ async def test_resume_restores_control_counters_and_elapsed_duration(
 
 
 def _hint_with_binding(tmp_path: Path, binding) -> tuple:
-    return _engagement_yaml(tmp_path), RuntimeState(
-        run_id=RunId("run_resume"),
-        engagement_id=EngagementId("eng_recovered"),
-        termination_reason=TerminationReason.APPROVAL_PENDING,
-        component_binding=binding,
-    )
+    return _engagement_yaml(tmp_path), _identity("eng_recovered", binding=binding)
 
 
 async def test_resume_rejects_unregistered_profile_before_bootstrap(
@@ -347,7 +365,7 @@ async def test_resume_rejects_unregistered_profile_before_bootstrap(
         ),
     )
     build = AsyncMock()
-    monkeypatch.setattr(resume_command, "_read_checkpoint_runtime", AsyncMock(return_value=hint))
+    monkeypatch.setattr(resume_command, "_read_checkpoint_identity", AsyncMock(return_value=hint))
     monkeypatch.setattr(resume_command, "build_resume_application", build)
 
     assert await resume_command.run(_args(engagement_path)) == EXIT_FAILURE
@@ -366,7 +384,7 @@ async def test_resume_rejects_changed_component_ids_before_bootstrap(
         ),
     )
     build = AsyncMock()
-    monkeypatch.setattr(resume_command, "_read_checkpoint_runtime", AsyncMock(return_value=hint))
+    monkeypatch.setattr(resume_command, "_read_checkpoint_identity", AsyncMock(return_value=hint))
     monkeypatch.setattr(resume_command, "build_resume_application", build)
 
     assert await resume_command.run(_args(engagement_path)) == EXIT_FAILURE
@@ -376,21 +394,25 @@ async def test_resume_rejects_changed_component_ids_before_bootstrap(
 async def test_resume_forwards_stored_builtin_selection_to_build(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    engagement_path, hint = _hint_with_binding(
-        tmp_path,
-        RuntimeComponentBinding(
-            profile_id="builtin",
-            version="1",
-            component_ids=dict(BUILTIN_COMPONENT_IDS),
-        ),
+    binding = RuntimeComponentBinding(
+        profile_id="builtin",
+        version="1",
+        component_ids=dict(BUILTIN_COMPONENT_IDS),
     )
+    engagement_path, hint = _hint_with_binding(tmp_path, binding)
     deps = build_test_application()
-    _FakeRunner.recovered = hint
+    recovered = RuntimeState(
+        run_id=RunId("run_resume"),
+        engagement_id=EngagementId("eng_recovered"),
+        termination_reason=TerminationReason.APPROVAL_PENDING,
+        component_binding=binding,
+    )
+    _FakeRunner.recovered = recovered
     _FakeRunner.final = _finished()
     _FakeRunner.resumed_with = None
     _FakeRunner.closed = False
     build = AsyncMock(return_value=(object(), deps))
-    monkeypatch.setattr(resume_command, "_read_checkpoint_runtime", AsyncMock(return_value=hint))
+    monkeypatch.setattr(resume_command, "_read_checkpoint_identity", AsyncMock(return_value=hint))
     monkeypatch.setattr(resume_command, "build_resume_application", build)
     monkeypatch.setattr(resume_command, "AgentLoopRunner", _FakeRunner)
     monkeypatch.setattr(resume_command, "settle_engagement", AsyncMock(return_value=_finished()))
@@ -401,3 +423,97 @@ async def test_resume_forwards_stored_builtin_selection_to_build(
     assert build.await_args.kwargs["component_profile"] == ComponentProfile(
         profile_id="builtin", version="1"
     )
+
+
+async def test_identity_reads_msgpack_without_running_constructors_and_strict_holds(
+    tmp_path: Path,
+) -> None:
+    _CONSTRUCTED.clear()
+    selected = StateCodecRegistry()
+    selected.register(_IdentityProbe.__module__, "_IdentityProbe", version="7")
+    binding = RuntimeComponentBinding(
+        profile_id="builtin",
+        version="1",
+        component_ids=dict(BUILTIN_COMPONENT_IDS),
+    )
+    run_id = "run-identity-msgpack"
+    path = tmp_path / "identity.sqlite3"
+    marker = _IdentityProbe(label="kept")
+    _CONSTRUCTED.clear()
+    config = {"configurable": {"thread_id": run_id, "checkpoint_ns": ""}}
+    checkpoint = {
+        "v": 4,
+        "ts": "2026-01-01T00:00:00+00:00",
+        "id": "00000000-0000-0000-0000-000000000002",
+        "channel_values": {
+            "runtime": {
+                "engagement_id": "eng-identity",
+                "mission_id": "mission-1",
+                "component_binding": binding.model_dump(mode="json"),
+                "extra": marker,
+            }
+        },
+        "channel_versions": {},
+        "versions_seen": {},
+        "updated_channels": None,
+    }
+    async with open_checkpointer(backend="sqlite", path=str(path), registry=selected) as saver:
+        assert saver is not None
+        await saver.aput(config, checkpoint, {}, {})
+    _CONSTRUCTED.clear()
+    found = await read_checkpoint_identity(
+        enabled=True, backend="sqlite", path=str(path), run_id=run_id
+    )
+    assert found is not None
+    assert found.engagement_id == EngagementId("eng-identity")
+    assert found.mission_id == "mission-1"
+    assert found.component_binding is not None
+    assert found.component_binding.profile_id == "builtin"
+    assert _CONSTRUCTED == []
+    async with open_checkpointer(
+        backend="sqlite", path=str(path), registry=selected
+    ) as strict_saver:
+        assert strict_saver is not None
+        restored = await strict_saver.aget(config)
+    assert restored is not None
+    extra = restored["channel_values"]["runtime"]["extra"]
+    assert isinstance(extra, _IdentityProbe)
+    assert extra.label == "kept"
+
+
+async def test_identity_handles_legacy_json_envelope_kwargs_without_construction() -> None:
+    _CONSTRUCTED.clear()
+    selected = StateCodecRegistry()
+    selected.register(_IdentityProbe.__module__, "_IdentityProbe", version="7")
+    binding = RuntimeComponentBinding(
+        profile_id="builtin",
+        version="1",
+        component_ids=dict(BUILTIN_COMPONENT_IDS),
+    )
+    envelope_id = _IdentityProbe.__module__.split(".") + ["_IdentityProbe"]
+    payload = {
+        "runtime": {
+            "engagement_id": "eng-legacy",
+            "mission_id": "mission-legacy",
+            "component_binding": binding.model_dump(mode="json"),
+            "evil": {
+                "lc": 2,
+                "type": "constructor",
+                "id": envelope_id,
+                "kwargs": {"label": "kept"},
+            },
+        }
+    }
+    raw = ("json", json.dumps(payload).encode("utf-8"))
+    async with open_identity_reader(backend="memory") as reader:
+        assert reader is not None
+        projected = reader.serde.loads_typed(raw)
+    assert projected["runtime"]["engagement_id"] == "eng-legacy"
+    assert projected["runtime"]["evil"] == {"label": "kept"}
+    assert _CONSTRUCTED == []
+    strict = build_checkpointer(enabled=True, registry=selected)
+    assert strict is not None
+    revived = strict.serde.loads_typed(raw)
+    evil = revived["runtime"]["evil"]
+    assert isinstance(evil, _IdentityProbe)
+    assert evil.label == "kept"

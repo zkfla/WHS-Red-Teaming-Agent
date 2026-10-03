@@ -127,6 +127,10 @@ class DefaultControlPlane:
         # the first resolved one returns the same PolicyDecision instead
         # of re-consuming rate-limit/budget capacity.
         self._resolved_outcomes: dict[ApprovalId, PolicyDecision] = {}
+        # Root review: admission never caches time checks. Receipts are
+        # caller correlation only. Retries track consumed attempts by key,
+        # never by replaying a stored decision before current checks.
+        self._consumed_reservations: set[tuple[str, str, str, int]] = set()
 
     async def evaluate(self, proposal: ActionProposal, context: ControlContext) -> PolicyDecision:
         engagement_id = context.engagement_id
@@ -138,7 +142,7 @@ class DefaultControlPlane:
                 proposal, PolicyVerdict.DENY, scope_reasons, ["scope"], severity=scope_severity
             )
 
-        in_flight = context.metadata.get("in_flight_actions")
+        in_flight = self._in_flight_from_context(context)
         try:
             roe_ok, roe_reasons, roe_severity = check_roe(
                 proposal, engagement, in_flight_actions=in_flight
@@ -199,9 +203,7 @@ class DefaultControlPlane:
                 severity=Severity.BLOCK_ACTION,
             )
 
-        budget = self._budgets.setdefault(
-            engagement_id, BudgetTracker(engagement.execution_budget)
-        )
+        budget = self._budgets.setdefault(engagement_id, BudgetTracker(engagement.execution_budget))
         if not budget.has_capacity():
             # No capacity left for any further action — end the run.
             return await self._finalize(
@@ -535,20 +537,14 @@ class DefaultControlPlane:
         elapsed = elapsed_duration_seconds
         if elapsed is not None:
             if not math.isfinite(elapsed):
-                raise ValueError(
-                    f"elapsed_duration_seconds must be finite, got {elapsed!r}"
-                )
+                raise ValueError(f"elapsed_duration_seconds must be finite, got {elapsed!r}")
             if elapsed < 0:
-                raise ValueError(
-                    f"elapsed_duration_seconds must be non-negative, got {elapsed}"
-                )
+                raise ValueError(f"elapsed_duration_seconds must be non-negative, got {elapsed}")
             max_duration = engagement.execution_budget.max_duration_seconds
             if max_duration is not None:
                 elapsed = min(elapsed, float(max_duration))
 
-        budget = self._budgets.setdefault(
-            normalized_id, BudgetTracker(engagement.execution_budget)
-        )
+        budget = self._budgets.setdefault(normalized_id, BudgetTracker(engagement.execution_budget))
         budget.rehydrate(
             actions_consumed=actions,
             tool_calls_consumed=tool_calls,
@@ -575,9 +571,7 @@ class DefaultControlPlane:
             rate_remaining=rate_limiter.remaining,
         )
 
-    async def record_tool_calls(
-        self, engagement_id: EngagementId | str, count: int = 1
-    ) -> int:
+    async def record_tool_calls(self, engagement_id: EngagementId | str, count: int = 1) -> int:
         """Charge ``count`` extra tool calls against the authoritative budget.
 
         Bounded-retry counterpart to ``BudgetTracker.consume_tool_calls``:
@@ -601,9 +595,7 @@ class DefaultControlPlane:
             raise KeyError(f"unregistered engagement: {engagement_id}")
         if count < 0:
             raise ValueError(f"tool-call count must be non-negative, got {count}")
-        budget = self._budgets.setdefault(
-            normalized_id, BudgetTracker(engagement.execution_budget)
-        )
+        budget = self._budgets.setdefault(normalized_id, BudgetTracker(engagement.execution_budget))
         budget.consume_tool_calls(count)
         return budget.remaining
 
@@ -626,6 +618,378 @@ class DefaultControlPlane:
             return True
         return budget.tool_calls_remaining > 0
 
+    def _recheck_time_gates(self, proposal, engagement, *, now_utc, in_flight):
+        from redteam.control.roe import UnsupportedRoePolicyError
+
+        try:
+            roe_ok, roe_reasons, roe_severity = check_roe(
+                proposal, engagement, now=now_utc, in_flight_actions=in_flight
+            )
+        except UnsupportedRoePolicyError as exc:
+            return False, "roe_window_closed", [str(exc)], Severity.ABORT_RUN
+        if roe_ok:
+            return True, "", [], None
+        joined = " ".join(roe_reasons).lower()
+        if "max_parallel" in joined or "in flight" in joined or "in-flight" in joined:
+            return (
+                False,
+                "roe_parallel_exceeded",
+                ["roe_parallel_exceeded", *roe_reasons],
+                roe_severity,
+            )
+        if "availability" in joined:
+            return (
+                False,
+                "availability_blocked",
+                ["availability_blocked", *roe_reasons],
+                roe_severity,
+            )
+        return False, "roe_window_closed", ["roe_window_closed", *roe_reasons], roe_severity
+
+    @staticmethod
+    def _in_flight_from_context(context: ControlContext):
+        typed = getattr(context, "in_flight_actions", None)
+        if typed is not None:
+            return typed
+        try:
+            meta = (context.metadata or {}).get("in_flight_actions")
+        except Exception:
+            return None
+        return meta
+
+    async def _current_admission_check(
+        self,
+        proposal: ActionProposal,
+        decision: PolicyDecision,
+        context: ControlContext,
+        *,
+        receipt_id: str,
+        attempt_index=None,
+    ):
+        now_utc = datetime.now(timezone.utc)
+        if receipt_id is None or not str(receipt_id):
+            return (
+                False,
+                "decision_mismatch",
+                ["missing receipt"],
+                ["admission"],
+                Severity.BLOCK_ACTION,
+                None,
+                None,
+                now_utc,
+                None,
+            )
+        idx = None
+        if attempt_index is not None:
+            try:
+                idx = int(attempt_index)
+            except Exception:
+                return (
+                    False,
+                    "decision_mismatch",
+                    ["invalid attempt index"],
+                    ["admission"],
+                    Severity.BLOCK_ACTION,
+                    None,
+                    None,
+                    now_utc,
+                    None,
+                )
+            if idx < 1:
+                return (
+                    False,
+                    "decision_mismatch",
+                    ["attempt_index must be >= 1"],
+                    ["admission"],
+                    Severity.BLOCK_ACTION,
+                    None,
+                    None,
+                    now_utc,
+                    None,
+                )
+        if decision.action_id != proposal.action_id or decision.verdict != PolicyVerdict.ALLOW:
+            return (
+                False,
+                "decision_mismatch",
+                ["admission requires ALLOW for this action"],
+                ["admission"],
+                Severity.BLOCK_ACTION,
+                None,
+                None,
+                now_utc,
+                idx,
+            )
+        if proposal.engagement_id != context.engagement_id:
+            return (
+                False,
+                "decision_mismatch",
+                ["proposal engagement does not match context"],
+                ["admission"],
+                Severity.BLOCK_ACTION,
+                None,
+                None,
+                now_utc,
+                idx,
+            )
+        try:
+            meta_run = (context.metadata or {}).get("run_id")
+        except Exception:
+            meta_run = None
+        if meta_run is not None and str(meta_run) != str(proposal.run_id):
+            return (
+                False,
+                "decision_mismatch",
+                ["proposal run does not match context"],
+                ["admission"],
+                Severity.BLOCK_ACTION,
+                None,
+                None,
+                now_utc,
+                idx,
+            )
+        if decision.approval_id is not None:
+            approval = await self._approvals.get(decision.approval_id)
+            if (
+                approval is None
+                or approval.action_id != proposal.action_id
+                or approval.status != ApprovalStatus.APPROVED
+            ):
+                return (
+                    False,
+                    "decision_mismatch",
+                    ["approval is not APPROVED for this action"],
+                    ["admission", "approval"],
+                    Severity.BLOCK_ACTION,
+                    None,
+                    None,
+                    now_utc,
+                    idx,
+                )
+        engagement = self._engagements.get(context.engagement_id)
+        if engagement is None:
+            return (
+                False,
+                "decision_mismatch",
+                ["unknown engagement"],
+                ["admission"],
+                Severity.BLOCK_ACTION,
+                None,
+                None,
+                now_utc,
+                idx,
+            )
+        scope_ok, scope_reasons, scope_severity = check_scope(proposal, engagement.scope)
+        if not scope_ok:
+            return (
+                False,
+                "scope_revoked",
+                list(scope_reasons),
+                ["scope"],
+                scope_severity,
+                engagement,
+                self._budgets.get(context.engagement_id),
+                now_utc,
+                idx,
+            )
+        in_flight = self._in_flight_from_context(context)
+        now_utc = datetime.now(timezone.utc)
+        time_ok, time_code, time_reasons, time_severity = self._recheck_time_gates(
+            proposal, engagement, now_utc=now_utc, in_flight=in_flight
+        )
+        if not time_ok:
+            base = (
+                [r for r in time_reasons[1:] if r]
+                if time_reasons and time_reasons[0] == time_code
+                else list(time_reasons)
+            )
+            return (
+                False,
+                time_code,
+                base,
+                ["roe"],
+                time_severity,
+                engagement,
+                self._budgets.get(context.engagement_id),
+                now_utc,
+                idx,
+            )
+        budget = self._budgets.get(context.engagement_id)
+        if budget is not None and budget.duration_exhausted():
+            return (
+                False,
+                "duration_exhausted",
+                ["execution duration budget is exhausted"],
+                ["budget"],
+                Severity.ABORT_RUN,
+                engagement,
+                budget,
+                now_utc,
+                idx,
+            )
+        return (True, "", [], [], None, engagement, budget, now_utc, idx)
+
+    async def admit_invocation(
+        self,
+        proposal: ActionProposal,
+        decision: PolicyDecision,
+        context: ControlContext,
+        *,
+        receipt_id: str,
+    ) -> PolicyDecision:
+        """Re-check scope, ROE time and duration without charging.
+
+        Time checks are fresh; receipt_id is caller correlation only.
+        """
+        (
+            ok,
+            code,
+            extra,
+            matched,
+            severity,
+            _eng,
+            _budget,
+            now_utc,
+            _idx,
+        ) = await self._current_admission_check(proposal, decision, context, receipt_id=receipt_id)
+        if not ok:
+            return await self._finalize(
+                proposal,
+                PolicyVerdict.DENY,
+                [code, *extra],
+                matched,
+                severity=severity,
+                approval_id=decision.approval_id,
+            )
+        allowed = PolicyDecision(
+            action_id=proposal.action_id,
+            verdict=PolicyVerdict.ALLOW,
+            reasons=["admitted"],
+            matched_rules=list(decision.matched_rules),
+            approval_id=decision.approval_id,
+            rate_limit_remaining=decision.rate_limit_remaining,
+            budget_remaining=decision.budget_remaining,
+            evaluated_at=now_utc,
+            severity=None,
+        )
+        return allowed
+
+    async def reserve_extra_tool_call(
+        self,
+        proposal: ActionProposal,
+        decision: PolicyDecision,
+        context: ControlContext,
+        *,
+        receipt_id: str,
+        attempt_index: int,
+    ) -> PolicyDecision:
+        """Reserve an extra retry call without charging rate or action counters.
+
+        Current checks precede the consumed-key check, capacity and one charge.
+        Decisions are never stored or replayed here.
+        """
+
+        def _severity_for(code: str) -> Severity:
+            if code in ("duration_exhausted", "roe_window_closed"):
+                return Severity.ABORT_RUN
+            return Severity.BLOCK_ACTION
+
+        def _deny_plain(code: str, detail: str) -> PolicyDecision:
+            sev = _severity_for(code)
+            base = (
+                "budget"
+                if code in ("tool_calls_exhausted", "duration_exhausted")
+                else ("admission" if code == "decision_mismatch" else "roe")
+            )
+            denied = PolicyDecision(
+                action_id=proposal.action_id,
+                verdict=PolicyVerdict.DENY,
+                reasons=[code, detail] if detail else [code],
+                matched_rules=[base, to_tag(sev)],
+                approval_id=decision.approval_id,
+                evaluated_at=datetime.now(timezone.utc),
+                severity=sev,
+            )
+            return denied
+
+        # A retry re-invokes the already-admitted action tool; it does not
+        # create a new parallel slot of its own. Concurrency is still checked
+        # here against the live others count from context (typed first, legacy
+        # metadata fallback), so a genuinely saturated parallel gate still
+        # denies instead of being bypassed.
+        (
+            ok,
+            code,
+            extra,
+            matched,
+            severity,
+            _eng,
+            budget,
+            now_utc,
+            idx,
+        ) = await self._current_admission_check(
+            proposal, decision, context, receipt_id=receipt_id, attempt_index=attempt_index
+        )
+        if not ok:
+            detail = extra[0] if extra else ""
+            base = (
+                "budget"
+                if code in ("tool_calls_exhausted", "duration_exhausted")
+                else (
+                    "admission"
+                    if code == "decision_mismatch"
+                    else ("scope" if code == "scope_revoked" else "roe")
+                )
+            )
+            sev = severity if severity is not None else _severity_for(code)
+            denied = PolicyDecision(
+                action_id=proposal.action_id,
+                verdict=PolicyVerdict.DENY,
+                reasons=[code, detail] if detail else [code],
+                matched_rules=[base, to_tag(sev)],
+                approval_id=decision.approval_id,
+                evaluated_at=now_utc,
+                severity=sev,
+            )
+            return denied
+        assert idx is not None
+        consumed_key = (
+            str(context.engagement_id),
+            str(proposal.action_id),
+            str(receipt_id),
+            int(idx),
+        )
+        if consumed_key in self._consumed_reservations:
+            allowed = PolicyDecision(
+                action_id=proposal.action_id,
+                verdict=PolicyVerdict.ALLOW,
+                reasons=["extra_tool_call_reserved"],
+                matched_rules=list(decision.matched_rules),
+                approval_id=decision.approval_id,
+                rate_limit_remaining=decision.rate_limit_remaining,
+                budget_remaining=(budget.remaining if budget is not None else None),
+                evaluated_at=now_utc,
+                severity=None,
+            )
+            return allowed
+        if budget is None:
+            return _deny_plain("tool_calls_exhausted", "no budget tracker for this engagement")
+        if budget.tool_calls_remaining <= 0:
+            return _deny_plain("tool_calls_exhausted", "tool call budget is exhausted")
+        budget.consume_tool_calls(1)
+        self._consumed_reservations.add(consumed_key)
+        allowed = PolicyDecision(
+            action_id=proposal.action_id,
+            verdict=PolicyVerdict.ALLOW,
+            reasons=["extra_tool_call_reserved"],
+            matched_rules=list(decision.matched_rules),
+            approval_id=decision.approval_id,
+            rate_limit_remaining=decision.rate_limit_remaining,
+            budget_remaining=budget.remaining,
+            evaluated_at=now_utc,
+            severity=None,
+        )
+        return allowed
+
     async def _finalize(
         self,
         proposal: ActionProposal,
@@ -638,8 +1002,10 @@ class DefaultControlPlane:
         severity: Severity | None = None,
         approval_id: ApprovalId | None = None,
     ) -> PolicyDecision:
-        # Carry the denial severity as a matched_rules tag (PolicyDecision
-        # has no severity field yet — see redteam.control.severity).
+        # Dual-write severity: typed PolicyDecision.severity plus the legacy
+        # matched_rules tag. Tag readers must use
+        # core.contracts.policy.legacy_denial_severity (or the
+        # PolicyDecision.denial_severity property), never a new parser here.
         if severity is not None:
             matched_rules = [*matched_rules, to_tag(severity)]
         decision = PolicyDecision(
@@ -651,6 +1017,7 @@ class DefaultControlPlane:
             rate_limit_remaining=rate_limit_remaining,
             budget_remaining=budget_remaining,
             evaluated_at=datetime.now(timezone.utc),
+            severity=severity,
         )
         await self._audit.record(proposal, decision)
         await self._record_blocked_action(proposal, decision)

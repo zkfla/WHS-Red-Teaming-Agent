@@ -74,7 +74,7 @@ def test_draft_to_engagement_config_maps_availability_impact_and_scope() -> None
     assert result.unenforced_operations == []
 
 
-def test_unrecognized_denied_operation_moves_to_notes_not_dropped() -> None:
+def test_future_denied_operation_remains_enforceable_after_a_tool_is_added() -> None:
     draft = EngagementDraft(
         name="X",
         allowed_hosts=["a.local"],
@@ -85,11 +85,10 @@ def test_unrecognized_denied_operation_moves_to_notes_not_dropped() -> None:
     result = draft_to_engagement_config(draft)
 
     assert "web.http_request" in result.engagement_config.rules_of_engagement[0].denied_operations
-    assert "web.not_a_real_operation" not in (
+    assert "web.not_a_real_operation" in (
         result.engagement_config.rules_of_engagement[0].denied_operations
     )
-    assert result.unenforced_operations == ["web.not_a_real_operation"]
-    assert "web.not_a_real_operation" in result.engagement_config.rules_of_engagement[0].notes
+    assert result.unenforced_operations == []
 
 
 def test_dump_engagement_yaml_round_trips_through_the_real_loader(tmp_path) -> None:  # noqa: ANN001

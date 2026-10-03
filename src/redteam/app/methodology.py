@@ -4,9 +4,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from redteam.capability.adapters.mcp.naming import legacy_alias_for_tool_id
 from redteam.capability.methodology import load_catalog, safe_path, verify_bundle
 from redteam.capability.servers.workspace import WorkspaceIO, WorkspacePolicy
 from redteam.core.config import MethodologyConfig
+from redteam.core.ids import ToolId
 from redteam.core.ports.tool_catalog import ToolCatalog
 from redteam.orchestration.agents.providers import CandidateProviderRegistry
 from redteam.orchestration.agents.registry import AgentRegistry
@@ -77,17 +79,7 @@ def wire_reference_agent(
     agents: AgentRegistry,
     providers: CandidateProviderRegistry,
 ) -> tuple[AgentRegistry, CandidateProviderRegistry]:
-    from redteam.core.ids import ToolId
-
-    descriptor = catalog.get(ToolId("analysis.read_file")) if catalog is not None else None
-    if (
-        descriptor is None
-        or "file_read" not in descriptor.operations
-        or descriptor.health_status.value == "unhealthy"
-        or descriptor.input_schema.get("properties", {}).get("asset_ref", {}).get("const")
-        != library.asset_ref
-    ):
-        raise ValueError("methodology_workspace_read_tool_required")
+    descriptor = _reference_reader(library, catalog)
     # Preserve caller-owned registries and the built-in Analysis verifier seam.
     scoped_agents = AgentRegistry(agents.all(), definitions=agents.definitions())
     scoped_providers = CandidateProviderRegistry()
@@ -96,8 +88,58 @@ def wire_reference_agent(
         if provider is None:
             raise ValueError("methodology_provider_registry_inconsistent")
         scoped_providers.register(key, provider)
-    spec, definition = reference_agent()
+    # Selected contract drives role, candidate, capture, and inspect meanings.
+    # Model prompt context for the engine root is left to the root owner.
+    spec, definition = reference_agent(library.selected_contract)
     scoped_agents.register_definition(definition)
     scoped_agents.register(spec)
-    scoped_providers.register(REFERENCE_PROVIDER_ID, MethodologyCandidateProvider(library))
+    scoped_providers.register(
+        REFERENCE_PROVIDER_ID, MethodologyCandidateProvider(library, descriptor.tool_id)
+    )
     return scoped_agents, scoped_providers
+
+
+def _reference_reader(library: ReferenceLibrary, catalog: ToolCatalog | None):
+    contracts = {entry.read_contract.model_dump_json() for entry in library.entries}
+    if len(contracts) != 1:
+        raise ValueError("methodology_read_contract_mismatch")
+    contract = library.entries[0].read_contract
+    if contract.asset_binding != "asset_ref_const" or contract.encoding != "utf-8":
+        raise ValueError("methodology_read_contract_unsupported")
+    candidates = (
+        catalog.list_tools_for_action(contract.capability, contract.operation) if catalog else []
+    )
+    candidates = [
+        tool
+        for tool in candidates
+        if tool.health_status.value != "unhealthy"
+        and contract.asset_binding == "asset_ref_const"
+        and tool.input_schema.get("properties", {}).get("asset_ref", {}).get("const")
+        == library.asset_ref
+    ]
+    if len(candidates) != 1:
+        raise ValueError("methodology_workspace_read_tool_required")
+    descriptor = candidates[0]
+    return descriptor
+
+
+def bind_reference_library(
+    library: ReferenceLibrary, catalog: ToolCatalog | None
+) -> ReferenceLibrary:
+    descriptor = _reference_reader(library, catalog)
+    proven: list[ToolId] = []
+    alias = legacy_alias_for_tool_id(descriptor.tool_id)
+    if alias is not None and alias != str(descriptor.tool_id) and catalog is not None:
+        try:
+            resolved = catalog.get(ToolId(alias))
+        except ValueError:
+            resolved = None  # Ambiguous old references prove no physical identity.
+        if resolved is not None and (resolved.server_id, resolved.tool_name, resolved.tool_id) == (
+            descriptor.server_id,
+            descriptor.tool_name,
+            descriptor.tool_id,
+        ):
+            proven.append(ToolId(alias))
+    return library.model_copy(
+        update={"reader_tool_id": descriptor.tool_id, "accepted_reader_ids": tuple(proven)}
+    )

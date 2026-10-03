@@ -9,7 +9,7 @@ from redteam.app.bootstrap import run_engagement
 from redteam.attack_graph.predicates import facts_of
 from redteam.attack_graph.service import AttackGraphService
 from redteam.attack_graph.stores.memory import InMemoryAttackGraphStore
-from redteam.capability.adapters.mcp.base import MCPCallResult
+from redteam.capability.adapters.mcp.base import MCPAdapter, MCPCallResult
 from redteam.capability.gateway import MCPToolGateway
 from redteam.capability.registry import MCPToolRegistry
 from redteam.control.service import DefaultControlPlane
@@ -241,7 +241,8 @@ def _descriptor(
 
 def _gateway(
     adapter: ScriptedApktoolAdapter,
-    *, decode_required: list[str] | None = None,
+    *,
+    decode_required: list[str] | None = None,
     jadx_adapter: ScriptedJadxAdapter | None = None,
     jadx_health: ToolHealthStatus = ToolHealthStatus.HEALTHY,
 ) -> MCPToolGateway:
@@ -252,7 +253,7 @@ def _gateway(
         _descriptor("list_smali_files", ["project_dir"]),
         _descriptor("search_in_files", ["project_dir", "search_pattern"]),
     ]
-    adapters = {adapter.server_id: adapter}
+    adapters: dict[str, MCPAdapter] = {adapter.server_id: adapter}
     if jadx_adapter is not None:
         descriptors.append(
             _descriptor(
@@ -299,9 +300,7 @@ def _deps(
 ):
     control = DefaultControlPlane({engagement.engagement_id: engagement})
     analysis_definition = next(
-        item
-        for item in builtin_agent_definitions()
-        if item.agent_id == ANALYSIS_AGENT.agent_id
+        item for item in builtin_agent_definitions() if item.agent_id == ANALYSIS_AGENT.agent_id
     )
     deps = build_test_application(
         control_plane=control,
@@ -432,9 +431,7 @@ async def test_optional_jadx_step_requires_a_healthy_registered_tool() -> None:
     unknown = await compile_for(ToolHealthStatus.UNKNOWN)
     unhealthy = await compile_for(ToolHealthStatus.UNHEALTHY)
 
-    assert [str(item.tool.tool_id) for item in healthy] == [
-        "analysis.get_android_manifest"
-    ]
+    assert [str(item.tool.tool_id) for item in healthy] == ["analysis.get_android_manifest"]
     assert unknown == []
     assert unhealthy == []
 

@@ -44,6 +44,10 @@ class InMemoryPathStore:
         self._lock = asyncio.Lock()
 
     def _merged(self, snapshot: PathPlan) -> PathPlan:
+        return self.merged_view(snapshot)
+
+    def merged_view(self, snapshot: PathPlan) -> PathPlan:
+        """Merge stored progress into a snapshot copy (lock-free staged read)."""
         merged = snapshot.model_copy(deep=True)
         for step in merged.steps:
             record = self._progress.get(
@@ -54,6 +58,14 @@ class InMemoryPathStore:
                 step.outcome = record["outcome"]
                 step.evidence_ids = list(record["evidence_ids"])
         return merged
+
+    def peek_active_pointer(self, run_id: str) -> tuple[str, int] | None:
+        """Lock-free staged read for the atomic backend (same boundary rule)."""
+        return self._active.get(run_id)
+
+    def peek_snapshot(self, run_id: str, path_id: str, version: int) -> PathPlan | None:
+        """Lock-free staged snapshot read (same boundary rule)."""
+        return self._snapshots.get((run_id, path_id, version))
 
     def _plan_progress(self, snapshot: PathPlan) -> tuple[list[str], dict]:
         """Compute (changed ids, progress records) without mutating state."""

@@ -10,6 +10,8 @@ from redteam.core.enums import ToolHealthStatus
 
 class MobSFMCPAdapter(ScopedAnalysisMCPAdapter):
     error_prefix = "mobsf"
+    #: REST client injected by from_settings; annotated for the typed contract.
+    client: MobSFClient
 
     @classmethod
     def from_settings(cls, settings, transport):

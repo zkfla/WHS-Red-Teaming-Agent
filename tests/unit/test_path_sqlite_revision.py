@@ -8,6 +8,7 @@ import pytest
 
 from redteam.attack_graph.stores.memory import InMemoryAttackGraphStore
 from redteam.orchestration.agents.providers import default_provider_registry
+from redteam.orchestration.agents.registry import default_registry
 from redteam.orchestration.context import ContextProjectionCache
 from redteam.orchestration.engine import InvestigationEngine
 from redteam.orchestration.paths import (
@@ -40,6 +41,7 @@ def _chain_step(sid, depends=None, objective=None):
         step_id=sid,
         objective=objective or ("objective-" + sid),
         depends_on=list(depends or []),
+        allowed_operations=["analysis.command_run"],
         completion_criteria=[CompletionCriterion(kind="evidence", description="seen-" + sid)],
     )
 
@@ -64,11 +66,17 @@ class _AcceptLLM:
 
 
 class _Agents:
+    def __init__(self):
+        self._definitions = default_registry().definitions()
+
     def all(self):
         return []
 
     def get(self, agent_id):
         return None
+
+    def definitions(self):
+        return self._definitions
 
 
 class _Evidence:
@@ -79,12 +87,35 @@ class _Evidence:
         return []
 
 
+def _engine_catalog():
+    from redteam.core.contracts.tool import ToolDescriptor
+    from redteam.core.ids import ToolId
+    from tests.fakes import DummyToolGateway
+
+    return DummyToolGateway(
+        tools=[
+            ToolDescriptor(
+                tool_id=ToolId("analysis.run_command"),
+                server_id="execution",
+                tool_name="run_command",
+                input_schema={"type": "object"},
+                output_schema={"type": "object"},
+                operations=["command_run"],
+                target_types=["asset"],
+                capability_tags=["analysis"],
+            )
+        ]
+    )
+
+
 def _engine_deps(path_store):
+    from redteam.orchestration.coordination import coordinator_for
     from redteam.orchestration.task_graph.sqlite import SQLiteTaskGraphStore
 
+    task_graph_store = SQLiteTaskGraphStore(path_store._path)
     return SimpleNamespace(
         path_store=path_store,
-        task_graph_store=SQLiteTaskGraphStore(path_store._path),
+        task_graph_store=task_graph_store,
         graph_store=InMemoryAttackGraphStore(),
         evidence_store=_Evidence(),
         agents=_Agents(),
@@ -92,8 +123,10 @@ def _engine_deps(path_store):
         context_cache=ContextProjectionCache(),
         llm_client=_AcceptLLM(),
         settings=OrchestrationSettings(),
+        planning_provider=None,
+        coordinator=coordinator_for(task_graph_store, path_store),
         engagement=None,
-        tool_catalog=None,
+        tool_catalog=_engine_catalog(),
         work_store=InMemoryWorkStore(),
     )
 

@@ -17,6 +17,7 @@ from dataclasses import replace
 from datetime import datetime, timezone
 
 from redteam.attack_graph.identity import host_node_id
+from redteam.capability.action_binding import BUILTIN_RETRY_POLICY
 from redteam.core.contracts.action import ActionProposal
 from redteam.core.contracts.target import HostTarget
 from redteam.core.contracts.tool import ToolDescriptor, ToolError, ToolInvocation, ToolResult
@@ -24,7 +25,6 @@ from redteam.core.enums import PolicyVerdict, RiskLevel
 from redteam.core.ids import ActionId, AgentId, EngagementId, RunId, ToolId
 from redteam.orchestration.agents import PlanStep
 from redteam.orchestration.nodes import execute_node, policy_node
-from redteam.orchestration.nodes.execute import _retry_safe
 from redteam.orchestration.paths.models import CompletionCriterion, PathPlan
 from redteam.orchestration.paths.models import PathStep as RegisteredStep
 from redteam.orchestration.router import route_after_policy
@@ -58,9 +58,7 @@ async def _seed_exec_target(deps, host: str = "a.local") -> None:
         scope=EngagementScope(allowed_hosts=[host]),
         rules_of_engagement=[],
         execution_budget=ExecutionBudget(max_actions=10),
-        rate_limit_policy=RateLimitPolicy(
-            max_actions_per_minute=30, max_concurrent_actions=2
-        ),
+        rate_limit_policy=RateLimitPolicy(max_actions_per_minute=30, max_concurrent_actions=2),
         approval_policy=ApprovalPolicy(),
         created_at=NOW,
         metadata={"target_refs": {host: host}},
@@ -326,7 +324,8 @@ async def test_retry_skipped_for_non_low_risk_tool() -> None:
 async def test_low_risk_state_changing_operation_is_not_retried() -> None:
     gateway = _FlakyGateway(fail_times=10, risk=RiskLevel.LOW)
     deps = build_test_application(
-        tool_gateway=gateway, tool_catalog=gateway,
+        tool_gateway=gateway,
+        tool_catalog=gateway,
         settings=OrchestrationSettings(max_retries=3),
     )
     await _ensure_exec_path(deps)
@@ -345,13 +344,11 @@ async def test_low_risk_state_changing_operation_is_not_retried() -> None:
 
 
 def test_http_retry_requires_an_explicit_read_only_method() -> None:
-    web = proposal().model_copy(update={"capability": "web", "operation": "http_request"})
-    assert not _retry_safe(web)
-    assert _retry_safe(web.model_copy(update={"arguments": {"method": "GET"}}))
-    assert not _retry_safe(web.model_copy(update={"arguments": {"method": "POST"}}))
-    assert not _retry_safe(
-        web.model_copy(update={"arguments": {"method": "GET", "body": "payload"}})
-    )
+    permits = BUILTIN_RETRY_POLICY.permits
+    assert not permits("web", "http_request", {})
+    assert permits("web", "http_request", {"method": "GET"})
+    assert not permits("web", "http_request", {"method": "POST"})
+    assert not permits("web", "http_request", {"method": "GET", "body": "payload"})
 
 
 async def test_non_retryable_failure_is_not_retried() -> None:

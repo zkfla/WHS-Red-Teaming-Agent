@@ -12,6 +12,7 @@ import json
 import os
 import stat
 import subprocess
+from dataclasses import dataclass
 from importlib.resources import files
 from pathlib import Path, PurePosixPath
 from typing import Annotated, Literal
@@ -19,10 +20,11 @@ from typing import Annotated, Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from redteam.capability.servers.workspace import WorkspaceIO, WorkspacePolicy
+from redteam.core.reference import ReferenceDomain as Domain
 
 Identity = Annotated[str, Field(pattern=r"^[a-z][a-z0-9-]{0,63}$")]
 Digest = Annotated[str, Field(pattern=r"^[a-f0-9]{64}$")]
-Domain = Literal["general", "web", "api", "recon", "mobile", "cloud_identity", "ai_llm", "vdb"]
+
 _MAX_BYTES = 65_536
 _DATA = files("redteam.capability").joinpath("reference_data")
 _TEMPLATES = ("NOTICE.md", "hypothesis-log.md", "evidence-report.md", "session-notes.md")
@@ -337,6 +339,45 @@ def verify_bundle(policy: WorkspacePolicy, *, catalog: ReferenceCatalog | None =
         if isinstance(exc, MethodologyError):
             raise
         raise MethodologyError("reference_bundle_invalid") from None
+
+
+#: Contribution kinds spoken by methodology provisioning (M27/M28).
+#: The composition root owns collection; the names are the draft.
+METHODOLOGY_READ_CONTRACT_KIND = "methodology_read_contract"
+REFERENCE_BUNDLE_KIND = "reference_bundle"
+
+
+@dataclass(frozen=True)
+class MethodologyReadContract:
+    """What a reader must satisfy to serve reference bundles (M28).
+
+    Names a capability/operation plus the asset binding rule instead of
+    pinning one tool id, so an equivalent reader can substitute. The
+    ``asset_ref_const`` rule keeps the current safety check: the
+    reader's ``asset_ref`` input schema must pin the bundle's asset.
+    Execution permission is never part of this contract.
+    """
+
+    capability: str = "analysis"
+    operation: str = "file_read"
+    asset_binding: str = "asset_ref_const"
+    encoding: str = "utf-8"
+
+
+BUILTIN_METHODOLOGY_READ_CONTRACT = MethodologyReadContract()
+
+
+def methodology_read_contract_contribution(contract: MethodologyReadContract | None = None):
+    """The read contract in the composition root's declaration shape."""
+    from redteam.core.extensions import Contribution, value_factory
+
+    active = contract or BUILTIN_METHODOLOGY_READ_CONTRACT
+    return Contribution(
+        kind=METHODOLOGY_READ_CONTRACT_KIND,
+        contribution_id=f"{active.capability}.{active.operation}:{active.asset_binding}",
+        version="1",
+        factory=value_factory(active),
+    )
 
 
 def main() -> None:

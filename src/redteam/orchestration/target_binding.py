@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from urllib.parse import urlsplit
 
 from redteam.core.contracts.target import AnyTarget, UrlTarget
+from redteam.core.provider_contracts import OperationTargetBinding, operation_target_binding
 
 
 @dataclass(frozen=True)
@@ -45,33 +47,52 @@ def network_identity(target: AnyTarget) -> NetworkIdentity | None:
     return NetworkIdentity(parsed.hostname, port, port is not None)
 
 
-def validate_network_arguments(target: AnyTarget, arguments: dict, *, operation: str = "") -> None:
+def validate_network_arguments(
+    target: AnyTarget,
+    arguments: dict,
+    *,
+    operation: str = "",
+    bindings: Mapping[str, OperationTargetBinding] | None = None,
+    argument_bindings: Mapping[str, str] | None = None,
+) -> None:
+    binding = operation_target_binding(operation, bindings)
+    if binding.requires_url_target and not isinstance(target, UrlTarget):
+        raise ValueError(f"{operation} requires a known URL target")
     identity = network_identity(target)
-    if operation == "page_read" and not isinstance(target, UrlTarget):
-        raise ValueError("page_read requires a known URL target")
     if identity is None:
         return
-    supplied_port = arguments.get("port")
-    if supplied_port is not None:
-        if isinstance(supplied_port, bool) or not isinstance(supplied_port, (int, str)):
+    declared = argument_bindings or {}
+
+    def fields(names):
+        return set(names) | {remote for remote, common in declared.items() if common in names}
+
+    ports = [arguments[name] for name in fields(("port",)) if arguments.get(name) is not None]
+    for value in ports:
+        if isinstance(value, bool) or not isinstance(value, (int, str)):
             raise ValueError("tool argument port is invalid")
-        if identity.port is not None and int(supplied_port) != identity.port:
+        if identity.port is not None and int(value) != identity.port:
             raise ValueError("tool argument port differs from proposal target")
-    for field in ("host", "domain", "hostname"):
+    if ports and any(int(value) != int(ports[0]) for value in ports):
+        raise ValueError("tool arguments contain conflicting ports")
+    for field in fields(("host", "domain", "hostname")):
         if field not in arguments:
             continue
         actual = network_identity_from_address(str(arguments[field]))
         if (
             actual.host != identity.host
             or (actual.port is not None and actual.port != identity.port)
-            or (identity.pinned and actual.port is None and supplied_port is None)
+            or (identity.pinned and actual.port is None and not ports)
         ):
             raise ValueError("tool argument address differs from proposal target")
-    for field in ("url", "base_url", "target_url"):
+    for field in fields(("url", "base_url", "target_url")):
         value = arguments.get(field)
         if not isinstance(value, str):
             continue
-        if value.startswith("/") and not value.startswith("//") and operation != "page_read":
+        if (
+            value.startswith("/")
+            and not value.startswith("//")
+            and not binding.requires_exact_url_match
+        ):
             continue
         parsed = urlsplit(value if "://" in value or value.startswith("//") else "//" + value)
         port = parsed.port or (443 if parsed.scheme == "https" else 80)
@@ -87,12 +108,21 @@ def validate_network_arguments(target: AnyTarget, arguments: dict, *, operation:
             expected = urlsplit(target.url)
             if parsed.scheme and parsed.scheme != expected.scheme:
                 raise ValueError("tool argument scheme differs from proposal target")
-            if operation == "page_read" and (
+            if binding.requires_exact_url_match and (
                 parsed.scheme != expected.scheme
                 or (parsed.path or "/") != (expected.path or "/")
                 or parsed.query != expected.query
             ):
-                raise ValueError("page_read URL differs from the known resource")
+                raise ValueError(f"{operation} URL differs from the known resource")
+    network_values = {"host", "domain", "hostname", "url", "base_url", "target_url", "port"}
+    for remote, common in declared.items():
+        if (
+            common not in network_values
+            and remote in arguments
+            and common in arguments
+            and arguments[remote] != arguments[common]
+        ):
+            raise ValueError("tool arguments contain conflicting target values")
 
 
 def network_identity_from_address(address: str) -> NetworkIdentity:

@@ -2,16 +2,12 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from contextlib import AsyncExitStack, asynccontextmanager
 
-from redteam.capability.adapters.mcp.analysis import AnalysisMCPAdapter
+from redteam.capability.action_binding import declares_retry_safe
 from redteam.capability.adapters.mcp.base import MCPAdapter
 from redteam.capability.adapters.mcp.example import ExampleMCPAdapter
-from redteam.capability.adapters.mcp.execution import ExecutionMCPAdapter
-from redteam.capability.adapters.mcp.mobile import MobileMCPAdapter
-from redteam.capability.adapters.mcp.recon import ReconMCPAdapter
-from redteam.capability.adapters.mcp.scoped_analysis import VDBMCPAdapter
 from redteam.capability.adapters.mcp.streamable_http import MCPServerAdapter
 from redteam.capability.adapters.mcp.transport import (
     AllowlistedMCPTransport,
@@ -19,32 +15,28 @@ from redteam.capability.adapters.mcp.transport import (
     StdioMCPTransport,
     StreamableHTTPMCPTransport,
 )
-from redteam.capability.adapters.mcp.web_api import WebAPIMCPAdapter
-from redteam.capability.adapters.mcp.workspace import WorkspaceMCPAdapter
-from redteam.capability.execution_manifest import validate_execution_descriptor
 from redteam.capability.gateway import (
     DEFAULT_HEALTH_REFRESH_INTERVAL_SECONDS,
     DEFAULT_HEALTH_REFRESH_TIMEOUT_SECONDS,
     MCPToolGateway,
 )
-from redteam.capability.manifest import validate_tool_manifest
-from redteam.capability.mobile_analysis_manifest import (
-    MOBILE_ANALYSIS_TOOLS,
-    validate_configured_discovery,
+from redteam.capability.manifest import split_tool_id, validate_tool_manifest
+from redteam.capability.registration import (
+    McpProfileBundle,
+    apply_profile_discovery_binding,
+    apply_server_catalog_target_types,
+    create_adapter_for_settings,
+    default_target_types_for_kind,
+    select_server_target_type,
+    validate_server_configured_discovery,
 )
-from redteam.capability.page_text_manifest import validate_page_text_discovery
 from redteam.capability.registry import MCPToolRegistry
-from redteam.capability.servers.page_text_mcp import load_page_text_config
-from redteam.capability.servers.web_search_mcp import load_web_search_config
 from redteam.capability.settings import (
     MCPConfigurationError,
     MCPServerKind,
     MCPServerSettings,
     MCPTransportKind,
 )
-from redteam.capability.vdb_manifest import validate_vdb_descriptor
-from redteam.capability.web_search_manifest import validate_web_search_discovery
-from redteam.capability.workspace_manifest import validate_workspace_descriptor
 
 
 async def build_mcp_tool_gateway(
@@ -53,6 +45,8 @@ async def build_mcp_tool_gateway(
     health_refresh_enabled: bool = True,
     health_refresh_interval_seconds: float = DEFAULT_HEALTH_REFRESH_INTERVAL_SECONDS,
     health_refresh_timeout_seconds: float = DEFAULT_HEALTH_REFRESH_TIMEOUT_SECONDS,
+    profile_bundles: Mapping[str, McpProfileBundle] | None = None,
+    env: Mapping[str, str] | None = None,
 ) -> MCPToolGateway:
     """Discover configured servers and return a ready-to-invoke gateway.
 
@@ -67,6 +61,8 @@ async def build_mcp_tool_gateway(
         health_refresh_enabled=health_refresh_enabled,
         health_refresh_interval_seconds=health_refresh_interval_seconds,
         health_refresh_timeout_seconds=health_refresh_timeout_seconds,
+        profile_bundles=profile_bundles,
+        env=env,
     )
 
 
@@ -77,6 +73,8 @@ async def open_mcp_tool_gateway(
     health_refresh_enabled: bool = True,
     health_refresh_interval_seconds: float = DEFAULT_HEALTH_REFRESH_INTERVAL_SECONDS,
     health_refresh_timeout_seconds: float = DEFAULT_HEALTH_REFRESH_TIMEOUT_SECONDS,
+    profile_bundles: Mapping[str, McpProfileBundle] | None = None,
+    env: Mapping[str, str] | None = None,
 ) -> AsyncIterator[MCPToolGateway]:
     """Engagement-scoped connections, required for stateful browser operations.
 
@@ -91,6 +89,8 @@ async def open_mcp_tool_gateway(
             health_refresh_enabled=health_refresh_enabled,
             health_refresh_interval_seconds=health_refresh_interval_seconds,
             health_refresh_timeout_seconds=health_refresh_timeout_seconds,
+            profile_bundles=profile_bundles,
+            env=env,
         )
 
 
@@ -101,7 +101,13 @@ async def _build_gateway(
     health_refresh_enabled: bool = True,
     health_refresh_interval_seconds: float = DEFAULT_HEALTH_REFRESH_INTERVAL_SECONDS,
     health_refresh_timeout_seconds: float = DEFAULT_HEALTH_REFRESH_TIMEOUT_SECONDS,
+    profile_bundles: Mapping[str, McpProfileBundle] | None = None,
+    env: Mapping[str, str] | None = None,
 ) -> MCPToolGateway:
+    bundles = dict(profile_bundles) if profile_bundles is not None else None
+    from redteam.core.environment import env_snapshot
+
+    environment = env_snapshot(env)
     if not server_ids:
         example = ExampleMCPAdapter()
         registry = MCPToolRegistry()
@@ -110,7 +116,8 @@ async def _build_gateway(
             validate_tool_manifest(descriptor)
         registry.replace_server_tools(example.server_id, example_descriptors)
         return MCPToolGateway(
-            registry, {example.server_id: example},
+            registry,
+            {example.server_id: example},
             {str(tool.tool_id): ("service_discovery",) for tool in registry.all()},
             health_refresh_enabled=health_refresh_enabled,
             health_refresh_interval_seconds=health_refresh_interval_seconds,
@@ -128,11 +135,11 @@ async def _build_gateway(
     output_schemas: dict[str, dict | None] = {}
     target_types: dict[str, str | None] = {}
     for server_id in server_ids:
-        settings = MCPServerSettings.from_environment(server_id)
+        settings = MCPServerSettings.from_environment(server_id, bundles=bundles, env=environment)
         transport = _create_transport(settings)
         if stack is not None:
             await stack.enter_async_context(transport.session())
-        adapter = _create_adapter(settings, transport)
+        adapter = _create_adapter(settings, transport, bundles)
         descriptors = await adapter.discover_tools()
         if not descriptors:
             raise MCPConfigurationError(f"MCP server {server_id!r} discovered no tools")
@@ -144,9 +151,6 @@ async def _build_gateway(
                     f"MCP server {server_id!r} operation bindings do not match discovered tools"
                 )
         server_bindings: dict[str, tuple[str, ...]] = {}
-        selected_specs = {
-            spec.tool_id: spec for spec in MOBILE_ANALYSIS_TOOLS.get(server_id, ())
-        }
         for descriptor in descriptors:
             if settings.tool_operations is not None:
                 operations = tuple(settings.tool_operations[descriptor.tool_name])
@@ -165,64 +169,27 @@ async def _build_gateway(
             # to Agent/Orchestration; it must not remain only in a private
             # Gateway map.
             descriptor.operations = list(operations)
-            selected_spec = selected_specs.get(str(descriptor.tool_id))
-            descriptor.target_types = (
-                [selected_spec.target_type]
-                if selected_spec is not None
-                else _default_target_types(settings.kind)
+            split = split_tool_id(descriptor.tool_id)
+            descriptor.retry_safe = declares_retry_safe(
+                split[0] if split is not None else "", operations
             )
-            if settings.profile == "page_text_readonly":
-                descriptor.target_types = ["url"]
-                try:
-                    config, _ = load_page_text_config(
-                        settings.page_text_config_path or "",
-                        settings.page_text_config_sha256,
-                    )
-                    validate_page_text_discovery(descriptor, config)
-                except ValueError:
-                    raise MCPConfigurationError(
-                        "page text discovery differs from operator configuration"
-                    ) from None
-                target_types[str(descriptor.tool_id)] = "url"
-            elif settings.profile == "execution":
-                descriptor.target_types = ["asset"]
-                try:
-                    validate_execution_descriptor(
-                        descriptor,
-                        settings.execution_asset_ref or "",
-                    )
-                except ValueError as exc:
-                    raise MCPConfigurationError(str(exc)) from exc
-                target_types[str(descriptor.tool_id)] = "asset"
-            elif settings.profile == "web_search_tavily":
-                descriptor.target_types = []
-                try:
-                    search_config, _ = load_web_search_config(
-                        settings.web_search_config_path or "",
-                        settings.web_search_config_sha256,
-                    )
-                    validate_web_search_discovery(descriptor, search_config)
-                except ValueError:
-                    raise MCPConfigurationError(
-                        "web search discovery differs from operator configuration"
-                    ) from None
-                target_types[str(descriptor.tool_id)] = None
-            elif settings.profile is not None:
-                descriptor.target_types = ["asset"]
-                try:
-                    if settings.profile in {"vdb_readonly", "vdb_readonly_extended"}:
-                        validate_vdb_descriptor(
-                            descriptor, settings.vdb_asset_ref or "", settings.profile
-                        )
-                    else:
-                        validate_workspace_descriptor(
-                            descriptor,
-                            settings.profile,
-                            settings.workspace_asset_ref or "",
-                        )
-                except ValueError as exc:
-                    raise MCPConfigurationError(str(exc)) from exc
-                target_types[str(descriptor.tool_id)] = "asset"
+            selected_target = select_server_target_type(server_id, str(descriptor.tool_id))
+            descriptor.target_types = (
+                [selected_target]
+                if selected_target is not None
+                else descriptor.target_types or default_target_types_for_kind(settings.kind)
+            )
+            profile = (
+                (bundles or {}).get(settings.profile)
+                if settings.profile is not None
+                else None
+            )
+            if profile is not None and profile.default_target_types and selected_target is None:
+                descriptor.target_types = list(profile.default_target_types)
+            if settings.profile is not None:
+                catalog_target = apply_profile_discovery_binding(descriptor, settings, bundles)
+                if catalog_target is not None:
+                    target_types[str(descriptor.tool_id)] = catalog_target
             # Validate after operator bindings are copied into the descriptor:
             # this is the exact manifest exposed to Agent/Orchestration.
             validate_tool_manifest(descriptor)
@@ -232,22 +199,15 @@ async def _build_gateway(
                 schema = adapter.output_schema_for_tool(descriptor.tool_id)
                 if schema is not None:
                     output_schemas[str(descriptor.tool_id)] = schema
-        if settings.tool_operations is not None and server_id in MOBILE_ANALYSIS_TOOLS:
+        if settings.tool_operations is not None:
             server_schemas = {
                 descriptor.tool_name: output_schemas.get(str(descriptor.tool_id))
                 for descriptor in descriptors
             }
-            try:
-                validate_configured_discovery(
-                    server_id, descriptors, server_bindings, server_schemas
-                )
-            except ValueError as exc:
-                raise MCPConfigurationError(
-                    f"MCP server {server_id!r} discovery differs from configured manifest: {exc}"
-                ) from exc
-        for spec in MOBILE_ANALYSIS_TOOLS.get(server_id, ()):
-            if spec.tool_id in server_bindings:
-                target_types[spec.tool_id] = spec.target_type
+            validate_server_configured_discovery(
+                server_id, descriptors, server_bindings, server_schemas
+            )
+        apply_server_catalog_target_types(server_id, server_bindings, target_types)
         registry.replace_server_tools(server_id, descriptors)
         adapters[server_id] = adapter
         server_concurrency[server_id] = settings.max_concurrency
@@ -273,72 +233,17 @@ def _default_target_types(kind: MCPServerKind) -> list[str]:
     Server-specific policy may narrow these later; these defaults never add
     an execution target and are used only to filter Agent candidates.
     """
-    if kind == MCPServerKind.MOBILE:
-        return ["device", "asset"]
-    if kind == MCPServerKind.ANALYSIS:
-        return ["asset", "endpoint", "observation"]
-    if kind == MCPServerKind.WEB_API:
-        return ["host", "service", "endpoint"]
-    if kind == MCPServerKind.RECON:
-        return ["host", "service", "endpoint"]
-    return []
+    return default_target_types_for_kind(kind)
 
 
-def _create_adapter(settings: MCPServerSettings, transport: MCPTransport) -> MCPAdapter:
+def _create_adapter(
+    settings: MCPServerSettings,
+    transport: MCPTransport,
+    bundles: Mapping[str, McpProfileBundle] | None = None,
+) -> MCPAdapter:
     if settings.allowed_tools is not None:
         transport = AllowlistedMCPTransport(transport, settings.allowed_tools)
-    if settings.server_id == "mobsf":
-        from redteam.capability.adapters.mcp.mobsf import MobSFMCPAdapter
-        return MobSFMCPAdapter.from_settings(settings, transport)
-
-    if settings.profile in {"page_text_readonly", "web_search_tavily"}:
-        return WebAPIMCPAdapter(
-            server_id=settings.server_id,
-            risk_level=settings.risk_level,
-            transport=transport,
-        )
-    if settings.profile == "execution":
-        return ExecutionMCPAdapter(
-            server_id=settings.server_id,
-            risk_level=settings.risk_level,
-            transport=transport,
-        )
-    if settings.profile is not None:
-        adapter_class = (
-            VDBMCPAdapter
-            if settings.profile in {"vdb_readonly", "vdb_readonly_extended"}
-            else WorkspaceMCPAdapter
-        )
-        return adapter_class(
-            server_id=settings.server_id,
-            risk_level=settings.risk_level,
-            transport=transport,
-        )
-    if settings.kind == MCPServerKind.WEB_API:
-        return WebAPIMCPAdapter(
-            server_id=settings.server_id,
-            risk_level=settings.risk_level,
-            transport=transport,
-        )
-    if settings.kind == MCPServerKind.MOBILE:
-        return MobileMCPAdapter(
-            server_id=settings.server_id,
-            risk_level=settings.risk_level,
-            transport=transport,
-        )
-    if settings.kind == MCPServerKind.RECON:
-        return ReconMCPAdapter(
-            server_id=settings.server_id,
-            risk_level=settings.risk_level,
-            transport=transport,
-        )
-    if settings.kind == MCPServerKind.ANALYSIS:
-        return AnalysisMCPAdapter(
-            server_id=settings.server_id,
-            risk_level=settings.risk_level,
-            transport=transport,
-        )
-    raise MCPConfigurationError(f"unsupported MCP server kind: {settings.kind}")
+    return create_adapter_for_settings(settings, transport, bundles)
 
 
 def _create_transport(

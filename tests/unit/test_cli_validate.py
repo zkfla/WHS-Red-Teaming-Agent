@@ -57,7 +57,7 @@ scope:
   allowed_hosts: ["a.local"]
 rules_of_engagement:
   - name: "typo"
-    denied_operations: ["recon.portscan"]
+    denied_operations: ["recon.PortScan"]
 execution_budget:
   max_actions: 1
 rate_limit_policy:
@@ -69,8 +69,8 @@ approval_policy:
     exit_code = await validate_command.run(_args(path))
     assert exit_code == EXIT_CONFIG_ERROR
     err = capsys.readouterr().err
-    assert "recon.portscan" in err
-    assert "not in the canonical v1 contract" in err
+    assert "recon.PortScan" in err
+    assert "must be lower_snake_case" in err
 
 
 async def test_invalid_capability_config_is_reported(tmp_path: Path, monkeypatch) -> None:

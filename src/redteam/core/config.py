@@ -14,7 +14,9 @@ never written into a config file or logged.
 
 from __future__ import annotations
 
+import json
 import os
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
@@ -29,6 +31,21 @@ from redteam.core.contracts.engagement import (
     ExecutionBudget,
     RateLimitPolicy,
     RuleOfEngagement,
+)
+from redteam.core.environment import (
+    extensions_env_raw as _extensions_env_raw,
+)
+from redteam.core.environment import (
+    llm_env_values as _llm_env_values,
+)
+from redteam.core.environment import (
+    methodology_env_raw as _methodology_env_raw,
+)
+from redteam.core.environment import (
+    orchestration_env_values as _orchestration_env_values,
+)
+from redteam.core.environment import (
+    planning_provider_env_raw as _planning_provider_env_raw,
 )
 from redteam.core.ids import EngagementId
 
@@ -71,7 +88,7 @@ class LLMConfig(BaseModel):
         return os.environ.get(self.api_key_env_var)
 
     @classmethod
-    def from_environment(cls) -> LLMConfig:
+    def from_environment(cls, env: Mapping[str, str] | None = None) -> LLMConfig:
         """The CLI's only source for ``llm`` (mirrors
         ``MCPServerSettings.from_environment``): ``REDTEAM_LLM_PROVIDER``/
         ``REDTEAM_LLM_MODEL``/``REDTEAM_LLM_API_KEY_ENV_VAR``.
@@ -86,8 +103,12 @@ class LLMConfig(BaseModel):
         provider would use, like ``"openai"``) is the same error, not a
         silent fallback either; ``build_llm_client`` enforces the actual
         provider allowlist, this only enforces that *something* was said.
+        Raw values come from the low common input boundary so the CLI
+        and the library share one collection path. Pass an explicit
+        mapping to validate that snapshot instead of the live process env.
         """
-        provider = os.environ.get("REDTEAM_LLM_PROVIDER")
+        vals = _llm_env_values(source=env)
+        provider = vals.get("provider")
         if not provider:
             raise ValueError(
                 "REDTEAM_LLM_PROVIDER is not set. Set it explicitly -- "
@@ -95,10 +116,10 @@ class LLMConfig(BaseModel):
                 "a real provider. There is no implicit default."
             )
         kwargs: dict[str, str] = {"provider": provider}
-        model = os.environ.get("REDTEAM_LLM_MODEL")
+        model = vals.get("model")
         if model:
             kwargs["default_model"] = model
-        api_key_env_var = os.environ.get("REDTEAM_LLM_API_KEY_ENV_VAR")
+        api_key_env_var = vals.get("api_key_env_var")
         if api_key_env_var:
             kwargs["api_key_env_var"] = api_key_env_var
         return cls(**kwargs)
@@ -111,6 +132,7 @@ class OrchestrationConfig(BaseModel):
     구 이름만 호환용으로 남겼고 값은 항상 참으로 고정된다.
     거짓은 규칙 경로 선택이 아니라 검증 오류로 거부된다.
     """
+
     max_retries: int = Field(default=3, ge=0)
     max_steps: int = Field(default=50, ge=1)
     tool_timeout_seconds: float = Field(default=10.0, gt=0, le=600)
@@ -120,13 +142,13 @@ class OrchestrationConfig(BaseModel):
     llm_candidate_generation: Literal[True] = True
 
     @classmethod
-    def from_environment(cls) -> OrchestrationConfig:
-        """CLI runtime settings, validated with the same rules as library config."""
-        values: dict[str, Any] = {
-            field: os.environ[f"REDTEAM_ORCHESTRATION_{field.upper()}"]
-            for field in ("max_steps", "max_retries", "llm_candidate_generation")
-            if f"REDTEAM_ORCHESTRATION_{field.upper()}" in os.environ
-        }
+    def from_environment(cls, env: Mapping[str, str] | None = None) -> OrchestrationConfig:
+        """CLI runtime settings, validated with the same rules as library config.
+
+        Raw values come from the low common input boundary. Pass an
+        explicit mapping to validate that snapshot instead of live env.
+        """
+        values: dict[str, Any] = dict(_orchestration_env_values(source=env))
         if "llm_candidate_generation" in values:
             values["llm_candidate_generation"] = TypeAdapter(bool).validate_python(
                 str(values["llm_candidate_generation"]).strip()
@@ -146,8 +168,8 @@ class MethodologyConfig(BaseModel):
     max_context_chars: int = Field(default=12000, ge=256, le=24000)
 
     @classmethod
-    def from_environment(cls) -> MethodologyConfig | None:
-        value = os.environ.get("REDTEAM_METHODOLOGY_CONFIG_JSON")
+    def from_environment(cls, env: Mapping[str, str] | None = None) -> MethodologyConfig | None:
+        value = _methodology_env_raw(source=env)
         if value is None:
             return None
         if not value.strip() or len(value) > 16384:
@@ -163,6 +185,26 @@ class CapabilityConfig(BaseModel):
     methodology: MethodologyConfig | None = None
 
 
+def extensions_from_environment(env: Mapping[str, str] | None = None) -> list[str]:
+    raw = _extensions_env_raw(source=env)
+    if raw is None or not raw.strip():
+        return []
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError("REDTEAM_EXTENSIONS must be a JSON list") from exc
+    if not isinstance(parsed, list):
+        raise ValueError("REDTEAM_EXTENSIONS must be a JSON list")
+    return TypeAdapter(list[str]).validate_python(parsed)
+
+
+def planning_provider_from_environment(env: Mapping[str, str] | None = None) -> str | None:
+    raw = _planning_provider_env_raw(source=env)
+    if raw is None or not raw.strip():
+        return None
+    return raw.strip()
+
+
 class LoggingConfig(BaseModel):
     level: str = "INFO"
 
@@ -173,6 +215,8 @@ class AppConfig(BaseModel):
     orchestration: OrchestrationConfig = Field(default_factory=OrchestrationConfig)
     capability: CapabilityConfig = Field(default_factory=CapabilityConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
+    extensions: list[str] = Field(default_factory=list)
+    planning_provider: str | None = None
 
 
 def load_app_config(path: str | Path) -> AppConfig:

@@ -300,15 +300,12 @@ class CandidateProviderRegistry:
 
 
 def default_provider_registry() -> CandidateProviderRegistry:
-    from redteam.orchestration.agents.recon import ReconCandidateProvider
-    from redteam.orchestration.agents.web import WebCandidateProvider
+    """Assembled from the built-in role bundles (M02): one unit per role."""
+    from redteam.orchestration.agents.packages import builtin_role_packages
 
-    playbook = PlaybookCandidateProvider()
-
-    providers: list[tuple[str, GraphCandidateProvider]] = [
-        ("playbook:recon", ReconCandidateProvider()),
-        ("playbook:web_api", WebCandidateProvider()),
-        *[(f"playbook:{role}", playbook) for role in ("mobile", "analysis", "reporting")],
-    ]
-
-    return CandidateProviderRegistry(providers)
+    registry = CandidateProviderRegistry()
+    for package in builtin_role_packages():
+        if not package.default_include:
+            continue
+        registry.register(package.provider_id, package.provider_factory())
+    return registry

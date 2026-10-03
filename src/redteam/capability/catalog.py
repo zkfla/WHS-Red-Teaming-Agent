@@ -4,13 +4,16 @@ from __future__ import annotations
 
 from collections.abc import Collection, Mapping
 from copy import deepcopy
-from typing import Any
+from typing import Any, TypeVar
 
 from pydantic import BaseModel, Field
 
+from redteam.capability.adapters.mcp.naming import (
+    is_canonical_mcp_tool_id,
+    parse_canonical_mcp_tool_id,
+)
 from redteam.capability.registry import MCPToolRegistry
 from redteam.core.action_semantics import (
-    CANONICAL_CAPABILITIES,
     ActionNamingError,
     canonical_action_key,
     validate_capability_name,
@@ -19,6 +22,25 @@ from redteam.core.action_semantics import (
 from redteam.core.contracts.tool import ToolDescriptor
 from redteam.core.enums import RiskLevel, ToolHealthStatus
 from redteam.core.ids import ToolId
+
+_MetadataT = TypeVar("_MetadataT")
+
+
+def _resolve_metadata_keys(
+    registry: MCPToolRegistry,
+    values: Mapping[str, _MetadataT],
+    label: str,
+) -> dict[ToolId, _MetadataT]:
+    resolved: dict[ToolId, _MetadataT] = {}
+    for key, value in values.items():
+        descriptor = registry.resolve(ToolId(str(key)))
+        if descriptor is None:
+            raise ValueError(f"{label} reference unknown tools: {key}")
+        tool_id = descriptor.tool_id
+        if tool_id in resolved and resolved[tool_id] != value:
+            raise ValueError(f"{label} conflict for the same tool: {tool_id}")
+        resolved[tool_id] = value
+    return resolved
 
 
 class ToolCandidateMetadata(BaseModel):
@@ -43,6 +65,19 @@ class ToolCandidateMetadata(BaseModel):
     health_status: ToolHealthStatus
 
 
+def _namespace_and_remote(tool_id: ToolId) -> tuple[str, str] | None:
+    """Namespace plus remote name for 2-part or canonical 3-part ids."""
+
+    text = str(tool_id)
+    if is_canonical_mcp_tool_id(text):
+        namespace, _server_id, remote = parse_canonical_mcp_tool_id(text)
+        return namespace, remote
+    namespace, separator, remote = text.partition(".")
+    if separator != "." or not remote or "." in remote:
+        return None
+    return namespace, remote
+
+
 class MCPToolCatalog:
     """Read-only action-to-tool view over one Registry discovery snapshot.
 
@@ -60,29 +95,34 @@ class MCPToolCatalog:
     ) -> None:
         self._registry = registry
         self._operation_bindings = (
-            {
-                ToolId(str(tool_id)): frozenset(operations)
-                for tool_id, operations in operation_bindings.items()
-            }
+            _resolve_metadata_keys(
+                registry,
+                {
+                    str(tool_id): frozenset(operations)
+                    for tool_id, operations in operation_bindings.items()
+                },
+                "operation bindings",
+            )
             if operation_bindings is not None
             else None
         )
         registered = {descriptor.tool_id for descriptor in registry.all()}
         self._resolved_operations: dict[ToolId, frozenset[str]] = {}
         if self._operation_bindings is not None:
-            unknown = set(self._operation_bindings) - registered
-            if unknown:
-                names = ", ".join(sorted(str(tool_id) for tool_id in unknown))
-                raise ValueError(f"operation bindings reference unknown tools: {names}")
             for tool_id in registered:
                 descriptor = registry.get(tool_id)
                 if descriptor is None:
                     continue
-                namespace, separator, _remote = str(descriptor.tool_id).partition(".")
-                if separator != "." or not _remote or "." in _remote:
+                parsed = _namespace_and_remote(descriptor.tool_id)
+                if parsed is None:
                     raise ValueError(f"operation bindings reference malformed tool id: {tool_id}")
-                if namespace not in CANONICAL_CAPABILITIES:
-                    raise ValueError(f"tool {tool_id} uses unsupported namespace {namespace!r}")
+                namespace, _remote = parsed
+                try:
+                    validate_capability_name(namespace)
+                except ActionNamingError as exc:
+                    raise ValueError(
+                        f"tool {tool_id} uses unsupported namespace {namespace!r}"
+                    ) from exc
                 if tool_id not in self._operation_bindings:
                     raise ValueError(
                         f"operation bindings are missing an explicit mapping for {tool_id}"
@@ -106,11 +146,16 @@ class MCPToolCatalog:
                 descriptor = registry.get(tool_id)
                 if descriptor is None:
                     continue
-                namespace, separator, _remote = str(descriptor.tool_id).partition(".")
-                if separator != "." or not _remote or "." in _remote:
+                parsed = _namespace_and_remote(descriptor.tool_id)
+                if parsed is None:
                     raise ValueError(f"registry holds malformed tool id: {tool_id}")
-                if namespace not in CANONICAL_CAPABILITIES:
-                    raise ValueError(f"tool {tool_id} uses unsupported namespace {namespace!r}")
+                namespace = parsed[0]
+                try:
+                    validate_capability_name(namespace)
+                except ActionNamingError as exc:
+                    raise ValueError(
+                        f"tool {tool_id} uses unsupported namespace {namespace!r}"
+                    ) from exc
                 candidates = list(descriptor.operations)
                 resolved = set()
                 for operation in candidates:
@@ -121,31 +166,46 @@ class MCPToolCatalog:
                             f"tool {tool_id} has noncanonical names: {exc.reason}"
                         ) from exc
                 self._resolved_operations[tool_id] = frozenset(resolved)
-        registered = {descriptor.tool_id for descriptor in registry.all()}
-        self._output_schemas = {
-            ToolId(str(tool_id)): deepcopy(schema)
-            for tool_id, schema in (output_schemas or {}).items()
-        }
-        self._target_types = {
-            ToolId(str(tool_id)): target_type
-            for tool_id, target_type in (target_types or {}).items()
-        }
-        unknown_metadata = (set(self._output_schemas) | set(self._target_types)) - registered
-        if unknown_metadata:
-            names = ", ".join(sorted(str(tool_id) for tool_id in unknown_metadata))
-            raise ValueError(f"candidate metadata references unknown tools: {names}")
+        self._output_schemas = _resolve_metadata_keys(
+            registry,
+            {str(key): deepcopy(value) for key, value in (output_schemas or {}).items()},
+            "candidate metadata",
+        )
+        self._target_types = _resolve_metadata_keys(
+            registry,
+            {str(key): value for key, value in (target_types or {}).items()},
+            "candidate metadata",
+        )
 
     def supports(self, tool_id: ToolId, operation: str) -> bool:
-        descriptor = self._registry.get(tool_id)
+        descriptor = self._registry.resolve(tool_id)
         if descriptor is None:
             return False
         return operation in self._operations_for(descriptor)
 
+    def executable_pairs(self) -> list[tuple[str, str]]:
+        pairs: set[tuple[str, str]] = set()
+        for tool_id, operations in self._resolved_operations.items():
+            parsed = _namespace_and_remote(tool_id)
+            if parsed is None:
+                continue
+            for operation in operations:
+                pairs.add((parsed[0], operation))
+        return sorted(pairs)
+
     def get(self, tool_id: ToolId) -> ToolDescriptor | None:
-        descriptor = self._registry.get(tool_id)
+        descriptor = self._registry.resolve(tool_id)
         if descriptor is None:
             return None
         return self.finalized(descriptor)
+
+    def resolve(self, tool_id: ToolId) -> ToolDescriptor | None:
+        """Canonical-first single resolver over the finalized catalog view."""
+
+        stored = self._registry.resolve(ToolId(str(tool_id)))
+        if stored is None:
+            return None
+        return self.finalized(stored)
 
     def list_by_capability(self, capability_tag: str) -> list[ToolDescriptor]:
         return [self.finalized(item) for item in self._registry.list_by_capability(capability_tag)]
@@ -196,8 +256,8 @@ class MCPToolCatalog:
 
         candidates: list[ToolDescriptor] = []
         for descriptor in self._registry.all():
-            namespace, separator, _ = str(descriptor.tool_id).partition(".")
-            if separator != "." or namespace != capability:
+            parsed = _namespace_and_remote(descriptor.tool_id)
+            if parsed is None or parsed[0] != capability:
                 continue
             if operation not in self._operations_for(descriptor):
                 continue
@@ -223,9 +283,10 @@ class MCPToolCatalog:
         candidates: list[ToolCandidateMetadata] = []
         for descriptor in self._registry.all():
             descriptor = self.finalized(descriptor)
-            namespace, separator, _ = str(descriptor.tool_id).partition(".")
-            if separator != "." or (capability is not None and namespace != capability):
+            parsed = _namespace_and_remote(descriptor.tool_id)
+            if parsed is None or (capability is not None and parsed[0] != capability):
                 continue
+            namespace = parsed[0]
             if not include_unhealthy and descriptor.health_status == ToolHealthStatus.UNHEALTHY:
                 continue
             required, optional = _argument_names(descriptor.input_schema)

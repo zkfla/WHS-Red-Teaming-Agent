@@ -13,13 +13,22 @@ from contextlib import suppress
 from datetime import datetime, timedelta, timezone
 
 from redteam.attack_graph.identity import node_id_for_target
-from redteam.core.contracts.action import ActionProposal
 from redteam.core.contracts.events import EventType
 from redteam.core.contracts.evidence import EvidenceRecord
+from redteam.core.contracts.policy import ControlContext, PolicyDecision
 from redteam.core.contracts.tool import ToolError, ToolInvocation, ToolResult
 from redteam.core.convert import build_tool_invocation
-from redteam.core.enums import AgentPhase, EvidenceSourceType, RiskLevel, ToolHealthStatus
+from redteam.core.enums import (
+    AgentPhase,
+    EvidenceSourceType,
+    PolicyVerdict,
+    RiskLevel,
+    Severity,
+    ToolHealthStatus,
+)
 from redteam.core.ids import EvidenceId, new_id
+from redteam.core.ports.control_plane import InvocationAdmissionControl
+from redteam.core.ports.tool_gateway import ToolStartAdmissionGateway, ToolStartRejected
 from redteam.orchestration.action_naming import (
     canonical_action_key,
     tool_matches_action_namespace,
@@ -33,32 +42,28 @@ from redteam.orchestration.runtime_observation import (
     append_runtime_observation,
 )
 from redteam.orchestration.state import GraphState
-
-# Risk LOW alone says nothing about idempotency (a low-risk auth attempt or
-# upload can still mutate state). Until Capability has an explicit retry-safe
-# descriptor contract, only known observation operations may be repeated.
-_RETRY_SAFE_ACTIONS = frozenset(
-    {
-        "recon.service_discovery",
-        "recon.endpoint_discovery",
-        "analysis.response_analysis",
-        "mobile.static_analysis",
-    }
-)
+from redteam.orchestration.work.models import WorkStatus
 
 
-def _retry_safe(proposal: ActionProposal) -> bool:
-    action = f"{proposal.capability}.{proposal.operation}"
-    if action in _RETRY_SAFE_ACTIONS:
-        return True
-    if action == "web.http_request":
-        method = proposal.arguments.get("method")
-        return (
-            isinstance(method, str)
-            and method.upper() in {"GET", "HEAD"}
-            and not any(key in proposal.arguments for key in ("body", "data", "json", "payload"))
-        )
-    return False
+class InvocationAdmissionDenied(ToolStartRejected):
+    def __init__(self, decision: PolicyDecision):
+        self.decision = decision
+        super().__init__("current control admission denied")
+
+
+async def _invocation_context(deps, runtime, proposal, work_id):
+    items = await deps.work_store.list_items(run_id=runtime.run_id)
+    others = sum(
+        item.work_id != work_id and item.status in {WorkStatus.LEASED, WorkStatus.RUNNING}
+        for item in items
+    )
+    return ControlContext(
+        engagement_id=proposal.engagement_id,
+        agent_id=proposal.agent_id,
+        correlation_id=str(proposal.action_id),
+        in_flight_actions=others,
+        metadata={"run_id": str(proposal.run_id)},
+    )
 
 
 async def _renew_lease_until_stopped(
@@ -104,6 +109,7 @@ async def _invoke_with_semaphore(
     step=None,
     work_id=None,
     proposal=None,
+    decision=None,
 ) -> ToolResult:
     """Invoke the tool, honoring the run-wide execution bound.
 
@@ -113,12 +119,25 @@ async def _invoke_with_semaphore(
     execution unbounded (legacy).
     """
 
-    async def invoke():
+    async def before_start():
         problems = await validate_current_action(deps, runtime, step, proposal)
         if problems:
-            raise ValueError("action changed before invocation")
+            raise ToolStartRejected("action changed before invocation")
         await claim_action_admission(deps, runtime, step, proposal)
+        if isinstance(deps.control_plane, InvocationAdmissionControl):
+            context = await _invocation_context(deps, runtime, proposal, work_id)
+            async with deps.policy_lock:
+                admitted = await deps.control_plane.admit_invocation(
+                    proposal, decision, context, receipt_id=str(invocation.invocation_id)
+                )
+            if admitted.verdict is not PolicyVerdict.ALLOW:
+                raise InvocationAdmissionDenied(admitted)
+
+    async def invoke():
         if deps.long_job_adapter is None:
+            if isinstance(deps.tool_gateway, ToolStartAdmissionGateway):
+                return await deps.tool_gateway.invoke_with_admission(invocation, before_start)
+            await before_start()
             return await deps.tool_gateway.invoke(invocation)
         if work_id is None:
             raise ValueError("long jobs require a durable execution record")
@@ -126,6 +145,7 @@ async def _invoke_with_semaphore(
         work = await deps.work_store.get(work_id)
         job_id = work.job_id if work else None
         if job_id is None:
+            await before_start()
             job_id = await manager.submit(invocation)
             if not await deps.work_store.bind_job(
                 work_id, owner=str(runtime.run_id), job_id=job_id
@@ -228,7 +248,16 @@ async def execute_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
         and deps.settings.max_retries > 0
         and descriptor is not None
         and descriptor.risk_level is RiskLevel.LOW
-        and _retry_safe(proposal)
+        and (
+            descriptor.retry_safe
+            or (
+                deps.retry_policy is not None
+                and deps.retry_policy.permits(
+                    proposal.capability, proposal.operation, proposal.arguments
+                )
+            )
+        )
+        and isinstance(deps.control_plane, InvocationAdmissionControl)
         and deps.long_job_adapter is None
     )
     max_retries = deps.settings.max_retries
@@ -247,6 +276,7 @@ async def execute_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             lease_ready = False
 
     retry_attempts = 0
+    admission_denial = None
     try:
         path_problems = await validate_current_action(deps, runtime, step, proposal)
         if path_problems:
@@ -303,6 +333,7 @@ async def execute_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                 step=step,
                 work_id=work_id,
                 proposal=proposal,
+                decision=decision,
             )
             error = result.error
             if (
@@ -313,24 +344,33 @@ async def execute_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                 or not error.retryable
             ):
                 break
-            # Each extra call needs an authoritative Control budget slot. The
-            # policy lock serializes this reservation with fan-out admissions;
-            # a missing optional extension keeps injected test doubles usable.
-            reserve = getattr(deps.control_plane, "has_tool_call_capacity", None)
-            charge = getattr(deps.control_plane, "record_tool_calls", None)
             if runtime.remaining_budget is not None and (
                 runtime.remaining_budget <= 1 + retry_attempts
             ):
                 break
-            if callable(reserve) and callable(charge):
-                async with deps.policy_lock:
-                    if not await reserve(proposal.engagement_id):
-                        break
-                    await charge(proposal.engagement_id, 1)
+            context = await _invocation_context(deps, runtime, proposal, work_id)
+            retry_control = deps.control_plane
+            if not isinstance(retry_control, InvocationAdmissionControl):
+                break
+            async with deps.policy_lock:
+                reservation = await retry_control.reserve_extra_tool_call(
+                    proposal,
+                    decision,
+                    context,
+                    receipt_id=str(invocation.invocation_id),
+                    attempt_index=retry_attempts + 1,
+                )
+            if reservation.verdict is not PolicyVerdict.ALLOW:
+                admission_denial = reservation
+                break
             retry_attempts += 1
     except Exception as exc:  # noqa: BLE001 - normalize adapter/transport failure
         now = datetime.now(timezone.utc)
-        if not binding_ready:
+        if isinstance(exc, InvocationAdmissionDenied):
+            admission_denial = exc.decision
+            error_code = "policy_admission_denied"
+            error_message = "current execution conditions no longer allow the action"
+        elif not binding_ready:
             error_code = "tool_binding_invalid"
             error_message = "approved action has no valid healthy tool binding"
         elif not lease_ready:
@@ -358,6 +398,24 @@ async def execute_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             stop_heartbeat.set()
             with suppress(asyncio.CancelledError):
                 await heartbeat_task
+
+    if admission_denial is not None:
+        state = {**state, "policy_decision": admission_denial}
+        runtime = append_runtime_observation(
+            runtime,
+            RuntimeObservation(
+                kind="control",
+                summary="Current invocation admission denied",
+                outcome=admission_denial.verdict.value,
+                step=runtime.step_count,
+                action_id=str(proposal.action_id),
+                capability=proposal.capability,
+                operation=proposal.operation,
+                reasons=admission_denial.reasons[:8],
+                matched_rules=admission_denial.matched_rules[:12],
+                alternative_allowed=admission_denial.denial_severity != Severity.ABORT_RUN.value,
+            ),
+        )
 
     if lease_lost.is_set():
         result = result.model_copy(
@@ -400,6 +458,11 @@ async def execute_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
     # extra slot so a bounded retry cannot silently exceed the run budget
     # (the Control Plane's own budget is charged once per admitted action).
     consumed = 1 + retry_attempts
+    executed = int(
+        not (
+            result.error and result.error.code == "policy_admission_denied" and retry_attempts == 0
+        )
+    )
     if runtime.remaining_budget is None:
         remaining_budget = None
     else:
@@ -413,14 +476,20 @@ async def execute_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                 remaining_budget = 0
     actions_by_agent = dict(runtime.actions_by_agent)
     agent_key = str(proposal.agent_id)
-    actions_by_agent[agent_key] = actions_by_agent.get(agent_key, 0) + 1
+    actions_by_agent[agent_key] = actions_by_agent.get(agent_key, 0) + executed
 
     next_runtime = append_runtime_observation(
         runtime.model_copy(
             update={
                 "phase": AgentPhase.VERIFY,
-                "actions_executed": runtime.actions_executed + 1,
-                "consecutive_failures": 0 if result.success else runtime.consecutive_failures + 1,
+                "actions_executed": runtime.actions_executed + executed,
+                "consecutive_failures": (
+                    runtime.consecutive_failures
+                    if not executed
+                    else 0
+                    if result.success
+                    else runtime.consecutive_failures + 1
+                ),
                 "remaining_budget": remaining_budget,
                 "retry_count": retry_attempts,
                 "retry_tool_calls": runtime.retry_tool_calls + retry_attempts,

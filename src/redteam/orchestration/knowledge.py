@@ -37,6 +37,7 @@ from redteam.attack_graph.predicates import (
 )
 from redteam.core.contracts.graph import Hypothesis
 from redteam.core.enums import GraphNodeType
+from redteam.orchestration.evidence_access import raw_from_metadata
 from redteam.orchestration.knowledge_validation import InternalAssessment, InternalTarget
 from redteam.orchestration.progress import knowledge_fingerprint
 
@@ -293,21 +294,6 @@ def _has_measured(properties: dict[str, Any], run_id: str | None = None) -> bool
     return False
 
 
-#: Evidence metadata keys holding the preserved raw tool payload.
-_RAW_EVIDENCE_KEYS = ("tool_result", "raw_tool_result")
-
-
-def _record_has_raw(record: Any) -> bool:
-    """Whether an evidence record carries its raw tool payload."""
-    meta = getattr(record, "metadata", {}) or {}
-    if not isinstance(meta, dict):
-        return False
-    for key in _RAW_EVIDENCE_KEYS:
-        if meta.get(key) is not None:
-            return True
-    return False
-
-
 async def _build_evidence_index(
     evidence_store: Any, run_id: str, *, engagement_id: str | None = None
 ) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -351,7 +337,7 @@ async def _build_evidence_index(
             diagnostics["run_mismatch"].append(eid)
             continue
         by_id[eid] = rec
-        if not _record_has_raw(rec):
+        if raw_from_metadata(getattr(rec, "metadata", None)) is None:
             no_raw.append(eid)
     diagnostics["no_raw"] = _sorted_str(no_raw)[:MAX_DIAGNOSTIC_IDS]
     return by_id, diagnostics
@@ -394,7 +380,7 @@ def _claim_grounding(
     rec = evidence_index.get(eid)
     if rec is None:
         return False, "evidence_not_found", eid
-    if not _record_has_raw(rec):
+    if raw_from_metadata(getattr(rec, "metadata", None)) is None:
         return False, "evidence_no_raw", eid
     return True, "grounded", eid
 
@@ -962,7 +948,8 @@ def _fact_view(
     for obs in _node_observations(node, observation_limit):
         obs_eid = obs.get("evidence_id") if isinstance(obs, dict) else None
         context_key = str(obs.get("context_key", "")) if isinstance(obs, dict) else ""
-        if not obs_eid or str(obs_eid) not in index or not _record_has_raw(index.get(str(obs_eid))):
+        obs_raw = raw_from_metadata(getattr(index.get(str(obs_eid)), "metadata", None))
+        if not obs_eid or str(obs_eid) not in index or obs_raw is None:
             reason = "evidence_lookup_failed" if index_failed else "observation_ungrounded"
             excluded.append(
                 ExcludedAttr(
@@ -1757,7 +1744,7 @@ async def collect_progress_content(
             for eid in (meta.get(key, []) if isinstance(meta.get(key, []), list) else [])
         }
         supported = any(
-            _record_has_raw(record)
+            raw_from_metadata(getattr(record, "metadata", None)) is not None
             and (eid in refs or str(record.hypothesis_id or "") == str(hyp.hypothesis_id))
             for eid, record in index.items()
         )

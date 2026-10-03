@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from redteam.capability.adapters.mcp.base import MCPCallResult
-from redteam.capability.adapters.mcp.naming import build_mcp_tool_id
+from redteam.capability.adapters.mcp.naming import build_canonical_mcp_tool_id
 from redteam.capability.adapters.mcp.transport import (
     MCPTransport,
     StreamableHTTPMCPTransport,
@@ -52,7 +52,9 @@ class MCPServerAdapter:
         remote_tools = await self._transport.list_tools()
         descriptors = [
             ToolDescriptor(
-                tool_id=build_mcp_tool_id(self._tool_namespace, tool.name),
+                tool_id=build_canonical_mcp_tool_id(
+                    self._tool_namespace, self.server_id, tool.name
+                ),
                 server_id=self.server_id,
                 tool_name=tool.name,
                 description=tool.description,

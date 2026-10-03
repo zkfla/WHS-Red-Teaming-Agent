@@ -100,9 +100,59 @@ def _parse_json_dict(text: str) -> dict[str, Any]:
     return parsed
 
 
+# Responses streaming contract, typed events only: response.output_text.delta
+# carries a str delta, and exactly one terminal event ends the stream
+# (response.completed success; response.failed, response.incomplete, or a
+# request-level error event never count as usable output). The non-streamed
+# answer is judged by the top-level status field instead.
+# Limits: litellm stays an optional lazy import, so shapes are read through
+# one accessor and untyped or unknown events are ignored. A stream without
+# response.completed never counts as success, even with text buffered.
+
+
+def _chunk_field(chunk: Any, name: str) -> Any:
+    if isinstance(chunk, dict):
+        return chunk.get(name)
+    return getattr(chunk, name, None)
+
+
+def _event_error_detail(chunk: Any) -> str | None:
+    event = _chunk_field(chunk, "response")
+    error = _chunk_field(event, "error") if event is not None else None
+    if error is None:
+        error = _chunk_field(chunk, "error")
+    if error is None:
+        detail = _chunk_field(chunk, "incomplete_details")
+        return str(detail) if detail is not None else None
+    if isinstance(error, dict):
+        return str(error.get("message") or error)
+    message = getattr(error, "message", None)
+    return str(message if message is not None else error)
+
+
+def _responses_output_text(response: Any) -> str | None:
+    output = _chunk_field(response, "output")
+    if not isinstance(output, (list, tuple)):
+        return None
+    parts: list[str] = []
+    for item in output:
+        content = _chunk_field(item, "content")
+        if not isinstance(content, (list, tuple)):
+            continue
+        for part in content:
+            if _chunk_field(part, "type") == "output_text":
+                text = _chunk_field(part, "text")
+                if isinstance(text, str) and text:
+                    parts.append(text)
+    return "".join(parts) or None
+
+
 class LiteLLMClient:
     def __init__(
-        self, model: str, api_key: str | None = None, num_retries: int = 0,
+        self,
+        model: str,
+        api_key: str | None = None,
+        num_retries: int = 0,
         **default_kwargs: Any,
     ) -> None:
         self._model = model
@@ -167,9 +217,7 @@ class LiteLLMClient:
                 f"markdown fences -- matching this JSON Schema: "
                 f"{json.dumps(response_schema)}"
             )
-            augmented_system = (
-                f"{system}\n\n{json_instruction}" if system else json_instruction
-            )
+            augmented_system = f"{system}\n\n{json_instruction}" if system else json_instruction
             text = await self._chatgpt_stream_text(
                 messages,
                 system=augmented_system,
@@ -215,6 +263,10 @@ class LiteLLMClient:
 
         call_kwargs: dict[str, Any] = self._call_kwargs(kwargs)
         call_kwargs.pop("messages", None)
+        # Streaming is this route's contract: delta accumulation below needs the
+        # iterator, while an explicit caller opt-out is still respected.
+        call_kwargs.setdefault("stream", True)
+        streaming = bool(call_kwargs.get("stream"))
         if text_format is not None:
             call_kwargs["text"] = {"format": text_format}
 
@@ -226,9 +278,36 @@ class LiteLLMClient:
             **call_kwargs,
         )
 
+        # Only a completed stream counts as success: text without the terminal
+        # event means truncation, and partial JSON must never pass as normal.
+        if not streaming:
+            status = _chunk_field(response, "status")
+            if status != "completed":
+                raise RuntimeError(f"chatgpt response not completed: {status or 'unknown status'}")
+            text = _responses_output_text(response)
+            if not text:
+                raise RuntimeError("chatgpt response returned no text")
+            return text
+
         text_parts: list[str] = []
+        completed = False
         async for chunk in cast(AsyncIterator[Any], response):
-            delta = getattr(chunk, "delta", None)
-            if delta:
-                text_parts.append(delta)
-        return "".join(text_parts)
+            event_type = _chunk_field(chunk, "type")
+            if event_type == "response.completed":
+                completed = True
+            elif event_type in ("response.failed", "error"):
+                detail = _event_error_detail(chunk)
+                raise RuntimeError(f"chatgpt stream failed: {detail or 'unknown error'}")
+            elif event_type == "response.incomplete":
+                detail = _event_error_detail(chunk)
+                raise RuntimeError(f"chatgpt stream incomplete: {detail or 'truncated output'}")
+            elif event_type == "response.output_text.delta":
+                delta = _chunk_field(chunk, "delta")
+                if isinstance(delta, str) and delta:
+                    text_parts.append(delta)
+        text = "".join(text_parts)
+        if not completed:
+            raise RuntimeError("chatgpt stream ended without completion")
+        if not text:
+            raise RuntimeError("chatgpt stream returned no text")
+        return text

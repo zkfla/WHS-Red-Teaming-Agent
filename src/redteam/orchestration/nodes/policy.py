@@ -36,16 +36,8 @@ _OUTCOME = {
     PolicyVerdict.DENY: (EventType.ACTION_DENIED, AgentPhase.REPLAN),
 }
 
-#: Control's machine-readable reaction hint rides in
-#: ``PolicyDecision.matched_rules`` as ``severity:<value>`` because the frozen
-#: ``PolicyDecision`` contract has no dedicated field (see
-#: ``redteam.control.severity``). Orchestration may not import Control's
-#: concrete package (dependency rules), so the documented tag string is read
-#: back here rather than through ``redteam.control.severity`` directly --
-#: but the *definition* of what each level means is not re-declared: these
-#: three constants derive from the one shared ``core.enums.Severity`` (see
-#: its docstring for the three levels), not independent string literals.
-_SEVERITY_TAG_PREFIX = "severity:"
+#: The shared decision carries the reaction hint directly. Its compatibility
+#: reader also understands legacy ``severity:<value>`` matched-rule tags.
 SEVERITY_BLOCK_ACTION = Severity.BLOCK_ACTION.value
 SEVERITY_REPLAN_GOAL = Severity.REPLAN_GOAL.value
 SEVERITY_ABORT_RUN = Severity.ABORT_RUN.value
@@ -60,13 +52,7 @@ def denial_severity(decision: PolicyDecision | None) -> str | None:
     replan.
     """
 
-    if decision is None or decision.verdict is not PolicyVerdict.DENY:
-        return None
-    for rule in decision.matched_rules:
-        if rule.startswith(_SEVERITY_TAG_PREFIX):
-            value = rule[len(_SEVERITY_TAG_PREFIX) :]
-            return value or None
-    return None
+    return decision.denial_severity if decision is not None else None
 
 
 async def policy_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
@@ -176,7 +162,7 @@ async def policy_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             engagement_id=runtime.engagement_id,
             agent_id=proposal.agent_id,
             correlation_id=correlation_id,
-            metadata={"in_flight_actions": in_flight},
+            in_flight_actions=in_flight,
         )
         try:
             decision = await deps.control_plane.evaluate(proposal, context)

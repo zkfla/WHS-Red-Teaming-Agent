@@ -450,16 +450,15 @@ async def test_recover_runtime_reads_a_durable_checkpoint_in_a_fresh_runner(tmp_
 async def test_raw_checkpoint_read_agrees_with_runner_recovery(tmp_path) -> None:
     """The CLI reads the engagement id directly from the checkpoint before
     building; it must match what the full runner later recovers."""
-    from redteam.app.cli.commands.resume import _read_checkpoint_runtime
+    from redteam.app.cli.commands.resume import _read_checkpoint_identity
 
     engagement, settings, approval_dir, audit_dir, stopped = await _run_to_pending(tmp_path)
-    hint = await _read_checkpoint_runtime(settings, RUN_ID)
+    hint = await _read_checkpoint_identity(settings, RUN_ID)
 
     assert hint is not None
     assert hint.engagement_id == engagement.engagement_id
-    assert hint.run_id == stopped.run_id
-    assert hint.termination_reason == TerminationReason.APPROVAL_PENDING
-    assert hint.pending_approval_id == stopped.pending_approval_id
+    assert hint.component_binding == stopped.component_binding
+    assert hint.mission_id == (str(stopped.mission_id) if stopped.mission_id else None)
 
 
 async def test_approved_durable_resume_executes_the_original_action(tmp_path) -> None:

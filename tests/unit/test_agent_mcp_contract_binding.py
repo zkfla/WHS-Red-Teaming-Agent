@@ -204,7 +204,7 @@ def test_supported_operation_and_tool_method_remain_separate():
     accepted, rejected = CandidateCompiler(
         h.FakeCatalog([descriptor])
     ).compile_drafts_with_rejections([draft])
-    assert not accepted and rejected[0].reason == "operation_unsupported"
+    assert not accepted and rejected[0].reason == "no_tool_for_operation"
 
 
 @pytest.mark.parametrize(

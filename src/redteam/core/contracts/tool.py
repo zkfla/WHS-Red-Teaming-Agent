@@ -32,6 +32,11 @@ class ToolDescriptor(BaseModel):
     capability_tags: list[str] = Field(default_factory=list)
     risk_level: RiskLevel = RiskLevel.LOW
     health_status: ToolHealthStatus = ToolHealthStatus.UNKNOWN
+    # Declared by the tool provider for its actual operation semantics.
+    retry_safe: bool = False
+    # Input argument -> shared target value (host/url/port/path/asset_ref/etc.).
+    # Providers declare different remote argument names without central edits.
+    argument_bindings: dict[str, str] = Field(default_factory=dict)
 
     @property
     def required_arguments(self) -> tuple[str, ...]:
@@ -46,9 +51,7 @@ class ToolDescriptor(BaseModel):
         if not isinstance(properties, dict):
             return ()
         required = set(self.required_arguments)
-        return tuple(
-            name for name in properties if isinstance(name, str) and name not in required
-        )
+        return tuple(name for name in properties if isinstance(name, str) and name not in required)
 
 
 class ExecutionContext(BaseModel):

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from copy import deepcopy
 from typing import Any
 
@@ -45,14 +46,14 @@ class CriterionWritingError(PathValidationError, ValueError):
         }
 
 
-def writing_schema(model: type[BaseModel]) -> dict[str, Any]:
+def writing_schema(
+    model: type[BaseModel], *, actions: Iterable[tuple[str, str]] | None = None
+) -> dict[str, Any]:
     """Require explicit supported criteria without narrowing the storage schema.
 
     Uses basic JSON Schema constraints supported by structured-output providers.
     The hypothesis-reference relationship and whitespace checks run in code.
     """
-    from redteam.core.action_semantics import CANONICAL_CAPABILITIES, CANONICAL_OPERATIONS
-
     schema = deepcopy(model.model_json_schema())
     defs = schema.get("$defs", {})
     criterion_schema = schema if model is CompletionCriterion else defs.get("CompletionCriterion")
@@ -66,16 +67,20 @@ def writing_schema(model: type[BaseModel]) -> dict[str, Any]:
         criterion_schema["required"] = list(
             dict.fromkeys([*criterion_schema.get("required", []), *_REQUIRED_FIELDS])
         )
-    # Constrain the action vocabulary at generation time so the model cannot
-    # emit a malformed operation (e.g. a ToolId or a capability.operation key in
-    # the bare operation field) -- the same canonical names the validator checks.
+    # Syntax is stable; available semantics come from the selected catalog.
+    # Omitting a catalog is not an implicit builtin-only execution mode.
+    pairs = tuple(actions) if actions is not None else ()
     action_schema = defs.get("ActionIntent")
     if action_schema is not None:
         action_properties = action_schema.get("properties", {})
         if "capability" in action_properties:
-            action_properties["capability"].update(enum=sorted(CANONICAL_CAPABILITIES))
+            action_properties["capability"].update(pattern=r"^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$")
+            if pairs:
+                action_properties["capability"].update(enum=sorted({cap for cap, _ in pairs}))
         if "operation" in action_properties:
-            action_properties["operation"].update(enum=sorted(CANONICAL_OPERATIONS))
+            action_properties["operation"].update(pattern=r"^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$")
+            if pairs:
+                action_properties["operation"].update(enum=sorted({op for _, op in pairs}))
     return schema
 
 

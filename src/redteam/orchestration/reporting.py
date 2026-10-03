@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from collections import Counter
-from collections.abc import Collection
+from collections.abc import Collection, Iterable
+from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, Field
 
@@ -17,6 +18,9 @@ from redteam.orchestration.diagnostics import DecisionDiagnostic
 from redteam.orchestration.operator_intents.redaction import redact_text
 from redteam.orchestration.state import RuntimeState, TerminationReason
 from redteam.orchestration.work.store import WorkStore
+
+if TYPE_CHECKING:
+    from redteam.orchestration.agents.definition import AgentDefinition
 
 
 class FindingProjection(BaseModel):
@@ -54,6 +58,71 @@ def _workstream_key(text: str) -> str | None:
         if any(needle in lowered for needle in needles):
             return key
     return None
+
+
+def _normalize_report_token(value: str) -> str:
+    return value.strip().lower()
+
+
+def _definition_group_key(definition: Any) -> str:
+    return f"agent:{str(definition.agent_id)}"
+
+
+def _index_agent_definitions(
+    agent_definitions: Iterable[Any],
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    by_agent_id: dict[str, Any] = {}
+    by_task_token: dict[str, Any] = {}
+    by_label_token: dict[str, Any] = {}
+    for definition in agent_definitions:
+        agent_id_text = str(definition.agent_id)
+        if agent_id_text and agent_id_text not in by_agent_id:
+            by_agent_id[agent_id_text] = definition
+        lowered_agent_id = _normalize_report_token(agent_id_text)
+        if lowered_agent_id and lowered_agent_id not in by_agent_id:
+            by_agent_id[lowered_agent_id] = definition
+        role_token = _normalize_report_token(str(getattr(definition, "role", "") or ""))
+        if role_token and role_token not in by_task_token:
+            by_task_token[role_token] = definition
+        for capability in getattr(definition, "capabilities", None) or ():
+            token = _normalize_report_token(str(capability or ""))
+            if token and token not in by_task_token:
+                by_task_token[token] = definition
+        for label in (
+            [str(getattr(definition, "role", "") or "")]
+            + [str(item or "") for item in (getattr(definition, "capabilities", None) or ())]
+            + [str(getattr(definition, "name", "") or "")]
+        ):
+            token = _normalize_report_token(label)
+            if token and token not in by_label_token:
+                by_label_token[token] = definition
+    return by_agent_id, by_task_token, by_label_token
+
+
+def _match_task_definition(
+    task: MissionTask,
+    by_agent_id: dict[str, Any],
+    by_task_token: dict[str, Any],
+) -> Any | None:
+    assigned = getattr(task, "assigned_agent", None)
+    if assigned is not None:
+        assigned_text = str(assigned)
+        matched = by_agent_id.get(assigned_text)
+        if matched is not None:
+            return matched
+        matched = by_agent_id.get(_normalize_report_token(assigned_text))
+        if matched is not None:
+            return matched
+    required = getattr(task, "required_capability", None)
+    if required:
+        matched = by_task_token.get(_normalize_report_token(str(required)))
+        if matched is not None:
+            return matched
+    return None
+
+
+def _match_workstream_definition(label: str, by_label_token: dict[str, Any]) -> Any | None:
+    return by_label_token.get(_normalize_report_token(str(label or "")))
 
 
 class MissionWorkstreamProjection(BaseModel):
@@ -149,6 +218,7 @@ class ReportingAgent:
         work_store: WorkStore,
         task_store: MissionTaskStore | None = None,
         required_hypothesis_ids: Collection[str] | None = None,
+        agent_definitions: Iterable[AgentDefinition] = (),
     ) -> TerminalReportProjection:
         if not runtime.is_terminal:
             raise ValueError("reporting projection requires a terminal runtime")
@@ -196,6 +266,7 @@ class ReportingAgent:
                     tasks,
                     verified_finding_count=sum(1 for item in projected_findings if item.verified),
                     evidence_count=len(evidence),
+                    agent_definitions=agent_definitions,
                 )
         actions = runtime.actions_executed
         terminal_work = sum(status_counts.values())
@@ -294,23 +365,39 @@ def _project_mission(
     *,
     verified_finding_count: int,
     evidence_count: int,
+    agent_definitions: Iterable[AgentDefinition] = (),
 ) -> MissionProjection:
     """Project Mission/Task records into a readable, secret-free summary."""
+    definitions = list(agent_definitions) if agent_definitions else []
+    if definitions:
+        by_agent_id, by_task_token, by_label_token = _index_agent_definitions(definitions)
+        typed_names: dict[str, str] = {}
+        for definition in definitions:
+            typed_names.setdefault(_definition_group_key(definition), str(definition.name))
+    else:
+        by_agent_id, by_task_token, by_label_token = {}, {}, {}
+        typed_names = {}
     grouped: dict[str | None, list[MissionTask]] = {}
     task_projections: list[MissionTaskProjection] = []
     for task in tasks:
-        key = _workstream_key(
-            " ".join(
-                part
-                for part in (
-                    task.required_capability or "",
-                    str(task.assigned_agent or ""),
-                    task.title,
-                    task.objective,
+        matched = _match_task_definition(task, by_agent_id, by_task_token) if definitions else None
+        if matched is not None:
+            key: str | None = _definition_group_key(matched)
+            label = str(matched.name)
+        else:
+            key = _workstream_key(
+                " ".join(
+                    part
+                    for part in (
+                        task.required_capability or "",
+                        str(task.assigned_agent or ""),
+                        task.title,
+                        task.objective,
+                    )
+                    if part
                 )
-                if part
             )
-        )
+            label = _WORKSTREAM_LABELS.get(key or "", key or "General")
         grouped.setdefault(key, []).append(task)
         task_projections.append(
             MissionTaskProjection(
@@ -318,7 +405,7 @@ def _project_mission(
                 title=redact_text(task.title),
                 status=task.status.value,
                 required=task.required,
-                workstream=_WORKSTREAM_LABELS.get(key or "", key or "General"),
+                workstream=label,
                 blocked_reason=redact_text(task.blocking_reason) if task.blocking_reason else None,
             )
         )
@@ -326,17 +413,25 @@ def _project_mission(
     workstreams: list[MissionWorkstreamProjection] = []
     covered: set[str | None] = set()
     for label in mission.initial_workstreams:
-        key = _workstream_key(label)
+        matched_label = _match_workstream_definition(label, by_label_token) if definitions else None
+        if matched_label is not None:
+            key = _definition_group_key(matched_label)
+            display = str(matched_label.name)
+        else:
+            key = _workstream_key(label)
+            display = label
         if key in covered:
             continue
         covered.add(key)
-        workstreams.append(_build_workstream(label, grouped.pop(key, [])))
+        workstreams.append(_build_workstream(display, grouped.pop(key, [])))
     for key, group in grouped.items():
         if key in covered:
             continue
-        workstreams.append(
-            _build_workstream(_WORKSTREAM_LABELS.get(key or "", key or "General"), group)
-        )
+        if key in typed_names:
+            display = typed_names[key]
+        else:
+            display = _WORKSTREAM_LABELS.get(key or "", key or "General")
+        workstreams.append(_build_workstream(display, group))
 
     status_counts = Counter(task.status.value for task in tasks)
     completed = status_counts.get(TaskStatus.COMPLETED.value, 0)

@@ -12,6 +12,7 @@ import os
 import re
 import shlex
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
 from urllib.parse import urlsplit
@@ -19,27 +20,17 @@ from urllib.parse import urlsplit
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from redteam.capability.server_roles import role_operations, role_spec
 from redteam.capability.servers.config import ServerPolicy
 from redteam.capability.settings import environment_prefix
 from redteam.core.config import EngagementConfig, load_engagement_config
+from redteam.core.contracts.action import ActionProposal
+from redteam.core.contracts.engagement import EngagementScope
+from redteam.core.contracts.target import UrlTarget
+from redteam.core.ids import ActionId, AgentId, EngagementId, RunId
+from redteam.core.scope_rules import check_scope
 
-ROLE_OPERATIONS = {
-    "web-http": {
-        "session_list": ["response_analysis"],
-        "http_request": ["http_request"],
-        "http_compare_sessions": ["response_analysis"],
-        "http_security_posture": ["response_analysis"],
-        "http_compare_anonymous": ["response_analysis"],
-    },
-    "recon-passive": {
-        "dns_resolve": ["service_discovery"],
-        "http_probe": ["service_discovery"],
-        "tls_inspect": ["service_discovery"],
-        "openapi_inventory": ["endpoint_discovery"],
-        "oidc_inventory": ["endpoint_discovery"],
-        "html_inventory": ["endpoint_discovery"],
-    },
-}
+ROLE_OPERATIONS = {role: role_operations(role) for role in ("web-http", "recon-passive")}
 _REF = re.compile(r"[A-Za-z0-9_.-]{1,80}")
 
 
@@ -171,22 +162,26 @@ def role_args(role: str, policy_path: str, policy_digest: str) -> list[str]:
 def connection_environment(spec: DeploymentSpec, policy_path: str, policy_digest: str) -> dict:
     values = {"REDTEAM_MCP_SERVERS": ",".join(spec.roles)}
     for role in spec.roles:
+        role_specification = role_spec(role)
+        if role_specification is None:
+            raise ValueError("deployment_unknown_server_role:" + role)
         prefix = environment_prefix(role)
         values.update(
             {
-                f"{prefix}_KIND": "web_api" if role == "web-http" else "recon",
-                f"{prefix}_TRANSPORT": "stdio",
+                f"{prefix}_KIND": role_specification.kind,
+                f"{prefix}_TRANSPORT": role_specification.transport,
                 f"{prefix}_COMMAND": sys.executable,
                 f"{prefix}_ARGS_JSON": json.dumps(role_args(role, policy_path, policy_digest)),
-                f"{prefix}_RISK_LEVEL": "high" if role == "web-http" else "medium",
-                f"{prefix}_MAX_CONCURRENCY": "1",
-                f"{prefix}_MAX_OUTPUT_BYTES": "262144",
+                f"{prefix}_RISK_LEVEL": role_specification.risk_level,
+                f"{prefix}_MAX_CONCURRENCY": str(role_specification.max_concurrency),
+                f"{prefix}_MAX_OUTPUT_BYTES": str(role_specification.max_output_bytes),
                 f"{prefix}_PASSTHROUGH_ENV": ",".join(
                     sorted(
                         {
                             session.bearer_env
                             for session in spec.policy.sessions.values()
-                            if session.bearer_env and role == "web-http"
+                            if session.bearer_env
+                            and role_specification.forwards_session_credentials
                         }
                     )
                 ),
@@ -199,7 +194,6 @@ def connection_environment(spec: DeploymentSpec, policy_path: str, policy_digest
 
 def provision(spec: DeploymentSpec, engagement: EngagementConfig, output: Path) -> Path:
     """Create a NEW private directory; never overwrite an existing engagement/.env."""
-    from redteam.app.mcp_deployment import deployment_metadata
 
     public = deployment_metadata(spec, engagement.scope)
     for key in public:
@@ -250,6 +244,73 @@ def main() -> None:
             2, "Deployment rejected; check approved scope, exact paths and session references.\n"
         )
     print(f"Created {path}. No server, login or target request was started.")
+
+
+def _declared_host_seeds(spec: DeploymentSpec, scope: EngagementScope) -> dict[str, list[str]]:
+    """Map policy hostnames to existing scope seeds without adding a bare host."""
+    declared = {entry.strip().lower() for entry in (*scope.allowed_hosts, *scope.allowed_domains)}
+    seeds: dict[str, list[str]] = {}
+    for host, ref in spec.host_bindings.items():
+        origin = urlsplit(spec.policy.targets[ref].origin)
+        port = origin.port or (443 if origin.scheme == "https" else 80)
+        matches = []
+        for entry in sorted(declared):
+            if entry == host:
+                matches.append(entry)
+                continue
+            try:
+                parsed = urlsplit("//" + entry)
+                if (
+                    parsed.hostname == host
+                    and parsed.port == port
+                    and not parsed.username
+                    and not parsed.password
+                    and not parsed.path
+                    and not parsed.query
+                    and not parsed.fragment
+                ):
+                    matches.append(entry)
+            except ValueError:
+                continue  # Malformed entries never create a seed binding.
+        if not matches:
+            raise ValueError("deployment_origin_outside_control_scope_or_explicit_host_seed")
+        seeds[host] = matches
+    return seeds
+
+
+def deployment_metadata(spec: DeploymentSpec, scope: EngagementScope) -> dict:
+    """Keep target/session aliases on the exact approved Graph seed identities."""
+    check_deployment_scope(spec, scope)
+    public = spec.public_metadata()
+    seeds = _declared_host_seeds(spec, scope)
+    public["target_refs"] = {
+        seed: ref for host, ref in spec.host_bindings.items() for seed in seeds[host]
+    }
+    public["auth_sessions"] = {
+        seed: public["auth_sessions"][host] for host in spec.host_bindings for seed in seeds[host]
+    }
+    return public
+
+
+def check_deployment_scope(spec: DeploymentSpec, scope: EngagementScope) -> None:
+    for target in spec.policy.targets.values():
+        proposal = ActionProposal(
+            action_id=ActionId("deployment-check"),
+            run_id=RunId("deployment-check"),
+            engagement_id=EngagementId("deployment-check"),
+            agent_id=AgentId("deployment-check"),
+            capability="web",
+            operation="http_request",
+            target=UrlTarget(url=target.origin),
+            arguments={},
+            reason="Operator deployment validation only; never executed",
+            created_at=datetime.now(timezone.utc),
+        )
+        allowed, _, _ = check_scope(proposal, scope)
+        if not allowed:
+            # Never strip ports to broaden scope; retain the current Control semantics.
+            raise ValueError("deployment_origin_outside_control_scope")
+    _declared_host_seeds(spec, scope)
 
 
 if __name__ == "__main__":

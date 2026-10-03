@@ -35,12 +35,20 @@ from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
-from redteam.app.methodology import load_reference_library, wire_reference_agent
+from redteam.app.extensions import ExtensionAssembly, ExtensionAssemblyError, collect_extensions
+from redteam.app.methodology import (
+    bind_reference_library,
+    load_reference_library,
+    wire_reference_agent,
+)
 from redteam.app.report_store import save_terminal_report
 from redteam.app.runtime_components import (
     ComponentFactoryContext,
     ComponentProfile,
     ComponentRegistry,
+    RuntimeComponents,
+    apply_extensions,
+    bind_extensions,
     ensure_durable_binding,
     instantiate,
     resolve_selection,
@@ -51,6 +59,10 @@ from redteam.attack_graph.stores.namespaced import EngagementScopedAttackGraphSt
 from redteam.attack_graph.stores.sqlite import SQLiteAttackGraphStore
 from redteam.capability.bootstrap import build_mcp_tool_gateway, open_mcp_tool_gateway
 from redteam.capability.gateway import MCPToolGateway
+from redteam.capability.registration import (
+    CapabilityFactoryContext,
+    builtin_mcp_registration_declaration,
+)
 from redteam.capability.registry import MCPToolRegistry
 from redteam.control.approval import ApprovalService
 from redteam.control.audit import AuditLog
@@ -68,10 +80,12 @@ from redteam.core.config import (
 from redteam.core.contracts.engagement import Engagement
 from redteam.core.contracts.events import EventEnvelope, EventType
 from redteam.core.enums import AgentPhase, GraphNodeType, MissionStatus, TaskStatus
+from redteam.core.environment import env_snapshot
+from redteam.core.extensions import hookimpl
 from redteam.core.ids import EngagementId, EventId, RunId, new_id
 from redteam.core.ports.attack_graph import AttackGraphStore
 from redteam.core.ports.control_plane import ControlPlane
-from redteam.core.ports.event_bus import EventBus
+from redteam.core.ports.event_bus import EventBus, EventHistory
 from redteam.core.ports.evidence_store import EvidenceStore
 from redteam.core.ports.llm import LLMClient
 from redteam.core.ports.task_graph import MissionTaskStore
@@ -86,11 +100,17 @@ from redteam.orchestration.agents.providers import (
 )
 from redteam.orchestration.agents.registry import AgentRegistry
 from redteam.orchestration.analysis import AnalysisVerifier
+from redteam.orchestration.checkpointing import (
+    StateCodecRegistry,
+    consume_state_codec_contributions,
+)
 from redteam.orchestration.component_binding import binding_for_registration
 from redteam.orchestration.context import RuntimeDeps
 from redteam.orchestration.coordination import (
+    AtomicStateBackend,
     ChangeSet,
     CoordinationError,
+    Coordinator,
     coordinator_for,
     validate_configuration,
 )
@@ -99,6 +119,7 @@ from redteam.orchestration.mission_bootstrap import bootstrap_mission
 from redteam.orchestration.observations import ResultMapperRegistry
 from redteam.orchestration.operator_intents import build_operator_intent_store
 from redteam.orchestration.outbox import deliver_pending
+from redteam.orchestration.paths import PathStore
 from redteam.orchestration.replanning import finalize_mission
 from redteam.orchestration.reporting import ReportingAgent
 from redteam.orchestration.runner import AgentLoopRunner
@@ -145,9 +166,14 @@ def build_llm_client(config: LLMConfig) -> LLMClient:
 
 async def _build_default_capability(
     config: CapabilityConfig,
+    *,
+    profile_bundles=None,
+    env=None,
 ) -> tuple[ToolGateway, ToolCatalog]:
     """Build one configured gateway and expose its read-only tool catalog."""
-    gateway = await build_mcp_tool_gateway(config.mcp_servers)
+    gateway = await build_mcp_tool_gateway(
+        config.mcp_servers, profile_bundles=profile_bundles, env=env
+    )
     return gateway, gateway
 
 
@@ -174,6 +200,29 @@ def _empty_tool_gateway() -> MCPToolGateway:
     return MCPToolGateway(MCPToolRegistry(), {})
 
 
+class _BuiltinMcpProfiles:
+    @hookimpl
+    def redteam_extensions(self):
+        return (builtin_mcp_registration_declaration(),)
+
+
+def _selected_mcp_profiles(assembly, environment):
+    bundles = {}
+    context = CapabilityFactoryContext(env=environment)
+    builtin = collect_extensions(plugins=(_BuiltinMcpProfiles(),))
+    for contribution in (
+        *builtin.contributions("mcp_profile"),
+        *assembly.contributions("mcp_profile"),
+    ):
+        bundle = contribution.factory(context)
+        if bundle.profile != contribution.contribution_id:
+            raise ExtensionAssemblyError("MCP profile differs from its declaration")
+        if bundle.profile in bundles:
+            raise ExtensionAssemblyError("duplicate MCP profile: " + bundle.profile)
+        bundles[bundle.profile] = bundle
+    return bundles
+
+
 async def build_runtime_deps(
     engagement: Engagement,
     evidence_dir: str | Path = "data/evidence",
@@ -190,6 +239,10 @@ async def build_runtime_deps(
     result_mappers: ResultMapperRegistry | None = None,
     tool_catalog: ToolCatalog | None = None,
     task_graph_store: MissionTaskStore | None = None,
+    path_store: PathStore | None = None,
+    atomic_state_backend: AtomicStateBackend | None = None,
+    extensions: ExtensionAssembly | None = None,
+    planning_provider_id: str | None = None,
 ) -> RuntimeDeps:
     """Wire in-memory/dummy backends for every port, from an ``Engagement`` alone.
 
@@ -215,9 +268,14 @@ async def build_runtime_deps(
     """
     if llm is None:
         raise ValueError("an explicit LLM client is required")
-    component_registration = resolve_selection(
-        component_profile, registry=component_registry
+    extension_assembly = extensions if extensions is not None else collect_extensions()
+    environment = env_snapshot()
+    profile_bundles = _selected_mcp_profiles(extension_assembly, environment)
+    state_codecs = StateCodecRegistry()
+    consume_state_codec_contributions(
+        extension_assembly.contributions("state_codec"), registry=state_codecs
     )
+    component_registration = resolve_selection(component_profile, registry=component_registry)
     settings = orchestration_settings or OrchestrationSettings()
     component_binding = ensure_durable_binding(
         binding_for_registration(component_registration),
@@ -228,6 +286,14 @@ async def build_runtime_deps(
         result_mappers=result_mappers,
         registry=component_registry,
     )
+    resolved_tasks = task_graph_store or _build_task_graph_store(settings)
+    resolved_paths = path_store or _build_path_store(settings)
+    coordinator = (
+        Coordinator(atomic_state_backend)
+        if atomic_state_backend is not None
+        else coordinator_for(resolved_tasks, resolved_paths)
+    )
+    coordinator.attach_paths(resolved_paths)
     event_bus = InMemoryEventBus()
     # Namespaced even though this builds one fresh store per call, so an
     # Engagement never silently depends on being the store's only tenant —
@@ -244,7 +310,37 @@ async def build_runtime_deps(
             graph_store=graph_store,
         ),
     )
-    tool_gateway, discovered_catalog = await _build_default_capability(CapabilityConfig())
+    profile_components = RuntimeComponents(
+        agents=agents if agents is not None else profile_components.agents,
+        candidate_providers=candidate_providers
+        if candidate_providers is not None
+        else profile_components.candidate_providers,
+        verifier=verifier if verifier is not None else profile_components.verifier,
+        result_mappers=result_mappers
+        if result_mappers is not None
+        else profile_components.result_mappers,
+        planning_provider=profile_components.planning_provider,
+        eligibility=profile_components.eligibility,
+        operation_bindings=profile_components.operation_bindings,
+        execution_recipes=profile_components.execution_recipes,
+        retry_policy=profile_components.retry_policy,
+    )
+    profile_components = apply_extensions(
+        profile_components,
+        ComponentFactoryContext(llm, evidence_store, graph_store),
+        extension_assembly,
+        planning_provider_id=planning_provider_id,
+        available_references=tuple(("mcp_profile", key) for key in profile_bundles),
+    )
+    component_binding = bind_extensions(
+        component_binding, extension_assembly, planning_provider_id=planning_provider_id
+    )
+    tool_gateway, discovered_catalog = await _build_default_capability(
+        CapabilityConfig(),
+        profile_bundles=profile_bundles,
+        env=environment,
+    )
+    profile_components.result_mappers.bind_catalog(tool_catalog or discovered_catalog)
     audit_log = AuditLog(FilesystemAuditStore(audit_dir))
     approvals = ApprovalService(FilesystemApprovalStore(approval_dir))
     control_plane = DefaultControlPlane(
@@ -262,6 +358,7 @@ async def build_runtime_deps(
         control_plane=control_plane,
         tool_gateway=tool_gateway,
         event_bus=event_bus,
+        event_history=event_bus,
         graph_store=graph_store,
         evidence_store=evidence_store,
         llm_client=llm,
@@ -274,15 +371,20 @@ async def build_runtime_deps(
         ),
         verifier=verifier if verifier is not None else profile_components.verifier,
         result_mappers=(
-            result_mappers
-            if result_mappers is not None
-            else profile_components.result_mappers
+            result_mappers if result_mappers is not None else profile_components.result_mappers
         ),
         component_binding=component_binding,
+        planning_provider=profile_components.planning_provider,
+        state_codecs=state_codecs,
+        coordinator=coordinator,
+        eligibility=profile_components.eligibility,
+        operation_bindings=profile_components.operation_bindings,
+        execution_recipes=profile_components.execution_recipes,
+        retry_policy=profile_components.retry_policy,
         tool_catalog=(tool_catalog if tool_catalog is not None else discovered_catalog),
         work_store=_build_work_store(settings),
-        task_graph_store=(task_graph_store or _build_task_graph_store(settings)),
-        path_store=_build_path_store(settings),
+        task_graph_store=resolved_tasks,
+        path_store=resolved_paths,
         operator_intent_store=build_operator_intent_store(
             settings.operator_intent_backend, settings.operator_intent_path
         ),
@@ -333,8 +435,11 @@ async def build_application(
     result_mappers: ResultMapperRegistry | None = None,
     tool_catalog: ToolCatalog | None = None,
     task_graph_store: MissionTaskStore | None = None,
+    path_store: PathStore | None = None,
+    atomic_state_backend: AtomicStateBackend | None = None,
     engagement_id: EngagementId | None = None,
     long_job_adapter=None,
+    extensions: ExtensionAssembly | None = None,
 ) -> tuple[Engagement, RuntimeDeps]:
     """``AppConfig``-aware composition root. Every dependency is overridable.
 
@@ -356,12 +461,28 @@ async def build_application(
     real config-driven wiring for others.
     """
     logging.basicConfig(level=config.logging.level)
+    selected_extensions = tuple(config.extensions)
+    extension_assembly = (
+        extensions if extensions is not None else collect_extensions(selected_extensions)
+    )
+    environment = env_snapshot()
+    profile_bundles = _selected_mcp_profiles(extension_assembly, environment)
+    state_codecs = StateCodecRegistry()
+    consume_state_codec_contributions(
+        extension_assembly.contributions("state_codec"), registry=state_codecs
+    )
+    if config.planning_provider is not None:
+        extension_assembly.resolve("planning", config.planning_provider)
 
     from redteam.app.mcp_deployment import synchronize_deployment
 
-    config = config.model_copy(update={
-        "engagement": synchronize_deployment(config.engagement, config.capability.mcp_servers)
-    })
+    config = config.model_copy(
+        update={
+            "engagement": synchronize_deployment(
+                config.engagement, config.capability.mcp_servers, env=environment
+            )
+        }
+    )
     library = (
         load_reference_library(config.capability.methodology)
         if config.capability.methodology is not None
@@ -373,15 +494,22 @@ async def build_application(
         config.orchestration
     )
     resolved_tasks = task_graph_store or _build_task_graph_store(resolved_settings)
-    resolved_paths = _build_path_store(resolved_settings)
+    resolved_paths = path_store or _build_path_store(resolved_settings)
     resolved_intents = build_operator_intent_store(
         resolved_settings.operator_intent_backend, resolved_settings.operator_intent_path
     )
+    coordinator = (
+        Coordinator(atomic_state_backend)
+        if atomic_state_backend is not None
+        else coordinator_for(resolved_tasks, resolved_paths)
+    )
+    coordinator.attach_paths(resolved_paths)
     coordinator = validate_configuration(
         SimpleNamespace(
             task_graph_store=resolved_tasks,
             path_store=resolved_paths,
             operator_intent_store=resolved_intents,
+            coordinator=coordinator,
         )
     )
 
@@ -396,9 +524,7 @@ async def build_application(
     if library is not None and str(resolved_engagement_id) != library.engagement_id:
         raise ValueError("methodology_engagement_mismatch")
     engagement = config.engagement.to_engagement(engagement_id=resolved_engagement_id)
-    component_registration = resolve_selection(
-        component_profile, registry=component_registry
-    )
+    component_registration = resolve_selection(component_profile, registry=component_registry)
     component_binding = ensure_durable_binding(
         binding_for_registration(component_registration),
         durable=resolved_settings.checkpointing
@@ -413,6 +539,50 @@ async def build_application(
     # Build the evidence store first so both the Control Plane (blocked
     # actions) and Orchestration (executed results) share one store.
     resolved_evidence_store = evidence_store or FilesystemEvidenceStore(evidence_dir)
+    resolved_attack_graph = attack_graph or EngagementScopedAttackGraphStore(
+        SQLiteAttackGraphStore(resolved_settings.attack_graph_path)
+        if resolved_settings.attack_graph_backend == "sqlite"
+        else InMemoryAttackGraphStore(),
+        engagement_id=engagement.engagement_id,
+    )
+    resolved_llm = llm or build_llm_client(config.llm)
+    profile_components, _ = instantiate(
+        component_registration,
+        ComponentFactoryContext(
+            llm_client=resolved_llm,
+            evidence_store=resolved_evidence_store,
+            graph_store=resolved_attack_graph,
+        ),
+    )
+
+    profile_components = RuntimeComponents(
+        agents=agents if agents is not None else profile_components.agents,
+        candidate_providers=candidate_providers
+        if candidate_providers is not None
+        else profile_components.candidate_providers,
+        verifier=verifier if verifier is not None else profile_components.verifier,
+        result_mappers=result_mappers
+        if result_mappers is not None
+        else profile_components.result_mappers,
+        planning_provider=profile_components.planning_provider,
+        eligibility=profile_components.eligibility,
+        operation_bindings=profile_components.operation_bindings,
+        execution_recipes=profile_components.execution_recipes,
+        retry_policy=profile_components.retry_policy,
+    )
+    profile_components = apply_extensions(
+        profile_components,
+        ComponentFactoryContext(resolved_llm, resolved_evidence_store, resolved_attack_graph),
+        extension_assembly,
+        planning_provider_id=config.planning_provider,
+        available_references=tuple(("mcp_profile", key) for key in profile_bundles),
+    )
+    component_binding = bind_extensions(
+        component_binding,
+        extension_assembly,
+        selected=selected_extensions,
+        planning_provider_id=config.planning_provider,
+    )
     # Resolve the tool gateway before the Control Plane so the latter can
     # read tool risk_level from the Registry for risk-tiered approval.
     resolved_tool_catalog = tool_catalog
@@ -437,19 +607,23 @@ async def build_application(
             resolved_tool_gateway = discovered_catalog
         elif mcp_stack is None:
             resolved_tool_gateway, discovered_catalog = await _build_default_capability(
-                config.capability
+                config.capability, profile_bundles=profile_bundles, env=environment
             )
         else:
             # The caller enters/exits this stack in the run's owning task.
             # Keep browser state alive through execution and approval waits.
             scoped_gateway = await mcp_stack.enter_async_context(
-                open_mcp_tool_gateway(config.capability.mcp_servers)
+                open_mcp_tool_gateway(
+                    config.capability.mcp_servers, profile_bundles=profile_bundles, env=environment
+                )
             )
             resolved_tool_gateway, discovered_catalog = scoped_gateway, scoped_gateway
         if resolved_tool_catalog is None:
             resolved_tool_catalog = discovered_catalog
     else:
         resolved_tool_gateway = tool_gateway
+    if resolved_tool_catalog is not None:
+        profile_components.result_mappers.bind_catalog(resolved_tool_catalog)
     resolved_control_plane = control_plane or DefaultControlPlane(
         {engagement.engagement_id: engagement},
         audit_log=AuditLog(FilesystemAuditStore(audit_dir)),
@@ -465,22 +639,33 @@ async def build_application(
     resolved_settings = orchestration_settings or OrchestrationSettings.from_config(
         config.orchestration
     )
-    resolved_attack_graph = attack_graph or EngagementScopedAttackGraphStore(
-        SQLiteAttackGraphStore(resolved_settings.attack_graph_path)
-        if resolved_settings.attack_graph_backend == "sqlite"
-        else InMemoryAttackGraphStore(),
-        engagement_id=engagement.engagement_id,
-    )
-    resolved_llm = llm or build_llm_client(config.llm)
-    profile_components, _ = instantiate(
-        component_registration,
-        ComponentFactoryContext(
-            llm_client=resolved_llm,
-            evidence_store=resolved_evidence_store,
-            graph_store=resolved_attack_graph,
-        ),
-    )
-
+    if extension_assembly.contributions("reference_bundle"):
+        if library is None:
+            raise ExtensionAssemblyError(
+                "reference entries require a configured reference workspace"
+            )
+        entries = {entry.reference_id: entry for entry in library.entries}
+        for contribution in extension_assembly.contributions("reference_bundle"):
+            entry = contribution.factory(None)
+            if entry.reference_id != contribution.contribution_id or entry.reference_id in entries:
+                raise ExtensionAssemblyError("duplicate or mismatched reference entry")
+            entries[entry.reference_id] = entry
+        library = library.model_copy(update={"entries": tuple(entries.values())})
+    for contribution in extension_assembly.contributions("methodology_read_contract"):
+        if library is None:
+            raise ExtensionAssemblyError("reference read contract requires a reference workspace")
+        contract = contribution.factory(None)
+        if any(
+            entry.read_contract.model_dump()
+            != {
+                "capability": contract.capability,
+                "operation": contract.operation,
+                "asset_binding": contract.asset_binding,
+                "encoding": contract.encoding,
+            }
+            for entry in library.entries
+        ):
+            raise ExtensionAssemblyError("reference read contract mismatch")
     resolved_agents = agents if agents is not None else profile_components.agents
     resolved_providers = (
         candidate_providers
@@ -493,6 +678,7 @@ async def build_application(
             or library.asset_ref in engagement.scope.denied_assets
         ):
             raise ValueError("methodology_asset_not_in_approved_scope")
+        library = bind_reference_library(library, resolved_tool_catalog)
         resolved_agents, resolved_providers = wire_reference_agent(
             library, resolved_tool_catalog, resolved_agents, resolved_providers
         )
@@ -500,6 +686,7 @@ async def build_application(
         control_plane=resolved_control_plane,
         tool_gateway=resolved_tool_gateway,
         event_bus=resolved_event_bus,
+        event_history=resolved_event_bus if isinstance(resolved_event_bus, EventHistory) else None,
         graph_store=resolved_attack_graph,
         evidence_store=resolved_evidence_store,
         llm_client=resolved_llm,
@@ -509,11 +696,16 @@ async def build_application(
         methodology_library=library,
         verifier=verifier if verifier is not None else profile_components.verifier,
         result_mappers=(
-            result_mappers
-            if result_mappers is not None
-            else profile_components.result_mappers
+            result_mappers if result_mappers is not None else profile_components.result_mappers
         ),
         component_binding=component_binding,
+        planning_provider=profile_components.planning_provider,
+        state_codecs=state_codecs,
+        coordinator=coordinator,
+        eligibility=profile_components.eligibility,
+        operation_bindings=profile_components.operation_bindings,
+        execution_recipes=profile_components.execution_recipes,
+        retry_policy=profile_components.retry_policy,
         tool_catalog=resolved_tool_catalog,
         work_store=_build_work_store(resolved_settings),
         task_graph_store=resolved_tasks,
@@ -523,8 +715,16 @@ async def build_application(
         tool_semaphore=asyncio.Semaphore(engagement.rate_limit_policy.max_concurrent_actions),
         settings=resolved_settings,
     )
-    from redteam.orchestration.mobile_mcp_binding import wire_mobile_mcp
-    deps = wire_mobile_mcp(deps)
+    from redteam.orchestration.mobile_mcp_binding import (
+        builtin_mobile_vendor_policies,
+        wire_mobile_mcp,
+    )
+
+    vendors = [
+        *builtin_mobile_vendor_policies(),
+        *(item.factory(None) for item in extension_assembly.contributions("vendor_policy")),
+    ]
+    deps = wire_mobile_mcp(deps, vendor_policies=vendors)
     return engagement, deps
 
 
@@ -557,6 +757,7 @@ async def _publish_terminal_artifacts(
         work_store=deps.work_store,
         task_store=deps.task_graph_store,
         required_hypothesis_ids=required_hypotheses,
+        agent_definitions=deps.agents.definitions(),
     )
     try:
         # The only thing that makes `redteam status`/`findings`/`report`
@@ -643,6 +844,7 @@ async def run_engagement(
     if deps is None:
         raise ValueError("run_engagement requires dependencies with an explicitly configured LLM")
     from redteam.orchestration.mobile_mcp_binding import wire_mobile_mcp
+
     deps = wire_mobile_mcp(deps, engagement)
     coordinator = validate_configuration(deps)
     settings = deps.settings
@@ -665,7 +867,12 @@ async def run_engagement(
         if await deps.evidence_store.list_for_run(run_id):
             raise ValueError("methodology_run_already_has_evidence_use_resume")
 
-    await seed_from_engagement(AttackGraphService(deps.graph_store), engagement, run_id=run_id)
+    await seed_from_engagement(
+        AttackGraphService(deps.graph_store),
+        engagement,
+        run_id=run_id,
+        execution_recipes=deps.execution_recipes,
+    )
     if library is not None:
         from redteam.attack_graph.predicates import Confidence, Provenance
 
@@ -839,6 +1046,7 @@ async def settle_engagement(
             llm_client=deps.llm_client,
             decision_max_attempts=deps.settings.decision_max_attempts,
             path_store=deps.path_store,
+            coordinator=deps.coordinator,
         )
         mission = await deps.task_graph_store.get_mission(runtime.mission_id)
         if mission is not None:
@@ -847,9 +1055,9 @@ async def settle_engagement(
             async def terminal_diagnostic(change: ChangeSet):
                 return change.records.get(("terminal_review", str(runtime.run_id)))
 
-            raw_diagnostic = await coordinator_for(deps.task_graph_store, deps.path_store).change(
-                terminal_diagnostic
-            )
+            raw_diagnostic = await (
+                deps.coordinator or coordinator_for(deps.task_graph_store, deps.path_store)
+            ).change(terminal_diagnostic)
             if raw_diagnostic is not None:
                 from redteam.orchestration.diagnostics import DecisionDiagnostic
 
@@ -876,7 +1084,7 @@ async def settle_engagement(
                     updates["termination_reason"] = TerminationReason.MISSION_BLOCKED
             runtime = runtime.model_copy(update=updates)
     if runtime.mission_id is not None:
-        coordinator = coordinator_for(deps.task_graph_store, deps.path_store)
+        coordinator = deps.coordinator or coordinator_for(deps.task_graph_store, deps.path_store)
         try:
             pending = await deliver_pending(
                 coordinator,

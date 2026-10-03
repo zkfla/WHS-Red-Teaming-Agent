@@ -22,12 +22,24 @@ become measured facts.
 from __future__ import annotations
 
 from redteam.orchestration.observations.mapper import (
+    RESULT_MAPPER_KIND,
     EdgeMutation,
     FindingMutation,
     GraphMutation,
+    MapperContribution,
     NodeMutation,
     ResultMapperRegistry,
     default_result_mapper_registry,
+    load_mapper_contribution,
+    mapper_contribution,
+    mapper_declarations_by_contribution_id,
+    register_contribution,
+    resolve_contribution_mapper,
+)
+from redteam.orchestration.observations.packages import (
+    builtin_extension_declaration,
+    builtin_observation_packages,
+    mobsf_observation_package,
 )
 
 __all__ = [
@@ -37,4 +49,14 @@ __all__ = [
     "NodeMutation",
     "ResultMapperRegistry",
     "default_result_mapper_registry",
+    "MapperContribution",
+    "register_contribution",
+    "resolve_contribution_mapper",
+    "mapper_contribution",
+    "load_mapper_contribution",
+    "mapper_declarations_by_contribution_id",
+    "RESULT_MAPPER_KIND",
+    "builtin_observation_packages",
+    "mobsf_observation_package",
+    "builtin_extension_declaration",
 ]

@@ -10,7 +10,7 @@ rule is enforced structurally (Agent code has no import path to
 
 from __future__ import annotations
 
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 from redteam.core.contracts.action import ActionProposal
 from redteam.core.contracts.policy import ControlContext, PolicyDecision
@@ -40,3 +40,31 @@ class ControlPlane(Protocol):
         same decision rather than re-consuming budget.
         """
         ...
+
+
+@runtime_checkable
+class InvocationAdmissionControl(Protocol):
+    """Current checks and extra-call accounting, separate from initial approval.
+
+    Existing narrow ControlPlane implementations remain usable. Production
+    control implements this port; retries require its extra-call reservation.
+    """
+
+    async def admit_invocation(
+        self,
+        proposal: ActionProposal,
+        decision: PolicyDecision,
+        context: ControlContext,
+        *,
+        receipt_id: str,
+    ) -> PolicyDecision: ...
+
+    async def reserve_extra_tool_call(
+        self,
+        proposal: ActionProposal,
+        decision: PolicyDecision,
+        context: ControlContext,
+        *,
+        receipt_id: str,
+        attempt_index: int,
+    ) -> PolicyDecision: ...

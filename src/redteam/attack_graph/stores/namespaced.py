@@ -69,12 +69,35 @@ class EngagementScopedAttackGraphStore:
     def _owns(self, namespaced_id: str) -> bool:
         return namespaced_id.startswith(f"{self._ns}{_NS_SEPARATOR}")
 
+    def _namespaced_edge(self, edge_id: GraphEdgeId) -> GraphEdgeId:
+        return GraphEdgeId(f"{self._ns}{_NS_SEPARATOR}{edge_id}")
+
+    def _stripped_edge(self, namespaced_id: GraphEdgeId) -> GraphEdgeId:
+        prefix = f"{self._ns}{_NS_SEPARATOR}"
+        raw = str(namespaced_id)
+        if not raw.startswith(prefix):
+            raise ValueError(
+                f"edge id {namespaced_id!r} does not belong to engagement namespace {self._ns!r}"
+            )
+        return GraphEdgeId(raw[len(prefix) :])
+
+    def _owns_edge_id(self, edge_id: str) -> bool:
+        return edge_id.startswith(f"{self._ns}{_NS_SEPARATOR}")
+
+    def _owns_edge(self, edge: GraphEdge) -> bool:
+        return self._owns(str(edge.source_id)) and self._owns(str(edge.target_id))
+
     def _translate_node(self, node: GraphNode) -> GraphNode:
         return node.model_copy(update={"id": self._stripped(node.id)})
 
     def _translate_edge(self, edge: GraphEdge) -> GraphEdge:
+        if self._owns_edge_id(str(edge.id)):
+            plain_id = self._stripped_edge(edge.id)
+        else:
+            plain_id = edge.id
         return edge.model_copy(
             update={
+                "id": plain_id,
                 "source_id": self._stripped(edge.source_id),
                 "target_id": self._stripped(edge.target_id),
             }
@@ -89,6 +112,7 @@ class EngagementScopedAttackGraphStore:
         await self._inner.add_edge(
             edge.model_copy(
                 update={
+                    "id": self._namespaced_edge(edge.id),
                     "source_id": self._namespaced(edge.source_id),
                     "target_id": self._namespaced(edge.target_id),
                 }
@@ -100,14 +124,16 @@ class EngagementScopedAttackGraphStore:
         return None if node is None else self._translate_node(node)
 
     async def get_edge(self, edge_id: GraphEdgeId) -> GraphEdge | None:
-        # Edge ids are deterministic from (type, source, target) — see
-        # ``attack_graph.service._edge_id`` — and already globally unique
-        # once source/target are namespaced, so the edge id itself is not
-        # separately namespaced; only its endpoints are.
-        edge = await self._inner.get_edge(edge_id)
-        if edge is None or not self._owns(str(edge.source_id)):
+        namespaced_id = self._namespaced_edge(edge_id)
+        edge = await self._inner.get_edge(namespaced_id)
+        if edge is not None and self._owns_edge(edge):
+            return self._translate_edge(edge)
+        legacy = await self._inner.get_edge(edge_id)
+        if legacy is None or not self._owns_edge(legacy):
             return None
-        return self._translate_edge(edge)
+        if _NS_SEPARATOR in str(legacy.id):
+            return None
+        return self._translate_edge(legacy)
 
     async def neighbors(self, node_id: GraphNodeId) -> list[GraphNode]:
         nodes = await self._inner.neighbors(self._namespaced(node_id))
@@ -127,7 +153,15 @@ class EngagementScopedAttackGraphStore:
     async def list_edges(self) -> list[GraphEdge]:
         listable = require_listable(self._inner, "list_edges")
         edges = await listable.list_edges()
-        return [self._translate_edge(e) for e in edges if self._owns(str(e.source_id))]
+        out = {}
+        for e in edges:
+            if self._owns_edge(e) and (
+                self._owns_edge_id(str(e.id)) or _NS_SEPARATOR not in str(e.id)
+            ):
+                translated = self._translate_edge(e)
+                if translated.id not in out or self._owns_edge_id(str(e.id)):
+                    out[translated.id] = translated
+        return list(out.values())
 
     # -- MutableAttackGraphStore (optional) ----------------------------
 
@@ -137,7 +171,12 @@ class EngagementScopedAttackGraphStore:
 
     async def remove_edge(self, edge_id: GraphEdgeId) -> bool:
         mutable = require_mutable(self._inner, "remove_edge")
-        edge = await self._inner.get_edge(edge_id)
-        if edge is None or not self._owns(str(edge.source_id)):
-            return False
-        return await mutable.remove_edge(edge_id)
+        namespaced_id = self._namespaced_edge(edge_id)
+        edge = await self._inner.get_edge(namespaced_id)
+        removed = False
+        if edge is not None and self._owns_edge(edge):
+            removed = await mutable.remove_edge(namespaced_id)
+        legacy = await self._inner.get_edge(edge_id)
+        if legacy is not None and self._owns_edge(legacy) and _NS_SEPARATOR not in str(legacy.id):
+            removed = await mutable.remove_edge(edge_id) or removed
+        return removed

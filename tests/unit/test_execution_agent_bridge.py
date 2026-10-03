@@ -134,7 +134,6 @@ async def test_enabled_bridge_uses_seeded_facts_and_overwrites_model_command() -
     options = await execution_agent_options(service, configured, RunId("run-test"))
     assert options == [
         {
-            "agent_id": "analysis-agent",
             "target_node_id": "asset:workspace-test",
             "capability": "analysis",
             "operation": "command_run",

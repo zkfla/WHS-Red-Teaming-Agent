@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import getpass
 import json
-import os
 import re
 import sys
 from pathlib import Path
@@ -26,9 +25,14 @@ from redteam.core.config import (
     LLMConfig,
     MethodologyConfig,
     OrchestrationConfig,
+    extensions_from_environment,
     load_engagement_config,
+    planning_provider_from_environment,
 )
+from redteam.core.environment import env_snapshot
 from redteam.core.redaction import SECRET_KEY_PARTS
+from redteam.settings import DEFAULT_ENV_PATH as _COMMON_DEFAULT_ENV_PATH
+from redteam.settings import load_dotenv_if_present as _common_load_dotenv
 
 # Exit codes (section 20): 0 success, 1 general run failure, 2 config/argument error.
 EXIT_OK = 0
@@ -44,7 +48,7 @@ EXIT_CONFIG_ERROR = 2
 # YAML file (``app.yaml``) in this CLI -- everything besides the
 # engagement lives in the environment (``REDTEAM_LLM_*``/``REDTEAM_MCP_*``).
 DEFAULT_ENGAGEMENT_PATH = Path("engagement.yaml")
-DEFAULT_ENV_PATH = Path(".env")
+DEFAULT_ENV_PATH = _COMMON_DEFAULT_ENV_PATH
 
 # Built from the one shared vocabulary (core.redaction.SECRET_KEY_PARTS,
 # also used by core.contracts.events/mission and
@@ -103,16 +107,19 @@ def load_app_config_for_run(engagement_path: str, *, require_llm: bool = True) -
     engagement_config = load_engagement_config(engagement_path)
     from redteam.app.mcp_deployment import synchronize_deployment
 
-    server_ids = mcp_server_ids_from_environment()
-    engagement_config = synchronize_deployment(engagement_config, server_ids)
+    environment = env_snapshot()
+    server_ids = mcp_server_ids_from_environment(source=environment)
+    engagement_config = synchronize_deployment(engagement_config, server_ids, env=environment)
     return AppConfig(
         engagement=engagement_config,
-        llm=LLMConfig.from_environment() if require_llm else LLMConfig(),
-        orchestration=OrchestrationConfig.from_environment(),
+        llm=LLMConfig.from_environment(environment) if require_llm else LLMConfig(),
+        orchestration=OrchestrationConfig.from_environment(environment),
         capability=CapabilityConfig(
             mcp_servers=server_ids,
-            methodology=MethodologyConfig.from_environment(),
+            methodology=MethodologyConfig.from_environment(environment),
         ),
+        extensions=extensions_from_environment(environment),
+        planning_provider=planning_provider_from_environment(environment),
     )
 
 
@@ -179,34 +186,13 @@ def write_env_var(env_path: Path, key: str, value: str) -> None:
 
 
 def load_dotenv_if_present(env_path: Path = DEFAULT_ENV_PATH) -> None:
-    """Best-effort ``.env`` loader for this process's own environment.
+    """Best-effort dotenv loader for this process's own environment.
 
-    A real shell/CI export always wins -- this only fills in what is
-    otherwise unset, so it can never override an operator's explicit
-    environment with a stale ``.env`` value. Not a config source of truth
-    by itself: it exists purely so a value ``write_env_var`` (or an
-    operator by hand) put in ``.env`` takes effect without a separate
-    manual ``export``/`source`` step before every ``redteam`` invocation.
-    A missing file, unreadable file, or malformed line is silently
-    skipped -- never fatal, and never a reason to block the CLI.
+    Compat entrypoint kept. Live shell exports always win; only missing
+    keys are filled from the file via the low common SDK parser.
+    Missing, unreadable, or malformed content is a silent no-op.
     """
-    if not env_path.exists():
-        return
-    try:
-        lines = env_path.read_text(encoding="utf-8").splitlines()
-    except OSError:
-        return
-    for line in lines:
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#") or "=" not in stripped:
-            continue
-        key, _, value = stripped.partition("=")
-        key = key.strip()
-        value = value.strip()
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
-            value = value[1:-1]
-        if key and key not in os.environ:
-            os.environ[key] = value
+    _common_load_dotenv(env_path)
 
 
 def render_table(headers: list[str], rows: list[list[str]]) -> None:
