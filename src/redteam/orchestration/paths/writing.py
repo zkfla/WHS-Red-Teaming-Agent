@@ -51,23 +51,31 @@ def writing_schema(model: type[BaseModel]) -> dict[str, Any]:
     Uses basic JSON Schema constraints supported by structured-output providers.
     The hypothesis-reference relationship and whitespace checks run in code.
     """
+    from redteam.core.action_semantics import CANONICAL_CAPABILITIES, CANONICAL_OPERATIONS
+
     schema = deepcopy(model.model_json_schema())
-    criterion_schema = (
-        schema
-        if model is CompletionCriterion
-        else schema.get("$defs", {}).get("CompletionCriterion")
-    )
-    if criterion_schema is None:
-        return schema
-    properties = criterion_schema["properties"]
-    properties["kind"].update(enum=sorted(ALLOWED_CRITERION_KINDS))
-    properties["description"].update(minLength=1)
-    properties["min_evidence"].update(minimum=1)
-    for name in _REQUIRED_FIELDS:
-        properties[name].pop("default", None)
-    criterion_schema["required"] = list(
-        dict.fromkeys([*criterion_schema.get("required", []), *_REQUIRED_FIELDS])
-    )
+    defs = schema.get("$defs", {})
+    criterion_schema = schema if model is CompletionCriterion else defs.get("CompletionCriterion")
+    if criterion_schema is not None:
+        properties = criterion_schema["properties"]
+        properties["kind"].update(enum=sorted(ALLOWED_CRITERION_KINDS))
+        properties["description"].update(minLength=1)
+        properties["min_evidence"].update(minimum=1)
+        for name in _REQUIRED_FIELDS:
+            properties[name].pop("default", None)
+        criterion_schema["required"] = list(
+            dict.fromkeys([*criterion_schema.get("required", []), *_REQUIRED_FIELDS])
+        )
+    # Constrain the action vocabulary at generation time so the model cannot
+    # emit a malformed operation (e.g. a ToolId or a capability.operation key in
+    # the bare operation field) -- the same canonical names the validator checks.
+    action_schema = defs.get("ActionIntent")
+    if action_schema is not None:
+        action_properties = action_schema.get("properties", {})
+        if "capability" in action_properties:
+            action_properties["capability"].update(enum=sorted(CANONICAL_CAPABILITIES))
+        if "operation" in action_properties:
+            action_properties["operation"].update(enum=sorted(CANONICAL_OPERATIONS))
     return schema
 
 

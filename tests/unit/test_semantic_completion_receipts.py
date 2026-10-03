@@ -547,3 +547,71 @@ async def test_same_run_session_alias_requires_successful_raw_mapping(
     else:
         assert out["runtime"].last_verdict is Verdict.UNKNOWN
         assert issues != []
+
+
+async def test_session_list_receipt_proves_exact_session_alias_for_completion() -> None:
+    store, _llm, service, _deps = _harness(_success_llm())
+    await service.upsert_node(
+        GraphNodeType.HOST,
+        node_id=TARGET_NODE,
+        facts={"target_ref": "bank-lab"},
+        provenance=Provenance(
+            step=0,
+            source="engagement:test",
+            run_id=str(RUN),
+            confidence=Confidence.SERVER_DECLARED,
+        ),
+        step=0,
+    )
+    mapping = h.make_tool_evidence(
+        evidence_id="ev-session-list-bob",
+        run_id=str(RUN),
+        engagement_id=str(ENGAGEMENT),
+        action_id="action-session-list",
+        invocation_id="inv-session-list",
+        path_id=PATH_ID,
+        path_version=PATH_VERSION,
+        step_id=STEP_ID,
+        target_node_id=TARGET_NODE,
+        capability="web",
+        operation="response_analysis",
+        tool_id="web.session_list",
+        output={
+            "sessions": [
+                {
+                    "target_ref": "bank-lab",
+                    "session_ref": "bob",
+                    "principal_ref": "test-bob",
+                }
+            ]
+        },
+    )
+    mapping.metadata["principal_ref"] = "bob"
+    await store.append(mapping)
+    step = PathStep(
+        step_id=STEP_ID,
+        objective="verify the supplied bob session alias",
+        target_node_ids=[TARGET_NODE],
+        principal_refs=["bob"],
+        allowed_operations=["web.response_analysis"],
+        completion_criteria=[
+            CompletionCriterion(
+                kind="evidence",
+                description="session_list contains bob",
+                min_evidence=1,
+                principal_refs=["bob"],
+            )
+        ],
+    )
+    plan = _path(step)
+
+    issues = await validate_completion(
+        path=plan,
+        step=step,
+        proposal=_completion_proposal(mapping.evidence_id),
+        evidence_store=store,
+        graph_service=service,
+        run_id=str(RUN),
+    )
+
+    assert issues == []

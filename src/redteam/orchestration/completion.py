@@ -1126,9 +1126,9 @@ async def validate_completion(
                     candidate = stored_args.get("session_ref")
                     if isinstance(candidate, str) and candidate.strip():
                         bound_session = candidate.strip()
-                _alias_ok = False
+                is_session_inventory = str(_field(record, "source_id", "")) == "web.session_list"
                 alias_verified: set[str] = set()
-                if bound_session is not None:
+                if bound_session is not None or is_session_inventory:
                     try:
                         for claimed_name in sorted(claimed_accounts):
                             if await _completion_alias_grounded(
@@ -1136,7 +1136,7 @@ async def validate_completion(
                                 graph_service=graph_service,
                                 run_id=run,
                                 target_ref=target_ref,
-                                session_name=bound_session,
+                                session_name=bound_session or claimed_name,
                                 principal_name=claimed_name,
                                 arguments_target_ref=stored_args.get("target_ref")
                                 if isinstance(stored_args, dict)

@@ -1,0 +1,50 @@
+# Overlay for finance-lab.yml: let an Agent running ON THE HOST (where
+# ChatGPT OAuth internet works) reach the MCP streamable-http servers.
+#
+# The base `lab` network is `internal: true`, so Docker cannot publish a
+# host port for a container that lives only on it. This overlay adds a
+# second, non-internal `egress` network to each MCP service purely so the
+# loopback port publish below has a host-reachable path. mock-bank is NOT
+# modified and stays internal-only; the MCP servers still reach it over
+# `lab`. Remove this overlay (recreate without it) to restore full isolation.
+#
+#   docker compose -f finance-lab.yml -f finance-lab.host-ports.yml up -d
+#
+# Recreates only the five MCP services (stateless); mock-bank is untouched.
+services:
+  web-http:
+    networks: [lab, egress]
+    ports: ["127.0.0.1:8010:8000"]
+  web-proxy:
+    networks: [lab, egress]
+    ports: ["127.0.0.1:8011:8000"]
+  web-browser:
+    networks: [lab, egress]
+    ports: ["127.0.0.1:8012:8931"]
+    # Compose replaces command as a whole. Keep the base browser options
+    # and target origin, adding only the published loopback authorities.
+    command:
+      - --headless
+      - --browser
+      - chromium
+      - --no-sandbox
+      - --isolated
+      - --block-service-workers
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8931"
+      - --allowed-origins
+      - http://mock-bank:8080
+      - --allowed-hosts
+      - web-browser:8931,localhost:8931,127.0.0.1:8931,localhost:8012,127.0.0.1:8012
+  recon-passive:
+    networks: [lab, egress]
+    ports: ["127.0.0.1:8013:8000"]
+  recon-active:
+    networks: [lab, egress]
+    ports: ["127.0.0.1:8014:8000"]
+
+networks:
+  egress:
+    driver: bridge
