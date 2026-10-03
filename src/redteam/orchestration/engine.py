@@ -1223,7 +1223,23 @@ class InvestigationEngine:
         if diagnostics:
             budget.last_failure = diagnostics[-1].model_copy(update={"attempts": budget.used})
             return [item.feedback() for item in diagnostics[-10:]]
-        return errors[-10:]
+        # Plain-string rejections (e.g. "required path steps are unfinished")
+        # carry no structured diagnostic, so without this the operator-facing
+        # failure keeps the generic admission summary. Surface the real reason
+        # through the same masking/bounds the structured path uses.
+        plain = [str(item) for item in errors[-10:] if str(item).strip()]
+        if plain:
+            from redteam.orchestration.diagnostics import safe_feedback
+
+            budget.last_failure = DecisionDiagnostic(
+                code="completion_or_action_not_admitted",
+                stage="next_action",
+                kind="format",
+                attempts=budget.used,
+                summary=safe_feedback("; ".join(plain)),
+                retryable=True,
+            )
+        return plain
 
     @staticmethod
     def _budget_failure(stage, budget):
@@ -2014,6 +2030,13 @@ class InvestigationEngine:
         if step is None:
             return path, ["completion refers to an unknown step"]
         proposal = decision.completion
+        if isinstance(proposal, dict) and not str(proposal.get("reason", "")).strip():
+            # The model always states its rationale at the turn level
+            # (TurnDecision.reason); the step-completion proposal's reason
+            # defaults to it rather than being rejected as empty. outcome and
+            # evidence_ids are never backfilled -- an omitted outcome or
+            # missing evidence must still fail, never be invented as success.
+            proposal = {**proposal, "reason": decision.reason}
         errors = await validate_completion(
             path=path,
             step=step,

@@ -14,7 +14,7 @@ from redteam.core.contracts.evidence import EvidenceRecord
 from redteam.core.contracts.tool import ToolResult
 from redteam.core.convert import digest_payload
 from redteam.core.enums import EvidenceSourceType, Verdict
-from redteam.core.ids import EvidenceId, new_id
+from redteam.core.ids import EvidenceId, GraphNodeId, new_id
 from redteam.core.ports.evidence_store import EvidenceStore
 from redteam.orchestration.action_naming import tool_matches_action_namespace
 from redteam.orchestration.cognition import StructuredDecisionClient
@@ -337,6 +337,21 @@ async def _session_alias_grounded(
     ):
         return False
     wanted = (session_name.strip(), principal_name.strip())
+    expected_target = (
+        arguments_target_ref.strip()
+        if isinstance(arguments_target_ref, str) and arguments_target_ref.strip()
+        else None
+    )
+    if expected_target is None and graph_service is not None:
+        try:
+            target_node = await graph_service.get_node(GraphNodeId(target_ref.strip()))
+            properties = getattr(target_node, "properties", {}) if target_node is not None else {}
+            facts = properties.get("facts", {}) if isinstance(properties, dict) else {}
+            declared_target = facts.get("target_ref") if isinstance(facts, dict) else None
+            if isinstance(declared_target, str) and declared_target.strip():
+                expected_target = declared_target.strip()
+        except Exception:
+            expected_target = None
     for record in await evidence_store.list_for_run(run_id):
         if str(record.run_id) != str(run_id):
             continue
@@ -374,10 +389,13 @@ async def _session_alias_grounded(
             ):
                 return True
         record_target = args.get("target_ref") if isinstance(args, dict) else None
-        if record_target != arguments_target_ref:
+        if record_target is not None and record_target != expected_target:
             continue
-        _, _, pairs = session_list_pairs(output, arguments_target_ref)
-        if wanted in pairs:
+        sessions, _, pairs = session_list_pairs(output, expected_target)
+        if wanted in pairs or (
+            session_name.strip() == principal_name.strip()
+            and session_name.strip() in sessions
+        ):
             return True
     return False
 

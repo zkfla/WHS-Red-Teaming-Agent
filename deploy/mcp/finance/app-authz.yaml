@@ -1,0 +1,46 @@
+# Access-control (BOLA) test engagement for the finance lab.
+#
+# The mock-bank exposes GET /api/accounts/alice with broken object-level auth
+# (VULNERABLE_DEMO=1 accepts ANY bearer), so the deny-declared bob session can
+# read alice's account. This config gives the agent a generous budget and
+# points the declared bob session at the vulnerable path so it can compare
+# anonymous vs bob and surface the access-control finding.
+#
+# Run (non-interactive), single fresh process, auto-approve high-risk web tools:
+#   REDTEAM_FINANCE_APP_YAML=deploy/mcp/finance/app-authz.yaml \
+#   REDTEAM_AGENT_AUTO_APPROVE=1 REDTEAM_DECISION_ATTEMPTS=6 \
+#   REDTEAM_OBJECTIVE="..." python examples/finance_agent_real.py
+engagement:
+  name: Finance lab access-control test
+  description: BOLA on /api/accounts/alice; bob (deny-declared) must not read alice
+  scope:
+    allowed_hosts: [mock-bank]
+  rules_of_engagement: []
+  execution_budget:
+    max_actions: 40
+    max_tool_calls: 40
+    max_duration_seconds: 600
+  rate_limit_policy:
+    max_actions_per_minute: 60
+    max_concurrent_actions: 1
+  approval_policy:
+    require_approval_for: []
+    auto_approve: true
+    auto_approve_up_to: null
+  metadata:
+    target_refs:
+      mock-bank: bank-lab
+    auth_sessions:
+      mock-bank:
+      - session_ref: bob
+        paths:
+        - /api/accounts/alice
+        expected_access: deny
+capability:
+  mcp_servers: [web-http, web-proxy, web-browser, recon-passive, recon-active]
+llm:
+  provider: litellm
+  default_model: gpt-4o-mini
+  api_key_env_var: LLM_API_KEY
+logging:
+  level: WARNING
