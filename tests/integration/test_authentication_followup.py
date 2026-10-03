@@ -80,6 +80,7 @@ class SessionGateway(DummyToolGateway):
                 server_id="test",
                 tool_name=tool.split(".")[1],
                 capability_tags=[tag],
+                operations=["endpoint_discovery" if tag == "recon" else "http_request"],
                 input_schema={
                     "type": "object",
                     "required": ["target_ref", "path"],

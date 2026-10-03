@@ -297,6 +297,7 @@ def _gateway() -> DummyToolGateway:
         tool_id=ToolId("recon.http_probe"),
         server_id="test",
         tool_name="http_probe",
+        operations=['service_discovery', 'endpoint_discovery'],
         input_schema={
             "type": "object",
             "properties": {"target_ref": {"type": "string"}, "path": {"type": "string"}},
@@ -310,6 +311,7 @@ def _gateway() -> DummyToolGateway:
         tool_id=ToolId("web.http_request"),
         server_id="test",
         tool_name="http_request",
+        operations=['http_request'],
         input_schema={
             "type": "object",
             "properties": {

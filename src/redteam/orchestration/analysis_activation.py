@@ -93,4 +93,4 @@ def analysis_role_visible(
 def analysis_tool_visible(tool: Any, activation: AnalysisActivation) -> bool:
     if STATIC_ANALYSIS_OPERATION not in tool.operations:
         return True
-    return activation.active
+    return activation.active and str(tool.tool_id) in activation.compatible_tool_ids

@@ -34,7 +34,11 @@ class DummyToolGateway:
         self._tools = list(tools or [])
 
     def list_tools_for_action(self, capability: str, operation: str) -> list[ToolDescriptor]:
-        return [tool for tool in self._tools if capability in tool.capability_tags]
+        return [
+            tool
+            for tool in self._tools
+            if capability in tool.capability_tags and operation in tool.operations
+        ]
 
     def get(self, tool_id: Any) -> ToolDescriptor | None:
         """Structural ``ToolCatalog`` support -- lets a test pass ``self``
@@ -55,9 +59,7 @@ class DummyToolGateway:
             success=self.success,
             output=self.output,
             error=(
-                None
-                if self.success
-                else ToolError(code="dummy_failure", message="forced failure")
+                None if self.success else ToolError(code="dummy_failure", message="forced failure")
             ),
             started_at=now,
             finished_at=now,

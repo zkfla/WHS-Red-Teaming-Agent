@@ -5,6 +5,7 @@ run suspends at REQUIRE_APPROVAL and continues only via reconcile_once()
 at POLICY with approval_outcome(). No rule fallback ever completes a turn:
 every structured answer comes from the in-file script below.
 """
+
 from __future__ import annotations
 
 from datetime import datetime, timezone
@@ -297,7 +298,7 @@ def _meaning_success() -> dict[str, Any]:
     }
 
 
-async def _setup(*, max_actions: int = 5):
+async def _setup(*, max_actions: int = 5, checkpoint_path: str | None = None):
     engagement = _engagement(max_actions=max_actions)
     llm = _ScriptedLLM()
     graph_store = InMemoryAttackGraphStore()
@@ -309,7 +310,10 @@ async def _setup(*, max_actions: int = 5):
     control_plane = DefaultControlPlane({engagement.engagement_id: engagement})
     gateway = _CountingGateway()
     settings = OrchestrationSettings(
-        checkpointing=True, max_steps=10, checkpoint_backend="memory"
+        checkpointing=True,
+        max_steps=10,
+        checkpoint_backend="sqlite" if checkpoint_path else "memory",
+        checkpoint_path=checkpoint_path or "data/orchestration/checkpoints.sqlite3",
     )
     deps = RuntimeDeps(
         control_plane=control_plane,
@@ -385,6 +389,35 @@ async def test_require_approval_then_approve_then_allow_and_execute() -> None:
     assert len(succeeded) == 1
     blocked = await deps.work_store.list_items(run_id=initial.run_id, status=WorkStatus.BLOCKED)
     assert len(blocked) == 0
+
+
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+async def test_new_runner_resumes_original_approved_action_once(backend, tmp_path) -> None:
+    _, control, gateway, deps, runner, initial = await _setup(
+        checkpoint_path=str(tmp_path / "checkpoint.sqlite3") if backend == "sqlite" else None
+    )
+    stopped = await runner.run(initial)
+    assert stopped.pending_approval_id is not None and gateway.calls == []
+    await control.resolve_approval(stopped.pending_approval_id, ApprovalStatus.APPROVED, "operator")
+    # A restarted process must use the shared durable checkpoint/store, not
+    # rely on the original Runner's in-memory thread binding.
+    resumed_runner = AgentLoopRunner(
+        deps,
+        settings=deps.settings,
+        checkpointer=runner._checkpointer if backend == "memory" else None,
+    )
+    try:
+        result = await resumed_runner.reconcile_once(stopped, timeout_seconds=0.01)
+        assert result.resumed and result.runtime.actions_executed == 1
+        assert len(gateway.calls) == 1
+        assert gateway.calls[0].action_id == stopped.pending_action_id
+        assert gateway.calls[0].arguments["apk_ref"] == ASSET_ID
+        # An old runtime is not permission to replay the same approved action.
+        await resumed_runner.reconcile_once(stopped, timeout_seconds=0.01)
+        assert len(gateway.calls) == 1
+    finally:
+        await resumed_runner.aclose()
+        await runner.aclose()
 
 
 async def test_require_approval_then_reject_then_never_executes() -> None:

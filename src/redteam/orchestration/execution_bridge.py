@@ -112,9 +112,7 @@ def agent_tool_visible(tool: ToolDescriptor, *, execution_ready: bool) -> bool:
     if not is_execution_tool(tool):
         return True
     return (
-        execution_ready
-        and tool.operations == ["command_run"]
-        and tool.tool_name == "run_command"
+        execution_ready and tool.operations == ["command_run"] and tool.tool_name == "run_command"
     )
 
 
@@ -141,6 +139,34 @@ def _arguments_for_facts(
     }
 
 
+def _configured_arguments(engagement: Engagement, run_id: RunId, node: GraphNode) -> dict[str, Any]:
+    config = execution_agent_config(engagement)
+    # Graph facts describe the binding; current operator configuration grants
+    # it. A later graph update must not select a new path or asset.
+    assets = {asset.strip() for asset in engagement.scope.allowed_assets} - {
+        asset.strip() for asset in engagement.scope.denied_assets
+    }
+    asset = next((name for name in config.assets if asset_node_id(name) == node.id), None)
+    if not config.enabled or asset is None or asset not in assets:
+        raise ValueError("execution Agent target is not currently configured in scope")
+    binding = config.assets[asset]
+    facts = facts_of(node.properties)
+    if (
+        facts.get(EXECUTION_RECIPE_FACT) != binding.recipe
+        or facts.get(EXECUTION_PATH_FACT) != binding.path
+    ):
+        raise ValueError("execution Agent graph binding differs from current configuration")
+    raw_refs = engagement.metadata.get("asset_refs", {})
+    expected_ref = raw_refs.get(asset, asset) if isinstance(raw_refs, dict) else asset
+    if len(assets) == 1 and engagement.metadata.get("asset_ref") is not None:
+        expected_ref = engagement.metadata["asset_ref"]
+    if facts.get("asset_ref") != str(expected_ref).strip():
+        raise ValueError("execution Agent asset reference differs from current configuration")
+    return _arguments_for_facts(
+        facts, engagement_id=str(engagement.engagement_id), run_id=str(run_id)
+    )
+
+
 async def execution_agent_options(
     service: AttackGraphService,
     engagement: Engagement | None,
@@ -157,11 +183,7 @@ async def execution_agent_options(
         if node is None or node.type is not GraphNodeType.ASSET:
             continue
         try:
-            arguments = _arguments_for_facts(
-                facts_of(node.properties),
-                engagement_id=str(engagement.engagement_id),
-                run_id=str(run_id),
-            )
+            arguments = _configured_arguments(engagement, run_id, node)
         except ValueError:
             continue
         options.append(
@@ -202,8 +224,4 @@ def bind_execution_arguments(
         or node.type is not GraphNodeType.ASSET
     ):
         raise ValueError("execution Agent only permits the fixed command_run recipe")
-    return _arguments_for_facts(
-        facts_of(node.properties),
-        engagement_id=str(engagement.engagement_id),
-        run_id=str(run_id),
-    )
+    return _configured_arguments(engagement, run_id, node)

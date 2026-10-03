@@ -9,6 +9,8 @@ real/default backends (used by the CLI and integration tests).
 from __future__ import annotations
 
 from redteam.attack_graph.stores.memory import InMemoryAttackGraphStore
+from redteam.core.contracts.tool import ToolDescriptor
+from redteam.core.ids import ToolId
 from redteam.core.ports.attack_graph import AttackGraphStore
 from redteam.core.ports.control_plane import ControlPlane
 from redteam.core.ports.event_bus import EventBus
@@ -57,10 +59,30 @@ def build_test_application(
         # is falsy and must not be replaced by the default one.
         agents=agents if agents is not None else default_registry(),
         candidate_providers=(
-            candidate_providers
-            if candidate_providers is not None
-            else default_provider_registry()
+            candidate_providers if candidate_providers is not None else default_provider_registry()
         ),
-        tool_catalog=tool_catalog,
+        # Node-level tests manually supply compiled actions. Their default
+        # assembly must still include explicit intent bindings, as production
+        # bootstrap does; an unconfigured Catalog is no longer admissible.
+        tool_catalog=tool_catalog
+        if tool_catalog is not None
+        else DummyToolGateway(
+            tools=[
+                ToolDescriptor(
+                    tool_id=ToolId("recon.probe"),
+                    server_id="test",
+                    tool_name="probe",
+                    capability_tags=["recon"],
+                    operations=["service_discovery", "auth_attempt"],
+                ),
+                ToolDescriptor(
+                    tool_id=ToolId("recon.http_probe"),
+                    server_id="test",
+                    tool_name="http_probe",
+                    capability_tags=["recon"],
+                    operations=["service_discovery", "endpoint_discovery"],
+                ),
+            ]
+        ),
         settings=settings if settings is not None else OrchestrationSettings(),
     )

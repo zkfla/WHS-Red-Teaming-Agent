@@ -29,6 +29,7 @@ from redteam.orchestration.analysis_activation import (
     analysis_tool_visible,
 )
 from redteam.orchestration.authentication import AuthenticationCheck
+from redteam.orchestration.candidates.catalog import bound_operations
 from redteam.orchestration.candidates.compiler import CandidateCompiler
 from redteam.orchestration.candidates.models import CandidateDraft
 from redteam.orchestration.cognition import (
@@ -82,6 +83,7 @@ from redteam.orchestration.paths.writing import (
     writing_schema,
 )
 from redteam.orchestration.runtime_observation import observations_for_prompt
+from redteam.orchestration.target_binding import network_identity, validate_network_arguments
 from redteam.orchestration.work.models import WorkStatus, is_unexecuted_stale
 
 
@@ -326,6 +328,13 @@ def _action_location(intent_index: int, field: str) -> str:
 
 
 _REJECTION_SUMMARIES = {
+    "operation_unsupported": "Choose an operation from the supported common vocabulary.",
+    "capability_unsupported": "Choose a supported common capability.",
+    "operation_invalid_format": "Use a bare operation name within the chosen capability.",
+    "no_tool_for_operation": "The operation is supported but has no usable selected tool binding.",
+    "target_type_mismatch": "Choose a tool that accepts this target type.",
+    "tool_unhealthy": "The bound tool is unavailable; reconcile health or choose another tool.",
+    "tool_catalog_inconsistent": "The catalog binding disagrees with lookup; refresh the catalog.",
     "unknown_operation": "Use a supported action capability and operation.",
     "tool_outside_capability_namespace": "Choose a tool from the action's capability namespace.",
     "unresolved_target": "Bind the action to a supplied or observed target.",
@@ -409,9 +418,7 @@ class InvestigationEngine:
                 **refs,
                 "graph_summary": "Current provided claims, observations and hypotheses prepared",
                 "runtime_observation_count": len(payload.get("runtime_observations", [])),
-                "role_activation": redact_secret_material(
-                    payload.get("role_activation", {})
-                ),
+                "role_activation": redact_secret_material(payload.get("role_activation", {})),
             },
             causation_id=self.last_event_id,
         )
@@ -475,7 +482,11 @@ class InvestigationEngine:
         # One shared read feeds both the capped LLM display and the full
         # internal material; only the display enters the context dict.
         knowledge, _ = await collect_knowledge(
-            service, self.deps.evidence_store, str(runtime.run_id), step=runtime.step_count
+            service,
+            self.deps.evidence_store,
+            str(runtime.run_id),
+            step=runtime.step_count,
+            engagement_id=str(runtime.engagement_id),
         )
         mission = (
             await self.deps.task_graph_store.get_mission(runtime.mission_id)
@@ -510,6 +521,20 @@ class InvestigationEngine:
         execution_options = await execution_agent_options(
             service, self.deps.engagement, runtime.run_id
         )
+        executable_options = []
+        for option in execution_options:
+            catalog = self.deps.tool_catalog
+            tool = catalog.get(option["tool_id"]) if catalog else None
+            if (
+                catalog is not None
+                and tool is not None
+                and "command_run" in bound_operations(catalog, tool, "analysis")
+                and (not tool.target_types or "asset" in tool.target_types)
+                and CandidateCompiler._schema_rejection(option["arguments"], tool.input_schema)
+                is None
+            ):
+                executable_options.append(option)
+        execution_options = executable_options
         analysis_status = await analysis_activation(service, self.deps.tool_catalog)
         visible_agents = [
             agent
@@ -522,16 +547,18 @@ class InvestigationEngine:
             capabilities = {cap for agent in self.deps.agents.all() for cap in agent.capabilities}
             for capability in sorted(capabilities):
                 for tool in self.deps.tool_catalog.list_by_capability(capability):
+                    operations = bound_operations(self.deps.tool_catalog, tool, capability)
                     if (
-                        tool.operations
+                        operations
                         and tool.health_status is not ToolHealthStatus.UNHEALTHY
                         and analysis_tool_visible(tool, analysis_status)
-                        and agent_tool_visible(
-                            tool, execution_ready=bool(execution_options)
-                        )
+                        and agent_tool_visible(tool, execution_ready=bool(execution_options))
                     ):
                         tools[str(tool.tool_id)] = redact_secret_material(
-                            tool.model_dump(mode="json"), drop_secret_keys=False
+                            tool.model_copy(update={"operations": operations}).model_dump(
+                                mode="json"
+                            ),
+                            drop_secret_keys=False,
                         )
         records = await self.deps.evidence_store.list_for_run(runtime.run_id)
         reference_context = {}
@@ -872,9 +899,16 @@ class InvestigationEngine:
                 catalog_failed = True
                 continue
             for tool in tools:
-                if tool.health_status is ToolHealthStatus.UNHEALTHY:
+                if tool.health_status is ToolHealthStatus.UNHEALTHY or not agent_tool_visible(
+                    tool, execution_ready=False
+                ):
                     continue
-                for operation in tool.operations or []:
+                try:
+                    live_operations = bound_operations(self.deps.tool_catalog, tool, cap)
+                except Exception:
+                    catalog_failed = True
+                    continue
+                for operation in live_operations:
                     pair = (cap, str(operation))
                     if pair in seen:
                         continue
@@ -1564,9 +1598,12 @@ class InvestigationEngine:
                 if step.agent_id and step.agent_id != intent.agent_id:
                     raise DecisionRuleError("action role is outside accepted step")
                 if (
-                    str(intent.agent_id) == ANALYSIS_AGENT_ID
+                    intent.capability == "analysis"
                     and intent.operation == STATIC_ANALYSIS_OPERATION
-                    and not analysis_status.active
+                    and (
+                        intent.target_node_id not in analysis_status.apk_asset_node_ids
+                        or str(intent.tool_id) not in analysis_status.compatible_tool_ids
+                    )
                 ):
                     raise DecisionRuleError("analysis_agent_inactive:" + analysis_status.reason)
                 execution_node = None
@@ -1579,16 +1616,24 @@ class InvestigationEngine:
                         raise DecisionRuleError("a real tool catalog is required for execution")
                     execution_tool = self.deps.tool_catalog.get(intent.tool_id)
                     if execution_tool is None:
-                        raise DecisionRuleError("requested tool is absent from catalog")
-                    intent = intent.model_copy(update={"arguments": bind_execution_arguments(
-                        engagement=self.deps.engagement,
-                        run_id=runtime.run_id,
-                        node=execution_node,
-                        tool=execution_tool,
-                        capability=intent.capability,
-                        operation=intent.operation,
-                        arguments=intent.arguments,
-                    )})
+                        raise DecisionRuleError(
+                            "No live tool binding serves the requested operation.",
+                            code="no_tool_for_operation",
+                            location=_action_location(intent_index, "operation"),
+                        )
+                    intent = intent.model_copy(
+                        update={
+                            "arguments": bind_execution_arguments(
+                                engagement=self.deps.engagement,
+                                run_id=runtime.run_id,
+                                node=execution_node,
+                                tool=execution_tool,
+                                capability=intent.capability,
+                                operation=intent.operation,
+                                arguments=intent.arguments,
+                            )
+                        }
+                    )
                 operation = f"{intent.capability}.{intent.operation}"
                 exclusions = await operator_exclusions(
                     self.deps,
@@ -1621,9 +1666,7 @@ class InvestigationEngine:
                     assessment,
                     _action_location(intent_index, "arguments"),
                 )
-                node = execution_node or await service.get_node(
-                    GraphNodeId(intent.target_node_id)
-                )
+                node = execution_node or await service.get_node(GraphNodeId(intent.target_node_id))
                 if node is None:
                     raise DecisionRuleError(
                         "referenced action target disappeared",
@@ -1644,13 +1687,39 @@ class InvestigationEngine:
                         "a real tool catalog is required for action compilation"
                     )
                 if self.deps.tool_catalog.get(intent.tool_id) is None:
-                    raise DecisionRuleError("requested tool is absent from catalog")
+                    raise DecisionRuleError(
+                        "No live tool binding serves the requested operation.",
+                        code="no_tool_for_operation",
+                        location=_action_location(intent_index, "operation"),
+                    )
+                asset_bindings = asset_argument_bindings(self.deps, target)
+                aliases = target_aliases(self.deps, target)
+                argument_defaults = dict(asset_bindings)
+                if len(aliases) == 1 and intent.operation != "web_search":
+                    argument_defaults["target_ref"] = aliases
+                intent = intent.model_copy(
+                    update={
+                        "arguments": bind_asset_arguments(
+                            intent.arguments,
+                            self.deps.tool_catalog.get(intent.tool_id),
+                            argument_defaults,
+                        )
+                    }
+                )
                 validate_argument_target(
-                    target, intent.arguments, target_aliases(self.deps, target)
+                    target,
+                    intent.arguments,
+                    aliases,
+                    operation=intent.operation,
+                    asset_bindings=asset_bindings,
                 )
                 tool = execution_tool or self.deps.tool_catalog.get(intent.tool_id)
                 if tool is None:
-                    raise DecisionRuleError("requested tool is absent from catalog")
+                    raise DecisionRuleError(
+                        "No live tool binding serves the requested operation.",
+                        code="no_tool_for_operation",
+                        location=_action_location(intent_index, "operation"),
+                    )
                 if await self.has_ambiguous_execution(intent, runtime):
                     raise DecisionRuleError(
                         "matching execution is uncertain; reconcile its stored result/job"
@@ -1713,7 +1782,7 @@ class InvestigationEngine:
                 )
             except (ValueError, TypeError, KeyError) as exc:
                 errors.append(
-                    exc.diagnostic.summary
+                    exc.diagnostic.feedback()
                     if isinstance(exc, DecisionRuleError)
                     else diagnostic_for_exception(exc, stage="action_compilation").feedback()
                 )
@@ -1750,6 +1819,10 @@ class InvestigationEngine:
                     item.plan_step.resolved_target(),
                     item.plan_step.arguments,
                     target_aliases(self.deps, item.plan_step.resolved_target()),
+                    operation=item.plan_step.operation,
+                    asset_bindings=asset_argument_bindings(
+                        self.deps, item.plan_step.resolved_target()
+                    ),
                 )
                 _principal_check(
                     steps[item.plan_step.path_step_id],
@@ -1760,7 +1833,7 @@ class InvestigationEngine:
                 )
             except (ValueError, TypeError) as exc:
                 errors.append(
-                    exc.diagnostic.summary
+                    exc.diagnostic.feedback()
                     if isinstance(exc, DecisionRuleError)
                     else diagnostic_for_exception(exc, stage="action_compilation").feedback()
                 )
@@ -2334,92 +2407,103 @@ def validate_principal_arguments(step, principal, arguments, knowledge) -> None:
 
 
 def target_aliases(deps, target) -> set[str]:
-    host = getattr(target, "host", None) or getattr(target, "domain", None)
-    if getattr(target, "url", None):
-        host = urlsplit(target.url).hostname
+    identity = network_identity(target)
+    authority = identity.authority if identity is not None else None
     aliases = {
         str(value)
         for value in (
-            host,
+            authority,
             getattr(target, "url", None),
             getattr(target, "asset_id", None),
             getattr(target, "service_name", None),
         )
         if value
     }
-    if deps.engagement and host:
+    if deps.engagement and authority:
         mapping = deps.engagement.metadata.get("target_refs", {})
         if isinstance(mapping, dict):
             configured = {
-                str(ref) for name, ref in mapping.items() if str(name).lower() == str(host).lower()
+                str(ref) for name, ref in mapping.items() if str(name).lower() == authority.lower()
             }
             if configured:
                 return configured
     return aliases
 
 
-def validate_argument_target(target, arguments: dict, aliases: set[str] | None = None) -> None:
-    """A claimed in-scope target cannot hide a different remote address in arguments."""
+def asset_argument_bindings(deps, target) -> dict[str, set[str]]:
+    asset = getattr(target, "asset_id", None)
+    if asset is None:
+        return {}
+    asset = str(asset)
+    metadata = deps.engagement.metadata if deps.engagement else {}
+    declared_assets = (
+        {item.strip() for item in deps.engagement.scope.allowed_assets}
+        - {item.strip() for item in deps.engagement.scope.denied_assets}
+        if deps.engagement
+        else set()
+    )
+    result = {}
+    for field in ("asset_ref", "apk_ref", "artifact_ref"):
+        mapping = metadata.get(field + "s", {})
+        ref = mapping.get(asset, asset) if isinstance(mapping, dict) else asset
+        if asset in declared_assets and len(declared_assets) == 1:
+            ref = metadata.get(field, ref)
+        result[field] = {str(ref).strip()}
+    return result
+
+
+def bind_asset_arguments(arguments: dict, tool, bindings: dict[str, set[str]]) -> dict:
+    values = dict(arguments)
+    properties = tool.input_schema.get("properties", {}) if tool else {}
+    if isinstance(properties, dict):
+        for field, refs in bindings.items():
+            if field in properties and field not in values and len(refs) == 1:
+                values[field] = next(iter(refs))
+    return values
+
+
+def validate_argument_target(
+    target,
+    arguments: dict,
+    aliases: set[str] | None = None,
+    *,
+    operation: str = "",
+    asset_bindings: dict[str, set[str]] | None = None,
+) -> None:
+    """Check addresses and Asset references without granting execution permission."""
     location = known_location(("arguments",))
-    target_host = getattr(target, "host", None) or getattr(target, "domain", None)
-    target_url = getattr(target, "url", None)
-    if target_url:
-        target_host = urlsplit(target_url).hostname
-    if arguments.get("target_ref") is not None:
-        allowed = aliases if aliases is not None else {str(target_host), str(target_url)}
-        if str(arguments["target_ref"]) not in allowed:
-            raise DecisionRuleError(
-                "tool target reference differs from proposal target binding",
-                code="unresolved_target",
-                location=location,
-            )
-    target_port = getattr(target, "port", None)
-    if target_url:
-        parsed_target = urlsplit(target_url)
-        target_port = parsed_target.port or (443 if parsed_target.scheme == "https" else 80)
-    for name in ("host", "domain", "hostname"):
-        if (
-            name in arguments
-            and target_host
-            and str(arguments[name]).lower() != str(target_host).lower()
-        ):
-            raise DecisionRuleError(
-                "tool argument address differs from proposal target",
-                code="unresolved_target",
-                location=location,
-            )
-    for name in ("url", "base_url", "target_url"):
-        value = arguments.get(name)
-        if isinstance(value, str) and target_host:
-            if value.startswith("/") and not value.startswith("//"):
-                continue
-            parsed = urlsplit(value if "://" in value or value.startswith("//") else "//" + value)
-            if parsed.hostname != str(target_host).lower():
-                raise DecisionRuleError(
-                    "tool argument URL differs from proposal target",
-                    code="unresolved_target",
-                    location=location,
+    try:
+        validate_network_arguments(target, arguments, operation=operation)
+        identity = network_identity(target)
+        allowed = (
+            aliases
+            if aliases is not None
+            else {
+                value
+                for value in (
+                    identity.authority if identity else None,
+                    getattr(target, "url", None),
                 )
-            actual_port = parsed.port or (443 if parsed.scheme == "https" else 80)
-            if target_port is not None and actual_port != target_port:
-                raise DecisionRuleError(
-                    "tool argument port differs from proposal target",
-                    code="unresolved_target",
-                    location=location,
-                )
-            if target_url and parsed.scheme and parsed.scheme != urlsplit(target_url).scheme:
-                raise DecisionRuleError(
-                    "tool argument scheme differs from proposal target",
-                    code="unresolved_target",
-                    location=location,
-                )
-    if arguments.get("port") is not None and target_port is not None:
-        if int(arguments["port"]) != target_port:
-            raise DecisionRuleError(
-                "tool argument port differs from proposal target",
-                code="unresolved_target",
-                location=location,
-            )
+                if value
+            }
+        )
+        if arguments.get("target_ref") is not None and str(arguments["target_ref"]) not in allowed:
+            raise ValueError("tool target reference differs from proposal target binding")
+        bindings = (
+            asset_bindings
+            or {field: {str(target.asset_id)} for field in ("asset_ref", "apk_ref", "artifact_ref")}
+            if getattr(target, "asset_id", None) is not None
+            else {}
+        )
+        for field, refs in bindings.items():
+            if field in arguments and str(arguments[field]) not in refs:
+                raise ValueError("tool asset reference differs from proposal target binding")
+    except (ValueError, TypeError):
+        raise DecisionRuleError(
+            "Tool arguments do not match the selected target binding.",
+            code="unresolved_target",
+            location=location,
+        ) from None
 
 
 async def operator_epoch(deps, runtime) -> str | None:
@@ -2621,12 +2705,61 @@ async def validate_current_action(deps, runtime, step, proposal=None) -> list[st
             problems.append("proposal differs from the accepted compiled action")
     try:
         validate_argument_target(
-            step.resolved_target(), step.arguments, target_aliases(deps, step.resolved_target())
+            step.resolved_target(),
+            step.arguments,
+            target_aliases(deps, step.resolved_target()),
+            operation=step.operation,
+            asset_bindings=asset_argument_bindings(deps, step.resolved_target()),
         )
         validate_principal_arguments(current, step.principal_ref, step.arguments, assessment)
-    except ValueError as exc:
+        catalog = deps.tool_catalog
+        tool = catalog.get(step.tool_id) if catalog else None
+        if (
+            tool is None
+            or catalog is None
+            or step.operation not in bound_operations(catalog, tool, step.capability)
+        ):
+            problems.append(_rejection_feedback("no_tool_for_operation", "operation"))
+        elif tool.target_types and step.resolved_target().kind not in tool.target_types:
+            problems.append(_rejection_feedback("target_type_mismatch", "arguments"))
+        else:
+            schema_error = CandidateCompiler._schema_rejection(step.arguments, tool.input_schema)
+            if schema_error:
+                problems.append(_rejection_feedback(*schema_error))
+            if step.capability == "analysis" and step.operation == STATIC_ANALYSIS_OPERATION:
+                activation = await analysis_activation(
+                    AttackGraphService(deps.graph_store), catalog
+                )
+                if (
+                    str(node_id_for_target(step.resolved_target()))
+                    not in activation.apk_asset_node_ids
+                    or str(step.tool_id) not in activation.compatible_tool_ids
+                ):
+                    problems.append("analysis Agent target or tool is no longer active")
+            if step.operation in EXECUTION_OPERATIONS:
+                node = await AttackGraphService(deps.graph_store).get_node(
+                    node_id_for_target(step.resolved_target())
+                )
+                if node is None:
+                    problems.append("execution Agent target disappeared")
+                elif (
+                    bind_execution_arguments(
+                        engagement=deps.engagement,
+                        run_id=runtime.run_id,
+                        node=node,
+                        tool=tool,
+                        capability=step.capability,
+                        operation=step.operation,
+                        arguments=step.arguments,
+                    )
+                    != step.arguments
+                ):
+                    problems.append(
+                        "execution Agent arguments differ from the current fixed recipe"
+                    )
+    except (ValueError, TypeError) as exc:
         problems.append(
-            exc.diagnostic.summary
+            exc.diagnostic.feedback()
             if isinstance(exc, DecisionRuleError)
             else diagnostic_for_exception(exc, stage="action_admission").feedback()
         )

@@ -180,7 +180,7 @@ async def test_excluded_endpoint_action_is_rejected_at_compilation_and_execution
     engine = InvestigationEngine(deps)
     context = await engine.context(runtime, await graph.observe(step=1))
     compiled, errors = await engine.compile_actions(path, [intent], runtime, context)
-    assert compiled == [] and "operator_excluded_endpoint" in errors
+    assert compiled == [] and any("operator_excluded_endpoint" in error for error in errors)
     # Replanning and approval cannot make the same excluded endpoint executable.
     from redteam.core.contracts.target import EndpointTarget
 
