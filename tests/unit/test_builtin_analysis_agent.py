@@ -94,15 +94,18 @@ async def test_mobile_pipeline_binds_configured_device_package_and_observed_cras
     assert crash_step.arguments == {"device": "redteam_x86", "id": "crash-17"}
 
 
-def test_analysis_agent_declares_the_apktool_pipeline() -> None:
+def test_analysis_agent_keeps_apktool_pipeline_before_optional_jadx_step() -> None:
     assert ANALYSIS_AGENT.capabilities == ["analysis"]
-    assert [str(step.tool_id) for step in ANALYSIS_AGENT.playbook] == [
+    tool_ids = [str(step.tool_id) for step in ANALYSIS_AGENT.playbook]
+    assert tool_ids[:4] == [
         "analysis.decode_apk",
         "analysis.get_manifest",
         "analysis.list_smali_files",
         "analysis.search_in_files",
     ]
-    assert len({step.attempt_record_key for step in ANALYSIS_AGENT.playbook}) == 4
+    assert tool_ids[4:] == ["analysis.get_android_manifest"]
+    assert ANALYSIS_AGENT.playbook[4].require_healthy_tool is True
+    assert len({step.attempt_record_key for step in ANALYSIS_AGENT.playbook}) == 5
     assert all(step.capability == "analysis" for step in ANALYSIS_AGENT.playbook)
     assert all(step.operation == "static_analysis" for step in ANALYSIS_AGENT.playbook)
 
@@ -152,3 +155,26 @@ async def test_analysis_pipeline_binds_asset_then_decode_project_facts() -> None
         step.arguments["project_dir"] == "/work/output/InsecureBankv2"
         for step in followups
     )
+
+    for followup in followups:
+        await service.record_attempt(asset.id, followup.attempt_record_key, step=2)
+    await service.upsert_node(
+        GraphNodeType.ASSET,
+        node_id=asset.id,
+        attrs={
+            "manifest_analyzed": True,
+            "smali_inventoried": True,
+            "sensitive_strings_searched": True,
+        },
+        step=2,
+    )
+
+    optional = await available_steps(
+        ANALYSIS_AGENT,
+        service.view(),
+        await service.observe(step=3),
+        step=3,
+    )
+
+    assert [step.step_id for step in optional] == ["inspect-jadx-manifest"]
+    assert optional[0].arguments == {}

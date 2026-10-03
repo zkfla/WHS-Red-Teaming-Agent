@@ -1,0 +1,26 @@
+{
+  "full_regression": {
+    "platform": "Windows Python 3.14.6",
+    "command": "python -m pytest -q",
+    "runs": 1,
+    "passed": 2472,
+    "skipped": 60,
+    "failed": 120,
+    "errors": 41,
+    "seconds": 382.33,
+    "status": "NOT_PASS"
+  },
+  "targeted_platform_diagnosis": {
+    "platform": "WSL Ubuntu Python 3.14.4 with POSIX /tmp workspace",
+    "passed": 4,
+    "failed": 0,
+    "seconds": 9.41,
+    "tests": [
+      "tests/unit/test_workspace_mcp.py::test_create_read_patch_and_digest_conflict",
+      "tests/unit/test_mcp_deployment.py::test_generated_settings_preserve_scope_approval_and_secret_indirection",
+      "tests/unit/test_vdb_extended.py::test_batch_partial_failures_and_duplicate_inputs_preserve_positions",
+      "tests/unit/test_finance_extensions.py::test_snapshot_reloaded_without_exposing_cookie"
+    ],
+    "not_a_full_regression": true
+  }
+}

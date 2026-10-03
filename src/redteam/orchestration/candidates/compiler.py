@@ -274,7 +274,14 @@ class CandidateCompiler:
         healthy = [
             tool
             for tool in usable
-            if not plan_step.compatible_tool_ids or tool.tool_id in plan_step.compatible_tool_ids
+            if (
+                not plan_step.require_healthy_tool
+                or tool.health_status is ToolHealthStatus.HEALTHY
+            )
+            and (
+                not plan_step.compatible_tool_ids
+                or tool.tool_id in plan_step.compatible_tool_ids
+            )
         ]
         if not healthy:
             return None, ("no_tool_for_operation", "operation")

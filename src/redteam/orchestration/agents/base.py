@@ -127,6 +127,8 @@ class PlanStep(BaseModel):
     tool_id: ToolId
     # Tool result contracts understood by this playbook; empty permits any compatible input.
     compatible_tool_ids: list[ToolId] = Field(default_factory=list)
+    # Opt-in for steps that must wait for an affirmative live health probe.
+    require_healthy_tool: bool = False
     assessment_kind: Literal["observation", "security_check"] = "security_check"
     authentication_check: AuthenticationCheck | None = None
 

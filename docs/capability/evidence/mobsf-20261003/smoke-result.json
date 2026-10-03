@@ -1,0 +1,135 @@
+[
+  {
+    "server": "execution",
+    "discovery": "PASS",
+    "health": "PASS",
+    "invoke": "PASS",
+    "calls": [
+      {
+        "tool_id": "analysis.run_command",
+        "success": true
+      }
+    ],
+    "seconds": 0.64
+  },
+  {
+    "server": "apktool",
+    "discovery": "PASS",
+    "health": "PASS",
+    "invoke": "PASS",
+    "calls": [
+      {
+        "tool_id": "analysis.decode_apk",
+        "success": true
+      },
+      {
+        "tool_id": "analysis.get_manifest",
+        "success": true
+      },
+      {
+        "tool_id": "analysis.list_smali_files",
+        "success": true
+      },
+      {
+        "tool_id": "analysis.search_in_files",
+        "success": true
+      }
+    ],
+    "seconds": 149.15
+  },
+  {
+    "server": "mobile-next",
+    "discovery": "PASS",
+    "health": "PASS",
+    "invoke": "PASS",
+    "calls": [
+      {
+        "tool_id": "mobile.mobile_launch_app",
+        "success": true
+      },
+      {
+        "tool_id": "mobile.mobile_get_device_logs",
+        "success": true
+      },
+      {
+        "tool_id": "mobile.mobile_list_crashes",
+        "skip": "Confirmed upstream Node ENOBUFS: crash inventory stdout 1114112 bytes exceeds its default buffer; no log deletion or external-client modification"
+      },
+      {
+        "tool_id": "mobile.mobile_get_crash",
+        "skip": "Confirmed upstream Node ENOBUFS: crash inventory stdout 1114112 bytes exceeds its default buffer; no log deletion or external-client modification"
+      }
+    ],
+    "seconds": 30.91,
+    "verified_at_utc": "2026-10-03T11:53:28.552981+00:00"
+  },
+  {
+    "server": "jadx",
+    "discovery": "SKIP",
+    "health": "SKIP",
+    "invoke": "SKIP",
+    "reason": "JADX GUI bridge is not running/configured; manifest requires an opened APK project"
+  },
+  {
+    "server": "analysis-local",
+    "discovery": "PASS",
+    "health": "PASS",
+    "invoke": "PASS",
+    "calls": [
+      {
+        "tool_id": "analysis.apk_file_listing",
+        "success": true
+      },
+      {
+        "tool_id": "analysis.apk_entry_digest",
+        "success": true
+      },
+      {
+        "tool_id": "analysis.apk_string_search",
+        "success": true
+      }
+    ],
+    "seconds": 0.21,
+    "verified_at_utc": "2026-10-03T11:53:29.730719+00:00"
+  },
+  {
+    "server": "mobile-local",
+    "discovery": "PASS",
+    "health": "PASS",
+    "invoke": "PASS",
+    "calls": [
+      {
+        "tool_id": "mobile.device_shell",
+        "success": true
+      }
+    ],
+    "seconds": 0.13,
+    "verified_at_utc": "2026-10-03T11:53:30.981889+00:00"
+  },
+  {
+    "server": "mobsf",
+    "discovery": "PASS",
+    "health": "PASS",
+    "invoke": "PASS",
+    "calls": [
+      {
+        "tool_id": "analysis.mobsf_submit_apk",
+        "success": true
+      },
+      {
+        "tool_id": "analysis.mobsf_start_scan",
+        "success": true
+      },
+      {
+        "tool_id": "analysis.mobsf_scan_status",
+        "success": true
+      },
+      {
+        "tool_id": "analysis.mobsf_report_summary",
+        "success": true
+      }
+    ],
+    "seconds": 13.19,
+    "verified_at_utc": "2026-10-03T12:10:06.394144+00:00"
+  }
+]

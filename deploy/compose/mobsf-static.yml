@@ -1,0 +1,39 @@
+# Start with MOBSF_API_KEY_FILE pointing to an operator-private file outside Git.
+services:
+  mobsf-static:
+    image: opensecurity/mobile-security-framework-mobsf:v4.4.6@sha256:72311e3553ca2c21043923cace27ed99f800cd641e9368160406779516dd774e
+    user: "9901:9901"
+    networks: [mobsf-internal]
+    environment:
+      MOBSF_API_KEY_FILE: /run/secrets/mobsf-api-key
+      MOBSF_API_ONLY: "1"
+      MOBSF_DISABLE_AUTHENTICATION: "0"
+    volumes:
+      - ${MOBSF_API_KEY_FILE:?set an operator-private secret file}:/run/secrets/mobsf-api-key:ro
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 256
+    mem_limit: 4g
+    cpus: 2.0
+    # Upstream startup prints the API key; never retain that stream in Docker logs.
+    logging:
+      driver: none
+  mobsf-api-relay:
+    image: python:3.11-slim@sha256:e41613d42d4891e4930f79523f93f81bbc7632584ec65e36ab055f41a800b41e
+    user: "9901:9901"
+    command: [python, /app/relay.py]
+    ports:
+      - "127.0.0.1:${MOBSF_PORT:-18000}:8000"
+    networks: [mobsf-internal, mobsf-ingress]
+    volumes:
+      - ../docker/mobsf-static/relay.py:/app/relay.py:ro
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 64
+    mem_limit: 512m
+    depends_on: [mobsf-static]
+networks:
+  mobsf-internal:
+    internal: true
+  mobsf-ingress: {}
