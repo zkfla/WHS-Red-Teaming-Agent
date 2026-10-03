@@ -11,7 +11,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
-from redteam.core.enums import ApprovalStatus, PolicyVerdict
+from redteam.core.enums import ApprovalStatus, PolicyVerdict, Severity
 from redteam.core.ids import ActionId, AgentId, ApprovalId, EngagementId
 
 
@@ -22,6 +22,7 @@ class ControlContext(BaseModel):
     agent_id: AgentId | None = None
     correlation_id: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
+    in_flight_actions: int | None = Field(default=None, ge=0)
 
 
 class PolicyDecision(BaseModel):
@@ -37,6 +38,23 @@ class PolicyDecision(BaseModel):
     budget_remaining: int | None = None
 
     evaluated_at: datetime
+    severity: Severity | None = None
+
+    @property
+    def denial_severity(self) -> str | None:
+        """Typed new decisions and the original tag meaning for old records."""
+        if self.verdict is not PolicyVerdict.DENY:
+            return None
+        if self.severity is not None:
+            return self.severity.value
+        return legacy_denial_severity(self.matched_rules)
+
+
+def legacy_denial_severity(matched_rules: list[str]) -> str | None:
+    for rule in matched_rules:
+        if rule.startswith("severity:"):
+            return rule[len("severity:") :] or None
+    return None
 
 
 class Approval(BaseModel):

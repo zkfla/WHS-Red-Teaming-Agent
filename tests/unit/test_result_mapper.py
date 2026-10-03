@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 
 import pytest
 
+from redteam.attack_graph.identity import node_id_for_target
 from redteam.core.contracts.target import EndpointTarget, HostTarget
 from redteam.core.contracts.tool import ToolError, ToolResult
 from redteam.core.enums import GraphEdgeType, GraphNodeType
@@ -59,6 +60,30 @@ def test_maps_a_successful_probe_to_service_and_endpoint() -> None:
 
     assert {n.node_type for n in mutation.nodes} == {GraphNodeType.SERVICE, GraphNodeType.ENDPOINT}
     assert {e.edge_type for e in mutation.edges} == {GraphEdgeType.HOSTS, GraphEdgeType.EXPOSES}
+
+
+@pytest.mark.parametrize(
+    "authority,host,port",
+    [
+        ("a.local:8443", "a.local", 8443),
+        ("[2001:db8::1]:8080", "2001:db8::1", 8080),
+    ],
+)
+def test_port_probe_survives_registry_validation(authority, host, port) -> None:
+    target = HostTarget(host=authority)
+    registry = ResultMapperRegistry()
+    registry.register("recon.http_probe", map_recon_http_probe)
+    mutation = registry.map_result(
+        tool_id=ToolId("recon.http_probe"),
+        target=target,
+        arguments={"target_ref": "x"},
+        result=_result(output={**_GOOD_OUTPUT, "host": host, "port": port, "scheme": "https"}),
+    )
+    assert registry.last_failure is None
+    assert len(mutation.nodes) == 2
+    assert all(node.facts["port"] == port for node in mutation.nodes)
+    hosts_edge = next(edge for edge in mutation.edges if edge.edge_type is GraphEdgeType.HOSTS)
+    assert hosts_edge.source_id == node_id_for_target(target)
 
 
 def test_defaults_path_to_root_when_argument_missing() -> None:
@@ -133,11 +158,14 @@ def test_probe_preserves_observed_https_port_and_original_path() -> None:
 
 
 def test_probe_rejects_a_result_for_a_different_target_ref() -> None:
-    assert map_recon_http_probe(
-        target=HostTarget(host="a.local"),
-        arguments={"target_ref": "expected", "path": "/"},
-        result=_result(output=_GOOD_OUTPUT),
-    ) == GraphMutation()
+    assert (
+        map_recon_http_probe(
+            target=HostTarget(host="a.local"),
+            arguments={"target_ref": "expected", "path": "/"},
+            result=_result(output=_GOOD_OUTPUT),
+        )
+        == GraphMutation()
+    )
 
 
 # -- registry --------------------------------------------------------------
@@ -235,13 +263,13 @@ def test_web_mapper_uses_executed_method_path_and_port() -> None:
     from redteam.orchestration.observations.web_http import map_web_http_request
 
     mutation = map_web_http_request(
-        target=EndpointTarget(host='a.local', port=8443, path='/old'),
-        arguments={'target_ref': 'x', 'path': '/actual', 'method': 'POST'},
-        result=_result(tool_id='web.http_request', output=_GOOD_OUTPUT),
+        target=EndpointTarget(host="a.local", port=8443, path="/old"),
+        arguments={"target_ref": "x", "path": "/actual", "method": "POST"},
+        result=_result(tool_id="web.http_request", output=_GOOD_OUTPUT),
     )
     node = mutation.nodes[0]
-    assert str(node.node_id) == 'endpoint:a.local:8443 POST /actual'
-    assert node.facts['observed_target'] == '/actual'
+    assert str(node.node_id) == "endpoint:a.local:8443 POST /actual"
+    assert node.facts["observed_target"] == "/actual"
 
 
 def test_web_mapper_models_a_session_reference_and_observed_access() -> None:
@@ -335,12 +363,15 @@ def test_web_mapper_preserves_only_normalized_response_metadata() -> None:
         assert "values" not in entry
 
 
-@pytest.mark.parametrize('status', [True, 0, 600, '200', None])
+@pytest.mark.parametrize("status", [True, 0, 600, "200", None])
 def test_web_mapper_rejects_invalid_status(status) -> None:
     from redteam.orchestration.observations.web_http import map_web_http_request
 
-    assert map_web_http_request(
-        target=EndpointTarget(host='a.local', path='/'),
-        arguments={'target_ref': 'x', 'path': '/'},
-        result=_result(output={**_GOOD_OUTPUT, 'status_code': status}),
-    ) == GraphMutation()
+    assert (
+        map_web_http_request(
+            target=EndpointTarget(host="a.local", path="/"),
+            arguments={"target_ref": "x", "path": "/"},
+            result=_result(output={**_GOOD_OUTPUT, "status_code": status}),
+        )
+        == GraphMutation()
+    )

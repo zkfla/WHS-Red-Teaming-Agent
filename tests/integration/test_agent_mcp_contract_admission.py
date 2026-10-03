@@ -9,7 +9,7 @@ from redteam.attack_graph.predicates import facts_of
 from redteam.attack_graph.service import AttackGraphService
 from redteam.core.contracts.action import ActionProposal
 from redteam.core.enums import GraphNodeType, PolicyVerdict
-from redteam.core.ids import GraphNodeId, RunId
+from redteam.core.ids import GraphNodeId, RunId, ToolId
 from redteam.orchestration.engine import ActionIntent, InvestigationEngine, validate_current_action
 from redteam.orchestration.nodes import execute_node, policy_node
 from redteam.orchestration.paths import PathPlan
@@ -22,16 +22,20 @@ from tests.unit.test_execution_agent_bridge import execution_descriptor
 
 
 @pytest.mark.parametrize("opaque", [False, True])
-async def test_pinned_seed_keeps_port_through_compilation_policy_and_execution(opaque):
+@pytest.mark.parametrize("physical", [False, True])
+async def test_pinned_seed_keeps_port_through_compilation_policy_and_execution(opaque, physical):
     host = "example.test:8443"
     configured = h.make_engagement(host)
     if opaque:
         configured.metadata["target_refs"] = {host: "pinned-mcp-reference"}
     llm = h.ScriptedLLM()
     gateway = DummyToolGateway()
+    descriptor = h.inventory_descriptor()
+    if physical:
+        descriptor.tool_id = ToolId(f"recon.{descriptor.server_id}.{descriptor.tool_name}")
     deps = replace(
         build_test_application(
-            tool_catalog=h.FakeCatalog([h.inventory_descriptor()]),
+            tool_catalog=h.FakeCatalog([descriptor]),
             tool_gateway=gateway,
             llm_client=llm,
         ),
@@ -50,6 +54,8 @@ async def test_pinned_seed_keeps_port_through_compilation_policy_and_execution(o
         PathPlan.model_validate(raw), runtime, context, GraphObservation()
     )
     intent = h.turn_actions(str(node.id))["actions"][0]
+    if physical:
+        intent["tool_id"] = str(descriptor.tool_id)
     intent["arguments"] = {}
     compiled, errors = await engine.compile_actions(
         path, [ActionIntent.model_validate(intent)], runtime, context
@@ -205,7 +211,7 @@ async def test_apk_activation_is_bound_to_selected_asset_and_rechecked():
     facts["apk_ref"] = ""
     await service.upsert_node(GraphNodeType.ASSET, node_id=node.id, facts=facts)
     problems = await validate_current_action(deps, runtime, candidate.plan_step)
-    assert any("no longer active" in problem for problem in problems)
+    assert any(problem.startswith("role_or_tool_inactive:") for problem in problems), problems
     # Another APK still activates the role, but it cannot authorize this asset.
     engine = InvestigationEngine(deps)
     context = await engine.context(runtime, GraphObservation())

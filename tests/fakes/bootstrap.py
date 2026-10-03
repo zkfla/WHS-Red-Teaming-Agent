@@ -9,6 +9,8 @@ real/default backends (used by the CLI and integration tests).
 from __future__ import annotations
 
 from redteam.attack_graph.stores.memory import InMemoryAttackGraphStore
+from redteam.capability.action_binding import BUILTIN_RETRY_POLICY
+from redteam.capability.execution_recipes import builtin_execution_recipes
 from redteam.core.contracts.tool import ToolDescriptor
 from redteam.core.ids import ToolId
 from redteam.core.ports.attack_graph import AttackGraphStore
@@ -85,4 +87,6 @@ def build_test_application(
             ]
         ),
         settings=settings if settings is not None else OrchestrationSettings(),
+        retry_policy=BUILTIN_RETRY_POLICY,
+        execution_recipes=builtin_execution_recipes(),
     )

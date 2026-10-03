@@ -14,6 +14,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
 
+from redteam.capability.action_binding import declares_retry_safe
 from redteam.capability.adapters.mcp.base import MCPCallResult
 from redteam.core.contracts.tool import ToolDescriptor
 from redteam.core.enums import RiskLevel, ToolHealthStatus
@@ -49,12 +50,11 @@ class ExampleMCPAdapter:
                 capability_tags=["recon"],
                 risk_level=RiskLevel.LOW,
                 health_status=ToolHealthStatus.HEALTHY,
+                retry_safe=declares_retry_safe("recon", ("service_discovery",)),
             )
         ]
 
-    async def invoke(
-        self, tool: ToolDescriptor, arguments: dict[str, Any]
-    ) -> MCPCallResult:
+    async def invoke(self, tool: ToolDescriptor, arguments: dict[str, Any]) -> MCPCallResult:
         started_at = datetime.now(timezone.utc)
         return MCPCallResult(
             success=True,

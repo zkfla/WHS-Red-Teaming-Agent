@@ -49,7 +49,10 @@ from redteam.app.runtime_components import binding_for_resume
 from redteam.capability.settings import MCPConfigurationError
 from redteam.core.config import AppConfig
 from redteam.event_bus.publisher import EventPublisher
-from redteam.orchestration.checkpointing import open_checkpointer
+from redteam.orchestration.checkpointing import (
+    CheckpointIdentity,
+    read_checkpoint_identity,
+)
 from redteam.orchestration.component_binding import (
     ComponentBindingError,
     ComponentProfile,
@@ -124,7 +127,7 @@ async def _run(
     settings = OrchestrationSettings.for_durable_run(config.orchestration, max_steps=args.max_steps)
 
     try:
-        hint = await _read_checkpoint_runtime(settings, args.run_id)
+        hint = await _read_checkpoint_identity(settings, args.run_id)
     except Exception as exc:  # noqa: BLE001 - never leave a broken run half-resumed
         eprint(f"ERROR: could not read checkpoint for run {args.run_id}: {exc}")
         return EXIT_FAILURE
@@ -146,6 +149,13 @@ async def _run(
             f"registered: {exc} -- refusing to resume."
         )
         return EXIT_FAILURE
+
+    config = config.model_copy(
+        update={
+            "extensions": list(stored_binding.extension_entry_points),
+            "planning_provider": stored_binding.planning_provider_id,
+        }
+    )
 
     try:
         engagement, deps = await build_resume_application(
@@ -324,32 +334,26 @@ async def build_resume_application(
     )
 
 
-async def _read_checkpoint_runtime(
+async def _read_checkpoint_identity(
     settings: OrchestrationSettings, run_id: str
-) -> RuntimeState | None:
-    """Read the run's latest checkpointed ``RuntimeState`` directly.
+) -> CheckpointIdentity | None:
+    """Read the run's resume identity without a typed checkpoint restore.
 
-    Needed before the application is built: the run's original
-    ``engagement_id`` lives only inside the checkpoint, and the rebuilt
-    Control Plane / Attack Graph must be scoped to it. Reading the raw saver
-    here (its serde returns typed models) avoids building the whole runtime
-    just to learn an id. Full replay-safety validation still happens later in
-    ``AgentLoopRunner.recover_runtime``.
+    Needed before the application is built: the original engagement_id and
+    the recorded component binding live inside the checkpoint, and the
+    per-run codec selection needed for a full typed restore is itself
+    derived from that binding. The identity reader therefore runs
+    constructor-free (raw projection only), so a checkpoint written with
+    selected codecs can still be read here. Full replay-safety validation
+    still happens later in AgentLoopRunner.recover_runtime with the strict
+    serializer and the recovered selection.
     """
-    async with open_checkpointer(
+    return await read_checkpoint_identity(
         enabled=settings.checkpointing,
         backend=settings.checkpoint_backend,
         path=settings.checkpoint_path,
-    ) as saver:
-        if saver is None:
-            return None
-        config = {"configurable": {"thread_id": str(run_id), "checkpoint_ns": ""}}
-        checkpoint = await saver.aget(config)
-        if not checkpoint:
-            return None
-        values = checkpoint.get("channel_values") or {}
-        runtime = values.get("runtime")
-        return runtime if isinstance(runtime, RuntimeState) else None
+        run_id=str(run_id),
+    )
 
 
 def _print_summary(final: RuntimeState) -> None:

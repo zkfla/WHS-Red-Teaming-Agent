@@ -35,6 +35,7 @@ from redteam.orchestration.analysis import (
     resolve_claim_for_review,
     session_list_pairs,
 )
+from redteam.orchestration.evidence_access import locate_raw, raw_from_metadata
 from redteam.orchestration.findings import FindingPromoter, PromotionRequest
 from redteam.orchestration.service_status import severity_for
 
@@ -45,9 +46,6 @@ __all__ = [
     "record_recovery_note",
     "recovery_report",
 ]
-
-# Raw payload keys, newest first. Mirrors the reader so the two agree.
-_RAW_KEYS = ("tool_result", "raw_tool_result")
 
 
 def is_execution_ambiguous(result: ToolResult | None) -> bool:
@@ -63,14 +61,6 @@ def is_execution_ambiguous(result: ToolResult | None) -> bool:
         result.metadata.get("orchestration_exception")
         or result.metadata.get("verification_exception")
     )
-
-
-def _stored_raw(record: EvidenceRecord) -> Any | None:
-    for key in _RAW_KEYS:
-        raw = record.metadata.get(key)
-        if raw is not None:
-            return raw
-    return None
 
 
 def _clean_recovery_identity(value: Any) -> str | None:
@@ -228,21 +218,21 @@ async def reprocess_evidence(
     passed verifier, the graph, and the mappers are touched.
     """
     record = await evidence_store.get(evidence_id)
-    if record is None:
+    status, raw = locate_raw(record, run_id)
+    if status == "missing":
         return {
             "status": "not_found",
             "evidence_id": str(evidence_id),
             "requested_run_id": str(run_id),
         }
-    if str(record.run_id) != str(run_id):
+    if status == "other_run":
         return {
             "status": "run_mismatch",
             "evidence_id": str(evidence_id),
             "requested_run_id": str(run_id),
             "actual_run_id": str(record.run_id),
         }
-    raw = _stored_raw(record)
-    if raw is None:
+    if status == "no_raw" or raw is None:
         return {
             "status": "no_raw",
             "evidence_id": str(evidence_id),
@@ -918,7 +908,7 @@ async def recovery_report(*, evidence_store: Any, run_id: str) -> dict:
         kind = record.metadata.get("record_kind")
         if isinstance(kind, str) and kind:
             kinds[kind] = kinds.get(kind, 0) + 1
-        raw = record.metadata.get("tool_result") or record.metadata.get("raw_tool_result")
+        raw = raw_from_metadata(getattr(record, "metadata", None))
         if raw is None:
             continue
         with_raw += 1

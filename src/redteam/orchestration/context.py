@@ -15,25 +15,35 @@ from redteam.core.contracts.engagement import Engagement
 from redteam.core.ids import RunId
 from redteam.core.ports.attack_graph import AttackGraphStore
 from redteam.core.ports.control_plane import ControlPlane
-from redteam.core.ports.event_bus import EventBus
+from redteam.core.ports.event_bus import EventBus, EventHistory
 from redteam.core.ports.evidence_store import EvidenceStore
 from redteam.core.ports.llm import LLMClient
 from redteam.core.ports.task_graph import MissionTaskStore
 from redteam.core.ports.tool_catalog import ToolCatalog
 from redteam.core.ports.tool_gateway import ToolGateway
+from redteam.core.provider_contracts import (
+    LEGACY_OPERATION_BINDINGS,
+    ExecutionRecipeSpec,
+    OperationTargetBinding,
+    RetryPolicy,
+)
 from redteam.orchestration.agents.providers import (
     CandidateProviderRegistry,
     default_provider_registry,
 )
 from redteam.orchestration.agents.registry import AgentRegistry, default_registry
 from redteam.orchestration.analysis import AnalysisVerifier, StructuredLLMAnalysisVerifier
+from redteam.orchestration.checkpointing import StateCodecRegistry
 from redteam.orchestration.component_binding import RuntimeComponentBinding
 from redteam.orchestration.context_projection import ContextProjectionCache
+from redteam.orchestration.coordination import Coordinator
+from redteam.orchestration.eligibility import EligibilityRegistry, default_eligibility_registry
 from redteam.orchestration.long_jobs import LongJobAdapter
 from redteam.orchestration.methodology import ReferenceLibrary
 from redteam.orchestration.observations import ResultMapperRegistry, default_result_mapper_registry
 from redteam.orchestration.operator_intents.store import OperatorIntentStore
 from redteam.orchestration.paths import InMemoryPathStore, PathStore
+from redteam.orchestration.planning import PlanningProvider
 from redteam.orchestration.settings import OrchestrationSettings
 from redteam.orchestration.task_graph.memory import InMemoryTaskGraphStore
 from redteam.orchestration.work.memory import InMemoryWorkStore
@@ -86,6 +96,19 @@ class RuntimeDeps:
     tool_semaphore: asyncio.Semaphore | None = field(default=None, compare=False)
     #: Which registered component set this run was built from.
     component_binding: RuntimeComponentBinding | None = field(default=None, compare=False)
+    planning_provider: PlanningProvider | None = field(default=None, compare=False)
+    state_codecs: StateCodecRegistry | None = field(default=None, compare=False)
+    coordinator: Coordinator | None = field(default=None, compare=False)
+    event_history: EventHistory | None = field(default=None, compare=False)
+    eligibility: EligibilityRegistry = field(
+        default_factory=default_eligibility_registry, compare=False
+    )
+    operation_bindings: dict[str, OperationTargetBinding] = field(
+        default_factory=lambda: {row.operation: row for row in LEGACY_OPERATION_BINDINGS},
+        compare=False,
+    )
+    execution_recipes: dict[str, ExecutionRecipeSpec] = field(default_factory=dict, compare=False)
+    retry_policy: RetryPolicy | None = field(default=None, compare=False)
 
     def __post_init__(self) -> None:
         if self.verifier is None:

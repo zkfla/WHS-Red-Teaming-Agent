@@ -58,16 +58,16 @@ def test_every_supported_intent_registers_and_compiles(operation):
     assert len(candidates) == 1 and not rejected
 
 
-@pytest.mark.parametrize("operation", ["future_intent", "some_remote_tool", "nmap_scan"])
-def test_unsupported_lower_snake_case_fails_before_registration(operation, monkeypatch):
+@pytest.mark.parametrize("operation", ["HTTP Request", "Bearer secret"])
+def test_invalid_format_operation_fails_before_registration(operation, monkeypatch):
     tool = descriptor(operation)
-    with pytest.raises(MCPConfigurationError, match="operation_unsupported"):
+    with pytest.raises(MCPConfigurationError, match="operation_invalid_format"):
         validate_tool_manifest(tool)
     registry = MCPToolRegistry()
     registry.register(tool)  # Raw discovery storage is not an executable catalog.
-    with pytest.raises(ValueError, match="operation_unsupported"):
+    with pytest.raises(ValueError, match="operation_invalid_format"):
         MCPToolCatalog(registry)
-    with pytest.raises(ValueError, match="operation_unsupported"):
+    with pytest.raises(ValueError, match="operation_invalid_format"):
         MCPToolCatalog(registry, {str(tool.tool_id): [operation]})
     prefix = "REDTEAM_MCP_SOME_SERVER"
     monkeypatch.setenv(f"{prefix}_KIND", "web_api")
@@ -76,9 +76,42 @@ def test_unsupported_lower_snake_case_fails_before_registration(operation, monke
         f"{prefix}_TOOL_OPERATIONS_JSON", '{"some_remote_tool":["' + operation + '"]}'
     )
     with pytest.raises(
-        MCPConfigurationError, match="some-server.*some_remote_tool.*operation_unsupported"
+        MCPConfigurationError,
+        match="TOOL_OPERATIONS_JSON.*some_remote_tool.*operation_invalid_format",
     ):
         MCPServerSettings.from_environment("some-server")
+
+
+@pytest.mark.parametrize("operation", ["future_intent", "some_remote_tool", "nmap_scan"])
+def test_valid_syntax_unknown_operation_registers_but_needs_binding(operation):
+    tool = descriptor(operation)
+    validate_tool_manifest(tool)
+    registry = MCPToolRegistry()
+    registry.register(tool)
+    catalog = MCPToolCatalog(registry)
+    assert catalog.supports(tool.tool_id, operation)
+    assert ("web", operation) in catalog.executable_pairs()
+    step = PlanStep(
+        step_id="future-binding",
+        capability="web",
+        operation=operation,
+        tool_id=tool.tool_id,
+        target=UrlTarget(url="https://docs.example/guide"),
+        reason="contract only; no tool call",
+    )
+    draft = CandidateDraft(
+        agent_id=AgentId("web-agent"),
+        plan_step=step,
+        target_node_ids=[GraphNodeId("endpoint:https://docs.example/guide")],
+    )
+    candidates, rejected = CandidateCompiler(catalog).compile_drafts_with_rejections([draft])
+    assert len(candidates) == 1 and not rejected
+    catalog_without_binding = MCPToolCatalog(MCPToolRegistry())
+    _, rejected = CandidateCompiler(catalog_without_binding).compile_drafts_with_rejections(
+        [draft]
+    )
+    assert rejected[0].reason == "no_tool_for_operation"
+    assert rejected[0].field == "operation"
 
 
 def test_remote_tool_name_never_becomes_an_intent_implicitly():
@@ -93,11 +126,24 @@ def test_remote_tool_name_never_becomes_an_intent_implicitly():
     assert not catalog.supports(tool.tool_id, "http_request")
 
 
+def test_agent_accepts_valid_syntax_unknown_operation_but_still_gates_target():
+    provider = LLMCandidateProvider(None)
+    action = {
+        "capability": "web",
+        "operation": "future_intent",
+        "target_node_id": "host:docs.example",
+    }
+    draft, drop = provider._to_draft(AgentId("web-agent"), action, 0, {"host:docs.example"}, {})
+    assert draft is not None and drop is None
+    _, target_drop = provider._to_draft(AgentId("web-agent"), action, 0, set(), {})
+    assert target_drop is not None and target_drop.reason == "unknown_target_node"
+
+
 @pytest.mark.parametrize(
     ("operation", "reason"),
     [
-        ("future_intent", "operation_unsupported"),
         ("HTTP Request", "operation_invalid_format"),
+        ("Bearer secret", "operation_invalid_format"),
     ],
 )
 def test_agent_rejects_operation_separately_from_unknown_target(operation, reason):

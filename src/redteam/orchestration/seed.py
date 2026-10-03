@@ -6,6 +6,8 @@ planner; the Control Plane still decides whether acting on it is allowed.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 from redteam.attack_graph.predicates import (
     Confidence,
     Provenance,
@@ -18,6 +20,7 @@ from redteam.core.contracts.engagement import Engagement
 from redteam.core.contracts.graph import GraphNode
 from redteam.core.enums import GraphNodeType
 from redteam.core.ids import RunId
+from redteam.core.provider_contracts import ExecutionRecipeSpec
 from redteam.orchestration.authentication import AuthSession
 from redteam.orchestration.execution_bridge import execution_facts_by_asset
 
@@ -65,6 +68,7 @@ async def seed_from_engagement(
     *,
     run_id: RunId | None = None,
     step: int = 0,
+    execution_recipes: Mapping[str, ExecutionRecipeSpec] | None = None,
 ) -> list[GraphNode]:
     """Create one in-scope node per allowed host/domain and mobile asset."""
     denied = {
@@ -75,9 +79,7 @@ async def seed_from_engagement(
         for value in (*engagement.scope.allowed_hosts, *engagement.scope.allowed_domains)
         if value and value.lower() not in denied
     ]
-    denied_assets = {
-        asset.strip() for asset in engagement.scope.denied_assets if asset.strip()
-    }
+    denied_assets = {asset.strip() for asset in engagement.scope.denied_assets if asset.strip()}
     declared_assets = list(
         dict.fromkeys(
             asset.strip()
@@ -135,7 +137,9 @@ async def seed_from_engagement(
         singular="package_name",
         plural="package_names",
     )
-    execution_facts = execution_facts_by_asset(engagement, declared_assets)
+    execution_facts = execution_facts_by_asset(
+        engagement, declared_assets, recipes=execution_recipes
+    )
     for asset in declared_assets:
         configured = {
             asset in device_serials,

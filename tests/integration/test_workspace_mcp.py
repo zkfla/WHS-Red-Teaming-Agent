@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from redteam.attack_graph.identity import node_id_for_target
+from redteam.capability.adapters.mcp.naming import build_canonical_mcp_tool_id
 from redteam.capability.bootstrap import open_mcp_tool_gateway
 from redteam.capability.settings import MCPConfigurationError, MCPServerSettings
 from redteam.capability.workspace_manifest import (
@@ -121,7 +122,9 @@ async def test_real_stdio_manifest_and_file_lifecycle(
     servers = configure_workspace(monkeypatch, tmp_path)
     async with open_mcp_tool_gateway(servers, health_refresh_enabled=False) as gateway:
         catalog = gateway.list_tools_for_action("analysis", "file_read")
-        assert [str(tool.tool_id) for tool in catalog] == ["analysis.read_file"]
+        assert [str(tool.tool_id) for tool in catalog] == [
+            build_canonical_mcp_tool_id("analysis", "workspace-read-test", "read_file")
+        ]
         for mode in ("read", "write"):
             profile = f"workspace_{mode}"
             for name, spec in workspace_specs(profile).items():

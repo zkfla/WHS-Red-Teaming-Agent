@@ -13,13 +13,16 @@ from typing import Any
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import SchemaError
 
+from redteam.capability.adapters.mcp.naming import parse_canonical_mcp_tool_id
 from redteam.capability.settings import MCPConfigurationError
 from redteam.core.action_semantics import (
-    CANONICAL_CAPABILITIES,
     ActionNamingError,
     canonical_action_key,
+    validate_capability_name,
 )
 from redteam.core.contracts.tool import ToolDescriptor
+from redteam.core.ids import ToolId
+from redteam.core.provider_contracts import TARGET_ARGUMENT_VALUES
 
 # These are graph/target kinds understood by the shared Core contracts.  A
 # server may advertise fewer kinds, but an unknown kind would be invisible to
@@ -40,6 +43,17 @@ KNOWN_TARGET_TYPES = frozenset(
 )
 
 
+def split_tool_id(value: ToolId | str) -> tuple[str, str | None, str] | None:
+    """Split a legacy 2-part or canonical 3-part tool id."""
+
+    parts = str(value).split(".")
+    if len(parts) == 2 and all(parts):
+        return (parts[0], None, parts[1])
+    if len(parts) == 3 and all(parts):
+        return (parts[0], parts[1], parts[2])
+    return None
+
+
 def validate_tool_manifest(descriptor: ToolDescriptor) -> None:
     """Validate one discovered descriptor before it enters the Registry.
 
@@ -56,6 +70,12 @@ def validate_tool_manifest(descriptor: ToolDescriptor) -> None:
     if descriptor.output_schema is not None:
         _validate_schema(descriptor.output_schema, f"{prefix} output schema")
     _validate_required_arguments(descriptor.input_schema, prefix)
+    properties = descriptor.input_schema.get("properties", {})
+    if any(
+        name not in properties or value not in TARGET_ARGUMENT_VALUES
+        for name, value in descriptor.argument_bindings.items()
+    ):
+        raise MCPConfigurationError(f"{prefix} has an invalid target argument binding")
     _validate_operations(descriptor.operations, prefix)
     namespace = str(descriptor.tool_id).partition(".")[0]
     for operation in descriptor.operations:
@@ -70,11 +90,21 @@ def validate_tool_manifest(descriptor: ToolDescriptor) -> None:
 
 def _validate_identity(descriptor: ToolDescriptor, prefix: str) -> None:
     tool_id = str(descriptor.tool_id)
-    namespace, separator, _remote_name = tool_id.partition(".")
-    if not separator or not namespace or not _remote_name or "." in _remote_name:
+    split = split_tool_id(tool_id)
+    if split is None:
         raise MCPConfigurationError(
             f"{prefix} must use <namespace>.<remote_tool_name> tool_id format"
         )
+    namespace, server_id, _remote_name = split
+    if server_id is not None:
+        try:
+            namespace, physical_server, remote_name = parse_canonical_mcp_tool_id(tool_id)
+        except ValueError as exc:
+            raise MCPConfigurationError(
+                f"{prefix} must use <namespace>.<remote_tool_name> tool_id format"
+            ) from exc
+        if (physical_server, remote_name) != (descriptor.server_id, descriptor.tool_name):
+            raise MCPConfigurationError(f"{prefix} tool identity differs from its physical server")
     if not descriptor.server_id.strip() or not descriptor.tool_name.strip():
         raise MCPConfigurationError(f"{prefix} must have non-empty server_id and tool_name")
     if not descriptor.capability_tags:
@@ -83,10 +113,12 @@ def _validate_identity(descriptor: ToolDescriptor, prefix: str) -> None:
         raise MCPConfigurationError(
             f"{prefix} namespace {namespace!r} is missing from capability_tags"
         )
-    if namespace not in CANONICAL_CAPABILITIES:
+    try:
+        validate_capability_name(namespace)
+    except ActionNamingError as exc:
         raise MCPConfigurationError(
             f"{prefix} namespace {namespace!r} is not a canonical capability"
-        )
+        ) from exc
 
 
 def _validate_schema(schema: dict[str, Any], label: str) -> None:
@@ -118,9 +150,7 @@ def _validate_operations(operations: list[str], prefix: str) -> None:
     if len(operations) != len(set(operations)) or any(
         not isinstance(operation, str) for operation in operations
     ):
-        raise MCPConfigurationError(
-            f"{prefix} operations must be unique lower_snake_case values"
-        )
+        raise MCPConfigurationError(f"{prefix} operations must be unique lower_snake_case values")
 
 
 def _validate_target_types(target_types: list[str], prefix: str) -> None:

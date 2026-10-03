@@ -26,12 +26,15 @@ __all__ = [
 
 
 def tool_namespace(tool_id: ToolId) -> str:
-    """Return the namespace from ``<namespace>.<remote_tool_name>``."""
+    """Read the namespace from legacy or physical tool IDs.
 
-    namespace, separator, remote_name = str(tool_id).partition(".")
-    if not separator or not namespace or not remote_name or "." in remote_name:
-        raise ValueError(f"tool_id {tool_id!r} must use <namespace>.<remote_tool_name>")
-    return namespace
+    Physical identity and escaping are checked by the capability catalog;
+    orchestration consumes its namespace without duplicating that parser.
+    """
+    parts = str(tool_id).split(".")
+    if len(parts) not in (2, 3) or not all(parts):
+        raise ValueError(f"tool_id {tool_id!r} must use a legacy or physical tool identity")
+    return parts[0]
 
 
 def tool_matches_action_namespace(tool_id: ToolId, capability: str) -> bool:

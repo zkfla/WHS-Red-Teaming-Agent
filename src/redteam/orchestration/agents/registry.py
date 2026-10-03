@@ -19,15 +19,7 @@ from redteam.orchestration.agents.base import (
     HypothesisDraft,
     PlanStep,
 )
-from redteam.orchestration.agents.builtin import (
-    ANALYSIS_AGENT,
-    MOBILE_AGENT,
-    WEB_API_AGENT,
-)
-from redteam.orchestration.agents.definition import (
-    AgentDefinition,
-    builtin_agent_definitions,
-)
+from redteam.orchestration.agents.definition import AgentDefinition
 from redteam.orchestration.expectations import Expectation
 from redteam.orchestration.progress import observation_fingerprint
 
@@ -160,9 +152,7 @@ class AgentRegistry:
                 return spec
         return eligible[0]
 
-    def revision_fingerprint(
-        self, agent_id: AgentId, observation: GraphObservation
-    ) -> str:
+    def revision_fingerprint(self, agent_id: AgentId, observation: GraphObservation) -> str:
         """Meaningful graph revision visible to one role's context profile."""
 
         definition = self.definition(agent_id)
@@ -206,11 +196,7 @@ class AgentRegistry:
 
         if capacity < 1:
             return 0
-        active = [
-            spec
-            for spec in self._specs
-            if self._is_active(spec, observation, phase)
-        ]
+        active = [spec for spec in self._specs if self._is_active(spec, observation, phase)]
         if not active:
             return capacity
 
@@ -292,11 +278,19 @@ RECON_AGENT = AgentSpec(
 def default_registry() -> AgentRegistry:
     """The registry used when nothing else is wired in ``app.bootstrap``.
 
-    Reporting remains a terminal read-only projector. The other roles are
-    executable when their activation predicate and a matching Tool Catalog
-    capability are present.
+    Assembled from the built-in role bundles so definition, playbook
+    and provider link stay one unit. Reporting remains a terminal
+    read-only projector. The other roles are executable when their
+    activation predicate and a matching Tool Catalog capability are
+    present.
     """
-    return AgentRegistry(
-        [RECON_AGENT, WEB_API_AGENT, MOBILE_AGENT, ANALYSIS_AGENT],
-        definitions=builtin_agent_definitions(),
-    )
+    from redteam.orchestration.agents.packages import builtin_role_packages
+
+    registry = AgentRegistry()
+    for package in builtin_role_packages():
+        if not package.default_include:
+            continue
+        registry.register_definition(package.definition)
+        if package.spec is not None:
+            registry.register(package.spec)
+    return registry

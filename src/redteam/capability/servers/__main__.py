@@ -2,15 +2,14 @@
 
 import argparse
 
+from redteam.capability.server_roles import launcher_role_names
 from redteam.capability.servers import active, nuclei, proxy, recon, web_http, zap
 from redteam.capability.servers.config import ServerPolicy
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("role", choices=[
-        "web-http", "web-proxy", "recon-passive", "recon-active", "web-zap", "web-nuclei",
-    ])
+    parser.add_argument("role", choices=list(launcher_role_names()))
     parser.add_argument("--policy", required=True)
     parser.add_argument("--policy-sha256", help="Require exact operator-generated policy bytes")
     parser.add_argument("--capture-path")

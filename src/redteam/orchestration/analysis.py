@@ -18,6 +18,7 @@ from redteam.core.ids import EvidenceId, GraphNodeId, new_id
 from redteam.core.ports.evidence_store import EvidenceStore
 from redteam.orchestration.action_naming import tool_matches_action_namespace
 from redteam.orchestration.cognition import StructuredDecisionClient
+from redteam.orchestration.evidence_access import raw_from_metadata
 from redteam.orchestration.expectations import Expectation, ExpectationOutcome, verdict_for
 
 VerificationOutcome = Literal["success", "refuted", "inconclusive", "blocked", "unknown"]
@@ -358,7 +359,7 @@ async def _session_alias_grounded(
         meta = record.metadata
         if str(meta.get("target_node_id", "")).strip() != target_ref.strip():
             continue
-        raw = meta.get("tool_result") or meta.get("raw_tool_result")
+        raw = raw_from_metadata(meta)
         if not isinstance(raw, dict) or raw.get("success") is not True:
             continue
         if not record.action_id or not record.invocation_id:
@@ -393,8 +394,7 @@ async def _session_alias_grounded(
             continue
         sessions, _, pairs = session_list_pairs(output, expected_target)
         if wanted in pairs or (
-            session_name.strip() == principal_name.strip()
-            and session_name.strip() in sessions
+            session_name.strip() == principal_name.strip() and session_name.strip() in sessions
         ):
             return True
     return False
@@ -707,7 +707,7 @@ class StructuredLLMAnalysisVerifier:
             request.result.invocation_id
         ):
             return "linked evidence does not answer this invocation"
-        raw = record.metadata.get("tool_result") or record.metadata.get("raw_tool_result")
+        raw = raw_from_metadata(record.metadata)
         if not isinstance(raw, dict):
             return "no preserved raw result to check against"
         if str(raw.get("action_id")) != str(request.proposal.action_id):

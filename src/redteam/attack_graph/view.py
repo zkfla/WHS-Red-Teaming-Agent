@@ -98,9 +98,7 @@ class AttackGraphView:
         self, source_id: GraphNodeId, target_id: GraphNodeId, edge_type: GraphEdgeType
     ) -> bool:
         return any(
-            edge.source_id == source_id
-            and edge.target_id == target_id
-            and edge.type == edge_type
+            edge.source_id == source_id and edge.target_id == target_id and edge.type == edge_type
             for edge in await self.list_edges()
         )
 
@@ -111,6 +109,7 @@ class AttackGraphView:
         max_per_type: int = DEFAULT_MAX_PER_TYPE,
         max_total: int = DEFAULT_MAX_TOTAL,
         max_attempted: int = DEFAULT_MAX_ATTEMPTED,
+        extra_content_keys: tuple[str, ...] = (),
     ) -> GraphObservation:
         return build_observation(
             await self.list_nodes(),
@@ -119,6 +118,7 @@ class AttackGraphView:
             max_per_type=max_per_type,
             max_total=max_total,
             max_attempted=max_attempted,
+            extra_content_keys=extra_content_keys,
         )
 
     async def resolve(

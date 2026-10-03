@@ -174,8 +174,12 @@ async def mock_gateway(configured, client):
     import redteam.capability.servers.mobsf as module
 
     original = module.MobSFClient
+
+    def client_for_config(_config):
+        return client
+
     try:
-        module.MobSFClient = lambda _: client
+        module.MobSFClient = client_for_config
         adapter._transport = InProcessTransport(create_server(configured))
     finally:
         module.MobSFClient = original

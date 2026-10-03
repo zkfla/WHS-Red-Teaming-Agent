@@ -36,6 +36,42 @@ class InMemoryTaskGraphStore:
             value = self._missions.get(mission_id)
             return value.redacted_copy() if value else None
 
+    def peek_mission(self, mission_id: MissionId) -> MissionPlan | None:
+        """Lock-free staged read for the atomic backend.
+
+        The caller already holds the backend boundary (shared lock or
+        transaction snapshot), so no locking or copying happens here.
+        """
+        return self._missions.get(mission_id)
+
+    def peek_tasks_of_mission(self, mission_id: MissionId) -> list[MissionTask]:
+        """Lock-free staged task list for one mission (same boundary rule)."""
+        return [task for task in self._tasks.values() if str(task.mission_id) == str(mission_id)]
+
+    def snapshot_tasks(
+        self,
+    ) -> tuple[dict[MissionId, MissionPlan], dict[TaskId, MissionTask]]:
+        """Copy staged mission/task state for one bounded rollback.
+
+        The caller already holds the backend boundary, so no locking
+        happens here. Each entry is an independent copy; later staged
+        mutations never leak into the snapshot. The snapshot is consumed
+        by restore_tasks and must not be reused afterwards.
+        """
+        return (
+            {key: item.model_copy(deep=True) for key, item in self._missions.items()},
+            {key: item.model_copy(deep=True) for key, item in self._tasks.items()},
+        )
+
+    def restore_tasks(
+        self,
+        snapshot: tuple[dict[MissionId, MissionPlan], dict[TaskId, MissionTask]],
+    ) -> None:
+        """Roll staged mission/task state back to a snapshot_tasks copy."""
+        missions, tasks = snapshot
+        self._missions = missions
+        self._tasks = tasks
+
     async def list_missions(
         self, *, engagement_id: EngagementId | None = None
     ) -> list[MissionPlan]:

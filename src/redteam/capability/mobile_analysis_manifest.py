@@ -61,52 +61,127 @@ def _spec(
 MOBILE_ANALYSIS_TOOLS: dict[str, tuple[MobileAnalysisToolSpec, ...]] = {
     # Conservative single-server risk tier: even report access retains HIGH.
     "mobsf": (
-        _spec("analysis", "mobsf_submit_apk", "static_analysis", ("apk_ref", "expected_sha256"),
-              ("engagement_id", "run_id"), risk=RiskLevel.HIGH,
-              output_schema=MobSFOutput.model_json_schema()),
-        _spec("analysis", "mobsf_start_scan", "static_analysis", ("apk_ref", "scan_ref"),
-              ("engagement_id", "run_id"), risk=RiskLevel.HIGH,
-              output_schema=MobSFOutput.model_json_schema()),
-        _spec("analysis", "mobsf_scan_status", "static_analysis", ("apk_ref", "scan_ref"),
-              ("engagement_id", "run_id"), risk=RiskLevel.HIGH,
-              output_schema=MobSFOutput.model_json_schema()),
-        _spec("analysis", "mobsf_report_summary", "static_analysis",
-              ("apk_ref", "scan_ref", "sections"),
-              ("engagement_id", "run_id"), risk=RiskLevel.HIGH,
-              output_schema=MobSFOutput.model_json_schema()),
+        _spec(
+            "analysis",
+            "mobsf_submit_apk",
+            "static_analysis",
+            ("apk_ref", "expected_sha256"),
+            ("engagement_id", "run_id"),
+            risk=RiskLevel.HIGH,
+            output_schema=MobSFOutput.model_json_schema(),
+        ),
+        _spec(
+            "analysis",
+            "mobsf_start_scan",
+            "static_analysis",
+            ("apk_ref", "scan_ref"),
+            ("engagement_id", "run_id"),
+            risk=RiskLevel.HIGH,
+            output_schema=MobSFOutput.model_json_schema(),
+        ),
+        _spec(
+            "analysis",
+            "mobsf_scan_status",
+            "static_analysis",
+            ("apk_ref", "scan_ref"),
+            ("engagement_id", "run_id"),
+            risk=RiskLevel.HIGH,
+            output_schema=MobSFOutput.model_json_schema(),
+        ),
+        _spec(
+            "analysis",
+            "mobsf_report_summary",
+            "static_analysis",
+            ("apk_ref", "scan_ref", "sections"),
+            ("engagement_id", "run_id"),
+            risk=RiskLevel.HIGH,
+            output_schema=MobSFOutput.model_json_schema(),
+        ),
     ),
     "mobile-next": (
-        _spec("mobile", "mobile_launch_app", "app_launch", ("device", "packageName"),
-              ("locale",), risk=RiskLevel.MEDIUM, target_type="device"),
-        _spec("mobile", "mobile_get_device_logs", "response_analysis", ("device",),
-              ("filter", "limit", "saveTo"), risk=RiskLevel.MEDIUM,
-              target_type="device"),
-        _spec("mobile", "mobile_list_crashes", "response_analysis", ("device",),
-              risk=RiskLevel.MEDIUM, target_type="device"),
-        _spec("mobile", "mobile_get_crash", "response_analysis", ("device", "id"),
-              risk=RiskLevel.MEDIUM, target_type="device"),
+        _spec(
+            "mobile",
+            "mobile_launch_app",
+            "app_launch",
+            ("device", "packageName"),
+            ("locale",),
+            risk=RiskLevel.MEDIUM,
+            target_type="device",
+        ),
+        _spec(
+            "mobile",
+            "mobile_get_device_logs",
+            "response_analysis",
+            ("device",),
+            ("filter", "limit", "saveTo"),
+            risk=RiskLevel.MEDIUM,
+            target_type="device",
+        ),
+        _spec(
+            "mobile",
+            "mobile_list_crashes",
+            "response_analysis",
+            ("device",),
+            risk=RiskLevel.MEDIUM,
+            target_type="device",
+        ),
+        _spec(
+            "mobile",
+            "mobile_get_crash",
+            "response_analysis",
+            ("device", "id"),
+            risk=RiskLevel.MEDIUM,
+            target_type="device",
+        ),
     ),
     "mobile-local": (
-        _spec("mobile", "device_shell", "device_shell", ("device_ref", "command"),
-              output_schema=DeviceShellOutput.model_json_schema()),
+        _spec(
+            "mobile",
+            "device_shell",
+            "device_shell",
+            ("device_ref", "command"),
+            output_schema=DeviceShellOutput.model_json_schema(),
+        ),
     ),
     "apktool": (
-        _spec("analysis", "decode_apk", "static_analysis", ("apk_path",),
-              ("force", "no_res", "no_src", "output_dir", "timeout")),
+        _spec(
+            "analysis",
+            "decode_apk",
+            "static_analysis",
+            ("apk_path",),
+            ("force", "no_res", "no_src", "output_dir", "timeout"),
+        ),
         _spec("analysis", "get_manifest", "static_analysis", ("project_dir",)),
         _spec("analysis", "get_apktool_yml", "static_analysis", ("project_dir",)),
         _spec("analysis", "list_smali_directories", "static_analysis", ("project_dir",)),
-        _spec("analysis", "list_smali_files", "static_analysis", ("project_dir",),
-              ("count", "offset", "package_prefix", "smali_dir")),
-        _spec("analysis", "get_smali_file", "static_analysis",
-              ("project_dir", "class_name")),
-        _spec("analysis", "list_resources", "static_analysis", ("project_dir",),
-              ("count", "offset", "resource_type")),
-        _spec("analysis", "get_resource_file", "static_analysis",
-              ("project_dir", "resource_type", "resource_name")),
-        _spec("analysis", "search_in_files", "static_analysis",
-              ("project_dir", "search_pattern"),
-              ("case_sensitive", "count", "file_extensions", "max_results", "offset")),
+        _spec(
+            "analysis",
+            "list_smali_files",
+            "static_analysis",
+            ("project_dir",),
+            ("count", "offset", "package_prefix", "smali_dir"),
+        ),
+        _spec("analysis", "get_smali_file", "static_analysis", ("project_dir", "class_name")),
+        _spec(
+            "analysis",
+            "list_resources",
+            "static_analysis",
+            ("project_dir",),
+            ("count", "offset", "resource_type"),
+        ),
+        _spec(
+            "analysis",
+            "get_resource_file",
+            "static_analysis",
+            ("project_dir", "resource_type", "resource_name"),
+        ),
+        _spec(
+            "analysis",
+            "search_in_files",
+            "static_analysis",
+            ("project_dir", "search_pattern"),
+            ("case_sensitive", "count", "file_extensions", "max_results", "offset"),
+        ),
     ),
     # jadx-mcp-server (zinja-coder): Java-decompilation static analysis, same
     # canonical op as apktool for candidate diversification. Read-only queries
@@ -115,30 +190,56 @@ MOBILE_ANALYSIS_TOOLS: dict[str, tuple[MobileAnalysisToolSpec, ...]] = {
     # gateway preserves and enforces those at invoke time, so they are not
     # re-pinned here (the manifest pins the input-argument contract).
     "jadx": (
-        _spec("analysis", "get_all_classes", "static_analysis", (),
-              ("count", "offset")),
-        _spec("analysis", "get_class_source", "static_analysis", ("class_name",),
-              ("with_line_numbers",)),
+        _spec("analysis", "get_all_classes", "static_analysis", (), ("count", "offset")),
+        _spec(
+            "analysis",
+            "get_class_source",
+            "static_analysis",
+            ("class_name",),
+            ("with_line_numbers",),
+        ),
         _spec("analysis", "get_methods_of_class", "static_analysis", ("class_name",)),
         _spec("analysis", "get_fields_of_class", "static_analysis", ("class_name",)),
         _spec("analysis", "search_method_by_name", "static_analysis", ("method_name",)),
-        _spec("analysis", "search_classes_by_keyword", "static_analysis", ("search_term",),
-              ("count", "offset", "package", "search_in")),
+        _spec(
+            "analysis",
+            "search_classes_by_keyword",
+            "static_analysis",
+            ("search_term",),
+            ("count", "offset", "package", "search_in"),
+        ),
         _spec("analysis", "get_android_manifest", "static_analysis", ()),
-        _spec("analysis", "get_strings", "static_analysis", (),
-              ("count", "offset")),
-        _spec("analysis", "get_xrefs_to_method", "static_analysis",
-              ("class_name", "method_name"), ("count", "offset")),
+        _spec("analysis", "get_strings", "static_analysis", (), ("count", "offset")),
+        _spec(
+            "analysis",
+            "get_xrefs_to_method",
+            "static_analysis",
+            ("class_name", "method_name"),
+            ("count", "offset"),
+        ),
     ),
     "analysis-local": (
-        _spec("analysis", "apk_file_listing", "static_analysis", ("apk_ref",),
-              output_schema=ApkFileListingOutput.model_json_schema()),
-        _spec("analysis", "apk_entry_digest", "static_analysis",
-              ("apk_ref", "entry_name"),
-              output_schema=ApkEntryDigestOutput.model_json_schema()),
-        _spec("analysis", "apk_string_search", "static_analysis",
-              ("apk_ref", "entry_name", "pattern"),
-              output_schema=ApkStringSearchOutput.model_json_schema()),
+        _spec(
+            "analysis",
+            "apk_file_listing",
+            "static_analysis",
+            ("apk_ref",),
+            output_schema=ApkFileListingOutput.model_json_schema(),
+        ),
+        _spec(
+            "analysis",
+            "apk_entry_digest",
+            "static_analysis",
+            ("apk_ref", "entry_name"),
+            output_schema=ApkEntryDigestOutput.model_json_schema(),
+        ),
+        _spec(
+            "analysis",
+            "apk_string_search",
+            "static_analysis",
+            ("apk_ref", "entry_name", "pattern"),
+            output_schema=ApkStringSearchOutput.model_json_schema(),
+        ),
     ),
 }
 
@@ -196,18 +297,27 @@ def validate_configured_discovery(
     specs = MOBILE_ANALYSIS_TOOLS.get(server_id)
     if specs is None:
         return
-    expected = {spec.tool_id: spec for spec in specs}
-    actual = {str(descriptor.tool_id): descriptor for descriptor in descriptors}
+    expected = {(server_id, spec.tool_id.partition(".")[2]): spec for spec in specs}
+    actual = {
+        (descriptor.server_id, descriptor.tool_name): descriptor for descriptor in descriptors
+    }
     if set(actual) != set(expected):
-        raise ValueError(f"{server_id}: discovered tool IDs differ from manifest")
-    for tool_id, descriptor in actual.items():
-        spec = expected[tool_id]
+        missing = sorted(set(expected) - set(actual))
+        extra = sorted(set(actual) - set(expected))
+        raise ValueError(
+            f"{server_id}: discovered tool IDs differ from manifest: "
+            f"missing={missing} extra={extra}"
+        )
+    for physical_key, descriptor in actual.items():
+        spec = expected[physical_key]
         if (
             spec.capability not in descriptor.capability_tags
             or descriptor.risk_level != spec.risk_level
-            or operation_bindings.get(tool_id) != (spec.operation,)
+            or operation_bindings.get(str(descriptor.tool_id)) != (spec.operation,)
         ):
-            raise ValueError(f"{tool_id}: capability, risk, or operation differs from manifest")
+            raise ValueError(
+                f"{str(descriptor.tool_id)}: capability, risk, or operation differs from manifest"
+            )
         validate_discovered_schema(
             spec,
             descriptor.input_schema,

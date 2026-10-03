@@ -45,13 +45,9 @@ def _validated_elapsed_duration(elapsed: float, *, cap: int | None) -> float:
     window.
     """
     if not math.isfinite(elapsed):
-        raise ValueError(
-            f"elapsed_duration_seconds must be finite, got {elapsed!r}"
-        )
+        raise ValueError(f"elapsed_duration_seconds must be finite, got {elapsed!r}")
     if elapsed < 0:
-        raise ValueError(
-            f"elapsed_duration_seconds must be non-negative, got {elapsed}"
-        )
+        raise ValueError(f"elapsed_duration_seconds must be non-negative, got {elapsed}")
     if cap is None:
         return elapsed
     return min(elapsed, float(cap))
@@ -86,6 +82,16 @@ class BudgetTracker:
                 return False
         return True
 
+    def duration_exhausted(self, *, now: float | None = None) -> bool:
+        """Whether the wall-clock duration budget is exhausted (time only)."""
+        max_duration = self._budget.max_duration_seconds
+        if max_duration is None:
+            return False
+        if self._started_at is None:
+            return False
+        now_value = time.monotonic() if now is None else now
+        return (now_value - self._started_at) >= max_duration
+
     def consume(self) -> None:
         """Charge one admitted action (which is also one tool call)."""
         self._consumed = min(self._consumed + 1, self._budget.max_actions)
@@ -101,9 +107,7 @@ class BudgetTracker:
         """
         if count < 0:
             raise ValueError(f"tool-call count must be non-negative, got {count}")
-        self._tool_calls_consumed = min(
-            self._tool_calls_consumed + count, self._tool_calls_cap
-        )
+        self._tool_calls_consumed = min(self._tool_calls_consumed + count, self._tool_calls_cap)
 
     def rehydrate(
         self,
@@ -162,9 +166,7 @@ class BudgetTracker:
         elapsed = (
             None
             if elapsed_duration_seconds is None
-            else _validated_elapsed_duration(
-                elapsed_duration_seconds, cap=max_duration
-            )
+            else _validated_elapsed_duration(elapsed_duration_seconds, cap=max_duration)
         )
         if max_duration is None:
             # No duration cap: nothing to anchor, existing behaviour.

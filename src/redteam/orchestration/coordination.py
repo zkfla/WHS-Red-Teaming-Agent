@@ -7,19 +7,17 @@ with one connection. The intent history is a recoverable audit projection.
 
 from __future__ import annotations
 
-import asyncio
-import copy
 import hashlib
 import json
-from collections.abc import Callable, Coroutine
+from collections.abc import Callable, Coroutine, Hashable
 from dataclasses import dataclass, field
-from typing import Any, TypeVar
+from datetime import datetime
+from typing import Any, Protocol, TypeVar
 
-from redteam.core.enums import MissionStatus
-from redteam.core.ids import MissionId
-from redteam.orchestration.paths.memory import InMemoryPathStore
-from redteam.orchestration.paths.models import PathVersionConflict
-from redteam.orchestration.task_graph.memory import InMemoryTaskGraphStore
+from redteam.core.contracts.mission import MissionPlan, MissionTask
+from redteam.core.enums import MissionStatus, TaskStatus
+from redteam.core.ids import EngagementId, MissionId, TaskId
+from redteam.orchestration.paths.models import PathPlan, PathVersionConflict
 
 T = TypeVar("T")
 CLOSED = frozenset({MissionStatus.COMPLETED, MissionStatus.FAILED, MissionStatus.CANCELLED})
@@ -42,10 +40,110 @@ def content_hash(value: Any) -> str:
     ).hexdigest()
 
 
+class AtomicStateBackend(Protocol):
+    """Public change session owned by one composite state provider.
+
+    The coordinator only consumes this surface; storage, concurrency and
+    records persistence stay inside the provider.
+
+    - ``change`` is the single atomic boundary: the provider stages
+      Task/Path/records, runs ``callback`` on detached memory views, then
+      commits everything together or rolls everything back. Partial
+      application is a failure. The callback must not perform outside I/O
+      (LLM, tools, publishing); only detached validation and mutation.
+    - ``atomic_scope`` is a diagnostic identity (memory/SQLite), optional
+      for custom providers.
+    - ``attach_paths`` binds a path store once; rebinding or a mismatched
+      store is rejected loudly.
+    - ``check_history`` rejects an operator-intent history that does not
+      pair with the provider (``None`` history always passes).
+    """
+
+    async def change(self, callback: Callable[[Any], Coroutine[Any, Any, T]]) -> T: ...
+
+    def atomic_scope(self) -> Hashable: ...
+
+    def attach_paths(self, paths: Any) -> None: ...
+
+    def check_history(self, history: Any | None) -> None: ...
+
+
+class StagedTaskGraph(Protocol):
+    """Staged task view a change callback observes.
+
+    Reads are public; the only bounded write is the task snapshot/restore
+    pair that rolls one intent application back to its pre-mutation
+    state. There is no general staged rollback primitive.
+    """
+
+    def peek_mission(self, mission_id: MissionId) -> MissionPlan | None: ...
+    def peek_tasks_of_mission(self, mission_id: MissionId) -> list[MissionTask]: ...
+    def snapshot_tasks(
+        self,
+    ) -> tuple[dict[MissionId, MissionPlan], dict[TaskId, MissionTask]]: ...
+    def restore_tasks(
+        self,
+        snapshot: tuple[dict[MissionId, MissionPlan], dict[TaskId, MissionTask]],
+    ) -> None: ...
+    async def create_mission(self, mission: MissionPlan) -> None: ...
+    async def get_mission(self, mission_id: MissionId) -> MissionPlan | None: ...
+    async def list_missions(
+        self, *, engagement_id: EngagementId | None = None
+    ) -> list[MissionPlan]: ...
+    async def update_mission(self, mission: MissionPlan) -> None: ...
+    async def create_task(self, task: MissionTask) -> None: ...
+    async def get_task(self, task_id: TaskId) -> MissionTask | None: ...
+    async def list_tasks(
+        self, *, mission_id: MissionId | None = None, status: TaskStatus | None = None
+    ) -> list[MissionTask]: ...
+    async def update_task(self, task: MissionTask) -> None: ...
+    async def transition_task(
+        self, task_id: TaskId, status: TaskStatus, *, now: datetime, reason: str | None = None
+    ) -> MissionTask: ...
+    async def add_dependency(
+        self, task_id: TaskId, dependency_id: TaskId, *, now: datetime
+    ) -> MissionTask: ...
+    async def update_priority(
+        self, task_id: TaskId, priority: int, *, now: datetime
+    ) -> MissionTask: ...
+    async def block_task(self, task_id: TaskId, reason: str, *, now: datetime) -> MissionTask: ...
+    async def unblock_task(self, task_id: TaskId, *, now: datetime) -> MissionTask: ...
+    async def split_task(
+        self, parent_id: TaskId, children: list[MissionTask]
+    ) -> list[MissionTask]: ...
+
+
+class StagedPaths(Protocol):
+    """Staged path view a change callback observes (public reads only)."""
+
+    def peek_active_pointer(self, run_id: str) -> tuple[str, int] | None: ...
+    def peek_snapshot(self, run_id: str, path_id: str, version: int) -> PathPlan | None: ...
+    def merged_view(self, snapshot: PathPlan) -> PathPlan: ...
+    async def get_active(self, run_id: str) -> PathPlan | None: ...
+    async def list_paths(self, run_id: str) -> list[PathPlan]: ...
+    async def register(
+        self,
+        path: PathPlan,
+        expected_version: int | None = None,
+        *,
+        expected_path_id: str | None = None,
+    ) -> PathPlan: ...
+    async def update_step(
+        self,
+        run_id: str,
+        path_id: str,
+        version: int,
+        step_id: str,
+        status: str,
+        outcome: str | None = None,
+        evidence_ids: list[str] | None = None,
+    ) -> PathPlan | None: ...
+
+
 @dataclass
 class ChangeSet:
-    tasks: InMemoryTaskGraphStore
-    paths: InMemoryPathStore
+    tasks: StagedTaskGraph
+    paths: StagedPaths
     records: dict[tuple[str, str], Any] = field(default_factory=dict)
 
     def binding(self, run_id: str, mission_id: str, engagement_id: str | None = None) -> dict:
@@ -74,16 +172,15 @@ class ChangeSet:
         )
 
     def token(self, run_id: str, mission_id: str) -> str:
-        mission = self.tasks._missions.get(MissionId(mission_id))
-        pointer = self.paths._active.get(run_id)
-        path = self.paths._snapshots.get((run_id, *pointer)) if pointer else None
+        mission = self.tasks.peek_mission(MissionId(mission_id))
+        pointer = self.paths.peek_active_pointer(run_id)
+        path = self.paths.peek_snapshot(run_id, *pointer) if pointer else None
         if path is not None:
-            path = self.paths._merged(path)
+            path = self.paths.merged_view(path)
         tasks = sorted(
             (
                 item.model_dump(mode="json")
-                for item in self.tasks._tasks.values()
-                if str(item.mission_id) == mission_id
+                for item in self.tasks.peek_tasks_of_mission(MissionId(mission_id))
             ),
             key=lambda item: item["task_id"],
         )
@@ -99,7 +196,7 @@ class ChangeSet:
 
     def admit(self, run_id: str, mission_id: str, *, token: str | None = None) -> None:
         bound = self.binding(run_id, mission_id)
-        mission = self.tasks._missions.get(MissionId(mission_id))
+        mission = self.tasks.peek_mission(MissionId(mission_id))
         if bound["closed"] or mission is None or mission.status is not MissionStatus.ACTIVE:
             raise CoordinationError("mission_not_active")
         if self.pending(run_id, mission_id):
@@ -124,132 +221,20 @@ class ChangeSet:
 
 
 class Coordinator:
-    def __init__(self, tasks: Any, paths: Any | None) -> None:
-        from redteam.orchestration.paths.sqlite import SQLitePathStore
-        from redteam.orchestration.task_graph.sqlite import SQLiteTaskGraphStore
+    """Thin facade: consumes only the backend change session plus bind/validate."""
 
-        self.tasks = tasks
-        self.paths = paths
-        self.lock = asyncio.Lock()
-        self.records: dict[tuple[str, str], Any] = {}
-        if isinstance(tasks, InMemoryTaskGraphStore):
-            if paths is not None and not isinstance(paths, InMemoryPathStore):
-                raise CoordinationError("atomic_store_configuration_unsupported")
-            self.sqlite = False
-            tasks._lock = self.lock
-            if paths is not None:
-                paths._lock = self.lock
-        elif isinstance(tasks, SQLiteTaskGraphStore):
-            if paths is not None and (
-                not isinstance(paths, SQLitePathStore)
-                or tasks._path.resolve() != paths._path.resolve()
-            ):
-                raise CoordinationError("atomic_store_configuration_unsupported")
-            self.sqlite = True
-        else:
-            raise CoordinationError("atomic_store_configuration_unsupported")
+    def __init__(self, backend: AtomicStateBackend) -> None:
+        self.backend = backend
 
     def attach_paths(self, paths: Any) -> None:
-        if self.paths is paths:
-            return
-        if self.paths is not None:
-            raise CoordinationError("task_store_already_bound_to_another_path_store")
-        from redteam.orchestration.paths.sqlite import SQLitePathStore
-
-        if self.sqlite:
-            if (
-                not isinstance(paths, SQLitePathStore)
-                or paths._path.resolve() != self.tasks._path.resolve()
-            ):
-                raise CoordinationError("atomic_store_configuration_unsupported")
-        else:
-            if not isinstance(paths, InMemoryPathStore):
-                raise CoordinationError("atomic_store_configuration_unsupported")
-            paths._lock = self.lock
-        self.paths = paths
-
-    def _transaction(self, callback: Callable[[ChangeSet], Coroutine[Any, Any, T]]) -> T:
-        from redteam.orchestration.task_graph.sqlite import SQLiteTaskGraphStore
-
-        db = self.tasks._connect()
-        try:
-            db.execute("BEGIN IMMEDIATE")
-            db.execute(
-                "CREATE TABLE IF NOT EXISTS orchestration_migrations(version INTEGER PRIMARY KEY)"
-            )
-            db.execute(
-                "CREATE TABLE IF NOT EXISTS orchestration_records("
-                "kind TEXT NOT NULL,identity TEXT NOT NULL,payload TEXT NOT NULL,"
-                "PRIMARY KEY(kind,identity))"
-            )
-            version = db.execute("SELECT MAX(version) FROM orchestration_migrations").fetchone()[0]
-            if version is not None and version > 1:
-                raise CoordinationError("unsupported_orchestration_schema_version")
-            db.execute("INSERT OR IGNORE INTO orchestration_migrations VALUES(1)")
-            from redteam.orchestration.paths.sqlite import SQLitePathStore
-
-            staged = ChangeSet(
-                SQLiteTaskGraphStore._load_memory(db),
-                SQLitePathStore._load_memory(db) if self.paths is not None else InMemoryPathStore(),
-                {
-                    (kind, identity): json.loads(payload)
-                    for kind, identity, payload in db.execute(
-                        "SELECT kind,identity,payload FROM orchestration_records"
-                    )
-                },
-            )
-            # Only detached memory validation/mutation is awaited in this private
-            # worker loop. No database methods, LLM, publisher or tool are called.
-            result = asyncio.run(callback(staged))
-            SQLiteTaskGraphStore._save_memory(db, staged.tasks)
-            if self.paths is not None:
-                SQLitePathStore._save_memory(db, staged.paths)
-            for (kind, identity), record in staged.records.items():
-                db.execute(
-                    "INSERT INTO orchestration_records VALUES(?,?,?) ON CONFLICT(kind,identity) "
-                    "DO UPDATE SET payload=excluded.payload",
-                    (kind, identity, json.dumps(record)),
-                )
-            db.commit()
-            return result
-        except BaseException:
-            db.rollback()
-            raise
-        finally:
-            db.close()
+        self.backend.attach_paths(paths)
 
     async def change(self, callback: Callable[[ChangeSet], Coroutine[Any, Any, T]]) -> T:
-        if self.sqlite:
-            await self.tasks.setup()
-            from redteam.orchestration.sqlite_support import run_sqlite
-
-            async with self.lock:
-                return await run_sqlite(lambda: self._transaction(callback))
-        async with self.lock:
-            staged_tasks = InMemoryTaskGraphStore()
-            staged_tasks._missions = copy.deepcopy(self.tasks._missions)
-            staged_tasks._tasks = copy.deepcopy(self.tasks._tasks)
-            staged_paths = InMemoryPathStore()
-            if self.paths is not None:
-                staged_paths._snapshots = copy.deepcopy(self.paths._snapshots)
-                staged_paths._progress = copy.deepcopy(self.paths._progress)
-                staged_paths._active = copy.deepcopy(self.paths._active)
-            staged = ChangeSet(staged_tasks, staged_paths, copy.deepcopy(self.records))
-            result = await callback(staged)
-            # No await between commits: readers and public mutations use lock.
-            self.tasks._missions, self.tasks._tasks = staged.tasks._missions, staged.tasks._tasks
-            if self.paths is not None:
-                self.paths._snapshots = staged.paths._snapshots
-                self.paths._progress, self.paths._active = (
-                    staged.paths._progress,
-                    staged.paths._active,
-                )
-            self.records = staged.records
-            return result
+        return await self.backend.change(callback)
 
     async def bind(self, run_id: str, mission_id: str, engagement_id: str) -> None:
         async def register(change: ChangeSet) -> None:
-            mission = change.tasks._missions.get(MissionId(mission_id))
+            mission = change.tasks.peek_mission(MissionId(mission_id))
             if mission is None or str(mission.engagement_id) != engagement_id:
                 raise CoordinationError("run_binding_mismatched")
             existing = change.records.get(("binding", run_id))
@@ -282,25 +267,38 @@ class Coordinator:
         return await self.change(capture)
 
 
-def coordinator_for(tasks: Any, paths: Any | None = None) -> Coordinator:
-    coordinator = getattr(tasks, "_orchestration_coordinator", None)
+def coordinator_for(
+    tasks: Any, paths: Any | None = None, *, backend: AtomicStateBackend | None = None
+) -> Coordinator:
+    """Reuse one coordinator per task store; the provider key lives in a registry.
+
+    ``backend`` lets the assembler inject a ready provider (custom or
+    builtin) instead of selecting one from ``tasks``/``paths``. The
+    injected backend must own ``tasks`` (and ``paths`` when given); it is
+    registered under ``tasks`` so later ``coordinator_for`` calls reuse the
+    same coordinator. Injecting a *different* backend for an already
+    registered store is rejected loudly.
+    """
+    # The compatibility owner follows the store's lifetime, without a global
+    # strong root. Custom/slotted stores can instead own Coordinator in RuntimeDeps.
+    coordinator = getattr(tasks, "_state_coordinator", None)
     if coordinator is None:
-        coordinator = Coordinator(tasks, paths)
-        tasks._orchestration_coordinator = coordinator
-    elif paths is not None:
+        from redteam.orchestration.state_backend import state_backend_for
+
+        coordinator = Coordinator(
+            backend if backend is not None else state_backend_for(tasks, paths)
+        )
+        tasks._state_coordinator = coordinator
+    elif backend is not None and coordinator.backend is not backend:
+        raise CoordinationError("atomic_state_backend_mismatched")
+    if paths is not None:
         coordinator.attach_paths(paths)
     return coordinator
 
 
 def validate_configuration(deps: Any) -> Coordinator:
-    from redteam.orchestration.operator_intents.store import (
-        InMemoryOperatorIntentStore,
-        SQLiteOperatorIntentStore,
+    coordinator = getattr(deps, "coordinator", None) or coordinator_for(
+        deps.task_graph_store, deps.path_store
     )
-
-    coordinator = coordinator_for(deps.task_graph_store, deps.path_store)
-    expected = SQLiteOperatorIntentStore if coordinator.sqlite else InMemoryOperatorIntentStore
-    history = getattr(deps, "operator_intent_store", None)
-    if history is not None and not isinstance(history, expected):
-        raise CoordinationError("atomic_intent_history_configuration_unsupported")
+    coordinator.backend.check_history(getattr(deps, "operator_intent_store", None))
     return coordinator

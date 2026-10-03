@@ -19,10 +19,11 @@ The model client is not a profile component.
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 from uuid import uuid4
 
+from redteam.app.extensions import ExtensionAssembly, ExtensionAssemblyError, collect_extensions
 from redteam.orchestration.component_binding import (
     AGENTS_COMPONENT,
     BUILTIN_COMPONENT_IDS,
@@ -53,6 +54,13 @@ class ComponentFactoryContext:
 
 
 @dataclass(frozen=True)
+class PlanningFactoryContext:
+    """Inference procedures get model access on each budgeted request."""
+
+    provider_id: str
+
+
+@dataclass(frozen=True)
 class RuntimeComponents:
     """One run freshly built agent side implementations."""
 
@@ -60,6 +68,11 @@ class RuntimeComponents:
     candidate_providers: Any
     verifier: Any
     result_mappers: Any
+    planning_provider: Any = None
+    eligibility: Any = None
+    operation_bindings: Any = None
+    execution_recipes: Any = None
+    retry_policy: Any = None
 
 
 RuntimeComponentFactory = Callable[[ComponentFactoryContext], RuntimeComponents]
@@ -68,21 +81,58 @@ RuntimeComponentFactory = Callable[[ComponentFactoryContext], RuntimeComponents]
 def _builtin_factory(context: ComponentFactoryContext) -> RuntimeComponents:
     """Build the canonical builtin set. Fresh objects on every call."""
     from redteam.attack_graph.service import AttackGraphService
-    from redteam.orchestration.agents.providers import default_provider_registry
-    from redteam.orchestration.agents.registry import default_registry
+    from redteam.orchestration.agents.providers import CandidateProviderRegistry
+    from redteam.orchestration.agents.registry import AgentRegistry
     from redteam.orchestration.analysis import StructuredLLMAnalysisVerifier
-    from redteam.orchestration.observations import default_result_mapper_registry
+    from redteam.orchestration.eligibility import EligibilityRegistry
+    from redteam.orchestration.observations import ResultMapperRegistry
 
-    return RuntimeComponents(
-        agents=default_registry(),
-        candidate_providers=default_provider_registry(),
+    components = RuntimeComponents(
+        agents=AgentRegistry(),
+        candidate_providers=CandidateProviderRegistry(),
         verifier=StructuredLLMAnalysisVerifier(
             context.llm_client,
             context.evidence_store,
             AttackGraphService(context.graph_store),
         ),
-        result_mappers=default_result_mapper_registry(),
+        result_mappers=ResultMapperRegistry(),
+        eligibility=EligibilityRegistry(),
     )
+    return apply_extensions(
+        components, context, collect_extensions(plugins=(_BuiltinRuntimeExtension(),))
+    )
+
+
+class _BuiltinRuntimeExtension:
+    from redteam.core.extensions import hookimpl
+
+    @hookimpl
+    def redteam_extensions(self):
+        from redteam.capability.action_binding import (
+            extension_contributions as action_contributions,
+        )
+        from redteam.capability.execution_recipes import (
+            extension_contributions as recipe_contributions,
+        )
+        from redteam.core.extensions import ExtensionDeclaration
+        from redteam.orchestration.agents.packages import builtin_extension_declaration as roles
+        from redteam.orchestration.analysis_activation import (
+            builtin_extension_declaration as eligibility,
+        )
+        from redteam.orchestration.observations.packages import (
+            builtin_extension_declaration as observations,
+        )
+
+        return (
+            roles(),
+            observations(),
+            eligibility(),
+            ExtensionDeclaration(
+                "builtin.action-data",
+                "1",
+                (*action_contributions(), *recipe_contributions()),
+            ),
+        )
 
 
 def default_component_registry() -> ComponentRegistry:
@@ -113,6 +163,7 @@ def binding_for_resume(
     stored: RuntimeComponentBinding | None,
     *,
     registry: ComponentRegistry | None = None,
+    extensions: ExtensionAssembly | None = None,
 ) -> RuntimeComponentBinding:
     """Return the binding to rebuild a run from.
 
@@ -124,6 +175,21 @@ def binding_for_resume(
         return builtin_component_binding()
     active = registry if registry is not None else default_component_registry()
     active.resolve_binding(stored)
+    try:
+        assembly = (
+            extensions
+            if extensions is not None
+            else collect_extensions(stored.extension_entry_points)
+        )
+    except ExtensionAssemblyError as exc:
+        raise ComponentBindingError(str(exc)) from exc
+    if assembly.binding() != stored.extension_versions:
+        raise ComponentBindingError("stored extensions differ from the selected declarations")
+    if stored.planning_provider_id is not None:
+        try:
+            assembly.resolve("planning", stored.planning_provider_id)
+        except ExtensionAssemblyError as exc:
+            raise ComponentBindingError(str(exc)) from exc
     return stored
 
 
@@ -138,6 +204,151 @@ def instantiate(
     ):
         raise ComponentBindingError("component factory must supply all four runtime components")
     return components, binding_for_registration(registration)
+
+
+def apply_extensions(
+    components: RuntimeComponents,
+    context: ComponentFactoryContext,
+    assembly: ExtensionAssembly,
+    *,
+    planning_provider_id: str | None = None,
+    available_references=(),
+) -> RuntimeComponents:
+    """Connect partial contributions to the same existing runtime registries."""
+    available = [
+        *available_references,
+        *(("candidate_provider", key) for key in components.candidate_providers.provider_ids),
+        *(("agent_definition", str(key)) for key in components.agents.definition_ids),
+        *(("agent_role", str(key)) for key in components.agents.definition_ids),
+        *(("agent_spec", str(key)) for key in components.agents.agent_ids),
+        *(("result_mapper", key) for key in components.result_mappers.all_meaningful_change_keys()),
+        *(
+            ("eligibility_provider", key)
+            for key in (
+                components.eligibility.provider_ids if components.eligibility is not None else ()
+            )
+        ),
+        *(
+            ("capability.action_binding", "operation:" + key)
+            for key in (components.operation_bindings or {})
+        ),
+        *(
+            ("capability.execution_recipe", "recipe:" + key)
+            for key in (components.execution_recipes or {})
+        ),
+    ]
+    assembly.validate_references(available)
+    assembly.validate_kinds(
+        (
+            "agent_role",
+            "agent_definition",
+            "agent_spec",
+            "candidate_provider",
+            "result_mapper",
+            "planning",
+            "verifier",
+            "eligibility_provider",
+            "state_codec",
+            "mcp_profile",
+            "vendor_policy",
+            "reference_bundle",
+            "methodology_read_contract",
+            "capability.action_binding",
+            "capability.retry_policy",
+            "capability.execution_recipe",
+        )
+    )
+    for contribution in assembly.contributions("candidate_provider"):
+        components.candidate_providers.register(
+            contribution.contribution_id, contribution.factory(context)
+        )
+    from redteam.orchestration.agents.packages import register_role_package
+
+    for contribution in assembly.contributions("agent_role"):
+        package = contribution.factory(context)
+        if str(package.agent_id) != contribution.contribution_id:
+            raise ExtensionAssemblyError("role package identity differs from its declaration")
+        register_role_package(components.agents, components.candidate_providers, package)
+    for contribution in assembly.contributions("agent_definition"):
+        definition = contribution.factory(context)
+        if str(definition.agent_id) != contribution.contribution_id:
+            raise ExtensionAssemblyError("agent definition identity differs from its declaration")
+        components.agents.register_definition(definition)
+    for contribution in assembly.contributions("agent_spec"):
+        spec = contribution.factory(context)
+        if str(spec.agent_id) != contribution.contribution_id:
+            raise ExtensionAssemblyError(
+                "agent specification identity differs from its declaration"
+            )
+        components.agents.register(spec)
+    for contribution in assembly.contributions("result_mapper"):
+        mapper = contribution.factory(context)
+        for tool_id in contribution.target_ids or (contribution.contribution_id,):
+            components.result_mappers.register(
+                tool_id, mapper, meaningful_change_keys=contribution.meaningful_change_keys
+            )
+    from redteam.orchestration.eligibility import default_eligibility_registry
+
+    eligibility = components.eligibility or default_eligibility_registry()
+    for contribution in assembly.contributions("eligibility_provider"):
+        eligibility.register(contribution.factory(context))
+    bindings = dict(components.operation_bindings or {})
+    for contribution in assembly.contributions("capability.action_binding"):
+        binding = contribution.factory(context)
+        if binding.operation in bindings:
+            raise ExtensionAssemblyError(f"duplicate operation binding: {binding.operation}")
+        bindings[binding.operation] = binding
+    recipes = dict(components.execution_recipes or {})
+    for contribution in assembly.contributions("capability.execution_recipe"):
+        recipe = contribution.factory(context)
+        if recipe.name in recipes:
+            raise ExtensionAssemblyError(f"duplicate execution recipe: {recipe.name}")
+        recipes[recipe.name] = recipe
+    retry_policies = assembly.contributions("capability.retry_policy")
+    if len(retry_policies) > 1:
+        raise ExtensionAssemblyError("select one retry policy")
+    verifiers = assembly.contributions("verifier")
+    if len(verifiers) > 1:
+        raise ExtensionAssemblyError("select one verification implementation")
+    for definition in components.agents.definitions():
+        if definition.schedulable:
+            if components.agents.get(definition.agent_id) is None:
+                raise ExtensionAssemblyError(f"missing executable role: {definition.agent_id}")
+    planners = assembly.contributions("planning")
+    if planning_provider_id is None and planners:
+        raise ExtensionAssemblyError("planning contributions require an explicit selection")
+    provider = components.planning_provider
+    if planning_provider_id is not None:
+        provider = assembly.resolve("planning", planning_provider_id).factory(
+            PlanningFactoryContext(planning_provider_id)
+        )
+    return replace(
+        components,
+        planning_provider=provider,
+        eligibility=eligibility,
+        operation_bindings=bindings,
+        execution_recipes=recipes,
+        retry_policy=retry_policies[0].factory(context)
+        if retry_policies
+        else components.retry_policy,
+        verifier=verifiers[0].factory(context) if verifiers else components.verifier,
+    )
+
+
+def bind_extensions(
+    binding: RuntimeComponentBinding,
+    assembly: ExtensionAssembly,
+    *,
+    selected: tuple[str, ...] = (),
+    planning_provider_id: str | None = None,
+) -> RuntimeComponentBinding:
+    return binding.model_copy(
+        update={
+            "extension_versions": assembly.binding(),
+            "extension_entry_points": selected,
+            "planning_provider_id": planning_provider_id,
+        }
+    )
 
 
 def ensure_durable_binding(

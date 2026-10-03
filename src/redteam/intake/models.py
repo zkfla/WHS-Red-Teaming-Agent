@@ -20,12 +20,13 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field, field_validator
 
+from redteam.core.action_semantics import CANONICAL_CAPABILITIES as BUILTIN_CAPABILITIES
 from redteam.core.redaction import redact_sensitive_text
 
 #: Canonical capability namespaces (docs/contracts/actions.md). Not
 #: re-declared in `redteam.core` — that vocabulary is fixed by PM there;
 #: this is just the one place Intake references it from.
-CANONICAL_CAPABILITIES: tuple[str, ...] = ("recon", "web", "mobile", "analysis")
+CANONICAL_CAPABILITIES: tuple[str, ...] = tuple(sorted(BUILTIN_CAPABILITIES))
 
 
 class EngagementDraft(BaseModel):

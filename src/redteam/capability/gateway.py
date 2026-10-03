@@ -26,6 +26,7 @@ from redteam.capability.registry import MCPToolRegistry
 from redteam.core.contracts.tool import ToolDescriptor, ToolError, ToolInvocation, ToolResult
 from redteam.core.enums import ToolHealthStatus
 from redteam.core.ids import ToolId
+from redteam.core.ports.tool_gateway import BeforeToolStart, ToolStartRejected
 
 # Health is a liveness signal, not an authorization decision. A single probe
 # is always bounded by this timeout so a hung MCP server can never stall an
@@ -185,6 +186,21 @@ class MCPToolGateway:
         return status
 
     async def invoke(self, invocation: ToolInvocation) -> ToolResult:
+        return await self._invoke(invocation)
+
+    async def invoke_with_admission(
+        self,
+        invocation: ToolInvocation,
+        before_start: BeforeToolStart,
+    ) -> ToolResult:
+        return await self._invoke(invocation, before_start=before_start)
+
+    async def _invoke(
+        self,
+        invocation: ToolInvocation,
+        *,
+        before_start: BeforeToolStart | None = None,
+    ) -> ToolResult:
         descriptor = self._catalog.get(invocation.tool_id)
         if descriptor is None:
             return ToolResult(
@@ -286,9 +302,12 @@ class MCPToolGateway:
                     descriptor,
                     arguments,
                     self._server_semaphores[descriptor.server_id],
+                    before_start=before_start,
                 ),
                 timeout=invocation.timeout_seconds,
             )
+        except ToolStartRejected:
+            raise
         except asyncio.TimeoutError:
             return self._error_result(
                 invocation,
@@ -428,8 +447,12 @@ async def _invoke_with_limit(
     descriptor: ToolDescriptor,
     arguments: dict[str, Any],
     semaphore: asyncio.Semaphore,
+    *,
+    before_start: BeforeToolStart | None = None,
 ) -> MCPCallResult:
     async with semaphore:
+        if before_start is not None:
+            await before_start()
         return await adapter.invoke(descriptor, arguments)
 
 

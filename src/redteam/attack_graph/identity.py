@@ -107,6 +107,8 @@ def endpoint_node_id(
     authority = ""
     if host:
         authority = host.strip().lower()
+        if port is not None and ":" in authority and not authority.startswith("["):
+            authority = f"[{authority}]"
         if port is not None:
             authority = f"{authority}:{port}"
         authority += " "
@@ -146,12 +148,12 @@ def session_credential_node_id(target_ref: str, session_ref: str) -> GraphNodeId
     return credential_node_id(f"{target_ref}/session:{session_ref}")
 
 
-def api_resource_node_id(
-    host: str, path: str, port: int | None = None
-) -> GraphNodeId:
+def api_resource_node_id(host: str, path: str, port: int | None = None) -> GraphNodeId:
     """Identity of an API resource template independent of its HTTP methods."""
 
     authority = host.strip().lower()
+    if port is not None and ":" in authority and not authority.startswith("["):
+        authority = f"[{authority}]"
     if port is not None:
         authority = f"{authority}:{port}"
     return make_node_id(
@@ -211,9 +213,7 @@ def node_id_for_target(target: AnyTarget) -> GraphNodeId:
     if isinstance(target, AssetTarget):
         return asset_node_id(str(target.asset_id))
     if isinstance(target, DeviceTarget):
-        identity = target.asset_id or AssetId(
-            f"{target.package_name}@{target.device_serial}"
-        )
+        identity = target.asset_id or AssetId(f"{target.package_name}@{target.device_serial}")
         return asset_node_id(str(identity))
     if isinstance(target, GraphNodeTarget):  # pragma: no cover - covered by `explicit`
         return target.node_id

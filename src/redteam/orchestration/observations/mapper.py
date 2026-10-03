@@ -11,8 +11,9 @@ deterministic node/edge ids a mapper computes (``attack_graph.identity``).
 
 from __future__ import annotations
 
+import importlib
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from typing import Any, TypeGuard
 
@@ -115,8 +116,7 @@ def _validate_mutation(mutation: GraphMutation, *, target: AnyTarget) -> None:
         encoded_type, _ = split_node_id(node.node_id)
         if encoded_type is not node.node_type:
             raise ValueError(
-                f"node id {node.node_id!r} encodes {encoded_type.value}, "
-                f"not {node.node_type.value}"
+                f"node id {node.node_id!r} encodes {encoded_type.value}, not {node.node_type.value}"
             )
         previous = node_types.setdefault(node.node_id, node.node_type)
         if previous is not node.node_type:
@@ -168,15 +168,44 @@ class ResultMapperRegistry:
     def __init__(self) -> None:
         self._mappers: dict[str, ResultMapperFn] = {}
         self._last_failure: MapperFailure | None = None
+        self._change_keys: dict[str, tuple[str, ...]] = {}
 
     @property
     def last_failure(self) -> MapperFailure | None:
         return self._last_failure
 
-    def register(self, tool_id: str, mapper: ResultMapperFn) -> None:
+    def has_mapper(self, tool_id: str) -> bool:
+        return tool_id in self._mappers
+
+    def register(self, tool_id: str, mapper: ResultMapperFn, *, meaningful_change_keys=()) -> None:
         if tool_id in self._mappers:
             raise ValueError(f"a result mapper is already registered for {tool_id!r}")
         self._mappers[tool_id] = mapper
+        self._change_keys[tool_id] = tuple(meaningful_change_keys)
+
+    def bind_catalog(self, catalog) -> None:
+        """Resolve existing explicit mapper aliases through the selected catalog."""
+        for tool_id, mapper in tuple(self._mappers.items()):
+            try:
+                descriptor = catalog.get(ToolId(tool_id))
+            except ValueError:
+                continue  # An ambiguous old alias proves no output connection.
+            if descriptor is not None and str(descriptor.tool_id) != tool_id:
+                resolved = str(descriptor.tool_id)
+                if resolved not in self._mappers:
+                    self.register(
+                        resolved,
+                        mapper,
+                        meaningful_change_keys=self.meaningful_change_keys(tool_id),
+                    )
+
+    def meaningful_change_keys(self, tool_id: str) -> tuple[str, ...]:
+        """Extra fingerprint keys one mapper's bundle declared (M18)."""
+        return self._change_keys.get(tool_id, ())
+
+    def all_meaningful_change_keys(self) -> dict[str, tuple[str, ...]]:
+        """Every declared key list, by tool id, for the fingerprint reader."""
+        return dict(self._change_keys)
 
     def map_result(
         self,
@@ -204,69 +233,135 @@ class ResultMapperRegistry:
             return GraphMutation()
 
 
-def default_result_mapper_registry() -> ResultMapperRegistry:
-    from redteam.orchestration.observations.mobile_analysis import (
-        map_apktool_decode,
-        map_apktool_manifest,
-    )
-    from redteam.orchestration.observations.mobile_runtime import (
-        map_mobile_crash_detail,
-        map_mobile_crash_list,
-        map_mobile_device_logs,
-    )
-    from redteam.orchestration.observations.recon_http import map_recon_http_probe
-    from redteam.orchestration.observations.recon_inventory import (
-        map_recon_html_inventory,
-        map_recon_openapi_inventory,
-    )
-    from redteam.orchestration.observations.recon_network import (
-        map_recon_dns_resolve,
-        map_recon_oidc_inventory,
-        map_recon_port_scan,
-        map_recon_tls_inspect,
-    )
-    from redteam.orchestration.observations.web_browser import map_web_browser_navigate
-    from redteam.orchestration.observations.web_http import (
-        map_web_compare_anonymous,
-        map_web_compare_sessions,
-        map_web_http_request,
-        map_web_http_security_posture,
-        map_web_session_list,
-    )
-    from redteam.orchestration.observations.web_proxy import (
-        map_web_nuclei_response_check,
-        map_web_proxy_compare_sessions,
-        map_web_proxy_get_flow,
-        map_web_proxy_list_flows,
-        map_web_proxy_mutate_json,
-        map_web_proxy_replay_flow,
-        map_web_zap_capture_snapshot,
+#: Contribution kind spoken by observation bundles. The composition
+#: root owns collection; the name is the draft so both sides can meet.
+RESULT_MAPPER_KIND = "result_mapper"
+
+
+@dataclass(frozen=True)
+class MapperContribution:
+    """One mapper's declaration: tools served, code reference, version,
+    and the extra fingerprint keys (M05/M18).
+
+    ``mapper_ref`` is a ``dotted.module:attr`` import reference resolved
+    only at assembly time -- the live function itself is never stored in
+    declaration metadata. ``meaningful_change_keys`` holds graph
+    attribute/fact keys beyond the shared planning allow-list whose
+    change wakes the owning role; empty means no extra contribution,
+    never a block on running the tool.
+    """
+
+    tool_ids: tuple[str, ...]
+    mapper_ref: str
+    mapper_version: str
+    meaningful_change_keys: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not self.tool_ids or not self.mapper_ref.strip() or not self.mapper_version.strip():
+            raise ValueError("mapper contribution identity must not be blank")
+
+
+def resolve_contribution_mapper(contribution: MapperContribution) -> ResultMapperFn:
+    """Import the mapper a bundle names; fails loudly when unresolvable."""
+    module_name, sep, attr = contribution.mapper_ref.partition(":")
+    if not sep or not module_name.strip() or not attr.strip():
+        raise ValueError(f"invalid mapper reference {contribution.mapper_ref!r}")
+    try:
+        module = importlib.import_module(module_name)
+        mapper = getattr(module, attr)
+    except (ImportError, AttributeError) as exc:
+        raise ValueError(f"unresolvable mapper reference {contribution.mapper_ref!r}") from exc
+    if not callable(mapper):
+        raise ValueError(f"mapper reference is not callable {contribution.mapper_ref!r}")
+    return mapper
+
+
+def register_contribution(
+    registry: ResultMapperRegistry, contribution: MapperContribution
+) -> MapperContribution:
+    """Register one bundle's mapper under every tool id it serves.
+
+    Exact-id matching, duplicate rejection and failure isolation stay
+    exactly as ``register``/``map_result`` define them; this only adds
+    the shared assembly path plus the fingerprint key bookkeeping. A
+    missing mapper never blocks tool execution -- ``map_result`` still
+    returns an empty change for unmapped tools.
+    """
+    mapper = resolve_contribution_mapper(contribution)
+    for tool_id in contribution.tool_ids:
+        registry.register(
+            tool_id, mapper, meaningful_change_keys=contribution.meaningful_change_keys
+        )
+    return contribution
+
+
+def _mapper_contribution_id(contribution: MapperContribution) -> str:
+    """Single tool id today; sorted join only if a bundle ever serves several."""
+    if len(contribution.tool_ids) == 1:
+        return contribution.tool_ids[0]
+    return "|".join(sorted(contribution.tool_ids))
+
+
+def mapper_contribution(contribution: MapperContribution):
+    """One bundle in the composition root's declaration shape.
+
+    The factory returns the resolved mapper callable (the runtime kind
+    contract), never the declaration object itself.
+    """
+    from redteam.core.extensions import Contribution
+
+    def _resolved_mapper(_context: Any) -> Any:
+        return resolve_contribution_mapper(contribution)
+
+    return Contribution(
+        kind=RESULT_MAPPER_KIND,
+        contribution_id=_mapper_contribution_id(contribution),
+        version=contribution.mapper_version,
+        factory=_resolved_mapper,
+        meaningful_change_keys=contribution.meaningful_change_keys,
+        target_ids=contribution.tool_ids,
     )
 
+
+def mapper_declarations_by_contribution_id(
+    packages: Iterable[MapperContribution] | None = None,
+) -> dict[str, MapperContribution]:
+    """Declarations keyed by contribution id, for full-declaration assembly.
+
+    Path (b): the root looks a declaration up here and calls
+    register_contribution() so fingerprint keys are recorded too.
+    """
+    from redteam.orchestration.observations.packages import builtin_observation_packages
+
+    selected = tuple(packages) if packages is not None else builtin_observation_packages()
+    declarations: dict[str, MapperContribution] = {}
+    for package in selected:
+        declarations[_mapper_contribution_id(package)] = package
+    return declarations
+
+
+def load_mapper_contribution(
+    contribution_id: str,
+    packages: Iterable[MapperContribution] | None = None,
+) -> MapperContribution:
+    """One declaration by contribution id; unknown ids fail loudly."""
+    try:
+        return mapper_declarations_by_contribution_id(packages)[contribution_id]
+    except KeyError:
+        raise ValueError(f"unknown mapper contribution {contribution_id!r}") from None
+
+
+def default_result_mapper_registry() -> ResultMapperRegistry:
+    """Assembled from the built-in observation bundles (M05).
+
+    Same mappers under the same exact tool ids as before; the bundles
+    only add the shared assembly path plus fingerprint key records.
+    The conditional MobSF mapper stays out: the mobile wiring adds it
+    from its bundle when the tool exists.
+    """
+    from redteam.orchestration.observations.packages import builtin_observation_packages
+
     registry = ResultMapperRegistry()
-    registry.register("analysis.decode_apk", map_apktool_decode)
-    registry.register("analysis.get_manifest", map_apktool_manifest)
-    registry.register("mobile.mobile_get_device_logs", map_mobile_device_logs)
-    registry.register("mobile.mobile_list_crashes", map_mobile_crash_list)
-    registry.register("mobile.mobile_get_crash", map_mobile_crash_detail)
-    registry.register("recon.dns_resolve", map_recon_dns_resolve)
-    registry.register("recon.http_probe", map_recon_http_probe)
-    registry.register("recon.tls_inspect", map_recon_tls_inspect)
-    registry.register("recon.html_inventory", map_recon_html_inventory)
-    registry.register("recon.openapi_inventory", map_recon_openapi_inventory)
-    registry.register("recon.oidc_inventory", map_recon_oidc_inventory)
-    registry.register("recon.port_scan", map_recon_port_scan)
-    registry.register("web.http_request", map_web_http_request)
-    registry.register("web.http_compare_sessions", map_web_compare_sessions)
-    registry.register("web.http_compare_anonymous", map_web_compare_anonymous)
-    registry.register("web.http_security_posture", map_web_http_security_posture)
-    registry.register("web.browser_navigate", map_web_browser_navigate)
-    registry.register("web.session_list", map_web_session_list)
-    registry.register("web.proxy_list_flows", map_web_proxy_list_flows)
-    registry.register("web.proxy_get_flow", map_web_proxy_get_flow)
-    registry.register("web.proxy_replay_flow", map_web_proxy_replay_flow)
-    registry.register("web.proxy_mutate_json", map_web_proxy_mutate_json)
-    registry.register("web.proxy_compare_sessions", map_web_proxy_compare_sessions)
-    registry.register("web.zap_capture_snapshot", map_web_zap_capture_snapshot)
-    registry.register("web.nuclei_response_check", map_web_nuclei_response_check)
+    for package in builtin_observation_packages():
+        register_contribution(registry, package)
     return registry

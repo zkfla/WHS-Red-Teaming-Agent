@@ -4,15 +4,38 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timedelta, timezone
+from typing import cast
 
 from redteam.core.ids import RunId
 from redteam.orchestration.work.models import (
-    ACTIVE_STATUSES,
-    TERMINAL_STATUSES,
     TaskLease,
     WorkItem,
     WorkStatus,
-    is_unexecuted_stale,
+)
+from redteam.orchestration.work.rules import (
+    abandon_candidate,
+    blocked_for_dependency,
+    can_bind,
+    decide_add,
+    decide_reconcile,
+    expired_lease_ids,
+    failed_item,
+    finished_item,
+    has_conflict,
+    is_expired,
+    lease_owned,
+    leased_item,
+    new_lease,
+    pending_item,
+    prereqs_succeeded,
+    refresh_pending_item,
+    renewed_lease,
+    require_terminal,
+    running_item,
+    should_invalidate,
+    stale_item,
+    terminal_failure_in,
+    validate_lease_ttl,
 )
 
 
@@ -29,38 +52,13 @@ class InMemoryWorkStore:
             same_candidate = [
                 existing
                 for existing in self._items.values()
-                if existing.run_id == item.run_id
-                and existing.candidate_key == item.candidate_key
+                if existing.run_id == item.run_id and existing.candidate_key == item.candidate_key
             ]
-            if any(
-                existing.status in {WorkStatus.LEASED, WorkStatus.RUNNING}
-                for existing in same_candidate
-            ):
+            verdict, target = decide_add(item, same_candidate)
+            if verdict == "reject":
                 return False
-            pending = [
-                existing
-                for existing in same_candidate
-                if existing.status is WorkStatus.PENDING
-            ]
-            if pending:
-                target = sorted(pending, key=lambda entry: entry.work_id)[0]
-                refreshed = item.model_copy(deep=True).model_copy(
-                    update={
-                        "work_id": target.work_id,
-                        "created_at": target.created_at,
-                        "attempt": target.attempt,
-                        "hypothesis_id": target.hypothesis_id or item.hypothesis_id,
-                        "job_id": target.job_id,
-                        "status": WorkStatus.PENDING,
-                        "outcome_reason": None,
-                    }
-                )
-                self._items[target.work_id] = refreshed
-                return False
-            blocking = [
-                existing for existing in same_candidate if not is_unexecuted_stale(existing)
-            ]
-            if blocking and not item.repeatable:
+            if target is not None:
+                self._items[target.work_id] = refresh_pending_item(target, item)
                 return False
             self._items[item.work_id] = item.model_copy(deep=True)
             return True
@@ -74,12 +72,8 @@ class InMemoryWorkStore:
         changed = []
         async with self._lock:
             for identity, item in self._items.items():
-                if (item.run_id == run_id and item.path_id == path_id
-                    and item.path_step_id in step_ids and item.status is WorkStatus.PENDING):
-                    self._items[identity] = item.model_copy(update={
-                        "status": WorkStatus.STALE, "updated_at": now,
-                        "outcome_reason": "path_step_changed",
-                    })
+                if should_invalidate(item, run_id, path_id, step_ids):
+                    self._items[identity] = stale_item(item, now, "path_step_changed")
                     changed.append(identity)
         return changed
 
@@ -87,16 +81,13 @@ class InMemoryWorkStore:
         async with self._lock:
             lease = self._leases.get(work_id)
             item = self._items.get(work_id)
-            if lease is None or item is None or lease.owner != owner:
+            if not can_bind(
+                lease, item, owner=owner, job_id=job_id, now=datetime.now(timezone.utc)
+            ):
                 return False
-            expires_at = lease.expires_at
-            if expires_at.tzinfo is None:
-                expires_at = expires_at.replace(tzinfo=timezone.utc)
-            if expires_at <= datetime.now(timezone.utc):
-                return False
-            if item.job_id and item.job_id != job_id:
-                return False
-            self._items[work_id] = item.model_copy(update={"job_id": job_id})
+            self._items[work_id] = cast(WorkItem, item).model_copy(
+                update={"job_id": job_id}
+            )
         return True
 
     async def list_items(
@@ -122,8 +113,7 @@ class InMemoryWorkStore:
         now: datetime,
         ttl: timedelta,
     ) -> TaskLease | None:
-        if ttl.total_seconds() <= 0:
-            raise ValueError("lease ttl must be positive")
+        validate_lease_ttl(ttl)
         async with self._lock:
             item = self._items.get(work_id)
             if item is None or item.status is not WorkStatus.PENDING:
@@ -131,36 +121,17 @@ class InMemoryWorkStore:
             failed_dependency = self._terminal_dependency_failure(item)
             if failed_dependency is not None:
                 dependency_id, dependency_status = failed_dependency
-                self._items[work_id] = item.model_copy(
-                    update={
-                        "status": WorkStatus.BLOCKED,
-                        "updated_at": now,
-                        "outcome_reason": (
-                            f"prerequisite_not_succeeded:{dependency_id}:"
-                            f"{dependency_status.value}"
-                        ),
-                    }
+                self._items[work_id] = blocked_for_dependency(
+                    item, dependency_id, dependency_status, now
                 )
                 return None
             if not self._dependencies_succeeded(item):
                 return None
             if self._has_conflict(item):
                 return None
-            lease = TaskLease(
-                work_id=work_id,
-                owner=owner,
-                issued_at=now,
-                heartbeat_at=now,
-                expires_at=now + ttl,
-            )
+            lease = new_lease(work_id, owner, now, ttl)
             self._leases[work_id] = lease
-            self._items[work_id] = item.model_copy(
-                update={
-                    "status": WorkStatus.LEASED,
-                    "attempt": item.attempt + 1,
-                    "updated_at": now,
-                }
-            )
+            self._items[work_id] = leased_item(item, now)
             return lease.model_copy(deep=True)
 
     async def heartbeat(
@@ -171,18 +142,15 @@ class InMemoryWorkStore:
         now: datetime,
         ttl: timedelta,
     ) -> TaskLease | None:
-        if ttl.total_seconds() <= 0:
-            raise ValueError("lease ttl must be positive")
+        validate_lease_ttl(ttl)
         async with self._lock:
             lease = self._leases.get(work_id)
-            if lease is None or lease.owner != owner or lease.expires_at <= now:
+            if lease is None or not lease_owned(lease, owner) or is_expired(lease.expires_at, now):
                 return None
-            renewed = lease.model_copy(update={"heartbeat_at": now, "expires_at": now + ttl})
+            renewed = renewed_lease(lease, now, ttl)
             self._leases[work_id] = renewed
             item = self._items[work_id]
-            self._items[work_id] = item.model_copy(
-                update={"status": WorkStatus.RUNNING, "updated_at": now}
-            )
+            self._items[work_id] = running_item(item, now)
             return renewed.model_copy(deep=True)
 
     async def complete(
@@ -194,26 +162,17 @@ class InMemoryWorkStore:
         now: datetime,
         reason: str | None = None,
     ) -> bool:
-        if status not in TERMINAL_STATUSES:
-            raise ValueError("complete requires a terminal status")
+        require_terminal(status)
         async with self._lock:
             lease = self._leases.get(work_id)
             item = self._items.get(work_id)
             if lease is None or item is None or lease.owner != owner:
                 return False
-            if lease.expires_at <= now:
-                self._items[work_id] = item.model_copy(
-                    update={
-                        "status": WorkStatus.STALE,
-                        "updated_at": now,
-                        "outcome_reason": "lease_expired",
-                    }
-                )
+            if is_expired(lease.expires_at, now):
+                self._items[work_id] = stale_item(item, now, "lease_expired")
                 del self._leases[work_id]
                 return False
-            self._items[work_id] = item.model_copy(
-                update={"status": status, "updated_at": now, "outcome_reason": reason}
-            )
+            self._items[work_id] = finished_item(item, status, now, reason)
             del self._leases[work_id]
             return True
 
@@ -222,28 +181,25 @@ class InMemoryWorkStore:
         async with self._lock:
             lease = self._leases.get(work_id)
             item = self._items.get(work_id)
-            if lease is None or item is None or lease.owner != owner or lease.expires_at <= now:
+            if (
+                lease is None
+                or item is None
+                or lease.owner != owner
+                or is_expired(lease.expires_at, now)
+            ):
                 return False
-            self._items[work_id] = item.model_copy(
-                update={"status": WorkStatus.PENDING, "updated_at": now}
-            )
+            self._items[work_id] = pending_item(item, now)
             del self._leases[work_id]
             return True
 
     async def reclaim_expired(self, *, now: datetime) -> list[str]:
         async with self._lock:
-            expired = sorted(
-                work_id for work_id, lease in self._leases.items() if lease.expires_at <= now
+            expired = expired_lease_ids(
+                {work_id: lease.expires_at for work_id, lease in self._leases.items()}, now
             )
             for work_id in expired:
                 item = self._items[work_id]
-                self._items[work_id] = item.model_copy(
-                    update={
-                        "status": WorkStatus.STALE,
-                        "updated_at": now,
-                        "outcome_reason": "lease_expired",
-                    }
-                )
+                self._items[work_id] = stale_item(item, now, "lease_expired")
                 del self._leases[work_id]
             return expired
 
@@ -258,99 +214,40 @@ class InMemoryWorkStore:
         async with self._lock:
             abandoned: list[str] = []
             for work_id, item in self._items.items():
-                if item.run_id != run_id or item.status not in ACTIVE_STATUSES:
-                    continue
                 lease = self._leases.get(work_id)
-                if lease is not None and lease.owner != owner:
+                if not abandon_candidate(item, run_id, owner, lease.owner if lease else None):
                     continue
-                self._items[work_id] = item.model_copy(
-                    update={
-                        "status": WorkStatus.FAILED,
-                        "updated_at": now,
-                        "outcome_reason": reason,
-                    }
-                )
+                self._items[work_id] = failed_item(item, now, reason)
                 self._leases.pop(work_id, None)
                 abandoned.append(work_id)
             return sorted(abandoned)
 
-    async def reconcile_job(
-        self, work_id: str, *, job_id: str, status: str, now: datetime
-    ) -> bool:
-        try:
-            target = WorkStatus(status)
-        except (ValueError, TypeError):
-            return False
-        if target not in {
-            WorkStatus.SUCCEEDED,
-            WorkStatus.FAILED,
-            WorkStatus.CANCELLED,
-        }:
-            return False
+    async def reconcile_job(self, work_id: str, *, job_id: str, status: str, now: datetime) -> bool:
         async with self._lock:
-            item = self._items.get(work_id)
-            if item is None:
+            applied, decided = decide_reconcile(self._items.get(work_id), job_id, status, now)
+            if not applied:
                 return False
-            if not item.job_id or item.job_id != job_id:
-                return False
-            if item.status is target:
-                previous = item.outcome_reason
-                if previous and "job_reconciled" in previous:
-                    self._leases.pop(work_id, None)
-                    return True
-                marker = f"job_reconciled:{target.value}"
-                reason = marker if not previous else f"{marker}:{previous}"
-                self._items[work_id] = item.model_copy(
-                    update={"status": target, "updated_at": now, "outcome_reason": reason}
-                )
-                self._leases.pop(work_id, None)
-                return True
-            if item.status in {WorkStatus.FAILED, WorkStatus.STALE}:
-                previous = item.outcome_reason
-                marker = f"job_reconciled:{target.value}"
-                reason = marker if not previous else f"{marker}:{previous}"
-                self._items[work_id] = item.model_copy(
-                    update={"status": target, "updated_at": now, "outcome_reason": reason}
-                )
-                self._leases.pop(work_id, None)
-                return True
-            if item.status not in ACTIVE_STATUSES:
-                return False
-            previous = item.outcome_reason
-            marker = f"job_reconciled:{target.value}"
-            reason = marker if not previous else f"{marker}:{previous}"
-            self._items[work_id] = item.model_copy(
-                update={"status": target, "updated_at": now, "outcome_reason": reason}
-            )
+            if decided is not None:
+                self._items[work_id] = decided
             self._leases.pop(work_id, None)
             return True
 
     def _dependencies_succeeded(self, item: WorkItem) -> bool:
-        return all(
-            dependency in self._items and self._items[dependency].status is WorkStatus.SUCCEEDED
-            for dependency in item.prerequisite_ids
+        return prereqs_succeeded(
+            {
+                dependency: (self._items[dependency].status if dependency in self._items else None)
+                for dependency in item.prerequisite_ids
+            }
         )
 
-    def _terminal_dependency_failure(
-        self, item: WorkItem
-    ) -> tuple[str, WorkStatus] | None:
-        for dependency_id in item.prerequisite_ids:
-            dependency = self._items.get(dependency_id)
-            if (
-                dependency is not None
-                and dependency.status in TERMINAL_STATUSES
-                and dependency.status is not WorkStatus.SUCCEEDED
-            ):
-                return dependency_id, dependency.status
-        return None
+    def _terminal_dependency_failure(self, item: WorkItem) -> tuple[str, WorkStatus] | None:
+        return terminal_failure_in(
+            {
+                dependency_id: self._items[dependency_id].status
+                for dependency_id in item.prerequisite_ids
+                if dependency_id in self._items
+            }
+        )
 
     def _has_conflict(self, item: WorkItem) -> bool:
-        keys = set(item.conflict_keys)
-        if not keys:
-            return False
-        return any(
-            other_id != item.work_id
-            and other.status in {WorkStatus.LEASED, WorkStatus.RUNNING}
-            and not keys.isdisjoint(other.conflict_keys)
-            for other_id, other in self._items.items()
-        )
+        return has_conflict(item, self._items.values())

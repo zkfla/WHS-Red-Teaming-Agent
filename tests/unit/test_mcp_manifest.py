@@ -116,7 +116,7 @@ async def test_bootstrap_validates_the_same_manifest_it_exposes_to_agent(
     )
     monkeypatch.setattr(
         "redteam.capability.bootstrap._create_adapter",
-        lambda settings, transport: adapter,
+        lambda settings, transport, bundles=None: adapter,
     )
 
     gateway = await build_mcp_tool_gateway([server_id])
@@ -126,7 +126,7 @@ async def test_bootstrap_validates_the_same_manifest_it_exposes_to_agent(
     assert registered.operations == ["http_request"]
     assert registered.required_arguments == ("target_ref", "path")
     assert registered.optional_arguments == ("method",)
-    assert registered.target_types == ["host", "service", "endpoint"]
+    assert registered.target_types == ["endpoint", "service", "host"]
     assert registered.output_schema == descriptor.output_schema
 
 
@@ -152,7 +152,7 @@ async def test_bootstrap_fails_closed_on_discovery_manifest_drift(
     )
     monkeypatch.setattr(
         "redteam.capability.bootstrap._create_adapter",
-        lambda settings, transport: adapter,
+        lambda settings, transport, bundles=None: adapter,
     )
 
     with pytest.raises(MCPConfigurationError, match="absent from properties"):

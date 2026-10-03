@@ -133,7 +133,9 @@ class AgentLoopRunner:
         if checkpointer is not None:
             self._checkpointer = checkpointer
         elif self._settings.checkpoint_backend == "memory":
-            self._checkpointer = build_checkpointer(enabled=self._settings.checkpointing)
+            self._checkpointer = build_checkpointer(
+                enabled=self._settings.checkpointing, registry=deps.state_codecs
+            )
         else:
             self._checkpointer = None
         self._graph = (
@@ -215,13 +217,17 @@ class AgentLoopRunner:
             if any(getattr(saved, name) != getattr(runtime, name) for name in fields):
                 return False
         if runtime.mission_id is None:
-            coordinator = coordinator_for(self._deps.task_graph_store, self._deps.path_store)
+            coordinator = self._deps.coordinator or coordinator_for(
+                self._deps.task_graph_store, self._deps.path_store
+            )
 
             async def legacy(change: ChangeSet):
                 return ("binding", str(runtime.run_id)) not in change.records
 
             return await coordinator.change(legacy)
-        coordinator = coordinator_for(self._deps.task_graph_store, self._deps.path_store)
+        coordinator = self._deps.coordinator or coordinator_for(
+            self._deps.task_graph_store, self._deps.path_store
+        )
 
         async def read(change: ChangeSet):
             return change.records.get(("binding", str(runtime.run_id)))
@@ -273,7 +279,9 @@ class AgentLoopRunner:
         """Recover committed same-run events without reviving investigation work."""
         if runtime.mission_id is None:
             return 0
-        coordinator = coordinator_for(self._deps.task_graph_store, self._deps.path_store)
+        coordinator = self._deps.coordinator or coordinator_for(
+            self._deps.task_graph_store, self._deps.path_store
+        )
         try:
             return await deliver_pending(
                 coordinator,
@@ -289,10 +297,12 @@ class AgentLoopRunner:
             return await self._binding_for(runtime)
         if not await self._binding_for(runtime):
             return False
-        coordinator = coordinator_for(self._deps.task_graph_store, self._deps.path_store)
+        coordinator = self._deps.coordinator or coordinator_for(
+            self._deps.task_graph_store, self._deps.path_store
+        )
 
         async def check(change: ChangeSet):
-            mission = change.tasks._missions.get(MissionId(str(runtime.mission_id)))
+            mission = change.tasks.peek_mission(MissionId(str(runtime.mission_id)))
             if mission is None or mission.status in CLOSED:
                 return False
             if mission.status is MissionStatus.BLOCKED:
@@ -308,13 +318,15 @@ class AgentLoopRunner:
     async def _reactivate(self, runtime: RuntimeState) -> bool:
         if runtime.mission_id is None:
             return True
-        coordinator = coordinator_for(self._deps.task_graph_store, self._deps.path_store)
+        coordinator = self._deps.coordinator or coordinator_for(
+            self._deps.task_graph_store, self._deps.path_store
+        )
 
         async def activate(change: ChangeSet):
             bound = change.binding(
                 str(runtime.run_id), str(runtime.mission_id), str(runtime.engagement_id)
             )
-            mission = change.tasks._missions.get(MissionId(str(runtime.mission_id)))
+            mission = change.tasks.peek_mission(MissionId(str(runtime.mission_id)))
             if bound["closed"] or mission is None or mission.status in CLOSED:
                 return False
             if change.pending(str(runtime.run_id), str(runtime.mission_id)):
@@ -419,7 +431,9 @@ class AgentLoopRunner:
         """Persist hard termination before returning control to app settlement."""
         if runtime.mission_id is None or reason is None or reason in RECONCILABLE_REASONS:
             return
-        coordinator = coordinator_for(self._deps.task_graph_store, self._deps.path_store)
+        coordinator = self._deps.coordinator or coordinator_for(
+            self._deps.task_graph_store, self._deps.path_store
+        )
 
         async def close(change: ChangeSet):
             change.binding(
@@ -939,6 +953,7 @@ class AgentLoopRunner:
         if self._graph is not None:
             return
         self._checkpointer_context = open_checkpointer(
+            registry=self._deps.state_codecs,
             enabled=self._settings.checkpointing,
             backend=self._settings.checkpoint_backend,
             path=self._settings.checkpoint_path,

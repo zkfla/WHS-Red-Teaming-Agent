@@ -39,7 +39,7 @@ from redteam.core.contracts.policy import ControlContext
 from redteam.core.contracts.target import UrlTarget
 from redteam.core.convert import NonAllowDecisionError, build_tool_invocation
 from redteam.core.enums import EvidenceSourceType, GraphNodeType, PolicyVerdict, RiskLevel
-from redteam.core.ids import ActionId, AgentId, EngagementId, GraphNodeId, RunId
+from redteam.core.ids import ActionId, AgentId, EngagementId, GraphNodeId, RunId, ToolId
 from redteam.orchestration.agents.base import AgentSpec
 from redteam.orchestration.agents.llm_provider import LLMCandidateProvider
 from redteam.orchestration.agents.providers import GraphCandidateContext
@@ -314,7 +314,9 @@ async def test_accepted_path_engine_executes_c_profile_and_records_evidence(
     tool_evidence = [x for x in evidence if x.source_type is EvidenceSourceType.TOOL]
     assert len(tool_evidence) == 1 and tool_evidence[0].metadata["success"] is True
     prompt = json.loads(llm.calls[0]["messages"][0]["content"])
-    shown = [tool for tool in prompt["tools"] if tool["tool_id"] == tool_id]
+    resolved = gateway.get(ToolId(tool_id))
+    assert resolved is not None
+    shown = [tool for tool in prompt["tools"] if tool["tool_id"] == str(resolved.tool_id)]
     assert len(shown) == 1 and shown[0]["operations"] == [operation]
     # Search result URLs are reference material, not new approved targets.
     if operation == "web_search":

@@ -3,26 +3,23 @@
 from __future__ import annotations
 
 import sys
-from datetime import datetime, timezone
+from collections.abc import Mapping
 from pathlib import Path
-from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from redteam.capability.deployment import (
     ROLE_OPERATIONS,
     DeploymentSpec,
+    check_deployment_scope,
+    deployment_metadata,
     digest,
     encoded,
     role_args,
 )
+from redteam.capability.server_roles import role_spec
 from redteam.capability.settings import MCPServerSettings, MCPTransportKind
-from redteam.control.scope import check_scope
 from redteam.core.config import EngagementConfig
-from redteam.core.contracts.action import ActionProposal
-from redteam.core.contracts.engagement import EngagementScope
-from redteam.core.contracts.target import UrlTarget
-from redteam.core.ids import ActionId, AgentId, EngagementId, RunId
 
 
 class DeploymentBinding(BaseModel):
@@ -39,75 +36,12 @@ class DeploymentBinding(BaseModel):
         return self
 
 
-def check_deployment_scope(spec: DeploymentSpec, scope: EngagementScope) -> None:
-    for target in spec.policy.targets.values():
-        proposal = ActionProposal(
-            action_id=ActionId("deployment-check"),
-            run_id=RunId("deployment-check"),
-            engagement_id=EngagementId("deployment-check"),
-            agent_id=AgentId("deployment-check"),
-            capability="web",
-            operation="http_request",
-            target=UrlTarget(url=target.origin),
-            arguments={},
-            reason="Operator deployment validation only; never executed",
-            created_at=datetime.now(timezone.utc),
-        )
-        allowed, _, _ = check_scope(proposal, scope)
-        if not allowed:
-            # Never strip ports to broaden scope; retain the current Control semantics.
-            raise ValueError("deployment_origin_outside_control_scope")
-    _declared_host_seeds(spec, scope)
-
-
-def _declared_host_seeds(spec: DeploymentSpec, scope: EngagementScope) -> dict[str, list[str]]:
-    """Map policy hostnames to existing scope seeds without adding a bare host."""
-    declared = {entry.strip().lower() for entry in (*scope.allowed_hosts, *scope.allowed_domains)}
-    seeds: dict[str, list[str]] = {}
-    for host, ref in spec.host_bindings.items():
-        origin = urlsplit(spec.policy.targets[ref].origin)
-        port = origin.port or (443 if origin.scheme == "https" else 80)
-        matches = []
-        for entry in sorted(declared):
-            if entry == host:
-                matches.append(entry)
-                continue
-            try:
-                parsed = urlsplit("//" + entry)
-                if (
-                    parsed.hostname == host
-                    and parsed.port == port
-                    and not parsed.username
-                    and not parsed.password
-                    and not parsed.path
-                    and not parsed.query
-                    and not parsed.fragment
-                ):
-                    matches.append(entry)
-            except ValueError:
-                continue  # Malformed entries never create a seed binding.
-        if not matches:
-            raise ValueError("deployment_origin_outside_control_scope_or_explicit_host_seed")
-        seeds[host] = matches
-    return seeds
-
-
-def deployment_metadata(spec: DeploymentSpec, scope: EngagementScope) -> dict:
-    """Keep target/session aliases on the exact approved Graph seed identities."""
-    check_deployment_scope(spec, scope)
-    public = spec.public_metadata()
-    seeds = _declared_host_seeds(spec, scope)
-    public["target_refs"] = {
-        seed: ref for host, ref in spec.host_bindings.items() for seed in seeds[host]
-    }
-    public["auth_sessions"] = {
-        seed: public["auth_sessions"][host] for host in spec.host_bindings for seed in seeds[host]
-    }
-    return public
-
-
 def synchronize_deployment(
-    engagement: EngagementConfig, server_ids: list[str], *, check_environment: bool = True
+    engagement: EngagementConfig,
+    server_ids: list[str],
+    *,
+    check_environment: bool = True,
+    env: Mapping[str, str] | None = None,
 ) -> EngagementConfig:
     raw = engagement.metadata.get("mcp_deployment")
     if raw is None:
@@ -124,6 +58,7 @@ def synchronize_deployment(
         spec = DeploymentSpec.model_validate_json(source_bytes)
         if encoded(spec.server_policy().model_dump(mode="json")) != policy_bytes:
             raise ValueError("deployment_policy_source_mismatch")
+        check_deployment_scope(spec, engagement.scope)
         public = deployment_metadata(spec, engagement.scope)
         for key, value in public.items():
             if key in engagement.metadata and engagement.metadata[key] != value:
@@ -132,8 +67,11 @@ def synchronize_deployment(
             raise ValueError("deployment_required_servers_missing")
         if check_environment:
             for role in spec.roles:
-                settings = MCPServerSettings.from_environment(role)
-                expected_kind = "web_api" if role == "web-http" else "recon"
+                settings = MCPServerSettings.from_environment(role, env=env)
+                specification = role_spec(role)
+                if specification is None:
+                    raise ValueError("deployment_role_not_registered")
+                expected_kind = specification.kind
                 if (
                     settings.transport != MCPTransportKind.STDIO
                     or not settings.command
@@ -141,13 +79,13 @@ def synchronize_deployment(
                     or Path(settings.command).parent.resolve()
                     != Path(sys.executable).parent.resolve()
                     or Path(settings.command).resolve() != Path(sys.executable).resolve()
-                    or settings.max_concurrency != 1
-                    or settings.max_output_bytes != 262144
+                    or settings.max_concurrency != specification.max_concurrency
+                    or settings.max_output_bytes != specification.max_output_bytes
                     or set(settings.process_environment)
                     != {
                         session.bearer_env
                         for session in spec.policy.sessions.values()
-                        if session.bearer_env and role == "web-http"
+                        if session.bearer_env and specification.forwards_session_credentials
                     }
                     or settings.kind.value != expected_kind
                     or settings.args
@@ -162,7 +100,7 @@ def synchronize_deployment(
                     or settings.risk_level.value
                     not in (
                         {"high", "critical"}
-                        if role == "web-http"
+                        if specification.forwards_session_credentials
                         else {"medium", "high", "critical"}
                     )
                 ):

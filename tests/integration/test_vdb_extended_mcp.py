@@ -10,6 +10,7 @@ from copy import deepcopy
 
 import pytest
 
+from redteam.capability.adapters.mcp.naming import build_canonical_mcp_tool_id
 from redteam.capability.bootstrap import open_mcp_tool_gateway
 from redteam.capability.vdb_manifest import VDB_EXTENDED_TOOLS, validate_vdb_descriptor
 from redteam.core.ids import ToolId
@@ -89,7 +90,9 @@ async def test_extended_real_stdio_discovery_and_nested_schema_drift(monkeypatch
     async with open_mcp_tool_gateway(["vdb-test"], health_refresh_enabled=False) as gateway:
         tools = gateway.list_tools_for_action("analysis", "static_analysis")
         assert {str(tool.tool_id) for tool in tools} == {
-            f"analysis.{name}" for name in VDB_EXTENDED_TOOLS if name != "vdb_status"
+            build_canonical_mcp_tool_id("analysis", "vdb-test", name)
+            for name in VDB_EXTENDED_TOOLS
+            if name != "vdb_status"
         }
         for name in VDB_EXTENDED_TOOLS:
             descriptor = gateway.get(ToolId(f"analysis.{name}"))

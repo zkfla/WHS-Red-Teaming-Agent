@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+from copy import deepcopy
 from datetime import datetime, timezone
 from typing import Any, Literal
 from urllib.parse import urlsplit
 
+from jsonschema import ValidationError as JSONSchemaValidationError
+from jsonschema import validate as validate_json_schema
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from redteam.attack_graph.identity import node_id_for_target, target_for_node
@@ -18,16 +21,10 @@ from redteam.core.contracts.graph import Hypothesis
 from redteam.core.contracts.mission import MissionCriterionResult, redact_secret_material
 from redteam.core.enums import EvidenceSourceType, MissionStatus, TaskStatus, ToolHealthStatus
 from redteam.core.ids import EventId, GraphNodeId, TaskId, new_id
+from redteam.core.provider_contracts import operation_target_binding
 from redteam.event_bus.publisher import EventPublisher
 from redteam.orchestration.agents.base import HypothesisDraft, PlanStep
 from redteam.orchestration.agents.providers import CandidateBatch, GraphCandidateContext
-from redteam.orchestration.analysis_activation import (
-    ANALYSIS_AGENT_ID,
-    STATIC_ANALYSIS_OPERATION,
-    analysis_activation,
-    analysis_role_visible,
-    analysis_tool_visible,
-)
 from redteam.orchestration.authentication import AuthenticationCheck
 from redteam.orchestration.candidates.catalog import bound_operations
 from redteam.orchestration.candidates.compiler import CandidateCompiler
@@ -49,8 +46,9 @@ from redteam.orchestration.diagnostics import (
     diagnostic_for_exception,
     known_location,
 )
+from redteam.orchestration.eligibility import EligibilityContext
 from redteam.orchestration.events import AGENT_CONTEXT_PREPARED, AGENT_TURN_DECIDED
-from redteam.orchestration.evidence_access import EvidenceReader
+from redteam.orchestration.evidence_access import EvidenceReader, raw_from_metadata
 from redteam.orchestration.execution_bridge import (
     EXECUTION_OPERATIONS,
     agent_tool_visible,
@@ -373,12 +371,35 @@ def _rejection_feedback(reason: str, field: str) -> str:
     ).feedback()
 
 
+def _admissible_step_operations(agents, step, catalog):
+    role = agents.get(step.agent_id) if step.agent_id else None
+    envelope = (
+        set(role.capabilities)
+        if role is not None
+        else {cap for definition in agents.definitions() for cap in definition.capabilities}
+    )
+    for key in step.allowed_operations:
+        capability, separator, operation = key.partition(".")
+        if not separator or capability not in envelope:
+            continue
+        try:
+            canonical_action_key(capability, operation)
+        except ActionNamingError:
+            continue
+        if catalog is not None and catalog.list_tools_for_action(capability, operation):
+            return True
+    return False
+
+
 class InvestigationEngine:
     def __init__(self, deps) -> None:
         self.deps = deps
         self.client = StructuredDecisionClient(
             deps.llm_client, max_attempts=deps.settings.decision_max_attempts
         )
+        from redteam.orchestration.planning import StructuredLLMPlanningProvider
+
+        self.planning_provider = deps.planning_provider or StructuredLLMPlanningProvider()
         self.last_event_id: EventId | None = None
         self._event_runtime: Any = None
         self.planning_diagnostic: DecisionDiagnostic | None = None
@@ -400,7 +421,7 @@ class InvestigationEngine:
         if runtime is not None and runtime.mission_id is not None:
             await self._review_token(runtime)
         if runtime is None:
-            result = await self.client.ask(stage=stage, payload=payload, **kwargs)
+            result = await self._propose(stage=stage, payload=payload, **kwargs)
             validate_written_criteria(result)
             return result
         publisher = EventPublisher(
@@ -423,7 +444,7 @@ class InvestigationEngine:
             causation_id=self.last_event_id,
         )
         self.last_event_id = prepared.event_id
-        result = await self.client.ask(stage=stage, payload=payload, **kwargs)
+        result = await self._propose(stage=stage, payload=payload, **kwargs)
         validate_written_criteria(result)
         public = {
             "stage": stage,
@@ -441,6 +462,52 @@ class InvestigationEngine:
         )
         self.last_event_id = decided.event_id
         return result
+
+    async def _propose(self, *, stage, payload, response_schema, system="", budget=None):
+        """Apply the same output boundary to builtin and delegated inference."""
+        from redteam.orchestration.planning import BudgetedInference, PlanningRequest
+
+        active_budget = budget or DecisionBudget(self.deps.settings.decision_max_attempts)
+        if active_budget.remaining == 0:
+            raise DecisionFailure(stage, "budget", active_budget.used, "decision budget exhausted")
+        before = active_budget.used
+        try:
+            result = await self.planning_provider.propose(
+                PlanningRequest(
+                    stage=stage,
+                    payload=deepcopy(payload),
+                    response_schema=deepcopy(response_schema),
+                    system=system,
+                    inference=BudgetedInference(self.client, active_budget),
+                )
+            )
+        finally:
+            # A delegated procedure must not leave semantic correction loops
+            # unbounded when it does not use StructuredDecisionClient itself.
+            if active_budget.used == before:
+                active_budget.consume()
+        try:
+            if not isinstance(result, dict):
+                raise ValueError("planning provider must return a proposal object")
+            json.dumps(result, allow_nan=False)
+            validate_json_schema(result, response_schema)
+        except JSONSchemaValidationError:
+            raise ValueError("planning proposal does not satisfy the writing schema") from None
+        validate_written_criteria(result)
+        return result
+
+    def _writing_schema(self, model):
+        catalog = self.deps.tool_catalog
+        capabilities = {
+            cap for definition in self.deps.agents.definitions() for cap in definition.capabilities
+        }
+        actions = {
+            (capability, operation)
+            for capability in capabilities
+            for tool in (catalog.list_by_capability(capability) if catalog else [])
+            for operation in bound_operations(catalog, tool, capability)
+        }
+        return writing_schema(model, actions=sorted(actions))
 
     async def record_completion_review(
         self, stage, path, runtime, review, evidence_ids, *, step_id=None
@@ -519,29 +586,44 @@ class InvestigationEngine:
             completed_task_paths = [item.model_dump(mode="json") for item in latest.values()]
         tools = {}
         execution_options = await execution_agent_options(
-            service, self.deps.engagement, runtime.run_id
+            service, self.deps.engagement, runtime.run_id, recipes=self.deps.execution_recipes
         )
         executable_options = []
         for option in execution_options:
             catalog = self.deps.tool_catalog
-            tool = catalog.get(option["tool_id"]) if catalog else None
+            try:
+                tool = catalog.get(option["tool_id"]) if catalog else None
+            except ValueError:
+                continue
             if (
                 catalog is not None
                 and tool is not None
-                and "command_run" in bound_operations(catalog, tool, "analysis")
+                and option["operation"] in bound_operations(catalog, tool, option["capability"])
                 and (not tool.target_types or "asset" in tool.target_types)
                 and CandidateCompiler._schema_rejection(option["arguments"], tool.input_schema)
                 is None
             ):
-                executable_options.append(option)
+                for agent in self.deps.agents.all():
+                    if option["capability"] in agent.capabilities:
+                        executable_options.append(
+                            {
+                                **option,
+                                "agent_id": str(agent.agent_id),
+                                "tool_id": str(tool.tool_id),
+                            }
+                        )
         execution_options = executable_options
-        analysis_status = await analysis_activation(service, self.deps.tool_catalog)
+        eligibility_context = EligibilityContext(
+            service, self.deps.tool_catalog, bool(execution_options)
+        )
+        role_decisions = {
+            str(agent.agent_id): await self.deps.eligibility.role(agent, eligibility_context)
+            for agent in self.deps.agents.all()
+        }
         visible_agents = [
             agent
             for agent in self.deps.agents.all()
-            if analysis_role_visible(
-                agent, analysis_status, execution_ready=bool(execution_options)
-            )
+            if role_decisions[str(agent.agent_id)].eligible
         ]
         if self.deps.tool_catalog is not None:
             capabilities = {cap for agent in self.deps.agents.all() for cap in agent.capabilities}
@@ -551,8 +633,12 @@ class InvestigationEngine:
                     if (
                         operations
                         and tool.health_status is not ToolHealthStatus.UNHEALTHY
-                        and analysis_tool_visible(tool, analysis_status)
-                        and agent_tool_visible(tool, execution_ready=bool(execution_options))
+                        and (await self.deps.eligibility.tool(tool, eligibility_context)).eligible
+                        and agent_tool_visible(
+                            tool,
+                            execution_ready=bool(execution_options),
+                            recipes=self.deps.execution_recipes,
+                        )
                     ):
                         tools[str(tool.tool_id)] = redact_secret_material(
                             tool.model_copy(update={"operations": operations}).model_dump(
@@ -572,9 +658,9 @@ class InvestigationEngine:
                         "status": item["status"],
                         "agent_id": "methodology-agent",
                         "target_node_id": f"asset:{library.asset_ref}",
-                        "capability": "analysis",
-                        "operation": "file_read",
-                        "tool_id": "analysis.read_file",
+                        "capability": library.selected_contract.capability,
+                        "operation": library.selected_contract.operation,
+                        "tool_id": str(library.reader_tool_id),
                         "arguments": {
                             "asset_ref": library.asset_ref,
                             "path": item["path"],
@@ -609,7 +695,9 @@ class InvestigationEngine:
         ]
         instructions = []
         if runtime.mission_id:
-            coordinator = coordinator_for(self.deps.task_graph_store, self.deps.path_store)
+            coordinator = self.deps.coordinator or coordinator_for(
+                self.deps.task_graph_store, self.deps.path_store
+            )
 
             async def canonical_instructions(change):
                 change.binding(
@@ -627,7 +715,13 @@ class InvestigationEngine:
         return {
             **reference_context,
             **({"execution_options": execution_options} if execution_options else {}),
-            "role_activation": {ANALYSIS_AGENT_ID: analysis_status.as_dict()},
+            "role_activation": {
+                str(agent.agent_id): {
+                    "active": role_decisions[str(agent.agent_id)].eligible,
+                    "reason": role_decisions[str(agent.agent_id)].reason,
+                }
+                for agent in self.deps.agents.all()
+            },
             "goal": mission.objective if mission else runtime.current_goal,
             "success_criteria": mission.success_criteria if mission else [runtime.current_goal],
             "mission": mission.model_dump(mode="json") if mission else None,
@@ -679,9 +773,9 @@ class InvestigationEngine:
         task_targets = task_context["task_target_node_ids"]
         mission_objective = task_context["mission_objective"]
         task_id = task_context["task_id"]
-        analysis_status = await analysis_activation(service, self.deps.tool_catalog)
+        eligibility_context = EligibilityContext(service, self.deps.tool_catalog)
         for agent in self.deps.agents.all():
-            if not analysis_role_visible(agent, analysis_status):
+            if not (await self.deps.eligibility.role(agent, eligibility_context)).eligible:
                 continue
             definition = self.deps.agents.definition(agent.agent_id)
             if definition is None:
@@ -900,7 +994,7 @@ class InvestigationEngine:
                 continue
             for tool in tools:
                 if tool.health_status is ToolHealthStatus.UNHEALTHY or not agent_tool_visible(
-                    tool, execution_ready=False
+                    tool, execution_ready=False, recipes=self.deps.execution_recipes
                 ):
                     continue
                 try:
@@ -967,7 +1061,9 @@ class InvestigationEngine:
         }
 
     async def _review_token(self, runtime):
-        coordinator = coordinator_for(self.deps.task_graph_store, self.deps.path_store)
+        coordinator = self.deps.coordinator or coordinator_for(
+            self.deps.task_graph_store, self.deps.path_store
+        )
 
         async def capture(change):
             if runtime.mission_id is not None:
@@ -984,7 +1080,9 @@ class InvestigationEngine:
             raise StateConflict("completion_path_snapshot_changed")
 
     async def _commit_review(self, runtime, token, mutation):
-        coordinator = coordinator_for(self.deps.task_graph_store, self.deps.path_store)
+        coordinator = self.deps.coordinator or coordinator_for(
+            self.deps.task_graph_store, self.deps.path_store
+        )
 
         async def commit(change: ChangeSet):
             if runtime.mission_id is not None:
@@ -1034,6 +1132,15 @@ class InvestigationEngine:
         # Progress and receipts are code-owned, never accepted from a model draft.
         for step in path.steps:
             step.status, step.outcome, step.evidence_ids = "pending", None, []
+            if step.required and not _admissible_step_operations(
+                self.deps.agents, step, self.deps.tool_catalog
+            ):
+                raise DecisionRuleError(
+                    "Required execution steps need an executable operation. Use the existing "
+                    "task or goal completion proposal to summarize completed prerequisites.",
+                    code="path_step_not_executable",
+                    location=known_location(("steps", "allowed_operations")),
+                )
         # Registration judges references against fresh internal material, never
         # the capped LLM display. A failed read admits nothing.
         assessment = await _collect_check_assessment(self.deps, runtime, service=service)
@@ -1086,7 +1193,7 @@ class InvestigationEngine:
                     ),
                     "reference_diagnostics": reference_notes,
                 },
-                response_schema=writing_schema(ReviewDecision),
+                response_schema=self._writing_schema(ReviewDecision),
                 system=SYSTEM,
                 budget=budget,
             )
@@ -1280,7 +1387,7 @@ class InvestigationEngine:
                         await self._ask(
                             stage="path_draft",
                             payload=context,
-                            response_schema=writing_schema(PathPlan),
+                            response_schema=self._writing_schema(PathPlan),
                             system=SYSTEM,
                             budget=drafting_budget,
                         )
@@ -1320,7 +1427,7 @@ class InvestigationEngine:
                     await self._ask(
                         stage="next_action",
                         payload={**context, "additional_evidence": extra},
-                        response_schema=writing_schema(TurnDecision),
+                        response_schema=self._writing_schema(TurnDecision),
                         system=SYSTEM,
                         budget=budget,
                     )
@@ -1584,7 +1691,7 @@ class InvestigationEngine:
         blocked = assessment_blocked(assessment)
         if blocked is not None:
             return [], [blocked]
-        analysis_status = await analysis_activation(service, self.deps.tool_catalog)
+        eligibility_context = EligibilityContext(service, self.deps.tool_catalog)
         steps = {step.step_id: step for step in path.steps}
         drafts = []
         errors = []
@@ -1613,18 +1720,21 @@ class InvestigationEngine:
                     raise DecisionRuleError("action role/capability is unavailable")
                 if step.agent_id and step.agent_id != intent.agent_id:
                     raise DecisionRuleError("action role is outside accepted step")
-                if (
-                    intent.capability == "analysis"
-                    and intent.operation == STATIC_ANALYSIS_OPERATION
-                    and (
-                        intent.target_node_id not in analysis_status.apk_asset_node_ids
-                        or str(intent.tool_id) not in analysis_status.compatible_tool_ids
+                tool_for_eligibility = (
+                    self.deps.tool_catalog.get(intent.tool_id) if self.deps.tool_catalog else None
+                )
+                if tool_for_eligibility is not None:
+                    eligible = await self.deps.eligibility.action(
+                        agent, tool_for_eligibility, intent.target_node_id, eligibility_context
                     )
-                ):
-                    raise DecisionRuleError("analysis_agent_inactive:" + analysis_status.reason)
+                    if not eligible.eligible:
+                        raise DecisionRuleError("role_or_tool_inactive:" + eligible.reason)
                 execution_node = None
                 execution_tool = None
-                if intent.operation in EXECUTION_OPERATIONS:
+                if intent.operation in EXECUTION_OPERATIONS or any(
+                    recipe.operation == intent.operation
+                    for recipe in self.deps.execution_recipes.values()
+                ):
                     execution_node = await service.get_node(GraphNodeId(intent.target_node_id))
                     if execution_node is None:
                         raise DecisionRuleError("execution Agent target disappeared")
@@ -1647,6 +1757,7 @@ class InvestigationEngine:
                                 capability=intent.capability,
                                 operation=intent.operation,
                                 arguments=intent.arguments,
+                                recipes=self.deps.execution_recipes,
                             )
                         }
                     )
@@ -1711,7 +1822,12 @@ class InvestigationEngine:
                 asset_bindings = asset_argument_bindings(self.deps, target)
                 aliases = target_aliases(self.deps, target)
                 argument_defaults = dict(asset_bindings)
-                if len(aliases) == 1 and intent.operation != "web_search":
+                if (
+                    len(aliases) == 1
+                    and operation_target_binding(
+                        intent.operation, self.deps.operation_bindings
+                    ).binds_target_arguments
+                ):
                     argument_defaults["target_ref"] = aliases
                 intent = intent.model_copy(
                     update={
@@ -1728,6 +1844,8 @@ class InvestigationEngine:
                     aliases,
                     operation=intent.operation,
                     asset_bindings=asset_bindings,
+                    operation_bindings=self.deps.operation_bindings,
+                    argument_bindings=self.deps.tool_catalog.get(intent.tool_id).argument_bindings,
                 )
                 tool = execution_tool or self.deps.tool_catalog.get(intent.tool_id)
                 if tool is None:
@@ -1803,7 +1921,7 @@ class InvestigationEngine:
                     else diagnostic_for_exception(exc, stage="action_compilation").feedback()
                 )
         compiled, rejected = CandidateCompiler(
-            self.deps.tool_catalog
+            self.deps.tool_catalog, operation_bindings=self.deps.operation_bindings
         ).compile_drafts_with_rejections(
             drafts,
         )
@@ -1839,6 +1957,8 @@ class InvestigationEngine:
                     asset_bindings=asset_argument_bindings(
                         self.deps, item.plan_step.resolved_target()
                     ),
+                    operation_bindings=self.deps.operation_bindings,
+                    argument_bindings=item.tool.argument_bindings,
                 )
                 _principal_check(
                     steps[item.plan_step.path_step_id],
@@ -1890,10 +2010,7 @@ class InvestigationEngine:
                 if record.run_id == runtime.run_id
                 and record.engagement_id == runtime.engagement_id
                 and record.metadata.get("candidate_key") == work.candidate_key
-                and (
-                    record.metadata.get("tool_result") is not None
-                    or record.metadata.get("raw_tool_result") is not None
-                )
+                and (raw_from_metadata(record.metadata) is not None)
             ]
             if not originals:
                 return True
@@ -1903,9 +2020,7 @@ class InvestigationEngine:
                     target_id = node_id_for_target(previous.resolved_target())
                 except (ValueError, TypeError):
                     return True
-                raw = original.metadata.get("tool_result")
-                if raw is None:
-                    raw = original.metadata.get("raw_tool_result")
+                raw = raw_from_metadata(original.metadata)
                 if (
                     target_id not in work.target_node_ids
                     or not isinstance(raw, dict)
@@ -2482,6 +2597,10 @@ def bind_asset_arguments(arguments: dict, tool, bindings: dict[str, set[str]]) -
         for field, refs in bindings.items():
             if field in properties and field not in values and len(refs) == 1:
                 values[field] = next(iter(refs))
+        for remote, field in (tool.argument_bindings if tool else {}).items():
+            refs = bindings.get(field, set())
+            if remote in properties and remote not in values and len(refs) == 1:
+                values[remote] = next(iter(refs))
     return values
 
 
@@ -2492,11 +2611,19 @@ def validate_argument_target(
     *,
     operation: str = "",
     asset_bindings: dict[str, set[str]] | None = None,
+    operation_bindings=None,
+    argument_bindings=None,
 ) -> None:
     """Check addresses and Asset references without granting execution permission."""
     location = known_location(("arguments",))
     try:
-        validate_network_arguments(target, arguments, operation=operation)
+        validate_network_arguments(
+            target,
+            arguments,
+            operation=operation,
+            bindings=operation_bindings,
+            argument_bindings=argument_bindings,
+        )
         identity = network_identity(target)
         allowed = (
             aliases
@@ -2521,6 +2648,12 @@ def validate_argument_target(
         for field, refs in bindings.items():
             if field in arguments and str(arguments[field]) not in refs:
                 raise ValueError("tool asset reference differs from proposal target binding")
+        for remote, field in (argument_bindings or {}).items():
+            if remote not in arguments:
+                continue
+            permitted = allowed if field == "target_ref" else bindings.get(field)
+            if permitted is not None and str(arguments[remote]) not in permitted:
+                raise ValueError("tool reference differs from proposal target binding")
     except (ValueError, TypeError):
         raise DecisionRuleError(
             "Tool arguments do not match the selected target binding.",
@@ -2532,7 +2665,7 @@ def validate_argument_target(
 async def operator_epoch(deps, runtime) -> str | None:
     if not runtime.mission_id:
         return None
-    coordinator = coordinator_for(deps.task_graph_store, deps.path_store)
+    coordinator = deps.coordinator or coordinator_for(deps.task_graph_store, deps.path_store)
 
     async def epoch(change):
         change.binding(str(runtime.run_id), str(runtime.mission_id), str(runtime.engagement_id))
@@ -2546,7 +2679,7 @@ async def claim_action_admission(deps, runtime, step, proposal) -> None:
     """Linearize a tool's start before releasing the lock for external I/O."""
     if runtime is None:
         return
-    coordinator = coordinator_for(deps.task_graph_store, deps.path_store)
+    coordinator = deps.coordinator or coordinator_for(deps.task_graph_store, deps.path_store)
     if runtime.mission_id is None:
 
         async def legacy(change):
@@ -2672,9 +2805,9 @@ async def validate_current_action(deps, runtime, step, proposal=None) -> list[st
         return ["action needs an accepted investigation path"]
     if runtime.mission_id:
         try:
-            await coordinator_for(deps.task_graph_store, deps.path_store).review_token(
-                str(runtime.run_id), str(runtime.mission_id)
-            )
+            await (
+                deps.coordinator or coordinator_for(deps.task_graph_store, deps.path_store)
+            ).review_token(str(runtime.run_id), str(runtime.mission_id))
         except (ValueError, PathError):
             return ["operator mutation or inactive mission blocks action admission"]
     path = await deps.path_store.get_active(str(runtime.run_id))
@@ -2727,16 +2860,18 @@ async def validate_current_action(deps, runtime, step, proposal=None) -> list[st
         ):
             problems.append("proposal differs from the accepted compiled action")
     try:
+        catalog = deps.tool_catalog
+        tool = catalog.get(step.tool_id) if catalog else None
         validate_argument_target(
             step.resolved_target(),
             step.arguments,
             target_aliases(deps, step.resolved_target()),
             operation=step.operation,
             asset_bindings=asset_argument_bindings(deps, step.resolved_target()),
+            operation_bindings=deps.operation_bindings,
+            argument_bindings=tool.argument_bindings if tool else None,
         )
         validate_principal_arguments(current, step.principal_ref, step.arguments, assessment)
-        catalog = deps.tool_catalog
-        tool = catalog.get(step.tool_id) if catalog else None
         if (
             tool is None
             or catalog is None
@@ -2749,17 +2884,18 @@ async def validate_current_action(deps, runtime, step, proposal=None) -> list[st
             schema_error = CandidateCompiler._schema_rejection(step.arguments, tool.input_schema)
             if schema_error:
                 problems.append(_rejection_feedback(*schema_error))
-            if step.capability == "analysis" and step.operation == STATIC_ANALYSIS_OPERATION:
-                activation = await analysis_activation(
-                    AttackGraphService(deps.graph_store), catalog
-                )
-                if (
-                    str(node_id_for_target(step.resolved_target()))
-                    not in activation.apk_asset_node_ids
-                    or str(step.tool_id) not in activation.compatible_tool_ids
-                ):
-                    problems.append("analysis Agent target or tool is no longer active")
-            if step.operation in EXECUTION_OPERATIONS:
+            agent = deps.agents.get(proposal.agent_id) if proposal is not None else None
+            eligible = await deps.eligibility.action(
+                agent,
+                tool,
+                node_id_for_target(step.resolved_target()),
+                EligibilityContext(AttackGraphService(deps.graph_store), catalog),
+            )
+            if not eligible.eligible:
+                problems.append("role_or_tool_inactive:" + eligible.reason)
+            if step.operation in EXECUTION_OPERATIONS or any(
+                recipe.operation == step.operation for recipe in deps.execution_recipes.values()
+            ):
                 node = await AttackGraphService(deps.graph_store).get_node(
                     node_id_for_target(step.resolved_target())
                 )
@@ -2774,6 +2910,7 @@ async def validate_current_action(deps, runtime, step, proposal=None) -> list[st
                         capability=step.capability,
                         operation=step.operation,
                         arguments=step.arguments,
+                        recipes=deps.execution_recipes,
                     )
                     != step.arguments
                 ):

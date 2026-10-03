@@ -14,6 +14,11 @@ never itself stores a tool.
 
 from __future__ import annotations
 
+from redteam.capability.adapters.mcp.naming import (
+    is_canonical_mcp_tool_id,
+    legacy_alias_for_tool_id,
+    parse_canonical_mcp_tool_id,
+)
 from redteam.core.contracts.tool import ToolDescriptor
 from redteam.core.enums import ToolHealthStatus
 from redteam.core.ids import ToolId
@@ -21,6 +26,16 @@ from redteam.core.ids import ToolId
 
 class ToolRegistrationConflictError(ValueError):
     """Raised instead of silently overwriting a ToolId owned by another tool."""
+
+
+class ToolAliasConflictError(ValueError):
+    """One legacy 2-part id is claimed by tools from several servers."""
+
+
+def legacy_alias_for_descriptor(descriptor: ToolDescriptor) -> str | None:
+    """Legacy alias for one registered descriptor, or None when unmappable."""
+
+    return legacy_alias_for_tool_id(descriptor.tool_id)
 
 
 class MCPToolRegistry:
@@ -39,6 +54,56 @@ class MCPToolRegistry:
         descriptor = self._tools.get(tool_id)
         return descriptor.model_copy(deep=True) if descriptor is not None else None
 
+    def resolve(self, tool_id: ToolId) -> ToolDescriptor | None:
+        """Canonical-first single resolver over the discovery snapshot."""
+
+        query = ToolId(str(tool_id))
+        if is_canonical_mcp_tool_id(query):
+            capability, server_id, remote_name = parse_canonical_mcp_tool_id(query)
+            matching = [
+                item
+                for item in self._tools.values()
+                if item.server_id == server_id
+                and item.tool_name == remote_name
+                and capability in item.capability_tags
+            ]
+            if len(matching) > 1:
+                raise ToolAliasConflictError("duplicate physical tool binding")
+            return matching[0].model_copy(deep=True) if matching else None
+        query_alias = legacy_alias_for_tool_id(query)
+        matches = (
+            [
+                descriptor
+                for descriptor in self._tools.values()
+                if legacy_alias_for_descriptor(descriptor) == query_alias
+            ]
+            if query_alias is not None
+            else []
+        )
+        exact = self._tools.get(query)
+        if exact is not None:
+            if is_canonical_mcp_tool_id(query):
+                return exact.model_copy(deep=True)
+            others = [item for item in matches if item.tool_id != query]
+            if others:
+                owners = sorted({str(item.server_id) for item in (exact, *others)})
+                raise ToolAliasConflictError(
+                    f"tool id {query} is claimed by several servers: "
+                    + ", ".join(owners)
+                    + "; use the canonical 3-part tool id"
+                )
+            return exact.model_copy(deep=True)
+        if len(matches) == 1:
+            return matches[0].model_copy(deep=True)
+        if len(matches) > 1:
+            owners = sorted({str(item.server_id) for item in matches})
+            raise ToolAliasConflictError(
+                f"legacy tool alias {query} matches tools from several servers: "
+                + ", ".join(owners)
+                + "; use the canonical 3-part tool id"
+            )
+        return None
+
     def list_by_capability(self, capability_tag: str) -> list[ToolDescriptor]:
         return [
             tool.model_copy(deep=True)
@@ -56,9 +121,7 @@ class MCPToolRegistry:
     def all(self) -> list[ToolDescriptor]:
         return [tool.model_copy(deep=True) for tool in self._sorted_tools()]
 
-    def replace_server_tools(
-        self, server_id: str, descriptors: list[ToolDescriptor]
-    ) -> None:
+    def replace_server_tools(self, server_id: str, descriptors: list[ToolDescriptor]) -> None:
         """Atomically replace the discovery snapshot for one MCP server."""
 
         replacements: dict[ToolId, ToolDescriptor] = {}

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from redteam.capability.adapters.mcp.naming import build_canonical_mcp_tool_id
 from redteam.capability.servers.page_text import PageTextConfig, PageTextResult
 from redteam.capability.servers.page_text_mcp import PROPOSED_OPERATION, REMOTE_TOOL_NAME
 from redteam.core.contracts.tool import ToolDescriptor
@@ -15,7 +16,11 @@ def validate_page_text_discovery(descriptor: ToolDescriptor, config: PageTextCon
     maximum = properties.get("max_chars", {}).get("anyOf", [])
     integer_options = [option for option in maximum if option.get("type") == "integer"]
     if (
-        str(descriptor.tool_id) != f"web.{REMOTE_TOOL_NAME}"
+        descriptor.tool_id
+        not in {
+            f"web.{REMOTE_TOOL_NAME}",
+            build_canonical_mcp_tool_id("web", descriptor.server_id, REMOTE_TOOL_NAME),
+        }
         or descriptor.tool_name != REMOTE_TOOL_NAME
         or descriptor.operations != [PROPOSED_OPERATION]
         or descriptor.target_types != ["url"]

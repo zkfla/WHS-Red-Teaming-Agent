@@ -38,6 +38,7 @@ from redteam.core.contracts.events import EventEnvelope, EventType
 from redteam.core.contracts.mission import MissionTask, OperatorIntent, Provenance
 from redteam.core.enums import GraphNodeType, MissionStatus, OperatorIntentType, TaskStatus
 from redteam.core.ids import EventId, MissionId, OperatorIntentId, RunId, TaskId, new_id
+from redteam.core.ports.event_bus import EventHistory
 from redteam.core.ports.task_graph import MissionTaskStore
 from redteam.event_bus.publisher import EventPublisher
 from redteam.orchestration.coordination import (
@@ -288,14 +289,18 @@ class OperatorIntentService:
         store: OperatorIntentStore,
         task_graph_store: MissionTaskStore,
         event_bus: object | None = None,
+        event_history: EventHistory | None = None,
         graph_store: object | None = None,
         work_store: object | None = None,
         path_store: object | None = None,
+        coordinator=None,
     ) -> None:
         self._store = store
         self._tasks = task_graph_store
         self._path_store = path_store
+        self._state_coordinator = coordinator
         self._event_bus = event_bus
+        self._injected_history = event_history
         # Optional, read-only evidence sources for ``explain``. Absent in a
         # bare/legacy deps bundle, in which case the projection degrades to
         # Task-only evidence rather than failing.
@@ -306,7 +311,9 @@ class OperatorIntentService:
     def _coordinator(self):
         # Custom injected stores remain usable for read-only projections;
         # operational calls require the supported atomic implementation.
-        return coordinator_for(self._tasks, self._path_store)
+        if self._state_coordinator is None:
+            self._state_coordinator = coordinator_for(self._tasks, self._path_store)
+        return self._state_coordinator
 
     @classmethod
     def from_deps(cls, deps: object) -> OperatorIntentService | None:
@@ -324,9 +331,11 @@ class OperatorIntentService:
             store=store,
             task_graph_store=task_graph_store,
             event_bus=getattr(deps, "event_bus", None),
+            event_history=getattr(deps, "event_history", None),
             graph_store=getattr(deps, "graph_store", None),
             work_store=getattr(deps, "work_store", None),
             path_store=getattr(deps, "path_store", None),
+            coordinator=getattr(deps, "coordinator", None),
         )
 
     # -- receive --------------------------------------------------------
@@ -591,7 +600,7 @@ class OperatorIntentService:
         envelope = publisher.build(
             event_type, payload, correlation_id=record.correlation_id, causation_id=causation_id
         )
-        mission = change.tasks._missions.get(record.intent.mission_id)
+        mission = change.tasks.peek_mission(record.intent.mission_id)
         if (
             mission is None
             or str(envelope.run_id) != str(record.run_id)
@@ -643,7 +652,7 @@ class OperatorIntentService:
             if record.run_id is None:
                 raise CoordinationError("run_binding_missing_or_mismatched")
             bound = change.binding(str(record.run_id), str(record.intent.mission_id))
-            mission = change.tasks._missions.get(record.intent.mission_id)
+            mission = change.tasks.peek_mission(record.intent.mission_id)
             if mission is None:
                 raise CoordinationError("mission_missing")
             saved = record.model_copy(deep=True)
@@ -755,12 +764,7 @@ class OperatorIntentService:
             staged_service._tasks = change.tasks
             # Compute against a detached store: validation failure cannot leak
             # task/preference changes into the transaction being committed.
-            original_missions = {
-                key: item.model_copy(deep=True) for key, item in change.tasks._missions.items()
-            }
-            original_tasks = {
-                key: item.model_copy(deep=True) for key, item in change.tasks._tasks.items()
-            }
+            staged_snapshot = change.tasks.snapshot_tasks()
             mutation: _MutationResult | None = None
             payload: dict[str, object]
             try:
@@ -769,7 +773,7 @@ class OperatorIntentService:
                     raise _ClosedMissionInstruction("instruction cannot change a closed run")
                 mutation = await staged_service._mutate(saved.intent, now=applied_at)
             except (TaskGraphError, ValueError) as exc:
-                change.tasks._missions, change.tasks._tasks = original_missions, original_tasks
+                change.tasks.restore_tasks(staged_snapshot)
                 saved.status, saved.outcome = IntentStatus.REJECTED, "rejected"
                 saved.reason = (
                     "mission_closed"
@@ -1018,6 +1022,8 @@ class OperatorIntentService:
             summary += f"; action {action_top.operation} ({detail})"
             if action_top.policy_reasons:
                 summary += f" policy: {action_top.policy_reasons[0]}"
+        if not self.event_history_available:
+            summary += "; event history unavailable"
         if records:
             latest = records[-1]
             summary += (
@@ -1253,18 +1259,11 @@ class OperatorIntentService:
     ) -> list[EventEnvelope]:
         if run_id is None:
             return []  # no safe way to bind a shared bus to this Mission
-        history = getattr(self._event_bus, "history", None)
-        if not callable(history):
+        source = self._history_source()
+        if source is None:
             return []
         try:
-            events = history(event_type=event_type)
-        except TypeError:
-            try:
-                events = [
-                    event for event in history() if getattr(event, "event_type", None) == event_type
-                ]
-            except Exception:  # noqa: BLE001
-                return []
+            events = source.history(event_type=event_type)
         except Exception:  # noqa: BLE001
             return []
         return [
@@ -1273,6 +1272,25 @@ class OperatorIntentService:
             if str(event.engagement_id) == str(engagement_id)
             and (run_id is None or event.run_id == run_id)
         ][-_MAX_EXPLAIN_ITEMS:]
+
+    def _history_source(self) -> EventHistory | None:
+        """Explicit event-history read contract (M29).
+
+        The optionally injected source wins; otherwise the live bus is
+        used only when it actually provides the history contract. A bus
+        without retention is not an error here -- callers report history
+        as unavailable instead of silently returning an empty list.
+        """
+        if self._injected_history is not None:
+            return self._injected_history
+        if isinstance(self._event_bus, EventHistory):
+            return self._event_bus
+        return None
+
+    @property
+    def event_history_available(self) -> bool:
+        """Whether an explicit event-history source is currently wired."""
+        return self._history_source() is not None
 
     # -- internals ------------------------------------------------------
 

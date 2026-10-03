@@ -62,10 +62,8 @@ class UnsupportedOperationError(ActionNamingError):
 
 
 def validate_capability_name(capability: str) -> None:
-    if capability not in CANONICAL_CAPABILITIES:
-        raise UnsupportedCapabilityError(
-            f"capability {capability!r} is not a canonical v1 namespace"
-        )
+    if not isinstance(capability, str) or not _LOWER_SNAKE_CASE.fullmatch(capability):
+        raise UnsupportedCapabilityError(f"capability {capability!r} must be lower_snake_case")
 
 
 def validate_operation_format(operation: str) -> None:
@@ -75,14 +73,15 @@ def validate_operation_format(operation: str) -> None:
 
 def validate_operation_name(operation: str) -> None:
     validate_operation_format(operation)
-    if operation not in CANONICAL_OPERATIONS:
-        raise UnsupportedOperationError(
-            f"operation {operation!r} is not in the canonical v1 contract"
-        )
 
 
 def canonical_action_key(capability: str, operation: str) -> str:
-    """Validate an intent, independently of any ToolId or ROE decision."""
+    """Validate intent syntax. Catalog bindings establish executable meaning.
+
+    The builtin vocabulary is documentation, not a closed permission list.
+    A syntactically valid name still needs a live registered tool and policy
+    admission; extensions cannot grant execution by inventing a name.
+    """
     validate_capability_name(capability)
     validate_operation_name(operation)
     return f"{capability}.{operation}"

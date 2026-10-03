@@ -56,7 +56,12 @@ class InMemoryEventBus:
         return sum(len(handlers) for handlers in self._handlers.values())
 
     def history(self, *, event_type: str | None = None) -> list[EventEnvelope]:
-        """Recently published events, oldest first. Debugging/tests only."""
+        """Recently published events, oldest first. Debugging/tests only.
+
+        This satisfies the EventHistory port (redteam.core.ports.event_bus)
+        structurally: same keyword-only filter, same oldest-first list.
+        The bounded ring buffer and debugging-only scope are unchanged.
+        """
         if event_type is None:
             return list(self._history)
         return [event for event in self._history if event.event_type == event_type]

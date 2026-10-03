@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass
 from functools import lru_cache
+from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
 
 from jsonschema import Draft202012Validator
@@ -27,6 +29,7 @@ from redteam.core.contracts.target import (
 )
 from redteam.core.contracts.tool import ToolDescriptor
 from redteam.core.enums import RiskLevel, ToolHealthStatus
+from redteam.core.provider_contracts import operation_target_binding
 from redteam.orchestration.action_naming import (
     canonical_action_key,
     tool_matches_action_namespace,
@@ -41,6 +44,9 @@ from redteam.orchestration.candidates.models import (
 from redteam.orchestration.candidates.scoring import score_candidate
 from redteam.orchestration.candidates.tool_selection import select_tool
 from redteam.orchestration.target_binding import network_identity, validate_network_arguments
+
+if TYPE_CHECKING:
+    from redteam.core.provider_contracts import OperationTargetBinding
 
 
 @lru_cache(maxsize=256)
@@ -66,8 +72,14 @@ class CandidateRejection:
 class CandidateCompiler:
     """Compiles hard-constrained candidates; it does not own domain meaning."""
 
-    def __init__(self, catalog: ToolCatalog | None = None) -> None:
+    def __init__(
+        self,
+        catalog: ToolCatalog | None = None,
+        *,
+        operation_bindings: Mapping[str, OperationTargetBinding] | None = None,
+    ) -> None:
         self._catalog = catalog
+        self._operation_bindings = operation_bindings
 
     async def compile_playbook(
         self,
@@ -142,7 +154,10 @@ class CandidateCompiler:
             return None, self._reject(draft, "target_mismatch")
         try:
             validate_network_arguments(
-                plan_step.resolved_target(), plan_step.arguments, operation=plan_step.operation
+                plan_step.resolved_target(),
+                plan_step.arguments,
+                operation=plan_step.operation,
+                bindings=self._operation_bindings,
             )
         except ValueError:
             return None, self._reject(draft, "unresolved_target", field="arguments")
@@ -151,11 +166,19 @@ class CandidateCompiler:
             reason, field = tool_rejection or ("no_compatible_tool", "")
             return None, self._reject(draft, reason, field=field)
         bound_arguments = self._bind_target_arguments(
-            plan_step.arguments, plan_step.resolved_target(), tool, plan_step.operation
+            plan_step.arguments,
+            plan_step.resolved_target(),
+            tool,
+            plan_step.operation,
+            bindings=self._operation_bindings,
         )
         try:
             validate_network_arguments(
-                plan_step.resolved_target(), bound_arguments, operation=plan_step.operation
+                plan_step.resolved_target(),
+                bound_arguments,
+                operation=plan_step.operation,
+                bindings=self._operation_bindings,
+                argument_bindings=getattr(tool, "argument_bindings", None),
             )
         except ValueError:
             return None, self._reject(draft, "unresolved_target", field="arguments")
@@ -238,7 +261,10 @@ class CandidateCompiler:
                 None,
             )
 
-        action_tools = self._catalog.list_tools_for_action(capability, operation)
+        try:
+            action_tools = self._catalog.list_tools_for_action(capability, operation)
+        except ValueError:
+            return None, ("no_compatible_tool", "")
         action_tools = [
             tool
             for tool in action_tools
@@ -248,7 +274,10 @@ class CandidateCompiler:
             # The common vocabulary was validated before resolution. An
             # absent namespace is therefore a missing binding, not an
             # unsupported common operation.
-            capability_tools = self._catalog.list_by_capability(capability)
+            try:
+                capability_tools = self._catalog.list_by_capability(capability)
+            except ValueError:
+                return None, ("no_compatible_tool", "")
             if not capability_tools:
                 return None, ("no_tool_for_operation", "operation")
             # list_tools_for_action hides unhealthy tools, so an
@@ -271,28 +300,41 @@ class CandidateCompiler:
             return None, ("tool_unhealthy", "")
         if not usable:
             return None, ("target_type_mismatch", "")
+        compatible = set(plan_step.compatible_tool_ids)
+        if compatible:
+            try:
+                compatible = {
+                    resolved.tool_id
+                    for tool_id in compatible
+                    if (resolved := self._catalog.get(tool_id)) is not None
+                }
+            except ValueError:
+                return None, ("no_compatible_tool", "")
         healthy = [
             tool
             for tool in usable
             if (
-                not plan_step.require_healthy_tool
-                or tool.health_status is ToolHealthStatus.HEALTHY
+                not plan_step.require_healthy_tool or tool.health_status is ToolHealthStatus.HEALTHY
             )
-            and (
-                not plan_step.compatible_tool_ids
-                or tool.tool_id in plan_step.compatible_tool_ids
-            )
+            and (not plan_step.compatible_tool_ids or tool.tool_id in compatible)
         ]
         if not healthy:
             return None, ("no_tool_for_operation", "operation")
-        if any(self._catalog.get(tool.tool_id) != tool for tool in healthy):
-            return None, ("tool_catalog_inconsistent", "")
+        try:
+            if any(self._catalog.get(tool.tool_id) != tool for tool in healthy):
+                return None, ("tool_catalog_inconsistent", "")
+        except ValueError:
+            return None, ("no_compatible_tool", "")
         schema_ok = [
             tool
             for tool in healthy
             if self._arguments_match_schema(
                 self._bind_target_arguments(
-                    plan_step.arguments, plan_step.resolved_target(), tool, plan_step.operation
+                    plan_step.arguments,
+                    plan_step.resolved_target(),
+                    tool,
+                    plan_step.operation,
+                    bindings=self._operation_bindings,
                 ),
                 tool.input_schema,
             )
@@ -303,6 +345,7 @@ class CandidateCompiler:
                 plan_step.resolved_target(),
                 healthy[0],
                 plan_step.operation,
+                bindings=self._operation_bindings,
             )
             reason, field = self._schema_rejection(bound_arguments, healthy[0].input_schema) or (
                 "schema_mismatch",
@@ -317,6 +360,7 @@ class CandidateCompiler:
         target: AnyTarget,
         tool: ToolDescriptor,
         operation: str,
+        bindings: Mapping[str, OperationTargetBinding] | None = None,
     ) -> dict:
         """Fill schema-declared identity fields from the selected target.
 
@@ -367,34 +411,59 @@ class CandidateCompiler:
         properties = tool.input_schema.get("properties", {})
         if not isinstance(properties, dict):
             return values
+        declared = tool.argument_bindings
         identity = network_identity(target)
         if identity is not None:
             target_values.update(
-                host=identity.host if "port" in properties else identity.authority,
+                host=identity.host
+                if ("port" in properties or "port" in declared.values())
+                else identity.authority,
                 target_ref=target.url if isinstance(target, UrlTarget) else identity.authority,
                 port=identity.port,
             )
-        if operation == "web_search":
+            target_values.update(domain=target_values["host"], hostname=target_values["host"])
+        if isinstance(target, UrlTarget):
+            target_values.update(base_url=target.url, target_url=target.url)
+        binding = operation_target_binding(operation, bindings)
+        binds_target_arguments = bool(getattr(binding, "binds_target_arguments", True))
+        binds_known_path = bool(getattr(binding, "binds_known_path_from_url", False))
+        if not binds_target_arguments:
             # The TargetRef belongs to the investigation. Search arguments
             # contain the query; a target URL is not a search input.
             target_values = {}
         for name, value in target_values.items():
             if name in properties and value is not None and name not in values:
                 values[name] = value
-        if (
-            operation == "endpoint_discovery"
-            and "path" in tool.required_arguments
-            and "path" not in values
-        ):
-            known_path = None
-            if isinstance(target, UrlTarget):
-                known_path = urlsplit(target.url).path or None
-            # EndpointTarget.path is already bound above via target_values.
-            # Bind here only when the target actually knows a path; otherwise
-            # leave it missing so _schema_rejection reports
-            # missing_required_argument for the LLM to refill.
-            if known_path:
-                values["path"] = known_path
+        for input_arg, shared in declared.items():
+            if input_arg in values or input_arg not in properties:
+                continue
+            known = target_values.get(str(shared))
+            if known is not None:
+                values[input_arg] = known
+        if binds_known_path:
+            wanted = [
+                key
+                for key in [
+                    "path",
+                    *[
+                        arg
+                        for arg, name in declared.items()
+                        if str(name) == "path" and arg != "path"
+                    ],
+                ]
+                if key in tool.required_arguments and key not in values
+            ]
+            if wanted:
+                known_path = None
+                if isinstance(target, UrlTarget):
+                    known_path = urlsplit(target.url).path or None
+                # EndpointTarget.path is already bound above via target_values.
+                # Bind here only when the target actually knows a path; otherwise
+                # leave it missing so _schema_rejection reports
+                # missing_required_argument for the LLM to refill.
+                if known_path:
+                    for key in wanted:
+                        values[key] = known_path
         return values
 
     @staticmethod

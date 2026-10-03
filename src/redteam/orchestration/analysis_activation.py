@@ -8,6 +8,12 @@ from typing import Any
 from redteam.attack_graph.predicates import facts_of
 from redteam.core.enums import GraphNodeType, ToolHealthStatus
 from redteam.core.ports.tool_catalog import ToolCatalog
+from redteam.orchestration.eligibility import (
+    ELIGIBILITY_PROVIDER_KIND,
+    EligibilityContext,
+    EligibilityDecision,
+    EligibilityScope,
+)
 
 ANALYSIS_AGENT_ID = "analysis-agent"
 STATIC_ANALYSIS_CAPABILITY = "analysis"
@@ -83,14 +89,70 @@ def analysis_role_visible(
     *,
     execution_ready: bool = False,
 ) -> bool:
-    return (
-        str(agent.agent_id) != ANALYSIS_AGENT_ID
-        or activation.active
-        or execution_ready
-    )
+    return str(agent.agent_id) != ANALYSIS_AGENT_ID or activation.active or execution_ready
 
 
 def analysis_tool_visible(tool: Any, activation: AnalysisActivation) -> bool:
     if STATIC_ANALYSIS_OPERATION not in tool.operations:
         return True
     return activation.active and str(tool.tool_id) in activation.compatible_tool_ids
+
+
+STATIC_ANALYSIS_ELIGIBILITY_ID = "eligibility:static-analysis"
+
+
+class StaticAnalysisEligibilityProvider:
+    """Built-in eligibility for the APK static-analysis role (M03).
+
+    Same meaning as the module functions below: an asset counts when it
+    carries a non-blank ``apk_ref`` fact; a tool counts when it is a
+    healthy ``analysis``/``static_analysis`` tool bound to ``asset``
+    targets. Delegates to those functions so the meaning cannot drift.
+    """
+
+    provider_id = STATIC_ANALYSIS_ELIGIBILITY_ID
+    applies_to = EligibilityScope(
+        capabilities=(STATIC_ANALYSIS_CAPABILITY,),
+        operations=(STATIC_ANALYSIS_OPERATION,),
+    )
+
+    async def asset_scope(self, context: EligibilityContext) -> tuple[str, ...]:
+        activation = await analysis_activation(context.graph, context.catalog)
+        return activation.apk_asset_node_ids
+
+    async def role_eligible(self, role_id: str, context: EligibilityContext) -> EligibilityDecision:
+        activation = await analysis_activation(context.graph, context.catalog)
+        if role_id != ANALYSIS_AGENT_ID:
+            return EligibilityDecision(True, "provider_does_not_constrain_role")
+        return EligibilityDecision(activation.active or context.execution_ready, activation.reason)
+
+    async def tool_eligible(self, tool: Any, context: EligibilityContext) -> EligibilityDecision:
+        activation = await analysis_activation(context.graph, context.catalog)
+        if STATIC_ANALYSIS_OPERATION not in tool.operations:
+            return EligibilityDecision(True, "provider_does_not_constrain_tool")
+        if activation.active and str(tool.tool_id) in activation.compatible_tool_ids:
+            return EligibilityDecision(True, "active")
+        return EligibilityDecision(False, activation.reason)
+
+
+def static_analysis_eligibility_contribution():
+    """This provider in the composition root's declaration shape."""
+    from redteam.core.extensions import Contribution
+
+    return Contribution(
+        kind=ELIGIBILITY_PROVIDER_KIND,
+        contribution_id=STATIC_ANALYSIS_ELIGIBILITY_ID,
+        version="1",
+        factory=lambda _ctx: StaticAnalysisEligibilityProvider(),
+    )
+
+
+def builtin_extension_declaration():
+    """Built-in eligibility as one declaration for the composition root."""
+    from redteam.core.extensions import ExtensionDeclaration
+
+    return ExtensionDeclaration(
+        extension_id="builtin.analysis-eligibility",
+        version="1",
+        contributions=(static_analysis_eligibility_contribution(),),
+    )

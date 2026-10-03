@@ -27,6 +27,15 @@ async def observe_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
         step=runtime.step_count + 1,
         max_per_type=deps.settings.observation_max_per_type,
         max_total=deps.settings.observation_max_total,
+        extra_content_keys=tuple(
+            sorted(
+                {
+                    key
+                    for keys in deps.result_mappers.all_meaningful_change_keys().values()
+                    for key in keys
+                }
+            )
+        ),
     )
     publisher = publisher_for(state, deps, "orchestration.observe")
     last_event_id = state.get("last_event_id")

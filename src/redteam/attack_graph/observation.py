@@ -86,14 +86,19 @@ VOLATILE_RELATION_KEYS = frozenset(
 )
 
 
-def _planning_content(node: GraphNode) -> str:
+def _planning_content(node: GraphNode, extra_keys: tuple[str, ...] = ()) -> str:
     """Digest of one node's planning-relevant content, stable across bookkeeping."""
 
     facts = facts_of(node.properties)
     attrs = attrs_of(node.properties)
+    keys = (
+        (set(PLANNING_CONTENT_KEYS) | set(extra_keys))
+        - VOLATILE_RELATION_KEYS
+        - {"attempted_operations"}
+    )
     payload = {
-        "facts": {key: facts[key] for key in PLANNING_CONTENT_KEYS if key in facts},
-        "attrs": {key: attrs[key] for key in PLANNING_CONTENT_KEYS if key in attrs},
+        "facts": {key: facts[key] for key in keys if key in facts},
+        "attrs": {key: attrs[key] for key in keys if key in attrs},
     }
     encoded = json.dumps(payload, sort_keys=True, default=str, separators=(",", ":")).encode()
     return hashlib.sha256(encoded).hexdigest()[:16]
@@ -163,9 +168,7 @@ class GraphObservation(BaseModel):
 
     def node_ids(self, node_type: GraphNodeType) -> list[GraphNodeId]:
         """Full ids for one type — the planner's handle back into the graph."""
-        return [
-            GraphNodeId(node_id) for node_id in self.node_ids_by_type.get(node_type.value, [])
-        ]
+        return [GraphNodeId(node_id) for node_id in self.node_ids_by_type.get(node_type.value, [])]
 
     def has_attempted(self, operation_key: str) -> bool:
         return operation_key in self.attempted
@@ -188,12 +191,11 @@ def build_observation(
     max_per_type: int = DEFAULT_MAX_PER_TYPE,
     max_total: int = DEFAULT_MAX_TOTAL,
     max_attempted: int = DEFAULT_MAX_ATTEMPTED,
+    extra_content_keys: tuple[str, ...] = (),
 ) -> GraphObservation:
     """Compress ``nodes`` into a planner-sized summary, most recently
     observed first."""
-    ordered = sorted(
-        nodes, key=lambda node: (-last_seen_step(node.properties), str(node.id))
-    )
+    ordered = sorted(nodes, key=lambda node: (-last_seen_step(node.properties), str(node.id)))
 
     nodes_by_type: dict[str, list[str]] = {}
     node_ids_by_type: dict[str, list[str]] = {}
@@ -220,7 +222,7 @@ def build_observation(
         # prompt-size decision and must not hide a content change from the
         # reactivation fingerprint.
         content.setdefault(node.type.value, []).append(
-            f"{node.id}={_planning_content(node)}"
+            f"{node.id}={_planning_content(node, extra_content_keys)}"
         )
         facts = facts_of(node.properties)
 
@@ -231,9 +233,7 @@ def build_observation(
         elif node.type == GraphNodeType.FINDING:
             verified = "verified" if facts.get("verified") else "unverified"
             severity = facts.get("severity", "info")
-            findings.append(
-                f"{facts.get('finding_id', node.id)} [{severity}/{verified}]"
-            )
+            findings.append(f"{facts.get('finding_id', node.id)} [{severity}/{verified}]")
 
     # Recency order, then capped: the oldest attempts are the least useful
     # lines to spend prompt budget on.
@@ -268,9 +268,7 @@ def build_observation(
         step=step,
         node_counts=node_counts,
         nodes_by_type={name: labels for name, labels in nodes_by_type.items() if labels},
-        node_ids_by_type={
-            name: ids for name, ids in node_ids_by_type.items() if ids
-        },
+        node_ids_by_type={name: ids for name, ids in node_ids_by_type.items() if ids},
         open_hypotheses=sorted(open_hypotheses),
         findings=sorted(findings),
         attempted=sorted(attempted),

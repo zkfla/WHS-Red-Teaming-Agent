@@ -111,12 +111,16 @@ def test_every_run_gets_fresh_objects() -> None:
 async def test_custom_profile_assembly_with_identity_overrides(tmp_path, override) -> None:
     from redteam.app.bootstrap import build_runtime_deps
     from redteam.llm.fake import FakeLLMClient
+    from redteam.orchestration.agents.providers import CandidateProviderRegistry
+    from redteam.orchestration.agents.registry import AgentRegistry
+    from redteam.orchestration.analysis import DeterministicAnalysisVerifier
+    from redteam.orchestration.observations import ResultMapperRegistry
     from tests.integration._engine_llm_harness import make_engagement
 
-    marker_verifier: Any = object()
-    marker_mappers: Any = object()
-    factory_agents = object()
-    factory_providers = object()
+    marker_verifier: Any = DeterministicAnalysisVerifier()
+    marker_mappers: Any = ResultMapperRegistry()
+    factory_agents = AgentRegistry()
+    factory_providers = CandidateProviderRegistry()
     custom_ids = {
         "agents": "custom-agents-v1",
         "candidate_providers": "custom-providers-v1",

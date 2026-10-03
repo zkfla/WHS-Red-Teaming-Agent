@@ -549,7 +549,13 @@ async def test_same_run_session_alias_requires_successful_raw_mapping(
         assert issues != []
 
 
-async def test_session_list_receipt_proves_exact_session_alias_for_completion() -> None:
+@pytest.mark.parametrize(
+    "tool_id", ["web.session_list", "web.bank.session_list", "web.bank.list_test_sessions"]
+)
+@pytest.mark.parametrize("row_target", ["bank-lab", "other-bank"])
+async def test_session_list_receipt_proves_exact_session_alias_for_completion(
+    tool_id: str, row_target: str
+) -> None:
     store, _llm, service, _deps = _harness(_success_llm())
     await service.upsert_node(
         GraphNodeType.HOST,
@@ -575,11 +581,11 @@ async def test_session_list_receipt_proves_exact_session_alias_for_completion() 
         target_node_id=TARGET_NODE,
         capability="web",
         operation="response_analysis",
-        tool_id="web.session_list",
+        tool_id=tool_id,
         output={
             "sessions": [
                 {
-                    "target_ref": "bank-lab",
+                    "target_ref": row_target,
                     "session_ref": "bob",
                     "principal_ref": "test-bob",
                 }
@@ -614,4 +620,4 @@ async def test_session_list_receipt_proves_exact_session_alias_for_completion() 
         run_id=str(RUN),
     )
 
-    assert issues == []
+    assert (issues == []) is (row_target == "bank-lab")

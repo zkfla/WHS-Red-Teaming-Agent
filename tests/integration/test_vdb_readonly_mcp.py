@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 
 from redteam.attack_graph.identity import node_id_for_target
+from redteam.capability.adapters.mcp.naming import build_canonical_mcp_tool_id
 from redteam.capability.bootstrap import open_mcp_tool_gateway
 from redteam.capability.vdb_manifest import VDB_TOOLS, validate_vdb_descriptor
 from redteam.control.risk import RegistryRiskResolver
@@ -93,8 +94,8 @@ async def test_stdio_catalog_missing_status_and_fail_closed(monkeypatch, tmp_pat
         assert {
             str(t.tool_id) for t in gateway.list_tools_for_action("analysis", "static_analysis")
         } == {
-            "analysis.search_by_cve",
-            "analysis.search_by_purl_like",
+            build_canonical_mcp_tool_id("analysis", "vdb-test", "search_by_cve"),
+            build_canonical_mcp_tool_id("analysis", "vdb-test", "search_by_purl_like"),
         }
         for name in VDB_TOOLS:
             descriptor = gateway.get(ToolId(f"analysis.{name}"))

@@ -87,7 +87,7 @@ def draft_to_engagement_config(draft: EngagementDraft) -> DraftConversionResult:
     if missing:
         raise DraftIncompleteError(missing)
 
-    from redteam.orchestration.action_naming import canonical_action_key
+    from redteam.core.action_semantics import canonical_action_key
 
     enforced_operations: list[str] = []
     unenforced_operations: list[str] = []

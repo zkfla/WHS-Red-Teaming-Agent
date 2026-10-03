@@ -15,6 +15,7 @@ from typing import Any
 from redteam.core.enums import EvidenceSourceType
 from redteam.orchestration.analysis import is_final_admission_receipt, session_list_pairs
 from redteam.orchestration.diagnostics import DecisionDiagnostic
+from redteam.orchestration.evidence_access import raw_from_metadata
 from redteam.orchestration.paths import (
     ALLOWED_CRITERION_KINDS,
     CompletionCriterion,
@@ -147,11 +148,11 @@ def _canonical_evidence_value(meta: dict[str, Any]) -> str:
 
 
 def _stored_raw_result(meta: dict[str, Any]) -> dict[str, Any] | None:
-    for key in ("tool_result", "raw_tool_result"):
-        raw = meta.get(key)
-        if isinstance(raw, dict):
-            return raw
-    return None
+    # Same key contract as the reader; the dict-only requirement stays.
+    # Both writers only ever store mappings under these keys, so the first
+    # preserved payload is the mapping completion reasons over.
+    raw = raw_from_metadata(meta)
+    return raw if isinstance(raw, dict) else None
 
 
 def _claimed_proposal_principal(stored_proposal: dict[str, Any]) -> str | None:
@@ -1126,7 +1127,12 @@ async def validate_completion(
                     candidate = stored_args.get("session_ref")
                     if isinstance(candidate, str) and candidate.strip():
                         bound_session = candidate.strip()
-                is_session_inventory = str(_field(record, "source_id", "")) == "web.session_list"
+                output = raw.get("output")
+                # The existing alias gate verifies full receipt and target
+                # linkage. Recognize its inventory shape, not one tool name.
+                is_session_inventory = isinstance(output, dict) and isinstance(
+                    output.get("sessions"), list
+                )
                 alias_verified: set[str] = set()
                 if bound_session is not None or is_session_inventory:
                     try:

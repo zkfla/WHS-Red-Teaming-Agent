@@ -22,9 +22,11 @@ request, and GET is fixed by this tool.
 
 from __future__ import annotations
 
+import ipaddress as _ipaddress
 from typing import Any
+from urllib.parse import urlsplit as _urlsplit
 
-from redteam.attack_graph.identity import endpoint_node_id, host_node_id, service_node_id
+from redteam.attack_graph.identity import endpoint_node_id, node_id_for_target, service_node_id
 from redteam.core.contracts.target import AnyTarget, HostTarget
 from redteam.core.contracts.tool import ToolResult
 from redteam.core.enums import GraphEdgeType, GraphNodeType
@@ -41,6 +43,44 @@ _APPLICATION_PROTOCOL = "http"
 _METHOD = "GET"
 
 
+def _split_authority(raw: str) -> tuple:
+    s = raw.strip()
+    if not s:
+        return None, None, False
+    has_scheme = "://" in s
+    if not has_scheme and "[" not in s and s.count(":") >= 2:
+        try:
+            ip = _ipaddress.ip_address(s)
+            return str(ip), None, True
+        except ValueError:
+            return None, None, False
+    target = s if has_scheme else "//" + s
+    try:
+        parts = _urlsplit(target)
+        host = parts.hostname
+        port = parts.port
+    except ValueError:
+        return None, None, False
+    if not host:
+        return None, None, False
+    if port is None and parts.netloc.endswith(":"):
+        return None, None, False
+    if port == 0:
+        return None, None, False
+    if port is not None and not 1 <= port <= 65535:
+        return None, None, False
+    return host, port, True
+
+
+def _hosts_equal(left: str, right: str) -> bool:
+    if left.lower() == right.lower():
+        return True
+    try:
+        return _ipaddress.ip_address(left) == _ipaddress.ip_address(right)
+    except ValueError:
+        return False
+
+
 def map_recon_http_probe(
     *, target: AnyTarget, arguments: dict[str, Any], result: ToolResult
 ) -> GraphMutation:
@@ -53,19 +93,43 @@ def map_recon_http_probe(
         # which also happens to carry a `.host` attribute) is left
         # alone rather than guessed at.
         return GraphMutation()
-    host = target.host
-    if not host:
+    raw_target_host = target.host
+    if not raw_target_host or not isinstance(raw_target_host, str):
         return GraphMutation()
-
+    thost, tport, tok = _split_authority(raw_target_host)
+    if not tok or thost is None:
+        return GraphMutation()
+    if tport is not None and not 1 <= tport <= 65535:
+        return GraphMutation()
     output = result.output
-    if "host" in output and output["host"] != host:
-        return GraphMutation()
+    oh_raw = output.get("host")
+    oport_from_host = None
+    if oh_raw is not None:
+        if not isinstance(oh_raw, str):
+            return GraphMutation()
+        ohost, oport_from_host, ook = _split_authority(oh_raw)
+        if not ook or ohost is None:
+            return GraphMutation()
+        if not _hosts_equal(thost, ohost):
+            return GraphMutation()
     port = output.get("port")
     if port is not None and (type(port) is not int or not 1 <= port <= 65535):
         return GraphMutation()
+    if oport_from_host is not None:
+        if port is not None and port != oport_from_host:
+            return GraphMutation()
+        if tport is not None and tport != oport_from_host:
+            return GraphMutation()
+        if port is None:
+            port = oport_from_host
     scheme = output.get("scheme")
     if scheme is not None and scheme not in {"http", "https"}:
         return GraphMutation()
+    if tport is not None and port is not None and tport != port:
+        return GraphMutation()
+    host = thost
+    if port is None:
+        port = tport
     status_code = output.get("status_code")
     target_ref = arguments.get("target_ref")
     output_target_ref = output.get("target_ref")
@@ -131,7 +195,7 @@ def map_recon_http_probe(
         endpoint_facts["scheme"] = scheme
         service_facts["scheme"] = scheme
 
-    host_id = host_node_id(host)
+    host_id = node_id_for_target(target)
     service_name = scheme or _APPLICATION_PROTOCOL
     if port is not None:
         service_name = f"{service_name}:{port}"

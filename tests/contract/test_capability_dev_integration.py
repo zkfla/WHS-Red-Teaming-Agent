@@ -116,14 +116,15 @@ def test_supported_operation_without_binding_is_not_an_unsupported_operation() -
     _, rejected = CandidateCompiler(MCPToolCatalog(registry)).compile_drafts_with_rejections(
         [unsupported]
     )
-    assert rejected[0].reason == "operation_unsupported"
+    assert rejected[0].reason == "no_tool_for_operation"
+    assert rejected[0].field == "operation"
 
 
 @pytest.mark.parametrize(
     ("capability", "operation", "code", "field"),
     [
-        ("secret_namespace", "http_request", "capability_unsupported", "capability"),
-        ("web", "secret_intent", "operation_unsupported", "operation"),
+        ("SECRET_NAMESPACE", "http_request", "capability_unsupported", "capability"),
+        ("web", "SECRET_INTENT", "operation_invalid_format", "operation"),
         ("web", "Bearer secret", "operation_invalid_format", "operation"),
     ],
 )
@@ -170,7 +171,8 @@ async def test_bootstrap_requires_explicit_or_declared_binding(
     adapter = _DiscoveredAdapter(tool.server_id, tool)
     monkeypatch.setattr("redteam.capability.bootstrap._create_transport", lambda settings: object())
     monkeypatch.setattr(
-        "redteam.capability.bootstrap._create_adapter", lambda settings, transport: adapter
+        "redteam.capability.bootstrap._create_adapter",
+        lambda settings, transport, bundles=None: adapter,
     )
     if expected is None:
         with pytest.raises(MCPConfigurationError, match="conflict"):

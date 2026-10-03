@@ -56,3 +56,28 @@ class FakeControlPlane:
 
     async def approval_outcome(self, approval_id: ApprovalId) -> PolicyDecision | None:
         return self._resolved.get(approval_id)
+
+    async def admit_invocation(
+        self,
+        proposal: ActionProposal,
+        decision: PolicyDecision,
+        context: ControlContext,
+        *,
+        receipt_id: str,
+    ) -> PolicyDecision:
+        """The fake has no accounting; preserve its configured current verdict."""
+        verdict = self.verdict_by_action_id.get(proposal.action_id, self.default_verdict)
+        if verdict is PolicyVerdict.REQUIRE_APPROVAL:
+            verdict = decision.verdict
+        return decision.model_copy(update={"verdict": verdict})
+
+    async def reserve_extra_tool_call(
+        self,
+        proposal: ActionProposal,
+        decision: PolicyDecision,
+        context: ControlContext,
+        *,
+        receipt_id: str,
+        attempt_index: int,
+    ) -> PolicyDecision:
+        return await self.admit_invocation(proposal, decision, context, receipt_id=receipt_id)
