@@ -65,8 +65,9 @@ async def test_real_streamable_http_discovery_and_invocation(
         await _wait_for_server(process, port)
         monkeypatch.setenv("REDTEAM_MCP_WEB_EXAMPLE_KIND", "web_api")
         monkeypatch.setenv(
-            "REDTEAM_MCP_WEB_EXAMPLE_ENDPOINT", f"http://127.0.0.1:{port}/mcp"
+            "REDTEAM_MCP_WEB_EXAMPLE_TOOL_OPERATIONS_JSON", '{"ping":["service_discovery"]}'
         )
+        monkeypatch.setenv("REDTEAM_MCP_WEB_EXAMPLE_ENDPOINT", f"http://127.0.0.1:{port}/mcp")
         config = load_app_config(repository_root / "examples/app.yaml")
         config.capability.mcp_servers = ["web-example"]
         _, deps = await build_application(config, llm=FakeLLMClient(), evidence_dir=tmp_path)
@@ -77,7 +78,7 @@ async def test_real_streamable_http_discovery_and_invocation(
                 action_id=ActionId("action_mcp_integration"),
                 run_id=run_id,
                 tool_id=ToolId("web.ping"),
-                operation="ping",
+                operation="service_discovery",
                 arguments={"message": "hello"},
                 execution_context=ExecutionContext(
                     engagement_id=EngagementId("eng_mcp_integration"),

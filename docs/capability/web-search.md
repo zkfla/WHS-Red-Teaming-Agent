@@ -4,9 +4,11 @@
 외부 전송 전 검사와 공급자 결과 정규화를 수행한다. 내부 Tavily 공급자는
 `redteam.capability.servers.tavily_search`에 있다. opt-in stdio MCP 서버와
 Capability Registry·Gateway 연결도 구현했다. 이 연결을 통한 실제 Tavily API
-호출은 아직 검증하지 않았으며, Control·Agent 연결도 완료되지 않았다.
+호출은 아직 검증하지 않았다. 2026-10-03 공통 통합에서 Agent 후보·Control 판단·
+Gateway 호출은 합성 공급자·scripted Agent로 연결 검증했다. 실제 LLM 자유 선택과
+운영 검색 품질·비용 검증은 별도이다.
 `WebSearchReader.search()`는 내부 메서드 이름이고, `web_search` operation은
-이번 Capability 연결의 **제안 바인딩**이지 확정된 canonical operation이 아니다.
+사용자 확인에 따라 공통 canonical operation에 반영했다. 실행 권한 부여는 아니다.
 
 ## 입력과 설정
 
@@ -167,9 +169,9 @@ stdout은 MCP 프로토콜 전용이고 SDK 진단 로그는 stderr로 보낸다
 등록 흐름은 `web_search_mcp.create_server()` → MCP discovery →
 `web_search_manifest.validate_web_search_discovery()` → `MCPToolRegistry` →
 기존 `WebAPIMCPAdapter` → `MCPToolGateway.invoke()`다. 원격 도구 이름은
-`web_search`, ToolId는 `web.web_search`다. 제안 operation도 `web_search`지만
+`web_search`, ToolId는 `web.web_search`다. canonical operation도 `web_search`지만
 operation은 의도, ToolId는 실행 도구를 가리키는 별개 식별자다. 이 바인딩은
-현재 Agent naming 검증이나 Control 승인 정책의 합의를 대신하지 않는다.
+Core의 공통 naming 검증과 같은 목록을 사용하며 Control의 실행 승인은 별도이다.
 검색어는 기존 TargetRef 종류로 표현하지 않았고 descriptor의 target_types는
 빈 목록이다. 공급자 API endpoint를 시험 대상 Target으로 간주하지 않는다.
 
@@ -252,7 +254,7 @@ Agent 실행 경로도 아니다.
 최초 결과의 원인을 확정하거나 Tavily의 전체 검색 품질을 보장하지 않는다.
 공급자는 관련성이 낮은 결과를 코드에서 임의 교체하지 않는다. 검색어 재구성,
 출처·언어·버전 선택과 관련성 평가는 후속 Agent 책임이다. 검색 품질 관찰 당시
-MCP 연결은 없었으며 현재도 Control·Agent 연결은 완료되지 않았다.
+MCP 연결은 없었다. 이후 공통 naming 및 합성 Agent·Control 연결 검증이 추가됐다.
 
 ### 테스트
 
@@ -279,8 +281,8 @@ URL·텍스트 검증, 설명의 줄 공백 정규화와 기존 제어문자 거
 Mock 기반 테스트 성공은 실제 외부 검색·인증·MCP 호출 검증이 아니다.
 
 운영에서 API 키 보관 방식, endpoint egress, 계정 요금·rate limit,
-개인정보 처리 조건을 검토해야 한다. Control·Agent 연결 전에는 제안
-operation·Target 표현·위험도와 공개 지식 조회 승인 정책을 PM/Core·Control·Agent와
-합의한다. 현재 Core Contract/Port를 바꾸지 않았으며, 검색 결과에 실행 권한을
+개인정보 처리 조건을 검토해야 한다. 공통 operation은 반영했지만 운영 Target 표현·
+위험도와 공개 지식 조회 승인 정책은 배포별로 Control·Agent와 확인한다.
+기존 Core 데이터 schema/Port는 유지했고 공통 naming helper를 추가했다. 검색 결과에 실행 권한을
 주지 않는다. Agent 실행에는 기존 ActionProposal → Control ALLOW →
 ToolInvocation → Gateway 경로가 필요하다.

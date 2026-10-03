@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import re
 from collections.abc import Collection, Mapping
 from copy import deepcopy
 from typing import Any
@@ -10,12 +9,15 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from redteam.capability.registry import MCPToolRegistry
+from redteam.core.contracts.action_naming import (
+    ActionNamingError,
+    canonical_action_key,
+    validate_capability_name,
+    validate_operation_name,
+)
 from redteam.core.contracts.tool import ToolDescriptor
 from redteam.core.enums import RiskLevel, ToolHealthStatus
 from redteam.core.ids import ToolId
-
-_CAPABILITY_NAMESPACE = re.compile(r"^[a-z][a-z0-9_]*$")
-_CANONICAL_OPERATION = re.compile(r"^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$")
 
 
 class ToolCandidateMetadata(BaseModel):
@@ -65,20 +67,16 @@ class MCPToolCatalog:
             else None
         )
         if self._operation_bindings is not None:
-            invalid_operations = sorted(
-                operation
-                for operations in self._operation_bindings.values()
-                for operation in operations
-                if not _CANONICAL_OPERATION.fullmatch(operation)
-            )
-            if invalid_operations:
-                names = ", ".join(invalid_operations)
-                raise ValueError(f"operation bindings contain noncanonical names: {names}")
+            for tool_id, operations in self._operation_bindings.items():
+                self._validate_bindings(tool_id, operations)
             registered = {descriptor.tool_id for descriptor in registry.all()}
             unknown = set(self._operation_bindings) - registered
             if unknown:
                 names = ", ".join(sorted(str(tool_id) for tool_id in unknown))
                 raise ValueError(f"operation bindings reference unknown tools: {names}")
+        else:
+            for descriptor in registry.all():
+                self._validate_bindings(descriptor.tool_id, descriptor.operations)
         registered = {descriptor.tool_id for descriptor in registry.all()}
         self._output_schemas = {
             ToolId(str(tool_id)): deepcopy(schema)
@@ -98,6 +96,18 @@ class MCPToolCatalog:
         if descriptor is None:
             return False
         return operation in self._operations_for(descriptor)
+
+    @staticmethod
+    def _validate_bindings(tool_id: ToolId, operations: Collection[str]) -> None:
+        namespace = str(tool_id).partition(".")[0]
+        for operation in operations:
+            try:
+                canonical_action_key(namespace, operation)
+            except ActionNamingError as exc:
+                raise ValueError(
+                    f"tool {tool_id!r} operation bindings contain noncanonical names: "
+                    f"{exc.reason}: {exc}"
+                ) from exc
 
     def get(self, tool_id: ToolId) -> ToolDescriptor | None:
         return self._registry.get(tool_id)
@@ -124,10 +134,7 @@ class MCPToolCatalog:
     ) -> list[ToolDescriptor]:
         """Return deterministic eligible candidates without selecting a tool."""
 
-        if not _CAPABILITY_NAMESPACE.fullmatch(capability):
-            raise ValueError("capability must be a lowercase namespace")
-        if not _CANONICAL_OPERATION.fullmatch(operation):
-            raise ValueError("operation must use lower_snake_case")
+        canonical_action_key(capability, operation)
 
         candidates: list[ToolDescriptor] = []
         for descriptor in self._registry.all():
@@ -136,10 +143,7 @@ class MCPToolCatalog:
                 continue
             if operation not in self._operations_for(descriptor):
                 continue
-            if (
-                not include_unhealthy
-                and descriptor.health_status == ToolHealthStatus.UNHEALTHY
-            ):
+            if not include_unhealthy and descriptor.health_status == ToolHealthStatus.UNHEALTHY:
                 continue
             candidates.append(descriptor)
         return candidates
@@ -153,20 +157,17 @@ class MCPToolCatalog:
     ) -> list[ToolCandidateMetadata]:
         """Project discovered tools into candidate records without choosing one."""
 
-        if capability is not None and not _CAPABILITY_NAMESPACE.fullmatch(capability):
-            raise ValueError("capability must be a lowercase namespace")
-        if operation is not None and not _CANONICAL_OPERATION.fullmatch(operation):
-            raise ValueError("operation must use lower_snake_case")
+        if capability is not None:
+            validate_capability_name(capability)
+        if operation is not None:
+            validate_operation_name(operation)
 
         candidates: list[ToolCandidateMetadata] = []
         for descriptor in self._registry.all():
             namespace, separator, _ = str(descriptor.tool_id).partition(".")
             if separator != "." or (capability is not None and namespace != capability):
                 continue
-            if (
-                not include_unhealthy
-                and descriptor.health_status == ToolHealthStatus.UNHEALTHY
-            ):
+            if not include_unhealthy and descriptor.health_status == ToolHealthStatus.UNHEALTHY:
                 continue
             required, optional = _argument_names(descriptor.input_schema)
             for bound_operation in sorted(self._operations_for(descriptor)):
@@ -181,9 +182,7 @@ class MCPToolCatalog:
                         optional_arguments=optional,
                         target_type=self._target_types.get(descriptor.tool_id),
                         risk_level=descriptor.risk_level,
-                        output_schema=deepcopy(
-                            self._output_schemas.get(descriptor.tool_id)
-                        ),
+                        output_schema=deepcopy(self._output_schemas.get(descriptor.tool_id)),
                         server_id=descriptor.server_id,
                         tool_name=descriptor.tool_name,
                         description=descriptor.description,
@@ -195,7 +194,7 @@ class MCPToolCatalog:
 
     def _operations_for(self, descriptor: ToolDescriptor) -> frozenset[str]:
         if self._operation_bindings is None:
-            return frozenset((*descriptor.operations, descriptor.tool_name))
+            return frozenset(descriptor.operations)
         return self._operation_bindings.get(descriptor.tool_id, frozenset())
 
 

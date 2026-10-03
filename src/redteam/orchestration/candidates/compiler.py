@@ -14,6 +14,7 @@ from jsonschema.exceptions import SchemaError, ValidationError
 from redteam.attack_graph.identity import node_id_for_target
 from redteam.attack_graph.observation import GraphObservation
 from redteam.attack_graph.view import AttackGraphView
+from redteam.core.contracts.action_naming import ActionNamingError
 from redteam.core.contracts.target import (
     AnyTarget,
     AssetTarget,
@@ -135,6 +136,9 @@ class CandidateCompiler:
             return None, self._reject(draft, "non_json_arguments")
         try:
             canonical_action_key(plan_step.capability, plan_step.operation)
+        except ActionNamingError as exc:
+            return None, self._reject(draft, exc.reason, field=exc.field)
+        try:
             execution_target_id = node_id_for_target(plan_step.resolved_target())
         except ValueError:
             return None, self._reject(draft, "unresolved_target")

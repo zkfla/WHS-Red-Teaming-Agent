@@ -151,7 +151,7 @@ async def _build_gateway(
             operations = (
                 settings.tool_operations[descriptor.tool_name]
                 if settings.tool_operations is not None
-                else (descriptor.tool_name,)
+                else ()  # Discovery alone is not an operator-approved intent binding.
             )
             # The operation binding is part of the Registry snapshot exposed
             # to Agent/Orchestration; it must not remain only in a private

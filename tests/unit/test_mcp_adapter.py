@@ -54,7 +54,7 @@ class FakeTransport:
 def _invocation(
     *,
     tool_id: ToolId | None = None,
-    operation: str = "ping",
+    operation: str = "service_discovery",
     timeout_seconds: float = 30.0,
 ) -> ToolInvocation:
     return ToolInvocation(
@@ -411,7 +411,9 @@ async def test_gateway_blocks_unhealthy_server_before_transport_call() -> None:
     adapter = WebAPIMCPAdapter(server_id="http", transport=backend)
     registry = MCPToolRegistry()
     registry.replace_server_tools("http", await adapter.discover_tools())
-    gateway = MCPToolGateway(registry, {adapter.server_id: adapter})
+    gateway = MCPToolGateway(
+        registry, {adapter.server_id: adapter}, {"web.http_request": ("http_request",)}
+    )
 
     result = await gateway.invoke(
         _invocation(tool_id=ToolId("web.http_request"), operation="http_request")
@@ -474,6 +476,7 @@ async def test_gateway_omits_output_above_server_byte_limit() -> None:
     gateway = MCPToolGateway(
         registry,
         {adapter.server_id: adapter},
+        {"web.http_request": ("http_request",)},
         server_output_limits={adapter.server_id: 128},
     )
 
@@ -519,6 +522,8 @@ async def test_dry_run_does_not_invoke_transport() -> None:
     registry.replace_server_tools("http", await adapter.discover_tools())
     invocation = _invocation(tool_id=ToolId("web.http_request"), operation="http_request")
     invocation.execution_context.dry_run = True
-    result = await MCPToolGateway(registry, {"http": adapter}).invoke(invocation)
+    result = await MCPToolGateway(
+        registry, {"http": adapter}, {"web.http_request": ("http_request",)}
+    ).invoke(invocation)
     assert result.success and result.output == {"dry_run": True, "executed": False}
     assert transport.calls == []

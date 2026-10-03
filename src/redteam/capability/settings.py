@@ -15,11 +15,15 @@ from enum import Enum
 from pathlib import Path
 from urllib.parse import urlparse
 
+from redteam.core.contracts.action_naming import (
+    ActionNamingError,
+    canonical_action_key,
+    validate_operation_format,
+)
 from redteam.core.enums import RiskLevel
 
 _SAFE_SERVER_ID = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 _SAFE_ENVIRONMENT_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-_CANONICAL_OPERATION = re.compile(r"^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$")
 _LOCAL_HOSTS = {"127.0.0.1", "::1", "localhost", "host.docker.internal"}
 
 
@@ -311,6 +315,17 @@ class MCPServerSettings:
                     f"{prefix}_ALLOWED_TOOLS_JSON"
                 )
 
+        namespace = "web" if kind == MCPServerKind.WEB_API else kind.value
+        for tool_name, operations in (tool_operations or {}).items():
+            for operation in operations:
+                try:
+                    canonical_action_key(namespace, operation)
+                except ActionNamingError as exc:
+                    raise MCPConfigurationError(
+                        f"MCP server {server_id!r} tool {tool_name!r}: "
+                        f"{exc.reason}: {exc}"
+                    ) from exc
+
         return cls(
             server_id=server_id,
             kind=kind,
@@ -463,17 +478,21 @@ def _load_tool_operations(prefix: str) -> dict[str, tuple[str, ...]] | None:
             )
         if (
             not isinstance(operations, list)
-            or any(
-                not isinstance(operation, str)
-                or not _CANONICAL_OPERATION.fullmatch(operation)
-                for operation in operations
-            )
+            or any(not isinstance(operation, str) for operation in operations)
             or len(operations) != len(set(operations))
         ):
             raise MCPConfigurationError(
                 "TOOL_OPERATIONS_JSON values must be arrays of unique lower_snake_case "
                 "operations"
             )
+        for operation in operations:
+            try:
+                validate_operation_format(operation)
+            except ActionNamingError as exc:
+                raise MCPConfigurationError(
+                    f"{prefix}_TOOL_OPERATIONS_JSON tool {tool_name!r}: "
+                    f"{exc.reason}: {exc}"
+                ) from exc
         bindings[tool_name] = tuple(operations)
     return bindings
 

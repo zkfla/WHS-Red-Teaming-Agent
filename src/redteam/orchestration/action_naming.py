@@ -1,4 +1,4 @@
-"""Canonical ActionProposal naming owned by the orchestration boundary.
+"""Compatibility exports for shared intent naming, plus ToolId helpers.
 
 An action key describes intent (``capability.operation``).  A ``ToolId``
 describes an execution mechanism and is deliberately validated separately.
@@ -6,54 +6,20 @@ describes an execution mechanism and is deliberately validated separately.
 
 from __future__ import annotations
 
-import re
-
+from redteam.core.contracts.action_naming import (
+    CANONICAL_CAPABILITIES,
+    CANONICAL_OPERATIONS,
+    canonical_action_key,
+)
 from redteam.core.ids import ToolId
 
-CANONICAL_CAPABILITIES = frozenset({"recon", "web", "mobile", "analysis"})
-CANONICAL_OPERATIONS = frozenset(
-    {
-        "port_scan",
-        "service_discovery",
-        "endpoint_discovery",
-        "http_request",
-        "auth_attempt",
-        "parameter_fuzz",
-        "file_upload",
-        "app_launch",
-        "device_shell",
-        "runtime_instrumentation",
-        "static_analysis",
-        "response_analysis",
-        # Approved workspace intents are product-independent. Keep them
-        # distinct so read permission never implicitly grants mutation.
-        "directory_list",
-        "file_read",
-        "file_search",
-        "file_write",
-        "file_edit",
-        # Execution Substrate proposal: pending cross-team contract agreement.
-        "command_run",
-        "command_job_start",
-        "command_job_status",
-        "command_job_cancel",
-    }
-)
-_LOWER_SNAKE_CASE = re.compile(r"^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$")
-
-
-def canonical_action_key(capability: str, operation: str) -> str:
-    """Validate and return the ROE key ``<capability>.<operation>``."""
-
-    if capability not in CANONICAL_CAPABILITIES:
-        raise ValueError(
-            f"capability {capability!r} is not a canonical v1 namespace"
-        )
-    if not _LOWER_SNAKE_CASE.fullmatch(operation):
-        raise ValueError(f"operation {operation!r} must be lower_snake_case")
-    if operation not in CANONICAL_OPERATIONS:
-        raise ValueError(f"operation {operation!r} is not in the canonical v1 contract")
-    return f"{capability}.{operation}"
+__all__ = [
+    "CANONICAL_CAPABILITIES",
+    "CANONICAL_OPERATIONS",
+    "canonical_action_key",
+    "tool_namespace",
+    "tool_matches_action_namespace",
+]
 
 
 def tool_namespace(tool_id: ToolId) -> str:
@@ -61,9 +27,7 @@ def tool_namespace(tool_id: ToolId) -> str:
 
     namespace, separator, remote_name = str(tool_id).partition(".")
     if not separator or not namespace or not remote_name or "." in remote_name:
-        raise ValueError(
-            f"tool_id {tool_id!r} must use <namespace>.<remote_tool_name>"
-        )
+        raise ValueError(f"tool_id {tool_id!r} must use <namespace>.<remote_tool_name>")
     return namespace
 
 

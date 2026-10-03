@@ -104,6 +104,22 @@ intends to do — not which tool implements it.
 
 Format: `lower_snake_case`.
 
+The shared executable vocabulary and typed validation errors live in
+`redteam.core.contracts.action_naming`. Capability registration and Agent
+planning use this one contract; `redteam.orchestration.action_naming` retains
+compatible exports. A well-formatted name outside this vocabulary is not a
+supported intent. This contract does not grant execution permission or define
+new capability/target schemas.
+
+Public-reference intents confirmed for capability integration on 2026-10-03:
+`web.page_read` (read bounded text from operator-allowlisted public HTTPS pages)
+and `web.web_search` (query public references through an operator-enabled search
+provider). ToolIds remain `web.fetch_page_text` and `web.web_search` respectively.
+Even when spellings coincide, a ToolId is not an implicit intent binding.
+Agent proposals still need an existing known TargetRef and Control ALLOW.
+Search's target is the approved planning context, not a query string or the
+provider endpoint; search results do not extend scope or authorize navigation.
+
 Examples: `port_scan`, `service_discovery`, `endpoint_discovery`,
 `http_request`, `auth_attempt`, `parameter_fuzz`, `file_upload`,
 `app_launch`, `device_shell`, `runtime_instrumentation`,

@@ -30,6 +30,7 @@ from typing import Any
 
 from redteam.attack_graph.identity import split_node_id, target_for_node
 from redteam.attack_graph.predicates import facts_of
+from redteam.core.contracts.action_naming import ActionNamingError, canonical_action_key
 from redteam.core.ids import AgentId, GraphNodeId, ToolId
 from redteam.core.ports.tool_catalog import ToolCatalog
 from redteam.orchestration.agents.base import AgentSpec, PlanStep
@@ -188,6 +189,15 @@ class LLMCandidateProvider:
             )
         capability = str(action.get("capability", ""))
         operation = str(action.get("operation", ""))
+        try:
+            canonical_action_key(capability, operation)
+        except ActionNamingError as exc:
+            return None, DraftDrop(
+                step_id=step_id,
+                target_node_id=node_id_str,
+                reason=exc.reason,
+                field=exc.field,
+            )
         tool_id = str(action.get("tool_id") or f"{capability}.{operation}")
         arguments = action.get("arguments")
         if not isinstance(arguments, dict):

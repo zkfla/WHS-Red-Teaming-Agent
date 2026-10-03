@@ -12,6 +12,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from redteam.attack_graph.identity import node_id_for_target, target_for_node
 from redteam.attack_graph.predicates import Confidence, Provenance, facts_of
+from redteam.core.contracts.action_naming import ActionNamingError, canonical_action_key
 from redteam.core.contracts.evidence import EvidenceRecord
 from redteam.core.contracts.graph import Hypothesis
 from redteam.core.contracts.mission import MissionCriterionResult, redact_secret_material
@@ -376,7 +377,8 @@ class InvestigationEngine:
             for capability in sorted(capabilities):
                 for tool in self.deps.tool_catalog.list_by_capability(capability):
                     if (
-                        tool.health_status is not ToolHealthStatus.UNHEALTHY
+                        tool.operations
+                        and tool.health_status is not ToolHealthStatus.UNHEALTHY
                         and analysis_tool_visible(tool, analysis_status)
                         and agent_tool_visible(
                             tool, execution_ready=bool(execution_options)
@@ -1046,6 +1048,7 @@ class InvestigationEngine:
                         raise ValueError("action references a missing hypothesis")
                     if hypothesis.metadata.get("target_node_id") != intent.target_node_id:
                         raise ValueError("existing hypothesis has no matching target binding")
+                canonical_action_key(intent.capability, intent.operation)
                 plan = PlanStep(
                     step_id=step.step_id,
                     path_id=path.path_id,
@@ -1083,7 +1086,9 @@ class InvestigationEngine:
                     )
                 )
             except (ValueError, TypeError, KeyError) as exc:
-                errors.append(str(exc))
+                errors.append(
+                    f"{exc.reason}: {exc.field}" if isinstance(exc, ActionNamingError) else str(exc)
+                )
         compiled, rejected = CandidateCompiler(
             self.deps.tool_catalog
         ).compile_drafts_with_rejections(

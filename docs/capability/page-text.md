@@ -9,8 +9,9 @@
 공개 HTTPS 페이지를 읽어 실제 텍스트와 출처를 반환하는 내부 기능이다.
 `servers/page_text_mcp.py`가 이 구현을 MCP `fetch_page_text` 도구로 노출한다.
 Capability profile이 명시적으로 설정되면 bootstrap이 discovery를 검증해
-Registry·Gateway에 등록한다. `page_read`는 이번 연결의 **제안 operation**이며
-최종 canonical operation이나 Control·Agent 정책으로 확정되지 않았다.
+Registry·Gateway에 등록한다. 2026-10-03 공통 통합에서 사용자 확인에 따라
+`page_read`를 공통 canonical operation에 반영했다. 등록·Agent 계획은 같은
+Core 작업 정의를 검사한다. 실행 승인·배포 ROE는 별도이다.
 
 JavaScript/브라우저 실행, 로그인, 파일 저장, PDF, 검색엔진, PoC 실행을 지원하지
 않는다. 본문은 불신 입력인 관측 자료다. 본문의 지시를 실행하거나 scope에 대상을
@@ -43,15 +44,15 @@ JavaScript/브라우저 실행, 로그인, 파일 저장, PDF, 검색엔진, PoC
 Capability 설정은 기존 `PageTextConfig`로 파일을 검사하고 SHA-256을 stdio
 인자에 고정한다. 자식 서버는 실행 직전 같은 파일을 다시 검사하며 바이트가
 변경됐으면 시작하지 않는다. 이 profile은 remote tool `fetch_page_text` 하나와
-제안 operation `page_read`를 정확히 바인딩한다. 호출 인자에는 URL과 선택적
+canonical operation `page_read`를 정확히 바인딩한다. 호출 인자에는 URL과 선택적
 `max_chars`만 있고 정책·상한·인증정보는 없다. discovery의 입력 한도와 출력
 schema를 실제 MCP 응답 및 같은 설정값에 대조한 뒤 등록한다. 이 도구만
 `url` 대상 메타데이터를 가지며 기존 `web_api` 기본 target 목록은 유지한다.
 
-`web` namespace, 제안 Action Key `web.page_read`, 실행 ToolId
-`web.fetch_page_text`는 서로 의미가 다르다. 현재 Orchestration naming 검증에는
-`page_read`가 없어 Agent 후보·Control 승인 경로는 연결되지 않았다. 공개 지식
-조회에 대한 최종 operation·Target·위험도·ROE는 담당 팀과 합의해야 한다.
+`web` namespace, Action Key `web.page_read`, 실행 ToolId
+`web.fetch_page_text`는 서로 의미가 다르다. 공통 naming 검증과 Agent 후보 생성·
+Control 판단·Gateway 호출은 합성 테스트로 연결 검증했다. 실제 LLM 자유 선택과
+운영 배포는 별도 검증이며, 운영자는 알려진 UrlTarget 및 승인 scope·ROE를 설정해야 한다.
 
 ## 입력·설정·출력
 
