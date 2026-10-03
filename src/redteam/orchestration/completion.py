@@ -1127,7 +1127,12 @@ async def validate_completion(
                     candidate = stored_args.get("session_ref")
                     if isinstance(candidate, str) and candidate.strip():
                         bound_session = candidate.strip()
-                is_session_inventory = str(_field(record, "source_id", "")) == "web.session_list"
+                output = raw.get("output")
+                # The existing alias gate verifies full receipt and target
+                # linkage. Recognize its inventory shape, not one tool name.
+                is_session_inventory = isinstance(output, dict) and isinstance(
+                    output.get("sessions"), list
+                )
                 alias_verified: set[str] = set()
                 if bound_session is not None or is_session_inventory:
                     try:
