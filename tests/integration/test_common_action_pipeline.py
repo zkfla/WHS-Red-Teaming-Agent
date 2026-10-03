@@ -4,8 +4,10 @@ Both upstream network providers are synthetic; no financial or paid API access.
 """
 
 import json
+import sys
 from dataclasses import replace
 from datetime import datetime, timezone
+from pathlib import Path
 
 import httpx
 import pytest
@@ -15,11 +17,13 @@ from redteam.attack_graph.identity import node_id_for_target
 from redteam.attack_graph.predicates import Confidence, Provenance
 from redteam.attack_graph.service import AttackGraphService
 from redteam.attack_graph.stores.memory import InMemoryAttackGraphStore
+from redteam.capability.adapters.mcp.transport import StdioMCPTransport
 from redteam.capability.bootstrap import build_mcp_tool_gateway
 from redteam.capability.servers.page_text import PageTextConfig
 from redteam.capability.servers.page_text_mcp import create_server as page_server
 from redteam.capability.servers.web_search import SearchConfig
 from redteam.capability.servers.web_search_mcp import create_server as search_server
+from redteam.capability.settings import MCPServerSettings
 from redteam.control.risk import RegistryRiskResolver
 from redteam.control.service import DefaultControlPlane
 from redteam.core.contracts.action import ActionProposal
@@ -56,6 +60,7 @@ from tests.integration.test_page_text_mcp import (
     _settings as page_settings,
 )
 from tests.integration.test_web_search_mcp import (
+    KEY,
     QUERY,
     FakeProvider,
 )
@@ -195,13 +200,44 @@ async def test_c_profile_agent_pipeline_keeps_control_gate(
         assert not page_calls and not search_provider.calls
 
 
-@pytest.mark.parametrize("operation", ["page_read", "web_search"])
+@pytest.mark.parametrize(
+    "operation,transport",
+    [
+        ("page_read", "in_process"),
+        ("web_search", "in_process"),
+        ("web_search", "stdio"),
+    ],
+)
 async def test_accepted_path_engine_executes_c_profile_and_records_evidence(
     operation,
+    transport,
     tmp_path,
     monkeypatch,
 ):
-    gateway, page_calls, search_provider = await configured_gateway(tmp_path, monkeypatch)
+    if transport == "stdio":
+        path = search_config(tmp_path / "search.json")
+        search_settings(monkeypatch, path)
+        settings = MCPServerSettings.from_environment("web-search")
+        fixture = Path(__file__).with_name("_web_search_stdio_fake.py")
+
+        def fake_stdio(_):
+            return StdioMCPTransport(
+                sys.executable,
+                args=(
+                    str(fixture),
+                    "--config",
+                    str(path),
+                    "--sha256",
+                    settings.web_search_config_sha256 or "",
+                ),
+                env={"TAVILY_API_KEY": KEY},
+            )
+
+        monkeypatch.setattr("redteam.capability.bootstrap._create_transport", fake_stdio)
+        gateway = await build_mcp_tool_gateway(["web-search"], health_refresh_enabled=False)
+        page_calls, search_provider = [], FakeProvider()
+    else:
+        gateway, page_calls, search_provider = await configured_gateway(tmp_path, monkeypatch)
     run_id = RunId("run-test")
     target = UrlTarget(url="https://docs.example/guide")
     node_id = str(node_id_for_target(target))
@@ -272,10 +308,17 @@ async def test_accepted_path_engine_executes_c_profile_and_records_evidence(
     )
     assert final.actions_executed == 1
     assert len(page_calls) == (1 if operation == "page_read" else 0)
-    assert len(search_provider.calls) == (1 if operation == "web_search" else 0)
+    if transport == "in_process":
+        assert len(search_provider.calls) == (1 if operation == "web_search" else 0)
     evidence = await deps.evidence_store.list_for_run(run_id)
     tool_evidence = [x for x in evidence if x.source_type is EvidenceSourceType.TOOL]
     assert len(tool_evidence) == 1 and tool_evidence[0].metadata["success"] is True
     prompt = json.loads(llm.calls[0]["messages"][0]["content"])
     shown = [tool for tool in prompt["tools"] if tool["tool_id"] == tool_id]
     assert len(shown) == 1 and shown[0]["operations"] == [operation]
+    # Search result URLs are reference material, not new approved targets.
+    if operation == "web_search":
+        returned = UrlTarget(url="https://docs.example.org/reference")
+        assert await graph.get_node(node_id_for_target(returned)) is None
+        assert configured.scope.allowed_hosts == ["docs.example"]
+    assert await graph.list_findings() == []

@@ -664,9 +664,9 @@ async def test_compiler_reports_when_no_tool_serves_the_action() -> None:
 
     _, rejections = compiler.compile_drafts_with_rejections(drafts)
 
-    # An empty catalog has nothing in the namespace at all, which is a
-    # missing capability rather than a missing operation binding.
-    assert rejections and rejections[0].reason == "capability_unavailable"
+    # The common operation is supported even when no server binds it.
+    assert rejections and rejections[0].reason == "no_tool_for_operation"
+    assert rejections[0].field == "operation"
 
 
 async def test_compiler_distinguishes_an_unbound_operation_from_a_missing_capability() -> None:

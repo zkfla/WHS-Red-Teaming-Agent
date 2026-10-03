@@ -340,6 +340,7 @@ async def test_recon_discovery_unlocks_a_real_web_http_request_call(with_browser
         tool_id=ToolId("recon.http_probe"),
         server_id="test",
         tool_name="http_probe",
+        operations=["service_discovery", "endpoint_discovery"],
         input_schema={
             "type": "object",
             "properties": {"target_ref": {"type": "string"}, "path": {"type": "string"}},
@@ -353,6 +354,7 @@ async def test_recon_discovery_unlocks_a_real_web_http_request_call(with_browser
         tool_id=ToolId("web.http_request"),
         server_id="test",
         tool_name="http_request",
+        operations=["http_request"],
         input_schema=_REAL_WEB_HTTP_REQUEST_SCHEMA,
         capability_tags=["web", "api"],
         risk_level=RiskLevel.LOW,
@@ -365,6 +367,7 @@ async def test_recon_discovery_unlocks_a_real_web_http_request_call(with_browser
                 tool_id=ToolId("web.browser_navigate"),
                 server_id="browser",
                 tool_name="browser_navigate",
+                operations=["http_request"],
                 capability_tags=["web"],
                 input_schema={
                     "type": "object",
@@ -419,6 +422,7 @@ async def test_browser_navigate_is_selected_when_http_mcp_is_unavailable() -> No
         tool_id=ToolId("recon.http_probe"),
         server_id="recon",
         tool_name="http_probe",
+        operations=["service_discovery", "endpoint_discovery"],
         input_schema={
             "type": "object",
             "properties": {"target_ref": {"type": "string"}, "path": {"type": "string"}},
@@ -432,6 +436,7 @@ async def test_browser_navigate_is_selected_when_http_mcp_is_unavailable() -> No
         tool_id=ToolId("web.browser_navigate"),
         server_id="browser",
         tool_name="browser_navigate",
+        operations=["http_request"],
         input_schema={
             "type": "object",
             "properties": {"url": {"type": "string"}},
@@ -463,6 +468,7 @@ async def test_proxy_history_is_selected_as_a_safe_observation_followup() -> Non
         tool_id=ToolId("recon.http_probe"),
         server_id="recon",
         tool_name="http_probe",
+        operations=["service_discovery", "endpoint_discovery"],
         input_schema={"type": "object", "properties": {"target_ref": {"type": "string"}}},
         capability_tags=["recon"],
         risk_level=RiskLevel.LOW,
@@ -472,6 +478,7 @@ async def test_proxy_history_is_selected_as_a_safe_observation_followup() -> Non
         tool_id=ToolId("web.proxy_list_flows"),
         server_id="proxy",
         tool_name="proxy_list_flows",
+        operations=["response_analysis"],
         input_schema={
             "type": "object",
             "properties": {
@@ -506,6 +513,7 @@ async def test_nuclei_passive_check_is_selected_after_http_observation() -> None
         tool_id=ToolId("recon.http_probe"),
         server_id="recon",
         tool_name="http_probe",
+        operations=["service_discovery", "endpoint_discovery"],
         input_schema={"type": "object", "properties": {"target_ref": {"type": "string"}}},
         capability_tags=["recon"],
         risk_level=RiskLevel.LOW,
@@ -515,6 +523,7 @@ async def test_nuclei_passive_check_is_selected_after_http_observation() -> None
         tool_id=ToolId("web.http_request"),
         server_id="http",
         tool_name="http_request",
+        operations=["http_request"],
         input_schema=_REAL_WEB_HTTP_REQUEST_SCHEMA,
         capability_tags=["web", "api"],
         risk_level=RiskLevel.LOW,
@@ -524,6 +533,7 @@ async def test_nuclei_passive_check_is_selected_after_http_observation() -> None
         tool_id=ToolId("web.nuclei_response_check"),
         server_id="nuclei",
         tool_name="nuclei_response_check",
+        operations=["response_analysis"],
         input_schema={
             "type": "object",
             "properties": {

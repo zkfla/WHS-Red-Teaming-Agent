@@ -40,6 +40,7 @@ from redteam.orchestration.candidates.models import (
 )
 from redteam.orchestration.candidates.scoring import score_candidate
 from redteam.orchestration.candidates.tool_selection import select_tool
+from redteam.orchestration.target_binding import network_identity, validate_network_arguments
 
 
 @lru_cache(maxsize=256)
@@ -76,9 +77,7 @@ class CandidateCompiler:
         *,
         step: int,
     ) -> list[ExecutableCandidate]:
-        drafts = await PlaybookCandidateProvider().propose(
-            spec, view, observation, step=step
-        )
+        drafts = await PlaybookCandidateProvider().propose(spec, view, observation, step=step)
         allowed = set(spec.capabilities) if spec.capabilities else None
         return self.compile_drafts(drafts, allowed_capabilities=allowed)
 
@@ -125,10 +124,7 @@ class CandidateCompiler:
         allowed_capabilities: set[str] | None,
     ) -> tuple[ExecutableCandidate | None, CandidateRejection | None]:
         plan_step = draft.plan_step
-        if (
-            allowed_capabilities is not None
-            and plan_step.capability not in allowed_capabilities
-        ):
+        if allowed_capabilities is not None and plan_step.capability not in allowed_capabilities:
             return None, self._reject(draft, "agent_capability_not_allowed")
         try:
             json.dumps(plan_step.arguments, sort_keys=True, allow_nan=False)
@@ -144,6 +140,12 @@ class CandidateCompiler:
             return None, self._reject(draft, "unresolved_target")
         if execution_target_id not in draft.target_node_ids:
             return None, self._reject(draft, "target_mismatch")
+        try:
+            validate_network_arguments(
+                plan_step.resolved_target(), plan_step.arguments, operation=plan_step.operation
+            )
+        except ValueError:
+            return None, self._reject(draft, "unresolved_target", field="arguments")
         tool, tool_rejection = self._resolve_tool_with_reason(plan_step)
         if tool is None:
             reason, field = tool_rejection or ("no_compatible_tool", "")
@@ -151,7 +153,15 @@ class CandidateCompiler:
         bound_arguments = self._bind_target_arguments(
             plan_step.arguments, plan_step.resolved_target(), tool, plan_step.operation
         )
-        bound_step = plan_step.model_copy(update={"arguments": bound_arguments})
+        try:
+            validate_network_arguments(
+                plan_step.resolved_target(), bound_arguments, operation=plan_step.operation
+            )
+        except ValueError:
+            return None, self._reject(draft, "unresolved_target", field="arguments")
+        bound_step = plan_step.model_copy(
+            update={"arguments": bound_arguments, "tool_id": tool.tool_id}
+        )
         bound_draft = draft.model_copy(update={"plan_step": bound_step})
         key = candidate_key(bound_draft)
         if key in seen:
@@ -229,25 +239,25 @@ class CandidateCompiler:
             )
 
         action_tools = self._catalog.list_tools_for_action(capability, operation)
+        action_tools = [
+            tool
+            for tool in action_tools
+            if capability in tool.capability_tags and operation in tool.operations
+        ]
         if not action_tools:
-            # "Nothing in this namespace at all" and "the namespace exists
-            # but no tool is bound to this intent" are different operator
-            # problems: the first is a missing capability, the second an
-            # missing intent binding. Collapsing them into one reason hides
-            # which configuration is actually missing.
+            # The common vocabulary was validated before resolution. An
+            # absent namespace is therefore a missing binding, not an
+            # unsupported common operation.
             capability_tools = self._catalog.list_by_capability(capability)
             if not capability_tools:
-                return None, ("capability_unavailable", "")
+                return None, ("no_tool_for_operation", "operation")
             # list_tools_for_action hides unhealthy tools, so an
             # all-unhealthy namespace presents as "nothing serves this
             # action". Reporting that as a missing binding would send
             # the operator looking for a binding that is already there.
-            operation_tools = [
-                tool for tool in capability_tools if operation in tool.operations
-            ]
+            operation_tools = [tool for tool in capability_tools if operation in tool.operations]
             if operation_tools and all(
-                tool.health_status is ToolHealthStatus.UNHEALTHY
-                for tool in operation_tools
+                tool.health_status is ToolHealthStatus.UNHEALTHY for tool in operation_tools
             ):
                 return None, ("tool_unhealthy", "")
             return None, ("no_tool_for_operation", "operation")
@@ -255,11 +265,10 @@ class CandidateCompiler:
             tool
             for tool in action_tools
             if tool.health_status is not ToolHealthStatus.UNHEALTHY
-            and (
-                not tool.target_types
-                or plan_step.resolved_target().kind in tool.target_types
-            )
+            and (not tool.target_types or plan_step.resolved_target().kind in tool.target_types)
         ]
+        if all(tool.health_status is ToolHealthStatus.UNHEALTHY for tool in action_tools):
+            return None, ("tool_unhealthy", "")
         if not usable:
             return None, ("target_type_mismatch", "")
         healthy = [
@@ -268,7 +277,9 @@ class CandidateCompiler:
             if not plan_step.compatible_tool_ids or tool.tool_id in plan_step.compatible_tool_ids
         ]
         if not healthy:
-            return None, ("no_healthy_compatible_tool", "")
+            return None, ("no_tool_for_operation", "operation")
+        if any(self._catalog.get(tool.tool_id) != tool for tool in healthy):
+            return None, ("tool_catalog_inconsistent", "")
         schema_ok = [
             tool
             for tool in healthy
@@ -286,9 +297,10 @@ class CandidateCompiler:
                 healthy[0],
                 plan_step.operation,
             )
-            reason, field = self._schema_rejection(
-                bound_arguments, healthy[0].input_schema
-            ) or ("schema_mismatch", "")
+            reason, field = self._schema_rejection(bound_arguments, healthy[0].input_schema) or (
+                "schema_mismatch",
+                "",
+            )
             return None, (reason, field)
         return select_tool(schema_ok), None
 
@@ -348,6 +360,17 @@ class CandidateCompiler:
         properties = tool.input_schema.get("properties", {})
         if not isinstance(properties, dict):
             return values
+        identity = network_identity(target)
+        if identity is not None:
+            target_values.update(
+                host=identity.host if "port" in properties else identity.authority,
+                target_ref=target.url if isinstance(target, UrlTarget) else identity.authority,
+                port=identity.port,
+            )
+        if operation == "web_search":
+            # The TargetRef belongs to the investigation. Search arguments
+            # contain the query; a target URL is not a search input.
+            target_values = {}
         for name, value in target_values.items():
             if name in properties and value is not None and name not in values:
                 values[name] = value

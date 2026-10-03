@@ -93,6 +93,7 @@ def descriptor(risk: RiskLevel) -> ToolDescriptor:
         server_id="srv",
         tool_name="probe",
         capability_tags=["recon"],
+        operations=["service_discovery", "auth_attempt"],
         risk_level=risk,
     )
 
