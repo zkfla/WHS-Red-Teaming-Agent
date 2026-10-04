@@ -44,7 +44,7 @@ from redteam.core.ids import new_id
 from redteam.orchestration.completion import check_record_linkage, validate_completion, verify_stored_origin
 from redteam.orchestration.coordination import content_hash
 from redteam.orchestration.evidence_access import raw_from_metadata
-from redteam.orchestration.work.models import ACTIVE_STATUSES
+from redteam.orchestration.work.models import WorkStatus
 from redteam.orchestration.result_claims import (
     RESULT_REVIEW_INSTRUCTION, ResultClaim, ResultReview, check_result_review,
 )
@@ -426,7 +426,11 @@ async def _pending_execution_errors(engine: Any, runtime: Any) -> list[str]:
         history = await engine.deps.work_store.list_items(run_id=runtime.run_id)
     except Exception:
         return ["execution history lookup failed; treating as unproven"]
-    if any(getattr(work, "status", None) in ACTIVE_STATUSES for work in (history or [])):
+    if any(
+        work.status in {WorkStatus.LEASED, WorkStatus.RUNNING}
+        or (work.status is WorkStatus.PENDING and work.job_id is not None)
+        for work in (history or [])
+    ):
         return ["unfinished execution records remain"]
     if getattr(runtime, "pending_approval_id", None):
         return ["an approval is still pending"]
