@@ -50,6 +50,13 @@ class WorkerOutcome(BaseModel):
     agent_id: str = ""
     executed: bool = False
     retry_attempts: int = 0
+    # Actual analysis-model requests made for this action, including retries.
+    # Aggregation adds these deltas once to the owning delegation; the
+    # earlier planning requests have already been accounted for there.
+    model_decision_attempts: int = Field(default=0, ge=0)
+    # Unknown request usage is None and stays sticky in delegation totals.
+    # Observation skips, code-only reviews and guards before a call cost 0.
+    model_tokens_used: int | None = Field(default=0, ge=0)
     succeeded: bool | None = None
     policy_verdict: PolicyVerdict | None = None
     policy_severity: str | None = None

@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from datetime import datetime, timezone
-from typing import Any, Literal, Protocol
+from typing import Any, Literal, Protocol, runtime_checkable
 
 from pydantic import BaseModel, Field
 
@@ -17,7 +18,7 @@ from redteam.core.enums import EvidenceSourceType, Verdict
 from redteam.core.ids import EvidenceId, GraphNodeId, new_id
 from redteam.core.ports.evidence_store import EvidenceStore
 from redteam.orchestration.action_naming import tool_matches_action_namespace
-from redteam.orchestration.cognition import StructuredDecisionClient
+from redteam.orchestration.cognition import DecisionBudget, StructuredDecisionClient
 from redteam.orchestration.evidence_access import raw_from_metadata
 from redteam.orchestration.expectations import Expectation, ExpectationOutcome, verdict_for
 
@@ -48,6 +49,23 @@ class AnalysisVerifier(Protocol):
     async def verify(self, request: VerificationRequest) -> VerificationAssessment: ...
 
 
+@runtime_checkable
+class BudgetedAnalysisVerifier(AnalysisVerifier, Protocol):
+    """Optional runtime-only seam; budgets and guards never enter model input.
+
+    Every model request, including retries, must use the supplied budget
+    and before_call guard. The caller owns the request-local usage counters.
+    """
+
+    async def verify_with_budget(
+        self,
+        request: VerificationRequest,
+        *,
+        budget: DecisionBudget,
+        before_call: Callable[[], Any] | None = None,
+    ) -> VerificationAssessment: ...
+
+
 class DeterministicAnalysisVerifier:
     """Default reviewer: reproducible and independent from the executor."""
 
@@ -69,6 +87,16 @@ class DeterministicAnalysisVerifier:
             outcome=outcome,
             claim_supported=claim_flag,
         )
+
+    async def verify_with_budget(
+        self,
+        request: VerificationRequest,
+        *,
+        budget: DecisionBudget,
+        before_call: Callable[[], Any] | None = None,
+    ) -> VerificationAssessment:
+        """Code-only review consumes no model requests or tokens."""
+        return await self.verify(request)
 
 
 _ANALYSIS_SYSTEM = (
@@ -434,7 +462,31 @@ class StructuredLLMAnalysisVerifier:
         self._graph = graph_service
         self._decider = StructuredDecisionClient(llm)
 
-    async def verify(self, request: VerificationRequest) -> VerificationAssessment:
+    async def verify(
+        self,
+        request: VerificationRequest,
+        *,
+        budget: DecisionBudget | None = None,
+        before_call: Callable[[], Any] | None = None,
+    ) -> VerificationAssessment:
+        return await self._verify(request, budget=budget, before_call=before_call)
+
+    async def verify_with_budget(
+        self,
+        request: VerificationRequest,
+        *,
+        budget: DecisionBudget,
+        before_call: Callable[[], Any] | None = None,
+    ) -> VerificationAssessment:
+        return await self.verify(request, budget=budget, before_call=before_call)
+
+    async def _verify(
+        self,
+        request: VerificationRequest,
+        *,
+        budget: DecisionBudget | None = None,
+        before_call: Callable[[], Any] | None = None,
+    ) -> VerificationAssessment:
         if self._llm is None:
             assessment = self._unknown(
                 request,
@@ -447,6 +499,8 @@ class StructuredLLMAnalysisVerifier:
                     payload=self._meaning_payload(request),
                     response_schema=self._meaning_schema(),
                     system=_ANALYSIS_SYSTEM,
+                    budget=budget,
+                    before_call=before_call,
                 )
             except Exception as exc:  # noqa: BLE001 - model failure is UNKNOWN, explicitly
                 kind = getattr(exc, "kind", None)

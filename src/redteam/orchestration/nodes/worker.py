@@ -13,7 +13,7 @@ from redteam.orchestration.nodes._support import graph_service
 from redteam.orchestration.nodes.execute import execute_node
 from redteam.orchestration.nodes.policy import denial_severity, policy_node
 from redteam.orchestration.nodes.update import update_node
-from redteam.orchestration.nodes.verify import verify_node
+from redteam.orchestration.nodes.verify import verification_budget, verify_node
 from redteam.orchestration.state import GraphState
 from redteam.orchestration.work.models import WorkStatus
 
@@ -62,6 +62,9 @@ async def worker_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
         "worker_outcomes": {},
         "last_event_id": item.last_event_id,
     }
+    # Private to this actual action, including all analysis retries. Keep it
+    # outside checkpoint/model data and retain it if a later node fails.
+    model_budget = verification_budget(local, deps=deps)
 
     heartbeat = await deps.work_store.heartbeat(
         item.work_id,
@@ -113,7 +116,7 @@ async def worker_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
 
         if local["runtime"].phase is AgentPhase.EXECUTE:
             local = await execute_node(local, deps=deps)
-            local = await verify_node(local, deps=deps)
+            local = await verify_node(local, deps=deps, budget=model_budget)
         local = await update_node(local, deps=deps)
 
         result = local.get("tool_result")
@@ -130,6 +133,10 @@ async def worker_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             ),
             executed=result is not None,
             retry_attempts=local["runtime"].retry_count if result is not None else 0,
+            model_decision_attempts=model_budget.used,
+            model_tokens_used=(
+                model_budget.tokens_used if model_budget.tokens_fully_known else None
+            ),
             succeeded=result.success if result is not None else None,
             policy_verdict=decision.verdict if decision is not None else None,
             policy_severity=denial_severity(decision) if decision is not None else None,
@@ -178,6 +185,10 @@ async def worker_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             ),
             executed=attempted,
             retry_attempts=local["runtime"].retry_count if attempted else 0,
+            model_decision_attempts=model_budget.used,
+            model_tokens_used=(
+                model_budget.tokens_used if model_budget.tokens_fully_known else None
+            ),
             succeeded=result.success if result is not None else False if attempted else None,
             policy_verdict=decision.verdict if decision is not None else None,
             policy_severity=denial_severity(decision) if decision is not None else None,
