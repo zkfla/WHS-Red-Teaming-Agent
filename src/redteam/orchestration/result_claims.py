@@ -8,6 +8,16 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from redteam.orchestration.completion import validate_result_claims
 from redteam.orchestration.paths import CompletionCriterion
+from redteam.orchestration.coordination import content_hash
+
+
+def mission_result_purpose(mission: Any) -> str:
+    """Bind stored meaning to current goal conditions, independent of revisions."""
+    return content_hash({
+        "objective": mission.objective,
+        "success_criteria": list(mission.success_criteria),
+        "operator_constraints": mission.operator_constraints,
+    })
 
 
 class ResultClaim(BaseModel):

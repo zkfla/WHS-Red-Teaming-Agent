@@ -46,7 +46,7 @@ from redteam.orchestration.coordination import content_hash
 from redteam.orchestration.evidence_access import raw_from_metadata
 from redteam.orchestration.work.models import WorkStatus
 from redteam.orchestration.result_claims import (
-    RESULT_REVIEW_INSTRUCTION, ResultClaim, ResultReview, check_result_review,
+    RESULT_REVIEW_INSTRUCTION, ResultClaim, ResultReview, check_result_review, mission_result_purpose,
 )
 
 #: Evidence metadata marker for an accepted task completion receipt.
@@ -769,7 +769,7 @@ async def complete_goal(engine: Any, path: Any, decision: Any, runtime: Any, con
         for task in tasks:
             if getattr(task, "required", False) and getattr(task, "status", None) is TaskStatus.RUNNING:
                 await change.tasks.transition_task(task.task_id, TaskStatus.COMPLETED, now=now)
-        await change.tasks.update_mission(mission.model_copy(update={"status": MissionStatus.COMPLETED, "updated_at": now, "revision": int(getattr(mission, "revision", 1) or 1) + 1, "criterion_results": [MissionCriterionResult(criterion=item.get("criterion"), met=True, evidence_ids=list(item.get("evidence_ids", [])), task_ids=list(bound_tasks.get(item.get("criterion"), [])), reason=str(review.get("reason", "")), result_claims=list(item.get("claims", []))) for item in items]}))
+        await change.tasks.update_mission(mission.model_copy(update={"status": MissionStatus.COMPLETED, "updated_at": now, "revision": int(getattr(mission, "revision", 1) or 1) + 1, "criterion_results": [MissionCriterionResult(criterion=item.get("criterion"), met=True, evidence_ids=list(item.get("evidence_ids", [])), task_ids=list(bound_tasks.get(item.get("criterion"), [])), reason=str(review.get("reason", "")), result_claims=list(item.get("claims", [])), purpose_hash=mission_result_purpose(mission)) for item in items]}))
         change.binding(str(runtime.run_id), str(runtime.mission_id))["closed"] = True
     await engine._commit_review(runtime, token, complete)
     return []

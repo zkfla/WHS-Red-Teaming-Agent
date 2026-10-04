@@ -42,7 +42,7 @@ from redteam.orchestration.cognition import (
     StructuredDecisionClient,
 )
 from redteam.orchestration.result_claims import (
-    RESULT_REVIEW_INSTRUCTION, ResultClaim, check_result_review,
+    RESULT_REVIEW_INSTRUCTION, ResultClaim, check_result_review, mission_result_purpose,
 )
 from redteam.orchestration.coordination import Coordinator, StateConflict, coordinator_for
 from redteam.orchestration.diagnostics import DecisionDiagnostic, safe_feedback
@@ -496,7 +496,10 @@ async def _terminal_criterion_results(mission, tasks, evidence, llm_client, budg
     prior = list(getattr(mission, "criterion_results", []) or [])
     if prior:
         table = {result.criterion: result for result in prior}
-        if set(table) == set(wanted) and all(result.met for result in table.values()):
+        if set(table) == set(wanted) and all(
+            result.met and result.purpose_hash == mission_result_purpose(mission)
+            for result in table.values()
+        ):
             cited_tasks = {str(task_id) for result in table.values() for task_id in list(result.task_ids or [])}
             cited_eids = {str(eid) for result in table.values() for eid in list(result.evidence_ids or [])}
             proven_union = {eid for ids in bound.values() for eid in ids}
@@ -651,6 +654,7 @@ async def _terminal_criterion_results(mission, tasks, evidence, llm_client, budg
                         evidence_ids=list(dict.fromkeys(item.evidence_ids)),
                         reason=safe_feedback(item.reason if review.accepted else review.reason),
                         result_claims=[claim.model_dump(mode="json") for claim in item.claims],
+                        purpose_hash=mission_result_purpose(mission),
                     )
                 refused = (
                     None

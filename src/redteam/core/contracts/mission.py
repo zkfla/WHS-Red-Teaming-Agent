@@ -121,6 +121,8 @@ class MissionCriterionResult(BaseModel):
     evidence_ids: list[str] = Field(default_factory=list)
     reason: str | None = None
     result_claims: list[dict[str, Any]] = Field(default_factory=list)
+    #: The result meaning judged by the model; None on legacy records.
+    purpose_hash: str | None = None
 
     @field_validator("criterion")
     @classmethod
