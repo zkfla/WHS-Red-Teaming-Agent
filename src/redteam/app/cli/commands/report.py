@@ -10,6 +10,7 @@ layer does not already produce.
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 
 from redteam.app.cli._shared import EXIT_FAILURE, EXIT_OK, eprint
@@ -65,9 +66,35 @@ def _render_markdown(report: TerminalReportProjection) -> str:
         f"- Verified findings / action: {report.effectiveness.verified_findings_per_action}",
         f"- Dead-end work ratio: {report.effectiveness.dead_end_work_ratio}",
         "",
-        "## Findings",
-        "",
     ]
+    if report.planning_diagnostic is not None:
+        diagnostic = report.planning_diagnostic
+        lines += [
+            "",
+            "## Planning diagnostic",
+            "",
+            f"- Stage: {diagnostic.stage}",
+            f"- Code: {diagnostic.code}",
+            f"- Reason: {diagnostic.summary}",
+            f"- Attempts: {diagnostic.attempts} / {diagnostic.attempt_limit or 'unknown'}",
+        ]
+        if diagnostic.stage_attempts:
+            lines.append(f"- Requests by stage: {json.dumps(diagnostic.stage_attempts)}")
+        cause = diagnostic.last_cause
+        while cause is not None:
+            lines.append(f"- Cause [{cause.stage}/{cause.code}]: {cause.summary}")
+            cause = cause.last_cause
+        if diagnostic.trace:
+            lines += ["", "### Decision trace", ""]
+            for item in diagnostic.trace:
+                lines.append(f"- {json.dumps(item, ensure_ascii=False)}")
+        else:
+            lines.append("Detailed decision trace was not recorded for this run.")
+    if report.request_observations:
+        lines += ["", "## Actual requests", ""]
+        for item in report.request_observations:
+            lines.append(f"- {json.dumps(item, ensure_ascii=False)}")
+    lines += ["", "## Findings", ""]
     if not report.findings:
         lines.append("(none)")
     for finding in report.findings:

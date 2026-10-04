@@ -16,7 +16,7 @@ from redteam.core.ports.evidence_store import EvidenceStore
 from redteam.core.ports.task_graph import MissionTaskStore
 from redteam.orchestration.context_projection import MappingStatus, project_run_processing
 from redteam.orchestration.coverage import CoverageGapSummary, project_coverage_gaps
-from redteam.orchestration.diagnostics import DecisionDiagnostic
+from redteam.orchestration.diagnostics import DecisionDiagnostic, safe_feedback
 from redteam.orchestration.operator_intents.redaction import redact_text
 from redteam.orchestration.state import RuntimeState, TerminationReason
 from redteam.orchestration.work.store import WorkStore
@@ -197,6 +197,7 @@ class TerminalReportProjection(BaseModel):
     phase: AgentPhase
     termination_reason: str | None
     planning_diagnostic: DecisionDiagnostic | None = None
+    request_observations: list[dict[str, Any]] = Field(default_factory=list)
     pending_event_count: int = 0
     event_delivery_pending: bool = False
     pending_approval_id: ApprovalId | None = None
@@ -314,6 +315,21 @@ class ReportingAgent:
             phase=runtime.phase,
             termination_reason=runtime.termination_reason,
             planning_diagnostic=runtime.planning_diagnostic,
+            request_observations=[
+                {
+                    "tool_id": str(item.metadata["tool_result"].get("tool_id", "")),
+                    "target": safe_feedback(str(item.metadata.get("target_node_id", ""))),
+                    **{
+                        key: safe_feedback(str(item.metadata["tool_result"]["output"][key]))
+                        for key in ("scheme", "host", "port", "status_code")
+                        if key in item.metadata["tool_result"]["output"]
+                    },
+                }
+                for item in evidence
+                if isinstance(item.metadata.get("tool_result"), dict)
+                and isinstance(item.metadata["tool_result"].get("output"), dict)
+                and "scheme" in item.metadata["tool_result"]["output"]
+            ][-20:],
             pending_event_count=runtime.pending_event_count,
             event_delivery_pending=runtime.event_delivery_pending,
             pending_approval_id=runtime.pending_approval_id,
@@ -353,11 +369,11 @@ class ReportingAgent:
             mission=mission,
             effectiveness=effectiveness,
             coverage=coverage,
-            coverage_status=(
-                "unknown" if coverage is None or coverage.unknown else "ok"
-            ),
-            result_processing=[MappingStatus.model_validate(item)
-                               for item in project_run_processing(evidence).values()],
+            coverage_status=("unknown" if coverage is None or coverage.unknown else "ok"),
+            result_processing=[
+                MappingStatus.model_validate(item)
+                for item in project_run_processing(evidence).values()
+            ],
         )
 
 

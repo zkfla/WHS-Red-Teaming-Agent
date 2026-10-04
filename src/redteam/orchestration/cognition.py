@@ -39,6 +39,7 @@ from jsonschema import validate as _validate_schema
 from pydantic import ValidationError as ModelValidationError
 from tenacity import AsyncRetrying, retry_if_exception_type, stop_after_attempt
 
+from redteam.core.contracts.mission import redact_secret_material
 from redteam.orchestration.diagnostics import (
     DecisionDiagnostic,
     diagnostic_for_exception,
@@ -111,6 +112,29 @@ class DecisionBudget:
         self._tokens_used = 0
         self._tokens_unknown = 0
         self.last_failure: DecisionDiagnostic | None = None
+        self.trace: list[dict[str, Any]] = []
+        self.stage_attempts: dict[str, int] = {}
+
+    def diagnostic_details(self) -> dict[str, Any]:
+        return {
+            "trace": list(self.trace),
+            "stage_attempts": dict(self.stage_attempts),
+            "attempt_limit": self.max_attempts,
+        }
+
+    def record(self, stage: str, outcome: str, **details: Any) -> None:
+        self.trace.append(
+            redact_secret_material(
+                {
+                    "attempt": self.used,
+                    "remaining": self.remaining,
+                    "stage": stage,
+                    "outcome": outcome,
+                    **details,
+                }
+            )
+        )
+        self.trace = self.trace[-20:]
 
     @property
     def max_attempts(self) -> int:
@@ -171,7 +195,7 @@ class DecisionBudget:
             return True
         return self._tokens_used >= max_tokens
 
-    def consume(self) -> int:
+    def consume(self, *, stage: str = "decision") -> int:
         """Consume one budgeted LLM request and return remaining.
 
         Raises RuntimeError when no budget remains; the client checks
@@ -181,6 +205,7 @@ class DecisionBudget:
         if self._used >= self._max_attempts:
             raise RuntimeError("decision budget exhausted")
         self._used += 1
+        self.stage_attempts[stage] = self.stage_attempts.get(stage, 0) + 1
         return self.remaining
 
     def __repr__(self) -> str:
@@ -206,9 +231,7 @@ class ReasoningHalted(Exception):
         super().__init__(self.reason_code)
 
 
-def should_halt_for_token_budget(
-    budget: DecisionBudget, max_tokens: int | None
-) -> bool:
+def should_halt_for_token_budget(budget: DecisionBudget, max_tokens: int | None) -> bool:
     """Public token-guard check for delegation owners (root/E).
 
     Pass the assignment's shared DecisionBudget and the delegation's
@@ -440,6 +463,7 @@ class StructuredDecisionClient:
                 summary="The shared decision attempt budget is exhausted.",
                 retryable=False,
                 last_cause=budget.last_failure,
+                **budget.diagnostic_details(),
                 location=budget.last_failure.location if budget.last_failure else "",
             )
             return DecisionFailure(stage, "budget", budget.used, diagnostic=diagnostic)
@@ -476,9 +500,7 @@ class StructuredDecisionClient:
                     retryable=False,
                 )
                 budget.last_failure = diagnostic
-                raise DecisionFailure(
-                    stage, "budget", budget.used, diagnostic=diagnostic
-                ) from exc
+                raise DecisionFailure(stage, "budget", budget.used, diagnostic=diagnostic) from exc
 
         if budget.remaining <= 0:
             raise exhausted()
@@ -494,10 +516,11 @@ class StructuredDecisionClient:
                 if budget.remaining <= 0:
                     raise exhausted()
                 await run_guard()
-                budget.consume()
+                budget.consume(stage=stage)
+                budget.record(stage, "request", feedback=safe_feedback(feedback))
                 with attempt:
                     try:
-                        return await self._attempt_once(
+                        result = await self._attempt_once(
                             stage=stage,
                             working=working,
                             response_schema=response_schema,
@@ -506,12 +529,15 @@ class StructuredDecisionClient:
                             kind=kind,
                             budget=budget,
                         )
+                        budget.record(stage, "response_validated")
+                        return result
                     except _RetryableDecisionError as exc:
                         budget.last_failure = exc.diagnostic.model_copy(
                             update={"attempts": budget.used}
                         )
                         feedback = exc.feedback
                         kind = exc.kind
+                        budget.record(stage, "response_rejected", reason=exc.diagnostic.feedback())
                         raise
         except _RetryableDecisionError as exc:
             raise exhausted() from exc

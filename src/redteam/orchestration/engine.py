@@ -46,8 +46,10 @@ from redteam.orchestration.coverage import project_coverage_gaps
 from redteam.orchestration.delegation import DelegationRequest
 from redteam.orchestration.diagnostics import (
     DecisionDiagnostic,
+    decision_context,
     diagnostic_for_exception,
     known_location,
+    safe_feedback,
 )
 from redteam.orchestration.eligibility import EligibilityContext
 from redteam.orchestration.events import AGENT_CONTEXT_PREPARED, AGENT_TURN_DECIDED
@@ -416,6 +418,9 @@ class InvestigationEngine:
         self.active_delegation: Any = None
 
     async def _ask(self, *, stage, payload, **kwargs):
+        budget = kwargs.get("budget")
+        if budget is not None:
+            budget.record(stage, "context", **decision_context(payload))
         # Raw writing validation occurs before permissive storage models can
         # normalize unknown kinds or fill omitted fields.
         kwargs["system"] = (
@@ -449,11 +454,20 @@ class InvestigationEngine:
                 "graph_summary": "Current provided claims, observations and hypotheses prepared",
                 "runtime_observation_count": len(payload.get("runtime_observations", [])),
                 "role_activation": redact_secret_material(payload.get("role_activation", {})),
+                "diagnostic_context": decision_context(payload),
+                "decision_budget": budget.diagnostic_details() if budget is not None else None,
             },
             causation_id=self.last_event_id,
         )
         self.last_event_id = prepared.event_id
-        result = await self._propose(stage=stage, payload=payload, **kwargs)
+        try:
+            result = await self._propose(stage=stage, payload=payload, **kwargs)
+        except DecisionFailure as exc:
+            if budget is not None:
+                exc.diagnostic = exc.diagnostic.model_copy(update=budget.diagnostic_details())
+            raise
+        if budget is not None:
+            budget.record(stage, "proposal", **decision_context(payload, result))
         validate_written_criteria(result)
         public = {
             "stage": stage,
@@ -463,6 +477,7 @@ class InvestigationEngine:
             "decision_summary": str(result.get("reason") or "")[:500],
             "assumptions": [str(item)[:500] for item in result.get("assumptions", [])[:5]],
             "candidate_source": "llm",
+            "diagnostic_context": decision_context(payload, result),
         }
         decided = await publisher.publish(
             AGENT_TURN_DECIDED,
@@ -518,7 +533,7 @@ class InvestigationEngine:
             # A delegated procedure must not leave semantic correction loops
             # unbounded when it does not use StructuredDecisionClient itself.
             if active_budget.used == before:
-                active_budget.consume()
+                active_budget.consume(stage=stage)
         try:
             if not isinstance(result, dict):
                 raise ValueError("planning provider must return a proposal object")
@@ -1377,6 +1392,11 @@ class InvestigationEngine:
 
     @staticmethod
     def _safe_errors(errors, budget):
+        budget.record(
+            "admission",
+            "rejected" if errors else "accepted",
+            feedback=[safe_feedback(str(item)) for item in errors[-10:]],
+        )
         diagnostics = getattr(errors, "diagnostics", [])
         if diagnostics:
             budget.last_failure = diagnostics[-1].model_copy(update={"attempts": budget.used})
@@ -1387,8 +1407,6 @@ class InvestigationEngine:
         # through the same masking/bounds the structured path uses.
         plain = [str(item) for item in errors[-10:] if str(item).strip()]
         if plain:
-            from redteam.orchestration.diagnostics import safe_feedback
-
             budget.last_failure = DecisionDiagnostic(
                 code="completion_or_action_not_admitted",
                 stage="next_action",
@@ -1413,6 +1431,7 @@ class InvestigationEngine:
                 summary="The shared decision budget ended before semantic admission.",
                 retryable=False,
                 last_cause=budget.last_failure,
+                **budget.diagnostic_details(),
                 location=budget.last_failure.location if budget.last_failure else "",
             ),
         )
@@ -1827,6 +1846,7 @@ class InvestigationEngine:
             except (ValueError, TypeError, KeyError, PathError) as exc:
                 diagnostic = diagnostic_for_exception(exc, stage="next_action")
                 budget.last_failure = diagnostic
+                budget.record("next_action", "rejected", reason=diagnostic.feedback())
                 context["feedback"] = [diagnostic.feedback()]
                 continue
         if last_control_succeeded:
@@ -1855,7 +1875,11 @@ class InvestigationEngine:
                     raise DecisionRuleError("action is outside accepted path")
                 checks = check_ready_step(path, step, assessment)
                 if checks:
-                    raise DecisionRuleError("accepted step prerequisites are not satisfied")
+                    raise DecisionRuleError(
+                        "accepted step prerequisites are not satisfied: " + "; ".join(checks),
+                        code="step_prerequisites_unmet",
+                        location=_action_location(intent_index, "path_step_id"),
+                    )
                 if intent.target_node_id not in known_target_ids(assessment):
                     raise DecisionRuleError(
                         "action target is not supplied or observed",
@@ -2423,6 +2447,15 @@ class InvestigationEngine:
             )
 
         updated = await self._commit_review(runtime, token, complete)
+        if budget is not None:
+            budget.record(
+                "completion_review",
+                "step_updated",
+                step_id=step.step_id,
+                previous_status=_text(step.status),
+                status=status,
+                reason=review["reason"],
+            )
         return updated or path, []
 
     async def complete_goal(self, path, decision, runtime, context, *, budget=None):

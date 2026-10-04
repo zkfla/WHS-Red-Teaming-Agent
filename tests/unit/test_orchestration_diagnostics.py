@@ -15,6 +15,7 @@ from redteam.orchestration.cognition import (
 )
 from redteam.orchestration.diagnostics import (
     DecisionDiagnostic,
+    decision_context,
     diagnostic_for_exception,
     schema_diagnostic,
 )
@@ -96,6 +97,55 @@ async def test_budget_keeps_last_actual_failure_across_calls_after_corrected_res
     assert caught.value.stage == "path_review"
     assert caught.value.diagnostic.last_cause.stage == "path_create"
     assert caught.value.diagnostic.last_cause.code == "schema_enum"
+
+
+async def test_shared_budget_records_generation_retries_and_review_exhaustion():
+    budget = DecisionBudget(2)
+    client = StructuredDecisionClient(Replies({"kind": "bad"}, {"kind": "evidence"}))
+    await client.ask(stage="path_draft", payload={}, response_schema=SCHEMA, budget=budget)
+    with pytest.raises(DecisionFailure) as caught:
+        await client.ask(stage="path_review", payload={}, response_schema=SCHEMA, budget=budget)
+    diagnostic = caught.value.diagnostic
+    assert diagnostic.stage_attempts == {"path_draft": 2}
+    assert diagnostic.attempt_limit == 2
+    assert [item["outcome"] for item in diagnostic.trace] == [
+        "request", "response_rejected", "request", "response_validated"
+    ]
+
+
+def test_decision_context_records_steps_and_proposal_without_raw_arguments():
+    context = decision_context(
+        {"active_path": {"steps": [{"step_id": "first", "status": "pending",
+                                     "depends_on": [], "unknown_field": "not-public"}]},
+         "feedback": ["password=hidden"]},
+        {"mode": "actions", "actions": [{"path_step_id": "second", "tool_id": "probe",
+                                           "arguments": {"password": "hidden"}}]},
+    )
+    encoded = json.dumps(context)
+    assert "pending" in encoded and "second" in encoded
+    assert "hidden" not in encoded and "not-public" not in encoded
+    assert "arguments" not in encoded
+
+
+def test_markdown_report_exposes_durable_planning_cause_and_legacy_trace_gap():
+    from redteam.app.cli.commands.report import _render_markdown
+    from redteam.orchestration.reporting import TerminalReportProjection
+
+    report = TerminalReportProjection(
+        run_id="run-test", phase=AgentPhase.FAILED, termination_reason="planning_error",
+        actions_executed=0, evidence_count=0, finding_count=0, ready_for_release=False,
+    )
+    diagnostic = DecisionDiagnostic(
+        code="decision_budget_exhausted", stage="next_action", kind="budget", attempts=3,
+        summary="budget exhausted", last_cause=DecisionDiagnostic(
+            code="step_prerequisites_unmet", stage="next_action", kind="format",
+            summary="prerequisite step not completed: first",
+        ),
+    )
+    report = report.model_copy(update={"planning_diagnostic": diagnostic})
+    text = _render_markdown(report)
+    assert "prerequisite step not completed: first" in text
+    assert "Detailed decision trace was not recorded" in text
 
 
 async def test_json_decode_error_does_not_store_raw_body():

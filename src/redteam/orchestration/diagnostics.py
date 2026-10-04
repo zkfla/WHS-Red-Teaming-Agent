@@ -12,6 +12,7 @@ from jsonschema import ValidationError as SchemaValidationError
 from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from redteam.core.action_semantics import ActionNamingError
+from redteam.core.contracts.mission import redact_secret_material
 from redteam.core.redaction import redact_sensitive_text
 
 _KNOWN_FIELDS = frozenset(
@@ -81,6 +82,14 @@ class DecisionDiagnostic(BaseModel):
     summary: str = Field(max_length=500)
     retryable: bool = False
     last_cause: DecisionDiagnostic | None = None
+    trace: list[dict[str, Any]] = Field(default_factory=list, max_length=20)
+    attempt_limit: int | None = None
+    stage_attempts: dict[str, int] = Field(default_factory=dict)
+
+    @field_validator("trace", mode="before")
+    @classmethod
+    def _safe_trace(cls, value):
+        return redact_secret_material(value[-20:])
 
     @field_validator("summary", mode="before")
     @classmethod
@@ -95,6 +104,49 @@ class DecisionDiagnostic(BaseModel):
     def feedback(self) -> str:
         location = f" at {self.location}" if self.location else ""
         return safe_feedback(f"{self.code}{location}: {self.summary}")
+
+
+def decision_context(payload: dict, proposal: dict | None = None) -> dict:
+    """Project execution-relevant references, never raw prompts or arguments."""
+    path = payload.get("draft_path") or payload.get("active_path") or {}
+    steps = path.get("steps", [])
+    if payload.get("step"):
+        steps = [payload["step"]]
+    context = {
+        "steps": [
+            {
+                key: step[key]
+                for key in ("step_id", "status", "depends_on", "required_fact_refs")
+                if key in step
+            }
+            for step in steps[:10]
+        ],
+        "feedback": [safe_feedback(str(item)) for item in payload.get("feedback", [])[:10]],
+    }
+    if proposal is not None:
+        context["proposal"] = {
+            key: proposal[key]
+            for key in ("mode", "decision", "path_step_id", "accepted", "reason")
+            if key in proposal
+        }
+        if "reason" in context["proposal"]:
+            context["proposal"]["reason"] = safe_feedback(str(context["proposal"]["reason"]))
+        context["actions"] = [
+            {
+                key: action[key]
+                for key in (
+                    "path_step_id",
+                    "agent_id",
+                    "target_node_id",
+                    "capability",
+                    "operation",
+                    "tool_id",
+                )
+                if key in action
+            }
+            for action in proposal.get("actions", [])[:10]
+        ]
+    return redact_secret_material(context)
 
 
 def known_location(parts: Any, *, fields: frozenset[str] = _KNOWN_FIELDS) -> str:
