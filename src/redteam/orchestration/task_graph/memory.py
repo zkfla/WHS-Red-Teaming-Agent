@@ -136,6 +136,12 @@ class InMemoryTaskGraphStore:
     async def update_task(self, task: MissionTask) -> None:
         async with self._lock:
             old = self._require(task.task_id)
+            if task.completion_evidence_id is not None and (
+                old.objective != task.objective or old.title != task.title
+            ):
+                # The delegated purpose changed, so a prior accepted receipt
+                # no longer binds this task. Drop it instead of carrying it.
+                task = task.model_copy(update={"completion_evidence_id": None})
             if old.mission_id != task.mission_id or old.created_at != task.created_at:
                 raise ValueError("task identity fields are immutable")
             if old.status is not task.status:

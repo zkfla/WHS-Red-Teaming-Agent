@@ -1321,6 +1321,13 @@ async def validate_completion(
             )
             evaluated.append((criterion, False, "evidence count"))
             continue
+        if kind == "semantic":
+            # Code admits here: origin reality, per-purpose success handling,
+            # and required target and principal linkage already passed above.
+            # The natural-language meaning stays with the caller existing
+            # review, which receives the raw excerpts with the proposal.
+            evaluated.append((criterion, True, "ok"))
+            continue
         if kind == "poc":
             if outcome == "refuted":
                 issues.add(

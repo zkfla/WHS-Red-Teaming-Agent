@@ -574,6 +574,7 @@ async def finalize_mission(
     decision_max_attempts: int = 3,
     path_store: Any | None = None,
     coordinator: Coordinator | None = None,
+    termination_reason: str | None = None,
 ) -> EventId | None:
     """Evaluate every criterion and atomically settle the current mission snapshot.
 
@@ -627,8 +628,14 @@ async def finalize_mission(
             if evidence_store is not None and run_id is not None
             else []
         )
+        # After a stop or a terminal failure there are no new model calls:
+        # project only the stored record with its original reason.
+        stopped = mission.status in {MissionStatus.FAILED, MissionStatus.CANCELLED} or (
+            termination_reason in {"operator_stopped", "user_interrupted"}
+        )
+        review_client = None if stopped else llm_client
         criterion_results, diagnostic = await _terminal_criterion_results(
-            mission, tasks, evidence, llm_client, budget
+            mission, tasks, evidence, review_client, budget
         )
         required = [task for task in tasks if task.required]
         if mission.status in {MissionStatus.FAILED, MissionStatus.CANCELLED, MissionStatus.BLOCKED}:
