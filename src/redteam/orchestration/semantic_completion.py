@@ -14,8 +14,8 @@ Rules followed:
   decides completion.
 - Explicit evidence ids from the decision win; step evidence is the
   fallback. Provenance is checked per record (same run, preserved raw
-  result, action and invocation linkage) while other steps or other
-  workers origins are allowed when the origin exists in this run.
+  result, action/invocation/tool/proposal linkage) while other steps or
+  other workers origins are allowed when the origin exists in this run.
   Cross-step path identity is never rewritten onto the origin.
 - Accepted task completions leave an immutable receipt in the original
   evidence area and bind the task receipt reference together with the
@@ -141,6 +141,114 @@ def verify_task_receipt(
     return []
 
 
+async def verify_single_origin(
+    *,
+    evidence_store: Any,
+    path_store: Any,
+    run_id: str,
+    engagement_id: str | None,
+    mission_id: str | None,
+    evidence_id: str,
+    require_proposal: bool = True,
+) -> tuple[Any | None, list[str]]:
+    """Prove one stored origin record against the actual execution.
+
+    Fetch, same run and engagement, preserved raw result, shared
+    action/invocation/tool/proposal linkage, and stored path origin under
+    the same mission. Returns (record, errors); lookups never succeed on
+    failure. Goal and terminal settlement share this single proof.
+    """
+    try:
+        record = await evidence_store.get(evidence_id)
+    except Exception:
+        return None, ["task origin lookup failed; treating as unproven"]
+    if record is None or _record_text(getattr(record, "run_id", "")) != str(run_id):
+        return None, ["task origin is missing or belongs to another run"]
+    if engagement_id is not None and _record_text(getattr(record, "engagement_id", "")) != str(engagement_id):
+        return None, ["task origin belongs to another engagement"]
+    meta = getattr(record, "metadata", None) or {}
+    if not isinstance(meta, dict):
+        return None, ["task origin '" + str(evidence_id) + "' has unreadable metadata"]
+    raw = raw_from_metadata(meta)
+    if not isinstance(raw, dict):
+        return None, ["task origin '" + str(evidence_id) + "' has no preserved raw result"]
+    linkage = check_record_linkage(record, meta, raw, str(evidence_id), require_proposal=require_proposal)
+    if linkage:
+        return None, [linkage[0][0]]
+    origin_errors = await verify_stored_origin(
+        path_store=path_store,
+        run_id=str(run_id),
+        m_path_id=_record_text(meta.get("path_id", "")).strip(),
+        m_version=meta.get("path_version", None),
+        m_step_id=_record_text(meta.get("path_step_id", "")).strip(),
+        mission_id=mission_id,
+    )
+    if origin_errors:
+        return None, ["task origin '" + str(evidence_id) + "' " + origin_errors[0]]
+    return record, []
+
+
+async def verify_receipt_bound_origins(
+    *,
+    evidence_store: Any,
+    path_store: Any,
+    run_id: str,
+    engagement_id: str | None,
+    mission_id: str | None,
+    task: MissionTask,
+) -> tuple[list[str], list[str]]:
+    """Shared receipt-to-origin proof for one completed required task.
+
+    Checks the receipt record itself (same run and engagement, system
+    source, payload shape) and the current purpose binding, then re-proves
+    every cited origin with the shared single-origin proof. Goal
+    settlement and terminal settlement consume this same helper, so their
+    receipt authority cannot drift apart. Returns (errors, proven ids).
+    """
+    receipt_id = task.completion_evidence_id
+    try:
+        receipt_record = await evidence_store.get(receipt_id)
+    except Exception:
+        return (["task receipt lookup failed; treating as unproven"], [])
+    if receipt_record is None:
+        return (["task receipt is missing"], [])
+    if _record_text(getattr(receipt_record, "run_id", "")) != str(run_id):
+        return (["task receipt belongs to another run"], [])
+    if engagement_id is not None and _record_text(getattr(receipt_record, "engagement_id", "")) != str(engagement_id):
+        return (["task receipt belongs to another engagement"], [])
+    if getattr(receipt_record, "source_type", None) is not EvidenceSourceType.SYSTEM:
+        return (["task receipt is not system evidence"], [])
+    receipt_payload = getattr(receipt_record, "metadata", None) or {}
+    if not isinstance(receipt_payload, dict):
+        return (["task receipt is missing"], [])
+    errors = verify_task_receipt(
+        task,
+        receipt_payload,
+        run_id=str(run_id),
+        mission_id=None if mission_id is None else str(mission_id),
+    )
+    if errors:
+        return (errors, [])
+    origins = [str(item).strip() for item in (receipt_payload.get("source_evidence_ids", []) or []) if str(item).strip()]
+    if not origins:
+        return (["task receipt cites no origin evidence"], [])
+    proven: list[str] = []
+    for identity in origins:
+        _, origin_errors = await verify_single_origin(
+            evidence_store=evidence_store,
+            path_store=path_store,
+            run_id=str(run_id),
+            engagement_id=engagement_id,
+            mission_id=mission_id,
+            evidence_id=identity,
+            require_proposal=True,
+        )
+        if origin_errors:
+            return (origin_errors, [])
+        proven.append(identity)
+    return ([], proven)
+
+
 def select_task_evidence_ids(decision: Any, path: Any) -> list[str]:
     """Explicit decision evidence first, step evidence as fallback.
 
@@ -189,7 +297,9 @@ async def _verify_task_origin(
     Readonly and purpose-free: no purpose hash is needed here and nothing
     is written. Other steps or other workers origins pass when stored in
     this run under the same mission. Declared task targets and subjects
-    are enforced; the review call weighs the rest with the excerpts.
+    are enforced; the review call weighs the rest with the excerpts. The
+    stored proposal is required: the execution path always stores it, so
+    cross-step admission loses nothing by demanding it.
     """
     try:
         record = await evidence_store.get(evidence_id)
@@ -207,7 +317,7 @@ async def _verify_task_origin(
     raw = raw_from_metadata(meta)
     if not isinstance(raw, dict):
         return None, ["evidence '" + str(evidence_id) + "' has no preserved raw result"]
-    linkage = check_record_linkage(record, meta, raw, str(evidence_id), require_proposal=False)
+    linkage = check_record_linkage(record, meta, raw, str(evidence_id), require_proposal=True)
     if linkage:
         return None, [linkage[0][0]]
     origin_errors = await verify_stored_origin(
@@ -509,61 +619,31 @@ async def _goal_task_coverage(
             task_evidence[str(task.task_id)] = proven
             origins = proven
         else:
-            try:
-                receipt_record = await engine.deps.evidence_store.get(receipt_id)
-            except Exception:
-                return (["task receipt lookup failed; treating as unproven"], {}, [])
-            if receipt_record is None:
-                return (["task receipt is missing"], {}, [])
-            if _record_text(getattr(receipt_record, "run_id", "")) != str(runtime.run_id):
-                return (["task receipt belongs to another run"], {}, [])
-            if engagement_id is not None and _record_text(getattr(receipt_record, "engagement_id", "")) != str(engagement_id):
-                return (["task receipt belongs to another engagement"], {}, [])
-            if getattr(receipt_record, "source_type", None) is not EvidenceSourceType.SYSTEM:
-                return (["task receipt is not system evidence"], {}, [])
-            receipt_payload = getattr(receipt_record, "metadata", None) or {}
-            if not isinstance(receipt_payload, dict):
-                return (["task receipt is missing"], {}, [])
-            errors = verify_task_receipt(
-                task,
-                receipt_payload,
+            errors, origins = await verify_receipt_bound_origins(
+                evidence_store=engine.deps.evidence_store,
+                path_store=path_store,
                 run_id=str(runtime.run_id),
-                mission_id=str(task.mission_id),
+                engagement_id=engagement_id,
+                mission_id=str(runtime.mission_id),
+                task=task,
             )
             if errors:
                 return (errors, {}, [])
-            origins = [str(item).strip() for item in (receipt_payload.get("source_evidence_ids", []) or []) if str(item).strip()]
             if not origins:
                 return (["task receipt cites no origin evidence"], {}, [])
             task_evidence[str(task.task_id)] = origins
         for identity in origins:
-            try:
-                origin = await engine.deps.evidence_store.get(identity)
-            except Exception:
-                return (["task origin lookup failed; treating as unproven"], {}, [])
-            if origin is None or _record_text(getattr(origin, "run_id", "")) != str(runtime.run_id):
-                return (["task origin is missing or belongs to another run"], {}, [])
-            if engagement_id is not None and _record_text(getattr(origin, "engagement_id", "")) != str(engagement_id):
-                return (["task origin belongs to another engagement"], {}, [])
-            origin_meta = getattr(origin, "metadata", None) or {}
-            if not isinstance(origin_meta, dict):
-                return (["task origin '" + str(identity) + "' has unreadable metadata"], {}, [])
-            origin_raw = raw_from_metadata(origin_meta)
-            if not isinstance(origin_raw, dict):
-                return (["task origin '" + str(identity) + "' has no preserved raw result"], {}, [])
-            linkage = check_record_linkage(origin, origin_meta, origin_raw, str(identity), require_proposal=True)
-            if linkage:
-                return ([linkage[0][0]], {}, [])
-            origin_errors = await verify_stored_origin(
+            origin, origin_errors = await verify_single_origin(
+                evidence_store=engine.deps.evidence_store,
                 path_store=path_store,
                 run_id=str(runtime.run_id),
-                m_path_id=_record_text(origin_meta.get("path_id", "")).strip(),
-                m_version=origin_meta.get("path_version", None),
-                m_step_id=_record_text(origin_meta.get("path_step_id", "")).strip(),
+                engagement_id=engagement_id,
                 mission_id=str(runtime.mission_id),
+                evidence_id=identity,
+                require_proposal=True,
             )
             if origin_errors:
-                return (["task origin '" + str(identity) + "' " + origin_errors[0]], {}, [])
+                return (origin_errors, {}, [])
             # Failed tool outcomes stay readable as general purpose
             # evidence here; the review call weighs them with the excerpt.
             # The cap only trims this payload; coverage above already ran.
@@ -638,4 +718,4 @@ async def complete_goal(engine: Any, path: Any, decision: Any, runtime: Any, con
     return []
 
 
-__all__ = ["TASK_RECEIPT_KIND", "EXCERPT_CHARS", "MAX_EXCERPTS", "purpose_hash", "build_task_receipt", "verify_task_receipt", "select_task_evidence_ids", "complete_task", "complete_goal"]
+__all__ = ["TASK_RECEIPT_KIND", "EXCERPT_CHARS", "MAX_EXCERPTS", "purpose_hash", "build_task_receipt", "verify_task_receipt", "verify_single_origin", "verify_receipt_bound_origins", "select_task_evidence_ids", "complete_task", "complete_goal"]
