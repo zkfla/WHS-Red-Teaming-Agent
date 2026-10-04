@@ -189,6 +189,30 @@ def _has_exact_recovery_proof(
     return cleaned_claimed <= (raw_principals | (raw_sessions & expected_sessions))
 
 
+async def _next_recovery_attempt(
+    *, evidence_store: Any, source: EvidenceRecord
+) -> tuple[int, int]:
+    """Read this origin's previous attempt once; initial application is 1.
+
+    Store errors propagate before replay starts. Legacy companions without
+    a number belong to the initial attempt and never reset a newer one.
+    """
+    previous = 1
+    for companion in await evidence_store.list_for_run(source.run_id):
+        if (
+            companion.run_id != source.run_id
+            or companion.engagement_id != source.engagement_id
+            or companion.action_id != source.action_id
+            or companion.invocation_id != source.invocation_id
+            or companion.metadata.get("source_evidence_id") != str(source.evidence_id)
+        ):
+            continue
+        attempt = companion.metadata.get("attempt", 1)
+        if type(attempt) is int and attempt > 0:
+            previous = max(previous, attempt)
+    return previous + 1, previous
+
+
 async def reprocess_evidence(
     *,
     evidence_id: str,
@@ -221,6 +245,9 @@ async def reprocess_evidence(
     everything from "invalid_raw" on leaves a companion note behind.
     The tool gateway is never called here; only the stored payload, the
     passed verifier, the graph, and the mappers are touched.
+    Initial application is attempt 1; each explicit recovery reads the
+    origin's previous maximum once and carries its new attempt plus
+    supersedes_attempt on every companion in this request.
     """
     record = await evidence_store.get(evidence_id)
     status, raw = locate_raw(record, run_id)
@@ -243,6 +270,22 @@ async def reprocess_evidence(
             "evidence_id": str(evidence_id),
             "requested_run_id": str(run_id),
         }
+    attempt, supersedes_attempt = await _next_recovery_attempt(
+        evidence_store=evidence_store, source=record
+    )
+    recovery_attempt = {"attempt": attempt, "supersedes_attempt": supersedes_attempt}
+    await record_recovery_note(
+        evidence_store=evidence_store,
+        run_id=record.run_id,
+        engagement_id=record.engagement_id,
+        source_evidence_id=str(record.evidence_id),
+        note="explicit recovery request started",
+        action_id=record.action_id,
+        invocation_id=record.invocation_id,
+        hypothesis_id=record.hypothesis_id,
+        recovery_status="attempted",
+        **recovery_attempt,
+    )
     try:
         result = ToolResult.model_validate(raw)
     except Exception as exc:  # noqa: BLE001 - a corrupt payload is data, not a crash
@@ -255,6 +298,7 @@ async def reprocess_evidence(
             action_id=record.action_id,
             invocation_id=record.invocation_id,
             hypothesis_id=record.hypothesis_id,
+            **recovery_attempt,
         )
         return {
             "status": "invalid_raw",
@@ -274,6 +318,7 @@ async def reprocess_evidence(
             action_id=record.action_id,
             invocation_id=record.invocation_id,
             hypothesis_id=record.hypothesis_id,
+            **recovery_attempt,
         )
         return {
             "status": "no_proposal",
@@ -293,6 +338,7 @@ async def reprocess_evidence(
             action_id=record.action_id,
             invocation_id=record.invocation_id,
             hypothesis_id=record.hypothesis_id,
+            **recovery_attempt,
         )
         return {
             "status": "invalid_proposal",
@@ -327,6 +373,7 @@ async def reprocess_evidence(
             action_id=record.action_id,
             invocation_id=record.invocation_id,
             hypothesis_id=record.hypothesis_id,
+            **recovery_attempt,
         )
         return {
             "status": "no_canonical",
@@ -344,6 +391,7 @@ async def reprocess_evidence(
             action_id=record.action_id,
             invocation_id=record.invocation_id,
             hypothesis_id=record.hypothesis_id,
+            **recovery_attempt,
         )
         return {
             "status": "link_mismatch",
@@ -361,6 +409,7 @@ async def reprocess_evidence(
             action_id=record.action_id,
             invocation_id=record.invocation_id,
             hypothesis_id=record.hypothesis_id,
+            **recovery_attempt,
         )
         return {
             "status": "link_mismatch",
@@ -381,6 +430,7 @@ async def reprocess_evidence(
             action_id=record.action_id,
             invocation_id=record.invocation_id,
             hypothesis_id=record.hypothesis_id,
+            **recovery_attempt,
         )
         return {
             "status": "link_mismatch",
@@ -399,6 +449,7 @@ async def reprocess_evidence(
             action_id=record.action_id,
             invocation_id=record.invocation_id,
             hypothesis_id=record.hypothesis_id,
+            **recovery_attempt,
         )
         return {
             "status": "link_mismatch",
@@ -420,6 +471,7 @@ async def reprocess_evidence(
             action_id=record.action_id,
             invocation_id=record.invocation_id,
             hypothesis_id=record.hypothesis_id,
+            **recovery_attempt,
         )
         return {
             "status": "link_mismatch",
@@ -449,6 +501,7 @@ async def reprocess_evidence(
             action_id=record.action_id,
             invocation_id=record.invocation_id,
             hypothesis_id=record.hypothesis_id,
+            **recovery_attempt,
         )
         return {
             "status": "anonymous_blocked",
@@ -507,6 +560,7 @@ async def reprocess_evidence(
                         action_id=record.action_id,
                         invocation_id=record.invocation_id,
                         hypothesis_id=record.hypothesis_id,
+                        **recovery_attempt,
                     )
                     return {
                         "status": "no_account_proof",
@@ -526,6 +580,7 @@ async def reprocess_evidence(
                     action_id=record.action_id,
                     invocation_id=record.invocation_id,
                     hypothesis_id=record.hypothesis_id,
+                    **recovery_attempt,
                 )
                 return {
                     "status": "no_account_proof",
@@ -670,6 +725,7 @@ async def reprocess_evidence(
                     action_id=proposal.action_id,
                     invocation_id=result.invocation_id,
                     hypothesis_id=proposal.hypothesis_id,
+                    **recovery_attempt,
                 )
                 support_audit_note = "support_audit=" + str(audit_note.evidence_id)
             except Exception as exc2:
@@ -810,7 +866,7 @@ async def reprocess_evidence(
                         action_id=proposal.action_id,
                         invocation_id=result.invocation_id,
                         hypothesis_id=proposal.hypothesis_id,
-                        attempt=1,
+                        **recovery_attempt,
                     )
             except Exception:  # noqa: BLE001 - references must not break recovery
                 pass
@@ -838,7 +894,7 @@ async def reprocess_evidence(
                     action_id=proposal.action_id,
                     invocation_id=result.invocation_id,
                     hypothesis_id=proposal.hypothesis_id,
-                    attempt=1,
+                    **recovery_attempt,
                 )
             except Exception:  # noqa: BLE001 - the attempt note must not break recovery
                 pass
@@ -894,7 +950,7 @@ async def reprocess_evidence(
                         action_id=proposal.action_id,
                         invocation_id=result.invocation_id,
                         hypothesis_id=proposal.hypothesis_id,
-                        attempt=1,
+                        **recovery_attempt,
                     )
                 except Exception:  # noqa: BLE001 - the companion must not break recovery
                     pass
@@ -924,7 +980,7 @@ async def reprocess_evidence(
                         action_id=proposal.action_id,
                         invocation_id=result.invocation_id,
                         hypothesis_id=proposal.hypothesis_id,
-                        attempt=1,
+                        **recovery_attempt,
                     )
                 except Exception:  # noqa: BLE001 - the companion must not mask the failure
                     pass
@@ -974,9 +1030,11 @@ async def reprocess_evidence(
         action_id=proposal.action_id,
         invocation_id=result.invocation_id,
         hypothesis_id=proposal.hypothesis_id,
+        **recovery_attempt,
     )
     return {
         "status": "ok",
+        **recovery_attempt,
         "evidence_id": str(evidence_id),
         "requested_run_id": str(run_id),
         "verdict": verdict.value,
@@ -1054,6 +1112,7 @@ async def record_processing_attempt(
     invocation_id: Any | None = None,
     hypothesis_id: Any | None = None,
     attempt: int = 1,
+    supersedes_attempt: int | None = None,
 ) -> EvidenceRecord:
     """Append an immutable companion stating one processing attempt.
 
@@ -1085,6 +1144,8 @@ async def record_processing_attempt(
             source_evidence_id, action_id, invocation_id, attempt
         ),
     }
+    if supersedes_attempt is not None:
+        payload["supersedes_attempt"] = supersedes_attempt
     note = EvidenceRecord(
         evidence_id=EvidenceId(new_id("ev")),
         run_id=run_id,
@@ -1121,6 +1182,7 @@ async def record_target_references(
     invocation_id: Any | None = None,
     hypothesis_id: Any | None = None,
     attempt: int = 1,
+    supersedes_attempt: int | None = None,
 ) -> EvidenceRecord:
     """Append a companion record carrying reference candidates.
 
@@ -1138,6 +1200,8 @@ async def record_target_references(
             source_evidence_id, action_id, invocation_id, attempt
         ),
     }
+    if supersedes_attempt is not None:
+        payload["supersedes_attempt"] = supersedes_attempt
     note = EvidenceRecord(
         evidence_id=EvidenceId(new_id("ev")),
         run_id=run_id,
@@ -1230,6 +1294,8 @@ async def record_recovery_note(
     processing_status: str | None = None,
     processing_stage: str | None = None,
     recovery_status: str | None = None,
+    attempt: int | None = None,
+    supersedes_attempt: int | None = None,
 ) -> EvidenceRecord:
     """Append a free-form companion note next to an existing record."""
     payload = {
@@ -1237,6 +1303,13 @@ async def record_recovery_note(
         "source_evidence_id": source_evidence_id,
         "note": note,
     }
+    if attempt is not None:
+        payload["attempt"] = attempt
+        payload["mapping_attempt_key"] = mapping_attempt_key(
+            source_evidence_id, action_id, invocation_id, attempt
+        )
+    if supersedes_attempt is not None:
+        payload["supersedes_attempt"] = supersedes_attempt
     # Structured last-state mirrors so root projects without parsing note.
     if mapping_status is not None:
         payload["mapping_status"] = mapping_status
