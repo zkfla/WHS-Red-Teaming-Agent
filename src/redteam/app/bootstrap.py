@@ -352,6 +352,7 @@ async def build_runtime_deps(
         evidence_service=EvidenceService(evidence_store),
         # Risk-tiered approval reads tool risk_level from the Registry.
         risk_resolver=RegistryRiskResolver(discovered_catalog),
+        outbound_descriptor_resolver=(tool_catalog or discovered_catalog).get,
     )
 
     return RuntimeDeps(
@@ -633,6 +634,9 @@ async def build_application(
             RegistryRiskResolver(resolved_tool_catalog)
             if resolved_tool_catalog is not None
             else None
+        ),
+        outbound_descriptor_resolver=(
+            resolved_tool_catalog.get if resolved_tool_catalog is not None else None
         ),
     )
     resolved_event_bus = event_bus or InMemoryEventBus()
@@ -1047,6 +1051,9 @@ async def settle_engagement(
             decision_max_attempts=deps.settings.decision_max_attempts,
             path_store=deps.path_store,
             coordinator=deps.coordinator,
+            termination_reason=runtime.termination_reason,
+            runtime=runtime,
+            engagement=deps.engagement,
         )
         mission = await deps.task_graph_store.get_mission(runtime.mission_id)
         if mission is not None:

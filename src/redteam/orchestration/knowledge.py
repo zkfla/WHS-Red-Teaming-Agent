@@ -36,12 +36,12 @@ from redteam.attack_graph.predicates import (
     values_equal,
 )
 from redteam.core.contracts.graph import Hypothesis
+from redteam.core.contracts.target import target_display_name
 from redteam.core.enums import GraphNodeType
 from redteam.orchestration.evidence_access import raw_from_metadata
 from redteam.orchestration.knowledge_validation import InternalAssessment, InternalTarget
 from redteam.orchestration.progress import knowledge_fingerprint
 from redteam.orchestration.target_references import referenced_targets
-from redteam.core.contracts.target import target_display_name
 
 SCOPE_LABEL = "engagement-scope"
 
