@@ -78,6 +78,8 @@ def build_task_receipt(
     reason: str,
     path_id: str | None = None,
     path_version: int | None = None,
+    related_attack_graph_node_ids: list[str] | None = None,
+    related_hypothesis_ids: list[str] | None = None,
 ) -> dict[str, Any]:
     """Public receipt payload stored as immutable evidence metadata."""
     return {
@@ -92,6 +94,8 @@ def build_task_receipt(
         "reason": str(reason or "")[:500],
         "path_id": str(path_id) if path_id else None,
         "path_version": path_version,
+        "related_attack_graph_node_ids": sorted({str(item) for item in (related_attack_graph_node_ids or []) if str(item).strip()}),
+        "related_hypothesis_ids": sorted({str(item) for item in (related_hypothesis_ids or []) if str(item).strip()}),
     }
 
 
@@ -123,6 +127,14 @@ def verify_task_receipt(
     expected = purpose_hash(task.objective or "")
     if str(receipt.get("purpose_hash", "")) != expected:
         return ["task purpose changed since the accepted receipt"]
+    for key, current in (
+        ("related_attack_graph_node_ids", list(task.related_attack_graph_node_ids or [])),
+        ("related_hypothesis_ids", list(task.related_hypothesis_ids or [])),
+    ):
+        if key in receipt:
+            stored = receipt.get(key)
+            if not isinstance(stored, list) or sorted(map(str, stored)) != sorted(map(str, current)):
+                return ["task subjects changed since the accepted receipt"]
     origins = [item for item in (receipt.get("source_evidence_ids", []) or []) if str(item).strip()]
     if not origins:
         return ["task receipt cites no origin evidence"]
@@ -368,7 +380,7 @@ async def complete_task(engine: Any, path: Any, decision: Any, runtime: Any, con
         return ["semantic completion review rejected the evidence"]
     mission = await engine.deps.task_graph_store.get_mission(runtime.mission_id)
     revision = int(getattr(mission, "revision", 1) or 1)
-    receipt_payload = build_task_receipt(task_id=str(task.task_id), mission_id=str(task.mission_id), run_id=str(runtime.run_id), purpose_hash_value=purpose_hash(getattr(task, "objective", "") or ""), mission_revision=revision, source_evidence_ids=[str(getattr(record, "evidence_id", "")) for record in verified], outcome="success", reason=str(review.get("reason", "")), path_id=getattr(path, "path_id", None), path_version=getattr(path, "version", None))
+    receipt_payload = build_task_receipt(task_id=str(task.task_id), mission_id=str(task.mission_id), run_id=str(runtime.run_id), purpose_hash_value=purpose_hash(task.objective or ""), mission_revision=revision, source_evidence_ids=[str(getattr(record, "evidence_id", "")) for record in verified], outcome="success", reason=str(review.get("reason", "")), path_id=getattr(path, "path_id", None), path_version=getattr(path, "version", None), related_attack_graph_node_ids=list(task.related_attack_graph_node_ids or []), related_hypothesis_ids=list(task.related_hypothesis_ids or []))
     receipt_record = _receipt_record(run_id=runtime.run_id, engagement_id=runtime.engagement_id, payload=receipt_payload, summary=str(review.get("reason", "")))
     async def complete(change: Any) -> None:
         staged = await change.tasks.get_task(task.task_id)
@@ -413,6 +425,8 @@ async def _legacy_task_proof(
     if not candidates:
         return (["completed required task lacks an accepted evidence-bearing path"], [])
     latest = max(candidates, key=lambda saved: getattr(saved, "version", 0))
+    if str(getattr(latest, "goal", "") or "").strip() != str(task.objective or "").strip():
+        return (["completed task path proves an older purpose; its stored proof is obsolete"], [])
     try:
         run_records = await engine.deps.evidence_store.list_for_run(str(run_id))
     except Exception:

@@ -512,7 +512,7 @@ def _reasoning_expired(engagement: Any, runtime: Any) -> bool | None:
         return None
 
 
-async def _terminal_criterion_results(mission, tasks, evidence, llm_client, budget, *, receipt_bound=None, receipt_unproven=None):
+async def _terminal_criterion_results(mission, tasks, evidence, llm_client, budget, *, receipt_bound=None, receipt_unproven=None, runtime=None, engagement=None):
     """Review natural criteria only against completed required work and actual evidence.
 
     Failed tool outcomes stay readable as general purpose evidence; the
@@ -598,6 +598,13 @@ async def _terminal_criterion_results(mission, tasks, evidence, llm_client, budg
     client = StructuredDecisionClient(llm_client, max_attempts=budget.max_attempts)
     diagnostic = budget.last_failure
     while budget.remaining:
+        if _reasoning_expired(engagement, runtime) is True:
+            diagnostic = _terminal_rule(
+                "terminal_reasoning_expired",
+                "The allowed reasoning window expired; no further review calls.",
+                budget.used,
+            )
+            break
         try:
             raw = await client.ask(
                 stage="terminal_criteria_review",
@@ -770,7 +777,7 @@ async def finalize_mission(
         # project only the stored record with its original reason.
         termination = termination_reason or getattr(runtime, "termination_reason", None)
         stopped = mission.status in {MissionStatus.FAILED, MissionStatus.CANCELLED} or (
-            termination in {"operator_stopped", "user_interrupted"}
+            termination in {"operator_stopped", "user_interrupted", "execution_error", "planning_error", "consecutive_failures"}
         ) or (
             _reasoning_expired(engagement, runtime) is True
         )
@@ -789,6 +796,7 @@ async def finalize_mission(
         criterion_results, diagnostic = await _terminal_criterion_results(
             mission, tasks, evidence, review_client, budget,
             receipt_bound=bound, receipt_unproven=unproven,
+            runtime=runtime, engagement=engagement,
         )
         required = [task for task in tasks if task.required]
         if mission.status in {MissionStatus.FAILED, MissionStatus.CANCELLED, MissionStatus.BLOCKED}:
