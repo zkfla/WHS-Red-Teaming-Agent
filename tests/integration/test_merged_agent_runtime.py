@@ -35,22 +35,6 @@ from redteam.orchestration.state import initial_graph_state
 from tests.fakes import DummyToolGateway, FakeControlPlane
 from tests.integration import _engine_llm_harness as h
 
-# Intentional contract 3.1/3.5.8: the proposal schema carries only the
-# minimal purpose shape (reason + steps); stored path/runtime attribution
-# is hydrated by code. Route old full-shape scripted drafts the same way.
-_SCRIPTED_ROUTE_KEY = h.ScriptedLLM._route_key
-
-
-def _minimal_route_key(schema):
-    props = schema.get("properties", {}) if isinstance(schema, dict) else {}
-    if "steps" in props:
-        return "path_draft"
-    return _SCRIPTED_ROUTE_KEY(schema)
-
-
-h.ScriptedLLM._route_key = staticmethod(_minimal_route_key)
-
-
 def _real_deps(llm, *, seed, world, intent_store=None):
     gateway = DummyToolGateway(tools=[h.inventory_descriptor()])
     deps = RuntimeDeps(
