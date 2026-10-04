@@ -34,6 +34,7 @@ from redteam.core.ids import (
 from redteam.orchestration.agents.base import PlanStep
 from redteam.orchestration.component_binding import RuntimeComponentBinding
 from redteam.orchestration.diagnostics import DecisionDiagnostic, safe_feedback
+from redteam.orchestration.delegation import DelegationState
 from redteam.orchestration.dispatch import (
     DispatchItem,
     WorkerOutcome,
@@ -84,6 +85,7 @@ class RuntimeState(BaseModel):
     active_path_id: str | None = None
     active_path_version: int | None = None
     active_path_step_id: str | None = None
+    delegations: dict[str, DelegationState] = Field(default_factory=dict)
     planning_error: str | None = None
     pending_event_count: int = Field(default=0, ge=0)
     event_delivery_pending: bool = False

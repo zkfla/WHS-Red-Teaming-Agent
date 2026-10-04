@@ -118,6 +118,7 @@ class PlanStep(BaseModel):
     path_id: str | None = None
     path_version: int | None = None
     path_step_id: str | None = None
+    delegation_id: str | None = None
     principal_ref: str | None = None
     operator_intent_id: str | None = None
     intent_index: int = 0

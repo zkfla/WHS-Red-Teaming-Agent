@@ -12,6 +12,7 @@ from redteam.core.enums import MissionStatus, OperatorIntentType, TaskStatus
 from redteam.core.ids import (
     AgentId,
     EngagementId,
+    EvidenceId,
     GraphNodeId,
     HypothesisId,
     MissionId,
@@ -202,6 +203,8 @@ class MissionTask(BaseModel):
     parent_task_id: TaskId | None = None
     dependency_task_ids: list[TaskId] = Field(default_factory=list)
     blocking_reason: str | None = None
+    # Committed atomically with completion; a review alone cannot complete a task.
+    completion_evidence_id: EvidenceId | None = None
     related_attack_graph_node_ids: list[GraphNodeId] = Field(default_factory=list)
     related_hypothesis_ids: list[HypothesisId] = Field(default_factory=list)
     provenance: Provenance

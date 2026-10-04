@@ -35,6 +35,21 @@ class EngagementScope(BaseModel):
     denied_assets: list[str] = Field(default_factory=list)
 
 
+class TargetActionPolicy(BaseModel):
+    """Additional action restrictions for targets matching an existing scope selector."""
+
+    name: str = ""
+    selector: EngagementScope
+    allowed_action_keys: list[str] | None = None
+    denied_action_keys: list[str] = Field(default_factory=list)
+
+
+class ExternalTextPolicy(BaseModel):
+    """Operator patterns supplement the shared explicit-credential transmission check."""
+
+    prohibited_patterns: list[str] = Field(default_factory=list)
+
+
 class RuleOfEngagement(BaseModel):
     name: str
     description: str = ""
@@ -94,6 +109,8 @@ class Engagement(BaseModel):
 
     scope: EngagementScope
     rules_of_engagement: list[RuleOfEngagement] = Field(default_factory=list)
+    target_action_policies: list[TargetActionPolicy] = Field(default_factory=list)
+    external_text_policy: ExternalTextPolicy = Field(default_factory=ExternalTextPolicy)
     execution_budget: ExecutionBudget
     rate_limit_policy: RateLimitPolicy
     approval_policy: ApprovalPolicy

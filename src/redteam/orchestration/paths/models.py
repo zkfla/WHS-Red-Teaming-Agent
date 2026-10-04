@@ -47,6 +47,7 @@ ALLOWED_CRITERION_KINDS = frozenset(
         "hypothesis_refuted",
         "coverage",
         "poc",
+        "semantic",
     }
 )
 

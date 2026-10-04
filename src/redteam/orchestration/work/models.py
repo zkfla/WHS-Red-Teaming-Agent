@@ -53,6 +53,7 @@ class WorkItem(BaseModel):
     path_version: int | None = None
     path_step_id: str | None = None
     mission_task_id: str | None = None
+    delegation_id: str | None = None
     job_id: str | None = None
     target_node_ids: list[GraphNodeId]
     hypothesis_id: HypothesisId | None = None

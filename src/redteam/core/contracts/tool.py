@@ -37,6 +37,8 @@ class ToolDescriptor(BaseModel):
     # Input argument -> shared target value (host/url/port/path/asset_ref/etc.).
     # Providers declare different remote argument names without central edits.
     argument_bindings: dict[str, str] = Field(default_factory=dict)
+    # Provider-declared input fields transmitted as text to an external service.
+    outbound_text_fields: list[str] = Field(default_factory=list)
 
     @property
     def required_arguments(self) -> tuple[str, ...]:

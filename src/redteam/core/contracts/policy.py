@@ -12,7 +12,7 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from redteam.core.enums import ApprovalStatus, PolicyVerdict, Severity
-from redteam.core.ids import ActionId, AgentId, ApprovalId, EngagementId
+from redteam.core.ids import ActionId, AgentId, ApprovalId, EngagementId, ToolId
 
 
 class ControlContext(BaseModel):
@@ -23,6 +23,8 @@ class ControlContext(BaseModel):
     correlation_id: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
     in_flight_actions: int | None = Field(default=None, ge=0)
+    # Assigned by the execution path from the registered, compiled tool binding.
+    selected_tool_id: ToolId | None = None
 
 
 class PolicyDecision(BaseModel):

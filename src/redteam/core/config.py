@@ -29,8 +29,10 @@ from redteam.core.contracts.engagement import (
     Engagement,
     EngagementScope,
     ExecutionBudget,
+    ExternalTextPolicy,
     RateLimitPolicy,
     RuleOfEngagement,
+    TargetActionPolicy,
 )
 from redteam.core.environment import (
     extensions_env_raw as _extensions_env_raw,
@@ -62,6 +64,8 @@ class EngagementConfig(BaseModel):
     description: str = ""
     scope: EngagementScope = Field(default_factory=EngagementScope)
     rules_of_engagement: list[RuleOfEngagement] = Field(default_factory=list)
+    target_action_policies: list[TargetActionPolicy] = Field(default_factory=list)
+    external_text_policy: ExternalTextPolicy = Field(default_factory=ExternalTextPolicy)
     execution_budget: ExecutionBudget
     rate_limit_policy: RateLimitPolicy = Field(
         default_factory=lambda: RateLimitPolicy(max_actions_per_minute=30)
