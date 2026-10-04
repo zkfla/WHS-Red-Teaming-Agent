@@ -20,6 +20,26 @@ class RemoteTool:
     description: str
     input_schema: dict[str, Any]
     output_schema: dict[str, Any] | None = None
+    # Opaque provider metadata from SDK discovery (tool meta merged
+    # with dumped annotations). Only the shared provider keys are
+    # ever read; anything else rides along untouched.
+    metadata: Mapping[str, Any] | None = None
+
+
+def remote_tool_metadata(tool: Any) -> dict[str, Any]:
+    # Collect SDK discovery metadata without knowing any tool names.
+    collected: dict[str, Any] = {}
+    raw_meta = getattr(tool, "meta", None)
+    if isinstance(raw_meta, Mapping):
+        collected.update({str(key): raw_meta[key] for key in raw_meta})
+    annotations = getattr(tool, "annotations", None)
+    dump = getattr(annotations, "model_dump", None)
+    if callable(dump):
+        try:
+            collected.setdefault("annotations", dump(mode="json"))
+        except (TypeError, ValueError):
+            pass
+    return collected
 
 
 @dataclass(frozen=True, slots=True)
@@ -111,6 +131,7 @@ class _SDKMCPTransport:
                             if getattr(tool, "output_schema", None) is not None
                             else None
                         ),
+                        metadata=remote_tool_metadata(tool) or None,
                     )
                     for tool in listing.tools
                 )

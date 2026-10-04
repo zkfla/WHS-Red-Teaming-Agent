@@ -202,9 +202,10 @@ class MCPServerSettings:
         if allowed_tools is not None and tool_operations is not None:
             allowed_names = set(allowed_tools)
             binding_names = set(tool_operations)
-            if binding_names != allowed_names:
+            unknown_names = binding_names - allowed_names
+            if unknown_names:
                 raise MCPConfigurationError(
-                    f"{prefix}_TOOL_OPERATIONS_JSON keys must exactly match "
+                    f"{prefix}_TOOL_OPERATIONS_JSON keys must be a subset of "
                     f"{prefix}_ALLOWED_TOOLS_JSON"
                 )
 

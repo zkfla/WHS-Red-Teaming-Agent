@@ -7,7 +7,7 @@ domain objects: a role-specific candidate provider owns those semantics.
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -82,6 +82,9 @@ class AgentDefinition(BaseModel):
     schedulable: bool = True
     activation_rules: list[ActivationRule] = Field(default_factory=list)
     capabilities: list[str] = Field(default_factory=list)
+    #: Explicit per-role tool selectors; None defers to the role manifest
+    #: default file. An explicitly empty selection allows no tool.
+    tool_selection: dict[str, Any] | None = None
     provider_id: str
     context_profile: ContextProfile
     planner_kind: Literal["llm"] = "llm"

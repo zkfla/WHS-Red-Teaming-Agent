@@ -16,6 +16,15 @@ from redteam.core.ids import ToolId
 class ToolCatalog(Protocol):
     def get(self, tool_id: ToolId) -> ToolDescriptor | None: ...
 
+    def all_descriptors(self) -> list[ToolDescriptor]:
+        """Every registered tool as a finalized descriptor.
+
+        Role views filter this list without consulting operation
+        bindings, so mapper-less tools stay visible and ops-empty
+        tools are still listed.
+        """
+        ...
+
     def list_by_capability(self, capability_tag: str) -> list[ToolDescriptor]: ...
 
     def list_tools_for_action(

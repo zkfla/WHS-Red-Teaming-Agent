@@ -7,7 +7,7 @@ import json
 from collections.abc import Mapping
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
 
 from jsonschema import Draft202012Validator
@@ -30,6 +30,7 @@ from redteam.core.contracts.target import (
 from redteam.core.contracts.tool import ToolDescriptor
 from redteam.core.enums import RiskLevel, ToolHealthStatus
 from redteam.core.provider_contracts import operation_target_binding
+from redteam.core.tool_binding import SELECTED_TOOL
 from redteam.orchestration.action_naming import (
     canonical_action_key,
     tool_matches_action_namespace,
@@ -136,31 +137,35 @@ class CandidateCompiler:
         allowed_capabilities: set[str] | None,
     ) -> tuple[ExecutableCandidate | None, CandidateRejection | None]:
         plan_step = draft.plan_step
-        if allowed_capabilities is not None and plan_step.capability not in allowed_capabilities:
-            return None, self._reject(draft, "agent_capability_not_allowed")
+        direct = self._is_direct_step(plan_step)
+        if not direct and allowed_capabilities is not None:
+            if plan_step.capability not in allowed_capabilities:
+                return None, self._reject(draft, "agent_capability_not_allowed")
         try:
             json.dumps(plan_step.arguments, sort_keys=True, allow_nan=False)
         except (TypeError, ValueError):
             return None, self._reject(draft, "non_json_arguments")
-        try:
-            canonical_action_key(plan_step.capability, plan_step.operation)
-        except ActionNamingError as exc:
-            return None, self._reject(draft, exc.reason, field=exc.field)
+        if not direct:
+            try:
+                canonical_action_key(plan_step.capability, plan_step.operation)
+            except ActionNamingError as exc:
+                return None, self._reject(draft, exc.reason, field=exc.field)
         try:
             execution_target_id = node_id_for_target(plan_step.resolved_target())
         except ValueError:
             return None, self._reject(draft, "unresolved_target")
         if execution_target_id not in draft.target_node_ids:
             return None, self._reject(draft, "target_mismatch")
-        try:
-            validate_network_arguments(
-                plan_step.resolved_target(),
-                plan_step.arguments,
-                operation=plan_step.operation,
-                bindings=self._operation_bindings,
-            )
-        except ValueError:
-            return None, self._reject(draft, "unresolved_target", field="arguments")
+        if not direct:
+            try:
+                validate_network_arguments(
+                    plan_step.resolved_target(),
+                    plan_step.arguments,
+                    operation=plan_step.operation,
+                    bindings=self._operation_bindings,
+                )
+            except ValueError:
+                return None, self._reject(draft, "unresolved_target", field="arguments")
         tool, tool_rejection = self._resolve_tool_with_reason(plan_step)
         if tool is None:
             reason, field = tool_rejection or ("no_compatible_tool", "")
@@ -171,6 +176,7 @@ class CandidateCompiler:
             tool,
             plan_step.operation,
             bindings=self._operation_bindings,
+            target_binding=getattr(tool, "target_binding", None) if direct else None,
         )
         try:
             validate_network_arguments(
@@ -179,6 +185,7 @@ class CandidateCompiler:
                 operation=plan_step.operation,
                 bindings=self._operation_bindings,
                 argument_bindings=getattr(tool, "argument_bindings", None),
+                target_binding=getattr(tool, "target_binding", None) if direct else None,
             )
         except ValueError:
             return None, self._reject(draft, "unresolved_target", field="arguments")
@@ -236,6 +243,51 @@ class CandidateCompiler:
             candidate_key=diagnostic_key,
         )
 
+    @staticmethod
+    def _is_direct_step(plan_step: PlanStep) -> bool:
+        return (
+            getattr(plan_step, "binding_mode", "legacy_action") == SELECTED_TOOL
+            and bool(plan_step.tool_id)
+        )
+
+    def _resolve_direct_tool(
+        self, plan_step: PlanStep
+    ) -> tuple[ToolDescriptor | None, tuple[str, str] | None]:
+        if self._catalog is None:
+            return None, ("no_compatible_tool", "")
+        try:
+            tool = self._catalog.get(plan_step.tool_id)
+        except ValueError:
+            return None, ("no_compatible_tool", "")
+        if tool is None:
+            return None, ("no_compatible_tool", "")
+        if tool.health_status is ToolHealthStatus.UNHEALTHY:
+            return None, ("tool_unhealthy", "")
+        if plan_step.require_healthy_tool:
+            if tool.health_status is not ToolHealthStatus.HEALTHY:
+                return None, ("tool_unhealthy", "")
+        try:
+            kind = plan_step.resolved_target().kind
+        except ValueError:
+            return None, ("unresolved_target", "")
+        if tool.target_types and kind not in tool.target_types:
+            return None, ("target_type_mismatch", "")
+        bound = self._bind_target_arguments(
+            plan_step.arguments,
+            plan_step.resolved_target(),
+            tool,
+            plan_step.operation,
+            bindings=self._operation_bindings,
+            target_binding=getattr(tool, "target_binding", None),
+        )
+        if not self._arguments_match_schema(bound, tool.input_schema):
+            reason, field = self._schema_rejection(bound, tool.input_schema) or (
+                "schema_mismatch",
+                "",
+            )
+            return None, (reason, field)
+        return tool, None
+
     def _resolve_tool_with_reason(
         self, plan_step: PlanStep
     ) -> tuple[ToolDescriptor | None, tuple[str, str] | None]:
@@ -245,6 +297,8 @@ class CandidateCompiler:
             plan_step.capability,
             plan_step.operation,
         )
+        if self._is_direct_step(plan_step):
+            return self._resolve_direct_tool(plan_step)
         if not tool_matches_action_namespace(preferred, capability):
             return None, ("tool_outside_capability_namespace", "")
         if self._catalog is None:
@@ -361,6 +415,7 @@ class CandidateCompiler:
         tool: ToolDescriptor,
         operation: str,
         bindings: Mapping[str, OperationTargetBinding] | None = None,
+        target_binding: Any | None = None,
     ) -> dict:
         """Fill schema-declared identity fields from the selected target.
 
@@ -424,9 +479,12 @@ class CandidateCompiler:
             target_values.update(domain=target_values["host"], hostname=target_values["host"])
         if isinstance(target, UrlTarget):
             target_values.update(base_url=target.url, target_url=target.url)
-        binding = operation_target_binding(operation, bindings)
-        binds_target_arguments = bool(getattr(binding, "binds_target_arguments", True))
-        binds_known_path = bool(getattr(binding, "binds_known_path_from_url", False))
+        if target_binding is not None:
+            active_binding = target_binding
+        else:
+            active_binding = operation_target_binding(operation, bindings)
+        binds_target_arguments = bool(getattr(active_binding, "binds_target_arguments", True))
+        binds_known_path = bool(getattr(active_binding, "binds_known_path_from_url", False))
         if not binds_target_arguments:
             # The TargetRef belongs to the investigation. Search arguments
             # contain the query; a target URL is not a search input.
@@ -505,6 +563,20 @@ class CandidateCompiler:
 def candidate_key(draft: CandidateDraft) -> str:
     """Stable identity intentionally excludes graph revision and score."""
 
+    step = draft.plan_step
+    if getattr(step, "binding_mode", "legacy_action") == SELECTED_TOOL:
+        if step.tool_id:
+            direct_payload = {
+                "contract_version": draft.contract_version,
+                "tool_id": str(step.tool_id),
+                "arguments": step.arguments,
+                "target_node_ids": sorted(map(str, draft.target_node_ids)),
+                "principal_ref": step.principal_ref,
+                "prerequisite_fingerprint": draft.prerequisite_fingerprint,
+            }
+            direct_encoded = json.dumps(direct_payload, sort_keys=True)
+            direct_encoded = direct_encoded.encode()
+            return "cand_" + hashlib.sha256(direct_encoded).hexdigest()[:24]
     hypothesis = draft.plan_step.hypothesis
     payload = {
         "contract_version": draft.contract_version,

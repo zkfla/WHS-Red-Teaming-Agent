@@ -7,7 +7,9 @@ from pathlib import Path
 from redteam.capability.adapters.mcp.naming import legacy_alias_for_tool_id
 from redteam.capability.methodology import load_catalog, safe_path, verify_bundle
 from redteam.capability.servers.workspace import WorkspaceIO, WorkspacePolicy
+from redteam.capability.workspace_manifest import WORKSPACE_READ_TOOLS
 from redteam.core.config import MethodologyConfig
+from redteam.core.contracts.tool import ToolDescriptor
 from redteam.core.ids import ToolId
 from redteam.core.ports.tool_catalog import ToolCatalog
 from redteam.orchestration.agents.providers import CandidateProviderRegistry
@@ -17,8 +19,15 @@ from redteam.orchestration.methodology import (
     MethodologyCandidateProvider,
     ReferenceEntry,
     ReferenceLibrary,
+    ReferenceReadContract,
     reference_agent,
 )
+
+
+# Provider pinned read shape (workspace_manifest, registration owner).
+# read_file structurally excludes write tools: their required inputs
+# carry content/old_text/new_text, which never equal this bounded shape.
+_READ_FILE_SPEC = WORKSPACE_READ_TOOLS["read_file"]
 
 
 def load_reference_library(config: MethodologyConfig) -> ReferenceLibrary:
@@ -106,21 +115,38 @@ def _reference_reader(library: ReferenceLibrary, catalog: ToolCatalog | None):
     contract = library.entries[0].read_contract
     if contract.asset_binding != "asset_ref_const" or contract.encoding != "utf-8":
         raise ValueError("methodology_read_contract_unsupported")
-    candidates = (
-        catalog.list_tools_for_action(contract.capability, contract.operation) if catalog else []
-    )
+    tools = catalog.all_descriptors() if catalog is not None else []
     candidates = [
-        tool
-        for tool in candidates
-        if tool.health_status.value != "unhealthy"
-        and contract.asset_binding == "asset_ref_const"
-        and tool.input_schema.get("properties", {}).get("asset_ref", {}).get("const")
-        == library.asset_ref
+        tool for tool in tools if _is_contract_reader(tool, contract, library.asset_ref)
     ]
     if len(candidates) != 1:
         raise ValueError("methodology_workspace_read_tool_required")
     descriptor = candidates[0]
     return descriptor
+
+
+def _is_contract_reader(
+    tool: ToolDescriptor, contract: ReferenceReadContract, asset_ref: str
+) -> bool:
+    # Reader role matched against the actual catalog plus the provider
+    # pinned read shape, never against a mandatory operation binding.
+    # all_descriptors lists write tools too, so the read shape below
+    # is the read/write gate: write inputs never match it.
+    if tool.health_status.value == "unhealthy":
+        return False
+    if contract.capability not in list(tool.capability_tags):
+        return False
+    if set(tool.required_arguments) != _READ_FILE_SPEC.required:
+        return False
+    if set(tool.optional_arguments) != _READ_FILE_SPEC.optional:
+        return False
+    properties = tool.input_schema.get("properties", {})
+    if properties.get("asset_ref", {}).get("const") != asset_ref:
+        return False
+    output = tool.output_schema or {}
+    if output.get("properties", {}).get("encoding", {}).get("const") != contract.encoding:
+        return False
+    return True
 
 
 def bind_reference_library(

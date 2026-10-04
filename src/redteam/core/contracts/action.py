@@ -12,10 +12,16 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from redteam.core.contracts.target import TargetRef
-from redteam.core.ids import ActionId, AgentId, EngagementId, HypothesisId, RunId
+from redteam.core.ids import ActionId, AgentId, EngagementId, HypothesisId, RunId, ToolId
+from redteam.core.tool_binding import (
+    LEGACY_ACTION,
+    SELECTED_TOOL,
+    BindingMode,
+    execution_display_key,
+)
 
 
 class ActionProposal(BaseModel):
@@ -24,8 +30,10 @@ class ActionProposal(BaseModel):
     engagement_id: EngagementId
     agent_id: AgentId
 
-    capability: str
-    operation: str
+    binding_mode: BindingMode = LEGACY_ACTION
+    tool_id: ToolId | None = None
+    capability: str = ""
+    operation: str = ""
 
     target: TargetRef
 
@@ -48,5 +56,14 @@ class ActionProposal(BaseModel):
     # `RuleOfEngagement.availability_impact_allowed` to have any effect —
     # see `redteam.control.roe`.
     availability_impact: bool = False
-
     created_at: datetime
+
+    @model_validator(mode="after")
+    def _binding_is_consistent(self):
+        if self.binding_mode == SELECTED_TOOL and not self.tool_id:
+            raise ValueError("selected_tool binding requires tool_id")
+        return self
+
+    @property
+    def action_key(self) -> str:
+        return execution_display_key(self)

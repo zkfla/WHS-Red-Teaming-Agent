@@ -14,6 +14,21 @@ from pydantic import BaseModel, Field, model_validator
 
 from redteam.core.enums import RiskLevel, ToolHealthStatus
 from redteam.core.ids import ActionId, AgentId, EngagementId, InvocationId, RunId, ToolId
+from redteam.core.tool_binding import LEGACY_ACTION, SELECTED_TOOL, BindingMode
+
+
+class ToolTargetBinding(BaseModel):
+    binds_target_arguments: bool = True
+    binds_known_path_from_url: bool = False
+    requires_url_target: bool = False
+    requires_exact_url_match: bool = False
+
+
+# Shared provider-metadata keys read from SDK discovery metadata. One
+# declaration for every provider; no per-tool central list. Absent keys
+# keep the contract defaults.
+PROVIDER_METADATA_TARGET_BINDING = "redteam.target_binding"
+PROVIDER_METADATA_COMMAND_FIELDS = "redteam.command_fields"
 
 
 class ToolDescriptor(BaseModel):
@@ -39,6 +54,10 @@ class ToolDescriptor(BaseModel):
     argument_bindings: dict[str, str] = Field(default_factory=dict)
     # Provider-declared input fields transmitted as text to an external service.
     outbound_text_fields: list[str] = Field(default_factory=list)
+    # Provider-declared target semantics consumed by direct selected-tool calls.
+    target_binding: ToolTargetBinding = Field(default_factory=ToolTargetBinding)
+    # Provider-declared command input fields inspected for risky command patterns.
+    command_fields: list[str] = Field(default_factory=list)
 
     @property
     def required_arguments(self) -> tuple[str, ...]:
@@ -71,9 +90,10 @@ class ToolInvocation(BaseModel):
     action_id: ActionId
     run_id: RunId
     tool_id: ToolId
-    # Canonical, tool-independent intent copied from ActionProposal.operation.
+    binding_mode: BindingMode = LEGACY_ACTION
+    # Legacy canonical intent copied from ActionProposal.operation; empty for direct calls.
     # The actual MCP remote tool name is resolved from tool_id via ToolDescriptor.
-    operation: str
+    operation: str = ""
     arguments: dict[str, Any] = Field(default_factory=dict)
     timeout_seconds: float = 30.0
     execution_context: ExecutionContext
@@ -83,6 +103,8 @@ class ToolInvocation(BaseModel):
     def _timeout_must_be_positive(self) -> ToolInvocation:
         if self.timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be > 0")
+        if self.binding_mode == SELECTED_TOOL and self.operation:
+            raise ValueError("selected_tool invocation must leave operation empty")
         return self
 
 

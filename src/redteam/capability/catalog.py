@@ -124,9 +124,8 @@ class MCPToolCatalog:
                         f"tool {tool_id} uses unsupported namespace {namespace!r}"
                     ) from exc
                 if tool_id not in self._operation_bindings:
-                    raise ValueError(
-                        f"operation bindings are missing an explicit mapping for {tool_id}"
-                    )
+                    self._resolved_operations[tool_id] = frozenset()
+                    continue
                 declared = list(self._operation_bindings[tool_id])
                 if descriptor.operations and set(declared) != set(descriptor.operations):
                     raise ValueError(
@@ -181,7 +180,31 @@ class MCPToolCatalog:
         descriptor = self._registry.resolve(tool_id)
         if descriptor is None:
             return False
+        if not operation:
+            return True
         return operation in self._operations_for(descriptor)
+
+    def select(self, tool_ids) -> list:
+        chosen = []
+        for tool_id in tool_ids:
+            descriptor = self.get(ToolId(str(tool_id)))
+            if descriptor is not None:
+                chosen.append(descriptor)
+        return chosen
+
+    def all_descriptors(self) -> list:
+        """Every registered tool as a finalized descriptor, sorted by id.
+
+        Role views filter this list without consulting operation
+        bindings, so mapper-less tools stay visible and ops-empty
+        tools are still listed.
+        """
+        return [
+            self.finalized(descriptor)
+            for descriptor in sorted(
+                self._registry.all(), key=lambda item: str(item.tool_id)
+            )
+        ]
 
     def executable_pairs(self) -> list[tuple[str, str]]:
         pairs: set[tuple[str, str]] = set()

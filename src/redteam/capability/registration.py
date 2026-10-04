@@ -475,6 +475,32 @@ def default_target_types_for_kind(kind: Any) -> list[str]:
     return list(_KIND_TARGET_TYPES.get(getattr(kind, "value", kind), ()))
 
 
+def project_default_target_binding(descriptor: Any, operations: Collection[str]) -> None:
+    """Default descriptor target semantics from bound-operation flags.
+
+    Presence decides, never values: a provider that explicitly
+    declares even default-equal flags keeps its declaration.
+    Tools bound to zero or several operations keep the generic
+    default. No new central list is consulted: the existing
+    operation table is reused as the default source.
+    """
+    from redteam.core.contracts.tool import ToolTargetBinding
+    from redteam.core.provider_contracts import operation_target_binding
+
+    bound = [str(operation) for operation in operations]
+    if len(bound) != 1:
+        return
+    if "target_binding" in (getattr(descriptor, "model_fields_set", None) or set()):
+        return
+    flags = operation_target_binding(bound[0])
+    descriptor.target_binding = ToolTargetBinding(
+        binds_target_arguments=flags.binds_target_arguments,
+        binds_known_path_from_url=flags.binds_known_path_from_url,
+        requires_url_target=flags.requires_url_target,
+        requires_exact_url_match=flags.requires_exact_url_match,
+    )
+
+
 def _bind_page_text_discovery(descriptor: Any, settings: Any) -> str | None:
     from redteam.capability.page_text_manifest import validate_page_text_discovery
     from redteam.capability.servers.page_text_mcp import load_page_text_config

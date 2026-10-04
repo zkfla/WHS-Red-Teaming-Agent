@@ -1,0 +1,32 @@
+# Package default role selections (selectors only, never role definitions).
+# AND across dimensions, OR within one dimension; methodology_refs never
+# filters tools. An explicit selection with no tool selectors allows no
+# tool; an omitted agent row defers to unconstrained.
+profile_id: builtin
+version: "1"
+roles:
+  - agent_id: recon-agent
+    tool_ids: []
+    server_ids: []
+    capability_tags: [recon]
+    methodology_refs: []
+  - agent_id: web-api-agent
+    tool_ids: []
+    server_ids: []
+    capability_tags: [web, api]
+    methodology_refs: []
+  - agent_id: mobile-agent
+    tool_ids: []
+    server_ids: []
+    capability_tags: [mobile]
+    methodology_refs: []
+  - agent_id: analysis-agent
+    tool_ids: []
+    server_ids: []
+    capability_tags: [analysis]
+    methodology_refs: []
+  - agent_id: reporting-agent
+    tool_ids: []
+    server_ids: []
+    capability_tags: []
+    methodology_refs: []

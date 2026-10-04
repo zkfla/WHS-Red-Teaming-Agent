@@ -33,6 +33,7 @@ from redteam.core.ids import (
     ToolId,
     new_id,
 )
+from redteam.core.tool_binding import SELECTED_TOOL, execution_fingerprint, is_direct
 
 
 class NonAllowDecisionError(ValueError):
@@ -54,12 +55,41 @@ def build_tool_invocation(
         raise NonAllowDecisionError(
             f"cannot build a ToolInvocation from a {decision.verdict.value} PolicyDecision"
         )
-
+    if is_direct(proposal.binding_mode, proposal.tool_id):
+        if proposal.tool_id is None or str(tool_id) != str(proposal.tool_id):
+            raise ValueError("direct invocation tool_id must equal proposal.tool_id")
+        fingerprint = execution_fingerprint(proposal.tool_id, proposal.target, proposal.arguments)
+        if decision.execution_fingerprint is not None:
+            if decision.execution_fingerprint != fingerprint:
+                raise ValueError("decision fingerprint does not match the approved proposal")
+        return ToolInvocation(
+            invocation_id=InvocationId(new_id("inv")),
+            action_id=proposal.action_id,
+            run_id=proposal.run_id,
+            tool_id=tool_id,
+            binding_mode=SELECTED_TOOL,
+            operation="",
+            arguments=proposal.arguments,
+            timeout_seconds=timeout_seconds,
+            execution_context=ExecutionContext(
+                engagement_id=proposal.engagement_id,
+                run_id=proposal.run_id,
+                agent_id=proposal.agent_id,
+                correlation_id=correlation_id,
+                dry_run=dry_run,
+            ),
+            created_at=datetime.now(timezone.utc),
+        )
+    fingerprint = execution_fingerprint(tool_id, proposal.target, proposal.arguments)
+    if decision.execution_fingerprint is not None:
+        if decision.execution_fingerprint != fingerprint:
+            raise ValueError("decision fingerprint does not match the approved proposal")
     return ToolInvocation(
         invocation_id=InvocationId(new_id("inv")),
         action_id=proposal.action_id,
         run_id=proposal.run_id,
         tool_id=tool_id,
+        binding_mode=proposal.binding_mode,
         operation=proposal.operation,
         arguments=proposal.arguments,
         timeout_seconds=timeout_seconds,

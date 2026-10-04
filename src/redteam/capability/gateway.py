@@ -27,6 +27,7 @@ from redteam.core.contracts.tool import ToolDescriptor, ToolError, ToolInvocatio
 from redteam.core.enums import ToolHealthStatus
 from redteam.core.ids import ToolId
 from redteam.core.ports.tool_gateway import BeforeToolStart, ToolStartRejected
+from redteam.core.tool_binding import SELECTED_TOOL
 
 # Health is a liveness signal, not an authorization decision. A single probe
 # is always bounded by this timeout so a hung MCP server can never stall an
@@ -230,7 +231,12 @@ class MCPToolGateway:
                 finished_at=datetime.now(timezone.utc),
             )
 
-        if not self._catalog.supports(invocation.tool_id, invocation.operation):
+        legacy_blocked = invocation.binding_mode != SELECTED_TOOL
+        if legacy_blocked:
+            allowed = self._catalog.supports(invocation.tool_id, invocation.operation)
+        else:
+            allowed = True
+        if not allowed:
             return self._error_result(
                 invocation,
                 code="operation_not_allowed_for_tool",

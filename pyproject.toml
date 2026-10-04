@@ -69,7 +69,7 @@ build-backend = "setuptools.build_meta"
 where = ["src"]
 
 [tool.setuptools.package-data]
-redteam = ["capability/reference_data/*.json", "capability/reference_data/templates/*.md"]
+redteam = ["capability/reference_data/*.json", "capability/reference_data/*.yaml", "capability/reference_data/templates/*.md"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

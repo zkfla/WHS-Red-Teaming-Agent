@@ -13,7 +13,13 @@ from redteam.capability.adapters.mcp.transport import (
     MCPTransport,
     StreamableHTTPMCPTransport,
 )
-from redteam.core.contracts.tool import ToolDescriptor, ToolError
+from redteam.core.contracts.tool import (
+    PROVIDER_METADATA_COMMAND_FIELDS,
+    PROVIDER_METADATA_TARGET_BINDING,
+    ToolDescriptor,
+    ToolError,
+    ToolTargetBinding,
+)
 from redteam.core.enums import RiskLevel, ToolHealthStatus
 from redteam.core.ids import ToolId
 
@@ -66,6 +72,8 @@ class MCPServerAdapter:
             )
             for tool in remote_tools
         ]
+        for descriptor, remote_tool in zip(descriptors, remote_tools, strict=True):
+            _apply_provider_metadata(descriptor, remote_tool.metadata)
         self._discovered_output_schemas = {
             descriptor.tool_id: deepcopy(remote_tool.output_schema)
             for descriptor, remote_tool in zip(descriptors, remote_tools, strict=True)
@@ -106,6 +114,25 @@ class MCPServerAdapter:
     async def health_check(self) -> ToolHealthStatus:
         healthy = await self._transport.health_check()
         return ToolHealthStatus.HEALTHY if healthy else ToolHealthStatus.UNHEALTHY
+
+
+def _apply_provider_metadata(
+    descriptor: ToolDescriptor, metadata: Mapping[str, Any] | None
+) -> None:
+    # Provider-declared target semantics and command fields from the
+    # shared metadata keys. Absent keys keep the contract defaults;
+    # no per-tool central list lives here.
+    if not metadata:
+        return
+    binding_spec = metadata.get(PROVIDER_METADATA_TARGET_BINDING)
+    if isinstance(binding_spec, Mapping):
+        known = {
+            key: binding_spec[key] for key in binding_spec if key in ToolTargetBinding.model_fields
+        }
+        descriptor.target_binding = ToolTargetBinding.model_validate(known)
+    command_fields = metadata.get(PROVIDER_METADATA_COMMAND_FIELDS)
+    if isinstance(command_fields, (list, tuple)):
+        descriptor.command_fields = [str(name) for name in command_fields if str(name)]
 
 
 def _safe_error_message(output: dict[str, Any] | str | None) -> str:

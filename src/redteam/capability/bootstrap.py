@@ -27,6 +27,7 @@ from redteam.capability.registration import (
     apply_server_catalog_target_types,
     create_adapter_for_settings,
     default_target_types_for_kind,
+    project_default_target_binding,
     select_server_target_type,
     validate_server_configured_discovery,
 )
@@ -146,14 +147,20 @@ async def _build_gateway(
         if settings.tool_operations is not None:
             discovered_names = {descriptor.tool_name for descriptor in descriptors}
             configured_names = set(settings.tool_operations)
-            if discovered_names != configured_names:
+            unknown_names = configured_names - discovered_names
+            if unknown_names:
                 raise MCPConfigurationError(
-                    f"MCP server {server_id!r} operation bindings do not match discovered tools"
+                    f"MCP server {server_id!r} operation bindings reference undiscovered tools"
                 )
         server_bindings: dict[str, tuple[str, ...]] = {}
         for descriptor in descriptors:
-            if settings.tool_operations is not None:
-                operations = tuple(settings.tool_operations[descriptor.tool_name])
+            configured = (
+                settings.tool_operations.get(descriptor.tool_name)
+                if settings.tool_operations is not None
+                else None
+            )
+            if configured is not None:
+                operations = tuple(configured)
                 if descriptor.operations and set(operations) != set(descriptor.operations):
                     raise MCPConfigurationError(
                         f"MCP server {server_id!r} tool {descriptor.tool_name!r} explicit "
@@ -162,13 +169,14 @@ async def _build_gateway(
             elif descriptor.operations:
                 operations = tuple(descriptor.operations)
             else:
-                # Discovery is not permission to promote a tool name to an intent.
-                # Unbound tools can be inspected but are never executable candidates.
+                # Unbound tools carry no legacy operation intent; they stay
+                # registered and addressable by direct selected-tool calls.
                 operations = ()
             # The operation binding is part of the Registry snapshot exposed
             # to Agent/Orchestration; it must not remain only in a private
             # Gateway map.
             descriptor.operations = list(operations)
+            project_default_target_binding(descriptor, operations)
             split = split_tool_id(descriptor.tool_id)
             descriptor.retry_safe = declares_retry_safe(
                 split[0] if split is not None else "", operations
