@@ -35,7 +35,6 @@ from redteam.orchestration.state import initial_graph_state
 from tests.fakes import DummyToolGateway, FakeControlPlane
 from tests.integration import _engine_llm_harness as h
 
-
 # Intentional contract 3.1/3.5.8: the proposal schema carries only the
 # minimal purpose shape (reason + steps); stored path/runtime attribution
 # is hydrated by code. Route old full-shape scripted drafts the same way.
