@@ -471,7 +471,7 @@ async def _bound_receipt_evidence(*, tasks, evidence_store, path_store, run_id, 
             if not isinstance(raw, dict):
                 proven = False
                 break
-            if _linkage(origin, meta, raw, str(identity), require_proposal=False):
+            if _linkage(origin, meta, raw, str(identity), require_proposal=True):
                 proven = False
                 break
             origin_errors = await _stored_origin(

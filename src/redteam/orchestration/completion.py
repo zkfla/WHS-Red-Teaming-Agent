@@ -404,6 +404,12 @@ def check_record_linkage(
             "completion_evidence_reference_needs_both_action_id_25",
             "evidence 'reference' needs both action_id and invocation_id linkage",
         )]
+    if _field(record, "source_type", None) is not EvidenceSourceType.TOOL:
+        return [(
+            f"evidence '{evidence_id}' is not tool evidence and cannot prove execution",
+            "completion_evidence_reference_is_not_tool_evidence_79",
+            "evidence 'reference' is not tool evidence and cannot prove execution",
+        )]
     mismatched = next(
         (
             key
@@ -437,6 +443,13 @@ def check_record_linkage(
             f"evidence '{evidence_id}' preserved raw result names no tool",
             "completion_evidence_reference_preserved_raw_result_names_no_tool_76",
             "evidence 'reference' preserved raw result names no tool",
+        )]
+    meta_tool = _s(meta.get("tool_id", "")).strip()
+    if meta_tool and meta_tool != str(raw.get("tool_id", "") or "").strip():
+        return [(
+            f"evidence '{evidence_id}' tool differs from its preserved raw result",
+            "completion_evidence_reference_tool_differs_from_preserved_raw_80",
+            "evidence 'reference' tool differs from its preserved raw result",
         )]
     stored_proposal = meta.get("proposal")
     if not isinstance(stored_proposal, dict):
@@ -473,7 +486,13 @@ def check_record_linkage(
     for key in ("run_id", "engagement_id"):
         proposed_value = _s(stored_proposal.get(key, "") or "").strip()
         record_value = _s(_field(record, key, "") or "").strip()
-        if proposed_value and record_value and proposed_value != record_value:
+        if not proposed_value or not record_value:
+            return [(
+                f"evidence '{evidence_id}' stored proposal has no {key} binding",
+                "completion_evidence_reference_stored_proposal_has_no_binding_81",
+                "evidence 'reference' stored proposal has no binding",
+            )]
+        if proposed_value != record_value:
             return [(
                 f"evidence '{evidence_id}' stored proposal answers another {key}",
                 "completion_evidence_reference_stored_proposal_answers_another_run_77",

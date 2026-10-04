@@ -551,7 +551,7 @@ async def _goal_task_coverage(
             origin_raw = raw_from_metadata(origin_meta)
             if not isinstance(origin_raw, dict):
                 return (["task origin '" + str(identity) + "' has no preserved raw result"], {}, [])
-            linkage = check_record_linkage(origin, origin_meta, origin_raw, str(identity), require_proposal=False)
+            linkage = check_record_linkage(origin, origin_meta, origin_raw, str(identity), require_proposal=True)
             if linkage:
                 return ([linkage[0][0]], {}, [])
             origin_errors = await verify_stored_origin(
