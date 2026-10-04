@@ -35,6 +35,7 @@ from redteam.orchestration.state import initial_graph_state
 from tests.fakes import DummyToolGateway, FakeControlPlane
 from tests.integration import _engine_llm_harness as h
 
+
 def _real_deps(llm, *, seed, world, intent_store=None):
     gateway = DummyToolGateway(tools=[h.inventory_descriptor()])
     deps = RuntimeDeps(
