@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import os
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -67,14 +68,18 @@ def load_web_search_config(
 
 
 def create_server(
-    config: SearchConfig, *, provider: SearchProvider | None = None, api_key: str = "",
+    config: SearchConfig,
+    *,
+    provider: SearchProvider | None = None,
+    api_key: str = "",
+    prohibited_patterns: Sequence[str] = (),
 ) -> MCPServer:
     """Expose one search tool; construction-time settings never become tool arguments."""
     if provider is None:
         if config.external_search_enabled and not api_key:
             raise ValueError("TAVILY_API_KEY is required for enabled web search")
         provider = TavilySearchProvider(api_key=api_key, config=config)
-    reader = WebSearchReader(provider, config)
+    reader = WebSearchReader(provider, config, prohibited_patterns=prohibited_patterns)
     server = _SearchMCPServer("web-search", log_level="WARNING")
 
     async def web_search(query: str, max_results: int = min(5, config.max_results)) -> SearchResult:

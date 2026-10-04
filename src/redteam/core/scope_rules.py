@@ -462,3 +462,64 @@ def check_scope(
     if allow_malformed:
         reason += f" (ignored malformed allow entries: {allow_malformed})"
     return False, [reason], Severity.BLOCK_ACTION
+
+
+def resolve_target_hostports(target: AnyTarget) -> tuple[list[HostPort], str | None]:
+    """Public wrapper over target address resolution (no new meaning)."""
+    return _resolve_target(target)
+
+
+def target_matches_selector(selector: EngagementScope, target: AnyTarget) -> bool:
+    """Whether a target falls inside a TargetActionPolicy selector scope.
+
+    Host, URL and Endpoint targets share one address reading, so the same
+    target reaches the same restriction in every spelling. URL path and query
+    never decide a match here (host-level unit only); page-resource path and
+    query comparison stays separate and must not be confused with this unit.
+    A target without a port still matches a port-pinned selector host (fail
+    closed) so a port-less spelling cannot bypass a port-designated limit.
+    Selector reading grants nothing new: True only routes the proposal to the
+    matched policy allow and deny key checks, it never allows by itself.
+    """
+    if isinstance(target, (AssetTarget, DeviceTarget)):
+        asset_id = str(
+            target.asset_id
+            if isinstance(target, AssetTarget)
+            else target.asset_id or target.package_name
+        )
+        if asset_id in selector.denied_assets:
+            return False
+        if not selector.allowed_assets:
+            return False
+        return asset_id in selector.allowed_assets
+    resolved, error = _resolve_target(target)
+    if error is not None or not resolved:
+        return False
+    denied_hosts, denied_host_bad = _host_entries(selector.denied_hosts)
+    allowed_hosts, _allowed_host_bad = _host_entries(selector.allowed_hosts)
+    denied_domains, denied_domain_bad = _domain_entries(selector.denied_domains)
+    allowed_domains, _allowed_domain_bad = _domain_entries(selector.allowed_domains)
+    allowed_nets, _allowed_net_bad = _network_entries(selector.allowed_networks)
+    if denied_host_bad or denied_domain_bad:
+        return True
+    for cand in resolved:
+        matched, deny_ambiguous = _matches_host_entry(cand, denied_hosts)
+        if matched:
+            return False
+        if deny_ambiguous:
+            return True
+        if _matches_domain(cand[0], denied_domains):
+            return False
+    if not (selector.allowed_hosts or selector.allowed_domains or selector.allowed_networks):
+        return False
+    for cand in resolved:
+        matched, needs_port = _matches_host_entry(cand, allowed_hosts)
+        if matched:
+            return True
+        if needs_port:
+            return True
+        if _matches_domain(cand[0], allowed_domains):
+            return True
+        if _matches_network(cand[0], allowed_nets):
+            return True
+    return False

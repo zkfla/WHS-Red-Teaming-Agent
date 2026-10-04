@@ -9,7 +9,7 @@ import asyncio
 import ipaddress
 import re
 import unicodedata
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Protocol
@@ -17,6 +17,8 @@ from urllib.parse import urlsplit
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+
+from redteam.core.outbound_text import check_outbound_text
 
 
 class SearchErrorCode(str, Enum):
@@ -39,7 +41,7 @@ class SearchError(ValueError):
 
     def __init__(self, code: SearchErrorCode) -> None:
         self.code = code
-        super().__init__(f"web_search: {code.value}")
+        super().__init__("web_search: " + code.value)
 
 
 class ProviderFailure(Exception):
@@ -133,19 +135,11 @@ class SearchProvider(Protocol):
     async def search(self, query: str, max_results: int) -> ProviderSearchResponse: ...
 
 
-_SENSITIVE_ASSIGNMENT = re.compile(
-    r"\b(?:authorization|cookie|password|passwd|token|api[_-]?key|apikey|"
-    r"access[_-]?token|refresh[_-]?token|secret)\s*[:=]",
-    re.IGNORECASE,
-)
-_BEARER_VALUE = re.compile(r"\bbearer\s+\S+", re.IGNORECASE)
+# Narrow outbound-text expressions live in redteam.core.outbound_text now;
+# this module keeps no private copy so every layer shares one meaning.
 _PROVIDER_ID = re.compile(r"[a-z][a-z0-9_-]{0,63}\Z")
 _BAD_ESCAPE = re.compile(r"%(?![0-9a-fA-F]{2})")
 _DNS_LABEL = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z")
-
-
-def _sensitive(query: str) -> bool:
-    return bool(_SENSITIVE_ASSIGNMENT.search(query) or _BEARER_VALUE.search(query))
 
 
 def _provider_url(value: str) -> str:
@@ -244,9 +238,16 @@ def _normalize(
 class WebSearchReader:
     """Validate outbound text, call one injected provider, return bounded observations."""
 
-    def __init__(self, provider: SearchProvider, config: SearchConfig) -> None:
+    def __init__(
+        self,
+        provider: SearchProvider,
+        config: SearchConfig,
+        *,
+        prohibited_patterns: Sequence[str] = (),
+    ) -> None:
         self._provider = provider
         self._config = config
+        self._prohibited_patterns = tuple(prohibited_patterns or ())
 
     async def _call_provider(self, request: SearchRequest, provider_id: str) -> SearchResult:
         response = await self._provider.search(
@@ -261,7 +262,11 @@ class WebSearchReader:
             raise SearchError(SearchErrorCode.INVALID_INPUT)
         if not self._config.external_search_enabled:
             raise SearchError(SearchErrorCode.EXTERNAL_SEARCH_DISABLED)
-        if _sensitive(request.query):
+        # Same narrow check as Control: explicit credentials plus operator
+        # prohibited patterns. The query never reaches the provider on block,
+        # and the error carries a stable code only (no query text).
+        verdict = check_outbound_text(request.query, self._prohibited_patterns)
+        if verdict.blocked:
             raise SearchError(SearchErrorCode.SENSITIVE_QUERY)
         try:
             provider_id = self._provider.provider_id

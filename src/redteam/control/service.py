@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import logging
 import math
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
@@ -40,16 +41,19 @@ from redteam.control.policy import (
     may_auto_approve,
     resolve_risk_threshold,
 )
+from redteam.control.outbound import OUTBOUND_MATCHED_RULE, evaluate_with_descriptor
 from redteam.control.rate_limit import RateLimiter
 from redteam.control.risk import RiskResolver
 from redteam.control.roe import UnsupportedRoePolicyError, check_roe
 from redteam.control.scope import check_scope
 from redteam.control.severity import Severity, to_tag
+from redteam.control.target_action import check_target_action_policies
 from redteam.core.contracts.action import ActionProposal
 from redteam.core.contracts.engagement import Engagement
 from redteam.core.contracts.policy import Approval, ControlContext, PolicyDecision
 from redteam.core.enums import ApprovalStatus, PolicyVerdict, RiskLevel
-from redteam.core.ids import ApprovalId, EngagementId
+from redteam.core.contracts.tool import ToolDescriptor
+from redteam.core.ids import ApprovalId, EngagementId, ToolId
 from redteam.evidence.service import EvidenceService
 
 logger = logging.getLogger(__name__)
@@ -98,6 +102,7 @@ class DefaultControlPlane:
         approvals: ApprovalService | None = None,
         evidence_service: EvidenceService | None = None,
         risk_resolver: RiskResolver | None = None,
+        outbound_descriptor_resolver: Callable[[ToolId], ToolDescriptor | None] | None = None,
     ) -> None:
         self._engagements = engagements
         self._audit = audit_log or AuditLog()
@@ -108,6 +113,12 @@ class DefaultControlPlane:
         # Capability Tool Registry (source of truth) so higher-risk actions
         # require human approval. None = no risk-based gating (unchanged).
         self._risk_resolver = risk_resolver
+        # Optional outbound-text narrowing: resolves the actually selected
+        # tool (ControlContext.selected_tool_id, supplied by root policy and
+        # execute paths) to its declared outbound_text_fields. None means
+        # unknown binding: no batch outbound reject here (unavailable-tool
+        # diagnosis applies elsewhere); declared empty means nothing to check.
+        self._outbound_descriptor_resolver = outbound_descriptor_resolver
         # Optional (Track B's EvidenceService): when present, DENY /
         # REQUIRE_APPROVAL decisions are also recorded as Evidence so the
         # final report includes blocked attempts, not just executed ones.
@@ -136,6 +147,19 @@ class DefaultControlPlane:
         engagement_id = context.engagement_id
         engagement = self._engagements[engagement_id]
 
+        # Outbound-text gate first: a blocked input is denied before any
+        # proposal original reaches durable audit or blocked-action evidence.
+        # Only a cleaned copy (empty arguments) plus safe reason codes is stored.
+        outbound_descriptor = self._resolve_outbound_descriptor(context)
+        outbound_blocked, outbound_reasons, _outbound_code = evaluate_with_descriptor(
+            proposal, outbound_descriptor, engagement.external_text_policy
+        )
+        if outbound_blocked:
+            # Outbound DENY: _finalize stores a cleaned copy plus safe codes only.
+            return await self._finalize(
+                proposal, PolicyVerdict.DENY, outbound_reasons, [OUTBOUND_MATCHED_RULE], severity=Severity.BLOCK_ACTION
+            )
+
         scope_ok, scope_reasons, scope_severity = check_scope(proposal, engagement.scope)
         if not scope_ok:
             return await self._finalize(
@@ -158,6 +182,14 @@ class DefaultControlPlane:
         if not roe_ok:
             return await self._finalize(
                 proposal, PolicyVerdict.DENY, roe_reasons, ["roe"], severity=roe_severity
+            )
+
+        target_ok, target_reasons, target_severity = check_target_action_policies(
+            proposal, engagement.target_action_policies
+        )
+        if not target_ok:
+            return await self._finalize(
+                proposal, PolicyVerdict.DENY, target_reasons, ["target_action_policy"], severity=target_severity
             )
 
         risk, risk_unresolved = self._resolve_risk(proposal)
@@ -813,6 +845,37 @@ class DefaultControlPlane:
                 now_utc,
                 idx,
             )
+        target_ok, target_reasons, target_severity = check_target_action_policies(
+            proposal, engagement.target_action_policies
+        )
+        if not target_ok:
+            return (
+                False,
+                "target_policy_denied",
+                list(target_reasons),
+                ["target_action_policy"],
+                target_severity,
+                engagement,
+                self._budgets.get(context.engagement_id),
+                now_utc,
+                idx,
+            )
+        outbound_descriptor = self._resolve_outbound_descriptor(context)
+        outbound_blocked, outbound_reasons, _outbound_code = evaluate_with_descriptor(
+            proposal, outbound_descriptor, engagement.external_text_policy
+        )
+        if outbound_blocked:
+            return (
+                False,
+                "outbound_blocked",
+                list(outbound_reasons),
+                [OUTBOUND_MATCHED_RULE],
+                Severity.BLOCK_ACTION,
+                engagement,
+                self._budgets.get(context.engagement_id),
+                now_utc,
+                idx,
+            )
         budget = self._budgets.get(context.engagement_id)
         if budget is not None and budget.duration_exhausted():
             return (
@@ -937,7 +1000,7 @@ class DefaultControlPlane:
                 else (
                     "admission"
                     if code == "decision_mismatch"
-                    else ("scope" if code == "scope_revoked" else "roe")
+                    else ("scope" if code == "scope_revoked" else ("target_action_policy" if code == "target_policy_denied" else ("outbound_text" if code == "outbound_blocked" else "roe")))
                 )
             )
             sev = severity if severity is not None else _severity_for(code)
@@ -1006,6 +1069,11 @@ class DefaultControlPlane:
         # matched_rules tag. Tag readers must use
         # core.contracts.policy.legacy_denial_severity (or the
         # PolicyDecision.denial_severity property), never a new parser here.
+        if verdict is PolicyVerdict.DENY and OUTBOUND_MATCHED_RULE in matched_rules:
+            # Outbound-text deny: never persist original arguments anywhere.
+            # Audit and blocked-action evidence see only a cleaned copy plus
+            # safe reason codes (no input text, values, or pattern contents).
+            proposal = proposal.model_copy(update={"arguments": {}})
         if severity is not None:
             matched_rules = [*matched_rules, to_tag(severity)]
         decision = PolicyDecision(
@@ -1022,6 +1090,16 @@ class DefaultControlPlane:
         await self._audit.record(proposal, decision)
         await self._record_blocked_action(proposal, decision)
         return decision
+
+    def _resolve_outbound_descriptor(self, context: ControlContext) -> ToolDescriptor | None:
+        tool_id = getattr(context, "selected_tool_id", None)
+        if tool_id is None or self._outbound_descriptor_resolver is None:
+            return None
+        try:
+            return self._outbound_descriptor_resolver(ToolId(str(tool_id)))
+        except Exception:
+            logger.exception("outbound descriptor lookup failed; treating as unknown")
+            return None
 
     def _resolve_risk(self, proposal: ActionProposal) -> tuple[RiskLevel | None, bool]:
         """Resolve an action's risk from the Registry.
