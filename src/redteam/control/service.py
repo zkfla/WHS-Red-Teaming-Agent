@@ -32,15 +32,21 @@ import math
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from typing import Any
 
 from redteam.control.approval import ApprovalService
 from redteam.control.audit import AuditLog
 from redteam.control.budget import BudgetTracker
 from redteam.control.outbound import OUTBOUND_MATCHED_RULE, evaluate_with_descriptor
 from redteam.control.policy import (
+    COMMAND_MATCH_PREFIX,
+    DEFAULT_COMMAND_APPROVAL_RULES,
+    POLICY_SEMANTICS_UNAVAILABLE,
+    auto_approval_ceiling,
     evaluate_policy,
     may_auto_approve,
     resolve_risk_threshold,
+    unavailable_restriction_reasons,
 )
 from redteam.control.rate_limit import RateLimiter
 from redteam.control.risk import RiskResolver
@@ -54,6 +60,8 @@ from redteam.core.contracts.policy import Approval, ControlContext, PolicyDecisi
 from redteam.core.contracts.tool import ToolDescriptor
 from redteam.core.enums import ApprovalStatus, PolicyVerdict, RiskLevel
 from redteam.core.ids import ApprovalId, EngagementId, ToolId
+from redteam.core.tool_binding import execution_fingerprint as _binding_fingerprint
+from redteam.core.tool_binding import is_direct as _is_direct_binding
 from redteam.evidence.service import EvidenceService
 
 logger = logging.getLogger(__name__)
@@ -63,6 +71,86 @@ logger = logging.getLogger(__name__)
 #: against an absurd value (e.g. a corrupt checkpoint) ever being materialised
 #: as a deque/list. It is far above any realistic engagement budget.
 _MAX_REHYDRATABLE_COUNT = 1_000_000
+
+
+def _same_action_content(first: ActionProposal, second: ActionProposal) -> bool:
+    """Whether two proposals describe the same approvable action.
+
+    Covers identity (action/run/engagement), binding (mode/tool), intent
+    (capability/operation/availability) and content (target/arguments).
+    Mutable mappings compare by normalized value via the shared binding
+    fingerprint helper; direct/selected-tool bindings additionally require
+    the same tool/target/arguments fingerprint.
+    """
+    if first.action_id != second.action_id:
+        return False
+    if getattr(first, "binding_mode", "legacy_action") != getattr(
+        second, "binding_mode", "legacy_action"
+    ):
+        return False
+    if getattr(first, "tool_id", None) != getattr(second, "tool_id", None):
+        return False
+    if not _binding_fingerprint_matches(first, second):
+        return False
+    return (
+        first.capability == second.capability
+        and first.operation == second.operation
+        and first.target == second.target
+        and first.arguments == second.arguments
+        and first.availability_impact == second.availability_impact
+        and first.engagement_id == second.engagement_id
+        and first.run_id == second.run_id
+        and first.agent_id == second.agent_id
+    )
+
+
+def _proposal_fingerprint(proposal: ActionProposal) -> str | None:
+    """Normalized tool/target/args fingerprint for direct bindings."""
+    tool_id = getattr(proposal, "tool_id", None)
+    if not _is_direct_binding(getattr(proposal, "binding_mode", "legacy_action"), tool_id):
+        return None
+    try:
+        return _binding_fingerprint(tool_id, proposal.target, proposal.arguments)
+    except Exception:
+        return None
+
+
+def _binding_fingerprint_matches(first: ActionProposal, second: ActionProposal) -> bool:
+    """Compare normalized tool/target/args for direct bindings."""
+    first_direct = _is_direct_binding(
+        getattr(first, "binding_mode", "legacy_action"), getattr(first, "tool_id", None)
+    )
+    second_direct = _is_direct_binding(
+        getattr(second, "binding_mode", "legacy_action"), getattr(second, "tool_id", None)
+    )
+    if not first_direct and not second_direct:
+        return True
+    if first_direct != second_direct:
+        return False
+    if getattr(first, "tool_id", None) != getattr(second, "tool_id", None):
+        return False
+    try:
+        return _binding_fingerprint(
+            getattr(first, "tool_id", None), first.target, first.arguments
+        ) == _binding_fingerprint(
+            getattr(second, "tool_id", None), second.target, second.arguments
+        )
+    except Exception:
+        return False
+
+
+def _stale_proposal_decision(action_id, approval_id: ApprovalId | str) -> PolicyDecision:
+    return PolicyDecision(
+        action_id=action_id,
+        verdict=PolicyVerdict.DENY,
+        reasons=[
+            f"stale approval {approval_id}: current proposal no longer "
+            f"matches the approved content -- cannot safely resume"
+        ],
+        matched_rules=["approval", "stale", to_tag(Severity.ABORT_RUN)],
+        approval_id=ApprovalId(str(approval_id)),
+        evaluated_at=datetime.now(timezone.utc),
+    )
 
 
 @dataclass(frozen=True)
@@ -138,6 +226,12 @@ class DefaultControlPlane:
         # the first resolved one returns the same PolicyDecision instead
         # of re-consuming rate-limit/budget capacity.
         self._resolved_outcomes: dict[ApprovalId, PolicyDecision] = {}
+        # Retains the approved proposal behind a resolved ALLOW so a later
+        # approval_outcome() with current_proposal can still prove the same
+        # tool/target/arguments binding. Popped proposals alone cannot
+        # validate a cache hit; without this, a changed call could reuse a
+        # cached ALLOW the human never saw.
+        self._resolved_proposals: dict[ApprovalId, ActionProposal] = {}
         # Root review: admission never caches time checks. Receipts are
         # caller correlation only. Retries track consumed attempts by key,
         # never by replaying a stored decision before current checks.
@@ -170,10 +264,21 @@ class DefaultControlPlane:
                 proposal, PolicyVerdict.DENY, scope_reasons, ["scope"], severity=scope_severity
             )
 
+        # Selected-tool direct inspection only: the selected descriptor's own
+        # risk, never the max over every tool serving the action. An unknown
+        # selected binding escalates to a human (no legacy max fallback).
+        # Legacy callers without a selected tool keep the registry behavior.
+        # Resolved once here so ROE, target-action and policy stages share it.
+        selected_descriptor = outbound_descriptor
+        has_selected_tool = getattr(context, "selected_tool_id", None) is not None
         in_flight = self._in_flight_from_context(context)
         try:
             roe_ok, roe_reasons, roe_severity = check_roe(
-                proposal, engagement, in_flight_actions=in_flight
+                proposal,
+                engagement,
+                in_flight_actions=in_flight,
+                selected=selected_descriptor,
+                has_selected_tool=has_selected_tool,
             )
         except UnsupportedRoePolicyError as exc:
             # A configured-but-unenforceable ROE field: fail the whole run
@@ -189,7 +294,10 @@ class DefaultControlPlane:
             )
 
         target_ok, target_reasons, target_severity = check_target_action_policies(
-            proposal, engagement.target_action_policies
+            proposal,
+            engagement.target_action_policies,
+            selected=selected_descriptor,
+            has_selected_tool=has_selected_tool,
         )
         if not target_ok:
             return await self._finalize(
@@ -200,14 +308,22 @@ class DefaultControlPlane:
                 severity=target_severity,
             )
 
-        risk, risk_unresolved = self._resolve_risk(proposal)
         approval_policy = engagement.approval_policy
+        if has_selected_tool:
+            if selected_descriptor is not None:
+                risk, risk_unresolved = selected_descriptor.risk_level, False
+            else:
+                risk, risk_unresolved = None, True
+        else:
+            risk, risk_unresolved = self._resolve_risk(proposal)
         verdict, policy_reasons, matched_rules = evaluate_policy(
             proposal,
             approval_policy,
             risk=risk,
             # Engagement-configured threshold, else the Engine default.
             risk_threshold=resolve_risk_threshold(approval_policy),
+            selected=selected_descriptor,
+            has_selected_tool=has_selected_tool,
         )
         if risk_unresolved and verdict == PolicyVerdict.ALLOW:
             # Manual escalation, not a fail-closed DENY: risk-tiered
@@ -224,6 +340,25 @@ class DefaultControlPlane:
             return await self._finalize(
                 proposal, verdict, policy_reasons, matched_rules, severity=Severity.REPLAN_GOAL
             )
+
+        unavailable = unavailable_restriction_reasons(
+            proposal,
+            engagement,
+            selected=selected_descriptor,
+            has_selected_tool=has_selected_tool,
+        )
+        if unavailable:
+            # Explicit restrictions with no provider declaration to
+            # evaluate: never silently pass. A firing meaning here always
+            # needs a human (existing human_required handling below
+            # bypasses auto-approval ceilings for this rule).
+            if verdict == PolicyVerdict.ALLOW:
+                verdict = PolicyVerdict.REQUIRE_APPROVAL
+                policy_reasons = list(unavailable)
+                matched_rules = [POLICY_SEMANTICS_UNAVAILABLE]
+            elif POLICY_SEMANTICS_UNAVAILABLE not in matched_rules:
+                matched_rules = [*matched_rules, POLICY_SEMANTICS_UNAVAILABLE]
+                policy_reasons = [*policy_reasons, *unavailable]
 
         rate_limiter = self._rate_limiters.setdefault(
             engagement_id, RateLimiter(engagement.rate_limit_policy)
@@ -259,9 +394,18 @@ class DefaultControlPlane:
         # Bounded auto-approval: legacy ``auto_approve`` maps to LOW;
         # ``auto_approve_up_to`` configures an explicit ceiling. Unknown
         # risk never qualifies.
-        if requires_approval and not may_auto_approve(approval_policy, risk):
-            approval = await self._approvals.request(proposal.action_id)
-            self._pending_proposals[approval.approval_id] = proposal
+        # A command-pattern or semantics-unavailable verdict always needs a
+        # human: it bypasses auto-approval ceilings by meaning, not by level.
+        human_required = any(
+            rule == POLICY_SEMANTICS_UNAVAILABLE or rule.startswith(COMMAND_MATCH_PREFIX)
+            for rule in matched_rules
+        )
+        if requires_approval and (human_required or not may_auto_approve(approval_policy, risk)):
+            fingerprint = _proposal_fingerprint(proposal)
+            approval = await self._approvals.request(
+                proposal.action_id, execution_fingerprint=fingerprint
+            )
+            self._pending_proposals[approval.approval_id] = proposal.model_copy(deep=True)
             decision = PolicyDecision(
                 action_id=proposal.action_id,
                 verdict=PolicyVerdict.REQUIRE_APPROVAL,
@@ -271,6 +415,8 @@ class DefaultControlPlane:
                 rate_limit_remaining=rate_limiter.remaining,
                 budget_remaining=budget.remaining,
                 evaluated_at=datetime.now(timezone.utc),
+                human_required=human_required,
+                execution_fingerprint=fingerprint,
             )
             await self._audit.record(proposal, decision)
             await self._record_blocked_action(proposal, decision)
@@ -365,13 +511,43 @@ class DefaultControlPlane:
                     f"approval {normalized_id} is already linked to a different proposal"
                 )
             return approval
-        self._pending_proposals[normalized_id] = proposal
+        expected_fp = getattr(approval, "execution_fingerprint", None)
+        candidate_fp = _proposal_fingerprint(proposal)
+        if expected_fp is None:
+            if candidate_fp is not None:
+                raise ValueError(
+                    f"approval {normalized_id} carries no execution fingerprint; "
+                    f"refusing to link a direct selected-tool proposal"
+                )
+        elif candidate_fp != expected_fp:
+            raise ValueError(
+                f"approval {normalized_id} fingerprint does not match proposal "
+                f"{proposal.action_id}; refusing to link"
+            )
+        self._pending_proposals[normalized_id] = proposal.model_copy(deep=True)
         return approval
 
-    async def approval_outcome(self, approval_id: ApprovalId | str) -> PolicyDecision | None:
+    async def approval_outcome(
+        self, approval_id: ApprovalId | str, current_proposal: ActionProposal | None = None
+    ) -> PolicyDecision | None:
         normalized_id = ApprovalId(str(approval_id))
         cached = self._resolved_outcomes.get(normalized_id)
         if cached is not None:
+            if current_proposal is None:
+                return cached
+            original = self._resolved_proposals.get(normalized_id)
+            if original is None:
+                if cached.verdict is not PolicyVerdict.ALLOW:
+                    return cached
+                return _stale_proposal_decision(cached.action_id, normalized_id)
+            if cached.action_id != current_proposal.action_id:
+                return _stale_proposal_decision(cached.action_id, normalized_id)
+            cached_fp = getattr(cached, "execution_fingerprint", None)
+            if cached_fp is not None:
+                if _proposal_fingerprint(current_proposal) != cached_fp:
+                    return _stale_proposal_decision(cached.action_id, normalized_id)
+            if not _same_action_content(original, current_proposal):
+                return _stale_proposal_decision(cached.action_id, normalized_id)
             return cached
 
         approval = await self._approvals.get(normalized_id)
@@ -411,6 +587,32 @@ class DefaultControlPlane:
             )
             self._resolved_outcomes[normalized_id] = decision
             return decision
+
+        stored_fp = _proposal_fingerprint(proposal)
+        expected_fp = getattr(approval, "execution_fingerprint", None)
+        if expected_fp is None:
+            if stored_fp is not None:
+                decision = _stale_proposal_decision(action_id, normalized_id)
+                self._resolved_outcomes[normalized_id] = decision
+                return decision
+        elif stored_fp != expected_fp:
+            decision = _stale_proposal_decision(action_id, normalized_id)
+            self._resolved_outcomes[normalized_id] = decision
+            return decision
+        if current_proposal is not None and expected_fp is not None:
+            if _proposal_fingerprint(current_proposal) != expected_fp:
+                decision = _stale_proposal_decision(action_id, normalized_id)
+                self._resolved_outcomes[normalized_id] = decision
+                return decision
+        if current_proposal is not None:
+            if current_proposal.action_id != proposal.action_id:
+                decision = _stale_proposal_decision(action_id, normalized_id)
+                self._resolved_outcomes[normalized_id] = decision
+                return decision
+            if not _same_action_content(proposal, current_proposal):
+                decision = _stale_proposal_decision(action_id, normalized_id)
+                self._resolved_outcomes[normalized_id] = decision
+                return decision
 
         # Only rate limit and budget can change between the original
         # REQUIRE_APPROVAL and this resolution -- Scope/ROE/Policy already
@@ -477,8 +679,64 @@ class DefaultControlPlane:
             budget_remaining=budget.remaining,
             approval_id=normalized_id,
         )
+        self._resolved_proposals[normalized_id] = proposal.model_copy(deep=True)
         self._resolved_outcomes[normalized_id] = decision
         return decision
+
+    async def describe_policy(self, engagement_id: EngagementId | str) -> dict[str, Any]:
+        normalized = EngagementId(str(engagement_id))
+        engagement = self._engagements.get(normalized)
+        if engagement is None:
+            raise KeyError(f"unregistered engagement: {engagement_id}")
+        approval_policy = engagement.approval_policy
+        roe_rules = list(engagement.rules_of_engagement or [])
+        time_gated = any(
+            r.start_at is not None or r.end_at is not None or r.allowed_time_windows
+            for r in roe_rules
+        )
+        max_parallel = any(r.max_parallel_actions is not None for r in roe_rules)
+        availability_gated = any(not r.availability_impact_allowed for r in roe_rules) if roe_rules else False
+        has_allow_lists = any(r.allowed_capabilities or r.allowed_operations or r.allowed_time_windows for r in roe_rules)
+        ceiling = auto_approval_ceiling(approval_policy)
+        threshold = resolve_risk_threshold(approval_policy)
+        command_label = COMMAND_MATCH_PREFIX[:-1] if COMMAND_MATCH_PREFIX.endswith(":") else COMMAND_MATCH_PREFIX
+        explicit_command_rules = list(
+            getattr(approval_policy, "command_approval_rules", None) or []
+        )
+        command_source = "explicit" if explicit_command_rules else "default"
+        return {
+            "engagement_id": str(normalized),
+            "scope_enforced": True,
+            "empty_allow_means_unrestricted": True,
+            "roe": {
+                "has_rules": bool(roe_rules),
+                "has_allow_lists": bool(has_allow_lists),
+                "time_gated": bool(time_gated),
+                "availability_gated": bool(availability_gated),
+                "max_parallel_configured": bool(max_parallel),
+            },
+            "approval": {
+                "explicit_approval_configured": bool(approval_policy.require_approval_for),
+                "command_rules_configured": bool(explicit_command_rules),
+                "command_rule_source": command_source,
+                "command_default_minimum_risk": (
+                    next(
+                        (
+                            rule.minimum_risk.value
+                            for rule in DEFAULT_COMMAND_APPROVAL_RULES
+                            if rule.minimum_risk is not None
+                        ),
+                        None,
+                    )
+                    if command_source == "default"
+                    else None
+                ),
+                "risk_threshold": threshold.value if threshold is not None else None,
+                "auto_approve_ceiling": ceiling.value if ceiling is not None else None,
+                "human_required_on": [command_label, POLICY_SEMANTICS_UNAVAILABLE],
+            },
+            "target_action_policies_configured": bool(engagement.target_action_policies),
+        }
 
     async def rehydrate(
         self,
@@ -658,12 +916,19 @@ class DefaultControlPlane:
             return True
         return budget.tool_calls_remaining > 0
 
-    def _recheck_time_gates(self, proposal, engagement, *, now_utc, in_flight):
+    def _recheck_time_gates(
+        self, proposal, engagement, *, now_utc, in_flight, selected=None, has_selected_tool=False
+    ):
         from redteam.control.roe import UnsupportedRoePolicyError
 
         try:
             roe_ok, roe_reasons, roe_severity = check_roe(
-                proposal, engagement, now=now_utc, in_flight_actions=in_flight
+                proposal,
+                engagement,
+                now=now_utc,
+                in_flight_actions=in_flight,
+                selected=selected,
+                has_selected_tool=has_selected_tool,
             )
         except UnsupportedRoePolicyError as exc:
             return False, "roe_window_closed", [str(exc)], Severity.ABORT_RUN
@@ -805,6 +1070,7 @@ class DefaultControlPlane:
                     now_utc,
                     idx,
                 )
+        has_valid_approval = decision.approval_id is not None
         engagement = self._engagements.get(context.engagement_id)
         if engagement is None:
             return (
@@ -818,6 +1084,11 @@ class DefaultControlPlane:
                 now_utc,
                 idx,
             )
+        # Same selected-tool meaning as evaluate(): the descriptor behind
+        # the call, so explicit restrictions reuse the provider-declared
+        # keys instead of blank capability/operation strings.
+        selected_descriptor = self._resolve_outbound_descriptor(context)
+        has_selected = getattr(context, "selected_tool_id", None) is not None
         scope_ok, scope_reasons, scope_severity = check_scope(proposal, engagement.scope)
         if not scope_ok:
             return (
@@ -834,7 +1105,12 @@ class DefaultControlPlane:
         in_flight = self._in_flight_from_context(context)
         now_utc = datetime.now(timezone.utc)
         time_ok, time_code, time_reasons, time_severity = self._recheck_time_gates(
-            proposal, engagement, now_utc=now_utc, in_flight=in_flight
+            proposal,
+            engagement,
+            now_utc=now_utc,
+            in_flight=in_flight,
+            selected=selected_descriptor,
+            has_selected_tool=has_selected,
         )
         if not time_ok:
             base = (
@@ -854,7 +1130,10 @@ class DefaultControlPlane:
                 idx,
             )
         target_ok, target_reasons, target_severity = check_target_action_policies(
-            proposal, engagement.target_action_policies
+            proposal,
+            engagement.target_action_policies,
+            selected=selected_descriptor,
+            has_selected_tool=has_selected,
         )
         if not target_ok:
             return (
@@ -868,7 +1147,30 @@ class DefaultControlPlane:
                 now_utc,
                 idx,
             )
-        outbound_descriptor = self._resolve_outbound_descriptor(context)
+        unavailable = unavailable_restriction_reasons(
+            proposal,
+            engagement,
+            selected=selected_descriptor,
+            has_selected_tool=has_selected,
+        )
+        if unavailable and not has_valid_approval:
+            # No approved human decision covers this call, so an
+            # unevaluable explicit restriction fails closed here. With a
+            # valid APPROVED approval the human already accepted it at
+            # evaluate time (same meaning), and only current gates below
+            # still apply.
+            return (
+                False,
+                "policy_semantics_unavailable",
+                list(unavailable),
+                ["policy"],
+                Severity.BLOCK_ACTION,
+                engagement,
+                self._budgets.get(context.engagement_id),
+                now_utc,
+                idx,
+            )
+        outbound_descriptor = selected_descriptor
         outbound_blocked, outbound_reasons, _outbound_code = evaluate_with_descriptor(
             proposal, outbound_descriptor, engagement.external_text_policy
         )
@@ -941,6 +1243,7 @@ class DefaultControlPlane:
             budget_remaining=decision.budget_remaining,
             evaluated_at=now_utc,
             severity=None,
+            execution_fingerprint=decision.execution_fingerprint,
         )
         return allowed
 
@@ -1048,6 +1351,7 @@ class DefaultControlPlane:
                 budget_remaining=(budget.remaining if budget is not None else None),
                 evaluated_at=now_utc,
                 severity=None,
+                execution_fingerprint=decision.execution_fingerprint,
             )
             return allowed
         if budget is None:
@@ -1066,6 +1370,7 @@ class DefaultControlPlane:
             budget_remaining=budget.remaining,
             evaluated_at=now_utc,
             severity=None,
+            execution_fingerprint=decision.execution_fingerprint,
         )
         return allowed
 
@@ -1102,6 +1407,7 @@ class DefaultControlPlane:
             budget_remaining=budget_remaining,
             evaluated_at=datetime.now(timezone.utc),
             severity=severity,
+            execution_fingerprint=_proposal_fingerprint(proposal),
         )
         await self._audit.record(proposal, decision)
         await self._record_blocked_action(proposal, decision)

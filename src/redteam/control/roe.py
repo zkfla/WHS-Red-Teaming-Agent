@@ -48,9 +48,11 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
+from redteam.control.policy import declared_namespaces, declared_operation_keys
 from redteam.control.severity import Severity
 from redteam.core.contracts.action import ActionProposal
 from redteam.core.contracts.engagement import Engagement, RuleOfEngagement
+from redteam.core.contracts.tool import ToolDescriptor
 
 # Shared time contract: canonical parsing lives in
 # redteam.core.execution_time; check_roe uses it at the original
@@ -76,6 +78,8 @@ def check_roe(
     *,
     now: datetime | None = None,
     in_flight_actions: int | None = None,
+    selected: ToolDescriptor | None = None,
+    has_selected_tool: bool = False,
 ) -> tuple[bool, list[str], Severity | None]:
     """Evaluate the proposal against the engagement Rules of Engagement.
 
@@ -118,14 +122,38 @@ def check_roe(
     now = now or datetime.now(timezone.utc)
     action_key = action.capability + "." + action.operation
 
+    # Direct selected-tool calls match explicit restrictions against the
+    # provider-declared keys (same meaning as the policy stage). When the
+    # descriptor declares nothing, capability/operation lists are skipped
+    # here: time/availability/parallel still enforce, and the policy stage
+    # escalates unevaluable explicit restrictions to a human instead.
+    if has_selected_tool:
+        namespaces = declared_namespaces(selected)
+        operation_keys = declared_operation_keys(selected)
+    else:
+        namespaces = {action.capability}
+        operation_keys = {action_key}
+
     # 1. Explicit denials win outright, regardless of any allow-list.
     for rule in rules:
-        if action.capability in rule.denied_capabilities:
-            reason = "capability '" + action.capability + "' denied by ROE rule '" + rule.name + "'"
-            return False, [reason], Severity.REPLAN_GOAL
-        if action_key in rule.denied_operations:
-            reason = "operation '" + action_key + "' denied by ROE rule '" + rule.name + "'"
-            return False, [reason], Severity.BLOCK_ACTION
+        if namespaces is not None:
+            denied_capability = next(
+                (entry for entry in rule.denied_capabilities if entry in namespaces), None
+            )
+            if denied_capability is not None:
+                reason = (
+                    "capability '" + denied_capability + "' denied by ROE rule '" + rule.name + "'"
+                )
+                return False, [reason], Severity.REPLAN_GOAL
+        if operation_keys is not None:
+            denied_operation = next(
+                (entry for entry in rule.denied_operations if entry in operation_keys), None
+            )
+            if denied_operation is not None:
+                reason = (
+                    "operation '" + denied_operation + "' denied by ROE rule '" + rule.name + "'"
+                )
+                return False, [reason], Severity.BLOCK_ACTION
         if rule.start_at is not None and now < _as_utc(rule.start_at):
             reason = (
                 "ROE rule '" + rule.name + "' window has not started "
@@ -164,14 +192,20 @@ def check_roe(
 
     # 3. Capability / operation allow-lists (restrictive when configured).
     allowed_caps = {cap for rule in rules for cap in rule.allowed_capabilities}
-    if allowed_caps and action.capability not in allowed_caps:
-        reason = "capability '" + action.capability + "' is not in the ROE allowed-capability list"
-        return False, [reason], Severity.REPLAN_GOAL
+    if namespaces is not None:
+        if allowed_caps and not (allowed_caps & namespaces):
+            reason = (
+                "capability '" + action.capability + "' is not in the ROE allowed-capability list"
+            )
+            return False, [reason], Severity.REPLAN_GOAL
 
     allowed_ops = {op for rule in rules for op in rule.allowed_operations}
-    if allowed_ops and action_key not in allowed_ops:
-        reason = "operation '" + action_key + "' is not in the ROE allowed-operation list"
-        return False, [reason], Severity.BLOCK_ACTION
+    if operation_keys is not None:
+        if allowed_ops and not (allowed_ops & operation_keys):
+            reason = (
+                "operation '" + action_key + "' is not in the ROE allowed-operation list"
+            )
+            return False, [reason], Severity.BLOCK_ACTION
 
     return True, [], None
 

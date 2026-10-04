@@ -60,12 +60,15 @@ class ApprovalService:
     def __init__(self, store: ApprovalStore | None = None) -> None:
         self._store = store or InMemoryApprovalStore()
 
-    async def request(self, action_id: ActionId) -> Approval:
+    async def request(
+        self, action_id: ActionId, *, execution_fingerprint: str | None = None
+    ) -> Approval:
         approval = Approval(
             approval_id=ApprovalId(new_id("appr")),
             action_id=action_id,
             status=ApprovalStatus.PENDING,
             requested_at=datetime.now(timezone.utc),
+            execution_fingerprint=execution_fingerprint,
         )
         await self._store.save(approval)
         return approval

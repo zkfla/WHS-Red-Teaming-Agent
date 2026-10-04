@@ -14,7 +14,7 @@ from typing import Protocol, runtime_checkable
 
 from redteam.core.contracts.action import ActionProposal
 from redteam.core.contracts.policy import ControlContext, PolicyDecision
-from redteam.core.ids import ApprovalId
+from redteam.core.ids import ApprovalId, EngagementId
 
 
 class ControlPlane(Protocol):
@@ -24,20 +24,28 @@ class ControlPlane(Protocol):
         context: ControlContext,
     ) -> PolicyDecision: ...
 
-    async def approval_outcome(self, approval_id: ApprovalId) -> PolicyDecision | None:
+    async def approval_outcome(
+        self, approval_id: ApprovalId, current_proposal: ActionProposal | None = None
+    ) -> PolicyDecision | None:
         """The final decision for a proposal that previously got
-        ``REQUIRE_APPROVAL``, once a human has resolved it — or ``None``
-        while still pending.
+            ``REQUIRE_APPROVAL``, once a human has resolved it — or ``None``
+            while still pending.
 
-        Never creates a new Approval and never re-runs Scope/ROE/Policy
-        (those already ran once, deterministically, against the same
-        immutable proposal and engagement config): only the pipeline
-        stages whose outcome can change between the original evaluation
-        and resolution (rate limit, budget) are re-checked, so a resolved
-        Approval cannot bypass either. A rejected or expired Approval
-        resolves to a ``DENY`` here, never left dangling. Idempotent:
-        calling this again after the first resolved call returns the
-        same decision rather than re-consuming budget.
+            Never creates a new Approval and never re-runs Scope/ROE/Policy
+            (those already ran once, deterministically, against the same
+            immutable proposal and engagement config): only the pipeline
+            stages whose outcome can change between the original evaluation
+            and resolution (rate limit, budget) are re-checked, so a resolved
+            Approval cannot bypass either. A rejected or expired Approval
+            resolves to a ``DENY`` here, never left dangling. Idempotent:
+            calling this again after the first resolved call returns the
+            same decision rather than re-consuming budget.
+        When ``current_proposal`` is given, the stored proposal must still
+        describe the same action (tool, arguments, target): a mismatch
+        resolves to a stale ``DENY`` instead of executing under an ALLOW
+        the human never saw. An ALLOW from here is consumed together with
+        ``admit_invocation`` -- explicit scope, time, target, outbound and
+        duration gates are re-checked there on the current proposal.
         """
         ...
 
@@ -68,3 +76,9 @@ class InvocationAdmissionControl(Protocol):
         receipt_id: str,
         attempt_index: int,
     ) -> PolicyDecision: ...
+
+
+@runtime_checkable
+class PolicyExplanationControl(Protocol):
+    async def describe_policy(self, engagement_id: EngagementId | str) -> dict:
+        ...

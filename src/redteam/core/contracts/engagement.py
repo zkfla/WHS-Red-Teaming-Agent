@@ -81,6 +81,14 @@ class RateLimitPolicy(BaseModel):
     max_concurrent_actions: int = Field(default=1, ge=1)
 
 
+class CommandApprovalRule(BaseModel):
+    """One operator-configured dangerous-command rule (C1)."""
+
+    name: str = ""
+    patterns: list[str] = Field(default_factory=list)
+    minimum_risk: RiskLevel | None = None
+
+
 class ApprovalPolicy(BaseModel):
     require_approval_for: list[str] = Field(default_factory=list)
     default_approval_id: ApprovalId | None = None
@@ -100,6 +108,11 @@ class ApprovalPolicy(BaseModel):
     #: legacy ``auto_approve`` flag. Unknown (unresolvable) risk is never
     #: auto-approved under a bounded ceiling, since it may exceed it.
     auto_approve_up_to: RiskLevel | None = None
+
+    #: Dangerous-command rules evaluated against the selected tool's
+    #: provider-declared command fields. Empty means no command gating.
+    #: A firing rule requires a human and bypasses auto-approval ceilings.
+    command_approval_rules: list[CommandApprovalRule] = Field(default_factory=list)
 
 
 class Engagement(BaseModel):

@@ -40,6 +40,19 @@ from redteam.core.contracts.tool import (
     ToolError,
     ToolInvocation,
     ToolResult,
+    ToolTargetBinding,
+    PROVIDER_METADATA_COMMAND_FIELDS,
+    PROVIDER_METADATA_TARGET_BINDING,
+)
+from redteam.core.tool_binding import (
+    LEGACY_ACTION,
+    SELECTED_TOOL,
+    BindingMode,
+    execution_display_key,
+    execution_fingerprint,
+    is_direct,
+    normalize_arguments,
+    normalize_json,
 )
 
 __all__ = [
@@ -82,4 +95,15 @@ __all__ = [
     "ToolInvocation",
     "ToolError",
     "ToolResult",
+    "ToolTargetBinding",
+    "PROVIDER_METADATA_COMMAND_FIELDS",
+    "PROVIDER_METADATA_TARGET_BINDING",
+    "BindingMode",
+    "LEGACY_ACTION",
+    "SELECTED_TOOL",
+    "execution_display_key",
+    "execution_fingerprint",
+    "is_direct",
+    "normalize_arguments",
+    "normalize_json",
 ]

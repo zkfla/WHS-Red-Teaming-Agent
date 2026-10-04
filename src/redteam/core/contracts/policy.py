@@ -41,6 +41,8 @@ class PolicyDecision(BaseModel):
 
     evaluated_at: datetime
     severity: Severity | None = None
+    human_required: bool = False
+    execution_fingerprint: str | None = None
 
     @property
     def denial_severity(self) -> str | None:
@@ -67,3 +69,4 @@ class Approval(BaseModel):
     resolved_at: datetime | None = None
     resolved_by: str | None = None
     notes: str = ""
+    execution_fingerprint: str | None = None
