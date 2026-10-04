@@ -12,6 +12,8 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from redteam.orchestration.result_claims import mission_result_purpose
+
 __all__ = [
     "GoalConditionCoverage",
     "TaskCoverage",
@@ -94,6 +96,9 @@ def project_coverage_gaps(*, mission: Any | None, tasks: list[Any]) -> CoverageG
     for criterion in list(getattr(mission, "success_criteria", None) or []):
         name = str(criterion)
         matched = results.get(name)
+        if matched is not None and getattr(matched, "purpose_hash", None) is not None:
+            if matched.purpose_hash != mission_result_purpose(mission):
+                matched = None
         if matched is None:
             conditions.append(GoalConditionCoverage(criterion=name))
             unmet.append(name)
