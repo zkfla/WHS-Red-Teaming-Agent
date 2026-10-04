@@ -1,7 +1,13 @@
-"""Reduce one parallel dispatch batch into the durable runtime counters."""
+"""Reduce one parallel dispatch batch into the durable runtime counters.
+
+Delegated follow-up outcomes ride the same channel (plan 3.5.5) and fold
+through the same formulas; per-delegation counts and stored evidence
+references accumulate from this batch only, never recounting earlier ones.
+"""
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import datetime, timezone
 
 from langgraph.types import Overwrite
@@ -10,6 +16,8 @@ from redteam.core.contracts.policy import PolicyDecision
 from redteam.core.enums import AgentPhase, PolicyVerdict
 from redteam.core.ids import ActionId
 from redteam.orchestration.context import RuntimeDeps
+from redteam.orchestration.delegation import DelegationState
+from redteam.orchestration.dispatch import WorkerOutcome
 from redteam.orchestration.nodes._support import advance
 from redteam.orchestration.nodes.policy import SEVERITY_ABORT_RUN, SEVERITY_REPLAN_GOAL
 from redteam.orchestration.runtime_observation import append_runtime_observation
@@ -20,11 +28,15 @@ async def aggregate_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
     runtime = state["runtime"]
     items = state.get("dispatch_items", [])
     all_outcomes = state.get("worker_outcomes", {})
-    outcomes = [
+    initial_outcomes = [
         all_outcomes[str(item.proposal.action_id)]
         for item in items
         if str(item.proposal.action_id) in all_outcomes
     ]
+    # Delegated follow-ups arrive on the same channel with fresh action ids
+    # (plan 3.5.5). Same formulas below; widened inputs only.
+    _, followup_outcomes = split_batch_outcomes(all_outcomes, items)
+    outcomes = [*initial_outcomes, *followup_outcomes]
 
     executed = [item for item in outcomes if item.executed]
     succeeded = [item for item in executed if item.succeeded]
@@ -58,6 +70,10 @@ async def aggregate_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             continue
         agent_key = str(dispatch.proposal.agent_id)
         actions_by_agent[agent_key] = actions_by_agent.get(agent_key, 0) + 1
+    for outcome in followup_outcomes:
+        if not outcome.executed or not outcome.agent_id:
+            continue
+        actions_by_agent[outcome.agent_id] = actions_by_agent.get(outcome.agent_id, 0) + 1
 
     last_with_verdict = next(
         (item for item in reversed(outcomes) if item.verdict is not None), None
@@ -109,6 +125,11 @@ async def aggregate_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
         else None
     )
 
+    delegations = dict(runtime.delegations)
+    for delegation_id, delegation in delegations.items():
+        related = [item for item in outcomes if item.delegation_id == delegation_id]
+        if related:
+            delegations[delegation_id] = update_delegation_from_outcomes(delegation, related)
     next_runtime = runtime.model_copy(
         update={
             "phase": AgentPhase.REPLAN,
@@ -119,6 +140,7 @@ async def aggregate_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             "consecutive_failures": consecutive_failures,
             "remaining_budget": remaining_budget,
             "actions_by_agent": actions_by_agent,
+            "delegations": delegations,
             "last_verdict": (
                 last_with_verdict.verdict if last_with_verdict else runtime.last_verdict
             ),
@@ -140,10 +162,7 @@ async def aggregate_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
     )
     # Fold each isolated worker's own records back in dispatch order so the
     # next decision turn sees the whole batch in a stable sequence.
-    for dispatch_item in items:
-        outcome = all_outcomes.get(str(dispatch_item.proposal.action_id))
-        if outcome is None:
-            continue
+    for outcome in outcomes:
         for observation in outcome.runtime_observations:
             next_runtime = append_runtime_observation(next_runtime, observation)
 
@@ -166,5 +185,68 @@ async def aggregate_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
         # batch into durable counters, so replace the channel explicitly.
         worker_outcomes=Overwrite(value={}),
         policy_decision=summary,
-        current_work_id=pending_dispatch.work_id if pending_dispatch else None,
+        current_work_id=(
+            pending_dispatch.work_id
+            if pending_dispatch is not None
+            else (pending_approval.work_id if pending_approval is not None else None)
+        ),
     )
+
+
+def split_batch_outcomes(
+    all_outcomes: dict[str, WorkerOutcome], dispatch_items: Sequence[object]
+) -> tuple[list[WorkerOutcome], list[WorkerOutcome]]:
+    """Initial outcomes in dispatch order, then follow-ups in action-id order.
+
+    The root reuses this to feed the same formulas from both the initial
+    batch and the delegated follow-ups of this turn only. Earlier turns
+    already left this channel through the explicit reset above, so no
+    entry is ever counted twice.
+    """
+
+    items = list(dispatch_items or [])
+    outcomes = dict(all_outcomes or {})
+    initial = [
+        outcomes[str(item.proposal.action_id)]
+        for item in items
+        if str(item.proposal.action_id) in outcomes
+    ]
+    covered = {str(item.proposal.action_id) for item in items}
+    followups = [outcome for key, outcome in outcomes.items() if key not in covered]
+    followups.sort(key=lambda outcome: str(outcome.action_id))
+    return initial, followups
+
+
+def update_delegation_from_outcomes(
+    delegation: DelegationState, outcomes: Sequence[WorkerOutcome]
+) -> DelegationState:
+    """Fold this batch outcomes into one delegation. Pure, no I/O.
+
+    Only entries naming this delegation count toward it, and only while
+    it is unfinished; unknown ids never create state here. Executed
+    actions accumulate, stored evidence ids merge without duplicates,
+    and an approval parks the delegation until the existing resume
+    path returns it to the same purpose and allowance.
+    """
+
+    mine = [
+        outcome
+        for outcome in outcomes
+        if outcome.delegation_id is not None and outcome.delegation_id == delegation.delegation_id
+    ]
+    if not mine or delegation.status == "finished":
+        return delegation
+    executed = sum(1 for outcome in mine if outcome.executed)
+    seen = list(delegation.evidence_ids)
+    for outcome in mine:
+        for evidence_id in outcome.evidence_ids:
+            if evidence_id not in seen:
+                seen.append(evidence_id)
+    update: dict[str, object] = {
+        "actions_used": delegation.actions_used + executed,
+        "evidence_ids": seen,
+    }
+    if delegation.status == "active" and any(outcome.approval_id is not None for outcome in mine):
+        update["status"] = "held"
+        update["termination_reason"] = "approval_pending"
+    return delegation.model_copy(update=update)

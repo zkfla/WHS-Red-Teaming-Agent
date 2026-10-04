@@ -1,4 +1,11 @@
-"""Contracts for bounded LangGraph map/reduce action dispatch."""
+"""Contracts for bounded LangGraph map/reduce action dispatch.
+
+The same envelope also carries delegated follow-up actions (plan 3.5.5):
+one entry per follow-up with its parent linkage, candidate identity, and
+stored evidence references. Aggregation widens its inputs to these entries
+without changing its formulas. All delegation fields are optional, so rows
+written before delegation existed keep loading and merging unchanged.
+"""
 
 from __future__ import annotations
 
@@ -25,6 +32,22 @@ class WorkerOutcome(BaseModel):
 
     action_id: str
     work_id: str
+    # Follow-up linkage for delegated investigation. None on the initial
+    # dispatch batch; set on each later action the delegation chose.
+    parent_action_id: str | None = None
+    # Stable execution identity of the follow-up candidate, for dedup and
+    # audit. Empty on rows written before delegation existed.
+    candidate_key: str = ""
+    # Stored evidence produced by this action (ids only, never bodies).
+    # Bodies stay in the evidence store and are read back by id.
+    evidence_ids: list[str] = Field(default_factory=list)
+    # Delegation that chose this action, if any. Entries whose id is
+    # unknown to the runtime update global counters only; they never
+    # create delegation state on their own.
+    delegation_id: str | None = None
+    # Acting role identity for per-role counting of follow-up actions.
+    # Empty on rows written by paths that count roles from dispatch.
+    agent_id: str = ""
     executed: bool = False
     retry_attempts: int = 0
     succeeded: bool | None = None
@@ -45,3 +68,9 @@ def merge_worker_outcomes(
     """Merge parallel writes by action id; replay of the same id is idempotent."""
 
     return {**left, **right}
+
+
+def is_delegated_follow_up(outcome: WorkerOutcome) -> bool:
+    """Whether this envelope entry is a delegated follow-up action."""
+
+    return outcome.delegation_id is not None or outcome.parent_action_id is not None
