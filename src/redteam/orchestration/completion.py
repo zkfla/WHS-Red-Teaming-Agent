@@ -383,6 +383,253 @@ async def _verify_prior_lineage(
         current = str(plan.parent_version)
 
 
+def check_record_linkage(
+    record: Any,
+    meta: dict[str, Any],
+    raw: dict[str, Any],
+    evidence_id: str,
+    *,
+    require_proposal: bool = True,
+) -> list[tuple[str, str, str]]:
+    """Shared actual-provenance linkage: action, invocation, tool, proposal.
+
+    Returns fully formatted (message, code, summary) triples, stopping at
+    the first failure so callers keep the existing single-issue behavior.
+    """
+    action_ref = _s(_field(record, "action_id", None)).strip()
+    invocation_ref = _s(_field(record, "invocation_id", None)).strip()
+    if not action_ref or not invocation_ref:
+        return [(
+            f"evidence '{evidence_id}' needs both action_id and invocation_id linkage",
+            "completion_evidence_reference_needs_both_action_id_25",
+            "evidence 'reference' needs both action_id and invocation_id linkage",
+        )]
+    mismatched = next(
+        (
+            key
+            for key, value in (("action_id", action_ref), ("invocation_id", invocation_ref))
+            if meta.get(key) is not None
+            and _s(meta.get(key)).strip()
+            and _s(meta.get(key)).strip() != value
+        ),
+        None,
+    )
+    if mismatched is not None:
+        return [(
+            f"evidence '{evidence_id}' {mismatched} disagrees with its original result",
+            "completion_evidence_reference_reference_disagrees_with_its_26",
+            "evidence 'reference' reference disagrees with its original result",
+        )]
+    if str(raw.get("action_id", "")).strip() != action_ref:
+        return [(
+            f"evidence '{evidence_id}' preserved raw result answers another action",
+            "completion_evidence_reference_preserved_raw_result_answers_27",
+            "evidence 'reference' preserved raw result answers another action",
+        )]
+    if str(raw.get("invocation_id", "")).strip() != invocation_ref:
+        return [(
+            f"evidence '{evidence_id}' preserved raw result answers another invocation",
+            "completion_evidence_reference_preserved_raw_result_answers_28",
+            "evidence 'reference' preserved raw result answers another invocation",
+        )]
+    if not str(raw.get("tool_id", "") or "").strip():
+        return [(
+            f"evidence '{evidence_id}' preserved raw result names no tool",
+            "completion_evidence_reference_preserved_raw_result_names_no_tool_76",
+            "evidence 'reference' preserved raw result names no tool",
+        )]
+    stored_proposal = meta.get("proposal")
+    if not isinstance(stored_proposal, dict):
+        if require_proposal:
+            return [(
+                f"evidence '{evidence_id}' has no stored proposal to prove linkage; identifier alone is not proof",
+                "completion_evidence_reference_has_no_stored_proposal_29",
+                "evidence 'reference' has no stored proposal to prove linkage; identifier alone is not proof",
+            )]
+        return []
+    stored_action = _s(stored_proposal.get("action_id", "")).strip()
+    if not stored_action or stored_action != action_ref:
+        return [(
+            f"evidence '{evidence_id}' stored proposal answers another action",
+            "completion_evidence_reference_stored_proposal_answers_another_30",
+            "evidence 'reference' stored proposal answers another action",
+        )]
+    stored_capability = stored_proposal.get("capability")
+    stored_operation = stored_proposal.get("operation")
+    if isinstance(stored_capability, str) and stored_capability.strip():
+        if stored_capability.strip() != _s(meta.get("capability", "")).strip():
+            return [(
+                f"evidence '{evidence_id}' stored behavior disagrees with its record",
+                "completion_evidence_reference_stored_behavior_disagrees_with_44",
+                "evidence 'reference' stored behavior disagrees with its record",
+            )]
+    if isinstance(stored_operation, str) and stored_operation.strip():
+        if stored_operation.strip() != _s(meta.get("operation", "")).strip():
+            return [(
+                f"evidence '{evidence_id}' stored behavior disagrees with its record",
+                "completion_evidence_reference_stored_behavior_disagrees_with_45",
+                "evidence 'reference' stored behavior disagrees with its record",
+            )]
+    for key in ("run_id", "engagement_id"):
+        proposed_value = _s(stored_proposal.get(key, "") or "").strip()
+        record_value = _s(_field(record, key, "") or "").strip()
+        if proposed_value and record_value and proposed_value != record_value:
+            return [(
+                f"evidence '{evidence_id}' stored proposal answers another {key}",
+                "completion_evidence_reference_stored_proposal_answers_another_run_77",
+                "evidence 'reference' stored proposal answers another run",
+            )]
+    return []
+
+
+async def verify_stored_origin(
+    *,
+    path_store: Any,
+    run_id: str,
+    m_path_id: str,
+    m_version: Any,
+    m_step_id: str,
+    mission_id: Any | None = None,
+) -> list[str]:
+    """Confirm a cited origin step is really stored in this run and mission.
+
+    Lineage staleness is judged by the caller; this only checks existence
+    and binding so other steps or other workers origins can count.
+    """
+    if not m_path_id or m_version is None or _s(m_version).strip() == "" or not m_step_id:
+        return ["has no path linkage (path_id/path_version/path_step_id required)"]
+    if path_store is None:
+        return ["origin needs stored path lookup (path store unavailable)"]
+    try:
+        plans = await path_store.list_paths(run_id)  # type: ignore[union-attr]
+    except Exception:
+        return ["origin lookup failed; treating as unproven"]
+    source = None
+    for plan in plans or []:
+        if _s(getattr(plan, "run_id", "")).strip() != str(run_id):
+            continue
+        if _s(getattr(plan, "path_id", "")).strip() != m_path_id:
+            continue
+        if _s(getattr(plan, "version", "")).strip() != _s(m_version).strip():
+            continue
+        source = plan
+        break
+    if source is None:
+        return ["origin path version is not stored in this run"]
+    if mission_id and _s(getattr(source, "mission_id", "") or "").strip():
+        if _s(source.mission_id).strip() != str(mission_id).strip():
+            return ["origin belongs to another mission"]
+    origin_step = next(
+        (item for item in (getattr(source, "steps", []) or []) if _s(getattr(item, "step_id", "")).strip() == m_step_id),
+        None,
+    )
+    if origin_step is None:
+        return ["origin step is not stored in this run"]
+    return []
+
+
+async def verify_origin_step(
+    *,
+    path_store: Any,
+    run_id: str,
+    path: PathPlan,
+    step: PathStep,
+    m_path_id: str,
+    m_version: Any,
+    m_step_id: str,
+    evidence_id: str,
+) -> list[tuple[str, str, str]]:
+    """Admit cited origins by stored existence, not by current-step equality.
+
+    Other steps or other workers origins pass when the cited path version
+    and step are really stored in this run under the same mission. The
+    same step in an older version keeps the lineage check; a foreign step
+    must not have been redefined after the evidence. Returns fully
+    formatted (message, code, summary) triples, empty when admitted.
+    """
+    path_id = _s(path.path_id).strip()
+    path_version = path.version
+    step_id = _s(step.step_id).strip()
+    if (
+        m_path_id == path_id
+        and _s(m_version).strip() == _s(path_version).strip()
+        and m_step_id == step_id
+    ):
+        return []
+    if path_store is None:
+        return [(
+            f"evidence '{evidence_id}' origin needs stored path lookup (path store unavailable)",
+            "completion_evidence_reference_origin_needs_stored_lookup_75",
+            "evidence 'reference' origin needs stored path lookup",
+        )]
+    try:
+        plans = await path_store.list_paths(run_id)  # type: ignore[union-attr]
+    except Exception:
+        return [(
+            f"evidence '{evidence_id}' origin lookup failed; treating as unproven",
+            "completion_evidence_reference_origin_lookup_failed_74",
+            "evidence 'reference' origin lookup failed; treating as unproven",
+        )]
+    source = None
+    newest = None
+    for plan in plans or []:
+        if _s(getattr(plan, "run_id", "")).strip() != str(run_id):
+            continue
+        if _s(getattr(plan, "path_id", "")).strip() != m_path_id:
+            continue
+        if _s(getattr(plan, "version", "")).strip() == _s(m_version).strip():
+            source = plan
+        if newest is None or getattr(plan, "version", 0) > getattr(newest, "version", 0):
+            newest = plan
+    if source is None:
+        return [(
+            f"evidence '{evidence_id}' origin path version is not stored in this run",
+            "completion_evidence_reference_origin_not_stored_70",
+            "evidence 'reference' origin path version is not stored",
+        )]
+    current_mission = _s(getattr(path, "mission_id", "") or "").strip()
+    source_mission = _s(getattr(source, "mission_id", "") or "").strip()
+    if current_mission and source_mission and current_mission != source_mission:
+        return [(
+            f"evidence '{evidence_id}' origin belongs to another mission",
+            "completion_evidence_reference_origin_other_mission_71",
+            "evidence 'reference' origin belongs to another mission",
+        )]
+    origin_step = next(
+        (item for item in (getattr(source, "steps", []) or []) if _s(getattr(item, "step_id", "")).strip() == m_step_id),
+        None,
+    )
+    if origin_step is None:
+        return [(
+            f"evidence '{evidence_id}' origin step is not stored in this run",
+            "completion_evidence_reference_origin_step_missing_72",
+            "evidence 'reference' origin step is not stored",
+        )]
+    if m_path_id == path_id and m_step_id == step_id:
+        compare_version = path_version
+        compare_step = step
+    elif newest is not None and _s(getattr(newest, "version", "")).strip() != _s(m_version).strip():
+        compare_version = getattr(newest, "version")
+        compare_step = origin_step
+    else:
+        return []
+    try:
+        lineage_ok, lineage_reason = await _verify_prior_lineage(
+            path_store, str(run_id), m_path_id, compare_version, m_version, m_step_id, compare_step
+        )
+    except Exception:
+        return [(
+            f"evidence '{evidence_id}' origin lineage lookup failed; treating as unproven",
+            "completion_evidence_reference_origin_lineage_lookup_failed_62",
+            "evidence 'reference' origin lineage lookup failed; treating as unproven",
+        )]
+    if not lineage_ok:
+        return [(
+            f"evidence '{evidence_id}' origin step changed after the evidence: {lineage_reason}",
+            "completion_evidence_reference_origin_redefined_73",
+            "evidence 'reference' origin step changed after the evidence",
+        )]
+    return []
 def _pool_record_ids(pool: list[Any]) -> tuple[set[str], set[tuple[str, str]]]:
     ids: set[str] = set()
     pairs: set[tuple[str, str]] = set()
@@ -798,15 +1045,16 @@ async def validate_completion(
     # Per-evidence linkage checks. Missing path linkage can never succeed
     # (worker D records path_id/path_version/path_step_id/principal_ref).
     valid_records: list[Any] = []
+    linked_records: list[Any] = []
     verified_by_evidence: dict[str, set[str]] = {}
+    has_semantic = any(
+        _criterion_kind(item) == "semantic" for item in _criteria_list(step)
+    )
     step_target_set = {
         _s(item).strip() for item in (step.target_node_ids or []) if _s(item).strip()
     }
     step_principal_set = {
         _s(item).strip() for item in (step.principal_refs or []) if _s(item).strip()
-    }
-    step_op_set = {
-        _s(item).strip().lower() for item in (step.allowed_operations or []) if _s(item).strip()
     }
     for eid in evidence_ids:
         try:
@@ -892,48 +1140,19 @@ async def validate_completion(
         # A step with no principal scope accepts anonymous initial
         # reconnaissance evidence as-is; an account-scoped step never does
         # unless it explicitly lists anonymous.
-        if m_path_id != path_id:
-            issues.add(
-                f"evidence '{eid}' belongs to a different path (path_id mismatch)",
-                code="completion_evidence_reference_belongs_to_a_different_19",
-                summary="evidence 'reference' belongs to a different path (path_id mismatch)",
-            )
-            continue
-        if _s(m_version).strip() != _s(path_version).strip():
-            if path_store is None:
-                issues.add(
-                    f"evidence '{eid}' belongs to a different path version",
-                    code="completion_evidence_reference_belongs_to_a_different_41",
-                    summary="evidence 'reference' belongs to a different path version",
-                )
-                continue
-            try:
-                lineage_ok, lineage_reason = await _verify_prior_lineage(
-                    path_store, run, path_id, path_version, m_version, step_id, step
-                )
-            except Exception:
-                issues.add(
-                    f"evidence '{eid}' prior-version lineage lookup failed; treating as unproven",
-                    code="completion_evidence_reference_prior_version_lineage_lookup_62",
-                    summary=(
-                        "evidence 'reference' prior-version lineage lookup failed; "
-                        "treating as unproven"
-                    ),
-                )
-                continue
-            if not lineage_ok:
-                issues.add(
-                    f"evidence '{eid}' {lineage_reason}",
-                    code="completion_evidence_reference_reference_42",
-                    summary="evidence 'reference' reference",
-                )
-                continue
-        if m_step_id != step_id:
-            issues.add(
-                f"evidence '{eid}' belongs to a different step",
-                code="completion_evidence_reference_belongs_to_a_different_20",
-                summary="evidence 'reference' belongs to a different step",
-            )
+        origin_errors = await verify_origin_step(
+            path_store=path_store,
+            run_id=run,
+            path=path,
+            step=step,
+            m_path_id=m_path_id,
+            m_version=m_version,
+            m_step_id=m_step_id,
+            evidence_id=eid,
+        )
+        for origin_message, origin_code, origin_summary in origin_errors:
+            issues.add(origin_message, code=origin_code, summary=origin_summary)
+        if origin_errors:
             continue
         canonical_value = _canonical_evidence_value(meta)
         if not canonical_value:
@@ -947,15 +1166,6 @@ async def validate_completion(
                 ),
             )
             continue
-        if step_op_set:
-            ev_op_names = _evidence_operation_names(meta)
-            if ev_op_names.isdisjoint(step_op_set):
-                issues.add(
-                    f"evidence '{eid}' uses an operation outside the step scope",
-                    code="completion_evidence_reference_uses_an_operation_outside_43",
-                    summary="evidence 'reference' uses an operation outside the step scope",
-                )
-                continue
         raw = _stored_raw_result(meta)
         if raw is None:
             issues.add(
@@ -982,86 +1192,14 @@ async def validate_completion(
                 summary="evidence 'reference' targets a different object",
             )
             continue
-        action_id = _field(record, "action_id", None)
-        invocation_id = _field(record, "invocation_id", None)
-        action_ref = _s(action_id).strip()
-        invocation_ref = _s(invocation_id).strip()
-        if not action_ref or not invocation_ref:
-            issues.add(
-                f"evidence '{eid}' needs both action_id and invocation_id linkage",
-                code="completion_evidence_reference_needs_both_action_id_25",
-                summary="evidence 'reference' needs both action_id and invocation_id linkage",
-            )
+        linkage_errors = check_record_linkage(record, meta, raw, eid)
+        for linkage_message, linkage_code, linkage_summary in linkage_errors:
+            issues.add(linkage_message, code=linkage_code, summary=linkage_summary)
+        if linkage_errors:
             continue
-        mismatched = next(
-            (
-                key
-                for key, value in (("action_id", action_ref), ("invocation_id", invocation_ref))
-                if meta.get(key) is not None
-                and _s(meta.get(key)).strip()
-                and _s(meta.get(key)).strip() != value
-            ),
-            None,
-        )
-        if mismatched is not None:
-            issues.add(
-                f"evidence '{eid}' {mismatched} disagrees with its original result",
-                code="completion_evidence_reference_reference_disagrees_with_its_26",
-                summary="evidence 'reference' reference disagrees with its original result",
-            )
-            continue
-        if str(raw.get("action_id", "")).strip() != action_ref:
-            issues.add(
-                f"evidence '{eid}' preserved raw result answers another action",
-                code="completion_evidence_reference_preserved_raw_result_answers_27",
-                summary="evidence 'reference' preserved raw result answers another action",
-            )
-            continue
-        if str(raw.get("invocation_id", "")).strip() != invocation_ref:
-            issues.add(
-                f"evidence '{eid}' preserved raw result answers another invocation",
-                code="completion_evidence_reference_preserved_raw_result_answers_28",
-                summary="evidence 'reference' preserved raw result answers another invocation",
-            )
-            continue
+        action_ref = _s(_field(record, "action_id", None)).strip()
+        invocation_ref = _s(_field(record, "invocation_id", None)).strip()
         stored_proposal = meta.get("proposal")
-        if not isinstance(stored_proposal, dict):
-            issues.add(
-                f"evidence '{eid}' has no stored proposal to prove linkage; "
-                "identifier alone is not proof",
-                code="completion_evidence_reference_has_no_stored_proposal_29",
-                summary=(
-                    "evidence 'reference' has no stored proposal to prove linkage; "
-                    "identifier alone is not proof"
-                ),
-            )
-            continue
-        stored_action = _s(stored_proposal.get("action_id", "")).strip()
-        if not stored_action or stored_action != action_ref:
-            issues.add(
-                f"evidence '{eid}' stored proposal answers another action",
-                code="completion_evidence_reference_stored_proposal_answers_another_30",
-                summary="evidence 'reference' stored proposal answers another action",
-            )
-            continue
-        stored_capability = stored_proposal.get("capability")
-        stored_operation = stored_proposal.get("operation")
-        if isinstance(stored_capability, str) and stored_capability.strip():
-            if stored_capability.strip() != _s(meta.get("capability", "")).strip():
-                issues.add(
-                    f"evidence '{eid}' stored behavior disagrees with its record",
-                    code="completion_evidence_reference_stored_behavior_disagrees_with_44",
-                    summary="evidence 'reference' stored behavior disagrees with its record",
-                )
-                continue
-        if isinstance(stored_operation, str) and stored_operation.strip():
-            if stored_operation.strip() != _s(meta.get("operation", "")).strip():
-                issues.add(
-                    f"evidence '{eid}' stored behavior disagrees with its record",
-                    code="completion_evidence_reference_stored_behavior_disagrees_with_45",
-                    summary="evidence 'reference' stored behavior disagrees with its record",
-                )
-                continue
         # Prefer the code-stored step account over tool args (same false-
         # rejection as the review path: args may carry only a session_ref).
         plan_step_dump = meta.get("plan_step")
@@ -1090,29 +1228,6 @@ async def validate_completion(
         failed_original = raw_success is False or (
             raw_success is None and isinstance(meta.get("error"), dict) and bool(meta.get("error"))
         )
-        if outcome == "success" and failed_original:
-            issues.add(
-                f"evidence '{eid}' records a failed original result and cannot support success",
-                code="completion_evidence_reference_records_a_failed_original_32",
-                summary=(
-                    "evidence 'reference' records a failed original result and cannot "
-                    "support success"
-                ),
-            )
-            continue
-        if outcome == "refuted" and failed_original:
-            issues.add(
-                f"evidence '{eid}' records a failed original result; "
-                "refuted needs a successful observation with a valid negative result, "
-                "never inconclusive or failure",
-                code="completion_evidence_reference_records_a_failed_original_33",
-                summary=(
-                    "evidence 'reference' records a failed original result; refuted "
-                    "needs a successful observation with a valid negative result, "
-                    "never inconclusive or failure"
-                ),
-            )
-            continue
         if step_principal_set and not explicit_anonymous:
             claimed_accounts = {str(item).strip() for item in ev_principals if str(item).strip()}
             stored_args = (
@@ -1175,6 +1290,35 @@ async def validate_completion(
                         ),
                     )
                     continue
+        if failed_original and outcome in {"success", "refuted"}:
+            if has_semantic:
+                # Failed originals stay readable as general results for
+                # natural-language conditions; the review call weighs them
+                # with the raw excerpt. Strong linkage above still applies.
+                linked_records.append(record)
+                continue
+            if outcome == "success":
+                issues.add(
+                    f"evidence '{eid}' records a failed original result and cannot support success",
+                    code="completion_evidence_reference_records_a_failed_original_32",
+                    summary=(
+                        "evidence 'reference' records a failed original result and cannot "
+                        "support success"
+                    ),
+                )
+            else:
+                issues.add(
+                    f"evidence '{eid}' records a failed original result; "
+                    "refuted needs a successful observation with a valid negative result, "
+                    "never inconclusive or failure",
+                    code="completion_evidence_reference_records_a_failed_original_33",
+                    summary=(
+                        "evidence 'reference' records a failed original result; refuted "
+                        "needs a successful observation with a valid negative result, "
+                        "never inconclusive or failure"
+                    ),
+                )
+            continue
         valid_records.append(record)
     criteria = _criteria_list(step)
     if not criteria:
@@ -1211,6 +1355,8 @@ async def validate_completion(
             evaluated.append((criterion, False, "missing hypothesis"))
             continue
         pool = list(valid_records)
+        if kind == "semantic" and linked_records:
+            pool = pool + [rec for rec in linked_records if rec not in pool]
         if required_principals:
             verified_pool: list[Any] = []
             have = set()
@@ -1491,4 +1637,9 @@ async def validate_completion(
     return issues.deduplicated()
 
 
-__all__ = ["validate_completion"]
+__all__ = [
+    "check_record_linkage",
+    "verify_stored_origin",
+    "verify_origin_step",
+    "validate_completion",
+]

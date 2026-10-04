@@ -137,10 +137,16 @@ class InMemoryTaskGraphStore:
         async with self._lock:
             old = self._require(task.task_id)
             if task.completion_evidence_id is not None and (
-                old.objective != task.objective or old.title != task.title
+                old.objective != task.objective
+                or old.related_attack_graph_node_ids != task.related_attack_graph_node_ids
+                or old.related_hypothesis_ids != task.related_hypothesis_ids
+                or old.required_capability != task.required_capability
             ):
-                # The delegated purpose changed, so a prior accepted receipt
-                # no longer binds this task. Drop it instead of carrying it.
+                # The delegated purpose itself changed (goal wording, target
+                # or subject linkage, or needed capability), so a prior
+                # accepted receipt no longer binds this task. Drop it
+                # instead of carrying it. A bare title edit is display-only
+                # and never invalidates the binding.
                 task = task.model_copy(update={"completion_evidence_id": None})
             if old.mission_id != task.mission_id or old.created_at != task.created_at:
                 raise ValueError("task identity fields are immutable")

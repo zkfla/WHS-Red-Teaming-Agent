@@ -35,10 +35,10 @@ import json
 from datetime import datetime, timezone
 from typing import Any
 
-from redteam.core.contracts.mission import MissionCriterionResult
+from redteam.core.contracts.mission import MissionCriterionResult, MissionTask
 from redteam.core.enums import EvidenceSourceType, MissionStatus, TaskStatus
 from redteam.core.ids import new_id
-from redteam.orchestration.completion import validate_completion
+from redteam.orchestration.completion import check_record_linkage, validate_completion, verify_stored_origin
 from redteam.orchestration.coordination import content_hash
 from redteam.orchestration.evidence_access import raw_from_metadata
 from redteam.orchestration.work.models import ACTIVE_STATUSES
@@ -95,19 +95,32 @@ def build_task_receipt(
     }
 
 
-def verify_task_receipt(task: Any, receipt: dict[str, Any]) -> list[str]:
+def verify_task_receipt(
+    task: MissionTask,
+    receipt: dict[str, Any],
+    *,
+    run_id: str | None = None,
+    mission_id: str | None = None,
+) -> list[str]:
     """Check a stored receipt against the task current purpose.
 
     A bare mission revision drift never invalidates; a purpose change
-    does. Returns error strings, empty when the receipt still binds.
+    does. Optional run and mission binding is enforced when supplied.
+    Returns error strings, empty when the receipt still binds.
     """
     if not isinstance(receipt, dict):
         return ["task receipt is missing"]
     if receipt.get("record_kind") != TASK_RECEIPT_KIND:
         return ["task receipt has an unknown kind"]
-    if str(receipt.get("task_id", "")) != str(getattr(task, "task_id", "")):
+    if str(receipt.get("task_id", "")) != str(task.task_id):
         return ["task receipt belongs to another task"]
-    expected = purpose_hash(getattr(task, "objective", "") or "")
+    if run_id is not None and str(receipt.get("run_id", "")) != str(run_id):
+        return ["task receipt belongs to another run"]
+    if mission_id is not None and str(receipt.get("mission_id", "")) != str(mission_id):
+        return ["task receipt belongs to another mission"]
+    if not str(receipt.get("outcome", "")).strip():
+        return ["task receipt has no outcome"]
+    expected = purpose_hash(task.objective or "")
     if str(receipt.get("purpose_hash", "")) != expected:
         return ["task purpose changed since the accepted receipt"]
     origins = [item for item in (receipt.get("source_evidence_ids", []) or []) if str(item).strip()]
@@ -148,12 +161,23 @@ def _record_text(value: Any) -> str:
     return "" if value is None else str(value)
 
 
-async def _verify_task_origin(*, evidence_store: Any, run_id: str, evidence_id: str) -> tuple[Any | None, list[str]]:
-    """Provenance check for one task-level origin record.
+async def _verify_task_origin(
+    *,
+    evidence_store: Any,
+    path_store: Any,
+    run_id: str,
+    engagement_id: str,
+    evidence_id: str,
+    task: Any,
+    mission_id: str | None = None,
+    step_principal_scope: set[str] | None = None,
+) -> tuple[Any | None, list[str]]:
+    """Task-level origin check: actual linkage, stored origin, relevance.
 
-    Same run, preserved raw result, and action and invocation linkage stay
-    mandatory. Path and step identity is not forced to the completing step:
-    other steps or other workers origins pass when they exist in this run.
+    Readonly and purpose-free: no purpose hash is needed here and nothing
+    is written. Other steps or other workers origins pass when stored in
+    this run under the same mission. Declared task targets and subjects
+    are enforced; the review call weighs the rest with the excerpts.
     """
     try:
         record = await evidence_store.get(evidence_id)
@@ -163,25 +187,53 @@ async def _verify_task_origin(*, evidence_store: Any, run_id: str, evidence_id: 
         return None, ["evidence '" + str(evidence_id) + "' does not exist"]
     if _record_text(getattr(record, "run_id", "")) != str(run_id):
         return None, ["evidence '" + str(evidence_id) + "' belongs to a different run"]
+    if engagement_id and _record_text(getattr(record, "engagement_id", "")) != str(engagement_id):
+        return None, ["evidence '" + str(evidence_id) + "' belongs to a different engagement"]
     meta = getattr(record, "metadata", None) or {}
     if not isinstance(meta, dict):
         return None, ["evidence '" + str(evidence_id) + "' has unreadable metadata"]
     raw = raw_from_metadata(meta)
     if not isinstance(raw, dict):
         return None, ["evidence '" + str(evidence_id) + "' has no preserved raw result"]
-    action_ref = _record_text(getattr(record, "action_id", None)).strip()
-    invocation_ref = _record_text(getattr(record, "invocation_id", None)).strip()
-    if not action_ref or not invocation_ref:
-        return None, ["evidence '" + str(evidence_id) + "' needs action and invocation linkage"]
-    if _record_text(raw.get("action_id", "")).strip() != action_ref:
-        return None, ["evidence '" + str(evidence_id) + "' raw result answers another action"]
-    if _record_text(raw.get("invocation_id", "")).strip() != invocation_ref:
-        return None, ["evidence '" + str(evidence_id) + "' raw result answers another invocation"]
-    stored_proposal = meta.get("proposal")
-    if isinstance(stored_proposal, dict):
-        stored_action = _record_text(stored_proposal.get("action_id", "")).strip()
-        if stored_action and stored_action != action_ref:
-            return None, ["evidence '" + str(evidence_id) + "' stored proposal answers another action"]
+    linkage = check_record_linkage(record, meta, raw, str(evidence_id), require_proposal=False)
+    if linkage:
+        return None, [linkage[0][0]]
+    origin_errors = await verify_stored_origin(
+        path_store=path_store,
+        run_id=str(run_id),
+        m_path_id=_record_text(meta.get("path_id", "")).strip(),
+        m_version=meta.get("path_version", None),
+        m_step_id=_record_text(meta.get("path_step_id", "")).strip(),
+        mission_id=mission_id,
+    )
+    if origin_errors:
+        return None, ["evidence '" + str(evidence_id) + "' " + origin_errors[0]]
+    target_ref = _record_text(meta.get("target_node_id", "")).strip()
+    if not target_ref:
+        return None, ["evidence '" + str(evidence_id) + "' has no target linkage"]
+    related_nodes: set[str] = set()
+    if task is not None:
+        for node in list(getattr(task, "related_attack_graph_node_ids", []) or []):
+            cleaned = str(node).strip()
+            if cleaned:
+                related_nodes.add(cleaned)
+    if related_nodes and target_ref not in related_nodes:
+        return None, ["evidence '" + str(evidence_id) + "' targets an object outside this task"]
+    principals: set[str] = set()
+    single = meta.get("principal_ref")
+    if isinstance(single, str) and single.strip():
+        principals.add(single.strip())
+    multi = meta.get("principal_refs")
+    if isinstance(multi, (list, tuple, set)):
+        for item in multi:
+            cleaned = str(item).strip()
+            if cleaned:
+                principals.add(cleaned)
+    lowered = {item.lower() for item in principals}
+    anonymous = meta.get("anonymous") is True or "anonymous" in lowered
+    scope = {str(item).strip() for item in (step_principal_scope or set()) if str(item).strip()}
+    if scope and principals and not anonymous and principals.isdisjoint(scope):
+        return None, ["evidence '" + str(evidence_id) + "' uses a principal outside this task"]
     return record, []
 
 
@@ -215,7 +267,7 @@ async def _pending_execution_errors(engine: Any, runtime: Any) -> list[str]:
     try:
         history = await engine.deps.work_store.list_items(run_id=runtime.run_id)
     except Exception:
-        history = []
+        return ["execution history lookup failed; treating as unproven"]
     if any(getattr(work, "status", None) in ACTIVE_STATUSES for work in (history or [])):
         return ["unfinished execution records remain"]
     if getattr(runtime, "pending_approval_id", None):
@@ -223,7 +275,7 @@ async def _pending_execution_errors(engine: Any, runtime: Any) -> list[str]:
     try:
         records = await engine.deps.evidence_store.list_for_run(runtime.run_id)
     except Exception:
-        return []
+        return ["task evidence lookup failed; treating as unproven"]
     settled = {
         _record_text(getattr(record, "action_id", None))
         for record in (records or [])
@@ -276,8 +328,23 @@ async def complete_task(engine: Any, path: Any, decision: Any, runtime: Any, con
         return ["task completion needs related stored evidence"]
     verified: list[Any] = []
     excerpt_notes: list[dict[str, Any]] = []
+    scope: set[str] = set()
+    for step in list(getattr(path, "steps", []) or []):
+        for ref in list(getattr(step, "principal_refs", []) or []):
+            cleaned = str(ref).strip()
+            if cleaned:
+                scope.add(cleaned)
     for identity in evidence_ids:
-        record, errors = await _verify_task_origin(evidence_store=engine.deps.evidence_store, run_id=str(runtime.run_id), evidence_id=identity)
+        record, errors = await _verify_task_origin(
+            evidence_store=engine.deps.evidence_store,
+            path_store=getattr(getattr(engine, "deps", None), "path_store", None),
+            run_id=str(runtime.run_id),
+            engagement_id=str(getattr(runtime, "engagement_id", "") or ""),
+            evidence_id=identity,
+            task=task,
+            mission_id=getattr(runtime, "mission_id", None),
+            step_principal_scope=scope or None,
+        )
         if errors:
             return errors
         if record is not None:
@@ -317,68 +384,140 @@ async def complete_task(engine: Any, path: Any, decision: Any, runtime: Any, con
     return []
 
 
-async def _legacy_task_proof(engine: Any, *, runtime: Any, task: Any, run_id: str) -> list[str]:
-    """Read a receipt-less completed task only through the stored path proof."""
-    latest = None
+async def _legacy_task_proof(
+    engine: Any, *, runtime: Any, task: MissionTask, run_id: str
+) -> tuple[list[str], list[str]]:
+    """Read a receipt-less completed task only through the stored path proof.
+
+    Returns (errors, proven_evidence_ids). Active paths only; a path with
+    no required steps proves nothing. A task that already has an accepted
+    receipt in this run but carries no receipt reference changed purpose,
+    so the legacy fallback must fail for it instead of minting coverage.
+    Record lookups never succeed on failure.
+    """
     try:
         listed = await engine.deps.path_store.list_paths(str(run_id))
     except Exception:
-        return ["completed required task lacks a readable path proof"]
-    for saved in listed or []:
-        if getattr(saved, "mission_task_id", None) != str(task.task_id) or getattr(saved, "mission_id", None) != str(runtime.mission_id):
-            continue
-        if latest is None or getattr(saved, "version", 0) > getattr(latest, "version", 0):
-            latest = saved
-    if latest is None:
-        return ["completed required task lacks an accepted evidence-bearing path"]
+        return (["completed required task path proof lookup failed; treating as unproven"], [])
+    try:
+        from redteam.orchestration.paths import is_active_status as _is_active
+    except Exception:
+        _is_active = lambda value: str(value or "").strip().lower() == "active"  # noqa: E731
+    candidates = [
+        saved
+        for saved in (listed or [])
+        if getattr(saved, "mission_task_id", None) == str(task.task_id)
+        and getattr(saved, "mission_id", None) == str(runtime.mission_id)
+        and _is_active(getattr(saved, "status", None))
+    ]
+    if not candidates:
+        return (["completed required task lacks an accepted evidence-bearing path"], [])
+    latest = max(candidates, key=lambda saved: getattr(saved, "version", 0))
+    try:
+        run_records = await engine.deps.evidence_store.list_for_run(str(run_id))
+    except Exception:
+        return (["completed required task receipt history lookup failed; treating as unproven"], [])
+    for rec in run_records or []:
+        meta = getattr(rec, "metadata", None) or {}
+        if (
+            isinstance(meta, dict)
+            and meta.get("record_kind") == TASK_RECEIPT_KIND
+            and str(meta.get("task_id", "")) == str(task.task_id)
+        ):
+            return (
+                ["completed task purpose changed since its accepted receipt; legacy path proof cannot substitute"],
+                [],
+            )
+    required_steps = [step for step in list(getattr(latest, "steps", []) or []) if getattr(step, "required", False)]
+    if not required_steps:
+        return (["completed task path has no required steps to prove it"], [])
     from redteam.attack_graph.service import AttackGraphService
     service = AttackGraphService(engine.deps.graph_store)
-    for step in list(getattr(latest, "steps", []) or []):
-        if not getattr(step, "required", False):
-            continue
+    proven: list[str] = []
+    engagement_id = getattr(runtime, "engagement_id", None)
+    for step in required_steps:
         if _record_text(getattr(step, "status", "")) != "completed":
-            return ["completed task has unfinished path steps"]
-        errors = await validate_completion(path=latest, step=step, proposal={"evidence_ids": list(getattr(step, "evidence_ids", []) or []), "outcome": getattr(step, "outcome", None) or "success", "reason": getattr(step, "objective", "") or ""}, evidence_store=engine.deps.evidence_store, graph_service=service, run_id=str(run_id), path_store=engine.deps.path_store)
+            return (["completed task has unfinished path steps"], [])
+        step_ids = [str(item).strip() for item in list(getattr(step, "evidence_ids", []) or []) if str(item).strip()]
+        if not step_ids:
+            return (["completed required task step cites no evidence"], [])
+        errors = await validate_completion(path=latest, step=step, proposal={"evidence_ids": step_ids, "outcome": getattr(step, "outcome", None) or "success", "reason": getattr(step, "objective", "") or ""}, evidence_store=engine.deps.evidence_store, graph_service=service, run_id=str(run_id), path_store=engine.deps.path_store)
         if errors:
-            return errors
-    return []
+            return (errors, [])
+        for identity in step_ids:
+            try:
+                record = await engine.deps.evidence_store.get(identity)
+            except Exception:
+                return (["task origin lookup failed; treating as unproven"], [])
+            if record is None or _record_text(getattr(record, "run_id", "")) != str(run_id):
+                return (["task origin is missing or belongs to another run"], [])
+            if engagement_id is not None and _record_text(getattr(record, "engagement_id", "")) != str(engagement_id):
+                return (["task origin belongs to another engagement"], [])
+            if identity not in proven:
+                proven.append(identity)
+    if not proven:
+        return (["completed required task has no proven origin evidence"], [])
+    return ([], proven)
 
 
-async def _goal_task_coverage(engine: Any, *, runtime: Any, tasks: list[Any]) -> tuple[list[str], dict[str, list[str]], list[dict[str, Any]]]:
-    """Check required tasks and gather their bound origin excerpts.
+async def _goal_task_coverage(
+    engine: Any, *, runtime: Any, tasks: list[MissionTask]
+) -> tuple[list[str], dict[str, list[str]], list[dict[str, Any]]]:
+    """Check every required task and gather their bound origin excerpts.
 
     Returns (errors, task_evidence, excerpts). Receipt-less legacy tasks
-    fall back to the stored path proof without minting new receipts.
+    fall back to the stored path proof without minting new receipts, and
+    their proven ids join the same task map. Every required task is
+    verified even after the excerpt cap is reached; the cap only trims
+    the review payload, never the coverage itself. Record lookups never
+    succeed on failure.
     """
     task_evidence: dict[str, list[str]] = {}
     excerpts: list[dict[str, Any]] = []
+    engagement_id = getattr(runtime, "engagement_id", None)
+    path_store = getattr(getattr(engine, "deps", None), "path_store", None)
     for task in tasks or []:
-        if not getattr(task, "required", False):
+        if not task.required:
             continue
-        if getattr(task, "status", None) is not TaskStatus.COMPLETED:
+        if task.status is not TaskStatus.COMPLETED:
             return (["required mission task '" + str(task.task_id) + "' is not completed"], {}, [])
-        receipt_id = getattr(task, "completion_evidence_id", None)
+        receipt_id = task.completion_evidence_id
         if receipt_id is None:
-            errors = await _legacy_task_proof(engine, runtime=runtime, task=task, run_id=str(runtime.run_id))
+            errors, proven = await _legacy_task_proof(engine, runtime=runtime, task=task, run_id=str(runtime.run_id))
             if errors:
                 return (errors, {}, [])
-            continue
-        try:
-            receipt_record = await engine.deps.evidence_store.get(receipt_id)
-        except Exception:
-            return (["task receipt lookup failed; treating as unproven"], {}, [])
-        if receipt_record is None:
-            return (["task receipt is missing"], {}, [])
-        receipt_payload = getattr(receipt_record, "metadata", None) or {}
-        if not isinstance(receipt_payload, dict):
-            return (["task receipt is missing"], {}, [])
-        errors = verify_task_receipt(task, receipt_payload)
-        if errors:
-            return (errors, {}, [])
-        origins = [str(item).strip() for item in (receipt_payload.get("source_evidence_ids", []) or []) if str(item).strip()]
-        if not origins:
-            return (["task receipt cites no origin evidence"], {}, [])
-        task_evidence[str(task.task_id)] = origins
+            if not proven:
+                return (["completed required task has no proven origin evidence"], {}, [])
+            task_evidence[str(task.task_id)] = proven
+            origins = proven
+        else:
+            try:
+                receipt_record = await engine.deps.evidence_store.get(receipt_id)
+            except Exception:
+                return (["task receipt lookup failed; treating as unproven"], {}, [])
+            if receipt_record is None:
+                return (["task receipt is missing"], {}, [])
+            if _record_text(getattr(receipt_record, "run_id", "")) != str(runtime.run_id):
+                return (["task receipt belongs to another run"], {}, [])
+            if engagement_id is not None and _record_text(getattr(receipt_record, "engagement_id", "")) != str(engagement_id):
+                return (["task receipt belongs to another engagement"], {}, [])
+            if getattr(receipt_record, "source_type", None) is not EvidenceSourceType.SYSTEM:
+                return (["task receipt is not system evidence"], {}, [])
+            receipt_payload = getattr(receipt_record, "metadata", None) or {}
+            if not isinstance(receipt_payload, dict):
+                return (["task receipt is missing"], {}, [])
+            errors = verify_task_receipt(
+                task,
+                receipt_payload,
+                run_id=str(runtime.run_id),
+                mission_id=str(task.mission_id),
+            )
+            if errors:
+                return (errors, {}, [])
+            origins = [str(item).strip() for item in (receipt_payload.get("source_evidence_ids", []) or []) if str(item).strip()]
+            if not origins:
+                return (["task receipt cites no origin evidence"], {}, [])
+            task_evidence[str(task.task_id)] = origins
         for identity in origins:
             try:
                 origin = await engine.deps.evidence_store.get(identity)
@@ -386,13 +525,32 @@ async def _goal_task_coverage(engine: Any, *, runtime: Any, tasks: list[Any]) ->
                 return (["task origin lookup failed; treating as unproven"], {}, [])
             if origin is None or _record_text(getattr(origin, "run_id", "")) != str(runtime.run_id):
                 return (["task origin is missing or belongs to another run"], {}, [])
+            if engagement_id is not None and _record_text(getattr(origin, "engagement_id", "")) != str(engagement_id):
+                return (["task origin belongs to another engagement"], {}, [])
+            origin_meta = getattr(origin, "metadata", None) or {}
+            if not isinstance(origin_meta, dict):
+                return (["task origin '" + str(identity) + "' has unreadable metadata"], {}, [])
+            origin_raw = raw_from_metadata(origin_meta)
+            if not isinstance(origin_raw, dict):
+                return (["task origin '" + str(identity) + "' has no preserved raw result"], {}, [])
+            linkage = check_record_linkage(origin, origin_meta, origin_raw, str(identity), require_proposal=False)
+            if linkage:
+                return ([linkage[0][0]], {}, [])
+            origin_errors = await verify_stored_origin(
+                path_store=path_store,
+                run_id=str(runtime.run_id),
+                m_path_id=_record_text(origin_meta.get("path_id", "")).strip(),
+                m_version=origin_meta.get("path_version", None),
+                m_step_id=_record_text(origin_meta.get("path_step_id", "")).strip(),
+                mission_id=str(runtime.mission_id),
+            )
+            if origin_errors:
+                return (["task origin '" + str(identity) + "' " + origin_errors[0]], {}, [])
             # Failed tool outcomes stay readable as general purpose
             # evidence here; the review call weighs them with the excerpt.
-            excerpts.append(_excerpt_of(origin))
-            if len(excerpts) >= MAX_EXCERPTS:
-                break
-        if len(excerpts) >= MAX_EXCERPTS:
-            break
+            # The cap only trims this payload; coverage above already ran.
+            if len(excerpts) < MAX_EXCERPTS:
+                excerpts.append(_excerpt_of(origin))
     return ([], task_evidence, excerpts)
 
 
@@ -420,7 +578,7 @@ async def complete_goal(engine: Any, path: Any, decision: Any, runtime: Any, con
         if getattr(cleanup, "outstanding", None):
             return ["required cleanup is still outstanding"]
     except Exception:
-        pass
+        return ["cleanup state lookup failed; treating as unproven"]
     await engine._check_review_path(runtime, path)
     review = await engine._ask(
         stage="goal_completion_review",
