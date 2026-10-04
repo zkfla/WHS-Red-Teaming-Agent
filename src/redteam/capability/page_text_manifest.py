@@ -24,6 +24,7 @@ def validate_page_text_discovery(descriptor: ToolDescriptor, config: PageTextCon
         or descriptor.tool_name != REMOTE_TOOL_NAME
         or descriptor.operations != [PROPOSED_OPERATION]
         or descriptor.target_types != ["url"]
+        or descriptor.outbound_text_fields != ["url"]
         or set(properties) != {"url", "max_chars"}
         or properties["url"].get("type") != "string"
         or inputs.get("required") != ["url"]

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Annotated
 
@@ -43,9 +44,14 @@ def load_page_text_config(
         raise ValueError("invalid page text configuration") from None
 
 
-def create_server(config: PageTextConfig, *, reader: PageTextReader | None = None) -> MCPServer:
+def create_server(
+    config: PageTextConfig,
+    *,
+    reader: PageTextReader | None = None,
+    prohibited_patterns: Sequence[str] = (),
+) -> MCPServer:
     """Expose only bounded page text; policy and network dependencies are construction-time only."""
-    page_reader = reader or PageTextReader(config)
+    page_reader = reader or PageTextReader(config, prohibited_patterns=prohibited_patterns)
     server = MCPServer("page-text", log_level="WARNING")
 
     async def fetch_page_text(url: str, max_chars: int | None = None) -> PageTextResult:

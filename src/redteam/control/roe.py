@@ -48,14 +48,14 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from redteam.core.execution_time import check_execution_time
-
 from redteam.control.severity import Severity
 from redteam.core.contracts.action import ActionProposal
 from redteam.core.contracts.engagement import Engagement, RuleOfEngagement
 
-# Backward-compatible aliases: the canonical parsing lives in
-# redteam.core.execution_time now; these names stay importable.
+# Shared time contract: canonical parsing lives in
+# redteam.core.execution_time; check_roe uses it at the original
+# positions so deny priority is unchanged. The time-only gate in the
+# same core module serves the root model-call guard with one meaning.
 from redteam.core.execution_time import as_utc as _as_utc
 from redteam.core.execution_time import parse_window as _parse_window
 from redteam.core.execution_time import time_in_window as _time_in_window
@@ -118,12 +118,6 @@ def check_roe(
     now = now or datetime.now(timezone.utc)
     action_key = action.capability + "." + action.operation
 
-    # Time guard first: one shared core meaning with the root model-call
-    # guard. A closed window ends the run whatever the capability lists say.
-    time_ok, time_reasons = check_execution_time(engagement, now=now)
-    if not time_ok:
-        return False, time_reasons, Severity.ABORT_RUN
-
     # 1. Explicit denials win outright, regardless of any allow-list.
     for rule in rules:
         if action.capability in rule.denied_capabilities:
@@ -132,6 +126,18 @@ def check_roe(
         if action_key in rule.denied_operations:
             reason = "operation '" + action_key + "' denied by ROE rule '" + rule.name + "'"
             return False, [reason], Severity.BLOCK_ACTION
+        if rule.start_at is not None and now < _as_utc(rule.start_at):
+            reason = (
+                "ROE rule '" + rule.name + "' window has not started "
+                + "(starts " + _as_utc(rule.start_at).isoformat() + ")"
+            )
+            return False, [reason], Severity.ABORT_RUN
+        if rule.end_at is not None and now > _as_utc(rule.end_at):
+            reason = (
+                "ROE rule '" + rule.name + "' window has ended "
+                + "(ended " + _as_utc(rule.end_at).isoformat() + ")"
+            )
+            return False, [reason], Severity.ABORT_RUN
         if not rule.availability_impact_allowed and action.availability_impact:
             reason = (
                 "action declares availability_impact=True, but ROE rule "
@@ -144,7 +150,19 @@ def check_roe(
                 assert parallel_reason is not None
                 return False, [parallel_reason], Severity.BLOCK_ACTION
 
-    # 2. Capability / operation allow-lists (restrictive when configured).
+    # 2. Time-of-day windows are restrictive when configured: if any rule
+    #    lists windows, now must fall inside at least one.
+    windows = [w for rule in rules for w in rule.allowed_time_windows]
+    if windows:
+        parsed = [pw for w in windows if (pw := _parse_window(w)) is not None]
+        if not any(_time_in_window(now.time(), start, end) for start, end in parsed):
+            reason = (
+                "current time " + now.time().strftime("%H:%M") + " UTC is outside the "
+                + "ROE allowed time windows " + str(windows)
+            )
+            return False, [reason], Severity.ABORT_RUN
+
+    # 3. Capability / operation allow-lists (restrictive when configured).
     allowed_caps = {cap for rule in rules for cap in rule.allowed_capabilities}
     if allowed_caps and action.capability not in allowed_caps:
         reason = "capability '" + action.capability + "' is not in the ROE allowed-capability list"

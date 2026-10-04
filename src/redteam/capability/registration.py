@@ -481,6 +481,7 @@ def _bind_page_text_discovery(descriptor: Any, settings: Any) -> str | None:
     from redteam.capability.settings import MCPConfigurationError
 
     descriptor.target_types = ["url"]
+    descriptor.outbound_text_fields = ["url"]
     try:
         config, _ = load_page_text_config(
             settings.page_text_config_path or "",
@@ -515,6 +516,7 @@ def _bind_web_search_discovery(descriptor: Any, settings: Any) -> str | None:
     from redteam.capability.web_search_manifest import validate_web_search_discovery
 
     descriptor.target_types = []
+    descriptor.outbound_text_fields = ["query"]
     try:
         search_config, _ = load_web_search_config(
             settings.web_search_config_path or "",

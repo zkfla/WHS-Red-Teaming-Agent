@@ -8,7 +8,7 @@ import ipaddress
 import logging
 import re
 import socket
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from email.message import Message
 from enum import Enum
 from html.parser import HTMLParser
@@ -16,6 +16,8 @@ from urllib.parse import urljoin, urlsplit
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+from redteam.core.outbound_text import check_outbound_text
 
 
 class PageTextErrorCode(str, Enum):
@@ -93,6 +95,8 @@ class PageTextConfig(_LocalModel):
     timeout_seconds: float = Field(default=5.0, gt=0, le=30, allow_inf_nan=False, strict=True)
     max_download_bytes: int = Field(default=262144, ge=1, le=1048576, strict=True)
     max_return_chars: int = Field(default=20000, ge=1, le=262144, strict=True)
+    # Compat input only: one hop is returned per call and never auto-followed.
+    # max_redirects no longer enables chained fetching; it stays validated.
     max_redirects: int = Field(default=3, ge=0, le=5, strict=True)
 
     @field_validator("allowed_origins")
@@ -123,6 +127,8 @@ class PageTextResult(_LocalModel):
     title: str | None = Field(default=None, repr=False)
     text: str = Field(repr=False)
     truncated: bool
+    redirect_url: str | None = Field(default=None, repr=False)
+    body_present: bool = True
 
 
 Resolver = Callable[[str, int], Awaitable[tuple[str, ...]]]
@@ -195,15 +201,20 @@ class PageTextReader:
         *,
         resolver: Resolver = _resolve,
         transport_factory: TransportFactory = _transport,
+        prohibited_patterns: Sequence[str] = (),
     ) -> None:
         self._config = config
         self._allowed = frozenset(_origin(_url(value)) for value in config.allowed_origins)
         self._resolver = resolver
         self._transport_factory = transport_factory
+        self._prohibited_patterns = tuple(prohibited_patterns or ())
 
     async def fetch_page_text(self, request: PageTextRequest) -> PageTextResult:
         limit = request.max_chars or self._config.max_return_chars
         if limit > self._config.max_return_chars:
+            raise PageTextError(PageTextErrorCode.INVALID_INPUT)
+        verdict = check_outbound_text(request.url, self._prohibited_patterns)
+        if verdict.blocked:
             raise PageTextError(PageTextErrorCode.INVALID_INPUT)
         started = asyncio.get_running_loop().time()
         try:
@@ -241,52 +252,53 @@ class PageTextReader:
         return checked[0]
 
     async def _fetch(self, requested_url: str, limit: int) -> PageTextResult:
+        # One hop only: a single request per call, never auto-followed.
+        # A redirect response is returned as data (redirect_url set,
+        # body_present False); the target is never fetched here.
         url = _url(requested_url)
-        seen: set[str] = set()
-        for hop in range(self._config.max_redirects + 1):
-            if str(url) in seen:
-                raise PageTextError(PageTextErrorCode.REDIRECT_ERROR)
-            seen.add(str(url))
-            address = await self._address(url)
-            host, port = _origin(url)
-            authority = f"[{host}]" if ":" in host else host
-            if port != 443:
-                authority += f":{port}"
-            # Fresh direct transport for each hop: no proxy, client cookie jar,
-            # authentication, HTTPX URL logging, redirect handling or retries.
-            async with self._transport_factory() as transport:
-                wire_request = httpx.Request(
-                    "GET", url.copy_with(host=address),
-                    headers={"Host": authority, "Accept-Encoding": "identity",
-                             "Accept": "text/html, text/plain"},
-                    extensions={
-                        "sni_hostname": host,
-                        "timeout": dict.fromkeys(
-                            ("connect", "read", "write", "pool"), self._config.timeout_seconds
-                        ),
-                    },
-                )
-                response = await transport.handle_async_request(wire_request)
-                try:
-                    if response.status_code in {301, 302, 303, 307, 308}:
-                        if hop == self._config.max_redirects:
-                            raise PageTextError(PageTextErrorCode.REDIRECT_ERROR)
-                        url = _redirect(url, response)
-                        continue
-                    if not 200 <= response.status_code < 300:
-                        raise PageTextError(PageTextErrorCode.HTTP_ERROR)
-                    mime, encoding = _format(response)
-                    body = await _body(response, self._config.max_download_bytes)
-                    title, text = extract_page_text(body, mime, encoding)
+        address = await self._address(url)
+        host, port = _origin(url)
+        authority = f"[{host}]" if ":" in host else host
+        if port != 443:
+            authority += f":{port}"
+        # Fresh direct transport for one hop: no proxy, client cookie jar,
+        # authentication, HTTPX URL logging, redirect handling or retries.
+        async with self._transport_factory() as transport:
+            wire_request = httpx.Request(
+                "GET", url.copy_with(host=address),
+                headers={"Host": authority, "Accept-Encoding": "identity",
+                         "Accept": "text/html, text/plain"},
+                extensions={
+                    "sni_hostname": host,
+                    "timeout": dict.fromkeys(
+                        ("connect", "read", "write", "pool"), self._config.timeout_seconds
+                    ),
+                },
+            )
+            response = await transport.handle_async_request(wire_request)
+            try:
+                if response.status_code in {301, 302, 303, 307, 308}:
+                    target = _redirect(url, response)
                     return PageTextResult(
                         requested_url=requested_url, final_url=str(url),
-                        status_code=response.status_code, content_type=mime,
-                        title=title[:limit] if title else None, text=text[:limit],
-                        truncated=len(text) > limit or bool(title and len(title) > limit),
+                        status_code=response.status_code, content_type="",
+                        title=None, text="", truncated=False,
+                        redirect_url=str(target), body_present=False,
                     )
-                finally:
-                    await response.aclose()
-        raise PageTextError(PageTextErrorCode.REDIRECT_ERROR)  # defensive loop guard
+                if not 200 <= response.status_code < 300:
+                    raise PageTextError(PageTextErrorCode.HTTP_ERROR)
+                mime, encoding = _format(response)
+                body = await _body(response, self._config.max_download_bytes)
+                title, text = extract_page_text(body, mime, encoding)
+                return PageTextResult(
+                    requested_url=requested_url, final_url=str(url),
+                    status_code=response.status_code, content_type=mime,
+                    title=title[:limit] if title else None, text=text[:limit],
+                    truncated=len(text) > limit or bool(title and len(title) > limit),
+                    redirect_url=None, body_present=True,
+                )
+            finally:
+                await response.aclose()
 
 
 def _redirect(url: httpx.URL, response: httpx.Response) -> httpx.URL:
