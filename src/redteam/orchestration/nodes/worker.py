@@ -13,7 +13,8 @@ from redteam.orchestration.nodes._support import graph_service
 from redteam.orchestration.nodes.execute import execute_node
 from redteam.orchestration.nodes.policy import denial_severity, policy_node
 from redteam.orchestration.nodes.update import update_node
-from redteam.orchestration.nodes.verify import verification_budget, verify_node
+from redteam.orchestration.analysis_budget import verification_budget
+from redteam.orchestration.nodes.verify import verify_node
 from redteam.orchestration.state import GraphState
 from redteam.orchestration.work.models import WorkStatus
 

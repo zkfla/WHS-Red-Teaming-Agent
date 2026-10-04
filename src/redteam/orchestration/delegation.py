@@ -40,3 +40,4 @@ class DelegationState(BaseModel):
     termination_reason: str | None = None
     summary: str | None = None
     unresolved: list[str] = Field(default_factory=list)
+    held_fingerprint: str | None = None

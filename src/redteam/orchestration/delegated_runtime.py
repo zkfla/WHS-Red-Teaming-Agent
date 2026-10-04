@@ -141,8 +141,6 @@ async def decide_delegations(engine, path, runtime, context):
     candidates = []
     advanced = False
     history = await engine.deps.work_store.list_items(run_id=runtime.run_id)
-    base_cursors = dict(runtime.agent_revision_cursors or {})
-    cursor_updates: dict[str, str] = {}
     for identity, state in list(values.items()):
         if state.status == "finished":
             continue
@@ -155,13 +153,12 @@ async def decide_delegations(engine, path, runtime, context):
             # on a fresh receipt id. A missing baseline records the current
             # revision and keeps waiting; an unreadable graph keeps the hold.
             fingerprint = await _worker_hold_fingerprint(engine, runtime, state)
-            agent_key = str(state.agent_id)
-            baseline = base_cursors.get(agent_key)
+            baseline = state.held_fingerprint
             if fingerprint is None or baseline is None or baseline == fingerprint:
                 if fingerprint is not None and baseline is None:
-                    cursor_updates[agent_key] = fingerprint
+                    values[identity] = state.model_copy(update={"held_fingerprint": fingerprint})
                 continue
-            cursor_updates[agent_key] = fingerprint
+            state = state.model_copy(update={"held_fingerprint": fingerprint})
             state = mark_active(state)
             values[identity] = state
         if state.status == "held" and runtime.pending_approval_id is None:
@@ -303,6 +300,11 @@ async def decide_delegations(engine, path, runtime, context):
             ),
         )
         values[identity] = result.delegation
+        if verdict is not None and verdict.decision == "hold":
+            fingerprint = await _worker_hold_fingerprint(engine, runtime, state)
+            values[identity] = values[identity].model_copy(
+                update={"held_fingerprint": fingerprint}
+            )
         advanced = True
         runtime = _publish_runtime(engine, runtime, values)
         if verdict is None:
@@ -344,15 +346,6 @@ async def decide_delegations(engine, path, runtime, context):
             values[identity] = values[identity].model_copy(
                 update={"unresolved": redact_secret_material(errors[-10:])}
             )
-    if cursor_updates:
-        runtime = runtime.model_copy(
-            update={
-                "agent_revision_cursors": {
-                    **runtime.agent_revision_cursors,
-                    **cursor_updates,
-                }
-            }
-        )
     runtime = _publish_runtime(engine, runtime, values)
     return candidates, advanced
 

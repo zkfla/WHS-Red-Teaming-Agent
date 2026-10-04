@@ -30,6 +30,7 @@ from redteam.core.enums import EvidenceSourceType, Verdict
 from redteam.core.ids import EvidenceId, new_id
 from redteam.orchestration.agents.base import PlanStep
 from redteam.orchestration.analysis import (
+    BudgetedAnalysisVerifier,
     VerificationRequest,
     append_review_receipt,
     hypothesis_status_for_assessment,
@@ -221,6 +222,8 @@ async def reprocess_evidence(
     graph_service: Any,
     verifier: Any,
     result_mappers: Any | None = None,
+    budget: Any | None = None,
+    before_call: Any | None = None,
 ) -> dict:
     """Replay one preserved result through meaning review and the graph.
 
@@ -595,8 +598,7 @@ async def reprocess_evidence(
     except Exception:
         stored_claim, stored_flag = (None, None)
     try:
-        assessment = await verifier.verify(
-            VerificationRequest(
+        request = VerificationRequest(
                 proposal=proposal,
                 result=result,
                 expectation=expectation,
@@ -605,7 +607,25 @@ async def reprocess_evidence(
                 violation_if_confirmed=stored_flag,
                 principal_ref=getattr(step, "principal_ref", None) if step is not None else None,
             )
-        )
+        if budget is not None and isinstance(verifier, BudgetedAnalysisVerifier):
+            assessment = await verifier.verify_with_budget(
+                request, budget=budget, before_call=before_call,
+            )
+        elif budget is not None and getattr(step, "delegation_id", None) is not None:
+            from redteam.orchestration.analysis import VerificationAssessment
+
+            assessment = VerificationAssessment(
+                verdict=Verdict.UNKNOWN,
+                reason="analysis verifier does not support delegated request budgets",
+                reviewer_id="analysis:budgeting_unsupported",
+                source_refs=request.source_refs,
+                outcome="unknown",
+                claim_supported=False,
+            )
+        else:
+            if before_call is not None:
+                await before_call()
+            assessment = await verifier.verify(request)
     except Exception:
         from redteam.orchestration.analysis import VerificationAssessment as _VA
 

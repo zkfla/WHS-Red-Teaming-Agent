@@ -145,8 +145,8 @@ def verify_task_receipt(
         return ["task receipt belongs to another run"]
     if mission_id is not None and str(receipt.get("mission_id", "")) != str(mission_id):
         return ["task receipt belongs to another mission"]
-    if not str(receipt.get("outcome", "")).strip():
-        return ["task receipt has no outcome"]
+    if receipt.get("outcome") != "success":
+        return ["task receipt does not prove successful completion"]
     expected = purpose_hash(task.objective or "")
     if str(receipt.get("purpose_hash", "")) != expected:
         return ["task purpose changed since the accepted receipt"]
@@ -486,12 +486,6 @@ async def complete_task(engine: Any, path: Any, decision: Any, runtime: Any, con
         return ["task completion needs related stored evidence"]
     verified: list[Any] = []
     excerpt_notes: list[dict[str, Any]] = []
-    scope: set[str] = set()
-    for step in list(getattr(path, "steps", []) or []):
-        for ref in list(getattr(step, "principal_refs", []) or []):
-            cleaned = str(ref).strip()
-            if cleaned:
-                scope.add(cleaned)
     for identity in evidence_ids:
         record, errors = await _verify_task_origin(
             evidence_store=engine.deps.evidence_store,
@@ -501,7 +495,7 @@ async def complete_task(engine: Any, path: Any, decision: Any, runtime: Any, con
             evidence_id=identity,
             task=task,
             mission_id=getattr(runtime, "mission_id", None),
-            step_principal_scope=scope or None,
+            step_principal_scope=None,
         )
         if errors:
             return errors
@@ -533,10 +527,13 @@ async def complete_task(engine: Any, path: Any, decision: Any, runtime: Any, con
         if hypothesis is None or hypothesis.status not in {"confirmed", "refuted", "rejected"}:
             return ["task hypothesis has no conclusive result"]
         kind = "hypothesis_confirmed" if hypothesis.status == "confirmed" else "hypothesis_refuted"
+        hypothesis_evidence = [str(record.evidence_id) for record in verified
+                               if str(record.hypothesis_id) == str(hypothesis_id)]
+        if not hypothesis_evidence:
+            return ["task hypothesis has no related original evidence"]
         claims.append(ResultClaim(
             description=hypothesis.description, kind=kind, hypothesis_id=str(hypothesis_id),
-            evidence_ids=[str(record.evidence_id) for record in verified
-                          if str(record.hypothesis_id) == str(hypothesis_id)],
+            evidence_ids=hypothesis_evidence,
         ).model_dump(mode="json"))
     errors = await check_result_review(
         claims=claims, evidence_ids=evidence_ids, evidence_store=engine.deps.evidence_store,
@@ -566,8 +563,9 @@ async def complete_task(engine: Any, path: Any, decision: Any, runtime: Any, con
     return []
 
 
-async def _legacy_task_proof(
-    engine: Any, *, runtime: Any, task: MissionTask, run_id: str
+async def verify_legacy_task_origins(
+    *, evidence_store: Any, path_store: Any, graph_service: Any,
+    mission_id: str, engagement_id: str | None, task: MissionTask, run_id: str
 ) -> tuple[list[str], list[str]]:
     """Read a receipt-less completed task only through the stored path proof.
 
@@ -578,7 +576,7 @@ async def _legacy_task_proof(
     Record lookups never succeed on failure.
     """
     try:
-        listed = await engine.deps.path_store.list_paths(str(run_id))
+        listed = await path_store.list_paths(str(run_id))
     except Exception:
         return (["completed required task path proof lookup failed; treating as unproven"], [])
     try:
@@ -589,7 +587,7 @@ async def _legacy_task_proof(
         saved
         for saved in (listed or [])
         if getattr(saved, "mission_task_id", None) == str(task.task_id)
-        and getattr(saved, "mission_id", None) == str(runtime.mission_id)
+        and getattr(saved, "mission_id", None) == str(mission_id)
         and _is_active(getattr(saved, "status", None))
     ]
     if not candidates:
@@ -598,7 +596,7 @@ async def _legacy_task_proof(
     if str(getattr(latest, "goal", "") or "").strip() != str(task.objective or "").strip():
         return (["completed task path proves an older purpose; its stored proof is obsolete"], [])
     try:
-        run_records = await engine.deps.evidence_store.list_for_run(str(run_id))
+        run_records = await evidence_store.list_for_run(str(run_id))
     except Exception:
         return (["completed required task receipt history lookup failed; treating as unproven"], [])
     for rec in run_records or []:
@@ -615,22 +613,19 @@ async def _legacy_task_proof(
     required_steps = [step for step in list(getattr(latest, "steps", []) or []) if getattr(step, "required", False)]
     if not required_steps:
         return (["completed task path has no required steps to prove it"], [])
-    from redteam.attack_graph.service import AttackGraphService
-    service = AttackGraphService(engine.deps.graph_store)
     proven: list[str] = []
-    engagement_id = getattr(runtime, "engagement_id", None)
     for step in required_steps:
         if _record_text(getattr(step, "status", "")) != "completed":
             return (["completed task has unfinished path steps"], [])
         step_ids = [str(item).strip() for item in list(getattr(step, "evidence_ids", []) or []) if str(item).strip()]
         if not step_ids:
             return (["completed required task step cites no evidence"], [])
-        errors = await validate_completion(path=latest, step=step, proposal={"evidence_ids": step_ids, "outcome": getattr(step, "outcome", None) or "success", "reason": getattr(step, "objective", "") or ""}, evidence_store=engine.deps.evidence_store, graph_service=service, run_id=str(run_id), path_store=engine.deps.path_store)
+        errors = await validate_completion(path=latest, step=step, proposal={"evidence_ids": step_ids, "outcome": getattr(step, "outcome", None) or "success", "reason": getattr(step, "objective", "") or ""}, evidence_store=evidence_store, graph_service=graph_service, run_id=str(run_id), path_store=path_store)
         if errors:
             return (errors, [])
         for identity in step_ids:
             try:
-                record = await engine.deps.evidence_store.get(identity)
+                record = await evidence_store.get(identity)
             except Exception:
                 return (["task origin lookup failed; treating as unproven"], [])
             if record is None or _record_text(getattr(record, "run_id", "")) != str(run_id):
@@ -667,7 +662,12 @@ async def _goal_task_coverage(
             return (["required mission task '" + str(task.task_id) + "' is not completed"], {}, [])
         receipt_id = task.completion_evidence_id
         if receipt_id is None:
-            errors, proven = await _legacy_task_proof(engine, runtime=runtime, task=task, run_id=str(runtime.run_id))
+            errors, proven = await verify_legacy_task_origins(
+                evidence_store=engine.deps.evidence_store, path_store=path_store,
+                graph_service=AttackGraphService(engine.deps.graph_store),
+                mission_id=str(runtime.mission_id), engagement_id=engagement_id,
+                task=task, run_id=str(runtime.run_id),
+            )
             if errors:
                 return (errors, {}, [])
             if not proven:

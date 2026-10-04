@@ -1614,16 +1614,52 @@ class InvestigationEngine:
                     continue
                 if decision.mode == "recover_evidence":
                     from redteam.attack_graph.service import AttackGraphService
+                    from redteam.orchestration.analysis_budget import verification_budget, verification_guard
+                    from redteam.orchestration.delegation_decision import record_decision_consumption
                     from redteam.orchestration.recovery import reprocess_evidence
 
-                    recovered = await reprocess_evidence(
-                        evidence_id=str(decision.evidence_request.get("evidence_id", "")),
-                        run_id=str(runtime.run_id),
-                        evidence_store=self.deps.evidence_store,
-                        graph_service=AttackGraphService(self.deps.graph_store),
-                        verifier=self.deps.verifier,
-                        result_mappers=self.deps.result_mappers,
-                    )
+                    evidence_id = str(decision.evidence_request.get("evidence_id", ""))
+                    source = await self.deps.evidence_store.get(evidence_id)
+                    from redteam.core.contracts.action import ActionProposal
+
+                    origin_step = None
+                    origin_proposal = None
+                    try:
+                        if source is not None:
+                            if source.metadata.get("plan_step") is not None:
+                                origin_step = PlanStep.model_validate(source.metadata["plan_step"])
+                            if source.metadata.get("proposal") is not None:
+                                origin_proposal = ActionProposal.model_validate(source.metadata["proposal"])
+                    except (ValueError, TypeError):
+                        # The shared reprocessor records malformed original
+                        # metadata; do not let admission parsing hide that result.
+                        origin_step = None
+                        origin_proposal = None
+                    review_state = {"runtime": runtime, "plan_step": origin_step,
+                                    "action_proposal": origin_proposal}
+                    model_budget = verification_budget(review_state, deps=self.deps)
+                    try:
+                        recovered = await reprocess_evidence(
+                            evidence_id=evidence_id, run_id=str(runtime.run_id),
+                            evidence_store=self.deps.evidence_store,
+                            graph_service=AttackGraphService(self.deps.graph_store),
+                            verifier=self.deps.verifier, result_mappers=self.deps.result_mappers,
+                            budget=model_budget,
+                            before_call=verification_guard(review_state, deps=self.deps,
+                                                           budget=model_budget),
+                        )
+                    finally:
+                        delegation_id = getattr(origin_step, "delegation_id", None)
+                        delegation = runtime.delegations.get(delegation_id)
+                        if delegation is not None:
+                            spent = record_decision_consumption(
+                                delegation, requests=model_budget.used,
+                                tokens=model_budget.tokens_used if model_budget.tokens_fully_known else None,
+                            )
+                            runtime = runtime.model_copy(update={"delegations": {
+                                **runtime.delegations, delegation_id: spent,
+                            }})
+                            self.updated_runtime = self._event_runtime = runtime
                     extra.append(recovered)
                     context = await self.context(runtime, observation)
                     last_control_succeeded = True

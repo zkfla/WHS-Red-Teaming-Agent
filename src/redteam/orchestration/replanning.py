@@ -406,86 +406,36 @@ def _terminal_rule(code: str, summary: str, attempts: int) -> DecisionDiagnostic
 
 
 async def _terminal_task_coverage(*, tasks, evidence, evidence_store, path_store, run_id, engagement_id, mission_id, graph_service=None):
-    """Proven evidence ownership per required task for terminal review.
+    """Use the same current-purpose and original-evidence proof as goal review."""
+    from redteam.orchestration.semantic_completion import (
+        verify_legacy_task_origins, verify_receipt_bound_origins,
+    )
 
-    Receipt-bound tasks go through the same shared receipt-to-origin proof
-    as goal settlement, so the two authorities cannot drift apart.
-    Receipt-less completed tasks keep their metadata-declared evidence only
-    when each record passes the same single-origin proof and targets an
-    object the task declares; their step-level proof stays with the loop
-    that completed them. Returns (bound, unproven, owners): receipt-proven
-    ids per task, tasks whose proof failed, and every reviewable evidence
-    id with its owning task. Lookup failures prove nothing, never success.
-    """
-    try:
-        from redteam.orchestration.semantic_completion import verify_receipt_bound_origins as _verify_bound
-        from redteam.orchestration.semantic_completion import verify_single_origin as _verify_single
-    except Exception:
-        unproven: set[str] = set()
-        for task in tasks or []:
-            if getattr(task, "required", False) and getattr(task, "status", None) is TaskStatus.COMPLETED and getattr(task, "completion_evidence_id", None) is not None:
-                unproven.add(str(task.task_id))
-        return {}, unproven, {}
     bound: dict[str, set[str]] = {}
-    unproven = set()
+    unproven: set[str] = set()
     owners: dict[str, str] = {}
-    required_done = [
-        task
-        for task in (tasks or [])
-        if getattr(task, "required", False)
-        and getattr(task, "status", None) is TaskStatus.COMPLETED
-    ]
-    for task in required_done:
-        task_id = str(task.task_id)
-        if getattr(task, "completion_evidence_id", None) is None:
+    for task in tasks or []:
+        if not task.required or task.status is not TaskStatus.COMPLETED:
             continue
-        errors, proven = await _verify_bound(
-            evidence_store=evidence_store,
-            path_store=path_store,
-            run_id=str(run_id),
-            engagement_id=engagement_id,
-            mission_id=str(mission_id),
-            task=task,
-            graph_service=graph_service,
-        )
+        if task.completion_evidence_id is None:
+            errors, proven = await verify_legacy_task_origins(
+                evidence_store=evidence_store, path_store=path_store,
+                graph_service=graph_service, run_id=str(run_id),
+                engagement_id=engagement_id, mission_id=str(mission_id), task=task,
+            )
+        else:
+            errors, proven = await verify_receipt_bound_origins(
+                evidence_store=evidence_store, path_store=path_store,
+                graph_service=graph_service, run_id=str(run_id),
+                engagement_id=engagement_id, mission_id=str(mission_id), task=task,
+            )
+        task_id = str(task.task_id)
         if errors or not proven:
             unproven.add(task_id)
             continue
         bound[task_id] = set(proven)
         for identity in proven:
             owners[identity] = task_id
-    declared_tasks = {str(task.task_id): task for task in required_done}
-    for item in evidence or []:
-        if getattr(item, "source_type", None) is not EvidenceSourceType.TOOL:
-            continue
-        identity = str(getattr(item, "evidence_id", ""))
-        if not identity or identity in owners:
-            continue
-        meta = getattr(item, "metadata", None) or {}
-        if not isinstance(meta, dict):
-            continue
-        declared = meta.get("mission_task_id")
-        if not isinstance(declared, str) or declared not in declared_tasks:
-            continue
-        if declared in unproven or declared in bound:
-            continue
-        record, errors = await _verify_single(
-            evidence_store=evidence_store,
-            path_store=path_store,
-            run_id=str(run_id),
-            engagement_id=engagement_id,
-            mission_id=str(mission_id),
-            evidence_id=identity,
-            require_proposal=True,
-        )
-        if errors or record is None:
-            continue
-        task = declared_tasks[declared]
-        related = {str(node).strip() for node in list(getattr(task, "related_attack_graph_node_ids", []) or []) if str(node).strip()}
-        target_ref = str(meta.get("target_node_id", "") or "").strip()
-        if related and target_ref not in related:
-            continue
-        owners[identity] = declared
     return bound, unproven, owners
 
 
@@ -508,7 +458,7 @@ def _reasoning_expired(engagement: Any, runtime: Any) -> bool | None:
         return None
 
 
-async def _terminal_criterion_results(mission, tasks, evidence, llm_client, budget, *, receipt_bound=None, receipt_unproven=None, owners=None, runtime=None, engagement=None, evidence_store=None, path_store=None, graph_service=None):
+async def _terminal_criterion_results(mission, tasks, evidence, llm_client, budget, *, receipt_bound=None, receipt_unproven=None, owners=None, runtime=None, engagement=None, evidence_store=None, path_store=None, graph_service=None, before_review=None, run_id=None):
     """Settle the original operator criteria against the shared task proof.
 
     Every original mission criterion goes through the same contract: only
@@ -547,7 +497,7 @@ async def _terminal_criterion_results(mission, tasks, evidence, llm_client, budg
                     errors = await check_result_review(
                         claims=result.result_claims, evidence_ids=result.evidence_ids,
                         evidence_store=evidence_store, graph_service=graph_service,
-                        path_store=path_store, run_id=str(getattr(runtime, "run_id", "")),
+                        path_store=path_store, run_id=str(run_id or getattr(runtime, "run_id", "")),
                         mission_id=str(mission.mission_id),
                     )
                     if errors:
@@ -592,6 +542,13 @@ async def _terminal_criterion_results(mission, tasks, evidence, llm_client, budg
         drop_secret_keys=True,
     )
     client = StructuredDecisionClient(llm_client, max_attempts=budget.max_attempts)
+    async def before_call():
+        if before_review is not None:
+            await before_review()
+        if _reasoning_expired(engagement, runtime) is True:
+            from redteam.orchestration.cognition import ReasoningHalted
+
+            raise ReasoningHalted("terminal_reasoning_expired")
     diagnostic = budget.last_failure
     while budget.remaining:
         if _reasoning_expired(engagement, runtime) is True:
@@ -607,6 +564,7 @@ async def _terminal_criterion_results(mission, tasks, evidence, llm_client, budg
                 payload=payload,
                 response_schema=_TerminalReview.model_json_schema(),
                 budget=budget,
+                before_call=before_call,
                 system=(
                     "Review each requested original mission criterion against actual completed "
                     "required tasks and supplied tool evidence. Task completion and tool "
@@ -665,7 +623,7 @@ async def _terminal_criterion_results(mission, tasks, evidence, llm_client, budg
                         claims=[claim.model_dump(mode="json") for claim in item.claims],
                         evidence_ids=item.evidence_ids, evidence_store=evidence_store,
                         graph_service=graph_service, path_store=path_store,
-                        run_id=str(getattr(runtime, "run_id", "")),
+                        run_id=str(run_id or getattr(runtime, "run_id", "")),
                         mission_id=str(mission.mission_id),
                     )
                     if errors:
@@ -802,11 +760,26 @@ async def finalize_mission(
             )
         else:
             bound, unproven, owners = {}, set(), {}
+        async def before_review():
+            if coordinator is None:
+                return
+            async def inspect(change):
+                change.binding(str(run_id), str(mission_id), str(mission.engagement_id))
+                current = await change.tasks.get_mission(mission_id)
+                if current is None or current.status in {
+                    MissionStatus.PAUSED, MissionStatus.FAILED, MissionStatus.CANCELLED,
+                } or change.pending(str(run_id), str(mission_id)):
+                    raise StateConflict("terminal_review_no_longer_allowed")
+                if change.token(str(run_id), str(mission_id)) != token:
+                    raise StateConflict("terminal_reviewed_state_changed")
+            await coordinator.change(inspect)
+
         criterion_results, diagnostic = await _terminal_criterion_results(
             mission, tasks, evidence, review_client, budget,
             receipt_bound=bound, receipt_unproven=unproven, owners=owners,
             runtime=runtime, engagement=engagement,
             evidence_store=evidence_store, path_store=path_store, graph_service=graph_service,
+            before_review=before_review, run_id=run_id,
         )
         required = [task for task in tasks if task.required]
         if mission.status in {MissionStatus.FAILED, MissionStatus.CANCELLED, MissionStatus.BLOCKED}:
@@ -822,7 +795,7 @@ async def finalize_mission(
         else:
             outcome = MissionStatus.BLOCKED
         if (
-            mission.status in {MissionStatus.FAILED, MissionStatus.CANCELLED, MissionStatus.BLOCKED}
+            mission.status in {MissionStatus.COMPLETED, MissionStatus.FAILED, MissionStatus.CANCELLED, MissionStatus.BLOCKED}
             and outcome is mission.status
             and criterion_results == mission.criterion_results
             and diagnostic is None

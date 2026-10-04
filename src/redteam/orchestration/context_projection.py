@@ -423,7 +423,7 @@ def _processing_view(source: dict[str, Any], companions: list[dict[str, Any]]) -
         "mapping_status", "mapping_outcome", "processing_status", "processing_stage",
         "processing_outcome", "recovery_status", "attempted", "confirmed", "failed_at",
     )
-    unique = {json.dumps({key: item[key] for key in meaningful if key in item},
+    unique = {json.dumps({key: item[key] for key in ("record_kind", *meaningful, "target_references") if key in item},
                          sort_keys=True, default=str): item for item in selected}
     view["processing_duplicate_count"] = len(selected) - len(unique)
     endings = [item for item in unique.values()
