@@ -35,7 +35,7 @@ import json
 from datetime import datetime, timezone
 from typing import Any
 
-from redteam.core.contracts.mission import MissionCriterionResult, MissionTask
+from redteam.core.contracts.mission import MissionCriterionResult, MissionTask, redact_secret_material
 from redteam.core.enums import EvidenceSourceType, MissionStatus, TaskStatus
 from redteam.core.ids import new_id
 from redteam.orchestration.completion import check_record_linkage, validate_completion, verify_stored_origin
@@ -253,7 +253,11 @@ def _excerpt_of(record: Any, *, limit: int = EXCERPT_CHARS) -> dict[str, Any]:
     meta = getattr(record, "metadata", None) or {}
     raw = raw_from_metadata(meta) if isinstance(meta, dict) else None
     try:
-        rendered = json.dumps(raw, ensure_ascii=False, default=str)
+        rendered = json.dumps(
+            redact_secret_material(raw, drop_secret_keys=True),
+            ensure_ascii=False,
+            default=str,
+        )
     except Exception:
         rendered = _record_text(raw)
     kept = max(1, int(limit))

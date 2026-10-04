@@ -516,8 +516,11 @@ async def verify_stored_origin(
         break
     if source is None:
         return ["origin path version is not stored in this run"]
-    if mission_id and _s(getattr(source, "mission_id", "") or "").strip():
-        if _s(source.mission_id).strip() != str(mission_id).strip():
+    if mission_id:
+        source_mission = _s(getattr(source, "mission_id", "") or "").strip()
+        if not source_mission:
+            return ["origin has no mission binding; treating as unproven"]
+        if source_mission != str(mission_id).strip():
             return ["origin belongs to another mission"]
     origin_step = next(
         (item for item in (getattr(source, "steps", []) or []) if _s(getattr(item, "step_id", "")).strip() == m_step_id),
@@ -589,6 +592,12 @@ async def verify_origin_step(
         )]
     current_mission = _s(getattr(path, "mission_id", "") or "").strip()
     source_mission = _s(getattr(source, "mission_id", "") or "").strip()
+    if current_mission and not source_mission:
+        return [(
+            f"evidence '{evidence_id}' origin has no mission binding; treating as unproven",
+            "completion_evidence_reference_origin_has_no_mission_binding_78",
+            "evidence 'reference' origin has no mission binding; treating as unproven",
+        )]
     if current_mission and source_mission and current_mission != source_mission:
         return [(
             f"evidence '{evidence_id}' origin belongs to another mission",
