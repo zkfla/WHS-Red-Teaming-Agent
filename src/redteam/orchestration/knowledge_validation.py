@@ -133,10 +133,9 @@ def check_principal_arguments(
     if session_refs:
         if principal is None or principal == "anonymous":
             raise AssessmentError("session arguments require an identified principal")
-        step_refs = getattr(step, "principal_refs", []) or []
-        allowed: set[str] = set()
-        for ref in step_refs:
-            allowed.update(bindings.get(ref, set()))
+        # Draft subjects describe an intended result, not account permissions.
+        # Actual registrations and the selected identity bind the execution.
+        allowed = {session for values in bindings.values() for session in values}
         if set(session_refs) - allowed or not set(session_refs) & bindings.get(principal, set()):
             raise AssessmentError("session arguments do not match accepted principal bindings")
     if arguments.get("principal_ref") is not None and str(arguments["principal_ref"]) != principal:

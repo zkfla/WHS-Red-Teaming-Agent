@@ -182,26 +182,19 @@ class PathPlan(BaseModel):
 
 
 def step_definition_equal(first: PathStep, second: PathStep) -> bool:
-    """Return True when two steps share revision-defining fields.
+    """Compare the result meaning, independent of suggested methods.
 
-    Compares objective, depends_on, completion_criteria (normalized),
-    allowed_operations, target_node_ids, principal_refs, required_fact_refs,
-    agent_id, required, and unknowns. Progress fields (status, outcome,
-    evidence_ids) are excluded: identical definitions carry progress over.
-    A changed target or principal resets the step so stale evidence can
-    never confirm the new definition.
+    Role, operation suggestions, open questions and the draft required flag
+    do not change what existing evidence proves. Changed purposes, subjects,
+    conditions or actual prerequisites require the result to be reviewed again.
     """
     return (
         first.objective == second.objective
         and sorted(first.depends_on) == sorted(second.depends_on)
         and criteria_key(first.completion_criteria) == criteria_key(second.completion_criteria)
-        and sorted(first.allowed_operations) == sorted(second.allowed_operations)
         and sorted(first.target_node_ids) == sorted(second.target_node_ids)
         and sorted(first.principal_refs) == sorted(second.principal_refs)
         and sorted(first.required_fact_refs) == sorted(second.required_fact_refs)
-        and first.agent_id == second.agent_id
-        and first.required == second.required
-        and sorted(first.unknowns) == sorted(second.unknowns)
     )
 
 

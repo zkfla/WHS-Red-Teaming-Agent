@@ -73,10 +73,12 @@ from redteam.orchestration.paths import PathError, PathPlan, is_active_status, i
 from redteam.orchestration.paths.models import (
     ALLOWED_CRITERION_KINDS,
     changed_steps_and_descendants,
+    step_definition_equal,
     validate_path_structure,
 )
 from redteam.orchestration.paths.writing import (
     CriterionWritingError,
+    normalize_path_proposals,
     validate_written_criteria,
     writing_schema,
 )
@@ -187,7 +189,7 @@ SYSTEM = (
     "chain-of-thought. Code reference paths are hints, not an execution pool or an exhaustive "
     "strategy list. Never claim completion from tool success alone. "
     "Operations use capability.operation. "
-    "Completion criteria must be typed and measurable, with evidence requirements; unknown future "
+    "Completion criteria describe measurable results; kind and evidence count have defaults. Future "
     "steps may stay pending. Do not invent observed facts or evidence. "
     "Declare availability_impact for actions that can disrupt service, "
     "and obey the engagement constraints."
@@ -414,7 +416,8 @@ class InvestigationEngine:
             kwargs.get("system", "")
             + " Supported completion kinds: "
             + ", ".join(sorted(ALLOWED_CRITERION_KINDS))
-            + ". New conditions require kind, nonblank description, min_evidence >= 1; "
+            + ". New conditions require a nonblank description; kind defaults to semantic "
+            "and min_evidence to 1. "
             "hypothesis kinds require hypothesis_id."
         )
         runtime = self._event_runtime
@@ -423,7 +426,7 @@ class InvestigationEngine:
         if runtime is None:
             result = await self._propose(stage=stage, payload=payload, **kwargs)
             validate_written_criteria(result)
-            return result
+            return normalize_path_proposals(result)
         publisher = EventPublisher(
             self.deps.event_bus,
             run_id=runtime.run_id,
@@ -461,7 +464,21 @@ class InvestigationEngine:
             causation_id=self.last_event_id,
         )
         self.last_event_id = decided.event_id
-        return result
+        active_path = await self.deps.path_store.get_active(str(runtime.run_id))
+        defaults = {
+            "run_id": str(runtime.run_id),
+            "mission_id": str(runtime.mission_id) if runtime.mission_id else None,
+            "mission_task_id": str(runtime.active_task_id) if runtime.active_task_id else None,
+            "path_id": active_path.path_id if active_path else new_id("path"),
+            "version": active_path.version + 1 if active_path else 1,
+            "parent_version": active_path.version if active_path else None,
+            "status": "candidate",
+            "goal": payload.get("goal", ""),
+            "review_records": {},
+            "changed_step_ids": [],
+            "evidence_ids": [],
+        }
+        return normalize_path_proposals(result, defaults=defaults)
 
     async def _propose(self, *, stage, payload, response_schema, system="", budget=None):
         """Apply the same output boundary to builtin and delegated inference."""
@@ -1132,15 +1149,6 @@ class InvestigationEngine:
         # Progress and receipts are code-owned, never accepted from a model draft.
         for step in path.steps:
             step.status, step.outcome, step.evidence_ids = "pending", None, []
-            if step.required and not _admissible_step_operations(
-                self.deps.agents, step, self.deps.tool_catalog
-            ):
-                raise DecisionRuleError(
-                    "Required execution steps need an executable operation. Use the existing "
-                    "task or goal completion proposal to summarize completed prerequisites.",
-                    code="path_step_not_executable",
-                    location=known_location(("steps", "allowed_operations")),
-                )
         # Registration judges references against fresh internal material, never
         # the capped LLM display. A failed read admits nothing.
         assessment = await _collect_check_assessment(self.deps, runtime, service=service)
@@ -1279,7 +1287,7 @@ class InvestigationEngine:
             accepted["changed_step_ids"] = changed_steps_and_descendants(
                 active.steps,
                 path.steps,
-                path.changed_step_ids,
+                [],
             )
         if "review_records" in PathPlan.model_fields:
             accepted["review_records"] = {"decision": review.decision, "reason": review.reason}
@@ -1303,8 +1311,7 @@ class InvestigationEngine:
         for identity, old in previous_steps.items():
             new = current_steps.get(identity)
             if new is not None:
-                exclude = {"status", "outcome", "evidence_ids"}
-                if old.model_dump(exclude=exclude) != new.model_dump(exclude=exclude):
+                if not step_definition_equal(old, new):
                     changed.add(identity)
         while True:
             descendants = {
@@ -1651,7 +1658,7 @@ class InvestigationEngine:
                 compiled, errors = await self.compile_actions(
                     path, decision.actions, runtime, context
                 )
-                if errors:
+                if errors and not compiled:
                     budget.last_failure = DecisionDiagnostic(
                         code="completion_or_action_not_admitted",
                         stage="next_action",
@@ -1670,6 +1677,17 @@ class InvestigationEngine:
                         decision.actions,
                     )
                     continue
+                if errors:
+                    await EventPublisher(
+                        self.deps.event_bus,
+                        run_id=runtime.run_id,
+                        engagement_id=runtime.engagement_id,
+                        source="orchestration.engine",
+                    ).publish(
+                        "ActionProposalsRejected",
+                        {"diagnostics": self._safe_errors(errors, budget)},
+                        causation_id=self.last_event_id,
+                    )
                 return path, compiled, None
             except (ValueError, TypeError, KeyError, PathError) as exc:
                 diagnostic = diagnostic_for_exception(exc, stage="next_action")
@@ -1703,12 +1721,6 @@ class InvestigationEngine:
                 checks = check_ready_step(path, step, assessment)
                 if checks:
                     raise DecisionRuleError("accepted step prerequisites are not satisfied")
-                if intent.target_node_id not in step.target_node_ids:
-                    raise DecisionRuleError(
-                        "action target is outside step envelope",
-                        code="unresolved_target",
-                        location=_action_location(intent_index, "target_node_id"),
-                    )
                 if intent.target_node_id not in known_target_ids(assessment):
                     raise DecisionRuleError(
                         "action target is not supplied or observed",
@@ -1718,8 +1730,6 @@ class InvestigationEngine:
                 agent = self.deps.agents.get(intent.agent_id)
                 if agent is None or intent.capability not in agent.capabilities:
                     raise DecisionRuleError("action role/capability is unavailable")
-                if step.agent_id and step.agent_id != intent.agent_id:
-                    raise DecisionRuleError("action role is outside accepted step")
                 tool_for_eligibility = (
                     self.deps.tool_catalog.get(intent.tool_id) if self.deps.tool_catalog else None
                 )
@@ -1780,12 +1790,6 @@ class InvestigationEngine:
                         code=exc.reason,
                         location=_action_location(intent_index, exc.field),
                     ) from None
-                if operation not in step.allowed_operations:
-                    raise DecisionRuleError("action operation is outside step envelope")
-                if intent.principal_ref and intent.principal_ref not in step.principal_refs:
-                    raise DecisionRuleError("action principal is outside step envelope")
-                if step.principal_refs and not intent.principal_ref:
-                    raise DecisionRuleError("step requires a principal reference")
                 _principal_check(
                     step,
                     intent.principal_ref,
@@ -1947,7 +1951,9 @@ class InvestigationEngine:
                     json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
                 ).hexdigest()[:24]
             )
+        admitted = []
         for item in compiled:
+            errors_before = len(errors)
             try:
                 validate_argument_target(
                     item.plan_step.resolved_target(),
@@ -1986,7 +1992,9 @@ class InvestigationEngine:
                 # silently repeat work on upgrade or infer novelty from a
                 # different hash; require reconciliation of the old execution.
                 errors.append("legacy execution identity requires reconciliation before retry")
-        return compiled, errors
+            if len(errors) == errors_before:
+                admitted.append(item)
+        return admitted, errors
 
     async def _legacy_identity_conflict(self, candidate, history, runtime) -> bool:
         legacy = [
@@ -2537,7 +2545,7 @@ def validate_principal_arguments(step, principal, arguments, knowledge) -> None:
     if session_refs:
         if principal is None or principal == "anonymous":
             raise DecisionRuleError("session arguments require an identified principal")
-        allowed = set().union(*(bindings.get(ref, set()) for ref in step.principal_refs))
+        allowed = {session for values in bindings.values() for session in values}
         if set(session_refs) - allowed or not set(session_refs) & bindings.get(principal, set()):
             raise DecisionRuleError("session arguments do not match accepted principal bindings")
     if arguments.get("principal_ref") is not None and str(arguments["principal_ref"]) != principal:
@@ -2835,16 +2843,8 @@ async def validate_current_action(deps, runtime, step, proposal=None) -> list[st
             assessment_text=current.objective,
         )
     )
-    if str(node_id_for_target(step.resolved_target())) not in current.target_node_ids:
-        problems.append("action target left the step envelope")
     if str(node_id_for_target(step.resolved_target())) not in known_target_ids(assessment):
         problems.append("action target is not supplied or observed")
-    if step.operation_key not in current.allowed_operations:
-        problems.append("action operation left the step envelope")
-    if step.principal_ref and step.principal_ref not in current.principal_refs:
-        problems.append("action principal left the step envelope")
-    if current.principal_refs and not step.principal_ref:
-        problems.append("accepted step requires a principal")
     if await operator_epoch(deps, runtime) != step.operator_intent_id:
         problems.append("operator instruction changed since action planning")
     if proposal is not None:
@@ -2856,7 +2856,6 @@ async def validate_current_action(deps, runtime, step, proposal=None) -> list[st
             or proposal.target != step.resolved_target()
             or proposal.arguments != step.arguments
             or proposal.availability_impact != step.availability_impact
-            or (current.agent_id and str(proposal.agent_id) != current.agent_id)
         ):
             problems.append("proposal differs from the accepted compiled action")
     try:
@@ -2885,6 +2884,10 @@ async def validate_current_action(deps, runtime, step, proposal=None) -> list[st
             if schema_error:
                 problems.append(_rejection_feedback(*schema_error))
             agent = deps.agents.get(proposal.agent_id) if proposal is not None else None
+            if proposal is not None and (
+                agent is None or step.capability not in agent.capabilities
+            ):
+                problems.append("action role/capability is unavailable")
             eligible = await deps.eligibility.action(
                 agent,
                 tool,
