@@ -70,7 +70,7 @@ NODE_NAMES = (
 )
 
 
-def _route_entry(state: GraphState) -> str:
+def _route_entry(state: GraphState):
     """Normal runs always start at OBSERVE. The one exception:
     ``AgentLoopRunner.reconcile_once`` seeds a resumed APPROVAL_PENDING
     run with ``runtime.phase == POLICY`` and the original ``action_proposal``
@@ -79,6 +79,9 @@ def _route_entry(state: GraphState) -> str:
     proposal through OBSERVE/PLAN.
     """
     if state["runtime"].phase == AgentPhase.POLICY and state.get("action_proposal") is not None:
+        step = state.get("plan_step")
+        if step is not None and step.delegation_id and state.get("dispatch_items"):
+            return route_after_plan(state)
         return "policy"
     return "observe"
 

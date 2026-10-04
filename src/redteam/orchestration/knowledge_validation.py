@@ -39,6 +39,8 @@ class InternalTarget:
     verification: str = "unconfirmed"
     address: str = ""
     target_ref: str | None = None
+    # Present only for a verified reference to an unvisited address.
+    execution_target: Any = None
 
 
 @dataclass

@@ -210,6 +210,15 @@ def resume_graph_state(
     ``action_proposal.action_id`` (``policy_node`` asserts this to decide
     whether to ask Control for a fresh judgement or the resolved outcome).
     """
+    dispatch_items = (
+        [
+            DispatchItem(
+                work_id=current_work_id, plan_step=plan_step, proposal=action_proposal
+            )
+        ]
+        if plan_step is not None and plan_step.delegation_id and current_work_id is not None
+        else []
+    )
     return {
         "runtime": runtime,
         "observation": None,
@@ -219,7 +228,7 @@ def resume_graph_state(
         "tool_result": None,
         "result_evidence_id": None,
         "current_work_id": current_work_id,
-        "dispatch_items": [],
+        "dispatch_items": dispatch_items,
         "worker_outcomes": {},
         "last_event_id": None,
     }

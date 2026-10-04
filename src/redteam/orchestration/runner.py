@@ -211,6 +211,7 @@ class AgentLoopRunner:
                 "actions_executed",
                 "retry_tool_calls",
                 "component_binding",
+                "delegations",
             )
             if not isinstance(saved, RuntimeState) or self._snapshot_replays_execution(checkpoint):
                 return False
@@ -871,6 +872,7 @@ class AgentLoopRunner:
             plan_step=state.get("plan_step"),
             current_work_id=state.get("current_work_id"),
         )
+        self._deps.batch_pending_approvals.discard(runtime.run_id)
         return await self._run_state(resumed_runtime, seeded)
 
     @staticmethod

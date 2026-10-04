@@ -46,6 +46,7 @@ from redteam.orchestration.diagnostics import (
     diagnostic_for_exception,
     known_location,
 )
+from redteam.orchestration.delegation import DelegationRequest
 from redteam.orchestration.eligibility import EligibilityContext
 from redteam.orchestration.events import AGENT_CONTEXT_PREPARED, AGENT_TURN_DECIDED
 from redteam.orchestration.evidence_access import EvidenceReader, raw_from_metadata
@@ -129,11 +130,13 @@ class TurnDecision(BaseModel):
         "update_hypothesis",
         "recover_evidence",
         "reconcile_job",
+        "delegate",
     ]
     reason: str
     response: str | None = Field(default=None, max_length=2000)
     assumptions: list[str] = Field(default_factory=list, max_length=5)
     actions: list[ActionIntent] = Field(default_factory=list)
+    delegations: list[DelegationRequest] = Field(default_factory=list)
     path: PathPlan | None = None
     path_step_id: str | None = None
     completion: dict[str, Any] = Field(default_factory=dict)
@@ -177,6 +180,13 @@ _PUBLIC_EVIDENCE_KEYS = frozenset(
         "path_step_id",
         "principal_ref",
         "receipt_kind",
+        "mapping_status",
+        "mapping_outcome",
+        "processing_status",
+        "processing_stage",
+        "processing_outcome",
+        "recovery_status",
+        "target_references",
     }
 )
 
@@ -193,6 +203,12 @@ SYSTEM = (
     "steps may stay pending. Do not invent observed facts or evidence. "
     "Declare availability_impact for actions that can disrupt service, "
     "and obey the engagement constraints."
+    " Plan roles, operations and target lists are suggestions, not permissions. "
+    "You may delegate a step's purpose to a registered specialist. That specialist chooses "
+    "its own methods within the engagement and returns evidence, partial results and gaps. "
+    "A synthesis step can cite earlier related evidence without relabeling its origin. "
+    "read_evidence may include target_references with target, source_evidence_id and raw_path "
+    "to an exact address in stored output; referenced addresses remain unconfirmed. "
     " Use complete_task to close the current mission task before proceeding to another required "
     "task; complete_goal settles the original mission only after all required tasks are covered."
     " Write public responses, reasons and assumptions in the operator's language; "
@@ -495,7 +511,9 @@ class InvestigationEngine:
                     payload=deepcopy(payload),
                     response_schema=deepcopy(response_schema),
                     system=system,
-                    inference=BudgetedInference(self.client, active_budget),
+                    inference=BudgetedInference(
+                        self.client, active_budget, before_call=self._ensure_reasoning_allowed
+                    ),
                 )
             )
         finally:
@@ -512,6 +530,19 @@ class InvestigationEngine:
             raise ValueError("planning proposal does not satisfy the writing schema") from None
         validate_written_criteria(result)
         return result
+
+    async def _ensure_reasoning_allowed(self):
+        runtime = self._event_runtime
+        if runtime is None:
+            return
+        if runtime.is_terminal:
+            raise DecisionRuleError("the run is terminal; no new model request is allowed")
+        if runtime.mission_id is not None:
+            await self._review_token(runtime)
+        from redteam.orchestration.reasoning_time import reasoning_time_allowed
+
+        if not reasoning_time_allowed(self.deps.engagement, runtime):
+            raise DecisionRuleError("the engagement time limit prevents a new model request")
 
     def _writing_schema(self, model):
         catalog = self.deps.tool_catalog
@@ -770,6 +801,7 @@ class InvestigationEngine:
             "execution_history": history[-20:],
             "execution_history_count": len(work_history),
             "execution_history_omitted_count": max(len(work_history) - len(history), 0),
+            "delegations": [item.model_dump(mode="json") for item in runtime.delegations.values()],
             "remaining_budget": runtime.remaining_budget,
             "feedback": redact_secret_material(runtime.planning_feedback),
             "runtime_observations": observations_for_prompt(runtime.recent_observations),
@@ -1459,6 +1491,13 @@ class InvestigationEngine:
                 last_control_succeeded = False
                 if decision.mode == "read_evidence":
                     request = decision.evidence_request
+                    if request.get("target_references"):
+                        from redteam.orchestration.target_references import register_references
+
+                        accepted = await register_references(
+                            self.deps.evidence_store, runtime, request["target_references"]
+                        )
+                        extra.append({"referenced_targets": accepted, "presence": "unconfirmed"})
                     extra.append(
                         await EvidenceReader(self.deps.evidence_store).read(
                             evidence_id=str(request.get("evidence_id", "")),
@@ -1798,21 +1837,26 @@ class InvestigationEngine:
                     _action_location(intent_index, "arguments"),
                 )
                 node = execution_node or await service.get_node(GraphNodeId(intent.target_node_id))
-                if node is None:
+                reference = assessment.targets.get(intent.target_node_id)
+                reference_target = reference.execution_target if reference is not None else None
+                if node is None and reference_target is None:
                     raise DecisionRuleError(
                         "referenced action target disappeared",
                         code="unresolved_target",
                         location=_action_location(intent_index, "target_node_id"),
                     )
-                node_facts = facts_of(node.properties)
-                target = target_for_node(
-                    node.id,
-                    node.type,
-                    observed=node_facts.get("observed_target"),
-                    device_serial=node_facts.get("device_serial"),
-                    device_ref=node_facts.get("device_ref"),
-                    package_name=node_facts.get("package_name"),
-                )
+                if reference_target is not None:
+                    target = reference_target
+                else:
+                    node_facts = facts_of(node.properties)
+                    target = target_for_node(
+                        node.id,
+                        node.type,
+                        observed=node_facts.get("observed_target"),
+                        device_serial=node_facts.get("device_serial"),
+                        device_ref=node_facts.get("device_ref"),
+                        package_name=node_facts.get("package_name"),
+                    )
                 if self.deps.tool_catalog is None:
                     raise DecisionRuleError(
                         "a real tool catalog is required for action compilation"
@@ -1858,6 +1902,59 @@ class InvestigationEngine:
                         code="no_tool_for_operation",
                         location=_action_location(intent_index, "operation"),
                     )
+                from redteam.core.outbound_text import check_outbound_arguments
+
+                outbound = check_outbound_arguments(
+                    intent.arguments,
+                    tool.outbound_text_fields,
+                    self.deps.engagement.external_text_policy.prohibited_patterns
+                    if self.deps.engagement else (),
+                )
+                if outbound.blocked:
+                    # Reject before work, dispatch and checkpoints retain the
+                    # selected text. The actual Control gate owns the verdict.
+                    from redteam.core.contracts.action import ActionProposal
+                    from redteam.core.contracts.policy import ControlContext
+                    from redteam.core.enums import PolicyVerdict
+
+                    proposal = ActionProposal(
+                        action_id=new_id("action"), run_id=runtime.run_id,
+                        engagement_id=runtime.engagement_id, agent_id=intent.agent_id,
+                        capability=intent.capability, operation=intent.operation,
+                        target=target, arguments=intent.arguments, reason=intent.reason,
+                        availability_impact=intent.availability_impact,
+                        created_at=datetime.now(timezone.utc),
+                    )
+                    async with self.deps.policy_lock:
+                        decision = await self.deps.control_plane.evaluate(
+                            proposal,
+                            ControlContext(
+                                engagement_id=runtime.engagement_id,
+                                agent_id=intent.agent_id, selected_tool_id=tool.tool_id,
+                                correlation_id=str(proposal.action_id),
+                            ),
+                        )
+                    if decision.verdict is not PolicyVerdict.DENY:
+                        raise DecisionRuleError("outbound text rejection was not enforced by Control")
+                    await self.deps.evidence_store.append(
+                        EvidenceRecord(
+                            evidence_id=new_id("evidence"), run_id=runtime.run_id,
+                            engagement_id=runtime.engagement_id,
+                            source_type=EvidenceSourceType.SYSTEM,
+                            source_id="orchestration.policy_preflight",
+                            content_type="application/json",
+                            digest=content_hash({"reason": outbound.reason_code}),
+                            summary="External text rejected before persistent action storage",
+                            created_at=datetime.now(timezone.utc),
+                            metadata={
+                                "record_kind": "policy_rejection",
+                                "action_id": str(proposal.action_id),
+                                "reason_code": outbound.reason_code,
+                                "verdict": decision.verdict.value,
+                            },
+                        )
+                    )
+                    raise DecisionRuleError("outbound_text_blocked:" + str(outbound.reason_code))
                 if await self.has_ambiguous_execution(intent, runtime):
                     raise DecisionRuleError(
                         "matching execution is uncertain; reconcile its stored result/job"
@@ -1915,7 +2012,7 @@ class InvestigationEngine:
                         target_node_ids=[node_id_for_target(target)],
                         prerequisite_fingerprint=assessment.fact_fingerprint,
                         execution_identity_version=2,
-                        conflict_keys=[f"target:{node.id}"],
+                        conflict_keys=[f"target:{node_id_for_target(target)}"],
                     )
                 )
             except (ValueError, TypeError, KeyError) as exc:
@@ -2171,6 +2268,12 @@ class InvestigationEngine:
         )
         if errors:
             return path, errors
+        source_results = [
+            await EvidenceReader(self.deps.evidence_store).read(
+                evidence_id=str(identity), run_id=str(runtime.run_id), limit=4000
+            )
+            for identity in proposal.get("evidence_ids", [])
+        ]
         await self._check_review_path(runtime, path)
         review = await self._ask(
             stage="completion_review",
@@ -2178,6 +2281,7 @@ class InvestigationEngine:
                 **context,
                 "step": step.model_dump(mode="json"),
                 "completion_proposal": proposal,
+                "source_results": source_results,
             },
             response_schema={
                 "type": "object",

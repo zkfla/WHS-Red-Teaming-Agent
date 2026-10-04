@@ -40,6 +40,8 @@ from redteam.core.enums import GraphNodeType
 from redteam.orchestration.evidence_access import raw_from_metadata
 from redteam.orchestration.knowledge_validation import InternalAssessment, InternalTarget
 from redteam.orchestration.progress import knowledge_fingerprint
+from redteam.orchestration.target_references import referenced_targets
+from redteam.core.contracts.target import target_display_name
 
 SCOPE_LABEL = "engagement-scope"
 
@@ -1341,6 +1343,18 @@ async def _known_targets(
             )
         )
     out.sort(key=lambda t: _priority(t.last_seen_step, t.node_id, targets, step))
+    existing = {item.node_id for item in out}
+    for identity, target in referenced_targets(index, run_id).items():
+        if identity not in existing:
+            out.append(
+                KnownTarget(
+                    node_id=identity,
+                    node_type="endpoint" if target.kind in {"url", "endpoint"} else target.kind,
+                    address=target_display_name(target),
+                    origin="referenced",
+                    verification="unconfirmed",
+                )
+            )
     return out, historical_targets
 
 
@@ -1648,6 +1662,9 @@ async def _build_snapshot_from_inputs(
         )
         for item in known_all
     }
+    for identity, target in referenced_targets(evidence_index, run).items():
+        if identity in targets and targets[identity].origin == "referenced":
+            targets[identity].execution_target = target
     refs: set[str] = set()
     for item in fact_all:
         refs.add(str(item.node_id))

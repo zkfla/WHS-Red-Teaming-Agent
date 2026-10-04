@@ -28,7 +28,9 @@ def route_after_observe(state: GraphState) -> str:
 def route_after_plan(state: GraphState) -> str | list[Send]:
     """Route one proposal normally or map a bounded batch to workers."""
     dispatch_items = state.get("dispatch_items", [])
-    if len(dispatch_items) > 1:
+    if len(dispatch_items) > 1 or any(
+        item.plan_step.delegation_id for item in dispatch_items
+    ):
         runtime = state["runtime"]
         return [
             Send("worker", {"runtime": runtime, "dispatch_item": item})

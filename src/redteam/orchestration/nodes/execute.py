@@ -51,7 +51,7 @@ class InvocationAdmissionDenied(ToolStartRejected):
         super().__init__("current control admission denied")
 
 
-async def _invocation_context(deps, runtime, proposal, work_id):
+async def _invocation_context(deps, runtime, proposal, work_id, tool_id=None):
     items = await deps.work_store.list_items(run_id=runtime.run_id)
     others = sum(
         item.work_id != work_id and item.status in {WorkStatus.LEASED, WorkStatus.RUNNING}
@@ -62,6 +62,7 @@ async def _invocation_context(deps, runtime, proposal, work_id):
         agent_id=proposal.agent_id,
         correlation_id=str(proposal.action_id),
         in_flight_actions=others,
+        selected_tool_id=tool_id,
         metadata={"run_id": str(proposal.run_id)},
     )
 
@@ -125,7 +126,7 @@ async def _invoke_with_semaphore(
             raise ToolStartRejected("action changed before invocation")
         await claim_action_admission(deps, runtime, step, proposal)
         if isinstance(deps.control_plane, InvocationAdmissionControl):
-            context = await _invocation_context(deps, runtime, proposal, work_id)
+            context = await _invocation_context(deps, runtime, proposal, work_id, invocation.tool_id)
             async with deps.policy_lock:
                 admitted = await deps.control_plane.admit_invocation(
                     proposal, decision, context, receipt_id=str(invocation.invocation_id)
@@ -348,7 +349,7 @@ async def execute_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                 runtime.remaining_budget <= 1 + retry_attempts
             ):
                 break
-            context = await _invocation_context(deps, runtime, proposal, work_id)
+            context = await _invocation_context(deps, runtime, proposal, work_id, invocation.tool_id)
             retry_control = deps.control_plane
             if not isinstance(retry_control, InvocationAdmissionControl):
                 break

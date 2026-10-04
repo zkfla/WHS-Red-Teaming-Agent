@@ -31,6 +31,7 @@ class WorkScheduler:
                 work_id=new_id("work"),
                 run_id=run_id,
                 mission_task_id=mission_task_id,
+                delegation_id=draft.plan_step.delegation_id,
                 candidate_key=candidate.candidate_key,
                 execution_identity_version=draft.execution_identity_version,
                 agent_id=draft.agent_id,

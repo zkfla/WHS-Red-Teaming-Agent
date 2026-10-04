@@ -374,5 +374,7 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
         plan_step=first.plan_step,
         action_proposal=first.proposal,
         current_work_id=first.work_id,
-        dispatch_items=dispatch if len(dispatch) > 1 else [],
+        dispatch_items=dispatch
+        if len(dispatch) > 1 or any(item.plan_step.delegation_id for item in dispatch)
+        else [],
     )
