@@ -44,6 +44,16 @@ def _path(criterion: object) -> dict:
     }
 
 
+def _minimal_path(criterion: object) -> dict:
+    # Model generation input: purpose+steps only. Code owns path/run/version.
+    return {
+        "reason": "Investigate the authorized goal.",
+        "steps": [
+            {"step_id": "step-1", "objective": "Observe.", "completion_criteria": [criterion]}
+        ],
+    }
+
+
 @pytest.mark.parametrize("kind", sorted(ALLOWED_CRITERION_KINDS))
 def test_generated_criteria_accept_all_canonical_kinds(kind):
     raw = _path(_criterion(kind))
@@ -52,17 +62,24 @@ def test_generated_criteria_accept_all_canonical_kinds(kind):
     assert PathPlan.model_validate(raw).steps[0].completion_criteria[0].is_known()
 
 
-@pytest.mark.parametrize("field", ["kind", "description", "min_evidence"])
-def test_generation_requires_explicit_fields_in_schema_and_raw_validation(field):
+def test_generation_requires_explicit_description_in_schema_and_raw_validation():
+    # Intentional minimal contract: only description is required.
     criterion = _criterion()
-    del criterion[field]
-    raw = _path(criterion)
+    del criterion["description"]
+    raw = _minimal_path(criterion)
     with pytest.raises(ValidationError):
         Draft202012Validator(writing_schema(PathPlan)).validate(raw)
     with pytest.raises(CriterionWritingError) as error:
         validate_written_criteria(raw)
     assert error.value.code == "criterion_fields_required"
-    assert field in error.value.required_fields
+    assert "description" in error.value.required_fields
+
+
+def test_generation_defaults_kind_and_evidence_count_without_explicit_fields():
+    # kind defaults to semantic, min_evidence to 1 in the new contract.
+    raw = _minimal_path({"description": "Collect evidence of the authorized observation."})
+    Draft202012Validator(writing_schema(PathPlan)).validate(raw)
+    validate_written_criteria(raw)
 
 
 @pytest.mark.parametrize("value", ["", "   ", "\t\n", None, 17])
@@ -107,15 +124,18 @@ def test_unknown_kind_is_rejected_before_storage_normalization():
     assert "secret-unrecognized-kind" not in str(feedback)
 
 
-def test_legacy_text_and_defaults_still_load_but_cannot_be_generated():
+def test_legacy_text_and_defaults_still_load_with_new_generation_meaning():
+    # Storage still reads legacy text as unknown; generation now accepts
+    # a nonblank description as semantic instead of rejecting it.
     step = PathStep.model_validate(
         {"step_id": "legacy", "objective": "Inspect.", "completion_criteria": ["Check it."]}
     )
     assert step.completion_criteria[0].kind == "unknown"
     assert not step.completion_criteria[0].is_known()
     assert CompletionCriterion.model_validate({}).kind == "unknown"
+    validate_written_criteria(_minimal_path("Check it."))
     with pytest.raises(CriterionWritingError):
-        validate_written_criteria(_path("Check it."))
+        validate_written_criteria(_minimal_path("   "))
 
 
 def test_writing_schema_does_not_modify_permissive_storage_schema():
@@ -131,28 +151,34 @@ def test_same_schema_applies_to_root_criterion_and_nested_path_envelope():
         path: PathPlan | None = None
 
     assert writing_schema(CompletionCriterion)["required"] == [
-        "kind",
         "description",
-        "min_evidence",
     ]
     assert (
         writing_schema(Envelope)["$defs"]["CompletionCriterion"]
         == (writing_schema(PathPlan)["$defs"]["CompletionCriterion"])
     )
-    Draft202012Validator(writing_schema(Envelope)).validate({"path": _path(_criterion())})
+    Draft202012Validator(writing_schema(Envelope)).validate({"path": _minimal_path(_criterion())})
 
 
 def test_free_form_tool_arguments_are_not_interpreted_as_path_criteria():
     validate_written_criteria({"actions": [{"arguments": {"completion_criteria": ["tool data"]}}]})
 
 
-@pytest.mark.parametrize("value", [None, "legacy-text", {}])
-def test_generated_criteria_require_array_without_legacy_coercion(value):
-    raw = _path(_criterion())
+@pytest.mark.parametrize("value", [None, 17])
+def test_generated_criteria_require_array_for_non_object_input(value):
+    raw = _minimal_path(_criterion())
     raw["steps"][0]["completion_criteria"] = value
     with pytest.raises(CriterionWritingError) as error:
         validate_written_criteria(raw)
     assert error.value.code == "criterion_list_required"
+
+
+def test_generated_single_object_or_text_is_accepted_as_one_criterion():
+    # Single dict/text is read as one-element array in the new contract.
+    validate_written_criteria(_minimal_path("legacy-text"))
+    with pytest.raises(CriterionWritingError) as error:
+        validate_written_criteria(_minimal_path({}))
+    assert error.value.code == "criterion_fields_required"
 
 
 def test_invalid_kind_type_does_not_expose_rejected_input():

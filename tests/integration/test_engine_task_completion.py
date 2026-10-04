@@ -165,7 +165,15 @@ class TaskBoundaryLLM(h.ScriptedLLM):
         if route == "completion_review":
             if "task" in payload:
                 self.task_review_payloads.append(payload)
-                return h.completion_accept("task review accept")
+                excerpts = payload.get("evidence_excerpts", [])
+                ids = [
+                    str(e.get("evidence_id"))
+                    for e in excerpts
+                    if isinstance(e, dict)
+                    and str(e.get("evidence_id", "")).strip()
+                ]
+                assert ids, "task review needs related stored evidence"
+                return h.task_accept(ids, reason="task review accept")
             self.step_review_payloads.append(payload)
             return h.completion_accept()
         if route == "goal_completion_review":

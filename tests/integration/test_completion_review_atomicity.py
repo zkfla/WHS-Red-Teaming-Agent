@@ -27,8 +27,25 @@ class Reviewer:
         self.calls += 1
         if self.hook:
             await self.hook()
-        if "criteria" in kwargs["response_schema"].get("properties", {}):
+        props = kwargs["response_schema"].get("properties", {})
+        if "criteria" in props:
             return h.goal_accept(self.criteria)
+        if "claims" in props:
+            import json as _json
+            try:
+                _payload = _json.loads(kwargs["messages"][0]["content"])
+                _excerpts = _payload.get("evidence_excerpts", [])
+                _ids = [
+                    str(e.get("evidence_id"))
+                    for e in _excerpts
+                    if isinstance(e, dict)
+                    and str(e.get("evidence_id", "")).strip()
+                ]
+            except Exception:
+                _ids = []
+            if not _ids:
+                _ids = ["proof-race"]
+            return h.task_accept(_ids)
         return h.completion_accept()
 
 
@@ -40,7 +57,8 @@ async def setup(mode):
         mission_id="mission-race", engagement_id="eng-t1", criteria=["actual response"]
     )
     mission.status = MissionStatus.ACTIVE
-    task.status = TaskStatus.RUNNING
+    # Goal settlement needs completed tasks to reach the review; step/task keep running.
+    task.status = TaskStatus.COMPLETED if mode == "goal" else TaskStatus.RUNNING
     await world.tasks.create_mission(mission)
     await world.tasks.create_task(task)
     runtime = h.make_runtime(
@@ -50,12 +68,15 @@ async def setup(mode):
         str(runtime.run_id), str(mission.mission_id), str(mission.engagement_id)
     )
     raw = h.draft_path(seed.node_id)
+    # Storage fixture: hydrate code-owned runtime fields onto minimal draft.
     raw.update(
         path_id="path-race",
         run_id=str(runtime.run_id),
+        version=1,
         status="active",
         mission_id=str(mission.mission_id),
         mission_task_id=str(task.task_id),
+        goal=task.objective,
     )
     if mode != "step":
         raw["steps"][0].update(status="completed", outcome="success", evidence_ids=["proof-race"])
@@ -74,7 +95,18 @@ async def setup(mode):
         )
     )
     reviewer.criteria = [
-        {"criterion": "actual response", "met": True, "evidence_ids": ["proof-race"]}
+        {
+            "criterion": "actual response",
+            "met": True,
+            "evidence_ids": ["proof-race"],
+            "claims": [
+                {
+                    "description": "actual response observed in stored evidence",
+                    "kind": "semantic",
+                    "evidence_ids": ["proof-race"],
+                }
+            ],
+        }
     ]
     return world, runtime, path, reviewer
 
@@ -130,7 +162,9 @@ async def test_review_rejects_changed_tasks_progress_or_pending_instructions(mod
                 path, TurnDecision.model_validate(h.turn_complete_goal()), runtime, context
             )
     assert reviewer.calls == 1
-    assert (await world.tasks.get_task(runtime.active_task_id)).status is TaskStatus.RUNNING
+    # Goal setup uses a completed task so the review is reachable; step/task stay running.
+    expected_task = TaskStatus.COMPLETED if mode == "goal" else TaskStatus.RUNNING
+    assert (await world.tasks.get_task(runtime.active_task_id)).status is expected_task
     assert (await world.tasks.get_mission(runtime.mission_id)).status is MissionStatus.ACTIVE
 
 
@@ -182,8 +216,30 @@ async def test_each_goal_criterion_records_only_its_actual_evidence_owner():
         )
     )
     reviewer.criteria = [
-        {"criterion": "first response", "met": True, "evidence_ids": ["proof-first"]},
-        {"criterion": "second response", "met": True, "evidence_ids": ["proof-race"]},
+        {
+            "criterion": "first response",
+            "met": True,
+            "evidence_ids": ["proof-first"],
+            "claims": [
+                {
+                    "description": "actual first response observed in stored evidence",
+                    "kind": "semantic",
+                    "evidence_ids": ["proof-first"],
+                }
+            ],
+        },
+        {
+            "criterion": "second response",
+            "met": True,
+            "evidence_ids": ["proof-race"],
+            "claims": [
+                {
+                    "description": "actual second response observed in stored evidence",
+                    "kind": "semantic",
+                    "evidence_ids": ["proof-race"],
+                }
+            ],
+        },
     ]
     engine = InvestigationEngine(world.deps)
     errors = await engine.complete_goal(

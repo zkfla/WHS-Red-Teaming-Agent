@@ -87,7 +87,7 @@ class ScriptedLLM:
     @staticmethod
     def _route_key(schema: dict[str, Any]) -> str:
         props = schema.get("properties", {})
-        if "path_id" in props and "steps" in props:
+        if "steps" in props:
             return "path_draft"
         if "decision" in props:
             return "path_review"
@@ -316,15 +316,9 @@ def draft_path(
     }
     if hypothesis_id:
         criterion["hypothesis_id"] = hypothesis_id
+    # Minimal generation input: purpose+steps only. Code hydrates runtime.
     return {
-        "path_id": "path-draft-1",
-        "run_id": "run-x",
-        "mission_id": None,
-        "version": 1,
-        "parent_version": None,
-        "status": "draft",
         "reason": "scripted draft",
-        "goal": "map the in-scope host",
         "steps": [
             {
                 "step_id": "step-1",
@@ -338,15 +332,8 @@ def draft_path(
                 "unknowns": [],
                 "completion_criteria": [criterion],
                 "required": True,
-                "status": "pending",
-                "outcome": None,
-                "evidence_ids": [],
             }
         ],
-        "hypothesis_ids": [],
-        "evidence_ids": [],
-        "changed_step_ids": [],
-        "review_records": {},
     }
 
 
@@ -419,13 +406,46 @@ def turn_complete_goal(reason: str = "scripted goal completion") -> dict[str, An
 
 
 def completion_accept(reason: str = "scripted semantic accept") -> dict[str, Any]:
+    # Step review stays old accepted/reason.
     return {"accepted": True, "reason": reason}
+
+
+def task_accept(
+    evidence_ids: list[str],
+    reason: str = "scripted task accept",
+    description: str = "actual result observed in stored evidence",
+) -> dict[str, Any]:
+    # Task review needs actual semantic claims tied to exact origins.
+    return {
+        "accepted": True,
+        "reason": reason,
+        "claims": [
+            {
+                "description": description,
+                "kind": "semantic",
+                "evidence_ids": list(evidence_ids),
+            }
+        ],
+    }
 
 
 def goal_accept(
     criteria: list[dict[str, Any]], reason: str = "scripted goal accept"
 ) -> dict[str, Any]:
-    return {"accepted": True, "reason": reason, "criteria": criteria}
+    # Goal review needs claims per criterion tied to exact origins.
+    normalized: list[dict[str, Any]] = []
+    for item in criteria:
+        entry = dict(item)
+        if "claims" not in entry:
+            entry["claims"] = [
+                {
+                    "description": f"actual result for {entry.get('criterion')}",
+                    "kind": "semantic",
+                    "evidence_ids": list(entry.get("evidence_ids", [])),
+                }
+            ]
+        normalized.append(entry)
+    return {"accepted": True, "reason": reason, "criteria": normalized}
 
 
 def meaning(
@@ -481,6 +501,8 @@ def make_tool_evidence(
         "success": success,
         "proposal": {
             "action_id": action_id,
+            "run_id": run_id,
+            "engagement_id": engagement_id,
             "capability": capability,
             "operation": operation,
             "arguments": {},

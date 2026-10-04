@@ -402,7 +402,10 @@ async def test_criterion_requires_evidence_from_its_completed_task() -> None:
     blocked = await _required_mission(store)
     assert blocked.status is MissionStatus.BLOCKED
     assert blocked.criterion_results[0].met is False
-    assert blocked.criterion_results[0].reason == "matching Task has no successful Evidence"
+    assert (
+        blocked.criterion_results[0].reason
+        == "completed required task proof is missing or obsolete"
+    )
 
     # A second active Mission with evidence tied to its own Task can complete.
     store = await _store_with_mission()
@@ -439,9 +442,16 @@ async def test_criterion_requires_evidence_from_its_completed_task() -> None:
         evidence_store=records,
         run_id=run_id,
     )
+    # New terminal contract: without receipt/path/LLM proof even the right-task
+    # evidence stays blocked; correct completion with proof is covered by
+    # task/goal integration tests with receipts.
     completed = await _required_mission(store)
-    assert completed.status is MissionStatus.COMPLETED
-    assert completed.criterion_results[0].evidence_ids == ["ev_right"]
+    assert completed.status is MissionStatus.BLOCKED
+    assert completed.criterion_results[0].met is False
+    assert (
+        completed.criterion_results[0].reason
+        == "completed required task proof is missing or obsolete"
+    )
 
 
 async def test_no_tasks_cannot_complete_a_mission() -> None:

@@ -106,7 +106,8 @@ class _ScriptedLabModel:
     @staticmethod
     def _route_key(schema: dict[str, Any]) -> str:
         props = schema.get("properties", {})
-        if "path_id" in props and "steps" in props:
+        # Minimal draft is purpose+steps; code owns path/run/version.
+        if "steps" in props:
             return "path_draft"
         if "decision" in props:
             return "path_review"
@@ -136,30 +137,17 @@ class _ScriptedLabModel:
                     {"kind": "evidence", "description": "synthetic", "min_evidence": 1}
                 ],
                 "required": True,
-                "status": "pending",
-                "outcome": None,
-                "evidence_ids": [],
             }
 
+        # Minimal model input only; runtime hydrates code-owned fields.
         return {
-            "path_id": "path-lab-1",
-            "run_id": "run-lab",
-            "mission_id": None,
-            "version": 1,
-            "parent_version": None,
-            "status": "draft",
             "reason": "scripted lab draft",
-            "goal": "probe the synthetic bank lab",
             "steps": [
                 step("step-1", "recon-agent", "recon.service_discovery"),
                 step("step-2", "web-api-agent", "web.http_request"),
                 step("step-3", "recon-agent", "recon.endpoint_discovery"),
                 step("step-4", "web-api-agent", "web.response_analysis"),
             ],
-            "hypothesis_ids": [],
-            "evidence_ids": [],
-            "changed_step_ids": [],
-            "review_records": {},
         }
 
     async def complete_structured(
@@ -237,7 +225,18 @@ class _ScriptedLabModel:
                 "accepted": True,
                 "reason": "lab goal done",
                 "criteria": [
-                    {"criterion": criterion, "met": True, "evidence_ids": receipts}
+                    {
+                        "criterion": criterion,
+                        "met": True,
+                        "evidence_ids": receipts,
+                        "claims": [
+                            {
+                                "description": f"actual lab result for {criterion}",
+                                "kind": "semantic",
+                                "evidence_ids": receipts,
+                            }
+                        ],
+                    }
                     for criterion in payload["mission"]["success_criteria"]
                 ],
             }

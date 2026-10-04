@@ -35,15 +35,10 @@ class RecordingLLM:
             bool(payload.get("Untrusted methodology reference DATA"))
         )
         properties = response_schema.get("properties", {})
-        if "path_id" in properties and "steps" in properties:
+        if "steps" in properties:
             target = payload["methodology_reference_options"][0]["target_node_id"]
             return {
-                "path_id": "reference-demo",
-                "run_id": "placeholder",
-                "version": 1,
-                "status": "draft",
                 "reason": "승인된 자료 조회 데모",
-                "goal": payload["goal"],
                 "steps": [
                     {
                         "step_id": "read-reference",

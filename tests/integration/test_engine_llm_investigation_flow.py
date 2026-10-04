@@ -481,6 +481,12 @@ async def test_budget_zero_allows_completion_review_but_blocks_new_execution():
     assert errors == []
 
     await world.tasks.transition_task(task.task_id, TaskStatus.RUNNING, now=h.utcnow())
+    # New contract: close the delegated task before settling the original goal.
+    llm.add("completion_review", h.task_accept(["ev-t1-zero"]))
+    _task_decision = TurnDecision(mode="complete_task", reason="task evidence ready")
+    _task_context = await engine.context(runtime, GraphObservation())
+    _task_errors = await engine.complete_task(finished, _task_decision, runtime, _task_context)
+    assert _task_errors == []
     llm.add(
         "goal_completion_review",
         h.goal_accept([{"criterion": "criterion-1", "met": True, "evidence_ids": ["ev-t1-zero"]}]),
