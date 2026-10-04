@@ -168,6 +168,7 @@ async def decide_delegations(engine, path, runtime, context):
         )
         verdict = None
         error = None
+        engine.active_delegation = state
         try:
             raw = await engine._ask(
                 stage="worker_next_action", payload=payload, response_schema=schema,
@@ -180,6 +181,7 @@ async def decide_delegations(engine, path, runtime, context):
             error = type(exc).__name__
         finally:
             engine.decision_token_limit = None
+            engine.active_delegation = None
         result = apply_turn_result(
             delegation=state, gate=gate, verdict=verdict, error=error,
             consumption=TurnConsumption(

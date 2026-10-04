@@ -406,6 +406,7 @@ class InvestigationEngine:
         self.last_reference_diagnostics: list[DecisionDiagnostic] = []
         self.updated_runtime: Any = None
         self.decision_token_limit: int | None = None
+        self.active_delegation: Any = None
 
     async def _ask(self, *, stage, payload, **kwargs):
         # Raw writing validation occurs before permissive storage models can
@@ -531,6 +532,13 @@ class InvestigationEngine:
 
         if not reasoning_time_allowed(self.deps.engagement, runtime):
             raise DecisionRuleError("the engagement time limit prevents a new model request")
+        delegation = self.active_delegation
+        if delegation is not None and delegation.budget.max_seconds is not None:
+            started = delegation.started_at
+            if started.tzinfo is None:
+                started = started.replace(tzinfo=timezone.utc)
+            if (datetime.now(timezone.utc) - started).total_seconds() >= delegation.budget.max_seconds:
+                raise DecisionRuleError("the delegated investigation time limit has ended")
 
     def _writing_schema(self, model):
         catalog = self.deps.tool_catalog
@@ -1721,6 +1729,9 @@ class InvestigationEngine:
                     )
                     continue
                 if errors:
+                    self.updated_runtime = runtime.model_copy(
+                        update={"planning_feedback": self._safe_errors(errors, budget)}
+                    )
                     await EventPublisher(
                         self.deps.event_bus,
                         run_id=runtime.run_id,
