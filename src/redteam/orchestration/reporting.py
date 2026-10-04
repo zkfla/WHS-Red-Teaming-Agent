@@ -14,9 +14,9 @@ from redteam.core.enums import AgentPhase, MissionStatus, TaskStatus
 from redteam.core.ids import ApprovalId, EvidenceId, FindingId, MissionId, RunId, TaskId
 from redteam.core.ports.evidence_store import EvidenceStore
 from redteam.core.ports.task_graph import MissionTaskStore
-from redteam.orchestration.diagnostics import DecisionDiagnostic
-from redteam.orchestration.coverage import CoverageGapSummary, project_coverage_gaps
 from redteam.orchestration.context_projection import MappingStatus, project_run_processing
+from redteam.orchestration.coverage import CoverageGapSummary, project_coverage_gaps
+from redteam.orchestration.diagnostics import DecisionDiagnostic
 from redteam.orchestration.operator_intents.redaction import redact_text
 from redteam.orchestration.state import RuntimeState, TerminationReason
 from redteam.orchestration.work.store import WorkStore

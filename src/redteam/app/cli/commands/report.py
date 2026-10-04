@@ -73,8 +73,7 @@ def _render_markdown(report: TerminalReportProjection) -> str:
     for finding in report.findings:
         status = "VERIFIED" if finding.verified else "CANDIDATE"
         lines.append(
-            f"- **[{status}/{finding.severity.upper()}]** {finding.title} "
-            f"(`{finding.finding_id}`)"
+            f"- **[{status}/{finding.severity.upper()}]** {finding.title} (`{finding.finding_id}`)"
         )
     if report.integrity_blockers:
         lines += ["", "## Integrity blockers", ""]
@@ -90,12 +89,19 @@ def _render_markdown(report: TerminalReportProjection) -> str:
         lines.append("Coverage is unknown for this report.")
     else:
         lines += [f"- Unmet condition: {item}" for item in report.coverage.unmet_conditions]
-        lines += [f"- Required task incomplete: {item}"
-                  for item in report.coverage.required_incomplete_tasks]
-        lines += [f"- Legacy completion without receipt: {item}"
-                  for item in report.coverage.completed_without_receipt]
-        if not (report.coverage.unmet_conditions or report.coverage.required_incomplete_tasks
-                or report.coverage.completed_without_receipt):
+        lines += [
+            f"- Required task incomplete: {item}"
+            for item in report.coverage.required_incomplete_tasks
+        ]
+        lines += [
+            f"- Legacy completion without receipt: {item}"
+            for item in report.coverage.completed_without_receipt
+        ]
+        if not (
+            report.coverage.unmet_conditions
+            or report.coverage.required_incomplete_tasks
+            or report.coverage.completed_without_receipt
+        ):
             lines.append("No gaps are recorded. Completion is determined by the mission review.")
     if report.mission is not None:
         lines += _render_mission(report.mission)
@@ -104,7 +110,8 @@ def _render_markdown(report: TerminalReportProjection) -> str:
         for item in report.result_processing:
             lines.append(
                 f"- {item.evidence_id}: interpretation={item.mapping_status}, "
-                f"application={item.processing_status}, recovery={item.recovery_status or 'unknown'}"
+                f"application={item.processing_status}, "
+                f"recovery={item.recovery_status or 'unknown'}"
             )
     return "\n".join(lines) + "\n"
 
@@ -142,7 +149,6 @@ def _render_mission(mission: MissionProjection) -> list[str]:
         mark = "MET" if criterion.met else "UNMET"
         detail = f" — {criterion.reason}" if criterion.reason else ""
         lines.append(
-            f"- **[{mark}]** {criterion.criterion} "
-            f"(evidence: {criterion.evidence_count}){detail}"
+            f"- **[{mark}]** {criterion.criterion} (evidence: {criterion.evidence_count}){detail}"
         )
     return lines

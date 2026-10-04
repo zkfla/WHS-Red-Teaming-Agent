@@ -40,7 +40,9 @@ def _origin_ids(result: ToolResult) -> tuple[str | None, str | None]:
     return action_id, invocation_id
 
 
-def _draft(url: str, raw_path: list[str | int], action_id: str | None, invocation_id: str | None) -> TargetReference | None:
+def _draft(
+    url: str, raw_path: list[str | int], action_id: str | None, invocation_id: str | None
+) -> TargetReference | None:
     if not is_absolute_url(url):
         return None
     try:

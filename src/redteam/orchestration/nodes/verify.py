@@ -23,7 +23,6 @@ from redteam.core.enums import (
     EvidenceSourceType,
     GraphEdgeType,
     GraphNodeType,
-    PolicyVerdict,
     Verdict,
 )
 from redteam.core.ids import EvidenceId, new_id
@@ -36,15 +35,15 @@ from redteam.orchestration.analysis import (
     hypothesis_status_for_assessment,
     resolve_claim_for_review,
 )
-from redteam.orchestration.cognition import DecisionBudget
-from redteam.orchestration.delegation_decision import record_decision_consumption
 from redteam.orchestration.analysis_budget import verification_budget, verification_guard
 from redteam.orchestration.authentication import (
     ACCESS_CONTROL_VIOLATION,
     assess_authentication,
     http_observation,
 )
+from redteam.orchestration.cognition import DecisionBudget
 from redteam.orchestration.context import RuntimeDeps
+from redteam.orchestration.delegation_decision import record_decision_consumption
 from redteam.orchestration.events import (
     AUTHENTICATION_CHECKED,
     HYPOTHESIS_RESOLVED,
@@ -190,13 +189,13 @@ async def verify_node(
         try:
             assert deps.verifier is not None
             request = VerificationRequest(
-                    proposal=proposal,
-                    result=result,
-                    expectation=expectation,
-                    source_refs=[str(evidence.evidence_id), str(result.invocation_id)],
-                    hypothesis_claim=hypothesis_claim_text,
-                    violation_if_confirmed=violation_flag,
-                    principal_ref=getattr(step, "principal_ref", None) if step is not None else None,
+                proposal=proposal,
+                result=result,
+                expectation=expectation,
+                source_refs=[str(evidence.evidence_id), str(result.invocation_id)],
+                hypothesis_claim=hypothesis_claim_text,
+                violation_if_confirmed=violation_flag,
+                principal_ref=getattr(step, "principal_ref", None) if step is not None else None,
             )
             before_call = verification_guard(state, deps=deps, budget=budget)
             if isinstance(deps.verifier, BudgetedAnalysisVerifier):
@@ -667,7 +666,7 @@ async def verify_node(
         last_event_id = refused.event_id
 
     delegation_id = getattr(step, "delegation_id", None)
-    delegation = runtime.delegations.get(delegation_id)
+    delegation = runtime.delegations.get(delegation_id) if delegation_id is not None else None
     if delegation is not None:
         # Persist sequential/approval-resume reviews as well. Isolated workers
         # return these same deltas through WorkerOutcome; their runtime copy
@@ -681,9 +680,14 @@ async def verify_node(
                 else budget.tokens_used - tokens_before
             ),
         )
-        runtime = runtime.model_copy(update={"delegations": {
-            **runtime.delegations, delegation_id: spent,
-        }})
+        runtime = runtime.model_copy(
+            update={
+                "delegations": {
+                    **runtime.delegations,
+                    delegation_id: spent,
+                }
+            }
+        )
 
     return advance(
         state,

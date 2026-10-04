@@ -17,7 +17,7 @@ from redteam.core.enums import AgentPhase, PolicyVerdict
 from redteam.core.ids import ActionId
 from redteam.orchestration.context import RuntimeDeps
 from redteam.orchestration.delegation import DelegationState
-from redteam.orchestration.dispatch import WorkerOutcome
+from redteam.orchestration.dispatch import DispatchItem, WorkerOutcome
 from redteam.orchestration.nodes._support import advance
 from redteam.orchestration.nodes.policy import SEVERITY_ABORT_RUN, SEVERITY_REPLAN_GOAL
 from redteam.orchestration.runtime_observation import append_runtime_observation
@@ -227,7 +227,7 @@ async def aggregate_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
 
 
 def split_batch_outcomes(
-    all_outcomes: dict[str, WorkerOutcome], dispatch_items: Sequence[object]
+    all_outcomes: dict[str, WorkerOutcome], dispatch_items: Sequence[DispatchItem]
 ) -> tuple[list[WorkerOutcome], list[WorkerOutcome]]:
     """Initial outcomes in dispatch order, then follow-ups in action-id order.
 
@@ -283,14 +283,15 @@ def update_delegation_from_outcomes(
             for outcome in mine
         )
         if resumed:
-            delegation = delegation.model_copy(update={"status": "active", "termination_reason": None})
+            delegation = delegation.model_copy(
+                update={"status": "active", "termination_reason": None}
+            )
     consumed = sum(1 + max(outcome.retry_attempts, 0) for outcome in mine if outcome.executed)
     # F1-owned analysis cost rides the same outcome envelope (model_* fields,
     # defaulting to zero until that API lands). Only the actual analysis cost
     # on the outcomes is added here; getattr keeps this inert until F1 lands.
     model_attempts = sum(
-        max(int(getattr(outcome, "model_decision_attempts", 0) or 0), 0)
-        for outcome in mine
+        max(int(getattr(outcome, "model_decision_attempts", 0) or 0), 0) for outcome in mine
     )
     model_tokens: int | None = 0
     for outcome in mine:
@@ -315,8 +316,7 @@ def update_delegation_from_outcomes(
         "evidence_ids": seen,
     }
     if delegation.status == "active" and any(
-        outcome.policy_verdict is PolicyVerdict.REQUIRE_APPROVAL
-        and outcome.approval_id is not None
+        outcome.policy_verdict is PolicyVerdict.REQUIRE_APPROVAL and outcome.approval_id is not None
         for outcome in mine
     ):
         update["status"] = "held"

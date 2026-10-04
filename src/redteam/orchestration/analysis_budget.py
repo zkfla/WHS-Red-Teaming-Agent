@@ -6,8 +6,8 @@ from datetime import datetime, timezone
 
 from redteam.core.enums import PolicyVerdict
 from redteam.orchestration.cognition import DecisionBudget, ReasoningHalted
-from redteam.orchestration.coordination import coordinator_for
 from redteam.orchestration.context import RuntimeDeps
+from redteam.orchestration.coordination import coordinator_for
 from redteam.orchestration.delegation_decision import remaining_decisions
 from redteam.orchestration.reasoning_time import reasoning_time_allowed
 from redteam.orchestration.state import GraphState, TerminationReason
@@ -22,7 +22,9 @@ def verification_budget(state: GraphState, *, deps: RuntimeDeps) -> DecisionBudg
     """
     step = state.get("plan_step")
     delegation_id = getattr(step, "delegation_id", None)
-    delegation = state["runtime"].delegations.get(delegation_id)
+    delegation = (
+        state["runtime"].delegations.get(delegation_id) if delegation_id is not None else None
+    )
     allowance = deps.settings.decision_max_attempts
     if delegation is not None:
         allowance = min(allowance, max(remaining_decisions(delegation) - 1, 0))
@@ -47,9 +49,7 @@ def verification_guard(state: GraphState, *, deps: RuntimeDeps, budget: Decision
             if runtime.mission_id is None:
                 change.legacy_scope(str(runtime.run_id))
                 return
-            change.binding(
-                str(runtime.run_id), str(runtime.mission_id), str(runtime.engagement_id)
-            )
+            change.binding(str(runtime.run_id), str(runtime.mission_id), str(runtime.engagement_id))
             change.admit(str(runtime.run_id), str(runtime.mission_id))
             if step is not None:
                 generation = change.generation(str(runtime.run_id), str(runtime.mission_id))
@@ -64,15 +64,19 @@ def verification_guard(state: GraphState, *, deps: RuntimeDeps, budget: Decision
         if not reasoning_time_allowed(deps.engagement, runtime, now=now):
             raise ReasoningHalted("analysis_engagement_time_exhausted")
         delegation_id = getattr(step, "delegation_id", None)
-        if delegation_id is None:
+        if delegation_id is None or step is None:
             return
         delegation = runtime.delegations.get(delegation_id)
         proposal = state["action_proposal"]
-        if delegation is None or proposal is None or (
-            delegation.path_id != step.path_id
-            or delegation.path_step_id != step.path_step_id
-            or delegation.mission_task_id != runtime.active_task_id
-            or delegation.agent_id != str(proposal.agent_id)
+        if (
+            delegation is None
+            or proposal is None
+            or (
+                delegation.path_id != step.path_id
+                or delegation.path_step_id != step.path_step_id
+                or delegation.mission_task_id != runtime.active_task_id
+                or delegation.agent_id != str(proposal.agent_id)
+            )
         ):
             raise ReasoningHalted("analysis_delegation_binding_mismatched")
         decision = state.get("policy_decision")
@@ -103,5 +107,3 @@ def verification_guard(state: GraphState, *, deps: RuntimeDeps, budget: Decision
                 raise ReasoningHalted("analysis_delegation_token_limit_or_unknown_usage")
 
     return before_call
-
-

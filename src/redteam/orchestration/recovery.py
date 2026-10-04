@@ -15,9 +15,9 @@ is never rewritten.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
 from dataclasses import dataclass
-from typing import Any
+from datetime import datetime, timezone
+from typing import Any, TypedDict
 
 from redteam.attack_graph.identity import node_id_for_target
 from redteam.attack_graph.predicates import Confidence, Provenance
@@ -190,9 +190,12 @@ def _has_exact_recovery_proof(
     return cleaned_claimed <= (raw_principals | (raw_sessions & expected_sessions))
 
 
-async def _next_recovery_attempt(
-    *, evidence_store: Any, source: EvidenceRecord
-) -> tuple[int, int]:
+class _RecoveryAttempt(TypedDict):
+    attempt: int
+    supersedes_attempt: int
+
+
+async def _next_recovery_attempt(*, evidence_store: Any, source: EvidenceRecord) -> tuple[int, int]:
     """Read this origin's previous attempt once; initial application is 1.
 
     Store errors propagate before replay starts. Legacy companions without
@@ -276,7 +279,10 @@ async def reprocess_evidence(
     attempt, supersedes_attempt = await _next_recovery_attempt(
         evidence_store=evidence_store, source=record
     )
-    recovery_attempt = {"attempt": attempt, "supersedes_attempt": supersedes_attempt}
+    recovery_attempt: _RecoveryAttempt = {
+        "attempt": attempt,
+        "supersedes_attempt": supersedes_attempt,
+    }
     await record_recovery_note(
         evidence_store=evidence_store,
         run_id=record.run_id,
@@ -599,17 +605,19 @@ async def reprocess_evidence(
         stored_claim, stored_flag = (None, None)
     try:
         request = VerificationRequest(
-                proposal=proposal,
-                result=result,
-                expectation=expectation,
-                source_refs=[str(record.evidence_id), str(result.invocation_id)],
-                hypothesis_claim=stored_claim,
-                violation_if_confirmed=stored_flag,
-                principal_ref=getattr(step, "principal_ref", None) if step is not None else None,
-            )
+            proposal=proposal,
+            result=result,
+            expectation=expectation,
+            source_refs=[str(record.evidence_id), str(result.invocation_id)],
+            hypothesis_claim=stored_claim,
+            violation_if_confirmed=stored_flag,
+            principal_ref=getattr(step, "principal_ref", None) if step is not None else None,
+        )
         if budget is not None and isinstance(verifier, BudgetedAnalysisVerifier):
             assessment = await verifier.verify_with_budget(
-                request, budget=budget, before_call=before_call,
+                request,
+                budget=budget,
+                before_call=before_call,
             )
         elif budget is not None and getattr(step, "delegation_id", None) is not None:
             from redteam.orchestration.analysis import VerificationAssessment
@@ -880,9 +888,7 @@ async def reprocess_evidence(
                         engagement_id=record.engagement_id,
                         source_evidence_id=str(record.evidence_id),
                         tool_id=str(result.tool_id),
-                        references=[
-                            item.model_dump(mode="json") for item in grounded
-                        ],
+                        references=[item.model_dump(mode="json") for item in grounded],
                         action_id=proposal.action_id,
                         invocation_id=result.invocation_id,
                         hypothesis_id=proposal.hypothesis_id,
@@ -1179,9 +1185,13 @@ async def record_processing_attempt(
         artifact_ref=None,
         digest=digest_payload(payload),
         summary=(
-            "processing " + processing.status
-            + " for " + str(tool_id)
-            + " (" + str(processing.stage or "start") + ")"
+            "processing "
+            + processing.status
+            + " for "
+            + str(tool_id)
+            + " ("
+            + str(processing.stage or "start")
+            + ")"
         )[:280],
         created_at=datetime.now(timezone.utc),
         metadata=payload,
@@ -1234,13 +1244,9 @@ async def record_target_references(
         content_type="application/json",
         artifact_ref=None,
         digest=digest_payload(payload),
-        summary=(
-            "target references for "
-            + str(tool_id)
-            + " ("
-            + str(len(list(references)))
-            + ")"
-        )[:280],
+        summary=("target references for " + str(tool_id) + " (" + str(len(list(references))) + ")")[
+            :280
+        ],
         created_at=datetime.now(timezone.utc),
         metadata=payload,
     )
@@ -1318,7 +1324,7 @@ async def record_recovery_note(
     supersedes_attempt: int | None = None,
 ) -> EvidenceRecord:
     """Append a free-form companion note next to an existing record."""
-    payload = {
+    payload: dict[str, Any] = {
         "record_kind": record_kind,
         "source_evidence_id": source_evidence_id,
         "note": note,

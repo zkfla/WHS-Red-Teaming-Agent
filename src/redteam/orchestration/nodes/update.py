@@ -196,9 +196,7 @@ async def update_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                 from redteam.orchestration.recovery import record_target_references
 
                 source_evidence_id = (
-                    str(state["result_evidence_id"])
-                    if state.get("result_evidence_id")
-                    else None
+                    str(state["result_evidence_id"]) if state.get("result_evidence_id") else None
                 )
                 if source_evidence_id is not None:
                     tool_result_json = result.model_dump(mode="json")
@@ -224,9 +222,7 @@ async def update_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                             engagement_id=runtime.engagement_id,
                             source_evidence_id=source_evidence_id,
                             tool_id=str(result.tool_id),
-                            references=[
-                                item.model_dump(mode="json") for item in grounded
-                            ],
+                            references=[item.model_dump(mode="json") for item in grounded],
                             action_id=proposal.action_id,
                             invocation_id=result.invocation_id,
                             hypothesis_id=proposal.hypothesis_id,
@@ -257,9 +253,7 @@ async def update_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
         findings_planned = findings_to_apply if provenance.evidence_id else []
         writes_planned = bool(nodes_to_apply or edges_to_apply or findings_planned)
         processing_source_evidence_id = (
-            str(state["result_evidence_id"])
-            if state.get("result_evidence_id")
-            else None
+            str(state["result_evidence_id"]) if state.get("result_evidence_id") else None
         )
         confirmed_nodes = 0
         confirmed_edges = 0
@@ -303,7 +297,9 @@ async def update_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                     facts={
                         **observed_facts,
                         **(
-                            {"evidence_ids": [provenance.evidence_id]} if provenance.evidence_id else {}
+                            {"evidence_ids": [provenance.evidence_id]}
+                            if provenance.evidence_id
+                            else {}
                         ),
                     },
                     labels=node_mutation.labels,

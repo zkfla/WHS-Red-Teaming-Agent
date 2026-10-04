@@ -15,11 +15,11 @@ from redteam.core.contracts.evidence import EvidenceRecord
 from redteam.core.contracts.target import TargetRef, target_display_name
 from redteam.core.contracts.tool import ToolResult
 from redteam.core.enums import EvidenceSourceType
-from redteam.core.ids import new_id
+from redteam.core.ids import EvidenceId, new_id
 from redteam.orchestration.evidence_access import raw_from_metadata
 from redteam.orchestration.target_binding import network_identity
 
-_TARGET = TypeAdapter(TargetRef)
+_TARGET: TypeAdapter[TargetRef] = TypeAdapter(TargetRef)
 
 
 def resolve_reference(entry: Any, records: dict[str, Any], run_id: str):
@@ -129,7 +129,7 @@ async def register_references(store, runtime, entries: list[Any]) -> list[str]:
         payload = {"record_kind": "target_reference", "target_references": accepted}
         await store.append(
             EvidenceRecord(
-                evidence_id=new_id("evidence"),
+                evidence_id=EvidenceId(new_id("evidence")),
                 run_id=runtime.run_id,
                 engagement_id=runtime.engagement_id,
                 source_type=EvidenceSourceType.SYSTEM,

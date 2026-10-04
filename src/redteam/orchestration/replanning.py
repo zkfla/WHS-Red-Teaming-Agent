@@ -41,12 +41,15 @@ from redteam.orchestration.cognition import (
     DecisionFailure,
     StructuredDecisionClient,
 )
-from redteam.orchestration.result_claims import (
-    RESULT_REVIEW_INSTRUCTION, ResultClaim, check_result_review, mission_result_purpose,
-)
 from redteam.orchestration.coordination import Coordinator, StateConflict, coordinator_for
 from redteam.orchestration.diagnostics import DecisionDiagnostic, safe_feedback
 from redteam.orchestration.operator_intents.suppression import endpoint_excluded
+from redteam.orchestration.result_claims import (
+    RESULT_REVIEW_INSTRUCTION,
+    ResultClaim,
+    check_result_review,
+    mission_result_purpose,
+)
 
 #: Provenance marker for endpoint-scoped second-principal acquisition Tasks.
 _ACQUIRE_SOURCE = "replan:acquire_second_principal"
@@ -405,10 +408,21 @@ def _terminal_rule(code: str, summary: str, attempts: int) -> DecisionDiagnostic
     )
 
 
-async def _terminal_task_coverage(*, tasks, evidence, evidence_store, path_store, run_id, engagement_id, mission_id, graph_service=None):
+async def _terminal_task_coverage(
+    *,
+    tasks,
+    evidence,
+    evidence_store,
+    path_store,
+    run_id,
+    engagement_id,
+    mission_id,
+    graph_service=None,
+):
     """Use the same current-purpose and original-evidence proof as goal review."""
     from redteam.orchestration.semantic_completion import (
-        verify_legacy_task_origins, verify_receipt_bound_origins,
+        verify_legacy_task_origins,
+        verify_receipt_bound_origins,
     )
 
     bound: dict[str, set[str]] = {}
@@ -419,15 +433,23 @@ async def _terminal_task_coverage(*, tasks, evidence, evidence_store, path_store
             continue
         if task.completion_evidence_id is None:
             errors, proven = await verify_legacy_task_origins(
-                evidence_store=evidence_store, path_store=path_store,
-                graph_service=graph_service, run_id=str(run_id),
-                engagement_id=engagement_id, mission_id=str(mission_id), task=task,
+                evidence_store=evidence_store,
+                path_store=path_store,
+                graph_service=graph_service,
+                run_id=str(run_id),
+                engagement_id=engagement_id,
+                mission_id=str(mission_id),
+                task=task,
             )
         else:
             errors, proven = await verify_receipt_bound_origins(
-                evidence_store=evidence_store, path_store=path_store,
-                graph_service=graph_service, run_id=str(run_id),
-                engagement_id=engagement_id, mission_id=str(mission_id), task=task,
+                evidence_store=evidence_store,
+                path_store=path_store,
+                graph_service=graph_service,
+                run_id=str(run_id),
+                engagement_id=engagement_id,
+                mission_id=str(mission_id),
+                task=task,
             )
         task_id = str(task.task_id)
         if errors or not proven:
@@ -458,7 +480,24 @@ def _reasoning_expired(engagement: Any, runtime: Any) -> bool | None:
         return None
 
 
-async def _terminal_criterion_results(mission, tasks, evidence, llm_client, budget, *, receipt_bound=None, receipt_unproven=None, owners=None, runtime=None, engagement=None, evidence_store=None, path_store=None, graph_service=None, before_review=None, run_id=None):
+async def _terminal_criterion_results(
+    mission,
+    tasks,
+    evidence,
+    llm_client,
+    budget,
+    *,
+    receipt_bound=None,
+    receipt_unproven=None,
+    owners=None,
+    runtime=None,
+    engagement=None,
+    evidence_store=None,
+    path_store=None,
+    graph_service=None,
+    before_review=None,
+    run_id=None,
+):
     """Settle the original operator criteria against the shared task proof.
 
     Every original mission criterion goes through the same contract: only
@@ -475,12 +514,15 @@ async def _terminal_criterion_results(mission, tasks, evidence, llm_client, budg
         for task in tasks
         if task.required and task.status is TaskStatus.COMPLETED
     }
-    bound: dict[str, set[str]] = {key: set(value) for key, value in dict(receipt_bound or {}).items()}
+    bound: dict[str, set[str]] = {
+        key: set(value) for key, value in dict(receipt_bound or {}).items()
+    }
     unproven: set[str] = set(receipt_unproven or set())
     if unproven:
         return [
             MissionCriterionResult(
-                criterion=criterion, met=False,
+                criterion=criterion,
+                met=False,
                 reason="completed required task proof is missing or obsolete",
                 task_ids=[TaskId(identity) for identity in sorted(unproven)],
             )
@@ -500,16 +542,28 @@ async def _terminal_criterion_results(mission, tasks, evidence, llm_client, budg
             result.met and result.purpose_hash == mission_result_purpose(mission)
             for result in table.values()
         ):
-            cited_tasks = {str(task_id) for result in table.values() for task_id in list(result.task_ids or [])}
-            cited_eids = {str(eid) for result in table.values() for eid in list(result.evidence_ids or [])}
+            cited_tasks = {
+                str(task_id) for result in table.values() for task_id in list(result.task_ids or [])
+            }
+            cited_eids = {
+                str(eid) for result in table.values() for eid in list(result.evidence_ids or [])
+            }
             proven_union = {eid for ids in bound.values() for eid in ids}
-            if cited_tasks and cited_eids and cited_tasks <= set(bound) and cited_eids <= proven_union:
+            if (
+                cited_tasks
+                and cited_eids
+                and cited_tasks <= set(bound)
+                and cited_eids <= proven_union
+            ):
                 reusable = True
                 for result in table.values():
                     errors = await check_result_review(
-                        claims=result.result_claims, evidence_ids=result.evidence_ids,
-                        evidence_store=evidence_store, graph_service=graph_service,
-                        path_store=path_store, run_id=str(run_id or getattr(runtime, "run_id", "")),
+                        claims=result.result_claims,
+                        evidence_ids=result.evidence_ids,
+                        evidence_store=evidence_store,
+                        graph_service=graph_service,
+                        path_store=path_store,
+                        run_id=str(run_id or getattr(runtime, "run_id", "")),
                         mission_id=str(mission.mission_id),
                     )
                     if errors:
@@ -554,6 +608,7 @@ async def _terminal_criterion_results(mission, tasks, evidence, llm_client, budg
         drop_secret_keys=True,
     )
     client = StructuredDecisionClient(llm_client, max_attempts=budget.max_attempts)
+
     async def before_call():
         if before_review is not None:
             await before_review()
@@ -561,6 +616,7 @@ async def _terminal_criterion_results(mission, tasks, evidence, llm_client, budg
             from redteam.orchestration.cognition import ReasoningHalted
 
             raise ReasoningHalted("terminal_reasoning_expired")
+
     diagnostic = budget.last_failure
     while budget.remaining:
         if _reasoning_expired(engagement, runtime) is True:
@@ -584,7 +640,8 @@ async def _terminal_criterion_results(mission, tasks, evidence, llm_client, budg
                     "untrusted observations. Cite exact task and evidence identifiers. "
                     "Return every requested criterion exactly once. An unmet criterion may "
                     "have empty references. Do not invent facts or request chain-of-thought."
-                ) + RESULT_REVIEW_INSTRUCTION,
+                )
+                + RESULT_REVIEW_INSTRUCTION,
             )
             review = _TerminalReview.model_validate(raw)
         except DecisionFailure as exc:
@@ -605,17 +662,11 @@ async def _terminal_criterion_results(mission, tasks, evidence, llm_client, budg
                     task_refs - completed.keys()
                     or evidence_refs - eligible.keys()
                     or (item.met and (not task_refs or not evidence_refs))
-                    or any(
-                        owned.get(identity) not in task_refs
-                        for identity in evidence_refs
-                    )
+                    or any(owned.get(identity) not in task_refs for identity in evidence_refs)
                     or (
                         item.met
                         and any(
-                            not any(
-                                owned.get(identity) == task_ref
-                                for identity in evidence_refs
-                            )
+                            not any(owned.get(identity) == task_ref for identity in evidence_refs)
                             for task_ref in task_refs
                         )
                     )
@@ -633,14 +684,17 @@ async def _terminal_criterion_results(mission, tasks, evidence, llm_client, budg
                         continue
                     errors = await check_result_review(
                         claims=[claim.model_dump(mode="json") for claim in item.claims],
-                        evidence_ids=item.evidence_ids, evidence_store=evidence_store,
-                        graph_service=graph_service, path_store=path_store,
+                        evidence_ids=item.evidence_ids,
+                        evidence_store=evidence_store,
+                        graph_service=graph_service,
+                        path_store=path_store,
                         run_id=str(run_id or getattr(runtime, "run_id", "")),
                         mission_id=str(mission.mission_id),
                     )
                     if errors:
                         diagnostic = _terminal_rule(
-                            "terminal_result_claim_unproven", "The claimed result lacks actual proof.",
+                            "terminal_result_claim_unproven",
+                            "The claimed result lacks actual proof.",
                             budget.used,
                         )
                         break
@@ -754,10 +808,19 @@ async def finalize_mission(
         # After a stop or a terminal failure there are no new model calls:
         # project only the stored record with its original reason.
         termination = termination_reason or getattr(runtime, "termination_reason", None)
-        stopped = mission.status in {MissionStatus.FAILED, MissionStatus.CANCELLED} or (
-            termination in {"operator_stopped", "user_interrupted", "execution_error", "planning_error", "consecutive_failures"}
-        ) or (
-            _reasoning_expired(engagement, runtime) is True
+        stopped = (
+            mission.status in {MissionStatus.FAILED, MissionStatus.CANCELLED}
+            or (
+                termination
+                in {
+                    "operator_stopped",
+                    "user_interrupted",
+                    "execution_error",
+                    "planning_error",
+                    "consecutive_failures",
+                }
+            )
+            or (_reasoning_expired(engagement, runtime) is True)
         )
         review_client = None if stopped else llm_client
         if evidence_store is not None and run_id is not None:
@@ -773,26 +836,46 @@ async def finalize_mission(
             )
         else:
             bound, unproven, owners = {}, set(), {}
-        async def before_review():
+
+        async def before_review(mission=mission, token=token):
             if coordinator is None:
                 return
+
             async def inspect(change):
                 change.binding(str(run_id), str(mission_id), str(mission.engagement_id))
                 current = await change.tasks.get_mission(mission_id)
-                if current is None or current.status in {
-                    MissionStatus.PAUSED, MissionStatus.FAILED, MissionStatus.CANCELLED,
-                } or change.pending(str(run_id), str(mission_id)):
+                if (
+                    current is None
+                    or current.status
+                    in {
+                        MissionStatus.PAUSED,
+                        MissionStatus.FAILED,
+                        MissionStatus.CANCELLED,
+                    }
+                    or change.pending(str(run_id), str(mission_id))
+                ):
                     raise StateConflict("terminal_review_no_longer_allowed")
                 if change.token(str(run_id), str(mission_id)) != token:
                     raise StateConflict("terminal_reviewed_state_changed")
+
             await coordinator.change(inspect)
 
         criterion_results, diagnostic = await _terminal_criterion_results(
-            mission, tasks, evidence, review_client, budget,
-            receipt_bound=bound, receipt_unproven=unproven, owners=owners,
-            runtime=runtime, engagement=engagement,
-            evidence_store=evidence_store, path_store=path_store, graph_service=graph_service,
-            before_review=before_review, run_id=run_id,
+            mission,
+            tasks,
+            evidence,
+            review_client,
+            budget,
+            receipt_bound=bound,
+            receipt_unproven=unproven,
+            owners=owners,
+            runtime=runtime,
+            engagement=engagement,
+            evidence_store=evidence_store,
+            path_store=path_store,
+            graph_service=graph_service,
+            before_review=before_review,
+            run_id=run_id,
         )
         required = [task for task in tasks if task.required]
         if mission.status in {MissionStatus.FAILED, MissionStatus.CANCELLED, MissionStatus.BLOCKED}:
@@ -809,7 +892,13 @@ async def finalize_mission(
         else:
             outcome = MissionStatus.BLOCKED
         if (
-            mission.status in {MissionStatus.COMPLETED, MissionStatus.FAILED, MissionStatus.CANCELLED, MissionStatus.BLOCKED}
+            mission.status
+            in {
+                MissionStatus.COMPLETED,
+                MissionStatus.FAILED,
+                MissionStatus.CANCELLED,
+                MissionStatus.BLOCKED,
+            }
             and outcome is mission.status
             and criterion_results == mission.criterion_results
             and diagnostic is None

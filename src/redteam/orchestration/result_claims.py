@@ -7,24 +7,28 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 from redteam.orchestration.completion import validate_result_claims
-from redteam.orchestration.paths import CompletionCriterion
 from redteam.orchestration.coordination import content_hash
+from redteam.orchestration.paths import CompletionCriterion
 
 
 def mission_result_purpose(mission: Any) -> str:
     """Bind stored meaning to current goal conditions, independent of revisions."""
-    return content_hash({
-        "objective": mission.objective,
-        "success_criteria": list(mission.success_criteria),
-        "operator_constraints": mission.operator_constraints,
-    })
+    return content_hash(
+        {
+            "objective": mission.objective,
+            "success_criteria": list(mission.success_criteria),
+            "operator_constraints": mission.operator_constraints,
+        }
+    )
 
 
 class ResultClaim(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     description: str = Field(min_length=1)
-    kind: Literal["semantic", "observation", "hypothesis_confirmed", "hypothesis_refuted", "poc"] = "semantic"
+    kind: Literal[
+        "semantic", "observation", "hypothesis_confirmed", "hypothesis_refuted", "poc"
+    ] = "semantic"
     evidence_ids: list[str] = Field(min_length=1)
     target_node_ids: list[str] = Field(default_factory=list)
     principal_refs: list[str] = Field(default_factory=list)
@@ -50,8 +54,14 @@ RESULT_REVIEW_INSTRUCTION = (
 
 
 async def check_result_review(
-    *, claims: list[Any], evidence_ids: list[str], evidence_store: Any,
-    graph_service: Any, path_store: Any, run_id: str, mission_id: str | None,
+    *,
+    claims: list[Any],
+    evidence_ids: list[str],
+    evidence_store: Any,
+    graph_service: Any,
+    path_store: Any,
+    run_id: str,
+    mission_id: str | None,
     target_node_ids: list[str] | None = None,
 ) -> list[str]:
     """Reuse actual origin, account, verdict and finding proofs per claimed result."""
@@ -66,14 +76,22 @@ async def check_result_review(
         if scope and set(claim.target_node_ids) - scope:
             return ["result claim concerns a different task target"]
         errors = await validate_result_claims(
-            criteria=[CompletionCriterion(kind=claim.kind, description=claim.description,
-                                          hypothesis_id=claim.hypothesis_id,
-                                          principal_refs=claim.principal_refs)],
+            criteria=[
+                CompletionCriterion(
+                    kind=claim.kind,
+                    description=claim.description,
+                    hypothesis_id=claim.hypothesis_id,
+                    principal_refs=claim.principal_refs,
+                )
+            ],
             evidence_ids=claim.evidence_ids,
             target_node_ids=claim.target_node_ids or list(target_node_ids or []),
             principal_refs=claim.principal_refs,
-            evidence_store=evidence_store, graph_service=graph_service,
-            run_id=run_id, path_store=path_store, mission_id=mission_id,
+            evidence_store=evidence_store,
+            graph_service=graph_service,
+            run_id=run_id,
+            path_store=path_store,
+            mission_id=mission_id,
         )
         if errors:
             return errors

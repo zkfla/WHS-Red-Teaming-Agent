@@ -34,21 +34,21 @@ from redteam.orchestration.cognition import (
     DecisionFailure,
     StructuredDecisionClient,
 )
-from redteam.orchestration.context_projection import project_run_processing
-from redteam.orchestration.coverage import project_coverage_gaps
 from redteam.orchestration.completion import validate_completion
+from redteam.orchestration.context_projection import project_run_processing
 from redteam.orchestration.coordination import (
     ChangeSet,
     StateConflict,
     content_hash,
     coordinator_for,
 )
+from redteam.orchestration.coverage import project_coverage_gaps
+from redteam.orchestration.delegation import DelegationRequest
 from redteam.orchestration.diagnostics import (
     DecisionDiagnostic,
     diagnostic_for_exception,
     known_location,
 )
-from redteam.orchestration.delegation import DelegationRequest
 from redteam.orchestration.eligibility import EligibilityContext
 from redteam.orchestration.events import AGENT_CONTEXT_PREPARED, AGENT_TURN_DECIDED
 from redteam.orchestration.evidence_access import EvidenceReader, raw_from_metadata
@@ -205,7 +205,8 @@ SYSTEM = (
     "chain-of-thought. Code reference paths are hints, not an execution pool or an exhaustive "
     "strategy list. Never claim completion from tool success alone. "
     "Operations use capability.operation. "
-    "Completion criteria describe measurable results; kind and evidence count have defaults. Future "
+    "Completion criteria describe measurable results; kind and evidence count have defaults. "
+    "Future "
     "steps may stay pending. Do not invent observed facts or evidence. "
     "Declare availability_impact for actions that can disrupt service, "
     "and obey the engagement constraints."
@@ -493,12 +494,14 @@ class InvestigationEngine:
         if active_budget.remaining == 0:
             raise DecisionFailure(stage, "budget", active_budget.used, "decision budget exhausted")
         before = active_budget.used
+
         async def before_call():
             await self._ensure_reasoning_allowed()
             if active_budget.token_halt_required(self.decision_token_limit):
                 from redteam.orchestration.cognition import ReasoningHalted
 
                 raise ReasoningHalted("delegation_token_limit_or_unknown_usage")
+
         try:
             result = await self.planning_provider.propose(
                 PlanningRequest(
@@ -543,7 +546,9 @@ class InvestigationEngine:
             started = delegation.started_at
             if started.tzinfo is None:
                 started = started.replace(tzinfo=timezone.utc)
-            if (datetime.now(timezone.utc) - started).total_seconds() >= delegation.budget.max_seconds:
+            if (
+                datetime.now(timezone.utc) - started
+            ).total_seconds() >= delegation.budget.max_seconds:
                 raise DecisionRuleError("the delegated investigation time limit has ended")
 
     def _writing_schema(self, model):
@@ -1509,7 +1514,9 @@ class InvestigationEngine:
                     from redteam.orchestration.delegated_runtime import accept_delegations
 
                     if not decision.delegations:
-                        raise DecisionRuleError("delegation decision needs an investigation purpose")
+                        raise DecisionRuleError(
+                            "delegation decision needs an investigation purpose"
+                        )
                     await accept_delegations(self, path, decision.delegations, runtime)
                     return path, [], "continue_planning"
                 if decision.mode == "read_evidence":
@@ -1614,8 +1621,13 @@ class InvestigationEngine:
                     continue
                 if decision.mode == "recover_evidence":
                     from redteam.attack_graph.service import AttackGraphService
-                    from redteam.orchestration.analysis_budget import verification_budget, verification_guard
-                    from redteam.orchestration.delegation_decision import record_decision_consumption
+                    from redteam.orchestration.analysis_budget import (
+                        verification_budget,
+                        verification_guard,
+                    )
+                    from redteam.orchestration.delegation_decision import (
+                        record_decision_consumption,
+                    )
                     from redteam.orchestration.recovery import reprocess_evidence
 
                     evidence_id = str(decision.evidence_request.get("evidence_id", ""))
@@ -1629,28 +1641,37 @@ class InvestigationEngine:
                             if source.metadata.get("plan_step") is not None:
                                 origin_step = PlanStep.model_validate(source.metadata["plan_step"])
                             if source.metadata.get("proposal") is not None:
-                                origin_proposal = ActionProposal.model_validate(source.metadata["proposal"])
+                                origin_proposal = ActionProposal.model_validate(
+                                    source.metadata["proposal"]
+                                )
                     except (ValueError, TypeError):
                         # The shared reprocessor records malformed original
                         # metadata; do not let admission parsing hide that result.
                         origin_step = None
                         origin_proposal = None
-                    review_state = {"runtime": runtime, "plan_step": origin_step,
-                                    "action_proposal": origin_proposal}
+                    review_state = {
+                        "runtime": runtime,
+                        "plan_step": origin_step,
+                        "action_proposal": origin_proposal,
+                    }
                     model_budget = verification_budget(review_state, deps=self.deps)
                     try:
                         recovered = await reprocess_evidence(
-                            evidence_id=evidence_id, run_id=str(runtime.run_id),
+                            evidence_id=evidence_id,
+                            run_id=str(runtime.run_id),
                             evidence_store=self.deps.evidence_store,
                             graph_service=AttackGraphService(self.deps.graph_store),
-                            verifier=self.deps.verifier, result_mappers=self.deps.result_mappers,
+                            verifier=self.deps.verifier,
+                            result_mappers=self.deps.result_mappers,
                             budget=model_budget,
-                            before_call=verification_guard(review_state, deps=self.deps,
-                                                           budget=model_budget),
+                            before_call=verification_guard(
+                                review_state, deps=self.deps, budget=model_budget
+                            ),
                         )
                     except Exception as exc:
                         recovered = {
-                            "status": "failed", "evidence_id": evidence_id,
+                            "status": "failed",
+                            "evidence_id": evidence_id,
                             "reason": type(exc).__name__,
                         }
                     finally:
@@ -1658,12 +1679,20 @@ class InvestigationEngine:
                         delegation = runtime.delegations.get(delegation_id)
                         if delegation is not None:
                             spent = record_decision_consumption(
-                                delegation, requests=model_budget.used,
-                                tokens=model_budget.tokens_used if model_budget.tokens_fully_known else None,
+                                delegation,
+                                requests=model_budget.used,
+                                tokens=model_budget.tokens_used
+                                if model_budget.tokens_fully_known
+                                else None,
                             )
-                            runtime = runtime.model_copy(update={"delegations": {
-                                **runtime.delegations, delegation_id: spent,
-                            }})
+                            runtime = runtime.model_copy(
+                                update={
+                                    "delegations": {
+                                        **runtime.delegations,
+                                        delegation_id: spent,
+                                    }
+                                }
+                            )
                             self.updated_runtime = self._event_runtime = runtime
                     extra.append(recovered)
                     context = await self.context(runtime, observation)
@@ -1975,7 +2004,8 @@ class InvestigationEngine:
                     intent.arguments,
                     tool.outbound_text_fields,
                     self.deps.engagement.external_text_policy.prohibited_patterns
-                    if self.deps.engagement else (),
+                    if self.deps.engagement
+                    else (),
                 )
                 if outbound.blocked:
                     # Reject before work, dispatch and checkpoints retain the
@@ -1985,10 +2015,15 @@ class InvestigationEngine:
                     from redteam.core.enums import PolicyVerdict
 
                     proposal = ActionProposal(
-                        action_id=new_id("action"), run_id=runtime.run_id,
-                        engagement_id=runtime.engagement_id, agent_id=intent.agent_id,
-                        capability=intent.capability, operation=intent.operation,
-                        target=target, arguments=intent.arguments, reason=intent.reason,
+                        action_id=new_id("action"),
+                        run_id=runtime.run_id,
+                        engagement_id=runtime.engagement_id,
+                        agent_id=intent.agent_id,
+                        capability=intent.capability,
+                        operation=intent.operation,
+                        target=target,
+                        arguments=intent.arguments,
+                        reason=intent.reason,
                         availability_impact=intent.availability_impact,
                         created_at=datetime.now(timezone.utc),
                     )
@@ -1997,15 +2032,19 @@ class InvestigationEngine:
                             proposal,
                             ControlContext(
                                 engagement_id=runtime.engagement_id,
-                                agent_id=intent.agent_id, selected_tool_id=tool.tool_id,
+                                agent_id=intent.agent_id,
+                                selected_tool_id=tool.tool_id,
                                 correlation_id=str(proposal.action_id),
                             ),
                         )
                     if decision.verdict is not PolicyVerdict.DENY:
-                        raise DecisionRuleError("outbound text rejection was not enforced by Control")
+                        raise DecisionRuleError(
+                            "outbound text rejection was not enforced by Control"
+                        )
                     await self.deps.evidence_store.append(
                         EvidenceRecord(
-                            evidence_id=new_id("evidence"), run_id=runtime.run_id,
+                            evidence_id=new_id("evidence"),
+                            run_id=runtime.run_id,
                             engagement_id=runtime.engagement_id,
                             source_type=EvidenceSourceType.SYSTEM,
                             source_id="orchestration.policy_preflight",
@@ -2396,6 +2435,7 @@ class InvestigationEngine:
 
         return await complete_task(self, path, decision, runtime, context, budget=budget)
 
+
 def validate_principal_arguments(step, principal, arguments, knowledge) -> None:
     """Principal wiring; accepts the internal material or the legacy display dict."""
     if isinstance(knowledge, InternalAssessment):
@@ -2705,7 +2745,8 @@ async def validate_current_action(deps, runtime, step, proposal=None) -> list[st
 
         delegation = runtime.delegations.get(step.delegation_id)
         if delegation is None or (
-            delegation.path_id != path.path_id or delegation.path_version != path.version
+            delegation.path_id != path.path_id
+            or delegation.path_version != path.version
             or delegation.path_step_id != step.path_step_id
             or delegation.mission_task_id != path.mission_task_id
             or (proposal is not None and delegation.agent_id != str(proposal.agent_id))
@@ -2715,9 +2756,11 @@ async def validate_current_action(deps, runtime, step, proposal=None) -> list[st
             problems.append("delegation action allowance is exhausted")
         elif not reasoning_time_allowed(deps.engagement, runtime):
             problems.append("engagement time prevents further execution")
-        elif delegation.budget.max_seconds is not None and (
-            datetime.now(timezone.utc) - delegation.started_at
-        ).total_seconds() >= delegation.budget.max_seconds:
+        elif (
+            delegation.budget.max_seconds is not None
+            and (datetime.now(timezone.utc) - delegation.started_at).total_seconds()
+            >= delegation.budget.max_seconds
+        ):
             problems.append("delegation time allowance is exhausted")
     problems.extend(
         await operator_exclusions(

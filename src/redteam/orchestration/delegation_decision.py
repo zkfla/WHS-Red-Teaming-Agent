@@ -238,6 +238,7 @@ def gate_delegation_decision(gate_in: DelegationGateInput) -> DelegationGate:
         remaining_actions=actions_left,
     )
 
+
 def open_delegation(
     request: DelegationRequest,
     *,
@@ -420,13 +421,17 @@ def parse_worker_next_action(result: Mapping[str, Any]) -> WorkerNextAction:
         return WorkerNextAction(
             decision=decision,
             actions=tuple(actions),
-            evidence_ids=_string_items(result.get("evidence_ids", []), name="evidence_ids", required=False),
+            evidence_ids=_string_items(
+                result.get("evidence_ids", []), name="evidence_ids", required=False
+            ),
             target_references=tuple(references),
         )
     if decision == DECISION_READ_EVIDENCE:
         return WorkerNextAction(
             decision=decision,
-            evidence_ids=_string_items(result.get("evidence_ids"), name="evidence_ids", required=True),
+            evidence_ids=_string_items(
+                result.get("evidence_ids"), name="evidence_ids", required=True
+            ),
             target_references=tuple(references),
         )
     if decision == DECISION_FINISH:
@@ -438,10 +443,14 @@ def parse_worker_next_action(result: Mapping[str, Any]) -> WorkerNextAction:
             raise ValueError("worker_next_action finish needs a finish_reason")
         return WorkerNextAction(
             decision=decision,
-            evidence_ids=_string_items(result.get("evidence_ids", []), name="evidence_ids", required=False),
+            evidence_ids=_string_items(
+                result.get("evidence_ids", []), name="evidence_ids", required=False
+            ),
             target_references=tuple(references),
             summary=summary,
-            unresolved=_string_items(result.get("unresolved", []), name="unresolved", required=False),
+            unresolved=_string_items(
+                result.get("unresolved", []), name="unresolved", required=False
+            ),
             finish_reason=finish_reason,
         )
     if decision == DECISION_HOLD:
@@ -450,10 +459,14 @@ def parse_worker_next_action(result: Mapping[str, Any]) -> WorkerNextAction:
             raise ValueError("worker_next_action hold needs a string summary")
         return WorkerNextAction(
             decision=decision,
-            evidence_ids=_string_items(result.get("evidence_ids", []), name="evidence_ids", required=False),
+            evidence_ids=_string_items(
+                result.get("evidence_ids", []), name="evidence_ids", required=False
+            ),
             target_references=tuple(references),
             summary=summary,
-            unresolved=_string_items(result.get("unresolved", []), name="unresolved", required=False),
+            unresolved=_string_items(
+                result.get("unresolved", []), name="unresolved", required=False
+            ),
         )
     raise ValueError("worker_next_action decision is not a known verdict")
 
@@ -495,7 +508,6 @@ def mark_held(
     if unresolved is not None:
         update["unresolved"] = list(unresolved)
     return delegation.model_copy(update=update)
-
 
 
 def mark_active(delegation: DelegationState) -> DelegationState:
@@ -544,7 +556,9 @@ def build_cleanup_finish(delegation: DelegationState, *, reason: str) -> Delegat
     )
 
 
-def close_from_gate(delegation: DelegationState, gate: DelegationGate) -> tuple[DelegationState, DelegationFinish | None]:
+def close_from_gate(
+    delegation: DelegationState, gate: DelegationGate
+) -> tuple[DelegationState, DelegationFinish | None]:
     """Durable end for a non-investigate gate: hold parks, cleanup closes.
 
     The root calls this when the gate forbids a model call, so the

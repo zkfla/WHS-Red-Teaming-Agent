@@ -71,9 +71,7 @@ class TargetReference(BaseModel):
             raise ValueError("reference raw_path must start at output")
         return value
 
-    @field_validator(
-        "source_evidence_id", "source_action_id", "source_invocation_id"
-    )
+    @field_validator("source_evidence_id", "source_action_id", "source_invocation_id")
     @classmethod
     def _source_ids_not_blank(cls, value: str | None) -> str | None:
         if value is not None and not value.strip():
@@ -110,7 +108,6 @@ def reference_address(target: AnyTarget) -> str | None:
     if isinstance(domain, str) and domain:
         return domain
     return None
-
 
 
 def _value_at_path(document: Any, raw_path: list[str | int]) -> tuple[bool, Any]:
@@ -156,6 +153,10 @@ def is_reference_grounded(
         return False
     if entry.source_invocation_id is not None and entry.source_invocation_id != invocation_id:
         return False
-    if evidence_id is not None and entry.source_evidence_id is not None and entry.source_evidence_id != evidence_id:
+    if (
+        evidence_id is not None
+        and entry.source_evidence_id is not None
+        and entry.source_evidence_id != evidence_id
+    ):
         return False
     return True

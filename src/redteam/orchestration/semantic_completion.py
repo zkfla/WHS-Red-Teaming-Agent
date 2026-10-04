@@ -36,18 +36,30 @@ from datetime import datetime, timezone
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict
-from redteam.attack_graph.service import AttackGraphService
 
-from redteam.core.contracts.mission import MissionCriterionResult, MissionTask, redact_secret_material
+from redteam.attack_graph.service import AttackGraphService
+from redteam.core.contracts.mission import (
+    MissionCriterionResult,
+    MissionTask,
+    redact_secret_material,
+)
 from redteam.core.enums import EvidenceSourceType, MissionStatus, TaskStatus
-from redteam.core.ids import new_id
-from redteam.orchestration.completion import check_record_linkage, validate_completion, verify_stored_origin
+from redteam.core.ids import EvidenceId, TaskId, new_id
+from redteam.orchestration.completion import (
+    check_record_linkage,
+    validate_completion,
+    verify_stored_origin,
+)
 from redteam.orchestration.coordination import content_hash
 from redteam.orchestration.evidence_access import raw_from_metadata
-from redteam.orchestration.work.models import WorkStatus
 from redteam.orchestration.result_claims import (
-    RESULT_REVIEW_INSTRUCTION, ResultClaim, ResultReview, check_result_review, mission_result_purpose,
+    RESULT_REVIEW_INSTRUCTION,
+    ResultClaim,
+    ResultReview,
+    check_result_review,
+    mission_result_purpose,
 )
+from redteam.orchestration.work.models import WorkStatus
 
 #: Evidence metadata marker for an accepted task completion receipt.
 TASK_RECEIPT_KIND = "task_completion_receipt"
@@ -116,8 +128,12 @@ def build_task_receipt(
         "reason": str(reason or "")[:500],
         "path_id": str(path_id) if path_id else None,
         "path_version": path_version,
-        "related_attack_graph_node_ids": sorted({str(item) for item in (related_attack_graph_node_ids or []) if str(item).strip()}),
-        "related_hypothesis_ids": sorted({str(item) for item in (related_hypothesis_ids or []) if str(item).strip()}),
+        "related_attack_graph_node_ids": sorted(
+            {str(item) for item in (related_attack_graph_node_ids or []) if str(item).strip()}
+        ),
+        "related_hypothesis_ids": sorted(
+            {str(item) for item in (related_hypothesis_ids or []) if str(item).strip()}
+        ),
         "claims": list(claims or []),
     }
 
@@ -156,7 +172,9 @@ def verify_task_receipt(
     ):
         if key in receipt:
             stored = receipt.get(key)
-            if not isinstance(stored, list) or sorted(map(str, stored)) != sorted(map(str, current)):
+            if not isinstance(stored, list) or sorted(map(str, stored)) != sorted(
+                map(str, current)
+            ):
                 return ["task subjects changed since the accepted receipt"]
     origins = [item for item in (receipt.get("source_evidence_ids", []) or []) if str(item).strip()]
     if not origins:
@@ -187,7 +205,9 @@ async def verify_single_origin(
         return None, ["task origin lookup failed; treating as unproven"]
     if record is None or _record_text(getattr(record, "run_id", "")) != str(run_id):
         return None, ["task origin is missing or belongs to another run"]
-    if engagement_id is not None and _record_text(getattr(record, "engagement_id", "")) != str(engagement_id):
+    if engagement_id is not None and _record_text(getattr(record, "engagement_id", "")) != str(
+        engagement_id
+    ):
         return None, ["task origin belongs to another engagement"]
     meta = getattr(record, "metadata", None) or {}
     if not isinstance(meta, dict):
@@ -195,7 +215,9 @@ async def verify_single_origin(
     raw = raw_from_metadata(meta)
     if not isinstance(raw, dict):
         return None, ["task origin '" + str(evidence_id) + "' has no preserved raw result"]
-    linkage = check_record_linkage(record, meta, raw, str(evidence_id), require_proposal=require_proposal)
+    linkage = check_record_linkage(
+        record, meta, raw, str(evidence_id), require_proposal=require_proposal
+    )
     if linkage:
         return None, [linkage[0][0]]
     origin_errors = await verify_stored_origin(
@@ -238,7 +260,9 @@ async def verify_receipt_bound_origins(
         return (["task receipt is missing"], [])
     if _record_text(getattr(receipt_record, "run_id", "")) != str(run_id):
         return (["task receipt belongs to another run"], [])
-    if engagement_id is not None and _record_text(getattr(receipt_record, "engagement_id", "")) != str(engagement_id):
+    if engagement_id is not None and _record_text(
+        getattr(receipt_record, "engagement_id", "")
+    ) != str(engagement_id):
         return (["task receipt belongs to another engagement"], [])
     if getattr(receipt_record, "source_type", None) is not EvidenceSourceType.SYSTEM:
         return (["task receipt is not system evidence"], [])
@@ -253,7 +277,11 @@ async def verify_receipt_bound_origins(
     )
     if errors:
         return (errors, [])
-    origins = [str(item).strip() for item in (receipt_payload.get("source_evidence_ids", []) or []) if str(item).strip()]
+    origins = [
+        str(item).strip()
+        for item in (receipt_payload.get("source_evidence_ids", []) or [])
+        if str(item).strip()
+    ]
     if not origins:
         return (["task receipt cites no origin evidence"], [])
     proven: list[str] = []
@@ -271,9 +299,13 @@ async def verify_receipt_bound_origins(
             return (origin_errors, [])
         proven.append(identity)
     errors = await check_result_review(
-        claims=receipt_payload.get("claims", []), evidence_ids=proven,
-        evidence_store=evidence_store, graph_service=graph_service,
-        path_store=path_store, run_id=str(run_id), mission_id=mission_id,
+        claims=receipt_payload.get("claims", []),
+        evidence_ids=proven,
+        evidence_store=evidence_store,
+        graph_service=graph_service,
+        path_store=path_store,
+        run_id=str(run_id),
+        mission_id=mission_id,
         target_node_ids=list(task.related_attack_graph_node_ids),
     )
     if errors:
@@ -413,7 +445,9 @@ def _excerpt_of(record: Any, *, limit: int = EXCERPT_CHARS) -> dict[str, Any]:
     }
 
 
-def _review_payload_common(*, purpose: str, conditions: list[str], excerpts: list[dict[str, Any]]) -> dict[str, Any]:
+def _review_payload_common(
+    *, purpose: str, conditions: list[str], excerpts: list[dict[str, Any]]
+) -> dict[str, Any]:
     return {
         "purpose": str(purpose or ""),
         "conditions": list(conditions or []),
@@ -443,7 +477,10 @@ async def _pending_execution_errors(engine: Any, runtime: Any) -> list[str]:
         for record in (records or [])
         if isinstance(getattr(record, "metadata", None), dict)
         and isinstance(getattr(record, "metadata", {}).get("tool_result", {}), dict)
-        and getattr(record, "metadata", {}).get("tool_result", {}).get("metadata", {}).get("execution_reconciled")
+        and getattr(record, "metadata", {})
+        .get("tool_result", {})
+        .get("metadata", {})
+        .get("execution_reconciled")
     }
     for record in records or []:
         meta = getattr(record, "metadata", None)
@@ -452,17 +489,22 @@ async def _pending_execution_errors(engine: Any, runtime: Any) -> list[str]:
             continue
         if raw.get("metadata", {}).get("orchestration_exception"):
             error = raw.get("error") or {}
-            if error.get("code") not in {"tool_binding_invalid", "lease_lost_before_execution"} and _record_text(getattr(record, "action_id", None)) not in settled:
+            if (
+                error.get("code") not in {"tool_binding_invalid", "lease_lost_before_execution"}
+                and _record_text(getattr(record, "action_id", None)) not in settled
+            ):
                 return ["an execution outcome is uncertain; collect its actual result or hold"]
     return []
 
 
-def _receipt_record(*, run_id: Any, engagement_id: Any, payload: dict[str, Any], summary: str) -> Any:
+def _receipt_record(
+    *, run_id: Any, engagement_id: Any, payload: dict[str, Any], summary: str
+) -> Any:
     from redteam.core.contracts.evidence import EvidenceRecord
 
     body = json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str)
     return EvidenceRecord(
-        evidence_id=new_id("evidence"),
+        evidence_id=EvidenceId(new_id("evidence")),
         run_id=run_id,
         engagement_id=engagement_id,
         source_type=EvidenceSourceType.SYSTEM,
@@ -475,13 +517,22 @@ def _receipt_record(*, run_id: Any, engagement_id: Any, payload: dict[str, Any],
     )
 
 
-async def complete_task(engine: Any, path: Any, decision: Any, runtime: Any, context: Any, *, budget: Any = None) -> list[str]:
+async def complete_task(
+    engine: Any, path: Any, decision: Any, runtime: Any, context: Any, *, budget: Any = None
+) -> list[str]:
     """Close one delegated task on its original purpose and stored origins."""
     token = await engine._review_token(runtime)
-    if getattr(runtime, "mission_id", None) is None or getattr(runtime, "active_task_id", None) is None:
+    if (
+        getattr(runtime, "mission_id", None) is None
+        or getattr(runtime, "active_task_id", None) is None
+    ):
         return ["task completion requires an active mission task"]
     task = await engine.deps.task_graph_store.get_task(runtime.active_task_id)
-    if task is None or getattr(task, "mission_id", None) != runtime.mission_id or getattr(task, "status", None) is not TaskStatus.RUNNING:
+    if (
+        task is None
+        or getattr(task, "mission_id", None) != runtime.mission_id
+        or getattr(task, "status", None) is not TaskStatus.RUNNING
+    ):
         return ["task completion requires the current running task"]
     if _record_text(getattr(path, "mission_task_id", "")) != str(task.task_id):
         return ["task completion path is not bound to this mission task"]
@@ -514,12 +565,25 @@ async def complete_task(engine: Any, path: Any, decision: Any, runtime: Any, con
     await engine._check_review_path(runtime, path)
     review = await engine._ask(
         stage="task_completion_review",
-        payload={**(context or {}), "task": task.model_dump(mode="json"), "path": path.model_dump(mode="json"), **_review_payload_common(purpose=getattr(task, "objective", "") or "", conditions=[], excerpts=excerpt_notes)},
+        payload={
+            **(context or {}),
+            "task": task.model_dump(mode="json"),
+            "path": path.model_dump(mode="json"),
+            **_review_payload_common(
+                purpose=getattr(task, "objective", "") or "", conditions=[], excerpts=excerpt_notes
+            ),
+        },
         response_schema=ResultReview.model_json_schema(),
         system=_engine_system(engine) + RESULT_REVIEW_INSTRUCTION,
         budget=budget,
     )
-    await engine.record_completion_review("task_completion_review", path, runtime, review, [str(getattr(record, "evidence_id", "")) for record in verified])
+    await engine.record_completion_review(
+        "task_completion_review",
+        path,
+        runtime,
+        review,
+        [str(getattr(record, "evidence_id", "")) for record in verified],
+    )
     if not review.get("accepted"):
         return ["semantic completion review rejected the evidence"]
     from redteam.attack_graph.service import AttackGraphService
@@ -527,26 +591,56 @@ async def complete_task(engine: Any, path: Any, decision: Any, runtime: Any, con
     claims = list(review.get("claims", []))
     service = AttackGraphService(engine.deps.graph_store)
     errors = await check_result_review(
-        claims=claims, evidence_ids=evidence_ids, evidence_store=engine.deps.evidence_store,
-        graph_service=service, path_store=engine.deps.path_store,
-        run_id=str(runtime.run_id), mission_id=str(runtime.mission_id),
+        claims=claims,
+        evidence_ids=evidence_ids,
+        evidence_store=engine.deps.evidence_store,
+        graph_service=service,
+        path_store=engine.deps.path_store,
+        run_id=str(runtime.run_id),
+        mission_id=str(runtime.mission_id),
         target_node_ids=list(task.related_attack_graph_node_ids),
     )
     if errors:
         return errors
     mission = await engine.deps.task_graph_store.get_mission(runtime.mission_id)
     revision = int(getattr(mission, "revision", 1) or 1)
-    receipt_payload = build_task_receipt(task_id=str(task.task_id), mission_id=str(task.mission_id), run_id=str(runtime.run_id), purpose_hash_value=purpose_hash(task.objective or ""), mission_revision=revision, source_evidence_ids=[str(getattr(record, "evidence_id", "")) for record in verified], outcome="success", reason=str(review.get("reason", "")), path_id=getattr(path, "path_id", None), path_version=getattr(path, "version", None), related_attack_graph_node_ids=list(task.related_attack_graph_node_ids or []), related_hypothesis_ids=list(task.related_hypothesis_ids or []))
+    receipt_payload = build_task_receipt(
+        task_id=str(task.task_id),
+        mission_id=str(task.mission_id),
+        run_id=str(runtime.run_id),
+        purpose_hash_value=purpose_hash(task.objective or ""),
+        mission_revision=revision,
+        source_evidence_ids=[str(getattr(record, "evidence_id", "")) for record in verified],
+        outcome="success",
+        reason=str(review.get("reason", "")),
+        path_id=getattr(path, "path_id", None),
+        path_version=getattr(path, "version", None),
+        related_attack_graph_node_ids=list(task.related_attack_graph_node_ids or []),
+        related_hypothesis_ids=list(task.related_hypothesis_ids or []),
+    )
     receipt_payload["claims"] = claims
-    receipt_record = _receipt_record(run_id=runtime.run_id, engagement_id=runtime.engagement_id,
-                                     payload=receipt_payload, summary=str(review.get("reason", "")))
+    receipt_record = _receipt_record(
+        run_id=runtime.run_id,
+        engagement_id=runtime.engagement_id,
+        payload=receipt_payload,
+        summary=str(review.get("reason", "")),
+    )
+
     async def complete(change: Any) -> None:
         staged = await change.tasks.get_task(task.task_id)
         if staged is None:
             raise ValueError("completion_task_missing")
-        updated = staged.model_copy(update={"completion_evidence_id": receipt_record.evidence_id, "updated_at": datetime.now(timezone.utc)})
+        updated = staged.model_copy(
+            update={
+                "completion_evidence_id": receipt_record.evidence_id,
+                "updated_at": datetime.now(timezone.utc),
+            }
+        )
         await change.tasks.update_task(updated)
-        await change.tasks.transition_task(task.task_id, TaskStatus.COMPLETED, now=datetime.now(timezone.utc))
+        await change.tasks.transition_task(
+            task.task_id, TaskStatus.COMPLETED, now=datetime.now(timezone.utc)
+        )
+
     # The receipt is immutable evidence; authority still comes only from
     # the atomic task transition below, never from the receipt alone.
     await engine.deps.evidence_store.append(receipt_record)
@@ -555,8 +649,14 @@ async def complete_task(engine: Any, path: Any, decision: Any, runtime: Any, con
 
 
 async def verify_legacy_task_origins(
-    *, evidence_store: Any, path_store: Any, graph_service: Any,
-    mission_id: str, engagement_id: str | None, task: MissionTask, run_id: str
+    *,
+    evidence_store: Any,
+    path_store: Any,
+    graph_service: Any,
+    mission_id: str,
+    engagement_id: str | None,
+    task: MissionTask,
+    run_id: str,
 ) -> tuple[list[str], list[str]]:
     """Read a receipt-less completed task only through the stored path proof.
 
@@ -570,16 +670,14 @@ async def verify_legacy_task_origins(
         listed = await path_store.list_paths(str(run_id))
     except Exception:
         return (["completed required task path proof lookup failed; treating as unproven"], [])
-    try:
-        from redteam.orchestration.paths import is_active_status as _is_active
-    except Exception:
-        _is_active = lambda value: str(value or "").strip().lower() == "active"  # noqa: E731
+    from redteam.orchestration.paths import is_active_status as _is_active
+
     candidates = [
         saved
         for saved in (listed or [])
         if getattr(saved, "mission_task_id", None) == str(task.task_id)
         and getattr(saved, "mission_id", None) == str(mission_id)
-        and _is_active(getattr(saved, "status", None))
+        and _is_active(str(getattr(saved, "status", "")))
     ]
     if not candidates:
         return (["completed required task lacks an accepted evidence-bearing path"], [])
@@ -598,20 +696,43 @@ async def verify_legacy_task_origins(
             and str(meta.get("task_id", "")) == str(task.task_id)
         ):
             return (
-                ["completed task purpose changed since its accepted receipt; legacy path proof cannot substitute"],
+                [
+                    "completed task purpose changed since its accepted receipt; "
+                    "legacy path proof cannot substitute"
+                ],
                 [],
             )
-    required_steps = [step for step in list(getattr(latest, "steps", []) or []) if getattr(step, "required", False)]
+    required_steps = [
+        step
+        for step in list(getattr(latest, "steps", []) or [])
+        if getattr(step, "required", False)
+    ]
     if not required_steps:
         return (["completed task path has no required steps to prove it"], [])
     proven: list[str] = []
     for step in required_steps:
         if _record_text(getattr(step, "status", "")) != "completed":
             return (["completed task has unfinished path steps"], [])
-        step_ids = [str(item).strip() for item in list(getattr(step, "evidence_ids", []) or []) if str(item).strip()]
+        step_ids = [
+            str(item).strip()
+            for item in list(getattr(step, "evidence_ids", []) or [])
+            if str(item).strip()
+        ]
         if not step_ids:
             return (["completed required task step cites no evidence"], [])
-        errors = await validate_completion(path=latest, step=step, proposal={"evidence_ids": step_ids, "outcome": getattr(step, "outcome", None) or "success", "reason": getattr(step, "objective", "") or ""}, evidence_store=evidence_store, graph_service=graph_service, run_id=str(run_id), path_store=path_store)
+        errors = await validate_completion(
+            path=latest,
+            step=step,
+            proposal={
+                "evidence_ids": step_ids,
+                "outcome": getattr(step, "outcome", None) or "success",
+                "reason": getattr(step, "objective", "") or "",
+            },
+            evidence_store=evidence_store,
+            graph_service=graph_service,
+            run_id=str(run_id),
+            path_store=path_store,
+        )
         if errors:
             return (errors, [])
         for identity in step_ids:
@@ -621,7 +742,9 @@ async def verify_legacy_task_origins(
                 return (["task origin lookup failed; treating as unproven"], [])
             if record is None or _record_text(getattr(record, "run_id", "")) != str(run_id):
                 return (["task origin is missing or belongs to another run"], [])
-            if engagement_id is not None and _record_text(getattr(record, "engagement_id", "")) != str(engagement_id):
+            if engagement_id is not None and _record_text(
+                getattr(record, "engagement_id", "")
+            ) != str(engagement_id):
                 return (["task origin belongs to another engagement"], [])
             if identity not in proven:
                 proven.append(identity)
@@ -654,10 +777,13 @@ async def _goal_task_coverage(
         receipt_id = task.completion_evidence_id
         if receipt_id is None:
             errors, proven = await verify_legacy_task_origins(
-                evidence_store=engine.deps.evidence_store, path_store=path_store,
+                evidence_store=engine.deps.evidence_store,
+                path_store=path_store,
                 graph_service=AttackGraphService(engine.deps.graph_store),
-                mission_id=str(runtime.mission_id), engagement_id=engagement_id,
-                task=task, run_id=str(runtime.run_id),
+                mission_id=str(runtime.mission_id),
+                engagement_id=engagement_id,
+                task=task,
+                run_id=str(runtime.run_id),
             )
             if errors:
                 return (errors, {}, [])
@@ -700,7 +826,9 @@ async def _goal_task_coverage(
     return ([], task_evidence, excerpts)
 
 
-async def complete_goal(engine: Any, path: Any, decision: Any, runtime: Any, context: Any, *, budget: Any = None) -> list[str]:
+async def complete_goal(
+    engine: Any, path: Any, decision: Any, runtime: Any, context: Any, *, budget: Any = None
+) -> list[str]:
     """Settle the original mission on its own criteria and required tasks."""
     token = await engine._review_token(runtime)
     if getattr(runtime, "mission_id", None) is None:
@@ -715,11 +843,14 @@ async def complete_goal(engine: Any, path: Any, decision: Any, runtime: Any, con
     if pending:
         return pending
     tasks = await engine.deps.task_graph_store.list_tasks(mission_id=runtime.mission_id)
-    errors, task_evidence, excerpts = await _goal_task_coverage(engine, runtime=runtime, tasks=tasks)
+    errors, task_evidence, excerpts = await _goal_task_coverage(
+        engine, runtime=runtime, tasks=tasks
+    )
     if errors:
         return errors
     try:
         from redteam.attack_graph.service import AttackGraphService
+
         cleanup = await AttackGraphService(engine.deps.graph_store).cleanup_report()
         if getattr(cleanup, "outstanding", None):
             return ["required cleanup is still outstanding"]
@@ -728,12 +859,27 @@ async def complete_goal(engine: Any, path: Any, decision: Any, runtime: Any, con
     await engine._check_review_path(runtime, path)
     review = await engine._ask(
         stage="goal_completion_review",
-        payload={**(context or {}), "mission": mission.model_dump(mode="json"), "path": path.model_dump(mode="json"), **_review_payload_common(purpose=getattr(mission, "objective", "") or "", conditions=criteria, excerpts=excerpts)},
+        payload={
+            **(context or {}),
+            "mission": mission.model_dump(mode="json"),
+            "path": path.model_dump(mode="json"),
+            **_review_payload_common(
+                purpose=getattr(mission, "objective", "") or "",
+                conditions=criteria,
+                excerpts=excerpts,
+            ),
+        },
         response_schema=_GoalReview.model_json_schema(),
         system=_engine_system(engine) + RESULT_REVIEW_INSTRUCTION,
         budget=budget,
     )
-    await engine.record_completion_review("goal_completion_review", path, runtime, review, [identity for origins in task_evidence.values() for identity in origins])
+    await engine.record_completion_review(
+        "goal_completion_review",
+        path,
+        runtime,
+        review,
+        [identity for origins in task_evidence.values() for identity in origins],
+    )
     if not review.get("accepted"):
         return ["semantic completion review rejected the evidence"]
     # No new goal prefix cases: the review must cover the original
@@ -748,31 +894,76 @@ async def complete_goal(engine: Any, path: Any, decision: Any, runtime: Any, con
             return ["goal criterion lacks evidence"]
         owners: set[str] = set()
         for identity in item.get("evidence_ids", []):
-            owner = next((str(task_id) for task_id, origins in task_evidence.items() if identity in origins), "")
+            owner = next(
+                (str(task_id) for task_id, origins in task_evidence.items() if identity in origins),
+                "",
+            )
             if not owner:
                 return ["goal criterion cites unrelated evidence"]
             owners.add(owner)
         if not owners:
             return ["goal criterion evidence lacks validated task ownership"]
         errors = await check_result_review(
-            claims=item.get("claims", []), evidence_ids=item["evidence_ids"],
+            claims=item.get("claims", []),
+            evidence_ids=item["evidence_ids"],
             evidence_store=engine.deps.evidence_store,
             graph_service=AttackGraphService(engine.deps.graph_store),
-            path_store=engine.deps.path_store, run_id=str(runtime.run_id),
+            path_store=engine.deps.path_store,
+            run_id=str(runtime.run_id),
             mission_id=str(runtime.mission_id),
         )
         if errors:
             return errors
         bound_tasks[item.get("criterion")] = sorted(owners)
     now = datetime.now(timezone.utc)
+
     async def complete(change: Any) -> None:
         for task in tasks:
-            if getattr(task, "required", False) and getattr(task, "status", None) is TaskStatus.RUNNING:
+            if (
+                getattr(task, "required", False)
+                and getattr(task, "status", None) is TaskStatus.RUNNING
+            ):
                 await change.tasks.transition_task(task.task_id, TaskStatus.COMPLETED, now=now)
-        await change.tasks.update_mission(mission.model_copy(update={"status": MissionStatus.COMPLETED, "updated_at": now, "revision": int(getattr(mission, "revision", 1) or 1) + 1, "criterion_results": [MissionCriterionResult(criterion=item.get("criterion"), met=True, evidence_ids=list(item.get("evidence_ids", [])), task_ids=list(bound_tasks.get(item.get("criterion"), [])), reason=str(review.get("reason", "")), result_claims=list(item.get("claims", [])), purpose_hash=mission_result_purpose(mission)) for item in items]}))
+        await change.tasks.update_mission(
+            mission.model_copy(
+                update={
+                    "status": MissionStatus.COMPLETED,
+                    "updated_at": now,
+                    "revision": int(getattr(mission, "revision", 1) or 1) + 1,
+                    "criterion_results": [
+                        MissionCriterionResult(
+                            criterion=item.get("criterion"),
+                            met=True,
+                            evidence_ids=list(item.get("evidence_ids", [])),
+                            task_ids=[
+                                TaskId(identity)
+                                for identity in bound_tasks.get(item.get("criterion"), [])
+                            ],
+                            reason=str(review.get("reason", "")),
+                            result_claims=list(item.get("claims", [])),
+                            purpose_hash=mission_result_purpose(mission),
+                        )
+                        for item in items
+                    ],
+                }
+            )
+        )
         change.binding(str(runtime.run_id), str(runtime.mission_id))["closed"] = True
+
     await engine._commit_review(runtime, token, complete)
     return []
 
 
-__all__ = ["TASK_RECEIPT_KIND", "EXCERPT_CHARS", "MAX_EXCERPTS", "purpose_hash", "build_task_receipt", "verify_task_receipt", "verify_single_origin", "verify_receipt_bound_origins", "select_task_evidence_ids", "complete_task", "complete_goal"]
+__all__ = [
+    "TASK_RECEIPT_KIND",
+    "EXCERPT_CHARS",
+    "MAX_EXCERPTS",
+    "purpose_hash",
+    "build_task_receipt",
+    "verify_task_receipt",
+    "verify_single_origin",
+    "verify_receipt_bound_origins",
+    "select_task_evidence_ids",
+    "complete_task",
+    "complete_goal",
+]

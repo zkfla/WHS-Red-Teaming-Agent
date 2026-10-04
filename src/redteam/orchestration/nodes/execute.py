@@ -126,7 +126,9 @@ async def _invoke_with_semaphore(
             raise ToolStartRejected("action changed before invocation")
         await claim_action_admission(deps, runtime, step, proposal)
         if isinstance(deps.control_plane, InvocationAdmissionControl):
-            context = await _invocation_context(deps, runtime, proposal, work_id, invocation.tool_id)
+            context = await _invocation_context(
+                deps, runtime, proposal, work_id, invocation.tool_id
+            )
             async with deps.policy_lock:
                 admitted = await deps.control_plane.admit_invocation(
                     proposal, decision, context, receipt_id=str(invocation.invocation_id)
@@ -358,7 +360,9 @@ async def execute_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                 runtime.remaining_budget <= 1 + retry_attempts
             ):
                 break
-            context = await _invocation_context(deps, runtime, proposal, work_id, invocation.tool_id)
+            context = await _invocation_context(
+                deps, runtime, proposal, work_id, invocation.tool_id
+            )
             retry_control = deps.control_plane
             if not isinstance(retry_control, InvocationAdmissionControl):
                 break

@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 from collections import OrderedDict
 from dataclasses import dataclass
-
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -262,7 +261,6 @@ class ContextProjector:
         )
 
 
-
 class MappingStatus(BaseModel):
     """One preserved call: how mapping, processing and reflection went.
 
@@ -310,13 +308,17 @@ def project_mapping_status(*, record: Any, outcome: Any | None = None) -> Mappin
     references = meta.get("target_references")
     reference_count = len(list(references)) if isinstance(references, list) else 0
     record_kind = _public_status_value(meta, "record_kind")
-    stage = _public_status_value(
-        meta, "processing_stage", "stage", "admission", "receipt_kind"
-    )
+    stage = _public_status_value(meta, "processing_stage", "stage", "admission", "receipt_kind")
     status = _public_status_value(
         meta, "processing_status", "processing_outcome", "recovery_status"
     )
-    if status is None and record_kind in {"target_references", "mapper_failure", "recovery_result", "recovery_note", "processing_attempt"}:
+    if status is None and record_kind in {
+        "target_references",
+        "mapper_failure",
+        "recovery_result",
+        "recovery_note",
+        "processing_attempt",
+    }:
         status = record_kind
     proposed = [
         "mapping_status",
@@ -327,6 +329,8 @@ def project_mapping_status(*, record: Any, outcome: Any | None = None) -> Mappin
         "recovery_status",
         "target_references",
     ]
+    mapping_status: str | None
+    mapping_outcome: str | None
     if outcome is not None:
         mapping_status = str(getattr(outcome, "status", "unknown"))
         mapping_outcome = str(getattr(outcome, "status", "unknown"))
@@ -385,15 +389,17 @@ def project_run_processing(records: list[EvidenceRecord]) -> dict[str, dict[str,
         source = sources.get(source_id)
         if source is None or companion.source_type is not EvidenceSourceType.SYSTEM:
             continue
-        if any(getattr(companion, key) != getattr(source, key)
-               for key in ("run_id", "engagement_id", "action_id", "invocation_id")):
+        if any(
+            getattr(companion, key) != getattr(source, key)
+            for key in ("run_id", "engagement_id", "action_id", "invocation_id")
+        ):
             continue
         companions[source_id].append(companion.metadata)
     return {
         identity: project_mapping_status(
-            record=source.model_copy(update={
-                "metadata": _processing_view(source.metadata, companions[identity])
-            })
+            record=source.model_copy(
+                update={"metadata": _processing_view(source.metadata, companions[identity])}
+            )
         ).model_dump(mode="json")
         for identity, source in sources.items()
     }
@@ -412,30 +418,55 @@ def _processing_view(source: dict[str, Any], companions: list[dict[str, Any]]) -
         return dict(source)
     attempt = max(grouped)
     selected = grouped[attempt]
-    view = {key: value for key, value in source.items()
-            if not key.startswith("processing_") and key not in {"attempted", "confirmed", "failed_at"}}
+    view = {
+        key: value
+        for key, value in source.items()
+        if not key.startswith("processing_") and key not in {"attempted", "confirmed", "failed_at"}
+    }
     view["processing_attempt"] = attempt
     previous = max((item for item in grouped if item < attempt), default=1)
-    links = {item.get("supersedes_attempt") for item in selected
-             if "supersedes_attempt" in item}
+    links = {item.get("supersedes_attempt") for item in selected if "supersedes_attempt" in item}
     conflict = attempt > 1 and links != {previous}
     meaningful = (
-        "mapping_status", "mapping_outcome", "processing_status", "processing_stage",
-        "processing_outcome", "recovery_status", "attempted", "confirmed", "failed_at",
+        "mapping_status",
+        "mapping_outcome",
+        "processing_status",
+        "processing_stage",
+        "processing_outcome",
+        "recovery_status",
+        "attempted",
+        "confirmed",
+        "failed_at",
     )
-    unique = {json.dumps({key: item[key] for key in ("record_kind", *meaningful, "target_references") if key in item},
-                         sort_keys=True, default=str): item for item in selected}
+    unique = {
+        json.dumps(
+            {
+                key: item[key]
+                for key in ("record_kind", *meaningful, "target_references")
+                if key in item
+            },
+            sort_keys=True,
+            default=str,
+        ): item
+        for item in selected
+    }
     view["processing_duplicate_count"] = len(selected) - len(unique)
-    endings = [item for item in unique.values()
-               if item.get("processing_status") not in {None, "attempted"}]
+    endings = [
+        item for item in unique.values() if item.get("processing_status") not in {None, "attempted"}
+    ]
     outcomes = {item.get("processing_status") for item in endings}
     detailed = [item for item in endings if item.get("record_kind") == "processing_attempt"]
-    details = {json.dumps({key: item[key] for key in meaningful if key in item},
-                          sort_keys=True, default=str) for item in detailed}
+    details = {
+        json.dumps(
+            {key: item[key] for key in meaningful if key in item}, sort_keys=True, default=str
+        )
+        for item in detailed
+    }
     conflict = conflict or len(outcomes) > 1 or len(details) > 1
     if conflict:
-        view.update(processing_status="unknown", processing_outcome="unknown",
-                    processing_conflict=True)
+        view.update(
+            processing_status="unknown", processing_outcome="unknown", processing_conflict=True
+        )
         return view
     chosen = detailed or endings or list(unique.values())
     for key in meaningful:
@@ -445,21 +476,26 @@ def _processing_view(source: dict[str, Any], companions: list[dict[str, Any]]) -
             if len(distinct) == 1:
                 view[key] = values[0]
     for key in ("mapping_status", "mapping_outcome", "recovery_status"):
-        values = {item[key] for item in selected if isinstance(item.get(key), str)}
-        if key == "recovery_status" and values - {"attempted"}:
+        status_values = {item[key] for item in selected if isinstance(item.get(key), str)}
+        if key == "recovery_status" and status_values - {"attempted"}:
             # Start and final records describe the same recovery, rather
             # than competing endings. Distinct final outcomes still conflict.
-            values.discard("attempted")
-        if len(values) == 1:
-            view[key] = next(iter(values))
-        elif len(values) > 1:
+            status_values.discard("attempted")
+        if len(status_values) == 1:
+            view[key] = next(iter(status_values))
+        elif len(status_values) > 1:
             view[key] = "unknown"
             view["processing_conflict"] = True
-    references = [entry for item in selected for entry in item.get("target_references", [])
-                  if isinstance(entry, dict)]
+    references = [
+        entry
+        for item in selected
+        for entry in item.get("target_references", [])
+        if isinstance(entry, dict)
+    ]
     if references:
-        view["target_references"] = list({json.dumps(entry, sort_keys=True): entry
-                                          for entry in references}.values())
+        view["target_references"] = list(
+            {json.dumps(entry, sort_keys=True): entry for entry in references}.values()
+        )
     return view
 
 

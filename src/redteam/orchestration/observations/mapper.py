@@ -280,7 +280,12 @@ class ResultMapperRegistry:
                 status="failed",
                 reason=type(exc).__name__,
             )
-        if not mutation.nodes and not mutation.edges and not mutation.findings and not mutation.target_references:
+        if (
+            not mutation.nodes
+            and not mutation.edges
+            and not mutation.findings
+            and not mutation.target_references
+        ):
             return MappingOutcome(
                 mutation=mutation,
                 tool_id=str(tool_id),
@@ -293,6 +298,7 @@ class ResultMapperRegistry:
             mapper=name,
             status="mapped",
         )
+
 
 @dataclass(frozen=True)
 class MappingOutcome:
@@ -309,6 +315,7 @@ class MappingOutcome:
     mapper: str | None
     status: str
     reason: str | None = None
+
 
 #: Contribution kind spoken by observation bundles. The composition
 #: root owns collection; the name is the draft so both sides can meet.

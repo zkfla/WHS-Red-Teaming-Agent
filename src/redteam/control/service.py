@@ -36,12 +36,12 @@ from datetime import datetime, timezone
 from redteam.control.approval import ApprovalService
 from redteam.control.audit import AuditLog
 from redteam.control.budget import BudgetTracker
+from redteam.control.outbound import OUTBOUND_MATCHED_RULE, evaluate_with_descriptor
 from redteam.control.policy import (
     evaluate_policy,
     may_auto_approve,
     resolve_risk_threshold,
 )
-from redteam.control.outbound import OUTBOUND_MATCHED_RULE, evaluate_with_descriptor
 from redteam.control.rate_limit import RateLimiter
 from redteam.control.risk import RiskResolver
 from redteam.control.roe import UnsupportedRoePolicyError, check_roe
@@ -51,8 +51,8 @@ from redteam.control.target_action import check_target_action_policies
 from redteam.core.contracts.action import ActionProposal
 from redteam.core.contracts.engagement import Engagement
 from redteam.core.contracts.policy import Approval, ControlContext, PolicyDecision
-from redteam.core.enums import ApprovalStatus, PolicyVerdict, RiskLevel
 from redteam.core.contracts.tool import ToolDescriptor
+from redteam.core.enums import ApprovalStatus, PolicyVerdict, RiskLevel
 from redteam.core.ids import ApprovalId, EngagementId, ToolId
 from redteam.evidence.service import EvidenceService
 
@@ -157,7 +157,11 @@ class DefaultControlPlane:
         if outbound_blocked:
             # Outbound DENY: _finalize stores a cleaned copy plus safe codes only.
             return await self._finalize(
-                proposal, PolicyVerdict.DENY, outbound_reasons, [OUTBOUND_MATCHED_RULE], severity=Severity.BLOCK_ACTION
+                proposal,
+                PolicyVerdict.DENY,
+                outbound_reasons,
+                [OUTBOUND_MATCHED_RULE],
+                severity=Severity.BLOCK_ACTION,
             )
 
         scope_ok, scope_reasons, scope_severity = check_scope(proposal, engagement.scope)
@@ -189,7 +193,11 @@ class DefaultControlPlane:
         )
         if not target_ok:
             return await self._finalize(
-                proposal, PolicyVerdict.DENY, target_reasons, ["target_action_policy"], severity=target_severity
+                proposal,
+                PolicyVerdict.DENY,
+                target_reasons,
+                ["target_action_policy"],
+                severity=target_severity,
             )
 
         risk, risk_unresolved = self._resolve_risk(proposal)
@@ -1000,7 +1008,15 @@ class DefaultControlPlane:
                 else (
                     "admission"
                     if code == "decision_mismatch"
-                    else ("scope" if code == "scope_revoked" else ("target_action_policy" if code == "target_policy_denied" else ("outbound_text" if code == "outbound_blocked" else "roe")))
+                    else (
+                        "scope"
+                        if code == "scope_revoked"
+                        else (
+                            "target_action_policy"
+                            if code == "target_policy_denied"
+                            else ("outbound_text" if code == "outbound_blocked" else "roe")
+                        )
+                    )
                 )
             )
             sev = severity if severity is not None else _severity_for(code)

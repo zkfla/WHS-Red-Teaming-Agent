@@ -163,7 +163,7 @@ async def policy_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             agent_id=proposal.agent_id,
             correlation_id=correlation_id,
             in_flight_actions=in_flight,
-            selected_tool_id=state["plan_step"].tool_id,
+            selected_tool_id=state["plan_step"].tool_id if state["plan_step"] is not None else None,
         )
         try:
             decision = await deps.control_plane.evaluate(proposal, context)
