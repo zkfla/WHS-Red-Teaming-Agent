@@ -193,7 +193,7 @@ def gate_delegation_decision(gate_in: DelegationGateInput) -> DelegationGate:
             action=CLEANUP,
             reason=TERMINATION_ACTIONS_EXHAUSTED,
             investigate_model_allowed=False,
-            cleanup_model_allowed=False,
+            cleanup_model_allowed=decisions_left >= 1,
             remaining_actions=actions_left,
         )
     max_tokens = delegation.budget.max_tokens
