@@ -18,7 +18,11 @@ def create_server(policy: ServerPolicy) -> MCPServer:
 
     @server.tool()
     def session_list() -> dict[str, Any]:
-        """List operator-provisioned test principals; never return credentials."""
+        """List operator-provisioned test principals; never return credentials.
+
+        This is configured inventory only, never proof of use or identity.
+        Verification must read each response's actual_session_ref receipt.
+        """
         return {
             "sessions": [
                 {
@@ -44,6 +48,12 @@ def create_server(policy: ServerPolicy) -> MCPServer:
 
         The operator enables methods and exact paths. A session_ref is bound to one target.
         This tool's success means execution completed, not that a vulnerability was found.
+
+        The response summary carries the actual-use receipt actual_session_ref
+        (None means this request actually ran anonymous). The top-level
+        session_ref echoes the request argument for backward compatibility;
+        actual_session_ref is the verification source. No token/cookie value
+        is ever recorded.
         """
         async with execution_lock:
             response = await request(
@@ -56,6 +66,8 @@ def create_server(policy: ServerPolicy) -> MCPServer:
                 query=query,
                 request_headers=request_headers,
             )
+        # session_ref = requested (compat echo); response.summary() holds the
+        # actual per-request receipt actually used on the wire.
         return {"target_ref": target_ref, "session_ref": session_ref, **response.summary()}
 
     @server.tool()
@@ -68,6 +80,9 @@ def create_server(policy: ServerPolicy) -> MCPServer:
         """Sequential GET with two distinct test principals; compare status/digests.
 
         Equality/difference is an observation, not proof of BOLA. No financial write requests.
+
+        Each side's summary carries its own actual_session_ref receipt so the
+        two actual requests stay distinguished. No secret material recorded.
         """
         first = policy.sessions.get(first_session_ref)
         second = policy.sessions.get(second_session_ref)
@@ -102,6 +117,9 @@ def create_server(policy: ServerPolicy) -> MCPServer:
         """One scoped GET: observe security headers and cookie flags without exposing values.
 
         Presence does not prove effective browser enforcement or regulatory compliance.
+
+        The response summary carries the actual_session_ref receipt for this
+        request (None means anonymous). No secret material recorded.
         """
         async with execution_lock:
             response = await request(policy, target_ref, path, session_ref=session_ref)
@@ -119,6 +137,10 @@ def create_server(policy: ServerPolicy) -> MCPServer:
         """Compare anonymous and registered bearer-session GETs, exactly two requests.
 
         Status/body equality is not proof of an authentication bypass. No cookie reuse.
+
+        The anonymous side's receipt is actual_session_ref None and the
+        authenticated side's receipt is the named ref, kept distinguished per
+        request. No secret material recorded.
         """
         # Validate the named credential before either request, including the anonymous one.
         if session_ref not in policy.sessions:

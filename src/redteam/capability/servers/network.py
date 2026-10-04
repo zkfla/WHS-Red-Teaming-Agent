@@ -116,6 +116,13 @@ class CapturedResponse:
     scheme: str | None = None
     protocol: str | None = None
     url: str | None = None
+    # Opaque receipt of which configured session was actually used for this
+    # live request: str means that named session, None means anonymous.
+    # Only the live request path sets has_session_receipt; fixture/HAR
+    # captures leave it False so an absent receipt is unknown, never proof
+    # of anonymous use. Never a token/cookie value, only the opaque ref.
+    actual_session_ref: str | None = None
+    has_session_receipt: bool = False
 
     def summary(self) -> dict[str, Any]:
         # No raw response, header values, URL query or token is returned to the model.
@@ -146,6 +153,10 @@ class CapturedResponse:
         ):
             if value is not None:
                 summary[key] = value
+        if self.has_session_receipt:
+            # Per-request actual-use receipt. None here means this request
+            # actually ran anonymous; absent means unknown (fixture/capture).
+            summary["actual_session_ref"] = self.actual_session_ref
         return summary
 
 
@@ -229,6 +240,8 @@ async def request(
                         scheme=url.scheme,
                         protocol=response.http_version,
                         url=profile.origin + path,
+                        actual_session_ref=session_ref,
+                        has_session_receipt=True,
                     )
     except (httpx.HTTPError, OSError, asyncio.TimeoutError, TimeoutError) as exc:
         raise ToolInputError("target HTTP request failed") from exc

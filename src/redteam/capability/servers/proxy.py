@@ -269,7 +269,11 @@ def create_server(policy: ServerPolicy, capture_path: str) -> MCPServer:
 
     @server.tool()
     async def proxy_replay_flow(flow_ref: str, session_ref: str | None = None) -> dict[str, Any]:
-        """Replay one operator-approved flow with a configured test session, never captured auth."""
+        """Replay one operator-approved flow with a configured test session, never captured auth.
+
+        The response summary carries the actual-use receipt actual_session_ref
+        (None means this replay actually ran anonymous). No secret recorded.
+        """
         flow = backend.get_flow(flow_ref)
         _require_replay(policy, flow)
         _require_session_for_write(flow, session_ref)
@@ -290,7 +294,11 @@ def create_server(policy: ServerPolicy, capture_path: str) -> MCPServer:
         mutations: dict[str, Any],
         session_ref: str | None = None,
     ) -> dict[str, Any]:
-        """Change allowlisted top-level JSON fields, then replay once with a test session."""
+        """Change allowlisted top-level JSON fields, then replay once with a test session.
+
+        The response summary carries the actual-use receipt actual_session_ref
+        (None means this replay actually ran anonymous). No secret recorded.
+        """
         flow = backend.get_flow(flow_ref)
         _require_replay(policy, flow)
         _require_session_for_write(flow, session_ref)
@@ -322,7 +330,11 @@ def create_server(policy: ServerPolicy, capture_path: str) -> MCPServer:
         first_session_ref: str,
         second_session_ref: str,
     ) -> dict[str, Any]:
-        """Replay one read-only flow with two distinct configured test principals."""
+        """Replay one read-only flow with two distinct configured test principals.
+
+        Each side's summary carries its own actual_session_ref receipt so the
+        two actual replays stay distinguished. No secret material recorded.
+        """
         flow = backend.get_flow(flow_ref)
         _require_replay(policy, flow)
         if flow.method not in _READ_METHODS or flow.request_json is not None:
