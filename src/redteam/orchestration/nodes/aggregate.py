@@ -236,14 +236,14 @@ def update_delegation_from_outcomes(
     ]
     if not mine or delegation.status == "finished":
         return delegation
-    executed = sum(1 for outcome in mine if outcome.executed)
+    consumed = sum(1 + max(outcome.retry_attempts, 0) for outcome in mine if outcome.executed)
     seen = list(delegation.evidence_ids)
     for outcome in mine:
         for evidence_id in outcome.evidence_ids:
             if evidence_id not in seen:
                 seen.append(evidence_id)
     update: dict[str, object] = {
-        "actions_used": delegation.actions_used + executed,
+        "actions_used": delegation.actions_used + consumed,
         "evidence_ids": seen,
     }
     if delegation.status == "active" and any(outcome.approval_id is not None for outcome in mine):

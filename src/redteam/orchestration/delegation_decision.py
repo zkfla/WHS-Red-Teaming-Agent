@@ -64,6 +64,7 @@ TERMINATION_TIME_EXHAUSTED = "time_exhausted"
 TERMINATION_STOPPED = "stopped"
 TERMINATION_DEADLINE_EXCEEDED = "deadline_exceeded"
 TERMINATION_APPROVAL_HELD = "approval_pending"
+TERMINATION_WORKER_HELD = "worker_held"
 TERMINATION_ALREADY_FINISHED = "already_finished"
 
 INVESTIGATE = "investigate"
@@ -184,7 +185,7 @@ def gate_delegation_decision(gate_in: DelegationGateInput) -> DelegationGate:
             action=CLEANUP,
             reason=TERMINATION_TIME_EXHAUSTED,
             investigate_model_allowed=False,
-            cleanup_model_allowed=decisions_left >= 1,
+            cleanup_model_allowed=False,
             remaining_actions=actions_left,
         )
     if actions_left <= 0:
@@ -197,18 +198,18 @@ def gate_delegation_decision(gate_in: DelegationGateInput) -> DelegationGate:
         )
     max_tokens = delegation.budget.max_tokens
     if max_tokens is not None:
-        if (delegation.tokens_used or 0) >= max_tokens:
+        if delegation.tokens_used is None or gate_in.usage_unknown:
             return DelegationGate(
                 action=CLEANUP,
-                reason=TERMINATION_TOKEN_EXHAUSTED,
+                reason=TERMINATION_TOKEN_USAGE_UNKNOWN,
                 investigate_model_allowed=False,
                 cleanup_model_allowed=False,
                 remaining_actions=actions_left,
             )
-        if gate_in.usage_unknown:
+        if delegation.tokens_used >= max_tokens:
             return DelegationGate(
                 action=CLEANUP,
-                reason=TERMINATION_TOKEN_USAGE_UNKNOWN,
+                reason=TERMINATION_TOKEN_EXHAUSTED,
                 investigate_model_allowed=False,
                 cleanup_model_allowed=False,
                 remaining_actions=actions_left,
@@ -462,24 +463,38 @@ def record_decision_consumption(
 ) -> DelegationState:
     """Fold one scoped call measured cost into the delegation.
 
-    Unknown usage never fabricates a zero; the caller raises the
-    unknown flag for the next gate instead.
+    Unknown usage never fabricates a zero: tokens None writes a sticky
+    unknown that later known usage does not clear, so a restart keeps
+    the unknown stop instead of losing it.
     """
 
     update: dict[str, Any] = {
         "decision_attempts_used": max(delegation.decision_attempts_used, 0) + max(requests, 0),
     }
-    if tokens is not None:
-        update["tokens_used"] = (delegation.tokens_used or 0) + max(tokens, 0)
+    if tokens is None:
+        update["tokens_used"] = None
+    elif delegation.tokens_used is not None:
+        update["tokens_used"] = delegation.tokens_used + max(tokens, 0)
     return delegation.model_copy(update=update)
 
 
-def mark_held(delegation: DelegationState, *, reason: str = TERMINATION_APPROVAL_HELD) -> DelegationState:
-    """Park an active delegation while its approval resolves upstream."""
+def mark_held(
+    delegation: DelegationState,
+    *,
+    reason: str = TERMINATION_APPROVAL_HELD,
+    summary: str | None = None,
+    unresolved: Sequence[str] | None = None,
+) -> DelegationState:
+    """Park an active delegation: approvals wait upstream, model holds wait on purpose."""
 
     if delegation.status != "active":
         return delegation
-    return delegation.model_copy(update={"status": "held", "termination_reason": reason})
+    update: dict[str, Any] = {"status": "held", "termination_reason": reason}
+    if summary is not None:
+        update["summary"] = summary
+    if unresolved is not None:
+        update["unresolved"] = list(unresolved)
+    return delegation.model_copy(update=update)
 
 
 
@@ -582,7 +597,12 @@ def apply_turn_result(
             error="worker_next_action returned no verdict",
         )
     if verdict.decision == DECISION_HOLD:
-        parked = mark_held(spent)
+        parked = mark_held(
+            spent,
+            reason=TERMINATION_WORKER_HELD,
+            summary=verdict.summary,
+            unresolved=list(verdict.unresolved) or None,
+        )
         return DelegationDecisionResult(
             delegation=parked,
             gate=gate,

@@ -75,6 +75,9 @@ async def worker_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                 action_id: WorkerOutcome(
                     action_id=action_id,
                     work_id=item.work_id,
+                    delegation_id=item.plan_step.delegation_id,
+                    candidate_key=item.plan_step.candidate_key,
+                    agent_id=str(item.proposal.agent_id),
                     error="lease_lost_before_execution",
                 )
             }
@@ -95,6 +98,9 @@ async def worker_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                         action_id: WorkerOutcome(
                             action_id=action_id,
                             work_id=item.work_id,
+                    delegation_id=item.plan_step.delegation_id,
+                    candidate_key=item.plan_step.candidate_key,
+                    agent_id=str(item.proposal.agent_id),
                             error=("deferred_for_approval" if released else "deferred_lease_lost"),
                         )
                     }
@@ -114,6 +120,14 @@ async def worker_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
         outcome = WorkerOutcome(
             action_id=action_id,
             work_id=item.work_id,
+            delegation_id=item.plan_step.delegation_id,
+            candidate_key=item.plan_step.candidate_key,
+            agent_id=str(item.proposal.agent_id),
+            evidence_ids=(
+                [str(local.get("result_evidence_id"))]
+                if local.get("result_evidence_id") is not None
+                else []
+            ),
             executed=result is not None,
             retry_attempts=local["runtime"].retry_count if result is not None else 0,
             succeeded=result.success if result is not None else None,
@@ -154,6 +168,14 @@ async def worker_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
         outcome = WorkerOutcome(
             action_id=action_id,
             work_id=item.work_id,
+            delegation_id=item.plan_step.delegation_id,
+            candidate_key=item.plan_step.candidate_key,
+            agent_id=str(item.proposal.agent_id),
+            evidence_ids=(
+                [str(local.get("result_evidence_id"))]
+                if local.get("result_evidence_id") is not None
+                else []
+            ),
             executed=attempted,
             retry_attempts=local["runtime"].retry_count if attempted else 0,
             succeeded=result.success if result is not None else False if attempted else None,
