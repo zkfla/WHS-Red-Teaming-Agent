@@ -28,7 +28,7 @@ from redteam.orchestration.knowledge_validation import assessment_blocked, check
 from redteam.orchestration.paths.models import step_definition_equal
 from redteam.orchestration.reasoning_time import reasoning_time_allowed
 from redteam.orchestration.target_references import register_references
-from redteam.orchestration.work.models import ACTIVE_STATUSES, WorkBudget
+from redteam.orchestration.work.models import WorkBudget, WorkStatus
 
 
 def _publish_runtime(engine, runtime, delegations):
@@ -178,8 +178,14 @@ async def decide_delegations(engine, path, runtime, context):
                 continue
             values[identity] = relinked
             state = relinked
+        # Only a genuinely in-flight row blocks a new proposal. A parked
+        # PENDING row (a sibling released by the deferred-for-approval path
+        # in worker_node) is re-acquirable through plan_node's pending lookup
+        # and must never stall this delegation autonomously after resume.
         if any(
-            item.delegation_id == identity and item.status in ACTIVE_STATUSES for item in history
+            item.delegation_id == identity
+            and item.status in (WorkStatus.LEASED, WorkStatus.RUNNING)
+            for item in history
         ):
             continue
         gate = gate_delegation_decision(
