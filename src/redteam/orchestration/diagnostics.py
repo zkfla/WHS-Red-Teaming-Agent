@@ -85,6 +85,13 @@ class DecisionDiagnostic(BaseModel):
     trace: list[dict[str, Any]] = Field(default_factory=list, max_length=20)
     attempt_limit: int | None = None
     stage_attempts: dict[str, int] = Field(default_factory=dict)
+    normal_limit: int | None = None
+    repair_limit: int | None = None
+    normal_used: int = Field(default=0, ge=0)
+    repair_used: int = Field(default=0, ge=0)
+    provider_status: int | None = None
+    provider_code: str | None = None
+    retry_after: float | None = None
 
     @field_validator("trace", mode="before")
     @classmethod

@@ -40,6 +40,7 @@ from pydantic import ValidationError as ModelValidationError
 from tenacity import AsyncRetrying, retry_if_exception_type, stop_after_attempt
 
 from redteam.core.contracts.mission import redact_secret_material
+from redteam.core.ports.llm import LLMProviderFailure
 from redteam.orchestration.diagnostics import (
     DecisionDiagnostic,
     diagnostic_for_exception,
@@ -104,10 +105,27 @@ class DecisionBudget:
     of returning an empty dict.
     """
 
-    def __init__(self, max_attempts: int = 3) -> None:
+    def __init__(
+        self,
+        max_attempts: int = 3,
+        *,
+        normal_limit: int | None = None,
+        repair_limit: int | None = None,
+    ) -> None:
         if max_attempts < 1:
             raise ValueError("max_attempts must be >= 1")
         self._max_attempts = int(max_attempts)
+        if (normal_limit is None) != (repair_limit is None):
+            raise ValueError("normal_limit and repair_limit must be supplied together")
+        repair_value = repair_limit if repair_limit is not None else 0
+        if normal_limit is not None and (normal_limit < 1 or repair_value < 0):
+            raise ValueError("normal_limit must be positive and repair_limit non-negative")
+        self.normal_limit = normal_limit
+        self.repair_limit = repair_limit
+        if normal_limit is not None:
+            self._max_attempts = normal_limit + repair_value
+        self.normal_used = 0
+        self.repair_used = 0
         self._used = 0
         self._tokens_used = 0
         self._tokens_unknown = 0
@@ -120,7 +138,42 @@ class DecisionBudget:
             "trace": list(self.trace),
             "stage_attempts": dict(self.stage_attempts),
             "attempt_limit": self.max_attempts,
+            "normal_limit": self.normal_limit,
+            "repair_limit": self.repair_limit,
+            "normal_used": self.normal_used,
+            "repair_used": self.repair_used,
         }
+
+    @classmethod
+    def reasoning_chain(cls, normal_limit: int, repair_limit: int) -> DecisionBudget:
+        """Bound normal planning separately from correction, without multiplying caps."""
+        return cls(normal_limit=normal_limit, repair_limit=repair_limit)
+
+    def permits(self, *, repair: bool = False) -> bool:
+        if self.remaining <= 0:
+            return False
+        if self.normal_limit is None:
+            return repair or self.normal_used < self.max_attempts
+        if repair:
+            return self.repair_used < (self.repair_limit or 0)
+        return self.normal_used < self.normal_limit
+
+    def exhaustion_code(self, *, repair: bool = False) -> str:
+        if self.normal_limit is None or self.remaining <= 0:
+            return "decision_budget_exhausted"
+        return "decision_repair_budget_exhausted" if repair else "decision_normal_budget_exhausted"
+
+    def record_progress(self, *, stage: str) -> None:
+        """Count a provider decision that made no model request, never invent usage."""
+        if self.normal_limit is None:
+            # Legacy procedure chains still need a finite progress cap.
+            limit = self.max_attempts
+        else:
+            limit = self.normal_limit
+        if self.normal_used >= limit:
+            raise RuntimeError("normal decision budget exhausted")
+        self.normal_used += 1
+        self.record(stage, "provider_decision_without_request")
 
     def record(self, stage: str, outcome: str, **details: Any) -> None:
         self.trace.append(
@@ -195,16 +248,20 @@ class DecisionBudget:
             return True
         return self._tokens_used >= max_tokens
 
-    def consume(self, *, stage: str = "decision") -> int:
+    def consume(self, *, stage: str = "decision", repair: bool = False) -> int:
         """Consume one budgeted LLM request and return remaining.
 
         Raises RuntimeError when no budget remains; the client checks
         remaining first and raises DecisionFailure(kind="budget")
         instead, so this error only signals a programming bug.
         """
-        if self._used >= self._max_attempts:
+        if not self.permits(repair=repair):
             raise RuntimeError("decision budget exhausted")
         self._used += 1
+        if repair:
+            self.repair_used += 1
+        else:
+            self.normal_used += 1
         self.stage_attempts[stage] = self.stage_attempts.get(stage, 0) + 1
         return self.remaining
 
@@ -417,6 +474,15 @@ class StructuredDecisionClient:
                     summary="Return a valid JSON object.",
                     retryable=True,
                 )
+            elif isinstance(exc, LLMProviderFailure):
+                diagnostic = DecisionDiagnostic(
+                    code="llm_provider_" + exc.kind,
+                    stage=stage,
+                    kind="transport",
+                    summary=str(exc),
+                    retryable=exc.retryable,
+                    **exc.diagnostic_fields(),
+                )
             else:
                 diagnostic = DecisionDiagnostic(
                     code="llm_transport_failed",
@@ -454,9 +520,11 @@ class StructuredDecisionClient:
         budget: DecisionBudget,
         before_call: Callable[..., Any] | None = None,
     ) -> dict[str, Any]:
+        is_repair = False
+
         def exhausted() -> DecisionFailure:
             diagnostic = DecisionDiagnostic(
-                code="decision_budget_exhausted",
+                code=budget.exhaustion_code(repair=is_repair),
                 stage=stage,
                 kind="budget",
                 attempts=budget.used,
@@ -502,7 +570,7 @@ class StructuredDecisionClient:
                 budget.last_failure = diagnostic
                 raise DecisionFailure(stage, "budget", budget.used, diagnostic=diagnostic) from exc
 
-        if budget.remaining <= 0:
+        if not budget.permits():
             raise exhausted()
         allowed = budget.remaining
         feedback = ""
@@ -513,10 +581,10 @@ class StructuredDecisionClient:
                 retry=retry_if_exception_type(_RetryableDecisionError),
                 reraise=True,
             ):
-                if budget.remaining <= 0:
+                if not budget.permits(repair=is_repair):
                     raise exhausted()
                 await run_guard()
-                budget.consume(stage=stage)
+                budget.consume(stage=stage, repair=is_repair)
                 budget.record(stage, "request", feedback=safe_feedback(feedback))
                 with attempt:
                     try:
@@ -538,6 +606,11 @@ class StructuredDecisionClient:
                         feedback = exc.feedback
                         kind = exc.kind
                         budget.record(stage, "response_rejected", reason=exc.diagnostic.feedback())
+                        if not exc.diagnostic.retryable:
+                            raise DecisionFailure(
+                                stage, exc.kind, budget.used, diagnostic=budget.last_failure
+                            ) from exc
+                        is_repair = True
                         raise
         except _RetryableDecisionError as exc:
             raise exhausted() from exc

@@ -39,10 +39,10 @@ Responses API.
 from __future__ import annotations
 
 import json
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from typing import Any, cast
 
-from redteam.core.ports.llm import StructuredCompletion
+from redteam.core.ports.llm import LLMProviderFailure, StructuredCompletion
 
 _CHATGPT_PROVIDER = "chatgpt"
 
@@ -166,6 +166,127 @@ def _extract_total_tokens(response: Any) -> int | None:
     return total
 
 
+# Provider-failure normalization (F1). LiteLLM 1.104.0 library source
+# (litellm/exceptions.py) shapes this duck-typed read: every provider error
+# carries ``status_code`` (401/403/404/400/422/408/429/500/502/503, ...),
+# optional short ``code``/``type``, optional ``headers`` mapping with
+# ``retry-after`` on 429/timeout, and an httpx ``response``. We read only
+# those minimal fields. Full message/body/headers/prompts are never stored.
+# Unknown status/code stay unknown. Mapping is generic HTTP semantics only:
+# no model/provider-name branching. Central code reads LLMProviderFailure
+# fields and never imports SDK types.
+
+
+def _safe_status(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int) and 100 <= value <= 599:
+        return value
+    return None
+
+
+def _safe_code(value: Any) -> str:
+    if not isinstance(value, str):
+        return "unknown"
+    text = value.strip()[:100]
+    if not text:
+        return "unknown"
+    if all(char.isalnum() or char in "_-." for char in text):
+        return text
+    return "unknown"
+
+
+def _retry_after_from_headers(headers: Any) -> float | None:
+    try:
+        items = dict(headers) if isinstance(headers, Mapping) else None
+    except Exception:
+        return None
+    if not items:
+        return None
+    lowered = {str(key).lower(): val for key, val in items.items()}
+    for key in ("retry-after", "retry_after", "ratelimit-reset", "retry-after-ms"):
+        if key not in lowered:
+            continue
+        raw = lowered[key]
+        try:
+            number = float(str(raw).strip())
+        except (TypeError, ValueError):
+            continue
+        if key == "retry-after-ms":
+            number = number / 1000.0
+        if number != number or number == float("inf") or number == float("-inf"):
+            continue
+        if number < 0:
+            continue
+        return min(number, 3600.0)
+    return None
+
+
+def _classify_status(status: int | None) -> tuple[str, bool]:
+    if status is None:
+        return ("unknown", True)
+    if status == 429:
+        return ("rate_limited", True)
+    if status in (401, 403):
+        return ("auth", False)
+    if status in (400, 404, 409, 413, 422):
+        return ("invalid_request", False)
+    if status in (408, 504):
+        return ("timeout", True)
+    if status in (500, 502, 503):
+        return ("server", True)
+    if 500 <= status <= 599:
+        return ("server", True)
+    if 400 <= status <= 499:
+        return ("invalid_request", False)
+    return ("unknown", True)
+
+
+def _normalize_provider_error(exc: BaseException) -> LLMProviderFailure:
+    if isinstance(exc, LLMProviderFailure):
+        return exc
+    status = _safe_status(getattr(exc, "status_code", None))
+    if status is None:
+        response = getattr(exc, "response", None)
+        response_status = _chunk_field(response, "status_code") if response is not None else None
+        status = _safe_status(response_status)
+    raw_code = getattr(exc, "code", None)
+    if raw_code is None:
+        raw_code = getattr(exc, "type", None)
+    code = _safe_code(raw_code)
+    retry_after = _retry_after_from_headers(getattr(exc, "headers", None))
+    if retry_after is None:
+        retry_after = _retry_after_from_headers(
+            getattr(getattr(exc, "response", None), "headers", None)
+        )
+    if retry_after is None:
+        for attr in ("retry_after", "retry-after"):
+            candidate = getattr(exc, attr, None)
+            if isinstance(candidate, (int, float)) and not isinstance(candidate, bool):
+                number = float(candidate)
+                if 0 <= number <= 3600.0 and number == number:
+                    retry_after = number
+                    break
+    kind, retryable = _classify_status(status)
+    return LLMProviderFailure(
+        kind=kind,
+        http_status=status,
+        provider_code=code,
+        retryable=retryable,
+        retry_after=retry_after,
+    )
+
+
+def _stream_protocol_failure() -> LLMProviderFailure:
+    return LLMProviderFailure(
+        kind="unknown",
+        http_status=None,
+        provider_code="unknown",
+        retryable=True,
+        retry_after=None,
+    )
+
+
 class LiteLLMClient:
     def __init__(
         self,
@@ -242,12 +363,17 @@ class LiteLLMClient:
         import litellm
 
         full_messages = ([{"role": "system", "content": system}] if system else []) + messages
-        response = await litellm.acompletion(
-            model=self._model,
-            messages=full_messages,
-            api_key=self._api_key,
-            **self._call_kwargs(kwargs),
-        )
+        try:
+            response = await litellm.acompletion(
+                model=self._model,
+                messages=full_messages,
+                api_key=self._api_key,
+                **self._call_kwargs(kwargs),
+            )
+        except LLMProviderFailure:
+            raise
+        except Exception as exc:
+            raise _normalize_provider_error(exc) from exc
         return response.choices[0].message.content or ""
 
     async def complete_structured_with_usage(
@@ -299,12 +425,17 @@ class LiteLLMClient:
                 call_kwargs["response_format"] = _native_chat_completion_format(response_schema)
             else:
                 call_kwargs["response_format"] = {"type": "json_object"}
-        response = await litellm.acompletion(
-            model=self._model,
-            messages=full_messages,
-            api_key=self._api_key,
-            **call_kwargs,
-        )
+        try:
+            response = await litellm.acompletion(
+                model=self._model,
+                messages=full_messages,
+                api_key=self._api_key,
+                **call_kwargs,
+            )
+        except LLMProviderFailure:
+            raise
+        except Exception as exc:
+            raise _normalize_provider_error(exc) from exc
         content = response.choices[0].message.content or "{}"
         return StructuredCompletion(
             value=content,
@@ -362,44 +493,54 @@ class LiteLLMClient:
         if text_format is not None:
             call_kwargs["text"] = {"format": text_format}
 
-        response = await litellm.aresponses(
-            model=self._model,
-            input=messages,
-            instructions=system,
-            api_key=self._api_key,
-            **call_kwargs,
-        )
+        try:
+            response = await litellm.aresponses(
+                model=self._model,
+                input=messages,
+                instructions=system,
+                api_key=self._api_key,
+                **call_kwargs,
+            )
+        except LLMProviderFailure:
+            raise
+        except Exception as exc:
+            raise _normalize_provider_error(exc) from exc
 
         # Only a completed stream counts as success: text without the terminal
         # event means truncation, and partial JSON must never pass as normal.
-        if not streaming:
-            status = _chunk_field(response, "status")
-            if status != "completed":
-                raise RuntimeError(f"chatgpt response not completed: {status or 'unknown status'}")
-            text = _responses_output_text(response)
-            if not text:
-                raise RuntimeError("chatgpt response returned no text")
-            return text
+        # Protocol truncations carry no HTTP status; they normalize to unknown
+        # retryable without provider free-text detail.
+        try:
+            if not streaming:
+                status = _chunk_field(response, "status")
+                if status != "completed":
+                    raise _stream_protocol_failure()
+                text = _responses_output_text(response)
+                if not text:
+                    raise _stream_protocol_failure()
+                return text
 
-        text_parts: list[str] = []
-        completed = False
-        async for chunk in cast(AsyncIterator[Any], response):
-            event_type = _chunk_field(chunk, "type")
-            if event_type == "response.completed":
-                completed = True
-            elif event_type in ("response.failed", "error"):
-                detail = _event_error_detail(chunk)
-                raise RuntimeError(f"chatgpt stream failed: {detail or 'unknown error'}")
-            elif event_type == "response.incomplete":
-                detail = _event_error_detail(chunk)
-                raise RuntimeError(f"chatgpt stream incomplete: {detail or 'truncated output'}")
-            elif event_type == "response.output_text.delta":
-                delta = _chunk_field(chunk, "delta")
-                if isinstance(delta, str) and delta:
-                    text_parts.append(delta)
-        text = "".join(text_parts)
-        if not completed:
-            raise RuntimeError("chatgpt stream ended without completion")
-        if not text:
-            raise RuntimeError("chatgpt stream returned no text")
-        return text
+            text_parts: list[str] = []
+            completed = False
+            async for chunk in cast(AsyncIterator[Any], response):
+                event_type = _chunk_field(chunk, "type")
+                if event_type == "response.completed":
+                    completed = True
+                elif event_type in ("response.failed", "error"):
+                    raise _stream_protocol_failure()
+                elif event_type == "response.incomplete":
+                    raise _stream_protocol_failure()
+                elif event_type == "response.output_text.delta":
+                    delta = _chunk_field(chunk, "delta")
+                    if isinstance(delta, str) and delta:
+                        text_parts.append(delta)
+            text = "".join(text_parts)
+            if not completed:
+                raise _stream_protocol_failure()
+            if not text:
+                raise _stream_protocol_failure()
+            return text
+        except LLMProviderFailure:
+            raise
+        except Exception as exc:
+            raise _normalize_provider_error(exc) from exc

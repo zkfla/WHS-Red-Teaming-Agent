@@ -86,6 +86,8 @@ class OrchestrationSettings(BaseModel):
     #: One runtime mode; frozen legacy core flags do not select it.
     llm_candidate_generation: Literal[True] = True
     decision_max_attempts: int = Field(default=3, ge=1, le=6)
+    # Normal plan/review decisions are not malformed-response retries.
+    decision_normal_limit: int = Field(default=8, ge=1, le=32)
     path_backend: Literal["memory", "sqlite"] = "memory"
 
     #: Overrides the value derived from ``max_steps`` when set.
