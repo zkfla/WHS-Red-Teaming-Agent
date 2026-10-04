@@ -206,6 +206,31 @@ class _ScriptedLabModel:
                         }
                     )
                 return turn
+            task = payload.get("active_task")
+            raw_status = (task or {}).get("status", "") if isinstance(task, dict) else ""
+            task_status = str(raw_status).lower()
+            if isinstance(task, dict) and task_status == "running":
+                task_receipts = [
+                    str(identity).strip()
+                    for step in active_path["steps"]
+                    for identity in (step.get("evidence_ids") or [])
+                    if str(identity).strip()
+                ]
+                return {
+                    "mode": "complete_task",
+                    "reason": "lab task evidence ready",
+                    "actions": [],
+                    "path": None,
+                    "path_step_id": None,
+                    "completion": {
+                        "evidence_ids": task_receipts,
+                        "outcome": "success",
+                        "reason": "lab task evidence ready",
+                        "criterion_results": [],
+                    },
+                    "evidence_request": {},
+                    "hypothesis_update": {},
+                }
             return {
                 "mode": "complete_goal",
                 "reason": "lab sequence done",
@@ -241,6 +266,26 @@ class _ScriptedLabModel:
                 ],
             }
         if route == "completion_review":
+            review_payload = json.loads(messages[0]["content"])
+            if isinstance(review_payload.get("task"), dict):
+                excerpts = review_payload.get("evidence_excerpts", [])
+                task_ids = [
+                    str(item.get("evidence_id", "")).strip()
+                    for item in excerpts
+                    if isinstance(item, dict) and str(item.get("evidence_id", "")).strip()
+                ]
+                assert task_ids, "task review needs related stored evidence"
+                return {
+                    "accepted": True,
+                    "reason": "lab task done",
+                    "claims": [
+                        {
+                            "description": "actual lab task result observed in stored evidence",
+                            "kind": "semantic",
+                            "evidence_ids": task_ids,
+                        }
+                    ],
+                }
             return {"accepted": True, "reason": "lab step done"}
         if route == "analysis_verify":
             return {
