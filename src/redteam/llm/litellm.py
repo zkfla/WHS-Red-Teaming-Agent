@@ -188,6 +188,41 @@ class LiteLLMClient:
         # from the local device-flow cache.
         _, provider, _, _ = litellm.get_llm_provider(model)
         self._is_chatgpt_subscription = provider == _CHATGPT_PROVIDER
+        if self._is_chatgpt_subscription:
+            # Reuse the SDK's current OpenAI text-model catalog instead of
+            # maintaining another list of model names. These aliases describe
+            # capabilities; account access is still decided by the provider.
+            subscription_models = {}
+            for name, info in litellm.model_cost.items():
+                if info.get("litellm_provider") != "openai" or info.get("mode") not in {
+                    "chat",
+                    "responses",
+                }:
+                    continue
+                capabilities = {
+                    key: value
+                    for key, value in info.items()
+                    if key.startswith("supports_")
+                    or key in {"max_tokens", "max_input_tokens", "max_output_tokens"}
+                }
+                subscription_models[f"{provider}/{name.removeprefix('openai/')}"] = {
+                    **capabilities,
+                    "litellm_provider": provider,
+                    "mode": "responses",
+                    "supports_native_streaming": True,
+                }
+            # This endpoint requires native streaming. LiteLLM treats models
+            # missing from its catalog as non-streaming and removes `stream`
+            # from the request, even when the caller explicitly enabled it.
+            # Register the provider's contract for the selected model using
+            # the SDK's public API; no model-name allowlist is needed.
+            subscription_models[model] = {
+                **subscription_models.get(model, {}),
+                "litellm_provider": provider,
+                "mode": "responses",
+                "supports_native_streaming": True,
+            }
+            litellm.register_model(subscription_models)
 
     def _call_kwargs(self, kwargs: dict[str, Any]) -> dict[str, Any]:
         merged: dict[str, Any] = {**self._default_kwargs, **kwargs}

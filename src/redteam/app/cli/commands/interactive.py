@@ -201,7 +201,7 @@ async def _ensure_runtime_config(
 
     console.print("\n[dim]No REDTEAM_LLM_PROVIDER set -- one-time runtime setup.[/dim]")
     while True:
-        model = console.input("LLM model (e.g. chatgpt/gpt-5.5, gpt-4o-mini): ").strip()
+        model = console.input("LLM model (e.g. chatgpt/gpt-6.1-sol, openai/gpt-6-luna): ").strip()
         if model:
             break
         console.print(

@@ -7,7 +7,7 @@ No API key is used for this provider.
 
 Run this once on a machine with a browser and internet access:
 
-    REDTEAM_LLM_MODEL=chatgpt/gpt-5.5 python examples/chatgpt_login.py
+    REDTEAM_LLM_MODEL=chatgpt/gpt-6.1-sol python examples/chatgpt_login.py
 
 On first run it prints a URL + device code. Sign in with your ChatGPT
 account, enter the code, and the token is cached for subsequent real runs.
@@ -22,7 +22,7 @@ from redteam.llm.litellm import LiteLLMClient
 
 
 async def main() -> None:
-    model = os.environ.get("REDTEAM_LLM_MODEL", "chatgpt/gpt-5.5")
+    model = os.environ.get("REDTEAM_LLM_MODEL", "chatgpt/gpt-6.1-sol")
     if not model.startswith("chatgpt/"):
         raise SystemExit(
             f"REDTEAM_LLM_MODEL={model!r} is not a chatgpt/ model; this login "
