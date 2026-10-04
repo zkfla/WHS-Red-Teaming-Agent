@@ -188,14 +188,6 @@ def gate_delegation_decision(gate_in: DelegationGateInput) -> DelegationGate:
             cleanup_model_allowed=False,
             remaining_actions=actions_left,
         )
-    if actions_left <= 0:
-        return DelegationGate(
-            action=CLEANUP,
-            reason=TERMINATION_ACTIONS_EXHAUSTED,
-            investigate_model_allowed=False,
-            cleanup_model_allowed=decisions_left >= 1,
-            remaining_actions=actions_left,
-        )
     max_tokens = delegation.budget.max_tokens
     if max_tokens is not None:
         if delegation.tokens_used is None or gate_in.usage_unknown:
@@ -214,6 +206,14 @@ def gate_delegation_decision(gate_in: DelegationGateInput) -> DelegationGate:
                 cleanup_model_allowed=False,
                 remaining_actions=actions_left,
             )
+    if actions_left <= 0:
+        return DelegationGate(
+            action=CLEANUP,
+            reason=TERMINATION_ACTIONS_EXHAUSTED,
+            investigate_model_allowed=False,
+            cleanup_model_allowed=decisions_left >= 1,
+            remaining_actions=actions_left,
+        )
     if decisions_left <= 0:
         return DelegationGate(
             action=CLEANUP,
