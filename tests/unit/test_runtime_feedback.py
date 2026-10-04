@@ -466,8 +466,9 @@ async def test_aggregate_folds_worker_records_in_dispatch_order() -> None:
         ("action_second", "control"),
     ]
     assert result["runtime"].actions_executed == 1
-    assert result["runtime"].pending_action_id == "action_second"
-    assert result["runtime"].pending_approval_id == "appr_x"
+    # A resolved DENY retains its audit id without creating a new hold.
+    assert result["runtime"].pending_action_id is None
+    assert result["runtime"].pending_approval_id is None
     from langgraph.types import Overwrite
 
     cleared = result["worker_outcomes"]

@@ -14,7 +14,8 @@ from typing import Any, Protocol, runtime_checkable
 class StructuredCompletion:
     """Request-local model value and measured total tokens, when the provider reports it."""
 
-    value: dict[str, Any]
+    #: Raw text is allowed so format errors retain their measured request cost.
+    value: dict[str, Any] | str
     total_tokens: int | None = None
 
 

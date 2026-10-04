@@ -253,9 +253,7 @@ class LiteLLMClient:
             )
             # The subscription streaming route surfaces text only, so the
             # request cost is unknown rather than zero.
-            return StructuredCompletion(
-                value=_parse_json_dict(text), total_tokens=None
-            )
+            return StructuredCompletion(value=text, total_tokens=None)
 
         import litellm
 
@@ -274,7 +272,7 @@ class LiteLLMClient:
         )
         content = response.choices[0].message.content or "{}"
         return StructuredCompletion(
-            value=_parse_json_dict(content),
+            value=content,
             total_tokens=_extract_total_tokens(response),
         )
 
@@ -297,7 +295,11 @@ class LiteLLMClient:
             system=system,
             **kwargs,
         )
-        return completion.value
+        return (
+            _parse_json_dict(completion.value)
+            if isinstance(completion.value, str)
+            else completion.value
+        )
 
     async def _chatgpt_stream_text(
         self,
