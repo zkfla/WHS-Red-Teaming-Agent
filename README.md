@@ -50,7 +50,7 @@ source .venv/bin/activate
 pip install -e ".[dev]"          # dev tooling + everything below except a real LLM provider
 pip install -e ".[dev,agent]"    # ...add `agent` for a real LLM provider too (one command)
 
-redteam                               # interactive: natural-language setup -> Preflight -> run
+redteam                               # interactive: fixed configuration questions -> Preflight -> run
 # -- or the explicit/scripted path --
 redteam init                         # writes ./engagement.yaml
 redteam validate engagement.yaml     # schema/ROE/capability checks, no target touched
@@ -245,12 +245,17 @@ redteam
 
 No YAML, no flags: this reads `engagement.yaml` from the current
 directory if it exists (offering `Start`/`Edit`/`New`/`Quit`), or starts
-a natural-language setup ("어떤 대상을 테스트하려고 하나요?") if it
-doesn't. The first run also does a one-time LLM setup prompt (skipped
+fixed configuration questions if it doesn't. Name, allowed hosts/domains/networks,
+objective, allowed capabilities, and action limit are entered separately; no LLM
+call interprets these answers. Optional limits and restrictions are available
+through the numbered settings menu. The first run also does a one-time LLM setup prompt (skipped
 once `REDTEAM_LLM_PROVIDER` is set — see Config below), persisting the
-answer to `.env`, never to a YAML file. `Edit` re-opens the same
-conversation on the existing config and patches only what you ask to
-change — it never regenerates scope/ROE from scratch. Either way you
+answer to `.env`, never to a YAML file. `Edit` shows a numbered menu; select
+one setting, enter its new value, and press Enter at the menu to save. Empty
+field input preserves the value; `-` clears an optional setting; `q` cancels.
+Existing unrelated scope, approval, rate-limit, rule, and metadata settings
+are preserved. Manually authored or multiple-rule configurations still use
+the existing direct-YAML editing path. Either way you
 land on a Preflight screen (target/scope/focus/budget, enforced ROE vs.
 documented-only notes, LLM/config/scope/MCP status) before anything
 executes, and `Enter` there hands off to the *exact same*
@@ -298,28 +303,14 @@ approval/resume. Redirected stdin uses a sequential fallback. JSON and
 See [CLI session architecture](docs/architecture/cli-session.md) for lifecycle,
 race handling, verification, and known boundaries.
 
-The natural-language layer is `redteam.intake` (the **Engagement Intake
-Assistant**), a distinct role from the Orchestrator:
-
-```text
-Intake Assistant  = prepares an Engagement (collect/structure/validate)
-Orchestrator      = executes one (plan/act/verify) -- unchanged by this
-```
-
-It reuses the same `LLMClient`/LiteLLM wiring as everything else (a
-different system prompt, not a new provider), and it never produces raw
-YAML itself — the model only ever returns a structured, temporary
-`EngagementDraft`; code (`redteam.intake.serializer`) converts a
-*complete* draft into the real `EngagementConfig`/`RuleOfEngagement`
-models and serializes those. Scope is never widened beyond what a draft
-explicitly states (the merge is field-level replace-or-keep, not an
-LLM-driven union), and a restriction that doesn't map onto a real
-enforced field (`denied_capabilities`/`denied_operations`/
-`availability_impact_allowed`) is recorded as a plainly-labeled
-"documented only, not enforced" note rather than silently trusted.
-Secrets (API keys) are collected by the CLI directly (`getpass`, stored
-in `.env`) — the Intake Assistant's schema has no field that could carry
-one, by construction.
+Initial configuration is collected by the CLI's fixed form and converted through
+the existing `redteam.intake` draft/serializer contracts. The LLM remains required
+for investigation planning and runtime conversation, but is not called to name
+an engagement or assign a numeric limit. Additional free-text restrictions are
+labeled as recorded instructions, not automatically enforced policy. API keys
+are still collected separately by the CLI using `getpass` and stored in `.env`.
+The serializer's historical `intake-assistant` source marker remains compatible
+with previously generated configuration files.
 
 `--verbose` adds diagnostic event details; `/trace` and Ctrl+O expose recent
 safe details without changing policy or execution. For automation, use

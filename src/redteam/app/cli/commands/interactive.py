@@ -1,7 +1,7 @@
 """``redteam`` with no subcommand — the interactive entrypoint (sections
 9-12, 28-29 of the spec this module implements).
 
-    User -> CLI -> Engagement Intake Assistant -> Structured Draft
+    User -> CLI -> Fixed configuration questions -> Structured Draft
          -> Config Validator -> Preflight -> Orchestrator -> Agent
          -> Capability -> Control Plane -> Tool
 
@@ -54,6 +54,7 @@ from redteam.app.cli.conversation import (
     ConversationError,
     catalog_tool_labels,
 )
+from redteam.app.cli.engagement_form import collect_engagement
 from redteam.app.cli.interactive_commands import InteractiveSession
 from redteam.capability.settings import MCPConfigurationError, mcp_server_ids_from_environment
 from redteam.control.approval import ApprovalService
@@ -71,17 +72,9 @@ from redteam.core.config import (
 from redteam.core.enums import ApprovalStatus
 from redteam.core.ids import ApprovalId
 from redteam.core.ports.llm import LLMClient
-from redteam.intake.assistant import IntakeAssistant, IntakeAssistantError, IntakeSession
-from redteam.intake.fallback import deterministic_intake_turn
-from redteam.intake.models import missing_required_fields
 from redteam.intake.serializer import (
-    DraftIncompleteError,
     UnsafeEditError,
-    draft_to_engagement_config,
     dump_engagement_yaml,
-    engagement_config_to_draft,
-    merge_draft,
-    scope_diff,
 )
 from redteam.orchestration.engagement_planner import sanitize_objective
 from redteam.orchestration.state import RuntimeState, TerminationReason
@@ -367,109 +360,18 @@ def _write_recon_policy(host: str) -> Path:
 # --- Engagement Intake (sections 9, 12) ------------------------------------
 
 
-def _build_intake_assistant(llm_client: LLMClient) -> IntakeAssistant:
-    """Use the configured model for structured intake in every environment."""
-    return IntakeAssistant(llm_client)
-
-
 async def _new_engagement(console: Console, llm_client: LLMClient) -> EngagementConfig | None:
-    assistant = _build_intake_assistant(llm_client)
-    session = IntakeSession()
-    first_message = console.input("[cyan]>[/cyan] 어떤 대상을 테스트하려고 하나요? ")
-    if not first_message.strip():
-        return None
-    return await _intake_loop(console, assistant, session, first_message)
+    return collect_engagement(console)
 
 
 async def _edit_engagement(
     console: Console, llm_client: LLMClient, existing: EngagementConfig
 ) -> EngagementConfig | None:
     try:
-        draft = engagement_config_to_draft(existing)
+        return collect_engagement(console, existing)
     except UnsafeEditError as exc:
         console.print(f"\n[red]{exc}[/red]")
         return None
-
-    assistant = _build_intake_assistant(llm_client)
-    session = IntakeSession(draft=draft, editing=True)
-    message = console.input("[cyan]>[/cyan] 뭘 바꿀까요? ")
-    if not message.strip():
-        return None
-
-    before = draft.model_copy(deep=True)
-    updated = await _intake_loop(console, assistant, session, message)
-    if updated is None:
-        return None
-
-    diff = scope_diff(before, session.draft)
-    if diff:
-        console.print("\n[bold]Scope changes[/bold]")
-        for field_name, (added, removed) in diff.items():
-            for host in added:
-                console.print(f"  [green]+[/green] {field_name}: {host}")
-            for host in removed:
-                console.print(f"  [red]-[/red] {field_name}: {host}")
-    return updated
-
-
-async def _intake_loop(
-    console: Console,
-    assistant: IntakeAssistant | None,
-    session: IntakeSession,
-    first_message: str,
-) -> EngagementConfig | None:
-    message = first_message
-    while True:
-        if assistant is None:
-            # No real model configured (see _build_intake_assistant) -- go
-            # straight to the deterministic parser every turn instead of
-            # round-tripping a canned, unhelpful structured response.
-            turn = deterministic_intake_turn(session.draft, sanitize_objective(message))
-        else:
-            try:
-                turn = await assistant.step(session, sanitize_objective(message))
-            except IntakeAssistantError as exc:
-                if session.editing:
-                    console.print(f"[red]{renderer.theme.ICON_FAILURE} {exc}[/red]")
-                    return None
-                turn = deterministic_intake_turn(session.draft, sanitize_objective(message))
-
-        session.draft = merge_draft(session.draft, turn.draft)
-        if turn.acknowledgement:
-            console.print(f"\n{turn.acknowledgement}")
-
-        missing = missing_required_fields(session.draft)
-        if not missing and turn.ready:
-            break
-
-        questions = list(turn.follow_up_questions)
-        if not questions and missing:
-            questions = [f"아직 확인이 필요합니다: {', '.join(missing)}"]
-        if not questions:
-            # The model thinks it's done but the code-side check disagrees
-            # with nothing to ask -- surface the gap plainly and stop
-            # looping forever (section 6: code decides, not the model).
-            questions = [f"확인이 더 필요합니다: {', '.join(missing) or 'unspecified'}"]
-
-        console.print("\n테스트 범위를 조금 더 확인하겠습니다.\n")
-        # Recheck the draft after each answer; ask only the next missing item.
-        console.print(f"  1. {questions[0]}")
-        message = console.input("\n[cyan]>[/cyan] ")
-        if not message.strip() or message.strip().lower() in {"q", "quit"}:
-            return None
-
-    try:
-        result = draft_to_engagement_config(session.draft)
-    except DraftIncompleteError as exc:
-        console.print(f"[red]{exc}[/red]")
-        return None
-
-    if result.unenforced_operations:
-        console.print(
-            f"\n[yellow]{renderer.theme.ICON_WARNING} Documented only, not enforced: "
-            f"{', '.join(result.unenforced_operations)}[/yellow]"
-        )
-    return result.engagement_config
 
 
 # --- Existing-config menu (section 11) -------------------------------------
@@ -572,7 +474,7 @@ async def _preflight_loop(
                 console,
                 target=engagement_config.name,
                 problem="; ".join(problems),
-                suggested_fix="Choose [E] Edit to fix this through the assistant, "
+                suggested_fix="Choose [E] Edit to fix the configuration, "
                 "or edit engagement.yaml directly.",
             )
             choice = renderer.prompt_choice(console, "", "[ E ] Edit   [ Q ] Quit")

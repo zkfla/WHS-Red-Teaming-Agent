@@ -1,6 +1,5 @@
 """``redteam`` with no subcommand (sections 9-12, 26): in-process so the
-Intake Assistant's LLM call and the terminal's stdin can both be
-scripted deterministically, instead of a real network/tty.
+fixed configuration prompts and terminal input are exercised without a real network/tty.
 
 Real ``run_command.build``/``execute`` still runs for real underneath
 (same ``ExampleMCPAdapter``/``FakeLLMClient`` path
@@ -12,7 +11,7 @@ from __future__ import annotations
 
 import contextlib
 from pathlib import Path
-from typing import Any, cast
+from typing import cast
 
 import pytest
 import yaml
@@ -81,9 +80,6 @@ def _patch(
     from tests.integration.test_cli_session import _ConversationLLM
 
     monkeypatch.setattr(interactive, "build_llm_client", lambda config: _ConversationLLM())
-    from redteam.intake.assistant import IntakeAssistant
-
-    monkeypatch.setattr(interactive, "_build_intake_assistant", lambda client: IntakeAssistant(llm))
     # Setup/UI tests must not call a real provider. Exercise the canonical
     # application runtime with the same explicit hold model as session tests.
     from redteam.app.cli.commands import run as run_command
@@ -130,8 +126,14 @@ async def test_no_config_intake_completes_preflight_and_runs(
         monkeypatch,
         tmp_path,
         answers=[
-            "127.0.0.1:5000의 VulnBank 테스트, 인증/금융 로직 위주, "
-            "DoS/데이터삭제 금지, 최대 100개",
+            "VulnBank Local",
+            "127.0.0.1:5000",
+            "",
+            "",
+            "인증/금융 로직 조사",
+            "recon, web",
+            "100",
+            "n",
             "",  # existing-config menu -> Start (config was just created)
             "n",  # one-time MCP auto-setup prompt -> decline
             "",  # preflight -> Start
@@ -196,59 +198,90 @@ async def test_existing_config_quick_start_needs_only_objective_input(
     assert any("RunId:" in line for line in console.transcript)
 
 
-async def test_guided_intake_asks_only_next_missing_question() -> None:
-    from redteam.intake.assistant import IntakeAssistant, IntakeSession
-
-    llm = _ScriptedIntakeLLM(
+async def test_fixed_setup_preserves_name_and_never_calls_model() -> None:
+    llm = _ScriptedIntakeLLM([])
+    console = _FakeConsole(
         [
-            {
-                "draft": {"name": "VulnBank", "allowed_hosts": ["example.local"]},
-                "follow_up_questions": ["최대 action 수는?", "이미 알려준 범위는?"],
-                "ready": False,
-            },
-            {"draft": {"max_actions": 5}, "follow_up_questions": [], "ready": True},
+            "mock-bank 취약점 조사 및 증명",
+            "localhost:8081",
+            "",
+            "",
+            "권한 검증",
+            "recon, web",
+            "30",
+            "n",
         ]
     )
-    console = _FakeConsole(["5"])
-
-    config = await interactive._intake_loop(
-        cast(Console, console), IntakeAssistant(llm), IntakeSession(), "VulnBank 점검"
-    )
-
+    config = await interactive._new_engagement(cast(Console, console), llm)
     assert config is not None
-    assert config.execution_budget.max_actions == 5
-    assert any("최대 action 수는?" in line for line in console.transcript)
-    assert not any("이미 알려준 범위는?" in line for line in console.transcript)
+    assert config.name == "mock-bank 취약점 조사 및 증명"
+    assert config.description == "권한 검증"
+    assert config.scope.allowed_hosts == ["localhost:8081"]
+    assert config.execution_budget.max_actions == 30
+    assert llm.calls == []
 
 
-async def test_guided_intake_recovers_from_llm_failure_without_repeating_input() -> None:
-    from redteam.intake.assistant import IntakeAssistant, IntakeSession
-
-    class _UnavailableLLM:
-        async def complete(
-            self,
-            *,
-            messages: list[dict[str, Any]],
-            system: str | None = None,
-            **kwargs: Any,
-        ) -> str:
-            raise RuntimeError("unavailable")
-
-        async def complete_structured(self, **_kwargs):  # noqa: ANN202
-            raise RuntimeError("unavailable")
-
-    console = _FakeConsole(["5", "recon, web"])
-    config = await interactive._intake_loop(
-        cast(Console, console),
-        IntakeAssistant(_UnavailableLLM()),
-        IntakeSession(),
-        "https://example.local:8443 테스트해줘",
+async def test_fixed_setup_reprompts_invalid_count_without_model() -> None:
+    llm = _ScriptedIntakeLLM([])
+    console = _FakeConsole(
+        [
+            "bank",
+            "localhost:8081",
+            "",
+            "",
+            "inspect",
+            "recon",
+            "많이",
+            "-3",
+            "30",
+            "n",
+        ]
     )
-
+    config = await interactive._new_engagement(cast(Console, console), llm)
     assert config is not None
-    assert config.scope.allowed_hosts == ["example.local:8443"]
-    assert config.execution_budget.max_actions == 5
-    assert config.rules_of_engagement[0].allowed_capabilities == ["recon", "web"]
+    assert config.execution_budget.max_actions == 30
+    assert llm.calls == []
+
+
+async def test_fixed_edit_preserves_unrelated_policy_and_explicitly_clears_optional_values():
+    from redteam.intake.models import EngagementDraft
+    from redteam.intake.serializer import draft_to_engagement_config
+
+    original = draft_to_engagement_config(
+        EngagementDraft(
+            name="bank",
+            allowed_hosts=["localhost:8081"],
+            max_actions=30,
+            description="inspect",
+            allowed_capabilities=["recon"],
+        )
+    ).engagement_config
+    original = original.model_copy(
+        update={
+            "metadata": {**original.metadata, "custom": "preserve"},
+            "rate_limit_policy": original.rate_limit_policy.model_copy(
+                update={"max_actions_per_minute": 7}
+            ),
+            "scope": original.scope.model_copy(update={"denied_hosts": ["excluded.local"]}),
+            "rules_of_engagement": [
+                original.rules_of_engagement[0].model_copy(
+                    update={"allowed_operations": ["service_discovery"], "max_parallel_actions": 2}
+                )
+            ],
+        }
+    )
+    llm = _ScriptedIntakeLLM([])
+    console = _FakeConsole(["5", "-", "7", "50", ""])
+    edited = await interactive._edit_engagement(cast(Console, console), llm, original)
+    assert edited is not None
+    assert edited.description == ""
+    assert edited.execution_budget.max_actions == 50
+    assert edited.scope == original.scope
+    assert edited.rate_limit_policy == original.rate_limit_policy
+    assert edited.approval_policy == original.approval_policy
+    assert edited.metadata == original.metadata
+    assert edited.rules_of_engagement == original.rules_of_engagement
+    assert llm.calls == []
 
 
 async def test_intake_llm_never_receives_a_secret(
@@ -259,8 +292,14 @@ async def test_intake_llm_never_receives_a_secret(
         monkeypatch,
         tmp_path,
         answers=[
-            "127.0.0.1:5000의 VulnBank 테스트, 인증/금융 로직 위주, "
-            "DoS/데이터삭제 금지, 최대 100개",
+            "VulnBank Local",
+            "127.0.0.1:5000",
+            "",
+            "",
+            "인증/금융 로직 조사",
+            "recon, web",
+            "100",
+            "n",
             "",  # existing-config menu -> Start
             "n",  # one-time MCP auto-setup prompt -> decline
             "",  # preflight -> Start
@@ -270,11 +309,7 @@ async def test_intake_llm_never_receives_a_secret(
 
     await interactive.run(_args())
 
-    for call in llm.calls:
-        blob = str(call["messages"]) + str(call["system"])
-        assert "sk-" not in blob
-        assert "Bearer" not in blob
-        assert "api_key" not in blob
+    assert llm.calls == []
 
 
 async def test_blank_first_answer_aborts_without_writing_engagement(
@@ -326,7 +361,9 @@ async def test_edit_patches_only_the_requested_field(
         tmp_path,
         answers=[
             "e",  # existing-config menu -> Edit
-            "최대 action을 200으로 바꿔줘",
+            "7",
+            "200",
+            "",  # choose max_actions, enter value, save
             "",  # back at existing-config menu after the edit -> Start
             "n",  # one-time MCP auto-setup prompt -> decline
             "",  # preflight -> Start

@@ -5,8 +5,7 @@ subcommands, and a second natural-language request must go through the
 same Runtime path as the first -- all through the real
 ``redteam.app.cli.commands.interactive.run()`` entry point, exactly like
 ``tests/integration/test_cli_interactive.py`` (same in-process
-``_FakeConsole``/``_ScriptedIntakeLLM`` doubles; only the Intake
-Assistant's LLM client and the terminal are test doubles -- the Agent
+terminal and runtime conversation/model doubles -- the Agent
 Runtime, Control Plane, and Capability Gateway run for real against an
 honest empty catalog (no MCP servers configured). The execution model is
 an explicitly injected hold plan and the Intake Assistant uses its own
@@ -202,6 +201,7 @@ class _HoldLLM:
             return {"accepted": False, "reason": "session hold", "claims": []}
         if route == "goal_completion_review":
             import json as _json2
+
             payload = _json2.loads(messages[0]["content"]) if messages else {}
             criteria = (payload.get("mission") or {}).get("success_criteria", []) or []
             return {
@@ -241,14 +241,6 @@ def _patch(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, answers: list[str]) 
     console = _FakeConsole(answers)
     monkeypatch.setattr(interactive, "Console", lambda: console)
     monkeypatch.setattr(interactive, "build_llm_client", lambda config: _ConversationLLM())
-    from redteam.intake.assistant import IntakeAssistant
-
-    intake_llm = _ScriptedIntakeLLM([dict(_COMPLETE_TURN)])
-
-    def _intake_for_test(client):
-        return IntakeAssistant(intake_llm)
-
-    monkeypatch.setattr(interactive, "_build_intake_assistant", _intake_for_test)
     hold_llm = _HoldLLM()
     original_build = run_command.build_application
 
@@ -276,7 +268,14 @@ async def test_run_finished_returns_to_prompt_and_accepts_slash_commands(
         monkeypatch,
         tmp_path,
         answers=[
-            "127.0.0.1:5000의 VulnBank 테스트, 최대 100개",  # first message -> intake
+            "VulnBank Local",
+            "127.0.0.1:5000",
+            "",
+            "",
+            "inspect",
+            "recon",
+            "100",
+            "n",  # fixed setup answers
             "",  # existing-config menu -> Start
             "",  # preflight -> Start
             "/help",
@@ -318,7 +317,14 @@ async def test_natural_language_second_request_runs_a_second_agent_run(
         monkeypatch,
         tmp_path,
         answers=[
-            "127.0.0.1:5000의 VulnBank 테스트, 최대 100개",
+            "VulnBank Local",
+            "127.0.0.1:5000",
+            "",
+            "",
+            "inspect",
+            "recon",
+            "100",
+            "n",
             "",
             "",
             "127.0.0.1:5000 다시 한 번 점검해줘",  # second objective, plain text
@@ -346,7 +352,14 @@ async def test_natural_language_explanation_does_not_start_a_new_run(
         monkeypatch,
         tmp_path,
         answers=[
-            "127.0.0.1:5000의 VulnBank 테스트, 최대 100개",
+            "VulnBank Local",
+            "127.0.0.1:5000",
+            "",
+            "",
+            "inspect",
+            "recon",
+            "100",
+            "n",
             "",
             "",
             "방금 왜 실패했어?",
@@ -368,7 +381,14 @@ async def test_free_form_question_is_answered_without_starting_a_new_run(
         monkeypatch,
         tmp_path,
         answers=[
-            "127.0.0.1:5000의 VulnBank 테스트, 최대 100개",
+            "VulnBank Local",
+            "127.0.0.1:5000",
+            "",
+            "",
+            "inspect",
+            "recon",
+            "100",
+            "n",
             "",
             "",
             "결과에서 확인된 내용이 뭐야?",
@@ -390,7 +410,14 @@ async def test_bare_exit_ends_session_without_starting_a_new_run(
         monkeypatch,
         tmp_path,
         answers=[
-            "127.0.0.1:5000의 VulnBank 테스트, 최대 100개",
+            "VulnBank Local",
+            "127.0.0.1:5000",
+            "",
+            "",
+            "inspect",
+            "recon",
+            "100",
+            "n",
             "",
             "",
             "exit",
@@ -414,7 +441,14 @@ async def test_unknown_slash_command_does_not_end_the_session(
         monkeypatch,
         tmp_path,
         answers=[
-            "127.0.0.1:5000의 VulnBank 테스트, 최대 100개",
+            "VulnBank Local",
+            "127.0.0.1:5000",
+            "",
+            "",
+            "inspect",
+            "recon",
+            "100",
+            "n",
             "",
             "",
             "/this-command-does-not-exist",
@@ -441,7 +475,14 @@ async def test_eof_at_idle_prompt_ends_the_session_cleanly(
         monkeypatch,
         tmp_path,
         answers=[
-            "127.0.0.1:5000의 VulnBank 테스트, 최대 100개",
+            "VulnBank Local",
+            "127.0.0.1:5000",
+            "",
+            "",
+            "inspect",
+            "recon",
+            "100",
+            "n",
             "",
             "",
             # nothing after the first run -- console.input() raises EOFError
