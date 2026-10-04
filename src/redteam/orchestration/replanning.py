@@ -477,6 +477,15 @@ async def _terminal_criterion_results(mission, tasks, evidence, llm_client, budg
     }
     bound: dict[str, set[str]] = {key: set(value) for key, value in dict(receipt_bound or {}).items()}
     unproven: set[str] = set(receipt_unproven or set())
+    if unproven:
+        return [
+            MissionCriterionResult(
+                criterion=criterion, met=False,
+                reason="completed required task proof is missing or obsolete",
+                task_ids=[TaskId(identity) for identity in sorted(unproven)],
+            )
+            for criterion in wanted
+        ], None
     owned: dict[str, str] = dict(owners or {})
     reviewable = {eid for eid, tid in owned.items() if tid in completed and tid not in unproven}
     eligible: dict[str, Any] = {}
@@ -788,6 +797,7 @@ async def finalize_mission(
             outcome = MissionStatus.FAILED
         elif (
             tasks
+            and not unproven
             and all(task.status is TaskStatus.COMPLETED for task in required)
             and all(result.met for result in criterion_results)
         ):

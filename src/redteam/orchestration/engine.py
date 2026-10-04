@@ -1648,6 +1648,11 @@ class InvestigationEngine:
                             before_call=verification_guard(review_state, deps=self.deps,
                                                            budget=model_budget),
                         )
+                    except Exception as exc:
+                        recovered = {
+                            "status": "failed", "evidence_id": evidence_id,
+                            "reason": type(exc).__name__,
+                        }
                     finally:
                         delegation_id = getattr(origin_step, "delegation_id", None)
                         delegation = runtime.delegations.get(delegation_id)

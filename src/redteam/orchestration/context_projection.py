@@ -446,6 +446,10 @@ def _processing_view(source: dict[str, Any], companions: list[dict[str, Any]]) -
                 view[key] = values[0]
     for key in ("mapping_status", "mapping_outcome", "recovery_status"):
         values = {item[key] for item in selected if isinstance(item.get(key), str)}
+        if key == "recovery_status" and values - {"attempted"}:
+            # Start and final records describe the same recovery, rather
+            # than competing endings. Distinct final outcomes still conflict.
+            values.discard("attempted")
         if len(values) == 1:
             view[key] = next(iter(values))
         elif len(values) > 1:
