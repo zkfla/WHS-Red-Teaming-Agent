@@ -217,23 +217,32 @@ async def test_resolver_timeout_is_distinct_from_dns_failure() -> None:
 
 
 async def test_relative_redirect_validates_dns_again_and_drops_cookies() -> None:
+    # Single-hop contract: one request returns the unvisited redirect target;
+    # DNS/scope for the target is checked on the next explicit request.
     first = Body((b"redirect body must not be read",))
     harness = Harness(lambda req: response(
         status=302, headers={"location": "../final", "set-cookie": "session=SECRET"},
         stream=first,
     ) if req.url.path == "/dir/start" else response())
     result = await harness.fetch(ORIGIN + "/dir/start")
-    assert result.final_url == ORIGIN + "/final"
-    assert len(harness.requests) == len(harness.resolutions) == 2
+    assert result.status_code == 302
+    assert result.final_url == ORIGIN + "/dir/start"
+    assert result.redirect_url == ORIGIN + "/final"
+    assert result.body_present is False
+    assert result.text == "" and result.content_type == ""
+    assert len(harness.requests) == len(harness.resolutions) == 1
     assert first.closed and first.reads == 0
-    await harness.fetch(ORIGIN + "/final")
+    assert all("cookie" not in req.headers and "authorization" not in req.headers
+               for req in harness.requests)
+    follow = await harness.fetch(result.redirect_url or ORIGIN + "/final")
+    assert follow.final_url == ORIGIN + "/final"
+    assert follow.body_present is True
+    assert len(harness.requests) == len(harness.resolutions) == 2
     assert all("cookie" not in req.headers and "authorization" not in req.headers
                for req in harness.requests)
 
 
 @pytest.mark.parametrize("location,code", [
-    ("https://evil.example", "access_denied"),
-    ("https://docs.example:8443", "access_denied"),
     ("http://docs.example", "redirect_error"),
     ("https://u:SECRET@docs.example", "redirect_error"),
     ("", "redirect_error"), ("https://[broken", "redirect_error"),
@@ -246,27 +255,57 @@ async def test_bad_redirect_does_not_send_next_request(location: str, code: str)
     assert len(harness.requests) == 1
 
 
+@pytest.mark.parametrize("location", [
+    "https://evil.example",
+    "https://docs.example:8443",
+])
+async def test_disallowed_redirect_returns_unvisited_target_and_next_request_denies(
+    location: str,
+) -> None:
+    # Well-formed but unapproved destinations are returned unvisited;
+    # the actual destination safety check runs on the next explicit request.
+    harness = Harness(lambda _: response(status=302, headers={"location": location}))
+    result = await harness.fetch()
+    assert result.status_code == 302
+    assert result.final_url == ORIGIN + "/"
+    assert result.redirect_url == location + "/"
+    assert result.body_present is False
+    assert len(harness.requests) == 1
+    with pytest.raises(PageTextError, match="access_denied"):
+        await harness.fetch(result.redirect_url or location)
+    assert len(harness.requests) == 1
+
+
 async def test_redirect_to_allowed_private_dns_is_denied() -> None:
     harness = Harness(lambda _: response(status=302, headers={"location": "/next"}))
     async def changing(host: str, port: int) -> tuple[str, ...]:
         return ("127.0.0.1",) if harness.requests else (PUBLIC_IP,)
     reader = PageTextReader(harness.config, resolver=changing,
                            transport_factory=lambda: httpx.MockTransport(harness.handle))
+    first = await reader.fetch_page_text(PageTextRequest(url=ORIGIN))
+    assert first.redirect_url == ORIGIN + "/next"
+    assert first.body_present is False
+    assert len(harness.requests) == 1
     with pytest.raises(PageTextError, match="access_denied"):
-        await reader.fetch_page_text(PageTextRequest(url=ORIGIN))
+        await reader.fetch_page_text(
+            PageTextRequest(url=first.redirect_url or ORIGIN + "/next")
+        )
     assert len(harness.requests) == 1
 
 
-@pytest.mark.parametrize("loop,maximum,expected", [(True, 3, 1), (False, 2, 3), (False, 0, 1)])
-async def test_redirect_loop_and_limit(loop: bool, maximum: int, expected: int) -> None:
+@pytest.mark.parametrize("loop,maximum", [(True, 3), (False, 2), (False, 0)])
+async def test_redirect_loop_and_limit(loop: bool, maximum: int) -> None:
+    # max_redirects is compat-only: one hop is returned, never auto-followed.
     harness = Harness(
         lambda req: response(status=302, headers={
             "location": "/" if loop else req.url.path + "next/",
         }), config=PageTextConfig(allowed_origins=(ORIGIN,), max_redirects=maximum),
     )
-    with pytest.raises(PageTextError, match="redirect_error"):
-        await harness.fetch()
-    assert len(harness.requests) == expected
+    result = await harness.fetch()
+    assert result.status_code == 302
+    assert result.body_present is False
+    assert result.redirect_url is not None
+    assert len(harness.requests) == 1
 
 
 @pytest.mark.parametrize("length", [None, "1", "5"])
@@ -360,7 +399,10 @@ async def test_safe_network_errors_and_logs(
         raise exception
     caplog.set_level(logging.DEBUG)
     harness = Harness(fail)
-    url = ORIGIN + "/SECRET_PATH?token=SECRET_QUERY"
+    # Narrow outbound check blocks explicit credential shapes (e.g. token=);
+    # use a non-credential secret marker so the network error path is reached
+    # while still proving secrets never leak into logs or error text.
+    url = ORIGIN + "/SECRET_PATH?next=SECRET_QUERY"
     with pytest.raises(PageTextError, match=code) as error:
         await harness.fetch(url)
     assert "SECRET" not in caplog.text + "".join(traceback.format_exception(error.value))
@@ -381,16 +423,17 @@ async def test_total_timeout_covers_dns_and_stream_cleanup() -> None:
 
 
 async def test_total_timeout_does_not_reset_at_redirects() -> None:
+    # Single-hop contract: the total timeout bounds the one request.
     harness = Harness(config=PageTextConfig(allowed_origins=(ORIGIN,), timeout_seconds=0.08))
     async def slow(request: httpx.Request) -> httpx.Response:
         harness.requests.append(request)
-        await asyncio.sleep(0.05)
+        await asyncio.sleep(0.15)
         return response(status=302, headers={"location": request.url.path + "next/"})
     reader = PageTextReader(harness.config, resolver=harness.resolve,
                            transport_factory=lambda: httpx.MockTransport(slow))
     with pytest.raises(PageTextError, match="timeout"):
         await reader.fetch_page_text(PageTextRequest(url=ORIGIN))
-    assert len(harness.requests) == 2
+    assert len(harness.requests) == 1
 
 
 def test_schema_rejects_policy_override_and_hides_validation_inputs() -> None:
@@ -503,9 +546,22 @@ async def test_cross_origin_redirect_preserves_new_origin_without_forwarding_cre
         config=PageTextConfig(allowed_origins=(ORIGIN, "https://other.example")),
     )
     result = await harness.fetch()
-    assert result.final_url == "https://other.example/final"
+    assert result.status_code == 303
+    assert result.final_url == ORIGIN + "/"
+    assert result.redirect_url == "https://other.example/final"
+    assert result.body_present is False
+    assert len(harness.requests) == 1
+    assert harness.requests[-1].extensions["sni_hostname"] == "docs.example"
+    assert "referer" not in harness.requests[-1].headers
+    assert all("cookie" not in req.headers and "authorization" not in req.headers
+               for req in harness.requests)
+    follow = await harness.fetch(result.redirect_url or "https://other.example/final")
+    assert follow.final_url == "https://other.example/final"
+    assert follow.body_present is True
     assert harness.requests[-1].extensions["sni_hostname"] == "other.example"
     assert "referer" not in harness.requests[-1].headers
+    assert all("cookie" not in req.headers and "authorization" not in req.headers
+               for req in harness.requests)
 
 
 async def test_successful_response_does_not_log_secret_headers_or_body(
@@ -514,6 +570,28 @@ async def test_successful_response_does_not_log_secret_headers_or_body(
     caplog.set_level(logging.DEBUG)
     result = await Harness(lambda _: response(
         b"SECRET_BODY", headers={"set-cookie": "session=SECRET_COOKIE"},
-    )).fetch(ORIGIN + "/SECRET_PATH?token=SECRET_QUERY")
+    )).fetch(ORIGIN + "/SECRET_PATH?next=SECRET_QUERY")
     assert "SECRET" not in caplog.text + repr(result)
     assert result.text == "SECRET_BODY"  # Body redaction is explicitly not promised.
+
+
+async def test_explicit_credential_url_never_resolves_or_sends(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Narrow outbound guard: explicit credential shapes are rejected before
+    # DNS or transport, with zero external transmission and safe logging.
+    caplog.set_level(logging.DEBUG)
+    for url in (
+        ORIGIN + "/path?token=SECRET_VALUE",
+        ORIGIN + "/path?password=SECRET_VALUE",
+        ORIGIN + "/path?api_key=SECRET_VALUE",
+    ):
+        harness = Harness()
+        with pytest.raises(PageTextError) as error:
+            await harness.fetch(url)
+        assert error.value.code == PageTextErrorCode.INVALID_INPUT
+        assert harness.requests == harness.resolutions == []
+        assert "SECRET_VALUE" not in caplog.text + "".join(
+            traceback.format_exception(error.value)
+        )
+        caplog.clear()

@@ -54,6 +54,11 @@ def _settings(monkeypatch: pytest.MonkeyPatch, path: Path) -> None:
     monkeypatch.setenv(f"{prefix}_RISK_LEVEL", "low")
     monkeypatch.setenv(f"{prefix}_PROFILE", "page_text_readonly")
     monkeypatch.setenv(f"{prefix}_PAGE_TEXT_CONFIG", str(path))
+    # Stdio child must import the same worktree source as the parent so
+    # discovery schemas stay in lockstep (fail-closed on version skew).
+    repo_src = str(Path(__file__).resolve().parents[2] / "src")
+    monkeypatch.setenv("PYTHONPATH", repo_src)
+    monkeypatch.setenv(f"{prefix}_PASSTHROUGH_ENV", "PYTHONPATH")
 
 
 class InProcessTransport:
@@ -199,6 +204,12 @@ async def test_actual_stdio_gateway_reads_local_https_and_preserves_ids(
         fixture = Path(__file__).with_name("_page_text_stdio_local.py")
 
         def local_stdio(_settings: MCPServerSettings) -> StdioMCPTransport:
+            repo_src = str(Path(__file__).resolve().parents[2] / "src")
+            import os as _os
+            child_env = {"PYTHONPATH": repo_src}
+            parent_pythonpath = _os.environ.get("PYTHONPATH")
+            if parent_pythonpath and parent_pythonpath != repo_src:
+                child_env["PYTHONPATH"] = repo_src + _os.pathsep + parent_pythonpath
             return StdioMCPTransport(
                 sys.executable,
                 args=(
@@ -206,6 +217,7 @@ async def test_actual_stdio_gateway_reads_local_https_and_preserves_ids(
                     "--sha256", settings.page_text_config_sha256 or "",
                     "--port", str(port), "--certificate", str(certificate),
                 ),
+                env=child_env,
             )
 
         monkeypatch.setattr("redteam.capability.bootstrap._create_transport", local_stdio)
@@ -227,6 +239,8 @@ async def test_actual_stdio_gateway_reads_local_https_and_preserves_ids(
             "title": "Local docs",
             "text": "Verified page text",
             "truncated": False,
+            "redirect_url": None,
+            "body_present": True,
         }
         assert result.action_id == invocation.action_id
         assert result.invocation_id == invocation.invocation_id

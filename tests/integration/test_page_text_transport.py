@@ -116,10 +116,25 @@ async def test_real_tls_pin_host_cert_redirect_and_connection_cleanup(tmp_path: 
         port = server.sockets[0].getsockname()[1]
         connected: list[tuple[str, int]] = []
         url = f"https://{HOST}:{port}/start"
+        # Single-hop contract: /start returns the unvisited redirect target;
+        # the destination safety check runs on the next explicit request.
         result = await _reader(port, trusted_context, connected).fetch_page_text(
             PageTextRequest(url=url)
         )
-        assert result.text == "ok" and result.final_url == f"https://{HOST}:{port}/end"
+        assert result.status_code == 302
+        assert result.final_url == url
+        assert result.redirect_url == f"https://{HOST}:{port}/end"
+        assert result.body_present is False and result.text == ""
+        assert connected == [(PUBLIC_IP, port)]
+        assert sni == [HOST]
+        assert len(requests) == 1
+        assert f"Host: {HOST}:{port}\r\n".encode() in requests[0]
+        await asyncio.wait_for(asyncio.gather(*(event.wait() for event in closed)), 1)
+        follow = await _reader(port, trusted_context, connected).fetch_page_text(
+            PageTextRequest(url=result.redirect_url or f"https://{HOST}:{port}/end")
+        )
+        assert follow.text == "ok" and follow.final_url == f"https://{HOST}:{port}/end"
+        assert follow.body_present is True
         assert connected == [(PUBLIC_IP, port), (PUBLIC_IP, port)]
         assert sni == [HOST, HOST]
         assert len(requests) == 2
@@ -127,11 +142,24 @@ async def test_real_tls_pin_host_cert_redirect_and_connection_cleanup(tmp_path: 
         await asyncio.wait_for(asyncio.gather(*(event.wait() for event in closed)), 1)
 
         # Even an allowlisted redirect origin cannot bypass the private-IP rule.
+        blocked_first = await _reader(
+            port, trusted_context, connected,
+            origins=(f"https://{HOST}:{port}", f"https://127.0.0.1:{port}"),
+        ).fetch_page_text(PageTextRequest(url=f"https://{HOST}:{port}/blocked"))
+        assert blocked_first.redirect_url == f"https://127.0.0.1:{port}/private"
+        assert blocked_first.body_present is False
+        assert connected == [(PUBLIC_IP, port)] * 3
+        assert len(requests) == 3
+        await asyncio.wait_for(asyncio.gather(*(event.wait() for event in closed)), 1)
         with pytest.raises(PageTextError) as forbidden:
             await _reader(
                 port, trusted_context, connected,
                 origins=(f"https://{HOST}:{port}", f"https://127.0.0.1:{port}"),
-            ).fetch_page_text(PageTextRequest(url=f"https://{HOST}:{port}/blocked"))
+            ).fetch_page_text(
+                PageTextRequest(
+                    url=blocked_first.redirect_url or f"https://127.0.0.1:{port}/private"
+                )
+            )
         assert forbidden.value.code == PageTextErrorCode.ACCESS_DENIED
         assert connected == [(PUBLIC_IP, port)] * 3
         assert len(requests) == 3
