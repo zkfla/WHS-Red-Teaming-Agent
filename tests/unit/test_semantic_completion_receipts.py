@@ -621,3 +621,90 @@ async def test_session_list_receipt_proves_exact_session_alias_for_completion(
     )
 
     assert (issues == []) is (row_target == "bank-lab")
+
+async def test_summary_step_aggregates_three_prior_origins_without_direct_execution() -> None:
+    store, _llm, service, _deps = _harness(_success_llm())
+    from redteam.orchestration.paths import InMemoryPathStore
+
+    prior_ids: list[str] = []
+    for stem in ("1", "2", "3"):
+        ev = h.make_tool_evidence(
+            evidence_id=f"ev-summary-{stem}",
+            run_id=str(RUN),
+            engagement_id=str(ENGAGEMENT),
+            action_id=f"action-summary-{stem}",
+            invocation_id=f"inv-summary-{stem}",
+            path_id=PATH_ID,
+            path_version=PATH_VERSION,
+            step_id=f"s{stem}",
+            target_node_id=TARGET_NODE,
+        )
+        await store.append(ev)
+        prior_ids.append(str(ev.evidence_id))
+
+    def _prior(step_id: str, stem: str) -> PathStep:
+        return PathStep(
+            step_id=step_id,
+            objective=f"collect part {stem}",
+            target_node_ids=[TARGET_NODE],
+            allowed_operations=["recon.service_discovery"],
+            completion_criteria=[
+                CompletionCriterion(
+                    kind="evidence",
+                    description=f"part {stem} observed",
+                    min_evidence=1,
+                )
+            ],
+            required=True,
+            status="completed",
+            evidence_ids=[f"ev-summary-{stem}"],
+        )
+
+    summary = PathStep(
+        step_id="summary",
+        objective="summarize three prior observations",
+        target_node_ids=[TARGET_NODE],
+        allowed_operations=["recon.service_discovery"],
+        completion_criteria=[
+            CompletionCriterion(
+                kind="evidence",
+                description="aggregate three origins",
+                min_evidence=3,
+            )
+        ],
+        required=True,
+        status="pending",
+        depends_on=["s1", "s2", "s3"],
+    )
+    plan = PathPlan(
+        path_id=PATH_ID,
+        run_id=str(RUN),
+        version=PATH_VERSION,
+        status="active",
+        reason="test summary",
+        goal="test",
+        steps=[_prior("s1", "1"), _prior("s2", "2"), _prior("s3", "3"), summary],
+    )
+    path_store = InMemoryPathStore()
+    await path_store.register(plan)
+
+    issues = await validate_completion(
+        path=plan,
+        step=summary,
+        proposal={
+            "outcome": "success",
+            "reason": "summary aggregates three stored origins",
+            "evidence_ids": list(prior_ids),
+            "criterion_results": [],
+        },
+        evidence_store=store,
+        graph_service=service,
+        run_id=str(RUN),
+        path_store=path_store,
+    )
+    assert issues == []
+    origins = [await store.get(eid) for eid in prior_ids]
+    assert all(rec is not None for rec in origins)
+    assert {str(rec.metadata.get("path_step_id")) for rec in origins} == {"s1", "s2", "s3"}
+    assert "summary" not in {str(rec.metadata.get("path_step_id")) for rec in origins}
+    assert all(str(rec.metadata.get("path_id")) == PATH_ID for rec in origins)

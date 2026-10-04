@@ -829,3 +829,131 @@ async def test_authorization_exclusion_allows_independent_web_read() -> None:
     assert "operator_excluded_area" in await validate_current_action(
         deps, runtime, bad_step
     )
+
+async def test_pending_future_required_step_still_allows_task_then_goal() -> None:
+    from redteam.attack_graph.observation import GraphObservation
+    from redteam.core.contracts.mission import MissionPlan
+    from redteam.orchestration.coordination import coordinator_for
+    from redteam.orchestration.engine import InvestigationEngine, TurnDecision
+    from redteam.orchestration.paths import PathPlan, PathStep
+
+    run_id = "run-future-step"
+    llm: Any = h.ScriptedLLM()
+    world = h.make_world(llm)
+    seeded = await h.seed_host(run_id, h.HOST)
+    world.graph_store = seeded.store
+    world.deps.graph_store = seeded.store
+    world.deps.engagement = h.make_engagement()
+    runtime = h.make_runtime(run_id, "eng-t1", mission_id="m-future", task_id="task-future")
+    now = _utcnow()
+    mission = MissionPlan(
+        mission_id=MissionId("m-future"),
+        engagement_id=EngagementId("eng-t1"),
+        objective="map the in-scope host",
+        status=MissionStatus.ACTIVE,
+        success_criteria=["map the host"],
+        created_at=now,
+        updated_at=now,
+        provenance=Provenance(source="test:future-step"),
+    )
+    task = MissionTask(
+        task_id=TaskId("task-future"),
+        mission_id=MissionId("m-future"),
+        title="map the host",
+        objective="map the in-scope host",
+        status=TaskStatus.RUNNING,
+        required=True,
+        provenance=Provenance(source="test:future-step"),
+        created_at=now,
+        updated_at=now,
+    )
+    await world.tasks.create_mission(mission)
+    await world.tasks.create_task(task)
+    await coordinator_for(world.tasks, world.deps.path_store).bind(
+        run_id, "m-future", "eng-t1"
+    )
+    ev_id = "ev-future-ready"
+    await world.evidence.append(
+        h.make_tool_evidence(
+            evidence_id=ev_id,
+            run_id=run_id,
+            engagement_id="eng-t1",
+            action_id="action-future-ready",
+            invocation_id="inv-future-ready",
+            path_id="path-future",
+            path_version=1,
+            step_id="step-1",
+            target_node_id=seeded.node_id,
+        )
+    )
+    path = PathPlan(
+        path_id="path-future",
+        run_id=run_id,
+        mission_id="m-future",
+        mission_task_id="task-future",
+        version=1,
+        status="active",
+        reason="future step stays pending",
+        goal="map the in-scope host",
+        steps=[
+            PathStep(
+                step_id="step-1",
+                objective="confirm host answers inventory",
+                agent_id=h.RECON_AGENT,
+                target_node_ids=[seeded.node_id],
+                allowed_operations=[h.CANONICAL_OP],
+                completion_criteria=[
+                    CompletionCriterion(kind="evidence", description="inventory observed")
+                ],
+                required=True,
+                status="completed",
+                evidence_ids=[ev_id],
+            ),
+            PathStep(
+                step_id="step-future",
+                objective="follow-up sweep not yet executed",
+                agent_id=h.RECON_AGENT,
+                target_node_ids=[seeded.node_id],
+                allowed_operations=[h.CANONICAL_OP],
+                completion_criteria=[
+                    CompletionCriterion(kind="evidence", description="future sweep")
+                ],
+                required=True,
+                status="pending",
+            ),
+        ],
+    )
+    await world.paths.register(path)
+    llm.add("completion_review", h.task_accept([ev_id], reason="task purpose proven"))
+    llm.add(
+        "goal_completion_review",
+        h.goal_accept([{"criterion": "map the host", "met": True, "evidence_ids": [ev_id]}]),
+    )
+    engine = InvestigationEngine(world.deps)
+    task_errors = await engine.complete_task(
+        path,
+        TurnDecision(
+            mode="complete_task",
+            reason="task evidence ready",
+            completion={"evidence_ids": [ev_id], "outcome": "success", "reason": "ready"},
+        ),
+        runtime,
+        await engine.context(runtime, GraphObservation()),
+    )
+    assert task_errors == []
+    done = await world.tasks.get_task(TaskId("task-future"))
+    assert done is not None and done.status is TaskStatus.COMPLETED
+    assert done.completion_evidence_id is not None
+    stored = await world.paths.list_paths(run_id)
+    future = next(p for p in stored if p.path_id == "path-future")
+    future_step = next(s for s in future.steps if s.step_id == "step-future")
+    assert future_step.status != "completed"
+    goal_errors = await engine.complete_goal(
+        path,
+        TurnDecision.model_validate(h.turn_complete_goal()),
+        runtime,
+        await engine.context(runtime, GraphObservation()),
+    )
+    assert goal_errors == []
+    final_mission = await world.tasks.get_mission(MissionId("m-future"))
+    assert final_mission is not None and final_mission.status is MissionStatus.COMPLETED

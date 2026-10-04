@@ -204,6 +204,8 @@ async def test_plan_failure_then_replan_preserves_structured_cause(monkeypatch):
 
     class Engine:
         last_event_id = None
+        # New contract stub: production engine always carries this.
+        updated_runtime = None
 
         def __init__(self, deps):
             pass
@@ -239,6 +241,8 @@ async def test_successful_plan_clears_current_diagnostic_and_retains_history(mon
 
     class Engine:
         last_event_id = None
+        # New contract stub: production engine always carries this.
+        updated_runtime = None
 
         def __init__(self, deps):
             pass
