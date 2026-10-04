@@ -5,7 +5,7 @@ from __future__ import annotations
 from redteam.core.contracts.mission import redact_secret_material
 from redteam.core.ids import GraphNodeId
 from redteam.attack_graph.service import AttackGraphService
-from redteam.orchestration.context_projection import ContextProjector
+from redteam.orchestration.context_projection import ContextProjector, project_evidence_excerpts
 from redteam.orchestration.cognition import DecisionBudget, DecisionFailure
 from redteam.orchestration.delegation import DelegationRequest
 from redteam.orchestration.delegation_decision import (
@@ -121,15 +121,6 @@ async def decide_delegations(engine, path, runtime, context):
             values[identity] = mark_finished(state, reason="specialist_or_purpose_unavailable")
             advanced = True
             continue
-        relevant = [
-            item for item in context.get("evidence", [])
-            if item["evidence_id"] in state.evidence_ids
-            or item.get("metadata", {}).get("target_node_id") in step.target_node_ids
-        ]
-        payload = build_worker_next_action_payload(
-            delegation=state, evidence_ids=state.evidence_ids, evidence_excerpts=relevant,
-            unresolved=state.unresolved, remaining_actions=gate.remaining_actions,
-        )
         service = AttackGraphService(engine.deps.graph_store)
         observation = await service.observe(step=runtime.step_count)
         projected = await ContextProjector(service, engine.deps.context_cache).project(
@@ -140,6 +131,17 @@ async def decide_delegations(engine, path, runtime, context):
         )
         relevant_ids = {identity for ids in projected.node_ids_by_type.values() for identity in ids}
         relevant_ids.update(step.target_node_ids)
+        records = [item for item in await engine.deps.evidence_store.list_for_run(runtime.run_id)
+                   if item.engagement_id == runtime.engagement_id]
+        relevant = [item.model_dump(mode="json") for item in project_evidence_excerpts(
+            records, target_node_ids=[GraphNodeId(item) for item in sorted(relevant_ids)],
+            limit=definition.context_profile.max_evidence,
+        )]
+        payload = build_worker_next_action_payload(
+            delegation=state, evidence_ids=state.evidence_ids,
+            evidence_excerpts=redact_secret_material(relevant),
+            unresolved=state.unresolved, remaining_actions=gate.remaining_actions,
+        )
         knowledge = dict(context.get("knowledge") or {})
         for section in ("facts", "known_targets"):
             knowledge[section] = [item for item in knowledge.get(section, [])

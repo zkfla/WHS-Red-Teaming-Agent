@@ -16,6 +16,7 @@ from redteam.core.ports.evidence_store import EvidenceStore
 from redteam.core.ports.task_graph import MissionTaskStore
 from redteam.orchestration.diagnostics import DecisionDiagnostic
 from redteam.orchestration.coverage import CoverageGapSummary, project_coverage_gaps
+from redteam.orchestration.context_projection import MappingStatus, project_run_processing
 from redteam.orchestration.operator_intents.redaction import redact_text
 from redteam.orchestration.state import RuntimeState, TerminationReason
 from redteam.orchestration.work.store import WorkStore
@@ -219,6 +220,7 @@ class TerminalReportProjection(BaseModel):
     #: before coverage existed, which read as unknown, never complete.
     coverage: CoverageGapSummary | None = None
     coverage_status: str = "unknown"
+    result_processing: list[MappingStatus] = Field(default_factory=list)
     effectiveness: RunEffectiveness = Field(default_factory=RunEffectiveness)
 
 
@@ -354,6 +356,8 @@ class ReportingAgent:
             coverage_status=(
                 "unknown" if coverage is None or coverage.unknown else "ok"
             ),
+            result_processing=[MappingStatus.model_validate(item)
+                               for item in project_run_processing(evidence).values()],
         )
 
 

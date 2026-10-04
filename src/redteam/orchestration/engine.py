@@ -34,6 +34,8 @@ from redteam.orchestration.cognition import (
     DecisionFailure,
     StructuredDecisionClient,
 )
+from redteam.orchestration.context_projection import project_run_processing
+from redteam.orchestration.coverage import project_coverage_gaps
 from redteam.orchestration.completion import validate_completion
 from redteam.orchestration.coordination import (
     ChangeSet,
@@ -172,6 +174,7 @@ _PUBLIC_EVIDENCE_KEYS = frozenset(
         "target_node_id",
         "hypothesis_id",
         "source_evidence_ids",
+        "source_evidence_id",
         "supporting_evidence_ids",
         "refuting_evidence_ids",
         "covered_principals",
@@ -187,6 +190,9 @@ _PUBLIC_EVIDENCE_KEYS = frozenset(
         "processing_outcome",
         "recovery_status",
         "target_references",
+        "failed_at",
+        "attempted",
+        "confirmed",
     }
 )
 
@@ -611,6 +617,7 @@ class InvestigationEngine:
             else None
         )
         completed_task_paths = []
+        tasks = []
         if runtime.mission_id:
             tasks = await self.deps.task_graph_store.list_tasks(mission_id=runtime.mission_id)
             completed_ids = {
@@ -691,6 +698,7 @@ class InvestigationEngine:
                             drop_secret_keys=False,
                         )
         records = await self.deps.evidence_store.list_for_run(runtime.run_id)
+        processing = project_run_processing(records)
         reference_context = {}
         library = getattr(self.deps, "methodology_library", None)
         if library is not None:
@@ -723,6 +731,7 @@ class InvestigationEngine:
                 "evidence_id": str(item.evidence_id),
                 "summary": redact_secret_material(item.summary),
                 "artifact_ref": item.artifact_ref,
+                "processing": processing.get(str(item.evidence_id)),
                 "metadata": redact_secret_material(
                     {
                         key: value
@@ -793,6 +802,8 @@ class InvestigationEngine:
             "evidence": evidence,
             "evidence_index": [str(item.evidence_id) for item in records],
             "evidence_count": len(records),
+            "result_processing": list(processing.values())[-20:],
+            "coverage": project_coverage_gaps(mission=mission, tasks=tasks).model_dump(mode="json"),
             "evidence_omitted_count": max(len(records) - len(evidence), 0),
             "execution_history": history[-20:],
             "execution_history_count": len(work_history),

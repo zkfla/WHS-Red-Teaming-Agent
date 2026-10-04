@@ -46,6 +46,7 @@ class EvidenceExcerpt(BaseModel):
     digest: str
     status_code: int | None = None
     error_code: str | None = None
+    processing: dict[str, Any] = Field(default_factory=dict)
 
 
 def project_evidence_excerpts(
@@ -63,6 +64,7 @@ def project_evidence_excerpts(
     if limit <= 0:
         return []
     targets = {str(item) for item in target_node_ids}
+    processing = project_run_processing(records)
     associated = []
     for record in sorted(records, key=lambda item: (item.created_at, str(item.evidence_id))):
         target_id = str(record.metadata.get("target_node_id", ""))
@@ -89,6 +91,7 @@ def project_evidence_excerpts(
                 digest=record.digest,
                 status_code=status if isinstance(status, int) else None,
                 error_code=str(error_code) if isinstance(error_code, str) else None,
+                processing=processing.get(str(record.evidence_id), {}),
             )
         )
     return associated[-limit:]
@@ -279,6 +282,9 @@ class MappingStatus(BaseModel):
     processing_outcome: str | None = None
     recovery_status: str | None = None
     reference_count: int = 0
+    attempted: dict[str, int] = Field(default_factory=dict)
+    confirmed: dict[str, int] = Field(default_factory=dict)
+    failed_at: str | None = None
     proposed_keys: list[str] = Field(default_factory=list)
 
 
@@ -345,8 +351,50 @@ def project_mapping_status(*, record: Any, outcome: Any | None = None) -> Mappin
         processing_outcome=status,
         recovery_status=_public_status_value(meta, "recovery_status"),
         reference_count=reference_count,
+        attempted=meta.get("attempted", {}),
+        confirmed=meta.get("confirmed", {}),
+        failed_at=_public_status_value(meta, "failed_at"),
         proposed_keys=[key for key in proposed if key in meta],
     )
+
+
+def project_run_processing(records: list[EvidenceRecord]) -> dict[str, dict[str, Any]]:
+    """Join system processing companions to preserved calls for prompt/report display.
+
+    This is a read-only view, never evidence admission or graph observation.
+    Companion fields can advance an apply/recovery status without rewriting
+    the source payload. Unfinished attempts remain explicitly attempted.
+    """
+    from redteam.core.enums import EvidenceSourceType
+    from redteam.orchestration.evidence_access import raw_from_metadata
+
+    sources = {
+        str(record.evidence_id): record
+        for record in records
+        if raw_from_metadata(record.metadata) is not None
+    }
+    metadata = {identity: dict(record.metadata) for identity, record in sources.items()}
+    keys = {
+        "mapping_status", "mapping_outcome", "processing_status", "processing_stage",
+        "processing_outcome", "recovery_status", "target_references", "attempted",
+        "confirmed", "failed_at",
+    }
+    for companion in sorted(records, key=lambda record: record.created_at):
+        source_id = str(companion.metadata.get("source_evidence_id", ""))
+        source = sources.get(source_id)
+        if source is None or companion.source_type is not EvidenceSourceType.SYSTEM:
+            continue
+        if any(getattr(companion, key) != getattr(source, key)
+               for key in ("run_id", "engagement_id", "action_id", "invocation_id")):
+            continue
+        metadata[source_id].update({key: companion.metadata[key]
+                                    for key in keys if key in companion.metadata})
+    return {
+        identity: project_mapping_status(
+            record=source.model_copy(update={"metadata": metadata[identity]})
+        ).model_dump(mode="json")
+        for identity, source in sources.items()
+    }
 
 
 def proposed_public_keys() -> tuple[str, ...]:

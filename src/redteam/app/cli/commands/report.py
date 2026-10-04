@@ -85,8 +85,27 @@ def _render_markdown(report: TerminalReportProjection) -> str:
     if report.outstanding_cleanup:
         lines += ["", "## Outstanding cleanup", ""]
         lines += [f"- {item}" for item in report.outstanding_cleanup]
+    lines += ["", "## Current goal gaps", ""]
+    if report.coverage is None or report.coverage.unknown:
+        lines.append("Coverage is unknown for this report.")
+    else:
+        lines += [f"- Unmet condition: {item}" for item in report.coverage.unmet_conditions]
+        lines += [f"- Required task incomplete: {item}"
+                  for item in report.coverage.required_incomplete_tasks]
+        lines += [f"- Legacy completion without receipt: {item}"
+                  for item in report.coverage.completed_without_receipt]
+        if not (report.coverage.unmet_conditions or report.coverage.required_incomplete_tasks
+                or report.coverage.completed_without_receipt):
+            lines.append("No gaps are recorded. Completion is determined by the mission review.")
     if report.mission is not None:
         lines += _render_mission(report.mission)
+    if report.result_processing:
+        lines += ["", "## Result processing", ""]
+        for item in report.result_processing:
+            lines.append(
+                f"- {item.evidence_id}: interpretation={item.mapping_status}, "
+                f"application={item.processing_status}, recovery={item.recovery_status or 'unknown'}"
+            )
     return "\n".join(lines) + "\n"
 
 
