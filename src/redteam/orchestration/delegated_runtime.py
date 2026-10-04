@@ -39,21 +39,53 @@ def _publish_runtime(engine, runtime, delegations):
 
 
 async def _worker_hold_fingerprint(engine, runtime, state):
-    """Role-visible canonical content fingerprint for a model-held investigation.
-
-    Reuses the existing per-role revision signal, so a change the role can
-    actually observe wakes the hold. A failed read can neither wake nor
-    stall the hold, and no receipt id is minted here.
-    """
+    """Content visible to this purpose; new record ids alone never wake it."""
+    from redteam.core.enums import EvidenceSourceType
+    from redteam.orchestration.completion import check_record_linkage
+    from redteam.orchestration.evidence_access import raw_from_metadata
+    from redteam.orchestration.progress import knowledge_fingerprint
+    from redteam.orchestration.target_references import resolve_reference
 
     try:
         service = AttackGraphService(engine.deps.graph_store)
         observation = await service.observe(step=runtime.step_count)
-    except Exception:  # noqa: BLE001 - failed reads cannot wake or stall a hold
-        return None
-    try:
-        return engine.deps.agents.revision_fingerprint(state.agent_id, observation)
-    except Exception:  # noqa: BLE001 - same rule for an unreadable revision
+        definition = engine.deps.agents.definition(state.agent_id)
+        path = await engine.deps.path_store.get_active(str(runtime.run_id))
+        step = next((item for item in path.steps if item.step_id == state.path_step_id), None) if path else None
+        if definition is None or step is None:
+            return None
+        projected = await ContextProjector(service, engine.deps.context_cache).project(
+            definition.context_profile, step=runtime.step_count,
+            target_node_ids=[GraphNodeId(item) for item in step.target_node_ids],
+            fallback=observation, cache_namespace=str(runtime.run_id),
+        )
+        relevant = {item for ids in projected.node_ids_by_type.values() for item in ids}
+        relevant.update(step.target_node_ids)
+        records = {str(item.evidence_id): item
+                   for item in await engine.deps.evidence_store.list_for_run(runtime.run_id)
+                   if item.run_id == runtime.run_id and item.engagement_id == runtime.engagement_id}
+        content = []
+        for identity, record in records.items():
+            raw = raw_from_metadata(record.metadata)
+            if record.source_type is EvidenceSourceType.TOOL and (
+                record.metadata.get("target_node_id") in relevant and isinstance(raw, dict)
+                and not check_record_linkage(record, record.metadata, raw, identity, require_proposal=True)
+            ):
+                content.append({"target": record.metadata.get("target_node_id"),
+                                "tool": record.source_id, "success": raw.get("success"),
+                                "output": raw.get("output"), "error": raw.get("error")})
+            for entry in record.metadata.get("target_references", []):
+                source = records.get(str(entry.get("source_evidence_id", ""))) if isinstance(entry, dict) else None
+                if source is None or source.metadata.get("target_node_id") not in relevant:
+                    continue
+                target = resolve_reference(entry, records, str(runtime.run_id))
+                if target is not None:
+                    content.append({"referenced_target": target.model_dump(mode="json")})
+        return knowledge_fingerprint({"facts": [
+            {"graph": engine.deps.agents.revision_fingerprint(state.agent_id, observation)},
+            *content,
+        ]})
+    except Exception:  # noqa: BLE001 - failed reads cannot wake a held investigation
         return None
 
 
@@ -144,25 +176,6 @@ async def decide_delegations(engine, path, runtime, context):
     for identity, state in list(values.items()):
         if state.status == "finished":
             continue
-        if (
-            state.status == "held"
-            and state.termination_reason == TERMINATION_WORKER_HELD
-            and runtime.pending_approval_id is None
-        ):
-            # Model hold wakes only on a role-visible content change, never
-            # on a fresh receipt id. A missing baseline records the current
-            # revision and keeps waiting; an unreadable graph keeps the hold.
-            fingerprint = await _worker_hold_fingerprint(engine, runtime, state)
-            baseline = state.held_fingerprint
-            if fingerprint is None or baseline is None or baseline == fingerprint:
-                if fingerprint is not None and baseline is None:
-                    values[identity] = state.model_copy(update={"held_fingerprint": fingerprint})
-                continue
-            state = state.model_copy(update={"held_fingerprint": fingerprint})
-            state = mark_active(state)
-            values[identity] = state
-        if state.status == "held" and runtime.pending_approval_id is None:
-            continue
         if state.path_id != path.path_id or state.mission_task_id != path.mission_task_id:
             values[identity] = mark_finished(state, reason="investigation_context_changed")
             advanced = True
@@ -182,6 +195,25 @@ async def decide_delegations(engine, path, runtime, context):
         # PENDING row (a sibling released by the deferred-for-approval path
         # in worker_node) is re-acquirable through plan_node's pending lookup
         # and must never stall this delegation autonomously after resume.
+        if (
+            state.status == "held"
+            and state.termination_reason == TERMINATION_WORKER_HELD
+            and runtime.pending_approval_id is None
+        ):
+            # Model hold wakes only on a role-visible content change, never
+            # on a fresh receipt id. A missing baseline records the current
+            # revision and keeps waiting; an unreadable graph keeps the hold.
+            fingerprint = await _worker_hold_fingerprint(engine, runtime, state)
+            baseline = state.held_fingerprint
+            if fingerprint is None or baseline is None or baseline == fingerprint:
+                if fingerprint is not None and baseline is None:
+                    values[identity] = state.model_copy(update={"held_fingerprint": fingerprint})
+                continue
+            state = state.model_copy(update={"held_fingerprint": fingerprint})
+            state = mark_active(state)
+            values[identity] = state
+        if state.status == "held" and runtime.pending_approval_id is None:
+            continue
         if any(
             item.delegation_id == identity
             and item.status in (WorkStatus.LEASED, WorkStatus.RUNNING)

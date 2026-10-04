@@ -70,7 +70,6 @@ def verification_guard(state: GraphState, *, deps: RuntimeDeps, budget: Decision
         proposal = state["action_proposal"]
         if delegation is None or proposal is None or (
             delegation.path_id != step.path_id
-            or delegation.path_version != step.path_version
             or delegation.path_step_id != step.path_step_id
             or delegation.mission_task_id != runtime.active_task_id
             or delegation.agent_id != str(proposal.agent_id)
