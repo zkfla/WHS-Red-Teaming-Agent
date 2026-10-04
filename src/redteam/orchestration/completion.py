@@ -1070,19 +1070,56 @@ async def validate_completion(
             code="completion_outcome_reference_is_not_a_successful_9",
             summary="outcome 'reference' is not a successful completion",
         )
+    return await validate_result_claims(
+        criteria=_criteria_list(step), evidence_ids=evidence_ids,
+        target_node_ids=list(step.target_node_ids), principal_refs=list(step.principal_refs),
+        evidence_store=evidence_store, graph_service=graph_service, run_id=run,
+        path_store=path_store, mission_id=path.mission_id, outcome=outcome,
+        proposal=proposal, path=path, step=step, issues=issues,
+    )
+
+
+async def validate_result_claims(
+    *,
+    criteria: list[CompletionCriterion],
+    evidence_ids: list[str],
+    target_node_ids: list[str],
+    principal_refs: list[str],
+    evidence_store: Any,
+    graph_service: Any,
+    run_id: str,
+    path_store: Any | None,
+    mission_id: str | None,
+    outcome: str = "success",
+    proposal: dict | None = None,
+    path: PathPlan | None = None,
+    step: PathStep | None = None,
+    issues: CompletionIssues | None = None,
+) -> list[str]:
+    """Verify actual result claims without requiring provisional steps to finish.
+
+    Step completion optionally supplies its lineage context. Task/mission
+    assessment uses stored origin existence and its actual result subjects,
+    while sharing account proof, final verdict receipts and finding checks.
+    Neither mode changes the source record's path, step or execution binding.
+    """
+    if issues is None:
+        issues = CompletionIssues()
+    run = str(run_id)
+    proposal = proposal or {"evidence_ids": evidence_ids, "outcome": outcome}
+    reason = proposal.get("reason", "")
+    step_id = step.step_id if step else "result"
     # Per-evidence linkage checks. Missing path linkage can never succeed
     # (worker D records path_id/path_version/path_step_id/principal_ref).
     valid_records: list[Any] = []
     linked_records: list[Any] = []
     verified_by_evidence: dict[str, set[str]] = {}
-    has_semantic = any(
-        _criterion_kind(item) == "semantic" for item in _criteria_list(step)
-    )
+    has_semantic = any(_criterion_kind(item) == "semantic" for item in criteria)
     step_target_set = {
-        _s(item).strip() for item in (step.target_node_ids or []) if _s(item).strip()
+        _s(item).strip() for item in target_node_ids if _s(item).strip()
     }
     step_principal_set = {
-        _s(item).strip() for item in (step.principal_refs or []) if _s(item).strip()
+        _s(item).strip() for item in principal_refs if _s(item).strip()
     }
     for eid in evidence_ids:
         try:
@@ -1168,16 +1205,20 @@ async def validate_completion(
         # A step with no principal scope accepts anonymous initial
         # reconnaissance evidence as-is; an account-scoped step never does
         # unless it explicitly lists anonymous.
-        origin_errors = await verify_origin_step(
-            path_store=path_store,
-            run_id=run,
-            path=path,
-            step=step,
-            m_path_id=m_path_id,
-            m_version=m_version,
-            m_step_id=m_step_id,
-            evidence_id=eid,
-        )
+        if path is not None and step is not None:
+            origin_errors = await verify_origin_step(
+                path_store=path_store, run_id=run, path=path, step=step,
+                m_path_id=m_path_id, m_version=m_version, m_step_id=m_step_id,
+                evidence_id=eid,
+            )
+        else:
+            origin_errors = [
+                (f"evidence '{eid}' {message}", "completion_origin_invalid", message)
+                for message in await verify_stored_origin(
+                    path_store=path_store, run_id=run, mission_id=mission_id,
+                    m_path_id=m_path_id, m_version=m_version, m_step_id=m_step_id,
+                )
+            ]
         for origin_message, origin_code, origin_summary in origin_errors:
             issues.add(origin_message, code=origin_code, summary=origin_summary)
         if origin_errors:
@@ -1348,7 +1389,6 @@ async def validate_completion(
                 )
             continue
         valid_records.append(record)
-    criteria = _criteria_list(step)
     if not criteria:
         issues.add(
             f"step '{step_id or '?'}' has no fixed completion criteria",
@@ -1670,4 +1710,5 @@ __all__ = [
     "verify_stored_origin",
     "verify_origin_step",
     "validate_completion",
+    "validate_result_claims",
 ]
