@@ -128,6 +128,24 @@ class _TransportLLM(_CompareLLM):
             found = receipts("step-2", "web.http_compare_sessions")
             assert found, "comparison must produce a real receipt"
             return {**h.turn_complete_step(found), "path_step_id": "step-2"}
+        if self._next_calls == 6:
+            task_receipts = receipts("step-2", "web.http_compare_sessions")
+            assert task_receipts, "task completion needs related stored evidence"
+            return {
+                "mode": "complete_task",
+                "reason": "discovered comparison ready",
+                "actions": [],
+                "path": None,
+                "path_step_id": None,
+                "completion": {
+                    "evidence_ids": task_receipts,
+                    "outcome": "success",
+                    "reason": "discovered comparison ready",
+                    "criterion_results": [],
+                },
+                "evidence_request": {},
+                "hypothesis_update": {},
+            }
         return h.turn_complete_goal()
 
 

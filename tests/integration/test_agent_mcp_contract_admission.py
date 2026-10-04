@@ -49,6 +49,14 @@ async def test_pinned_seed_keeps_port_through_compilation_policy_and_execution(o
     engine = InvestigationEngine(deps)
     context = await engine.context(runtime, GraphObservation())
     raw = h.draft_path(str(node.id))
+    # Minimal generation input: hydrate code-owned runtime fields for storage.
+    raw.update(
+        path_id="path-pinned",
+        run_id=str(runtime.run_id),
+        version=1,
+        status="draft",
+        goal=context["goal"],
+    )
     llm.add("path_review", h.review_accept())
     path = await engine.register_path(
         PathPlan.model_validate(raw), runtime, context, GraphObservation()

@@ -14,10 +14,13 @@ from redteam.event_bus.memory import InMemoryEventBus
 from redteam.event_bus.publisher import EventPublisher
 from redteam.orchestration.coordination import coordinator_for
 from redteam.orchestration.paths import InMemoryPathStore, SQLitePathStore
+from redteam.orchestration.paths.models import PathPlan
 from redteam.orchestration.replanning import finalize_mission
+from redteam.orchestration.semantic_completion import build_task_receipt, purpose_hash
 from redteam.orchestration.task_graph.memory import InMemoryTaskGraphStore
 from redteam.orchestration.task_graph.sqlite import SQLiteTaskGraphStore
 from tests.fakes import FakeEvidenceStore
+from tests.integration import _engine_llm_harness as h
 
 RUN = RunId("run-terminal")
 MISSION = MissionId("mission-terminal")
@@ -48,6 +51,13 @@ class TerminalLLM:
                     "task_ids": [self.task_id],
                     "evidence_ids": [self.evidence_id],
                     "reason": "Actual measured service response.",
+                    "claims": [
+                        {
+                            "description": "Actual measured service response.",
+                            "kind": "observation",
+                            "evidence_ids": [self.evidence_id],
+                        }
+                    ],
                 }
                 for index, criterion in enumerate(CRITERIA)
             ],
@@ -81,24 +91,66 @@ async def world(request, tmp_path):
             title="Observe service",
             objective="Observe service",
             status=TaskStatus.COMPLETED,
+            completion_evidence_id=EvidenceId("task-proof"),
             provenance=Provenance(source="test:terminal"),
             created_at=now,
             updated_at=now,
         )
     )
     evidence = FakeEvidenceStore()
+    path = h.draft_path("terminal-host")
+    path.update(
+        path_id="terminal-path",
+        run_id=str(RUN),
+        version=1,
+        status="active",
+        goal="Observe service",
+        mission_id=str(MISSION),
+        mission_task_id=str(TASK),
+    )
+    await paths.register(PathPlan.model_validate(path))
+    origin = h.make_tool_evidence(
+        evidence_id="actual-proof",
+        run_id=str(RUN),
+        engagement_id=str(ENGAGEMENT),
+        action_id="terminal-action",
+        invocation_id="terminal-invocation",
+        path_id="terminal-path",
+        path_version=1,
+        step_id="step-1",
+        target_node_id="terminal-host",
+        output={"services": ["https"], "status": 200},
+    )
+    await evidence.append(origin)
     await evidence.append(
         EvidenceRecord(
-            evidence_id=EvidenceId("actual-proof"),
+            evidence_id=EvidenceId("task-proof"),
             run_id=RUN,
             engagement_id=ENGAGEMENT,
-            source_type=EvidenceSourceType.TOOL,
-            source_id="recon.service_discovery",
+            source_type=EvidenceSourceType.SYSTEM,
+            source_id="orchestration.task_completion_receipt",
             content_type="application/json",
             digest="actual-observation",
             created_at=now,
             summary="The authorized host returned its measured service inventory.",
-            metadata={"success": True, "mission_task_id": str(TASK)},
+            metadata=build_task_receipt(
+                task_id=str(TASK),
+                mission_id=str(MISSION),
+                run_id=str(RUN),
+                purpose_hash_value=purpose_hash("Observe service"),
+                mission_revision=1,
+                source_evidence_ids=["actual-proof"],
+                outcome="success",
+                reason="The measured service response was reviewed for the task purpose.",
+                # This receipt claims a measured response; a failed call cannot prove it.
+                claims=[
+                    {
+                        "description": "Measured service response.",
+                        "kind": "observation",
+                        "evidence_ids": ["actual-proof"],
+                    }
+                ],
+            ),
         )
     )
     coordinator = coordinator_for(store, paths)
@@ -186,7 +238,7 @@ async def test_no_qualifying_evidence_does_not_call_model_or_claim_completion(wo
     mission = await store.get_mission(MISSION)
     assert mission.status is MissionStatus.BLOCKED
     assert all(
-        not item.met and item.reason == "completed_task_evidence_missing"
+        not item.met and item.reason == "completed required task proof is missing or obsolete"
         for item in mission.criterion_results
     )
     assert not llm.calls
@@ -221,6 +273,7 @@ async def test_new_required_task_during_review_invalidates_completion_without_ex
                 update={
                     "task_id": TaskId("late-required"),
                     "status": TaskStatus.READY,
+                    "completion_evidence_id": None,
                 }
             )
         )
@@ -261,20 +314,33 @@ async def test_refused_semantic_review_records_safe_failure_cause(world):
     await world[4].change(inspect)
 
 
-@pytest.mark.parametrize("field", ["run_id", "engagement_id", "mission_task_id", "success"])
+@pytest.mark.parametrize("field", ["run_id", "engagement_id", "receipt_task_id", "success"])
 async def test_wrong_run_engagement_task_or_failed_tool_evidence_is_ineligible(world, field):
-    record = world[2].records[0]
+    record = await world[2].get(EvidenceId("actual-proof"))
+    origin_index = world[2].records.index(record)
     updates = {
         "run_id": RunId("foreign-run"),
         "engagement_id": EngagementId("foreign-engagement"),
-        "mission_task_id": "foreign-task",
+        "receipt_task_id": "foreign-task",
         "success": False,
     }
     if field in {"run_id", "engagement_id"}:
-        world[2].records[0] = record.model_copy(update={field: updates[field]})
+        world[2].records[origin_index] = record.model_copy(update={field: updates[field]})
+    elif field == "receipt_task_id":
+        receipt = await world[2].get(EvidenceId("task-proof"))
+        receipt_index = world[2].records.index(receipt)
+        world[2].records[receipt_index] = receipt.model_copy(
+            update={"metadata": {**receipt.metadata, "task_id": updates[field]}}
+        )
     else:
-        world[2].records[0] = record.model_copy(
-            update={"metadata": {**record.metadata, field: updates[field]}}
+        world[2].records[origin_index] = record.model_copy(
+            update={
+                "metadata": {
+                    **record.metadata,
+                    "success": False,
+                    "tool_result": {**record.metadata["tool_result"], "success": False},
+                }
+            }
         )
     llm = TerminalLLM()
     await settle(world, llm)

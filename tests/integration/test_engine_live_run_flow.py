@@ -84,6 +84,16 @@ class LiveScriptedLLM(h.ScriptedLLM):
         if route == "analysis_verify":
             return h.meaning("success", True)
         if route == "completion_review":
+            payload = self._payload(messages)
+            if isinstance(payload.get("task"), dict):
+                excerpts = payload.get("evidence_excerpts", [])
+                task_ids = [
+                    str(item.get("evidence_id", "")).strip()
+                    for item in excerpts
+                    if isinstance(item, dict) and str(item.get("evidence_id", "")).strip()
+                ]
+                assert task_ids, "task review needs related stored evidence"
+                return h.task_accept(task_ids, reason="inventory tool result observed")
             return h.completion_accept()
         if route == "goal_completion_review":
             payload = self._payload(messages)
@@ -111,6 +121,19 @@ class LiveScriptedLLM(h.ScriptedLLM):
                 assert tool_evidence, "turn 2 needs the executed call's evidence"
                 step_id = payload["active_path"]["steps"][0]["step_id"]
                 return {**h.turn_complete_step(tool_evidence), "path_step_id": step_id}
+            if self._actions_calls == 3:
+                # Close the single required task before settling the mission.
+                assert tool_evidence, "turn 3 needs the executed call's evidence"
+                return {
+                    "mode": "complete_task",
+                    "reason": "task evidence ready",
+                    "actions": [],
+                    "path": None,
+                    "path_step_id": None,
+                    "completion": {"evidence_ids": list(tool_evidence)},
+                    "evidence_request": {},
+                    "hypothesis_update": {},
+                }
             return h.turn_complete_goal()
         raise AssertionError(f"no live answer for route {route!r}")
 

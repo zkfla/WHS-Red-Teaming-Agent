@@ -94,6 +94,19 @@ def path_draft(identity):
     return raw
 
 
+def _plan_for_register(draft, runtime, context):
+    draft.update(
+        {
+            "path_id": "test-path",
+            "run_id": str(runtime.run_id),
+            "version": 1,
+            "status": "draft",
+            "goal": context.get("goal", ""),
+        }
+    )
+    return PathPlan.model_validate(draft)
+
+
 def action(identity):
     return ActionIntent.model_validate(h.turn_actions(identity)["actions"][0])
 
@@ -102,7 +115,7 @@ async def register(world, identity, context=None):
     context = context or await world.engine.context(world.runtime, GraphObservation())
     world.llm.add("path_review", h.review_accept())
     return await world.engine.register_path(
-        PathPlan.model_validate(path_draft(identity)),
+        _plan_for_register(path_draft(identity), world.runtime, context),
         world.runtime,
         context,
         GraphObservation(),
@@ -193,12 +206,14 @@ async def test_revised_path_can_reference_original_target_omitted_from_summary(w
         {
             "decision": "revise",
             "reason": "Use the original measured target.",
-            "path": path_draft(identity),
+            "path": _plan_for_register(path_draft(identity), world.runtime, context).model_dump(
+                mode="json"
+            ),
         },
     )
     world.llm.add("path_review", h.review_accept())
     accepted = await world.engine.register_path(
-        PathPlan.model_validate(path_draft(world.identities[0])),
+        _plan_for_register(path_draft(world.identities[0]), world.runtime, context),
         world.runtime,
         context,
         GraphObservation(),
@@ -213,7 +228,7 @@ async def test_forged_prompt_target_does_not_authorize_path(world):
     context["knowledge"]["known_targets"].append({"node_id": identity})
     with pytest.raises(ValueError, match="unknown target"):
         await world.engine.register_path(
-            PathPlan.model_validate(path_draft(identity)),
+            _plan_for_register(path_draft(identity), world.runtime, context),
             world.runtime,
             context,
             GraphObservation(),
@@ -554,7 +569,7 @@ async def test_summary_cannot_promote_unconfirmed_or_foreign_original_facts(worl
     assert identity + "#fact:status_code" not in authority.fact_refs
     with pytest.raises(ValueError, match="unknown target"):
         await world.engine.register_path(
-            PathPlan.model_validate(path_draft(identity)),
+            _plan_for_register(path_draft(identity), world.runtime, context),
             world.runtime,
             context,
             GraphObservation(),
@@ -618,7 +633,7 @@ async def test_declared_session_outside_prompt_cap_is_valid_but_not_a_measured_f
     llm.add("path_review", h.review_accept())
     context = await engine.context(runtime, GraphObservation())
     path = await engine.register_path(
-        PathPlan.model_validate(raw), runtime, context, GraphObservation()
+        _plan_for_register(raw, runtime, context), runtime, context, GraphObservation()
     )
     intent = action("host:provided-059").model_copy(
         update={"principal_ref": "session-59", "arguments": {"session_ref": "session-59"}}

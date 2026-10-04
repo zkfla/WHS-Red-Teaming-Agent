@@ -67,14 +67,7 @@ class _CompareLLM(h.ScriptedLLM):
         # name; the rejection proof is no invocations plus a held run.
         refs = [] if self.case in ("no_sessions", "wrong_path") else ["alice", "bob"]
         return {
-            "path_id": "path-draft-compare",
-            "run_id": "run-x",
-            "mission_id": None,
-            "version": 1,
-            "parent_version": None,
-            "status": "draft",
             "reason": "scripted compare draft",
-            "goal": "compare principals",
             "steps": [
                 {
                     "step_id": "step-1",
@@ -88,15 +81,8 @@ class _CompareLLM(h.ScriptedLLM):
                     "unknowns": [],
                     "completion_criteria": [_crit()],
                     "required": True,
-                    "status": "pending",
-                    "outcome": None,
-                    "evidence_ids": [],
                 },
             ],
-            "hypothesis_ids": [],
-            "evidence_ids": [],
-            "changed_step_ids": [],
-            "review_records": {},
         }
 
     async def complete_structured(
@@ -111,6 +97,16 @@ class _CompareLLM(h.ScriptedLLM):
         if route == "analysis_verify":
             return h.meaning("success", True)
         if route == "completion_review":
+            review_payload = self._payload(messages)
+            if isinstance(review_payload.get("task"), dict):
+                excerpts = review_payload.get("evidence_excerpts", [])
+                task_ids = [
+                    str(item.get("evidence_id", "")).strip()
+                    for item in excerpts
+                    if isinstance(item, dict) and str(item.get("evidence_id", "")).strip()
+                ]
+                assert task_ids, "task review needs related stored evidence"
+                return h.task_accept(task_ids, reason="compare task done")
             return h.completion_accept()
         if route == "goal_completion_review":
             payload = self._payload(messages)
@@ -225,6 +221,31 @@ class _CompareLLM(h.ScriptedLLM):
                         "hypothesis_update": {},
                     }
                 return {**h.turn_complete_step(owned), "path_step_id": "step-1"}
+            if self._next_calls == 3:
+                step_receipts = [
+                    str(r.evidence_id)
+                    for r in records
+                    if isinstance(getattr(r, "metadata", {}).get("tool_result"), dict)
+                    and r.metadata.get("path_step_id") == "step-1"
+                    and str(getattr(r, "metadata", {}).get("tool_id", r.source_id))
+                    == "web.http_compare_sessions"
+                ]
+                assert step_receipts, "task completion needs related stored evidence"
+                return {
+                    "mode": "complete_task",
+                    "reason": "compare task evidence ready",
+                    "actions": [],
+                    "path": None,
+                    "path_step_id": None,
+                    "completion": {
+                        "evidence_ids": step_receipts,
+                        "outcome": "success",
+                        "reason": "compare task evidence ready",
+                        "criterion_results": [],
+                    },
+                    "evidence_request": {},
+                    "hypothesis_update": {},
+                }
             return h.turn_complete_goal()
         raise AssertionError(f"no compare answer for {route!r}")
 
