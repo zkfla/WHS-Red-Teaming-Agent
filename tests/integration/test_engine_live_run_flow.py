@@ -121,8 +121,8 @@ class LiveScriptedLLM(h.ScriptedLLM):
                 assert tool_evidence, "turn 2 needs the executed call's evidence"
                 step_id = payload["active_path"]["steps"][0]["step_id"]
                 return {**h.turn_complete_step(tool_evidence), "path_step_id": step_id}
-            if self._actions_calls == 3:
-                # Close the single required task before settling the mission.
+            if payload.get("active_task"):
+                # Follow stored task state if a prior turn exhausted its decision budget.
                 assert tool_evidence, "turn 3 needs the executed call's evidence"
                 return {
                     "mode": "complete_task",

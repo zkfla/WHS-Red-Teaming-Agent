@@ -278,8 +278,10 @@ async def test_duplicate_execution_uses_original_facts_not_summary(world, change
         path, [action(identity)], world.runtime, context
     )
     if change != "original_outside_summary":
-        assert second[0].candidate_key == candidate.candidate_key
+        assert second == []
         assert any("identical action already recorded" in error for error in errors)
+        recorded = await world.w.work.list_items(run_id=world.runtime.run_id)
+        assert len(recorded) == 1 and recorded[0].candidate_key == candidate.candidate_key
     else:
         assert second[0].candidate_key != candidate.candidate_key
         assert not errors

@@ -221,7 +221,7 @@ class _CompareLLM(h.ScriptedLLM):
                         "hypothesis_update": {},
                     }
                 return {**h.turn_complete_step(owned), "path_step_id": "step-1"}
-            if self._next_calls == 3:
+            if payload.get("active_task"):
                 step_receipts = [
                     str(r.evidence_id)
                     for r in records
