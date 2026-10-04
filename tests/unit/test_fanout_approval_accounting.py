@@ -509,7 +509,7 @@ class _ScriptedLLM:
     @staticmethod
     def _route_key(schema: dict) -> str:
         props = schema.get("properties", {})
-        if "path_id" in props and "steps" in props:
+        if "steps" in props:
             return "path_draft"
         if "decision" in props:
             return "path_review"
@@ -517,6 +517,8 @@ class _ScriptedLLM:
             return "next_action"
         if "criteria" in props:
             return "goal_completion_review"
+        if "claims" in props:
+            return "task_completion_review"
         if "accepted" in props:
             return "completion_review"
         if "claim_supported" in props:
@@ -554,15 +556,9 @@ def _fanout_probe_descriptor() -> ToolDescriptor:
 
 
 def _fanout_path_draft(node_a: str, node_b: str) -> dict:
+    # Minimal model draft: purpose + steps only. Runtime identity is code-owned.
     return {
-        "path_id": "path-draft-fanout",
-        "run_id": "run-x",
-        "mission_id": None,
-        "version": 1,
-        "parent_version": None,
-        "status": "draft",
         "reason": "scripted fanout draft",
-        "goal": "probe both hosts",
         "steps": [
             {
                 "step_id": "step-1",
@@ -578,15 +574,8 @@ def _fanout_path_draft(node_a: str, node_b: str) -> dict:
                     {"kind": "evidence", "description": "fanout probe", "min_evidence": 1}
                 ],
                 "required": True,
-                "status": "pending",
-                "outcome": None,
-                "evidence_ids": [],
             }
         ],
-        "hypothesis_ids": [],
-        "evidence_ids": [],
-        "changed_step_ids": [],
-        "review_records": {},
     }
 
 

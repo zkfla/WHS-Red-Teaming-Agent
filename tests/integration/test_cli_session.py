@@ -123,7 +123,7 @@ class _HoldLLM:
     @staticmethod
     def _route_key(schema):
         props = schema.get("properties", {})
-        if "path_id" in props and "steps" in props:
+        if "steps" in props:
             return "path_draft"
         if "decision" in props:
             return "path_review"
@@ -131,6 +131,8 @@ class _HoldLLM:
             return "next_action"
         if "criteria" in props:
             return "goal_completion_review"
+        if "claims" in props:
+            return "task_completion_review"
         if "accepted" in props:
             return "completion_review"
         if "claim_supported" in props:
@@ -148,15 +150,9 @@ class _HoldLLM:
         return "host:127.0.0.1:5000"
 
     def _draft(self, node_id):
+        # Minimal model draft: purpose + steps only. Runtime identity is code-owned.
         return {
-            "path_id": "path-session-hold",
-            "run_id": "run-x",
-            "mission_id": None,
-            "version": 1,
-            "parent_version": None,
-            "status": "draft",
             "reason": "session hold plan",
-            "goal": "hold with no tools configured",
             "steps": [
                 {
                     "step_id": "step-1",
@@ -172,15 +168,8 @@ class _HoldLLM:
                         {"kind": "evidence", "description": "hold", "min_evidence": 1}
                     ],
                     "required": True,
-                    "status": "pending",
-                    "outcome": None,
-                    "evidence_ids": [],
                 }
             ],
-            "hypothesis_ids": [],
-            "evidence_ids": [],
-            "changed_step_ids": [],
-            "review_records": {},
         }
 
     @staticmethod
@@ -206,9 +195,28 @@ class _HoldLLM:
         if route == "next_action":
             return self._hold()
         if route == "completion_review":
+            # Step review keeps the old accepted/reason shape (no claims).
             return {"accepted": True, "reason": "session hold"}
+        if route == "task_completion_review":
+            # Task review needs claims; hold flow never completes so this stays unproven.
+            return {"accepted": False, "reason": "session hold", "claims": []}
         if route == "goal_completion_review":
-            return {"accepted": True, "reason": "session hold", "criteria": []}
+            import json as _json2
+            payload = _json2.loads(messages[0]["content"]) if messages else {}
+            criteria = (payload.get("mission") or {}).get("success_criteria", []) or []
+            return {
+                "accepted": True,
+                "reason": "session hold",
+                "criteria": [
+                    {
+                        "criterion": c,
+                        "met": False,
+                        "evidence_ids": [],
+                        "claims": [],
+                    }
+                    for c in criteria
+                ],
+            }
         if route == "analysis_verify":
             return {
                 "meaning": "hold",

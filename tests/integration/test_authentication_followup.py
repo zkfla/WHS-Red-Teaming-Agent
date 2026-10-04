@@ -164,7 +164,7 @@ class _AuthLLM:
     @staticmethod
     def _route_key(schema: dict[str, Any]) -> str:
         props = schema.get("properties", {})
-        if "path_id" in props and "steps" in props:
+        if "steps" in props:
             return "path_draft"
         if "decision" in props:
             return "path_review"
@@ -172,6 +172,8 @@ class _AuthLLM:
             return "next_action"
         if "criteria" in props:
             return "goal_completion_review"
+        if "claims" in props:
+            return "task_completion_review"
         if "accepted" in props:
             return "completion_review"
         if "claim_supported" in props:
@@ -196,15 +198,9 @@ class _AuthLLM:
         }
 
     def _draft(self) -> dict[str, Any]:
+        # Minimal model draft: purpose + steps only. Runtime identity is code-owned.
         return {
-            "path_id": "path-draft-1",
-            "run_id": "run-x",
-            "mission_id": None,
-            "version": 1,
-            "parent_version": None,
-            "status": "draft",
             "reason": "scripted web draft",
-            "goal": "compare anonymous and session responses",
             "steps": [
                 {
                     "step_id": "step-1",
@@ -220,9 +216,6 @@ class _AuthLLM:
                         {"kind": "evidence", "description": "baseline recorded", "min_evidence": 1}
                     ],
                     "required": True,
-                    "status": "pending",
-                    "outcome": None,
-                    "evidence_ids": [],
                 },
                 {
                     "step_id": "step-2",
@@ -242,15 +235,8 @@ class _AuthLLM:
                         }
                     ],
                     "required": True,
-                    "status": "pending",
-                    "outcome": None,
-                    "evidence_ids": [],
                 },
             ],
-            "hypothesis_ids": [],
-            "evidence_ids": [],
-            "changed_step_ids": [],
-            "review_records": {},
         }
 
     def _anonymous(self) -> dict[str, Any]:
@@ -363,16 +349,71 @@ class _AuthLLM:
         if route == "analysis_verify":
             return h.meaning("success", True)
         if route == "completion_review":
+            # Step review keeps the old accepted/reason shape (no claims).
             return h.completion_accept()
+        if route == "task_completion_review":
+            # Task review: accepted/reason/claims with actual evidence ids.
+            payload = self._payload(messages)
+            run_id = (payload.get("path") or {}).get("run_id", "")
+            records = await self._evidence.list_for_run(run_id) if run_id else []
+            task_receipts = [
+                str(r.evidence_id)
+                for r in records
+                if isinstance(getattr(r, "metadata", {}).get("tool_result"), dict)
+            ]
+            if not task_receipts:
+                for step in payload.get("path", {}).get("steps", []):
+                    task_receipts.extend(step.get("evidence_ids", []))
+            return {
+                "accepted": True,
+                "reason": "scripted semantic accept",
+                "claims": [
+                    {
+                        "description": "web tool result observed",
+                        "kind": "observation",
+                        "evidence_ids": list(task_receipts),
+                        "target_node_ids": [],
+                        "principal_refs": [],
+                    }
+                ],
+            }
         if route == "goal_completion_review":
             payload = self._payload(messages)
             criteria = payload["mission"]["success_criteria"]
             receipts: list[str] = []
             for step in payload["path"]["steps"]:
                 receipts.extend(step.get("evidence_ids", []))
-            return h.goal_accept(
-                [{"criterion": c, "met": True, "evidence_ids": list(receipts)} for c in criteria]
-            )
+            if not receipts:
+                run_id = (payload.get("path") or {}).get("run_id", "")
+                run_id = run_id or payload.get("active_path", {}).get("run_id", "")
+                if run_id:
+                    records = await self._evidence.list_for_run(run_id)
+                    receipts = [
+                        str(r.evidence_id)
+                        for r in records
+                        if isinstance(getattr(r, "metadata", {}).get("tool_result"), dict)
+                    ]
+            return {
+                "accepted": True,
+                "reason": "scripted goal accept",
+                "criteria": [
+                    {
+                        "criterion": c,
+                        "met": True,
+                        "evidence_ids": list(receipts),
+                        "claims": [
+                            {
+                                "description": "web tool result observed",
+                                "kind": "observation",
+                                "evidence_ids": list(receipts),
+                                "target_node_ids": [],
+                                "principal_refs": [],
+                            }
+                        ],
+                    }
+                    for c in criteria
+                ],
+            }
         if route == "next_action":
             self._actions += 1
             if self._actions == 1:

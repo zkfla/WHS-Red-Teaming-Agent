@@ -53,7 +53,7 @@ class _BootstrapLLM:
     @staticmethod
     def _route_key(schema: dict[str, Any]) -> str:
         props = schema.get("properties", {})
-        if "path_id" in props and "steps" in props:
+        if "steps" in props:
             return "path_draft"
         if "decision" in props:
             return "path_review"
@@ -61,6 +61,8 @@ class _BootstrapLLM:
             return "next_action"
         if "criteria" in props:
             return "goal_completion_review"
+        if "claims" in props:
+            return "task_completion_review"
         if "accepted" in props:
             return "completion_review"
         if "claim_supported" in props:
@@ -90,16 +92,10 @@ class _BootstrapLLM:
         return "host:a.local"
 
     def _draft(self, host_id: str) -> dict[str, Any]:
+        # Minimal model draft: purpose + steps only. Runtime identity is code-owned.
         crit = {"kind": "evidence", "description": "tool evidence recorded", "min_evidence": 1}
         return {
-            "path_id": "path-bootstrap-1",
-            "run_id": "run-x",
-            "mission_id": None,
-            "version": 1,
-            "parent_version": None,
-            "status": "draft",
             "reason": "scripted recovery plan",
-            "goal": "recover stalled service then run web",
             "steps": [
                 {
                     "step_id": "step-1",
@@ -113,9 +109,6 @@ class _BootstrapLLM:
                     "unknowns": [],
                     "completion_criteria": [crit],
                     "required": True,
-                    "status": "pending",
-                    "outcome": None,
-                    "evidence_ids": [],
                 },
                 {
                     "step_id": "step-2",
@@ -129,15 +122,8 @@ class _BootstrapLLM:
                     "unknowns": [],
                     "completion_criteria": [crit],
                     "required": True,
-                    "status": "pending",
-                    "outcome": None,
-                    "evidence_ids": [],
                 },
             ],
-            "hypothesis_ids": [],
-            "evidence_ids": [],
-            "changed_step_ids": [],
-            "review_records": {},
         }
 
     async def complete_structured(
@@ -158,7 +144,37 @@ class _BootstrapLLM:
         if route == "path_review":
             return {"decision": "accept", "reason": "scripted accept", "path": None}
         if route == "completion_review":
+            # Step review keeps the old accepted/reason shape (no claims).
             return {"accepted": True, "reason": "scripted accept"}
+        if route == "task_completion_review":
+            # Task review: accepted/reason/claims with actual evidence ids.
+            assert messages is not None
+            payload = _json.loads(messages[0]["content"])
+            run_id = (payload.get("path") or {}).get("run_id", "")
+            run_id = run_id or payload.get("active_path", {}).get("run_id", "")
+            recs = await self._evidence.list_for_run(run_id) if run_id else []
+            tool_ids = [
+                str(r.evidence_id)
+                for r in recs
+                if isinstance(getattr(r, "metadata", {}).get("tool_result"), dict)
+            ]
+            receipts = list(tool_ids)
+            for st in (payload.get("path") or {}).get("steps", []):
+                receipts.extend(st.get("evidence_ids", []))
+            receipts = list(dict.fromkeys(receipts))
+            return {
+                "accepted": True,
+                "reason": "scripted accept",
+                "claims": [
+                    {
+                        "description": "recon tool result observed",
+                        "kind": "observation",
+                        "evidence_ids": receipts,
+                        "target_node_ids": [],
+                        "principal_refs": [],
+                    }
+                ],
+            }
         if route == "goal_completion_review":
             assert messages is not None
             payload = _json.loads(messages[0]["content"])
@@ -169,15 +185,32 @@ class _BootstrapLLM:
             for st in payload.get("path", {}).get("steps", []):
                 receipts.extend(st.get("evidence_ids", []))
             if not receipts:
-                recs = await self._evidence.list_for_run(
-                    payload.get("active_path", {}).get("run_id", "")
-                )
-                receipts = [str(r.evidence_id) for r in recs[:4]]
+                active_id = payload.get("active_path", {}).get("run_id", "")
+                path_id = (payload.get("path") or {}).get("run_id", "")
+                recs = await self._evidence.list_for_run(active_id or path_id)
+                receipts = [
+                    str(r.evidence_id)
+                    for r in recs
+                    if isinstance(getattr(r, "metadata", {}).get("tool_result"), dict)
+                ]
             return {
                 "accepted": True,
                 "reason": "scripted goal accept",
                 "criteria": [
-                    {"criterion": c, "met": True, "evidence_ids": list(receipts) or ["ev-dummy"]}
+                    {
+                        "criterion": c,
+                        "met": True,
+                        "evidence_ids": list(receipts),
+                        "claims": [
+                            {
+                                "description": "recon tool result observed",
+                                "kind": "observation",
+                                "evidence_ids": list(receipts),
+                                "target_node_ids": [],
+                                "principal_refs": [],
+                            }
+                        ],
+                    }
                     for c in criteria
                 ],
             }

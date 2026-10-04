@@ -103,7 +103,7 @@ class _ScriptedLLM:
     @staticmethod
     def _route_key(schema: dict[str, Any]) -> str:
         props = schema.get("properties", {})
-        if "path_id" in props and "steps" in props:
+        if "steps" in props:
             return "path_draft"
         if "decision" in props:
             return "path_review"
@@ -111,6 +111,8 @@ class _ScriptedLLM:
             return "next_action"
         if "criteria" in props:
             return "goal_completion_review"
+        if "claims" in props:
+            return "task_completion_review"
         if "accepted" in props:
             return "completion_review"
         if "claim_supported" in props:
@@ -141,15 +143,10 @@ class _ScriptedLLM:
 
 
 def _draft_path(asset_node_id: str) -> dict[str, Any]:
+    # Minimal model draft: purpose + steps only. Runtime identity
+    # (path_id/run_id/version/status/goal/evidence) is code-owned.
     return {
-        "path_id": "path-draft-1",
-        "run_id": "run-x",
-        "mission_id": None,
-        "version": 1,
-        "parent_version": None,
-        "status": "draft",
         "reason": "scripted mobile draft",
-        "goal": "analyze the declared mobile artifact",
         "steps": [
             {
                 "step_id": "step-1",
@@ -169,15 +166,8 @@ def _draft_path(asset_node_id: str) -> dict[str, Any]:
                     }
                 ],
                 "required": True,
-                "status": "pending",
-                "outcome": None,
-                "evidence_ids": [],
             }
         ],
-        "hypothesis_ids": [],
-        "evidence_ids": [],
-        "changed_step_ids": [],
-        "review_records": {},
     }
 
 

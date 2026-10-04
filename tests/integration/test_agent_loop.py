@@ -93,7 +93,7 @@ class _LoopLLM:
     @staticmethod
     def _route_key(schema: dict[str, Any]) -> str:
         props = schema.get("properties", {})
-        if "path_id" in props and "steps" in props:
+        if "steps" in props:
             return "path_draft"
         if "decision" in props:
             return "path_review"
@@ -101,6 +101,8 @@ class _LoopLLM:
             return "next_action"
         if "criteria" in props:
             return "goal_completion_review"
+        if "claims" in props:
+            return "task_completion_review"
         if "accepted" in props:
             return "completion_review"
         if "claim_supported" in props:
@@ -135,22 +137,90 @@ class _LoopLLM:
         route = self._route_key(response_schema)
         self.calls.append({"route": route})
         if route == "path_draft":
-            return h.draft_path(NODE_ID)
+            # Minimal model draft: purpose + steps only. Runtime identity is code-owned.
+            full = h.draft_path(NODE_ID)
+            return {
+                "reason": full.get("reason", "scripted draft"),
+                "steps": [
+                    {
+                        key: value
+                        for key, value in step.items()
+                        if key not in ("status", "outcome", "evidence_ids")
+                    }
+                    for step in full.get("steps", [])
+                ],
+            }
         if route == "path_review":
             return h.review_accept()
         if route == "analysis_verify":
             return h.meaning("success", True)
         if route == "completion_review":
-            return h.completion_accept()
+            # Step review keeps the old accepted/reason shape (no claims).
+            return {"accepted": True, "reason": "scripted semantic accept"}
+        if route == "task_completion_review":
+            # Task review: accepted/reason/claims with actual evidence ids.
+            payload = self._payload(messages)
+            run_id = (payload.get("path") or {}).get("run_id", "")
+            records = await self._evidence.list_for_run(run_id) if run_id else []
+            task_receipts = [
+                str(r.evidence_id)
+                for r in records
+                if isinstance(getattr(r, "metadata", {}).get("tool_result"), dict)
+            ]
+            if not task_receipts:
+                for step in (payload.get("path") or {}).get("steps", []):
+                    task_receipts.extend(step.get("evidence_ids", []))
+            return {
+                "accepted": True,
+                "reason": "scripted semantic accept",
+                "claims": [
+                    {
+                        "description": "inventory tool result observed",
+                        "kind": "observation",
+                        "evidence_ids": list(task_receipts),
+                        "target_node_ids": [],
+                        "principal_refs": [],
+                    }
+                ],
+            }
         if route == "goal_completion_review":
+            # Goal review: every original criterion needs evidence + claims.
             payload = self._payload(messages)
             criteria = payload["mission"]["success_criteria"]
             receipts: list[str] = []
             for step in payload["path"]["steps"]:
                 receipts.extend(step.get("evidence_ids", []))
-            return h.goal_accept(
-                [{"criterion": c, "met": True, "evidence_ids": list(receipts)} for c in criteria]
-            )
+            if not receipts:
+                run_id = (payload.get("path") or {}).get("run_id", "")
+                run_id = run_id or payload.get("active_path", {}).get("run_id", "")
+                if run_id:
+                    records = await self._evidence.list_for_run(run_id)
+                    receipts = [
+                        str(r.evidence_id)
+                        for r in records
+                        if isinstance(getattr(r, "metadata", {}).get("tool_result"), dict)
+                    ]
+            return {
+                "accepted": True,
+                "reason": "scripted goal accept",
+                "criteria": [
+                    {
+                        "criterion": c,
+                        "met": True,
+                        "evidence_ids": list(receipts),
+                        "claims": [
+                            {
+                                "description": "inventory tool result observed",
+                                "kind": "observation",
+                                "evidence_ids": list(receipts),
+                                "target_node_ids": [],
+                                "principal_refs": [],
+                            }
+                        ],
+                    }
+                    for c in criteria
+                ],
+            }
         if route == "next_action":
             self._actions += 1
             if self._actions == 1:
@@ -169,6 +239,19 @@ class _LoopLLM:
                 assert tool_evidence, "turn 2 needs the executed call evidence"
                 step_id = payload["active_path"]["steps"][0]["step_id"]
                 return {**h.turn_complete_step(tool_evidence), "path_step_id": step_id}
+            if self._actions == 3:
+                # Close the single required task before settling the mission.
+                # Empty completion falls back to the completed step evidence.
+                return {
+                    "mode": "complete_task",
+                    "reason": "task evidence ready",
+                    "actions": [],
+                    "path": None,
+                    "path_step_id": None,
+                    "completion": {},
+                    "evidence_request": {},
+                    "hypothesis_update": {},
+                }
             return h.turn_complete_goal()
         raise AssertionError(f"no scripted answer for route {route!r}")
 
@@ -262,7 +345,13 @@ async def test_llm_single_probe_executes_original_behavior() -> None:
 
 async def test_goal_preserved_in_accepted_path() -> None:
     engagement = _engagement()
-    deps = _loop_deps(engagement)
+    # New contract needs step + task + goal reviews: allow the shared
+    # decision budget to cover the extra task turn (max 6, same as the
+    # task-boundary reference flow).
+    deps = _loop_deps(
+        engagement,
+        settings=OrchestrationSettings(max_steps=8, checkpointing=False, decision_max_attempts=6),
+    )
     final = await run_engagement(engagement, deps)
     assert final.mission_id is not None
     mission = await deps.task_graph_store.get_mission(final.mission_id)
@@ -270,6 +359,29 @@ async def test_goal_preserved_in_accepted_path() -> None:
     path = await deps.path_store.get_active(str(final.run_id))
     assert path is not None and path.goal == mission.objective
     assert final.termination_reason == TerminationReason.GOAL_ACHIEVED
+    # Thin regression: the executed tool call backs the mission purpose.
+    # The gateway really ran inventory, and the settled criteria cite only
+    # that stored tool evidence (no dummy ids, no invented claims).
+    gateway = deps.tool_gateway
+    assert isinstance(gateway, DummyToolGateway)
+    assert [str(inv.tool_id) for inv in gateway.invocations] == [h.INVENTORY_TOOL]
+    tool_ids = {
+        str(r.evidence_id)
+        for r in await deps.evidence_store.list_for_run(final.run_id)
+        if isinstance(getattr(r, "metadata", {}).get("tool_result"), dict)
+    }
+    assert tool_ids, "goal needs the executed call evidence"
+    assert mission.criterion_results, "goal settlement keeps its evidence results"
+    for result in mission.criterion_results:
+        assert result.met and result.evidence_ids
+        assert set(map(str, result.evidence_ids)) <= tool_ids
+        assert result.result_claims, "each criterion keeps its actual result claims"
+        for claim in result.result_claims:
+            if isinstance(claim, dict):
+                claimed = claim.get("evidence_ids", [])
+            else:
+                claimed = getattr(claim, "evidence_ids", [])
+            assert set(map(str, claimed)) <= tool_ids
 
 
 async def test_no_automatic_task_creation() -> None:
@@ -421,9 +533,7 @@ class _BatchLLM:
         self._turns = 0
 
     def _draft(self) -> dict[str, Any]:
-        first = next(iter(self._steps))
-        draft = h.draft_path(first)
-        draft["reason"] = "scripted batch draft"
+        # Minimal model draft: purpose + steps only. Runtime identity is code-owned.
         steps: list[dict[str, Any]] = [
             {
                     "step_id": step_id,
@@ -439,14 +549,10 @@ class _BatchLLM:
                     {"kind": "evidence", "description": "probe recorded", "min_evidence": 1}
                 ],
                 "required": True,
-                "status": "pending",
-                "outcome": None,
-                "evidence_ids": [],
             }
             for node, step_id in self._steps.items()
         ]
-        draft["steps"] = steps
-        return draft
+        return {"reason": "scripted batch draft", "steps": steps}
 
     def _single(self, node: str) -> dict[str, Any]:
         attempt = self._seq
