@@ -58,6 +58,10 @@ def _render_markdown(report: TerminalReportProjection) -> str:
         f"- Actions executed: {report.actions_executed}",
         f"- Evidence recorded: {report.evidence_count}",
         f"- Findings: {report.finding_count}",
+        f"- Outcome: {getattr(report, 'run_outcome', 'unknown')}",
+        f"- Model requests: {getattr(report, 'model_requests_used', 0)} "
+        f"(tokens: {getattr(report, 'model_tokens_used', 0)}, "
+        f"unknown usage: {getattr(report, 'model_usage_unknown', 0)})",
         "",
         "## Effectiveness",
         "",
@@ -80,6 +84,13 @@ def _render_markdown(report: TerminalReportProjection) -> str:
         ]
         if diagnostic.stage_attempts:
             lines.append(f"- Requests by stage: {json.dumps(diagnostic.stage_attempts)}")
+        if diagnostic.provider_status is not None:
+            lines.append(f"- Provider status: {diagnostic.provider_status}")
+        if diagnostic.provider_code:
+            lines.append(f"- Provider code: {diagnostic.provider_code}")
+        if diagnostic.retry_after is not None:
+            lines.append(f"- Provider retry after: {diagnostic.retry_after}s")
+        lines.append(f"- Provider retryable: {diagnostic.retryable}")
         cause = diagnostic.last_cause
         while cause is not None:
             lines.append(f"- Cause [{cause.stage}/{cause.code}]: {cause.summary}")
@@ -140,6 +151,54 @@ def _render_markdown(report: TerminalReportProjection) -> str:
                 f"application={item.processing_status}, "
                 f"recovery={item.recovery_status or 'unknown'}"
             )
+    # F1 additive tail: existing section order above never changes. New
+    # sections only project IDs plus safe summaries; raw text stays in the
+    # evidence store and is never copied here.
+    lines += ["", "## Run outcome", ""]
+    lines.append(f"- Outcome: {getattr(report, 'run_outcome', 'unknown')}")
+    lines.append(
+        f"- Model usage: {getattr(report, 'model_requests_used', 0)} requests, "
+        f"{getattr(report, 'model_tokens_used', 0)} tokens, "
+        f"{getattr(report, 'model_usage_unknown', 0)} unknown"
+    )
+    unresolved_details = getattr(report, "unresolved_details", []) or []
+    unresolved_refs = getattr(report, "unresolved_evidence_ids", []) or []
+    lines += ["", "## Investigation unresolved", ""]
+    if not unresolved_details and not unresolved_refs:
+        lines.append("(none — no unresolved investigation record for this run.)")
+    else:
+        for identity in unresolved_refs:
+            lines.append(f"- Unresolved ref: {identity}")
+        for detail in unresolved_details:
+            lines.append(
+                f"- {detail.evidence_id}: outcome={detail.outcome}, "
+                f"reason={detail.reason or '(none)'}"
+            )
+            for gap in detail.gaps:
+                lines.append(f"  - Gap [{gap.code}]: {gap.description or '(none)'}")
+                for question in gap.unresolved_questions:
+                    lines.append(f"    - Question: {question}")
+                for condition in gap.required_conditions:
+                    lines.append(f"    - Needs: {condition}")
+                for suggestion in gap.next_suggestions:
+                    lines.append(f"    - Next: {suggestion}")
+                if gap.evidence_refs:
+                    lines.append(f"    - Evidence refs: {', '.join(gap.evidence_refs)}")
+                if gap.target_node_ids:
+                    lines.append(f"    - Targets: {', '.join(gap.target_node_ids)}")
+    evidence_reads = getattr(report, "evidence_reads", []) or []
+    lines += ["", "## Evidence reads", ""]
+    if not evidence_reads:
+        lines.append("(none)")
+    for entry in evidence_reads:
+        query = f", query={entry.query}" if entry.query else ""
+        delegation = (
+            f", delegation={entry.delegation_id}" if entry.delegation_id else ""
+        )
+        lines.append(
+            f"- {entry.evidence_id}: {entry.status} "
+            f"(offset={entry.offset}, limit={entry.limit}{query}{delegation})"
+        )
     return "\n".join(lines) + "\n"
 
 

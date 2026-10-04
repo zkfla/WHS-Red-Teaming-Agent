@@ -181,6 +181,199 @@ class RunEffectiveness(BaseModel):
     dead_end_work_ratio: float = 0.0
 
 
+# F1 report connection. All additive: existing fields/order never change.
+# Detail canon lives in the existing evidence store
+# (metadata record_kind == investigation_unresolved); runtime keeps refs only.
+# Graph-handler branches are NOT interpreted here (owner B/root only): we read
+# exactly record_kind == investigation_unresolved. No new store, no raw text.
+_UNRESOLVED_DETAIL_LIMIT = 20
+_UNRESOLVED_REF_LIMIT = 50
+_READ_PROJECTION_LIMIT = 10
+
+
+def _safe_nonneg_int(value: Any) -> int:
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, int) and value >= 0:
+        return value
+    return 0
+
+
+def _safe_id_token(value: Any, limit: int = 200) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()[:limit]
+    return text or None
+
+
+def _safe_id_list(values: Any, limit: int = 20) -> list[str]:
+    if not isinstance(values, (list, tuple)):
+        return []
+    cleaned: list[str] = []
+    for item in list(values)[:limit]:
+        token = _safe_id_token(item)
+        if token is not None:
+            cleaned.append(token)
+    return cleaned
+
+
+def _safe_text_list(values: Any, limit: int = 10, chars: int = 500) -> list[str]:
+    if not isinstance(values, (list, tuple)):
+        return []
+    cleaned: list[str] = []
+    for item in list(values)[:limit]:
+        if item is None:
+            continue
+        text = safe_feedback(str(item), chars)
+        if text:
+            cleaned.append(text)
+    return cleaned
+
+
+class EvidenceReadProjection(BaseModel):
+    """Durable lookup spec only: offset/query request plus outcome status."""
+
+    evidence_id: str = ""
+    offset: int = Field(default=0, ge=0)
+    limit: int = Field(default=0, ge=0)
+    query: str | None = None
+    status: str = "unknown"
+    delegation_id: str | None = None
+
+
+class UnresolvedGapProjection(BaseModel):
+    code: str = "unknown"
+    description: str = ""
+    unresolved_questions: list[str] = Field(default_factory=list)
+    target_node_ids: list[str] = Field(default_factory=list)
+    evidence_refs: list[str] = Field(default_factory=list)
+    required_conditions: list[str] = Field(default_factory=list)
+    next_suggestions: list[str] = Field(default_factory=list)
+
+
+class InvestigationUnresolvedProjection(BaseModel):
+    evidence_id: str = ""
+    reported_by: str = "unknown"
+    mission_id: str | None = None
+    task_id: str | None = None
+    path_id: str | None = None
+    path_version: int | None = None
+    path_step_id: str | None = None
+    outcome: str = "unknown"
+    reason: str = ""
+    source_evidence_ids: list[str] = Field(default_factory=list)
+    gaps: list[UnresolvedGapProjection] = Field(default_factory=list)
+    claim_supported: bool = False
+
+
+def _project_evidence_reads(runtime: Any) -> list[EvidenceReadProjection]:
+    entries = getattr(runtime, "evidence_reads", None)
+    if not isinstance(entries, (list, tuple)):
+        return []
+    projected: list[EvidenceReadProjection] = []
+    for item in list(entries)[-_READ_PROJECTION_LIMIT:]:
+        if not isinstance(item, dict):
+            continue
+        request = item.get("request") if isinstance(item.get("request"), dict) else {}
+        status_raw = str(item.get("status", "unknown"))
+        status = status_raw.strip()[:60] or "unknown"
+        projected.append(
+            EvidenceReadProjection(
+                evidence_id=str(request.get("evidence_id", ""))[:200],
+                offset=_safe_nonneg_int(request.get("offset", 0)),
+                limit=_safe_nonneg_int(request.get("limit", 0)),
+                query=safe_feedback(str(request["query"]), 200)
+                if request.get("query") is not None
+                else None,
+                status=status,
+                delegation_id=_safe_id_token(item.get("delegation_id")),
+            )
+        )
+    return projected
+
+
+def _project_unresolved_details(evidence: Any) -> list[InvestigationUnresolvedProjection]:
+    ordered: list[Any] = []
+    for item in evidence or []:
+        metadata = getattr(item, "metadata", None)
+        if not isinstance(metadata, dict):
+            continue
+        if metadata.get("record_kind") != "investigation_unresolved":
+            continue
+        ordered.append(item)
+    ordered = ordered[:_UNRESOLVED_DETAIL_LIMIT]
+    projected: list[InvestigationUnresolvedProjection] = []
+    for item in ordered:
+        metadata = item.metadata if isinstance(item.metadata, dict) else {}
+        gaps: list[UnresolvedGapProjection] = []
+        raw_gaps = metadata.get("gaps")
+        if isinstance(raw_gaps, (list, tuple)):
+            for gap in list(raw_gaps)[:10]:
+                if not isinstance(gap, dict):
+                    continue
+                gaps.append(
+                    UnresolvedGapProjection(
+                        code=safe_feedback(str(gap.get("code", "unknown")), 100)
+                        or "unknown",
+                        description=safe_feedback(str(gap.get("description", "")), 500),
+                        unresolved_questions=_safe_text_list(
+                            gap.get("unresolved_questions", gap.get("questions", [])),
+                        ),
+                        target_node_ids=_safe_id_list(
+                            gap.get("target_node_ids", gap.get("targets", []))
+                        ),
+                        evidence_refs=_safe_id_list(
+                            gap.get("evidence_ids", gap.get("evidence_refs", []))
+                        ),
+                        required_conditions=_safe_text_list(
+                            gap.get("required_conditions", gap.get("conditions", []))
+                        ),
+                        next_suggestions=_safe_text_list(
+                            gap.get("next_suggestions", gap.get("suggestions", []))
+                        ),
+                    )
+                )
+        reported = safe_feedback(str(metadata.get("reported_by", "unknown")), 60)
+        projected.append(
+            InvestigationUnresolvedProjection(
+                evidence_id=str(getattr(item, "evidence_id", ""))[:200],
+                reported_by=reported or "unknown",
+                mission_id=_safe_id_token(metadata.get("mission_id")),
+                task_id=_safe_id_token(metadata.get("task_id")),
+                path_id=_safe_id_token(metadata.get("path_id")),
+                path_version=metadata.get("path_version")
+                if isinstance(metadata.get("path_version"), int)
+                and not isinstance(metadata.get("path_version"), bool)
+                else None,
+                path_step_id=_safe_id_token(metadata.get("path_step_id")),
+                outcome=safe_feedback(str(metadata.get("outcome", "unknown")), 60)
+                or "unknown",
+                reason=safe_feedback(str(metadata.get("reason", "")), 500),
+                source_evidence_ids=_safe_id_list(metadata.get("source_evidence_ids", [])),
+                gaps=gaps,
+                claim_supported=False,
+            )
+        )
+    return projected
+
+
+def _project_run_outcome(
+    *,
+    ready_for_release: bool,
+    phase: Any,
+    has_unresolved_detail: bool,
+) -> str:
+    if ready_for_release:
+        return "goal_achieved"
+    if has_unresolved_detail:
+        return "unresolved"
+    if phase is AgentPhase.FAILED:
+        return "failed"
+    if phase is AgentPhase.FINISHED:
+        return "unresolved"
+    return "unknown"
+
+
 # Termination reasons that may still release. NO_ACTIONABLE_PLAN is the
 # depleted-frontier exit; GOAL_ACHIEVED is accepted only when the central
 # contract defines it (getattr keeps this working before it does) and only
@@ -223,6 +416,18 @@ class TerminalReportProjection(BaseModel):
     coverage_status: str = "unknown"
     result_processing: list[MappingStatus] = Field(default_factory=list)
     effectiveness: RunEffectiveness = Field(default_factory=RunEffectiveness)
+    # F1 additive outcome/usage/unresolved projections. Defaults keep reports
+    # stored before this existed loadable; they read as unknown/empty, never
+    # as success.
+    run_outcome: str = "unknown"
+    model_requests_used: int = Field(default=0, ge=0)
+    model_tokens_used: int = Field(default=0, ge=0)
+    model_usage_unknown: int = Field(default=0, ge=0)
+    unresolved_evidence_ids: list[str] = Field(default_factory=list)
+    evidence_reads: list[EvidenceReadProjection] = Field(default_factory=list)
+    unresolved_details: list[InvestigationUnresolvedProjection] = Field(
+        default_factory=list
+    )
 
 
 class ReportingAgent:
@@ -310,7 +515,21 @@ class ReportingAgent:
             ),
             dead_end_work_ratio=(round(dead_ends / terminal_work, 6) if terminal_work else 0.0),
         )
-        return TerminalReportProjection(
+        # F1 additive reads: refs stay IDs only; detail canon is looked up from
+        # the existing evidence store here, never copied as raw into runtime.
+        unresolved_refs = [
+            str(item)[:200]
+            for item in (getattr(runtime, "unresolved_evidence_ids", None) or [])
+        ][-_UNRESOLVED_REF_LIMIT:]
+        unresolved_details = _project_unresolved_details(evidence)
+        if unresolved_refs:
+            ref_order = {identity: index for index, identity in enumerate(unresolved_refs)}
+            unresolved_details = sorted(
+                unresolved_details,
+                key=lambda item: ref_order.get(item.evidence_id, len(ref_order)),
+            )
+        evidence_read_projections = _project_evidence_reads(runtime)
+        report = TerminalReportProjection(
             run_id=runtime.run_id,
             phase=runtime.phase,
             termination_reason=runtime.termination_reason,
@@ -374,7 +593,26 @@ class ReportingAgent:
                 MappingStatus.model_validate(item)
                 for item in project_run_processing(evidence).values()
             ],
+            model_requests_used=_safe_nonneg_int(
+                getattr(runtime, "model_requests_used", 0)
+            ),
+            model_tokens_used=_safe_nonneg_int(
+                getattr(runtime, "model_tokens_used", 0)
+            ),
+            model_usage_unknown=_safe_nonneg_int(
+                getattr(runtime, "model_usage_unknown", 0)
+            ),
+            unresolved_evidence_ids=unresolved_refs,
+            evidence_reads=evidence_read_projections,
+            unresolved_details=unresolved_details,
+            run_outcome="unknown",
         )
+        report.run_outcome = _project_run_outcome(
+            ready_for_release=report.ready_for_release,
+            phase=report.phase,
+            has_unresolved_detail=bool(unresolved_details or unresolved_refs),
+        )
+        return report
 
 
 async def _resolve_mission(
