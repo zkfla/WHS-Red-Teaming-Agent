@@ -95,12 +95,18 @@ async def verify_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
         evidence.metadata["http_observation"] = response_observation
     # Read the selected mapper's validated observations. Physical tool ids
     # and tools sharing the comparison mapper use the same evidence path.
-    mutation = deps.result_mappers.map_result(
+    # The per-call outcome travels on the evidence record itself so every
+    # preserved result carries its mapping status; the raw tool_result
+    # payload stays immutable and no_mapper never refuses execution.
+    outcome = deps.result_mappers.map_result_with_outcome(
         tool_id=result.tool_id,
         target=proposal.target,
         arguments=proposal.arguments,
         result=result,
     )
+    mutation = outcome.mutation
+    evidence.metadata["mapping_status"] = outcome.status
+    evidence.metadata["mapping_outcome"] = outcome.status
     comparisons = [
         item
         for node in mutation.nodes
@@ -138,43 +144,63 @@ async def verify_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
 
     expectation = step.expectation if step is not None else None
     verification_failed = False
+    # Pure observation with no hypothesis and no specialized check claims
+    # nothing: skip the meaning-review call and admit UNKNOWN directly.
+    # Anything with a hypothesis or an authentication check still goes
+    # through the verifier below.
+    observation_skip = (
+        step is not None
+        and step.assessment_kind == "observation"
+        and proposal.hypothesis_id is None
+        and step.authentication_check is None
+    )
     try:
         hypothesis_claim_text, violation_flag = await resolve_claim_for_review(
             service, proposal.hypothesis_id, step
         )
     except Exception:
         hypothesis_claim_text, violation_flag = (None, None)
-    try:
-        assert deps.verifier is not None
-        assessment = await deps.verifier.verify(
-            VerificationRequest(
-                proposal=proposal,
-                result=result,
-                expectation=expectation,
-                source_refs=[str(evidence.evidence_id), str(result.invocation_id)],
-                hypothesis_claim=hypothesis_claim_text,
-                violation_if_confirmed=violation_flag,
-                principal_ref=getattr(step, "principal_ref", None) if step is not None else None,
-            )
-        )
-    except Exception as exc:  # noqa: BLE001 - preserve evidence and close work safely
-        verification_failed = True
-        result = result.model_copy(
-            update={
-                "metadata": {
-                    **result.metadata,
-                    "verification_exception": type(exc).__name__,
-                }
-            }
-        )
+    if observation_skip:
         assessment = VerificationAssessment(
             verdict=Verdict.UNKNOWN,
-            reason="analysis verifier failed before reaching a verdict",
-            reviewer_id=f"analysis:error:{type(exc).__name__}",
+            reason="observation only; no hypothesis or security claim to review",
+            reviewer_id="analysis:observation_skip",
             source_refs=[str(evidence.evidence_id), str(result.invocation_id)],
             outcome="unknown",
             claim_supported=False,
         )
+    else:
+        try:
+            assert deps.verifier is not None
+            assessment = await deps.verifier.verify(
+                VerificationRequest(
+                    proposal=proposal,
+                    result=result,
+                    expectation=expectation,
+                    source_refs=[str(evidence.evidence_id), str(result.invocation_id)],
+                    hypothesis_claim=hypothesis_claim_text,
+                    violation_if_confirmed=violation_flag,
+                    principal_ref=getattr(step, "principal_ref", None) if step is not None else None,
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 - preserve evidence and close work safely
+            verification_failed = True
+            result = result.model_copy(
+                update={
+                    "metadata": {
+                        **result.metadata,
+                        "verification_exception": type(exc).__name__,
+                    }
+                }
+            )
+            assessment = VerificationAssessment(
+                verdict=Verdict.UNKNOWN,
+                reason="analysis verifier failed before reaching a verdict",
+                reviewer_id=f"analysis:error:{type(exc).__name__}",
+                source_refs=[str(evidence.evidence_id), str(result.invocation_id)],
+                outcome="unknown",
+                claim_supported=False,
+            )
     verdict, reason = assessment.verdict, assessment.reason
 
     # The public receipt is appended once below as the final admission,

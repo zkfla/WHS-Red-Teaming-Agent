@@ -128,21 +128,26 @@ async def update_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
     # Tool Result -> Attack Graph Mutation (SERVICE/ENDPOINT discovery, if
     # a mapper is registered for this tool_id): the only writer of domain
     # facts about discovered nodes, and it never raises
-    # -- `ResultMapperRegistry.map_result` degrades to "nothing new" for
-    # an unmapped tool_id, a failed/blocked action, or malformed output.
+    # -- `ResultMapperRegistry.map_result_with_outcome` degrades to "nothing
+    # new" for an unmapped tool_id, a failed/blocked action, or malformed
+    # output. The outcome (mapped/empty/no_mapper/failed) is computed for
+    # every preserved result so failures stay visible; graph writes below
+    # stay success-gated and never promote unmeasured output.
     mutated_nodes = 0
     mutated_edges = 0
     mutated_findings = 0
-    if succeeded and result is not None and step is not None:
-        mutation = deps.result_mappers.map_result(
+    if result is not None and step is not None:
+        outcome = deps.result_mappers.map_result_with_outcome(
             tool_id=result.tool_id,
             target=proposal.target,
             arguments=proposal.arguments,
             result=result,
         )
-        mutated_nodes = len(mutation.nodes)
-        mutated_edges = len(mutation.edges)
-        mutated_findings = len(mutation.findings)
+        mutation = outcome.mutation
+        if succeeded:
+            mutated_nodes = len(mutation.nodes)
+            mutated_edges = len(mutation.edges)
+            mutated_findings = len(mutation.findings)
         mapper_failure = deps.result_mappers.last_failure
         if mapper_failure is not None:
             try:
@@ -163,6 +168,7 @@ async def update_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                     action_id=proposal.action_id,
                     invocation_id=result.invocation_id,
                     hypothesis_id=proposal.hypothesis_id,
+                    attempt=1,
                 )
             except Exception:  # noqa: BLE001 - the audit note must not break the update
                 pass
@@ -181,7 +187,60 @@ async def update_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             )
             last_event = failed_event
 
-        for node_mutation in mutation.nodes:
+        if mutation.target_references:
+            try:
+                from redteam.orchestration.observations.reference_scan import (
+                    is_reference_grounded,
+                )
+                from redteam.orchestration.recovery import record_target_references
+
+                source_evidence_id = (
+                    str(state["result_evidence_id"])
+                    if state.get("result_evidence_id")
+                    else None
+                )
+                if source_evidence_id is not None:
+                    tool_result_json = result.model_dump(mode="json")
+                    grounded = []
+                    for entry in mutation.target_references:
+                        draft = entry
+                        if draft.source_evidence_id is None:
+                            draft = draft.model_copy(
+                                update={"source_evidence_id": source_evidence_id}
+                            )
+                        if is_reference_grounded(
+                            draft,
+                            tool_result=tool_result_json,
+                            action_id=str(proposal.action_id),
+                            invocation_id=str(result.invocation_id),
+                            evidence_id=source_evidence_id,
+                        ):
+                            grounded.append(draft)
+                    if grounded:
+                        await record_target_references(
+                            evidence_store=deps.evidence_store,
+                            run_id=runtime.run_id,
+                            engagement_id=runtime.engagement_id,
+                            source_evidence_id=source_evidence_id,
+                            tool_id=str(result.tool_id),
+                            references=[
+                                item.model_dump(mode="json") for item in grounded
+                            ],
+                            action_id=proposal.action_id,
+                            invocation_id=result.invocation_id,
+                            hypothesis_id=proposal.hypothesis_id,
+                            attempt=1,
+                        )
+            except Exception:  # noqa: BLE001 - references must not break the update
+                pass
+
+        # Graph writes stay success-gated: a verification or tool failure
+        # still records the mapping outcome and grounded references above,
+        # but never promotes unmeasured output into nodes/edges/findings.
+        nodes_to_apply = mutation.nodes if succeeded else []
+        edges_to_apply = mutation.edges if succeeded else []
+        findings_to_apply = mutation.findings if succeeded else []
+        for node_mutation in nodes_to_apply:
             observed_facts = dict(node_mutation.facts)
             if node_mutation.observations and provenance.evidence_id:
                 observed_facts["observations"] = [
@@ -214,7 +273,7 @@ async def update_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                 correlation_id=correlation_id,
                 causation_id=last_event.event_id,
             )
-        for edge_mutation in mutation.edges:
+        for edge_mutation in edges_to_apply:
             await service.link(
                 edge_mutation.edge_type,
                 edge_mutation.source_id,
@@ -224,7 +283,7 @@ async def update_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             )
 
         if provenance.evidence_id:
-            for finding_mutation in mutation.findings:
+            for finding_mutation in findings_to_apply:
                 existing = await service.get_finding(finding_mutation.finding_id)
                 evidence_ids = sorted(
                     {
@@ -300,7 +359,7 @@ async def update_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                         causation_id=created.event_id,
                     )
 
-        if mutation.nodes or mutation.edges or mutation.findings:
+        if succeeded and (mutation.nodes or mutation.edges or mutation.findings):
             last_event = await publisher.publish(
                 GRAPH_MUTATION_APPLIED,
                 {

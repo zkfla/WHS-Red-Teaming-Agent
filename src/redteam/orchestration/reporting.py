@@ -15,6 +15,7 @@ from redteam.core.ids import ApprovalId, EvidenceId, FindingId, MissionId, RunId
 from redteam.core.ports.evidence_store import EvidenceStore
 from redteam.core.ports.task_graph import MissionTaskStore
 from redteam.orchestration.diagnostics import DecisionDiagnostic
+from redteam.orchestration.coverage import CoverageGapSummary, project_coverage_gaps
 from redteam.orchestration.operator_intents.redaction import redact_text
 from redteam.orchestration.state import RuntimeState, TerminationReason
 from redteam.orchestration.work.store import WorkStore
@@ -179,6 +180,17 @@ class RunEffectiveness(BaseModel):
     dead_end_work_ratio: float = 0.0
 
 
+# Termination reasons that may still release. NO_ACTIONABLE_PLAN is the
+# depleted-frontier exit; GOAL_ACHIEVED is accepted only when the central
+# contract defines it (getattr keeps this working before it does) and only
+# beside the meaningful-success proofs below (mission completed, criteria
+# met, required tasks done) -- the reason alone never certifies success.
+_RELEASE_OK_REASONS = (
+    TerminationReason.NO_ACTIONABLE_PLAN,
+    getattr(TerminationReason, "GOAL_ACHIEVED", TerminationReason.NO_ACTIONABLE_PLAN),
+)
+
+
 class TerminalReportProjection(BaseModel):
     run_id: RunId
     phase: AgentPhase
@@ -203,6 +215,10 @@ class TerminalReportProjection(BaseModel):
     deferred_hypotheses: list[str] = Field(default_factory=list)
     #: Optional so reports persisted before Mission reporting existed still load.
     mission: MissionProjection | None = None
+    #: Gap projection beside the mission view; absent on reports stored
+    #: before coverage existed, which read as unknown, never complete.
+    coverage: CoverageGapSummary | None = None
+    coverage_status: str = "unknown"
     effectiveness: RunEffectiveness = Field(default_factory=RunEffectiveness)
 
 
@@ -219,6 +235,7 @@ class ReportingAgent:
         task_store: MissionTaskStore | None = None,
         required_hypothesis_ids: Collection[str] | None = None,
         agent_definitions: Iterable[AgentDefinition] = (),
+        coverage: CoverageGapSummary | None = None,
     ) -> TerminalReportProjection:
         if not runtime.is_terminal:
             raise ValueError("reporting projection requires a terminal runtime")
@@ -268,6 +285,8 @@ class ReportingAgent:
                     evidence_count=len(evidence),
                     agent_definitions=agent_definitions,
                 )
+                if coverage is None:
+                    coverage = project_coverage_gaps(mission=plan, tasks=tasks)
         actions = runtime.actions_executed
         terminal_work = sum(status_counts.values())
         dead_ends = sum(
@@ -298,7 +317,7 @@ class ReportingAgent:
             pending_approval_id=runtime.pending_approval_id,
             ready_for_release=(
                 runtime.phase is AgentPhase.FINISHED
-                and runtime.termination_reason == TerminationReason.NO_ACTIONABLE_PLAN
+                and runtime.termination_reason in _RELEASE_OK_REASONS
                 and not integrity.blocking
                 # Required scope only: non-required open hypotheses are
                 # reported as deferred and never alone block release.
@@ -331,6 +350,10 @@ class ReportingAgent:
             outstanding_cleanup=[str(item.node_id) for item in cleanup.outstanding],
             mission=mission,
             effectiveness=effectiveness,
+            coverage=coverage,
+            coverage_status=(
+                "unknown" if coverage is None or coverage.unknown else "ok"
+            ),
         )
 
 

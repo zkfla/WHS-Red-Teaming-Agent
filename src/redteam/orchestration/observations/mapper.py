@@ -28,6 +28,7 @@ from redteam.core.contracts.tool import ToolResult
 from redteam.core.enums import GraphEdgeType, GraphNodeType, Verdict
 from redteam.core.ids import GraphNodeId, ToolId
 from redteam.orchestration.expectations import Expectation
+from redteam.orchestration.observations.reference_scan import TargetReference
 
 logger = logging.getLogger(__name__)
 
@@ -88,6 +89,12 @@ class GraphMutation:
     edges: list[EdgeMutation] = field(default_factory=list)
     findings: list[FindingMutation] = field(default_factory=list)
 
+    # Reference candidates are a separate channel from nodes/edges/findings:
+    # addresses this run preserved origin mentioned, never synthesized
+    # facts. UPDATE stores them as an evidence metadata companion only and
+    # never turns them into graph nodes or facts.
+    target_references: list[TargetReference] = field(default_factory=list)
+
 
 def is_http_status(value: Any) -> TypeGuard[int]:
     """A real HTTP status code.
@@ -111,6 +118,15 @@ ResultMapperFn = Callable[..., GraphMutation]
 def _validate_mutation(mutation: GraphMutation, *, target: AnyTarget) -> None:
     """Reject a whole mapper batch before UPDATE can apply it partially."""
 
+    for entry in mutation.target_references:
+        if not isinstance(entry, TargetReference):
+            raise ValueError("mapper emitted a non-TargetReference entry")
+        if not entry.raw_path or entry.raw_path[0] != "output":
+            raise ValueError("reference raw_path must start at output")
+        if getattr(entry.target, "kind", None) == "graph_node":
+            raise ValueError("references must not assert graph nodes")
+        if getattr(entry.target, "graph_node_id", None) is not None:
+            raise ValueError("references must not assert node identity")
     node_types: dict[GraphNodeId, GraphNodeType] = {}
     for node in mutation.nodes:
         encoded_type, _ = split_node_id(node.node_id)
@@ -215,23 +231,84 @@ class ResultMapperRegistry:
         arguments: dict[str, Any],
         result: ToolResult,
     ) -> GraphMutation:
+        return self.map_result_with_outcome(
+            tool_id=tool_id,
+            target=target,
+            arguments=arguments,
+            result=result,
+        ).mutation
+
+    def map_result_with_outcome(
+        self,
+        *,
+        tool_id: ToolId,
+        target: AnyTarget,
+        arguments: dict[str, Any],
+        result: ToolResult,
+    ) -> MappingOutcome:
+        """Map one preserved result with its per-call outcome.
+
+        Status is mapped when a mapper ran clean, empty when nothing was
+        discovered, no_mapper when no mapper serves the tool, and failed
+        when the mapper raised. The shared last_failure slot keeps its
+        existing meaning for current readers.
+        """
         self._last_failure = None
         mapper = self._mappers.get(str(tool_id))
         if mapper is None:
-            return GraphMutation()
+            return MappingOutcome(
+                mutation=GraphMutation(),
+                tool_id=str(tool_id),
+                mapper=None,
+                status="no_mapper",
+            )
+        name = getattr(mapper, "__name__", type(mapper).__name__)
         try:
             mutation = mapper(target=target, arguments=arguments, result=result)
             _validate_mutation(mutation, target=target)
-            return mutation
         except Exception as exc:  # noqa: BLE001 - mapper failure is observable, not fatal
             self._last_failure = MapperFailure(
                 tool_id=str(tool_id),
-                mapper=getattr(mapper, "__name__", type(mapper).__name__),
+                mapper=name,
                 reason=type(exc).__name__,
             )
             logger.warning("result mapper for %s raised; ignoring", tool_id, exc_info=True)
-            return GraphMutation()
+            return MappingOutcome(
+                mutation=GraphMutation(),
+                tool_id=str(tool_id),
+                mapper=name,
+                status="failed",
+                reason=type(exc).__name__,
+            )
+        if not mutation.nodes and not mutation.edges and not mutation.findings and not mutation.target_references:
+            return MappingOutcome(
+                mutation=mutation,
+                tool_id=str(tool_id),
+                mapper=name,
+                status="empty",
+            )
+        return MappingOutcome(
+            mutation=mutation,
+            tool_id=str(tool_id),
+            mapper=name,
+            status="mapped",
+        )
 
+@dataclass(frozen=True)
+class MappingOutcome:
+    """Immutable per-call mapping result.
+
+    The shared last_failure slot stays for existing readers, but the
+    outcome itself travels with the call: status is mapped when a mapper
+    ran clean, empty when nothing was discovered, no_mapper when no
+    mapper serves the tool, and failed when the mapper raised.
+    """
+
+    mutation: GraphMutation
+    tool_id: str
+    mapper: str | None
+    status: str
+    reason: str | None = None
 
 #: Contribution kind spoken by observation bundles. The composition
 #: root owns collection; the name is the draft so both sides can meet.

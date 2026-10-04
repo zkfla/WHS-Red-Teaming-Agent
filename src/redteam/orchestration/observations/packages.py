@@ -133,6 +133,14 @@ def builtin_observation_packages() -> tuple[MapperContribution, ...]:
             f"{base}.web_proxy:map_web_nuclei_response_check",
             keys=("passive_check_observed",),
         ),
+        _bundle(
+            "web.web_search",
+            f"{base}.public_lookup:map_public_search_results",
+        ),
+        _bundle(
+            "web.fetch_page_text",
+            f"{base}.public_lookup:map_public_page_read",
+        ),
     )
 
 

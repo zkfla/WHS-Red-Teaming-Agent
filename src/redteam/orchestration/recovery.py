@@ -43,6 +43,8 @@ __all__ = [
     "is_execution_ambiguous",
     "reprocess_evidence",
     "record_mapping_failure",
+    "record_target_references",
+    "mapping_attempt_key",
     "record_recovery_note",
     "recovery_report",
 ]
@@ -714,24 +716,50 @@ async def reprocess_evidence(
         else:
             verdict = Verdict.UNKNOWN
             reason = "violation was not promoted to a Finding: " + promotion.refused_reason
-    mutation_summary = {"nodes": 0, "edges": 0}
+    # Pre-seeded so the companion note below never KeyErrors when mapping
+    # is skipped (no mappers configured): the note reports zeros, honestly.
+    mutation_summary = {"nodes": 0, "edges": 0, "target_references": 0}
     mapper_failure = None
-    if result_mappers is not None and result.success:
-        mutation = result_mappers.map_result(
+    mapping_status = "skipped"
+    # The outcome is computed for every replayed result so failures stay
+    # visible; graph writes below stay success-gated, mirroring UPDATE.
+    if result_mappers is not None:
+        map_with_outcome = getattr(result_mappers, "map_result_with_outcome", None)
+        if map_with_outcome is not None:
+            outcome = map_with_outcome(
+                tool_id=result.tool_id,
+                target=proposal.target,
+                arguments=dict(proposal.arguments),
+                result=result,
+            )
+            mutation = outcome.mutation
+            mapping_status = outcome.status
+        else:
+            mutation = result_mappers.map_result(
             tool_id=result.tool_id,
             target=proposal.target,
             arguments=dict(proposal.arguments),
             result=result,
         )
         failure = result_mappers.last_failure
-        mutation_summary = {"nodes": len(mutation.nodes), "edges": len(mutation.edges)}
+        if map_with_outcome is None:
+            mapping_status = "failed" if failure is not None else "mapped"
+        mutation_summary = {
+            "nodes": len(mutation.nodes),
+            "edges": len(mutation.edges),
+            "target_references": len(getattr(mutation, "target_references", [])),
+        }
         if failure is not None:
             mapper_failure = {
                 "tool_id": failure.tool_id,
                 "mapper": failure.mapper,
                 "reason": failure.reason,
             }
-        for node_mutation in mutation.nodes:
+        # Graph writes stay success-gated: a failed replay still reports its
+        # mapping outcome above, but never promotes output into the graph.
+        nodes_to_apply = mutation.nodes if result.success else []
+        edges_to_apply = mutation.edges if result.success else []
+        for node_mutation in nodes_to_apply:
             observed_facts = dict(node_mutation.facts)
             if node_mutation.observations:
                 observed_facts["observations"] = [
@@ -749,7 +777,7 @@ async def reprocess_evidence(
                 labels=node_mutation.labels,
                 provenance=provenance,
             )
-        for edge_mutation in mutation.edges:
+        for edge_mutation in edges_to_apply:
             await graph_service.link(
                 edge_mutation.edge_type,
                 edge_mutation.source_id,
@@ -770,6 +798,10 @@ async def reprocess_evidence(
         + str(mutation_summary["nodes"])
         + " edges="
         + str(mutation_summary["edges"]),
+        " references="
+        + str(mutation_summary["target_references"])
+        + " mapping="
+        + str(mapping_status),
     ]
     if step_degraded:
         parts.append("step context unreadable, replayed degraded")
@@ -804,9 +836,86 @@ async def reprocess_evidence(
         "finding_id": finding_id,
         "mutation": mutation_summary,
         "mapper_failure": mapper_failure,
+        "mapping_status": mapping_status,
         "companion_evidence_id": str(companion.evidence_id),
         "review_receipt": receipt_status,
     }
+
+
+def mapping_attempt_key(
+    source_evidence_id: str | None,
+    action_id: Any | None,
+    invocation_id: Any | None,
+    attempt: int,
+) -> str:
+    """Dedup key for one processing attempt over existing identifiers.
+
+    Built only from the call and evidence identifiers plus the processing
+    attempt: no new record identifier ever enters the execution meaning key.
+    """
+    return "|".join(
+        [
+            str(source_evidence_id or ""),
+            str(action_id or ""),
+            str(invocation_id or ""),
+            str(attempt),
+        ]
+    )
+
+
+async def record_target_references(
+    *,
+    evidence_store: Any,
+    run_id: Any,
+    engagement_id: Any,
+    source_evidence_id: str,
+    tool_id: str,
+    references: list[Any],
+    action_id: Any | None = None,
+    invocation_id: Any | None = None,
+    hypothesis_id: Any | None = None,
+    attempt: int = 1,
+) -> EvidenceRecord:
+    """Append a companion record carrying reference candidates.
+
+    The original evidence record is never touched: entries travel on this
+    SYSTEM companion through source_evidence_id, each already echoing the
+    origin identifiers. No graph node or fact is created here or implied.
+    """
+    payload = {
+        "record_kind": "target_references",
+        "source_evidence_id": source_evidence_id,
+        "tool_id": tool_id,
+        "target_references": list(references),
+        "attempt": attempt,
+        "mapping_attempt_key": mapping_attempt_key(
+            source_evidence_id, action_id, invocation_id, attempt
+        ),
+    }
+    note = EvidenceRecord(
+        evidence_id=EvidenceId(new_id("ev")),
+        run_id=run_id,
+        engagement_id=engagement_id,
+        source_type=EvidenceSourceType.SYSTEM,
+        source_id="orchestration.recovery",
+        action_id=action_id,
+        invocation_id=invocation_id,
+        hypothesis_id=hypothesis_id,
+        content_type="application/json",
+        artifact_ref=None,
+        digest=digest_payload(payload),
+        summary=(
+            "target references for "
+            + str(tool_id)
+            + " ("
+            + str(len(list(references)))
+            + ")"
+        )[:280],
+        created_at=datetime.now(timezone.utc),
+        metadata=payload,
+    )
+    await evidence_store.append(note)
+    return note
 
 
 async def record_mapping_failure(
@@ -818,6 +927,7 @@ async def record_mapping_failure(
     tool_id: str,
     mapper: str,
     reason: str,
+    attempt: int = 1,
     action_id: Any | None = None,
     invocation_id: Any | None = None,
     hypothesis_id: Any | None = None,
@@ -834,6 +944,10 @@ async def record_mapping_failure(
         "tool_id": tool_id,
         "mapper": mapper,
         "reason": reason,
+        "attempt": attempt,
+        "mapping_attempt_key": mapping_attempt_key(
+            source_evidence_id, action_id, invocation_id, attempt
+        ),
     }
     note = EvidenceRecord(
         evidence_id=EvidenceId(new_id("ev")),
@@ -924,4 +1038,5 @@ async def recovery_report(*, evidence_store: Any, run_id: str) -> dict:
         "record_kinds": kinds,
         "mapping_failures": kinds.get("mapper_failure", 0),
         "verification_failures": verification_failures,
+        "target_reference_companions": kinds.get("target_references", 0),
     }

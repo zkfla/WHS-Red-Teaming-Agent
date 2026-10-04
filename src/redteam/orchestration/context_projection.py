@@ -6,7 +6,9 @@ import asyncio
 from collections import OrderedDict
 from dataclasses import dataclass
 
-from pydantic import BaseModel
+from typing import Any
+
+from pydantic import BaseModel, ConfigDict, Field
 
 from redteam.attack_graph.observation import GraphObservation, build_observation
 from redteam.attack_graph.service import AttackGraphService
@@ -255,6 +257,109 @@ class ContextProjector:
             ),
             truncated=observation.truncated,
         )
+
+
+
+class MappingStatus(BaseModel):
+    """One preserved call: how mapping, processing and reflection went.
+
+    proposed_keys lists the metadata public keys a caller may ask for; only
+    keys actually present on the record travel back, never guessed values.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    evidence_id: str
+    mapping_status: str = "unknown"
+    mapping_outcome: str | None = None
+    mapping_tool: str | None = None
+    mapping_reason: str | None = None
+    processing_status: str = "unknown"
+    processing_stage: str | None = None
+    processing_outcome: str | None = None
+    recovery_status: str | None = None
+    reference_count: int = 0
+    proposed_keys: list[str] = Field(default_factory=list)
+
+
+def _public_status_value(metadata: dict[str, Any], *names: str) -> str | None:
+    for name in names:
+        value = metadata.get(name)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def project_mapping_status(*, record: Any, outcome: Any | None = None) -> MappingStatus:
+    """Project the same status contract the root public layer reads.
+
+    Reads only metadata keys root already exposes; never rewrites the
+    original tool_result or any preserved raw payload.
+    """
+    metadata = getattr(record, "metadata", None)
+    meta = dict(metadata) if isinstance(metadata, dict) else {}
+    references = meta.get("target_references")
+    reference_count = len(list(references)) if isinstance(references, list) else 0
+    record_kind = _public_status_value(meta, "record_kind")
+    stage = _public_status_value(
+        meta, "processing_stage", "stage", "admission", "receipt_kind"
+    )
+    status = _public_status_value(
+        meta, "processing_status", "processing_outcome", "recovery_status"
+    )
+    if status is None and record_kind in {"target_references", "mapper_failure", "recovery_result", "recovery_note"}:
+        status = record_kind
+    proposed = [
+        "mapping_status",
+        "mapping_outcome",
+        "processing_status",
+        "processing_stage",
+        "processing_outcome",
+        "recovery_status",
+        "target_references",
+    ]
+    if outcome is not None:
+        mapping_status = str(getattr(outcome, "status", "unknown"))
+        mapping_outcome = str(getattr(outcome, "status", "unknown"))
+        mapping_tool = getattr(outcome, "mapper", None)
+        mapping_reason = getattr(outcome, "reason", None)
+        if isinstance(mapping_tool, str) and not mapping_tool.strip():
+            mapping_tool = None
+        if isinstance(mapping_reason, str) and not mapping_reason.strip():
+            mapping_reason = None
+    else:
+        mapping_status = _public_status_value(meta, "mapping_status", "mapping_outcome")
+        if mapping_status is None:
+            mapping_status = "stored" if reference_count else "unknown"
+        mapping_outcome = _public_status_value(meta, "mapping_outcome", "mapping_status")
+        mapping_tool = _public_status_value(meta, "tool_id", "mapper")
+        mapping_reason = _public_status_value(meta, "reason", "error")
+    return MappingStatus(
+        evidence_id=str(getattr(record, "evidence_id", "")),
+        mapping_status=mapping_status or "unknown",
+        mapping_outcome=mapping_outcome,
+        mapping_tool=mapping_tool,
+        mapping_reason=mapping_reason,
+        processing_status=status or "unknown",
+        processing_stage=stage,
+        processing_outcome=status,
+        recovery_status=_public_status_value(meta, "recovery_status"),
+        reference_count=reference_count,
+        proposed_keys=[key for key in proposed if key in meta],
+    )
+
+
+def proposed_public_keys() -> tuple[str, ...]:
+    """Metadata public keys D proposes for the root public layer."""
+    return (
+        "mapping_status",
+        "mapping_outcome",
+        "processing_status",
+        "processing_stage",
+        "processing_outcome",
+        "recovery_status",
+        "target_references",
+    )
 
 
 async def project_knowledge_section(

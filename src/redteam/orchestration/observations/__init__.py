@@ -27,6 +27,7 @@ from redteam.orchestration.observations.mapper import (
     FindingMutation,
     GraphMutation,
     MapperContribution,
+    MappingOutcome,
     NodeMutation,
     ResultMapperRegistry,
     default_result_mapper_registry,
@@ -41,6 +42,16 @@ from redteam.orchestration.observations.packages import (
     builtin_observation_packages,
     mobsf_observation_package,
 )
+from redteam.orchestration.observations.public_lookup import (
+    map_public_page_read,
+    map_public_search_results,
+)
+from redteam.orchestration.observations.reference_scan import (
+    TargetReference,
+    is_absolute_url,
+    is_reference_grounded,
+    reference_address,
+)
 
 __all__ = [
     "EdgeMutation",
@@ -50,6 +61,8 @@ __all__ = [
     "ResultMapperRegistry",
     "default_result_mapper_registry",
     "MapperContribution",
+    "MappingOutcome",
+    "TargetReference",
     "register_contribution",
     "resolve_contribution_mapper",
     "mapper_contribution",
@@ -59,4 +72,9 @@ __all__ = [
     "builtin_observation_packages",
     "mobsf_observation_package",
     "builtin_extension_declaration",
+    "map_public_search_results",
+    "map_public_page_read",
+    "is_absolute_url",
+    "is_reference_grounded",
+    "reference_address",
 ]
