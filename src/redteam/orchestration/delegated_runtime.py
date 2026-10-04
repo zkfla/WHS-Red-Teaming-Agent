@@ -10,11 +10,13 @@ from redteam.orchestration.cognition import DecisionBudget, DecisionFailure
 from redteam.orchestration.delegation import DelegationRequest
 from redteam.orchestration.delegation_decision import (
     DelegationGateInput,
+    TERMINATION_WORKER_HELD,
     TurnConsumption,
     apply_turn_result,
     build_worker_next_action_payload,
     close_from_gate,
     gate_delegation_decision,
+    mark_active,
     mark_finished,
     open_delegation,
     parse_worker_next_action,
@@ -23,6 +25,7 @@ from redteam.orchestration.delegation_decision import (
 )
 from redteam.orchestration.evidence_access import EvidenceReader
 from redteam.orchestration.knowledge_validation import assessment_blocked, check_ready_step
+from redteam.orchestration.paths.models import step_definition_equal
 from redteam.orchestration.reasoning_time import reasoning_time_allowed
 from redteam.orchestration.target_references import register_references
 from redteam.orchestration.work.models import ACTIVE_STATUSES, WorkBudget
@@ -33,6 +36,59 @@ def _publish_runtime(engine, runtime, delegations):
     engine.updated_runtime = updated
     engine._event_runtime = updated
     return updated
+
+
+async def _worker_hold_fingerprint(engine, runtime, state):
+    """Role-visible canonical content fingerprint for a model-held investigation.
+
+    Reuses the existing per-role revision signal, so a change the role can
+    actually observe wakes the hold. A failed read can neither wake nor
+    stall the hold, and no receipt id is minted here.
+    """
+
+    try:
+        service = AttackGraphService(engine.deps.graph_store)
+        observation = await service.observe(step=runtime.step_count)
+    except Exception:  # noqa: BLE001 - failed reads cannot wake or stall a hold
+        return None
+    try:
+        return engine.deps.agents.revision_fingerprint(state.agent_id, observation)
+    except Exception:  # noqa: BLE001 - same rule for an unreadable revision
+        return None
+
+
+async def _relink_same_purpose(engine, runtime, path, state):
+    """Re-link one delegation when a newer path keeps the same purpose.
+
+    Same investigation and mission with a newer version: the stored
+    version's step definition must still mean the same purpose with the
+    same actual dependencies, and the step must sit outside the active
+    plan's own changed ids (which already include descendants). Anything
+    else returns None so the caller finishes just that affected step.
+    """
+
+    current = next((item for item in path.steps if item.step_id == state.path_step_id), None)
+    if current is None or state.path_step_id in set(path.changed_step_ids or []):
+        return None
+    try:
+        plans = await engine.deps.path_store.list_paths(str(runtime.run_id))
+    except Exception:  # noqa: BLE001 - unreadable history cannot prove sameness
+        return None
+    previous = next(
+        (
+            step
+            for plan in plans
+            if plan.path_id == state.path_id and plan.version == state.path_version
+            for step in plan.steps
+            if step.step_id == state.path_step_id
+        ),
+        None,
+    )
+    if previous is None:
+        return None
+    if not step_definition_equal(previous, current):
+        return None
+    return state.model_copy(update={"path_version": path.version})
 
 
 async def accept_delegations(engine, path, requests, runtime):
@@ -85,18 +141,46 @@ async def decide_delegations(engine, path, runtime, context):
     candidates = []
     advanced = False
     history = await engine.deps.work_store.list_items(run_id=runtime.run_id)
+    base_cursors = dict(runtime.agent_revision_cursors or {})
+    cursor_updates: dict[str, str] = {}
     for identity, state in list(values.items()):
-        if state.status == "finished" or (
-            state.status == "held" and runtime.pending_approval_id is None
-        ):
+        if state.status == "finished":
             continue
         if (
-            state.path_id != path.path_id or state.path_version != path.version
-            or state.mission_task_id != path.mission_task_id
+            state.status == "held"
+            and state.termination_reason == TERMINATION_WORKER_HELD
+            and runtime.pending_approval_id is None
         ):
+            # Model hold wakes only on a role-visible content change, never
+            # on a fresh receipt id. A missing baseline records the current
+            # revision and keeps waiting; an unreadable graph keeps the hold.
+            fingerprint = await _worker_hold_fingerprint(engine, runtime, state)
+            agent_key = str(state.agent_id)
+            baseline = base_cursors.get(agent_key)
+            if fingerprint is None or baseline is None or baseline == fingerprint:
+                if fingerprint is not None and baseline is None:
+                    cursor_updates[agent_key] = fingerprint
+                continue
+            cursor_updates[agent_key] = fingerprint
+            state = mark_active(state)
+            values[identity] = state
+        if state.status == "held" and runtime.pending_approval_id is None:
+            continue
+        if state.path_id != path.path_id or state.mission_task_id != path.mission_task_id:
             values[identity] = mark_finished(state, reason="investigation_context_changed")
             advanced = True
             continue
+        if state.path_version != path.version:
+            # Same investigation and mission under a newer version: follow
+            # the version when the step still means the same purpose with
+            # the same actual dependencies; finish only affected steps.
+            relinked = await _relink_same_purpose(engine, runtime, path, state)
+            if relinked is None:
+                values[identity] = mark_finished(state, reason="investigation_context_changed")
+                advanced = True
+                continue
+            values[identity] = relinked
+            state = relinked
         if any(
             item.delegation_id == identity and item.status in ACTIVE_STATUSES for item in history
         ):
@@ -260,6 +344,15 @@ async def decide_delegations(engine, path, runtime, context):
             values[identity] = values[identity].model_copy(
                 update={"unresolved": redact_secret_material(errors[-10:])}
             )
+    if cursor_updates:
+        runtime = runtime.model_copy(
+            update={
+                "agent_revision_cursors": {
+                    **runtime.agent_revision_cursors,
+                    **cursor_updates,
+                }
+            }
+        )
     runtime = _publish_runtime(engine, runtime, values)
     return candidates, advanced
 

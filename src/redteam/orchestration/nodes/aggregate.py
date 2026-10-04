@@ -81,7 +81,18 @@ async def aggregate_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
     last_with_event = next(
         (item for item in reversed(outcomes) if item.last_event_id is not None), None
     )
-    pending_approval = next((item for item in outcomes if item.approval_id is not None), None)
+    # Only an unresolved REQUIRE_APPROVAL counts as pending. Resolved ALLOW
+    # and DENY outcomes keep their approval id for audit, so id presence
+    # alone must never re-park an already decided action.
+    pending_approval = next(
+        (
+            item
+            for item in outcomes
+            if item.policy_verdict is PolicyVerdict.REQUIRE_APPROVAL
+            and item.approval_id is not None
+        ),
+        None,
+    )
     pending_dispatch = next(
         (
             item
@@ -130,6 +141,23 @@ async def aggregate_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
         related = [item for item in outcomes if item.delegation_id == delegation_id]
         if related:
             delegations[delegation_id] = update_delegation_from_outcomes(delegation, related)
+    # A batch that decides the previously pending action clears its markers.
+    # Anything else preserves them; only REQUIRE_APPROVAL sets them above.
+    approval_resolved = (
+        pending_approval is None
+        and runtime.pending_approval_id is not None
+        and runtime.pending_action_id is not None
+        and any(
+            outcome.approval_id is not None
+            and outcome.approval_id == runtime.pending_approval_id
+            and (
+                outcome.executed
+                or outcome.policy_verdict is PolicyVerdict.ALLOW
+                or outcome.policy_verdict is PolicyVerdict.DENY
+            )
+            for outcome in outcomes
+        )
+    )
     next_runtime = runtime.model_copy(
         update={
             "phase": AgentPhase.REPLAN,
@@ -150,13 +178,18 @@ async def aggregate_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             "pending_approval_id": (
                 pending_approval.approval_id
                 if pending_approval is not None
-                else runtime.pending_approval_id
+                else (None if approval_resolved else runtime.pending_approval_id)
             ),
             "active_hypothesis_id": None,
             "termination_reason": (
                 TerminationReason.APPROVAL_PENDING
                 if pending_approval is not None
-                else runtime.termination_reason
+                else (
+                    None
+                    if approval_resolved
+                    and runtime.termination_reason == TerminationReason.APPROVAL_PENDING
+                    else runtime.termination_reason
+                )
             ),
         }
     )
@@ -225,8 +258,14 @@ def update_delegation_from_outcomes(
     Only entries naming this delegation count toward it, and only while
     it is unfinished; unknown ids never create state here. Executed
     actions accumulate, stored evidence ids merge without duplicates,
-    and an approval parks the delegation until the existing resume
-    path returns it to the same purpose and allowance.
+    and only an unresolved REQUIRE_APPROVAL verdict parks the delegation
+    until the existing resume path returns it to the same purpose and
+    allowance. Resolved ALLOW/DENY outcomes keep their approval id for
+    audit, so they release an approval hold instead of re-parking it.
+    Worker-side analysis model cost carried on the outcomes folds into
+    the lifetime decision/token counters here (the direct follow-up
+    decision cost already lives in the runtime); unknown token usage
+    stays sticky.
     """
 
     mine = [
@@ -237,13 +276,33 @@ def update_delegation_from_outcomes(
     if not mine or delegation.status == "finished":
         return delegation
     if delegation.status == "held" and delegation.termination_reason == "approval_pending":
-        resumed = any(outcome.executed for outcome in mine) or any(
-            outcome.policy_verdict is PolicyVerdict.DENY and outcome.approval_id is None
+        resumed = any(
+            outcome.executed
+            or outcome.policy_verdict is PolicyVerdict.ALLOW
+            or outcome.policy_verdict is PolicyVerdict.DENY
             for outcome in mine
         )
         if resumed:
             delegation = delegation.model_copy(update={"status": "active", "termination_reason": None})
     consumed = sum(1 + max(outcome.retry_attempts, 0) for outcome in mine if outcome.executed)
+    # F1-owned analysis cost rides the same outcome envelope (model_* fields,
+    # defaulting to zero until that API lands). Only the actual analysis cost
+    # on the outcomes is added here; getattr keeps this inert until F1 lands.
+    model_attempts = sum(
+        max(int(getattr(outcome, "model_decision_attempts", 0) or 0), 0)
+        for outcome in mine
+    )
+    model_tokens: int | None = 0
+    for outcome in mine:
+        tokens = getattr(outcome, "model_tokens_used", 0)
+        if tokens is None:
+            model_tokens = None
+        elif model_tokens is not None:
+            model_tokens += max(int(tokens or 0), 0)
+    if delegation.tokens_used is None or model_tokens is None:
+        folded_tokens = None
+    else:
+        folded_tokens = delegation.tokens_used + model_tokens
     seen = list(delegation.evidence_ids)
     for outcome in mine:
         for evidence_id in outcome.evidence_ids:
@@ -251,9 +310,15 @@ def update_delegation_from_outcomes(
                 seen.append(evidence_id)
     update: dict[str, object] = {
         "actions_used": delegation.actions_used + consumed,
+        "decision_attempts_used": delegation.decision_attempts_used + model_attempts,
+        "tokens_used": folded_tokens,
         "evidence_ids": seen,
     }
-    if delegation.status == "active" and any(outcome.approval_id is not None for outcome in mine):
+    if delegation.status == "active" and any(
+        outcome.policy_verdict is PolicyVerdict.REQUIRE_APPROVAL
+        and outcome.approval_id is not None
+        for outcome in mine
+    ):
         update["status"] = "held"
         update["termination_reason"] = "approval_pending"
     return delegation.model_copy(update=update)
