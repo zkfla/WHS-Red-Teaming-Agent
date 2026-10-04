@@ -4,8 +4,10 @@ Production paths only (no network/clock). The stand-in model answers the
 new minimal contracts: purpose+steps path proposals and worker_next_action
 verdicts; completion conditions use the typed-claim shapes.
 """
+
 from __future__ import annotations
 
+import dataclasses
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Any
@@ -13,10 +15,10 @@ from typing import Any
 import pytest
 
 from redteam.attack_graph.observation import GraphObservation
-from redteam.core.enums import PolicyVerdict, Verdict
+from redteam.core.enums import EvidenceSourceType, PolicyVerdict
 from redteam.core.ids import AgentId, ApprovalId
 from redteam.orchestration.agents.registry import default_registry
-from redteam.orchestration.analysis import DeterministicAnalysisVerifier
+from redteam.orchestration.analysis import BudgetedAnalysisVerifier, DeterministicAnalysisVerifier
 from redteam.orchestration.analysis_budget import verification_guard
 from redteam.orchestration.candidates.models import PriorityScore
 from redteam.orchestration.cognition import DecisionBudget, ReasoningHalted
@@ -27,7 +29,7 @@ from redteam.orchestration.dispatch import WorkerOutcome
 from redteam.orchestration.engine import InvestigationEngine
 from redteam.orchestration.nodes import aggregate_node
 from redteam.orchestration.nodes.plan import plan_node
-from redteam.orchestration.nodes.policy import policy_node
+from redteam.orchestration.nodes.worker import worker_node
 from redteam.orchestration.observations import default_result_mapper_registry
 from redteam.orchestration.reasoning_time import reasoning_time_allowed
 from redteam.orchestration.settings import OrchestrationSettings
@@ -35,6 +37,8 @@ from redteam.orchestration.state import RuntimeState, TerminationReason, initial
 from redteam.orchestration.work.models import WorkItem, WorkStatus
 from tests.fakes import DummyToolGateway, FakeControlPlane
 from tests.integration import _engine_llm_harness as h
+
+RUN_TWO = "run-del-two"
 
 
 class MinimalLLM:
@@ -67,8 +71,13 @@ class MinimalLLM:
         return "unknown"
 
     async def complete_structured(
-        self, *, messages: list[dict[str, Any]], response_schema: dict[str, Any],
-        system: str | None = None, num_retries: int = 0, **_: Any,
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        response_schema: dict[str, Any],
+        system: str | None = None,
+        num_retries: int = 0,
+        **_: Any,
     ) -> dict[str, Any]:
         stage = self._stage(response_schema)
         self.calls.append({"stage": stage, "messages": messages})
@@ -178,8 +187,15 @@ async def _delegated_setup(run_id: str):
     delegation_id = next(iter(runtime.delegations))
     assert runtime.delegations[delegation_id].status == "active"
     return SimpleNamespace(
-        llm=llm, seed=seed, world=world, deps=deps, control=control,
-        runtime=runtime, engine=engine, path=path, delegation_id=delegation_id,
+        llm=llm,
+        seed=seed,
+        world=world,
+        deps=deps,
+        control=control,
+        runtime=runtime,
+        engine=engine,
+        path=path,
+        delegation_id=delegation_id,
     )
 
 
@@ -204,12 +220,11 @@ async def test_minimal_purpose_steps_draft_registers() -> None:
 
 
 async def test_worker_two_followups_share_control_ledger_and_collection() -> None:
-    ctx = await _delegated_setup("run-del-two")
+    ctx = await _delegated_setup(RUN_TWO)
     runtime = ctx.runtime
     proposals = []
-    for turn, (probe, evidence_id, tokens) in enumerate(
-        (("one", "ev-del-1", 40), ("two", "ev-del-2", None)), start=1
-    ):
+    real_evidence_ids = []
+    for turn, probe in enumerate(("one", "two"), start=1):
         ctx.llm.add("worker_next_action", worker_propose(ctx.seed.node_id, probe))
         planned = await plan_node(
             {**initial_graph_state(runtime), "observation": GraphObservation()},
@@ -227,39 +242,61 @@ async def test_worker_two_followups_share_control_ledger_and_collection() -> Non
         ]
         assert len(rows) == turn
         assert len({row.candidate_key for row in rows}) == turn
-
-        policed = await policy_node(planned, deps=ctx.deps)
-        runtime = policed["runtime"]
-        proposals.append(item.proposal)
-
-        outcome = WorkerOutcome(
-            action_id=str(item.proposal.action_id), work_id=item.work_id,
-            parent_action_id=str(proposals[-2].action_id) if len(proposals) > 1 else None,
-            candidate_key=item.plan_step.candidate_key or "",
-            delegation_id=ctx.delegation_id, agent_id=h.RECON_AGENT,
-            executed=True, succeeded=True, policy_verdict=PolicyVerdict.ALLOW,
-            verdict=Verdict.PASS, evidence_ids=[evidence_id],
-            model_decision_attempts=2 if tokens is not None else 0,
-            model_tokens_used=tokens,
+        worker_result = await worker_node(
+            {"runtime": runtime, "dispatch_item": item},
+            deps=ctx.deps,
         )
+        outcome = worker_result["worker_outcomes"][str(item.proposal.action_id)]
+        assert outcome.error is None
+        assert outcome.executed is True
+        assert outcome.succeeded is True
+        assert outcome.policy_verdict is PolicyVerdict.ALLOW
+        assert outcome.model_decision_attempts == 0
+        assert outcome.evidence_ids != []
+        real_evidence_ids.extend(outcome.evidence_ids)
+        proposals.append(item.proposal)
         aggregated = await aggregate_node(
-            {**policed, "dispatch_items": planned["dispatch_items"],
-             "worker_outcomes": {outcome.action_id: outcome}},
+            {**planned, "worker_outcomes": worker_result["worker_outcomes"]},
             deps=ctx.deps,
         )
         runtime = aggregated["runtime"]
-        finished = await ctx.world.work.complete(
-            item.work_id, owner=str(runtime.run_id), status=WorkStatus.SUCCEEDED,
-            now=datetime.now(timezone.utc),
-        )
-        assert finished is True
-
+        tool_records = [
+            record
+            for record in await ctx.world.evidence.list_for_run(RUN_TWO)
+            if record.source_type is EvidenceSourceType.TOOL
+        ]
+        assert len(tool_records) == turn
+    assert isinstance(ctx.deps.verifier, BudgetedAnalysisVerifier)
+    gateway = ctx.deps.tool_gateway
+    assert len(gateway.invocations) == 2
+    assert [invocation.arguments.get("probe") for invocation in gateway.invocations] == [
+        "one",
+        "two",
+    ]
+    assert len({invocation.invocation_id for invocation in gateway.invocations}) == 2
     assert len(ctx.control.evaluated) == 2
     assert [str(entry.action_id) for entry in ctx.control.evaluated] == [
         str(proposal.action_id) for proposal in proposals
     ]
+    by_action = {str(record.metadata["action_id"]): record for record in tool_records}
+    assert set(by_action) == {str(proposal.action_id) for proposal in proposals}
+    for invocation in gateway.invocations:
+        record = by_action[str(invocation.action_id)]
+        assert str(record.metadata["tool_result"]["invocation_id"]) == str(invocation.invocation_id)
+        assert str(record.invocation_id) == str(invocation.invocation_id)
+    assert set(real_evidence_ids) == {str(record.evidence_id) for record in tool_records}
+    for record in tool_records:
+        assert record.metadata.get("plan_step", {}).get("delegation_id") == ctx.delegation_id
+    rows = [
+        row
+        for row in await ctx.world.work.list_items(run_id=runtime.run_id)
+        if row.delegation_id == ctx.delegation_id
+    ]
+    assert len(rows) == 2
+    assert {row.status for row in rows} == {WorkStatus.SUCCEEDED}
     control_obs = [
-        obs for obs in runtime.recent_observations
+        obs
+        for obs in runtime.recent_observations
         if obs.kind == "control" and obs.outcome == PolicyVerdict.ALLOW.value
     ]
     assert len(control_obs) >= 2
@@ -267,10 +304,9 @@ async def test_worker_two_followups_share_control_ledger_and_collection() -> Non
     delegation = runtime.delegations[ctx.delegation_id]
     assert delegation.status == "active"
     assert delegation.actions_used == 2
-    # Two worker follow-up decisions plus the two analysis reviews carried
-    # on the first round outcome; the second round carried none.
-    assert delegation.decision_attempts_used == 4
-    assert delegation.evidence_ids == ["ev-del-1", "ev-del-2"]
+    assert delegation.decision_attempts_used == 2
+    assert delegation.evidence_ids == real_evidence_ids
+    assert len(real_evidence_ids) == 2
     assert delegation.tokens_used is None
     assert runtime.pending_approval_id is None
 
@@ -282,17 +318,17 @@ async def test_resolved_allow_deny_clear_pending() -> None:
 
     deps = build_test_application()
     item = fanout_item("action_appr", "a.local")
-    base_rt = RuntimeState(
-        run_id=item.proposal.run_id, engagement_id=item.proposal.engagement_id
-    )
+    base_rt = RuntimeState(run_id=item.proposal.run_id, engagement_id=item.proposal.engagement_id)
     pending_outcome = WorkerOutcome(
-        action_id="action_appr", work_id=item.work_id,
+        action_id="action_appr",
+        work_id=item.work_id,
         policy_verdict=PolicyVerdict.REQUIRE_APPROVAL,
         approval_id=ApprovalId("appr_action_appr"),
     )
     held = await aggregate_node(
         state_with(
-            base_rt, dispatch_items=[item],
+            base_rt,
+            dispatch_items=[item],
             worker_outcomes={"action_appr": pending_outcome},
         ),
         deps=deps,
@@ -302,13 +338,17 @@ async def test_resolved_allow_deny_clear_pending() -> None:
 
     for verdict, executed in ((PolicyVerdict.ALLOW, True), (PolicyVerdict.DENY, False)):
         resolved = WorkerOutcome(
-            action_id="action_appr", work_id=item.work_id,
-            executed=executed, succeeded=True if executed else None,
-            policy_verdict=verdict, approval_id=ApprovalId("appr_action_appr"),
+            action_id="action_appr",
+            work_id=item.work_id,
+            executed=executed,
+            succeeded=True if executed else None,
+            policy_verdict=verdict,
+            approval_id=ApprovalId("appr_action_appr"),
         )
         cleared = await aggregate_node(
             state_with(
-                held["runtime"], dispatch_items=[item],
+                held["runtime"],
+                dispatch_items=[item],
                 worker_outcomes={"action_appr": resolved},
             ),
             deps=deps,
@@ -409,14 +449,9 @@ async def test_analysis_retry_time_guard_and_unknown_usage_accumulate() -> None:
         update={"started_at": datetime(2000, 1, 1, tzinfo=timezone.utc)}
     )
     assert reasoning_time_allowed(expired_engagement, ancient) is False
-    guard_deps = SimpleNamespace(
-        coordinator=None,
-        task_graph_store=world.tasks,
-        path_store=world.paths,
-        engagement=expired_engagement,
-    )
+    expired_deps = dataclasses.replace(deps, engagement=expired_engagement)
     expired_guard = verification_guard(
-        {"runtime": ancient}, deps=guard_deps, budget=DecisionBudget(3)
+        {"runtime": ancient}, deps=expired_deps, budget=DecisionBudget(3)
     )
     with pytest.raises(ReasoningHalted, match="analysis_engagement_time_exhausted"):
         await expired_guard()
@@ -424,17 +459,17 @@ async def test_analysis_retry_time_guard_and_unknown_usage_accumulate() -> None:
 
 async def test_opened_delegation_never_reissues_initial_budget() -> None:
     first = open_delegation(
-        DelegationRequest(
-            path_step_id="step-1", agent_id=h.RECON_AGENT, objective="map inventory"
-        ),
-        path_id="path-1", path_version=1, decision_limit=4,
+        DelegationRequest(path_step_id="step-1", agent_id=h.RECON_AGENT, objective="map inventory"),
+        path_id="path-1",
+        path_version=1,
+        decision_limit=4,
     )
     assert first.budget.max_actions >= 1
     assert first.decision_attempts_used == 0
     reopened = open_delegation(
-        DelegationRequest(
-            path_step_id="step-1", agent_id=h.RECON_AGENT, objective="map inventory"
-        ),
-        path_id="path-1", path_version=1, decision_limit=4,
+        DelegationRequest(path_step_id="step-1", agent_id=h.RECON_AGENT, objective="map inventory"),
+        path_id="path-1",
+        path_version=1,
+        decision_limit=4,
     )
     assert reopened.delegation_id != first.delegation_id
