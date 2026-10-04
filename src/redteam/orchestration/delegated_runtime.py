@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 from redteam.core.contracts.mission import redact_secret_material
+from redteam.core.ids import GraphNodeId
+from redteam.attack_graph.service import AttackGraphService
+from redteam.orchestration.context_projection import ContextProjector
 from redteam.orchestration.cognition import DecisionBudget, DecisionFailure
 from redteam.orchestration.delegation import DelegationRequest
 from redteam.orchestration.delegation_decision import (
@@ -127,6 +130,29 @@ async def decide_delegations(engine, path, runtime, context):
             delegation=state, evidence_ids=state.evidence_ids, evidence_excerpts=relevant,
             unresolved=state.unresolved, remaining_actions=gate.remaining_actions,
         )
+        service = AttackGraphService(engine.deps.graph_store)
+        observation = await service.observe(step=runtime.step_count)
+        projected = await ContextProjector(service, engine.deps.context_cache).project(
+            definition.context_profile, step=runtime.step_count,
+            target_node_ids=[GraphNodeId(item) for item in step.target_node_ids],
+            fallback=observation,
+            cache_namespace=str(runtime.run_id),
+        )
+        relevant_ids = {identity for ids in projected.node_ids_by_type.values() for identity in ids}
+        relevant_ids.update(step.target_node_ids)
+        knowledge = dict(context.get("knowledge") or {})
+        for section in ("facts", "known_targets"):
+            knowledge[section] = [item for item in knowledge.get(section, [])
+                                  if item.get("node_id") in relevant_ids]
+        provided = dict(knowledge.get("provided") or {})
+        provided["claims"] = [item for item in provided.get("claims", [])
+                              if item.get("node_id") in relevant_ids]
+        knowledge["provided"] = provided
+        for section in ("hypotheses", "findings"):
+            details = dict(knowledge.get(section) or {})
+            details["items"] = [item for item in details.get("items", [])
+                                if item.get("target_node_id") in relevant_ids]
+            knowledge[section] = details
         reader = EvidenceReader(engine.deps.evidence_store)
         payload["requested_evidence"] = [
             await reader.read(evidence_id=item, run_id=str(runtime.run_id), limit=4000)
@@ -137,7 +163,7 @@ async def decide_delegations(engine, path, runtime, context):
             active_task=context.get("active_task"),
             specialist=definition.model_dump(mode="json"),
             engagement_constraints=context.get("engagement_constraints"),
-            knowledge=context.get("knowledge"),
+            knowledge=knowledge, role_observation=projected.model_dump(mode="json"),
             tools=[item for item in context.get("tools", [])
                    if set(item.get("capability_tags", [])) & set(role.capabilities)],
             execution_history=[item for item in context.get("execution_history", [])
