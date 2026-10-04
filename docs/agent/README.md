@@ -13,6 +13,7 @@ src/redteam/event_bus/       EventEnvelope transport + publisher
 |---|---|
 | [orchestration.md](orchestration.md) | the loop, agents/playbooks, planners, verification, checkpointing |
 | [orchestration-implementation-plan.md](orchestration-implementation-plan.md) | benchmark-backed target design, phases, team contracts and completion criteria |
+| [2026-10-04 modularization plan and work records](modularization-20261004/README.md) | provider assembly implementation, audits, independent reviews and final CI results |
 | [attack-graph.md](attack-graph.md) | node identity, predicates, preconditions, integrity, snapshots |
 | [event-bus.md](event-bus.md) | envelope construction, correlation, what each node emits |
 
