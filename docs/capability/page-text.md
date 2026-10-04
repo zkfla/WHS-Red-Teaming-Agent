@@ -68,10 +68,11 @@ Control 판단·Gateway 호출은 합성 테스트로 연결 검증했다. 실�
 | `timeout_seconds` | 기본 5초, 0초 초과~30초. DNS·리다이렉트·다운로드 전체 작업 제한 |
 | `max_download_bytes` | 기본 262144바이트, 1~1048576. 최종 응답 본문 제한 |
 | `max_return_chars` | 기본 20000문자, 1~262144. 텍스트와 제목 각각의 상한 |
-| `max_redirects` | 기본 3회, 0~5. 최초 요청 외 추가 요청의 최대 횟수 |
+| `max_redirects` | 기본 3회, 0~5. 기존 설정 입력 호환용. 자동 이동은 수행하지 않음 |
 | `PageTextResult.requested_url` | 입력 URL 그대로 |
 | `final_url` | 실제 응답을 받은 정규화 URL. IP로 대체한 연결용 URL이 아님 |
-| `status_code`, `content_type` | 실제 2xx 상태 및 정규화 MIME |
+| `status_code`, `content_type` | 실제 응답 상태 및 정규화 MIME. 이동 응답은 실제 3xx 상태 |
+| `redirect_url`, `body_present` | 미방문 이동 목적지와 본문 수신 여부. 이동 응답은 본문 없이 목적지만 반환 |
 | `title` | 실제 첫 HTML title 또는 `None`; 일반 텍스트에는 `None` |
 | `text`, `truncated` | 추출 텍스트와 반환 문자 제한으로 본문/제목이 잘렸는지 여부 |
 
@@ -124,12 +125,14 @@ Agent 인자나 운영자 미승인 플러그인에 이 교체 지점을 노출�
 
 301/302/303/307/308만 수동 처리한다. 상대 Location은 현재 출처 URL 기준으로
 해석한다. 단일 Location이 없거나 형식이 잘못되면 `redirect_error`다.
-다음 목적지의 origin·DNS/IP를 모두 검사한 뒤 요청한다. 동일 URL 반복과 횟수
-초과를 거절한다. fragment만 다른 이동은 지원하지 않는다.
+이동 목적지를 검사해 반환하고 **목적지에는 연결하지 않는다**. 조사 에이전트가
+반환된 주소로 새 행동을 제안하면 기존 정책 경로가 실제 목적지를 다시 판단한다.
+후속 호출은 전역·위임 실행 예산과 같은 행동 중복 억제를 사용한다.
+`max_redirects`를 요청마다 새 이동 예산으로 사용하지 않는다.
 
 리다이렉트 본문은 읽지 않고 응답을 닫는다. 쿠키·Authorization·Referer를 다음
-hop에 전달하지 않는다. DNS를 각 hop에서 새로 검사하므로 같은 hostname의 DNS가
-비공개 주소로 바뀌면 다음 요청을 거절한다. 전체 `asyncio.wait_for`와 HTTP I/O
+hop에 전달하지 않는다. DNS는 각 새 요청에서 검사하므로 같은 hostname의 DNS가
+비공개 주소로 바뀌면 새 요청을 거절한다. 전체 `asyncio.wait_for`와 HTTP I/O
 timeout을 함께 적용한다. 응답은 성공·거절·다운로드 취소 시 `finally`에서 닫힌다.
 취소된 시스템 DNS 작업의 내부 thread가 종료될 때까지 기다리지는 않지만 그 결과로
 후속 HTTP 요청을 실행하지 않는다. 동기 HTML 파싱은 다운로드 상한으로 작업량을
