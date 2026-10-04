@@ -148,8 +148,9 @@ async def update_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             mutated_nodes = len(mutation.nodes)
             mutated_edges = len(mutation.edges)
             mutated_findings = len(mutation.findings)
-        mapper_failure = deps.result_mappers.last_failure
-        if mapper_failure is not None:
+        # Call-local failure read: the shared last_failure slot stays only
+        # for the legacy map_result wrapper, new consumers use the outcome.
+        if outcome.status == "failed":
             try:
                 from redteam.orchestration.recovery import record_mapping_failure
 
@@ -163,8 +164,8 @@ async def update_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                         else None
                     ),
                     tool_id=str(result.tool_id),
-                    mapper=mapper_failure.mapper,
-                    reason=mapper_failure.reason,
+                    mapper=outcome.mapper or "unknown",
+                    reason=outcome.reason or "unknown",
                     action_id=proposal.action_id,
                     invocation_id=result.invocation_id,
                     hypothesis_id=proposal.hypothesis_id,
@@ -176,9 +177,9 @@ async def update_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                 RESULT_MAPPER_FAILED,
                 {
                     "operation": proposal.operation,
-                    "tool_id": mapper_failure.tool_id,
-                    "mapper": mapper_failure.mapper,
-                    "reason": mapper_failure.reason,
+                    "tool_id": outcome.tool_id,
+                    "mapper": outcome.mapper,
+                    "reason": outcome.reason,
                     "action_id": str(proposal.action_id),
                     "invocation_id": str(result.invocation_id),
                 },
@@ -240,138 +241,254 @@ async def update_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
         nodes_to_apply = mutation.nodes if succeeded else []
         edges_to_apply = mutation.edges if succeeded else []
         findings_to_apply = mutation.findings if succeeded else []
-        for node_mutation in nodes_to_apply:
-            observed_facts = dict(node_mutation.facts)
-            if node_mutation.observations and provenance.evidence_id:
-                observed_facts["observations"] = [
-                    {**item, "evidence_id": provenance.evidence_id}
-                    for item in node_mutation.observations
-                ]
-            discovered = await service.upsert_node(
-                node_mutation.node_type,
-                node_id=node_mutation.node_id,
-                attrs=node_mutation.attrs,
-                facts={
-                    **observed_facts,
-                    **(
-                        {"evidence_ids": [provenance.evidence_id]} if provenance.evidence_id else {}
+        # Processing record: before-attempt intent, confirmed counters after
+        # each write phase, and a partial/failed companion on exception. The
+        # original evidence record is never touched. Skipped calls produce no
+        # companion here: their mapping outcome already travels on the verify
+        # metadata, so nothing masquerades a skip as work done.
+        from redteam.orchestration.recovery import (
+            ProcessingAttempt,
+            record_processing_attempt,
+        )
+
+        # Only actual write attempts produce processing records: skipped
+        # calls already expose their mapping outcome on the verify metadata,
+        # so no companion here masquerades a skip as work done.
+        findings_planned = findings_to_apply if provenance.evidence_id else []
+        writes_planned = bool(nodes_to_apply or edges_to_apply or findings_planned)
+        processing_source_evidence_id = (
+            str(state["result_evidence_id"])
+            if state.get("result_evidence_id")
+            else None
+        )
+        confirmed_nodes = 0
+        confirmed_edges = 0
+        confirmed_findings = 0
+        processing_stage: str | None = None
+        processing_failed_at: str | None = None
+        if writes_planned:
+            try:
+                await record_processing_attempt(
+                    evidence_store=deps.evidence_store,
+                    run_id=runtime.run_id,
+                    engagement_id=runtime.engagement_id,
+                    source_evidence_id=processing_source_evidence_id,
+                    tool_id=str(result.tool_id),
+                    processing=ProcessingAttempt(
+                        status="attempted",
+                        attempted_nodes=len(nodes_to_apply),
+                        attempted_edges=len(edges_to_apply),
+                        attempted_findings=len(findings_planned),
                     ),
-                },
-                labels=node_mutation.labels,
-                provenance=provenance,
-                step=runtime.step_count,
-            )
-            last_event = await publisher.publish(
-                EventType.GRAPH_UPDATED,
-                {
-                    "node_id": str(discovered.id),
-                    "node_type": discovered.type.value,
-                    "action_id": proposal.action_id,
-                    "attrs": node_mutation.attrs,
-                    "blocked": False,
-                },
-                correlation_id=correlation_id,
-                causation_id=last_event.event_id,
-            )
-        for edge_mutation in edges_to_apply:
-            await service.link(
-                edge_mutation.edge_type,
-                edge_mutation.source_id,
-                edge_mutation.target_id,
-                edge_mutation.properties,
-                provenance=provenance,
-            )
-
-        if provenance.evidence_id:
-            for finding_mutation in findings_to_apply:
-                existing = await service.get_finding(finding_mutation.finding_id)
-                evidence_ids = sorted(
+                    action_id=proposal.action_id,
+                    invocation_id=result.invocation_id,
+                    hypothesis_id=proposal.hypothesis_id,
+                    attempt=1,
+                )
+            except Exception:  # noqa: BLE001 - the attempt note must not break the update
+                pass
+        processing_failed_at = "nodes"
+        try:
+            for node_mutation in nodes_to_apply:
+                observed_facts = dict(node_mutation.facts)
+                if node_mutation.observations and provenance.evidence_id:
+                    observed_facts["observations"] = [
+                        {**item, "evidence_id": provenance.evidence_id}
+                        for item in node_mutation.observations
+                    ]
+                discovered = await service.upsert_node(
+                    node_mutation.node_type,
+                    node_id=node_mutation.node_id,
+                    attrs=node_mutation.attrs,
+                    facts={
+                        **observed_facts,
+                        **(
+                            {"evidence_ids": [provenance.evidence_id]} if provenance.evidence_id else {}
+                        ),
+                    },
+                    labels=node_mutation.labels,
+                    provenance=provenance,
+                    step=runtime.step_count,
+                )
+                confirmed_nodes += 1
+                last_event = await publisher.publish(
+                    EventType.GRAPH_UPDATED,
                     {
-                        provenance.evidence_id,
-                        *(existing.evidence_ids if existing is not None else []),
-                    }
-                )
-                hypothesis = Hypothesis(
-                    hypothesis_id=finding_mutation.hypothesis_id,
-                    description=finding_mutation.expectation.description,
-                    confidence=1.0,
-                    status="confirmed",
-                    metadata={
-                        "check_id": finding_mutation.check_id,
-                        "expectation": finding_mutation.expectation.model_dump(mode="json"),
-                        "verdict": finding_mutation.verdict.value,
-                        "reason": finding_mutation.reason,
-                        "evidence_ids": evidence_ids,
-                        "target_node_id": str(finding_mutation.target_node_id),
+                        "node_id": str(discovered.id),
+                        "node_type": discovered.type.value,
+                        "action_id": proposal.action_id,
+                        "attrs": node_mutation.attrs,
+                        "blocked": False,
                     },
+                    correlation_id=correlation_id,
+                    causation_id=last_event.event_id,
                 )
-                await service.record_hypothesis(
-                    hypothesis,
-                    about=finding_mutation.target_node_id,
-                    step=runtime.step_count,
+            processing_stage = "nodes"
+            processing_failed_at = "edges"
+            for edge_mutation in edges_to_apply:
+                await service.link(
+                    edge_mutation.edge_type,
+                    edge_mutation.source_id,
+                    edge_mutation.target_id,
+                    edge_mutation.properties,
                     provenance=provenance,
                 )
-                finding = Finding(
-                    finding_id=finding_mutation.finding_id,
-                    title=finding_mutation.title,
-                    description=finding_mutation.description,
-                    severity=finding_mutation.severity,
-                    verified=True,
-                    evidence_ids=evidence_ids,
-                    metadata={
-                        **finding_mutation.metadata,
-                        "hypothesis_id": finding_mutation.hypothesis_id,
-                        "target": str(finding_mutation.target_node_id),
-                        "expectation": finding_mutation.expectation.model_dump(mode="json"),
-                        "verdict": finding_mutation.verdict.value,
-                        "verification_reason": finding_mutation.reason,
-                    },
-                )
-                await service.record_finding(
-                    finding,
-                    hypothesis_id=finding_mutation.hypothesis_id,
-                    about=finding_mutation.target_node_id,
-                    step=runtime.step_count,
-                    provenance=provenance,
-                )
-                if existing is None:
-                    created = await publisher.publish(
-                        EventType.FINDING_CREATED,
-                        {
-                            "finding_id": finding.finding_id,
-                            "title": finding.title,
-                            "severity": finding.severity,
-                            "evidence_ids": finding.evidence_ids,
-                            "hypothesis_id": finding_mutation.hypothesis_id,
-                            "action_id": proposal.action_id,
-                            "candidate_key": step.candidate_key,
-                        },
-                        correlation_id=correlation_id,
-                        causation_id=last_event.event_id,
-                    )
-                    last_event = await publisher.publish(
-                        EventType.FINDING_VERIFIED,
-                        {
-                            "finding_id": finding.finding_id,
-                            "reason": finding_mutation.reason,
-                        },
-                        correlation_id=correlation_id,
-                        causation_id=created.event_id,
-                    )
+                confirmed_edges += 1
 
-        if succeeded and (mutation.nodes or mutation.edges or mutation.findings):
-            last_event = await publisher.publish(
-                GRAPH_MUTATION_APPLIED,
-                {
-                    "action_id": str(proposal.action_id),
-                    "tool_id": str(result.tool_id),
-                    "nodes": len(mutation.nodes),
-                    "edges": len(mutation.edges),
-                    "findings": len(mutation.findings),
-                },
-                correlation_id=correlation_id,
-                causation_id=last_event.event_id,
-            )
+            processing_stage = "edges"
+            if provenance.evidence_id:
+                processing_failed_at = "findings"
+                for finding_mutation in findings_to_apply:
+                    existing = await service.get_finding(finding_mutation.finding_id)
+                    evidence_ids = sorted(
+                        {
+                            provenance.evidence_id,
+                            *(existing.evidence_ids if existing is not None else []),
+                        }
+                    )
+                    hypothesis = Hypothesis(
+                        hypothesis_id=finding_mutation.hypothesis_id,
+                        description=finding_mutation.expectation.description,
+                        confidence=1.0,
+                        status="confirmed",
+                        metadata={
+                            "check_id": finding_mutation.check_id,
+                            "expectation": finding_mutation.expectation.model_dump(mode="json"),
+                            "verdict": finding_mutation.verdict.value,
+                            "reason": finding_mutation.reason,
+                            "evidence_ids": evidence_ids,
+                            "target_node_id": str(finding_mutation.target_node_id),
+                        },
+                    )
+                    await service.record_hypothesis(
+                        hypothesis,
+                        about=finding_mutation.target_node_id,
+                        step=runtime.step_count,
+                        provenance=provenance,
+                    )
+                    finding = Finding(
+                        finding_id=finding_mutation.finding_id,
+                        title=finding_mutation.title,
+                        description=finding_mutation.description,
+                        severity=finding_mutation.severity,
+                        verified=True,
+                        evidence_ids=evidence_ids,
+                        metadata={
+                            **finding_mutation.metadata,
+                            "hypothesis_id": finding_mutation.hypothesis_id,
+                            "target": str(finding_mutation.target_node_id),
+                            "expectation": finding_mutation.expectation.model_dump(mode="json"),
+                            "verdict": finding_mutation.verdict.value,
+                            "verification_reason": finding_mutation.reason,
+                        },
+                    )
+                    await service.record_finding(
+                        finding,
+                        hypothesis_id=finding_mutation.hypothesis_id,
+                        about=finding_mutation.target_node_id,
+                        step=runtime.step_count,
+                        provenance=provenance,
+                    )
+                    confirmed_findings += 1
+                    if existing is None:
+                        created = await publisher.publish(
+                            EventType.FINDING_CREATED,
+                            {
+                                "finding_id": finding.finding_id,
+                                "title": finding.title,
+                                "severity": finding.severity,
+                                "evidence_ids": finding.evidence_ids,
+                                "hypothesis_id": finding_mutation.hypothesis_id,
+                                "action_id": proposal.action_id,
+                                "candidate_key": step.candidate_key,
+                            },
+                            correlation_id=correlation_id,
+                            causation_id=last_event.event_id,
+                        )
+                        last_event = await publisher.publish(
+                            EventType.FINDING_VERIFIED,
+                            {
+                                "finding_id": finding.finding_id,
+                                "reason": finding_mutation.reason,
+                            },
+                            correlation_id=correlation_id,
+                            causation_id=created.event_id,
+                        )
+
+            processing_stage = "findings"
+            if succeeded and (mutation.nodes or mutation.edges or mutation.findings):
+                last_event = await publisher.publish(
+                    GRAPH_MUTATION_APPLIED,
+                    {
+                        "action_id": str(proposal.action_id),
+                        "tool_id": str(result.tool_id),
+                        "nodes": len(mutation.nodes),
+                        "edges": len(mutation.edges),
+                        "findings": len(mutation.findings),
+                    },
+                    correlation_id=correlation_id,
+                    causation_id=last_event.event_id,
+                )
+
+                processing_stage = "done"
+                if writes_planned:
+                    try:
+                        await record_processing_attempt(
+                            evidence_store=deps.evidence_store,
+                            run_id=runtime.run_id,
+                            engagement_id=runtime.engagement_id,
+                            source_evidence_id=processing_source_evidence_id,
+                            tool_id=str(result.tool_id),
+                            processing=ProcessingAttempt(
+                                status="confirmed",
+                                stage="done",
+                                attempted_nodes=len(nodes_to_apply),
+                                attempted_edges=len(edges_to_apply),
+                                attempted_findings=len(findings_planned),
+                                confirmed_nodes=confirmed_nodes,
+                                confirmed_edges=confirmed_edges,
+                                confirmed_findings=confirmed_findings,
+                            ),
+                            action_id=proposal.action_id,
+                            invocation_id=result.invocation_id,
+                            hypothesis_id=proposal.hypothesis_id,
+                            attempt=1,
+                        )
+                    except Exception:  # noqa: BLE001 - the companion must not break the update
+                        pass
+        except Exception as exc:  # noqa: BLE001 - partial state is recorded, then the throw stands
+            if writes_planned:
+                try:
+                    await record_processing_attempt(
+                        evidence_store=deps.evidence_store,
+                        run_id=runtime.run_id,
+                        engagement_id=runtime.engagement_id,
+                        source_evidence_id=processing_source_evidence_id,
+                        tool_id=str(result.tool_id),
+                        processing=ProcessingAttempt(
+                            status=(
+                                "partial"
+                                if (confirmed_nodes or confirmed_edges or confirmed_findings)
+                                else "failed"
+                            ),
+                            stage=processing_stage,
+                            attempted_nodes=len(nodes_to_apply),
+                            attempted_edges=len(edges_to_apply),
+                            attempted_findings=len(findings_planned),
+                            confirmed_nodes=confirmed_nodes,
+                            confirmed_edges=confirmed_edges,
+                            confirmed_findings=confirmed_findings,
+                            failed_at=processing_failed_at,
+                            reason=type(exc).__name__,
+                        ),
+                        action_id=proposal.action_id,
+                        invocation_id=result.invocation_id,
+                        hypothesis_id=proposal.hypothesis_id,
+                        attempt=1,
+                    )
+                except Exception:  # noqa: BLE001 - the companion must not mask the failure
+                    pass
+            raise
 
     work_id = state.get("current_work_id")
     approval_waiting = decision is not None and decision.verdict is PolicyVerdict.REQUIRE_APPROVAL

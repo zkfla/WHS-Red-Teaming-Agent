@@ -313,7 +313,7 @@ def project_mapping_status(*, record: Any, outcome: Any | None = None) -> Mappin
     status = _public_status_value(
         meta, "processing_status", "processing_outcome", "recovery_status"
     )
-    if status is None and record_kind in {"target_references", "mapper_failure", "recovery_result", "recovery_note"}:
+    if status is None and record_kind in {"target_references", "mapper_failure", "recovery_result", "recovery_note", "processing_attempt"}:
         status = record_kind
     proposed = [
         "mapping_status",

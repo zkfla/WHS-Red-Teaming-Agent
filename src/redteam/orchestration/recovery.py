@@ -16,6 +16,7 @@ is never rewritten.
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from dataclasses import dataclass
 from typing import Any
 
 from redteam.attack_graph.identity import node_id_for_target
@@ -45,6 +46,8 @@ __all__ = [
     "record_mapping_failure",
     "record_target_references",
     "mapping_attempt_key",
+    "ProcessingAttempt",
+    "record_processing_attempt",
     "record_recovery_note",
     "recovery_report",
 ]
@@ -736,55 +739,153 @@ async def reprocess_evidence(
             mapping_status = outcome.status
         else:
             mutation = result_mappers.map_result(
-            tool_id=result.tool_id,
-            target=proposal.target,
-            arguments=dict(proposal.arguments),
-            result=result,
-        )
-        failure = result_mappers.last_failure
-        if map_with_outcome is None:
+                tool_id=result.tool_id,
+                target=proposal.target,
+                arguments=dict(proposal.arguments),
+                result=result,
+            )
+        # Call-local failure read: the shared last_failure slot stays only
+        # for the legacy map_result path above, the outcome carries the rest.
+        if map_with_outcome is not None:
+            if outcome.status == "failed":
+                mapper_failure = {
+                    "tool_id": outcome.tool_id,
+                    "mapper": outcome.mapper or "unknown",
+                    "reason": outcome.reason or "unknown",
+                }
+        else:
+            failure = result_mappers.last_failure
             mapping_status = "failed" if failure is not None else "mapped"
+            if failure is not None:
+                mapper_failure = {
+                    "tool_id": failure.tool_id,
+                    "mapper": failure.mapper,
+                    "reason": failure.reason,
+                }
         mutation_summary = {
             "nodes": len(mutation.nodes),
             "edges": len(mutation.edges),
             "target_references": len(getattr(mutation, "target_references", [])),
         }
-        if failure is not None:
-            mapper_failure = {
-                "tool_id": failure.tool_id,
-                "mapper": failure.mapper,
-                "reason": failure.reason,
-            }
         # Graph writes stay success-gated: a failed replay still reports its
         # mapping outcome above, but never promotes output into the graph.
         nodes_to_apply = mutation.nodes if result.success else []
         edges_to_apply = mutation.edges if result.success else []
-        for node_mutation in nodes_to_apply:
-            observed_facts = dict(node_mutation.facts)
-            if node_mutation.observations:
-                observed_facts["observations"] = [
-                    {**item, "evidence_id": str(record.evidence_id)}
-                    for item in node_mutation.observations
-                ]
-            await graph_service.upsert_node(
-                node_mutation.node_type,
-                node_id=node_mutation.node_id,
-                attrs=node_mutation.attrs,
-                facts={
-                    **observed_facts,
-                    "evidence_ids": [str(record.evidence_id)],
-                },
-                labels=node_mutation.labels,
-                provenance=provenance,
-            )
-        for edge_mutation in edges_to_apply:
-            await graph_service.link(
-                edge_mutation.edge_type,
-                edge_mutation.source_id,
-                edge_mutation.target_id,
-                edge_mutation.properties,
-                provenance=provenance,
-            )
+        # Same processing channel as UPDATE, same helper: before-attempt
+        # intent, confirmed counters per phase, and a partial/failed
+        # companion on exception. No tool rerun, no ToolResult rewrite.
+        replay_writes_planned = bool(nodes_to_apply or edges_to_apply)
+        replay_confirmed_nodes = 0
+        replay_confirmed_edges = 0
+        replay_stage: str | None = None
+        replay_failed_at: str | None = None
+        if replay_writes_planned:
+            try:
+                await record_processing_attempt(
+                    evidence_store=evidence_store,
+                    run_id=record.run_id,
+                    engagement_id=record.engagement_id,
+                    source_evidence_id=str(record.evidence_id),
+                    tool_id=str(result.tool_id),
+                    processing=ProcessingAttempt(
+                        status="attempted",
+                        attempted_nodes=len(nodes_to_apply),
+                        attempted_edges=len(edges_to_apply),
+                    ),
+                    action_id=proposal.action_id,
+                    invocation_id=result.invocation_id,
+                    hypothesis_id=proposal.hypothesis_id,
+                    attempt=1,
+                )
+            except Exception:  # noqa: BLE001 - the attempt note must not break recovery
+                pass
+        replay_failed_at = "nodes"
+        try:
+            for node_mutation in nodes_to_apply:
+                observed_facts = dict(node_mutation.facts)
+                if node_mutation.observations:
+                    observed_facts["observations"] = [
+                        {**item, "evidence_id": str(record.evidence_id)}
+                        for item in node_mutation.observations
+                    ]
+                await graph_service.upsert_node(
+                    node_mutation.node_type,
+                    node_id=node_mutation.node_id,
+                    attrs=node_mutation.attrs,
+                    facts={
+                        **observed_facts,
+                        "evidence_ids": [str(record.evidence_id)],
+                    },
+                    labels=node_mutation.labels,
+                    provenance=provenance,
+                )
+                replay_confirmed_nodes += 1
+            replay_stage = "nodes"
+            replay_failed_at = "edges"
+            for edge_mutation in edges_to_apply:
+                await graph_service.link(
+                    edge_mutation.edge_type,
+                    edge_mutation.source_id,
+                    edge_mutation.target_id,
+                    edge_mutation.properties,
+                    provenance=provenance,
+                )
+                replay_confirmed_edges += 1
+            replay_stage = "done"
+            if replay_writes_planned:
+                try:
+                    await record_processing_attempt(
+                        evidence_store=evidence_store,
+                        run_id=record.run_id,
+                        engagement_id=record.engagement_id,
+                        source_evidence_id=str(record.evidence_id),
+                        tool_id=str(result.tool_id),
+                        processing=ProcessingAttempt(
+                            status="confirmed",
+                            stage="done",
+                            attempted_nodes=len(nodes_to_apply),
+                            attempted_edges=len(edges_to_apply),
+                            confirmed_nodes=replay_confirmed_nodes,
+                            confirmed_edges=replay_confirmed_edges,
+                        ),
+                        action_id=proposal.action_id,
+                        invocation_id=result.invocation_id,
+                        hypothesis_id=proposal.hypothesis_id,
+                        attempt=1,
+                    )
+                except Exception:  # noqa: BLE001 - the companion must not break recovery
+                    pass
+        except Exception as exc:  # noqa: BLE001 - partial state is recorded on the same channel
+            if replay_writes_planned:
+                try:
+                    await record_processing_attempt(
+                        evidence_store=evidence_store,
+                        run_id=record.run_id,
+                        engagement_id=record.engagement_id,
+                        source_evidence_id=str(record.evidence_id),
+                        tool_id=str(result.tool_id),
+                        processing=ProcessingAttempt(
+                            status=(
+                                "partial"
+                                if (replay_confirmed_nodes or replay_confirmed_edges)
+                                else "failed"
+                            ),
+                            stage=replay_stage,
+                            attempted_nodes=len(nodes_to_apply),
+                            attempted_edges=len(edges_to_apply),
+                            confirmed_nodes=replay_confirmed_nodes,
+                            confirmed_edges=replay_confirmed_edges,
+                            failed_at=replay_failed_at,
+                            reason=type(exc).__name__,
+                        ),
+                        action_id=proposal.action_id,
+                        invocation_id=result.invocation_id,
+                        hypothesis_id=proposal.hypothesis_id,
+                        attempt=1,
+                    )
+                except Exception:  # noqa: BLE001 - the companion must not mask the failure
+                    pass
+            raise
     parts = [
         "reprocessed " + str(record.evidence_id) + ": verdict=" + verdict.value,
         "hypothesis="
@@ -861,6 +962,97 @@ def mapping_attempt_key(
             str(attempt),
         ]
     )
+
+
+@dataclass(frozen=True)
+class ProcessingAttempt:
+    """One apply pass over a mapped mutation: tried versus confirmed.
+
+    status is attempted (writes starting), confirmed (all applied),
+    partial (some applied, then failed) or failed (none applied, error).
+    stage is the last completed write phase: None, nodes, edges,
+    findings or done. Counts are confirmed writes, except attempted_*
+    which state intent. The original record is never touched: this
+    travels on an immutable companion next to it.
+    """
+
+    status: str
+    stage: str | None = None
+    attempted_nodes: int = 0
+    attempted_edges: int = 0
+    attempted_findings: int = 0
+    confirmed_nodes: int = 0
+    confirmed_edges: int = 0
+    confirmed_findings: int = 0
+    failed_at: str | None = None
+    reason: str | None = None
+
+
+async def record_processing_attempt(
+    *,
+    evidence_store: Any,
+    run_id: Any,
+    engagement_id: Any,
+    source_evidence_id: str | None,
+    tool_id: str,
+    processing: ProcessingAttempt,
+    action_id: Any | None = None,
+    invocation_id: Any | None = None,
+    hypothesis_id: Any | None = None,
+    attempt: int = 1,
+) -> EvidenceRecord:
+    """Append an immutable companion stating one processing attempt.
+
+    Same channel as the mapping-failure and reference companions: the
+    original evidence record is never rewritten. Root reads
+    processing_status / processing_stage off this companion metadata.
+    """
+    payload = {
+        "record_kind": "processing_attempt",
+        "source_evidence_id": source_evidence_id,
+        "tool_id": tool_id,
+        "processing_status": processing.status,
+        "processing_stage": processing.stage,
+        "processing_outcome": processing.status,
+        "attempted": {
+            "nodes": processing.attempted_nodes,
+            "edges": processing.attempted_edges,
+            "findings": processing.attempted_findings,
+        },
+        "confirmed": {
+            "nodes": processing.confirmed_nodes,
+            "edges": processing.confirmed_edges,
+            "findings": processing.confirmed_findings,
+        },
+        "failed_at": processing.failed_at,
+        "reason": processing.reason,
+        "attempt": attempt,
+        "mapping_attempt_key": mapping_attempt_key(
+            source_evidence_id, action_id, invocation_id, attempt
+        ),
+    }
+    note = EvidenceRecord(
+        evidence_id=EvidenceId(new_id("ev")),
+        run_id=run_id,
+        engagement_id=engagement_id,
+        source_type=EvidenceSourceType.SYSTEM,
+        source_id="orchestration.recovery",
+        action_id=action_id,
+        invocation_id=invocation_id,
+        hypothesis_id=hypothesis_id,
+        content_type="application/json",
+        artifact_ref=None,
+        digest=digest_payload(payload),
+        summary=(
+            "processing " + processing.status
+            + " for " + str(tool_id)
+            + " (" + str(processing.stage or "start") + ")"
+        )[:280],
+        created_at=datetime.now(timezone.utc),
+        metadata=payload,
+    )
+    await evidence_store.append(note)
+    return note
 
 
 async def record_target_references(
