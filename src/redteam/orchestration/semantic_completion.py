@@ -35,6 +35,9 @@ import json
 from datetime import datetime, timezone
 from typing import Any
 
+from pydantic import BaseModel, ConfigDict
+from redteam.attack_graph.service import AttackGraphService
+
 from redteam.core.contracts.mission import MissionCriterionResult, MissionTask, redact_secret_material
 from redteam.core.enums import EvidenceSourceType, MissionStatus, TaskStatus
 from redteam.core.ids import new_id
@@ -42,6 +45,9 @@ from redteam.orchestration.completion import check_record_linkage, validate_comp
 from redteam.orchestration.coordination import content_hash
 from redteam.orchestration.evidence_access import raw_from_metadata
 from redteam.orchestration.work.models import ACTIVE_STATUSES
+from redteam.orchestration.result_claims import (
+    RESULT_REVIEW_INSTRUCTION, ResultClaim, ResultReview, check_result_review,
+)
 
 #: Evidence metadata marker for an accepted task completion receipt.
 TASK_RECEIPT_KIND = "task_completion_receipt"
@@ -51,6 +57,21 @@ EXCERPT_CHARS = 2000
 
 #: Cap on excerpts forwarded to one review call.
 MAX_EXCERPTS = 8
+
+
+class _GoalCriterionReview(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    criterion: str
+    met: bool
+    evidence_ids: list[str]
+    claims: list[ResultClaim]
+
+
+class _GoalReview(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    accepted: bool
+    reason: str
+    criteria: list[_GoalCriterionReview]
 
 
 def _engine_system(engine: Any) -> str:
@@ -80,6 +101,7 @@ def build_task_receipt(
     path_version: int | None = None,
     related_attack_graph_node_ids: list[str] | None = None,
     related_hypothesis_ids: list[str] | None = None,
+    claims: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Public receipt payload stored as immutable evidence metadata."""
     return {
@@ -96,6 +118,7 @@ def build_task_receipt(
         "path_version": path_version,
         "related_attack_graph_node_ids": sorted({str(item) for item in (related_attack_graph_node_ids or []) if str(item).strip()}),
         "related_hypothesis_ids": sorted({str(item) for item in (related_hypothesis_ids or []) if str(item).strip()}),
+        "claims": list(claims or []),
     }
 
 
@@ -196,6 +219,7 @@ async def verify_receipt_bound_origins(
     engagement_id: str | None,
     mission_id: str | None,
     task: MissionTask,
+    graph_service: Any | None = None,
 ) -> tuple[list[str], list[str]]:
     """Shared receipt-to-origin proof for one completed required task.
 
@@ -246,6 +270,14 @@ async def verify_receipt_bound_origins(
         if origin_errors:
             return (origin_errors, [])
         proven.append(identity)
+    errors = await check_result_review(
+        claims=receipt_payload.get("claims", []), evidence_ids=proven,
+        evidence_store=evidence_store, graph_service=graph_service,
+        path_store=path_store, run_id=str(run_id), mission_id=mission_id,
+        target_node_ids=list(task.related_attack_graph_node_ids),
+    )
+    if errors:
+        return (errors, [])
     return ([], proven)
 
 
@@ -485,17 +517,41 @@ async def complete_task(engine: Any, path: Any, decision: Any, runtime: Any, con
     review = await engine._ask(
         stage="task_completion_review",
         payload={**(context or {}), "task": task.model_dump(mode="json"), "path": path.model_dump(mode="json"), **_review_payload_common(purpose=getattr(task, "objective", "") or "", conditions=[], excerpts=excerpt_notes)},
-        response_schema={"type": "object", "properties": {"accepted": {"type": "boolean"}, "reason": {"type": "string"}}, "required": ["accepted", "reason"], "additionalProperties": False},
-        system=_engine_system(engine),
+        response_schema=ResultReview.model_json_schema(),
+        system=_engine_system(engine) + RESULT_REVIEW_INSTRUCTION,
         budget=budget,
     )
     await engine.record_completion_review("task_completion_review", path, runtime, review, [str(getattr(record, "evidence_id", "")) for record in verified])
     if not review.get("accepted"):
         return ["semantic completion review rejected the evidence"]
+    from redteam.attack_graph.service import AttackGraphService
+
+    claims = list(review.get("claims", []))
+    service = AttackGraphService(engine.deps.graph_store)
+    for hypothesis_id in task.related_hypothesis_ids:
+        hypothesis = await service.get_hypothesis(str(hypothesis_id))
+        if hypothesis is None or hypothesis.status not in {"confirmed", "refuted", "rejected"}:
+            return ["task hypothesis has no conclusive result"]
+        kind = "hypothesis_confirmed" if hypothesis.status == "confirmed" else "hypothesis_refuted"
+        claims.append(ResultClaim(
+            description=hypothesis.description, kind=kind, hypothesis_id=str(hypothesis_id),
+            evidence_ids=[str(record.evidence_id) for record in verified
+                          if str(record.hypothesis_id) == str(hypothesis_id)],
+        ).model_dump(mode="json"))
+    errors = await check_result_review(
+        claims=claims, evidence_ids=evidence_ids, evidence_store=engine.deps.evidence_store,
+        graph_service=service, path_store=engine.deps.path_store,
+        run_id=str(runtime.run_id), mission_id=str(runtime.mission_id),
+        target_node_ids=list(task.related_attack_graph_node_ids),
+    )
+    if errors:
+        return errors
     mission = await engine.deps.task_graph_store.get_mission(runtime.mission_id)
     revision = int(getattr(mission, "revision", 1) or 1)
     receipt_payload = build_task_receipt(task_id=str(task.task_id), mission_id=str(task.mission_id), run_id=str(runtime.run_id), purpose_hash_value=purpose_hash(task.objective or ""), mission_revision=revision, source_evidence_ids=[str(getattr(record, "evidence_id", "")) for record in verified], outcome="success", reason=str(review.get("reason", "")), path_id=getattr(path, "path_id", None), path_version=getattr(path, "version", None), related_attack_graph_node_ids=list(task.related_attack_graph_node_ids or []), related_hypothesis_ids=list(task.related_hypothesis_ids or []))
-    receipt_record = _receipt_record(run_id=runtime.run_id, engagement_id=runtime.engagement_id, payload=receipt_payload, summary=str(review.get("reason", "")))
+    receipt_payload["claims"] = claims
+    receipt_record = _receipt_record(run_id=runtime.run_id, engagement_id=runtime.engagement_id,
+                                     payload=receipt_payload, summary=str(review.get("reason", "")))
     async def complete(change: Any) -> None:
         staged = await change.tasks.get_task(task.task_id)
         if staged is None:
@@ -626,6 +682,7 @@ async def _goal_task_coverage(
                 engagement_id=engagement_id,
                 mission_id=str(runtime.mission_id),
                 task=task,
+                graph_service=AttackGraphService(engine.deps.graph_store),
             )
             if errors:
                 return (errors, {}, [])
@@ -681,8 +738,8 @@ async def complete_goal(engine: Any, path: Any, decision: Any, runtime: Any, con
     review = await engine._ask(
         stage="goal_completion_review",
         payload={**(context or {}), "mission": mission.model_dump(mode="json"), "path": path.model_dump(mode="json"), **_review_payload_common(purpose=getattr(mission, "objective", "") or "", conditions=criteria, excerpts=excerpts)},
-        response_schema={"type": "object", "properties": {"accepted": {"type": "boolean"}, "reason": {"type": "string"}, "criteria": {"type": "array", "items": {"type": "object", "properties": {"criterion": {"type": "string"}, "met": {"type": "boolean"}, "evidence_ids": {"type": "array", "items": {"type": "string"}}}, "required": ["criterion", "met", "evidence_ids"], "additionalProperties": False}}}, "required": ["accepted", "reason", "criteria"], "additionalProperties": False},
-        system=_engine_system(engine),
+        response_schema=_GoalReview.model_json_schema(),
+        system=_engine_system(engine) + RESULT_REVIEW_INSTRUCTION,
         budget=budget,
     )
     await engine.record_completion_review("goal_completion_review", path, runtime, review, [identity for origins in task_evidence.values() for identity in origins])
@@ -706,13 +763,22 @@ async def complete_goal(engine: Any, path: Any, decision: Any, runtime: Any, con
             owners.add(owner)
         if not owners:
             return ["goal criterion evidence lacks validated task ownership"]
+        errors = await check_result_review(
+            claims=item.get("claims", []), evidence_ids=item["evidence_ids"],
+            evidence_store=engine.deps.evidence_store,
+            graph_service=AttackGraphService(engine.deps.graph_store),
+            path_store=engine.deps.path_store, run_id=str(runtime.run_id),
+            mission_id=str(runtime.mission_id),
+        )
+        if errors:
+            return errors
         bound_tasks[item.get("criterion")] = sorted(owners)
     now = datetime.now(timezone.utc)
     async def complete(change: Any) -> None:
         for task in tasks:
             if getattr(task, "required", False) and getattr(task, "status", None) is TaskStatus.RUNNING:
                 await change.tasks.transition_task(task.task_id, TaskStatus.COMPLETED, now=now)
-        await change.tasks.update_mission(mission.model_copy(update={"status": MissionStatus.COMPLETED, "updated_at": now, "revision": int(getattr(mission, "revision", 1) or 1) + 1, "criterion_results": [MissionCriterionResult(criterion=item.get("criterion"), met=True, evidence_ids=list(item.get("evidence_ids", [])), task_ids=list(bound_tasks.get(item.get("criterion"), [])), reason=str(review.get("reason", ""))) for item in items]}))
+        await change.tasks.update_mission(mission.model_copy(update={"status": MissionStatus.COMPLETED, "updated_at": now, "revision": int(getattr(mission, "revision", 1) or 1) + 1, "criterion_results": [MissionCriterionResult(criterion=item.get("criterion"), met=True, evidence_ids=list(item.get("evidence_ids", [])), task_ids=list(bound_tasks.get(item.get("criterion"), [])), reason=str(review.get("reason", "")), result_claims=list(item.get("claims", []))) for item in items]}))
         change.binding(str(runtime.run_id), str(runtime.mission_id))["closed"] = True
     await engine._commit_review(runtime, token, complete)
     return []

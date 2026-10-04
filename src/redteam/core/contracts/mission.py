@@ -120,6 +120,7 @@ class MissionCriterionResult(BaseModel):
     task_ids: list[TaskId] = Field(default_factory=list)
     evidence_ids: list[str] = Field(default_factory=list)
     reason: str | None = None
+    result_claims: list[dict[str, Any]] = Field(default_factory=list)
 
     @field_validator("criterion")
     @classmethod

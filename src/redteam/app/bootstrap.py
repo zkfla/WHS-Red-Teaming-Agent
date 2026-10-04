@@ -1054,6 +1054,7 @@ async def settle_engagement(
             termination_reason=runtime.termination_reason,
             runtime=runtime,
             engagement=deps.engagement,
+            graph_service=AttackGraphService(deps.graph_store),
         )
         mission = await deps.task_graph_store.get_mission(runtime.mission_id)
         if mission is not None:

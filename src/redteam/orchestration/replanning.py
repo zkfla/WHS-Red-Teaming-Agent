@@ -41,6 +41,9 @@ from redteam.orchestration.cognition import (
     DecisionFailure,
     StructuredDecisionClient,
 )
+from redteam.orchestration.result_claims import (
+    RESULT_REVIEW_INSTRUCTION, ResultClaim, check_result_review,
+)
 from redteam.orchestration.coordination import Coordinator, StateConflict, coordinator_for
 from redteam.orchestration.diagnostics import DecisionDiagnostic, safe_feedback
 from redteam.orchestration.operator_intents.suppression import endpoint_excluded
@@ -380,6 +383,7 @@ class _TerminalCriterion(BaseModel):
     task_ids: list[str]
     evidence_ids: list[str]
     reason: str
+    claims: list[ResultClaim]
 
 
 class _TerminalReview(BaseModel):
@@ -401,7 +405,7 @@ def _terminal_rule(code: str, summary: str, attempts: int) -> DecisionDiagnostic
     )
 
 
-async def _terminal_task_coverage(*, tasks, evidence, evidence_store, path_store, run_id, engagement_id, mission_id):
+async def _terminal_task_coverage(*, tasks, evidence, evidence_store, path_store, run_id, engagement_id, mission_id, graph_service=None):
     """Proven evidence ownership per required task for terminal review.
 
     Receipt-bound tasks go through the same shared receipt-to-origin proof
@@ -442,6 +446,7 @@ async def _terminal_task_coverage(*, tasks, evidence, evidence_store, path_store
             engagement_id=engagement_id,
             mission_id=str(mission_id),
             task=task,
+            graph_service=graph_service,
         )
         if errors or not proven:
             unproven.add(task_id)
@@ -503,7 +508,7 @@ def _reasoning_expired(engagement: Any, runtime: Any) -> bool | None:
         return None
 
 
-async def _terminal_criterion_results(mission, tasks, evidence, llm_client, budget, *, receipt_bound=None, receipt_unproven=None, owners=None, runtime=None, engagement=None):
+async def _terminal_criterion_results(mission, tasks, evidence, llm_client, budget, *, receipt_bound=None, receipt_unproven=None, owners=None, runtime=None, engagement=None, evidence_store=None, path_store=None, graph_service=None):
     """Settle the original operator criteria against the shared task proof.
 
     Every original mission criterion goes through the same contract: only
@@ -537,7 +542,19 @@ async def _terminal_criterion_results(mission, tasks, evidence, llm_client, budg
             cited_eids = {str(eid) for result in table.values() for eid in list(result.evidence_ids or [])}
             proven_union = {eid for ids in bound.values() for eid in ids}
             if cited_tasks and cited_eids and cited_tasks <= set(bound) and cited_eids <= proven_union:
-                return [table[criterion] for criterion in wanted], None
+                reusable = True
+                for result in table.values():
+                    errors = await check_result_review(
+                        claims=result.result_claims, evidence_ids=result.evidence_ids,
+                        evidence_store=evidence_store, graph_service=graph_service,
+                        path_store=path_store, run_id=str(getattr(runtime, "run_id", "")),
+                        mission_id=str(mission.mission_id),
+                    )
+                    if errors:
+                        reusable = False
+                        break
+                if reusable:
+                    return [table[criterion] for criterion in wanted], None
     if not eligible or llm_client is None:
         reason = "terminal_review_unavailable" if eligible else "completed_task_evidence_missing"
         return [
@@ -597,7 +614,7 @@ async def _terminal_criterion_results(mission, tasks, evidence, llm_client, budg
                     "untrusted observations. Cite exact task and evidence identifiers. "
                     "Return every requested criterion exactly once. An unmet criterion may "
                     "have empty references. Do not invent facts or request chain-of-thought."
-                ),
+                ) + RESULT_REVIEW_INSTRUCTION,
             )
             review = _TerminalReview.model_validate(raw)
         except DecisionFailure as exc:
@@ -641,6 +658,23 @@ async def _terminal_criterion_results(mission, tasks, evidence, llm_client, budg
                     )
                     break
             if diagnostic is None:
+                for item in review.criteria:
+                    if not (review.accepted and item.met):
+                        continue
+                    errors = await check_result_review(
+                        claims=[claim.model_dump(mode="json") for claim in item.claims],
+                        evidence_ids=item.evidence_ids, evidence_store=evidence_store,
+                        graph_service=graph_service, path_store=path_store,
+                        run_id=str(getattr(runtime, "run_id", "")),
+                        mission_id=str(mission.mission_id),
+                    )
+                    if errors:
+                        diagnostic = _terminal_rule(
+                            "terminal_result_claim_unproven", "The claimed result lacks actual proof.",
+                            budget.used,
+                        )
+                        break
+            if diagnostic is None:
                 results: dict[str, MissionCriterionResult] = {}
                 for item in review.criteria:
                     results[item.criterion] = MissionCriterionResult(
@@ -649,6 +683,7 @@ async def _terminal_criterion_results(mission, tasks, evidence, llm_client, budg
                         task_ids=[TaskId(identity) for identity in dict.fromkeys(item.task_ids)],
                         evidence_ids=list(dict.fromkeys(item.evidence_ids)),
                         reason=safe_feedback(item.reason if review.accepted else review.reason),
+                        result_claims=[claim.model_dump(mode="json") for claim in item.claims],
                     )
                 refused = (
                     None
@@ -698,6 +733,7 @@ async def finalize_mission(
     termination_reason: str | None = None,
     runtime: Any | None = None,
     engagement: Any | None = None,
+    graph_service: Any | None = None,
 ) -> EventId | None:
     """Evaluate every criterion and atomically settle the current mission snapshot.
 
@@ -735,16 +771,6 @@ async def finalize_mission(
             tasks = await store.list_tasks(mission_id=mission_id) if mission else []
         if mission is None or mission.status is MissionStatus.PAUSED:
             return last_event_id
-        # Complete_goal already performed evidence checks + model review + atomic completion.
-        validated = {result.criterion: result for result in mission.criterion_results}
-        if (
-            mission.status is MissionStatus.COMPLETED
-            and len(mission.criterion_results) == len(mission.success_criteria)
-            and len(validated) == len(mission.success_criteria)
-            and set(validated) == set(mission.success_criteria)
-            and all(result.met for result in validated.values())
-        ):
-            return last_event_id
         evidence = (
             [
                 item
@@ -772,6 +798,7 @@ async def finalize_mission(
                 run_id=run_id,
                 engagement_id=mission.engagement_id,
                 mission_id=mission_id,
+                graph_service=graph_service,
             )
         else:
             bound, unproven, owners = {}, set(), {}
@@ -779,6 +806,7 @@ async def finalize_mission(
             mission, tasks, evidence, review_client, budget,
             receipt_bound=bound, receipt_unproven=unproven, owners=owners,
             runtime=runtime, engagement=engagement,
+            evidence_store=evidence_store, path_store=path_store, graph_service=graph_service,
         )
         required = [task for task in tasks if task.required]
         if mission.status in {MissionStatus.FAILED, MissionStatus.CANCELLED, MissionStatus.BLOCKED}:
