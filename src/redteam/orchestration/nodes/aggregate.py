@@ -236,6 +236,13 @@ def update_delegation_from_outcomes(
     ]
     if not mine or delegation.status == "finished":
         return delegation
+    if delegation.status == "held" and delegation.termination_reason == "approval_pending":
+        resumed = any(outcome.executed for outcome in mine) or any(
+            outcome.policy_verdict is PolicyVerdict.DENY and outcome.approval_id is None
+            for outcome in mine
+        )
+        if resumed:
+            delegation = delegation.model_copy(update={"status": "active", "termination_reason": None})
     consumed = sum(1 + max(outcome.retry_attempts, 0) for outcome in mine if outcome.executed)
     seen = list(delegation.evidence_ids)
     for outcome in mine:
