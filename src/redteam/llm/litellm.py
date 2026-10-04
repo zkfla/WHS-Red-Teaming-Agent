@@ -42,6 +42,8 @@ import json
 from collections.abc import AsyncIterator
 from typing import Any, cast
 
+from redteam.core.ports.llm import StructuredCompletion
+
 _CHATGPT_PROVIDER = "chatgpt"
 
 
@@ -147,6 +149,23 @@ def _responses_output_text(response: Any) -> str | None:
     return "".join(parts) or None
 
 
+def _extract_total_tokens(response: Any) -> int | None:
+    """Read the provider-reported total tokens for one request, if present.
+
+    Returns None when the SDK response carries no usable total: the
+    request cost is unknown, never zero. Only non-negative integers
+    count; anything else (missing, bool, negative, non-numeric) is
+    unknown.
+    """
+    usage = _chunk_field(response, "usage")
+    if usage is None:
+        return None
+    total = _chunk_field(usage, "total_tokens")
+    if isinstance(total, bool) or not isinstance(total, int) or total < 0:
+        return None
+    return total
+
+
 class LiteLLMClient:
     def __init__(
         self,
@@ -196,14 +215,22 @@ class LiteLLMClient:
         )
         return response.choices[0].message.content or ""
 
-    async def complete_structured(
+    async def complete_structured_with_usage(
         self,
         *,
         messages: list[dict[str, Any]],
         response_schema: dict[str, Any],
         system: str | None = None,
         **kwargs: Any,
-    ) -> dict[str, Any]:
+    ) -> StructuredCompletion:
+        """Structured call plus this request's provider-reported usage.
+
+        Mirrors complete_structured exactly (same subscription/standard
+        paths, same JSON parsing) and additionally returns total_tokens:
+        None when the SDK response carries no usable total. No shared
+        last_usage state is kept; usage travels with this request's
+        result for the caller to record on its own budget.
+        """
         if self._is_chatgpt_subscription:
             # Verified directly: unlike a plain OpenAI API key's
             # `response_format`, this backend's `text.format=json_object`
@@ -224,7 +251,11 @@ class LiteLLMClient:
                 kwargs=kwargs,
                 text_format=_native_responses_format(response_schema),
             )
-            return _parse_json_dict(text)
+            # The subscription streaming route surfaces text only, so the
+            # request cost is unknown rather than zero.
+            return StructuredCompletion(
+                value=_parse_json_dict(text), total_tokens=None
+            )
 
         import litellm
 
@@ -242,7 +273,31 @@ class LiteLLMClient:
             **call_kwargs,
         )
         content = response.choices[0].message.content or "{}"
-        return _parse_json_dict(content)
+        return StructuredCompletion(
+            value=_parse_json_dict(content),
+            total_tokens=_extract_total_tokens(response),
+        )
+
+    async def complete_structured(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        response_schema: dict[str, Any],
+        system: str | None = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        """Completion constrained to a JSON schema (usage discarded).
+
+        Kept for existing JSON-only callers; delegates to
+        complete_structured_with_usage so both paths stay identical.
+        """
+        completion = await self.complete_structured_with_usage(
+            messages=messages,
+            response_schema=response_schema,
+            system=system,
+            **kwargs,
+        )
+        return completion.value
 
     async def _chatgpt_stream_text(
         self,

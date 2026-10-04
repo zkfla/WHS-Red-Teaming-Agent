@@ -108,6 +108,8 @@ class DecisionBudget:
             raise ValueError("max_attempts must be >= 1")
         self._max_attempts = int(max_attempts)
         self._used = 0
+        self._tokens_used = 0
+        self._tokens_unknown = 0
         self.last_failure: DecisionDiagnostic | None = None
 
     @property
@@ -124,6 +126,50 @@ class DecisionBudget:
     def remaining(self) -> int:
         """LLM requests still available (max_attempts - used)."""
         return self._max_attempts - self._used
+
+    @property
+    def tokens_used(self) -> int:
+        """Known model tokens consumed so far (requests with reported usage)."""
+        return self._tokens_used
+
+    @property
+    def unknown_usage_count(self) -> int:
+        """Requests made without reported usage (unknown token cost)."""
+        return self._tokens_unknown
+
+    @property
+    def tokens_fully_known(self) -> bool:
+        """Whether every request so far reported its token usage."""
+        return self._tokens_unknown == 0
+
+    def add_usage(self, total_tokens: int | None) -> None:
+        """Record one request's token usage on this assignment's budget.
+
+        None (or any non-integer/negative value) counts as unknown usage
+        instead of zero: without provider telemetry the cost cannot be
+        proven, so a configured token budget must halt rather than assume
+        nothing was spent.
+        """
+        if isinstance(total_tokens, bool) or not isinstance(total_tokens, int):
+            self._tokens_unknown += 1
+            return
+        if total_tokens < 0:
+            self._tokens_unknown += 1
+            return
+        self._tokens_used += total_tokens
+
+    def token_halt_required(self, max_tokens: int | None) -> bool:
+        """Whether further model investigation must stop under a token cap.
+
+        No cap (None) never halts. With a cap, halt when known usage
+        already reached it or when any request's usage is unknown, since
+        staying under the cap can no longer be proven.
+        """
+        if max_tokens is None:
+            return False
+        if self._tokens_unknown > 0:
+            return True
+        return self._tokens_used >= max_tokens
 
     def consume(self) -> int:
         """Consume one budgeted LLM request and return remaining.
@@ -142,6 +188,35 @@ class DecisionBudget:
             f"DecisionBudget(max_attempts={self._max_attempts}, "
             f"used={self._used}, remaining={self.remaining})"
         )
+
+
+class ReasoningHalted(Exception):
+    """A before-call guard refused another model request.
+
+    Carries only a safe reason code (for example a stop, pause, or
+    deadline marker) -- never prompt text, model output, or secrets.
+    The client converts this into DecisionFailure(kind="budget") so no
+    new failure kind is introduced.
+    """
+
+    def __init__(self, reason_code: str = "reasoning_not_allowed") -> None:
+        if not isinstance(reason_code, str) or not reason_code:
+            reason_code = "reasoning_not_allowed"
+        self.reason_code = reason_code
+        super().__init__(self.reason_code)
+
+
+def should_halt_for_token_budget(
+    budget: DecisionBudget, max_tokens: int | None
+) -> bool:
+    """Public token-guard check for delegation owners (root/E).
+
+    Pass the assignment's shared DecisionBudget and the delegation's
+    configured token cap (WorkBudget.max_tokens). True means further
+    model calls must stop: known usage reached the cap, or some
+    request's usage is unknown so the cap can no longer be proven.
+    """
+    return budget.token_halt_required(max_tokens)
 
 
 class _RetryableDecisionError(Exception):
@@ -195,6 +270,18 @@ class StructuredDecisionClient:
     working. When a budget is given it is the sole limit;
     self._max_attempts is ignored and never multiplied with it.
 
+    Request guard: before_call is an optional zero-argument callable
+    (sync or async) awaited before every actual LLM request, including
+    retries. A denied guard raises DecisionFailure(kind="budget") with a
+    safe fixed reason instead of spending the attempt budget. None (the
+    default) keeps existing callers unchanged.
+
+    Usage accounting: when the provider offers
+    complete_structured_with_usage, each request's total_tokens is
+    recorded on the shared budget; providers without it record unknown
+    usage. No shared last_usage state is kept: usage lives on the
+    request-local budget the caller already holds.
+
     Evidence hook: context_provider is an optional (stage, payload)
     callable, sync or async, injected by the root. When present it may
     return an extra dict merged into the payload without overwriting
@@ -222,6 +309,7 @@ class StructuredDecisionClient:
         response_schema: dict[str, Any],
         system: str = "",
         budget: DecisionBudget | None = None,
+        before_call: Callable[..., Any] | None = None,
     ) -> dict[str, Any]:
         if budget is None:
             budget = DecisionBudget(self._max_attempts)
@@ -232,7 +320,9 @@ class StructuredDecisionClient:
         for key, value in extra.items():
             working.setdefault(key, value)
         json.dumps(working)
-        return await self._ask_with_tenacity(stage, working, response_schema, system, budget)
+        return await self._ask_with_tenacity(
+            stage, working, response_schema, system, budget, before_call
+        )
 
     async def _resolve_extra_context(self, stage: str, payload: dict[str, Any]) -> dict[str, Any]:
         provider = self._context_provider
@@ -265,16 +355,33 @@ class StructuredDecisionClient:
         system: str,
         feedback: str,
         kind: str,
+        budget: DecisionBudget,
     ) -> dict[str, Any]:
         messages = [{"role": "user", "content": self._prompt_for(working, feedback, kind)}]
+        use_metered = callable(getattr(self._llm, "complete_structured_with_usage", None))
         try:
-            raw = await self._llm.complete_structured(
-                messages=messages,
-                response_schema=response_schema,
-                system=system,
-                num_retries=0,
-            )
+            if use_metered:
+                completion = await self._llm.complete_structured_with_usage(
+                    messages=messages,
+                    response_schema=response_schema,
+                    system=system,
+                    num_retries=0,
+                )
+                budget.add_usage(getattr(completion, "total_tokens", None))
+                raw = getattr(completion, "value", None)
+            else:
+                raw = await self._llm.complete_structured(
+                    messages=messages,
+                    response_schema=response_schema,
+                    system=system,
+                    num_retries=0,
+                )
+                # Legacy dict-only providers never report usage: the cost of
+                # this request is unknown, never zero.
+                budget.add_usage(None)
         except Exception as exc:
+            # A request was attempted but no usage was reported: unknown.
+            budget.add_usage(None)
             if isinstance(exc, ValidationError):
                 diagnostic = schema_diagnostic(exc, response_schema, stage=stage)
             elif isinstance(exc, ModelValidationError):
@@ -322,6 +429,7 @@ class StructuredDecisionClient:
         response_schema: dict[str, Any],
         system: str,
         budget: DecisionBudget,
+        before_call: Callable[..., Any] | None = None,
     ) -> dict[str, Any]:
         def exhausted() -> DecisionFailure:
             diagnostic = DecisionDiagnostic(
@@ -336,6 +444,42 @@ class StructuredDecisionClient:
             )
             return DecisionFailure(stage, "budget", budget.used, diagnostic=diagnostic)
 
+        async def run_guard() -> None:
+            if before_call is None:
+                return
+            try:
+                guard_result = before_call()
+                if inspect.isawaitable(guard_result):
+                    await guard_result
+            except DecisionFailure:
+                raise
+            except ReasoningHalted as halted:
+                diagnostic = DecisionDiagnostic(
+                    code="reasoning_guard_blocked",
+                    stage=stage,
+                    kind="budget",
+                    attempts=budget.used,
+                    summary=halted.reason_code,
+                    retryable=False,
+                )
+                budget.last_failure = diagnostic
+                raise DecisionFailure(
+                    stage, "budget", budget.used, diagnostic=diagnostic
+                ) from halted
+            except Exception as exc:
+                diagnostic = DecisionDiagnostic(
+                    code="reasoning_guard_blocked",
+                    stage=stage,
+                    kind="budget",
+                    attempts=budget.used,
+                    summary="Model reasoning is not allowed at this time.",
+                    retryable=False,
+                )
+                budget.last_failure = diagnostic
+                raise DecisionFailure(
+                    stage, "budget", budget.used, diagnostic=diagnostic
+                ) from exc
+
         if budget.remaining <= 0:
             raise exhausted()
         allowed = budget.remaining
@@ -349,6 +493,7 @@ class StructuredDecisionClient:
             ):
                 if budget.remaining <= 0:
                     raise exhausted()
+                await run_guard()
                 budget.consume()
                 with attempt:
                     try:
@@ -359,6 +504,7 @@ class StructuredDecisionClient:
                             system=system,
                             feedback=feedback,
                             kind=kind,
+                            budget=budget,
                         )
                     except _RetryableDecisionError as exc:
                         budget.last_failure = exc.diagnostic.model_copy(
