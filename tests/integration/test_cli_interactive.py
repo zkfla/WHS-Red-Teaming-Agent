@@ -118,25 +118,21 @@ _COMPLETE_TURN = {
 }
 
 
-async def test_no_config_intake_completes_preflight_and_runs(
+async def test_no_config_fixed_setup_runs_automatically(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    llm = _ScriptedIntakeLLM([dict(_COMPLETE_TURN)])
-    _patch(
+    # ARTEX-style minimal setup: description + objective only. New creation
+    # skips the existing-config menu and the preflight start question and
+    # proceeds automatically when preflight is clean. The trailing "n"
+    # answers the one-time MCP opt-in prompt (no servers configured).
+    llm = _ScriptedIntakeLLM([])
+    console = _patch(
         monkeypatch,
         tmp_path,
         answers=[
-            "VulnBank Local",
-            "127.0.0.1:5000",
-            "",
-            "",
-            "인증/금융 로직 조사",
-            "recon, web",
-            "100",
+            "http://127.0.0.1:5000 ...",
+            "inspect",
             "n",
-            "",  # existing-config menu -> Start (config was just created)
-            "n",  # one-time MCP auto-setup prompt -> decline
-            "",  # preflight -> Start
         ],
         llm=llm,
     )
@@ -145,12 +141,20 @@ async def test_no_config_intake_completes_preflight_and_runs(
 
     assert exit_code == _shared.EXIT_OK
     saved = load_engagement_config(tmp_path / "engagement.yaml")
-    assert saved.name == "VulnBank Local"
-    # Section 6: exactly what the LLM/user produced, nothing widened.
+    # Name is derived from the first host:port found in the description.
+    assert saved.name == "127.0.0.1:5000"
     assert saved.scope.allowed_hosts == ["127.0.0.1:5000"]
     assert saved.scope.allowed_domains == []
     assert saved.scope.allowed_networks == []
-    assert saved.metadata["source"] == "intake-assistant"
+    assert saved.description == "http://127.0.0.1:5000 ..."
+    assert saved.metadata["objective"] == "inspect"
+    # Empty allow list keeps the existing ROE meaning (no restriction).
+    assert saved.rules_of_engagement[0].allowed_capabilities == []
+    from redteam.core.config import OrchestrationConfig
+
+    assert saved.execution_budget.max_actions == OrchestrationConfig.from_environment().max_steps
+    assert llm.calls == []
+    assert any("RunId:" in line for line in console.transcript)
 
 
 async def test_existing_config_accepts_one_line_mission_objective() -> None:
@@ -198,48 +202,109 @@ async def test_existing_config_quick_start_needs_only_objective_input(
     assert any("RunId:" in line for line in console.transcript)
 
 
-async def test_fixed_setup_preserves_name_and_never_calls_model() -> None:
+async def test_existing_config_enter_reuses_stored_objective(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Enter on an existing setting uses the stored goal instead of asking
+    # for a new one. No objective typing, no preflight start question.
+    from redteam.core.config import EngagementConfig
+
+    config = EngagementConfig.model_validate(
+        {
+            "name": "127.0.0.1:5000",
+            "description": "http://127.0.0.1:5000 ...",
+            "scope": {"allowed_hosts": ["127.0.0.1:5000"]},
+            "execution_budget": {"max_actions": 50},
+            "metadata": {"objective": "inspect"},
+        }
+    )
+    (tmp_path / "engagement.yaml").write_text(
+        yaml.safe_dump(config.model_dump(mode="json")), encoding="utf-8"
+    )
+    console = _patch(
+        monkeypatch,
+        tmp_path,
+        answers=["", "n"],
+        llm=_ScriptedIntakeLLM([]),
+    )
+
+    assert await interactive.run(_args()) == _shared.EXIT_OK
+    assert any("RunId:" in line for line in console.transcript)
+
+
+async def test_existing_menu_new_goes_directly_to_preflight(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Choosing New from the existing-setting menu goes straight to
+    # preflight: no return to the menu and no extra start question.
+    from redteam.core.config import EngagementConfig
+
+    old = EngagementConfig.model_validate(
+        {
+            "name": "Old",
+            "scope": {"allowed_hosts": ["old.local"]},
+            "execution_budget": {"max_actions": 5},
+        }
+    )
+    (tmp_path / "engagement.yaml").write_text(
+        yaml.safe_dump(old.model_dump(mode="json")), encoding="utf-8"
+    )
+    console = _patch(
+        monkeypatch,
+        tmp_path,
+        answers=["n", "http://127.0.0.1:5000 ...", "inspect", "n"],
+        llm=_ScriptedIntakeLLM([]),
+    )
+
+    assert await interactive.run(_args()) == _shared.EXIT_OK
+    saved = load_engagement_config(tmp_path / "engagement.yaml")
+    assert saved.name == "127.0.0.1:5000"
+    assert saved.metadata["objective"] == "inspect"
+    assert any("RunId:" in line for line in console.transcript)
+
+
+async def test_fixed_setup_derives_name_and_defaults_without_model() -> None:
     llm = _ScriptedIntakeLLM([])
     console = _FakeConsole(
         [
-            "mock-bank 취약점 조사 및 증명",
-            "localhost:8081",
-            "",
-            "",
-            "권한 검증",
-            "recon, web",
-            "30",
-            "n",
+            "http://127.0.0.1:5000 권한 검증",
+            "inspect",
         ]
     )
     config = await interactive._new_engagement(cast(Console, console), llm)
     assert config is not None
-    assert config.name == "mock-bank 취약점 조사 및 증명"
-    assert config.description == "권한 검증"
-    assert config.scope.allowed_hosts == ["localhost:8081"]
-    assert config.execution_budget.max_actions == 30
+    # Name is automatic from the first host:port in the description.
+    assert config.name == "127.0.0.1:5000"
+    assert config.description == "http://127.0.0.1:5000 권한 검증"
+    assert config.scope.allowed_hosts == ["127.0.0.1:5000"]
+    assert config.metadata["objective"] == "inspect"
+    # Empty allow list keeps the existing ROE meaning (no restriction).
+    assert config.rules_of_engagement[0].allowed_capabilities == []
+    from redteam.core.config import OrchestrationConfig
+
+    assert config.execution_budget.max_actions == OrchestrationConfig.from_environment().max_steps
     assert llm.calls == []
 
 
-async def test_fixed_setup_reprompts_invalid_count_without_model() -> None:
+async def test_fixed_edit_reprompts_invalid_count_without_model() -> None:
+    # New creation never asks for a count, so the invalid-count reprompt
+    # lives on the edit path (form.edit), where item 7 is still the count.
+    from redteam.intake.models import EngagementDraft
+    from redteam.intake.serializer import draft_to_engagement_config
+
+    original = draft_to_engagement_config(
+        EngagementDraft(
+            name="127.0.0.1:5000",
+            allowed_hosts=["127.0.0.1:5000"],
+            max_actions=50,
+            description="http://127.0.0.1:5000 ...",
+        )
+    ).engagement_config
     llm = _ScriptedIntakeLLM([])
-    console = _FakeConsole(
-        [
-            "bank",
-            "localhost:8081",
-            "",
-            "",
-            "inspect",
-            "recon",
-            "많이",
-            "-3",
-            "30",
-            "n",
-        ]
-    )
-    config = await interactive._new_engagement(cast(Console, console), llm)
-    assert config is not None
-    assert config.execution_budget.max_actions == 30
+    console = _FakeConsole(["7", "많이", "-3", "30", ""])
+    edited = await interactive._edit_engagement(cast(Console, console), llm, original)
+    assert edited is not None
+    assert edited.execution_budget.max_actions == 30
     assert llm.calls == []
 
 
@@ -287,22 +352,14 @@ async def test_fixed_edit_preserves_unrelated_policy_and_explicitly_clears_optio
 async def test_intake_llm_never_receives_a_secret(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    llm = _ScriptedIntakeLLM([dict(_COMPLETE_TURN)])
+    llm = _ScriptedIntakeLLM([])
     _patch(
         monkeypatch,
         tmp_path,
         answers=[
-            "VulnBank Local",
-            "127.0.0.1:5000",
-            "",
-            "",
-            "인증/금융 로직 조사",
-            "recon, web",
-            "100",
-            "n",
-            "",  # existing-config menu -> Start
+            "http://127.0.0.1:5000 ...",
+            "inspect",
             "n",  # one-time MCP auto-setup prompt -> decline
-            "",  # preflight -> Start
         ],
         llm=llm,
     )
@@ -312,16 +369,28 @@ async def test_intake_llm_never_receives_a_secret(
     assert llm.calls == []
 
 
-async def test_blank_first_answer_aborts_without_writing_engagement(
+async def test_q_cancels_without_writing_engagement(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     llm = _ScriptedIntakeLLM([])
-    _patch(monkeypatch, tmp_path, answers=[""], llm=llm)
+    _patch(monkeypatch, tmp_path, answers=["q"], llm=llm)
 
     exit_code = await interactive.run(_args())
 
     assert exit_code == _shared.EXIT_OK
     assert not (tmp_path / "engagement.yaml").exists()
+
+
+async def test_fixed_setup_asks_hosts_only_when_description_has_no_address() -> None:
+    llm = _ScriptedIntakeLLM([])
+    console = _FakeConsole(["내부망 점검", "inspect", "127.0.0.1:5000"])
+    config = await interactive._new_engagement(cast(Console, console), llm)
+    assert config is not None
+    assert config.scope.allowed_hosts == ["127.0.0.1:5000"]
+    assert config.name == "127.0.0.1:5000"
+    assert config.description == "내부망 점검"
+    assert config.metadata["objective"] == "inspect"
+    assert llm.calls == []
 
 
 async def test_eof_exits_with_config_error_and_no_traceback(

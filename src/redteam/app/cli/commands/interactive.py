@@ -76,7 +76,8 @@ from redteam.intake.serializer import (
     UnsafeEditError,
     dump_engagement_yaml,
 )
-from redteam.orchestration.engagement_planner import sanitize_objective
+from redteam.intake.targets import explicit_target_origins
+from redteam.orchestration.engagement_planner import default_objective, sanitize_objective
 from redteam.orchestration.state import RuntimeState, TerminationReason
 
 logger = logging.getLogger(__name__)
@@ -123,13 +124,13 @@ async def _run(console: Console, *, verbose: bool) -> int:
         if engagement_config is None:
             return EXIT_OK
         _write_engagement(DEFAULT_ENGAGEMENT_PATH, engagement_config)
+        objective = f"/new {default_objective(engagement_config.name, engagement_config.metadata)}"
     else:
         engagement_config = load_engagement_config(DEFAULT_ENGAGEMENT_PATH)
-
-    selected = await _existing_config_menu(console, engagement_config, llm_client)
-    if selected is None:
-        return EXIT_OK
-    engagement_config, objective = selected
+        selected = await _existing_config_menu(console, engagement_config, llm_client)
+        if selected is None:
+            return EXIT_OK
+        engagement_config, objective = selected
 
     capability_config = await _ensure_mcp_config(console, engagement_config, capability_config)
 
@@ -160,7 +161,8 @@ async def _run(console: Console, *, verbose: bool) -> int:
         console,
         full_config,
         session=session,
-        objective=objective or f"/new Assess the declared scope of {engagement_config.name}",
+        objective=objective
+        or f"/new {default_objective(engagement_config.name, engagement_config.metadata)}",
         verbose=verbose,
         conversation=conversation,
     )
@@ -281,7 +283,8 @@ async def _ensure_mcp_config(
         return capability_config
 
     try:
-        policy_path = _write_recon_policy(host)
+        origin = explicit_target_origins(engagement_config.description).get(host)
+        policy_path = _write_recon_policy(host, origin=origin)
     except (OSError, ValueError) as exc:
         console.print(
             f"[yellow]{renderer.theme.ICON_WARNING} could not auto-configure MCP: {exc}[/yellow]"
@@ -318,7 +321,7 @@ async def _ensure_mcp_config(
     return CapabilityConfig(mcp_servers=["recon-passive"])
 
 
-def _write_recon_policy(host: str) -> Path:
+def _write_recon_policy(host: str, *, origin: str | None = None) -> Path:
     """A minimal, tightly-scoped ``recon-passive`` policy for exactly one
     host: read-only paths, and ``allowed_networks`` pinned to that host's
     own resolved addresses (a /32 or /128 each, not an open range) --
@@ -334,9 +337,14 @@ def _write_recon_policy(host: str) -> Path:
     request to that same host still failed "target address outside
     configured networks" the moment resolution returned the IPv6 entry.
     """
-    hostname = host.rsplit(":", 1)[0] if ":" in host and not host.startswith("[") else host
-    port_text = host.rsplit(":", 1)[1] if ":" in host and not host.startswith("[") else None
-    port = int(port_text) if port_text else 80
+    from redteam.core.contracts.target import HostTarget
+    from redteam.core.scope_rules import resolve_target_hostports
+
+    identities, error = resolve_target_hostports(HostTarget(host=host))
+    if error or not identities:
+        raise ValueError("invalid target address")
+    hostname, declared_port = identities[0]
+    port = declared_port or 80
     try:
         infos = socket.getaddrinfo(hostname, port, type=socket.SOCK_STREAM)
     except OSError as exc:
@@ -349,7 +357,7 @@ def _write_recon_policy(host: str) -> Path:
     ]
 
     policy = {
-        "targets": {host: {"origin": f"http://{host}", "allowed_paths": ["/"]}},
+        "targets": {host: {"origin": origin or f"http://{host}", "allowed_paths": ["/"]}},
         "allowed_networks": networks,
     }
     path = Path("mcp-recon-policy.json")
@@ -397,6 +405,10 @@ async def _existing_config_menu(
         )
         command = choice.lower()
         if command in ("", "start", "s"):
+            if engagement_config.metadata.get("objective"):
+                return engagement_config, (
+                    f"/new {default_objective(engagement_config.name, engagement_config.metadata)}"
+                )
             return engagement_config, None
         if command in ("e", "edit"):
             updated = await _edit_engagement(console, llm_client, engagement_config)
@@ -409,6 +421,9 @@ async def _existing_config_menu(
             if fresh is not None:
                 engagement_config = fresh
                 _write_engagement(DEFAULT_ENGAGEMENT_PATH, engagement_config)
+                return engagement_config, (
+                    f"/new {default_objective(engagement_config.name, engagement_config.metadata)}"
+                )
             continue
         if command in ("q", "quit"):
             return None
@@ -448,7 +463,7 @@ async def _preflight_loop(
         renderer.render_roe_checklist(
             console,
             allowed=[cap.capitalize() for cap in (rule.allowed_capabilities if rule else [])]
-            or ["Recon", "Web/API testing"],
+            or ["기능 종류 제한 없음 (대상 범위·승인 정책 적용)"],
             denied=[cap.capitalize() for cap in (rule.denied_capabilities if rule else [])],
             documented_only=[rule.notes] if rule and rule.notes else [],
         )
@@ -583,8 +598,8 @@ async def _execute_scoped(
             return EXIT_FAILURE, None
 
     shown_message = sanitize_objective(user_message or objective or "")
-    effective_objective = sanitize_objective(objective or "").strip() or (
-        f"Assess the declared scope of {full_config.engagement.name}"
+    effective_objective = sanitize_objective(objective or "").strip() or default_objective(
+        full_config.engagement.name, full_config.engagement.metadata
     )
     if conversation is not None and (user_message or objective):
         # Initial objective normalization through the dialogue model. Only

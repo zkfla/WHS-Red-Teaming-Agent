@@ -148,6 +148,22 @@ async def test_declining_leaves_capability_config_untouched(
     assert not (tmp_path / ".env").exists()
 
 
+@pytest.mark.parametrize(
+    ("host", "origin"),
+    [("localhost:443", "https://localhost:443"), ("[::1]:8081", "http://[::1]:8081")],
+)
+async def test_setup_preserves_declared_scheme_and_ipv6_target(host, origin, tmp_path):
+    config = _engagement(host).model_copy(update={"description": f"{origin}/ 조사"})
+    await interactive._ensure_mcp_config(
+        cast(Console, _FakeConsole(["y"])), config, CapabilityConfig()
+    )
+    policy = ServerPolicy.model_validate_json(
+        (tmp_path / "mcp-recon-policy.json").read_text(encoding="utf-8")
+    )
+    assert policy.targets[host].origin == origin
+    assert policy.allowed_networks
+
+
 async def test_already_configured_never_prompts(monkeypatch: pytest.MonkeyPatch) -> None:
     # `_ensure_runtime_config` (called before this, in the real `_run()`
     # flow) already derived `capability_config` from the environment when

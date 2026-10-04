@@ -68,6 +68,17 @@ async def test_parse_objective_is_deterministic_without_an_llm() -> None:
     assert focus == ["authorization"]
 
 
+def test_saved_goal_reaches_mission_and_explicit_request_overrides_it() -> None:
+    engagement = _engagement().model_copy(update={"metadata": {"objective": "권한 검증 및 증명"}})
+    mission = plan_mission(engagement, MissionId("saved"), now=_now())
+    assert mission.objective == "권한 검증 및 증명"
+    assert mission.success_criteria == ["권한 검증 및 증명"]
+    overridden = plan_mission(
+        engagement, MissionId("override"), objective="정찰만 수행", now=_now()
+    )
+    assert overridden.objective == "정찰만 수행"
+
+
 async def test_parse_objective_ignores_a_secret_looking_llm_rewrite() -> None:
     class _LeakyLLM:
         async def complete_structured(self, **_: Any) -> dict[str, Any]:

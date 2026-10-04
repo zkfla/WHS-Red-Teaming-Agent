@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pydantic import ValidationError
 
-from redteam.core.config import EngagementConfig
+from redteam.core.config import EngagementConfig, OrchestrationConfig
 from redteam.intake.models import CANONICAL_CAPABILITIES, EngagementDraft
 from redteam.intake.serializer import (
     DraftIncompleteError,
@@ -12,6 +12,7 @@ from redteam.intake.serializer import (
     engagement_config_to_draft,
     scope_diff,
 )
+from redteam.intake.targets import explicit_target_origins
 
 # Display/input metadata only. Validation and conversion remain in the
 # existing configuration contracts; this form owns no execution policy.
@@ -20,8 +21,10 @@ QUESTIONS = {
     "allowed_hosts": "허용 호스트 (예: localhost:8081, 여러 값은 쉼표로 구분)",
     "allowed_domains": "허용 도메인 (없으면 Enter)",
     "allowed_networks": "허용 네트워크 CIDR (없으면 Enter)",
-    "description": "조사 목표 (자유문)",
-    "allowed_capabilities": f"허용 기능 ({', '.join(CANONICAL_CAPABILITIES)}; 쉼표로 구분)",
+    "description": "작업 설명 (대상 URL 또는 주소 포함)",
+    "allowed_capabilities": (
+        f"허용 기능 ({', '.join(CANONICAL_CAPABILITIES)}; 빈 목록은 기능 제한 없음)"
+    ),
     "max_actions": "최대 작업 횟수",
     "max_tool_calls": "최대 도구 호출 횟수",
     "max_duration_seconds": "최대 실행 시간 (초)",
@@ -30,6 +33,7 @@ QUESTIONS = {
     "denied_operations": "금지 행동 (정식 기능.행동 이름; 쉼표로 구분)",
     "availability_impact_allowed": "가용성에 영향을 주는 행동 허용 여부 (y/n)",
     "notes": "추가 제약 (기록용이며 자동 집행되지 않음; 쉼표로 구분)",
+    "objective": "작업 목표 (달성할 결과)",
 }
 
 
@@ -48,17 +52,24 @@ def _ask(console, draft: EngagementDraft, field: str, *, editing: bool) -> Engag
         if answer.lower() in {"q", "quit"}:
             raise Cancelled
         if not answer:
-            if field == "name" and not editing:
-                raise Cancelled
-            if field in {"name", "max_actions", "allowed_capabilities"} and not current:
+            if (
+                field in {"name", "description", "objective"} and not current and not editing
+            ) or (field == "max_actions" and current is None):
                 console.print("값을 입력해 주세요. 취소하려면 q를 입력하세요.")
                 continue
             return draft
         try:
+            if answer == "-" and field in {"description", "objective"} and not editing:
+                raise ValueError("작업 설명과 목표는 비울 수 없습니다.")
             if answer == "-":
                 value = [] if kind == "array" else None
             elif kind == "array":
                 value = [item.strip() for item in answer.split(",") if item.strip()]
+                if field == "allowed_hosts":
+                    hosts = explicit_target_origins(answer, address_list=True)
+                    if not hosts:
+                        raise ValueError("대상 URL 또는 호스트 주소를 입력해 주세요.")
+                    value = list(hosts)
             elif kind == "integer":
                 value = int(answer)
                 if value < 0:
@@ -103,22 +114,22 @@ def collect_engagement(console, existing: EngagementConfig | None = None):
         if existing:
             draft = _edit_fields(console, draft)
         else:
-            console.print("점검 설정을 입력하세요. 취소: q. 주소는 호스트와 포트로 입력하세요.")
-            for field in (
-                "name",
-                "allowed_hosts",
-                "allowed_domains",
-                "allowed_networks",
-                "description",
-                "allowed_capabilities",
-                "max_actions",
-            ):
+            console.print(
+                "작업 설명과 목표를 입력하세요. 취소: q. 세부 설정은 이후 편집 가능합니다."
+            )
+            for field in ("description", "objective"):
                 draft = _ask(console, draft, field, editing=False)
-            if (
-                console.input("시간·금지 행동 등 추가 설정을 수정할까요? [y/N]: ").strip().lower()
-                == "y"
-            ):
-                draft = _edit_fields(console, draft)
+            hosts = list(explicit_target_origins(draft.description or ""))
+            draft = draft.model_copy(update={"allowed_hosts": hosts})
+            while not draft.allowed_hosts:
+                console.print("설명에서 대상 주소를 찾지 못했습니다.")
+                draft = _ask(console, draft, "allowed_hosts", editing=False)
+            draft = draft.model_copy(
+                update={
+                    "name": draft.allowed_hosts[0],
+                    "max_actions": OrchestrationConfig.from_environment().max_steps,
+                }
+            )
         while True:
             try:
                 result = draft_to_engagement_config(draft)
@@ -159,9 +170,15 @@ def collect_engagement(console, existing: EngagementConfig | None = None):
                     "scope": scope,
                     "rules_of_engagement": [rule],
                     "execution_budget": config.execution_budget,
-                    "metadata": {**existing.metadata, "focus_areas": draft.focus_areas},
+                    "metadata": {
+                        **existing.metadata,
+                        "focus_areas": draft.focus_areas,
+                        **({"objective": draft.objective} if draft.objective else {}),
+                    },
                 }
             )
+            if not draft.objective:
+                config.metadata.pop("objective", None)
             for field, (added, removed) in scope_diff(before, draft).items():
                 console.print(f"범위 변경 {field}: 추가 {added}, 제거 {removed}")
         return config

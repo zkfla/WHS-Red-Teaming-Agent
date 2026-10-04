@@ -136,7 +136,11 @@ def draft_to_engagement_config(draft: EngagementDraft) -> DraftConversionResult:
         ),
         rate_limit_policy=RateLimitPolicy(max_actions_per_minute=30),
         approval_policy=ApprovalPolicy(),
-        metadata={"focus_areas": list(draft.focus_areas), "source": _INTAKE_SOURCE_TAG},
+        metadata={
+            "focus_areas": list(draft.focus_areas),
+            "source": _INTAKE_SOURCE_TAG,
+            **({"objective": draft.objective} if draft.objective else {}),
+        },
     )
     return DraftConversionResult(
         engagement_config=engagement_config, unenforced_operations=unenforced_operations
@@ -174,6 +178,7 @@ def engagement_config_to_draft(config: EngagementConfig) -> EngagementDraft:
     return EngagementDraft(
         name=config.name,
         description=config.description or None,
+        objective=config.metadata.get("objective"),
         allowed_hosts=list(config.scope.allowed_hosts),
         allowed_domains=list(config.scope.allowed_domains),
         allowed_networks=list(config.scope.allowed_networks),

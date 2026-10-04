@@ -268,16 +268,8 @@ async def test_run_finished_returns_to_prompt_and_accepts_slash_commands(
         monkeypatch,
         tmp_path,
         answers=[
-            "VulnBank Local",
-            "127.0.0.1:5000",
-            "",
-            "",
+            "http://127.0.0.1:5000 ...",
             "inspect",
-            "recon",
-            "100",
-            "n",  # fixed setup answers
-            "",  # existing-config menu -> Start
-            "",  # preflight -> Start
             "/help",
             "/status",
             "/tools",
@@ -293,6 +285,12 @@ async def test_run_finished_returns_to_prompt_and_accepts_slash_commands(
     capsys.readouterr()
 
     assert exit_code == _shared.EXIT_OK
+    from redteam.core.config import load_engagement_config
+
+    saved = load_engagement_config(tmp_path / "engagement.yaml")
+    # Description stays as the explicit user input, goal stays separate.
+    assert saved.description == "http://127.0.0.1:5000 ..."
+    assert saved.metadata["objective"] == "inspect"
     # RunFinished happened (a report/summary was rendered)...
     assert any("RunId:" in line for line in console.transcript)
     # ...and the session did NOT end there: /help ran afterward.
@@ -317,16 +315,8 @@ async def test_natural_language_second_request_runs_a_second_agent_run(
         monkeypatch,
         tmp_path,
         answers=[
-            "VulnBank Local",
-            "127.0.0.1:5000",
-            "",
-            "",
+            "http://127.0.0.1:5000 ...",
             "inspect",
-            "recon",
-            "100",
-            "n",
-            "",
-            "",
             "127.0.0.1:5000 다시 한 번 점검해줘",  # second objective, plain text
             "/exit",
         ],
@@ -352,16 +342,8 @@ async def test_natural_language_explanation_does_not_start_a_new_run(
         monkeypatch,
         tmp_path,
         answers=[
-            "VulnBank Local",
-            "127.0.0.1:5000",
-            "",
-            "",
+            "http://127.0.0.1:5000 ...",
             "inspect",
-            "recon",
-            "100",
-            "n",
-            "",
-            "",
             "방금 왜 실패했어?",
             "/exit",
         ],
@@ -381,16 +363,8 @@ async def test_free_form_question_is_answered_without_starting_a_new_run(
         monkeypatch,
         tmp_path,
         answers=[
-            "VulnBank Local",
-            "127.0.0.1:5000",
-            "",
-            "",
+            "http://127.0.0.1:5000 ...",
             "inspect",
-            "recon",
-            "100",
-            "n",
-            "",
-            "",
             "결과에서 확인된 내용이 뭐야?",
             "/exit",
         ],
@@ -410,16 +384,8 @@ async def test_bare_exit_ends_session_without_starting_a_new_run(
         monkeypatch,
         tmp_path,
         answers=[
-            "VulnBank Local",
-            "127.0.0.1:5000",
-            "",
-            "",
+            "http://127.0.0.1:5000 ...",
             "inspect",
-            "recon",
-            "100",
-            "n",
-            "",
-            "",
             "exit",
         ],
     )
@@ -441,16 +407,8 @@ async def test_unknown_slash_command_does_not_end_the_session(
         monkeypatch,
         tmp_path,
         answers=[
-            "VulnBank Local",
-            "127.0.0.1:5000",
-            "",
-            "",
+            "http://127.0.0.1:5000 ...",
             "inspect",
-            "recon",
-            "100",
-            "n",
-            "",
-            "",
             "/this-command-does-not-exist",
             "/exit",
         ],
@@ -475,16 +433,8 @@ async def test_eof_at_idle_prompt_ends_the_session_cleanly(
         monkeypatch,
         tmp_path,
         answers=[
-            "VulnBank Local",
-            "127.0.0.1:5000",
-            "",
-            "",
+            "http://127.0.0.1:5000 ...",
             "inspect",
-            "recon",
-            "100",
-            "n",
-            "",
-            "",
             # nothing after the first run -- console.input() raises EOFError
         ],
     )

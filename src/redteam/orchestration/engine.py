@@ -22,6 +22,7 @@ from redteam.core.contracts.mission import redact_secret_material
 from redteam.core.enums import EvidenceSourceType, TaskStatus, ToolHealthStatus
 from redteam.core.ids import EventId, GraphNodeId, new_id
 from redteam.core.provider_contracts import operation_target_binding
+from redteam.core.redaction import redact_sensitive_text
 from redteam.event_bus.publisher import EventPublisher
 from redteam.orchestration.agents.base import HypothesisDraft, PlanStep
 from redteam.orchestration.agents.providers import CandidateBatch, GraphCandidateContext
@@ -801,6 +802,7 @@ class InvestigationEngine:
             "active_task": (active_task.model_dump(mode="json") if active_task else None),
             "operator_instructions": instructions,
             "engagement_constraints": {
+                "description": redact_sensitive_text(self.deps.engagement.description),
                 "mcp_targets": self.deps.engagement.metadata.get("mcp_targets", {}),
                 "scope": self.deps.engagement.scope.model_dump(mode="json"),
                 "rules_of_engagement": [

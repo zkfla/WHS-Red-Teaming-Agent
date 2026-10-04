@@ -303,10 +303,19 @@ approval/resume. Redirected stdin uses a sequential fallback. JSON and
 See [CLI session architecture](docs/architecture/cli-session.md) for lifecycle,
 race handling, verification, and known boundaries.
 
-Initial configuration is collected by the CLI's fixed form and converted through
-the existing `redteam.intake` draft/serializer contracts. The LLM remains required
-for investigation planning and runtime conversation, but is not called to name
-an engagement or assign a numeric limit. Additional free-text restrictions are
+Initial configuration asks only for a task description (including target URLs or
+addresses) and the desired outcome. Exact host/port scope is read from explicit
+addresses; if none is present, the CLI asks for the target separately. The first
+target supplies the default name and the configured orchestration step limit
+supplies the default action budget (50 by default). Capability types are unrestricted
+by default under the existing scope and approval policies. Use **Edit** to adjust
+the name, scope, limits, and restrictions. Successful setup proceeds through
+preflight without asking for the same objective or another Start confirmation.
+The description stays in the existing configuration and planning context; the
+saved goal is used unless a subsequent request explicitly overrides it.
+Conversion still uses the existing `redteam.intake` draft/serializer contracts.
+The LLM remains required for investigation planning and runtime conversation,
+but is not called during initial configuration. Additional free-text restrictions are
 labeled as recorded instructions, not automatically enforced policy. API keys
 are still collected separately by the CLI using `getpass` and stored in `.env`.
 The serializer's historical `intake-assistant` source marker remains compatible

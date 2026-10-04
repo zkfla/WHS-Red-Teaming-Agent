@@ -15,6 +15,7 @@ never sourced from an LLM.
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 from datetime import datetime
 from typing import Any
 
@@ -62,6 +63,14 @@ def extract_focus_areas(text: str) -> list[str]:
     return list(dict.fromkeys(found))
 
 
+def default_objective(name: str, metadata: Mapping[str, Any]) -> str:
+    """Use the operator's saved goal when no request explicitly overrides it."""
+    recorded = metadata.get("objective")
+    if isinstance(recorded, str) and recorded.strip():
+        return sanitize_objective(recorded.strip())
+    return f"Assess the declared scope of {sanitize_objective(name)}"
+
+
 def plan_mission(
     engagement: Engagement,
     mission_id: MissionId,
@@ -76,8 +85,8 @@ def plan_mission(
     objective text, then any recorded on ``Engagement.metadata['focus_areas']``.
     """
 
-    objective_text = sanitize_objective((objective or "").strip()) or (
-        f"Assess the declared scope of {sanitize_objective(engagement.name)}"
+    objective_text = sanitize_objective((objective or "").strip()) or default_objective(
+        engagement.name, engagement.metadata
     )
     recorded = engagement.metadata.get("focus_areas")
     focus = (

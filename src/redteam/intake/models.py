@@ -36,6 +36,7 @@ class EngagementDraft(BaseModel):
 
     name: str | None = None
     description: str | None = None
+    objective: str | None = None
 
     allowed_hosts: list[str] = Field(default_factory=list)
     allowed_domains: list[str] = Field(default_factory=list)
@@ -76,7 +77,7 @@ class EngagementDraft(BaseModel):
     max_tool_calls: int | None = None
     max_duration_seconds: int | None = None
 
-    @field_validator("name", "description")
+    @field_validator("name", "description", "objective")
     @classmethod
     def _redact_text(cls, value: str | None) -> str | None:
         return redact_sensitive_text(value) if value is not None else None
