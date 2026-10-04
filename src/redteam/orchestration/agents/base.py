@@ -21,6 +21,7 @@ from redteam.core.contracts.target import AnyTarget, TargetRef
 from redteam.core.enums import RiskLevel
 from redteam.core.ids import AgentId, EngagementId, HypothesisId, RunId, ToolId
 from redteam.core.ports.llm import LLMClient
+from redteam.core.tool_binding import execution_display_key
 from redteam.orchestration.action_naming import (
     canonical_action_key,
     tool_matches_action_namespace,
@@ -123,8 +124,9 @@ class PlanStep(BaseModel):
     operator_intent_id: str | None = None
     intent_index: int = 0
     availability_impact: bool = False
-    capability: str
-    operation: str
+    capability: str = ""
+    operation: str = ""
+    binding_mode: Literal["legacy_action", "selected_tool"] = "legacy_action"
     tool_id: ToolId
     # Tool result contracts understood by this playbook; empty permits any compatible input.
     compatible_tool_ids: list[ToolId] = Field(default_factory=list)
@@ -163,13 +165,14 @@ class PlanStep(BaseModel):
 
     @model_validator(mode="after")
     def _has_exactly_one_target_source(self) -> PlanStep:
-        try:
-            canonical_action_key(self.capability, self.operation)
-        except ValueError as exc:
-            raise PydanticCustomError(
-                "unknown_operation", "Use a supported action meaning."
-            ) from exc
-        if not tool_matches_action_namespace(self.tool_id, self.capability):
+        if self.binding_mode == "legacy_action":
+            try:
+                canonical_action_key(self.capability, self.operation)
+            except ValueError as exc:
+                raise PydanticCustomError(
+                    "unknown_operation", "Use a supported action meaning."
+                ) from exc
+        if self.binding_mode == "legacy_action" and not tool_matches_action_namespace(self.tool_id, self.capability):
             raise PydanticCustomError(
                 "tool_outside_capability_namespace",
                 "step {step_id} binds tool {tool_id} outside capability namespace {capability}",
@@ -202,7 +205,7 @@ class PlanStep(BaseModel):
     @property
     def operation_key(self) -> str:
         """Canonical ROE/action key recorded in the graph."""
-        return canonical_action_key(self.capability, self.operation)
+        return execution_display_key(self)
 
     @property
     def attempt_record_key(self) -> str:

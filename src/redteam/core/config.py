@@ -187,6 +187,7 @@ class MethodologyConfig(BaseModel):
 class CapabilityConfig(BaseModel):
     mcp_servers: list[str] = Field(default_factory=list)
     methodology: MethodologyConfig | None = None
+    role_manifest_path: str | None = None
 
 
 def extensions_from_environment(env: Mapping[str, str] | None = None) -> list[str]:

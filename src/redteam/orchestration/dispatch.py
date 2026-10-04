@@ -57,6 +57,8 @@ class WorkerOutcome(BaseModel):
     # Unknown request usage is None and stays sticky in delegation totals.
     # Observation skips, code-only reviews and guards before a call cost 0.
     model_tokens_used: int | None = Field(default=0, ge=0)
+    model_known_tokens_used: int = Field(default=0, ge=0)
+    model_usage_unknown: int = Field(default=0, ge=0)
     succeeded: bool | None = None
     policy_verdict: PolicyVerdict | None = None
     policy_severity: str | None = None

@@ -39,6 +39,7 @@ from redteam.orchestration.context_projection import ContextProjectionCache
 from redteam.orchestration.coordination import Coordinator
 from redteam.orchestration.eligibility import EligibilityRegistry, default_eligibility_registry
 from redteam.orchestration.long_jobs import LongJobAdapter
+from redteam.orchestration.local_tools import LocalToolRegistry
 from redteam.orchestration.methodology import ReferenceLibrary
 from redteam.orchestration.observations import ResultMapperRegistry, default_result_mapper_registry
 from redteam.orchestration.operator_intents.store import OperatorIntentStore
@@ -109,6 +110,7 @@ class RuntimeDeps:
     )
     execution_recipes: dict[str, ExecutionRecipeSpec] = field(default_factory=dict, compare=False)
     retry_policy: RetryPolicy | None = field(default=None, compare=False)
+    local_tools: LocalToolRegistry = field(default_factory=LocalToolRegistry, compare=False)
 
     def __post_init__(self) -> None:
         if self.verifier is None:

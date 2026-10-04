@@ -210,6 +210,12 @@ class AgentLoopRunner:
                 "step_count",
                 "actions_executed",
                 "retry_tool_calls",
+                "model_requests_used",
+                "model_tokens_used",
+                "model_usage_unknown",
+                "unresolved_evidence_ids",
+                "evidence_reads",
+                "local_tool_result_ids",
                 "component_binding",
                 "delegations",
             )

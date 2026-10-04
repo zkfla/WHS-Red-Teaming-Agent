@@ -92,6 +92,12 @@ class RuntimeState(BaseModel):
     planning_diagnostic: DecisionDiagnostic | None = None
     planning_diagnostic_history: list[DecisionDiagnostic] = Field(default_factory=list)
     planning_feedback: list[str] = Field(default_factory=list)
+    model_requests_used: int = Field(default=0, ge=0)
+    model_tokens_used: int = Field(default=0, ge=0)
+    model_usage_unknown: int = Field(default=0, ge=0)
+    unresolved_evidence_ids: list[str] = Field(default_factory=list)
+    evidence_reads: list[dict] = Field(default_factory=list)
+    local_tool_result_ids: list[str] = Field(default_factory=list)
     recent_observations: list[RuntimeObservation] = Field(default_factory=list)
     operator_intent_id: OperatorIntentId | None = None
     mission_status: MissionStatus | None = None

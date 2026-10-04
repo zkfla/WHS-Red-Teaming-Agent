@@ -226,21 +226,26 @@ async def execute_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
     lease_lost = asyncio.Event()
     heartbeat_task: asyncio.Task[None] | None = None
     lease_ready = True
-    try:
-        canonical_action_key(proposal.capability, proposal.operation)
+    if step.binding_mode == "selected_tool":
         binding_ready = bool(
-            step.capability == proposal.capability
-            and step.operation == proposal.operation
-            and tool_matches_action_namespace(step.tool_id, proposal.capability)
+            proposal.binding_mode == step.binding_mode and proposal.tool_id == step.tool_id
         )
-    except ValueError:
-        binding_ready = False
+    else:
+        try:
+            canonical_action_key(proposal.capability, proposal.operation)
+            binding_ready = bool(
+                step.capability == proposal.capability
+                and step.operation == proposal.operation
+                and tool_matches_action_namespace(step.tool_id, proposal.capability)
+            )
+        except ValueError:
+            binding_ready = False
     descriptor = None
     if binding_ready and deps.tool_catalog is not None:
         descriptor = deps.tool_catalog.get(step.tool_id)
         binding_ready = bool(
             descriptor is not None
-            and proposal.capability in descriptor.capability_tags
+            and (step.binding_mode == "selected_tool" or proposal.capability in descriptor.capability_tags)
             and descriptor.health_status is not ToolHealthStatus.UNHEALTHY
         )
     # A bounded retry needs a retryable gateway error, a known LOW-risk
@@ -254,7 +259,8 @@ async def execute_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
         and (
             descriptor.retry_safe
             or (
-                deps.retry_policy is not None
+                step.binding_mode == "legacy_action"
+                and deps.retry_policy is not None
                 and deps.retry_policy.permits(
                     proposal.capability, proposal.operation, proposal.arguments
                 )

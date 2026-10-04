@@ -162,6 +162,9 @@ async def aggregate_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
         update={
             "phase": AgentPhase.REPLAN,
             "actions_executed": runtime.actions_executed + len(executed),
+            "model_requests_used": runtime.model_requests_used + sum(item.model_decision_attempts for item in outcomes),
+            "model_tokens_used": runtime.model_tokens_used + sum(item.model_known_tokens_used for item in outcomes),
+            "model_usage_unknown": runtime.model_usage_unknown + sum(item.model_usage_unknown for item in outcomes),
             "retry_tool_calls": (
                 runtime.retry_tool_calls + sum(item.retry_attempts for item in executed)
             ),

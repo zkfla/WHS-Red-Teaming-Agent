@@ -14,6 +14,7 @@ from redteam.core.contracts.target import AssetTarget
 from redteam.core.contracts.tool import ToolResult
 from redteam.core.ids import AgentId, AssetId, GraphNodeId, ToolId
 from redteam.core.reference import ReferenceDomain
+from redteam.core.tool_binding import is_direct
 from redteam.orchestration.agents.base import AgentSpec, PlanStep
 from redteam.orchestration.agents.definition import AgentDefinition, ContextProfile
 from redteam.orchestration.agents.providers import CandidateBatch, GraphCandidateContext
@@ -118,14 +119,16 @@ class ReferenceLibrary(BaseModel):
     def capture(self, proposal: ActionProposal, result: ToolResult) -> dict:
         """Only inspect explicitly selected file reads. Return no unrelated content."""
         entry = next((e for e in self.entries if e.path == proposal.arguments.get("path")), None)
-        if entry is None or (proposal.capability, proposal.operation) != (
+        direct = is_direct(proposal.binding_mode, proposal.tool_id)
+        if entry is None or (not direct and (proposal.capability, proposal.operation) != (
             entry.read_contract.capability,
             entry.read_contract.operation,
-        ):
+        )):
             return {}
         rejected = {"methodology_rejected": entry.reference_id}
         if (
-            str(proposal.agent_id) != REFERENCE_AGENT_ID
+            (not direct and str(proposal.agent_id) != REFERENCE_AGENT_ID)
+            or (direct and not self.accepts_reader_id(proposal.tool_id))
             or str(proposal.engagement_id) != self.engagement_id
             or str(proposal.run_id) != self.run_id
             or not isinstance(proposal.target, AssetTarget)
@@ -170,11 +173,24 @@ class ReferenceLibrary(BaseModel):
         for record in records:
             if (str(record.engagement_id), str(record.run_id)) != (self.engagement_id, self.run_id):
                 continue
-            if (
-                not self.accepts_reader_id(record.source_id)
-                or record.metadata.get("agent_id") != REFERENCE_AGENT_ID
-            ):
+            if not self.accepts_reader_id(record.source_id):
                 continue
+            if record.metadata.get("agent_id") != REFERENCE_AGENT_ID:
+                # New direct calls retain the original proposal identity;
+                # the execution entry already checked its role tool view.
+                try:
+                    proposal = ActionProposal.model_validate(record.metadata.get("proposal"))
+                except ValidationError:
+                    continue
+                if (
+                    not is_direct(proposal.binding_mode, proposal.tool_id)
+                    or not self.accepts_reader_id(proposal.tool_id)
+                    or str(proposal.agent_id) != str(record.metadata.get("agent_id", ""))
+                    or proposal.action_id != record.action_id
+                    or str(proposal.run_id) != self.run_id
+                    or str(proposal.engagement_id) != self.engagement_id
+                ):
+                    continue
             if record.metadata.get("methodology_rejected") == entry.reference_id:
                 return "invalid", 0, ""
             raw = record.metadata.get("methodology_chunk")
@@ -231,9 +247,13 @@ class ReferenceLibrary(BaseModel):
             offset = next_offset
         return "invalid", 0, ""
 
-    def progress(self, records: list[EvidenceRecord]) -> tuple[dict, ...]:
+    def progress(
+        self, records: list[EvidenceRecord], *, reference_ids: set[str] | None = None
+    ) -> tuple[dict, ...]:
         output = []
         for entry in self.entries:
+            if reference_ids is not None and entry.reference_id not in reference_ids:
+                continue
             status, offset, _text = self.inspect(records, entry)
             output.append(
                 {
@@ -245,9 +265,17 @@ class ReferenceLibrary(BaseModel):
             )
         return tuple(output)
 
-    def excerpts(self, records: list[EvidenceRecord], capabilities: list[str]) -> tuple[dict, ...]:
+    def excerpts(
+        self,
+        records: list[EvidenceRecord],
+        capabilities: list[str],
+        *,
+        reference_ids: set[str] | None = None,
+    ) -> tuple[dict, ...]:
         output, remaining = [], self.max_context_chars
         for entry in self.entries:
+            if reference_ids is not None and entry.reference_id not in reference_ids:
+                continue
             if not set(entry.domains).intersection({"general", *capabilities}):
                 continue
             status, _offset, text = self.inspect(records, entry)

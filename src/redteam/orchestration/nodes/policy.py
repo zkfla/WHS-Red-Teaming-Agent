@@ -133,7 +133,12 @@ async def policy_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
         assert runtime.pending_approval_id is not None
         resume_error: str | None
         try:
-            resolved = await deps.control_plane.approval_outcome(runtime.pending_approval_id)
+            if proposal.binding_mode == "selected_tool":
+                resolved = await deps.control_plane.approval_outcome(
+                    runtime.pending_approval_id, current_proposal=proposal,
+                )
+            else:
+                resolved = await deps.control_plane.approval_outcome(runtime.pending_approval_id)
         except Exception as exc:  # noqa: BLE001 - policy failures must fail closed
             resolved = None
             resume_error = type(exc).__name__

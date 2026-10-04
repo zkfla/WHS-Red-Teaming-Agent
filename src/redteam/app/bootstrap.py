@@ -28,6 +28,8 @@ Two entry points build a ``RuntimeDeps``:
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import asyncio
 import logging
 from contextlib import AsyncExitStack
@@ -324,6 +326,7 @@ async def build_runtime_deps(
         operation_bindings=profile_components.operation_bindings,
         execution_recipes=profile_components.execution_recipes,
         retry_policy=profile_components.retry_policy,
+        local_tools=profile_components.local_tools,
     )
     profile_components = apply_extensions(
         profile_components,
@@ -341,6 +344,14 @@ async def build_runtime_deps(
         env=environment,
     )
     profile_components.result_mappers.bind_catalog(tool_catalog or discovered_catalog)
+    from redteam.capability.role_manifest import configure_role_tools
+
+    role_fingerprint = configure_role_tools(
+        profile_components.agents.definitions(), tool_catalog or discovered_catalog,
+    )
+    component_binding = component_binding.model_copy(update={
+        "role_tools_fingerprint": role_fingerprint,
+    })
     audit_log = AuditLog(FilesystemAuditStore(audit_dir))
     approvals = ApprovalService(FilesystemApprovalStore(approval_dir))
     control_plane = DefaultControlPlane(
@@ -382,6 +393,7 @@ async def build_runtime_deps(
         operation_bindings=profile_components.operation_bindings,
         execution_recipes=profile_components.execution_recipes,
         retry_policy=profile_components.retry_policy,
+        local_tools=profile_components.local_tools,
         tool_catalog=(tool_catalog if tool_catalog is not None else discovered_catalog),
         work_store=_build_work_store(settings),
         task_graph_store=resolved_tasks,
@@ -570,6 +582,7 @@ async def build_application(
         operation_bindings=profile_components.operation_bindings,
         execution_recipes=profile_components.execution_recipes,
         retry_policy=profile_components.retry_policy,
+        local_tools=profile_components.local_tools,
     )
     profile_components = apply_extensions(
         profile_components,
@@ -710,6 +723,7 @@ async def build_application(
         operation_bindings=profile_components.operation_bindings,
         execution_recipes=profile_components.execution_recipes,
         retry_policy=profile_components.retry_policy,
+        local_tools=profile_components.local_tools,
         tool_catalog=resolved_tool_catalog,
         work_store=_build_work_store(resolved_settings),
         task_graph_store=resolved_tasks,
@@ -719,6 +733,14 @@ async def build_application(
         tool_semaphore=asyncio.Semaphore(engagement.rate_limit_policy.max_concurrent_actions),
         settings=resolved_settings,
     )
+    from redteam.capability.role_manifest import configure_role_tools
+
+    role_fingerprint = configure_role_tools(
+        resolved_agents.definitions(), resolved_tool_catalog, config.capability.role_manifest_path,
+    )
+    deps = replace(deps, component_binding=component_binding.model_copy(update={
+        "role_tools_fingerprint": role_fingerprint,
+    }))
     from redteam.orchestration.mobile_mcp_binding import (
         builtin_mobile_vendor_policies,
         wire_mobile_mcp,
@@ -1049,6 +1071,7 @@ async def settle_engagement(
             run_id=runtime.run_id,
             llm_client=deps.llm_client,
             decision_max_attempts=deps.settings.decision_max_attempts,
+            decision_normal_limit=deps.settings.decision_normal_limit,
             path_store=deps.path_store,
             coordinator=deps.coordinator,
             termination_reason=runtime.termination_reason,

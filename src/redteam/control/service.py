@@ -707,7 +707,10 @@ class DefaultControlPlane:
         return {
             "engagement_id": str(normalized),
             "scope_enforced": True,
-            "empty_allow_means_unrestricted": True,
+            "empty_allow_lists": {
+                "rules_of_engagement": "no_additional_restriction",
+                "target_action_policy": "deny_all_when_explicit_empty",
+            },
             "roe": {
                 "has_rules": bool(roe_rules),
                 "has_allow_lists": bool(has_allow_lists),

@@ -618,7 +618,7 @@ async def _terminal_criterion_results(
             raise ReasoningHalted("terminal_reasoning_expired")
 
     diagnostic = budget.last_failure
-    while budget.remaining:
+    while budget.permits():
         if _reasoning_expired(engagement, runtime) is True:
             diagnostic = _terminal_rule(
                 "terminal_reasoning_expired",
@@ -626,6 +626,7 @@ async def _terminal_criterion_results(
                 budget.used,
             )
             break
+        before_usage = (budget.used, budget.tokens_used, budget.unknown_usage_count)
         try:
             raw = await client.ask(
                 stage="terminal_criteria_review",
@@ -647,6 +648,11 @@ async def _terminal_criterion_results(
         except DecisionFailure as exc:
             diagnostic = exc.diagnostic
             break
+        finally:
+            if runtime is not None:
+                runtime.model_requests_used += budget.used - before_usage[0]
+                runtime.model_tokens_used += budget.tokens_used - before_usage[1]
+                runtime.model_usage_unknown += budget.unknown_usage_count - before_usage[2]
         names = [item.criterion for item in review.criteria]
         if len(names) != len(wanted) or set(names) != set(wanted):
             diagnostic = _terminal_rule(
@@ -753,6 +759,7 @@ async def finalize_mission(
     now: datetime | None = None,
     llm_client: Any | None = None,
     decision_max_attempts: int = 3,
+    decision_normal_limit: int = 8,
     path_store: Any | None = None,
     coordinator: Coordinator | None = None,
     termination_reason: str | None = None,
@@ -771,7 +778,7 @@ async def finalize_mission(
     coordinator = coordinator or (
         coordinator_for(store, path_store) if path_store is not None else None
     )
-    budget = DecisionBudget(decision_max_attempts)
+    budget = DecisionBudget.reasoning_chain(decision_normal_limit, decision_max_attempts)
     now = now or datetime.now(timezone.utc)
     for _ in range(3):
         token = None

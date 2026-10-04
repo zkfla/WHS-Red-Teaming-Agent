@@ -13,7 +13,7 @@ from redteam.attack_graph.predicates import Confidence, Provenance
 from redteam.core.contracts.events import EventType
 from redteam.core.contracts.graph import Finding, Hypothesis
 from redteam.core.enums import AgentPhase, PolicyVerdict
-from redteam.orchestration.action_naming import canonical_action_key
+from redteam.core.tool_binding import execution_display_key
 from redteam.orchestration.context import RuntimeDeps
 from redteam.orchestration.events import GRAPH_MUTATION_APPLIED, RESULT_MAPPER_FAILED
 from redteam.orchestration.nodes._support import advance, graph_service, publisher_for
@@ -37,7 +37,7 @@ async def update_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
     service = graph_service(deps)
     publisher = publisher_for(state, deps, "orchestration.update")
     correlation_id = str(proposal.action_id)
-    operation_key = canonical_action_key(proposal.capability, proposal.operation)
+    operation_key = execution_display_key(proposal)
     blocked = result is None
     tool_succeeded = result is not None and result.success
     verification_exception = (

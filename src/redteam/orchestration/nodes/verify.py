@@ -5,6 +5,7 @@ verified ``Finding`` carrying the ``EvidenceId`` behind it.
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
 
 from redteam.attack_graph.identity import (
@@ -26,7 +27,7 @@ from redteam.core.enums import (
     Verdict,
 )
 from redteam.core.ids import EvidenceId, new_id
-from redteam.orchestration.action_naming import canonical_action_key
+from redteam.core.tool_binding import execution_display_key
 from redteam.orchestration.analysis import (
     BudgetedAnalysisVerifier,
     VerificationAssessment,
@@ -70,7 +71,11 @@ def _follow_up_possible(step: object | None) -> bool:
 
 
 async def verify_node(
-    state: GraphState, *, deps: RuntimeDeps, budget: DecisionBudget | None = None
+    state: GraphState,
+    *,
+    deps: RuntimeDeps,
+    budget: DecisionBudget | None = None,
+    requester_guard: Callable[[], Awaitable[None]] | None = None,
 ) -> GraphState:
     runtime = state["runtime"]
     proposal = state["action_proposal"]
@@ -197,7 +202,7 @@ async def verify_node(
                 violation_if_confirmed=violation_flag,
                 principal_ref=getattr(step, "principal_ref", None) if step is not None else None,
             )
-            before_call = verification_guard(state, deps=deps, budget=budget)
+            before_call = requester_guard or verification_guard(state, deps=deps, budget=budget)
             if isinstance(deps.verifier, BudgetedAnalysisVerifier):
                 assessment = await deps.verifier.verify_with_budget(
                     request, budget=budget, before_call=before_call
@@ -667,7 +672,7 @@ async def verify_node(
 
     delegation_id = getattr(step, "delegation_id", None)
     delegation = runtime.delegations.get(delegation_id) if delegation_id is not None else None
-    if delegation is not None:
+    if delegation is not None and requester_guard is None:
         # Persist sequential/approval-resume reviews as well. Isolated workers
         # return these same deltas through WorkerOutcome; their runtime copy
         # is discarded, so aggregation owns the parent-state update.
@@ -694,6 +699,9 @@ async def verify_node(
         runtime.model_copy(
             update={
                 "phase": AgentPhase.UPDATE,
+                "model_requests_used": runtime.model_requests_used + budget.used - attempts_before,
+                "model_tokens_used": runtime.model_tokens_used + budget.tokens_used - tokens_before,
+                "model_usage_unknown": runtime.model_usage_unknown + budget.unknown_usage_count - unknown_before,
                 "last_verdict": verdict,
                 "consecutive_failures": (
                     runtime.consecutive_failures + 1
@@ -751,11 +759,10 @@ def _evidence_metadata(proposal, result, step, runtime) -> dict:
     metadata["action_id"] = str(proposal.action_id)
     metadata["invocation_id"] = str(result.invocation_id)
     metadata["tool_id"] = str(result.tool_id)
-    try:
-        canonical_operation = canonical_action_key(proposal.capability, proposal.operation)
-    except ValueError:
-        canonical_operation = proposal.capability + "." + proposal.operation
-    metadata["canonical_operation"] = canonical_operation
+    metadata["canonical_operation"] = execution_display_key(proposal)
+    metadata["binding_mode"] = proposal.binding_mode
+    if runtime.mission_id is not None:
+        metadata["mission_id"] = str(runtime.mission_id)
     metadata["proposal"] = proposal.model_dump(mode="json")
     if step is not None:
         metadata["plan_step"] = step.model_dump(mode="json")

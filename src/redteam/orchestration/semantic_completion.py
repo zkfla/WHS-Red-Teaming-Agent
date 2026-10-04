@@ -50,6 +50,11 @@ from redteam.orchestration.completion import (
     validate_completion,
     verify_stored_origin,
 )
+from redteam.orchestration.completion_proposal import (
+    CompletionProposal,
+    record_unresolved,
+    validate_unresolved,
+)
 from redteam.orchestration.coordination import content_hash
 from redteam.orchestration.evidence_access import raw_from_metadata
 from redteam.orchestration.result_claims import (
@@ -536,6 +541,15 @@ async def complete_task(
         return ["task completion requires the current running task"]
     if _record_text(getattr(path, "mission_task_id", "")) != str(task.task_id):
         return ["task completion path is not bound to this mission task"]
+    raw_proposal = getattr(decision, "completion", {})
+    if raw_proposal:
+        proposal = CompletionProposal.model_validate({
+            **raw_proposal, "reason": raw_proposal.get("reason") or decision.reason,
+        })
+        if proposal.unresolved:
+            return await settle_unresolved(
+                engine, path, proposal, runtime, token=token, task=task,
+            )
     evidence_ids = select_task_evidence_ids(decision, path)
     if not evidence_ids:
         return ["task completion needs related stored evidence"]
@@ -645,6 +659,75 @@ async def complete_task(
     # the atomic task transition below, never from the receipt alone.
     await engine.deps.evidence_store.append(receipt_record)
     await engine._commit_review(runtime, token, complete)
+    return []
+
+
+async def settle_unresolved(
+    engine: Any, path: Any, proposal: CompletionProposal, runtime: Any, *,
+    token: Any, task: Any = None, finish_investigation: bool = False,
+) -> list[str]:
+    """End an investigation unit without granting a success/refutation receipt."""
+    pending = await _pending_execution_errors(engine, runtime)
+    if pending:
+        return pending
+    targets = list(task.related_attack_graph_node_ids) if task is not None else list(
+        dict.fromkeys(target for step in path.steps for target in step.target_node_ids)
+    )
+    errors = await validate_unresolved(
+        proposal, evidence_store=engine.deps.evidence_store, runtime=runtime,
+        target_node_ids=targets,
+    )
+    if errors:
+        return errors
+    await engine._check_review_path(runtime, path)
+    identity = await record_unresolved(
+        evidence_store=engine.deps.evidence_store, runtime=runtime, proposal=proposal,
+        path=path, task_id=str(task.task_id) if task is not None else None,
+    )
+    now = datetime.now(timezone.utc)
+
+    async def block(change: Any) -> None:
+        if task is not None:
+            await change.tasks.transition_task(
+                task.task_id, TaskStatus.BLOCKED, now=now,
+                reason=proposal.reason,
+            )
+        for step in path.steps:
+            if step.status in {"pending", "running"}:
+                await change.paths.update_step(
+                    str(runtime.run_id), path.path_id, path.version, step.step_id,
+                    "blocked", outcome=proposal.outcome,
+                    evidence_ids=list(dict.fromkeys([*step.evidence_ids, identity])),
+                )
+        if finish_investigation:
+            mission = await change.tasks.get_mission(runtime.mission_id)
+            if mission is None:
+                raise ValueError("unresolved_mission_missing")
+            for unfinished in await change.tasks.list_tasks(mission_id=runtime.mission_id):
+                if unfinished.status in {TaskStatus.PENDING, TaskStatus.READY, TaskStatus.RUNNING}:
+                    await change.tasks.transition_task(
+                        unfinished.task_id, TaskStatus.BLOCKED, now=now,
+                        reason=proposal.reason,
+                    )
+            await change.tasks.update_mission(mission.model_copy(update={
+                "status": MissionStatus.BLOCKED, "updated_at": now,
+            }))
+
+    await engine._commit_review(runtime, token, block)
+    runtime.unresolved_evidence_ids = list(dict.fromkeys([
+        *runtime.unresolved_evidence_ids, identity,
+    ]))
+    from redteam.orchestration.delegation_decision import mark_finished
+
+    runtime.delegations = {
+        key: mark_finished(value, reason="investigation_unresolved")
+        if value.path_id == path.path_id and value.path_version == path.version
+        else value
+        for key, value in runtime.delegations.items()
+    }
+    if finish_investigation:
+        runtime.mission_status = MissionStatus.BLOCKED
+    engine.updated_runtime = engine._event_runtime = runtime
     return []
 
 
@@ -836,6 +919,15 @@ async def complete_goal(
     mission = await engine.deps.task_graph_store.get_mission(runtime.mission_id)
     if mission is None:
         return ["goal completion requires an operator mission"]
+    raw_proposal = getattr(decision, "completion", {})
+    if raw_proposal:
+        proposal = CompletionProposal.model_validate({
+            **raw_proposal, "reason": raw_proposal.get("reason") or decision.reason,
+        })
+        if proposal.unresolved:
+            return await settle_unresolved(
+                engine, path, proposal, runtime, token=token, finish_investigation=True,
+            )
     criteria = list(getattr(mission, "success_criteria", []) or [])
     if not criteria:
         return ["goal has no original operator criteria"]

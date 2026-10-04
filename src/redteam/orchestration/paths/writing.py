@@ -55,7 +55,8 @@ class CriterionWritingError(PathValidationError, ValueError):
 
 
 def writing_schema(
-    model: type[BaseModel], *, actions: Iterable[tuple[str, str]] | None = None
+    model: type[BaseModel], *, actions: Iterable[tuple[str, str]] | None = None,
+    selected_tool: bool = False,
 ) -> dict[str, Any]:
     """Expose meaning and structural references without operational boilerplate.
 
@@ -97,9 +98,19 @@ def writing_schema(
     # Syntax is stable; available semantics come from the selected catalog.
     # Omitting a catalog is not an implicit builtin-only execution mode.
     pairs = tuple(actions) if actions is not None else ()
-    action_schema = defs.get("ActionIntent")
+    action_schema = (
+        schema if selected_tool and "tool_id" in schema.get("properties", {})
+        else defs.get("ActionIntent")
+    )
     if action_schema is not None:
         action_properties = action_schema.get("properties", {})
+        if selected_tool:
+            for name in ("capability", "operation", "binding_mode"):
+                action_properties.pop(name, None)
+            action_schema["required"] = [
+                name for name in action_schema.get("required", [])
+                if name not in {"capability", "operation", "binding_mode"}
+            ]
         if "capability" in action_properties:
             action_properties["capability"].update(pattern=r"^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$")
             if pairs:

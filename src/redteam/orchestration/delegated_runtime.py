@@ -5,7 +5,10 @@ from __future__ import annotations
 from redteam.attack_graph.service import AttackGraphService
 from redteam.core.contracts.mission import redact_secret_material
 from redteam.core.ids import GraphNodeId
+from redteam.capability.role_manifest import resolve_role_selection, tools_for_role
 from redteam.orchestration.cognition import DecisionBudget, DecisionFailure
+from redteam.orchestration.completion_proposal import CompletionProposal
+from redteam.orchestration.local_tools import LocalToolCall
 from redteam.orchestration.context_projection import ContextProjector, project_evidence_excerpts
 from redteam.orchestration.delegation import DelegationRequest
 from redteam.orchestration.delegation_decision import (
@@ -23,7 +26,9 @@ from redteam.orchestration.delegation_decision import (
     remaining_decisions,
     worker_next_action_schema,
 )
-from redteam.orchestration.evidence_access import EvidenceReader
+from redteam.orchestration.evidence_access import (
+    EvidenceReader, EvidenceReadRequest, read_for_runtime, restore_reads,
+)
 from redteam.orchestration.knowledge_validation import assessment_blocked, check_ready_step
 from redteam.orchestration.paths.models import step_definition_equal
 from redteam.orchestration.reasoning_time import reasoning_time_allowed
@@ -338,9 +343,9 @@ async def decide_delegations(engine, path, runtime, context):
             knowledge=knowledge,
             role_observation=projected.model_dump(mode="json"),
             tools=[
-                item
-                for item in context.get("tools", [])
-                if set(item.get("capability_tags", [])) & set(role.capabilities)
+                item.model_dump(mode="json")
+                for item in tools_for_role(definition, engine.deps.tool_catalog)
+                if item.health_status.value != "unhealthy"
             ],
             execution_history=[
                 item
@@ -348,15 +353,36 @@ async def decide_delegations(engine, path, runtime, context):
                 if set(item.get("target_node_ids", [])) & set(step.target_node_ids)
                 or item.get("delegation_id") == identity
             ],
+            local_tools=context.get("local_tools", []),
+            local_tool_results=await engine.local_results(runtime, delegation_id=identity),
+            evidence_reads=await restore_reads(engine.deps.evidence_store, runtime, delegation_id=identity),
         )
+        library = engine.deps.methodology_library
+        if library is not None:
+            library.check_context(runtime.engagement_id, runtime.run_id)
+            selection = resolve_role_selection(definition)
+            # Nonempty references narrow the existing domain-based view;
+            # omitted/empty references keep the package's domain defaults.
+            reference_ids = (
+                set(selection.methodology_refs)
+                if selection is not None and selection.methodology_refs
+                else None
+            )
+            payload["methodology_progress"] = library.progress(
+                records, reference_ids=reference_ids
+            )
+            payload["Untrusted methodology reference DATA"] = library.excerpts(
+                records, list(definition.capabilities), reference_ids=reference_ids
+            )
         if gate.cleanup_model_allowed and not gate.investigate_model_allowed:
             payload["finish_only"] = True
             payload["termination_reason"] = gate.reason
         allowance = min(
-            engine.deps.settings.decision_max_attempts,
+            engine.deps.settings.decision_normal_limit + engine.deps.settings.decision_max_attempts,
             max(remaining_decisions(state) - (1 if gate.investigate_model_allowed else 0), 1),
         )
-        budget = DecisionBudget(allowance)
+        normal = min(engine.deps.settings.decision_normal_limit, allowance)
+        budget = DecisionBudget.reasoning_chain(normal, max(allowance - normal, 0))
         schema = worker_next_action_schema()
         action_schema = engine._writing_schema(ActionIntent)
         for field in ("path_step_id", "agent_id"):
@@ -367,6 +393,11 @@ async def decide_delegations(engine, path, runtime, context):
         schema["properties"]["actions"]["items"] = action_schema
         if "$defs" in action_schema:
             schema["$defs"] = action_schema.pop("$defs")
+        schema["properties"]["tool_calls"]["items"] = LocalToolCall.model_json_schema()
+        completion_schema = CompletionProposal.model_json_schema()
+        schema.setdefault("$defs", {}).update(completion_schema.pop("$defs", {}))
+        schema["properties"]["completion"] = completion_schema
+        schema["properties"]["evidence_requests"]["items"] = EvidenceReadRequest.model_json_schema()
         if not gate.investigate_model_allowed:
             schema["properties"]["decision"]["enum"] = ["finish"]
         engine.decision_token_limit = (
@@ -387,6 +418,34 @@ async def decide_delegations(engine, path, runtime, context):
                 budget=budget,
             )
             verdict = parse_worker_next_action(raw)
+            if verdict.tool_calls and gate.investigate_model_allowed:
+                await engine.execute_local_calls(
+                    list(verdict.tool_calls), runtime=runtime, path=path,
+                    budget=budget, delegation=state,
+                )
+            if verdict.decision == "finish":
+                from dataclasses import replace
+                from types import SimpleNamespace
+
+                completion = verdict.completion or {
+                    "outcome": "inconclusive",
+                    "reason": verdict.summary or verdict.finish_reason or "Investigation ended without a verified completion claim.",
+                    "evidence_ids": list(verdict.evidence_ids),
+                    "gaps": [{"description": item} for item in verdict.unresolved],
+                }
+                path, completion_errors = await engine.complete_step(
+                    path,
+                    SimpleNamespace(
+                        path_step_id=state.path_step_id, completion=completion,
+                        reason=verdict.summary or str(completion.get("reason", "")),
+                    ),
+                    runtime, context, budget=budget,
+                )
+                if completion_errors:
+                    verdict = replace(
+                        verdict, decision="hold",
+                        unresolved=(*verdict.unresolved, *completion_errors),
+                    )
         except (DecisionFailure, ValueError, TypeError) as exc:
             error = type(exc).__name__
         finally:
@@ -438,10 +497,15 @@ async def decide_delegations(engine, path, runtime, context):
                 engine.deps.evidence_store, runtime, list(verdict.target_references)
             )
         if verdict.decision == "read_evidence":
-            reader = EvidenceReader(engine.deps.evidence_store)
+            requests = list(verdict.evidence_requests) or [
+                {"evidence_id": item, "limit": 4000} for item in verdict.evidence_ids
+            ]
             excerpts = [
-                await reader.read(evidence_id=item, run_id=str(runtime.run_id), limit=4000)
-                for item in verdict.evidence_ids
+                await read_for_runtime(
+                    engine.deps.evidence_store, runtime,
+                    EvidenceReadRequest.model_validate(item), delegation_id=identity,
+                )
+                for item in requests
             ]
             # Store refs; the next scoped call reads them from the original store.
             values[identity] = values[identity].model_copy(

@@ -21,6 +21,11 @@ from redteam.orchestration.action_naming import tool_matches_action_namespace
 from redteam.orchestration.cognition import DecisionBudget, StructuredDecisionClient
 from redteam.orchestration.evidence_access import raw_from_metadata
 from redteam.orchestration.expectations import Expectation, ExpectationOutcome, verdict_for
+from redteam.orchestration.session_proof import (
+    actual_receipt_conflict,
+    collect_actual_sessions,
+    has_actual_receipt,
+)
 
 VerificationOutcome = Literal["success", "refuted", "inconclusive", "blocked", "unknown"]
 
@@ -66,6 +71,37 @@ class BudgetedAnalysisVerifier(AnalysisVerifier, Protocol):
     ) -> VerificationAssessment: ...
 
 
+class ClaimVerificationInput(BaseModel):
+    """Posthoc claim review input: original sources plus the new claim."""
+
+    claim: dict[str, Any] = Field(default_factory=dict)
+    evidence_ids: list[str] = Field(default_factory=list)
+    run_id: str = ""
+
+
+@runtime_checkable
+class PosthocClaimVerifier(Protocol):
+    """Meaning review for a new claim without a pre-recorded expectation."""
+
+    async def verify_claim_with_budget(
+        self,
+        *,
+        claim: dict[str, Any],
+        evidence_ids: list[str],
+        run_id: str,
+        budget: DecisionBudget,
+        before_call: Callable[[], Any] | None = None,
+        security_claim: bool = False,
+    ) -> VerificationAssessment: ...
+
+
+_CLAIM_SYSTEM = (
+    "Judge the new claim against the preserved raw excerpts. Confirm only "
+    "what the excerpts show for that claim; a bare success proves nothing. "
+    "Reply with JSON only."
+)
+
+
 class DeterministicAnalysisVerifier:
     """Default reviewer: reproducible and independent from the executor."""
 
@@ -97,6 +133,29 @@ class DeterministicAnalysisVerifier:
     ) -> VerificationAssessment:
         """Code-only review consumes no model requests or tokens."""
         return await self.verify(request)
+
+    async def verify_claim_with_budget(
+        self,
+        *,
+        claim: dict[str, Any],
+        evidence_ids: list[str],
+        run_id: str,
+        budget: DecisionBudget,
+        before_call: Callable[[], Any] | None = None,
+        security_claim: bool = False,
+    ) -> VerificationAssessment:
+        """Deterministic path cannot judge meaning; evidence preserved."""
+        _ = (claim, run_id, budget, before_call, security_claim)
+        refs = [str(item) for item in (evidence_ids or []) if str(item).strip()]
+        return VerificationAssessment(
+            verdict=Verdict.UNKNOWN,
+            reason="deterministic review cannot judge a new claim",
+            reviewer_id=self.reviewer_id,
+            source_refs=refs,
+            outcome="unknown",
+            claim_supported=False,
+        )
+
 
 
 _ANALYSIS_SYSTEM = (
@@ -168,6 +227,47 @@ def _expected_canonical(capability: str, operation: str) -> str:
         return str(capability) + "." + str(operation)
 
 
+def _posthoc_source_gap(record: Any, raw: Any) -> str | None:
+    """Origin-immutable check for one cited source without a live proposal.
+
+    Same rule as the per-record half of the live grounding checks: the
+    stored origin pair must be present and the preserved raw must answer
+    it. The review never rewrites the source for a new step.
+    """
+    if record is None:
+        return "linked evidence is missing"
+    action = getattr(record, "action_id", None)
+    invocation = getattr(record, "invocation_id", None)
+    if action is None or invocation is None:
+        return "source lacks origin binding"
+    if not isinstance(raw, dict):
+        return "no preserved raw to check"
+    if str(raw.get("action_id")) != str(action):
+        return "preserved raw answers another action"
+    if str(raw.get("invocation_id")) != str(invocation):
+        return "preserved raw answers another invocation"
+    return None
+
+
+def _is_direct_tool_binding(proposal: Any) -> bool:
+    """True when the proposal selected a concrete tool, not a legacy action.
+
+    A direct selection carries its identity in ``tool_id``; the legacy
+    capability/operation pair may be empty and must not be demanded.
+    """
+    try:
+        mode = getattr(proposal, "binding_mode", "legacy_action")
+    except Exception:
+        return False
+    if str(mode or "") != "selected_tool":
+        return False
+    try:
+        tool_id = getattr(proposal, "tool_id", None)
+    except Exception:
+        return False
+    return bool(str(tool_id or "").strip())
+
+
 async def resolve_claim_for_review(
     graph_service: Any,
     hypothesis_id: Any | None,
@@ -227,6 +327,9 @@ def session_list_pairs(
     target_ref count. Row targets are configured aliases and may differ from
     the canonical metadata target_node_id, so the canonical value must NOT
     be used here. Missing or mismatched row targets are skipped (fail closed).
+
+    Inventory only: a listing is not actual-use proof, so these rows are
+    never merged into actual-use session sets. Kept for inventory readers.
     """
     sessions: set[str] = set()
     principals: set[str] = set()
@@ -280,19 +383,15 @@ def _has_raw_account_artifact(
         if cleaned is not None:
             expected_sessions.add(cleaned)
     raw_principals: set[str] = set()
-    raw_sessions: set[str] = set()
-    http_obs = metadata.get("http_observation")
-    if isinstance(http_obs, dict):
-        cleaned = _clean_identity(http_obs.get("session_ref"))
-        if cleaned is not None:
-            raw_sessions.add(cleaned)
+    # Single precedence, shared with completion: any actual receipt anywhere
+    # drops every legacy echo; inventory rows never prove use.
+    raw_sessions = collect_actual_sessions(metadata, raw)
+    # Cross-layer actual disagreement is unprovable; fail closed outright.
+    if actual_receipt_conflict(metadata, raw) is not None:
+        return False
     comparison = metadata.get("session_comparison")
     comparison_dict: dict[str, Any] | None = comparison if isinstance(comparison, dict) else None
     if comparison_dict is not None:
-        for key in ("first_session_ref", "second_session_ref"):
-            cleaned = _clean_identity(comparison_dict.get(key))
-            if cleaned is not None:
-                raw_sessions.add(cleaned)
         for key in ("first_principal_ref", "second_principal_ref"):
             cleaned = _clean_identity(comparison_dict.get(key))
             if cleaned is not None:
@@ -302,10 +401,6 @@ def _has_raw_account_artifact(
     except Exception:
         output = None
     if isinstance(output, dict):
-        for key in ("session_ref", "first_session_ref", "second_session_ref"):
-            cleaned = _clean_identity(output.get(key))
-            if cleaned is not None:
-                raw_sessions.add(cleaned)
         for key in ("principal_ref", "first_principal_ref", "second_principal_ref"):
             cleaned = _clean_identity(output.get(key))
             if cleaned is not None:
@@ -313,22 +408,9 @@ def _has_raw_account_artifact(
         for nested_key in ("first", "second", "authenticated", "anonymous"):
             nested = output.get(nested_key)
             if isinstance(nested, dict):
-                for key in ("session_ref", "session"):
-                    cleaned = _clean_identity(nested.get(key))
-                    if cleaned is not None:
-                        raw_sessions.add(cleaned)
                 cleaned = _clean_identity(nested.get("principal_ref"))
                 if cleaned is not None:
                     raw_principals.add(cleaned)
-    try:
-        args_target = arguments.get("target_ref") if isinstance(arguments, dict) else None
-    except Exception:
-        args_target = None
-    row_sessions, row_principals, _row_pairs = session_list_pairs(
-        output, args_target if isinstance(args_target, str) else None
-    )
-    raw_sessions |= row_sessions
-    raw_principals |= row_principals
     if comparison_dict is not None:
         first_principal = _clean_identity(comparison_dict.get("first_principal_ref"))
         second_principal = _clean_identity(comparison_dict.get("second_principal_ref"))
@@ -340,8 +422,14 @@ def _has_raw_account_artifact(
                     return False
             if first_principal is None or second_principal is None:
                 return False
-        first_session = _clean_identity(comparison_dict.get("first_session_ref"))
-        second_session = _clean_identity(comparison_dict.get("second_session_ref"))
+        # Single precedence with the collector: any actual receipt anywhere
+        # drops every legacy echo; legacy pair only on fully legacy proof.
+        if has_actual_receipt(metadata, raw):
+            session_pair = ("first_actual_session_ref", "second_actual_session_ref")
+        else:
+            session_pair = ("first_session_ref", "second_session_ref")
+        first_session = _clean_identity(comparison_dict.get(session_pair[0]))
+        second_session = _clean_identity(comparison_dict.get(session_pair[1]))
         if (first_session is not None or second_session is not None) and expected_sessions:
             for observed in (first_session, second_session):
                 if observed is not None and observed not in expected_sessions:
@@ -398,6 +486,8 @@ async def _session_alias_grounded(
             continue
         if str(raw.get("tool_id")) != str(record.source_id):
             continue
+        if actual_receipt_conflict(meta, raw) is not None:
+            continue
         stored = meta.get("proposal")
         if not isinstance(stored, dict) or str(stored.get("action_id")) != str(record.action_id):
             continue
@@ -408,23 +498,37 @@ async def _session_alias_grounded(
         candidates: list[Any] = [output]
         candidates.extend(output.get(key) for key in ("first", "second", "authenticated"))
         for item in candidates:
-            if (
-                isinstance(item, dict)
-                and (
-                    _clean_identity(item.get("session_ref", item.get("session"))),
-                    _clean_identity(item.get("principal_ref")),
-                )
-                == wanted
-            ):
+            if not isinstance(item, dict):
+                continue
+            # Single precedence with the collector: in actual mode a unit
+            # without its own actual key is skipped, never echo-guessed.
+            principal = _clean_identity(item.get("principal_ref"))
+            if has_actual_receipt(meta, raw):
+                if item is output:
+                    keys = (
+                        "actual_session_ref",
+                        "first_actual_session_ref",
+                        "second_actual_session_ref",
+                    )
+                else:
+                    keys = ("actual_session_ref",)
+                if not any(key in item for key in keys):
+                    continue
+                if any(
+                    (session, principal) == wanted
+                    for key in keys
+                    for session in [_clean_identity(item.get(key))]
+                    if session is not None
+                ):
+                    return True
+            elif (
+                _clean_identity(item.get("session_ref", item.get("session"))),
+                principal,
+            ) == wanted:
                 return True
         record_target = args.get("target_ref") if isinstance(args, dict) else None
         if record_target is not None and record_target != expected_target:
             continue
-        sessions, _, pairs = session_list_pairs(output, expected_target)
-        if wanted in pairs or (
-            session_name.strip() == principal_name.strip() and session_name.strip() in sessions
-        ):
-            return True
     return False
 
 
@@ -479,6 +583,195 @@ class StructuredLLMAnalysisVerifier:
         before_call: Callable[[], Any] | None = None,
     ) -> VerificationAssessment:
         return await self.verify(request, budget=budget, before_call=before_call)
+
+    async def verify_claim_with_budget(
+        self,
+        *,
+        claim: dict[str, Any],
+        evidence_ids: list[str],
+        run_id: str,
+        budget: DecisionBudget,
+        before_call: Callable[[], Any] | None = None,
+        security_claim: bool = False,
+    ) -> VerificationAssessment:
+        """Posthoc meaning review. Same caller budget; no receipt here."""
+        refs = [str(item) for item in (evidence_ids or []) if str(item).strip()]
+        if not refs:
+            return self._unknown_claim(refs, "no evidence reference to check")
+        excerpts: list[str] = []
+        for ref in refs:
+            try:
+                record = await self._store.get(EvidenceId(ref))
+            except Exception:
+                return self._unknown_claim(refs, "evidence store unreadable")
+            if record is None:
+                return self._unknown_claim(refs, "linked evidence is missing")
+            if str(record.run_id) != str(run_id):
+                return self._unknown_claim(refs, "linked evidence is another run")
+            raw = raw_from_metadata(getattr(record, "metadata", None))
+            gap = _posthoc_source_gap(record, raw)
+            if gap is not None:
+                return self._unknown_claim(refs, gap)
+            assert isinstance(raw, dict)
+            metadata = getattr(record, "metadata", None)
+            target_ref = (
+                metadata.get("target_node_id") if isinstance(metadata, dict) else None
+            )
+            excerpts.append(
+                json.dumps(
+                    {
+                        "evidence_id": ref,
+                        "action_id": str(getattr(record, "action_id", "")),
+                        "target_node_id": target_ref,
+                        "output": raw.get("output"),
+                    },
+                    ensure_ascii=False,
+                    default=str,
+                )[:2000]
+            )
+        claimed_principals: list[str] = []
+        try:
+            raw_principals = claim.get("principal_refs") if isinstance(claim, dict) else None
+        except Exception:
+            raw_principals = None
+        if isinstance(raw_principals, (list, tuple, set)):
+            for _item in raw_principals:
+                _cleaned = _clean_identity(_item)
+                if _cleaned is not None and _cleaned not in claimed_principals:
+                    claimed_principals.append(_cleaned)
+                if len(claimed_principals) >= 8:
+                    break
+        if claimed_principals:
+            try:
+                _claim_target = claim.get("target_node_id") if isinstance(claim, dict) else None
+            except Exception:
+                _claim_target = None
+            if not isinstance(_claim_target, str) or not _claim_target.strip():
+                _claim_target = None
+            else:
+                _claim_target = _claim_target.strip()
+            for _wanted in claimed_principals:
+                _proven = False
+                for _ref in refs:
+                    try:
+                        _src = await self._store.get(EvidenceId(_ref))
+                    except Exception:
+                        continue
+                    if _src is None:
+                        continue
+                    _meta = getattr(_src, "metadata", None)
+                    if not isinstance(_meta, dict):
+                        continue
+                    _raw = raw_from_metadata(_meta)
+                    if not isinstance(_raw, dict):
+                        continue
+                    try:
+                        _stored = _meta.get("proposal")
+                    except Exception:
+                        _stored = None
+                    _stored_args: dict[str, Any] = {}
+                    try:
+                        if isinstance(_stored, dict):
+                            _maybe = _stored.get("arguments")
+                            if isinstance(_maybe, dict):
+                                _stored_args = _maybe
+                    except Exception:
+                        _stored_args = {}
+                    try:
+                        if _has_raw_account_artifact(_meta, _raw, _wanted, _stored_args):
+                            _proven = True
+                            break
+                    except Exception:
+                        pass
+                    try:
+                        _actual_sessions = collect_actual_sessions(_meta, _raw)
+                    except Exception:
+                        _actual_sessions = set()
+                    if not _actual_sessions or _claim_target is None:
+                        continue
+                    for _sess in _actual_sessions:
+                        try:
+                            _alias_ok = await _session_alias_grounded(
+                                evidence_store=self._store,
+                                graph_service=getattr(self, "_graph", None),
+                                run_id=str(run_id),
+                                target_ref=str(_claim_target),
+                                session_name=str(_sess),
+                                principal_name=str(_wanted),
+                                arguments_target_ref=_stored_args.get("target_ref")
+                                if isinstance(_stored_args, dict)
+                                else None,
+                            )
+                        except Exception:
+                            continue
+                        if _alias_ok:
+                            _proven = True
+                            break
+                    if _proven:
+                        break
+                if not _proven:
+                    return self._unknown_claim(refs, "claimed account lacks actual-use proof")
+        if self._llm is None:
+            return self._unknown_claim(refs, "no model configured for review")
+        try:
+            meaning = await self._decider.ask(
+                stage="analysis_claim_verify",
+                payload={"claim": claim, "excerpts": excerpts},
+                response_schema=self._meaning_schema(),
+                system=_CLAIM_SYSTEM,
+                budget=budget,
+                before_call=before_call,
+            )
+        except Exception as exc:
+            kind = getattr(exc, "kind", None)
+            suffix = " (" + str(kind) + ")" if kind else ""
+            return self._unknown_claim(refs, "model decision failed" + suffix)
+        return self._claim_decision(refs, meaning, security_claim=security_claim)
+
+    def _unknown_claim(self, refs: list[str], reason: str) -> VerificationAssessment:
+        return VerificationAssessment(
+            verdict=Verdict.UNKNOWN,
+            reason=reason + "; evidence preserved, no verdict reached",
+            reviewer_id=self.reviewer_id,
+            source_refs=list(refs),
+            outcome="unknown",
+            claim_supported=False,
+        )
+
+    def _claim_decision(
+        self, refs: list[str], meaning: Any, *, security_claim: bool = False
+    ) -> VerificationAssessment:
+        if not isinstance(meaning, dict):
+            return self._unknown_claim(refs, "model returned no decision")
+        outcome = meaning.get("outcome")
+        if outcome not in self._OUTCOMES:
+            return self._unknown_claim(refs, "model outcome uninterpretable")
+        supported = meaning.get("claim_supported")
+        if not isinstance(supported, bool):
+            return self._unknown_claim(refs, "model omitted claim_supported")
+        reason = str(meaning.get("reason") or "").strip()[:500]
+        suffix = ": " + reason if reason else ""
+        if outcome in ("unknown", "inconclusive", "blocked"):
+            if supported is not False:
+                return self._unknown_claim(refs, "model reached no conclusion")
+            return self._unknown_claim(refs, "model reached no conclusion" + suffix)
+        if outcome == "success" and supported is not True:
+            return self._unknown_claim(refs, "tested claim not supported" + suffix)
+        if outcome == "refuted" and supported is not False:
+            return self._unknown_claim(refs, "refuted needs an unsupported claim")
+        return VerificationAssessment(
+            # A verified runtime-known security claim is a violation; any
+            # other verified new claim stays a benign pass. The verdict is
+            # never minted from a bare model-success boolean: success above
+            # already required a grounded outcome with claim_supported True.
+            verdict=Verdict.VIOLATION if security_claim else Verdict.PASS,
+            reason=("model confirms the claim" + suffix),
+            reviewer_id=self.reviewer_id,
+            source_refs=list(refs),
+            outcome=outcome,
+            claim_supported=supported,
+        )
+
 
     async def _verify(
         self,
@@ -728,7 +1021,12 @@ class StructuredLLMAnalysisVerifier:
             gaps.append("result action does not match the proposal")
         if not result.invocation_id:
             gaps.append("result carries no invocation")
-        if not proposal.capability or not proposal.operation:
+        if _is_direct_tool_binding(proposal):
+            # Selected-tool origin: identity is the actual tool that ran,
+            # not the legacy capability/operation pair (may be empty).
+            if str(result.tool_id) != str(proposal.tool_id):
+                gaps.append("result came from another tool than selected")
+        elif not proposal.capability or not proposal.operation:
             gaps.append("proposal names no behavior")
         else:
             if not tool_matches_action_namespace(result.tool_id, proposal.capability):
@@ -771,18 +1069,24 @@ class StructuredLLMAnalysisVerifier:
         if str(raw.get("tool_id")) != str(request.result.tool_id):
             return "preserved raw result came from another tool"
         metadata = getattr(record, "metadata", None) or {}
-        if metadata.get("capability") != request.proposal.capability:
-            return "linked evidence describes another capability"
-        if metadata.get("operation") != request.proposal.operation:
-            return "linked evidence describes another behavior"
-        canonical = metadata.get("canonical_operation") or metadata.get("operation_key")
-        if not isinstance(canonical, str) or not canonical.strip():
-            return "no canonical operation proof; bare operation alone proves nothing"
-        expected_canonical = _expected_canonical(
-            request.proposal.capability, request.proposal.operation
-        )
-        if str(canonical).strip().lower() != expected_canonical.strip().lower():
-            return "linked evidence describes another behavior"
+        if _is_direct_tool_binding(request.proposal):
+            # Selected-tool origin: skip the canonical cap/op proof and
+            # check the actual tool identity instead. Empty cap/op allowed.
+            if str(request.result.tool_id) != str(request.proposal.tool_id):
+                return "result came from another tool than selected"
+        else:
+            if metadata.get("capability") != request.proposal.capability:
+                return "linked evidence describes another capability"
+            if metadata.get("operation") != request.proposal.operation:
+                return "linked evidence describes another behavior"
+            canonical = metadata.get("canonical_operation") or metadata.get("operation_key")
+            if not isinstance(canonical, str) or not canonical.strip():
+                return "no canonical operation proof; bare operation alone proves nothing"
+            expected_canonical = _expected_canonical(
+                request.proposal.capability, request.proposal.operation
+            )
+            if str(canonical).strip().lower() != expected_canonical.strip().lower():
+                return "linked evidence describes another behavior"
         meta_action = metadata.get("action_id")
         if meta_action is not None and str(meta_action) != str(request.proposal.action_id):
             return "linked evidence disagrees with its original action"
@@ -962,21 +1266,6 @@ async def _covered_principals_from_sources(store: Any, source_refs: Any) -> list
                     cleaned = _clean_receipt_identity(nested.get("principal_ref"))
                     if cleaned is not None and cleaned not in seen:
                         seen[cleaned] = None
-        try:
-            stored_args = (
-                metadata.get("proposal", {}).get("arguments", {})
-                if isinstance(metadata.get("proposal"), dict)
-                else {}
-            )
-            args_target = stored_args.get("target_ref") if isinstance(stored_args, dict) else None
-        except Exception:
-            args_target = None
-        _, row_principals, _ = session_list_pairs(
-            output, args_target if isinstance(args_target, str) else None
-        )
-        for cleaned in row_principals:
-            if cleaned not in seen:
-                seen[cleaned] = None
     return sorted(seen)
 
 
@@ -1104,3 +1393,114 @@ def hypothesis_status_for_assessment(assessment: VerificationAssessment) -> str:
     if outcome == "refuted":
         return HYPOTHESIS_REJECTED
     return HYPOTHESIS_INCONCLUSIVE
+
+
+async def append_posthoc_claim_receipt(
+    *,
+    evidence_store: Any,
+    run_id: str,
+    engagement_id: str,
+    claim: dict[str, Any],
+    evidence_ids: list[str],
+    assessment: VerificationAssessment,
+    hypothesis_id: str | None = None,
+    action_id: str | None = None,
+    invocation_id: str | None = None,
+    target_node_id: str | None = None,
+) -> Any | None:
+    """Final-admission receipt for a posthoc common-recording review.
+
+    No pre-recorded expectation is required; the causal proof is the
+    linked original evidence plus the meaning review outcome. The
+    authoritative origin pair comes from the cited source evidence,
+    never from model input. Without that pair there is no receipt,
+    so an unlinkable claim can never count as approval.
+    """
+    clean_action = str(action_id or "").strip()
+    clean_invocation = str(invocation_id or "").strip()
+    if not clean_action or not clean_invocation:
+        return None
+    refs = [str(item) for item in (evidence_ids or []) if str(item).strip()]
+    if not refs:
+        return None
+    supporting, refuting = _receipt_support_assignment(assessment, refs)
+    outcome = getattr(assessment, "outcome", None)
+    try:
+        covered_principals = await _covered_principals_from_sources(evidence_store, refs)
+    except Exception:
+        covered_principals = []
+    statement = ""
+    try:
+        if isinstance(claim, dict):
+            for key in ("statement", "description", "claim"):
+                value = claim.get(key)
+                if isinstance(value, str) and value.strip():
+                    statement = value.strip()[:500]
+                    break
+    except Exception:
+        statement = ""
+    claimed_principals: list[str] = []
+    try:
+        _raw_claimed = claim.get("principal_refs") if isinstance(claim, dict) else None
+    except Exception:
+        _raw_claimed = None
+    if isinstance(_raw_claimed, (list, tuple, set)):
+        for _item in _raw_claimed:
+            _cleaned = _clean_identity(_item)
+            if _cleaned is not None and _cleaned not in claimed_principals:
+                claimed_principals.append(_cleaned)
+            if len(claimed_principals) >= 8:
+                break
+    verdict = (
+        assessment.verdict.value
+        if hasattr(assessment.verdict, "value")
+        else str(assessment.verdict)
+    )
+    payload: dict[str, Any] = {
+        "record_kind": "review_receipt",
+        "public": True,
+        "admission": "final",
+        "posthoc": True,
+        "origin": "graph.record",
+        "supersedes": [],
+        "reviewer_id": assessment.reviewer_id,
+        "verdict": verdict,
+        "outcome": outcome,
+        "reason": str(getattr(assessment, "reason", "") or "")[:500],
+        "claim_supported": getattr(assessment, "claim_supported", None),
+        "claim": statement,
+        "claimed_principals": list(claimed_principals),
+        "action_id": clean_action,
+        "invocation_id": clean_invocation,
+        "target_node_id": str(target_node_id).strip() if target_node_id else None,
+        "hypothesis_id": str(hypothesis_id).strip() if hypothesis_id else None,
+        "source_evidence_ids": list(refs),
+        "supporting_evidence_ids": supporting,
+        "refuting_evidence_ids": refuting,
+        "covered_principals": covered_principals,
+    }
+    receipt = EvidenceRecord(
+        evidence_id=EvidenceId(new_id("ev")),
+        run_id=run_id,
+        engagement_id=engagement_id,
+        source_type=EvidenceSourceType.SYSTEM,
+        source_id=str(assessment.reviewer_id),
+        action_id=clean_action,
+        invocation_id=clean_invocation,
+        hypothesis_id=str(hypothesis_id).strip() if hypothesis_id else None,
+        content_type="application/json",
+        artifact_ref=None,
+        digest=digest_payload(payload),
+        summary=(
+            "posthoc review "
+            + str(outcome or "unknown")
+            + "/"
+            + str(verdict)
+            + " for "
+            + clean_action
+        )[:280],
+        created_at=datetime.now(timezone.utc),
+        metadata=payload,
+    )
+    await evidence_store.append(receipt)
+    return receipt

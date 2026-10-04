@@ -73,6 +73,7 @@ class RuntimeComponents:
     operation_bindings: Any = None
     execution_recipes: Any = None
     retry_policy: Any = None
+    local_tools: Any = None
 
 
 RuntimeComponentFactory = Callable[[ComponentFactoryContext], RuntimeComponents]
@@ -122,6 +123,7 @@ class _BuiltinRuntimeExtension:
         from redteam.orchestration.observations.packages import (
             builtin_extension_declaration as observations,
         )
+        from redteam.orchestration.graph_recording import graph_recording_contribution
 
         return (
             roles(),
@@ -132,6 +134,7 @@ class _BuiltinRuntimeExtension:
                 "1",
                 (*action_contributions(), *recipe_contributions()),
             ),
+            ExtensionDeclaration("builtin.graph-recording", "1", (graph_recording_contribution(),)),
         )
 
 
@@ -256,6 +259,7 @@ def apply_extensions(
             "capability.action_binding",
             "capability.retry_policy",
             "capability.execution_recipe",
+            "runtime_tool",
         )
     )
     for contribution in assembly.contributions("candidate_provider"):
@@ -315,6 +319,12 @@ def apply_extensions(
             if components.agents.get(definition.agent_id) is None:
                 raise ExtensionAssemblyError(f"missing executable role: {definition.agent_id}")
     planners = assembly.contributions("planning")
+    from redteam.orchestration.local_tools import LocalToolRegistry
+
+    local_tools = components.local_tools or LocalToolRegistry()
+    for contribution in assembly.contributions("runtime_tool"):
+        descriptor, handler = contribution.factory(context)
+        local_tools.register(descriptor, handler)
     if planning_provider_id is None and planners:
         raise ExtensionAssemblyError("planning contributions require an explicit selection")
     provider = components.planning_provider
@@ -324,6 +334,7 @@ def apply_extensions(
         )
     return replace(
         components,
+        local_tools=local_tools,
         planning_provider=provider,
         eligibility=eligibility,
         operation_bindings=bindings,

@@ -75,6 +75,7 @@ DECISION_PROPOSE_ACTIONS = "propose_actions"
 DECISION_READ_EVIDENCE = "read_evidence"
 DECISION_FINISH = "finish"
 DECISION_HOLD = "hold"
+DECISION_TOOL_CALLS = "tool_calls"
 
 
 @dataclass(frozen=True)
@@ -322,6 +323,7 @@ def worker_next_action_schema() -> dict[str, Any]:
                     DECISION_READ_EVIDENCE,
                     DECISION_FINISH,
                     DECISION_HOLD,
+                    DECISION_TOOL_CALLS,
                 ],
             },
             "actions": {"type": "array", "items": {"type": "object"}},
@@ -330,6 +332,9 @@ def worker_next_action_schema() -> dict[str, Any]:
             "summary": {"type": "string"},
             "unresolved": {"type": "array", "items": {"type": "string"}},
             "finish_reason": {"type": "string"},
+            "tool_calls": {"type": "array", "items": {"type": "object"}},
+            "evidence_requests": {"type": "array", "items": {"type": "object"}},
+            "completion": {"type": "object"},
         },
         "required": ["decision"],
         "additionalProperties": True,
@@ -347,6 +352,9 @@ class WorkerNextAction:
     summary: str | None = None
     unresolved: tuple[str, ...] = ()
     finish_reason: str | None = None
+    tool_calls: tuple[dict[str, Any], ...] = ()
+    evidence_requests: tuple[dict[str, Any], ...] = ()
+    completion: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -407,6 +415,16 @@ def parse_worker_next_action(result: Mapping[str, Any]) -> WorkerNextAction:
     if not isinstance(result, Mapping):
         raise ValueError("worker_next_action must be a JSON object")
     decision = result.get("decision")
+    if decision == DECISION_TOOL_CALLS:
+        from redteam.orchestration.local_tools import LocalToolCall
+
+        calls = tuple(
+            LocalToolCall.model_validate(item).model_dump(mode="json")
+            for item in result.get("tool_calls", [])
+        )
+        if not calls:
+            raise ValueError("worker tool_calls needs a registered local tool call")
+        return WorkerNextAction(decision=decision, tool_calls=calls)
     references = result.get("target_references", [])
     if references is None:
         references = []
@@ -427,11 +445,18 @@ def parse_worker_next_action(result: Mapping[str, Any]) -> WorkerNextAction:
             target_references=tuple(references),
         )
     if decision == DECISION_READ_EVIDENCE:
+        from redteam.orchestration.evidence_access import EvidenceReadRequest
+
+        requests = tuple(
+            EvidenceReadRequest.model_validate(item).model_dump(mode="json")
+            for item in result.get("evidence_requests", [])
+        )
         return WorkerNextAction(
             decision=decision,
             evidence_ids=_string_items(
-                result.get("evidence_ids"), name="evidence_ids", required=True
+                result.get("evidence_ids", []), name="evidence_ids", required=not requests
             ),
+            evidence_requests=requests,
             target_references=tuple(references),
         )
     if decision == DECISION_FINISH:
@@ -452,6 +477,7 @@ def parse_worker_next_action(result: Mapping[str, Any]) -> WorkerNextAction:
                 result.get("unresolved", []), name="unresolved", required=False
             ),
             finish_reason=finish_reason,
+            completion=result.get("completion"),
         )
     if decision == DECISION_HOLD:
         summary = result.get("summary", "")

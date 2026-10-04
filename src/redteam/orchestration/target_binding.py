@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from urllib.parse import urlsplit
 
 from redteam.core.contracts.target import AnyTarget, UrlTarget
+from redteam.core.contracts.tool import ToolTargetBinding
 from redteam.core.provider_contracts import OperationTargetBinding, operation_target_binding
 
 
@@ -54,8 +55,9 @@ def validate_network_arguments(
     operation: str = "",
     bindings: Mapping[str, OperationTargetBinding] | None = None,
     argument_bindings: Mapping[str, str] | None = None,
+    target_binding: ToolTargetBinding | None = None,
 ) -> None:
-    binding = operation_target_binding(operation, bindings)
+    binding = target_binding if target_binding is not None else operation_target_binding(operation, bindings)
     if binding.requires_url_target and not isinstance(target, UrlTarget):
         raise ValueError(f"{operation} requires a known URL target")
     identity = network_identity(target)

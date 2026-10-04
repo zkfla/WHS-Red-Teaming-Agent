@@ -130,7 +130,9 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             termination_reason=TerminationReason.GOAL_ACHIEVED
             if outcome == "goal_achieved"
             else None
-            if outcome == "task_completed"
+            if outcome in {"task_completed", "task_blocked"}
+            else TerminationReason.MISSION_BLOCKED
+            if outcome == "investigation_finished"
             else TerminationReason.INVESTIGATION_HELD,
         )
         last_event_id = engine.last_event_id
@@ -289,6 +291,8 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             agent_id=candidate.draft.agent_id,
             capability=step.capability,
             operation=step.operation,
+            binding_mode=step.binding_mode,
+            tool_id=step.tool_id,
             target=step.resolved_target(),
             arguments=step.arguments,
             reason=step.reason,

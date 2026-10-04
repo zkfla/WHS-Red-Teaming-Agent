@@ -13,7 +13,8 @@ from __future__ import annotations
 from typing import Any
 
 from redteam.core.enums import EvidenceSourceType
-from redteam.orchestration.analysis import is_final_admission_receipt, session_list_pairs
+from redteam.orchestration.analysis import is_final_admission_receipt
+from redteam.orchestration.session_proof import collect_actual_sessions
 from redteam.orchestration.diagnostics import DecisionDiagnostic
 from redteam.orchestration.evidence_access import raw_from_metadata
 from redteam.orchestration.paths import (
@@ -167,20 +168,12 @@ def _claimed_proposal_principal(stored_proposal: dict[str, Any]) -> str | None:
 
 
 def _raw_account_names(raw: dict[str, Any], meta: dict[str, Any]) -> set[str]:
-    found: set[str] = set()
-    http_obs = meta.get("http_observation")
-    if isinstance(http_obs, dict):
-        session_ref = http_obs.get("session_ref")
-        if isinstance(session_ref, str) and session_ref.strip():
-            found.add(session_ref.strip())
+    # Session names come from the shared actual-use collector only; principal
+    # echoes stay readable here as before.
+    found: set[str] = collect_actual_sessions(meta, raw)
     comparison = meta.get("session_comparison")
     if isinstance(comparison, dict):
-        for key in (
-            "first_session_ref",
-            "second_session_ref",
-            "first_principal_ref",
-            "second_principal_ref",
-        ):
+        for key in ("first_principal_ref", "second_principal_ref"):
             value = comparison.get(key)
             if isinstance(value, str) and value.strip():
                 found.add(value.strip())
@@ -189,17 +182,16 @@ def _raw_account_names(raw: dict[str, Any], meta: dict[str, Any]) -> set[str]:
     except Exception:
         output = None
     if isinstance(output, dict):
-        for key in (
-            "session_ref",
-            "principal_ref",
-            "first_session_ref",
-            "second_session_ref",
-            "first_principal_ref",
-            "second_principal_ref",
-        ):
+        for key in ("principal_ref", "first_principal_ref", "second_principal_ref"):
             value = output.get(key)
             if isinstance(value, str) and value.strip():
                 found.add(value.strip())
+        for nested_key in ("first", "second", "authenticated", "anonymous"):
+            nested = output.get(nested_key)
+            if isinstance(nested, dict):
+                value = nested.get("principal_ref")
+                if isinstance(value, str) and value.strip():
+                    found.add(value.strip())
     return found
 
 
@@ -233,19 +225,23 @@ def _has_exact_account_proof(
         if cleaned is not None:
             expected_sessions.add(cleaned)
     raw_principals: set[str] = set()
-    raw_sessions: set[str] = set()
+    # Session names come from the shared actual-use collector only; the
+    # per-unit receipt-vs-echo rule lives in session_proof, not here.
+    raw_sessions: set[str] = collect_actual_sessions(meta, raw)
+    # Actual-only values for the mismatch gate below.
+    actual_receipts: set[str] = set()
     http_obs = meta.get("http_observation")
     if isinstance(http_obs, dict):
-        cleaned = _clean_completion_identity(http_obs.get("session_ref"))
+        cleaned = _clean_completion_identity(http_obs.get("actual_session_ref"))
         if cleaned is not None:
-            raw_sessions.add(cleaned)
+            actual_receipts.add(cleaned)
     comparison = meta.get("session_comparison")
     comparison_dict: dict[str, Any] | None = comparison if isinstance(comparison, dict) else None
     if comparison_dict is not None:
-        for key in ("first_session_ref", "second_session_ref"):
+        for key in ("first_actual_session_ref", "second_actual_session_ref"):
             cleaned = _clean_completion_identity(comparison_dict.get(key))
             if cleaned is not None:
-                raw_sessions.add(cleaned)
+                actual_receipts.add(cleaned)
         for key in ("first_principal_ref", "second_principal_ref"):
             cleaned = _clean_completion_identity(comparison_dict.get(key))
             if cleaned is not None:
@@ -255,10 +251,14 @@ def _has_exact_account_proof(
     except Exception:
         output = None
     if isinstance(output, dict):
-        for key in ("session_ref", "first_session_ref", "second_session_ref"):
+        for key in (
+            "actual_session_ref",
+            "first_actual_session_ref",
+            "second_actual_session_ref",
+        ):
             cleaned = _clean_completion_identity(output.get(key))
             if cleaned is not None:
-                raw_sessions.add(cleaned)
+                actual_receipts.add(cleaned)
         for key in ("principal_ref", "first_principal_ref", "second_principal_ref"):
             cleaned = _clean_completion_identity(output.get(key))
             if cleaned is not None:
@@ -266,19 +266,20 @@ def _has_exact_account_proof(
         for nested_key in ("first", "second", "authenticated", "anonymous"):
             nested = output.get(nested_key)
             if isinstance(nested, dict):
-                for key in ("session_ref", "session"):
-                    cleaned = _clean_completion_identity(nested.get(key))
-                    if cleaned is not None:
-                        raw_sessions.add(cleaned)
+                cleaned = _clean_completion_identity(nested.get("actual_session_ref"))
+                if cleaned is not None:
+                    actual_receipts.add(cleaned)
                 cleaned = _clean_completion_identity(nested.get("principal_ref"))
                 if cleaned is not None:
                     raw_principals.add(cleaned)
-    args_target = stored_args.get("target_ref") if isinstance(stored_args, dict) else None
-    row_sessions, row_principals, _ = session_list_pairs(
-        output, args_target if isinstance(args_target, str) else None
-    )
-    raw_sessions |= row_sessions
-    raw_principals |= row_principals
+    # Configured session inventory (session_list rows) is never actual-use
+    # proof: it is not merged into the raw receipt sets above. Session to
+    # principal binding stays on the separate alias-grounded lookup, and an
+    # absent receipt proves nothing, including anonymous use.
+    if actual_receipts and expected_sessions and actual_receipts.isdisjoint(expected_sessions):
+        # The response says it used sessions nobody asked for: requested echo
+        # must not rescue it, so the whole account proof is rejected.
+        return False
     if comparison_dict is not None:
         first_principal = _clean_completion_identity(comparison_dict.get("first_principal_ref"))
         second_principal = _clean_completion_identity(comparison_dict.get("second_principal_ref"))
@@ -478,6 +479,14 @@ def check_record_linkage(
                 )
             ]
         return []
+    if stored_proposal.get("binding_mode") == "selected_tool" and (
+        not stored_proposal.get("tool_id") or str(stored_proposal["tool_id"]) != str(raw.get("tool_id"))
+    ):
+        return [(
+            f"evidence '{evidence_id}' selected tool differs from its original result",
+            "completion_selected_tool_mismatch",
+            "evidence selected tool differs from its original result",
+        )]
     stored_action = _s(stored_proposal.get("action_id", "")).strip()
     if not stored_action or stored_action != action_ref:
         return [
@@ -856,18 +865,22 @@ def _verified_completion_accounts(
         if isinstance(value, str) and value.strip():
             expected_sessions.add(value.strip())
     raw_principals: set[str] = set()
-    raw_sessions: set[str] = set()
+    # Session names come from the shared actual-use collector only; the
+    # per-unit receipt-vs-echo rule lives in session_proof, not here.
+    raw_sessions: set[str] = collect_actual_sessions(meta, raw)
+    # Actual-only values for the mismatch gate below.
+    actual_receipts: set[str] = set()
     http_obs = meta.get("http_observation")
     if isinstance(http_obs, dict):
-        value = http_obs.get("session_ref")
+        value = http_obs.get("actual_session_ref")
         if isinstance(value, str) and value.strip():
-            raw_sessions.add(value.strip())
+            actual_receipts.add(value.strip())
     comparison = meta.get("session_comparison")
     if isinstance(comparison, dict):
-        for key in ("first_session_ref", "second_session_ref"):
+        for key in ("first_actual_session_ref", "second_actual_session_ref"):
             value = comparison.get(key)
             if isinstance(value, str) and value.strip():
-                raw_sessions.add(value.strip())
+                actual_receipts.add(value.strip())
         for key in ("first_principal_ref", "second_principal_ref"):
             value = comparison.get(key)
             if isinstance(value, str) and value.strip():
@@ -877,10 +890,14 @@ def _verified_completion_accounts(
     except Exception:
         output = None
     if isinstance(output, dict):
-        for key in ("session_ref", "first_session_ref", "second_session_ref"):
+        for key in (
+            "actual_session_ref",
+            "first_actual_session_ref",
+            "second_actual_session_ref",
+        ):
             value = output.get(key)
             if isinstance(value, str) and value.strip():
-                raw_sessions.add(value.strip())
+                actual_receipts.add(value.strip())
         for key in ("principal_ref", "first_principal_ref", "second_principal_ref"):
             value = output.get(key)
             if isinstance(value, str) and value.strip():
@@ -888,19 +905,21 @@ def _verified_completion_accounts(
         for nested_key in ("first", "second", "authenticated", "anonymous"):
             nested = output.get(nested_key)
             if isinstance(nested, dict):
-                for key in ("session_ref", "session"):
-                    value = nested.get(key)
-                    if isinstance(value, str) and value.strip():
-                        raw_sessions.add(value.strip())
+                value = nested.get("actual_session_ref")
+                if isinstance(value, str) and value.strip():
+                    actual_receipts.add(value.strip())
                 value = nested.get("principal_ref")
                 if isinstance(value, str) and value.strip():
                     raw_principals.add(value.strip())
-    args_target = args.get("target_ref") if isinstance(args, dict) else None
-    row_sessions, row_principals, _ = session_list_pairs(
-        output, args_target if isinstance(args_target, str) else None
-    )
-    raw_sessions |= row_sessions
-    raw_principals |= row_principals
+    # Configured session inventory (session_list rows) is never actual-use
+    # proof: it is not merged into the raw receipt sets above. Session to
+    # principal binding stays on the separate alias-grounded lookup, and an
+    # absent receipt proves nothing, including anonymous use.
+    if actual_receipts and expected_sessions and actual_receipts.isdisjoint(expected_sessions):
+        # The response says it used sessions nobody asked for: the whole
+        # receipt channel is rejected and only the separate alias-grounded
+        # lookup (outside this function) may still ground the claim.
+        return set()
     verified: set[str] = set()
     for name in cleaned_claimed:
         if name in raw_principals:

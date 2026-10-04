@@ -25,6 +25,8 @@ from __future__ import annotations
 import json
 from typing import TYPE_CHECKING, Any
 
+from pydantic import BaseModel, ConfigDict, Field
+
 if TYPE_CHECKING:
     from redteam.orchestration.analysis import StructuredLLMAnalysisVerifier
 
@@ -55,6 +57,44 @@ __all__ = [
 DEFAULT_CONTEXT_CHARS = 8000
 # Hard ceiling even when the caller asks for more.
 ABSOLUTE_MAX_CHARS = 20000
+
+
+class EvidenceReadRequest(BaseModel):
+    """One durable lookup specification, never a copy of the raw evidence."""
+    model_config = ConfigDict(extra="allow")
+    evidence_id: str = Field(min_length=1)
+    offset: int = Field(default=0, ge=0)
+    limit: int = Field(default=4000, ge=0, le=ABSOLUTE_MAX_CHARS)
+    query: str | None = None
+
+
+async def read_for_runtime(
+    evidence_store: Any, runtime: Any, request: EvidenceReadRequest, *,
+    delegation_id: str | None = None,
+) -> dict:
+    """Read and retain only the request/status for the next scoped decision."""
+    result = await EvidenceReader(evidence_store).read(
+        run_id=str(runtime.run_id),
+        **request.model_dump(include={"evidence_id", "offset", "limit", "query"}),
+    )
+    entry = {
+        "request": request.model_dump(include={"evidence_id", "offset", "limit", "query"}),
+        "status": result["status"],
+        "delegation_id": delegation_id,
+    }
+    retained = [item for item in runtime.evidence_reads if item != entry]
+    runtime.evidence_reads = [*retained, entry][-10:]
+    return result
+
+
+async def restore_reads(evidence_store: Any, runtime: Any, *, delegation_id: str | None = None) -> list[dict]:
+    """Reconstitute the requested windows from the single original store."""
+    reader = EvidenceReader(evidence_store)
+    return [
+        await reader.read(run_id=str(runtime.run_id), **item["request"])
+        for item in runtime.evidence_reads
+        if item.get("delegation_id") == delegation_id
+    ]
 # Raw payload keys understood by the reader, newest first.
 _RAW_KEYS = ("tool_result", "raw_tool_result")
 

@@ -135,6 +135,8 @@ async def worker_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             executed=result is not None,
             retry_attempts=local["runtime"].retry_count if result is not None else 0,
             model_decision_attempts=model_budget.used,
+            model_known_tokens_used=model_budget.tokens_used,
+            model_usage_unknown=model_budget.unknown_usage_count,
             model_tokens_used=(
                 model_budget.tokens_used if model_budget.tokens_fully_known else None
             ),
@@ -187,6 +189,8 @@ async def worker_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             executed=attempted,
             retry_attempts=local["runtime"].retry_count if attempted else 0,
             model_decision_attempts=model_budget.used,
+            model_known_tokens_used=model_budget.tokens_used,
+            model_usage_unknown=model_budget.unknown_usage_count,
             model_tokens_used=(
                 model_budget.tokens_used if model_budget.tokens_fully_known else None
             ),
