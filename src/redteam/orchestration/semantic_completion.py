@@ -526,19 +526,6 @@ async def complete_task(engine: Any, path: Any, decision: Any, runtime: Any, con
 
     claims = list(review.get("claims", []))
     service = AttackGraphService(engine.deps.graph_store)
-    for hypothesis_id in task.related_hypothesis_ids:
-        hypothesis = await service.get_hypothesis(str(hypothesis_id))
-        if hypothesis is None or hypothesis.status not in {"confirmed", "refuted", "rejected"}:
-            return ["task hypothesis has no conclusive result"]
-        kind = "hypothesis_confirmed" if hypothesis.status == "confirmed" else "hypothesis_refuted"
-        hypothesis_evidence = [str(record.evidence_id) for record in verified
-                               if str(record.hypothesis_id) == str(hypothesis_id)]
-        if not hypothesis_evidence:
-            return ["task hypothesis has no related original evidence"]
-        claims.append(ResultClaim(
-            description=hypothesis.description, kind=kind, hypothesis_id=str(hypothesis_id),
-            evidence_ids=hypothesis_evidence,
-        ).model_dump(mode="json"))
     errors = await check_result_review(
         claims=claims, evidence_ids=evidence_ids, evidence_store=engine.deps.evidence_store,
         graph_service=service, path_store=engine.deps.path_store,
