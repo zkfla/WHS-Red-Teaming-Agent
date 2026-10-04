@@ -62,6 +62,9 @@ async def replan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
     if decision is not None and decision.reasons:
         feedback.extend(safe_feedback(item) for item in decision.reasons)
     if reason:
+        from redteam.orchestration.delegated_runtime import close_delegations
+
+        runtime = close_delegations(runtime, reason)
         failed = reason in {
             TerminationReason.PLANNING_ERROR,
             TerminationReason.EXECUTION_ERROR,

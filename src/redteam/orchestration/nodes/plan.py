@@ -60,7 +60,9 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
         path, candidates, outcome = await engine.decide(
             runtime, observation, last_event_id=state.get("last_event_id")
         )
+        runtime = engine.updated_runtime or runtime
     except (DecisionFailure, PathError, ValueError, TypeError) as exc:
+        runtime = engine.updated_runtime or runtime
         diagnostic = diagnostic_for_exception(exc, stage="path_or_action")
         event = await publisher.publish(
             "PlanningFailed",
@@ -170,9 +172,13 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
     conflicts: set[str] = set()
     targets: Counter[str] = Counter()
     role_counts: Counter[str] = Counter()
+    delegation_counts: Counter[str] = Counter()
     for candidate in candidates:
         if len(chosen) >= limit:
             break
+        delegation_id = candidate.plan_step.delegation_id
+        if delegation_id and delegation_counts[delegation_id]:
+            continue
         definition = deps.agents.definition(candidate.draft.agent_id)
         if definition and role_counts[candidate.draft.agent_id] >= definition.max_concurrency:
             continue
@@ -196,6 +202,8 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
         conflicts.update(candidate.draft.conflict_keys)
         targets.update(candidate.draft.target_node_ids)
         role_counts.update([candidate.draft.agent_id])
+        if delegation_id:
+            delegation_counts.update([delegation_id])
     if not chosen:
         return advance(
             state,

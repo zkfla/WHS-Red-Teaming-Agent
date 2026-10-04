@@ -387,6 +387,9 @@ class AgentLoopRunner:
         except asyncio.CancelledError:
             latest = await self._latest_runtime(runtime)
             reason = TerminationReason.USER_INTERRUPTED
+            from redteam.orchestration.delegated_runtime import close_delegations
+
+            latest = close_delegations(latest, reason)
             await self._cleanup_after_failure(latest, reason=reason)
             await self._close_finished_binding(latest, reason=reason)
             if self._stop_requested:
@@ -410,6 +413,9 @@ class AgentLoopRunner:
         except BaseException as exc:
             latest = await self._latest_runtime(runtime)
             reason = f"runner_error:{type(exc).__name__}"
+            from redteam.orchestration.delegated_runtime import close_delegations
+
+            latest = close_delegations(latest, reason)
             await self._cleanup_after_failure(latest, reason=reason)
             await self._close_finished_binding(latest, reason=TerminationReason.EXECUTION_ERROR)
             self._failure_runtime = latest.model_copy(

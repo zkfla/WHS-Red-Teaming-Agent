@@ -424,6 +424,8 @@ class InvestigationEngine:
         # Reference-absence notes from the last reference_paths call. Plain
         # diagnostics only, never internal assessment material.
         self.last_reference_diagnostics: list[DecisionDiagnostic] = []
+        self.updated_runtime: Any = None
+        self.decision_token_limit: int | None = None
 
     async def _ask(self, *, stage, payload, **kwargs):
         # Raw writing validation occurs before permissive storage models can
@@ -504,6 +506,12 @@ class InvestigationEngine:
         if active_budget.remaining == 0:
             raise DecisionFailure(stage, "budget", active_budget.used, "decision budget exhausted")
         before = active_budget.used
+        async def before_call():
+            await self._ensure_reasoning_allowed()
+            if active_budget.token_halt_required(self.decision_token_limit):
+                from redteam.orchestration.cognition import ReasoningHalted
+
+                raise ReasoningHalted("delegation_token_limit_or_unknown_usage")
         try:
             result = await self.planning_provider.propose(
                 PlanningRequest(
@@ -512,7 +520,7 @@ class InvestigationEngine:
                     response_schema=deepcopy(response_schema),
                     system=system,
                     inference=BudgetedInference(
-                        self.client, active_budget, before_call=self._ensure_reasoning_allowed
+                        self.client, active_budget, before_call=before_call
                     ),
                 )
             )
@@ -1407,6 +1415,7 @@ class InvestigationEngine:
 
     async def decide(self, runtime, observation, *, last_event_id=None):
         self._event_runtime = runtime
+        self.updated_runtime = runtime
         self.last_event_id = last_event_id
         await self._review_token(runtime)
         context = await self.context(runtime, observation)
@@ -1456,6 +1465,14 @@ class InvestigationEngine:
                 raise self._budget_failure("path_draft", drafting_budget)
             if path is None:
                 return None, [], "path held or rejected"
+        from redteam.orchestration.delegated_runtime import decide_delegations
+
+        delegated, advanced = await decide_delegations(self, path, runtime, context)
+        runtime = self.updated_runtime or runtime
+        if delegated:
+            return path, delegated, None
+        if advanced:
+            return path, [], "continue_planning"
         extra = []
         last_control_succeeded = False
         budget = DecisionBudget(self.deps.settings.decision_max_attempts)
@@ -1489,6 +1506,13 @@ class InvestigationEngine:
                 continue
             try:
                 last_control_succeeded = False
+                if decision.mode == "delegate":
+                    from redteam.orchestration.delegated_runtime import accept_delegations
+
+                    if not decision.delegations:
+                        raise DecisionRuleError("delegation decision needs an investigation purpose")
+                    await accept_delegations(self, path, decision.delegations, runtime)
+                    return path, [], "continue_planning"
                 if decision.mode == "read_evidence":
                     request = decision.evidence_request
                     if request.get("target_references"):
@@ -2937,6 +2961,25 @@ async def validate_current_action(deps, runtime, step, proposal=None) -> list[st
     if blocked is not None:
         return [blocked]
     problems = check_ready_step(path, current, assessment)
+    if step.delegation_id:
+        from redteam.orchestration.reasoning_time import reasoning_time_allowed
+
+        delegation = runtime.delegations.get(step.delegation_id)
+        if delegation is None or (
+            delegation.path_id != path.path_id or delegation.path_version != path.version
+            or delegation.path_step_id != step.path_step_id
+            or delegation.mission_task_id != path.mission_task_id
+            or (proposal is not None and delegation.agent_id != str(proposal.agent_id))
+        ):
+            problems.append("action no longer belongs to its delegated investigation")
+        elif delegation.actions_used >= delegation.budget.max_actions:
+            problems.append("delegation action allowance is exhausted")
+        elif not reasoning_time_allowed(deps.engagement, runtime):
+            problems.append("engagement time prevents further execution")
+        elif delegation.budget.max_seconds is not None and (
+            datetime.now(timezone.utc) - delegation.started_at
+        ).total_seconds() >= delegation.budget.max_seconds:
+            problems.append("delegation time allowance is exhausted")
     problems.extend(
         await operator_exclusions(
             deps,

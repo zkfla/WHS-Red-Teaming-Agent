@@ -262,6 +262,15 @@ async def execute_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
         and deps.long_job_adapter is None
     )
     max_retries = deps.settings.max_retries
+    if step.delegation_id:
+        delegation = runtime.delegations.get(step.delegation_id)
+        if delegation is None:
+            binding_ready = False
+        else:
+            max_retries = min(
+                max_retries,
+                max(delegation.budget.max_actions - delegation.actions_used - 1, 0),
+            )
     if work_id is not None:
         try:
             lease_ready = (
