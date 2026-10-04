@@ -724,6 +724,9 @@ async def reprocess_evidence(
     mutation_summary = {"nodes": 0, "edges": 0, "target_references": 0}
     mapper_failure = None
     mapping_status = "skipped"
+    replay_writes_planned = False
+    replay_processing_status = "unknown"
+    replay_processing_stage = None
     # The outcome is computed for every replayed result so failures stay
     # visible; graph writes below stay success-gated, mirroring UPDATE.
     if result_mappers is not None:
@@ -771,6 +774,46 @@ async def reprocess_evidence(
         # mapping outcome above, but never promotes output into the graph.
         nodes_to_apply = mutation.nodes if result.success else []
         edges_to_apply = mutation.edges if result.success else []
+        # References ride the same companion channel as UPDATE: only entries
+        # grounded against the preserved raw payload are stored, never nodes.
+        if getattr(mutation, "target_references", []):
+            try:
+                from redteam.orchestration.observations.reference_scan import (
+                    is_reference_grounded,
+                )
+
+                grounded = []
+                for entry in mutation.target_references:
+                    draft = entry
+                    if draft.source_evidence_id is None:
+                        draft = draft.model_copy(
+                            update={"source_evidence_id": str(record.evidence_id)}
+                        )
+                    if is_reference_grounded(
+                        draft,
+                        tool_result=raw if isinstance(raw, dict) else {},
+                        action_id=str(proposal.action_id),
+                        invocation_id=str(result.invocation_id),
+                        evidence_id=str(record.evidence_id),
+                    ):
+                        grounded.append(draft)
+                if grounded:
+                    await record_target_references(
+                        evidence_store=evidence_store,
+                        run_id=record.run_id,
+                        engagement_id=record.engagement_id,
+                        source_evidence_id=str(record.evidence_id),
+                        tool_id=str(result.tool_id),
+                        references=[
+                            item.model_dump(mode="json") for item in grounded
+                        ],
+                        action_id=proposal.action_id,
+                        invocation_id=result.invocation_id,
+                        hypothesis_id=proposal.hypothesis_id,
+                        attempt=1,
+                    )
+            except Exception:  # noqa: BLE001 - references must not break recovery
+                pass
         # Same processing channel as UPDATE, same helper: before-attempt
         # intent, confirmed counters per phase, and a partial/failed
         # companion on exception. No tool rerun, no ToolResult rewrite.
@@ -886,6 +929,11 @@ async def reprocess_evidence(
                 except Exception:  # noqa: BLE001 - the companion must not mask the failure
                     pass
             raise
+    # The write try above re-raises, so reaching here means the replayed
+    # writes (if any) are confirmed; the summary carries the last state.
+    if replay_writes_planned:
+        replay_processing_status = "confirmed"
+        replay_processing_stage = "done"
     parts = [
         "reprocessed " + str(record.evidence_id) + ": verdict=" + verdict.value,
         "hypothesis="
@@ -919,6 +967,10 @@ async def reprocess_evidence(
         source_evidence_id=str(record.evidence_id),
         note="; ".join(parts),
         record_kind="recovery_result",
+        mapping_status=mapping_status,
+        processing_status=replay_processing_status,
+        processing_stage=replay_processing_stage,
+        recovery_status="ok",
         action_id=proposal.action_id,
         invocation_id=result.invocation_id,
         hypothesis_id=proposal.hypothesis_id,
@@ -938,6 +990,8 @@ async def reprocess_evidence(
         "mutation": mutation_summary,
         "mapper_failure": mapper_failure,
         "mapping_status": mapping_status,
+        "processing_status": replay_processing_status,
+        "processing_stage": replay_processing_stage,
         "companion_evidence_id": str(companion.evidence_id),
         "review_receipt": receipt_status,
     }
@@ -1172,6 +1226,10 @@ async def record_recovery_note(
     action_id: Any | None = None,
     invocation_id: Any | None = None,
     hypothesis_id: Any | None = None,
+    mapping_status: str | None = None,
+    processing_status: str | None = None,
+    processing_stage: str | None = None,
+    recovery_status: str | None = None,
 ) -> EvidenceRecord:
     """Append a free-form companion note next to an existing record."""
     payload = {
@@ -1179,6 +1237,17 @@ async def record_recovery_note(
         "source_evidence_id": source_evidence_id,
         "note": note,
     }
+    # Structured last-state mirrors so root projects without parsing note.
+    if mapping_status is not None:
+        payload["mapping_status"] = mapping_status
+        payload["mapping_outcome"] = mapping_status
+    if processing_status is not None:
+        payload["processing_status"] = processing_status
+        payload["processing_outcome"] = processing_status
+    if processing_stage is not None:
+        payload["processing_stage"] = processing_stage
+    if recovery_status is not None:
+        payload["recovery_status"] = recovery_status
     record = EvidenceRecord(
         evidence_id=EvidenceId(new_id("ev")),
         run_id=run_id,
