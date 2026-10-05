@@ -127,6 +127,17 @@ def test_decision_context_records_steps_and_proposal_without_raw_arguments():
     assert "arguments" not in encoded
 
 
+def test_decision_context_accepts_structured_terminal_feedback_without_copying_contents():
+    context = decision_context(
+        {"feedback": {"code": "terminal_reference_invalid", "private": "opaque-private"}},
+        {"accepted": True}, validated=False,
+    )
+    assert context["feedback"] == []
+    assert context["feedback_shape"] == {"type": "object", "field_count": 2}
+    assert context["proposal"]["accepted_shape"] == {"type": "boolean"}
+    assert "opaque-private" not in json.dumps(context)
+
+
 def test_markdown_report_exposes_durable_planning_cause_and_legacy_trace_gap():
     from redteam.app.cli.commands.report import _render_markdown
     from redteam.orchestration.reporting import TerminalReportProjection
@@ -160,6 +171,87 @@ async def test_json_decode_error_does_not_store_raw_body():
     assert "secret-body" not in caught.value.diagnostic.model_dump_json()
 
 
+@pytest.mark.parametrize("provider_parse", [False, True])
+async def test_json_rejection_records_decoder_coordinates_without_response_contents(provider_parse):
+    body = '{\n"opaque-private": }'
+    try:
+        json.loads(body)
+    except json.JSONDecodeError as exc:
+        expected = exc
+    response = expected if provider_parse else "```json\n" + body + "\n```"
+    llm = Replies(response)
+    with pytest.raises(DecisionFailure) as caught:
+        await StructuredDecisionClient(llm, max_attempts=1).ask(
+            stage="next_action", payload={}, response_schema=SCHEMA,
+        )
+    diagnostic = caught.value.diagnostic
+    rejected = next(row for row in diagnostic.trace if row["outcome"] == "response_rejected")
+    assert rejected["parse_error"] == {
+        "coordinate_source": "decoder_input", "line": expected.lineno,
+        "column": expected.colno, "position": expected.pos,
+        "input_length": len(body), "syntax_reason": "expected_value",
+        "at_input_end": False, "start_category": "object",
+    }
+    assert diagnostic.last_cause.validation_issues == [{
+        "rule": "json_decode",
+        "location": f"decoder input line {expected.lineno}, column {expected.colno}",
+    }]
+    assert len(llm.prompts) == 1
+    assert "opaque-private" not in diagnostic.model_dump_json()
+
+
+def _decode_error(body: str) -> json.JSONDecodeError:
+    try:
+        json.loads(body)
+    except json.JSONDecodeError as exc:
+        return exc
+    raise AssertionError(f"body parses cleanly: {body!r}")
+
+
+async def test_json_syntax_reasons_map_real_decoder_messages():
+    truncated = _decode_error('{"a": 1')
+    assert truncated.pos >= len(truncated.doc)
+    diagnostic = diagnostic_for_exception(truncated, stage="next_action")
+    assert diagnostic.code == "invalid_json"
+    assert diagnostic.kind == "format"
+    assert diagnostic.retryable is True
+    assert diagnostic.validation_issues == [{
+        "rule": "json_decode",
+        "location": f"decoder input line {truncated.lineno}, column {truncated.colno}",
+    }]
+    assert "Return a valid JSON object" in diagnostic.summary
+    assert truncated.msg not in diagnostic.model_dump_json()
+    assert truncated.doc not in diagnostic.model_dump_json()
+
+    sentinel = "opaqueControlFragment"
+    control = _decode_error('"ab' + sentinel + '\x01cd"')
+    context = diagnostic_for_exception(control, stage="next_action")
+    assert context.code == "invalid_json"
+    assert "Return a valid JSON object" in context.summary
+    # Letters survive JSON serialization unchanged, so a copied fragment
+    # cannot hide behind quote or control-character escaping.
+    assert sentinel not in context.model_dump_json()
+
+    escape = _decode_error('{"a": "x\\d"}')
+    escape_diagnostic = diagnostic_for_exception(escape, stage="next_action")
+    assert escape_diagnostic.code == "invalid_json"
+    assert "Use valid JSON escapes" in escape_diagnostic.summary
+
+
+async def test_json_unknown_syntax_never_copies_raw_message():
+    sentinel = "opaque-sentinel-syntax-msg"
+    body = '{"kind": "' + sentinel + '"}'
+    exc = json.JSONDecodeError("mystery decoder failure " + sentinel, body, 3)
+    diagnostic = diagnostic_for_exception(exc, stage="next_action")
+    assert diagnostic.code == "invalid_json"
+    assert diagnostic.summary.startswith("Return a valid JSON object")
+    dumped = diagnostic.model_dump_json()
+    assert sentinel not in dumped
+    assert "mystery decoder failure" not in dumped
+    assert diagnostic.feedback().startswith("invalid_json")
+    assert sentinel not in diagnostic.feedback()
+
+
 def test_schema_unknown_property_location_is_not_copied():
     error = SchemaValidationError("raw response", validator="type", path=["kind", "raw-secret-key"])
     diagnostic = schema_diagnostic(error, SCHEMA, stage="path_create")
@@ -177,6 +269,141 @@ def test_pydantic_validation_excludes_input_and_message():
     diagnostic = diagnostic_for_exception(caught.value, stage="path_create")
     assert diagnostic.location == "$.kind"
     assert "secret-input" not in diagnostic.model_dump_json()
+
+
+@pytest.mark.parametrize(
+    ("read_input", "field", "rule"),
+    [
+        ({"evidence_ids": ["opaque-private-value"]}, "evidence_id", "missing"),
+        ({"evidence_id": ["opaque-private-value"]}, "evidence_id", "string_type"),
+        ({"evidence_id": "opaque-private-value", "offset": -1}, "offset", "greater_than_equal"),
+        ({"evidence_id": "opaque-private-value", "limit": 20001}, "limit", "less_than_equal"),
+    ],
+)
+def test_read_rejections_preserve_public_rule_location_and_input_shape(read_input, field, rule):
+    from redteam.orchestration.evidence_access import EvidenceReadRequest
+
+    with pytest.raises(ValidationError) as caught:
+        EvidenceReadRequest.model_validate(read_input)
+    diagnostic = diagnostic_for_exception(caught.value, stage="next_action")
+    assert diagnostic.validation_issues[0] == {"rule": rule, "location": f"$.{field}"}
+    assert rule in diagnostic.feedback() and field in diagnostic.feedback()
+    context = decision_context({}, {"mode": "read_evidence", "evidence_request": read_input})
+    shape = context["proposal"]["evidence_request_shape"]
+    if field in {"offset", "limit"}:
+        assert shape["fields"][field]["value"] == read_input[field]
+    elif isinstance(read_input.get("evidence_id"), list):
+        assert shape["fields"]["evidence_id"]["type"] == "array"
+    else:
+        assert shape["unknown_field_count"] == 1
+        assert shape["unknown_field_shapes"][0]["type"] == "array"
+    assert "opaque-private-value" not in json.dumps(context)
+    assert "opaque-private-value" not in diagnostic.model_dump_json()
+
+
+async def test_schema_rejection_records_shape_before_validation_and_keeps_retry_cause_in_report():
+    from redteam.app.cli.commands.report import _render_markdown
+    from redteam.orchestration.evidence_access import EvidenceReadRequest
+    from redteam.orchestration.reporting import TerminalReportProjection
+
+    schema = {
+        "type": "object",
+        "properties": {
+            "mode": {"type": "string", "enum": ["read_evidence"]},
+            "evidence_request": EvidenceReadRequest.model_json_schema(),
+        },
+        "required": ["mode", "evidence_request"],
+    }
+    llm = Replies({"mode": "read_evidence", "evidence_request": ["opaque-private-value"]})
+    with pytest.raises(DecisionFailure) as caught:
+        await StructuredDecisionClient(llm, max_attempts=1).ask(
+            stage="next_action", payload={}, response_schema=schema,
+        )
+    diagnostic = caught.value.diagnostic
+    rejection = next(item for item in diagnostic.trace if item["outcome"] == "response_rejected")
+    assert rejection["proposal"]["evidence_request_shape"]["type"] == "array"
+    assert rejection["validation_issues"] == [{"rule": "type", "location": "$.evidence_request"}]
+    assert diagnostic.last_cause.validation_issues == rejection["validation_issues"]
+    assert len(llm.prompts) == 1
+    report = TerminalReportProjection(
+        run_id="run-safe", phase=AgentPhase.FAILED, termination_reason="planning_error",
+        actions_executed=0, evidence_count=0, finding_count=0, ready_for_release=False,
+        planning_diagnostic=diagnostic,
+    )
+    for rendered in (report.model_dump_json(), _render_markdown(report)):
+        assert "$.evidence_request" in rendered
+        assert "opaque-private-value" not in rendered
+
+
+def test_read_shape_does_not_copy_unknown_keys_queries_or_convert_bad_control_types():
+    from redteam.orchestration.diagnostics import evidence_request_shape
+
+    shape = evidence_request_shape({
+        "query": "opaque-private-value", "opaque-private-key": {"password": "secret"},
+        "offset": True, "limit": "20001",
+    })
+    assert shape["fields"]["offset"] == {"type": "boolean"}
+    assert shape["fields"]["limit"] == {"type": "string", "length": 5}
+    assert shape["unknown_field_count"] == 1
+    assert "opaque-private" not in json.dumps(shape)
+    assert "secret" not in json.dumps(shape)
+    assert evidence_request_shape({"limit": float("inf")})["fields"]["limit"] == {
+        "type": "number", "finite": False,
+    }
+
+
+async def test_prevalidation_projection_never_copies_malformed_public_reference_or_reason():
+    schema = {
+        "type": "object",
+        "properties": {"reason": {"type": "string"}, "path_step_id": {"type": "string"}},
+        "required": ["reason"],
+    }
+    llm = Replies({
+        "reason": {"opaque-private-key": "opaque-private-value"},
+        "path_step_id": ["opaque-private-value"],
+        "actions": [{"tool_id": {"opaque-private-key": "opaque-private-value"}}],
+    })
+    with pytest.raises(DecisionFailure) as caught:
+        await StructuredDecisionClient(llm, max_attempts=1).ask(
+            stage="next_action", payload={}, response_schema=schema,
+        )
+    rejected = next(
+        item for item in caught.value.diagnostic.trace if item["outcome"] == "response_rejected"
+    )
+    assert rejected["proposal"]["reason_shape"]["type"] == "object"
+    assert rejected["proposal"]["path_step_id_shape"]["type"] == "array"
+    assert "opaque-private" not in caught.value.diagnostic.model_dump_json()
+
+
+async def test_custom_planning_provider_rejection_keeps_final_shape_and_rules_without_fake_usage():
+    from dataclasses import replace
+
+    from redteam.orchestration.engine import InvestigationEngine
+    from tests.fakes import build_test_application
+
+    class CustomProvider:
+        async def propose(self, request):
+            return {"reason": {"opaque-private-key": "opaque-private-value"}}
+
+    engine = InvestigationEngine(
+        replace(build_test_application(), planning_provider=CustomProvider())
+    )
+    budget = DecisionBudget(1)
+    with pytest.raises(ValueError) as caught:
+        await engine._propose(
+            stage="next_action", payload={}, budget=budget,
+            response_schema={
+                "type": "object", "properties": {"reason": {"type": "string"}},
+                "required": ["reason"],
+            },
+        )
+    diagnostic = diagnostic_for_exception(caught.value, stage="next_action")
+    assert diagnostic.code == "schema_type" and diagnostic.location == "$.reason"
+    assert diagnostic.trace[0]["diagnostic_context"]["proposal"]["reason_shape"]["type"] == "object"
+    assert diagnostic.validation_issues == [{"rule": "type", "location": "$.reason"}]
+    assert budget.used == budget.tokens_used == budget.unknown_usage_count == 0
+    assert budget.normal_used == 1
+    assert "opaque-private" not in diagnostic.model_dump_json()
 
 
 @pytest.mark.parametrize(
@@ -334,3 +561,24 @@ def test_redaction_precedes_truncation_and_checkpoint_history_is_bounded():
     assert len(runtime.planning_feedback) == 10
     assert all(len(item) == 500 for item in runtime.planning_feedback)
     assert "hidden-value" not in runtime.model_dump_json()
+
+
+@pytest.mark.parametrize("verdict", ["allow", "deny", "require_approval"])
+async def test_replan_feedback_keeps_rejections_without_treating_permission_as_failure(verdict):
+    from datetime import datetime, timezone
+
+    from redteam.core.contracts.policy import PolicyDecision
+    from redteam.core.enums import PolicyVerdict
+    from redteam.orchestration.nodes.replan import replan_node
+    from redteam.orchestration.state import initial_graph_state
+    from tests.fakes import build_test_application
+
+    explanation = "policy explanation"
+    state = initial_graph_state(RuntimeState(run_id="run-safe", engagement_id="eng-safe"))
+    state["policy_decision"] = PolicyDecision(
+        action_id="action-safe", verdict=PolicyVerdict(verdict),
+        reasons=[explanation], evaluated_at=datetime.now(timezone.utc),
+    )
+    result = await replan_node(state, deps=build_test_application())
+    assert (explanation in result["runtime"].planning_feedback) == (verdict != "allow")
+    assert state["policy_decision"].reasons == [explanation]

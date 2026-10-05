@@ -268,7 +268,10 @@ async def test_mobile_agent_reaches_runtime_finding_and_crash_followup() -> None
     engagement = _engagement()
     adapter = ScriptedMobileNextAdapter()
     gateway = _gateway(adapter)
-    control = DefaultControlPlane({engagement.engagement_id: engagement})
+    control = DefaultControlPlane(
+        {engagement.engagement_id: engagement},
+        outbound_descriptor_resolver=gateway.get,
+    )
     mobile_definition = next(
         item
         for item in builtin_agent_definitions()

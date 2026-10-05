@@ -21,7 +21,10 @@ from redteam.core.contracts.engagement import (
 )
 from redteam.core.contracts.tool import ToolDescriptor
 from redteam.core.enums import GraphNodeType, RiskLevel, ToolHealthStatus
-from redteam.core.ids import EngagementId, RunId, ToolId
+from redteam.core.ids import AgentId, EngagementId, RunId, ToolId
+from redteam.orchestration.agents.base import AgentSpec
+from redteam.orchestration.agents.definition import AgentDefinition, ContextProfile
+from redteam.orchestration.agents.registry import AgentRegistry
 from redteam.orchestration.engine import InvestigationEngine
 from redteam.orchestration.execution_bridge import (
     agent_tool_visible,
@@ -170,7 +173,7 @@ def test_bridge_exposes_only_synchronous_fixed_execution_operation() -> None:
     assert agent_tool_visible(analysis_descriptor(), execution_ready=False)
 
 
-async def test_disabled_execution_catalog_does_not_change_agent_context() -> None:
+async def test_legacy_optout_hides_execution_options_but_registered_direct_tool_visible() -> None:
     configured = engagement(apk_ref="insecurebankv2")
     graph_store = InMemoryAttackGraphStore()
     service = AttackGraphService(graph_store)
@@ -195,8 +198,138 @@ async def test_disabled_execution_catalog_does_not_change_agent_context() -> Non
     without_execution = await InvestigationEngine(baseline).context(runtime, observation)
     disabled_execution = await InvestigationEngine(extended).context(runtime, observation)
 
-    assert disabled_execution == without_execution
+    # Legacy channel: opt-in off means no fixed-recipe options in either context.
     assert "execution_options" not in disabled_execution
-    assert [item["tool_id"] for item in disabled_execution["tools"]] == [
+    assert "execution_options" not in without_execution
+    # New channel: a registered direct tool is visible in the new context.
+    assert [item["tool_id"] for item in without_execution["tools"]] == [
         "analysis.decode_apk"
     ]
+    assert sorted(item["tool_id"] for item in disabled_execution["tools"]) == [
+        "analysis.decode_apk",
+        "analysis.run_command",
+    ]
+    # Visibility aside, no other context field may drift with registration.
+    assert {
+        k: v for k, v in disabled_execution.items() if k not in ("tools", "tools_by_role")
+    } == {k: v for k, v in without_execution.items() if k not in ("tools", "tools_by_role")}
+    for context in (without_execution, disabled_execution):
+        mapping = context["tools_by_role"]
+        role_ids = {item["agent_id"] for item in context["roles"]}
+        assert set(mapping) == role_ids
+        tool_ids = {item["tool_id"] for item in context["tools"]}
+        union_ids = {tool_id for ids in mapping.values() for tool_id in ids}
+        assert union_ids == tool_ids
+    assert {
+        tool_id for ids in without_execution["tools_by_role"].values() for tool_id in ids
+    } == {"analysis.decode_apk"}
+    assert {
+        tool_id for ids in disabled_execution["tools_by_role"].values() for tool_id in ids
+    } == {"analysis.decode_apk", "analysis.run_command"}
+    assert all(
+        "analysis.run_command" not in ids
+        for ids in without_execution["tools_by_role"].values()
+    )
+    assert sorted(disabled_execution["tools_by_role"]["analysis-agent"]) == [
+        "analysis.decode_apk",
+        "analysis.run_command",
+    ]
+    assert without_execution["tools_by_role"]["analysis-agent"] == [
+        "analysis.decode_apk"
+    ]
+    for role_id in ("recon-agent", "web-api-agent", "mobile-agent"):
+        assert "analysis.run_command" not in disabled_execution["tools_by_role"][role_id]
+        assert "analysis.run_command" not in without_execution["tools_by_role"][role_id]
+
+
+async def test_custom_selections_map_per_role_in_live_context() -> None:
+    configured = engagement(apk_ref="insecurebankv2")
+    graph_store = InMemoryAttackGraphStore()
+    service = AttackGraphService(graph_store)
+    await seed_from_engagement(service, configured, run_id=RunId("run-test"))
+    agents = AgentRegistry(
+        definitions=[
+            AgentDefinition(
+                agent_id=AgentId("custom-a"),
+                role="custom",
+                name="Custom A",
+                provider_id="playbook:analysis",
+                context_profile=ContextProfile(profile_id="custom-a"),
+                capabilities=["analysis"],
+                tool_selection={"server_ids": ["apktool"]},
+            ),
+            AgentDefinition(
+                agent_id=AgentId("custom-b"),
+                role="custom",
+                name="Custom B",
+                provider_id="playbook:analysis",
+                context_profile=ContextProfile(profile_id="custom-b"),
+                capabilities=["analysis"],
+                tool_selection={"server_ids": ["execution"]},
+            ),
+        ],
+        specs=[
+            AgentSpec(agent_id=AgentId("custom-a"), name="Custom A", capabilities=["analysis"]),
+            AgentSpec(agent_id=AgentId("custom-b"), name="Custom B", capabilities=["analysis"]),
+        ],
+    )
+    deps = build_test_application(
+        graph_store=graph_store,
+        tool_catalog=catalog(analysis_descriptor(), execution_descriptor()),
+        agents=agents,
+    )
+    deps = replace(deps, engagement=configured)
+    runtime = RuntimeState(
+        run_id=RunId("run-test"),
+        engagement_id=configured.engagement_id,
+        current_goal="inspect the asset",
+        remaining_budget=4,
+    )
+    observation = GraphObservation(
+        node_counts={GraphNodeType.ASSET.value: 1},
+        nodes_by_type={GraphNodeType.ASSET.value: ["workspace-test"]},
+        node_ids_by_type={GraphNodeType.ASSET.value: ["asset:workspace-test"]},
+    )
+    context = await InvestigationEngine(deps).context(runtime, observation)
+    assert {item["agent_id"] for item in context["roles"]} == {"custom-a", "custom-b"}
+    assert set(context["tools_by_role"]) == {"custom-a", "custom-b"}
+    assert context["tools_by_role"]["custom-a"] == ["analysis.decode_apk"]
+    assert context["tools_by_role"]["custom-b"] == ["analysis.run_command"]
+    assert "analysis.run_command" not in context["tools_by_role"]["custom-a"]
+    assert "analysis.decode_apk" not in context["tools_by_role"]["custom-b"]
+    assert {item["tool_id"] for item in context["tools"]} == {
+        "analysis.decode_apk",
+        "analysis.run_command",
+    }
+    assert {tool_id for ids in context["tools_by_role"].values() for tool_id in ids} == {
+        item["tool_id"] for item in context["tools"]
+    }
+
+
+async def test_catalog_none_leaves_empty_mapping_per_visible_role() -> None:
+    configured = engagement(apk_ref="insecurebankv2")
+    graph_store = InMemoryAttackGraphStore()
+    service = AttackGraphService(graph_store)
+    await seed_from_engagement(service, configured, run_id=RunId("run-test"))
+    deps = build_test_application(
+        graph_store=graph_store, tool_catalog=catalog(analysis_descriptor())
+    )
+    deps = replace(deps, engagement=configured, tool_catalog=None)
+    runtime = RuntimeState(
+        run_id=RunId("run-test"),
+        engagement_id=configured.engagement_id,
+        current_goal="inspect the asset",
+        remaining_budget=4,
+    )
+    observation = GraphObservation(
+        node_counts={GraphNodeType.ASSET.value: 1},
+        nodes_by_type={GraphNodeType.ASSET.value: ["workspace-test"]},
+        node_ids_by_type={GraphNodeType.ASSET.value: ["asset:workspace-test"]},
+    )
+    context = await InvestigationEngine(deps).context(runtime, observation)
+    assert context["tools"] == []
+    assert context["roles"] != []
+    assert set(context["tools_by_role"]) == {
+        item["agent_id"] for item in context["roles"]
+    }
+    assert all(ids == [] for ids in context["tools_by_role"].values())

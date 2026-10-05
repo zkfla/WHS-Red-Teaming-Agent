@@ -49,8 +49,8 @@ class Reviewer:
         return h.completion_accept()
 
 
-async def setup(mode):
-    reviewer = Reviewer()
+async def setup(mode, reviewer=None):
+    reviewer = reviewer if reviewer is not None else Reviewer()
     seed = await h.seed_host("run-review-race")
     world = h.make_world(reviewer, graph_store=seed.store)
     mission, task = h.make_mission_task(
@@ -166,6 +166,94 @@ async def test_review_rejects_changed_tasks_progress_or_pending_instructions(mod
     expected_task = TaskStatus.COMPLETED if mode == "goal" else TaskStatus.RUNNING
     assert (await world.tasks.get_task(runtime.active_task_id)).status is expected_task
     assert (await world.tasks.get_mission(runtime.mission_id)).status is MissionStatus.ACTIVE
+
+
+class _ScopeCapture:
+    """Record review requests; answer the step review from a script."""
+
+    def __init__(self, *, accepted: bool, reason: str):
+        self.calls = 0
+        self.systems: list[str] = []
+        self.contents: list[str] = []
+        self._answer = {"accepted": accepted, "reason": reason}
+
+    async def complete_structured(self, **kwargs):
+        self.calls += 1
+        self.systems.append(kwargs.get("system") or "")
+        self.contents.append(str(kwargs.get("messages") or ""))
+        return dict(self._answer)
+
+    async def complete(self, **kwargs):
+        return ""
+
+
+async def test_step_review_request_carries_step_scope_only():
+    reviewer = _ScopeCapture(accepted=True, reason="step objective met on stored evidence")
+    world, runtime, path, _ = await setup("step", reviewer=reviewer)
+    engine = InvestigationEngine(world.deps)
+    context = await engine.context(runtime, GraphObservation())
+
+    finished, errors = await engine.complete_step(
+        path,
+        TurnDecision.model_validate(h.turn_complete_step(["proof-race"])),
+        runtime,
+        context,
+    )
+
+    assert errors == []
+    assert reviewer.calls == 1
+    system = reviewer.systems[0]
+    assert "supplied path step only" in system
+    assert "running mission task" in system
+    content = reviewer.contents[0]
+    assert "confirm the host answers inventory" in content
+    assert "harness completion condition" in content
+    # Stage-only progress: the step completes while its task still runs.
+    step = next(s for s in finished.steps if s.step_id == "step-1")
+    assert str(step.status) == "completed"
+    assert (await world.tasks.get_task(runtime.active_task_id)).status is TaskStatus.RUNNING
+    assert (await world.tasks.get_mission(runtime.mission_id)).status is MissionStatus.ACTIVE
+
+
+async def test_step_review_rejection_returns_the_actual_reason():
+    marker = "inventory shows the port closed, no banner captured"
+    reviewer = _ScopeCapture(accepted=False, reason=marker)
+    world, runtime, path, _ = await setup("step", reviewer=reviewer)
+    engine = InvestigationEngine(world.deps)
+    context = await engine.context(runtime, GraphObservation())
+
+    _, errors = await engine.complete_step(
+        path,
+        TurnDecision.model_validate(h.turn_complete_step(["proof-race"])),
+        runtime,
+        context,
+    )
+
+    assert reviewer.calls == 1
+    assert len(errors) == 1
+    assert marker in errors[0]
+    assert "semantic completion review rejected" in errors[0]
+    # The next decision consumes the actual reason through safe feedback.
+    from redteam.orchestration.cognition import DecisionBudget
+
+    assert marker in " ".join(engine._safe_errors(errors, DecisionBudget(3)))
+
+
+async def test_step_review_without_evidence_keeps_the_guard():
+    reviewer = _ScopeCapture(accepted=True, reason="must not be reached")
+    world, runtime, path, _ = await setup("step", reviewer=reviewer)
+    engine = InvestigationEngine(world.deps)
+    context = await engine.context(runtime, GraphObservation())
+
+    _, errors = await engine.complete_step(
+        path,
+        TurnDecision.model_validate(h.turn_complete_step([])),
+        runtime,
+        context,
+    )
+
+    assert errors != []
+    assert reviewer.calls == 0
 
 
 async def test_each_goal_criterion_records_only_its_actual_evidence_owner():

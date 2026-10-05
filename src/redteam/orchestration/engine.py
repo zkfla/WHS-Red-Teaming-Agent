@@ -15,7 +15,6 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from redteam.attack_graph.identity import node_id_for_target, target_for_node
 from redteam.attack_graph.predicates import Confidence, Provenance, facts_of
-from redteam.capability.role_manifest import role_tool_visible, tools_for_role
 from redteam.core.contracts.evidence import EvidenceRecord
 from redteam.core.contracts.graph import Hypothesis
 from redteam.core.contracts.mission import redact_secret_material
@@ -26,6 +25,7 @@ from redteam.core.redaction import redact_sensitive_text
 from redteam.event_bus.publisher import EventPublisher
 from redteam.orchestration.agents.base import HypothesisDraft, PlanStep
 from redteam.orchestration.agents.providers import CandidateBatch, GraphCandidateContext
+from redteam.orchestration.agents.role_view import role_tool_visible, tools_for_role
 from redteam.orchestration.authentication import AuthenticationCheck
 from redteam.orchestration.candidates.catalog import bound_operations
 from redteam.orchestration.candidates.compiler import CandidateCompiler
@@ -56,6 +56,7 @@ from redteam.orchestration.diagnostics import (
     diagnostic_for_exception,
     known_location,
     safe_feedback,
+    schema_diagnostic,
 )
 from redteam.orchestration.eligibility import EligibilityContext
 from redteam.orchestration.events import AGENT_CONTEXT_PREPARED, AGENT_TURN_DECIDED
@@ -230,9 +231,15 @@ SYSTEM = (
     "chain-of-thought. Code reference paths are hints, not an execution pool or an exhaustive "
     "strategy list. Never claim completion from tool success alone. "
     "Choose registered tools by tool_id; capability/operation bindings are not required. "
+    "For direct calls, tools_by_role identifies which registered tools each role may select. "
     "Completion criteria describe measurable results; kind and evidence count have defaults. "
     "Future "
     "steps may stay pending. Do not invent observed facts or evidence. "
+    "A successful tool call or local fact recording does not change a path step's status. "
+    "When a step's own criteria are supported, propose mode complete_step with path_step_id "
+    "and completion (outcome, evidence_ids, reason) for review and status update. "
+    "Step dependencies use the stored active_path step status, "
+    "not a narrative claim of completion. "
     "Declare availability_impact for actions that can disrupt service, "
     "and obey the engagement constraints."
     " Plan roles, operations and target lists are suggestions, not permissions. "
@@ -246,6 +253,7 @@ SYSTEM = (
     "preserve gaps and do not prove absence of vulnerabilities or goal achievement. "
     "read_evidence may include target_references with target, source_evidence_id and raw_path "
     "to an exact address in stored output; referenced addresses remain unconfirmed. "
+    "For read_evidence, use evidence_read_contract for the input location and request schema. "
     " Use complete_task to close the current mission task before proceeding to another required "
     "task; complete_goal settles the original mission only after all required tasks are covered."
     " Write public responses, reasons and assumptions in the operator's language; "
@@ -327,8 +335,11 @@ def ready_step(path, step, knowledge) -> list[str]:
 class DecisionRuleError(ValueError):
     """A code-owned validation rule, safe to carry into correction feedback."""
 
-    def __init__(self, summary: str, *, code: str = "decision_rule_violation", location: str = ""):
-        self.diagnostic = DecisionDiagnostic(
+    def __init__(
+        self, summary: str, *, code: str = "decision_rule_violation", location: str = "",
+        diagnostic: DecisionDiagnostic | None = None,
+    ):
+        self.diagnostic = diagnostic or DecisionDiagnostic(
             code=code,
             stage="validation",
             kind="semantic",
@@ -608,7 +619,7 @@ class InvestigationEngine:
 
         active_budget = budget or self._decision_budget()
         if not active_budget.permits():
-            raise DecisionFailure(stage, "budget", active_budget.used, "decision budget exhausted")
+            raise self._budget_failure(stage, active_budget)
         before = active_budget.used
         tokens_before = active_budget.tokens_used
         unknown_before = active_budget.unknown_usage_count
@@ -644,13 +655,28 @@ class InvestigationEngine:
                 runtime.model_requests_used += active_budget.used - before
                 runtime.model_tokens_used += active_budget.tokens_used - tokens_before
                 runtime.model_usage_unknown += active_budget.unknown_usage_count - unknown_before
+        proposal_context = decision_context(payload, result, validated=False)
         try:
             if not isinstance(result, dict):
                 raise ValueError("planning provider must return a proposal object")
             json.dumps(result, allow_nan=False)
             validate_json_schema(result, response_schema)
-        except JSONSchemaValidationError:
-            raise ValueError("planning proposal does not satisfy the writing schema") from None
+        except (JSONSchemaValidationError, ValueError, TypeError) as exc:
+            diagnostic = (
+                schema_diagnostic(exc, response_schema, stage=stage)
+                if isinstance(exc, JSONSchemaValidationError)
+                else DecisionDiagnostic(
+                    code="invalid_decision", stage=stage, kind="format",
+                    summary="Planning providers must return a JSON proposal object.",
+                    retryable=True,
+                )
+            ).model_copy(update={
+                "trace": [{
+                    "attempt": active_budget.used, "stage": stage,
+                    "outcome": "proposal_rejected", "diagnostic_context": proposal_context,
+                }],
+            })
+            raise DecisionRuleError(diagnostic.summary, diagnostic=diagnostic) from None
         validate_written_criteria(result)
         return result
 
@@ -662,10 +688,13 @@ class InvestigationEngine:
             raise DecisionRuleError("the run is terminal; no new model request is allowed")
         if runtime.mission_id is not None:
             await self._review_token(runtime)
-        from redteam.orchestration.reasoning_time import reasoning_time_allowed
+        from redteam.orchestration.cognition import ReasoningHalted
+        from redteam.orchestration.reasoning_time import reasoning_time_failure
 
-        if not reasoning_time_allowed(self.deps.engagement, runtime):
-            raise DecisionRuleError("the engagement time limit prevents a new model request")
+        time_failure = reasoning_time_failure(self.deps.engagement, runtime)
+        if time_failure is not None:
+            reason_code, termination_reason = time_failure
+            raise ReasoningHalted(reason_code, termination_reason=termination_reason)
         delegation = self.active_delegation
         if delegation is not None and delegation.budget.max_seconds is not None:
             started = delegation.started_at
@@ -808,6 +837,9 @@ class InvestigationEngine:
             for agent in self.deps.agents.all()
             if role_decisions[str(agent.agent_id)].eligible
         ]
+        tools_by_role: dict[str, list[str]] = {
+            str(agent.agent_id): [] for agent in visible_agents
+        }
         if self.deps.tool_catalog is not None:
             for agent in visible_agents:
                 definition = self.deps.agents.definition(agent.agent_id)
@@ -816,6 +848,7 @@ class InvestigationEngine:
                         tool.health_status is not ToolHealthStatus.UNHEALTHY
                         and (await self.deps.eligibility.tool(tool, eligibility_context)).eligible
                     ):
+                        tools_by_role[str(agent.agent_id)].append(str(tool.tool_id))
                         tools[str(tool.tool_id)] = redact_secret_material(
                             tool.model_dump(mode="json"),
                             drop_secret_keys=False,
@@ -890,6 +923,11 @@ class InvestigationEngine:
             instructions = await coordinator.change(canonical_instructions)
         return {
             **reference_context,
+            "evidence_read_contract": {
+                "mode": "read_evidence",
+                "input_field": "evidence_request",
+                "schema": EvidenceReadRequest.model_json_schema(),
+            },
             **({"execution_options": execution_options} if execution_options else {}),
             "role_activation": {
                 str(agent.agent_id): {
@@ -928,6 +966,7 @@ class InvestigationEngine:
                 for agent in visible_agents
             ],
             "tools": list(tools.values()),
+            "tools_by_role": tools_by_role,
             "local_tools": [
                 {
                     "tool_id": item.tool_id,
@@ -1529,6 +1568,15 @@ class InvestigationEngine:
         # LEASED is checked again on admission; RUNNING keeps its real result.
 
     @staticmethod
+    def _record_rejection(budget, stage, diagnostic):
+        budget.record(
+            stage, "rejected", reason=diagnostic.feedback(),
+            validation_issues=diagnostic.validation_issues,
+            diagnostic_context=(diagnostic.trace[-1].get("diagnostic_context")
+                                if diagnostic.trace else None),
+        )
+
+    @staticmethod
     def _safe_errors(errors, budget):
         budget.record(
             "admission",
@@ -1617,6 +1665,7 @@ class InvestigationEngine:
                             retryable=True,
                         )
                     drafting_budget.last_failure = diagnostic
+                    self._record_rejection(drafting_budget, "path_draft", diagnostic)
                     context["feedback"] = (
                         [exc.correction()]
                         if isinstance(exc, CriterionWritingError)
@@ -1664,6 +1713,7 @@ class InvestigationEngine:
                 else:
                     context["feedback"] = [diagnostic.feedback()]
                 budget.last_failure = diagnostic.model_copy(update={"attempts": budget.used})
+                self._record_rejection(budget, "next_action", diagnostic)
                 continue
             try:
                 last_control_succeeded = False
@@ -1826,7 +1876,7 @@ class InvestigationEngine:
                 if decision.mode in {"revise_path", "switch_path"}:
                     if decision.path is None:
                         raise DecisionRuleError("path change needs a structured path")
-                    if not budget.remaining:
+                    if not budget.permits():
                         return path, [], "continue_planning"
                     updated = await self.register_path(
                         decision.path,
@@ -1842,7 +1892,7 @@ class InvestigationEngine:
                     last_control_succeeded = True
                     continue
                 if decision.mode == "complete_step":
-                    if not budget.remaining:
+                    if not budget.permits():
                         self.planning_diagnostic = self._budget_failure(
                             "completion_review", budget
                         ).diagnostic
@@ -1862,7 +1912,7 @@ class InvestigationEngine:
                     last_control_succeeded = not errors
                     continue
                 if decision.mode == "complete_goal":
-                    if not budget.remaining:
+                    if not budget.permits():
                         self.planning_diagnostic = self._budget_failure(
                             "completion_review", budget
                         ).diagnostic
@@ -1890,7 +1940,7 @@ class InvestigationEngine:
                     context["feedback"] = self._safe_errors(errors, budget)
                     continue
                 if decision.mode == "complete_task":
-                    if not budget.remaining:
+                    if not budget.permits():
                         self.planning_diagnostic = self._budget_failure(
                             "completion_review", budget
                         ).diagnostic
@@ -1961,7 +2011,7 @@ class InvestigationEngine:
             except (ValueError, TypeError, KeyError, PathError) as exc:
                 diagnostic = diagnostic_for_exception(exc, stage="next_action")
                 budget.last_failure = diagnostic
-                budget.record("next_action", "rejected", reason=diagnostic.feedback())
+                self._record_rejection(budget, "next_action", diagnostic)
                 context["feedback"] = [diagnostic.feedback()]
                 continue
         if last_control_succeeded:
@@ -2594,7 +2644,14 @@ class InvestigationEngine:
                 "required": ["accepted", "reason"],
                 "additionalProperties": False,
             },
-            system=SYSTEM,
+            system=(
+                SYSTEM
+                + "\nReview completion of the supplied path step only: judge its objective "
+                "and completion criteria against the proposal and source results. "
+                "Other unfinished steps, a running mission task, or an unmet overall goal "
+                "do not reject this step unless required by this step's own criteria. "
+                "Accepting a step does not complete its task or the mission."
+            ),
             budget=budget,
         )
         await self.record_completion_review(
@@ -2606,7 +2663,10 @@ class InvestigationEngine:
             step_id=step.step_id,
         )
         if not review["accepted"]:
-            return path, ["semantic completion review rejected the evidence"]
+            return path, [
+                "semantic completion review rejected the evidence: "
+                + safe_feedback(review["reason"])
+            ]
         outcome = proposal.get("outcome", "inconclusive")
         status = "completed" if outcome in {"success", "refuted"} else "blocked"
 

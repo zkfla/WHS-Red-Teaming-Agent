@@ -93,7 +93,9 @@ async def test_bad_compile_repairs_then_good_compiles_with_shared_budget():
     assert note is None
     assert len(compiled) == 1
     assert str(compiled[0].tool.tool_id) == h.INVENTORY_TOOL
-    assert str(compiled[0].plan_step.operation_key) == h.CANONICAL_OP
+    # Direct-tool binding records the selected tool id, not the legacy
+    # capability.operation key: the ledger key must name the compiled tool.
+    assert str(compiled[0].plan_step.operation_key) == str(compiled[0].tool.tool_id)
     routes = [c["route"] for c in llm.calls]
     assert routes == ["path_draft", "path_review", "next_action", "next_action"]
     assert len(llm.calls) == 4
@@ -103,6 +105,64 @@ async def test_bad_compile_repairs_then_good_compiles_with_shared_budget():
     assert isinstance(second_next.get("repair_references"), dict)
     assert set(("items", "omitted_count")) <= set(second_next["repair_references"])
     assert second_next.get("feedback")
+
+
+async def test_custom_provider_initial_rejection_survives_later_error_and_success():
+    from dataclasses import replace
+
+    from redteam.orchestration.planning import StructuredLLMPlanningProvider
+
+    llm = h.ScriptedLLM()
+    seed = await h.seed_host("run-custom-rejection")
+    world = h.make_world(llm, graph_store=seed.store)
+    deps, _ = _real_deps(llm, seed=seed, world=world)
+
+    class CustomProvider:
+        def __init__(self):
+            self.next_calls = 0
+            self.default = StructuredLLMPlanningProvider()
+
+        async def propose(self, request):
+            if request.stage != "next_action":
+                return await self.default.propose(request)
+            self.next_calls += 1
+            if self.next_calls == 1:
+                return {
+                    "mode": "read_evidence", "reason": "read original output",
+                    "evidence_request": ["opaque-private-value"],
+                }
+            result = h.turn_actions(seed.node_id)
+            if self.next_calls == 2:
+                result["actions"][0]["tool_id"] = "recon.unknown_tool"
+            return result
+
+    provider = CustomProvider()
+    deps = replace(deps, planning_provider=provider)
+    llm.add("path_draft", h.draft_path(seed.node_id))
+    llm.add("path_review", h.review_accept())
+    engine = InvestigationEngine(deps)
+    _, compiled, note = await engine.decide(
+        h.make_runtime("run-custom-rejection", "eng-t1"), GraphObservation(),
+    )
+    assert note is None and len(compiled) == 1
+    assert provider.next_calls == 3
+    assert [call["route"] for call in llm.calls] == ["path_draft", "path_review"]
+    prepared = [
+        event for event in deps.event_bus.history()
+        if event.event_type == AGENT_CONTEXT_PREPARED and event.payload["stage"] == "next_action"
+    ]
+    trace = prepared[-1].payload["decision_budget"]["trace"]
+    first_rejection = next(
+        entry for entry in trace
+        if {"rule": "type", "location": "$.evidence_request"} in entry.get("validation_issues", [])
+    )
+    assert (
+        first_rejection["diagnostic_context"]["proposal"]["evidence_request_shape"]["type"]
+        == "array"
+    )
+    assert "opaque-private-value" not in json.dumps(
+        [event.model_dump(mode="json") for event in prepared]
+    )
 
 
 async def test_context_keeps_raw_but_projects_public_allowlist():
@@ -242,7 +302,18 @@ async def test_plan_node_event_causation_and_planning_failed_cause():
     assert failed
     decided = [e for e in fail_history if e.event_type == AGENT_TURN_DECIDED]
     assert decided
-    assert failed[-1].causation_id in {e.event_id for e in decided}
+    decided_ids = {e.event_id for e in decided}
+    cause = failed[-1].causation_id
+    if cause not in decided_ids:
+        # A fatal attempt dies inside the proposal, before any TurnDecided:
+        # its causation must be that attempt's ContextPrepared, which itself
+        # chains back to a decided event. Nothing synthetic is fabricated here,
+        # only history is read.
+        prepared = [e for e in fail_history if e.event_type == AGENT_CONTEXT_PREPARED]
+        assert {e.event_id for e in prepared}, "no prepared event for the fatal attempt"
+        assert cause in {e.event_id for e in prepared}
+        cause_event = next(e for e in prepared if e.event_id == cause)
+        assert cause_event.causation_id in decided_ids
 
 
 async def test_guidance_keeps_epoch_but_exclude_moves_it():

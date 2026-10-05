@@ -107,7 +107,9 @@ async def test_llm_draft_review_action_to_step_completion():
     # The playbook only knows recon.probe/http_probe/ping: an inventory
     # tool in the compiled slot proves the model intent ran, not a rule.
     assert str(compiled[0].tool.tool_id) == h.INVENTORY_TOOL
-    assert str(compiled[0].plan_step.operation_key) == h.CANONICAL_OP
+    # Direct-tool binding records the selected tool id, not the legacy
+    # capability.operation key: the ledger key must name the compiled tool.
+    assert str(compiled[0].plan_step.operation_key) == str(compiled[0].tool.tool_id)
     active = await world.paths.get_active("run-t1-flow")
     assert active is not None
     assert active.review_records.get("decision") == "accept"

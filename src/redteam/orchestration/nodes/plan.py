@@ -14,7 +14,7 @@ from redteam.core.contracts.graph import Hypothesis
 from redteam.core.enums import AgentPhase, TaskStatus
 from redteam.core.ids import ActionId, new_id
 from redteam.orchestration.candidates.models import ExecutableCandidate
-from redteam.orchestration.cognition import DecisionFailure
+from redteam.orchestration.cognition import DecisionFailure, ReasoningHalted
 from redteam.orchestration.context import RuntimeDeps
 from redteam.orchestration.diagnostics import diagnostic_for_exception
 from redteam.orchestration.dispatch import DispatchItem
@@ -61,9 +61,10 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             runtime, observation, last_event_id=state.get("last_event_id")
         )
         runtime = engine.updated_runtime or runtime
-    except (DecisionFailure, PathError, ValueError, TypeError) as exc:
+    except (DecisionFailure, PathError, ValueError, TypeError, ReasoningHalted) as exc:
         runtime = engine.updated_runtime or runtime
         diagnostic = diagnostic_for_exception(exc, stage="path_or_action")
+        termination = diagnostic.termination_reason or TerminationReason.PLANNING_ERROR
         event = await publisher.publish(
             "PlanningFailed",
             {
@@ -79,8 +80,10 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             runtime.model_copy(
                 update={
                     "phase": AgentPhase.REPLAN,
-                    "termination_reason": TerminationReason.PLANNING_ERROR,
-                    "planning_error": type(exc).__name__,
+                    "termination_reason": termination,
+                    "planning_error": (
+                        None if diagnostic.termination_reason else type(exc).__name__
+                    ),
                     "planning_diagnostic": diagnostic,
                     "planning_diagnostic_history": [
                         *runtime.planning_diagnostic_history,

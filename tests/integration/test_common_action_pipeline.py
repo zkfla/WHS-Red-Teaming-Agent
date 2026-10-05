@@ -278,7 +278,9 @@ async def test_accepted_path_engine_executes_c_profile_and_records_evidence(
     llm.add("next_action", turn)
     llm.add("next_action", hold())
     control = DefaultControlPlane(
-        {configured.engagement_id: configured}, risk_resolver=RegistryRiskResolver(gateway)
+        {configured.engagement_id: configured},
+        risk_resolver=RegistryRiskResolver(gateway),
+        outbound_descriptor_resolver=gateway.get,
     )
     deps = replace(
         build_test_application(

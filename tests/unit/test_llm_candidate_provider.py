@@ -15,6 +15,7 @@ from redteam.core.ids import AgentId, GraphNodeId, ToolId
 from redteam.orchestration.agents.base import AgentSpec
 from redteam.orchestration.agents.llm_provider import LLMCandidateProvider
 from redteam.orchestration.agents.providers import GraphCandidateContext
+from tests.fakes import DummyToolGateway
 
 ENDPOINT_KEY = "mock-bank:8080 GET /api/accounts/alice"
 ENDPOINT_ID = str(make_node_id(GraphNodeType.ENDPOINT, ENDPOINT_KEY))
@@ -198,40 +199,31 @@ async def test_raw_outcome_is_fed_to_the_model_prompt() -> None:
 
 
 async def test_prompt_uses_tool_schema_required_arguments() -> None:
-    class _Catalog:
-        def get(self, tool_id: ToolId) -> ToolDescriptor | None:
-            return None
-
-        def list_by_capability(self, capability_tag: str) -> list[ToolDescriptor]:
-            return []
-
-        def list_tools_for_action(
-            self, capability: str, operation: str
-        ) -> list[ToolDescriptor]:
-            assert (capability, operation) == ("recon", "endpoint_discovery")
-            return [
-                ToolDescriptor(
-                    tool_id=ToolId("recon.html_inventory"),
-                    server_id="test",
-                    tool_name="html_inventory",
-                    input_schema={
-                        "type": "object",
-                        "required": ["target_ref", "path"],
-                        "properties": {
-                            "target_ref": {"type": "string"},
-                            "path": {"type": "string"},
-                        },
+    catalog = DummyToolGateway(
+        tools=[
+            ToolDescriptor(
+                tool_id=ToolId("recon.html_inventory"),
+                server_id="test",
+                tool_name="html_inventory",
+                capability_tags=["recon"],
+                operations=["endpoint_discovery"],
+                input_schema={
+                    "type": "object",
+                    "required": ["target_ref", "path"],
+                    "properties": {
+                        "target_ref": {"type": "string"},
+                        "path": {"type": "string"},
                     },
-                )
-            ]
-
+                },
+            )
+        ]
+    )
     llm = _ScriptedLLM([])
     context = _context()
     context = replace(
         context, available_operations=(("recon", "endpoint_discovery"),)
     )
-
-    await LLMCandidateProvider(llm, _Catalog()).propose_graph(_spec(), context)
+    await LLMCandidateProvider(llm, catalog).propose_graph(_spec(), context)
 
     assert "required arguments from tool schema: path, target_ref" in llm.last_prompt
 

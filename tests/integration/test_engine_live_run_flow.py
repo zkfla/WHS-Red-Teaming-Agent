@@ -123,6 +123,9 @@ class LiveScriptedLLM(h.ScriptedLLM):
                 return {**h.turn_complete_step(tool_evidence), "path_step_id": step_id}
             if payload.get("active_task"):
                 # Follow stored task state if a prior turn exhausted its decision budget.
+                # Explicit evidence selection: keep the executed call's evidence on
+                # the proposal with the required outcome so the explicit-evidence
+                # consumption path is exercised.
                 assert tool_evidence, "turn 3 needs the executed call's evidence"
                 return {
                     "mode": "complete_task",
@@ -130,7 +133,11 @@ class LiveScriptedLLM(h.ScriptedLLM):
                     "actions": [],
                     "path": None,
                     "path_step_id": None,
-                    "completion": {"evidence_ids": list(tool_evidence)},
+                    "completion": {
+                        "outcome": "success",
+                        "reason": "inventory evidence ready",
+                        "evidence_ids": list(tool_evidence),
+                    },
                     "evidence_request": {},
                     "hypothesis_update": {},
                 }
@@ -139,8 +146,12 @@ class LiveScriptedLLM(h.ScriptedLLM):
 
 
 def _live_deps(llm: LiveScriptedLLM, gateway: CountingGateway, engagement: Any) -> RuntimeDeps:
+    catalog = h.FakeCatalog([h.inventory_descriptor()])
     return RuntimeDeps(
-        control_plane=DefaultControlPlane({engagement.engagement_id: engagement}),
+        control_plane=DefaultControlPlane(
+            {engagement.engagement_id: engagement},
+            outbound_descriptor_resolver=catalog.get,
+        ),
         tool_gateway=gateway,
         event_bus=InMemoryEventBus(),
         graph_store=llm._graph,
@@ -148,7 +159,7 @@ def _live_deps(llm: LiveScriptedLLM, gateway: CountingGateway, engagement: Any) 
         llm_client=llm,
         engagement=engagement,
         agents=default_registry(),
-        tool_catalog=h.FakeCatalog([h.inventory_descriptor()]),
+        tool_catalog=catalog,
         work_store=InMemoryWorkStore(),
         task_graph_store=InMemoryTaskGraphStore(),
         path_store=InMemoryPathStore(),

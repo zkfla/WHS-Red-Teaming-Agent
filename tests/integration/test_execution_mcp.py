@@ -18,7 +18,11 @@ from mcp import Client
 
 from redteam.attack_graph.identity import node_id_for_target
 from redteam.capability.adapters.mcp.execution import ExecutionMCPAdapter
-from redteam.capability.adapters.mcp.transport import RemoteCallResult, RemoteTool
+from redteam.capability.adapters.mcp.transport import (
+    RemoteCallResult,
+    RemoteTool,
+    remote_tool_metadata,
+)
 from redteam.capability.bootstrap import open_mcp_tool_gateway
 from redteam.capability.execution_manifest import (
     EXECUTION_TOOLS,
@@ -82,6 +86,7 @@ class InProcessTransport:
                 description=tool.description or "",
                 input_schema=dict(tool.input_schema),
                 output_schema=dict(tool.output_schema or {}),
+                metadata=remote_tool_metadata(tool),
             )
             for tool in listing.tools
         ]

@@ -82,8 +82,9 @@ class AgentDefinition(BaseModel):
     schedulable: bool = True
     activation_rules: list[ActivationRule] = Field(default_factory=list)
     capabilities: list[str] = Field(default_factory=list)
-    #: Explicit per-role tool selectors; None defers to the role manifest
-    #: default file. An explicitly empty selection allows no tool.
+    #: Explicit per-role selectors; assembly resolves omitted selection from
+    #: the role manifest. Standalone views fall back to this definition's
+    #: capabilities. An explicitly empty selection allows no tool.
     tool_selection: dict[str, Any] | None = None
     provider_id: str
     context_profile: ContextProfile

@@ -120,6 +120,7 @@ async def exercise_agent(gateway, configured, artifact_dir: Path, *, deny=False)
         control_plane=DefaultControlPlane(
             {engagement.engagement_id: engagement},
             risk_resolver=RegistryRiskResolver(gateway),
+            outbound_descriptor_resolver=gateway.get,
         ),
         tool_gateway=gateway,
         tool_catalog=gateway,

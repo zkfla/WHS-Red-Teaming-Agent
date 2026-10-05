@@ -12,25 +12,22 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Mapping
 from pathlib import Path
-from typing import TYPE_CHECKING
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field
 
+from redteam.core.contracts.role_selection import (
+    RoleToolSelection,
+    coerce_selection,
+    fallback_from_capabilities,
+    select_for_role,
+    selection_allows,
+)
 from redteam.core.ids import ToolId
 
-if TYPE_CHECKING:
-    pass
-
-class RoleToolSelection(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    agent_id: str = Field(min_length=1)
-    tool_ids: list[str] = Field(default_factory=list)
-    server_ids: list[str] = Field(default_factory=list)
-    capability_tags: list[str] = Field(default_factory=list)
-    methodology_refs: list[str] = Field(default_factory=list)
+_coerce_selection = coerce_selection
+_fallback_from_capabilities = fallback_from_capabilities
 class RoleManifest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     profile_id: str = "builtin"
@@ -63,27 +60,6 @@ def load_role_manifest(path=None):
     if not isinstance(data, dict):
         raise ValueError("role manifest must be a mapping")
     return RoleManifest.model_validate(data)
-def select_for_role(manifest, agent_id):
-    for role in manifest.roles:
-        if role.agent_id == agent_id:
-            return role
-    return None
-
-
-def _coerce_selection(agent_id, inline):
-    """Inline definition selectors into a RoleToolSelection."""
-    if isinstance(inline, RoleToolSelection):
-        if str(inline.agent_id) != str(agent_id):
-            raise ValueError("inline selection agent_id does not match the definition")
-        return inline
-    if not isinstance(inline, Mapping):
-        raise ValueError("AgentDefinition.tool_selection must be a mapping")
-    if "agent_id" in inline and str(inline["agent_id"]) != str(agent_id):
-        raise ValueError("inline selection agent_id does not match the definition")
-    data = {key: inline[key] for key in inline if key != "agent_id"}
-    return RoleToolSelection(agent_id=str(agent_id), **data)
-
-
 def _effective_selection(agent, file_manifest, package_default):
     """Custom file row, else inline, else default row, else capabilities."""
     agent_id = str(getattr(agent, "agent_id", ""))
@@ -118,22 +94,6 @@ def resolve_role_selection(definition, manifest=None):
     if row is not None:
         return row
     return _fallback_from_capabilities(definition)
-
-
-def _fallback_from_capabilities(agent):
-    """Field-default selection derived from the definition capabilities.
-
-    No central name branching: whatever capabilities the definition
-    already declares become the capability tag filter.
-    """
-    tags = sorted({str(tag) for tag in (getattr(agent, "capabilities", None) or ()) if str(tag)})
-    if not tags:
-        return None
-    return RoleToolSelection(
-        agent_id=str(getattr(agent, "agent_id", "")), capability_tags=tags
-    )
-
-
 def role_tool_visible(definition, tool, manifest=None):
     """Same-view predicate shared by context, workers, and execution entry.
 
@@ -235,22 +195,3 @@ def configure_role_tools(agents, catalog=None, path=None):
             continue
         tools_for_role(agent, catalog)
     return RoleManifest(roles=resolved).fingerprint()
-def selection_allows(selection, tool_id="", server_id="", capability_tags=()):
-    """Whether one tool passes a resolved role selection.
-
-    None means no selection data at any level and stays unconstrained.
-    An explicit selection without tool selectors allows nothing.
-    """
-    if selection is None:
-        return True
-    if not (selection.tool_ids or selection.server_ids or selection.capability_tags):
-        return False
-    if selection.tool_ids and str(tool_id) not in selection.tool_ids:
-        return False
-    if selection.server_ids and str(server_id) not in selection.server_ids:
-        return False
-    if selection.capability_tags:
-        wanted = [str(tag) for tag in capability_tags]
-        if not any(tag in selection.capability_tags for tag in wanted):
-            return False
-    return True

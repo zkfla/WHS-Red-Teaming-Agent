@@ -91,9 +91,13 @@ def _render_markdown(report: TerminalReportProjection) -> str:
         if diagnostic.retry_after is not None:
             lines.append(f"- Provider retry after: {diagnostic.retry_after}s")
         lines.append(f"- Provider retryable: {diagnostic.retryable}")
+        if diagnostic.validation_issues:
+            lines.append(f"- Validation issues: {json.dumps(diagnostic.validation_issues)}")
         cause = diagnostic.last_cause
         while cause is not None:
-            lines.append(f"- Cause [{cause.stage}/{cause.code}]: {cause.summary}")
+            lines.append(f"- Cause [{cause.stage}/{cause.code}]: {cause.feedback()}")
+            if cause.validation_issues:
+                lines.append(f"- Validation issues: {json.dumps(cause.validation_issues)}")
             cause = cause.last_cause
         if diagnostic.trace:
             lines += ["", "### Decision trace", ""]

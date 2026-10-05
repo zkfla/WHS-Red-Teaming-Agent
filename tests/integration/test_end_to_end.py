@@ -80,7 +80,9 @@ async def test_minimal_vertical_slice_end_to_end(tmp_path, monkeypatch) -> None:
     assert path is not None and path.steps[0].evidence_ids
     node = await deps.graph_store.get_node(GraphNodeId(f"host:{h.HOST}"))
     assert node is not None
-    assert h.CANONICAL_OP in facts_of(node.properties)["attempted_operations"]
+    # Direct-tool runs record the actually invoked tool id, not the legacy
+    # capability.operation key: prove the ledger entry names the executed call.
+    assert str(gateway.calls[0].tool_id) in facts_of(node.properties)["attempted_operations"]
     assert (tmp_path / "data" / "reports" / f"{final.run_id}.json").exists()
 
 

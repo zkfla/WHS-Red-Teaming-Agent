@@ -201,7 +201,11 @@ async def test_agent_loads_reference_via_mcp_then_passes_data_to_web_llm(
         # including the executable Analysis Agent introduced by mobile analysis.
         # A historical schedulable=False assertion rejected that valid integration.
         for definition in builtin.definitions():
-            assert deps.agents.definition(definition.agent_id) == definition
+            live = deps.agents.definition(definition.agent_id)
+            assert live is not None
+            assert live.model_dump(exclude={"tool_selection"}) == definition.model_dump(
+                exclude={"tool_selection"}
+            )
         assert REFERENCE_AGENT_ID in deps.agents.agent_ids
         final = await run_engagement(engagement, deps, objective="합성 API 방법론 자료만 확인")
         activation = await analysis_activation(

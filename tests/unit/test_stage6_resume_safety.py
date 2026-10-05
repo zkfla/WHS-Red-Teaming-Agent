@@ -59,7 +59,9 @@ class _RecordingPlane(FakeControlPlane):
         self.approval_calls = 0
         self._decision = decision
 
-    async def approval_outcome(self, approval_id: ApprovalId) -> PolicyDecision | None:
+    async def approval_outcome(
+        self, approval_id: ApprovalId, current_proposal: ActionProposal | None = None
+    ) -> PolicyDecision | None:
         self.approval_calls += 1
         return self._decision
 

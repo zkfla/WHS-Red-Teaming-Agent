@@ -111,9 +111,12 @@ class _CompareLLM(h.ScriptedLLM):
         if route == "goal_completion_review":
             payload = self._payload(messages)
             criteria = payload["mission"]["success_criteria"]
-            receipts: list[str] = []
-            for step in payload["path"]["steps"]:
-                receipts.extend(step.get("evidence_ids", []))
+            excerpts = payload.get("evidence_excerpts", [])
+            receipts = [
+                str(item.get("evidence_id", "")).strip()
+                for item in excerpts
+                if isinstance(item, dict) and str(item.get("evidence_id", "")).strip()
+            ]
             return h.goal_accept(
                 [{"criterion": c, "met": True, "evidence_ids": list(receipts)} for c in criteria]
             )
@@ -318,10 +321,10 @@ class ComparisonGateway(SessionGateway):
             return result
         assert invocation.arguments["target_ref"] == "bank"
         assert invocation.arguments["path"] == "/orders/1234"
-        assert {
-            invocation.arguments["first_session_ref"],
-            invocation.arguments["second_session_ref"],
-        } == {"alice", "bob"}
+        assert invocation.arguments["first_session_ref"] == "alice"
+        assert invocation.arguments["second_session_ref"] == "bob"
+        # Mock response receipts for the declared simulated sides
+        # (alice -> first, bob -> second). Mock response receipt, no actual HTTP.
         result = result.model_copy(
             update={
                 "output": {
@@ -330,11 +333,13 @@ class ComparisonGateway(SessionGateway):
                         "principal_ref": "alice-principal",
                         "status_code": 200,
                         "body_sha256": "a" * 64,
+                        "actual_session_ref": "alice",
                     },
                     "second": {
                         "principal_ref": "bob-principal",
                         "status_code": 403,
                         "body_sha256": "b" * 64,
+                        "actual_session_ref": "bob",
                     },
                     "same_status": False,
                     "same_body": False,

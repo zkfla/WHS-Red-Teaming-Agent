@@ -15,7 +15,11 @@ from mcp import Client
 
 from redteam.app.bootstrap import run_engagement
 from redteam.capability.adapters.mcp.execution import ExecutionMCPAdapter
-from redteam.capability.adapters.mcp.transport import RemoteCallResult, RemoteTool
+from redteam.capability.adapters.mcp.transport import (
+    RemoteCallResult,
+    RemoteTool,
+    remote_tool_metadata,
+)
 from redteam.capability.execution_manifest import (
     EXECUTION_TOOLS,
     validate_execution_descriptor,
@@ -92,6 +96,7 @@ class InProcessTransport:
                 description=tool.description or "",
                 input_schema=dict(tool.input_schema),
                 output_schema=dict(tool.output_schema or {}),
+                metadata=remote_tool_metadata(tool),
             )
             for tool in listing.tools
         ]
@@ -243,8 +248,9 @@ def turn_action() -> dict[str, Any]:
                 "capability": "analysis",
                 "operation": "command_run",
                 "tool_id": "analysis.run_command",
-                # Deliberately hostile model input: the bridge must replace it.
-                "arguments": {"executable": "python", "args": ["-c", "bad"]},
+                # Direct selection supplies the valid registered input; legacy
+                # recipe replacement and executable denial have separate tests.
+                "arguments": {"executable": "wc", "args": ["-l", "input.txt"]},
                 "reason": "process the configured graph-bound input",
                 "expected_observation": "bounded line count output",
                 "hypothesis": None,
@@ -293,6 +299,7 @@ async def run_agent_loop(
         control_plane=DefaultControlPlane(
             {configured.engagement_id: configured},
             risk_resolver=RegistryRiskResolver(gateway),
+            outbound_descriptor_resolver=gateway.get,
         ),
         tool_gateway=gateway,
         tool_catalog=gateway,

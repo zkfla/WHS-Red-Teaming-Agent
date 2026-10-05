@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from redteam.core.enums import AgentPhase
+from redteam.core.enums import AgentPhase, PolicyVerdict
 from redteam.orchestration.context import RuntimeDeps
 from redteam.orchestration.diagnostics import safe_feedback
 from redteam.orchestration.events import REPLAN_TRIGGERED
@@ -59,7 +59,7 @@ async def replan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
         feedback.append(
             safe_feedback("tool_failed:" + (result.error.code if result.error else "unknown"))
         )
-    if decision is not None and decision.reasons:
+    if decision is not None and decision.verdict is not PolicyVerdict.ALLOW and decision.reasons:
         feedback.extend(safe_feedback(item) for item in decision.reasons)
     if reason:
         from redteam.orchestration.delegated_runtime import close_delegations

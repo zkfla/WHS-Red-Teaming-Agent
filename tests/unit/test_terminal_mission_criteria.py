@@ -212,7 +212,7 @@ async def test_invented_or_wrong_task_reference_cannot_satisfy_criteria(world, m
         evidence_id="foreign-evidence" if mismatch == "evidence" else "actual-proof",
         task_id="another-task" if mismatch == "task" else str(TASK),
     )
-    await settle(world, llm, decision_max_attempts=2)
+    await settle(world, llm, decision_max_attempts=2, decision_normal_limit=2)
     mission = await world[0].get_mission(MISSION)
     assert mission.status is MissionStatus.BLOCKED
     assert not any(item.met for item in mission.criterion_results)
@@ -279,7 +279,7 @@ async def test_new_required_task_during_review_invalidates_completion_without_ex
         )
 
     llm = TerminalLLM(hook=add_work)
-    await settle(world, llm, decision_max_attempts=1)
+    await settle(world, llm, decision_max_attempts=1, decision_normal_limit=1)
     latest = await store.get_mission(MISSION)
     assert latest.status is MissionStatus.BLOCKED
     assert not any(result.met for result in latest.criterion_results)

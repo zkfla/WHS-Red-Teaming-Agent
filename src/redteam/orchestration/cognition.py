@@ -32,7 +32,7 @@ from __future__ import annotations
 import inspect
 import json
 from collections.abc import Callable
-from typing import Any
+from typing import Any, Literal
 
 from jsonschema import ValidationError
 from jsonschema import validate as _validate_schema
@@ -43,7 +43,10 @@ from redteam.core.contracts.mission import redact_secret_material
 from redteam.core.ports.llm import LLMProviderFailure
 from redteam.orchestration.diagnostics import (
     DecisionDiagnostic,
+    decision_context,
     diagnostic_for_exception,
+    evidence_request_shape,
+    json_parse_context,
     safe_feedback,
     schema_diagnostic,
 )
@@ -290,10 +293,17 @@ class ReasoningHalted(Exception):
     new failure kind is introduced.
     """
 
-    def __init__(self, reason_code: str = "reasoning_not_allowed") -> None:
+    def __init__(
+        self, reason_code: str = "reasoning_not_allowed", *,
+        termination_reason: Literal["budget_exhausted"] | None = None,
+    ) -> None:
         if not isinstance(reason_code, str) or not reason_code:
             reason_code = "reasoning_not_allowed"
         self.reason_code = reason_code
+        self.diagnostic = DecisionDiagnostic(
+            code="reasoning_guard_blocked", stage="reasoning_guard", kind="budget",
+            summary=reason_code, retryable=False, termination_reason=termination_reason,
+        )
         super().__init__(self.reason_code)
 
 
@@ -309,8 +319,13 @@ def should_halt_for_token_budget(budget: DecisionBudget, max_tokens: int | None)
 
 
 class _RetryableDecisionError(Exception):
-    def __init__(self, diagnostic: DecisionDiagnostic) -> None:
+    def __init__(
+        self, diagnostic: DecisionDiagnostic, proposal_context: dict | None = None,
+    ) -> None:
         self.diagnostic = diagnostic
+        self.proposal_context = proposal_context or {
+            "proposal_shape": {"observed": False, "reason": "unavailable"}
+        }
         self.kind = diagnostic.kind
         self.feedback = diagnostic.feedback()
         super().__init__(self.feedback)
@@ -318,6 +333,10 @@ class _RetryableDecisionError(Exception):
 
 class _NonObjectDecision(ValueError):
     """The model returned a non-object JSON value."""
+
+    def __init__(self, value: Any) -> None:
+        self.proposal_context = {"proposal_shape": evidence_request_shape(value)}
+        super().__init__("Return a JSON object.")
 
 
 def _parse_text_result(raw: Any) -> dict[str, Any]:
@@ -335,9 +354,9 @@ def _parse_text_result(raw: Any) -> dict[str, Any]:
             text = chr(10).join(lines).strip()
         parsed = json.loads(text or "{}")
         if not isinstance(parsed, dict):
-            raise _NonObjectDecision("Return a JSON object.")
+            raise _NonObjectDecision(parsed)
         return parsed
-    raise _NonObjectDecision("Return a JSON object.")
+    raise _NonObjectDecision(raw)
 
 
 class StructuredDecisionClient:
@@ -471,11 +490,15 @@ class StructuredDecisionClient:
         except Exception as exc:
             # A request was attempted but no usage was reported: unknown.
             budget.add_usage(None)
+            parse_context = None
             if isinstance(exc, ValidationError):
                 diagnostic = schema_diagnostic(exc, response_schema, stage=stage)
             elif isinstance(exc, ModelValidationError):
                 diagnostic = diagnostic_for_exception(exc, stage=stage)
-            elif isinstance(exc, (json.JSONDecodeError, UnicodeDecodeError)):
+            elif isinstance(exc, json.JSONDecodeError):
+                diagnostic = diagnostic_for_exception(exc, stage=stage)
+                parse_context = json_parse_context(exc)
+            elif isinstance(exc, UnicodeDecodeError):
                 diagnostic = DecisionDiagnostic(
                     code="invalid_json",
                     stage=stage,
@@ -500,15 +523,23 @@ class StructuredDecisionClient:
                     summary="The LLM request failed before a validated response was received.",
                     retryable=True,
                 )
-            raise _RetryableDecisionError(diagnostic) from exc
+            raise _RetryableDecisionError(diagnostic, parse_context) from exc
+        proposal_context = {"proposal_shape": {"observed": False, "reason": "unparsed"}}
         try:
             candidate = _parse_text_result(raw)
+            proposal_context = decision_context(
+                working, candidate, response_schema=response_schema, validated=False,
+            )
             _validate_schema(instance=candidate, schema=response_schema)
         except ValidationError as exc:
             raise _RetryableDecisionError(
-                schema_diagnostic(exc, response_schema, stage=stage)
+                schema_diagnostic(exc, response_schema, stage=stage), proposal_context
             ) from exc
         except (json.JSONDecodeError, UnicodeDecodeError, _NonObjectDecision) as exc:
+            if isinstance(exc, json.JSONDecodeError):
+                raise _RetryableDecisionError(
+                    diagnostic_for_exception(exc, stage=stage), json_parse_context(exc),
+                ) from exc
             raise _RetryableDecisionError(
                 DecisionDiagnostic(
                     code="invalid_json",
@@ -516,7 +547,8 @@ class StructuredDecisionClient:
                     kind="format",
                     summary="Return a valid JSON object.",
                     retryable=True,
-                )
+                ),
+                exc.proposal_context if isinstance(exc, _NonObjectDecision) else proposal_context,
             ) from exc
         return candidate
 
@@ -555,14 +587,9 @@ class StructuredDecisionClient:
             except DecisionFailure:
                 raise
             except ReasoningHalted as halted:
-                diagnostic = DecisionDiagnostic(
-                    code="reasoning_guard_blocked",
-                    stage=stage,
-                    kind="budget",
-                    attempts=budget.used,
-                    summary=halted.reason_code,
-                    retryable=False,
-                )
+                diagnostic = halted.diagnostic.model_copy(update={
+                    "stage": stage, "attempts": budget.used, "last_cause": budget.last_failure,
+                })
                 budget.last_failure = diagnostic
                 raise DecisionFailure(
                     stage, "budget", budget.used, diagnostic=diagnostic
@@ -606,7 +633,10 @@ class StructuredDecisionClient:
                             kind=kind,
                             budget=budget,
                         )
-                        budget.record(stage, "response_validated")
+                        budget.record(
+                            stage, "response_validated",
+                            **decision_context(working, result, response_schema=response_schema),
+                        )
                         return result
                     except _RetryableDecisionError as exc:
                         budget.last_failure = exc.diagnostic.model_copy(
@@ -614,7 +644,11 @@ class StructuredDecisionClient:
                         )
                         feedback = exc.feedback
                         kind = exc.kind
-                        budget.record(stage, "response_rejected", reason=exc.diagnostic.feedback())
+                        budget.record(
+                            stage, "response_rejected", reason=exc.diagnostic.feedback(),
+                            validation_issues=exc.diagnostic.validation_issues,
+                            **exc.proposal_context,
+                        )
                         if not exc.diagnostic.retryable:
                             raise DecisionFailure(
                                 stage, exc.kind, budget.used, diagnostic=budget.last_failure

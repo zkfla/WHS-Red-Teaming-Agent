@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, cast
 
 import pytest
@@ -153,6 +153,9 @@ class _A6Catalog:
             for t in self._tools.values()
             if capability in t.capability_tags and operation in (t.operations or [])
         ]
+
+    def all_descriptors(self):
+        return list(self._tools.values())
 
 
 async def _ensure_a6_path(d, *, host: str = "a.local") -> _FixturePathPlan:
@@ -1440,6 +1443,7 @@ async def test_a_drop_only_frontier_is_reported_as_no_executable_candidates() ->
             "path_step_id": _A6_STEP_ID, "agent_id": "recon-agent",
             "target_node_id": "host:a.local", "principal_ref": None,
             "capability": "recon", "operation": "endpoint_discovery",
+            "binding_mode": "legacy_action",
             "tool_id": "recon.probe", "arguments": {}, "reason": "probe",
             "expected_observation": None, "hypothesis": None,
             "existing_hypothesis_id": None, "expectation": None,
@@ -1559,3 +1563,71 @@ async def test_replan_maps_a_hard_stop_to_its_own_reason() -> None:
 
     triggered = d.event_bus.history(event_type=REPLAN_TRIGGERED)
     assert [item.payload["reason"] for item in triggered] == ["max_steps_reached"]
+
+
+# -- TIME-HALT TERMINATION ----------------------------------------------------
+# Duration expiry must finish the run as budget-exhausted (typed halt), never
+# failed/planning_error. No sleeps: expiry is fixed via started_at/duration.
+
+
+def _time_engagement(*, max_duration_seconds: int = 300):
+    from redteam.core.contracts.engagement import (
+        ApprovalPolicy,
+        Engagement,
+        EngagementScope,
+        ExecutionBudget,
+        RateLimitPolicy,
+    )
+
+    return Engagement(
+        engagement_id=ENGAGEMENT,
+        name="time-halt fixture",
+        scope=EngagementScope(allowed_hosts=["a.local"]),
+        rules_of_engagement=[],
+        execution_budget=ExecutionBudget(
+            max_actions=10, max_duration_seconds=max_duration_seconds
+        ),
+        rate_limit_policy=RateLimitPolicy(
+            max_actions_per_minute=30, max_concurrent_actions=2
+        ),
+        approval_policy=ApprovalPolicy(),
+        created_at=NOW,
+        metadata={},
+    )
+
+
+async def test_plan_finishes_expired_duration_as_budget_exhausted() -> None:
+    import dataclasses
+
+    llm = _ScriptedLLM()
+    d = dataclasses.replace(deps(llm_client=llm), engagement=_time_engagement())
+    expired = runtime(started_at=NOW - timedelta(seconds=400))
+
+    planned = await plan_node(state_with(expired), deps=d)
+
+    assert planned["runtime"].termination_reason == TerminationReason.BUDGET_EXHAUSTED
+    assert planned["runtime"].planning_error is None
+    assert planned["runtime"].phase is AgentPhase.REPLAN
+    assert planned["runtime"].planning_diagnostic is not None
+    assert planned["runtime"].planning_diagnostic.code == "reasoning_guard_blocked"
+    assert planned["runtime"].model_requests_used == 0
+    assert llm.calls == []
+
+    finished = await replan_node(planned, deps=d)
+
+    assert finished["runtime"].phase is AgentPhase.FINISHED
+    assert finished["runtime"].termination_reason == TerminationReason.BUDGET_EXHAUSTED
+    assert llm.calls == []
+
+
+async def test_plan_keeps_missing_start_time_as_planning_error() -> None:
+    import dataclasses
+
+    llm = _ScriptedLLM()
+    d = dataclasses.replace(deps(llm_client=llm), engagement=_time_engagement())
+
+    planned = await plan_node(state_with(runtime()), deps=d)
+
+    assert planned["runtime"].termination_reason == TerminationReason.PLANNING_ERROR
+    assert planned["runtime"].planning_error == "DecisionFailure"
+    assert llm.calls == []

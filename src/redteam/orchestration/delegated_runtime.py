@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 from redteam.attack_graph.service import AttackGraphService
-from redteam.capability.role_manifest import resolve_role_selection, tools_for_role
 from redteam.core.contracts.mission import redact_secret_material
 from redteam.core.ids import GraphNodeId
+from redteam.orchestration.agents.role_view import resolve_role_selection, tools_for_role
 from redteam.orchestration.cognition import DecisionBudget, DecisionFailure
 from redteam.orchestration.completion_proposal import (
     CompletionProposal,

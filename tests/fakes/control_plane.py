@@ -54,7 +54,14 @@ class FakeControlPlane:
         """Test setup helper: make ``approval_outcome`` return ``decision``."""
         self._resolved[approval_id] = decision
 
-    async def approval_outcome(self, approval_id: ApprovalId) -> PolicyDecision | None:
+    async def approval_outcome(
+        self, approval_id: ApprovalId, current_proposal: ActionProposal | None = None
+    ) -> PolicyDecision | None:
+        # Port-signature parity only: the extra proposal is accepted so this
+        # double stays assignable to the public port, but it never changes
+        # the canned outcome. Re-judgement (stale/mismatch DENY) belongs to
+        # the real gate, not this fake.
+        _ = current_proposal
         return self._resolved.get(approval_id)
 
     async def admit_invocation(

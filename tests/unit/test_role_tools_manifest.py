@@ -12,6 +12,12 @@ from redteam.capability.role_manifest import configure_role_tools, role_tool_vis
 from redteam.core.contracts.tool import ToolDescriptor
 from redteam.core.ids import AgentId, ToolId
 from redteam.orchestration.agents.definition import AgentDefinition, ContextProfile
+from redteam.orchestration.agents.role_view import (
+    role_tool_visible as runtime_tool_visible,
+)
+from redteam.orchestration.agents.role_view import (
+    tools_for_role as runtime_tools_for_role,
+)
 
 
 def _agent(agent_id="specialist", selection=None, capabilities=None):
@@ -71,6 +77,11 @@ def test_file_override_alias_pins_the_same_view_after_file_changes(tmp_path):
     # Consumers use the injected snapshot; editing the source does not widen it.
     path.write_text('{"roles":[]}', encoding="utf-8")
     assert len(tools_for_role(first, catalog)) == 1
+    assert runtime_tools_for_role(first, catalog) == tools_for_role(first, catalog)
+    assert all(
+        runtime_tool_visible(first, tool) == role_tool_visible(first, tool)
+        for tool in catalog.all_descriptors()
+    )
     second = _agent()
     same = _file(
         tmp_path, "same.json", [{"agent_id": "specialist", "tool_ids": ["analysis.reader.read"]}]
@@ -92,6 +103,8 @@ def test_omitted_roles_keep_package_or_capability_defaults_and_empty_blocks(tmp_
     assert {tool.server_id for tool in tools_for_role(omitted, catalog)} == {"reader", "other"}
     assert tools_for_role(blocked, catalog) == []
     assert tools_for_role(builtin, catalog) == []  # package YAML recon tags, not web
+    for configured in (package, omitted, blocked, builtin):
+        assert runtime_tools_for_role(configured, catalog) == tools_for_role(configured, catalog)
 
 
 def test_selectors_and_dimensions_or_members_and_order_independent_digest(tmp_path):

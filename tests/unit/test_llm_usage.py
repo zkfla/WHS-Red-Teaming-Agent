@@ -200,7 +200,10 @@ async def test_repair_exhaustion_does_not_spend_the_next_normal_decision(monkeyp
     assert budget.tokens_used == 15
 
 
-async def test_guard_denial_before_repair_counts_only_the_request_already_sent(monkeypatch):
+@pytest.mark.parametrize("termination", [None, "budget_exhausted"])
+async def test_guard_denial_before_repair_counts_only_the_request_already_sent(
+    monkeypatch, termination,
+):
     provider = client(monkeypatch, [("invalid json", 13)])
     budget = DecisionBudget.reasoning_chain(2, 2)
     guards = 0
@@ -209,7 +212,7 @@ async def test_guard_denial_before_repair_counts_only_the_request_already_sent(m
         nonlocal guards
         guards += 1
         if guards == 2:
-            raise ReasoningHalted("deadline_reached")
+            raise ReasoningHalted("deadline_reached", termination_reason=termination)
 
     with pytest.raises(DecisionFailure) as caught:
         await StructuredDecisionClient(provider).ask(
@@ -217,6 +220,8 @@ async def test_guard_denial_before_repair_counts_only_the_request_already_sent(m
             budget=budget, before_call=guard,
         )
     assert caught.value.diagnostic.code == "reasoning_guard_blocked"
+    assert caught.value.diagnostic.termination_reason == termination
+    assert caught.value.diagnostic.last_cause.code == "invalid_json"
     assert (budget.used, budget.normal_used, budget.repair_used) == (1, 1, 0)
     assert budget.tokens_used == 13 and budget.unknown_usage_count == 0
 
@@ -230,6 +235,99 @@ async def test_worker_total_limit_narrows_combined_normal_and_repair_budget(monk
         await decider.ask(stage="worker_next", payload={}, response_schema=SCHEMA, budget=budget)
     assert caught.value.diagnostic.code == "decision_budget_exhausted"
     assert budget.used == 2 and budget.tokens_used == 8
+
+
+async def test_normal_exhaustion_takes_graceful_continue_without_extra_request():
+    """Normal-lane exhaustion with repair left stays on continue_planning."""
+    from redteam.attack_graph.observation import GraphObservation
+    from redteam.orchestration.engine import InvestigationEngine
+    from redteam.orchestration.paths import CompletionCriterion, PathPlan, PathStep
+    from redteam.orchestration.settings import OrchestrationSettings
+    from tests.integration import _engine_llm_harness as h
+
+    llm = h.ScriptedLLM()
+    seed = await h.seed_host("run-t8-bound")
+    world = h.make_world(llm, graph_store=seed.store)
+    world.deps.settings = OrchestrationSettings(
+        decision_normal_limit=1, decision_max_attempts=1
+    )
+    step = PathStep(
+        step_id="step-1",
+        objective="inventory the host",
+        agent_id=h.RECON_AGENT,
+        target_node_ids=[seed.node_id],
+        allowed_operations=[h.CANONICAL_OP],
+        completion_criteria=[
+            CompletionCriterion(kind="evidence", description="x", min_evidence=1),
+        ],
+    )
+    await world.paths.register(PathPlan(
+        path_id="path-t8-bound",
+        run_id="run-t8-bound",
+        version=1,
+        status="active",
+        reason="t8",
+        goal="g",
+        steps=[step],
+    ))
+    runtime = h.make_runtime("run-t8-bound", "eng-t8")
+    engine = InvestigationEngine(world.deps)
+    llm.add("next_action", h.turn_complete_step(["ev-t8-1"]))
+
+    path, _, outcome = await engine.decide(runtime, GraphObservation())
+
+    assert outcome == "continue_planning"
+    assert path is not None
+    assert engine.planning_diagnostic is not None
+    assert engine.planning_diagnostic.code == "decision_normal_budget_exhausted"
+    assert engine.planning_diagnostic.last_cause is None
+    assert len(llm.calls) == 1
+
+
+async def test_repair_drain_stays_on_the_error_track():
+    """Repair-lane exhaustion still raises instead of continuing."""
+    from redteam.attack_graph.observation import GraphObservation
+    from redteam.orchestration.engine import InvestigationEngine
+    from redteam.orchestration.paths import CompletionCriterion, PathPlan, PathStep
+    from redteam.orchestration.settings import OrchestrationSettings
+    from tests.integration import _engine_llm_harness as h
+
+    llm = h.ScriptedLLM()
+    seed = await h.seed_host("run-t8-repair")
+    world = h.make_world(llm, graph_store=seed.store)
+    world.deps.settings = OrchestrationSettings(
+        decision_normal_limit=2, decision_max_attempts=1
+    )
+    step = PathStep(
+        step_id="step-1",
+        objective="inventory the host",
+        agent_id=h.RECON_AGENT,
+        target_node_ids=[seed.node_id],
+        allowed_operations=[h.CANONICAL_OP],
+        completion_criteria=[
+            CompletionCriterion(kind="evidence", description="x", min_evidence=1),
+        ],
+    )
+    await world.paths.register(PathPlan(
+        path_id="path-t8-repair",
+        run_id="run-t8-repair",
+        version=1,
+        status="active",
+        reason="t8",
+        goal="g",
+        steps=[step],
+    ))
+    runtime = h.make_runtime("run-t8-repair", "eng-t8")
+    engine = InvestigationEngine(world.deps)
+    llm.add("next_action", {"bogus": True})
+    llm.add("next_action", {"bogus": True})
+
+    with pytest.raises(DecisionFailure) as caught:
+        await engine.decide(runtime, GraphObservation())
+
+    assert caught.value.diagnostic.code == "decision_repair_budget_exhausted"
+    assert caught.value.diagnostic.termination_reason is None
+    assert len(llm.calls) == 2
 
 
 @pytest.mark.parametrize(

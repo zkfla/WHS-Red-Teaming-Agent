@@ -175,6 +175,8 @@ async def test_original_authority_reaches_policy_and_actual_tool_call(world, wit
         agent_id=h.RECON_AGENT,
         capability=step.capability,
         operation=step.operation,
+        binding_mode=step.binding_mode,
+        tool_id=step.tool_id,
         target=step.resolved_target(),
         arguments=step.arguments,
         availability_impact=step.availability_impact,

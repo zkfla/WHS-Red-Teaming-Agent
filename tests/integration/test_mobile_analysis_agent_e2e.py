@@ -298,7 +298,10 @@ def _deps(
     llm: ScriptedLLM,
     settings: OrchestrationSettings | None = None,
 ):
-    control = DefaultControlPlane({engagement.engagement_id: engagement})
+    control = DefaultControlPlane(
+        {engagement.engagement_id: engagement},
+        outbound_descriptor_resolver=gateway.get,
+    )
     analysis_definition = next(
         item for item in builtin_agent_definitions() if item.agent_id == ANALYSIS_AGENT.agent_id
     )
@@ -530,7 +533,14 @@ async def test_analysis_schema_drift_rejects_candidate_before_gateway_call() -> 
         {"apk_path": "/work/input/InsecureBankv2.apk"},
     )
     llm = _llm_for(invalid_action, invalid_action, invalid_action)
-    _, deps = _deps(engagement, gateway, llm=llm)
+    _, deps = _deps(
+        engagement,
+        gateway,
+        llm=llm,
+        settings=OrchestrationSettings(
+            checkpointing=True, max_steps=30, decision_normal_limit=3
+        ),
+    )
 
     final = await run_engagement(engagement, deps=deps)
 
