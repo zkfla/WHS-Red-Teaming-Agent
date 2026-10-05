@@ -45,6 +45,37 @@ async def test_empty_terminal_projection_is_releaseable_and_read_only() -> None:
     assert await graph.list_findings() == []
 
 
+async def test_reporting_preserves_operational_diagnostic_in_json_and_markdown() -> None:
+    from redteam.app.cli.commands.report import _render_markdown
+    from redteam.orchestration.diagnostics import operational_exception_diagnostic
+    from redteam.orchestration.reporting import TerminalReportProjection
+    from redteam.orchestration.runtime_observation import RuntimeObservation
+
+    diagnostic = operational_exception_diagnostic(
+        OSError("opaque-private-evidence-path"), stage="verify", code="verification_failed",
+        summary="Evidence verification could not finish.",
+    )
+    projection = await ReportingAgent().project(
+        RuntimeState(
+            run_id=RunId("run"), engagement_id=EngagementId("eng"),
+            phase=AgentPhase.FAILED,
+            recent_observations=[RuntimeObservation(
+                kind="tool", summary="Evidence verification could not finish.",
+                outcome="failed", step=1, diagnostic=diagnostic,
+            )],
+        ),
+        graph=AttackGraphService(InMemoryAttackGraphStore()),
+        evidence_store=FakeEvidenceStore(), work_store=InMemoryWorkStore(),
+    )
+    restored = TerminalReportProjection.model_validate_json(projection.model_dump_json())
+    assert restored.runtime_observations[0].diagnostic == diagnostic
+    markdown = _render_markdown(restored)
+    assert "verification_failed" in markdown
+    assert "OSError" in markdown
+    assert "opaque-private" not in markdown
+    assert "opaque-private" not in restored.model_dump_json()
+
+
 async def test_reporting_projects_ledger_derived_effectiveness() -> None:
     store = InMemoryWorkStore()
     now = datetime.now(timezone.utc)

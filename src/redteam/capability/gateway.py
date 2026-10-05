@@ -35,6 +35,10 @@ from redteam.core.tool_binding import SELECTED_TOOL
 # every invocation"; a positive interval throttles repeated probes per server.
 DEFAULT_HEALTH_REFRESH_INTERVAL_SECONDS = 0.0
 DEFAULT_HEALTH_REFRESH_TIMEOUT_SECONDS = 5.0
+# Fixed stage/owner labels for gateway-raised failures. These name the
+# owning stage module, never a tool/server name, and never copy inputs.
+_GATEWAY_STAGE = "gateway"
+_GATEWAY_SOURCE = "gateway"
 
 
 class MCPToolGateway:
@@ -208,31 +212,18 @@ class MCPToolGateway:
     ) -> ToolResult:
         descriptor = self._catalog.get(invocation.tool_id)
         if descriptor is None:
-            return ToolResult(
-                invocation_id=invocation.invocation_id,
-                action_id=invocation.action_id,
-                tool_id=invocation.tool_id,
-                success=False,
-                error=ToolError(
-                    code="unknown_tool", message=f"tool {invocation.tool_id} not registered"
-                ),
-                started_at=datetime.now(timezone.utc),
-                finished_at=datetime.now(timezone.utc),
+            return self._error_result(
+                invocation,
+                code="unknown_tool",
+                message=f"tool {invocation.tool_id} not registered",
             )
 
         adapter = self._adapters.get(descriptor.server_id)
         if adapter is None:
-            return ToolResult(
-                invocation_id=invocation.invocation_id,
-                action_id=invocation.action_id,
-                tool_id=invocation.tool_id,
-                success=False,
-                error=ToolError(
-                    code="unknown_server",
-                    message=f"no adapter registered for server {descriptor.server_id}",
-                ),
-                started_at=datetime.now(timezone.utc),
-                finished_at=datetime.now(timezone.utc),
+            return self._error_result(
+                invocation,
+                code="unknown_server",
+                message=f"no adapter registered for server {descriptor.server_id}",
             )
 
         legacy_blocked = invocation.binding_mode != SELECTED_TOOL
@@ -333,6 +324,7 @@ class MCPToolGateway:
                 invocation,
                 code="adapter_error",
                 message=f"adapter execution failed: {type(exc).__name__}",
+                exc=exc,
             )
 
         if not adapter_result.success:
@@ -439,14 +431,23 @@ class MCPToolGateway:
         code: str,
         message: str,
         retryable: bool = False,
+        exc: BaseException | None = None,
     ) -> ToolResult:
         occurred_at = datetime.now(timezone.utc)
+        details: dict[str, object] = {
+            "stage": _GATEWAY_STAGE,
+            "source": _GATEWAY_SOURCE,
+        }
+        if exc is not None:
+            details["exception_type"] = type(exc).__name__[:100]
         return ToolResult(
             invocation_id=invocation.invocation_id,
             action_id=invocation.action_id,
             tool_id=invocation.tool_id,
             success=False,
-            error=ToolError(code=code, message=message, retryable=retryable),
+            error=ToolError(
+                code=code, message=message, retryable=retryable, details=details
+            ),
             started_at=occurred_at,
             finished_at=occurred_at,
         )

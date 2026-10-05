@@ -738,6 +738,36 @@ async def test_execute_rejects_a_tool_binding_for_a_different_approved_intent() 
 # -- VERIFY ---------------------------------------------------------------
 
 
+async def test_verifier_exception_reaches_receipt_and_next_runtime_without_input():
+    class BrokenVerifier:
+        async def verify(self, request):
+            raise OSError("opaque-private-verifier-detail")
+
+    d = deps(verifier=BrokenVerifier())
+    service = AttackGraphService(d.graph_store)
+    await service.record_hypothesis(Hypothesis(hypothesis_id="hyp_1", description="reachable"))
+    state = state_with(
+        runtime(), action_proposal=proposal(hypothesis_id=HypothesisId("hyp_1")),
+        tool_result=tool_result(), plan_step=RECON_AGENT.playbook[0],
+    )
+    result = await verify_node(state, deps=d)
+    assert result["runtime"].last_verdict is Verdict.UNKNOWN
+    diagnostic = result["runtime"].recent_observations[-1].diagnostic
+    assert diagnostic is not None
+    assert diagnostic.code == "verification_failed"
+    assert diagnostic.error_type == "OSError"
+    receipts = [
+        item for item in d.evidence_store.records
+        if item.metadata.get("record_kind") == "review_receipt"
+        and item.metadata.get("admission") == "final"
+    ]
+    assert len(receipts) == 1
+    assert receipts[0].metadata["diagnostic"] == diagnostic.model_dump(mode="json")
+    assert "opaque-private" not in receipts[0].model_dump_json()
+    assert "opaque-private" not in result["runtime"].model_dump_json()
+    assert await hypothesis_status(service, "hyp_1") == HYPOTHESIS_INCONCLUSIVE
+
+
 async def test_verify_records_evidence_then_reaches_a_verdict() -> None:
     d = deps()
     service = AttackGraphService(d.graph_store)

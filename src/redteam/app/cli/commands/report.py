@@ -15,6 +15,7 @@ from pathlib import Path
 
 from redteam.app.cli._shared import EXIT_FAILURE, EXIT_OK, eprint
 from redteam.app.report_store import load_terminal_report
+from redteam.orchestration.diagnostics import DecisionDiagnostic
 from redteam.orchestration.reporting import MissionProjection, TerminalReportProjection
 
 
@@ -48,6 +49,19 @@ async def run_generate(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def _diagnostic_detail_lines(diagnostic: DecisionDiagnostic) -> list[str]:
+    lines = []
+    if diagnostic.error_type:
+        lines.append(f"- Exception type: {diagnostic.error_type}")
+    if diagnostic.exception_chain:
+        lines.append(f"- Exception chain: {json.dumps(diagnostic.exception_chain)}")
+    if diagnostic.parse_error is not None:
+        lines.append(f"- Parse structure: {diagnostic.parse_error.model_dump_json()}")
+    if diagnostic.failure_counts:
+        lines.append(f"- Failure counts: {json.dumps(diagnostic.failure_counts)}")
+    return lines
+
+
 def _render_markdown(report: TerminalReportProjection) -> str:
     lines = [
         f"# Run Report: {report.run_id}",
@@ -71,6 +85,26 @@ def _render_markdown(report: TerminalReportProjection) -> str:
         f"- Dead-end work ratio: {report.effectiveness.dead_end_work_ratio}",
         "",
     ]
+    for observation in report.runtime_observations:
+        if observation.diagnostic is None:
+            continue
+        diagnostic = observation.diagnostic
+        lines += [
+            "", "## Execution diagnostic", "",
+            f"- Step: {observation.step}; outcome: {observation.outcome}",
+            f"- Stage: {diagnostic.stage}; code: {diagnostic.code}",
+            f"- Reason: {diagnostic.summary}",
+            f"- Retryable: {diagnostic.retryable}",
+        ]
+        lines += _diagnostic_detail_lines(diagnostic)
+    if report.mission is not None:
+        outstanding = [task.task_id for task in report.mission.tasks if task.status == "running"]
+        if outstanding:
+            lines += [
+                "", "## Unfinished task settlement", "",
+                "The run has ended; these stored task states remain unfinished.",
+                f"- Task references: {json.dumps(outstanding)}",
+            ]
     if report.planning_diagnostic is not None:
         diagnostic = report.planning_diagnostic
         lines += [
@@ -93,9 +127,11 @@ def _render_markdown(report: TerminalReportProjection) -> str:
         lines.append(f"- Provider retryable: {diagnostic.retryable}")
         if diagnostic.validation_issues:
             lines.append(f"- Validation issues: {json.dumps(diagnostic.validation_issues)}")
+        lines += _diagnostic_detail_lines(diagnostic)
         cause = diagnostic.last_cause
         while cause is not None:
             lines.append(f"- Cause [{cause.stage}/{cause.code}]: {cause.feedback()}")
+            lines += _diagnostic_detail_lines(cause)
             if cause.validation_issues:
                 lines.append(f"- Validation issues: {json.dumps(cause.validation_issues)}")
             cause = cause.last_cause

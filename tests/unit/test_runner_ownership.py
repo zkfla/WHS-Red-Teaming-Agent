@@ -17,6 +17,42 @@ RUN, MISSION, ENG = "run-owner", "mission-owner", "eng-owner"
 NOW = datetime(2026, 10, 1, tzinfo=timezone.utc)
 
 
+@pytest.mark.parametrize("cleanup_fails", [False, True])
+async def test_run_exception_preserves_safe_diagnostic_in_failure_runtime(
+    cleanup_fails, monkeypatch,
+):
+    _, runner, graph, runtime, _ = await setup(MissionStatus.ACTIVE, None)
+
+    async def fail(state, config):
+        try:
+            raise OSError("opaque-private-storage-detail")
+        except OSError as cause:
+            raise RuntimeError("opaque-private-run-detail") from cause
+
+    graph.ainvoke = fail
+    if cleanup_fails:
+        async def fail_cleanup(*args, **kwargs):
+            raise OSError("opaque-private-cleanup-detail")
+
+        monkeypatch.setattr(runner, "_abandon_active_work", fail_cleanup)
+    incoming = runtime.model_copy(update={"phase": AgentPhase.OBSERVE})
+    with pytest.raises(RuntimeError, match="opaque-private-run-detail"):
+        await runner.run(incoming)
+    failed = runner.failure_runtime
+    assert failed is not None
+    assert failed.termination_reason == TerminationReason.EXECUTION_ERROR
+    diagnostics = [
+        item.diagnostic for item in failed.recent_observations if item.diagnostic is not None
+    ]
+    diagnostic = next(item for item in diagnostics if item.code == "run_execution_failed")
+    assert diagnostic is not None
+    assert diagnostic.stage == "runner"
+    assert diagnostic.error_type == "RuntimeError"
+    assert diagnostic.exception_chain == ["RuntimeError", "OSError"]
+    assert any(item.code == "run_cleanup_failed" for item in diagnostics) == cleanup_fails
+    assert "opaque-private" not in failed.model_dump_json()
+
+
 async def setup(status, reason):
     deps = build_test_application()
     mission = MissionPlan(
@@ -54,6 +90,24 @@ async def setup(status, reason):
     graph = Graph()
     runner._graph = graph
     return deps, runner, graph, runtime, coordinator
+
+
+async def test_checkpoint_recovery_failure_keeps_fallback_and_safe_cause(monkeypatch):
+    _, runner, graph, runtime, _ = await setup(MissionStatus.ACTIVE, None)
+
+    async def fail_snapshot(config):
+        raise OSError("opaque-private-checkpoint-location")
+
+    graph.aget_state = fail_snapshot
+    monkeypatch.setattr(runner, "_checkpointer", object())
+    recovered = await runner._latest_runtime(runtime)
+    assert recovered.run_id == runtime.run_id
+    assert recovered.step_count == runtime.step_count
+    diagnostic = recovered.recent_observations[-1].diagnostic
+    assert diagnostic is not None
+    assert diagnostic.code == "checkpoint_recovery_failed"
+    assert diagnostic.error_type == "OSError"
+    assert "opaque-private" not in recovered.model_dump_json()
 
 
 @pytest.mark.parametrize(

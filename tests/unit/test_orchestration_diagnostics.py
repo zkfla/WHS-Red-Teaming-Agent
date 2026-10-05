@@ -29,6 +29,88 @@ SCHEMA = {
 }
 
 
+async def test_general_request_failures_keep_counts_timing_and_shallow_shapes():
+    sentinel = "opaque-private-reply-material"
+    llm = Replies(
+        RuntimeError(sentinel), {"kind": sentinel},
+        '{"kind":"evidence"}}', ' \n```json\n{"kind":"evidence"}\n```\n ',
+    )
+    budget = DecisionBudget(max_attempts=4)
+    result = await StructuredDecisionClient(llm).ask(
+        stage="next_action", payload={}, response_schema=SCHEMA, budget=budget,
+    )
+    assert result == {"kind": "evidence"}
+    assert budget.failure_counts == {
+        "llm_transport_failed": 1, "schema_enum": 1, "invalid_json": 1,
+    }
+    rows = [row for row in budget.trace if row["outcome"] in {
+        "response_rejected", "response_validated",
+    }]
+    assert len(rows) == 4
+    assert all(isinstance(row["elapsed_ms"], int) and row["elapsed_ms"] >= 0 for row in rows)
+    assert [row["response_shape"]["type"] for row in rows] == [
+        "absent", "object", "string", "string",
+    ]
+    assert rows[-1]["normalization"]["fence_stripped"] is True
+    assert rows[-1]["normalization"]["stripped"] is True
+    assert budget.last_failure is not None
+    assert budget.last_failure.parse_error is not None
+    assert budget.last_failure.parse_error.suffix_category == "closing_delimiter"
+    assert budget.last_failure.parse_error.remaining_length == 1
+    for _ in range(25):
+        budget.record("next_action", "context")
+    diagnostic = DecisionDiagnostic(
+        code="decision_budget_exhausted", stage="next_action", kind="budget",
+        summary="The request budget is exhausted.", last_cause=budget.last_failure,
+        **budget.diagnostic_details(),
+    )
+    assert not any(row["outcome"] == "response_rejected" for row in diagnostic.trace)
+    assert diagnostic.failure_counts["invalid_json"] == 1
+    assert diagnostic.last_cause is not None
+    assert diagnostic.last_cause.parse_error is not None
+    assert diagnostic.last_cause.parse_error.remaining_length == 1
+    assert sentinel not in diagnostic.model_dump_json()
+
+
+def test_operational_cause_preserves_attached_diagnostic_without_exception_text():
+    from redteam.orchestration.diagnostics import operational_exception_diagnostic
+
+    original = DecisionDiagnostic(
+        code="storage_unavailable", stage="evidence", kind="execution",
+        summary="Evidence storage is unavailable.", retryable=False,
+    )
+    failure = RuntimeError("opaque-private-storage-location")
+    failure.diagnostic = original  # type: ignore[attr-defined]
+    diagnostic = operational_exception_diagnostic(
+        failure, stage="runner", code="run_failed", summary="Run failed.",
+    )
+    assert diagnostic.code == "storage_unavailable"
+    assert diagnostic.stage == "evidence"
+    assert diagnostic.error_type == "RuntimeError"
+    assert "opaque-private" not in diagnostic.model_dump_json()
+
+
+async def test_empty_reply_reports_actual_fallback_parser_input_length():
+    budget = DecisionBudget(max_attempts=1)
+    with pytest.raises(DecisionFailure):
+        await StructuredDecisionClient(Replies(" \n ")).ask(
+            stage="next_action", payload={}, response_schema=SCHEMA, budget=budget,
+        )
+    row = next(item for item in budget.trace if item["outcome"] == "response_rejected")
+    assert row["normalization"]["empty"] is True
+    assert row["normalization"]["parser_input_length"] == 2
+    assert row["response_shape"]["length"] == 3
+
+
+def test_diagnostic_labels_use_existing_secret_masking():
+    diagnostic = DecisionDiagnostic(
+        code="Bearer opaquePrivateHeaderMaterial", stage="token=opaquePrivateStageMaterial",
+        kind="execution", summary="Tool execution failed.",
+    )
+    assert "opaquePrivateHeaderMaterial" not in diagnostic.model_dump_json()
+    assert "opaquePrivateStageMaterial" not in diagnostic.model_dump_json()
+
+
 class Replies:
     def __init__(self, *replies):
         self.replies = iter(replies)
@@ -191,6 +273,8 @@ async def test_json_rejection_records_decoder_coordinates_without_response_conte
         "column": expected.colno, "position": expected.pos,
         "input_length": len(body), "syntax_reason": "expected_value",
         "at_input_end": False, "start_category": "object",
+        "first_value_end": None, "remaining_length": len(body),
+        "framing": "undecodable", "suffix_category": "other",
     }
     assert diagnostic.last_cause.validation_issues == [{
         "rule": "json_decode",

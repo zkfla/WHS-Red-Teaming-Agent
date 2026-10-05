@@ -9,12 +9,14 @@ from redteam.core.enums import AgentPhase, PolicyVerdict
 from redteam.core.redaction import redact_sensitive_text
 from redteam.orchestration.analysis_budget import verification_budget
 from redteam.orchestration.context import RuntimeDeps
+from redteam.orchestration.diagnostics import operational_exception_diagnostic
 from redteam.orchestration.dispatch import WorkerOutcome
 from redteam.orchestration.nodes._support import graph_service
 from redteam.orchestration.nodes.execute import execute_node
 from redteam.orchestration.nodes.policy import denial_severity, policy_node
 from redteam.orchestration.nodes.update import update_node
 from redteam.orchestration.nodes.verify import verify_node
+from redteam.orchestration.runtime_observation import RuntimeObservation
 from redteam.orchestration.state import GraphState
 from redteam.orchestration.work.models import WorkStatus
 
@@ -206,7 +208,23 @@ async def worker_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             approval_id=decision.approval_id if decision is not None else None,
             verdict=local["runtime"].last_verdict,
             last_event_id=local.get("last_event_id"),
-            runtime_observations=_own_observations(base_observations, local["runtime"], action_id),
+            runtime_observations=[
+                *_own_observations(base_observations, local["runtime"], action_id),
+                RuntimeObservation(
+                    kind="state",
+                    summary=f"Worker {action_id} failed: {type(exc).__name__}"[:500],
+                    outcome="failed",
+                    step=runtime.step_count,
+                    action_id=action_id,
+                    diagnostic=operational_exception_diagnostic(
+                        exc,
+                        stage="worker",
+                        code="worker_error",
+                        summary="isolated worker failed",
+                    ),
+                    alternative_allowed=True,
+                ),
+            ],
             # Checkpoint only the class. Exception text may contain tool output,
             # target secrets, or transport details and belongs in protected logs.
             error=type(exc).__name__,

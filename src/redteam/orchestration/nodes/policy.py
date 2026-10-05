@@ -21,6 +21,7 @@ from redteam.core.contracts.policy import ControlContext, PolicyDecision
 from redteam.core.contracts.target import target_display_name
 from redteam.core.enums import AgentPhase, PolicyVerdict, Severity
 from redteam.orchestration.context import RuntimeDeps
+from redteam.orchestration.diagnostics import operational_exception_diagnostic
 from redteam.orchestration.engine import validate_current_action
 from redteam.orchestration.nodes._support import advance, publisher_for
 from redteam.orchestration.runtime_observation import (
@@ -129,6 +130,7 @@ async def policy_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
     resuming_approval = (
         runtime.pending_approval_id is not None and runtime.pending_action_id == proposal.action_id
     )
+    policy_diagnostic = None
     if resuming_approval:
         assert runtime.pending_approval_id is not None
         resume_error: str | None
@@ -142,6 +144,12 @@ async def policy_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
         except Exception as exc:  # noqa: BLE001 - policy failures must fail closed
             resolved = None
             resume_error = type(exc).__name__
+            policy_diagnostic = operational_exception_diagnostic(
+                exc,
+                stage="policy",
+                code="approval_outcome_lookup_failed",
+                summary="approval outcome lookup failed",
+            )
         else:
             resume_error = None
         if resolved is not None:
@@ -179,6 +187,12 @@ async def policy_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                 reasons=["control plane evaluation failed"],
                 matched_rules=[f"control_error:{type(exc).__name__}"],
                 evaluated_at=datetime.now(timezone.utc),
+            )
+            policy_diagnostic = operational_exception_diagnostic(
+                exc,
+                stage="policy",
+                code="control_plane_evaluation_failed",
+                summary="control plane evaluation failed",
             )
 
     evaluated = await publisher.publish(
@@ -260,6 +274,7 @@ async def policy_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             alternative_allowed=(
                 decision.verdict is PolicyVerdict.ALLOW or severity != SEVERITY_ABORT_RUN
             ),
+            diagnostic=policy_diagnostic,
         ),
     )
 

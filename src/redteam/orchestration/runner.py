@@ -21,9 +21,11 @@ from redteam.orchestration.checkpointing import build_checkpointer, open_checkpo
 from redteam.orchestration.component_binding import builtin_component_binding
 from redteam.orchestration.context import RuntimeDeps
 from redteam.orchestration.coordination import CLOSED, ChangeSet, CoordinationError, coordinator_for
+from redteam.orchestration.diagnostics import operational_exception_diagnostic
 from redteam.orchestration.graph import build_graph
 from redteam.orchestration.outbox import deliver_pending
 from redteam.orchestration.progress import canonical_progress_fingerprint
+from redteam.orchestration.runtime_observation import RuntimeObservation, append_runtime_observation
 from redteam.orchestration.settings import OrchestrationSettings
 from redteam.orchestration.state import (
     GraphState,
@@ -396,7 +398,7 @@ class AgentLoopRunner:
             from redteam.orchestration.delegated_runtime import close_delegations
 
             latest = close_delegations(latest, reason)
-            await self._cleanup_after_failure(latest, reason=reason)
+            latest = await self._cleanup_after_failure(latest, reason=reason)
             await self._close_finished_binding(latest, reason=reason)
             if self._stop_requested:
                 return latest.model_copy(
@@ -418,11 +420,24 @@ class AgentLoopRunner:
             raise
         except BaseException as exc:
             latest = await self._latest_runtime(runtime)
+            latest = append_runtime_observation(
+                latest,
+                RuntimeObservation(
+                    kind="state",
+                    summary="Run execution failed before returning a terminal result.",
+                    outcome="failed",
+                    step=latest.step_count,
+                    diagnostic=operational_exception_diagnostic(
+                        exc, stage="runner", code="run_execution_failed",
+                        summary="Run execution failed before returning a terminal result.",
+                    ),
+                ),
+            )
             reason = f"runner_error:{type(exc).__name__}"
             from redteam.orchestration.delegated_runtime import close_delegations
 
             latest = close_delegations(latest, reason)
-            await self._cleanup_after_failure(latest, reason=reason)
+            latest = await self._cleanup_after_failure(latest, reason=reason)
             await self._close_finished_binding(latest, reason=TerminationReason.EXECUTION_ERROR)
             self._failure_runtime = latest.model_copy(
                 update={
@@ -470,15 +485,28 @@ class AgentLoopRunner:
         task.cancel()
         return True
 
-    async def _cleanup_after_failure(self, runtime: RuntimeState, *, reason: str) -> None:
+    async def _cleanup_after_failure(
+        self, runtime: RuntimeState, *, reason: str,
+    ) -> RuntimeState:
         cleanup = self._abandon_active_work(runtime, reason=reason)
         try:
             await asyncio.wait_for(
                 asyncio.shield(cleanup),
                 timeout=self._settings.drain_timeout_seconds,
             )
-        except Exception:  # noqa: BLE001 - preserve the original run failure
-            pass
+        except Exception as exc:  # noqa: BLE001 - preserve the original run failure
+            return append_runtime_observation(
+                runtime,
+                RuntimeObservation(
+                    kind="state", summary="Active work cleanup could not finish.",
+                    outcome="cleanup_failed", step=runtime.step_count,
+                    diagnostic=operational_exception_diagnostic(
+                        exc, stage="cleanup", code="run_cleanup_failed",
+                        summary="Active work cleanup could not finish.",
+                    ),
+                ),
+            )
+        return runtime
 
     async def _latest_runtime(self, fallback: RuntimeState) -> RuntimeState:
         """Recover the last completed super-step without masking a failure."""
@@ -489,8 +517,18 @@ class AgentLoopRunner:
             snapshot = await self._graph.aget_state(self.config())
             candidate = snapshot.values.get("runtime") if snapshot.values else None
             return candidate if isinstance(candidate, RuntimeState) else fallback
-        except Exception:  # noqa: BLE001 - recovery is best effort
-            return fallback
+        except Exception as exc:  # noqa: BLE001 - recovery is best effort
+            return append_runtime_observation(
+                fallback,
+                RuntimeObservation(
+                    kind="state", summary="The last checkpoint could not be recovered.",
+                    outcome="recovery_failed", step=fallback.step_count,
+                    diagnostic=operational_exception_diagnostic(
+                        exc, stage="checkpoint_recovery", code="checkpoint_recovery_failed",
+                        summary="Checkpoint recovery failed; the initial state was used.",
+                    ),
+                ),
+            )
 
     async def _abandon_active_work(
         self,

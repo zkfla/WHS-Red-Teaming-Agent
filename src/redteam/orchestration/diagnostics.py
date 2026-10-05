@@ -58,6 +58,7 @@ _KNOWN_FIELDS = frozenset(
         "evidence_ids",
         "completion",
         "review",
+        "claims",
         "accepted",
         "feedback",
         "revisions",
@@ -78,6 +79,59 @@ def _identifier(value: str, fallback: str) -> str:
     if not value or len(value) > 100:
         return fallback
     return value if all(char.isalnum() or char in "_-" for char in value) else fallback
+
+
+def error_type_for(exc: BaseException) -> str:
+    """Safe exception type name only; never messages or tracebacks."""
+    return _identifier(type(exc).__name__, "unknown")
+
+
+def exception_chain_for(exc: BaseException, *, limit: int = 5) -> list[str]:
+    """Current-first type-name chain, max 5, no messages or tracebacks."""
+    chain: list[str] = []
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and len(chain) < limit:
+        if id(current) in seen:
+            break
+        seen.add(id(current))
+        chain.append(_identifier(type(current).__name__, "unknown"))
+        cause = getattr(current, "__cause__", None)
+        context = getattr(current, "__context__", None)
+        nxt: BaseException | None = None
+        if isinstance(cause, BaseException):
+            nxt = cause
+        elif isinstance(context, BaseException) and not getattr(
+            current, "__suppress_context__", False
+        ):
+            nxt = context
+        current = nxt
+    return chain
+
+
+class ParseErrorContext(BaseModel):
+    """Public typed JSON parse coordinates; never source text."""
+
+    coordinate_source: Literal["decoder_input"] = "decoder_input"
+    line: int = Field(default=0, ge=0)
+    column: int = Field(default=0, ge=0)
+    position: int = Field(default=0, ge=0)
+    input_length: int = Field(default=0, ge=0)
+    syntax_reason: Literal[
+        "expected_value", "expected_property_name", "expected_colon", "expected_comma",
+        "unterminated_string", "extra_data", "invalid_unicode_escape", "trailing_comma",
+        "invalid_control_character", "invalid_escape", "unknown",
+    ] = "unknown"
+    at_input_end: bool = False
+    start_category: Literal["object", "array", "other", "empty"] = "empty"
+    first_value_end: int | None = Field(default=None, ge=0)
+    remaining_length: int = Field(default=0, ge=0)
+    framing: Literal[
+        "empty", "first_value_only", "first_value_with_suffix", "undecodable",
+    ] = "undecodable"
+    suffix_category: Literal[
+        "none", "whitespace", "closing_delimiter", "object_start", "array_start", "other",
+    ] = "other"
 
 
 class DecisionDiagnostic(BaseModel):
@@ -102,10 +156,54 @@ class DecisionDiagnostic(BaseModel):
     validation_issues: list[dict[str, str]] = Field(default_factory=list, max_length=10)
     termination_reason: Literal["budget_exhausted"] | None = None
 
+    error_type: str = Field(default="", max_length=100)
+    exception_chain: list[str] = Field(default_factory=list, max_length=5)
+    parse_error: ParseErrorContext | None = None
+    failure_counts: dict[str, int] = Field(default_factory=dict)
+
+    @field_validator("code", "stage", mode="before")
+    @classmethod
+    def _safe_labels(cls, value: str) -> str:
+        return safe_feedback(value, 100)
+
     @field_validator("trace", mode="before")
     @classmethod
     def _safe_trace(cls, value):
         return redact_secret_material(value[-20:])
+
+    @field_validator("error_type", mode="before")
+    @classmethod
+    def _safe_error_type(cls, value: str) -> str:
+        if not value:
+            return ""
+        return _identifier(str(value), "unknown")
+
+    @field_validator("exception_chain", mode="before")
+    @classmethod
+    def _safe_chain(cls, value: Any) -> list[str]:
+        if not isinstance(value, list):
+            return []
+        cleaned: list[str] = []
+        for item in value[:5]:
+            cleaned.append(_identifier(str(item), "unknown"))
+        return cleaned
+
+    @field_validator("failure_counts", mode="before")
+    @classmethod
+    def _safe_counts(cls, value: Any) -> dict[str, int]:
+        if not isinstance(value, dict):
+            return {}
+        cleaned_counts: dict[str, int] = {}
+        for key, count in list(value.items())[:50]:
+            safe_key = _identifier(str(key), "")
+            if not safe_key:
+                continue
+            if isinstance(count, bool):
+                continue
+            if not isinstance(count, int) or count < 0:
+                continue
+            cleaned_counts[safe_key] = count
+        return cleaned_counts
 
     @field_validator("summary", mode="before")
     @classmethod
@@ -166,6 +264,29 @@ def _value_shape(value: Any, *, control_number: bool = False) -> dict[str, Any]:
     elif kind == "object":
         shape["field_count"] = len(value)
     return shape
+
+
+def shallow_response_shape(value: Any) -> dict[str, Any]:
+    """Shallow response type/length only; never raw contents, hashes, or values."""
+    if value is None:
+        return {"type": "absent", "observed": False}
+    shape = _value_shape(value)
+    # _value_shape without control_number never copies values; keep safe keys only.
+    allowed = {"type", "length", "field_count", "item_types"}
+    return {key: shape[key] for key in allowed if key in shape}
+
+
+class JsonNormalizationContext(BaseModel):
+    """Received vs parser-input difference; lengths and flags only, never raw."""
+
+    received_type: Literal[
+        "string", "object", "array", "integer", "number", "boolean", "null", "non_json",
+    ] = "non_json"
+    received_length: int | None = Field(default=None, ge=0)
+    parser_input_length: int = Field(default=0, ge=0)
+    stripped: bool = False
+    fence_stripped: bool = False
+    empty: bool = False
 
 
 def evidence_request_shape(value: Any) -> dict[str, Any]:
@@ -235,23 +356,80 @@ def _json_syntax_hint(msg: str) -> tuple[str, str]:
     return "unknown", ""
 
 
-def json_parse_context(exc: json.JSONDecodeError) -> dict[str, Any]:
+def json_parse_context(
+    exc: json.JSONDecodeError, *, normalization: JsonNormalizationContext | None = None,
+) -> dict[str, Any]:
     """Coordinates describe the decoder input, never the original response."""
-    first = exc.doc.lstrip()[:1]
-    return {
+    context: dict[str, Any] = {
         "proposal_shape": {"observed": False, "reason": "unparsed"},
-        "parse_error": {
-            "coordinate_source": "decoder_input",
-            "line": exc.lineno,
-            "column": exc.colno,
-            "position": exc.pos,
-            "input_length": len(exc.doc),
-            "syntax_reason": _json_syntax_hint(exc.msg)[0],
-            "at_input_end": exc.pos >= len(exc.doc),
-            "start_category": "object" if first == "{" else "array" if first == "["
-            else "other" if first else "empty",
-        },
+        "parse_error": parse_error_for(exc).model_dump(mode="json"),
     }
+    if normalization is not None:
+        context["normalization"] = normalization.model_dump(mode="json")
+    return context
+
+
+def _suffix_category(doc: str, end: int) -> str:
+    """Classify chars after the first value without copying them."""
+    rest = doc[end:]
+    if not rest:
+        return "none"
+    stripped = rest.lstrip()
+    if not stripped:
+        return "whitespace"
+    first = stripped[:1]
+    if first in ("}", "]"):
+        return "closing_delimiter"
+    if first == "{":
+        return "object_start"
+    if first == "[":
+        return "array_start"
+    return "other"
+
+
+def _first_value_framing(doc: str, pos: int) -> tuple[int | None, int, str, str]:
+    """Top-level first-value end, remaining length, framing, and suffix.
+
+    Computed from the decoder input only. A re-parse is used solely for
+    framing coordinates and is never accepted as a valid proposal.
+    No truncation is asserted from the error position alone.
+    """
+    input_length = len(doc)
+    if not doc.strip():
+        return None, input_length, "empty", "none"
+    try:
+        leading = len(doc) - len(doc.lstrip())
+        _, end = json.JSONDecoder().raw_decode(doc, idx=leading)
+        remaining = max(0, input_length - end)
+        trailing = doc[end:]
+        if trailing.strip():
+            return end, remaining, "first_value_with_suffix", _suffix_category(doc, end)
+        suffix = "whitespace" if trailing else "none"
+        return end, remaining, "first_value_only", suffix
+    except Exception:
+        pass
+    return None, input_length, "undecodable", "other"
+
+
+def parse_error_for(exc: json.JSONDecodeError) -> ParseErrorContext:
+    """Typed parse coordinates with safe framing; never source text."""
+    first = exc.doc.lstrip()[:1]
+    start = "object" if first == "{" else "array" if first == "[" else "other" if first else "empty"
+    first_end, remaining, framing, suffix = _first_value_framing(exc.doc, exc.pos)
+    return ParseErrorContext.model_validate({
+        "coordinate_source": "decoder_input",
+        "line": exc.lineno,
+        "column": exc.colno,
+        "position": exc.pos,
+        "input_length": len(exc.doc),
+        "syntax_reason": _json_syntax_hint(exc.msg)[0],
+        "at_input_end": exc.pos >= len(exc.doc),
+        "start_category": start,
+        "first_value_end": first_end,
+        "remaining_length": remaining,
+        "framing": framing,
+        "suffix_category": suffix,
+    })
 
 
 def decision_context(
@@ -398,6 +576,8 @@ def schema_diagnostic(
         summary=rules.get(rule, "Match the required JSON schema."),
         retryable=True,
         validation_issues=[{"rule": rule, "location": location} for location in locations],
+        error_type=error_type_for(exc),
+        exception_chain=exception_chain_for(exc),
     )
 
 
@@ -413,6 +593,9 @@ def diagnostic_for_exception(exc: BaseException, *, stage: str) -> DecisionDiagn
             location=location, summary="Return a valid JSON object. " + correction,
             retryable=True,
             validation_issues=[{"rule": "json_decode", "location": location}],
+            error_type=error_type_for(exc),
+            exception_chain=exception_chain_for(exc),
+            parse_error=parse_error_for(exc),
         )
     if isinstance(exc, ActionNamingError):
         summaries = {
@@ -427,6 +610,8 @@ def diagnostic_for_exception(exc: BaseException, *, stage: str) -> DecisionDiagn
             location=known_location((exc.field,)),
             summary=summaries.get(exc.reason, "Use a supported action name."),
             retryable=True,
+            error_type=error_type_for(exc),
+            exception_chain=exception_chain_for(exc),
         )
     if isinstance(exc, ValidationError):
         # include_input=False is mandatory even though messages are not copied.
@@ -453,6 +638,8 @@ def diagnostic_for_exception(exc: BaseException, *, stage: str) -> DecisionDiagn
                 summary=action_rules[rule],
                 retryable=True,
                 validation_issues=issues,
+                error_type=error_type_for(exc),
+                exception_chain=exception_chain_for(exc),
             )
         summaries = {
             "missing": "Include the required field.",
@@ -473,6 +660,8 @@ def diagnostic_for_exception(exc: BaseException, *, stage: str) -> DecisionDiagn
             summary=summaries.get(rule, "Match the required model fields and validation rules."),
             retryable=True,
             validation_issues=issues,
+            error_type=error_type_for(exc),
+            exception_chain=exception_chain_for(exc),
         )
     return DecisionDiagnostic(
         code="invalid_decision",
@@ -480,4 +669,31 @@ def diagnostic_for_exception(exc: BaseException, *, stage: str) -> DecisionDiagn
         kind="format",
         summary="The decision did not satisfy an orchestration validation rule.",
         retryable=True,
+        error_type=error_type_for(exc),
+        exception_chain=exception_chain_for(exc),
+    )
+
+
+def operational_exception_diagnostic(
+    exc: BaseException, stage: str, code: str, summary: str
+) -> DecisionDiagnostic:
+    """Runner/operation failures; never messages, inputs, or tracebacks."""
+    attached = getattr(exc, "diagnostic", None)
+    if isinstance(attached, DecisionDiagnostic):
+        update: dict[str, object] = {}
+        if not attached.error_type:
+            update["error_type"] = error_type_for(exc)
+        if not attached.exception_chain:
+            update["exception_chain"] = exception_chain_for(exc)
+        if update:
+            return attached.model_copy(update=update)
+        return attached
+    return DecisionDiagnostic(
+        code=_identifier(code, "execution_failed"),
+        stage=_identifier(stage, "decision"),
+        kind="execution",
+        summary=summary,
+        retryable=False,
+        error_type=error_type_for(exc),
+        exception_chain=exception_chain_for(exc),
     )

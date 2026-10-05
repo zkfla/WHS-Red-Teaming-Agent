@@ -34,6 +34,7 @@ from redteam.orchestration.action_naming import (
     tool_matches_action_namespace,
 )
 from redteam.orchestration.context import RuntimeDeps
+from redteam.orchestration.diagnostics import DecisionDiagnostic, operational_exception_diagnostic
 from redteam.orchestration.engine import claim_action_admission, validate_current_action
 from redteam.orchestration.long_jobs import LongJobManager, LongJobState
 from redteam.orchestration.nodes._support import advance, publisher_for
@@ -298,6 +299,7 @@ async def execute_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
 
     retry_attempts = 0
     admission_denial = None
+    orchestration_diagnostic = None
     try:
         path_problems = await validate_current_action(deps, runtime, step, proposal)
         if path_problems:
@@ -402,6 +404,12 @@ async def execute_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
         else:
             error_code = f"gateway_exception:{type(exc).__name__}"
             error_message = "tool gateway raised an exception"
+        orchestration_diagnostic = operational_exception_diagnostic(
+            exc,
+            stage="execute",
+            code=error_code.replace(":", "_"),
+            summary=error_message,
+        )
         result = ToolResult(
             invocation_id=invocation.invocation_id,
             action_id=invocation.action_id,
@@ -411,6 +419,7 @@ async def execute_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                 code=error_code,
                 # Exception text may contain target output or secrets.
                 message=error_message,
+                details={"stage": "execute", "source": "orchestration/execute"},
             ),
             started_at=now,
             finished_at=now,
@@ -501,6 +510,34 @@ async def execute_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
     agent_key = str(proposal.agent_id)
     actions_by_agent[agent_key] = actions_by_agent.get(agent_key, 0) + executed
 
+    # One projection point for returned tool failures: only the allowlisted
+    # stage/exception_type travel from the failure detail into the next
+    # judgment. Free-text messages and inputs never do.
+    execution_diagnostic = orchestration_diagnostic
+    if execution_diagnostic is None and result.error is not None:
+        returned_details = result.error.details
+        returned_stage = (
+            returned_details.get("stage")
+            if isinstance(returned_details, dict) and isinstance(returned_details.get("stage"), str)
+            else "execute"
+        )
+        if returned_stage not in ("gateway", "execute"):
+            returned_stage = "execute"
+        returned_exception_type = (
+            returned_details.get("exception_type")
+            if isinstance(returned_details, dict)
+            and isinstance(returned_details.get("exception_type"), str)
+            else None
+        )
+        execution_diagnostic = DecisionDiagnostic(
+            code=result.error.code[:100],
+            stage=returned_stage,
+            kind="execution",
+            summary=f"Tool execution failed: {result.error.code}"[:500],
+            retryable=bool(result.error.retryable),
+            error_type=returned_exception_type[:100] if returned_exception_type else "",
+        )
+
     next_runtime = append_runtime_observation(
         runtime.model_copy(
             update={
@@ -537,6 +574,7 @@ async def execute_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             operation=proposal.operation,
             reasons=([result.error.code, result.error.message] if result.error is not None else []),
             alternative_allowed=True,
+            diagnostic=execution_diagnostic,
         ),
     )
 

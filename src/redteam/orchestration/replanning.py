@@ -685,11 +685,12 @@ async def _terminal_criterion_results(
                     )
                     break
             if diagnostic is None:
-                for item in review.criteria:
+                for criterion_index, item in enumerate(review.criteria):
                     if not (review.accepted and item.met):
                         continue
                     errors = await check_result_review(
                         claims=[claim.model_dump(mode="json") for claim in item.claims],
+                        claims_location=("criteria", criterion_index, "claims"),
                         evidence_ids=item.evidence_ids,
                         evidence_store=evidence_store,
                         graph_service=graph_service,

@@ -16,6 +16,7 @@ from typing import Literal
 from pydantic import BaseModel, Field, field_validator
 
 from redteam.core.redaction import redact_sensitive_text
+from redteam.orchestration.diagnostics import DecisionDiagnostic
 
 MAX_RUNTIME_OBSERVATIONS = 12
 
@@ -36,6 +37,10 @@ class RuntimeObservation(BaseModel):
     approval_id: str | None = None
     requires_approval: bool = False
     alternative_allowed: bool = True
+    # Structured failure detail for the next judgment and the report reader.
+    # None on rows written before diagnostics existed. Never carries inputs,
+    # outputs, prompts, or exception text -- only fixed codes and safe summaries.
+    diagnostic: DecisionDiagnostic | None = None
 
     @field_validator(
         "summary",
@@ -96,6 +101,13 @@ def append_runtime_observation(runtime, observation: RuntimeObservation):  # noq
         )
         if merged.get("approval_id") is None:
             merged["approval_id"] = existing.approval_id
+        # Keep the stored diagnostic when the refresh carries none; the merged
+        # row already folds through the existing aggregate path, so no extra
+        # state is needed for the parent to see it.
+        if merged.get("diagnostic") is None:
+            merged["diagnostic"] = (
+                existing.diagnostic.model_dump() if existing.diagnostic is not None else None
+            )
         refreshed = type(existing).model_validate(merged)
         if refreshed.model_dump(mode="json", exclude_none=True) == existing.model_dump(
             mode="json", exclude_none=True

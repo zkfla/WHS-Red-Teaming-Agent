@@ -14,7 +14,7 @@ from typing import Any
 
 from redteam.core.enums import EvidenceSourceType
 from redteam.orchestration.analysis import claim_target_is_grounded, is_final_admission_receipt
-from redteam.orchestration.diagnostics import DecisionDiagnostic
+from redteam.orchestration.diagnostics import DecisionDiagnostic, known_location
 from redteam.orchestration.evidence_access import raw_from_metadata
 from redteam.orchestration.paths import (
     ALLOWED_CRITERION_KINDS,
@@ -1082,14 +1082,21 @@ class CompletionIssues(list[str]):
         super().__init__()
         self.diagnostics: list[DecisionDiagnostic] = []
 
-    def add(self, message: str, *, code: str, summary: str) -> None:
+    def add(
+        self,
+        message: str,
+        *,
+        code: str,
+        summary: str,
+        location: str = "$.completion",
+    ) -> None:
         self.append(message)
         self.diagnostics.append(
             DecisionDiagnostic(
                 code=code,
                 stage="completion_validation",
                 kind="format",
-                location="$.completion",
+                location=location,
                 summary=summary,
                 retryable=True,
             )
@@ -1259,6 +1266,7 @@ async def validate_result_claims(
     path: PathPlan | None = None,
     step: PathStep | None = None,
     issues: CompletionIssues | None = None,
+    evidence_location: tuple[str | int, ...] = ("completion", "evidence_ids"),
 ) -> list[str]:
     """Verify actual result claims without requiring provisional steps to finish.
 
@@ -1290,8 +1298,10 @@ async def validate_result_claims(
         issues.add("review receipt lookup failed", code="completion_review_receipt_lookup_failed",
                    summary="review receipt lookup failed")
     expanded_ids: list[str] = []
+    source_locations: dict[str, str] = {}
     cited_receipt_keys: set[tuple[Any, ...]] = set()
-    for eid in evidence_ids:
+    for reference_index, eid in enumerate(evidence_ids):
+        reference_location = known_location((*evidence_location, reference_index))
         try:
             cited = await evidence_store.get(eid)
         except Exception:
@@ -1301,46 +1311,57 @@ async def validate_result_claims(
                 (meta for meta in admission_receipts if meta.get("receipt_id") == str(eid)), None
             )
             if admitted is None:
-                issues.add("review receipt is stale or unavailable",
-                           code="completion_stale_review_receipt",
-                           summary="review receipt is stale or unavailable")
+                issues.add(
+                    location=reference_location,
+                    message="review receipt is stale or unavailable",
+                    code="completion_stale_review_receipt",
+                    summary="review receipt is stale or unavailable",
+                )
                 continue
             cited_meta = getattr(cited, "metadata", {}) or {}
-            if (
-                str(cited_meta.get("action_id", "")) != str(cited.action_id)
-                or str(cited_meta.get("invocation_id", "")) != str(cited.invocation_id)
-            ):
+            if str(cited_meta.get("action_id", "")) != str(cited.action_id) or str(
+                cited_meta.get("invocation_id", "")
+            ) != str(cited.invocation_id):
                 issues.add(
-                    "review receipt origin disagrees",
+                    location=reference_location,
+                    message="review receipt origin disagrees",
                     code="completion_receipt_origin_invalid",
                     summary="review receipt origin disagrees",
                 )
                 continue
             cited_receipt_keys.add(_receipt_review_key(admitted))
-            expanded_ids.extend(str(ref) for ref in admitted.get("source_evidence_ids", []) or [])
+            for ref in admitted.get("source_evidence_ids", []) or []:
+                source_id = str(ref)
+                expanded_ids.append(source_id)
+                source_locations.setdefault(source_id, reference_location)
         else:
             expanded_ids.append(str(eid))
+            source_locations.setdefault(str(eid), reference_location)
     evidence_ids = list(dict.fromkeys(expanded_ids))
     for eid in evidence_ids:
+        reference_location = source_locations[eid]
         try:
             record = await evidence_store.get(eid)  # type: ignore[union-attr]
         except Exception as exc:  # noqa: BLE001 - store failure is a validation issue
             issues.add(
-                f"evidence '{eid}' lookup failed: {type(exc).__name__}",
+                location=reference_location,
+                message=f"evidence '{eid}' lookup failed: {type(exc).__name__}",
                 code="completion_evidence_reference_lookup_failed_reference_39",
                 summary="evidence 'reference' lookup failed: reference",
             )
             continue
         if record is None:
             issues.add(
-                f"evidence '{eid}' does not exist",
+                location=reference_location,
+                message=f"evidence '{eid}' does not exist",
                 code="completion_evidence_reference_does_not_exist_15",
                 summary="evidence 'reference' does not exist",
             )
             continue
         if _s(_field(record, "run_id", "")) != run:
             issues.add(
-                f"evidence '{eid}' belongs to a different run",
+                location=reference_location,
+                message=f"evidence '{eid}' belongs to a different run",
                 code="completion_evidence_reference_belongs_to_a_different_16",
                 summary="evidence 'reference' belongs to a different run",
             )
@@ -1348,7 +1369,8 @@ async def validate_result_claims(
         meta = _field(record, "metadata", {}) or {}
         if not isinstance(meta, dict):
             issues.add(
-                f"evidence '{eid}' has unreadable metadata",
+                location=reference_location,
+                message=f"evidence '{eid}' has unreadable metadata",
                 code="completion_evidence_reference_has_unreadable_metadata_17",
                 summary="evidence 'reference' has unreadable metadata",
             )
@@ -1358,7 +1380,8 @@ async def validate_result_claims(
         m_step_id = _s(meta.get("path_step_id", "")).strip()
         if not m_path_id or m_version is None or _s(m_version).strip() == "" or not m_step_id:
             issues.add(
-                f"evidence '{eid}' has no path linkage "
+                location=reference_location,
+                message=f"evidence '{eid}' has no path linkage "
                 "(path_id/path_version/path_step_id required)",
                 code="completion_evidence_reference_has_no_path_linkage_18",
                 summary=(
@@ -1378,7 +1401,8 @@ async def validate_result_claims(
                 pass
             else:
                 issues.add(
-                    f"evidence '{eid}' is anonymous but the step requires an account; "
+                    location=reference_location,
+                    message=f"evidence '{eid}' is anonymous but the step requires an account; "
                     "anonymous receipt cannot satisfy an account-scoped step",
                     code="completion_evidence_reference_is_anonymous_but_the_40",
                     summary=(
@@ -1390,14 +1414,16 @@ async def validate_result_claims(
         elif step_principal_set:
             if not ev_principals:
                 issues.add(
-                    f"evidence '{eid}' has no principal_ref",
+                    location=reference_location,
+                    message=f"evidence '{eid}' has no principal_ref",
                     code="completion_evidence_reference_has_no_principal_ref_60",
                     summary="evidence 'reference' has no principal_ref",
                 )
                 continue
             if ev_principals.isdisjoint(step_principal_set):
                 issues.add(
-                    f"evidence '{eid}' uses a principal outside the step scope",
+                    location=reference_location,
+                    message=f"evidence '{eid}' uses a principal outside the step scope",
                     code="completion_evidence_reference_uses_a_principal_outside_61",
                     summary="evidence 'reference' uses a principal outside the step scope",
                 )
@@ -1429,13 +1455,19 @@ async def validate_result_claims(
                 )
             ]
         for origin_message, origin_code, origin_summary in origin_errors:
-            issues.add(origin_message, code=origin_code, summary=origin_summary)
+            issues.add(
+                location=reference_location,
+                message=origin_message,
+                code=origin_code,
+                summary=origin_summary,
+            )
         if origin_errors:
             continue
         canonical_value = _canonical_evidence_value(meta)
         if not canonical_value:
             issues.add(
-                f"evidence '{eid}' has no canonical operation proof "
+                location=reference_location,
+                message=f"evidence '{eid}' has no canonical operation proof "
                 "(bare operation alone proves nothing)",
                 code="completion_evidence_reference_has_no_canonical_operation_21",
                 summary=(
@@ -1447,7 +1479,11 @@ async def validate_result_claims(
         raw = _stored_raw_result(meta)
         if raw is None:
             issues.add(
-                f"evidence '{eid}' has no preserved raw ToolResult (metadata tool_result required)",
+                location=reference_location,
+                message=(
+                    f"evidence '{eid}' has no preserved raw ToolResult "
+                    "(metadata tool_result required)"
+                ),
                 code="completion_evidence_reference_has_no_preserved_raw_22",
                 summary=(
                     "evidence 'reference' has no preserved raw ToolResult (metadata "
@@ -1458,7 +1494,8 @@ async def validate_result_claims(
         target_ref = _s(meta.get("target_node_id", "")).strip()
         if not target_ref:
             issues.add(
-                f"evidence '{eid}' has no target linkage",
+                location=reference_location,
+                message=f"evidence '{eid}' has no target linkage",
                 code="completion_evidence_reference_has_no_target_linkage_23",
                 summary="evidence 'reference' has no target linkage",
             )
@@ -1467,9 +1504,8 @@ async def validate_result_claims(
             related = False
             for receipt_meta in admission_receipts:
                 claimed_target = str(receipt_meta.get("target_node_id", "") or "")
-                if (
-                    claimed_target in step_target_set
-                    and _receipt_links_record(receipt_meta, record)
+                if claimed_target in step_target_set and _receipt_links_record(
+                    receipt_meta, record
                 ):
                     try:
                         related = await claim_target_is_grounded(
@@ -1481,14 +1517,20 @@ async def validate_result_claims(
                         break
             if not related:
                 issues.add(
-                    f"evidence '{eid}' targets a different object",
+                    location=reference_location,
+                    message=f"evidence '{eid}' targets a different object",
                     code="completion_evidence_reference_targets_a_different_object_24",
                     summary="evidence 'reference' targets a different object",
                 )
                 continue
         linkage_errors = check_record_linkage(record, meta, raw, eid)
         for linkage_message, linkage_code, linkage_summary in linkage_errors:
-            issues.add(linkage_message, code=linkage_code, summary=linkage_summary)
+            issues.add(
+                location=reference_location,
+                message=linkage_message,
+                code=linkage_code,
+                summary=linkage_summary,
+            )
         if linkage_errors:
             continue
         stored_proposal = meta.get("proposal")
@@ -1513,7 +1555,8 @@ async def validate_result_claims(
             )
         if stored_claimed is not None and stored_claimed not in ev_principals:
             issues.add(
-                f"evidence '{eid}' stored account differs from its record",
+                location=reference_location,
+                message=f"evidence '{eid}' stored account differs from its record",
                 code="completion_evidence_reference_stored_account_differs_from_31",
                 summary="evidence 'reference' stored account differs from its record",
             )
@@ -1563,7 +1606,8 @@ async def validate_result_claims(
                                     break
                     except Exception:
                         issues.add(
-                            f"evidence '{eid}' session binding lookup failed; "
+                            location=reference_location,
+                            message=f"evidence '{eid}' session binding lookup failed; "
                             "treating as ungrounded",
                             code="completion_evidence_reference_session_binding_lookup_failed_68",
                             summary=(
@@ -1576,9 +1620,12 @@ async def validate_result_claims(
                     verified_by_evidence[eid] = set(alias_verified)
                 else:
                     issues.add(
-                        f"evidence '{eid}' declares account {sorted(claimed_accounts)} but has "
-                        "no exact raw session receipt or grounded session binding; "
-                        "declaration alone is not proof",
+                        location=reference_location,
+                        message=(
+                            f"evidence '{eid}' declares account {sorted(claimed_accounts)} "
+                            "but has no exact raw session receipt or grounded session binding; "
+                            "declaration alone is not proof"
+                        ),
                         code="completion_evidence_reference_declares_account_reference_but_63",
                         summary=(
                             "evidence 'reference' declares account reference but has no exact "
@@ -1596,7 +1643,11 @@ async def validate_result_claims(
                 continue
             if outcome == "success":
                 issues.add(
-                    f"evidence '{eid}' records a failed original result and cannot support success",
+                    location=reference_location,
+                    message=(
+                        f"evidence '{eid}' records a failed original result "
+                        "and cannot support success"
+                    ),
                     code="completion_evidence_reference_records_a_failed_original_32",
                     summary=(
                         "evidence 'reference' records a failed original result and cannot "
@@ -1605,7 +1656,8 @@ async def validate_result_claims(
                 )
             else:
                 issues.add(
-                    f"evidence '{eid}' records a failed original result; "
+                    location=reference_location,
+                    message=f"evidence '{eid}' records a failed original result; "
                     "refuted needs a successful observation with a valid negative result, "
                     "never inconclusive or failure",
                     code="completion_evidence_reference_records_a_failed_original_33",

@@ -330,6 +330,52 @@ async def test_repair_drain_stays_on_the_error_track():
     assert len(llm.calls) == 2
 
 
+@pytest.mark.parametrize("mode", ["revise_path", "switch_path"])
+async def test_revised_path_review_normal_exhaustion_defers_without_admitting_candidate(mode):
+    from redteam.attack_graph.observation import GraphObservation
+    from redteam.orchestration.engine import InvestigationEngine
+    from redteam.orchestration.paths import PathPlan
+    from redteam.orchestration.settings import OrchestrationSettings
+    from tests.integration import _engine_llm_harness as h
+
+    run_id = "run-review-bound"
+    llm = h.ScriptedLLM()
+    seed = await h.seed_host(run_id)
+    world = h.make_world(llm, graph_store=seed.store)
+    world.deps.settings = OrchestrationSettings(decision_normal_limit=2)
+    active = PathPlan(
+        **h.draft_path(seed.node_id), path_id="path-review-bound", run_id=run_id,
+        version=1, status="active", goal="g",
+    )
+    active.steps[0].status = "completed"
+    active.steps[0].evidence_ids = ["ev-prior-progress"]
+    active = await world.paths.register(active)
+    proposed = h.draft_path(seed.node_id)
+    proposed["steps"][0]["objective"] = "collect additional evidence"
+    llm.add("next_action", {"mode": mode, "reason": "change path", "path": proposed})
+    llm.add("path_review", {"decision": "revise", "reason": "review replacement", "path": proposed})
+    runtime = h.make_runtime(run_id, "eng-review-bound")
+    engine = InvestigationEngine(world.deps)
+
+    path, actions, outcome = await engine.decide(runtime, GraphObservation())
+
+    assert outcome == "continue_planning" and actions == []
+    assert path == active
+    assert await world.paths.get_active(run_id) == active
+    assert engine.planning_diagnostic is not None
+    assert engine.planning_diagnostic.code == "decision_normal_budget_exhausted"
+    assert engine.planning_diagnostic.stage == "path_review"
+    assert engine.planning_diagnostic.normal_used == 2
+    assert engine.planning_diagnostic.repair_used == 0
+    assert [call["route"] for call in llm.calls] == ["next_action", "path_review"]
+
+    llm.add("next_action", {"mode": "hold", "reason": "await additional evidence"})
+    next_engine = InvestigationEngine(world.deps)
+    path, actions, outcome = await next_engine.decide(runtime, GraphObservation())
+    assert path == active and actions == [] and outcome == "await additional evidence"
+    assert len(llm.calls) == 3
+
+
 @pytest.mark.parametrize(
     "status,code,retry_after,expected_kind,retryable",
     [(401, "invalid_api_key", None, "auth", False),

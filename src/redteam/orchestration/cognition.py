@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import time
 from collections.abc import Callable
 from typing import Any, Literal
 
@@ -43,17 +44,22 @@ from redteam.core.contracts.mission import redact_secret_material
 from redteam.core.ports.llm import LLMProviderFailure
 from redteam.orchestration.diagnostics import (
     DecisionDiagnostic,
+    JsonNormalizationContext,
     decision_context,
     diagnostic_for_exception,
+    error_type_for,
     evidence_request_shape,
+    exception_chain_for,
     json_parse_context,
     safe_feedback,
     schema_diagnostic,
+    shallow_response_shape,
 )
 
 DECISION_KINDS = ("transport", "format", "budget", "unknown")
 
 _MAX_FEEDBACK_CHARS = 500
+_EMPTY_OBJECT_TEXT = "{}"
 
 
 class DecisionFailure(Exception):
@@ -140,6 +146,7 @@ class DecisionBudget:
         self.last_failure: DecisionDiagnostic | None = None
         self.trace: list[dict[str, Any]] = []
         self.stage_attempts: dict[str, int] = {}
+        self.failure_counts: dict[str, int] = {}
 
     def diagnostic_details(self) -> dict[str, Any]:
         return {
@@ -150,6 +157,7 @@ class DecisionBudget:
             "repair_limit": self.repair_limit,
             "normal_used": self.normal_used,
             "repair_used": self.repair_used,
+            "failure_counts": dict(self.failure_counts),
         }
 
     @classmethod
@@ -200,6 +208,13 @@ class DecisionBudget:
             )
         )
         self.trace = self.trace[-20:]
+
+    def record_failure(self, code: str) -> None:
+        """Count one failure code outside the trimmed trace window."""
+        key = str(code)[:100]
+        if not key:
+            return
+        self.failure_counts[key] = self.failure_counts.get(key, 0) + 1
 
     @property
     def max_attempts(self) -> int:
@@ -321,13 +336,22 @@ def should_halt_for_token_budget(budget: DecisionBudget, max_tokens: int | None)
 class _RetryableDecisionError(Exception):
     def __init__(
         self, diagnostic: DecisionDiagnostic, proposal_context: dict | None = None,
+        *,
+        elapsed_ms: int = 0,
+        response_shape: dict[str, Any] | None = None,
+        normalization: JsonNormalizationContext | None = None,
     ) -> None:
         self.diagnostic = diagnostic
         self.proposal_context = proposal_context or {
             "proposal_shape": {"observed": False, "reason": "unavailable"}
         }
+        if normalization is not None:
+            self.proposal_context = dict(self.proposal_context)
+            self.proposal_context["normalization"] = normalization.model_dump(mode="json")
         self.kind = diagnostic.kind
         self.feedback = diagnostic.feedback()
+        self.elapsed_ms = max(0, int(elapsed_ms))
+        self.response_shape = dict(response_shape) if isinstance(response_shape, dict) else None
         super().__init__(self.feedback)
 
 
@@ -335,24 +359,48 @@ class _NonObjectDecision(ValueError):
     """The model returned a non-object JSON value."""
 
     def __init__(self, value: Any) -> None:
-        self.proposal_context = {"proposal_shape": evidence_request_shape(value)}
+        self.proposal_context: dict[str, Any] = {"proposal_shape": evidence_request_shape(value)}
         super().__init__("Return a JSON object.")
 
 
-def _parse_text_result(raw: Any) -> dict[str, Any]:
+def normalize_json_text(raw: str) -> tuple[str, JsonNormalizationContext]:
+    """Parser-owned strip/fence normalization; lengths and flags only, never raw."""
+    received_length = len(raw)
+    outer_stripped = raw.strip()
+    stripped = outer_stripped != raw
+    text = outer_stripped
+    fence = chr(96) * 3
+    fence_stripped = False
+    if text.startswith(fence):
+        lines = text.splitlines()
+        if lines and lines[0].startswith(fence):
+            lines = lines[1:]
+            fence_stripped = True
+        if lines and lines[-1].strip().startswith(fence):
+            lines = lines[:-1]
+            fence_stripped = True
+        if fence_stripped:
+            text = chr(10).join(lines).strip()
+    return text, JsonNormalizationContext(
+        received_type="string",
+        received_length=received_length,
+        parser_input_length=len(text or _EMPTY_OBJECT_TEXT),
+        stripped=stripped,
+        fence_stripped=fence_stripped,
+        empty=text == "",
+    )
+
+
+def _parse_text_result(
+    raw: Any, *, normalization_sink: list[JsonNormalizationContext] | None = None,
+) -> dict[str, Any]:
     if isinstance(raw, dict):
         return raw
     if isinstance(raw, str):
-        text = raw.strip()
-        fence = chr(96) * 3
-        if text.startswith(fence):
-            lines = text.splitlines()
-            if lines and lines[0].startswith(fence):
-                lines = lines[1:]
-            if lines and lines[-1].strip().startswith(fence):
-                lines = lines[:-1]
-            text = chr(10).join(lines).strip()
-        parsed = json.loads(text or "{}")
+        text, normalization = normalize_json_text(raw)
+        if normalization_sink is not None:
+            normalization_sink.append(normalization)
+        parsed = json.loads(text or _EMPTY_OBJECT_TEXT)
         if not isinstance(parsed, dict):
             raise _NonObjectDecision(parsed)
         return parsed
@@ -464,9 +512,10 @@ class StructuredDecisionClient:
         feedback: str,
         kind: str,
         budget: DecisionBudget,
-    ) -> dict[str, Any]:
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
         messages = [{"role": "user", "content": self._prompt_for(working, feedback, kind)}]
         use_metered = callable(getattr(self._llm, "complete_structured_with_usage", None))
+        attempt_start = time.perf_counter()
         try:
             if use_metered:
                 completion = await self._llm.complete_structured_with_usage(
@@ -490,6 +539,8 @@ class StructuredDecisionClient:
         except Exception as exc:
             # A request was attempted but no usage was reported: unknown.
             budget.add_usage(None)
+            elapsed_ms = max(0, int((time.perf_counter() - attempt_start) * 1000))
+            response_shape: dict[str, Any] = {"type": "absent", "observed": False}
             parse_context = None
             if isinstance(exc, ValidationError):
                 diagnostic = schema_diagnostic(exc, response_schema, stage=stage)
@@ -505,6 +556,8 @@ class StructuredDecisionClient:
                     kind="format",
                     summary="Return a valid JSON object.",
                     retryable=True,
+                    error_type=error_type_for(exc),
+                    exception_chain=exception_chain_for(exc),
                 )
             elif isinstance(exc, LLMProviderFailure):
                 diagnostic = DecisionDiagnostic(
@@ -513,6 +566,8 @@ class StructuredDecisionClient:
                     kind="transport",
                     summary=str(exc),
                     retryable=exc.retryable,
+                    error_type=error_type_for(exc),
+                    exception_chain=exception_chain_for(exc),
                     **exc.diagnostic_fields(),
                 )
             else:
@@ -522,23 +577,43 @@ class StructuredDecisionClient:
                     kind="transport",
                     summary="The LLM request failed before a validated response was received.",
                     retryable=True,
+                    error_type=error_type_for(exc),
+                    exception_chain=exception_chain_for(exc),
                 )
-            raise _RetryableDecisionError(diagnostic, parse_context) from exc
+            raise _RetryableDecisionError(
+                diagnostic, parse_context, elapsed_ms=elapsed_ms, response_shape=response_shape,
+            ) from exc
         proposal_context = {"proposal_shape": {"observed": False, "reason": "unparsed"}}
+        normalization_sink: list[JsonNormalizationContext] = []
         try:
-            candidate = _parse_text_result(raw)
-            proposal_context = decision_context(
+            candidate = _parse_text_result(raw, normalization_sink=normalization_sink)
+            normalization = normalization_sink[0] if normalization_sink else None
+            base_context = decision_context(
                 working, candidate, response_schema=response_schema, validated=False,
             )
+            if normalization is not None:
+                proposal_context = dict(base_context)
+                proposal_context["normalization"] = normalization.model_dump(mode="json")
+            else:
+                proposal_context = base_context
             _validate_schema(instance=candidate, schema=response_schema)
         except ValidationError as exc:
+            elapsed_ms = max(0, int((time.perf_counter() - attempt_start) * 1000))
             raise _RetryableDecisionError(
-                schema_diagnostic(exc, response_schema, stage=stage), proposal_context
+                schema_diagnostic(exc, response_schema, stage=stage), proposal_context,
+                elapsed_ms=elapsed_ms, response_shape=shallow_response_shape(raw),
+                normalization=normalization_sink[0] if normalization_sink else None,
             ) from exc
         except (json.JSONDecodeError, UnicodeDecodeError, _NonObjectDecision) as exc:
+            elapsed_ms = max(0, int((time.perf_counter() - attempt_start) * 1000))
+            response_shape = shallow_response_shape(raw)
+            normalization = normalization_sink[0] if normalization_sink else None
             if isinstance(exc, json.JSONDecodeError):
+                parse_ctx = json_parse_context(exc, normalization=normalization)
                 raise _RetryableDecisionError(
-                    diagnostic_for_exception(exc, stage=stage), json_parse_context(exc),
+                    diagnostic_for_exception(exc, stage=stage), parse_ctx,
+                    elapsed_ms=elapsed_ms, response_shape=response_shape,
+                    normalization=normalization,
                 ) from exc
             raise _RetryableDecisionError(
                 DecisionDiagnostic(
@@ -547,10 +622,19 @@ class StructuredDecisionClient:
                     kind="format",
                     summary="Return a valid JSON object.",
                     retryable=True,
+                    error_type=error_type_for(exc),
+                    exception_chain=exception_chain_for(exc),
                 ),
                 exc.proposal_context if isinstance(exc, _NonObjectDecision) else proposal_context,
+                elapsed_ms=elapsed_ms, response_shape=response_shape, normalization=normalization,
             ) from exc
-        return candidate
+        metrics = {
+            "elapsed_ms": max(0, int((time.perf_counter() - attempt_start) * 1000)),
+            "response_shape": shallow_response_shape(raw),
+        }
+        if normalization_sink:
+            metrics["normalization"] = normalization_sink[0].model_dump(mode="json")
+        return candidate, metrics
 
     async def _ask_with_tenacity(
         self,
@@ -589,6 +673,8 @@ class StructuredDecisionClient:
             except ReasoningHalted as halted:
                 diagnostic = halted.diagnostic.model_copy(update={
                     "stage": stage, "attempts": budget.used, "last_cause": budget.last_failure,
+                    "error_type": error_type_for(halted),
+                    "exception_chain": exception_chain_for(halted),
                 })
                 budget.last_failure = diagnostic
                 raise DecisionFailure(
@@ -602,6 +688,8 @@ class StructuredDecisionClient:
                     attempts=budget.used,
                     summary="Model reasoning is not allowed at this time.",
                     retryable=False,
+                    error_type=error_type_for(exc),
+                    exception_chain=exception_chain_for(exc),
                 )
                 budget.last_failure = diagnostic
                 raise DecisionFailure(stage, "budget", budget.used, diagnostic=diagnostic) from exc
@@ -624,7 +712,7 @@ class StructuredDecisionClient:
                 budget.record(stage, "request", feedback=safe_feedback(feedback))
                 with attempt:
                     try:
-                        result = await self._attempt_once(
+                        result, metrics = await self._attempt_once(
                             stage=stage,
                             working=working,
                             response_schema=response_schema,
@@ -635,10 +723,12 @@ class StructuredDecisionClient:
                         )
                         budget.record(
                             stage, "response_validated",
+                            **metrics,
                             **decision_context(working, result, response_schema=response_schema),
                         )
                         return result
                     except _RetryableDecisionError as exc:
+                        budget.record_failure(exc.diagnostic.code)
                         budget.last_failure = exc.diagnostic.model_copy(
                             update={"attempts": budget.used}
                         )
@@ -647,6 +737,8 @@ class StructuredDecisionClient:
                         budget.record(
                             stage, "response_rejected", reason=exc.diagnostic.feedback(),
                             validation_issues=exc.diagnostic.validation_issues,
+                            elapsed_ms=exc.elapsed_ms,
+                            response_shape=exc.response_shape,
                             **exc.proposal_context,
                         )
                         if not exc.diagnostic.retryable:

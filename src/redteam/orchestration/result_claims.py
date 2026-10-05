@@ -63,13 +63,14 @@ async def check_result_review(
     run_id: str,
     mission_id: str | None,
     target_node_ids: list[str] | None = None,
+    claims_location: tuple[str | int, ...] = ("claims",),
 ) -> list[str]:
     """Reuse actual origin, account, verdict and finding proofs per claimed result."""
     if not claims:
         return ["completion review describes no supported result"]
     available = set(evidence_ids)
     scope = set(target_node_ids or [])
-    for value in claims:
+    for claim_index, value in enumerate(claims):
         claim = ResultClaim.model_validate(value)
         if set(claim.evidence_ids) - available:
             return ["result claim cites unrelated evidence"]
@@ -92,6 +93,7 @@ async def check_result_review(
             run_id=run_id,
             path_store=path_store,
             mission_id=mission_id,
+            evidence_location=(*claims_location, claim_index, "evidence_ids"),
         )
         if errors:
             return errors

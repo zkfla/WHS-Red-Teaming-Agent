@@ -45,6 +45,7 @@ from redteam.orchestration.authentication import (
 from redteam.orchestration.cognition import DecisionBudget
 from redteam.orchestration.context import RuntimeDeps
 from redteam.orchestration.delegation_decision import record_decision_consumption
+from redteam.orchestration.diagnostics import operational_exception_diagnostic
 from redteam.orchestration.events import (
     AUTHENTICATION_CHECKED,
     HYPOTHESIS_RESOLVED,
@@ -52,6 +53,10 @@ from redteam.orchestration.events import (
 )
 from redteam.orchestration.findings import FindingPromoter, PromotionRequest
 from redteam.orchestration.nodes._support import advance, graph_service, publisher_for
+from redteam.orchestration.runtime_observation import (
+    RuntimeObservation,
+    append_runtime_observation,
+)
 from redteam.orchestration.service_status import (
     severity_for,
 )
@@ -165,6 +170,7 @@ async def verify_node(
 
     expectation = step.expectation if step is not None else None
     verification_failed = False
+    verification_diagnostic = None
     # Pure observation with no hypothesis and no specialized check claims
     # nothing: skip the meaning-review call and admit UNKNOWN directly.
     # Anything with a hypothesis or an authentication check still goes
@@ -223,11 +229,20 @@ async def verify_node(
                 assessment = await deps.verifier.verify(request)
         except Exception as exc:  # noqa: BLE001 - preserve evidence and close work safely
             verification_failed = True
+            verification_diagnostic = operational_exception_diagnostic(
+                exc,
+                stage="verify",
+                code="verification_failed",
+                summary="analysis verifier failed before reaching a verdict",
+            )
             result = result.model_copy(
                 update={
                     "metadata": {
                         **result.metadata,
                         "verification_exception": type(exc).__name__,
+                        "verification_diagnostic": verification_diagnostic.model_dump(
+                            mode="json"
+                        ),
                     }
                 }
             )
@@ -448,6 +463,7 @@ async def verify_node(
             assessment=admitted,
             admission="final",
             supersedes=superseded_stages,
+            diagnostic=verification_diagnostic,
         )
         try:
             admitted.last_record_stage = "verify_node_final"
@@ -694,26 +710,42 @@ async def verify_node(
             }
         )
 
+    admitted_runtime = runtime.model_copy(
+        update={
+            "phase": AgentPhase.UPDATE,
+            "model_requests_used": runtime.model_requests_used + budget.used - attempts_before,
+            "model_tokens_used": runtime.model_tokens_used + budget.tokens_used - tokens_before,
+            "model_usage_unknown": (
+                runtime.model_usage_unknown
+                + budget.unknown_usage_count
+                - unknown_before
+            ),
+            "last_verdict": verdict,
+            "consecutive_failures": (
+                runtime.consecutive_failures + 1
+                if verification_failed
+                else runtime.consecutive_failures
+            ),
+        }
+    )
+    if verification_failed and verification_diagnostic is not None:
+        admitted_runtime = append_runtime_observation(
+            admitted_runtime,
+            RuntimeObservation(
+                kind="state",
+                summary="Analysis verifier failed before reaching a verdict.",
+                outcome="unknown",
+                step=runtime.step_count,
+                action_id=str(proposal.action_id),
+                capability=proposal.capability,
+                operation=proposal.operation,
+                diagnostic=verification_diagnostic,
+                alternative_allowed=True,
+            ),
+        )
     return advance(
         state,
-        runtime.model_copy(
-            update={
-                "phase": AgentPhase.UPDATE,
-                "model_requests_used": runtime.model_requests_used + budget.used - attempts_before,
-                "model_tokens_used": runtime.model_tokens_used + budget.tokens_used - tokens_before,
-                "model_usage_unknown": (
-                    runtime.model_usage_unknown
-                    + budget.unknown_usage_count
-                    - unknown_before
-                ),
-                "last_verdict": verdict,
-                "consecutive_failures": (
-                    runtime.consecutive_failures + 1
-                    if verification_failed
-                    else runtime.consecutive_failures
-                ),
-            }
-        ),
+        admitted_runtime,
         last_event_id=last_event_id,
         tool_result=result,
         result_evidence_id=evidence.evidence_id,

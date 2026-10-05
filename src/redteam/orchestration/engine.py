@@ -1569,6 +1569,7 @@ class InvestigationEngine:
 
     @staticmethod
     def _record_rejection(budget, stage, diagnostic):
+        budget.record_failure(diagnostic.code)
         budget.record(
             stage, "rejected", reason=diagnostic.feedback(),
             validation_issues=diagnostic.validation_issues,
@@ -1586,6 +1587,7 @@ class InvestigationEngine:
         diagnostics = getattr(errors, "diagnostics", [])
         if diagnostics:
             budget.last_failure = diagnostics[-1].model_copy(update={"attempts": budget.used})
+            budget.record_failure(diagnostics[-1].code)
             return [item.feedback() for item in diagnostics[-10:]]
         # Plain-string rejections (e.g. "required path steps are unfinished")
         # carry no structured diagnostic, so without this the operator-facing
@@ -1601,6 +1603,7 @@ class InvestigationEngine:
                 summary=safe_feedback("; ".join(plain)),
                 retryable=True,
             )
+            budget.record_failure(budget.last_failure.code)
         return plain
 
     @staticmethod
@@ -1878,14 +1881,20 @@ class InvestigationEngine:
                         raise DecisionRuleError("path change needs a structured path")
                     if not budget.permits():
                         return path, [], "continue_planning"
-                    updated = await self.register_path(
-                        decision.path,
-                        runtime,
-                        context,
-                        observation,
-                        switch=decision.mode == "switch_path",
-                        budget=budget,
-                    )
+                    try:
+                        updated = await self.register_path(
+                            decision.path,
+                            runtime,
+                            context,
+                            observation,
+                            switch=decision.mode == "switch_path",
+                            budget=budget,
+                        )
+                    except DecisionFailure as exc:
+                        if exc.diagnostic.code != "decision_normal_budget_exhausted":
+                            raise
+                        self.planning_diagnostic = exc.diagnostic
+                        return path, [], "continue_planning"
                     if updated is None:
                         return path, [], "path revision held"
                     path = updated
@@ -1900,14 +1909,15 @@ class InvestigationEngine:
                     path, errors = await self.complete_step(
                         path, decision, runtime, context, budget=budget
                     )
-                    budget.last_failure = DecisionDiagnostic(
-                        code="completion_or_action_not_admitted",
-                        stage="next_action",
-                        kind="semantic",
-                        attempts=budget.used,
-                        summary="Evidence, path or execution checks rejected this decision.",
-                        retryable=True,
-                    )
+                    if errors:
+                        budget.last_failure = DecisionDiagnostic(
+                            code="completion_or_action_not_admitted",
+                            stage="next_action",
+                            kind="semantic",
+                            attempts=budget.used,
+                            summary="Evidence, path or execution checks rejected this decision.",
+                            retryable=True,
+                        )
                     context["feedback"] = self._safe_errors(errors, budget)
                     last_control_succeeded = not errors
                     continue
@@ -2586,6 +2596,16 @@ class InvestigationEngine:
             # missing evidence must still fail, never be invented as success.
             proposal = {**proposal, "reason": decision.reason}
         parsed = CompletionProposal.model_validate(proposal)
+        if budget is not None:
+            budget.record(
+                "completion_review", "step_completion_requested",
+                step_id=step.step_id,
+                previous_status=step.status,
+                previous_outcome=step.outcome,
+                proposed_outcome=parsed.outcome,
+                proposed_evidence_count=len(parsed.evidence_ids),
+                new_evidence_count=len(set(parsed.evidence_ids) - set(step.evidence_ids)),
+            )
         if parsed.unresolved:
             errors = await validate_unresolved(
                 parsed, evidence_store=self.deps.evidence_store, runtime=runtime,
@@ -2611,6 +2631,13 @@ class InvestigationEngine:
             runtime.unresolved_evidence_ids = list(dict.fromkeys([
                 *runtime.unresolved_evidence_ids, identity,
             ]))
+            if budget is not None:
+                budget.record(
+                    "completion_review", "step_updated",
+                    step_id=step.step_id, previous_status=step.status,
+                    status="blocked", updated_outcome=parsed.outcome,
+                    unresolved_evidence_id=identity,
+                )
             return updated or path, []
         errors = await validate_completion(
             path=path,

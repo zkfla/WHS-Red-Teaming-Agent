@@ -1073,3 +1073,85 @@ async def test_unresolved_result_is_durable_gap_and_cannot_prove_success(outcome
     assert not is_final_admission_receipt(gap)
     assert await _posthoc_complete(store, service, HYP_ID, [receipt_id], kind="poc")
     assert await service.list_findings() == []
+
+
+async def test_completion_reference_feedback_identifies_original_submission_positions():
+    from redteam.orchestration.cognition import DecisionBudget
+    from redteam.orchestration.engine import InvestigationEngine
+
+    store, _, service, _, _, refs = await _recording_world()
+    invalid = await store.get(refs[1])
+    invalid.metadata.pop("path_id")
+    private_id = "opaquePrivateMissingReference"
+    issues = await _posthoc_complete(
+        store,
+        service,
+        None,
+        [refs[0], private_id, refs[1]],
+        kind="evidence",
+    )
+    feedback = InvestigationEngine._safe_errors(issues, DecisionBudget(3))
+    assert any(
+        "$.completion.evidence_ids[1]" in item and "does not exist" in item for item in feedback
+    )
+    assert any(
+        "$.completion.evidence_ids[2]" in item and "no path linkage" in item for item in feedback
+    )
+    assert private_id not in " ".join(feedback)
+    assert refs[1] not in " ".join(feedback)
+
+
+async def test_expanded_receipt_reference_failure_points_to_submitted_receipt_position():
+    store, _, service, _, _, refs = await _recording_world()
+    original = await store.get(refs[1])
+    original.metadata.pop("path_id")
+    proposal = _proposal(action_id="record-action-2", hyp_id=None)
+    result = _result().model_copy(update={"invocation_id": InvocationId("record-inv-2")})
+    receipt = await append_review_receipt(
+        evidence_store=store,
+        proposal=proposal,
+        result=result,
+        assessment=VerificationAssessment(
+            verdict=Verdict.UNKNOWN,
+            reason="reviewed source",
+            reviewer_id="analysis:test",
+            source_refs=[refs[1]],
+            outcome="unknown",
+            claim_supported=False,
+        ),
+        admission="final",
+    )
+    issues = await _posthoc_complete(
+        store,
+        service,
+        None,
+        [refs[0], str(receipt.evidence_id)],
+        kind="evidence",
+    )
+    diagnostics = [d for d in issues.diagnostics if "no_path_linkage" in d.code]
+    assert len(diagnostics) == 1
+    assert diagnostics[0].location == "$.completion.evidence_ids[1]"
+    assert refs[1] not in diagnostics[0].feedback()
+
+
+@pytest.mark.parametrize("prefix", [("claims",), ("criteria", 1, "claims")])
+async def test_result_claim_reference_location_uses_claim_local_submission(prefix):
+    from redteam.orchestration.result_claims import check_result_review
+
+    store, _, service, _, _, refs = await _recording_world()
+    invalid = await store.get(refs[1])
+    invalid.metadata.pop("path_id")
+    issues = await check_result_review(
+        claims=[
+            {"description": "second source", "kind": "observation", "evidence_ids": [refs[1]]},
+        ],
+        evidence_ids=refs, evidence_store=store, graph_service=service,
+        path_store=None, run_id=str(RUN), mission_id=None,
+        claims_location=prefix,
+    )
+    diagnostics = [d for d in issues.diagnostics if "no_path_linkage" in d.code]
+    assert len(diagnostics) == 1
+    expected = "$.claims[0].evidence_ids[0]" if len(prefix) == 1 else (
+        "$.criteria[1].claims[0].evidence_ids[0]"
+    )
+    assert diagnostics[0].location == expected

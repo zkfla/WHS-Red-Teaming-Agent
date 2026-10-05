@@ -735,6 +735,8 @@ async def test_long_running_tool_renews_its_work_lease() -> None:
     deps = _loop_deps(
         engagement,
         gateway=gateway,
+        # This direct runner has no mission/task to complete; hold after execution.
+        finish=False,
         settings=OrchestrationSettings(checkpointing=False, lease_ttl_seconds=0.06),
     )
     await seed_from_engagement(AttackGraphService(deps.graph_store), engagement)
@@ -758,6 +760,8 @@ async def test_long_running_tool_renews_its_work_lease() -> None:
         gateway.release.set()
     final = await asyncio.wait_for(task, timeout=10.0)
     assert final.actions_executed == 1
+    assert final.phase is AgentPhase.FINISHED
+    assert final.termination_reason == TerminationReason.INVESTIGATION_HELD
     work = await deps.work_store.list_items(run_id=final.run_id)
     assert work[0].status is WorkStatus.SUCCEEDED
 

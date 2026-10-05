@@ -138,6 +138,35 @@ async def test_llm_draft_review_action_to_step_completion():
     assert await world.evidence.get("ev-t1-1") is not None
 
 
+async def test_successful_step_completion_does_not_invent_a_rejection(monkeypatch):
+    from redteam.orchestration.cognition import DecisionBudget
+
+    llm = h.ScriptedLLM()
+    seed = await h.seed_host("run-completion-diagnostic")
+    world = h.make_world(llm, graph_store=seed.store)
+    runtime = h.make_runtime("run-completion-diagnostic", "eng-t1")
+    engine = InvestigationEngine(world.deps)
+    llm.add("path_draft", h.draft_path(seed.node_id))
+    llm.add("path_review", h.review_accept())
+    llm.add("next_action", h.turn_actions(seed.node_id))
+    path, _, _ = await engine.decide(runtime, GraphObservation())
+    await world.evidence.append(h.make_tool_evidence(
+        evidence_id="ev-completion-diagnostic", run_id=str(runtime.run_id),
+        engagement_id="eng-t1", action_id="action-completion-diagnostic",
+        invocation_id="inv-completion-diagnostic", path_id=path.path_id,
+        path_version=path.version, step_id="step-1", target_node_id=seed.node_id,
+    ))
+    budget = DecisionBudget.reasoning_chain(8, 3)
+    monkeypatch.setattr(engine, "_decision_budget", lambda: budget)
+    llm.add("next_action", h.turn_complete_step(["ev-completion-diagnostic"]))
+    llm.add("completion_review", h.completion_accept())
+    llm.add("next_action", {**h.turn_complete_goal("review finished"), "mode": "hold"})
+    finished, _, outcome = await engine.decide(runtime, GraphObservation())
+    assert finished.steps[0].status == "completed"
+    assert outcome == "review finished"
+    assert budget.last_failure is None
+
+
 async def test_tool_outside_playbook_is_exposed_and_compiles():
     """recon.inventory rides recon.service_discovery although no playbook emits it."""
     assert "service_discovery" in CANONICAL_OPERATIONS

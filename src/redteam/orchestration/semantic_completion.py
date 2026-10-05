@@ -981,7 +981,7 @@ async def complete_goal(
     if len(items) != len(criteria) or set(table) != set(criteria):
         return ["goal review must cover the original operator criteria exactly"]
     bound_tasks: dict[str, list[str]] = {}
-    for item in items:
+    for criterion_index, item in enumerate(items):
         if not item.get("met") or not item.get("evidence_ids"):
             return ["goal criterion lacks evidence"]
         owners: set[str] = set()
@@ -997,6 +997,7 @@ async def complete_goal(
             return ["goal criterion evidence lacks validated task ownership"]
         errors = await check_result_review(
             claims=item.get("claims", []),
+            claims_location=("criteria", criterion_index, "claims"),
             evidence_ids=item["evidence_ids"],
             evidence_store=engine.deps.evidence_store,
             graph_service=AttackGraphService(engine.deps.graph_store),

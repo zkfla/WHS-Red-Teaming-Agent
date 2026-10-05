@@ -18,6 +18,7 @@ from redteam.orchestration.context_projection import MappingStatus, project_run_
 from redteam.orchestration.coverage import CoverageGapSummary, project_coverage_gaps
 from redteam.orchestration.diagnostics import DecisionDiagnostic, safe_feedback
 from redteam.orchestration.operator_intents.redaction import redact_text
+from redteam.orchestration.runtime_observation import MAX_RUNTIME_OBSERVATIONS, RuntimeObservation
 from redteam.orchestration.state import RuntimeState, TerminationReason
 from redteam.orchestration.work.store import WorkStore
 
@@ -395,6 +396,9 @@ class TerminalReportProjection(BaseModel):
     termination_reason: str | None
     planning_diagnostic: DecisionDiagnostic | None = None
     planning_diagnostic_history: list[DecisionDiagnostic] = Field(default_factory=list)
+    runtime_observations: list[RuntimeObservation] = Field(
+        default_factory=list, max_length=MAX_RUNTIME_OBSERVATIONS,
+    )
     request_observations: list[dict[str, Any]] = Field(default_factory=list)
     pending_event_count: int = 0
     event_delivery_pending: bool = False
@@ -537,6 +541,7 @@ class ReportingAgent:
             termination_reason=runtime.termination_reason,
             planning_diagnostic=runtime.planning_diagnostic,
             planning_diagnostic_history=list(runtime.planning_diagnostic_history),
+            runtime_observations=list(runtime.recent_observations[-MAX_RUNTIME_OBSERVATIONS:]),
             request_observations=[
                 {
                     "tool_id": str(item.metadata["tool_result"].get("tool_id", "")),

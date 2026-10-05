@@ -29,6 +29,7 @@ from redteam.core.ports.evidence_store import EvidenceStore
 from redteam.orchestration.action_naming import tool_matches_action_namespace
 from redteam.orchestration.cognition import DecisionBudget, StructuredDecisionClient
 from redteam.orchestration.coordination import content_hash
+from redteam.orchestration.diagnostics import DecisionDiagnostic
 from redteam.orchestration.evidence_access import raw_from_metadata
 from redteam.orchestration.expectations import Expectation, ExpectationOutcome, verdict_for
 from redteam.orchestration.session_proof import (
@@ -1369,6 +1370,7 @@ async def append_review_receipt(
     assessment: VerificationAssessment,
     admission: str = "interim",
     supersedes: list[str] | None = None,
+    diagnostic: DecisionDiagnostic | None = None,
 ) -> Any | None:
     """Append the public review receipt for one meaning judgment.
 
@@ -1419,6 +1421,8 @@ async def append_review_receipt(
         "refuting_evidence_ids": refuting,
         "covered_principals": covered_principals,
     }
+    if diagnostic is not None:
+        payload["diagnostic"] = diagnostic.model_dump(mode="json")
     receipt = EvidenceRecord(
         evidence_id=EvidenceId(new_id("ev")),
         run_id=proposal.run_id,
