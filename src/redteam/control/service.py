@@ -325,7 +325,7 @@ class DefaultControlPlane:
             selected=selected_descriptor,
             has_selected_tool=has_selected_tool,
         )
-        if risk_unresolved and verdict == PolicyVerdict.ALLOW:
+        if risk_unresolved and verdict != PolicyVerdict.DENY:
             # Manual escalation, not a fail-closed DENY: risk-tiered
             # approval exists precisely to catch risky actions, so when
             # the risk lookup errors we escalate to a human rather than
@@ -333,8 +333,11 @@ class DefaultControlPlane:
             # A human can still approve it -- this stage only refuses to
             # decide ALLOW on its own when it doesn't know the risk.
             verdict = PolicyVerdict.REQUIRE_APPROVAL
-            policy_reasons = ["tool risk_level could not be resolved — requiring approval"]
-            matched_rules = ["risk:unresolved"]
+            policy_reasons = [
+                *policy_reasons,
+                "tool risk_level could not be resolved — requiring approval",
+            ]
+            matched_rules = [*matched_rules, "risk:unresolved"]
         if verdict == PolicyVerdict.DENY:
             # A policy deny rejects this class of action — switch goals.
             return await self._finalize(
@@ -352,13 +355,10 @@ class DefaultControlPlane:
             # evaluate: never silently pass. A firing meaning here always
             # needs a human (existing human_required handling below
             # bypasses auto-approval ceilings for this rule).
-            if verdict == PolicyVerdict.ALLOW:
-                verdict = PolicyVerdict.REQUIRE_APPROVAL
-                policy_reasons = list(unavailable)
-                matched_rules = [POLICY_SEMANTICS_UNAVAILABLE]
-            elif POLICY_SEMANTICS_UNAVAILABLE not in matched_rules:
+            verdict = PolicyVerdict.REQUIRE_APPROVAL
+            policy_reasons = [*policy_reasons, *unavailable]
+            if POLICY_SEMANTICS_UNAVAILABLE not in matched_rules:
                 matched_rules = [*matched_rules, POLICY_SEMANTICS_UNAVAILABLE]
-                policy_reasons = [*policy_reasons, *unavailable]
 
         rate_limiter = self._rate_limiters.setdefault(
             engagement_id, RateLimiter(engagement.rate_limit_policy)

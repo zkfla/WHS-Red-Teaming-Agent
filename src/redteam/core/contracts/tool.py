@@ -56,7 +56,10 @@ class ToolDescriptor(BaseModel):
     outbound_text_fields: list[str] = Field(default_factory=list)
     # Provider-declared target semantics consumed by direct selected-tool calls.
     target_binding: ToolTargetBinding = Field(default_factory=ToolTargetBinding)
-    # Provider-declared command input fields inspected for risky command patterns.
+    # Provider-declared ordered input components of ONE command, not
+    # independent text fields. Consumers assemble strings and string-array
+    # elements in field/array order for command-pattern inspection.
+    # Example: ["executable", "args"]. Empty means no command input.
     command_fields: list[str] = Field(default_factory=list)
 
     @property

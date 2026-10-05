@@ -26,6 +26,8 @@ from mcp.server import MCPServer
 from mcp_types import CallToolResult, TextContent
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from redteam.core.contracts.tool import PROVIDER_METADATA_COMMAND_FIELDS
+
 PROPOSED_OPERATION = "command_run"
 REMOTE_TOOL_NAME = "run_command"
 MODULE = "redteam.capability.servers.execution"
@@ -1067,6 +1069,10 @@ def create_server(
     *,
     engine: DockerExecutionEngine | None = None,
 ) -> MCPServer:
+    # The provider manifest imports these result types; resolve it after
+    # module initialization so registration shares its command declaration.
+    from redteam.capability.execution_manifest import EXECUTION_TOOLS
+
     executor = engine or DockerExecutionEngine(policy)
     server = MCPServer("execution-substrate", log_level="WARNING")
 
@@ -1155,7 +1161,8 @@ def create_server(
     job_status.__annotations__["asset_ref"] = Literal[policy.asset_ref]
     job_cancel.__annotations__["asset_ref"] = Literal[policy.asset_ref]
     for function in (run_command, job_start, job_status, job_cancel):
-        server.tool()(function)
+        spec = EXECUTION_TOOLS[function.__name__]
+        server.tool(meta={PROVIDER_METADATA_COMMAND_FIELDS: list(spec.command_fields)})(function)
     return server
 
 

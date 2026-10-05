@@ -248,10 +248,15 @@ def unavailable_restriction_reasons(
 def _command_text_candidates(
     arguments: Mapping[str, Any], command_fields: Sequence[str]
 ) -> list[str]:
-    """Collect command text from declared fields only."""
-    candidates: list[str] = []
+    """Join the provider-declared ordered components of one command.
+
+    String arrays contribute their elements in order. Undeclared input
+    fields never contribute to this command; an empty declaration checks
+    nothing. This is pattern inspection, not shell parsing or execution.
+    """
+    components: list[str] = []
     if not isinstance(arguments, Mapping):
-        return candidates
+        return []
     for field_name in command_fields:
         if not isinstance(field_name, str):
             continue
@@ -259,10 +264,10 @@ def _command_text_candidates(
             continue
         value = arguments[field_name]
         if isinstance(value, str):
-            candidates.append(value)
+            components.append(value)
         elif isinstance(value, (list, tuple)):
-            candidates.extend(item for item in value if isinstance(item, str))
-    return candidates
+            components.extend(item for item in value if isinstance(item, str))
+    return [" ".join(components)] if components else []
 
 
 def match_command_rules(
@@ -302,63 +307,11 @@ def evaluate_policy(
     selected: ToolDescriptor | None = None,
     has_selected_tool: bool = False,
 ) -> tuple[PolicyVerdict, list[str], list[str]]:
-    require = approval_policy.require_approval_for
-    action_key = f"{action.capability}.{action.operation}"
-
-    if action.capability in require:
-        return (
-            PolicyVerdict.REQUIRE_APPROVAL,
-            [f"capability '{action.capability}' requires approval"],
-            [action.capability],
-        )
-    if action_key in require:
-        return (
-            PolicyVerdict.REQUIRE_APPROVAL,
-            [f"operation '{action_key}' requires approval"],
-            [action_key],
-        )
-
-    if require and has_selected_tool:
-        namespaces = declared_namespaces(selected)
-        operation_keys = declared_operation_keys(selected)
-        if namespaces is None and operation_keys is None:
-            return (
-                PolicyVerdict.REQUIRE_APPROVAL,
-                [
-                    "policy semantics unavailable: the selected tool declares "
-                    "no operations/capability tags to evaluate the explicit "
-                    "approval policy against -- declare provider operations or "
-                    "relax require_approval_for"
-                ],
-                [POLICY_SEMANTICS_UNAVAILABLE],
-            )
-        for entry in require:
-            if "." in entry:
-                matched = operation_keys is not None and entry in operation_keys
-            else:
-                matched = namespaces is not None and entry in namespaces
-            if matched:
-                return (
-                    PolicyVerdict.REQUIRE_APPROVAL,
-                    [f"operation '{entry}' requires approval (provider-declared)"],
-                    [entry],
-                )
-        need_namespaces = any("." not in entry for entry in require)
-        need_operation_keys = any("." in entry for entry in require)
-        if (need_namespaces and namespaces is None) or (
-            need_operation_keys and operation_keys is None
-        ):
-            return (
-                PolicyVerdict.REQUIRE_APPROVAL,
-                [
-                    "policy semantics unavailable: the selected tool declares "
-                    "no operations/capability tags to evaluate the explicit "
-                    "approval policy against -- declare provider operations or "
-                    "relax require_approval_for"
-                ],
-                [POLICY_SEMANTICS_UNAVAILABLE],
-            )
-
+    """Accumulate approval grounds without losing mandatory human review."""
+    reasons: list[str] = []
+    matched_rules: list[str] = []
+    # Command grounds are evaluated before ordinary approval grounds.
+    # Neither a matching action rule nor a risk threshold may hide them.
     explicit_rules = list(getattr(approval_policy, "command_approval_rules", None) or [])
     if explicit_rules:
         command_rules = explicit_rules
@@ -368,33 +321,60 @@ def evaluate_policy(
         command_rules = []
     if command_rules:
         if not has_selected_tool or selected is None:
-            return (
-                PolicyVerdict.REQUIRE_APPROVAL,
-                [
-                    "policy semantics unavailable: command approval rules need "
-                    "a selected tool to evaluate -- declare the calling tool or "
-                    "remove command_approval_rules"
-                ],
-                [POLICY_SEMANTICS_UNAVAILABLE],
+            reasons.append(
+                "policy semantics unavailable: command approval rules need "
+                "a selected tool to evaluate -- declare the calling tool or "
+                "remove command_approval_rules"
             )
-        command_fields = getattr(selected, "command_fields", None)
-        if command_fields is None:
-            return (
-                PolicyVerdict.REQUIRE_APPROVAL,
-                [
+            matched_rules.append(POLICY_SEMANTICS_UNAVAILABLE)
+        else:
+            command_fields = selected.command_fields
+            if command_fields is None:
+                reasons.append(
                     "policy semantics unavailable: the selected tool declares "
                     "no command fields to evaluate command approval rules -- "
                     "declare provider command fields or remove command_approval_rules"
-                ],
-                [POLICY_SEMANTICS_UNAVAILABLE],
+                )
+                matched_rules.append(POLICY_SEMANTICS_UNAVAILABLE)
+            else:
+                firing = match_command_rules(action.arguments, command_fields, command_rules, risk)
+                if firing:
+                    reasons.append(
+                        f"dangerous command rule matched ({', '.join(firing)}) -- requiring approval"
+                    )
+                    matched_rules.extend(firing)
+
+    require = approval_policy.require_approval_for
+    if has_selected_tool:
+        # Direct calls use provider declarations, never model-written
+        # capability/operation strings, to interpret explicit policies.
+        namespaces = declared_namespaces(selected)
+        operation_keys = declared_operation_keys(selected)
+        for entry in require:
+            declared = operation_keys if "." in entry else namespaces
+            if declared is not None and entry in declared:
+                reasons.append(f"operation '{entry}' requires approval (provider-declared)")
+                matched_rules.append(entry)
+        need_namespaces = any("." not in entry for entry in require)
+        need_operation_keys = any("." in entry for entry in require)
+        if (need_namespaces and namespaces is None) or (
+            need_operation_keys and operation_keys is None
+        ):
+            reasons.append(
+                "policy semantics unavailable: the selected tool declares "
+                "no operations/capability tags to evaluate the explicit "
+                "approval policy against -- declare provider operations or "
+                "relax require_approval_for"
             )
-        firing = match_command_rules(action.arguments, command_fields, command_rules, risk)
-        if firing:
-            return (
-                PolicyVerdict.REQUIRE_APPROVAL,
-                [f"dangerous command rule matched ({', '.join(firing)}) -- requiring approval"],
-                firing,
-            )
+            matched_rules.append(POLICY_SEMANTICS_UNAVAILABLE)
+    else:
+        action_key = f"{action.capability}.{action.operation}"
+        if action.capability in require:
+            reasons.append(f"capability '{action.capability}' requires approval")
+            matched_rules.append(action.capability)
+        if action_key in require:
+            reasons.append(f"operation '{action_key}' requires approval")
+            matched_rules.append(action_key)
 
     # Risk-tiered approval: the tool's registry risk_level meets the
     # approval threshold, so a human must sign off even without an
@@ -405,13 +385,12 @@ def evaluate_policy(
         risk_threshold if risk_threshold is not None else resolve_risk_threshold(approval_policy)
     )
     if risk is not None and risk_meets_threshold(risk, effective_threshold):
-        return (
-            PolicyVerdict.REQUIRE_APPROVAL,
-            [
-                f"tool risk_level '{risk.value}' requires approval "
-                f"(>= '{effective_threshold.value}')"
-            ],
-            [f"risk:{risk.value}"],
+        reasons.append(
+            f"tool risk_level '{risk.value}' requires approval "
+            f"(>= '{effective_threshold.value}')"
         )
+        matched_rules.append(f"risk:{risk.value}")
 
+    if matched_rules:
+        return PolicyVerdict.REQUIRE_APPROVAL, reasons, list(dict.fromkeys(matched_rules))
     return PolicyVerdict.ALLOW, ["no matching approval rule"], []

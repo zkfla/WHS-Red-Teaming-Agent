@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from redteam.capability.servers.execution import (
     CommandResult,
@@ -21,6 +21,7 @@ class ExecutionToolSpec:
     optional: frozenset[str]
     output_schema: dict
     risk_level: RiskLevel
+    command_fields: list[str] = field(default_factory=list)
 
 
 _CONTEXT = frozenset({"engagement_id", "run_id"})
@@ -31,6 +32,7 @@ EXECUTION_TOOLS = {
         optional=_CONTEXT | {"timeout_seconds"},
         output_schema=CommandResult.model_json_schema(),
         risk_level=RiskLevel.HIGH,
+        command_fields=["executable", "args"],
     ),
     "job_start": ExecutionToolSpec(
         operation="command_job_start",
@@ -38,6 +40,7 @@ EXECUTION_TOOLS = {
         optional=_CONTEXT | {"timeout_seconds"},
         output_schema=JobStartResult.model_json_schema(),
         risk_level=RiskLevel.HIGH,
+        command_fields=["executable", "args"],
     ),
     "job_status": ExecutionToolSpec(
         operation="command_job_status",
@@ -70,6 +73,7 @@ def validate_execution_descriptor(descriptor: ToolDescriptor, asset_ref: str) ->
         or descriptor.operations != [spec.operation]
         or descriptor.target_types != ["asset"]
         or descriptor.output_schema != spec.output_schema
+        or descriptor.command_fields != spec.command_fields
     ):
         raise ValueError("execution discovery schema/operation differs from pinned manifest")
 
