@@ -56,6 +56,7 @@ from redteam.core.ids import EvidenceId, new_id
 from redteam.orchestration.analysis import (
     _posthoc_source_gap,
     append_posthoc_claim_receipt,
+    claim_target_is_grounded,
     hypothesis_status_for_assessment,
 )
 from redteam.orchestration.coordination import content_hash
@@ -103,11 +104,11 @@ class RecordedFact(BaseModel):
 
     evidence_id: str = Field(min_length=1)
     raw_path: list[str] = Field(
-        min_length=1,
         description=(
             "Keys under the preserved ToolResult output: the stored raw "
             "payload is the full ToolResult dict, the pointer walks "
-            "output first, then these keys (list indices as decimal text)."
+            "output first, then these keys (list indices as decimal text). "
+            "An empty path points at the entire output, including text."
         ),
     )
     value: Any = None
@@ -397,7 +398,7 @@ class GraphRecordingHandler:
             refused_facts.append({"evidence_id": eid, "reason": gap})
             return
         output = raw.get("output")
-        if not isinstance(output, dict):
+        if not isinstance(output, (dict, str)):
             refused_facts.append({"evidence_id": eid, "reason": "no preserved output"})
             return
         found, actual = _locate(output, fact.raw_path)
@@ -663,6 +664,14 @@ class GraphRecordingHandler:
                 node = None
             if node is None:
                 return _refused_entry(base, "unknown target node")
+        elif refs:
+            source_targets = set()
+            for ref in refs:
+                source = await store.get(ref)
+                source_targets.add(str(source.metadata.get("target_node_id", "") or ""))
+            if len(source_targets) != 1 or not next(iter(source_targets)):
+                return _refused_entry(base, "hypothesis spans targets")
+            about = next(iter(source_targets))
         normalized = " ".join(draft.statement.strip().split())[:2000]
         stable_id = "hyp_" + content_hash(
             {"run": run_id, "target": about or "", "statement": normalized}
@@ -772,81 +781,60 @@ class GraphRecordingHandler:
                     new_hypothesis_ids=new_hypothesis_ids,
                 )
             )
-        review: dict[str, Any] = {"status": "skipped", "reason": "no claim to review"}
-        assessment: Any = None
-        if recording.hypotheses and not recording.findings:
-            verifier = self._verifier
-            if verifier is None:
-                verifier = getattr(getattr(context, "deps", None), "verifier", None)
-            verify = getattr(verifier, "verify_claim_with_budget", None)
-            if verify is None:
-                review = {"status": "deferred", "reason": "no posthoc verifier"}
-            elif context.budget is None:
-                review = {"status": "deferred", "reason": "no caller budget"}
-            else:
-                claim = {
-                    "facts": [
-                        {
-                            "target_node_id": item["target_node_id"],
-                            "fact_name": item["fact_name"],
-                        }
-                        for item in accepted_facts
-                    ],
-                    "hypotheses": [
-                        str(item.statement or "")[:500] for item in recording.hypotheses
-                    ],
-                    "findings": [
-                        str(item.statement or "")[:500] for item in recording.findings
-                    ],
-                }
-                try:
-                    assessment = await verify(
-                        claim=claim,
-                        evidence_ids=list(seen_refs),
-                        run_id=run_id,
-                        budget=context.budget,
-                        before_call=context.before_call,
-                    )
-                except Exception as exc:
-                    review = {"status": "review_failed", "reason": type(exc).__name__}
-                else:
-                    verdict = getattr(assessment, "verdict", "?")
-                    review = {
-                        "status": "reviewed",
-                        "verdict": verdict.value if hasattr(verdict, "value") else str(verdict),
-                        "outcome": getattr(assessment, "outcome", None),
-                        "claim_supported": getattr(assessment, "claim_supported", None),
-                        "reason": str(getattr(assessment, "reason", "") or "")[:500],
-                    }
-        if (
-            assessment is not None
-            and review.get("status") == "reviewed"
-            and service is not None
-            and new_hypothesis_ids
-        ):
+        review: dict[str, Any] = {"status": "per-claim"}
+        finding_verifier = self._verifier or getattr(context.deps, "verifier", None)
+        # Standalone hypotheses each receive their own assessment and receipt.
+        # A matching finding below supplies that hypothesis's review instead.
+        for draft, entry in zip(recording.hypotheses, hypotheses_out, strict=True):
+            hid = entry.get("hypothesis_id")
+            if not hid:
+                continue
+            covered = any(
+                (item.hypothesis_id == hid or (
+                    not item.hypothesis_id and len(new_hypothesis_ids) == 1
+                ))
+                and (not item.target_node_id or item.target_node_id == entry["target_node_id"])
+                for item in recording.findings
+            )
+            if covered:
+                continue
             try:
-                resolved_status = hypothesis_status_for_assessment(assessment)
+                if context.budget is None or finding_verifier is None:
+                    raise ValueError("review unavailable")
+                target = entry["target_node_id"]
+                if not target:
+                    targets = set()
+                    for ref in draft.evidence_refs:
+                        source = await store.get(ref)
+                        targets.add(str(source.metadata.get("target_node_id", "") or ""))
+                    if len(targets) != 1 or not next(iter(targets)):
+                        raise ValueError("target linkage")
+                    target = next(iter(targets))
+                claim = {"statement": draft.statement, "target_node_id": target,
+                         "hypothesis_id": hid}
+                assessment = await finding_verifier.verify_claim_with_budget(
+                    claim=claim, evidence_ids=draft.evidence_refs, run_id=run_id,
+                    budget=context.budget, before_call=context.before_call,
+                )
+                first = await store.get(draft.evidence_refs[0])
+                receipt = await append_posthoc_claim_receipt(
+                    evidence_store=store, run_id=run_id, engagement_id=engagement_id,
+                    claim=claim, evidence_ids=draft.evidence_refs, assessment=assessment,
+                    hypothesis_id=hid, action_id=str(first.action_id),
+                    invocation_id=str(first.invocation_id), target_node_id=target,
+                )
+                if receipt is None:
+                    raise ValueError("receipt unavailable")
+                new_evidence_ids.append(str(receipt.evidence_id))
+                status = hypothesis_status_for_assessment(assessment)
+                updated = await service.resolve_hypothesis(hid, status=status, step=step)
+                if updated is None:
+                    raise ValueError("hypothesis missing")
+                entry.update(status=status, receipt_id=str(receipt.evidence_id))
             except Exception:
-                resolved_status = None
-            if resolved_status is not None:
-                for hid in list(new_hypothesis_ids):
-                    try:
-                        updated = await service.resolve_hypothesis(
-                            hid, status=resolved_status, step=step
-                        )
-                    except Exception:
-                        continue
-                    if updated is not None:
-                        for entry in hypotheses_out:
-                            if entry.get("hypothesis_id") == hid:
-                                entry["status"] = resolved_status
-        if recording.hypotheses and recording.findings:
-            review = {"status": "skipped", "reason": "per-finding review covers claims"}
+                entry.update(status="refused", reason="hypothesis review incomplete")
         findings_out: list[dict[str, Any]] = []
         existing_claims: set[str] = set()
-        finding_verifier: Any = self._verifier
-        if finding_verifier is None:
-            finding_verifier = getattr(getattr(context, "deps", None), "verifier", None)
         if recording.findings and service is not None:
             try:
                 for item in await service.list_findings():
@@ -875,6 +863,11 @@ class GraphRecordingHandler:
                     record_ids=record_ids,
                 )
             )
+        for entry in hypotheses_out:
+            if entry.get("hypothesis_id"):
+                current = await service.get_hypothesis(entry["hypothesis_id"])
+                if current is not None and entry.get("status") != "refused":
+                    entry["status"] = current.status
         branches_out: list[dict[str, Any]] = []
         for note in recording.branches:
             for ref in note.evidence_refs:
@@ -983,12 +976,21 @@ class GraphRecordingHandler:
         if target_node is None:
             return _refused_entry(base, "unknown target node", "finding_id")
         hypothesis_id: str | None = None
-        owned_hypothesis = False
         if draft.hypothesis_id is not None and draft.hypothesis_id.strip():
             hypothesis_id = draft.hypothesis_id.strip()
-        elif len(new_hypothesis_ids) == 1:
-            hypothesis_id = new_hypothesis_ids[0]
         else:
+            for candidate_id in new_hypothesis_ids:
+                candidate = await service.get_hypothesis(candidate_id)
+                if candidate is not None and (
+                    candidate.metadata.get("target_node_id") == target
+                    and (
+                        len(new_hypothesis_ids) == 1
+                        or " ".join(candidate.description.split()) == " ".join(draft.statement.split())
+                    )
+                ):
+                    hypothesis_id = candidate_id
+                    break
+        if hypothesis_id is None:
             # Finding-only first claim: code builds the hyp context from
             # the claim itself; the model is never forced to file one first.
             created = await self._write_hypothesis(
@@ -1009,7 +1011,17 @@ class GraphRecordingHandler:
                     base, str(created.get("reason") or "hypothesis unwritable"), "finding_id"
                 )
             hypothesis_id = str(created["hypothesis_id"])
-            owned_hypothesis = True
+        stored_hypothesis = await service.get_hypothesis(hypothesis_id)
+        if stored_hypothesis is None or (
+            stored_hypothesis.metadata.get("target_node_id") != target
+        ):
+            return _refused_entry(base, "hypothesis claim or target differs", "finding_id")
+        for ref in refs:
+            source = await store.get(ref)
+            if _posthoc_source_gap(source, raw_from_metadata(source.metadata)) is not None:
+                return _refused_entry(base, "source origin invalid", "finding_id")
+            if not await claim_target_is_grounded(service, source, target):
+                return _refused_entry(base, "claim target has no source-backed relation", "finding_id")
         verify = getattr(verifier, "verify_claim_with_budget", None)
         if verify is None or budget is None:
             return {
@@ -1034,6 +1046,10 @@ class GraphRecordingHandler:
                     "target_node_id": target,
                     "hypothesis_id": hypothesis_id,
                     "principal_refs": list(claimed_principals),
+                    "reference_hypothesis": {
+                        "hypothesis_id": hypothesis_id,
+                        "description": stored_hypothesis.description,
+                    },
                 },
                 evidence_ids=list(refs),
                 run_id=run_id,
@@ -1050,18 +1066,6 @@ class GraphRecordingHandler:
                 "status": "refused",
                 "reason": "review failed",
             }
-        if owned_hypothesis:
-            try:
-                owned_status = hypothesis_status_for_assessment(assessment)
-            except Exception:
-                owned_status = None
-            if owned_status is not None:
-                try:
-                    await service.resolve_hypothesis(
-                        hypothesis_id, status=owned_status, step=step
-                    )
-                except Exception:
-                    pass
         finding_verdict = getattr(assessment, "verdict", "?")
         review_summary: dict[str, Any] = {
             "verdict": (
@@ -1107,6 +1111,33 @@ class GraphRecordingHandler:
                 "review": review_summary,
             }
         new_evidence_ids.append(str(receipt.evidence_id))
+        # Only this matching claim is resolved, after its receipt is durable.
+        try:
+            if assessment.hypothesis_outcome not in ("success", "refuted"):
+                return {
+                    **base, "hypothesis_id": hypothesis_id, "target_node_id": target,
+                    "receipt_id": str(receipt.evidence_id), "finding_id": None,
+                    "status": "refused", "reason": "reference hypothesis unresolved",
+                    "review": review_summary,
+                }
+            hyp_assessment = assessment.model_copy(
+                update={"outcome": assessment.hypothesis_outcome}
+            )
+            hypothesis_status = hypothesis_status_for_assessment(hyp_assessment)
+            updated = await service.resolve_hypothesis(
+                hypothesis_id, status=hypothesis_status, step=step
+            )
+            if updated is None:
+                raise ValueError("hypothesis missing")
+        except Exception:
+            return _refused_entry(base, "hypothesis resolution failed", "finding_id")
+        if assessment.outcome != "success" or assessment.claim_supported is not True:
+            return {
+                **base, "hypothesis_id": hypothesis_id, "target_node_id": target,
+                "receipt_id": str(receipt.evidence_id), "finding_id": None,
+                "status": "refused", "reason": "claim not supported", "review": review_summary,
+            }
+
         capability = first_meta.get("capability") or "graph.record"
         operation = first_meta.get("operation") or "record"
         agent = first_meta.get("agent_id") or ""
@@ -1126,6 +1157,11 @@ class GraphRecordingHandler:
                 source_refs=list(refs),
                 severity=str(draft.severity or "medium"),
                 assessment_kind="security_check",
+                extra_metadata={
+                    "outcome": assessment.outcome,
+                    "claim_supported": assessment.claim_supported,
+                    "review_receipt_id": str(receipt.evidence_id),
+                },
             ),
             existing_claims=existing_claims,
         )

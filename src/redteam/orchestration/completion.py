@@ -13,7 +13,7 @@ from __future__ import annotations
 from typing import Any
 
 from redteam.core.enums import EvidenceSourceType
-from redteam.orchestration.analysis import is_final_admission_receipt
+from redteam.orchestration.analysis import claim_target_is_grounded, is_final_admission_receipt
 from redteam.orchestration.session_proof import collect_actual_sessions
 from redteam.orchestration.diagnostics import DecisionDiagnostic
 from redteam.orchestration.evidence_access import raw_from_metadata
@@ -317,9 +317,9 @@ def _evidence_hypothesis_id(record: Any) -> str:
 
 
 async def _load_final_receipts(evidence_store: Any, run_id: str) -> list[dict[str, Any]]:
-    """Latest final-admission receipt per action+invocation; interim/stale excluded."""
+    """Latest final receipt per origin and hypothesis/claim, including negatives."""
     records = await evidence_store.list_for_run(run_id)
-    latest: dict[tuple[str, str], tuple[Any, dict[str, Any]]] = {}
+    latest: dict[tuple[str, str, str], tuple[Any, dict[str, Any]]] = {}
     for rec in list(records or []):
         try:
             if not is_final_admission_receipt(rec):
@@ -329,12 +329,17 @@ async def _load_final_receipts(evidence_store: Any, run_id: str) -> list[dict[st
             continue
         if not isinstance(meta, dict):
             continue
+        if str(getattr(rec, "run_id", "")) != str(run_id):
+            continue
         action = str(meta.get("action_id", "") or "").strip()
         invocation = str(meta.get("invocation_id", "") or "").strip()
         if not action or not invocation:
             continue
         created = getattr(rec, "created_at", None)
-        key = (action, invocation)
+        identity = str(meta.get("hypothesis_id") or meta.get("claim_identity") or "")
+        key = (action, invocation, identity)
+        meta = {**meta, "receipt_id": str(rec.evidence_id),
+                "engagement_id": str(rec.engagement_id)}
         prev = latest.get(key)
         if prev is None:
             latest[key] = (created, dict(meta))
@@ -345,6 +350,26 @@ async def _load_final_receipts(evidence_store: Any, run_id: str) -> list[dict[st
         except Exception:
             continue
     return [meta for _, meta in latest.values()]
+
+
+def _receipt_links_record(meta: dict[str, Any], record: Any) -> bool:
+    """Receipt links to a preserved original without changing its metadata."""
+    return (
+        str(_field(record, "evidence_id", "")) in {
+            str(item) for item in meta.get("source_evidence_ids", []) or []
+        }
+        and (
+            (str(_field(record, "action_id", "")), str(_field(record, "invocation_id", "")))
+            == (str(meta.get("action_id", "")), str(meta.get("invocation_id", "")))
+            or any(
+                str(item.get("evidence_id", "")) == str(_field(record, "evidence_id", ""))
+                and str(item.get("action_id", "")) == str(_field(record, "action_id", ""))
+                and str(item.get("invocation_id", "")) == str(_field(record, "invocation_id", ""))
+                for item in meta.get("source_origins", []) or [] if isinstance(item, dict)
+            )
+        )
+        and str(_field(record, "engagement_id", "")) == str(meta.get("engagement_id", ""))
+    )
 
 
 async def _verify_prior_lineage(
@@ -747,13 +772,16 @@ def _final_receipt_confirms(
     hypothesis_id: str | None = None,
 ) -> bool:
     for meta in receipts:
-        if meta.get("outcome") != "success":
+        reviewed_outcome = meta.get("outcome")
+        if hypothesis_id and meta.get("hypothesis_outcome") is not None:
+            reviewed_outcome = meta.get("hypothesis_outcome")
+        if reviewed_outcome != "success":
             continue
         if str(meta.get("verdict") or "").strip().lower() == "unknown":
             continue
         if str(meta.get("verdict") or "").strip().lower() not in ("violation", "pass"):
             continue
-        if meta.get("claim_supported") is not True:
+        if meta.get("hypothesis_outcome") is None and meta.get("claim_supported") is not True:
             continue
         if hypothesis_id is not None and hypothesis_id.strip():
             receipt_hid = meta.get("hypothesis_id")
@@ -768,7 +796,13 @@ def _final_receipt_confirms(
         invocation = str(meta.get("invocation_id", "") or "").strip()
         if not action or not invocation:
             continue
-        if (action, invocation) not in pool_pairs:
+        receipt_pairs = {(action, invocation)}
+        receipt_pairs.update(
+            (str(item.get("action_id", "")), str(item.get("invocation_id", "")))
+            for item in meta.get("source_origins", []) or []
+            if isinstance(item, dict) and str(item.get("evidence_id", "")) in pool_ids
+        )
+        if not (receipt_pairs & pool_pairs):
             continue
         return True
     return False
@@ -781,13 +815,16 @@ def _final_receipt_refutes(
     hypothesis_id: str | None = None,
 ) -> bool:
     for meta in receipts:
-        if meta.get("outcome") != "refuted":
+        reviewed_outcome = meta.get("outcome")
+        if hypothesis_id and meta.get("hypothesis_outcome") is not None:
+            reviewed_outcome = meta.get("hypothesis_outcome")
+        if reviewed_outcome != "refuted":
             continue
         if str(meta.get("verdict") or "").strip().lower() == "unknown":
             continue
         if str(meta.get("verdict") or "").strip().lower() not in ("pass", "anomaly"):
             continue
-        if meta.get("claim_supported") is not False:
+        if meta.get("hypothesis_outcome") is None and meta.get("claim_supported") is not False:
             continue
         if hypothesis_id is not None and hypothesis_id.strip():
             receipt_hid = meta.get("hypothesis_id")
@@ -802,7 +839,13 @@ def _final_receipt_refutes(
         invocation = str(meta.get("invocation_id", "") or "").strip()
         if not action or not invocation:
             continue
-        if (action, invocation) not in pool_pairs:
+        receipt_pairs = {(action, invocation)}
+        receipt_pairs.update(
+            (str(item.get("action_id", "")), str(item.get("invocation_id", "")))
+            for item in meta.get("source_origins", []) or []
+            if isinstance(item, dict) and str(item.get("evidence_id", "")) in pool_ids
+        )
+        if not (receipt_pairs & pool_pairs):
             continue
         return True
     return False
@@ -835,7 +878,13 @@ def _final_success_violation_receipt(
         invocation = str(meta.get("invocation_id", "") or "").strip()
         if not action or not invocation:
             continue
-        if (action, invocation) not in pool_pairs:
+        receipt_pairs = {(action, invocation)}
+        receipt_pairs.update(
+            (str(item.get("action_id", "")), str(item.get("invocation_id", "")))
+            for item in meta.get("source_origins", []) or []
+            if isinstance(item, dict) and str(item.get("evidence_id", "")) in pool_ids
+        )
+        if not (receipt_pairs & pool_pairs):
             continue
         return True
     return False
@@ -1200,6 +1249,41 @@ async def validate_result_claims(
     has_semantic = any(_criterion_kind(item) == "semantic" for item in criteria)
     step_target_set = {_s(item).strip() for item in target_node_ids if _s(item).strip()}
     step_principal_set = {_s(item).strip() for item in principal_refs if _s(item).strip()}
+    # Resolve explicit receipt references into originals before the unchanged
+    # path/origin/raw checks. Keep only latest per-claim receipts as links.
+    try:
+        admission_receipts = await _load_final_receipts(evidence_store, run)
+    except Exception:
+        admission_receipts = []
+        issues.add("review receipt lookup failed", code="completion_review_receipt_lookup_failed",
+                   summary="review receipt lookup failed")
+    expanded_ids: list[str] = []
+    for eid in evidence_ids:
+        try:
+            cited = await evidence_store.get(eid)
+        except Exception:
+            cited = None
+        if cited is not None and is_final_admission_receipt(cited):
+            admitted = next(
+                (meta for meta in admission_receipts if meta.get("receipt_id") == str(eid)), None
+            )
+            if admitted is None:
+                issues.add("review receipt is stale or unavailable",
+                           code="completion_stale_review_receipt",
+                           summary="review receipt is stale or unavailable")
+                continue
+            cited_meta = getattr(cited, "metadata", {}) or {}
+            if (
+                str(cited_meta.get("action_id", "")) != str(cited.action_id)
+                or str(cited_meta.get("invocation_id", "")) != str(cited.invocation_id)
+            ):
+                issues.add("review receipt origin disagrees", code="completion_receipt_origin_invalid",
+                           summary="review receipt origin disagrees")
+                continue
+            expanded_ids.extend(str(ref) for ref in admitted.get("source_evidence_ids", []) or [])
+        else:
+            expanded_ids.append(str(eid))
+    evidence_ids = list(dict.fromkeys(expanded_ids))
     for eid in evidence_ids:
         try:
             record = await evidence_store.get(eid)  # type: ignore[union-attr]
@@ -1343,12 +1427,23 @@ async def validate_result_claims(
             )
             continue
         if step_target_set and target_ref not in step_target_set:
-            issues.add(
-                f"evidence '{eid}' targets a different object",
-                code="completion_evidence_reference_targets_a_different_object_24",
-                summary="evidence 'reference' targets a different object",
-            )
-            continue
+            related = False
+            for receipt_meta in admission_receipts:
+                claimed_target = str(receipt_meta.get("target_node_id", "") or "")
+                if claimed_target in step_target_set and _receipt_links_record(receipt_meta, record):
+                    try:
+                        related = await claim_target_is_grounded(graph_service, record, claimed_target)
+                    except Exception:
+                        related = False
+                    if related:
+                        break
+            if not related:
+                issues.add(
+                    f"evidence '{eid}' targets a different object",
+                    code="completion_evidence_reference_targets_a_different_object_24",
+                    summary="evidence 'reference' targets a different object",
+                )
+                continue
         linkage_errors = check_record_linkage(record, meta, raw, eid)
         for linkage_message, linkage_code, linkage_summary in linkage_errors:
             issues.add(linkage_message, code=linkage_code, summary=linkage_summary)
@@ -1538,7 +1633,13 @@ async def validate_result_claims(
                 evaluated.append((criterion, False, "principal scope"))
                 continue
         if kind in {"hypothesis_confirmed", "hypothesis_refuted"} and hid:
-            pool = [rec for rec in pool if _evidence_hypothesis_id(rec) == hid]
+            pool = [
+                rec for rec in pool
+                if _evidence_hypothesis_id(rec) == hid or any(
+                    str(meta.get("hypothesis_id", "")) == hid and _receipt_links_record(meta, rec)
+                    for meta in admission_receipts
+                )
+            ]
             status = ""
             try:
                 hypothesis = await graph_service.get_hypothesis(hid)  # type: ignore[union-attr]

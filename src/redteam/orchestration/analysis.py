@@ -19,6 +19,7 @@ from redteam.core.ids import EvidenceId, GraphNodeId, new_id
 from redteam.core.ports.evidence_store import EvidenceStore
 from redteam.orchestration.action_naming import tool_matches_action_namespace
 from redteam.orchestration.cognition import DecisionBudget, StructuredDecisionClient
+from redteam.orchestration.coordination import content_hash
 from redteam.orchestration.evidence_access import raw_from_metadata
 from redteam.orchestration.expectations import Expectation, ExpectationOutcome, verdict_for
 from redteam.orchestration.session_proof import (
@@ -48,6 +49,7 @@ class VerificationAssessment(BaseModel):
     outcome: VerificationOutcome | None = None
     last_record_stage: str | None = None
     claim_supported: bool | None = None
+    hypothesis_outcome: VerificationOutcome | None = None
 
 
 class AnalysisVerifier(Protocol):
@@ -246,7 +248,50 @@ def _posthoc_source_gap(record: Any, raw: Any) -> str | None:
         return "preserved raw answers another action"
     if str(raw.get("invocation_id")) != str(invocation):
         return "preserved raw answers another invocation"
+    # Local import keeps completion's receipt consumer import acyclic.
+    from redteam.orchestration.completion import check_record_linkage
+
+    metadata = getattr(record, "metadata", {}) or {}
+    errors = check_record_linkage(record, metadata, raw, "reference")
+    if errors:
+        return errors[0][2]
     return None
+
+
+async def claim_target_is_grounded(
+    graph_service: Any, record: Any, target_node_id: str
+) -> bool:
+    """A source target or a measured, source-backed direct relation."""
+    meta = getattr(record, "metadata", {}) or {}
+    source = str(meta.get("target_node_id", "") or "").strip()
+    if not source or not target_node_id:
+        return False
+    proposal = meta.get("proposal", {})
+    try:
+        parsed = ActionProposal.model_validate(proposal)
+        if str(node_id_for_target(parsed.target)) != source:
+            return False
+    except Exception:
+        return False
+    if source == target_node_id:
+        return True
+    if graph_service is None:
+        return False
+    from redteam.attack_graph.predicates import Confidence
+
+    for edge in await graph_service.list_edges():
+        if {str(edge.source_id), str(edge.target_id)} != {source, target_node_id}:
+            continue
+        for entry in edge.properties.get("provenance", []) or []:
+            if not isinstance(entry, dict):
+                continue
+            if (
+                str(entry.get("run_id", "")) == str(record.run_id)
+                and str(entry.get("evidence_id", "")) == str(record.evidence_id)
+                and entry.get("confidence") == Confidence.MEASURED
+            ):
+                return True
+    return False
 
 
 def _is_direct_tool_binding(proposal: Any) -> bool:
@@ -422,12 +467,8 @@ def _has_raw_account_artifact(
                     return False
             if first_principal is None or second_principal is None:
                 return False
-        # Single precedence with the collector: any actual receipt anywhere
-        # drops every legacy echo; legacy pair only on fully legacy proof.
-        if has_actual_receipt(metadata, raw):
-            session_pair = ("first_actual_session_ref", "second_actual_session_ref")
-        else:
-            session_pair = ("first_session_ref", "second_session_ref")
+        # Request echo pairs never establish session use.
+        session_pair = ("first_actual_session_ref", "second_actual_session_ref")
         first_session = _clean_identity(comparison_dict.get(session_pair[0]))
         second_session = _clean_identity(comparison_dict.get(session_pair[1]))
         if (first_session is not None or second_session is not None) and expected_sessions:
@@ -492,6 +533,14 @@ async def _session_alias_grounded(
         if not isinstance(stored, dict) or str(stored.get("action_id")) != str(record.action_id):
             continue
         args = stored.get("arguments", {})
+        record_target = args.get("target_ref") if isinstance(args, dict) else None
+        if record_target is not None and record_target != expected_target:
+            continue
+        actual_sessions = collect_actual_sessions(meta, raw)
+        if session_name.strip() not in actual_sessions:
+            continue
+        if _posthoc_source_gap(record, raw) is not None:
+            continue
         output = raw.get("output")
         if not isinstance(output, dict):
             continue
@@ -521,14 +570,6 @@ async def _session_alias_grounded(
                     if session is not None
                 ):
                     return True
-            elif (
-                _clean_identity(item.get("session_ref", item.get("session"))),
-                principal,
-            ) == wanted:
-                return True
-        record_target = args.get("target_ref") if isinstance(args, dict) else None
-        if record_target is not None and record_target != expected_target:
-            continue
     return False
 
 
@@ -599,6 +640,10 @@ class StructuredLLMAnalysisVerifier:
         if not refs:
             return self._unknown_claim(refs, "no evidence reference to check")
         excerpts: list[str] = []
+        source_engagement: str | None = None
+        claim_target = str(claim.get("target_node_id", "") or "").strip()
+        if not claim_target:
+            return self._unknown_claim(refs, "claim has no target linkage")
         for ref in refs:
             try:
                 record = await self._store.get(EvidenceId(ref))
@@ -608,10 +653,20 @@ class StructuredLLMAnalysisVerifier:
                 return self._unknown_claim(refs, "linked evidence is missing")
             if str(record.run_id) != str(run_id):
                 return self._unknown_claim(refs, "linked evidence is another run")
+            engagement = str(getattr(record, "engagement_id", "") or "")
+            if not engagement or (source_engagement is not None and engagement != source_engagement):
+                return self._unknown_claim(refs, "linked evidence is another engagement")
+            source_engagement = engagement
             raw = raw_from_metadata(getattr(record, "metadata", None))
             gap = _posthoc_source_gap(record, raw)
             if gap is not None:
                 return self._unknown_claim(refs, gap)
+            try:
+                target_ok = await claim_target_is_grounded(self._graph, record, claim_target)
+            except Exception:
+                target_ok = False
+            if not target_ok:
+                return self._unknown_claim(refs, "claim target has no source-backed relation")
             assert isinstance(raw, dict)
             metadata = getattr(record, "metadata", None)
             target_ref = (
@@ -623,6 +678,7 @@ class StructuredLLMAnalysisVerifier:
                         "evidence_id": ref,
                         "action_id": str(getattr(record, "action_id", "")),
                         "target_node_id": target_ref,
+                        "proposal": metadata.get("proposal"),
                         "output": raw.get("output"),
                     },
                     ensure_ascii=False,
@@ -714,11 +770,23 @@ class StructuredLLMAnalysisVerifier:
         if self._llm is None:
             return self._unknown_claim(refs, "no model configured for review")
         try:
+            response_schema = self._meaning_schema()
+            if claim.get("reference_hypothesis"):
+                response_schema["properties"]["hypothesis_outcome"] = {
+                    "type": "string", "enum": ["success", "refuted", "unknown"],
+                    "description": "Whether evidence supports, refutes, or does not resolve the cited hypothesis."
+                }
+                response_schema["required"].append("hypothesis_outcome")
             meaning = await self._decider.ask(
                 stage="analysis_claim_verify",
                 payload={"claim": claim, "excerpts": excerpts},
-                response_schema=self._meaning_schema(),
-                system=_CLAIM_SYSTEM,
+                response_schema=response_schema,
+                system=_CLAIM_SYSTEM + (
+                    " When reference_hypothesis is given, independently judge its meaning "
+                    "from these same sources. A paraphrase may support it; an unrelated "
+                    "claim or a narrower negative result does not resolve it. Return "
+                    "hypothesis_outcome separately from the new claim outcome."
+                ),
                 budget=budget,
                 before_call=before_call,
             )
@@ -726,7 +794,15 @@ class StructuredLLMAnalysisVerifier:
             kind = getattr(exc, "kind", None)
             suffix = " (" + str(kind) + ")" if kind else ""
             return self._unknown_claim(refs, "model decision failed" + suffix)
-        return self._claim_decision(refs, meaning, security_claim=security_claim)
+        assessment = self._claim_decision(refs, meaning, security_claim=security_claim)
+        if claim.get("reference_hypothesis"):
+            hyp_outcome = meaning.get("hypothesis_outcome") if isinstance(meaning, dict) else None
+            if hyp_outcome not in ("success", "refuted", "unknown"):
+                return self._unknown_claim(refs, "reference hypothesis meaning not reviewed")
+            if assessment.outcome not in ("success", "refuted"):
+                hyp_outcome = "unknown"
+            assessment = assessment.model_copy(update={"hypothesis_outcome": hyp_outcome})
+        return assessment
 
     def _unknown_claim(self, refs: list[str], reason: str) -> VerificationAssessment:
         return VerificationAssessment(
@@ -764,8 +840,13 @@ class StructuredLLMAnalysisVerifier:
             # other verified new claim stays a benign pass. The verdict is
             # never minted from a bare model-success boolean: success above
             # already required a grounded outcome with claim_supported True.
-            verdict=Verdict.VIOLATION if security_claim else Verdict.PASS,
-            reason=("model confirms the claim" + suffix),
+            verdict=(
+                Verdict.VIOLATION
+                if security_claim and outcome == "success" and supported is True
+                else Verdict.PASS
+            ),
+            reason=(("model refutes the claim" if outcome == "refuted"
+                     else "model confirms the claim") + suffix),
             reviewer_id=self.reviewer_id,
             source_refs=list(refs),
             outcome=outcome,
@@ -1145,33 +1226,11 @@ class StructuredLLMAnalysisVerifier:
                 pass
             else:
                 bound_session = _clean_identity(args.get("session_ref"))
-                raw_session_hit = False
-                if bound_session is not None:
-                    http_obs = metadata.get("http_observation")
-                    if (
-                        isinstance(http_obs, dict)
-                        and _clean_identity(http_obs.get("session_ref")) == bound_session
-                    ):
-                        raw_session_hit = True
-                    if not raw_session_hit:
-                        try:
-                            output = raw.get("output") if isinstance(raw, dict) else None
-                        except Exception:
-                            output = None
-                        if isinstance(output, dict):
-                            for key in ("session_ref", "first_session_ref", "second_session_ref"):
-                                if _clean_identity(output.get(key)) == bound_session:
-                                    raw_session_hit = True
-                                    break
-                            if not raw_session_hit:
-                                for nested_key in ("first", "second", "authenticated"):
-                                    nested = output.get(nested_key)
-                                    if isinstance(nested, dict) and (
-                                        _clean_identity(nested.get("session_ref")) == bound_session
-                                        or _clean_identity(nested.get("session")) == bound_session
-                                    ):
-                                        raw_session_hit = True
-                                        break
+                raw_session_hit = (
+                    bound_session is not None
+                    and actual_receipt_conflict(metadata, raw) is None
+                    and bound_session in collect_actual_sessions(metadata, raw)
+                )
                 if bound_session is None or not raw_session_hit:
                     return (
                         "account claim has no exact raw session receipt; "
@@ -1242,30 +1301,29 @@ async def _covered_principals_from_sources(store: Any, source_refs: Any) -> list
             continue
         if not isinstance(metadata, dict):
             continue
+        raw = raw_from_metadata(metadata)
+        if _posthoc_source_gap(record, raw) is not None:
+            continue
+        if actual_receipt_conflict(metadata, raw) is not None:
+            continue
+        candidates: set[str] = set()
         comparison = metadata.get("session_comparison")
-        if isinstance(comparison, dict):
-            for key in ("first_principal_ref", "second_principal_ref"):
-                cleaned = _clean_receipt_identity(comparison.get(key))
-                if cleaned is not None and cleaned not in seen:
-                    seen[cleaned] = None
-        raw: Any = metadata.get("tool_result")
-        if not isinstance(raw, dict):
-            raw = metadata.get("raw_tool_result")
-        try:
-            output = raw.get("output") if isinstance(raw, dict) else None
-        except Exception:
-            output = None
+        output = raw.get("output")
+        units = [comparison, output]
         if isinstance(output, dict):
+            units.extend(output.get(key) for key in ("first", "second", "authenticated", "anonymous"))
+        for unit in units:
+            if not isinstance(unit, dict):
+                continue
             for key in ("principal_ref", "first_principal_ref", "second_principal_ref"):
-                cleaned = _clean_receipt_identity(output.get(key))
-                if cleaned is not None and cleaned not in seen:
-                    seen[cleaned] = None
-            for nested_key in ("first", "second", "authenticated", "anonymous"):
-                nested = output.get(nested_key)
-                if isinstance(nested, dict):
-                    cleaned = _clean_receipt_identity(nested.get("principal_ref"))
-                    if cleaned is not None and cleaned not in seen:
-                        seen[cleaned] = None
+                candidate = _clean_receipt_identity(unit.get(key))
+                if candidate is not None:
+                    candidates.add(candidate)
+        stored = metadata.get("proposal", {})
+        args = stored.get("arguments", {}) if isinstance(stored, dict) else {}
+        for candidate in candidates:
+            if _has_raw_account_artifact(metadata, raw, candidate, args):
+                seen[candidate] = None
     return sorted(seen)
 
 
@@ -1423,6 +1481,24 @@ async def append_posthoc_claim_receipt(
     refs = [str(item) for item in (evidence_ids or []) if str(item).strip()]
     if not refs:
         return None
+    origin_pairs: set[tuple[str, str]] = set()
+    source_origins: list[dict[str, str]] = []
+    for ref in refs:
+        source = await evidence_store.get(EvidenceId(ref))
+        if source is None or str(source.run_id) != str(run_id):
+            return None
+        if str(source.engagement_id) != str(engagement_id):
+            return None
+        if _posthoc_source_gap(source, raw_from_metadata(source.metadata)) is not None:
+            return None
+        origin_pairs.add((str(source.action_id), str(source.invocation_id)))
+        source_origins.append({
+            "evidence_id": str(source.evidence_id),
+            "action_id": str(source.action_id),
+            "invocation_id": str(source.invocation_id),
+        })
+    if (clean_action, clean_invocation) not in origin_pairs:
+        return None
     supporting, refuting = _receipt_support_assignment(assessment, refs)
     outcome = getattr(assessment, "outcome", None)
     try:
@@ -1461,6 +1537,7 @@ async def append_posthoc_claim_receipt(
         "public": True,
         "admission": "final",
         "posthoc": True,
+        "hypothesis_outcome": assessment.hypothesis_outcome,
         "origin": "graph.record",
         "supersedes": [],
         "reviewer_id": assessment.reviewer_id,
@@ -1469,12 +1546,18 @@ async def append_posthoc_claim_receipt(
         "reason": str(getattr(assessment, "reason", "") or "")[:500],
         "claim_supported": getattr(assessment, "claim_supported", None),
         "claim": statement,
+        "claim_identity": content_hash({
+            "statement": " ".join(str(claim.get("statement", "")).split()),
+            "target_node_id": target_node_id,
+            "principal_refs": sorted(claimed_principals),
+        }),
         "claimed_principals": list(claimed_principals),
         "action_id": clean_action,
         "invocation_id": clean_invocation,
         "target_node_id": str(target_node_id).strip() if target_node_id else None,
         "hypothesis_id": str(hypothesis_id).strip() if hypothesis_id else None,
         "source_evidence_ids": list(refs),
+        "source_origins": source_origins,
         "supporting_evidence_ids": supporting,
         "refuting_evidence_ids": refuting,
         "covered_principals": covered_principals,
