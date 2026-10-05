@@ -87,7 +87,9 @@ async def read_for_runtime(
     return result
 
 
-async def restore_reads(evidence_store: Any, runtime: Any, *, delegation_id: str | None = None) -> list[dict]:
+async def restore_reads(
+    evidence_store: Any, runtime: Any, *, delegation_id: str | None = None
+) -> list[dict]:
     """Reconstitute the requested windows from the single original store."""
     reader = EvidenceReader(evidence_store)
     return [

@@ -211,3 +211,96 @@ async def test_observation_is_bounded_and_prefers_recent_nodes() -> None:
     assert len(observation.nodes_by_type["host"]) == 3
     # Most recently seen wins the limited slots.
     assert observation.nodes_by_type["host"][0].startswith("h9")
+
+
+async def test_relation_reconfirmation_changes_revision_only_for_meaningful_grounding_or_value():
+    from redteam.attack_graph.predicates import (
+        claim_assertions,
+        claim_key_for_fact,
+        claim_provenance_of,
+    )
+    from redteam.orchestration.analysis import claim_target_is_grounded
+    from redteam.orchestration.progress import observation_fingerprint
+    from tests.integration import _engine_llm_harness as h
+
+    svc = service()
+    a = await svc.observe_target(HostTarget(host="host-01"))
+    b = await svc.observe_target(HostTarget(host="related.local"))
+    content = {
+        "relation": {"type": "observed", "source_node_id": str(a.id), "target_node_id": str(b.id)},
+        "observation": "discovered",
+    }
+
+    def prov(eid, confidence):
+        return Provenance(
+            step=1, source="test", evidence_id=eid, run_id="run-reconfirm", confidence=confidence
+        )
+
+    async def revision():
+        observation = await svc.observe()
+        return observation.relation_digests, observation_fingerprint(
+            observation, include_edge_types=[GraphEdgeType.OBSERVED]
+        )
+
+    await svc.link(
+        GraphEdgeType.OBSERVED,
+        a.id,
+        b.id,
+        properties=content,
+        provenance=prov("inferred", Confidence.INFERRED),
+    )
+    before = await revision()
+    first = await svc.link(
+        GraphEdgeType.OBSERVED,
+        a.id,
+        b.id,
+        properties=content,
+        provenance=prov("measured-1", Confidence.MEASURED),
+    )
+    measured = await revision()
+    assert before[0] != measured[0] and before[1] != measured[1]
+    await svc.link(
+        GraphEdgeType.OBSERVED,
+        a.id,
+        b.id,
+        properties=content,
+        provenance=prov("measured-2", Confidence.MEASURED),
+    )
+    assert await revision() == measured
+    entry = claim_provenance_of(first.properties)[claim_key_for_fact("relation")]
+    assert entry["evidence_id"] == "inferred"
+    current = (await svc.list_edges())[0]
+    assertions = claim_assertions(
+        claim_provenance_of(current.properties)[claim_key_for_fact("relation")]
+    )
+    assert {item["evidence_id"] for item in assertions} == {"inferred", "measured-1", "measured-2"}
+    for eid in ("measured-1", "measured-2"):
+        record = h.make_tool_evidence(
+            evidence_id=eid,
+            run_id="run-reconfirm",
+            engagement_id="eng-t1",
+            action_id="act-" + eid,
+            invocation_id="inv-" + eid,
+            path_id="path-1",
+            path_version=1,
+            step_id="step-1",
+            target_node_id=str(a.id),
+        )
+        proposal, _ = h.make_proposal_result(
+            run_id="run-reconfirm",
+            engagement_id="eng-t1",
+            action_id="act-" + eid,
+            invocation_id="inv-" + eid,
+            host="host-01",
+        )
+        record.metadata["proposal"] = proposal.model_dump(mode="json")
+        assert await claim_target_is_grounded(svc, record, str(b.id))
+    await svc.link(
+        GraphEdgeType.OBSERVED,
+        a.id,
+        b.id,
+        properties={**content, "observation": "contacted"},
+        provenance=prov("changed", Confidence.MEASURED),
+    )
+    changed = await revision()
+    assert changed[0] != measured[0] and changed[1] != measured[1]

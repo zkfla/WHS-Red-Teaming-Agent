@@ -159,8 +159,6 @@ def worker_propose(node_id: str, probe: str) -> dict[str, Any]:
         "actions": [
             {
                 "target_node_id": node_id,
-                "capability": "recon",
-                "operation": "service_discovery",
                 "tool_id": h.INVENTORY_TOOL,
                 "arguments": {"probe": probe},
                 "reason": f"inventory sweep {probe}",
@@ -168,6 +166,14 @@ def worker_propose(node_id: str, probe: str) -> dict[str, Any]:
         ],
         "summary": f"worker sweep {probe}",
     }
+
+
+def root_propose(node_id: str) -> dict[str, Any]:
+    response = h.turn_actions(node_id)
+    for action in response["actions"]:
+        action.pop("capability", None)
+        action.pop("operation", None)
+    return response
 
 
 async def _delegated_setup(run_id: str):
@@ -209,7 +215,7 @@ async def test_minimal_purpose_steps_draft_registers() -> None:
     assert set(draft) == {"reason", "steps"}
     llm.add("path_draft", draft)
     llm.add("path_review", h.review_accept())
-    llm.add("next_action", h.turn_actions(seed.node_id))
+    llm.add("next_action", root_propose(seed.node_id))
     path, compiled, note = await engine.decide(
         h.make_runtime("run-del-minimal", "eng-t1"), GraphObservation()
     )
@@ -405,7 +411,7 @@ async def test_parked_pending_does_not_block_worker_while_leased_does() -> None:
             updated_at=now,
         )
     )
-    llm2.add("next_action", h.turn_actions(seed2.node_id))
+    llm2.add("next_action", root_propose(seed2.node_id))
     _, leased_candidates, leased_note = await engine2.decide(runtime2, GraphObservation())
     assert "worker_next_action" not in [call["stage"] for call in llm2.calls]
     assert leased_note in (None, "continue_planning")
@@ -473,3 +479,44 @@ async def test_opened_delegation_never_reissues_initial_budget() -> None:
         decision_limit=4,
     )
     assert reopened.delegation_id != first.delegation_id
+
+
+async def test_worker_provider_failure_preserves_diagnostic_usage_and_report(tmp_path):
+    from redteam.app.cli.commands.report import _render_markdown
+    from redteam.app.report_store import load_terminal_report, save_terminal_report
+    from redteam.attack_graph.service import AttackGraphService
+    from redteam.core.enums import AgentPhase
+    from redteam.core.ports.llm import LLMProviderFailure
+    from redteam.orchestration.reporting import ReportingAgent
+
+    ctx = await _delegated_setup("run-worker-provider")
+    ctx.llm.add("worker_next_action", LLMProviderFailure(
+        kind="auth", http_status=401, provider_code="invalid_api_key", retryable=False,
+    ))
+    calls_before = len(ctx.llm.calls)
+    await ctx.engine.decide(ctx.runtime, GraphObservation())
+    runtime = ctx.engine.updated_runtime
+    delegation = runtime.delegations[ctx.delegation_id]
+    assert len(ctx.llm.calls) == calls_before + 1
+    assert delegation.status == "finished"
+    assert delegation.termination_reason == "provider_failure"
+    assert delegation.decision_attempts_used == 1
+    assert runtime.model_requests_used == 4 and runtime.model_usage_unknown == 4
+    assert ctx.deps.tool_gateway.invocations == []
+    assert len(runtime.unresolved_evidence_ids) == 1
+    record = await ctx.world.evidence.get(runtime.unresolved_evidence_ids[0])
+    assert record.metadata["claim_supported"] is False
+    assert record.metadata["diagnostic"]["provider_status"] == 401
+    assert record.metadata["gaps"][0]["code"] == "provider_failure"
+    runtime = RuntimeState.model_validate_json(runtime.model_dump_json())
+    report = await ReportingAgent().project(
+        runtime.model_copy(update={
+            "phase": AgentPhase.FINISHED, "termination_reason": "investigation_held",
+        }), graph=AttackGraphService(ctx.seed.store),
+        evidence_store=ctx.world.evidence, work_store=ctx.world.work,
+    )
+    save_terminal_report(report, reports_dir=tmp_path)
+    restored = load_terminal_report(runtime.run_id, reports_dir=tmp_path)
+    assert restored.run_outcome == "unresolved" and not restored.ready_for_release
+    assert restored.unresolved_details[0].diagnostic.provider_code == "invalid_api_key"
+    assert "status=401" in _render_markdown(restored)

@@ -37,6 +37,7 @@ from urllib.parse import urljoin, urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
 
+from redteam.attack_graph.identity import node_id_for_target
 from redteam.attack_graph.predicates import (
     CLAIM_ATTR_PREFIX,
     CLAIM_FACT_PREFIX,
@@ -45,14 +46,13 @@ from redteam.attack_graph.predicates import (
     Provenance,
 )
 from redteam.attack_graph.service import AttackGraphService
-from redteam.attack_graph.identity import node_id_for_target
 from redteam.core.contracts.evidence import EvidenceRecord
 from redteam.core.contracts.graph import Hypothesis
 from redteam.core.contracts.target import EndpointTarget, HostTarget, TargetRef, UrlTarget
 from redteam.core.convert import digest_payload
 from redteam.core.enums import EvidenceSourceType, GraphEdgeType
 from redteam.core.extensions import Contribution
-from redteam.core.ids import EvidenceId, new_id
+from redteam.core.ids import EngagementId, EvidenceId, RunId, new_id
 from redteam.orchestration.analysis import (
     _posthoc_source_gap,
     append_posthoc_claim_receipt,
@@ -243,7 +243,7 @@ def _inferred_provenance(*, step: int, evidence_id: str | None, run_id: str) -> 
     )
 
 
-_TARGET_REF_ADAPTER = TypeAdapter(TargetRef)
+_TARGET_REF_ADAPTER: TypeAdapter[TargetRef] = TypeAdapter(TargetRef)
 
 
 def _proposal_target(metadata: Any) -> Any | None:
@@ -673,7 +673,9 @@ class GraphRecordingHandler:
                 inferred_edge_id = str(inferred_edge.id)
                 record_ids.append(inferred_edge_id)
             except Exception:
-                refused_facts.append({"evidence_id": eid, "reason": "inferred relation write failed"})
+                refused_facts.append(
+                    {"evidence_id": eid, "reason": "inferred relation write failed"}
+                )
         accepted_facts.append(
             {
                 "evidence_id": eid,
@@ -893,12 +895,12 @@ class GraphRecordingHandler:
                         existing_claims.add(str(key))
             except Exception:
                 existing_claims = set()
-        for draft in recording.findings:
-            for ref in draft.evidence_refs:
+        for finding_draft in recording.findings:
+            for ref in finding_draft.evidence_refs:
                 _remember(seen_refs, ref)
             findings_out.append(
                 await self._promote_finding(
-                    draft,
+                    finding_draft,
                     store=store,
                     service=service,
                     run_id=run_id,
@@ -1035,7 +1037,8 @@ class GraphRecordingHandler:
                     candidate.metadata.get("target_node_id") == target
                     and (
                         len(new_hypothesis_ids) == 1
-                        or " ".join(candidate.description.split()) == " ".join(draft.statement.split())
+                        or " ".join(candidate.description.split())
+                        == " ".join(draft.statement.split())
                     )
                 ):
                     hypothesis_id = candidate_id
@@ -1071,7 +1074,9 @@ class GraphRecordingHandler:
             if _posthoc_source_gap(source, raw_from_metadata(source.metadata)) is not None:
                 return _refused_entry(base, "source origin invalid", "finding_id")
             if not await claim_target_is_grounded(service, source, target):
-                return _refused_entry(base, "claim target has no source-backed relation", "finding_id")
+                return _refused_entry(
+                    base, "claim target has no source-backed relation", "finding_id"
+                )
         verify = getattr(verifier, "verify_claim_with_budget", None)
         if verify is None or budget is None:
             return {
@@ -1289,8 +1294,8 @@ class GraphRecordingHandler:
         }
         record = EvidenceRecord(
             evidence_id=EvidenceId(new_id("ev")),
-            run_id=run_id,
-            engagement_id=engagement_id,
+            run_id=RunId(run_id),
+            engagement_id=EngagementId(engagement_id),
             source_type=EvidenceSourceType.AGENT,
             source_id="graph.record",
             action_id=None,

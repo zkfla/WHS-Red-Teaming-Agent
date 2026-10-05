@@ -245,7 +245,10 @@ async def execute_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
         descriptor = deps.tool_catalog.get(step.tool_id)
         binding_ready = bool(
             descriptor is not None
-            and (step.binding_mode == "selected_tool" or proposal.capability in descriptor.capability_tags)
+            and (
+                step.binding_mode == "selected_tool"
+                or proposal.capability in descriptor.capability_tags
+            )
             and descriptor.health_status is not ToolHealthStatus.UNHEALTHY
         )
     # A bounded retry needs a retryable gateway error, a known LOW-risk

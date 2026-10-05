@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from pydantic import ValidationError
 
 from redteam.core.config import EngagementConfig, OrchestrationConfig
@@ -62,7 +64,7 @@ def _ask(console, draft: EngagementDraft, field: str, *, editing: bool) -> Engag
             if answer == "-" and field in {"description", "objective"} and not editing:
                 raise ValueError("작업 설명과 목표는 비울 수 없습니다.")
             if answer == "-":
-                value = [] if kind == "array" else None
+                value: Any = [] if kind == "array" else None
             elif kind == "array":
                 value = [item.strip() for item in answer.split(",") if item.strip()]
                 if field == "allowed_hosts":

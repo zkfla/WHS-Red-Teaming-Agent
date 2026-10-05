@@ -49,6 +49,9 @@ class DummyToolGateway:
     def list_by_capability(self, capability_tag: str) -> list[ToolDescriptor]:
         return [tool for tool in self._tools if capability_tag in tool.capability_tags]
 
+    def all_descriptors(self) -> list[ToolDescriptor]:
+        return list(self._tools)
+
     async def invoke(self, invocation: ToolInvocation) -> ToolResult:
         self.invocations.append(invocation)
         now = datetime.now(timezone.utc)

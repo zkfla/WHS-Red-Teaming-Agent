@@ -57,7 +57,11 @@ def validate_network_arguments(
     argument_bindings: Mapping[str, str] | None = None,
     target_binding: ToolTargetBinding | None = None,
 ) -> None:
-    binding = target_binding if target_binding is not None else operation_target_binding(operation, bindings)
+    binding = (
+        target_binding
+        if target_binding is not None
+        else operation_target_binding(operation, bindings)
+    )
     if binding.requires_url_target and not isinstance(target, UrlTarget):
         raise ValueError(f"{operation} requires a known URL target")
     identity = network_identity(target)

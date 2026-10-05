@@ -135,6 +135,9 @@ class _FakeCatalog:
     def get(self, tool_id: Any) -> ToolDescriptor | None:
         return self._tools.get(str(tool_id))
 
+    def all_descriptors(self) -> list[ToolDescriptor]:
+        return list(self._tools.values())
+
     def list_by_capability(self, capability_tag: str) -> list[ToolDescriptor]:
         return [t for t in self._tools.values() if capability_tag in t.capability_tags]
 
@@ -244,8 +247,6 @@ def _turn_mobile_action(asset_node_id: str) -> dict[str, Any]:
                 "agent_id": MOBILE_AGENT_ID,
                 "target_node_id": asset_node_id,
                 "principal_ref": None,
-                "capability": MOBILE_CAPABILITY,
-                "operation": MOBILE_OPERATION,
                 "tool_id": MOBILE_TOOL,
                 "arguments": {},
                 "reason": "analyze the declared artifact",

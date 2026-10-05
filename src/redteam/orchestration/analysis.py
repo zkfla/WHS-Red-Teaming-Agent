@@ -15,7 +15,16 @@ from redteam.core.contracts.evidence import EvidenceRecord
 from redteam.core.contracts.tool import ToolResult
 from redteam.core.convert import digest_payload
 from redteam.core.enums import EvidenceSourceType, Verdict
-from redteam.core.ids import EvidenceId, GraphNodeId, new_id
+from redteam.core.ids import (
+    ActionId,
+    EngagementId,
+    EvidenceId,
+    GraphNodeId,
+    HypothesisId,
+    InvocationId,
+    RunId,
+    new_id,
+)
 from redteam.core.ports.evidence_store import EvidenceStore
 from redteam.orchestration.action_naming import tool_matches_action_namespace
 from redteam.orchestration.cognition import DecisionBudget, StructuredDecisionClient
@@ -571,7 +580,7 @@ async def _session_alias_grounded(
             principal = _clean_identity(item.get("principal_ref"))
             if has_actual_receipt(meta, raw):
                 if item is output:
-                    keys = (
+                    keys: tuple[str, ...] = (
                         "actual_session_ref",
                         "first_actual_session_ref",
                         "second_actual_session_ref",
@@ -671,7 +680,9 @@ class StructuredLLMAnalysisVerifier:
             if str(record.run_id) != str(run_id):
                 return self._unknown_claim(refs, "linked evidence is another run")
             engagement = str(getattr(record, "engagement_id", "") or "")
-            if not engagement or (source_engagement is not None and engagement != source_engagement):
+            if not engagement or (
+                source_engagement is not None and engagement != source_engagement
+            ):
                 return self._unknown_claim(refs, "linked evidence is another engagement")
             source_engagement = engagement
             raw = raw_from_metadata(getattr(record, "metadata", None))
@@ -685,7 +696,7 @@ class StructuredLLMAnalysisVerifier:
             if not target_ok:
                 return self._unknown_claim(refs, "claim target has no source-backed relation")
             assert isinstance(raw, dict)
-            metadata = getattr(record, "metadata", None)
+            metadata: Any = getattr(record, "metadata", None)
             target_ref = (
                 metadata.get("target_node_id") if isinstance(metadata, dict) else None
             )
@@ -791,7 +802,10 @@ class StructuredLLMAnalysisVerifier:
             if claim.get("reference_hypothesis"):
                 response_schema["properties"]["hypothesis_outcome"] = {
                     "type": "string", "enum": ["success", "refuted", "unknown"],
-                    "description": "Whether evidence supports, refutes, or does not resolve the cited hypothesis."
+                    "description": (
+                        "Whether evidence supports, refutes, "
+                        "or does not resolve the cited hypothesis."
+                    ),
                 }
                 response_schema["required"].append("hypothesis_outcome")
             meaning = await self._decider.ask(
@@ -1318,7 +1332,7 @@ async def _covered_principals_from_sources(store: Any, source_refs: Any) -> list
             continue
         if not isinstance(metadata, dict):
             continue
-        raw = raw_from_metadata(metadata)
+        raw: Any = raw_from_metadata(metadata)
         if _posthoc_source_gap(record, raw) is not None:
             continue
         if actual_receipt_conflict(metadata, raw) is not None:
@@ -1328,7 +1342,10 @@ async def _covered_principals_from_sources(store: Any, source_refs: Any) -> list
         output = raw.get("output")
         units = [comparison, output]
         if isinstance(output, dict):
-            units.extend(output.get(key) for key in ("first", "second", "authenticated", "anonymous"))
+            units.extend(
+                output.get(key)
+                for key in ("first", "second", "authenticated", "anonymous")
+            )
         for unit in units:
             if not isinstance(unit, dict):
                 continue
@@ -1581,13 +1598,13 @@ async def append_posthoc_claim_receipt(
     }
     receipt = EvidenceRecord(
         evidence_id=EvidenceId(new_id("ev")),
-        run_id=run_id,
-        engagement_id=engagement_id,
+        run_id=RunId(run_id),
+        engagement_id=EngagementId(engagement_id),
         source_type=EvidenceSourceType.SYSTEM,
         source_id=str(assessment.reviewer_id),
-        action_id=clean_action,
-        invocation_id=clean_invocation,
-        hypothesis_id=str(hypothesis_id).strip() if hypothesis_id else None,
+        action_id=ActionId(clean_action),
+        invocation_id=InvocationId(clean_invocation),
+        hypothesis_id=HypothesisId(str(hypothesis_id).strip()) if hypothesis_id else None,
         content_type="application/json",
         artifact_ref=None,
         digest=digest_payload(payload),

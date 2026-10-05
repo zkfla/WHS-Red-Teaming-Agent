@@ -101,6 +101,19 @@ def _render_markdown(report: TerminalReportProjection) -> str:
                 lines.append(f"- {json.dumps(item, ensure_ascii=False)}")
         else:
             lines.append("Detailed decision trace was not recorded for this run.")
+    if report.planning_diagnostic_history:
+        lines += ["", "## Earlier planning diagnostics", ""]
+        for prior in report.planning_diagnostic_history:
+            lines.append(
+                f"- [{prior.stage}/{prior.code}] {prior.summary} "
+                f"(attempts={prior.attempts}, retryable={prior.retryable})"
+            )
+            if prior.provider_status is not None:
+                lines.append(f"  - Provider status: {prior.provider_status}")
+            if prior.provider_code:
+                lines.append(f"  - Provider code: {prior.provider_code}")
+            if prior.retry_after is not None:
+                lines.append(f"  - Provider retry after: {prior.retry_after}s")
     if report.request_observations:
         lines += ["", "## Actual requests", ""]
         for item in report.request_observations:
@@ -145,11 +158,11 @@ def _render_markdown(report: TerminalReportProjection) -> str:
         lines += _render_mission(report.mission)
     if report.result_processing:
         lines += ["", "## Result processing", ""]
-        for item in report.result_processing:
+        for result_status in report.result_processing:
             lines.append(
-                f"- {item.evidence_id}: interpretation={item.mapping_status}, "
-                f"application={item.processing_status}, "
-                f"recovery={item.recovery_status or 'unknown'}"
+                f"- {result_status.evidence_id}: interpretation={result_status.mapping_status}, "
+                f"application={result_status.processing_status}, "
+                f"recovery={result_status.recovery_status or 'unknown'}"
             )
     # F1 additive tail: existing section order above never changes. New
     # sections only project IDs plus safe summaries; raw text stays in the
@@ -200,9 +213,7 @@ def _render_markdown(report: TerminalReportProjection) -> str:
         lines.append("(none)")
     for entry in evidence_reads:
         query = f", query={entry.query}" if entry.query else ""
-        delegation = (
-            f", delegation={entry.delegation_id}" if entry.delegation_id else ""
-        )
+        delegation = f", delegation={entry.delegation_id}" if entry.delegation_id else ""
         lines.append(
             f"- {entry.evidence_id}: {entry.status} "
             f"(offset={entry.offset}, limit={entry.limit}{query}{delegation})"

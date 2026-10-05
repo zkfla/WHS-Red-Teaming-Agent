@@ -23,7 +23,6 @@ from redteam.orchestration.methodology import (
     reference_agent,
 )
 
-
 # Provider pinned read shape (workspace_manifest, registration owner).
 # read_file structurally excludes write tools: their required inputs
 # carry content/old_text/new_text, which never equal this bounded shape.

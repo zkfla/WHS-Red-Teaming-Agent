@@ -131,13 +131,14 @@ def decision_context(payload: dict, proposal: dict | None = None) -> dict:
         "feedback": [safe_feedback(str(item)) for item in payload.get("feedback", [])[:10]],
     }
     if proposal is not None:
-        context["proposal"] = {
+        proposal_view: dict[str, Any] = {
             key: proposal[key]
             for key in ("mode", "decision", "path_step_id", "accepted", "reason")
             if key in proposal
         }
-        if "reason" in context["proposal"]:
-            context["proposal"]["reason"] = safe_feedback(str(context["proposal"]["reason"]))
+        context["proposal"] = proposal_view
+        if "reason" in proposal_view:
+            proposal_view["reason"] = safe_feedback(str(proposal_view["reason"]))
         context["actions"] = [
             {
                 key: action[key]

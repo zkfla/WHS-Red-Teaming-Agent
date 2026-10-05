@@ -101,6 +101,10 @@ class MCPToolGateway:
     def list_by_capability(self, capability_tag: str) -> list[ToolDescriptor]:
         return self._catalog.list_by_capability(capability_tag)
 
+    def all_descriptors(self) -> list[ToolDescriptor]:
+        """Expose the complete registered catalog through the public port."""
+        return self._catalog.all_descriptors()
+
     def all(self) -> list[ToolDescriptor]:
         """Every registered tool, regardless of capability — read-only
         catalog enumeration for callers like `redteam tools list`."""

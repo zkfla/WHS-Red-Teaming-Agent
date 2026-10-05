@@ -14,7 +14,7 @@ import hashlib
 import json
 from collections.abc import Mapping
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field
@@ -22,7 +22,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from redteam.core.ids import ToolId
 
 if TYPE_CHECKING:
-    from redteam.capability.catalog import MCPToolCatalog
+    pass
 
 class RoleToolSelection(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -37,7 +37,7 @@ class RoleManifest(BaseModel):
     version: str = "1"
     roles: list[RoleToolSelection] = Field(default_factory=list)
     def normalized_roles(self) -> list:
-        merged = {}
+        merged: dict = {}
         for role in self.roles:
             entry = merged.setdefault(role.agent_id, {})
             for name in ("tool_ids", "server_ids", "capability_tags", "methodology_refs"):
@@ -49,9 +49,8 @@ class RoleManifest(BaseModel):
             ordered.append(item)
         return ordered
     def fingerprint(self) -> str:
-        blob = json.dumps(self.normalized_roles(), sort_keys=True, default=str)
-        blob = blob.encode("utf-8")
-        return hashlib.sha256(blob).hexdigest()
+        payload = json.dumps(self.normalized_roles(), sort_keys=True, default=str)
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 def default_manifest_path():
     return Path(__file__).resolve().parent / "reference_data" / "roles_default.yaml"
 def load_role_manifest(path=None):

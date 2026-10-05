@@ -3,15 +3,15 @@
 from __future__ import annotations
 
 from redteam.attack_graph.service import AttackGraphService
+from redteam.capability.role_manifest import resolve_role_selection, tools_for_role
 from redteam.core.contracts.mission import redact_secret_material
 from redteam.core.ids import GraphNodeId
-from redteam.capability.role_manifest import resolve_role_selection, tools_for_role
 from redteam.orchestration.cognition import DecisionBudget, DecisionFailure
 from redteam.orchestration.completion_proposal import (
-    CompletionProposal, InvestigationGap, record_unresolved,
+    CompletionProposal,
+    InvestigationGap,
+    record_unresolved,
 )
-from redteam.orchestration.diagnostics import diagnostic_for_exception
-from redteam.orchestration.local_tools import LocalToolCall
 from redteam.orchestration.context_projection import ContextProjector, project_evidence_excerpts
 from redteam.orchestration.delegation import DelegationRequest
 from redteam.orchestration.delegation_decision import (
@@ -29,10 +29,15 @@ from redteam.orchestration.delegation_decision import (
     remaining_decisions,
     worker_next_action_schema,
 )
+from redteam.orchestration.diagnostics import diagnostic_for_exception
 from redteam.orchestration.evidence_access import (
-    EvidenceReader, EvidenceReadRequest, read_for_runtime, restore_reads,
+    EvidenceReader,
+    EvidenceReadRequest,
+    read_for_runtime,
+    restore_reads,
 )
 from redteam.orchestration.knowledge_validation import assessment_blocked, check_ready_step
+from redteam.orchestration.local_tools import LocalToolCall
 from redteam.orchestration.paths.models import step_definition_equal
 from redteam.orchestration.reasoning_time import reasoning_time_allowed
 from redteam.orchestration.target_references import register_references
@@ -358,7 +363,9 @@ async def decide_delegations(engine, path, runtime, context):
             ],
             local_tools=context.get("local_tools", []),
             local_tool_results=await engine.local_results(runtime, delegation_id=identity),
-            evidence_reads=await restore_reads(engine.deps.evidence_store, runtime, delegation_id=identity),
+            evidence_reads=await restore_reads(
+                engine.deps.evidence_store, runtime, delegation_id=identity
+            ),
         )
         library = engine.deps.methodology_library
         if library is not None:
@@ -436,7 +443,11 @@ async def decide_delegations(engine, path, runtime, context):
 
                 completion = verdict.completion or {
                     "outcome": "inconclusive",
-                    "reason": verdict.summary or verdict.finish_reason or "Investigation ended without a verified completion claim.",
+                    "reason": (
+                        verdict.summary
+                        or verdict.finish_reason
+                        or "Investigation ended without a verified completion claim."
+                    ),
                     "evidence_ids": list(verdict.evidence_ids),
                     "gaps": [{"description": item} for item in verdict.unresolved],
                 }
@@ -478,7 +489,11 @@ async def decide_delegations(engine, path, runtime, context):
                     outcome="blocked", reason=diagnostic.feedback(),
                     evidence_ids=list(state.evidence_ids),
                     gaps=[InvestigationGap(
-                        code="provider_failure" if diagnostic.kind == "transport" else "assessment_failure",
+                        code=(
+                            "provider_failure"
+                            if diagnostic.kind == "transport"
+                            else "assessment_failure"
+                        ),
                         description=diagnostic.feedback(),
                         target_node_ids=list(step.target_node_ids),
                     )],

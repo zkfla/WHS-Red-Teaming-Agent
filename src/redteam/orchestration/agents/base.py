@@ -172,7 +172,10 @@ class PlanStep(BaseModel):
                 raise PydanticCustomError(
                     "unknown_operation", "Use a supported action meaning."
                 ) from exc
-        if self.binding_mode == "legacy_action" and not tool_matches_action_namespace(self.tool_id, self.capability):
+        if (
+            self.binding_mode == "legacy_action"
+            and not tool_matches_action_namespace(self.tool_id, self.capability)
+        ):
             raise PydanticCustomError(
                 "tool_outside_capability_namespace",
                 "step {step_id} binds tool {tool_id} outside capability namespace {capability}",

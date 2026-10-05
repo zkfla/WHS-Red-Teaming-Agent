@@ -511,19 +511,14 @@ async def test_same_run_session_alias_requires_successful_raw_mapping(
         tool_id="web.session_list",
         success=mapping_success,
         output={
-            "sessions": [
-                {
-                    "target_ref": "configured-target",
-                    "session_ref": "SessionA",
-                    "principal_ref": "Alice",
-                }
-            ]
+            "actual_session_ref": "SessionA",
+            "principal_ref": "Alice",
         },
     )
     mapping.metadata["proposal"]["arguments"] = {"target_ref": "configured-target"}
     await store.append(mapping)
     proposal = _proposal(args={"target_ref": "configured-target", "session_ref": "SessionA"})
-    result = _result(output={"status": 200, "session_ref": "SessionA"})
+    result = _result(output={"status": 200, "actual_session_ref": "SessionA"})
     out = await _run_verify(
         service, deps, proposal, result, _plan_step(violation=True, principal_ref="Alice")
     )
@@ -553,7 +548,7 @@ async def test_same_run_session_alias_requires_successful_raw_mapping(
     "tool_id", ["web.session_list", "web.bank.session_list", "web.bank.list_test_sessions"]
 )
 @pytest.mark.parametrize("row_target", ["bank-lab", "other-bank"])
-async def test_session_list_receipt_proves_exact_session_alias_for_completion(
+async def test_session_inventory_never_proves_actual_use_for_completion(
     tool_id: str, row_target: str
 ) -> None:
     store, _llm, service, _deps = _harness(_success_llm())
@@ -620,7 +615,9 @@ async def test_session_list_receipt_proves_exact_session_alias_for_completion(
         run_id=str(RUN),
     )
 
-    assert (issues == []) is (row_target == "bank-lab")
+    assert issues
+    assert any("session" in item or "principal" in item for item in issues)
+
 
 async def test_summary_step_aggregates_three_prior_origins_without_direct_execution() -> None:
     store, _llm, service, _deps = _harness(_success_llm())
@@ -708,3 +705,371 @@ async def test_summary_step_aggregates_three_prior_origins_without_direct_execut
     assert {str(rec.metadata.get("path_step_id")) for rec in origins} == {"s1", "s2", "s3"}
     assert "summary" not in {str(rec.metadata.get("path_step_id")) for rec in origins}
     assert all(str(rec.metadata.get("path_id")) == PATH_ID for rec in origins)
+
+
+# Runtime-local recording regressions use preserved originals and the real
+# verifier, graph service and completion consumer; only the model is scripted.
+async def _recording_world(*, output=None, response=None):
+    from redteam.orchestration.graph_recording import (
+        GraphRecordingHandler,
+        graph_recording_descriptor,
+    )
+    from redteam.orchestration.local_tools import LocalToolRegistry
+
+    store, llm, service, deps = _harness(response or _success_llm())
+    await service.observe_target(TARGET)
+    refs = []
+    for index in (1, 2):
+        proposal = _proposal(action_id=f"record-action-{index}", hyp_id=None)
+        evidence = h.make_tool_evidence(
+            evidence_id=f"record-source-{index}",
+            run_id=str(RUN),
+            engagement_id=str(ENGAGEMENT),
+            action_id=str(proposal.action_id),
+            invocation_id=f"record-inv-{index}",
+            path_id=PATH_ID,
+            path_version=PATH_VERSION,
+            step_id=STEP_ID,
+            target_node_id=TARGET_NODE,
+            output={"status": 200, "address": "https://other.local/api"}
+            if output is None
+            else output,
+        )
+        evidence.metadata["proposal"] = proposal.model_dump(mode="json")
+        await store.append(evidence)
+        refs.append(str(evidence.evidence_id))
+    registry = LocalToolRegistry()
+    registry.register(
+        graph_recording_descriptor(),
+        GraphRecordingHandler(evidence_store=store, graph_service=service),
+    )
+    return store, llm, service, deps, registry, refs
+
+
+def _recording_context(deps, *, limit=10):
+    from redteam.orchestration.cognition import DecisionBudget
+    from redteam.orchestration.local_tools import LocalToolContext
+
+    return LocalToolContext(
+        deps=deps,
+        runtime=RuntimeState(run_id=RUN, engagement_id=ENGAGEMENT),
+        purpose="validate supplied source",
+        budget=DecisionBudget.reasoning_chain(limit, 0),
+    )
+
+
+async def _posthoc_complete(
+    store, service, hid, refs, *, kind="hypothesis_confirmed", outcome="success"
+):
+    plan = _path(_path_step(kind=kind))
+    plan.steps[0].completion_criteria[0].hypothesis_id = hid
+    return await validate_completion(
+        path=plan,
+        step=plan.steps[0],
+        proposal={"outcome": outcome, "reason": "source reviewed", "evidence_ids": refs},
+        evidence_store=store,
+        graph_service=service,
+        run_id=str(RUN),
+    )
+
+
+async def test_local_record_string_and_same_value_replay_preserve_original():
+    from copy import deepcopy
+
+    from redteam.attack_graph.predicates import facts_of
+    from redteam.orchestration.analysis import is_final_admission_receipt
+
+    store, llm, service, deps, registry, refs = await _recording_world(output="service banner")
+    original = deepcopy((await store.get(refs[0])).model_dump(mode="json"))
+    args = {
+        "facts": [
+            {
+                "evidence_id": refs[0],
+                "raw_path": [],
+                "value": "service banner",
+                "fact_name": "banner",
+                "target_node_id": TARGET_NODE,
+            }
+        ],
+        "branches": [
+            {
+                "question": "Inspect another endpoint",
+                "rationale": "banner raises a question",
+                "evidence_refs": refs,
+            }
+        ],
+    }
+    first = await registry.call("graph.record", args, _recording_context(deps))
+    repeat = await registry.call("graph.record", args, _recording_context(deps))
+    assert first.ok and repeat.ok
+    assert first.payload["record_ids"] == repeat.payload["record_ids"]
+    assert facts_of((await service.get_node(TARGET_NODE)).properties)["banner"] == "service banner"
+    branch = await store.get(first.payload["branches"][0]["evidence_id"])
+    assert branch.metadata["record_kind"] == "branch_note"
+    assert branch.metadata["evidence_refs"] == refs
+    assert str(branch.evidence_id) in first.refs
+    assert not is_final_admission_receipt(branch)
+    assert llm.calls == 0
+    assert (await store.get(refs[0])).model_dump(mode="json") == original
+
+
+async def test_scalar_measurement_cannot_ground_an_arbitrary_related_target():
+    from redteam.attack_graph.predicates import facts_of
+    from redteam.orchestration.analysis import claim_target_is_grounded
+
+    store, llm, service, deps, registry, refs = await _recording_world()
+    unrelated = await service.observe_target(HostTarget(host="unrelated.local"))
+    result = await registry.call(
+        "graph.record",
+        {
+            "facts": [
+                {
+                    "evidence_id": refs[0],
+                    "raw_path": ["status"],
+                    "value": 200,
+                    "fact_name": "status_code",
+                    "target_node_id": TARGET_NODE,
+                    "edge": {
+                        "edge_type": "owns",
+                        "source_node_id": TARGET_NODE,
+                        "target_node_id": str(unrelated.id),
+                    },
+                }
+            ],
+            "findings": [
+                {
+                    "statement": "unrelated host exposes data",
+                    "target_node_id": str(unrelated.id),
+                    "evidence_refs": refs,
+                }
+            ],
+        },
+        _recording_context(deps),
+    )
+    assert result.payload["accepted_facts"]
+    assert facts_of((await service.get_node(TARGET_NODE)).properties)["status_code"] == 200
+    assert not await claim_target_is_grounded(service, await store.get(refs[0]), str(unrelated.id))
+    assert result.payload["findings"][0]["status"] == "refused"
+    assert await service.list_findings() == []
+    assert llm.calls == 0
+
+
+@pytest.mark.parametrize("address_proof", [True, False])
+async def test_discovered_entity_requires_address_not_success_scalar(address_proof):
+    from redteam.attack_graph.identity import node_id_for_target
+    from redteam.core.contracts.target import UrlTarget
+    from redteam.orchestration.analysis import claim_target_is_grounded
+
+    store, _, service, deps, registry, refs = await _recording_world()
+    discovered = UrlTarget(url="https://other.local/api")
+    result = await registry.call(
+        "graph.record",
+        {
+            "facts": [
+                {
+                    "evidence_id": refs[0],
+                    "raw_path": ["status"],
+                    "value": 200,
+                    "entity_raw_path": ["address"] if address_proof else ["status"],
+                    "fact_name": "response_status",
+                    "target_node_id": TARGET_NODE,
+                    "new_entity": {
+                        "target": discovered.model_dump(mode="json"),
+                        "relation": "owns",
+                    },
+                }
+            ]
+        },
+        _recording_context(deps),
+    )
+    node = await service.get_node(node_id_for_target(discovered))
+    if address_proof:
+        assert result.ok and node is not None
+        assert node.properties["attrs"]["observation"] == "discovered"
+        assert "in_scope" not in node.properties["attrs"]
+        assert await claim_target_is_grounded(service, await store.get(refs[0]), str(node.id))
+        relations = await service.list_edges()
+        assert {edge.type.value for edge in relations} == {"observed", "owns"}
+    else:
+        assert not result.ok and node is None
+        assert await service.list_edges() == []
+
+
+@pytest.mark.parametrize("attack", ["run", "engagement", "invocation", "system", "value"])
+async def test_recorded_fact_rejects_mismatched_origin_and_value(attack):
+    from redteam.core.enums import EvidenceSourceType
+
+    store, _, service, deps, registry, refs = await _recording_world()
+    original = await store.get(refs[0])
+    if attack == "run":
+        original.run_id = RunId("another-run")
+    elif attack == "engagement":
+        original.engagement_id = EngagementId("another-engagement")
+    elif attack == "invocation":
+        original.metadata["tool_result"]["invocation_id"] = "forged-invocation"
+    elif attack == "system":
+        original.source_type = EvidenceSourceType.SYSTEM
+    result = await registry.call(
+        "graph.record",
+        {
+            "facts": [
+                {
+                    "evidence_id": refs[0],
+                    "raw_path": ["status"],
+                    "value": 201 if attack == "value" else 200,
+                    "fact_name": "status_code",
+                    "target_node_id": TARGET_NODE,
+                }
+            ]
+        },
+        _recording_context(deps),
+    )
+    assert not result.ok and result.payload["refused_facts"]
+    assert "status_code" not in (await service.get_node(TARGET_NODE)).properties["facts"]
+
+
+async def test_posthoc_hypothesis_receipt_completes_from_prior_original_or_receipt():
+    from copy import deepcopy
+
+    store, llm, service, deps, registry, refs = await _recording_world()
+    originals = [deepcopy((await store.get(ref)).model_dump(mode="json")) for ref in refs]
+    recorded = await registry.call(
+        "graph.record",
+        {
+            "hypotheses": [
+                {
+                    "statement": "response observed",
+                    "target_node_id": TARGET_NODE,
+                    "evidence_refs": refs,
+                }
+            ]
+        },
+        _recording_context(deps),
+    )
+    entry = recorded.payload["hypotheses"][0]
+    assert entry["status"] == "confirmed"
+    assert llm.calls == 1
+    assert await _posthoc_complete(store, service, entry["hypothesis_id"], refs) == []
+    assert (
+        await _posthoc_complete(store, service, entry["hypothesis_id"], [entry["receipt_id"]]) == []
+    )
+    assert [(await store.get(ref)).model_dump(mode="json") for ref in refs] == originals
+
+
+async def test_finding_paraphrase_one_review_replay_and_latest_refutation():
+    from copy import deepcopy
+
+    response = {**_success_llm(), "hypothesis_outcome": "success"}
+    store, llm, service, deps, registry, refs = await _recording_world(response=response)
+    originals = [deepcopy((await store.get(ref)).model_dump(mode="json")) for ref in refs]
+    args = {
+        "hypotheses": [
+            {
+                "statement": "Unauthenticated callers can read accounts",
+                "target_node_id": TARGET_NODE,
+                "evidence_refs": refs,
+            }
+        ],
+        "findings": [
+            {
+                "statement": "Anonymous requests disclose another customer's account",
+                "target_node_id": TARGET_NODE,
+                "evidence_refs": refs,
+            }
+        ],
+    }
+    first = await registry.call("graph.record", args, _recording_context(deps))
+    finding = first.payload["findings"][0]
+    assert first.ok and finding["status"] == "recorded"
+    hid = finding["hypothesis_id"]
+    assert llm.calls == 1
+    assert await _posthoc_complete(store, service, hid, refs, kind="poc") == []
+    repeat = await registry.call("graph.record", args, _recording_context(deps))
+    assert repeat.payload["findings"][0]["hypothesis_id"] == hid
+    assert len(await service.list_findings()) == 1
+    assert await _posthoc_complete(store, service, hid, refs, kind="poc") == []
+    llm._response = {**_refuted_llm(), "hypothesis_outcome": "refuted"}
+    reversed_args = deepcopy(args)
+    reversed_args["findings"][0]["evidence_refs"] = list(reversed(refs))
+    latest = await registry.call("graph.record", reversed_args, _recording_context(deps))
+    assert latest.payload["findings"][0]["status"] == "refused"
+    assert (await service.get_hypothesis(hid)).status == "rejected"
+    assert await _posthoc_complete(store, service, hid, refs, kind="poc")
+    assert (
+        await _posthoc_complete(
+            store, service, hid, refs, kind="hypothesis_refuted", outcome="refuted"
+        )
+        == []
+    )
+    assert [(await store.get(ref)).model_dump(mode="json") for ref in refs] == originals
+
+
+async def test_unresolved_reference_cannot_borrow_an_existing_finding_for_poc():
+    store, llm, service, deps, registry, refs = await _recording_world(
+        response={**_success_llm(), "hypothesis_outcome": "success"}
+    )
+    args = {
+        "findings": [
+            {
+                "statement": "account data exposed",
+                "target_node_id": TARGET_NODE,
+                "evidence_refs": refs,
+            }
+        ]
+    }
+    first = await registry.call("graph.record", args, _recording_context(deps))
+    entry = first.payload["findings"][0]
+    llm._response = {**_success_llm(), "hypothesis_outcome": "unknown"}
+    changed = {
+        "findings": [
+            {
+                "statement": "a broader unrelated disclosure",
+                "hypothesis_id": entry["hypothesis_id"],
+                "target_node_id": TARGET_NODE,
+                "evidence_refs": refs,
+            }
+        ]
+    }
+    refused = await registry.call("graph.record", changed, _recording_context(deps))
+    assert refused.payload["findings"][0]["status"] == "refused"
+    assert not await _posthoc_complete(
+        store,
+        service,
+        entry["hypothesis_id"],
+        [refused.payload["findings"][0]["receipt_id"]],
+        kind="poc",
+    )
+    assert len(await service.list_findings()) == 1
+
+
+@pytest.mark.parametrize("outcome", ["blocked", "inconclusive"])
+async def test_unresolved_result_is_durable_gap_and_cannot_prove_success(outcome):
+    from redteam.orchestration.analysis import is_final_admission_receipt
+    from redteam.orchestration.completion_proposal import (
+        CompletionProposal,
+        record_unresolved,
+        validate_unresolved,
+    )
+
+    store, _, service, _, _, _ = await _recording_world()
+    runtime = RuntimeState(run_id=RUN, engagement_id=ENGAGEMENT)
+    proposal = CompletionProposal(
+        outcome=outcome,
+        reason="no supporting source",
+        gaps=[{"code": "insufficient_evidence", "description": "missing actual response"}],
+    )
+    assert (
+        await validate_unresolved(
+            proposal, evidence_store=store, runtime=runtime, target_node_ids=[TARGET_NODE]
+        )
+        == []
+    )
+    plan = _path(_path_step())
+    receipt_id = await record_unresolved(
+        evidence_store=store, runtime=runtime, proposal=proposal, path=plan, step_id=STEP_ID
+    )
+    gap = await store.get(receipt_id)
+    assert gap.metadata["outcome"] == outcome and gap.metadata["claim_supported"] is False
+    assert not is_final_admission_receipt(gap)
+    assert await _posthoc_complete(store, service, HYP_ID, [receipt_id], kind="poc")
+    assert await service.list_findings() == []

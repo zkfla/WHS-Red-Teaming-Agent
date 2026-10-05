@@ -35,14 +35,14 @@ from redteam.core.contracts.target import (
     target_graph_node_id,
 )
 from redteam.core.contracts.tool import (
+    PROVIDER_METADATA_COMMAND_FIELDS,
+    PROVIDER_METADATA_TARGET_BINDING,
     ExecutionContext,
     ToolDescriptor,
     ToolError,
     ToolInvocation,
     ToolResult,
     ToolTargetBinding,
-    PROVIDER_METADATA_COMMAND_FIELDS,
-    PROVIDER_METADATA_TARGET_BINDING,
 )
 from redteam.core.tool_binding import (
     LEGACY_ACTION,

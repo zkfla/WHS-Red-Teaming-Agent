@@ -144,6 +144,54 @@ async def test_invocation_refreshes_discovery_snapshot_and_recovers() -> None:
     assert registered is not None and registered.health_status is ToolHealthStatus.HEALTHY
 
 
+async def test_bootstrapped_gateway_exposes_unbound_tools_to_role_selection(monkeypatch, tmp_path):
+    from redteam.capability.role_manifest import configure_role_tools, tools_for_role
+    from redteam.core.ids import AgentId
+    from redteam.orchestration.agents.definition import AgentDefinition, ContextProfile
+
+    class DiscoveryAdapter(_FakeAdapter):
+        async def discover_tools(self):
+            return [
+                _descriptor(health=ToolHealthStatus.HEALTHY),
+                _descriptor(ToolId("recon.reader"), health=ToolHealthStatus.HEALTHY).model_copy(
+                    update={"operations": []}
+                ),
+            ]
+
+    monkeypatch.setenv("REDTEAM_MCP_RECON_SERVER_KIND", "recon")
+    monkeypatch.setenv("REDTEAM_MCP_RECON_SERVER_TRANSPORT", "stdio")
+    monkeypatch.setenv("REDTEAM_MCP_RECON_SERVER_COMMAND", "fake-transport")
+    monkeypatch.setenv("REDTEAM_MCP_RECON_SERVER_ALLOWED_TOOLS_JSON", '["probe", "reader"]')
+    monkeypatch.setenv(
+        "REDTEAM_MCP_RECON_SERVER_TOOL_OPERATIONS_JSON", '{"probe":["service_discovery"]}'
+    )
+    monkeypatch.setattr("redteam.capability.bootstrap._create_transport", lambda settings: object())
+    monkeypatch.setattr(
+        "redteam.capability.bootstrap._create_adapter", lambda *args: DiscoveryAdapter()
+    )
+    gateway = await build_mcp_tool_gateway([SERVER])
+    assert {str(tool.tool_id) for tool in gateway.all_descriptors()} == {
+        "recon.probe",
+        "recon.reader",
+    }
+    agent = AgentDefinition(
+        agent_id=AgentId("recon-agent"),
+        role="recon",
+        name="Recon",
+        provider_id="package:recon",
+        context_profile=ContextProfile(profile_id="recon"),
+        capabilities=["recon"],
+    )
+    path = tmp_path / "role-tools.yaml"
+    path.write_text(
+        "roles:\n  - agent_id: recon-agent\n    tool_ids: [recon.reader]\n", encoding="utf-8"
+    )
+    assert configure_role_tools([agent], gateway, path)
+    visible = tools_for_role(agent, gateway)
+    assert len(visible) == 1 and visible[0].tool_id == "recon.reader"
+    assert visible[0].operations == []
+
+
 async def test_invocation_blocks_when_refresh_reports_unhealthy() -> None:
     adapter = _FakeAdapter(health=ToolHealthStatus.UNHEALTHY)
     gateway = _gateway(adapter, registered_health=ToolHealthStatus.HEALTHY)
@@ -202,9 +250,7 @@ async def test_refresh_health_updates_planner_candidates() -> None:
     adapter = _FakeAdapter(health=ToolHealthStatus.UNHEALTHY)
     gateway = _gateway(adapter, registered_health=ToolHealthStatus.HEALTHY)
 
-    assert [tool.tool_id for tool in gateway.list_tools_for_action("recon", OPERATION)] == [
-        TOOL_ID
-    ]
+    assert [tool.tool_id for tool in gateway.list_tools_for_action("recon", OPERATION)] == [TOOL_ID]
 
     statuses = await gateway.refresh_health(force=True)
 
@@ -254,9 +300,7 @@ def test_registry_update_server_health_reports_change_and_reads_back() -> None:
     registry.register(_descriptor(ToolId("recon.b"), SERVER, health=ToolHealthStatus.HEALTHY))
     registry.register(_descriptor(ToolId("web.c"), OTHER_SERVER, health=ToolHealthStatus.HEALTHY))
 
-    assert (
-        registry.update_server_health(SERVER, ToolHealthStatus.UNHEALTHY) is True
-    )
+    assert registry.update_server_health(SERVER, ToolHealthStatus.UNHEALTHY) is True
     assert registry.update_server_health(SERVER, ToolHealthStatus.UNHEALTHY) is False
     assert registry.server_health(SERVER) is ToolHealthStatus.UNHEALTHY
     assert registry.server_health(OTHER_SERVER) is ToolHealthStatus.HEALTHY

@@ -56,6 +56,7 @@ from redteam.orchestration.analysis import (
 from redteam.orchestration.context_projection import ContextProjectionCache
 from redteam.orchestration.coordination import coordinator_for
 from redteam.orchestration.eligibility import default_eligibility_registry
+from redteam.orchestration.local_tools import LocalToolRegistry
 from redteam.orchestration.observations import default_result_mapper_registry
 from redteam.orchestration.paths import InMemoryPathStore
 from redteam.orchestration.seed import seed_from_engagement
@@ -63,6 +64,7 @@ from redteam.orchestration.settings import OrchestrationSettings
 from redteam.orchestration.state import RuntimeState
 from redteam.orchestration.task_graph.memory import InMemoryTaskGraphStore
 from redteam.orchestration.work.memory import InMemoryWorkStore
+from tests.fakes.control_plane import FakeControlPlane
 
 HOST = "host-01"
 RECON_AGENT = "recon-agent"
@@ -171,6 +173,9 @@ class FakeCatalog:
     def list_by_capability(self, capability_tag: str) -> list[ToolDescriptor]:
         return [t for t in self._tools.values() if capability_tag in t.capability_tags]
 
+    def all_descriptors(self) -> list[ToolDescriptor]:
+        return list(self._tools.values())
+
     def list_tools_for_action(self, capability: str, operation: str) -> list[ToolDescriptor]:
         return [
             t
@@ -239,6 +244,8 @@ def make_world(
     paths = InMemoryPathStore()
     settings = OrchestrationSettings(decision_max_attempts=decision_max_attempts)
     deps = SimpleNamespace(
+        control_plane=FakeControlPlane(),
+        local_tools=LocalToolRegistry(),
         event_bus=InMemoryEventBus(),
         llm_client=llm,
         settings=settings,

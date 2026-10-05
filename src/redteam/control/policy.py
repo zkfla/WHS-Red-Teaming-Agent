@@ -158,6 +158,8 @@ def declared_operation_keys(selected: ToolDescriptor | None) -> set[str] | None:
     ``None`` when no canonical key can be formed: no operations declared,
     or operations declared without any namespace to pair them with.
     """
+    if selected is None:
+        return None
     namespaces = declared_namespaces(selected)
     if namespaces is None:
         return None
@@ -340,7 +342,8 @@ def evaluate_policy(
                 firing = match_command_rules(action.arguments, command_fields, command_rules, risk)
                 if firing:
                     reasons.append(
-                        f"dangerous command rule matched ({', '.join(firing)}) -- requiring approval"
+                        "dangerous command rule matched "
+                        f"({', '.join(firing)}) -- requiring approval"
                     )
                     matched_rules.extend(firing)
 

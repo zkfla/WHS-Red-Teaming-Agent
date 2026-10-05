@@ -16,7 +16,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from redteam.core.contracts.evidence import EvidenceRecord
 from redteam.core.contracts.mission import redact_secret_material
 from redteam.core.enums import EvidenceSourceType
-from redteam.core.ids import new_id
+from redteam.core.ids import EvidenceId, new_id
 from redteam.orchestration.diagnostics import DecisionDiagnostic
 
 
@@ -114,7 +114,7 @@ async def record_unresolved(
     })
     identity = new_id("evidence")
     await evidence_store.append(EvidenceRecord(
-        evidence_id=identity,
+        evidence_id=EvidenceId(identity),
         run_id=runtime.run_id,
         engagement_id=runtime.engagement_id,
         source_type=EvidenceSourceType.SYSTEM,

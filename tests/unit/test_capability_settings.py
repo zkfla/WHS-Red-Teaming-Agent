@@ -124,9 +124,7 @@ def test_invalid_server_id_cannot_be_mapped_to_environment() -> None:
 
 
 @pytest.mark.parametrize("value", ["0", "33", "1.5", "many"])
-def test_invalid_server_concurrency_rejected(
-    monkeypatch: pytest.MonkeyPatch, value: str
-) -> None:
+def test_invalid_server_concurrency_rejected(monkeypatch: pytest.MonkeyPatch, value: str) -> None:
     monkeypatch.setenv("REDTEAM_MCP_WEB_KIND", "web_api")
     monkeypatch.setenv("REDTEAM_MCP_WEB_ENDPOINT", "http://localhost:8765/mcp")
     monkeypatch.setenv("REDTEAM_MCP_WEB_MAX_CONCURRENCY", value)
@@ -136,9 +134,7 @@ def test_invalid_server_concurrency_rejected(
 
 
 @pytest.mark.parametrize("value", ["0", "1023", "16777217", "1.5", "many"])
-def test_invalid_server_output_limit_rejected(
-    monkeypatch: pytest.MonkeyPatch, value: str
-) -> None:
+def test_invalid_server_output_limit_rejected(monkeypatch: pytest.MonkeyPatch, value: str) -> None:
     monkeypatch.setenv("REDTEAM_MCP_WEB_KIND", "web_api")
     monkeypatch.setenv("REDTEAM_MCP_WEB_ENDPOINT", "http://localhost:8765/mcp")
     monkeypatch.setenv("REDTEAM_MCP_WEB_MAX_OUTPUT_BYTES", value)
@@ -222,7 +218,7 @@ async def test_duplicate_server_ids_fail_before_discovery() -> None:
         await build_mcp_tool_gateway(["web", "web"])
 
 
-@pytest.mark.parametrize("value", ['[]', '{}', '[null]', '["a","a"]', 'not-json'])
+@pytest.mark.parametrize("value", ["[]", "{}", "[null]", '["a","a"]', "not-json"])
 def test_invalid_tool_allowlist_rejected(monkeypatch: pytest.MonkeyPatch, value: str) -> None:
     monkeypatch.setenv("REDTEAM_MCP_BROWSER_KIND", "web_api")
     monkeypatch.setenv("REDTEAM_MCP_BROWSER_ENDPOINT", "http://localhost:8931/mcp")
@@ -252,7 +248,7 @@ def test_invalid_tool_operation_bindings_rejected(
         MCPServerSettings.from_environment("web")
 
 
-def test_tool_operation_binding_keys_must_match_tool_allowlist(
+def test_tool_operation_binding_keys_cannot_escape_tool_allowlist(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("REDTEAM_MCP_WEB_KIND", "web_api")
@@ -262,5 +258,15 @@ def test_tool_operation_binding_keys_must_match_tool_allowlist(
         "REDTEAM_MCP_WEB_TOOL_OPERATIONS_JSON",
         '{"different_tool":["http_request"]}',
     )
-    with pytest.raises(MCPConfigurationError, match="keys must exactly match"):
+    with pytest.raises(MCPConfigurationError, match="keys must be a subset"):
         MCPServerSettings.from_environment("web")
+
+
+def test_tool_allowlist_accepts_partial_operation_bindings(monkeypatch) -> None:
+    monkeypatch.setenv("REDTEAM_MCP_WEB_KIND", "web_api")
+    monkeypatch.setenv("REDTEAM_MCP_WEB_ENDPOINT", "http://localhost:8931/mcp")
+    monkeypatch.setenv("REDTEAM_MCP_WEB_ALLOWED_TOOLS_JSON", '["http_request", "new_reader"]')
+    monkeypatch.setenv("REDTEAM_MCP_WEB_TOOL_OPERATIONS_JSON", '{"http_request":["http_request"]}')
+    settings = MCPServerSettings.from_environment("web")
+    assert settings.allowed_tools == ("http_request", "new_reader")
+    assert settings.tool_operations == {"http_request": ("http_request",)}

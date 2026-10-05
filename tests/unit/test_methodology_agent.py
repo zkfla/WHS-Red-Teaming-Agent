@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 from datetime import datetime, timezone
 
 import pytest
@@ -161,6 +162,9 @@ def test_conflicting_page_is_rejected():
 
 
 @pytest.mark.parametrize("operation", ["write", "patch"])
+@pytest.mark.skipif(
+    os.name != "posix", reason="workspace requires POSIX descriptor-relative safe IO"
+)
 @pytest.mark.parametrize(
     "path", ["methodology", "methodology/file.md", "methodology/references/new.md"]
 )

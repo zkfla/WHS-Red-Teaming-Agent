@@ -113,9 +113,7 @@ class CountingGateway:
 class TaskBoundaryLLM(h.ScriptedLLM):
     """Actions, complete_step, complete_task per task, then goal."""
 
-    def __init__(
-        self, *, graph_store: Any, evidence_store: Any
-    ) -> None:
+    def __init__(self, *, graph_store: Any, evidence_store: Any) -> None:
         super().__init__()
         self._graph = graph_store
         self._evidence = evidence_store
@@ -146,17 +144,13 @@ class TaskBoundaryLLM(h.ScriptedLLM):
     ) -> dict[str, Any]:
         route = self._route_key(response_schema)
         payload = self._payload(messages)
-        self.calls.append(
-            {"route": route, "messages": messages, "system": system}
-        )
+        self.calls.append({"route": route, "messages": messages, "system": system})
         if route == "path_draft":
             self._draft_calls += 1
             node = self._node_for(payload.get("active_task"))
             draft = h.draft_path(node)
             if self._draft_calls > 1:
-                draft["steps"][0]["objective"] = (
-                    "confirm the second host answers inventory"
-                )
+                draft["steps"][0]["objective"] = "confirm the second host answers inventory"
             return draft
         if route == "path_review":
             return h.review_accept()
@@ -169,8 +163,7 @@ class TaskBoundaryLLM(h.ScriptedLLM):
                 ids = [
                     str(e.get("evidence_id"))
                     for e in excerpts
-                    if isinstance(e, dict)
-                    and str(e.get("evidence_id", "")).strip()
+                    if isinstance(e, dict) and str(e.get("evidence_id", "")).strip()
                 ]
                 assert ids, "task review needs related stored evidence"
                 return h.task_accept(ids, reason="task review accept")
@@ -225,36 +218,28 @@ class TaskBoundaryLLM(h.ScriptedLLM):
                 for action in turn["actions"]:
                     assert isinstance(action, dict)
                     action["path_step_id"] = step_id
+                    action.pop("capability", None)
+                    action.pop("operation", None)
                 return turn
             if count == 2:
                 path_id = str(active_path.get("path_id"))
                 run_id = str(active_path.get("run_id"))
-                records = await self._evidence.list_for_run(
-                    run_id
-                )
+                records = await self._evidence.list_for_run(run_id)
                 mine = [
                     str(r.evidence_id)
                     for r in records
                     if isinstance(
-                        getattr(r, "metadata", {}).get(
-                            "tool_result"
-                        ),
+                        getattr(r, "metadata", {}).get("tool_result"),
                         dict,
                     )
-                    and str(
-                        getattr(r, "metadata", {}).get(
-                            "path_id", ""
-                        )
-                    ) == path_id
+                    and str(getattr(r, "metadata", {}).get("path_id", "")) == path_id
                 ]
                 if not mine:
                     mine = [
                         str(r.evidence_id)
                         for r in records
                         if isinstance(
-                            getattr(r, "metadata", {}).get(
-                                "tool_result"
-                            ),
+                            getattr(r, "metadata", {}).get("tool_result"),
                             dict,
                         )
                     ]
@@ -276,9 +261,7 @@ class TaskBoundaryLLM(h.ScriptedLLM):
             return h.turn_complete_goal("task closed")
         raise AssertionError(f"no answer for {route!r}")
 
-    async def complete(
-        self, *, messages: Any, system: Any = None, **_: Any
-    ) -> str:
+    async def complete(self, *, messages: Any, system: Any = None, **_: Any) -> str:
         return ""
 
 
@@ -289,9 +272,11 @@ def _live_deps(
     event_bus: InMemoryEventBus,
     task_store: InMemoryTaskGraphStore,
 ) -> RuntimeDeps:
+    catalog = h.FakeCatalog([h.inventory_descriptor()])
     return RuntimeDeps(
         control_plane=DefaultControlPlane(
-            {engagement.engagement_id: engagement}
+            {engagement.engagement_id: engagement},
+            outbound_descriptor_resolver=catalog.get,
         ),
         tool_gateway=gateway,
         event_bus=event_bus,
@@ -300,7 +285,7 @@ def _live_deps(
         llm_client=llm,
         engagement=engagement,
         agents=default_registry(),
-        tool_catalog=h.FakeCatalog([h.inventory_descriptor()]),
+        tool_catalog=catalog,
         work_store=InMemoryWorkStore(),
         task_graph_store=task_store,
         path_store=InMemoryPathStore(),
@@ -343,9 +328,7 @@ async def _install_dependent_second_task(
         seen["second_id"] = str(second.task_id)
         seen["second_initial"] = "pending"
 
-    await event_bus.subscribe(
-        EventType.MISSION_CREATED, _on_mission_created
-    )
+    await event_bus.subscribe(EventType.MISSION_CREATED, _on_mission_created)
 
 
 async def _install_optional_pending_task(
@@ -380,9 +363,7 @@ async def _install_optional_pending_task(
         seen["required_id"] = str(first.task_id)
         seen["optional_id"] = str(optional.task_id)
 
-    await event_bus.subscribe(
-        EventType.MISSION_CREATED, _on_mission_created
-    )
+    await event_bus.subscribe(EventType.MISSION_CREATED, _on_mission_created)
 
 
 async def test_two_required_tasks_dependency_promotion_closes_goal() -> None:
@@ -401,21 +382,15 @@ async def test_two_required_tasks_dependency_promotion_closes_goal() -> None:
     runtime = await run_engagement(engagement, deps)
     assert seen.get("done"), "hook must create second task"
     assert seen.get("second_initial") == "pending"
-    assert len(gateway.calls) == 2, (
-        f"expected 2 tool calls, got {len(gateway.calls)}"
-    )
+    assert len(gateway.calls) == 2, f"expected 2 tool calls, got {len(gateway.calls)}"
     assert llm.task_review_payloads, "task review must run"
     assert llm.step_review_payloads, "step review must run"
     assert runtime.mission_id is not None
-    mission = await deps.task_graph_store.get_mission(
-        runtime.mission_id
-    )
+    mission = await deps.task_graph_store.get_mission(runtime.mission_id)
     assert mission is not None
     assert mission.status == MissionStatus.COMPLETED
     assert runtime.termination_reason == TerminationReason.GOAL_ACHIEVED
-    tasks = await deps.task_graph_store.list_tasks(
-        mission_id=runtime.mission_id
-    )
+    tasks = await deps.task_graph_store.list_tasks(mission_id=runtime.mission_id)
     by_id = {str(t.task_id): t for t in tasks}
     first = by_id[seen["first_id"]]
     second = by_id[seen["second_id"]]
@@ -442,38 +417,20 @@ async def test_two_required_tasks_dependency_promotion_closes_goal() -> None:
         if e.event_type == EventType.TASK_COMPLETED
         and str(e.payload.get("task_id")) == seen["second_id"]
     )
-    idx_mission = next(
-        i
-        for i, e in enumerate(order)
-        if e.event_type == EventType.MISSION_UPDATED
-    )
+    idx_mission = next(i for i, e in enumerate(order) if e.event_type == EventType.MISSION_UPDATED)
     assert idx_first < idx_second < idx_mission
     paths = await deps.path_store.list_paths(str(runtime.run_id))
     task_paths = [p for p in paths if p.mission_task_id]
     assert len({p.mission_task_id for p in task_paths}) >= 2
-    first_paths = [
-        p for p in task_paths if str(p.mission_task_id) == seen["first_id"]
-    ]
-    second_paths = [
-        p for p in task_paths if str(p.mission_task_id) == seen["second_id"]
-    ]
+    first_paths = [p for p in task_paths if str(p.mission_task_id) == seen["first_id"]]
+    second_paths = [p for p in task_paths if str(p.mission_task_id) == seen["second_id"]]
     assert first_paths and second_paths
-    assert {p.path_id for p in first_paths}.isdisjoint(
-        {p.path_id for p in second_paths}
-    )
-    first_targets = {
-        t for p in first_paths for s in p.steps for t in s.target_node_ids
-    }
-    second_targets = {
-        t for p in second_paths for s in p.steps for t in s.target_node_ids
-    }
+    assert {p.path_id for p in first_paths}.isdisjoint({p.path_id for p in second_paths})
+    first_targets = {t for p in first_paths for s in p.steps for t in s.target_node_ids}
+    second_targets = {t for p in second_paths for s in p.steps for t in s.target_node_ids}
     assert first_targets.isdisjoint(second_targets)
-    first_receipts = {
-        e for p in first_paths for s in p.steps for e in s.evidence_ids
-    }
-    second_receipts = {
-        e for p in second_paths for s in p.steps for e in s.evidence_ids
-    }
+    first_receipts = {e for p in first_paths for s in p.steps for e in s.evidence_ids}
+    second_receipts = {e for p in second_paths for s in p.steps for e in s.evidence_ids}
     assert first_receipts
     assert second_receipts
     assert first_receipts.isdisjoint(second_receipts)
@@ -494,14 +451,10 @@ async def test_optional_pending_task_never_emits_false_completion() -> None:
     runtime = await run_engagement(engagement, deps)
     assert seen.get("done")
     assert runtime.mission_id is not None
-    mission = await deps.task_graph_store.get_mission(
-        runtime.mission_id
-    )
+    mission = await deps.task_graph_store.get_mission(runtime.mission_id)
     assert mission is not None
     assert mission.status == MissionStatus.COMPLETED
-    optional = await deps.task_graph_store.get_task(
-        TaskId(seen["optional_id"])
-    )
+    optional = await deps.task_graph_store.get_task(TaskId(seen["optional_id"]))
     assert optional is not None
     assert optional.status is not TaskStatus.COMPLETED
     completed = event_bus.history(event_type=EventType.TASK_COMPLETED)
@@ -530,12 +483,8 @@ async def test_wrong_task_receipts_rejected() -> None:
     world.deps.graph_store = seeded.store
     world.deps.engagement = h.make_engagement()
     engine = InvestigationEngine(world.deps)
-    runtime = h.make_runtime(
-        "run-receipt-guard", "eng-t1", mission_id="m-guard"
-    )
-    runtime = runtime.model_copy(
-        update={"active_task_id": TaskId("task-guard")}
-    )
+    runtime = h.make_runtime("run-receipt-guard", "eng-t1", mission_id="m-guard")
+    runtime = runtime.model_copy(update={"active_task_id": TaskId("task-guard")})
     now = _utcnow()
     mission_id = MissionId("m-guard")
     from redteam.core.contracts.mission import MissionPlan
@@ -586,9 +535,9 @@ async def test_wrong_task_receipts_rejected() -> None:
                 agent_id=h.RECON_AGENT,
                 target_node_ids=[seeded.node_id],
                 allowed_operations=[h.CANONICAL_OP],
-                completion_criteria=[CompletionCriterion(
-                    kind="evidence", description="x", min_evidence=1
-                )],
+                completion_criteria=[
+                    CompletionCriterion(kind="evidence", description="x", min_evidence=1)
+                ],
                 required=True,
                 status="completed",
                 outcome="success",
@@ -638,9 +587,9 @@ async def test_wrong_task_receipts_rejected() -> None:
                 agent_id=h.RECON_AGENT,
                 target_node_ids=[seeded.node_id],
                 allowed_operations=[h.CANONICAL_OP],
-                completion_criteria=[CompletionCriterion(
-                    kind="evidence", description="x", min_evidence=1
-                )],
+                completion_criteria=[
+                    CompletionCriterion(kind="evidence", description="x", min_evidence=1)
+                ],
                 required=True,
                 status="pending",
             )
@@ -704,9 +653,7 @@ async def test_authorization_exclusion_allows_independent_web_read() -> None:
     )
     run_id = RunId("run-authz-scope")
     plain_id = endpoint_node_id("GET", "/api/health", host="a.local")
-    authz_id = endpoint_node_id(
-        "GET", "/api/orders/1234", host="a.local"
-    )
+    authz_id = endpoint_node_id("GET", "/api/orders/1234", host="a.local")
     graph = AttackGraphService(deps.graph_store)
     for nid, endpoint_path in (
         (plain_id, "/api/health"),
@@ -783,14 +730,10 @@ async def test_authorization_exclusion_allows_independent_web_read() -> None:
         arguments={"path": "/api/orders/1234", "method": "GET"},
         reason="check object authorization",
     )
-    compiled_ok, errors_ok = await engine.compile_actions(
-        path, [neutral], runtime, context
-    )
+    compiled_ok, errors_ok = await engine.compile_actions(path, [neutral], runtime, context)
     assert errors_ok == [], f"neutral read blocked: {errors_ok}"
     assert len(compiled_ok) == 1
-    compiled_bad, errors_bad = await engine.compile_actions(
-        path, [blocked], runtime, context
-    )
+    compiled_bad, errors_bad = await engine.compile_actions(path, [blocked], runtime, context)
     assert compiled_bad == []
     assert any("operator_excluded_area" in e for e in errors_bad)
     ok_step = PlanStep(
@@ -826,9 +769,8 @@ async def test_authorization_exclusion_allows_independent_web_read() -> None:
         reason="check object authorization",
     )
     assert await validate_current_action(deps, runtime, ok_step) == []
-    assert "operator_excluded_area" in await validate_current_action(
-        deps, runtime, bad_step
-    )
+    assert "operator_excluded_area" in await validate_current_action(deps, runtime, bad_step)
+
 
 async def test_pending_future_required_step_still_allows_task_then_goal() -> None:
     from redteam.attack_graph.observation import GraphObservation
@@ -869,9 +811,7 @@ async def test_pending_future_required_step_still_allows_task_then_goal() -> Non
     )
     await world.tasks.create_mission(mission)
     await world.tasks.create_task(task)
-    await coordinator_for(world.tasks, world.deps.path_store).bind(
-        run_id, "m-future", "eng-t1"
-    )
+    await coordinator_for(world.tasks, world.deps.path_store).bind(run_id, "m-future", "eng-t1")
     ev_id = "ev-future-ready"
     await world.evidence.append(
         h.make_tool_evidence(

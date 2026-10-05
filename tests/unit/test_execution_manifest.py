@@ -9,7 +9,11 @@ import pytest
 from mcp import Client
 
 from redteam.capability.adapters.mcp.execution import ExecutionMCPAdapter
-from redteam.capability.adapters.mcp.transport import RemoteCallResult, RemoteTool
+from redteam.capability.adapters.mcp.transport import (
+    RemoteCallResult,
+    RemoteTool,
+    remote_tool_metadata,
+)
 from redteam.capability.execution_manifest import (
     EXECUTION_TOOLS,
     validate_execution_descriptor,
@@ -133,24 +137,60 @@ async def test_real_mcp_discovery_matches_pinned_manifest(tmp_path: Path) -> Non
     async with Client(server) as client:
         listing = await client.list_tools()
     assert {tool.name for tool in listing.tools} == set(EXECUTION_TOOLS)
-    descriptors = []
-    for remote in listing.tools:
-        spec = EXECUTION_TOOLS[remote.name]
-        descriptor = ToolDescriptor(
-            tool_id=ToolId(f"analysis.{remote.name}"),
-            server_id="execution",
-            tool_name=remote.name,
-            description=remote.description or "",
-            input_schema=dict(remote.input_schema),
-            output_schema=dict(remote.output_schema or {}),
-            operations=[spec.operation],
-            target_types=["asset"],
-            capability_tags=["analysis"],
-            risk_level=RiskLevel.HIGH,
-            health_status=ToolHealthStatus.HEALTHY,
-        )
+
+    class DiscoveryTransport(ErrorTransport):
+        async def list_tools(self) -> list[RemoteTool]:
+            return [
+                RemoteTool(
+                    name=remote.name,
+                    description=remote.description or "",
+                    input_schema=dict(remote.input_schema),
+                    output_schema=dict(remote.output_schema or {}),
+                    metadata=remote_tool_metadata(remote),
+                )
+                for remote in listing.tools
+            ]
+
+    descriptors = await ExecutionMCPAdapter(
+        server_id="execution", risk_level=RiskLevel.HIGH, transport=DiscoveryTransport()
+    ).discover_tools()
+    for descriptor in descriptors:
+        descriptor.operations = [EXECUTION_TOOLS[descriptor.tool_name].operation]
+        descriptor.target_types = ["asset"]
         validate_execution_descriptor(descriptor, "workspace-test")
-        descriptors.append(descriptor)
+        expected = (
+            ["executable", "args"] if descriptor.tool_name in {"run_command", "job_start"} else []
+        )
+        assert descriptor.command_fields == expected
+
+    # The discovered declaration must reach the actual policy consumer,
+    # including an operator's grep rule despite a HIGH auto-approval ceiling.
+    from redteam.control.policy import evaluate_policy
+    from redteam.core.contracts.engagement import ApprovalPolicy, CommandApprovalRule
+    from redteam.core.enums import PolicyVerdict
+    from tests.unit.test_policy import _proposal
+
+    approval = ApprovalPolicy(
+        require_approval_for=["analysis"],
+        auto_approve_up_to=RiskLevel.HIGH,
+        command_approval_rules=[CommandApprovalRule(name="grep-human", patterns=["grep"])],
+    )
+    for descriptor in descriptors:
+        verdict, _, matched = evaluate_policy(
+            _proposal().model_copy(
+                update={"arguments": {"executable": "grep", "args": ["needle", "input.txt"]}}
+            ),
+            approval,
+            risk=RiskLevel.HIGH,
+            selected=descriptor,
+            has_selected_tool=True,
+        )
+        assert verdict is PolicyVerdict.REQUIRE_APPROVAL
+        assert ("command:grep-human" in matched) == bool(descriptor.command_fields)
+
+    missing_declaration = descriptors[0].model_copy(update={"command_fields": []})
+    with pytest.raises(ValueError, match="manifest"):
+        validate_execution_descriptor(missing_declaration, "workspace-test")
 
     changed = next(item for item in descriptors if item.tool_name == "run_command").model_copy(
         deep=True
@@ -208,6 +248,4 @@ async def test_server_returns_execution_error_as_structured_tool_failure(
             },
         )
     assert result.is_error is True
-    assert result.structured_content == {
-        "error_code": "execution_executable_not_allowed"
-    }
+    assert result.structured_content == {"error_code": "execution_executable_not_allowed"}

@@ -38,8 +38,8 @@ from redteam.orchestration.component_binding import RuntimeComponentBinding
 from redteam.orchestration.context_projection import ContextProjectionCache
 from redteam.orchestration.coordination import Coordinator
 from redteam.orchestration.eligibility import EligibilityRegistry, default_eligibility_registry
-from redteam.orchestration.long_jobs import LongJobAdapter
 from redteam.orchestration.local_tools import LocalToolRegistry
+from redteam.orchestration.long_jobs import LongJobAdapter
 from redteam.orchestration.methodology import ReferenceLibrary
 from redteam.orchestration.observations import ResultMapperRegistry, default_result_mapper_registry
 from redteam.orchestration.operator_intents.store import OperatorIntentStore

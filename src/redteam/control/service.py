@@ -695,11 +695,22 @@ class DefaultControlPlane:
             for r in roe_rules
         )
         max_parallel = any(r.max_parallel_actions is not None for r in roe_rules)
-        availability_gated = any(not r.availability_impact_allowed for r in roe_rules) if roe_rules else False
-        has_allow_lists = any(r.allowed_capabilities or r.allowed_operations or r.allowed_time_windows for r in roe_rules)
+        availability_gated = (
+            any(not r.availability_impact_allowed for r in roe_rules)
+            if roe_rules
+            else False
+        )
+        has_allow_lists = any(
+            r.allowed_capabilities or r.allowed_operations or r.allowed_time_windows
+            for r in roe_rules
+        )
         ceiling = auto_approval_ceiling(approval_policy)
         threshold = resolve_risk_threshold(approval_policy)
-        command_label = COMMAND_MATCH_PREFIX[:-1] if COMMAND_MATCH_PREFIX.endswith(":") else COMMAND_MATCH_PREFIX
+        command_label = (
+            COMMAND_MATCH_PREFIX[:-1]
+            if COMMAND_MATCH_PREFIX.endswith(":")
+            else COMMAND_MATCH_PREFIX
+        )
         explicit_command_rules = list(
             getattr(approval_policy, "command_approval_rules", None) or []
         )

@@ -574,8 +574,7 @@ def candidate_key(draft: CandidateDraft) -> str:
                 "principal_ref": step.principal_ref,
                 "prerequisite_fingerprint": draft.prerequisite_fingerprint,
             }
-            direct_encoded = json.dumps(direct_payload, sort_keys=True)
-            direct_encoded = direct_encoded.encode()
+            direct_encoded = json.dumps(direct_payload, sort_keys=True).encode()
             return "cand_" + hashlib.sha256(direct_encoded).hexdigest()[:24]
     hypothesis = draft.plan_step.hypothesis
     payload = {

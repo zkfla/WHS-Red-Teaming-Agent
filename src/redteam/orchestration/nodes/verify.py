@@ -701,7 +701,11 @@ async def verify_node(
                 "phase": AgentPhase.UPDATE,
                 "model_requests_used": runtime.model_requests_used + budget.used - attempts_before,
                 "model_tokens_used": runtime.model_tokens_used + budget.tokens_used - tokens_before,
-                "model_usage_unknown": runtime.model_usage_unknown + budget.unknown_usage_count - unknown_before,
+                "model_usage_unknown": (
+                    runtime.model_usage_unknown
+                    + budget.unknown_usage_count
+                    - unknown_before
+                ),
                 "last_verdict": verdict,
                 "consecutive_failures": (
                     runtime.consecutive_failures + 1

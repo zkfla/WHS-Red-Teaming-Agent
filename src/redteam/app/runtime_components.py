@@ -120,10 +120,10 @@ class _BuiltinRuntimeExtension:
         from redteam.orchestration.analysis_activation import (
             builtin_extension_declaration as eligibility,
         )
+        from redteam.orchestration.graph_recording import graph_recording_contribution
         from redteam.orchestration.observations.packages import (
             builtin_extension_declaration as observations,
         )
-        from redteam.orchestration.graph_recording import graph_recording_contribution
 
         return (
             roles(),

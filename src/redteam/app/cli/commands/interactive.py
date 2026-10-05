@@ -130,7 +130,10 @@ async def _run(console: Console, *, verbose: bool) -> int:
         selected = await _existing_config_menu(console, engagement_config, llm_client)
         if selected is None:
             return EXIT_OK
-        engagement_config, objective = selected
+        engagement_config, selected_objective = selected
+        objective = selected_objective or (
+            f"/new {default_objective(engagement_config.name, engagement_config.metadata)}"
+        )
 
     capability_config = await _ensure_mcp_config(console, engagement_config, capability_config)
 

@@ -14,7 +14,6 @@ from typing import Any
 
 from redteam.core.enums import EvidenceSourceType
 from redteam.orchestration.analysis import claim_target_is_grounded, is_final_admission_receipt
-from redteam.orchestration.session_proof import collect_actual_sessions
 from redteam.orchestration.diagnostics import DecisionDiagnostic
 from redteam.orchestration.evidence_access import raw_from_metadata
 from redteam.orchestration.paths import (
@@ -26,6 +25,7 @@ from redteam.orchestration.paths import (
     is_active_status,
     is_known_criterion,
 )
+from redteam.orchestration.session_proof import collect_actual_sessions
 
 _ALLOWED_KINDS = ALLOWED_CRITERION_KINDS
 _VALID_OUTCOMES = frozenset({"success", "refuted", "inconclusive", "blocked"})
@@ -523,7 +523,8 @@ def check_record_linkage(
             ]
         return []
     if stored_proposal.get("binding_mode") == "selected_tool" and (
-        not stored_proposal.get("tool_id") or str(stored_proposal["tool_id"]) != str(raw.get("tool_id"))
+        not stored_proposal.get("tool_id")
+        or str(stored_proposal["tool_id"]) != str(raw.get("tool_id"))
     ):
         return [(
             f"evidence '{evidence_id}' selected tool differs from its original result",
@@ -840,7 +841,11 @@ def _final_receipt_refutes(
             continue
         if str(meta.get("verdict") or "").strip().lower() == "unknown":
             continue
-        if meta.get("hypothesis_outcome") is None and str(meta.get("verdict") or "").strip().lower() not in ("pass", "anomaly"):
+        if (
+            meta.get("hypothesis_outcome") is None
+            and str(meta.get("verdict") or "").strip().lower()
+            not in ("pass", "anomaly")
+        ):
             continue
         if meta.get("hypothesis_outcome") is None and meta.get("claim_supported") is not False:
             continue
@@ -884,7 +889,10 @@ def _final_success_violation_receipts(
             continue
         if meta.get("claim_supported") is not True:
             continue
-        if meta.get("hypothesis_outcome") is not None and meta.get("hypothesis_outcome") != "success":
+        if (
+            meta.get("hypothesis_outcome") is not None
+            and meta.get("hypothesis_outcome") != "success"
+        ):
             continue
         if hypothesis_id is not None and hypothesis_id.strip():
             receipt_hid = meta.get("hypothesis_id")
@@ -1298,8 +1306,11 @@ async def validate_result_claims(
                 str(cited_meta.get("action_id", "")) != str(cited.action_id)
                 or str(cited_meta.get("invocation_id", "")) != str(cited.invocation_id)
             ):
-                issues.add("review receipt origin disagrees", code="completion_receipt_origin_invalid",
-                           summary="review receipt origin disagrees")
+                issues.add(
+                    "review receipt origin disagrees",
+                    code="completion_receipt_origin_invalid",
+                    summary="review receipt origin disagrees",
+                )
                 continue
             expanded_ids.extend(str(ref) for ref in admitted.get("source_evidence_ids", []) or [])
         else:
@@ -1451,9 +1462,14 @@ async def validate_result_claims(
             related = False
             for receipt_meta in admission_receipts:
                 claimed_target = str(receipt_meta.get("target_node_id", "") or "")
-                if claimed_target in step_target_set and _receipt_links_record(receipt_meta, record):
+                if (
+                    claimed_target in step_target_set
+                    and _receipt_links_record(receipt_meta, record)
+                ):
                     try:
-                        related = await claim_target_is_grounded(graph_service, record, claimed_target)
+                        related = await claim_target_is_grounded(
+                            graph_service, record, claimed_target
+                        )
                     except Exception:
                         related = False
                     if related:
@@ -1854,10 +1870,16 @@ async def validate_result_claims(
                         current_hypothesis = await graph_service.get_hypothesis(check_hid)
                     except Exception:
                         continue
-                    if current_hypothesis is None or _norm_status(current_hypothesis.status) != "confirmed":
+                    if (
+                        current_hypothesis is None
+                        or _norm_status(current_hypothesis.status) != "confirmed"
+                    ):
                         continue
                 if receipt_ref:
-                    if not any(str(meta.get("receipt_id", "")) == receipt_ref for meta in poc_receipts):
+                    if not any(
+                        str(meta.get("receipt_id", "")) == receipt_ref
+                        for meta in poc_receipts
+                    ):
                         # A later review of the same claim/source group can
                         # reconfirm an already promoted finding. Another claim
                         # or a latest negative result cannot borrow it.

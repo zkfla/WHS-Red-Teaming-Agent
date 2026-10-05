@@ -28,11 +28,10 @@ Two entry points build a ``RuntimeDeps``:
 
 from __future__ import annotations
 
-from dataclasses import replace
-
 import asyncio
 import logging
 from contextlib import AsyncExitStack
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace

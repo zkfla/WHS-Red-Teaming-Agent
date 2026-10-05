@@ -275,7 +275,7 @@ def _project_evidence_reads(runtime: Any) -> list[EvidenceReadProjection]:
     for item in list(entries)[-_READ_PROJECTION_LIMIT:]:
         if not isinstance(item, dict):
             continue
-        request = item.get("request") if isinstance(item.get("request"), dict) else {}
+        request: Any = item.get("request") if isinstance(item.get("request"), dict) else {}
         status_raw = str(item.get("status", "unknown"))
         status = status_raw.strip()[:60] or "unknown"
         projected.append(
@@ -314,8 +314,7 @@ def _project_unresolved_details(evidence: Any) -> list[InvestigationUnresolvedPr
                     continue
                 gaps.append(
                     UnresolvedGapProjection(
-                        code=safe_feedback(str(gap.get("code", "unknown")), 100)
-                        or "unknown",
+                        code=safe_feedback(str(gap.get("code", "unknown")), 100) or "unknown",
                         description=safe_feedback(str(gap.get("description", "")), 500),
                         unresolved_questions=_safe_text_list(
                             gap.get("unresolved_questions", gap.get("questions", [])),
@@ -347,15 +346,15 @@ def _project_unresolved_details(evidence: Any) -> list[InvestigationUnresolvedPr
                 and not isinstance(metadata.get("path_version"), bool)
                 else None,
                 path_step_id=_safe_id_token(metadata.get("path_step_id")),
-                outcome=safe_feedback(str(metadata.get("outcome", "unknown")), 60)
-                or "unknown",
+                outcome=safe_feedback(str(metadata.get("outcome", "unknown")), 60) or "unknown",
                 reason=safe_feedback(str(metadata.get("reason", "")), 500),
                 source_evidence_ids=_safe_id_list(metadata.get("source_evidence_ids", [])),
                 gaps=gaps,
                 claim_supported=False,
                 diagnostic=(
                     DecisionDiagnostic.model_validate(metadata["diagnostic"])
-                    if isinstance(metadata.get("diagnostic"), dict) else None
+                    if isinstance(metadata.get("diagnostic"), dict)
+                    else None
                 ),
             )
         )
@@ -395,6 +394,7 @@ class TerminalReportProjection(BaseModel):
     phase: AgentPhase
     termination_reason: str | None
     planning_diagnostic: DecisionDiagnostic | None = None
+    planning_diagnostic_history: list[DecisionDiagnostic] = Field(default_factory=list)
     request_observations: list[dict[str, Any]] = Field(default_factory=list)
     pending_event_count: int = 0
     event_delivery_pending: bool = False
@@ -430,9 +430,7 @@ class TerminalReportProjection(BaseModel):
     model_usage_unknown: int = Field(default=0, ge=0)
     unresolved_evidence_ids: list[str] = Field(default_factory=list)
     evidence_reads: list[EvidenceReadProjection] = Field(default_factory=list)
-    unresolved_details: list[InvestigationUnresolvedProjection] = Field(
-        default_factory=list
-    )
+    unresolved_details: list[InvestigationUnresolvedProjection] = Field(default_factory=list)
 
 
 class ReportingAgent:
@@ -523,8 +521,7 @@ class ReportingAgent:
         # F1 additive reads: refs stay IDs only; detail canon is looked up from
         # the existing evidence store here, never copied as raw into runtime.
         unresolved_refs = [
-            str(item)[:200]
-            for item in (getattr(runtime, "unresolved_evidence_ids", None) or [])
+            str(item)[:200] for item in (getattr(runtime, "unresolved_evidence_ids", None) or [])
         ][-_UNRESOLVED_REF_LIMIT:]
         unresolved_details = _project_unresolved_details(evidence)
         if unresolved_refs:
@@ -539,6 +536,7 @@ class ReportingAgent:
             phase=runtime.phase,
             termination_reason=runtime.termination_reason,
             planning_diagnostic=runtime.planning_diagnostic,
+            planning_diagnostic_history=list(runtime.planning_diagnostic_history),
             request_observations=[
                 {
                     "tool_id": str(item.metadata["tool_result"].get("tool_id", "")),
@@ -598,15 +596,9 @@ class ReportingAgent:
                 MappingStatus.model_validate(item)
                 for item in project_run_processing(evidence).values()
             ],
-            model_requests_used=_safe_nonneg_int(
-                getattr(runtime, "model_requests_used", 0)
-            ),
-            model_tokens_used=_safe_nonneg_int(
-                getattr(runtime, "model_tokens_used", 0)
-            ),
-            model_usage_unknown=_safe_nonneg_int(
-                getattr(runtime, "model_usage_unknown", 0)
-            ),
+            model_requests_used=_safe_nonneg_int(getattr(runtime, "model_requests_used", 0)),
+            model_tokens_used=_safe_nonneg_int(getattr(runtime, "model_tokens_used", 0)),
+            model_usage_unknown=_safe_nonneg_int(getattr(runtime, "model_usage_unknown", 0)),
             unresolved_evidence_ids=unresolved_refs,
             evidence_reads=evidence_read_projections,
             unresolved_details=unresolved_details,

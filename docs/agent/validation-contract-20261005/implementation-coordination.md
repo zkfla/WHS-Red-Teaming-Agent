@@ -86,3 +86,40 @@ D 세션 참조 생산자:
 
 범위는 12건의 실제 리뷰 실패 조건에 한정한다. 새로운 field registry/store/tool-name case는 추가하지 않는다. 선행 CLI 변경과 기존 checkpoint 경계는 보존하고 이번 조정에서 커밋하거나 정리하지 않는다. 수정 완료·재리뷰·최종 검증 결과는 아직 이 문서에서 선언하지 않는다.
 
+## 최종 검증 준비 — 549a5c0b 기준
+
+이번 대조에서 HEAD는 `549a5c0b`였다. 이후 루트가 Sol High 영향 재리뷰 종료·필수 지적 없음 및 최종 테스트 진입을 알렸다. 코드리뷰 종료와 기능 검증 통과는 별개다. 이 메모는 테스트 소스·현재 공개 계약·CI 설정을 읽은 최소 매핑이며, 작성자가 테스트/라이브를 실행하거나 제품/테스트를 수정한 결과가 아니다. 에이전트도 생성하지 않았다.
+
+최신 검증 소유권: **A 실행/역할/승인, B 그래프/주장/완료/진행, F 판단 예산/오류/보고, Root 공통 fake·형식/타입·실제 mock-bank 및 CR19 통합 확인**. 아래 파일은 관련 사례를 골라 재사용할 후보이며 전체 파일/전체 스위트를 일괄 실행하라는 지시가 아니다. 누락은 읽은 기존 사례에서 새 계약을 직접 검증하는 assertion을 확인하지 못했다는 뜻이며, 테스트 실행 실패를 뜻하지 않는다.
+
+| 계획 항목 | 실제 관련 기존 테스트 소스 | 최소 보완 의미 / 아직 입증되지 않은 경로 | 소유 |
+|---|---|---|---|
+| 1 완료 규격·선행 증거·외부 출처 거절 | `tests/integration/test_engine_llm_investigation_flow.py:92,193,209`; `tests/unit/test_semantic_completion_receipts.py:278,398,625`; `tests/integration/test_completion_review_atomicity.py:171`; `tests/unit/test_terminal_mission_criteria.py:318` | 공개 판정 enum과 실제 입력 일치. 사전 가설 없는 원본→사후 검토 영수증→가설 확인/반박 완료. 동일 원본의 복수 주장과 동일 원본 집합 순서 변경 후 최신 반박이 과거 성공을 대체해야 함. | B |
+| 2 미해결 기록·종료·보고·오승격 방지 | `tests/unit/test_semantic_completion_receipts.py:338,358,378`; `tests/unit/test_terminal_mission_criteria.py:202,248`; `tests/unit/test_orchestration_reporting.py:19,81`; `tests/unit/test_mission_reporting.py:119` | 증거 부족/기능 부재/승인 대기/실행 실패를 작은 매개변수 사례로 처리해 미완료 상태와 같은 막힘 정본이 보고에 도달함을 확인. 성공 영수증·확정 취약점·반박으로 오승격되지 않아야 함. | B 상태/완료; F 보고 소비 |
+| 3 파일 선택·미바인딩/mapper 없는 결과→기록 | `tests/integration/test_runtime_extensions.py:135,188,301`; `tests/unit/test_component_binding.py:58`; `tests/unit/test_capability_catalog.py:127,144`; `tests/contract/test_action_binding_consistency.py`; `tests/unit/test_execution_manifest.py:126` | 기존 확장 사례는 행동 연결된 도구를 컴파일한다. 역할 YAML 선택 변경/빈 선택/미등록 참조/재개 지문과 `operations=[]`인 도구의 직접 호출을 별도로 확인. 원본 전달→실제 로컬 기록 호출→응답 반환까지 mapper 없이 연결하며 문자열 원본 전체/구간과 잘못된 값 거절도 포함. | A 선택/호출; B 기록; Root 공통 fake |
+| 4 목적 내 선택·다른 갈래 전달 | `tests/unit/test_autonomous_delegation.py:202,222,360`; `tests/unit/test_operator_endpoint_suppression.py:117`; `tests/unit/test_context_projection.py:20,70` | 기존 목적 위임/제외 범위 사례는 공통 기록의 조사 갈래를 검증하지 않는다. 워커가 갈래를 등록하면 루트 문맥에는 도달하되 해당 워커가 목적을 확장해 원격 호출하지 않는 한 연결 사례를 추가/보완. | A 도구 뷰; B 갈래 기록; F 판단 전달 |
+| 5 명령 사람 승인·동일 호출 재개 | `tests/unit/test_policy.py:180,199`; `tests/unit/test_risk.py:102,185`; `tests/integration/test_approval_resume.py:359,385,413`; `tests/unit/test_tool_start_admission.py:58`; `tests/unit/test_control_resume_accounting.py:291,330`; `tests/unit/test_execution_manifest.py:126` | CR01~03의 한 조합: 실제 발견 명령 선언→실행 파일+인자 순서 결합→일반 승인 규칙 동시 일치→자동 승인 상한 안에서도 사람 필수. 선택된 도구 위험 조회, 승인 후 도구/대상/입력 변경 거절 및 범위 밖 거절. 기존 최대 위험도/옛 승인 사례는 legacy 호환으로 유지. | A |
+| 6 실제 세션 사용과 계정 근거 | `tests/unit/test_finance_network.py:36,102`; `tests/unit/test_result_mapper_sessions.py:71,89`; `tests/unit/test_semantic_completion_receipts.py:398,437,495,556`; `tests/integration/test_second_principal_mission.py:437,495,532` | 요청 echo뿐인 현재 결과/명시적 익명/한쪽 실제 사용 부재는 proof 아님. 과거 실제 별칭이 있어도 현재 사용을 대신하지 않음(CR09/17). 실제 요청 생산→원본 저장→분석 및 완료 소비와 옛 자료 읽기 호환을 분리. 취약/정상 비교의 거짓 확정·반박은 실제 mock-bank에서 별도 확인. | B 자동 사례; Root 실제 비교 |
+| 7 정상 판단·보정·조회 이월·사용량·재개 | `tests/unit/test_llm_usage.py:42,63,75`; `tests/unit/test_orchestration_diagnostics.py:79,102,210`; `tests/unit/test_autonomous_delegation.py:418,460`; `tests/unit/test_checkpointing.py:40,73`; `tests/unit/test_processing_recovery.py:102,185`; `tests/unit/test_orchestration_progress.py:6,20` | 잔여 총량이 정상 상한보다 작아도 첫 형식 오류를 보정할 수 있고 총량은 넘지 않음(CR10). 정상 수정/보정 각각 소진, 원본 조회·로컬 기록 직후 마지막 응답의 다음 판단 전달 및 재개 후 실제 요청/토큰 누적. CR18 재관측 proof와 CR19 관계 내용/근거 수준에 따른 대기 해제는 아래 별도 사례로 보완. | F 예산/조회; B 진행; Root CR19 통합 |
+| 8 제공자 실패·진단·보고·마스킹 | `tests/unit/test_orchestration_diagnostics.py:45,67,130,151,234,318`; `tests/unit/test_llm_usage.py:63`; `tests/unit/test_mission_reporting.py:190,315` | 기존 일반 RuntimeError 마스킹을 넘어 공개 제공자 실패의 비재시도/일시/미확인 조합을 검사. 워커 오류→기존 미해결 정본→다음 판단→JSON/Markdown 보고가 동일 코드·재시도 의미를 읽고 비밀 원문을 저장하지 않음(CR11). | F |
+| 9 관련 형식·타입·경계 및 실제 실행 | `tests/unit/test_control_plane_bypass.py:62,72,86`; `pyproject.toml` Ruff/MyPy 설정; `.github/workflows/ci.yml`; 실제 자료 `data/live-tests/mock-bank-20261005-rerun-02/` | Root가 변경 관련 형식/타입/의존 검사와 실제 LLM/MCP·승인 재개·원본/보고 산출물을 담당. 기존 스크립트는 실행 조건을 읽고 사용하며 과거 성공을 이번 검증으로 세지 않음. 원격 CI의 전체 pytest/Ruff/MyPy/Compose·컨테이너 검사는 기존 워크플로대로 진행. | Root |
+
+### 최소 의미 사례 묶음과 테스트 중복 방지
+
+- **B 주장/완료 묶음:** 한 원본의 가설+발견 동시 제출과 기존 가설 참조를 매개변수화하고 확인/반박/미확인을 대조(CR04/05). 명시 무관 대상 및 스칼라 측정으로 관계를 꾸민 경우는 admission 거절(CR06/13). 주장 성공이어도 가설 미해결이면 옛 발견 사항을 빌려 PoC 완료하지 않음(CR14); 새 주장 성공과 참조 가설 반박은 별도 결론으로 읽음(CR15). 같은 원본 집합 순서 변경·최신 부정 판정·복수 주장은 한 영수증 소비 묶음으로 다룸(CR07/08/16). 최종 승격 조건을 삭제하는 방향으로 테스트를 맞추지 않는다.
+- **B 진행 묶음 / Root CR19 준비:** 기존 `test_hold_wakes_on_related_raw_not_on_duplicate_ids`는 관련 원본 내용 반복을 확인하며 관계 주장 출처 재확인까지 검증하지 않는다. 같은 관계·값·측정 수준에 새 원본 E2를 기록하면 E2로 관련성 proof는 인정(CR18), 역할 지문/대기 상태는 그대로(CR19). 추론→측정 또는 실제 값 변화는 의미 변화로 읽는다. 재관측·증거 ID 변화만 진행으로 세지 않는다. Root는 CR19 통합·리뷰 경계를 맡고 B는 이 진행 회귀 사례를 소유한다.
+- **A 실행/승인 묶음:** 역할 선택으로 등록 도구 노출→행동 연결 없는 직접 호출과 명령 선언→정책→사람 승인→같은 호출 재개를 연결한다. legacy API는 기존 사례를 유지하되 신규 selected-tool 성공을 legacy 행동 매핑으로 우회시키지 않는다.
+- **F 판단/보고 묶음:** 작은 잔여 총량에서 JSON 보정, 비재시도 실패 중단, 원인 정본 참조와 보고, 체크포인트 재개 누적을 묶는다. 자동 사례의 응답은 scripted/mock임을 표시하고 실제 모델 품질이나 제공자 호출 성공으로 표현하지 않는다.
+
+### 공통 fake와 실행 분할
+
+현재 `core/ports/tool_catalog.py:19`는 `all_descriptors()`를 공개한다. `tests/integration/_engine_llm_harness.py`의 `FakeCatalog`는 `get`, `list_by_capability`, `list_tools_for_action`만 있고 이 메서드가 없다. 해당 harness의 inventory 도구도 `operations=['service_discovery']`로 선언되어 있어 미바인딩 직접 호출을 검증하지 않는다. 공통 fake가 실제 포트를 따르도록 하는 수정은 **Root의 테스트 소유**이며 제품에 옛 포트 fallback을 추가하지 않는다. 각 워커는 자기 테스트 안의 독립 fake만 담당하고 공통 harness를 동시에 수정하지 않는다. 기존 assertion이 옛 계약을 고정한 경우 공개 legacy 동작인지 신규 계약으로 바꿀 부분인지 확인한 뒤 갱신한다.
+
+공통 fake가 준비되면 A/B/F는 자기 의미 사례·관련 파일만 확인하고 Root에 실제 실행 파일/사례, 실패 원인, 수정 여부, 남은 미확인을 보고한다. B는 계획 2의 상태/완료를, F는 같은 정본의 보고를 각각 맡아 중복 저장·서로 다른 기대값을 만들지 않는다. Root는 교차 경로와 형식/타입·실제 LLM/MCP를 통합한다. 필요한 실패 조건이 해결되면 종료하며 점수·반복 횟수를 채우기 위한 확대 검증은 하지 않는다.
+
+### 현재 미검증 목록
+
+이 조정 작성자는 위 자동 사례를 실행하지 않았다. 특히 selected-tool/역할 YAML/로컬 그래프 기록/command_fields/actual-only 세션/분리 예산 계약의 새 assertion은 기존 테스트 소스 검색에서 확인하지 못했다. 기존 파일이 존재한다는 사실은 최신 계약의 실행 통과를 증명하지 않는다. 검증 워커가 사례를 보완하거나 실행한 결과는 이후 Root가 취합한다.
+
+실제 LLM이 미바인딩 등록 도구를 골라 MCP 호출하고 원본을 읽어 공통 기록을 호출하는 경로, 취약/정상 mock-bank 비교, 명령 사람 승인 후 동일 호출 재개, 제공자 실제 연결/오류 및 최종 산출물은 Root 실행 근거가 필요하다. 실제 MCP 도구 하나를 `tool_operations` 부분 설정에서 제외해 unbound 등록 경로를 구성할 수 있으며 fake 전용 검증으로 제한하지 않는다. 과거 BOLA 원본 누락·팀원 전송 오류 상세 부재는 여전히 과거 자료의 미확인으로 남기고 이번 실행 결과로 소급 확정하지 않는다.
+
