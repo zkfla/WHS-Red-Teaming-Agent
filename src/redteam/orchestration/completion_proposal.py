@@ -17,6 +17,7 @@ from redteam.core.contracts.evidence import EvidenceRecord
 from redteam.core.contracts.mission import redact_secret_material
 from redteam.core.enums import EvidenceSourceType
 from redteam.core.ids import new_id
+from redteam.orchestration.diagnostics import DecisionDiagnostic
 
 
 class InvestigationGap(BaseModel):
@@ -90,11 +91,13 @@ async def validate_unresolved(
 async def record_unresolved(
     *, evidence_store: Any, runtime: Any, proposal: CompletionProposal,
     path: Any, step_id: str | None = None, task_id: str | None = None,
+    diagnostic: DecisionDiagnostic | None = None,
 ) -> str:
     """Store one canonical system note, explicitly separate from completion receipts."""
     payload = redact_secret_material({
         "record_kind": "investigation_unresolved",
-        "reported_by": "model",
+        "reported_by": "system" if diagnostic else "model",
+        "diagnostic": diagnostic.model_dump(mode="json") if diagnostic else None,
         "mission_id": str(runtime.mission_id) if runtime.mission_id else None,
         "task_id": task_id,
         "path_id": path.path_id,

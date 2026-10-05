@@ -186,6 +186,14 @@ def _render_markdown(report: TerminalReportProjection) -> str:
                     lines.append(f"    - Evidence refs: {', '.join(gap.evidence_refs)}")
                 if gap.target_node_ids:
                     lines.append(f"    - Targets: {', '.join(gap.target_node_ids)}")
+            if detail.diagnostic is not None:
+                diagnostic = detail.diagnostic
+                lines.append(f"  - Diagnostic: {diagnostic.code}; {diagnostic.summary}")
+                lines.append(
+                    f"  - Provider: status={diagnostic.provider_status}, "
+                    f"code={diagnostic.provider_code}, retryable={diagnostic.retryable}, "
+                    f"retry_after={diagnostic.retry_after}"
+                )
     evidence_reads = getattr(report, "evidence_reads", []) or []
     lines += ["", "## Evidence reads", ""]
     if not evidence_reads:

@@ -264,6 +264,7 @@ class InvestigationUnresolvedProjection(BaseModel):
     source_evidence_ids: list[str] = Field(default_factory=list)
     gaps: list[UnresolvedGapProjection] = Field(default_factory=list)
     claim_supported: bool = False
+    diagnostic: DecisionDiagnostic | None = None
 
 
 def _project_evidence_reads(runtime: Any) -> list[EvidenceReadProjection]:
@@ -352,6 +353,10 @@ def _project_unresolved_details(evidence: Any) -> list[InvestigationUnresolvedPr
                 source_evidence_ids=_safe_id_list(metadata.get("source_evidence_ids", [])),
                 gaps=gaps,
                 claim_supported=False,
+                diagnostic=(
+                    DecisionDiagnostic.model_validate(metadata["diagnostic"])
+                    if isinstance(metadata.get("diagnostic"), dict) else None
+                ),
             )
         )
     return projected

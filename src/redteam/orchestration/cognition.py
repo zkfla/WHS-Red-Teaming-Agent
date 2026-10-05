@@ -111,6 +111,7 @@ class DecisionBudget:
         *,
         normal_limit: int | None = None,
         repair_limit: int | None = None,
+        total_limit: int | None = None,
     ) -> None:
         if max_attempts < 1:
             raise ValueError("max_attempts must be >= 1")
@@ -124,6 +125,10 @@ class DecisionBudget:
         self.repair_limit = repair_limit
         if normal_limit is not None:
             self._max_attempts = normal_limit + repair_value
+        if total_limit is not None:
+            if total_limit < 1:
+                raise ValueError("total_limit must be positive")
+            self._max_attempts = min(self._max_attempts, total_limit)
         self.normal_used = 0
         self.repair_used = 0
         self._used = 0
@@ -145,9 +150,13 @@ class DecisionBudget:
         }
 
     @classmethod
-    def reasoning_chain(cls, normal_limit: int, repair_limit: int) -> DecisionBudget:
+    def reasoning_chain(
+        cls, normal_limit: int, repair_limit: int, *, total_limit: int | None = None
+    ) -> DecisionBudget:
         """Bound normal planning separately from correction, without multiplying caps."""
-        return cls(normal_limit=normal_limit, repair_limit=repair_limit)
+        return cls(
+            normal_limit=normal_limit, repair_limit=repair_limit, total_limit=total_limit
+        )
 
     def permits(self, *, repair: bool = False) -> bool:
         if self.remaining <= 0:

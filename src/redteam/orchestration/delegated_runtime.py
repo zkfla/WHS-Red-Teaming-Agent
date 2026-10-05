@@ -7,7 +7,10 @@ from redteam.core.contracts.mission import redact_secret_material
 from redteam.core.ids import GraphNodeId
 from redteam.capability.role_manifest import resolve_role_selection, tools_for_role
 from redteam.orchestration.cognition import DecisionBudget, DecisionFailure
-from redteam.orchestration.completion_proposal import CompletionProposal
+from redteam.orchestration.completion_proposal import (
+    CompletionProposal, InvestigationGap, record_unresolved,
+)
+from redteam.orchestration.diagnostics import diagnostic_for_exception
 from redteam.orchestration.local_tools import LocalToolCall
 from redteam.orchestration.context_projection import ContextProjector, project_evidence_excerpts
 from redteam.orchestration.delegation import DelegationRequest
@@ -381,8 +384,11 @@ async def decide_delegations(engine, path, runtime, context):
             engine.deps.settings.decision_normal_limit + engine.deps.settings.decision_max_attempts,
             max(remaining_decisions(state) - (1 if gate.investigate_model_allowed else 0), 1),
         )
-        normal = min(engine.deps.settings.decision_normal_limit, allowance)
-        budget = DecisionBudget.reasoning_chain(normal, max(allowance - normal, 0))
+        budget = DecisionBudget.reasoning_chain(
+            engine.deps.settings.decision_normal_limit,
+            engine.deps.settings.decision_max_attempts,
+            total_limit=allowance,
+        )
         schema = worker_next_action_schema()
         action_schema = engine._writing_schema(ActionIntent)
         for field in ("path_step_id", "agent_id"):
@@ -407,6 +413,7 @@ async def decide_delegations(engine, path, runtime, context):
         )
         verdict = None
         error = None
+        diagnostic = None
         engine.active_delegation = state
         try:
             raw = await engine._ask(
@@ -447,7 +454,8 @@ async def decide_delegations(engine, path, runtime, context):
                         unresolved=(*verdict.unresolved, *completion_errors),
                     )
         except (DecisionFailure, ValueError, TypeError) as exc:
-            error = type(exc).__name__
+            diagnostic = diagnostic_for_exception(exc, stage="worker_next_action")
+            error = diagnostic.feedback()
         finally:
             engine.decision_token_limit = None
             engine.active_delegation = None
@@ -463,6 +471,35 @@ async def decide_delegations(engine, path, runtime, context):
             ),
         )
         values[identity] = result.delegation
+        if diagnostic is not None:
+            identity_ref = await record_unresolved(
+                evidence_store=engine.deps.evidence_store, runtime=runtime,
+                proposal=CompletionProposal(
+                    outcome="blocked", reason=diagnostic.feedback(),
+                    evidence_ids=list(state.evidence_ids),
+                    gaps=[InvestigationGap(
+                        code="provider_failure" if diagnostic.kind == "transport" else "assessment_failure",
+                        description=diagnostic.feedback(),
+                        target_node_ids=list(step.target_node_ids),
+                    )],
+                ),
+                path=path, step_id=state.path_step_id, task_id=state.mission_task_id,
+                diagnostic=diagnostic,
+            )
+            runtime.unresolved_evidence_ids = list(dict.fromkeys([
+                *runtime.unresolved_evidence_ids, identity_ref,
+            ]))
+            values[identity] = values[identity].model_copy(update={
+                "evidence_ids": list(dict.fromkeys([
+                    *values[identity].evidence_ids, identity_ref,
+                ])),
+                "summary": diagnostic.feedback(),
+                "unresolved": [*values[identity].unresolved, diagnostic.feedback()][-20:],
+            })
+            if diagnostic.kind == "transport" and not diagnostic.retryable:
+                values[identity] = mark_finished(
+                    values[identity], reason="provider_failure", summary=diagnostic.feedback()
+                )
         if verdict is not None and verdict.decision == "hold":
             fingerprint = await _worker_hold_fingerprint(engine, runtime, state)
             values[identity] = values[identity].model_copy(update={"held_fingerprint": fingerprint})
