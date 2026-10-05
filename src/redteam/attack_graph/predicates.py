@@ -400,6 +400,37 @@ def values_equal(first: Any, second: Any) -> bool:
     return _canonical_value(first) == _canonical_value(second)
 
 
+def claim_assertions(entry: dict[str, Any]) -> list[dict[str, Any]]:
+    """First source plus bounded reassertions of exactly the same claim value."""
+    confirmations = entry.get("confirmations", [])
+    return [entry, *[
+        item for item in confirmations if isinstance(item, dict)
+        and values_equal(item.get("value"), entry.get("value"))
+    ]] if isinstance(confirmations, list) else [entry]
+
+
+def retain_claim_confirmation(
+    original: dict[str, Any], current: dict[str, Any]
+) -> dict[str, Any]:
+    """Preserve the sticky first source while retaining equal edge assertions.
+
+    The original value/source never changes. A measured reobservation is a
+    separate witness; unrelated edge attributes are separate claim entries.
+    """
+    if not values_equal(original.get("value"), current.get("value")):
+        return original
+    identity_fields = ("run_id", "evidence_id", "source", "confidence")
+    identity = tuple(current.get(name) for name in identity_fields)
+    if any(tuple(item.get(name) for name in identity_fields) == identity
+           for item in claim_assertions(original)):
+        return original
+    confirmations = claim_assertions(original)[1:]
+    return {
+        **original,
+        "confirmations": [*confirmations, current][-MAX_PROVENANCE_ENTRIES:],
+    }
+
+
 def _digest_value(value: Any) -> str:
     """Short digest identifying one list element across merges."""
     return hashlib.sha256(_canonical_value(value).encode()).hexdigest()[:16]

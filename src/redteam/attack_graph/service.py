@@ -45,6 +45,7 @@ from redteam.attack_graph.predicates import (
     cleanup_of,
     facts_of,
     merge_properties,
+    retain_claim_confirmation,
     validate_properties,
     values_equal,
 )
@@ -453,7 +454,12 @@ class AttackGraphService:
                     and claim_key in prior_claims
                     and values_equal(prior_values[prop_key], relation_values[prop_key])
                 ):
-                    continue  # unchanged relation keeps its source (sticky)
+                    # Keep the first source sticky, while retaining the exact
+                    # current assertion for consumers of new source evidence.
+                    merged_claims[claim_key] = retain_claim_confirmation(
+                        prior_claims[claim_key], entry
+                    )
+                    continue
                 merged_claims[claim_key] = entry
             edge_properties[CLAIM_PROVENANCE_KEY] = merged_claims
 

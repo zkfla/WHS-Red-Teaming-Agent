@@ -279,6 +279,7 @@ async def claim_target_is_grounded(
         return False
     from redteam.attack_graph.predicates import (
         Confidence,
+        claim_assertions,
         claim_key_for_fact,
         claim_provenance_of,
         values_equal,
@@ -297,14 +298,16 @@ async def claim_target_is_grounded(
         entry = claim_provenance_of(edge.properties).get(claim_key_for_fact("relation"))
         if not isinstance(entry, dict):
             continue
-        if (
-            str(entry.get("run_id", "")) == str(record.run_id)
-            and str(entry.get("evidence_id", "")) == str(record.evidence_id)
-            and entry.get("confidence") == Confidence.MEASURED
-            and values_equal(entry.get("value"), relation)
-            and values_equal(edge.properties.get("relation"), relation)
-        ):
-            return True
+        if not values_equal(edge.properties.get("relation"), relation):
+            continue
+        for assertion in claim_assertions(entry):
+            if (
+                str(assertion.get("run_id", "")) == str(record.run_id)
+                and str(assertion.get("evidence_id", "")) == str(record.evidence_id)
+                and assertion.get("confidence") == Confidence.MEASURED
+                and values_equal(assertion.get("value"), relation)
+            ):
+                return True
     return False
 
 
