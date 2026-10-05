@@ -78,6 +78,8 @@ async def test_pinned_seed_keeps_port_through_compilation_policy_and_execution(o
         run_id=runtime.run_id,
         engagement_id=runtime.engagement_id,
         agent_id=h.RECON_AGENT,
+        binding_mode=step.binding_mode,
+        tool_id=step.tool_id,
         capability=step.capability,
         operation=step.operation,
         target=step.resolved_target(),
@@ -97,6 +99,7 @@ async def prepared(*, static=False):
     configured = engagement()
     tool = execution_descriptor()
     raw_path, raw_intent = draft_path(), turn_action()["actions"][0]
+    raw_intent["binding_mode"] = "legacy_action"
     if static:
         configured.metadata["apk_ref"] = "apk-policy"
         tool = tool.model_copy(
@@ -113,7 +116,12 @@ async def prepared(*, static=False):
             }
         )
         raw_path["steps"][0]["allowed_operations"] = ["analysis.static_analysis"]
-        raw_intent.update(operation="static_analysis", tool_id="analysis.decode_apk", arguments={})
+        raw_intent.update(
+            operation="static_analysis",
+            tool_id="analysis.decode_apk",
+            binding_mode="legacy_action",
+            arguments={},
+        )
     llm = h.ScriptedLLM()
     deps = replace(
         build_test_application(tool_catalog=h.FakeCatalog([tool]), llm_client=llm),
@@ -225,7 +233,12 @@ async def test_apk_activation_is_bound_to_selected_asset_and_rechecked():
     context = await engine.context(runtime, GraphObservation())
     path = await deps.path_store.get_active(str(runtime.run_id))
     raw_intent = turn_action()["actions"][0]
-    raw_intent.update(operation="static_analysis", tool_id="analysis.decode_apk", arguments={})
+    raw_intent.update(
+        operation="static_analysis",
+        tool_id="analysis.decode_apk",
+        binding_mode="legacy_action",
+        arguments={},
+    )
     compiled, errors = await engine.compile_actions(
         path, [ActionIntent.model_validate(raw_intent)], runtime, context
     )

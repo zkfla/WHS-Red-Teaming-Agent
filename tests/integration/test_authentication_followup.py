@@ -122,6 +122,9 @@ class SessionGateway(DummyToolGateway):
                 "output": {
                     "target_ref": target_ref,
                     "session_ref": session_ref,
+                    # This gateway actually applied the requested session.
+                    # Keep the request echo separate from the provider receipt.
+                    "actual_session_ref": session_ref,
                     "status_code": status,
                     "body_bytes": 0,
                     "body_sha256": ("b" if session_ref else "a") * 64,

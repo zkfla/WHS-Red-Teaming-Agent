@@ -879,9 +879,12 @@ def _final_success_violation_receipts(
     pool_ids: set[str],
     pool_pairs: set[tuple[str, str]],
     hypothesis_id: str | None = None,
+    allowed_review_keys: set[tuple[Any, ...]] | None = None,
 ) -> list[dict[str, Any]]:
     matching = []
     for meta in receipts:
+        if allowed_review_keys and _receipt_review_key(meta) not in allowed_review_keys:
+            continue
         if meta.get("outcome") != "success":
             continue
         verdict = meta.get("verdict")
@@ -1287,6 +1290,7 @@ async def validate_result_claims(
         issues.add("review receipt lookup failed", code="completion_review_receipt_lookup_failed",
                    summary="review receipt lookup failed")
     expanded_ids: list[str] = []
+    cited_receipt_keys: set[tuple[Any, ...]] = set()
     for eid in evidence_ids:
         try:
             cited = await evidence_store.get(eid)
@@ -1312,6 +1316,7 @@ async def validate_result_claims(
                     summary="review receipt origin disagrees",
                 )
                 continue
+            cited_receipt_keys.add(_receipt_review_key(admitted))
             expanded_ids.extend(str(ref) for ref in admitted.get("source_evidence_ids", []) or [])
         else:
             expanded_ids.append(str(eid))
@@ -1817,7 +1822,11 @@ async def validate_result_claims(
             assert final_receipts is not None
             poc_ids, poc_pairs = _pool_record_ids(pool)
             poc_receipts = _final_success_violation_receipts(
-                final_receipts, poc_ids, poc_pairs, hid
+                final_receipts,
+                poc_ids,
+                poc_pairs,
+                hid,
+                cited_receipt_keys or None,
             )
             if not poc_receipts:
                 issues.add(

@@ -105,17 +105,20 @@ def writing_schema(
     if action_schema is not None:
         action_properties = action_schema.get("properties", {})
         if selected_tool:
-            for name in ("capability", "operation", "binding_mode"):
-                action_properties.pop(name, None)
+            # Direct calls are owned by the selected tool. Older models may
+            # still echo capability/operation labels; accept those optional
+            # hints without using them as an execution binding. Keep
+            # binding_mode code-owned so model output cannot switch paths.
+            action_properties.pop("binding_mode", None)
             action_schema["required"] = [
                 name for name in action_schema.get("required", [])
                 if name not in {"capability", "operation", "binding_mode"}
             ]
-        if "capability" in action_properties:
+        if not selected_tool and "capability" in action_properties:
             action_properties["capability"].update(pattern=r"^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$")
             if pairs:
                 action_properties["capability"].update(enum=sorted({cap for cap, _ in pairs}))
-        if "operation" in action_properties:
+        if not selected_tool and "operation" in action_properties:
             action_properties["operation"].update(pattern=r"^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$")
             if pairs:
                 action_properties["operation"].update(enum=sorted({op for _, op in pairs}))

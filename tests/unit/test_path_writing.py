@@ -8,6 +8,7 @@ import pytest
 from jsonschema import Draft202012Validator, ValidationError
 from pydantic import BaseModel
 
+from redteam.orchestration.engine import ActionIntent
 from redteam.orchestration.paths.models import (
     ALLOWED_CRITERION_KINDS,
     CompletionCriterion,
@@ -187,3 +188,45 @@ def test_invalid_kind_type_does_not_expose_rejected_input():
     with pytest.raises(CriterionWritingError) as error:
         validate_written_criteria(_path(criterion))
     assert "secret" not in str(error.value.correction())
+
+
+def _selected_tool_intent(**overrides: object) -> dict:
+    base: dict = {
+        "path_step_id": "step-1",
+        "agent_id": "agent-1",
+        "target_node_id": "node-1",
+        "tool_id": "tool-1",
+        "reason": "Use the selected tool.",
+    }
+    base.update(overrides)
+    return base
+
+
+def test_selected_tool_schema_hides_binding_and_keeps_legacy_hints_optional():
+    schema = writing_schema(ActionIntent, selected_tool=True)
+    properties = schema["properties"]
+    assert "binding_mode" not in properties
+    assert "capability" in properties
+    assert "operation" in properties
+    required = schema.get("required", [])
+    assert "tool_id" in required
+    assert "capability" not in required
+    assert "operation" not in required
+    Draft202012Validator(schema).validate(_selected_tool_intent())
+    Draft202012Validator(schema).validate(
+        _selected_tool_intent(capability="recon", operation="http_probe")
+    )
+    with pytest.raises(ValidationError):
+        Draft202012Validator(schema).validate(
+            _selected_tool_intent(binding_mode="legacy_action")
+        )
+
+
+def test_legacy_hints_do_not_switch_selected_tool_binding():
+    echoed = ActionIntent.model_validate(
+        _selected_tool_intent(capability="recon", operation="http_probe")
+    )
+    assert echoed.binding_mode == "selected_tool"
+    assert echoed.tool_id == "tool-1"
+    plain = ActionIntent.model_validate(_selected_tool_intent())
+    assert plain.binding_mode == "selected_tool"

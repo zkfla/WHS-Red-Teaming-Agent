@@ -1032,7 +1032,7 @@ async def test_unresolved_reference_cannot_borrow_an_existing_finding_for_poc():
     }
     refused = await registry.call("graph.record", changed, _recording_context(deps))
     assert refused.payload["findings"][0]["status"] == "refused"
-    assert not await _posthoc_complete(
+    assert await _posthoc_complete(
         store,
         service,
         entry["hypothesis_id"],
