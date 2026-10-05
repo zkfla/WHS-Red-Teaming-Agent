@@ -316,10 +316,28 @@ def _evidence_hypothesis_id(record: Any) -> str:
     return ""
 
 
+def _receipt_review_key(meta: dict[str, Any]) -> tuple:
+    hypothesis = str(meta.get("hypothesis_id") or "")
+    claim = str(meta.get("claim_identity") or "")
+    if meta.get("posthoc") is True and claim:
+        origins = tuple(sorted({
+            (str(item.get("evidence_id", "")), str(item.get("action_id", "")),
+             str(item.get("invocation_id", "")))
+            for item in meta.get("source_origins", []) or []
+            if isinstance(item, dict)
+        }))
+        return (
+            str(meta.get("engagement_id", "")), hypothesis, claim,
+            tuple(sorted({str(item) for item in meta.get("source_evidence_ids", []) or []})),
+            origins,
+        )
+    return (str(meta.get("action_id", "")), str(meta.get("invocation_id", "")), hypothesis)
+
+
 async def _load_final_receipts(evidence_store: Any, run_id: str) -> list[dict[str, Any]]:
-    """Latest final receipt per origin and hypothesis/claim, including negatives."""
+    """Latest per claim and normalized sources; legacy receipts retain origin grouping."""
     records = await evidence_store.list_for_run(run_id)
-    latest: dict[tuple[str, str, str], tuple[Any, dict[str, Any]]] = {}
+    latest: dict[tuple, tuple[Any, dict[str, Any]]] = {}
     for rec in list(records or []):
         try:
             if not is_final_admission_receipt(rec):
@@ -336,10 +354,10 @@ async def _load_final_receipts(evidence_store: Any, run_id: str) -> list[dict[st
         if not action or not invocation:
             continue
         created = getattr(rec, "created_at", None)
-        identity = str(meta.get("hypothesis_id") or meta.get("claim_identity") or "")
-        key = (action, invocation, identity)
         meta = {**meta, "receipt_id": str(rec.evidence_id),
                 "engagement_id": str(rec.engagement_id)}
+        # First origin is audit data; source ordering never creates a new claim.
+        key = _receipt_review_key(meta)
         prev = latest.get(key)
         if prev is None:
             latest[key] = (created, dict(meta))
@@ -822,7 +840,7 @@ def _final_receipt_refutes(
             continue
         if str(meta.get("verdict") or "").strip().lower() == "unknown":
             continue
-        if str(meta.get("verdict") or "").strip().lower() not in ("pass", "anomaly"):
+        if meta.get("hypothesis_outcome") is None and str(meta.get("verdict") or "").strip().lower() not in ("pass", "anomaly"):
             continue
         if meta.get("hypothesis_outcome") is None and meta.get("claim_supported") is not False:
             continue
@@ -851,12 +869,13 @@ def _final_receipt_refutes(
     return False
 
 
-def _final_success_violation_receipt(
+def _final_success_violation_receipts(
     receipts: list[dict[str, Any]],
     pool_ids: set[str],
     pool_pairs: set[tuple[str, str]],
     hypothesis_id: str | None = None,
-) -> bool:
+) -> list[dict[str, Any]]:
+    matching = []
     for meta in receipts:
         if meta.get("outcome") != "success":
             continue
@@ -864,6 +883,8 @@ def _final_success_violation_receipt(
         if str(verdict or "").strip().lower() != "violation":
             continue
         if meta.get("claim_supported") is not True:
+            continue
+        if meta.get("hypothesis_outcome") is not None and meta.get("hypothesis_outcome") != "success":
             continue
         if hypothesis_id is not None and hypothesis_id.strip():
             receipt_hid = meta.get("hypothesis_id")
@@ -886,8 +907,8 @@ def _final_success_violation_receipt(
         )
         if not (receipt_pairs & pool_pairs):
             continue
-        return True
-    return False
+        matching.append(meta)
+    return matching
 
 
 def _verified_completion_accounts(
@@ -1491,33 +1512,34 @@ async def validate_result_claims(
             if verified_names:
                 verified_by_evidence[eid] = set(verified_names)
             else:
+                # Past mappings interpret identity only for sessions whose
+                # use is proven by this record's actual receipts.
+                actual_sessions = collect_actual_sessions(meta, raw)
                 bound_session: str | None = None
                 if isinstance(stored_args, dict):
                     candidate = stored_args.get("session_ref")
                     if isinstance(candidate, str) and candidate.strip():
                         bound_session = candidate.strip()
-                output = raw.get("output")
-                # The existing alias gate verifies full receipt and target
-                # linkage. Recognize its inventory shape, not one tool name.
-                is_session_inventory = isinstance(output, dict) and isinstance(
-                    output.get("sessions"), list
-                )
+                if bound_session is not None:
+                    actual_sessions = actual_sessions & {bound_session}
                 alias_verified: set[str] = set()
-                if bound_session is not None or is_session_inventory:
+                if actual_sessions:
                     try:
                         for claimed_name in sorted(claimed_accounts):
-                            if await _completion_alias_grounded(
-                                evidence_store=evidence_store,
-                                graph_service=graph_service,
-                                run_id=run,
-                                target_ref=target_ref,
-                                session_name=bound_session or claimed_name,
-                                principal_name=claimed_name,
-                                arguments_target_ref=stored_args.get("target_ref")
-                                if isinstance(stored_args, dict)
-                                else None,
-                            ):
-                                alias_verified.add(claimed_name)
+                            for actual_session in sorted(actual_sessions):
+                                if await _completion_alias_grounded(
+                                    evidence_store=evidence_store,
+                                    graph_service=graph_service,
+                                    run_id=run,
+                                    target_ref=target_ref,
+                                    session_name=actual_session,
+                                    principal_name=claimed_name,
+                                    arguments_target_ref=stored_args.get("target_ref")
+                                    if isinstance(stored_args, dict)
+                                    else None,
+                                ):
+                                    alias_verified.add(claimed_name)
+                                    break
                     except Exception:
                         issues.add(
                             f"evidence '{eid}' session binding lookup failed; "
@@ -1778,7 +1800,10 @@ async def validate_result_claims(
                 continue
             assert final_receipts is not None
             poc_ids, poc_pairs = _pool_record_ids(pool)
-            if not _final_success_violation_receipt(final_receipts, poc_ids, poc_pairs, hid):
+            poc_receipts = _final_success_violation_receipts(
+                final_receipts, poc_ids, poc_pairs, hid
+            )
+            if not poc_receipts:
                 issues.add(
                     f"{label} has no final admission success/violation receipt "
                     "(same run/action/invocation/source; interim excluded)",
@@ -1822,6 +1847,43 @@ async def validate_result_claims(
                     linked_hid = finding_meta.get("hypothesis_id")
                     if linked_hid is None or str(linked_hid).strip() != hid.strip():
                         continue
+                receipt_ref = str(finding_meta.get("review_receipt_id") or "")
+                check_hid = hid or (finding_meta.get("hypothesis_id") if receipt_ref else None)
+                if check_hid:
+                    try:
+                        current_hypothesis = await graph_service.get_hypothesis(check_hid)
+                    except Exception:
+                        continue
+                    if current_hypothesis is None or _norm_status(current_hypothesis.status) != "confirmed":
+                        continue
+                if receipt_ref:
+                    if not any(str(meta.get("receipt_id", "")) == receipt_ref for meta in poc_receipts):
+                        # A later review of the same claim/source group can
+                        # reconfirm an already promoted finding. Another claim
+                        # or a latest negative result cannot borrow it.
+                        try:
+                            promoted_review = await evidence_store.get(receipt_ref)
+                        except Exception:
+                            continue
+                        if (
+                            promoted_review is None
+                            or str(promoted_review.run_id) != run
+                            or not is_final_admission_receipt(promoted_review)
+                        ):
+                            continue
+                        promoted_meta = {
+                            **promoted_review.metadata,
+                            "engagement_id": str(promoted_review.engagement_id),
+                        }
+                        if not any(
+                            _receipt_review_key(meta) == _receipt_review_key(promoted_meta)
+                            for meta in poc_receipts
+                        ):
+                            continue
+                elif not any(meta.get("posthoc") is not True for meta in poc_receipts):
+                    # Older findings can consume only their legacy admission
+                    # semantics, never a new claim's unpromoted review.
+                    continue
                 finding_ok = True
                 break
             if not finding_ok:

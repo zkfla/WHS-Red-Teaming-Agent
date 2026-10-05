@@ -75,7 +75,7 @@ GRAPH_RECORD_CONTRIBUTION_ID = "graph-record"
 
 
 class FactEdge(BaseModel):
-    """Optional edge write: a relation between two existing nodes."""
+    """Inferred relation between existing nodes; the scalar stays measured on its source."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -95,7 +95,10 @@ class NewEntityDecl(BaseModel):
     target: TargetRef
     relation: str = Field(
         default="observed",
-        description="GraphEdgeType value from the observed source to the new entity.",
+        description=(
+            "Optional inferred relation from source to entity. Code always "
+            "records the address-backed observed relation separately."
+        ),
     )
 
 
@@ -459,13 +462,30 @@ class GraphRecordingHandler:
                         {"evidence_id": eid, "reason": "edge endpoint missing"}
                     )
                     return
+                # Exact scalar equality grounds only the source's attribute;
+                # it does not prove the model-selected relation or endpoint.
+                measured = await service.upsert_node(
+                    source_node.type if str(source_node.id) == target else edge_node.type,
+                    node_id=target,
+                    facts={fact.fact_name: fact.value},
+                    provenance=provenance,
+                    step=step,
+                )
                 edge = await service.link(
                     edge_type,
                     source_node.id,
                     edge_node.id,
-                    properties={fact.fact_name: fact.value},
-                    provenance=provenance,
+                    properties={
+                        fact.fact_name: fact.value,
+                        "relation": {
+                            "type": edge_type.value,
+                            "source_node_id": str(source_node.id),
+                            "target_node_id": str(edge_node.id),
+                        },
+                    },
+                    provenance=_inferred_provenance(step=step, evidence_id=eid, run_id=run_id),
                 )
+                record_ids.append(str(measured.id))
                 record_ids.append(str(edge.id))
                 accepted_facts.append(
                     {
@@ -473,6 +493,8 @@ class GraphRecordingHandler:
                         "target_node_id": target,
                         "fact_name": fact.fact_name,
                         "record_id": str(edge.id),
+                        "measurement_record_id": str(measured.id),
+                        "relation_confidence": Confidence.INFERRED.value,
                     }
                 )
             else:
@@ -614,10 +636,17 @@ class GraphRecordingHandler:
             return
         try:
             edge = await service.link(
-                relation,
+                GraphEdgeType.OBSERVED,
                 anchor.id,
                 node.id,
-                properties={"observation": observation},
+                properties={
+                    "observation": observation,
+                    "relation": {
+                        "type": GraphEdgeType.OBSERVED.value,
+                        "source_node_id": str(anchor.id),
+                        "target_node_id": str(node.id),
+                    },
+                },
                 provenance=provenance,
             )
         except Exception:
@@ -625,6 +654,26 @@ class GraphRecordingHandler:
             return
         record_ids.append(str(node.id))
         record_ids.append(str(edge.id))
+        inferred_edge_id = None
+        if relation is not GraphEdgeType.OBSERVED:
+            try:
+                inferred_edge = await service.link(
+                    relation,
+                    anchor.id,
+                    node.id,
+                    properties={
+                        "relation": {
+                            "type": relation.value,
+                            "source_node_id": str(anchor.id),
+                            "target_node_id": str(node.id),
+                        },
+                    },
+                    provenance=provenance.model_copy(update={"confidence": Confidence.INFERRED}),
+                )
+                inferred_edge_id = str(inferred_edge.id)
+                record_ids.append(inferred_edge_id)
+            except Exception:
+                refused_facts.append({"evidence_id": eid, "reason": "inferred relation write failed"})
         accepted_facts.append(
             {
                 "evidence_id": eid,
@@ -632,6 +681,7 @@ class GraphRecordingHandler:
                 "fact_name": fact.fact_name,
                 "record_id": str(node.id),
                 "edge_id": str(edge.id),
+                "inferred_edge_id": inferred_edge_id,
                 "observation": observation,
             }
         )

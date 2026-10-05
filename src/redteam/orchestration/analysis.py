@@ -277,20 +277,34 @@ async def claim_target_is_grounded(
         return True
     if graph_service is None:
         return False
-    from redteam.attack_graph.predicates import Confidence
+    from redteam.attack_graph.predicates import (
+        Confidence,
+        claim_key_for_fact,
+        claim_provenance_of,
+        values_equal,
+    )
 
     for edge in await graph_service.list_edges():
         if {str(edge.source_id), str(edge.target_id)} != {source, target_node_id}:
             continue
-        for entry in edge.properties.get("provenance", []) or []:
-            if not isinstance(entry, dict):
-                continue
-            if (
-                str(entry.get("run_id", "")) == str(record.run_id)
-                and str(entry.get("evidence_id", "")) == str(record.evidence_id)
-                and entry.get("confidence") == Confidence.MEASURED
-            ):
-                return True
+        # Coarse provenance may belong only to a scalar attribute. Consume
+        # the specific relation assertion and its snapshot instead.
+        relation = {
+            "type": edge.type.value,
+            "source_node_id": str(edge.source_id),
+            "target_node_id": str(edge.target_id),
+        }
+        entry = claim_provenance_of(edge.properties).get(claim_key_for_fact("relation"))
+        if not isinstance(entry, dict):
+            continue
+        if (
+            str(entry.get("run_id", "")) == str(record.run_id)
+            and str(entry.get("evidence_id", "")) == str(record.evidence_id)
+            and entry.get("confidence") == Confidence.MEASURED
+            and values_equal(entry.get("value"), relation)
+            and values_equal(edge.properties.get("relation"), relation)
+        ):
+            return True
     return False
 
 
