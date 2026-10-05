@@ -11,10 +11,16 @@ import json
 from pydantic import BaseModel, Field
 
 from redteam.attack_graph.predicates import (
+    CLAIM_FACT_PREFIX,
+    CLAIM_PROVENANCE_KEY,
+    Confidence,
     attrs_of,
+    claim_assertions,
+    claim_provenance_of,
     facts_of,
     last_seen_step,
     predicate_flags,
+    values_equal,
 )
 from redteam.core.contracts.graph import GraphEdge, GraphNode
 from redteam.core.enums import GraphNodeType
@@ -72,6 +78,7 @@ PLANNING_CONTENT_KEYS = (
 VOLATILE_RELATION_KEYS = frozenset(
     {
         "provenance",
+        CLAIM_PROVENANCE_KEY,
         "step",
         "first_seen_step",
         "last_seen_step",
@@ -118,10 +125,28 @@ def _relation_content(edge: GraphEdge) -> str:
         for key in sorted(properties, key=str)
         if str(key) not in VOLATILE_RELATION_KEYS
     }
+    # Source identities and confirmation counts are audit data. Project only
+    # the grounding levels for the current value, so a new measured witness
+    # is stable while an inferred relation becoming measured is meaningful.
+    grounding: dict[str, list[str]] = {}
+    for claim_key, entry in claim_provenance_of(properties).items():
+        if not claim_key.startswith(CLAIM_FACT_PREFIX):
+            continue
+        property_key = claim_key[len(CLAIM_FACT_PREFIX) :]
+        if property_key not in stable or not values_equal(entry.get("value"), stable[property_key]):
+            continue
+        levels = {
+            Confidence(assertion["confidence"]).value
+            for assertion in claim_assertions(entry)
+            if assertion.get("confidence") in {level.value for level in Confidence}
+        }
+        if levels:
+            grounding[claim_key] = sorted(levels)
     payload = {
         "source": str(edge.source_id),
         "target": str(edge.target_id),
         "properties": stable,
+        "grounding": grounding,
     }
     encoded = json.dumps(payload, sort_keys=True, default=str, separators=(",", ":")).encode()
     return hashlib.sha256(encoded).hexdigest()[:16]
