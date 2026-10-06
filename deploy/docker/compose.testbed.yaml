@@ -1,0 +1,26 @@
+services:
+  agent:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/agent.Dockerfile
+    stdin_open: true
+    tty: true
+    environment:
+      REDTEAM_LLM_BACKEND: ${REDTEAM_LLM_BACKEND:-litellm}
+      REDTEAM_LLM_MODEL: ${REDTEAM_LLM_MODEL:-}
+      REDTEAM_LLM_API_KEY: ${REDTEAM_LLM_API_KEY:-}
+    depends_on:
+      - target
+    networks:
+      - redteam_lab
+
+  target:
+    image: ${REDTEAM_TARGET_IMAGE:?Set REDTEAM_TARGET_IMAGE to an authorized local testbed image}
+    ports:
+      - "127.0.0.1:${REDTEAM_TARGET_HOST_PORT:-3000}:${REDTEAM_TARGET_CONTAINER_PORT:-3000}"
+    networks:
+      - redteam_lab
+
+networks:
+  redteam_lab:
+    driver: bridge

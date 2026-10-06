@@ -1,0 +1,15 @@
+{
+  "discovery": {
+    "seed_paths": ["/robots.txt", "/sitemap.xml", "/openapi.json", "/swagger.json"],
+    "max_paths": 24,
+    "follow_same_origin_links": true,
+    "inspect_api_specifications": true,
+    "canary_prefix": "redteam-canary"
+  },
+  "recon": {
+    "ports": [80, 443, 8000, 8080, 8443],
+    "timeout_seconds": 0.35,
+    "max_ports": 2048
+  },
+  "detectors": []
+}

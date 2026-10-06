@@ -1,0 +1,2 @@
+"""Authorized reconnaissance adapters."""
+
