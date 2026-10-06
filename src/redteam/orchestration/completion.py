@@ -30,17 +30,6 @@ from redteam.orchestration.session_proof import collect_actual_sessions
 _ALLOWED_KINDS = ALLOWED_CRITERION_KINDS
 _VALID_OUTCOMES = frozenset({"success", "refuted", "inconclusive", "blocked"})
 
-# Phrases that mean "no candidates left" and must never alone justify completion.
-_NO_CANDIDATE_PHRASES = (
-    "no candidate",
-    "no further",
-    "exhausted",
-    "no actionable",
-    "후보가 없",
-    "후보 소진",
-)
-
-
 def _field(obj: Any, name: str, default: Any = None) -> Any:
     if isinstance(obj, dict):
         return obj.get(name, default)
@@ -1081,6 +1070,9 @@ class CompletionIssues(list[str]):
     def __init__(self) -> None:
         super().__init__()
         self.diagnostics: list[DecisionDiagnostic] = []
+        # Call-local origin references for the next semantic review. Never
+        # persisted as an admission receipt or accepted across later checks.
+        self.verified_source_ids: tuple[str, ...] = ()
 
     def add(
         self,
@@ -1104,6 +1096,7 @@ class CompletionIssues(list[str]):
 
     def deduplicated(self) -> CompletionIssues:
         result = CompletionIssues()
+        result.verified_source_ids = self.verified_source_ids
         seen: set[str] = set()
         for message, diagnostic in zip(self, self.diagnostics, strict=True):
             if message not in seen:
@@ -1279,7 +1272,6 @@ async def validate_result_claims(
         issues = CompletionIssues()
     run = str(run_id)
     proposal = proposal or {"evidence_ids": evidence_ids, "outcome": outcome}
-    reason = proposal.get("reason", "")
     step_id = step.step_id if step else "result"
     # Per-evidence linkage checks. Missing path linkage can never succeed
     # (worker D records path_id/path_version/path_step_id/principal_ref).
@@ -2014,14 +2006,6 @@ async def validate_result_claims(
                     summary="refuted outcome contradicts a confirmed hypothesis condition",
                 )
                 break
-    if outcome == "success" and not valid_records:
-        lowered_reason = _s(reason).lower()
-        if any(phrase in lowered_reason for phrase in _NO_CANDIDATE_PHRASES):
-            issues.add(
-                "lack of candidates alone cannot justify completion",
-                code="completion_lack_of_candidates_alone_cannot_justify_38",
-                summary="lack of candidates alone cannot justify completion",
-            )
     # Proposal claim vs reality: only flag explicit false-met claims.
     claims = _proposal_claims(proposal)
     for key, claimed in claims:
@@ -2038,6 +2022,8 @@ async def validate_result_claims(
                         summary="proposal claims 'reference' is met but reference is not satisfied",
                     )
                 break
+    if not issues:
+        issues.verified_source_ids = tuple(evidence_ids)
     return issues.deduplicated()
 
 

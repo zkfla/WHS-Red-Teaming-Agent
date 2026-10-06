@@ -11,7 +11,7 @@ from urllib.parse import urlsplit
 
 from jsonschema import ValidationError as JSONSchemaValidationError
 from jsonschema import validate as validate_json_schema
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from redteam.attack_graph.identity import node_id_for_target, target_for_node
 from redteam.attack_graph.predicates import Confidence, Provenance, facts_of
@@ -41,7 +41,11 @@ from redteam.orchestration.completion_proposal import (
     record_unresolved,
     validate_unresolved,
 )
-from redteam.orchestration.context_projection import project_run_processing
+from redteam.orchestration.context_projection import (
+    completion_review_context,
+    project_run_processing,
+    review_path_reference,
+)
 from redteam.orchestration.coordination import (
     ChangeSet,
     StateConflict,
@@ -437,6 +441,24 @@ def _rejection_feedback(reason: str, field: str) -> str:
     ).feedback()
 
 
+def _structured_completion_unresolved(decision: Any) -> bool:
+    """True only when the structured completion proposal is unresolved.
+
+    The public CompletionProposal contract decides, never the free-text
+    reason alone: an empty or malformed proposal never exempts the budget
+    gate, and success/refuted keep the existing model-review budget.
+    """
+    raw = getattr(decision, "completion", None)
+    if isinstance(decision, dict):
+        raw = decision.get("completion", raw)
+    if not isinstance(raw, dict) or not raw:
+        return False
+    try:
+        return bool(CompletionProposal.model_validate(raw).unresolved)
+    except (TypeError, ValidationError):
+        return False
+
+
 class InvestigationEngine:
     def __init__(self, deps) -> None:
         self.deps = deps
@@ -528,6 +550,25 @@ class InvestigationEngine:
                 if metadata.get("delegation_id") == delegation_id:
                     results.append(redact_secret_material(metadata))
         return results
+
+    async def review_context(self, runtime, context, evidence_ids):
+        """Refresh relevant registered state through the existing public queries."""
+        from redteam.attack_graph.service import AttackGraphService
+
+        knowledge, _ = await collect_knowledge(
+            AttackGraphService(self.deps.graph_store), self.deps.evidence_store,
+            str(runtime.run_id), step=runtime.step_count,
+            engagement_id=str(runtime.engagement_id),
+        )
+        delegation = self.active_delegation
+        results = await self.local_results(
+            runtime,
+            delegation_id=delegation.delegation_id if delegation is not None else None,
+        )
+        return completion_review_context(
+            {**(context or {}), "knowledge": knowledge, "local_tool_results": results},
+            evidence_ids,
+        )
 
     async def _ask(self, *, stage, payload, **kwargs):
         budget = kwargs.get("budget")
@@ -1755,6 +1796,13 @@ class InvestigationEngine:
                             EvidenceReadRequest.model_validate(request),
                         )
                     )
+                    # The narrowed completion review reads requested windows
+                    # from this same context. Refresh them here so a later
+                    # complete_* in this round sees what was just read,
+                    # reusing the existing restore path; no new store/cache.
+                    context["requested_evidence"] = await restore_reads(
+                        self.deps.evidence_store, runtime
+                    )
                     last_control_succeeded = True
                     continue
                 if decision.mode == "update_hypothesis":
@@ -1901,7 +1949,9 @@ class InvestigationEngine:
                     last_control_succeeded = True
                     continue
                 if decision.mode == "complete_step":
-                    if not budget.permits():
+                    # Unresolved settlement needs no further model call, so the
+                    # structured unresolved proposal bypasses the review gate.
+                    if not budget.permits() and not _structured_completion_unresolved(decision):
                         self.planning_diagnostic = self._budget_failure(
                             "completion_review", budget
                         ).diagnostic
@@ -1922,7 +1972,7 @@ class InvestigationEngine:
                     last_control_succeeded = not errors
                     continue
                 if decision.mode == "complete_goal":
-                    if not budget.permits():
+                    if not budget.permits() and not _structured_completion_unresolved(decision):
                         self.planning_diagnostic = self._budget_failure(
                             "completion_review", budget
                         ).diagnostic
@@ -1950,7 +2000,7 @@ class InvestigationEngine:
                     context["feedback"] = self._safe_errors(errors, budget)
                     continue
                 if decision.mode == "complete_task":
-                    if not budget.permits():
+                    if not budget.permits() and not _structured_completion_unresolved(decision):
                         self.planning_diagnostic = self._budget_failure(
                             "completion_review", budget
                         ).diagnostic
@@ -2650,19 +2700,41 @@ class InvestigationEngine:
         )
         if errors:
             return path, errors
+        # Receipt citations expand to their proven originals inside code
+        # validation; the review reads those originals, never just the
+        # receipt wrapper. Before the shared attribute lands, cited ids
+        # remain the compatible fallback.
+        proven_ids = [str(identity) for identity in proposal.get("evidence_ids", [])]
+        review_sources = list(getattr(errors, "verified_source_ids", None) or proven_ids)
         source_results = [
             await EvidenceReader(self.deps.evidence_store).read(
                 evidence_id=str(identity), run_id=str(runtime.run_id), limit=4000
             )
-            for identity in proposal.get("evidence_ids", [])
+            for identity in review_sources
+        ]
+        dependency_states = [
+            {
+                "step_id": candidate.step_id,
+                "objective": candidate.objective,
+                "status": candidate.status,
+                "outcome": candidate.outcome,
+            }
+            for candidate in path.steps
+            if candidate.step_id in set(step.depends_on or [])
         ]
         await self._check_review_path(runtime, path)
         review = await self._ask(
             stage="completion_review",
             payload={
-                **context,
+                # Narrowed review context: constraints, related read
+                # windows, mission limits, plus the snapshot reference.
+                # Tool lists, histories, and goal criteria stay out.
+                **await self.review_context(runtime, context, review_sources),
+                "active_path": review_path_reference(path),
                 "step": step.model_dump(mode="json"),
+                "step_dependencies": dependency_states,
                 "completion_proposal": proposal,
+                "source_evidence_ids": review_sources,
                 "source_results": source_results,
             },
             response_schema={

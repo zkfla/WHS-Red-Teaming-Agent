@@ -160,16 +160,8 @@ class _LoopLLM:
         if route == "task_completion_review":
             # Task review: accepted/reason/claims with actual evidence ids.
             payload = self._payload(messages)
-            run_id = (payload.get("path") or {}).get("run_id", "")
-            records = await self._evidence.list_for_run(run_id) if run_id else []
-            task_receipts = [
-                str(r.evidence_id)
-                for r in records
-                if isinstance(getattr(r, "metadata", {}).get("tool_result"), dict)
-            ]
-            if not task_receipts:
-                for step in (payload.get("path") or {}).get("steps", []):
-                    task_receipts.extend(step.get("evidence_ids", []))
+            task_receipts = list(payload["verified_source_ids"])
+            assert task_receipts, "task review needs the verified executed call evidence"
             return {
                 "accepted": True,
                 "reason": "scripted semantic accept",
@@ -187,19 +179,8 @@ class _LoopLLM:
             # Goal review: every original criterion needs evidence + claims.
             payload = self._payload(messages)
             criteria = payload["mission"]["success_criteria"]
-            receipts: list[str] = []
-            for step in payload["path"]["steps"]:
-                receipts.extend(step.get("evidence_ids", []))
-            if not receipts:
-                run_id = (payload.get("path") or {}).get("run_id", "")
-                run_id = run_id or payload.get("active_path", {}).get("run_id", "")
-                if run_id:
-                    records = await self._evidence.list_for_run(run_id)
-                    receipts = [
-                        str(r.evidence_id)
-                        for r in records
-                        if isinstance(getattr(r, "metadata", {}).get("tool_result"), dict)
-                    ]
+            receipts = list(payload["verified_source_ids"])
+            assert receipts, "goal review needs the verified executed call evidence"
             return {
                 "accepted": True,
                 "reason": "scripted goal accept",

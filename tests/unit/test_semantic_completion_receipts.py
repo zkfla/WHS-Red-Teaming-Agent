@@ -928,7 +928,7 @@ async def test_recorded_fact_rejects_mismatched_origin_and_value(attack):
     assert "status_code" not in (await service.get_node(TARGET_NODE)).properties["facts"]
 
 
-async def test_posthoc_hypothesis_receipt_completes_from_prior_original_or_receipt():
+async def test_standalone_hypothesis_registers_open_without_model_review():
     from copy import deepcopy
 
     store, llm, service, deps, registry, refs = await _recording_world()
@@ -947,13 +947,156 @@ async def test_posthoc_hypothesis_receipt_completes_from_prior_original_or_recei
         _recording_context(deps),
     )
     entry = recorded.payload["hypotheses"][0]
-    assert entry["status"] == "confirmed"
-    assert llm.calls == 1
-    assert await _posthoc_complete(store, service, entry["hypothesis_id"], refs) == []
-    assert (
-        await _posthoc_complete(store, service, entry["hypothesis_id"], [entry["receipt_id"]]) == []
-    )
+    assert recorded.ok
+    assert entry["status"] == "open"
+    assert "receipt_id" not in entry
+    assert llm.calls == 0
+    assert (await service.get_hypothesis(entry["hypothesis_id"])).status == "open"
+    # An open question alone satisfies no confirmation criterion.
+    assert await _posthoc_complete(store, service, entry["hypothesis_id"], refs) != []
     assert [(await store.get(ref)).model_dump(mode="json") for ref in refs] == originals
+
+
+async def test_explicit_security_finding_confirms_open_hypothesis_with_receipt():
+    store, llm, service, deps, registry, refs = await _recording_world(
+        response={**_success_llm(), "hypothesis_outcome": "success"}
+    )
+    recorded = await registry.call(
+        "graph.record",
+        {
+            "hypotheses": [
+                {
+                    "statement": "Unauthenticated callers can read accounts",
+                    "target_node_id": TARGET_NODE,
+                    "evidence_refs": refs,
+                }
+            ]
+        },
+        _recording_context(deps),
+    )
+    hid = recorded.payload["hypotheses"][0]["hypothesis_id"]
+    assert recorded.payload["hypotheses"][0]["status"] == "open"
+    assert llm.calls == 0
+    found = await registry.call(
+        "graph.record",
+        {
+            "findings": [
+                {
+                    "statement": "Anonymous requests disclose another customer's account",
+                    "target_node_id": TARGET_NODE,
+                    "hypothesis_id": hid,
+                    "evidence_refs": refs,
+                }
+            ]
+        },
+        _recording_context(deps),
+    )
+    finding = found.payload["findings"][0]
+    assert found.ok and finding["status"] == "recorded"
+    assert finding["hypothesis_id"] == hid
+    assert llm.calls == 1
+    assert (await service.get_hypothesis(hid)).status == "confirmed"
+    assert await _posthoc_complete(store, service, hid, refs) == []
+    assert await _posthoc_complete(store, service, hid, [finding["receipt_id"]]) == []
+
+
+async def test_empty_hypothesis_ref_registers_open_without_review():
+    store, llm, service, deps, registry, refs = await _recording_world()
+    recorded = await registry.call(
+        "graph.record",
+        {
+            "hypotheses": [
+                {
+                    "statement": "needs a follow-up question",
+                    "target_node_id": TARGET_NODE,
+                    "evidence_refs": [],
+                }
+            ]
+        },
+        _recording_context(deps),
+    )
+    entry = recorded.payload["hypotheses"][0]
+    assert recorded.ok
+    assert entry["status"] == "open"
+    assert "receipt_id" not in entry
+    assert llm.calls == 0
+    assert (await service.get_hypothesis(entry["hypothesis_id"])).status == "open"
+
+
+async def test_hypothesis_without_verifier_registers_open():
+    from dataclasses import replace
+
+    from redteam.orchestration.graph_recording import (
+        GraphRecordingHandler,
+        graph_recording_descriptor,
+    )
+    from redteam.orchestration.local_tools import LocalToolRegistry
+
+    store, llm, service, deps, registry, refs = await _recording_world()
+    plain = LocalToolRegistry()
+    plain.register(
+        graph_recording_descriptor(),
+        GraphRecordingHandler(evidence_store=store, graph_service=service),
+    )
+    context = _recording_context(deps)
+    context = replace(context, deps=replace(deps, verifier=None))
+    recorded = await plain.call(
+        "graph.record",
+        {
+            "hypotheses": [
+                {
+                    "statement": "response observed",
+                    "target_node_id": TARGET_NODE,
+                    "evidence_refs": refs,
+                }
+            ]
+        },
+        context,
+    )
+    entry = recorded.payload["hypotheses"][0]
+    assert recorded.ok
+    assert entry["status"] == "open"
+    assert llm.calls == 0
+
+
+async def test_confirmed_hypothesis_reregistration_keeps_confirmed_status():
+    store, llm, service, deps, registry, refs = await _recording_world(
+        response={**_success_llm(), "hypothesis_outcome": "success"}
+    )
+    first = await registry.call(
+        "graph.record",
+        {
+            "findings": [
+                {
+                    "statement": "Anonymous requests disclose another customer's account",
+                    "target_node_id": TARGET_NODE,
+                    "evidence_refs": refs,
+                }
+            ]
+        },
+        _recording_context(deps),
+    )
+    hid = first.payload["findings"][0]["hypothesis_id"]
+    assert (await service.get_hypothesis(hid)).status == "confirmed"
+    calls = llm.calls
+    repeat = await registry.call(
+        "graph.record",
+        {
+            "hypotheses": [
+                {
+                    "statement": "Anonymous requests disclose another customer's account",
+                    "target_node_id": TARGET_NODE,
+                    "evidence_refs": refs,
+                }
+            ]
+        },
+        _recording_context(deps),
+    )
+    assert repeat.ok
+    assert repeat.payload["hypotheses"][0]["hypothesis_id"] == hid
+    assert repeat.payload["hypotheses"][0]["status"] == "confirmed"
+    assert llm.calls == calls
+    assert (await service.get_hypothesis(hid)).status == "confirmed"
 
 
 async def test_finding_paraphrase_one_review_replay_and_latest_refutation():

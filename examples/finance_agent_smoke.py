@@ -243,9 +243,8 @@ class _ScriptedLabModel:
             }
         if route == "goal_completion_review":
             payload = json.loads(messages[0]["content"])
-            receipts = [
-                identity for step in payload["path"]["steps"] for identity in step["evidence_ids"]
-            ]
+            receipts = list(payload.get("verified_source_ids", []))
+            assert receipts, "goal review must name every proven origin"
             return {
                 "accepted": True,
                 "reason": "lab goal done",

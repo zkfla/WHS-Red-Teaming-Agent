@@ -12,6 +12,8 @@ or declare a new typed entity whose id is code-derived and linked back
 to the observed source, hypotheses are recorded as INFERRED, and a
 first vulnerability claim
 runs posthoc review, a final-admission receipt, and promotion here.
+Standalone hypotheses are never reviewed here; they stay open inference
+until an explicit finding or execution verification resolves them.
 The root generic runtime_tool dispatch only returns this handler's
 result; it never branches on the graph name or performs hidden
 follow-up registration.
@@ -134,9 +136,28 @@ class RecordedFact(BaseModel):
 class HypothesisDraft(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    statement: str = Field(min_length=1)
-    evidence_refs: list[str] = Field(default_factory=list)
-    target_node_id: str | None = None
+    statement: str = Field(
+        min_length=1,
+        description=(
+            "Open inference only: registering a question here never confirms, "
+            "refutes, or reviews it. Resolution needs an explicit finding "
+            "or execution verification."
+        ),
+    )
+    evidence_refs: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Optional same-run evidence for the question; emptiness alone "
+            "does not refuse the draft."
+        ),
+    )
+    target_node_id: str | None = Field(
+        default=None,
+        description=(
+            "Optional target linkage; omission keeps the draft open and "
+            "unresolved rather than refused."
+        ),
+    )
 
 
 class FindingDraft(BaseModel):
@@ -835,56 +856,9 @@ class GraphRecordingHandler:
             )
         review: dict[str, Any] = {"status": "per-claim"}
         finding_verifier = self._verifier or getattr(context.deps, "verifier", None)
-        # Standalone hypotheses each receive their own assessment and receipt.
-        # A matching finding below supplies that hypothesis's review instead.
-        for draft, entry in zip(recording.hypotheses, hypotheses_out, strict=True):
-            hid = entry.get("hypothesis_id")
-            if not hid:
-                continue
-            covered = any(
-                (item.hypothesis_id == hid or (
-                    not item.hypothesis_id and len(new_hypothesis_ids) == 1
-                ))
-                and (not item.target_node_id or item.target_node_id == entry["target_node_id"])
-                for item in recording.findings
-            )
-            if covered:
-                continue
-            try:
-                if context.budget is None or finding_verifier is None:
-                    raise ValueError("review unavailable")
-                target = entry["target_node_id"]
-                if not target:
-                    targets = set()
-                    for ref in draft.evidence_refs:
-                        source = await store.get(ref)
-                        targets.add(str(source.metadata.get("target_node_id", "") or ""))
-                    if len(targets) != 1 or not next(iter(targets)):
-                        raise ValueError("target linkage")
-                    target = next(iter(targets))
-                claim = {"statement": draft.statement, "target_node_id": target,
-                         "hypothesis_id": hid}
-                assessment = await finding_verifier.verify_claim_with_budget(
-                    claim=claim, evidence_ids=draft.evidence_refs, run_id=run_id,
-                    budget=context.budget, before_call=context.before_call,
-                )
-                first = await store.get(draft.evidence_refs[0])
-                receipt = await append_posthoc_claim_receipt(
-                    evidence_store=store, run_id=run_id, engagement_id=engagement_id,
-                    claim=claim, evidence_ids=draft.evidence_refs, assessment=assessment,
-                    hypothesis_id=hid, action_id=str(first.action_id),
-                    invocation_id=str(first.invocation_id), target_node_id=target,
-                )
-                if receipt is None:
-                    raise ValueError("receipt unavailable")
-                new_evidence_ids.append(str(receipt.evidence_id))
-                status = hypothesis_status_for_assessment(assessment)
-                updated = await service.resolve_hypothesis(hid, status=status, step=step)
-                if updated is None:
-                    raise ValueError("hypothesis missing")
-                entry.update(status=status, receipt_id=str(receipt.evidence_id))
-            except Exception:
-                entry.update(status="refused", reason="hypothesis review incomplete")
+        # Standalone hypotheses stay open here: recording a question is not
+        # resolving it. An explicit finding below reviews and resolves its own
+        # hypothesis; other hypotheses resolve through execution verification.
         findings_out: list[dict[str, Any]] = []
         existing_claims: set[str] = set()
         if recording.findings and service is not None:
@@ -1332,8 +1306,9 @@ def graph_recording_descriptor() -> LocalToolDescriptor:
             "Record normalized facts/hypotheses/findings/branches. Facts are "
             "code-checked against the preserved ToolResult output (raw_path "
             "walks output first) and written to existing graph nodes or "
-            "edges only; hypotheses are the model inference; findings run "
-            "posthoc review plus promotion here."
+            "edges only; hypotheses stay open inference here and resolve "
+            "through an explicit finding or execution verification; "
+            "findings run posthoc review plus promotion here."
         ),
         input_schema=GraphRecordingInput.model_json_schema(),
         contribution_id=GRAPH_RECORD_CONTRIBUTION_ID,

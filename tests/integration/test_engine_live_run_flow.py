@@ -98,9 +98,8 @@ class LiveScriptedLLM(h.ScriptedLLM):
         if route == "goal_completion_review":
             payload = self._payload(messages)
             criteria = payload["mission"]["success_criteria"]
-            receipts: list[str] = []
-            for step in payload["path"]["steps"]:
-                receipts.extend(step.get("evidence_ids", []))
+            receipts = list(payload.get("verified_source_ids", []))
+            assert receipts, "goal review must name every proven origin"
             return h.goal_accept(
                 [{"criterion": c, "met": True, "evidence_ids": list(receipts)} for c in criteria]
             )

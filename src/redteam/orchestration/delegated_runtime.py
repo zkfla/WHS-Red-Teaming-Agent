@@ -451,13 +451,26 @@ async def decide_delegations(engine, path, runtime, context):
                     "evidence_ids": list(verdict.evidence_ids),
                     "gaps": [{"description": item} for item in verdict.unresolved],
                 }
+                scoped_reads = (
+                    await restore_reads(
+                        engine.deps.evidence_store, runtime, delegation_id=identity
+                    )
+                    or []
+                )
+                root_requested = context.get("requested_evidence", [])
+                if not isinstance(root_requested, list):
+                    root_requested = []
+                completion_context = {
+                    **context,
+                    "requested_evidence": [*root_requested, *scoped_reads],
+                }
                 path, completion_errors = await engine.complete_step(
                     path,
                     SimpleNamespace(
                         path_step_id=state.path_step_id, completion=completion,
                         reason=verdict.summary or str(completion.get("reason", "")),
                     ),
-                    runtime, context, budget=budget,
+                    runtime, completion_context, budget=budget,
                 )
                 if completion_errors:
                     verdict = replace(

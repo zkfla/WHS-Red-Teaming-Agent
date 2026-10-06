@@ -166,6 +166,11 @@ class TaskBoundaryLLM(h.ScriptedLLM):
                     if isinstance(e, dict) and str(e.get("evidence_id", "")).strip()
                 ]
                 assert ids, "task review needs related stored evidence"
+                assert "path" not in payload, "task review must not carry the full path"
+                assert set(ids) <= set(
+                    payload.get("verified_source_ids", [])
+                ), "every shown excerpt id must be a verified source"
+                assert payload.get("review_note"), "task review needs the read-range note"
                 return h.task_accept(ids, reason="task review accept")
             self.step_review_payloads.append(payload)
             return h.completion_accept()
@@ -174,6 +179,10 @@ class TaskBoundaryLLM(h.ScriptedLLM):
             assert isinstance(mission, dict)
             criteria = mission["success_criteria"]
             assert isinstance(criteria, list)
+            assert "path" not in payload, "goal review must not carry the full path"
+            ownership = payload.get("task_evidence", {})
+            assert isinstance(ownership, dict) and ownership, "goal review needs ownership map"
+            assert payload.get("review_note"), "goal review needs the read-range note"
             active = payload["active_path"]
             assert isinstance(active, dict)
             run_id = str(active["run_id"])
@@ -186,6 +195,12 @@ class TaskBoundaryLLM(h.ScriptedLLM):
                     dict,
                 )
             ]
+            verified = set(payload.get("verified_source_ids", []))
+            assert set(receipts) <= verified, "proven origins must all be named"
+            for window in payload.get("requested_evidence", []):
+                assert str(window.get("evidence_id", "")) in verified, (
+                    "kept windows must stay within verified sources"
+                )
             return h.goal_accept(
                 [
                     {

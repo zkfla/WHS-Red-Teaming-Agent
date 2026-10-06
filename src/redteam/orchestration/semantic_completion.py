@@ -55,6 +55,9 @@ from redteam.orchestration.completion_proposal import (
     record_unresolved,
     validate_unresolved,
 )
+from redteam.orchestration.context_projection import (
+    review_path_reference,
+)
 from redteam.orchestration.coordination import content_hash
 from redteam.orchestration.evidence_access import raw_from_metadata
 from redteam.orchestration.result_claims import (
@@ -460,6 +463,116 @@ def _review_payload_common(
     }
 
 
+#: Review guidance attached to every completion review payload. The review
+#: call receives every proven origin id, but shown contents cover only some
+#: of them. The reviewer must never describe an unshown id as read or quote
+#: content for it; such ids count only as proven references through the
+#: ownership map and the receipt binding.
+REVIEW_EXCERPT_NOTE = (
+    "evidence_excerpts and requested_evidence hold the stored contents actually "
+    "shown to this review. verified_source_ids can name more proven origins than "
+    "the shown contents cover. Never describe an evidence id without shown content "
+    "as read, and never quote or paraphrase content for it; unshown ids count only "
+    "as proven references through the task_evidence ownership map and the receipt "
+    "binding, never as observed results."
+)
+
+
+def _task_review_subject(task: MissionTask) -> dict[str, Any]:
+    """Minimal task identity for the review call: purpose and origin subjects.
+
+    The full task record stays in the store; the reviewer gets the delegated
+    purpose plus the subject bindings the origin checks already enforced.
+    """
+    return {
+        "task_id": str(task.task_id),
+        "mission_id": str(task.mission_id),
+        "objective": str(task.objective or ""),
+        "required": bool(task.required),
+        "related_attack_graph_node_ids": [
+            str(item) for item in (task.related_attack_graph_node_ids or [])
+        ],
+        "related_hypothesis_ids": [
+            str(item) for item in (task.related_hypothesis_ids or [])
+        ],
+    }
+
+
+def _mission_review_subject(mission: Any, criteria: list[str]) -> dict[str, Any]:
+    """Original operator contract for the goal review: criteria and constraints.
+
+    The full mission record stays in the store; the reviewer judges the
+    original success criteria under the original operator constraints.
+    """
+    constraints = getattr(mission, "operator_constraints", {}) or {}
+    return {
+        "mission_id": str(getattr(mission, "mission_id", "")),
+        "success_criteria": list(criteria),
+        "operator_constraints": dict(constraints) if isinstance(constraints, dict) else {},
+    }
+
+
+def _task_review_payload(
+    *,
+    task: MissionTask,
+    path: Any,
+    context: Any,
+    evidence_ids: list[str],
+    excerpts: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Assemble the task review payload: subjects, ownership and shown contents.
+
+    The full task record and the full path stay in their stores. Every proven
+    origin id is named even when the excerpt cap trims the shown contents.
+    """
+    return {
+        **context,
+        "task": _task_review_subject(task),
+        "active_path": review_path_reference(path),
+        **_review_payload_common(
+            purpose=getattr(task, "objective", "") or "",
+            conditions=[],
+            excerpts=excerpts,
+        ),
+        "verified_source_ids": list(evidence_ids),
+        "task_evidence": {str(task.task_id): list(evidence_ids)},
+        "review_note": REVIEW_EXCERPT_NOTE,
+    }
+
+
+def _goal_review_payload(
+    *,
+    mission: Any,
+    criteria: list[str],
+    path: Any,
+    context: Any,
+    task_evidence: dict[str, list[str]],
+    excerpts: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Assemble the goal review payload: original contract plus ownership map.
+
+    The full mission record and the full path stay in their stores. The
+    task_evidence map names every proven origin per owning task even when the
+    excerpt cap trims the shown contents.
+    """
+    verified = [identity for origins in task_evidence.values() for identity in origins]
+    return {
+        **context,
+        "mission": _mission_review_subject(mission, criteria),
+        "active_path": review_path_reference(path),
+        **_review_payload_common(
+            purpose=getattr(mission, "objective", "") or "",
+            conditions=criteria,
+            excerpts=excerpts,
+        ),
+        "verified_source_ids": verified,
+        "task_evidence": {
+            str(task_id): list(origins) for task_id, origins in task_evidence.items()
+        },
+        "review_note": REVIEW_EXCERPT_NOTE,
+    }
+
+
 async def _pending_execution_errors(engine: Any, runtime: Any) -> list[str]:
     try:
         history = await engine.deps.work_store.list_items(run_id=runtime.run_id)
@@ -579,14 +692,13 @@ async def complete_task(
     await engine._check_review_path(runtime, path)
     review = await engine._ask(
         stage="task_completion_review",
-        payload={
-            **(context or {}),
-            "task": task.model_dump(mode="json"),
-            "path": path.model_dump(mode="json"),
-            **_review_payload_common(
-                purpose=getattr(task, "objective", "") or "", conditions=[], excerpts=excerpt_notes
-            ),
-        },
+        payload=_task_review_payload(
+            task=task,
+            path=path,
+            context=await engine.review_context(runtime, context, evidence_ids),
+            evidence_ids=evidence_ids,
+            excerpts=excerpt_notes,
+        ),
         response_schema=ResultReview.model_json_schema(),
         system=_engine_system(engine) + RESULT_REVIEW_INSTRUCTION,
         budget=budget,
@@ -710,7 +822,9 @@ async def settle_unresolved(
                         reason=proposal.reason,
                     )
             await change.tasks.update_mission(mission.model_copy(update={
-                "status": MissionStatus.BLOCKED, "updated_at": now,
+                "status": MissionStatus.BLOCKED,
+                "updated_at": now,
+                "revision": int(getattr(mission, "revision", 1) or 1) + 1,
             }))
 
     await engine._commit_review(runtime, token, block)
@@ -951,16 +1065,17 @@ async def complete_goal(
     await engine._check_review_path(runtime, path)
     review = await engine._ask(
         stage="goal_completion_review",
-        payload={
-            **(context or {}),
-            "mission": mission.model_dump(mode="json"),
-            "path": path.model_dump(mode="json"),
-            **_review_payload_common(
-                purpose=getattr(mission, "objective", "") or "",
-                conditions=criteria,
-                excerpts=excerpts,
+        payload=_goal_review_payload(
+            mission=mission,
+            criteria=criteria,
+            path=path,
+            context=await engine.review_context(
+                runtime, context,
+                [identity for origins in task_evidence.values() for identity in origins],
             ),
-        },
+            task_evidence=task_evidence,
+            excerpts=excerpts,
+        ),
         response_schema=_GoalReview.model_json_schema(),
         system=_engine_system(engine) + RESULT_REVIEW_INSTRUCTION,
         budget=budget,
