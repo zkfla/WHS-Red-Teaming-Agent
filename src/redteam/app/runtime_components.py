@@ -176,6 +176,20 @@ def binding_for_resume(
     """
     if stored is None:
         return builtin_component_binding()
+    if stored.specialist_profile_path is not None:
+        from redteam.app.agent_profile import load_specialist_profile
+
+        try:
+            loaded = load_specialist_profile(stored.specialist_profile_path)
+        except (ValueError, OSError) as exc:
+            raise ComponentBindingError("stored specialist profile unavailable or invalid") from exc
+        if (
+            loaded.fingerprint != stored.specialist_profile_fingerprint
+            or loaded.bindings != stored.prompt_bindings
+        ):
+            raise ComponentBindingError(
+                "stored specialist prompts/profile changed; new Run required"
+            )
     active = registry if registry is not None else default_component_registry()
     active.resolve_binding(stored)
     try:

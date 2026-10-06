@@ -37,6 +37,7 @@ __all__ = [
     "methodology_env_raw",
     "extensions_env_raw",
     "planning_provider_env_raw",
+    "specialist_profile_env_raw",
     "app_selection_env_values",
     "mcp_server_list",
     "read_prefixed_values",
@@ -99,6 +100,9 @@ class AppSelectionEnvInput(_SnapshotSettings):
     extensions: str | None = Field(default=None, validation_alias="REDTEAM_EXTENSIONS")
     planning_provider: str | None = Field(
         default=None, validation_alias="REDTEAM_PLANNING_PROVIDER"
+    )
+    specialist_profile: str | None = Field(
+        default=None, validation_alias="REDTEAM_SPECIALIST_PROFILE"
     )
 
 
@@ -213,6 +217,10 @@ def extensions_env_raw(source: Mapping[str, str] | None = None) -> str | None:
 def planning_provider_env_raw(source: Mapping[str, str] | None = None) -> str | None:
     """Raw inference-role provider name. None means no explicit choice."""
     return _collect_raw(AppSelectionEnvInput, source)["planning_provider"]
+
+
+def specialist_profile_env_raw(source: Mapping[str, str] | None = None) -> str | None:
+    return _collect_raw(AppSelectionEnvInput, source)["specialist_profile"]
 
 
 def app_selection_env_values(

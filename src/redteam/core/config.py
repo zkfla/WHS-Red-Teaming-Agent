@@ -49,6 +49,7 @@ from redteam.core.environment import (
 from redteam.core.environment import (
     planning_provider_env_raw as _planning_provider_env_raw,
 )
+from redteam.core.environment import specialist_profile_env_raw
 from redteam.core.ids import EngagementId
 
 
@@ -214,6 +215,15 @@ class LoggingConfig(BaseModel):
     level: str = "INFO"
 
 
+def specialist_profile_from_environment(env: Mapping[str, str] | None = None) -> str | None:
+    raw = specialist_profile_env_raw(source=env)
+    if raw is None:
+        return None
+    if not raw.strip():
+        raise ValueError("REDTEAM_SPECIALIST_PROFILE must be a nonblank path")
+    return raw.strip()
+
+
 class AppConfig(BaseModel):
     engagement: EngagementConfig
     llm: LLMConfig = Field(default_factory=LLMConfig)
@@ -222,6 +232,7 @@ class AppConfig(BaseModel):
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
     extensions: list[str] = Field(default_factory=list)
     planning_provider: str | None = None
+    specialist_profile: str | None = None
 
 
 def load_app_config(path: str | Path) -> AppConfig:

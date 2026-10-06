@@ -627,12 +627,20 @@ class StructuredLLMAnalysisVerifier:
     _OUTCOMES = ("success", "refuted", "inconclusive", "blocked", "unknown")
 
     def __init__(
-        self, llm: Any, evidence_store: EvidenceStore, graph_service: Any | None = None
+        self, llm: Any, evidence_store: EvidenceStore, graph_service: Any | None = None,
+        *, agent_prompts=None,
     ) -> None:
         self._llm = llm
         self._store = evidence_store
         self._graph = graph_service
         self._decider = StructuredDecisionClient(llm)
+        self._agent_prompts = agent_prompts
+
+    def _system(self, stage: str, contract: str) -> str:
+        return (
+            self._agent_prompts.compose(stage, contract)
+            if self._agent_prompts is not None else contract
+        )
 
     async def verify(
         self,
@@ -813,12 +821,12 @@ class StructuredLLMAnalysisVerifier:
                 stage="analysis_claim_verify",
                 payload={"claim": claim, "excerpts": excerpts},
                 response_schema=response_schema,
-                system=_CLAIM_SYSTEM + (
+                system=self._system("analysis_claim_verify", _CLAIM_SYSTEM + (
                     " When reference_hypothesis is given, independently judge its meaning "
                     "from these same sources. A paraphrase may support it; an unrelated "
                     "claim or a narrower negative result does not resolve it. Return "
                     "hypothesis_outcome separately from the new claim outcome."
-                ),
+                )),
                 budget=budget,
                 before_call=before_call,
             )
@@ -904,7 +912,7 @@ class StructuredLLMAnalysisVerifier:
                     stage="analysis_verify",
                     payload=self._meaning_payload(request),
                     response_schema=self._meaning_schema(),
-                    system=_ANALYSIS_SYSTEM,
+                    system=self._system("analysis_verify", _ANALYSIS_SYSTEM),
                     budget=budget,
                     before_call=before_call,
                 )

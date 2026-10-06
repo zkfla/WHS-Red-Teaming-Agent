@@ -435,6 +435,8 @@ class TerminalReportProjection(BaseModel):
     unresolved_evidence_ids: list[str] = Field(default_factory=list)
     evidence_reads: list[EvidenceReadProjection] = Field(default_factory=list)
     unresolved_details: list[InvestigationUnresolvedProjection] = Field(default_factory=list)
+    specialist_profile_fingerprint: str | None = None
+    prompt_bindings: dict[str, dict[str, str]] = Field(default_factory=dict)
 
 
 class ReportingAgent:
@@ -607,6 +609,14 @@ class ReportingAgent:
             unresolved_evidence_ids=unresolved_refs,
             evidence_reads=evidence_read_projections,
             unresolved_details=unresolved_details,
+            specialist_profile_fingerprint=(
+                runtime.component_binding.specialist_profile_fingerprint
+                if runtime.component_binding is not None else None
+            ),
+            prompt_bindings=(
+                runtime.component_binding.prompt_bindings
+                if runtime.component_binding is not None else {}
+            ),
             run_outcome="unknown",
         )
         report.run_outcome = _project_run_outcome(

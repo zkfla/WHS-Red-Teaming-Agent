@@ -609,6 +609,10 @@ class InvestigationEngine:
                 "role_activation": redact_secret_material(payload.get("role_activation", {})),
                 "diagnostic_context": decision_context(payload),
                 "decision_budget": budget.diagnostic_details() if budget is not None else None,
+                "prompt_bindings": (
+                    self.deps.component_binding.prompt_bindings
+                    if self.deps.component_binding is not None else {}
+                ),
             },
             causation_id=self.last_event_id,
         )

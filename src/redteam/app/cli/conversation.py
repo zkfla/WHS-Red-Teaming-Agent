@@ -94,12 +94,18 @@ class ConversationAssistant:
         *,
         timeout_seconds: float = 30.0,
         max_attempts: int = 3,
+        agent_prompts=None,
     ) -> None:
         self._llm = llm
         self._timeout_seconds = float(timeout_seconds)
         self._max_attempts = int(max_attempts)
         self._history: list[dict[str, str]] = []
         self._client = StructuredDecisionClient(self._llm, max_attempts=self._max_attempts)
+        self._agent_prompts = agent_prompts
+
+    def bind_prompts(self, agent_prompts) -> None:
+        """Composition-only injection. Prompt files are never read during a decision."""
+        self._agent_prompts = agent_prompts
 
     async def decide(
         self,
@@ -137,7 +143,10 @@ class ConversationAssistant:
                     stage="conversation_decide",
                     payload=payload,
                     response_schema=ConversationDecision.model_json_schema(),
-                    system=_SYSTEM_PROMPT,
+                    system=(
+                        self._agent_prompts.compose("conversation_decide", _SYSTEM_PROMPT)
+                        if self._agent_prompts is not None else _SYSTEM_PROMPT
+                    ),
                 ),
                 timeout=self._timeout_seconds,
             )

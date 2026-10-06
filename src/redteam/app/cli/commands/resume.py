@@ -153,6 +153,7 @@ async def _run(
     config = config.model_copy(
         update={
             "extensions": list(stored_binding.extension_entry_points),
+            "specialist_profile": stored_binding.specialist_profile_path,
             "planning_provider": stored_binding.planning_provider_id,
         }
     )

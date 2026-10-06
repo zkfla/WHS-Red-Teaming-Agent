@@ -28,6 +28,7 @@ from redteam.core.config import (
     extensions_from_environment,
     load_engagement_config,
     planning_provider_from_environment,
+    specialist_profile_from_environment,
 )
 from redteam.core.environment import env_snapshot
 from redteam.core.redaction import SECRET_KEY_PARTS
@@ -120,6 +121,7 @@ def load_app_config_for_run(engagement_path: str, *, require_llm: bool = True) -
         ),
         extensions=extensions_from_environment(environment),
         planning_provider=planning_provider_from_environment(environment),
+        specialist_profile=specialist_profile_from_environment(environment),
     )
 
 

@@ -49,6 +49,15 @@ async def run(args: argparse.Namespace) -> int:
     except (OSError, ValidationError, ValueError) as exc:
         return _fail(args, [*checks, ("Application configuration", False, [str(exc)])])
     checks.append(("Application configuration", True, []))
+    if app_config.specialist_profile is not None:
+        from redteam.app.agent_profile import load_specialist_profile
+
+        try:
+            load_specialist_profile(app_config.specialist_profile)
+        except (ValueError, OSError):
+            checks.append(("Specialist profile", False, ["profile/prompt configuration invalid"]))
+        else:
+            checks.append(("Specialist profile", True, []))
 
     scope_problems = check_scope(engagement_config)
     checks.append(("Scope", not scope_problems, scope_problems))

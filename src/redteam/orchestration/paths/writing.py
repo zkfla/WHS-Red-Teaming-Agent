@@ -22,6 +22,7 @@ _PATH_RUNTIME_FIELDS = frozenset(
     {
         "path_id", "run_id", "mission_id", "mission_task_id", "version", "parent_version",
         "status", "goal", "review_records", "changed_step_ids", "evidence_ids",
+        "planning_artifacts",
     }
 )
 

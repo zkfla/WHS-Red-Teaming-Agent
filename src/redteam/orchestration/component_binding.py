@@ -77,6 +77,9 @@ class RuntimeComponentBinding(BaseModel):
     extension_entry_points: tuple[str, ...] = ()
     planning_provider_id: str | None = None
     role_tools_fingerprint: str | None = None
+    specialist_profile_path: str | None = None
+    specialist_profile_fingerprint: str | None = None
+    prompt_bindings: dict[str, dict[str, str]] = Field(default_factory=dict)
 
     def component_id(self, slot: str) -> str | None:
         """Return the stable id recorded for one component slot."""
@@ -94,12 +97,7 @@ def builtin_component_binding() -> RuntimeComponentBinding:
 
 def is_builtin_binding(binding: RuntimeComponentBinding | None) -> bool:
     """Return true only for the full canonical builtin record."""
-    return (
-        binding is not None
-        and binding.profile_id == BUILTIN_PROFILE_ID
-        and binding.version == BUILTIN_PROFILE_VERSION
-        and binding.component_ids == BUILTIN_COMPONENT_IDS
-    )
+    return binding is not None and binding == builtin_component_binding()
 
 
 def selection_of(binding: RuntimeComponentBinding) -> ComponentProfile:

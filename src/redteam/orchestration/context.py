@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from redteam.attack_graph.service import AttackGraphService
 from redteam.core.contracts.engagement import Engagement
 from redteam.core.ids import RunId
+from redteam.core.ports.agent_prompts import AgentPrompts
 from redteam.core.ports.attack_graph import AttackGraphStore
 from redteam.core.ports.control_plane import ControlPlane
 from redteam.core.ports.event_bus import EventBus, EventHistory
@@ -98,6 +99,7 @@ class RuntimeDeps:
     #: Which registered component set this run was built from.
     component_binding: RuntimeComponentBinding | None = field(default=None, compare=False)
     planning_provider: PlanningProvider | None = field(default=None, compare=False)
+    agent_prompts: AgentPrompts | None = field(default=None, compare=False)
     state_codecs: StateCodecRegistry | None = field(default=None, compare=False)
     coordinator: Coordinator | None = field(default=None, compare=False)
     event_history: EventHistory | None = field(default=None, compare=False)

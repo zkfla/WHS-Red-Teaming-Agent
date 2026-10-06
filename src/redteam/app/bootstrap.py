@@ -473,11 +473,27 @@ async def build_application(
     real config-driven wiring for others.
     """
     logging.basicConfig(level=config.logging.level)
+    from redteam.app.agent_profile import load_specialist_profile
+
+    specialists = (
+        load_specialist_profile(config.specialist_profile)
+        if config.specialist_profile is not None else None
+    )
+    if specialists is not None and (
+        agents is not None or candidate_providers is not None
+        or config.planning_provider is not None
+    ):
+        raise ValueError("specialist_profile_conflicts_with_explicit_roles_or_planner")
     selected_extensions = tuple(config.extensions)
     extension_assembly = (
         extensions if extensions is not None else collect_extensions(selected_extensions)
     )
     environment = env_snapshot()
+    if specialists is not None and any(
+        extension_assembly.contributions(kind)
+        for kind in ("agent_role", "agent_definition", "agent_spec", "planning")
+    ):
+        raise ValueError("specialist_profile_conflicts_with_role_extensions")
     profile_bundles = _selected_mcp_profiles(extension_assembly, environment)
     state_codecs = StateCodecRegistry()
     consume_state_codec_contributions(
@@ -596,6 +612,21 @@ async def build_application(
         selected=selected_extensions,
         planning_provider_id=config.planning_provider,
     )
+    if specialists is not None:
+        profile_components = specialists.assemble(profile_components)
+        if verifier is None:
+            from redteam.attack_graph.service import AttackGraphService
+            from redteam.orchestration.analysis import StructuredLLMAnalysisVerifier
+
+            profile_components = replace(profile_components, verifier=StructuredLLMAnalysisVerifier(
+                resolved_llm, resolved_evidence_store, AttackGraphService(resolved_attack_graph),
+                agent_prompts=specialists.prompts,
+            ))
+        component_binding = component_binding.model_copy(update={
+            "specialist_profile_path": specialists.path,
+            "specialist_profile_fingerprint": specialists.fingerprint,
+            "prompt_bindings": specialists.bindings,
+        })
     # Resolve the tool gateway before the Control Plane so the latter can
     # read tool risk_level from the Registry for risk-tiered approval.
     resolved_tool_catalog = tool_catalog
@@ -732,6 +763,8 @@ async def build_application(
         tool_semaphore=asyncio.Semaphore(engagement.rate_limit_policy.max_concurrent_actions),
         settings=resolved_settings,
     )
+    if specialists is not None:
+        deps = replace(deps, agent_prompts=specialists.prompts)
     from redteam.capability.role_manifest import configure_role_tools
 
     role_fingerprint = configure_role_tools(

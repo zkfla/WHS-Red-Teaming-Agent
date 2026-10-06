@@ -179,6 +179,8 @@ class PathPlan(BaseModel):
     evidence_ids: list[str] = []
     changed_step_ids: list[str] = []
     review_records: dict = {}
+    # Code-produced Planner/Atomizer provenance. No execution permission.
+    planning_artifacts: dict = Field(default_factory=dict)
 
 
 def step_definition_equal(first: PathStep, second: PathStep) -> bool:

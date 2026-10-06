@@ -1,5 +1,49 @@
 # WHS Red Teaming Agent
 
+## dev-jm 브랜치 안내 — PRD v2 P0
+
+이 브랜치는 `dev-orchestration`의 `6a2cba4`를 기준으로 **P0 직렬 MVP**를
+통합한 버전입니다. 기존 기본 모드는 유지하며 아래 프로필을 명시적으로 선택하면
+역할별 MD 지침과 Planner/Atomizer 분리 경로를 사용합니다.
+전체 PRD 완료나 실제 LLM의 취약점 탐지 성능 검증을 의미하지 않습니다.
+
+```text
+사용자 대화 → Planner 검증 질문 → Atomizer 작업 DAG
+           → Web/Mobile 목적 위임 → 도구 선택·인자 검증·Control·MCP
+           → 원본 증거·그래프 → Research/Evidence 검토
+```
+
+- 구현: trusted MD 로더, 프롬프트 버전/해시와 resume 드리프트 검사,
+  질문·대상·사용자·의존 참조 검사, step/task/goal 완료 검토 연결.
+- 유지: 실제 catalog 기반 도구 선택, 공유 판단 예산, Control 승인·scope,
+  원본 증거와 최신 상태에 대한 원자적 반영 검사.
+- 후속: P1 이벤트 협업·독립 워커 병렬화, P2 판단 격리·코드 산출물,
+  P3 실제 Mobile·승인 runner·실제 모델 평가.
+- 검증: Python 3.11 로컬 전체 **2,927 passed / 51 skipped**, 관련 검사 128개 통과.
+  Ruff·Mypy·Compose 설정 검사 통과. 모델은 명시적인 fixture를 사용했고,
+  MCP 통합은 실제 stdio 프로세스·Control·loopback 합성 웹으로 확인했습니다.
+
+**먼저 읽기:** [구현 범위·역할별 상태·설치/실행·검증·한계](docs/agent/prd-v2-implementation-20261006.md)
+· [전체 PRD v2와 P1~P3 계획](docs/prd-specialist-worker-parallelism-20261006.md)
+· [공통 개발 지침](AGENTS.md).
+런타임 지침은 [프로필](config/agents/specialists.yaml)과
+[공통 시스템 지침](config/agents/prompts/common.md)에서 시작합니다.
+개발용 `AGENTS.md`는 실행 정책이나 에이전트 시스템 프롬프트가 아닙니다.
+
+프로젝트 루트에서 설치한 뒤, LLM 공급자·승인된 engagement·MCP 서버를 설정하세요.
+비밀키, 개인 `.env`, 가상환경, 로컬 실행 데이터는 이 브랜치에 포함하지 않습니다.
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -e ".[dev,agent]"
+export REDTEAM_SPECIALIST_PROFILE="$PWD/config/agents/specialists.yaml"
+python -m redteam.app.cli
+```
+
+P0 프로필 선택만으로 MCP 서버가 설치되거나 시험 권한이 생기지는 않습니다.
+`unset REDTEAM_SPECIALIST_PROFILE`로 기존 기본 모드를 선택할 수 있습니다.
+
 ## Project Goal
 
 A multi-agent framework for **authorized security testing** engagements.

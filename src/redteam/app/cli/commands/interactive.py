@@ -115,7 +115,15 @@ async def _run(console: Console, *, verbose: bool) -> int:
         logging_config,
     ) = await _ensure_runtime_config(console)
     llm_client = build_llm_client(llm_config)
-    conversation = ConversationAssistant(llm_client)
+    from redteam.app.agent_profile import load_specialist_profile
+    from redteam.core.config import specialist_profile_from_environment
+    from redteam.core.environment import env_snapshot
+
+    profile_path = specialist_profile_from_environment(env_snapshot())
+    profile = load_specialist_profile(profile_path) if profile_path is not None else None
+    conversation = ConversationAssistant(
+        llm_client, agent_prompts=profile.prompts if profile is not None else None,
+    )
 
     if not DEFAULT_ENGAGEMENT_PATH.exists():
         console.print("\nNo engagement configuration found.\n")
@@ -155,6 +163,7 @@ async def _run(console: Console, *, verbose: bool) -> int:
         orchestration=orchestration_config,
         capability=capability_config,
         logging=logging_config,
+        specialist_profile=profile_path,
     )
     logging.basicConfig(level=logging_config.level, force=True)
     from redteam.app.cli.session_runtime import run_session

@@ -46,6 +46,13 @@ async def run_session(
 ) -> RunResult:
     from redteam.app.cli.commands import run as run_command
 
+    if config.specialist_profile is not None:
+        from redteam.app.agent_profile import load_specialist_profile
+
+        loaded = load_specialist_profile(config.specialist_profile)
+        prompts = built[1].agent_prompts if built is not None else loaded.prompts
+        conversation.bind_prompts(prompts)
+
     if frontend is None:
         if not sys.stdin.isatty():
             frontend = ConsoleFrontend(console)
@@ -90,6 +97,14 @@ async def run_session(
             engagement, deps = built or await run_command.build(
                 current, max_steps=None, mcp_stack=stack, **build_options
             )
+            if config.specialist_profile is not None and (
+                deps.component_binding is None
+                or deps.component_binding.specialist_profile_fingerprint != loaded.fingerprint
+            ):
+                return RunResult(
+                    exit_code=2,
+                    error="세션 시작 후 전문 역할/프롬프트가 변경됐습니다. 새 세션으로 확인하세요.",
+                )
             # Do not dispatch using a configuration changed during bootstrap.
             if (
                 session.engagement_path.exists()
