@@ -571,22 +571,161 @@ def check_record_linkage(
     return []
 
 
-async def verify_stored_origin(
+NATIVE_ORIGIN_VERSION = 1
+
+
+def preserved_target_is_absent(metadata: dict[str, Any]) -> bool:
+    """An explicit target-free native proposal, never a missing target field.
+
+    This describes stored input only. Callers still prove the actual raw
+    result and work/task lineage before admitting an execution origin.
+    """
+    from redteam.core.contracts.action import ActionProposal
+
+    stored = metadata.get("proposal")
+    if (
+        not _is_native_origin(metadata)
+        or not isinstance(stored, dict)
+        or "target" not in stored
+        or stored["target"] is not None
+    ):
+        return False
+    try:
+        proposal = ActionProposal.model_validate(stored)
+    except (ValueError, TypeError):
+        return False
+    return proposal.binding_mode == "selected_tool" and proposal.target is None
+
+
+def _origin_version(metadata: Any) -> int:
+    try:
+        value = metadata.get("execution_origin_version", 0) if isinstance(metadata, dict) else 0
+    except Exception:
+        return 0
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _is_native_origin(metadata: Any) -> bool:
+    return _origin_version(metadata) == NATIVE_ORIGIN_VERSION
+
+
+def _has_path_linkage(m_path_id: str, m_version: Any, m_step_id: str) -> bool:
+    return bool(m_path_id and m_version is not None and _s(m_version).strip() != "" and m_step_id)
+
+
+async def _verify_native_work_and_task(
+    *,
+    metadata: dict[str, Any],
+    run_id: str,
+    mission_id: Any | None,
+    task_graph_store: Any | None,
+    work_store: Any | None,
+) -> tuple[list[str], bool]:
+    # Native origin proves an actual execution: a stored work record plus the
+    # live task purpose it was delegated for. Task existence alone is not
+    # execution proof, and identifier echoes without stored records prove
+    # nothing. Every compared value must be present on both sides; a missing
+    # value fails closed instead of being skipped. The one exception is an
+    # explicit missionless (goal-only) observation: when the metadata and
+    # the stored work both carry no mission task and there is no mission at
+    # all, no task is fabricated and the proven work record alone admits the
+    # basic origin. That admission never claims a successful mission
+    # completion; settlement layers above still require their own task
+    # receipt. The goal purpose hash stays mandatory: without a live task
+    # there is no current objective to compare against yet, so the stored
+    # work hash must equal the metadata hash and later closure decides
+    # success.
+    work_id = _s(metadata.get("work_id", "")).strip()
+    if not work_id:
+        return (["native origin has no work binding; treating as unproven"], False)
+    if work_store is None:
+        return (["native origin needs stored work lookup (work store unavailable)"], False)
+    try:
+        work = await work_store.get(work_id)  # type: ignore[union-attr]
+    except Exception:
+        return (["origin work lookup failed; treating as unproven"], False)
+    if work is None:
+        return (["origin work record is missing; treating as unproven"], False)
+    if _s(getattr(work, "run_id", "")).strip() != str(run_id):
+        return (["origin work belongs to another run"], False)
+    for key in ("candidate_key", "model_tool_call_id", "task_purpose_hash"):
+        expected = _s(getattr(work, key, "") or "").strip()
+        actual = _s(metadata.get(key, "") or "").strip()
+        if not expected or not actual:
+            return (["origin work " + key + " has no binding; treating as unproven"], False)
+        if expected != actual:
+            return (["origin work " + key + " disagrees with its stored execution"], False)
+    # Empty target refs describe a target-free call only when the stored
+    # proposal explicitly preserves that native input. Missing input is not
+    # permission to erase a targeted execution's binding.
+    targets = getattr(work, "target_node_ids", None)
+    if preserved_target_is_absent(metadata):
+        raw = _stored_raw_result(metadata)
+        if (
+            targets is None or list(targets)
+            or metadata.get("target_node_id")
+            or not isinstance(raw, dict)
+            or str(raw.get("action_id", "")) != str(metadata["proposal"]["action_id"])
+            or str(raw.get("action_id", "")) != str(metadata.get("action_id", ""))
+            or str(raw.get("tool_id", "")) != str(metadata["proposal"]["tool_id"])
+            or not str(metadata.get("invocation_id", ""))
+            or str(raw.get("invocation_id", "")) != str(metadata["invocation_id"])
+            or str(metadata["proposal"]["run_id"]) != str(run_id)
+        ):
+            return (["target-free origin disagrees with its stored execution"], False)
+    elif targets is not None and not list(targets):
+        return (["origin work has no target binding; treating as unproven"], False)
+    try:
+        work_version = int(getattr(work, "execution_origin_version", 0) or 0)
+    except (TypeError, ValueError):
+        work_version = 0
+    if work_version != NATIVE_ORIGIN_VERSION:
+        return (["origin work is not native execution; treating as unproven"], False)
+    work_task = _s(getattr(work, "mission_task_id", "") or "").strip()
+    meta_task = _s(metadata.get("mission_task_id", "") or "").strip()
+    meta_mission = _s(metadata.get("mission_id", "") or "").strip()
+    if not work_task and not meta_task:
+        if mission_id is None and not meta_mission:
+            return ([], True)
+        return (["native origin has no task binding; treating as unproven"], False)
+    if not work_task or not meta_task:
+        return (["origin work mission_task_id has no binding; treating as unproven"], False)
+    if work_task != meta_task:
+        return (["origin work mission_task_id disagrees with its stored execution"], False)
+    task_id = meta_task
+    if task_graph_store is None:
+        return (["native origin needs stored task lookup (task store unavailable)"], False)
+    try:
+        task = await task_graph_store.get_task(task_id)  # type: ignore[union-attr]
+    except Exception:
+        return (["origin task lookup failed; treating as unproven"], False)
+    if task is None:
+        return (["origin task is missing; treating as unproven"], False)
+    if mission_id is not None and _s(getattr(task, "mission_id", "") or "").strip():
+        if _s(getattr(task, "mission_id", "")).strip() != str(mission_id).strip():
+            return (["origin belongs to another mission"], False)
+    expected_hash = _s(metadata.get("task_purpose_hash", "") or "").strip()
+    if not expected_hash:
+        return (["origin task purpose has no binding; treating as unproven"], False)
+    from redteam.orchestration.coordination import content_hash as _content_hash
+    current_hash = _content_hash({"objective": _s(getattr(task, "objective", "")).strip()})
+    if current_hash != expected_hash:
+        return (["origin task purpose changed since the evidence"], False)
+    return ([], True)
+
+
+async def _verify_legacy_path_origin(
     *,
     path_store: Any,
     run_id: str,
     m_path_id: str,
     m_version: Any,
     m_step_id: str,
-    mission_id: Any | None = None,
+    mission_id: Any | None,
 ) -> list[str]:
-    """Confirm a cited origin step is really stored in this run and mission.
-
-    Lineage staleness is judged by the caller; this only checks existence
-    and binding so other steps or other workers origins can count.
-    """
-    if not m_path_id or m_version is None or _s(m_version).strip() == "" or not m_step_id:
-        return ["has no path linkage (path_id/path_version/path_step_id required)"]
     if path_store is None:
         return ["origin needs stored path lookup (path store unavailable)"]
     try:
@@ -624,6 +763,60 @@ async def verify_stored_origin(
     return []
 
 
+async def verify_stored_origin(
+    *,
+    path_store: Any,
+    run_id: str,
+    m_path_id: str,
+    m_version: Any,
+    m_step_id: str,
+    mission_id: Any | None = None,
+    metadata: dict[str, Any] | None = None,
+    record: Any | None = None,
+    task_graph_store: Any | None = None,
+    work_store: Any | None = None,
+) -> list[str]:
+    _ = record
+    meta = metadata if isinstance(metadata, dict) else {}
+    if _is_native_origin(meta):
+        native_errors, verified = await _verify_native_work_and_task(
+            metadata=meta,
+            run_id=str(run_id),
+            mission_id=mission_id,
+            task_graph_store=task_graph_store,
+            work_store=work_store,
+        )
+        if native_errors:
+            return native_errors
+        if _has_path_linkage(m_path_id, m_version, m_step_id):
+            return await _verify_legacy_path_origin(
+                path_store=path_store,
+                run_id=str(run_id),
+                m_path_id=m_path_id,
+                m_version=m_version,
+                m_step_id=m_step_id,
+                mission_id=mission_id,
+            )
+        if verified:
+            return []
+        # No marker-only admission: without stored work/task lookups a native
+        # origin cannot prove an actual execution. The legacy missing-path
+        # message stays for callers that never had path refs.
+        if task_graph_store is None and work_store is None:
+            return ["native origin needs stored work/task lookup (stores unavailable)"]
+        return ["native origin has no task/work binding; treating as unproven"]
+    if not _has_path_linkage(m_path_id, m_version, m_step_id):
+        return ["has no path linkage (path_id/path_version/path_step_id required)"]
+    return await _verify_legacy_path_origin(
+        path_store=path_store,
+        run_id=str(run_id),
+        m_path_id=m_path_id,
+        m_version=m_version,
+        m_step_id=m_step_id,
+        mission_id=mission_id,
+    )
+
+
 async def verify_origin_step(
     *,
     path_store: Any,
@@ -634,6 +827,11 @@ async def verify_origin_step(
     m_version: Any,
     m_step_id: str,
     evidence_id: str,
+    metadata: dict[str, Any] | None = None,
+    record: Any | None = None,
+    task_graph_store: Any | None = None,
+    work_store: Any | None = None,
+    mission_id: Any | None = None,
 ) -> list[tuple[str, str, str]]:
     """Admit cited origins by stored existence, not by current-step equality.
 
@@ -652,6 +850,23 @@ async def verify_origin_step(
         and m_step_id == step_id
     ):
         return []
+    if _is_native_origin(metadata if isinstance(metadata, dict) else {}):
+        native_errors, verified = await _verify_native_work_and_task(
+            metadata=metadata if isinstance(metadata, dict) else {},
+            run_id=str(run_id),
+            mission_id=mission_id,
+            task_graph_store=task_graph_store,
+            work_store=work_store,
+        )
+        for message in native_errors:
+            formatted = (
+                "evidence '" + str(evidence_id) + "' " + message,
+                "completion_origin_invalid",
+                message,
+            )
+            return [formatted]
+        if verified:
+            return []
     if path_store is None:
         return [
             (
@@ -1260,7 +1475,10 @@ async def validate_result_claims(
     step: PathStep | None = None,
     issues: CompletionIssues | None = None,
     evidence_location: tuple[str | int, ...] = ("completion", "evidence_ids"),
-) -> list[str]:
+    task_graph_store: Any | None = None,
+    work_store: Any | None = None,
+    task: Any | None = None,
+ ) -> list[str]:
     """Verify actual result claims without requiring provisional steps to finish.
 
     Step completion optionally supplies its lineage context. Task/mission
@@ -1273,8 +1491,8 @@ async def validate_result_claims(
     run = str(run_id)
     proposal = proposal or {"evidence_ids": evidence_ids, "outcome": outcome}
     step_id = step.step_id if step else "result"
-    # Per-evidence linkage checks. Missing path linkage can never succeed
-    # (worker D records path_id/path_version/path_step_id/principal_ref).
+    # Per-evidence linkage checks. Legacy evidence without path linkage can
+    # never succeed; native origins prove against the executed work and task.
     valid_records: list[Any] = []
     linked_records: list[Any] = []
     verified_by_evidence: dict[str, set[str]] = {}
@@ -1330,6 +1548,12 @@ async def validate_result_claims(
             expanded_ids.append(str(eid))
             source_locations.setdefault(str(eid), reference_location)
     evidence_ids = list(dict.fromkeys(expanded_ids))
+    expected_task_hash: str | None = None
+    if task is not None:
+        from redteam.orchestration.coordination import content_hash as _purpose_hash_fn
+        expected_task_hash = _purpose_hash_fn(
+            {"objective": _s(_field(task, "objective", "")).strip()}
+        )
     for eid in evidence_ids:
         reference_location = source_locations[eid]
         try:
@@ -1370,7 +1594,10 @@ async def validate_result_claims(
         m_path_id = _s(meta.get("path_id", "")).strip()
         m_version = meta.get("path_version", None)
         m_step_id = _s(meta.get("path_step_id", "")).strip()
-        if not m_path_id or m_version is None or _s(m_version).strip() == "" or not m_step_id:
+        native_meta = _is_native_origin(meta)
+        if not native_meta and (
+            not m_path_id or m_version is None or _s(m_version).strip() == "" or not m_step_id
+        ):
             issues.add(
                 location=reference_location,
                 message=f"evidence '{eid}' has no path linkage "
@@ -1433,6 +1660,11 @@ async def validate_result_claims(
                 m_version=m_version,
                 m_step_id=m_step_id,
                 evidence_id=eid,
+                metadata=meta,
+                record=record,
+                task_graph_store=task_graph_store,
+                work_store=work_store,
+                mission_id=mission_id,
             )
         else:
             origin_errors = [
@@ -1444,6 +1676,10 @@ async def validate_result_claims(
                     m_path_id=m_path_id,
                     m_version=m_version,
                     m_step_id=m_step_id,
+                    metadata=meta,
+                    record=record,
+                    task_graph_store=task_graph_store,
+                    work_store=work_store,
                 )
             ]
         for origin_message, origin_code, origin_summary in origin_errors:
@@ -1455,6 +1691,16 @@ async def validate_result_claims(
             )
         if origin_errors:
             continue
+        if expected_task_hash is not None:
+            task_hash = _s(meta.get("task_purpose_hash", "") or "").strip()
+            if task_hash and task_hash != expected_task_hash:
+                issues.add(
+                    location=reference_location,
+                    message=f"evidence '{eid}' purpose changed since the evidence",
+                    code="completion_evidence_reference_purpose_changed_since_evidence",
+                    summary="evidence 'reference' purpose changed since the evidence",
+                )
+                continue
         canonical_value = _canonical_evidence_value(meta)
         if not canonical_value:
             issues.add(
@@ -1484,7 +1730,7 @@ async def validate_result_claims(
             )
             continue
         target_ref = _s(meta.get("target_node_id", "")).strip()
-        if not target_ref:
+        if not target_ref and not preserved_target_is_absent(meta):
             issues.add(
                 location=reference_location,
                 message=f"evidence '{eid}' has no target linkage",
@@ -1492,8 +1738,11 @@ async def validate_result_claims(
                 summary="evidence 'reference' has no target linkage",
             )
             continue
-        if step_target_set and target_ref not in step_target_set:
-            related = False
+        if target_ref and step_target_set and target_ref not in step_target_set:
+            related = any([
+                await claim_target_is_grounded(graph_service, record, target)
+                for target in step_target_set
+            ])
             for receipt_meta in admission_receipts:
                 claimed_target = str(receipt_meta.get("target_node_id", "") or "")
                 if claimed_target in step_target_set and _receipt_links_record(
@@ -2028,6 +2277,7 @@ async def validate_result_claims(
 
 
 __all__ = [
+    "NATIVE_ORIGIN_VERSION",
     "check_record_linkage",
     "verify_stored_origin",
     "verify_origin_step",

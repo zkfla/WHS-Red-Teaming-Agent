@@ -120,7 +120,14 @@ class _BuiltinRuntimeExtension:
         from redteam.orchestration.analysis_activation import (
             builtin_extension_declaration as eligibility,
         )
+        from redteam.orchestration.authentication_local_tools import (
+            authentication_assessment_contribution,
+        )
         from redteam.orchestration.graph_recording import graph_recording_contribution
+        from redteam.orchestration.job_local_tools import job_reconciliation_contribution
+        from redteam.orchestration.native_local_tools import (
+            native_local_tool_contributions,
+        )
         from redteam.orchestration.observations.packages import (
             builtin_extension_declaration as observations,
         )
@@ -135,6 +142,18 @@ class _BuiltinRuntimeExtension:
                 (*action_contributions(), *recipe_contributions()),
             ),
             ExtensionDeclaration("builtin.graph-recording", "1", (graph_recording_contribution(),)),
+            ExtensionDeclaration(
+                "builtin.native-local-tools",
+                "1",
+                native_local_tool_contributions(),
+            ),
+            ExtensionDeclaration(
+                "builtin.authentication-assessment", "1",
+                (authentication_assessment_contribution(),),
+            ),
+            ExtensionDeclaration(
+                "builtin.job-reconciliation", "1", (job_reconciliation_contribution(),),
+            ),
         )
 
 

@@ -1,32 +1,9 @@
-"""The LangGraph ``StateGraph`` for one agent run. Owned by Agent Team.
+"""Native ReAct scheduling with durable checkpoints and approval recovery.
 
-```text
-START -> OBSERVE -> PLAN --proposal--> POLICY --ALLOW--> EXECUTE -> VERIFY --+
-  |         ^         |                   |                                 |
-  |         |         |                   \\--deny/approval-needed--> UPDATE <+
-  |         |         |                                                 |
-  |         |         \\--no proposal--> REPLAN <------------------------+
-  |         |                              |
-  |         \\-------- another turn -------+-- terminal --> END
-  |
-  \\-- resumed APPROVAL_PENDING run (AgentLoopRunner.reconcile_once,
-       runtime.phase already POLICY) -----> POLICY
-```
-
-The resume edge (``_route_entry``) is the only conditional START: every
-fresh run always enters at OBSERVE.
-
-LangGraph is the workflow runtime and nothing more: it schedules these
-seven functions and persists ``GraphState`` between them. It owns no
-domain model — the Attack Graph and the Evidence Store do, and
-``RuntimeState`` only carries their ids. Replacing LangGraph would mean
-rewriting this file and ``runner.py``; no node, contract or other team's
-module would change.
-
-``build_graph(deps)`` still returns a compiled graph with the same
-signature the skeleton had. Pass ``checkpointer=`` to get per-super-step
-snapshots (see ``checkpointing.py``); ``runner.AgentLoopRunner`` wires
-that plus the recursion limit the loop needs.
+Normal turns are MODEL -> TOOLS -> SETTLE -> MODEL/END. Existing policy,
+execution and result owners run inside TOOLS. The explicit legacy nodes
+remain only to finish approval checkpoints created before this transition.
+Domain state remains in the canonical graph, task and evidence stores.
 """
 
 from __future__ import annotations
@@ -41,83 +18,75 @@ from redteam.orchestration.context import RuntimeDeps
 from redteam.orchestration.nodes import (
     aggregate_node,
     execute_node,
-    observe_node,
-    plan_node,
     policy_node,
-    replan_node,
     update_node,
     verify_node,
     worker_node,
 )
-from redteam.orchestration.router import (
-    route_after_observe,
-    route_after_plan,
-    route_after_policy,
-    route_after_replan,
-)
+from redteam.orchestration.nodes.react import model_node, settle_node, tools_node
+from redteam.orchestration.router import route_after_plan, route_after_policy
 from redteam.orchestration.state import GraphState
 
 NODE_NAMES = (
-    "observe",
-    "plan",
+    "model",
+    "tools",
+    "settle",
     "policy",
     "execute",
     "verify",
     "update",
     "worker",
     "aggregate",
-    "replan",
 )
 
 
 def _route_entry(state: GraphState):
-    """Normal runs always start at OBSERVE. The one exception:
-    ``AgentLoopRunner.reconcile_once`` seeds a resumed APPROVAL_PENDING
-    run with ``runtime.phase == POLICY`` and the original ``action_proposal``
-    already in state (``orchestration.state.resume_graph_state``) — that
-    invocation must re-enter directly at POLICY, never re-derive a fresh
-    proposal through OBSERVE/PLAN.
-    """
+    """Resume native batches intact; route older approvals to their owner."""
+    if state.get("native_calls"):
+        return "tools"
     if state["runtime"].phase == AgentPhase.POLICY and state.get("action_proposal") is not None:
         step = state.get("plan_step")
         if step is not None and step.delegation_id and state.get("dispatch_items"):
             return route_after_plan(state)
         return "policy"
-    return "observe"
+    return "model"
+
+
+def _after_model(state: GraphState):
+    return "settle" if state["runtime"].termination_reason else "tools"
+
+
+def _after_settle(state: GraphState):
+    return "end" if state["runtime"].is_terminal else "model"
 
 
 def build_graph(deps: RuntimeDeps, *, checkpointer: Any | None = None) -> Any:
     graph = StateGraph(GraphState)
 
-    graph.add_node("observe", functools.partial(observe_node, deps=deps))
-    graph.add_node("plan", functools.partial(plan_node, deps=deps))
+    graph.add_node("model", functools.partial(model_node, deps=deps))
+    graph.add_node("tools", functools.partial(tools_node, deps=deps))
+    graph.add_node("settle", functools.partial(settle_node, deps=deps))
+
     graph.add_node("policy", functools.partial(policy_node, deps=deps))
     graph.add_node("execute", functools.partial(execute_node, deps=deps))
     graph.add_node("verify", functools.partial(verify_node, deps=deps))
     graph.add_node("update", functools.partial(update_node, deps=deps))
     graph.add_node("worker", functools.partial(worker_node, deps=deps))
     graph.add_node("aggregate", functools.partial(aggregate_node, deps=deps))
-    graph.add_node("replan", functools.partial(replan_node, deps=deps))
 
     graph.add_conditional_edges(
-        START, _route_entry, {"observe": "observe", "policy": "policy"}
+        START, _route_entry, {"model": "model", "tools": "tools", "policy": "policy"}
     )
-    graph.add_conditional_edges(
-        "observe", route_after_observe, {"plan": "plan", "replan": "replan"}
-    )
-    graph.add_conditional_edges(
-        "plan", route_after_plan, {"policy": "policy", "replan": "replan"}
-    )
+    graph.add_conditional_edges("model", _after_model, {"tools": "tools", "settle": "settle"})
+    graph.add_edge("tools", "settle")
+    graph.add_conditional_edges("settle", _after_settle, {"model": "model", "end": END})
     graph.add_conditional_edges(
         "policy", route_after_policy, {"execute": "execute", "update": "update"}
     )
     graph.add_edge("execute", "verify")
     graph.add_edge("verify", "update")
-    graph.add_edge("update", "replan")
+    graph.add_edge("update", "settle")
     graph.add_edge("worker", "aggregate")
-    graph.add_edge("aggregate", "replan")
-    graph.add_conditional_edges(
-        "replan", route_after_replan, {"observe": "observe", "end": END}
-    )
+    graph.add_edge("aggregate", "settle")
 
     return graph.compile(checkpointer=checkpointer)

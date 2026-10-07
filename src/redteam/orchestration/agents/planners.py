@@ -364,7 +364,7 @@ def _target_label(step: PlanStep) -> str:
 
     if step.target is None:
         return step.target_bind or "unresolved"
-    target = step.resolved_target()
+    target = step.target
     label = target_display_name(target)
     path = getattr(target, "path", None)
     if isinstance(path, str) and path:

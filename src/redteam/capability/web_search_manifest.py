@@ -22,6 +22,7 @@ def validate_web_search_discovery(descriptor: ToolDescriptor, config: SearchConf
         or descriptor.tool_name != REMOTE_TOOL_NAME
         or descriptor.operations != [PROPOSED_OPERATION]
         or descriptor.target_types != []
+        or descriptor.requires_target is not False
         or descriptor.outbound_text_fields != ["query"]
         or set(properties) != {"query", "max_results"}
         or inputs.get("required") != ["query"]

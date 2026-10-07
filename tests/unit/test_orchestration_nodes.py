@@ -1062,7 +1062,12 @@ async def test_update_processing_the_same_probe_result_twice_does_not_duplicate_
     assert len(endpoint_nodes) == 1
 
     edges = await service.list_edges()
-    assert len(edges) == 2  # HOSTS + EXPOSES, not duplicated
+    # HOSTS host->service + EXPOSES service->endpoint + HOSTS host->endpoint.
+    assert len(edges) == 3, "recon probe keeps three unique measured relations"
+    kinds = {(edge.type, str(edge.source_id), str(edge.target_id)) for edge in edges}
+    assert len(kinds) == 3, "repeated probe results must not duplicate relations"
+    assert sum(1 for edge in edges if edge.type is GraphEdgeType.HOSTS) == 2
+    assert sum(1 for edge in edges if edge.type is GraphEdgeType.EXPOSES) == 1
 
 
 async def test_update_does_not_invent_a_service_from_a_failed_probe() -> None:

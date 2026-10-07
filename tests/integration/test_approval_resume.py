@@ -1,13 +1,15 @@
-"""Approval resume through the real engine contract (scripted LLM, mobile asset).
+"""Approval resume through the real engine contract (scripted native LLM, mobile asset).
 
-Plan: draft -> review -> one mobile action on a declared asset, then the
+Plan: one genuine native mobile tool call on a declared asset, then the
 run suspends at REQUIRE_APPROVAL and continues only via reconcile_once()
 at POLICY with approval_outcome(). No rule fallback ever completes a turn:
-every structured answer comes from the in-file script below.
+model turns come from complete_native below and verification answers come
+from the genuine analysis_verify review.
 """
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from typing import Any
 
@@ -36,10 +38,21 @@ from redteam.core.enums import (
     ToolHealthStatus,
 )
 from redteam.core.ids import ActionId, AgentId, EngagementId, RunId, ToolId
+from redteam.core.ports.llm import NativeCompletion, NativeToolCall
 from redteam.event_bus.memory import InMemoryEventBus
 from redteam.orchestration.agents.registry import default_registry
 from redteam.orchestration.context import RuntimeDeps
+from redteam.orchestration.local_tools import LocalToolRegistry
 from redteam.orchestration.mission_bootstrap import bootstrap_mission
+from redteam.orchestration.native_binding import exposed_tool_name
+from redteam.orchestration.native_local_tools import (
+    GOAL_SETTLE_TOOL_ID,
+    TASK_SETTLE_TOOL_ID,
+    goal_settle_descriptor,
+    goal_settle_handler,
+    task_settle_descriptor,
+    task_settle_handler,
+)
 from redteam.orchestration.paths import InMemoryPathStore
 from redteam.orchestration.runner import AgentLoopRunner
 from redteam.orchestration.settings import OrchestrationSettings
@@ -47,6 +60,7 @@ from redteam.orchestration.state import RuntimeState, TerminationReason
 from redteam.orchestration.task_graph.memory import InMemoryTaskGraphStore
 from redteam.orchestration.work.memory import InMemoryWorkStore
 from redteam.orchestration.work.models import WorkStatus
+from tests.integration import _engine_llm_harness as h
 
 ASSET_ID = "evil.apk"
 ASSET_NODE_ID = "asset:evil.apk"
@@ -61,29 +75,32 @@ def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
-class _ScriptedLLM:
-    def __init__(self) -> None:
-        self._routes: dict[str, list[Any]] = {}
-        self.calls: list[dict[str, Any]] = []
+def _native_tool_registry() -> LocalToolRegistry:
+    registry = LocalToolRegistry()
+    registry.register(task_settle_descriptor(), task_settle_handler)
+    registry.register(goal_settle_descriptor(), goal_settle_handler)
+    return registry
 
-    def add(self, route: str, response: Any) -> None:
-        self._routes.setdefault(route, []).append(response)
+
+def _exposed_names(tools: list[Any]) -> set[str]:
+    return {str(getattr(spec, "name", "")) for spec in tools}
+
+
+class _ScriptedNativeLLM:
+    """One genuine native mobile call, then hold. Reviews stay genuine."""
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+        self.reviews: list[str] = []
+        self.turns = 0
 
     @staticmethod
     def _route_key(schema: dict[str, Any]) -> str:
         props = schema.get("properties", {})
-        if "steps" in props:
-            return "path_draft"
-        if "decision" in props:
-            return "path_review"
-        if "mode" in props:
-            return "next_action"
         if "criteria" in props:
             return "goal_completion_review"
         if "claims" in props:
             return "task_completion_review"
-        if "accepted" in props:
-            return "completion_review"
         if "claim_supported" in props:
             return "analysis_verify"
         return "unknown"
@@ -98,14 +115,83 @@ class _ScriptedLLM:
         **_: Any,
     ) -> dict[str, Any]:
         route = self._route_key(response_schema)
+        self.reviews.append(route)
         self.calls.append({"route": route, "messages": messages, "system": system})
-        queue = self._routes.get(route, [])
-        if not queue:
-            raise AssertionError(f"no scripted response left for route {route!r}")
-        response = queue.pop(0)
-        if isinstance(response, Exception):
-            raise response
-        return response
+        if route == "analysis_verify":
+            return h.meaning("success", True)
+        if route == "task_completion_review":
+            payload = json.loads(messages[0]["content"])
+            receipts = list(payload["verified_source_ids"])
+            assert receipts, "task review needs the verified executed call evidence"
+            return {
+                "accepted": True,
+                "reason": "scripted semantic accept",
+                "claims": [
+                    {
+                        "description": "mobile tool result observed",
+                        "kind": "observation",
+                        "evidence_ids": list(receipts),
+                        "target_node_ids": [],
+                        "principal_refs": [],
+                    }
+                ],
+            }
+        if route == "goal_completion_review":
+            payload = json.loads(messages[0]["content"])
+            criteria = payload["mission"]["success_criteria"]
+            receipts = list(payload["verified_source_ids"])
+            assert receipts, "goal review needs the verified executed call evidence"
+            return {
+                "accepted": True,
+                "reason": "scripted goal accept",
+                "criteria": [
+                    {
+                        "criterion": item,
+                        "met": True,
+                        "evidence_ids": list(receipts),
+                        "claims": [
+                            {
+                                "description": "mobile tool result observed",
+                                "kind": "observation",
+                                "evidence_ids": list(receipts),
+                                "target_node_ids": [],
+                                "principal_refs": [],
+                            }
+                        ],
+                    }
+                    for item in criteria
+                ],
+            }
+        raise AssertionError(f"legacy strategy route is not part of the native loop: {route!r}")
+
+    async def complete_native(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[Any],
+        system: str | None = None,
+        **_: Any,
+    ) -> NativeCompletion:
+        names = _exposed_names(tools)
+        mobile = exposed_tool_name(MOBILE_TOOL)
+        task_settle = exposed_tool_name(TASK_SETTLE_TOOL_ID)
+        goal_settle = exposed_tool_name(GOAL_SETTLE_TOOL_ID)
+        assert mobile in names, "native model needs the registered mobile tool"
+        assert task_settle in names, "native model needs the task settlement helper"
+        assert goal_settle in names, "native model needs the goal settlement helper"
+        self.turns += 1
+        if self.turns == 1:
+            self.calls.append({"turn": self.turns, "tool_calls": [mobile]})
+            return NativeCompletion(
+                tool_calls=(
+                    NativeToolCall(
+                        call_id="call-mobile-1",
+                        name=mobile,
+                        arguments={"apk_ref": ASSET_ID},
+                    ),
+                ),
+                text="",
+            )
+        return NativeCompletion(tool_calls=(), text="")
 
     async def complete(self, *, messages: Any, system: str | None = None, **_: Any) -> str:
         return ""
@@ -152,6 +238,10 @@ class _FakeCatalog:
 class _CountingGateway:
     def __init__(self) -> None:
         self.calls: list[Any] = []
+
+    @property
+    def invocations(self) -> list[Any]:
+        return self.calls
 
     async def invoke(self, invocation: Any) -> ToolResult:
         self.calls.append(invocation)
@@ -204,94 +294,9 @@ def _engagement(*, max_actions: int = 5) -> Engagement:
     )
 
 
-def _draft_path(asset_node_id: str) -> dict[str, Any]:
-    # Minimal model draft: purpose + steps only. Runtime identity
-    # (path_id/run_id/version/status/goal/evidence) is code-owned.
-    return {
-        "reason": "scripted mobile draft",
-        "steps": [
-            {
-                "step_id": "step-1",
-                "objective": "analyze the declared APK artifact",
-                "agent_id": MOBILE_AGENT_ID,
-                "target_node_ids": [asset_node_id],
-                "principal_refs": [],
-                "allowed_operations": [MOBILE_OP_KEY],
-                "depends_on": [],
-                "required_fact_refs": [],
-                "unknowns": [],
-                "completion_criteria": [
-                    {
-                        "kind": "evidence",
-                        "description": "static analysis evidence recorded",
-                        "min_evidence": 1,
-                    }
-                ],
-                "required": True,
-            }
-        ],
-    }
-
-
-def _review_accept() -> dict[str, Any]:
-    return {"decision": "accept", "reason": "scripted accept", "path": None}
-
-
-def _turn_mobile_action(asset_node_id: str) -> dict[str, Any]:
-    return {
-        "mode": "actions",
-        "reason": "scripted mobile action",
-        "actions": [
-            {
-                "path_step_id": "step-1",
-                "agent_id": MOBILE_AGENT_ID,
-                "target_node_id": asset_node_id,
-                "principal_ref": None,
-                "tool_id": MOBILE_TOOL,
-                "arguments": {},
-                "reason": "analyze the declared artifact",
-                "expected_observation": "static analysis returns artifact structure",
-                "hypothesis": None,
-                "existing_hypothesis_id": None,
-                "expectation": None,
-                "authentication_check": None,
-                "availability_impact": False,
-            }
-        ],
-        "path": None,
-        "path_step_id": None,
-        "completion": {},
-        "evidence_request": {},
-        "hypothesis_update": {},
-    }
-
-
-def _turn_hold() -> dict[str, Any]:
-    return {
-        "mode": "hold",
-        "reason": "scripted hold after the approval turn",
-        "actions": [],
-        "path": None,
-        "path_step_id": None,
-        "completion": {},
-        "evidence_request": {},
-        "hypothesis_update": {},
-    }
-
-
-def _meaning_success() -> dict[str, Any]:
-    return {
-        "meaning": "scripted",
-        "outcome": "success",
-        "reason": "scripted meaning",
-        "confidence": 0.8,
-        "claim_supported": True,
-    }
-
-
 async def _setup(*, max_actions: int = 5, checkpoint_path: str | None = None):
     engagement = _engagement(max_actions=max_actions)
-    llm = _ScriptedLLM()
+    llm = _ScriptedNativeLLM()
     graph_store = InMemoryAttackGraphStore()
     evidence_store = _FakeEvidenceStore()
     path_store = InMemoryPathStore()
@@ -316,6 +321,7 @@ async def _setup(*, max_actions: int = 5, checkpoint_path: str | None = None):
         engagement=engagement,
         agents=default_registry(),
         tool_catalog=_FakeCatalog([_mobile_descriptor()]),
+        local_tools=_native_tool_registry(),
         work_store=work_store,
         task_graph_store=task_store,
         path_store=path_store,
@@ -348,11 +354,6 @@ async def _setup(*, max_actions: int = 5, checkpoint_path: str | None = None):
         current_goal=mission.objective,
         remaining_budget=engagement.execution_budget.max_actions,
     )
-    llm.add("path_draft", _draft_path(ASSET_NODE_ID))
-    llm.add("path_review", _review_accept())
-    llm.add("next_action", _turn_mobile_action(ASSET_NODE_ID))
-    llm.add("next_action", _turn_hold())
-    llm.add("analysis_verify", _meaning_success())
     runner = AgentLoopRunner(deps, settings=deps.settings)
     return engagement, control_plane, gateway, deps, runner, initial
 

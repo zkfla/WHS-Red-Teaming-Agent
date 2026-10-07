@@ -7,11 +7,12 @@ from typing import Any
 
 from redteam.attack_graph.identity import (
     endpoint_node_id,
+    node_id_for_target,
     path_parameters,
     session_credential_node_id,
     session_principal_node_id,
 )
-from redteam.core.contracts.target import AnyTarget
+from redteam.core.contracts.target import AnyTarget, HostTarget
 from redteam.core.contracts.tool import ToolResult
 from redteam.core.enums import GraphEdgeType, GraphNodeType
 from redteam.core.ids import GraphNodeId
@@ -548,6 +549,19 @@ def map_web_http_request(
             )
     ]
     edges: list[EdgeMutation] = []
+    source_id = node_id_for_target(target)
+    if isinstance(target, HostTarget) and source_id != endpoint_id:
+        # The executed request measured this resource on its source target.
+        # Preserve that relation with the request's evidence provenance so
+        # later claims can consume host and endpoint originals together.
+        edges.append(EdgeMutation(
+            GraphEdgeType.HOSTS, source_id, endpoint_id,
+            {"relation": {
+                "type": GraphEdgeType.HOSTS.value,
+                "source_node_id": str(source_id),
+                "target_node_id": str(endpoint_id),
+            }},
+        ))
     if isinstance(argument_session_ref, str):
         identity_nodes, identity_edges = _session_identity_mutations(
             target_ref=target_ref,

@@ -38,6 +38,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict
 
 from redteam.attack_graph.service import AttackGraphService
+from redteam.core.contracts.events import EventType
 from redteam.core.contracts.mission import (
     MissionCriterionResult,
     MissionTask,
@@ -45,8 +46,10 @@ from redteam.core.contracts.mission import (
 )
 from redteam.core.enums import EvidenceSourceType, MissionStatus, TaskStatus
 from redteam.core.ids import EvidenceId, TaskId, new_id
+from redteam.event_bus.publisher import EventPublisher
 from redteam.orchestration.completion import (
     check_record_linkage,
+    preserved_target_is_absent,
     validate_completion,
     verify_stored_origin,
 )
@@ -100,6 +103,33 @@ def _engine_system(engine: Any) -> str:
     except Exception:
         return ""
     return engine_system
+
+
+async def _publish_settlement(
+    engine: Any, runtime: Any, event_type: str, payload: dict[str, Any]
+) -> Any | None:
+    """Announce one accepted settlement on the engine event chain.
+
+    The semantic owner publishes exactly once per accepted settlement,
+    citing the engine last event so legacy and native callers share one
+    chain. Callers thread engine.last_event_id back into their own state.
+    """
+    bus = getattr(getattr(engine, "deps", None), "event_bus", None)
+    if bus is None:
+        return None
+    publisher = EventPublisher(
+        bus,
+        run_id=runtime.run_id,
+        engagement_id=runtime.engagement_id,
+        source="orchestration.semantic_completion",
+    )
+    event = await publisher.publish(
+        event_type,
+        dict(payload),
+        causation_id=getattr(engine, "last_event_id", None),
+    )
+    engine.last_event_id = event.event_id
+    return event
 
 
 def purpose_hash(objective: str) -> str:
@@ -199,7 +229,10 @@ async def verify_single_origin(
     mission_id: str | None,
     evidence_id: str,
     require_proposal: bool = True,
-) -> tuple[Any | None, list[str]]:
+    task: Any | None = None,
+    task_graph_store: Any | None = None,
+    work_store: Any | None = None,
+ ) -> tuple[Any | None, list[str]]:
     """Prove one stored origin record against the actual execution.
 
     Fetch, same run and engagement, preserved raw result, shared
@@ -235,9 +268,19 @@ async def verify_single_origin(
         m_version=meta.get("path_version", None),
         m_step_id=_record_text(meta.get("path_step_id", "")).strip(),
         mission_id=mission_id,
+        metadata=meta,
+        record=record,
+        task_graph_store=task_graph_store,
+        work_store=work_store,
     )
     if origin_errors:
         return None, ["task origin '" + str(evidence_id) + "' " + origin_errors[0]]
+    if task is not None:
+        expected_hash = _record_text(meta.get("task_purpose_hash", "") or "").strip()
+        current_hash = purpose_hash(_record_text(getattr(task, "objective", "")))
+        if expected_hash and expected_hash != current_hash:
+            message = "task origin '" + str(evidence_id) + "' purpose changed since the evidence"
+            return None, [message]
     return record, []
 
 
@@ -250,7 +293,9 @@ async def verify_receipt_bound_origins(
     mission_id: str | None,
     task: MissionTask,
     graph_service: Any | None = None,
-) -> tuple[list[str], list[str]]:
+    task_graph_store: Any | None = None,
+    work_store: Any | None = None,
+ ) -> tuple[list[str], list[str]]:
     """Shared receipt-to-origin proof for one completed required task.
 
     Checks the receipt record itself (same run and engagement, system
@@ -302,6 +347,9 @@ async def verify_receipt_bound_origins(
             mission_id=mission_id,
             evidence_id=identity,
             require_proposal=True,
+            task=task,
+            task_graph_store=task_graph_store,
+            work_store=work_store,
         )
         if origin_errors:
             return (origin_errors, [])
@@ -315,6 +363,9 @@ async def verify_receipt_bound_origins(
         run_id=str(run_id),
         mission_id=mission_id,
         target_node_ids=list(task.related_attack_graph_node_ids),
+        task=task,
+        task_graph_store=task_graph_store,
+        work_store=work_store,
     )
     if errors:
         return (errors, [])
@@ -363,7 +414,9 @@ async def _verify_task_origin(
     task: Any,
     mission_id: str | None = None,
     step_principal_scope: set[str] | None = None,
-) -> tuple[Any | None, list[str]]:
+    task_graph_store: Any | None = None,
+    work_store: Any | None = None,
+ ) -> tuple[Any | None, list[str]]:
     """Task-level origin check: actual linkage, stored origin, relevance.
 
     Readonly and purpose-free: no purpose hash is needed here and nothing
@@ -399,11 +452,19 @@ async def _verify_task_origin(
         m_version=meta.get("path_version", None),
         m_step_id=_record_text(meta.get("path_step_id", "")).strip(),
         mission_id=mission_id,
+        metadata=meta,
+        record=record,
+        task_graph_store=task_graph_store,
+        work_store=work_store,
     )
     if origin_errors:
         return None, ["evidence '" + str(evidence_id) + "' " + origin_errors[0]]
+    task_hash = _record_text(meta.get("task_purpose_hash", "") or "").strip()
+    if task_hash and task is not None:
+        if task_hash != purpose_hash(_record_text(getattr(task, "objective", ""))):
+            return None, ["evidence '" + str(evidence_id) + "' purpose changed since the evidence"]
     target_ref = _record_text(meta.get("target_node_id", "")).strip()
-    if not target_ref:
+    if not target_ref and not preserved_target_is_absent(meta):
         return None, ["evidence '" + str(evidence_id) + "' has no target linkage"]
     related_nodes: set[str] = set()
     if task is not None:
@@ -411,7 +472,7 @@ async def _verify_task_origin(
             cleaned = str(node).strip()
             if cleaned:
                 related_nodes.add(cleaned)
-    if related_nodes and target_ref not in related_nodes:
+    if target_ref and related_nodes and target_ref not in related_nodes:
         return None, ["evidence '" + str(evidence_id) + "' targets an object outside this task"]
     principals: set[str] = set()
     single = meta.get("principal_ref")
@@ -652,8 +713,9 @@ async def complete_task(
         or getattr(task, "status", None) is not TaskStatus.RUNNING
     ):
         return ["task completion requires the current running task"]
-    if _record_text(getattr(path, "mission_task_id", "")) != str(task.task_id):
-        return ["task completion path is not bound to this mission task"]
+    if path is not None:
+        if _record_text(getattr(path, "mission_task_id", "")) != str(task.task_id):
+            return ["task completion path is not bound to this mission task"]
     raw_proposal = getattr(decision, "completion", {})
     if raw_proposal:
         proposal = CompletionProposal.model_validate({
@@ -678,6 +740,8 @@ async def complete_task(
             task=task,
             mission_id=getattr(runtime, "mission_id", None),
             step_principal_scope=None,
+            task_graph_store=getattr(getattr(engine, "deps", None), "task_graph_store", None),
+            work_store=getattr(getattr(engine, "deps", None), "work_store", None),
         )
         if errors:
             return errors
@@ -725,6 +789,9 @@ async def complete_task(
         run_id=str(runtime.run_id),
         mission_id=str(runtime.mission_id),
         target_node_ids=list(task.related_attack_graph_node_ids),
+        task=task,
+        task_graph_store=getattr(getattr(engine, "deps", None), "task_graph_store", None),
+        work_store=getattr(getattr(engine, "deps", None), "work_store", None),
     )
     if errors:
         return errors
@@ -771,6 +838,12 @@ async def complete_task(
     # the atomic task transition below, never from the receipt alone.
     await engine.deps.evidence_store.append(receipt_record)
     await engine._commit_review(runtime, token, complete)
+    await _publish_settlement(
+        engine,
+        runtime,
+        EventType.TASK_COMPLETED,
+        {"mission_id": runtime.mission_id, "task_id": task.task_id},
+    )
     return []
 
 
@@ -782,9 +855,13 @@ async def settle_unresolved(
     pending = await _pending_execution_errors(engine, runtime)
     if pending:
         return pending
-    targets = list(task.related_attack_graph_node_ids) if task is not None else list(
-        dict.fromkeys(target for step in path.steps for target in step.target_node_ids)
-    )
+    if task is not None:
+        targets = list(task.related_attack_graph_node_ids)
+    elif path is not None:
+        steps = getattr(path, "steps", []) or []
+        targets = list(dict.fromkeys(target for step in steps for target in step.target_node_ids))
+    else:
+        targets = []
     errors = await validate_unresolved(
         proposal, evidence_store=engine.deps.evidence_store, runtime=runtime,
         target_node_ids=targets,
@@ -804,7 +881,7 @@ async def settle_unresolved(
                 task.task_id, TaskStatus.BLOCKED, now=now,
                 reason=proposal.reason,
             )
-        for step in path.steps:
+        for step in (getattr(path, "steps", []) or []):
             if step.status in {"pending", "running"}:
                 await change.paths.update_step(
                     str(runtime.run_id), path.path_id, path.version, step.step_id,
@@ -833,12 +910,13 @@ async def settle_unresolved(
     ]))
     from redteam.orchestration.delegation_decision import mark_finished
 
-    runtime.delegations = {
-        key: mark_finished(value, reason="investigation_unresolved")
-        if value.path_id == path.path_id and value.path_version == path.version
-        else value
-        for key, value in runtime.delegations.items()
-    }
+    if path is not None:
+        runtime.delegations = {
+            key: mark_finished(value, reason="investigation_unresolved")
+            if value.path_id == path.path_id and value.path_version == path.version
+            else value
+            for key, value in runtime.delegations.items()
+        }
     if finish_investigation:
         runtime.mission_status = MissionStatus.BLOCKED
     engine.updated_runtime = engine._event_runtime = runtime
@@ -966,6 +1044,8 @@ async def _goal_task_coverage(
     excerpts: list[dict[str, Any]] = []
     engagement_id = getattr(runtime, "engagement_id", None)
     path_store = getattr(getattr(engine, "deps", None), "path_store", None)
+    task_graph_store = getattr(getattr(engine, "deps", None), "task_graph_store", None)
+    work_store = getattr(getattr(engine, "deps", None), "work_store", None)
     for task in tasks or []:
         if not task.required:
             continue
@@ -997,6 +1077,8 @@ async def _goal_task_coverage(
                 mission_id=str(runtime.mission_id),
                 task=task,
                 graph_service=AttackGraphService(engine.deps.graph_store),
+                task_graph_store=task_graph_store,
+                work_store=work_store,
             )
             if errors:
                 return (errors, {}, [])
@@ -1012,6 +1094,9 @@ async def _goal_task_coverage(
                 mission_id=str(runtime.mission_id),
                 evidence_id=identity,
                 require_proposal=True,
+                task=task,
+                task_graph_store=task_graph_store,
+                work_store=work_store,
             )
             if origin_errors:
                 return (origin_errors, {}, [])
@@ -1119,6 +1204,8 @@ async def complete_goal(
             path_store=engine.deps.path_store,
             run_id=str(runtime.run_id),
             mission_id=str(runtime.mission_id),
+            task_graph_store=getattr(getattr(engine, "deps", None), "task_graph_store", None),
+            work_store=getattr(getattr(engine, "deps", None), "work_store", None),
         )
         if errors:
             return errors
@@ -1159,6 +1246,12 @@ async def complete_goal(
         change.binding(str(runtime.run_id), str(runtime.mission_id))["closed"] = True
 
     await engine._commit_review(runtime, token, complete)
+    await _publish_settlement(
+        engine,
+        runtime,
+        EventType.MISSION_UPDATED,
+        {"mission_id": runtime.mission_id, "status": "completed"},
+    )
     return []
 
 

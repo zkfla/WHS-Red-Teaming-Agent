@@ -17,6 +17,6 @@ from redteam.core.scope_rules import HostPort, target_matches_selector
 __all__ = ["HostPort", "selector_matches_target", "target_matches_selector"]
 
 
-def selector_matches_target(selector: EngagementScope, target: AnyTarget) -> bool:
+def selector_matches_target(selector: EngagementScope, target: AnyTarget | None) -> bool:
     """Whether target falls inside a TargetActionPolicy selector scope."""
-    return target_matches_selector(selector, target)
+    return target is not None and target_matches_selector(selector, target)

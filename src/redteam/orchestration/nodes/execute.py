@@ -52,6 +52,38 @@ class InvocationAdmissionDenied(ToolStartRejected):
         super().__init__("current control admission denied")
 
 
+def _native_lineage(step, runtime, work_id=None) -> dict:
+    """Native call lineage for execution events.
+
+    Read-only: the runtime owns ``execution_origin_version`` /
+    ``model_tool_call_id`` / ``mission_task_id`` / ``task_purpose_hash``.
+    Missing values stay at legacy defaults; no path is invented here and
+    no validation exemption follows from origin -- admission still runs
+    through ``validate_current_action`` / ``claim_action_admission``.
+    """
+    origin_version = getattr(step, "execution_origin_version", 0)
+    if origin_version is None:
+        origin_version = getattr(step, "origin_version", 0)
+    try:
+        origin_version = int(origin_version or 0)
+    except (TypeError, ValueError):
+        origin_version = 0
+    mission_task_id = getattr(step, "mission_task_id", None)
+    if mission_task_id is None:
+        mission_task_id = getattr(runtime, "active_task_id", None)
+    lineage: dict = {
+        "execution_origin_version": origin_version,
+        "model_tool_call_id": str(getattr(step, "model_tool_call_id", "") or ""),
+        "task_purpose_hash": str(getattr(step, "task_purpose_hash", "") or ""),
+        "candidate_key": str(getattr(step, "candidate_key", "") or ""),
+    }
+    if mission_task_id is not None:
+        lineage["mission_task_id"] = str(mission_task_id)
+    if work_id is not None:
+        lineage["work_id"] = str(work_id)
+    return lineage
+
+
 async def _invocation_context(deps, runtime, proposal, work_id, tool_id=None):
     items = await deps.work_store.list_items(run_id=runtime.run_id)
     others = sum(
@@ -217,6 +249,7 @@ async def execute_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             "tool_id": invocation.tool_id,
             "candidate_key": step.candidate_key,
             "hypothesis_id": proposal.hypothesis_id,
+            **_native_lineage(step, runtime, state.get("current_work_id")),
         },
         correlation_id=correlation_id,
         causation_id=state.get("last_event_id"),
@@ -316,10 +349,13 @@ async def execute_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                 "plan_step": step.model_dump(mode="json"),
                 "invocation": invocation.model_dump(mode="json"),
                 "candidate_key": step.candidate_key,
-                "target_node_id": str(node_id_for_target(proposal.target)),
                 "work_id": work_id,
                 "receipt_kind": "execution_submission",
             }
+            # Target-independent execution: a targetless proposal has no
+            # graph target to name. The key is left out, never invented.
+            if proposal.target is not None:
+                receipt["target_node_id"] = str(node_id_for_target(proposal.target))
             await deps.evidence_store.append(
                 EvidenceRecord(
                     evidence_id=EvidenceId(new_id("evidence")),
@@ -481,6 +517,7 @@ async def execute_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             "error_code": result.error.code if result.error else None,
             "candidate_key": step.candidate_key,
             "hypothesis_id": proposal.hypothesis_id,
+            **_native_lineage(step, runtime, state.get("current_work_id")),
         },
         correlation_id=correlation_id,
         causation_id=started.event_id,

@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 from enum import Enum
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from redteam.core.ids import AgentId, GraphNodeId, HypothesisId, RunId
 from redteam.orchestration.candidates.models import PriorityScore
@@ -53,6 +53,9 @@ class WorkItem(BaseModel):
     path_version: int | None = None
     path_step_id: str | None = None
     mission_task_id: str | None = None
+    model_tool_call_id: str = ""
+    task_purpose_hash: str = ""
+    execution_origin_version: int = 0
     delegation_id: str | None = None
     job_id: str | None = None
     target_node_ids: list[GraphNodeId]
@@ -71,9 +74,19 @@ class WorkItem(BaseModel):
     @field_validator("target_node_ids")
     @classmethod
     def _target_ids_are_stable(cls, value: list[GraphNodeId]) -> list[GraphNodeId]:
-        if not value:
-            raise ValueError("work requires at least one target reference")
         return sorted(set(value), key=str)
+
+    @model_validator(mode="after")
+    def _empty_refs_need_native_lineage(self) -> WorkItem:
+        # Empty refs alone prove no targeted absence: they only record
+        # native lineage (execution_origin_version == 1). Whether the
+        # execution genuinely needed no target is decided by the
+        # provider-declared descriptor at compile/admission time and by
+        # the explicit stored proposal at completion time -- never by a
+        # duplicated requires_target flag here.
+        if not self.target_node_ids and self.execution_origin_version != 1:
+            raise ValueError("work requires at least one target reference")
+        return self
 
     @field_validator("conflict_keys", "prerequisite_ids")
     @classmethod

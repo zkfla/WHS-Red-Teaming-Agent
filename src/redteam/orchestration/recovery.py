@@ -37,6 +37,7 @@ from redteam.orchestration.analysis import (
     resolve_claim_for_review,
     session_list_pairs,
 )
+from redteam.orchestration.completion import check_record_linkage, preserved_target_is_absent
 from redteam.orchestration.evidence_access import locate_raw, raw_from_metadata
 from redteam.orchestration.findings import FindingPromoter, PromotionRequest
 from redteam.orchestration.service_status import severity_for
@@ -448,7 +449,11 @@ async def reprocess_evidence(
             "companion_evidence_id": str(companion.evidence_id),
         }
     target_ref = str(meta.get("target_node_id", "") or "").strip()
-    if not target_ref:
+    if preserved_target_is_absent(meta) and (
+        target_ref or check_record_linkage(record, meta, raw, str(evidence_id))
+    ):
+        return {"status": "link_mismatch", "evidence_id": str(evidence_id)}
+    if not target_ref and not preserved_target_is_absent(meta):
         companion = await record_recovery_note(
             evidence_store=evidence_store,
             run_id=record.run_id,
@@ -467,7 +472,9 @@ async def reprocess_evidence(
             "companion_evidence_id": str(companion.evidence_id),
         }
     try:
-        expected_target = str(node_id_for_target(proposal.target))
+        expected_target = (
+            str(node_id_for_target(proposal.target)) if proposal.target is not None else ""
+        )
     except Exception:
         expected_target = ""
     if expected_target and target_ref != expected_target:
@@ -613,7 +620,18 @@ async def reprocess_evidence(
             violation_if_confirmed=stored_flag,
             principal_ref=getattr(step, "principal_ref", None) if step is not None else None,
         )
-        if budget is not None and isinstance(verifier, BudgetedAnalysisVerifier):
+        if (
+            step is not None and step.assessment_kind == "observation"
+            and proposal.hypothesis_id is None and step.authentication_check is None
+        ):
+            from redteam.orchestration.analysis import VerificationAssessment
+
+            assessment = VerificationAssessment(
+                verdict=Verdict.UNKNOWN, reason="observation only; no security claim to review",
+                reviewer_id="analysis:observation_skip", source_refs=request.source_refs,
+                outcome="unknown", claim_supported=False,
+            )
+        elif budget is not None and isinstance(verifier, BudgetedAnalysisVerifier):
             assessment = await verifier.verify_with_budget(
                 request,
                 budget=budget,
@@ -765,7 +783,10 @@ async def reprocess_evidence(
                     + ")"
                 )
     finding_id = None
-    if verdict is Verdict.VIOLATION and proposal.hypothesis_id is not None:
+    if (
+        verdict is Verdict.VIOLATION and proposal.hypothesis_id is not None
+        and proposal.target is not None
+    ):
         existing_claims = {
             str(item.metadata.get("claim_key"))
             for item in await graph_service.list_findings()

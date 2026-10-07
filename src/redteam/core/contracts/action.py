@@ -35,7 +35,7 @@ class ActionProposal(BaseModel):
     capability: str = ""
     operation: str = ""
 
-    target: TargetRef
+    target: TargetRef | None
 
     # Tool arguments are inherently open-ended (every MCP tool defines
     # its own input schema) — `Any` values here are deliberate, not an
@@ -62,6 +62,8 @@ class ActionProposal(BaseModel):
     def _binding_is_consistent(self):
         if self.binding_mode == SELECTED_TOOL and not self.tool_id:
             raise ValueError("selected_tool binding requires tool_id")
+        if self.target is None and self.binding_mode != SELECTED_TOOL:
+            raise ValueError("legacy action requires a target")
         return self
 
     @property

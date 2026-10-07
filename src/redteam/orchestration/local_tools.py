@@ -19,10 +19,27 @@ from typing import Any, Protocol
 from pydantic import BaseModel, Field
 
 from redteam.core.extensions import Contribution
+from redteam.core.ids import EventId
 from redteam.orchestration.cognition import DecisionBudget
 
 RUNTIME_TOOL_KIND = "runtime_tool"
 RUNTIME_TOOL_CONTRIBUTION_VERSION = "v1"
+
+# Shared termination vocabulary for the native model/tool loop. Only a
+# successful canonical settlement handler (task/goal settle in
+# orchestration.native_local_tools) may set one of these on
+# LocalToolResult.runtime_outcome. Plain helpers (evidence reads, status
+# reads) always leave it None. The graph consumes the value generically
+# without branching on tool names.
+RUNTIME_OUTCOME_VALUES = frozenset(
+    {
+        "goal_achieved",
+        "task_completed",
+        "task_blocked",
+        "investigation_held",
+        "investigation_finished",
+    }
+)
 
 
 class LocalToolCall(BaseModel):
@@ -41,6 +58,7 @@ class LocalToolContext:
     delegation: Any | None = None
     budget: DecisionBudget | None = None
     before_call: Callable[[], Any] | None = None
+    last_event_id: EventId | None = None
 
 
 @dataclass(frozen=True)
@@ -63,11 +81,21 @@ class LocalToolResult:
     refs: tuple[str, ...] = ()
     error: str | None = None
     local_call_id: str = ""
+    runtime_outcome: str | None = None
+    last_event_id: EventId | None = None
+
+    def __post_init__(self) -> None:
+        if self.runtime_outcome is None:
+            return
+        if self.runtime_outcome not in RUNTIME_OUTCOME_VALUES:
+            raise ValueError("unknown runtime outcome")
+        if not self.ok:
+            raise ValueError("runtime outcome needs a successful result")
 
 
 class LocalToolHandler(Protocol):
     async def __call__(
-        self, tool_input: dict[str, Any], context: LocalToolContext
+        self, tool_input: dict[str, Any], context: LocalToolContext, /
     ) -> LocalToolResult: ...
 
 

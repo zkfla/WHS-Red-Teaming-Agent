@@ -9,7 +9,7 @@ per-turn hand-offs that never leave this subpackage.
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Annotated, TypedDict
+from typing import Annotated, Any, TypedDict
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -155,6 +155,24 @@ class RuntimeState(BaseModel):
         return self.phase in (AgentPhase.FINISHED, AgentPhase.FAILED)
 
 
+class NativeCallState(BaseModel):
+    """One provider call's durable disposition, not an investigation plan.
+
+    Raw result bodies remain in EvidenceStore. The original execution
+    envelope is retained only for an admitted/deferred call and approval.
+    """
+
+    call_id: str
+    name: str
+    tool_id: str
+    arguments: dict[str, Any] | None = None
+    argument_error: str | None = None
+    dispatch: DispatchItem | None = None
+    evidence_ids: list[str] = Field(default_factory=list)
+    feedback: dict[str, Any] = Field(default_factory=dict)
+    completed: bool = False
+
+
 class GraphState(TypedDict, total=False):
     runtime: RuntimeState
 
@@ -176,6 +194,11 @@ class GraphState(TypedDict, total=False):
     #: Id of the last event published this turn, so the next node can
     #: cite it as ``causation_id`` and the chain stays walkable.
     last_event_id: EventId | None
+    # Native model-tool roundtrip. No complete provider responses/reasoning.
+    native_calls: list[NativeCallState]
+    native_messages: list[dict[str, Any]]
+    native_final_text: str | None
+    native_outcome: str | None
 
 
 def initial_graph_state(
@@ -194,6 +217,10 @@ def initial_graph_state(
         "dispatch_items": [],
         "worker_outcomes": {},
         "last_event_id": last_event_id,
+        "native_calls": [],
+        "native_messages": [],
+        "native_final_text": None,
+        "native_outcome": None,
     }
 
 

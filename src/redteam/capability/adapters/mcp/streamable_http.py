@@ -14,7 +14,9 @@ from redteam.capability.adapters.mcp.transport import (
     StreamableHTTPMCPTransport,
 )
 from redteam.core.contracts.tool import (
+    PROVIDER_METADATA_AVAILABILITY_IMPACT,
     PROVIDER_METADATA_COMMAND_FIELDS,
+    PROVIDER_METADATA_REQUIRES_TARGET,
     PROVIDER_METADATA_TARGET_BINDING,
     ToolDescriptor,
     ToolError,
@@ -133,6 +135,17 @@ def _apply_provider_metadata(
     command_fields = metadata.get(PROVIDER_METADATA_COMMAND_FIELDS)
     if isinstance(command_fields, (list, tuple)):
         descriptor.command_fields = [str(name) for name in command_fields if str(name)]
+    availability_impact = metadata.get(PROVIDER_METADATA_AVAILABILITY_IMPACT)
+    # Owner-declared bool only; any other type keeps the descriptor default
+    # instead of coercing (e.g. "true"/1 must not become True).
+    if isinstance(availability_impact, bool):
+        descriptor.availability_impact = availability_impact
+    requires_target = metadata.get(PROVIDER_METADATA_REQUIRES_TARGET)
+    # Owner-declared bool only; absent keys keep the contract default and
+    # any other type is ignored instead of coerced. Never inferred from
+    # target binding or target types here.
+    if isinstance(requires_target, bool):
+        descriptor.requires_target = requires_target
 
 
 def _safe_error_message(output: dict[str, Any] | str | None) -> str:

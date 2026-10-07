@@ -28,7 +28,9 @@ class ToolTargetBinding(BaseModel):
 # declaration for every provider; no per-tool central list. Absent keys
 # keep the contract defaults.
 PROVIDER_METADATA_TARGET_BINDING = "redteam.target_binding"
+PROVIDER_METADATA_REQUIRES_TARGET = "redteam.requires_target"
 PROVIDER_METADATA_COMMAND_FIELDS = "redteam.command_fields"
+PROVIDER_METADATA_AVAILABILITY_IMPACT = "redteam.availability_impact"
 
 
 class ToolDescriptor(BaseModel):
@@ -56,11 +58,21 @@ class ToolDescriptor(BaseModel):
     outbound_text_fields: list[str] = Field(default_factory=list)
     # Provider-declared target semantics consumed by direct selected-tool calls.
     target_binding: ToolTargetBinding = Field(default_factory=ToolTargetBinding)
+    # Provider-owned declaration: execution uses configured infrastructure,
+    # not an engagement target selected by the caller. Argument binding and
+    # compatible target kinds alone do not imply this permission.
+    requires_target: bool = True
     # Provider-declared ordered input components of ONE command, not
     # independent text fields. Consumers assemble strings and string-array
     # elements in field/array order for command-pattern inspection.
     # Example: ["executable", "args"]. Empty means no command input.
     command_fields: list[str] = Field(default_factory=list)
+    # Provider-declared availability effect for its actual operation semantics.
+    # Defaults to False ("no known impact") so existing descriptors are
+    # unaffected; a provider whose tool genuinely can affect availability
+    # must set this explicitly. Never inferred from tool name, risk level,
+    # or command content.
+    availability_impact: bool = False
 
     @property
     def required_arguments(self) -> tuple[str, ...]:

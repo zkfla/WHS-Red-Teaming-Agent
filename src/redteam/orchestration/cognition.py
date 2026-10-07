@@ -493,6 +493,77 @@ class StructuredDecisionClient:
             raise ValueError("context_provider must return a dict or None")
         return result
 
+    async def ask_native(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        tools: list[Any],
+        system: str = "",
+        budget: DecisionBudget | None = None,
+        before_call: Callable[..., Any] | None = None,
+    ) -> Any:
+        """One native model response, with the existing request budget owner.
+
+        Tool input failures belong to individual calls, not a giant decision
+        schema. Only provider failures retry here; execution never does.
+        """
+        request = getattr(self._llm, "complete_native", None)
+        if not callable(request):
+            raise DecisionFailure(
+                "native_action", "transport", 0,
+                diagnostic=DecisionDiagnostic(
+                    code="native_tool_calling_unavailable", stage="native_action",
+                    kind="transport", retryable=False,
+                    summary="The configured model adapter does not support native tool calls.",
+                ),
+            )
+        active = budget or DecisionBudget(self._max_attempts)
+        repair = False
+        while active.permits(repair=repair):
+            if before_call is not None:
+                guarded = before_call()
+                if inspect.isawaitable(guarded):
+                    await guarded
+            active.consume(stage="native_action", repair=repair)
+            try:
+                response = await request(
+                    messages=messages, tools=tools, system=system, num_retries=0
+                )
+            except Exception as exc:
+                active.add_usage(None)
+                diagnostic = diagnostic_for_exception(exc, stage="native_action")
+                if isinstance(exc, LLMProviderFailure):
+                    diagnostic = DecisionDiagnostic(
+                        code="llm_provider_" + exc.kind, stage="native_action",
+                        kind="transport", retryable=exc.retryable,
+                        summary=str(exc), **exc.diagnostic_fields(),
+                    )
+                active.last_failure = diagnostic
+                active.record_failure(diagnostic.code)
+                if not diagnostic.retryable:
+                    raise DecisionFailure(
+                        "native_action", diagnostic.kind, active.used,
+                        diagnostic=diagnostic,
+                    ) from exc
+                repair = True
+                continue
+            active.add_usage(getattr(response, "total_tokens", None))
+            active.record(
+                "native_action", "native_response",
+                tool_call_count=len(getattr(response, "tool_calls", ())),
+            )
+            return response
+        raise DecisionFailure(
+            "native_action", "budget", active.used,
+            diagnostic=DecisionDiagnostic(
+                code=active.exhaustion_code(repair=repair), stage="native_action",
+                kind="budget", retryable=False,
+                summary="The native model request allowance is exhausted.",
+                last_cause=active.last_failure,
+                **active.diagnostic_details(),
+            ),
+        )
+
     def _prompt_for(self, working: dict[str, Any], feedback: str, kind: str) -> str:
         body = json.dumps(working)
         if not feedback:

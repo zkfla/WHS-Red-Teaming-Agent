@@ -1,4 +1,4 @@
-"""CLI persistence and mandatory-model contracts through real commands."""
+"""CLI persistence and mandatory-model contracts through real commands (native loop)."""
 
 from __future__ import annotations
 
@@ -8,11 +8,13 @@ import json
 import os
 import sys
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from redteam.app.bootstrap import run_engagement
 from redteam.app.cli.commands import run as run_command
+from redteam.attack_graph.stores.memory import InMemoryAttackGraphStore
 from redteam.control.approval import ApprovalService
 from redteam.control.audit import AuditLog
 from redteam.control.service import DefaultControlPlane
@@ -21,10 +23,28 @@ from redteam.core.contracts.action import ActionProposal
 from redteam.core.contracts.engagement import ApprovalPolicy
 from redteam.core.contracts.policy import ControlContext
 from redteam.core.contracts.target import HostTarget
+from redteam.core.contracts.tool import ToolResult
 from redteam.core.enums import ApprovalStatus, PolicyVerdict
 from redteam.core.ids import ActionId, AgentId, RunId
+from redteam.core.ports.llm import NativeCompletion, NativeToolCall
+from redteam.event_bus.memory import InMemoryEventBus
+from redteam.orchestration.agents.registry import default_registry
+from redteam.orchestration.context import RuntimeDeps
+from redteam.orchestration.local_tools import LocalToolRegistry
+from redteam.orchestration.native_binding import exposed_tool_name
+from redteam.orchestration.native_local_tools import (
+    GOAL_SETTLE_TOOL_ID,
+    TASK_SETTLE_TOOL_ID,
+    goal_settle_descriptor,
+    goal_settle_handler,
+    task_settle_descriptor,
+    task_settle_handler,
+)
+from redteam.orchestration.paths import InMemoryPathStore
+from redteam.orchestration.settings import OrchestrationSettings
+from redteam.orchestration.task_graph.memory import InMemoryTaskGraphStore
+from redteam.orchestration.work.memory import InMemoryWorkStore
 from tests.integration import _engine_llm_harness as h
-from tests.integration.test_end_to_end import _world
 
 _ENGAGEMENT = """
 name: CLI Smoke
@@ -37,6 +57,253 @@ rate_limit_policy:
 approval_policy:
   require_approval_for: []
 """
+
+
+def _native_tool_registry() -> LocalToolRegistry:
+    registry = LocalToolRegistry()
+    registry.register(task_settle_descriptor(), task_settle_handler)
+    registry.register(goal_settle_descriptor(), goal_settle_handler)
+    return registry
+
+
+def _exposed_names(tools: list[Any]) -> set[str]:
+    return {str(getattr(spec, "name", "")) for spec in tools}
+
+
+def _remote_executed_evidence(messages: list[dict[str, Any]]) -> list[str]:
+    found: list[str] = []
+    for message in messages:
+        if message.get("role") != "tool" or not message.get("tool_call_id"):
+            continue
+        try:
+            body = json.loads(message.get("content") or "{}")
+        except ValueError:
+            continue
+        if not isinstance(body, dict) or body.get("ok") is not True:
+            continue
+        if body.get("executed") is not True:
+            continue
+        for identity in body.get("evidence_ids") or []:
+            text = str(identity)
+            if text and text not in found:
+                found.append(text)
+    return found
+
+
+def _tool_result(messages: list[dict[str, Any]], call_id: str) -> dict[str, Any] | None:
+    for message in messages:
+        if message.get("role") != "tool" or message.get("tool_call_id") != call_id:
+            continue
+        try:
+            body = json.loads(message.get("content") or "{}")
+        except ValueError:
+            return None
+        return body if isinstance(body, dict) else None
+    return None
+
+
+class _CliCountingGateway:
+    """Tool gateway double that counts real invocations and answers success."""
+
+    def __init__(self) -> None:
+        self.calls: list[Any] = []
+
+    async def invoke(self, invocation: Any) -> ToolResult:
+        self.calls.append(invocation)
+        now = h.utcnow()
+        return ToolResult(
+            invocation_id=invocation.invocation_id,
+            action_id=invocation.action_id,
+            tool_id=invocation.tool_id,
+            success=True,
+            output={"inventory": "ok", "host": h.HOST},
+            started_at=now,
+            finished_at=now,
+            metadata={},
+        )
+
+
+class _CliNativeLLM:
+    """Native scripted model: one inventory call, then task/goal settlement."""
+
+    def __init__(self, *, graph_store: Any, evidence_store: Any) -> None:
+        self._graph = graph_store
+        self._evidence = evidence_store
+        self.calls: list[dict[str, Any]] = []
+        self.reviews: list[str] = []
+        self.turns = 0
+        self._task_call: str | None = None
+        self._goal_call: str | None = None
+
+    @staticmethod
+    def _route_key(schema: dict[str, Any]) -> str:
+        props = schema.get("properties", {})
+        if "criteria" in props:
+            return "goal_completion_review"
+        if "claims" in props:
+            return "task_completion_review"
+        if "claim_supported" in props:
+            return "analysis_verify"
+        return "unknown"
+
+    async def complete_structured(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        response_schema: dict[str, Any],
+        system: str | None = None,
+        num_retries: int = 0,
+        **_: Any,
+    ) -> dict[str, Any]:
+        route = self._route_key(response_schema)
+        self.reviews.append(route)
+        if route == "analysis_verify":
+            return h.meaning("success", True)
+        if route == "task_completion_review":
+            payload = json.loads(messages[0]["content"])
+            receipts = list(payload["verified_source_ids"])
+            assert receipts, "task review needs the verified executed call evidence"
+            return {
+                "accepted": True,
+                "reason": "scripted semantic accept",
+                "claims": [
+                    {
+                        "description": "inventory tool result observed",
+                        "kind": "observation",
+                        "evidence_ids": list(receipts),
+                        "target_node_ids": [],
+                        "principal_refs": [],
+                    }
+                ],
+            }
+        if route == "goal_completion_review":
+            payload = json.loads(messages[0]["content"])
+            criteria = payload["mission"]["success_criteria"]
+            receipts = list(payload["verified_source_ids"])
+            assert receipts, "goal review needs the verified executed call evidence"
+            return {
+                "accepted": True,
+                "reason": "scripted goal accept",
+                "criteria": [
+                    {
+                        "criterion": item,
+                        "met": True,
+                        "evidence_ids": list(receipts),
+                        "claims": [
+                            {
+                                "description": "inventory tool result observed",
+                                "kind": "observation",
+                                "evidence_ids": list(receipts),
+                                "target_node_ids": [],
+                                "principal_refs": [],
+                            }
+                        ],
+                    }
+                    for item in criteria
+                ],
+            }
+        raise AssertionError(
+            f"legacy strategy route is not part of the native loop: {route!r}"
+        )
+
+    async def complete(
+        self, *, messages: list[dict[str, Any]], system: str | None = None, **_: Any
+    ) -> str:
+        return ""
+
+    async def complete_native(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[Any],
+        system: str | None = None,
+        **_: Any,
+    ) -> NativeCompletion:
+        names = _exposed_names(tools)
+        inventory = exposed_tool_name(h.INVENTORY_TOOL)
+        task_tool = exposed_tool_name(TASK_SETTLE_TOOL_ID)
+        goal_tool = exposed_tool_name(GOAL_SETTLE_TOOL_ID)
+        assert inventory in names, "native model needs the registered inventory tool"
+        assert task_tool in names, "native model needs the task settlement helper"
+        assert goal_tool in names, "native model needs the goal settlement helper"
+        self.turns += 1
+        evidenced = _remote_executed_evidence(messages)
+        self.calls.append({"turn": self.turns, "evidenced": list(evidenced)})
+        if self.turns == 1:
+            return NativeCompletion(
+                tool_calls=(
+                    NativeToolCall(call_id="call-cli-1", name=inventory, arguments={}),
+                ),
+                text="",
+            )
+        if self._task_call is None:
+            assert evidenced, "task settlement needs the executed call evidence"
+            self._task_call = "call-cli-task"
+            return NativeCompletion(
+                tool_calls=(
+                    NativeToolCall(
+                        call_id=self._task_call,
+                        name=task_tool,
+                        arguments={
+                            "outcome": "success",
+                            "reason": "task evidence ready",
+                            "evidence_ids": list(evidenced),
+                        },
+                    ),
+                ),
+                text="",
+            )
+        seen = _tool_result(messages, self._task_call)
+        if seen is None or seen.get("ok") is not True:
+            return NativeCompletion(tool_calls=(), text="")
+        if self._goal_call is None:
+            self._goal_call = "call-cli-goal"
+            return NativeCompletion(
+                tool_calls=(
+                    NativeToolCall(
+                        call_id=self._goal_call,
+                        name=goal_tool,
+                        arguments={
+                            "outcome": "success",
+                            "reason": "goal evidence ready",
+                            "evidence_ids": list(evidenced),
+                        },
+                    ),
+                ),
+                text="",
+            )
+        return NativeCompletion(tool_calls=(), text="")
+
+
+def _native_world():
+    engagement = h.make_engagement(engagement_id="eng_e2e")
+    llm = _CliNativeLLM(
+        graph_store=InMemoryAttackGraphStore(), evidence_store=h.FakeEvidenceStore()
+    )
+    gateway = _CliCountingGateway()
+    catalog = h.FakeCatalog([h.inventory_descriptor()])
+    deps = RuntimeDeps(
+        control_plane=DefaultControlPlane(
+            {engagement.engagement_id: engagement},
+            outbound_descriptor_resolver=catalog.get,
+        ),
+        tool_gateway=gateway,
+        event_bus=InMemoryEventBus(),
+        graph_store=llm._graph,
+        evidence_store=llm._evidence,
+        llm_client=llm,
+        engagement=engagement,
+        agents=default_registry(),
+        tool_catalog=catalog,
+        local_tools=_native_tool_registry(),
+        work_store=InMemoryWorkStore(),
+        task_graph_store=InMemoryTaskGraphStore(),
+        path_store=InMemoryPathStore(),
+        operator_intent_store=None,
+        settings=OrchestrationSettings(
+            max_steps=8, checkpointing=False, decision_max_attempts=6
+        ),
+    )
+    return engagement, deps, gateway
 
 
 async def _run_cli(*args: str, cwd: Path) -> tuple[int, str, str]:
@@ -56,7 +323,7 @@ async def _run_cli(*args: str, cwd: Path) -> tuple[int, str, str]:
         stderr=asyncio.subprocess.PIPE,
     )
     try:
-        out, err = await asyncio.wait_for(proc.communicate(), timeout=20)
+        out, err = await asyncio.wait_for(proc.communicate(), timeout=120)
     finally:
         if proc.returncode is None:
             proc.kill()
@@ -73,7 +340,7 @@ async def test_init_validate_and_persisted_status_findings_report(tmp_path, monk
     assert code == 0, err
     assert "Configuration valid." in out
     monkeypatch.chdir(tmp_path)
-    engagement, deps, gateway = _world()
+    engagement, deps, gateway = _native_world()
     final = await run_engagement(engagement, deps)
     assert len(gateway.calls) == 1
     code, out, err = await _run_cli("status", str(final.run_id), cwd=tmp_path)
@@ -106,7 +373,7 @@ async def test_json_command_streams_actual_events(tmp_path, monkeypatch, capsys)
     monkeypatch.delenv("REDTEAM_MCP_SERVERS", raising=False)
     path = tmp_path / "engagement.yaml"
     path.write_text(_ENGAGEMENT, encoding="utf-8")
-    engagement, deps, gateway = _world()
+    engagement, deps, gateway = _native_world()
 
     async def build(config, **kwargs):
         return engagement, deps

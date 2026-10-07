@@ -621,7 +621,9 @@ async def test_generated_inventory_and_tls_drafts_compile_cleanly() -> None:
     # And the invariant itself: whatever executes must be a node the draft
     # actually named.
     for item in compiled:
-        target_node = node_id_for_target(item.plan_step.resolved_target())
+        target = item.plan_step.resolved_target()
+        assert target is not None
+        target_node = node_id_for_target(target)
         assert target_node in item.draft.target_node_ids
 
 

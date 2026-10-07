@@ -1,14 +1,24 @@
 """Production composition and MCP stdio to a real local HTTP target.
 
 Only the model is scripted. Control, gateway, MCP subprocess, HTTP requests,
-evidence, path revisions, mission gates and terminal reports are production code.
-This proves transport/runtime wiring, not the quality of a live model's decisions.
+evidence, the native tool loop, mission gates and terminal reports are
+production code. This proves transport/runtime wiring, not the quality of a
+live model's decisions.
+
+Native-loop migration: the scripted model answers complete_native only and
+follows the real sequence -- discover the operator-registered sessions with the
+web.session_list tool, then compare them with web.http_compare_sessions using
+the discovered session refs, then settle through the genuine task/goal
+settlement tools. The retired structured path/mode plan is gone, so there is no
+fabricated path revision to assert; the durable proof is the executed
+discovery/comparison evidence plus its work/task/call provenance. Any
+complete_structured call is limited to the genuine review routes (analysis
+verification plus task/goal settlement reviews); legacy strategy routes raise.
 """
 
 from __future__ import annotations
 
 import asyncio
-import copy
 import json
 import sys
 from contextlib import AsyncExitStack
@@ -29,130 +39,185 @@ from redteam.core.contracts.engagement import (
     RateLimitPolicy,
 )
 from redteam.core.contracts.events import EventEnvelope, EventType
-from redteam.core.enums import GraphNodeType, MissionStatus
+from redteam.core.enums import GraphNodeType, MissionStatus, TaskStatus
 from redteam.core.ids import ToolId
-from redteam.core.ports.tool_catalog import ToolCatalog
+from redteam.core.ports.llm import NativeCompletion, NativeToolCall
+from redteam.evidence.stores.filesystem import FilesystemEvidenceStore
+from redteam.orchestration.native_binding import exposed_tool_name
+from redteam.orchestration.native_local_tools import (
+    GOAL_SETTLE_TOOL_ID,
+    TASK_SETTLE_TOOL_ID,
+)
 from redteam.orchestration.paths.sqlite import SQLitePathStore
 from redteam.orchestration.settings import OrchestrationSettings
 from redteam.orchestration.state import TerminationReason
 from redteam.orchestration.task_graph.sqlite import SQLiteTaskGraphStore
-from tests.integration import _engine_llm_harness as h
-from tests.integration.test_second_principal_mission import _CompareLLM
+from redteam.orchestration.work.models import WorkStatus
+from redteam.orchestration.work.sqlite import SQLiteWorkStore
+from tests.integration.test_second_principal_mission import (
+    _CompareNativeLLM,
+    _exposed_names,
+    _tool_result,
+)
+
+COMPARE_PATH = "/orders/1234"
+DISCOVERY_CALL_ID = "call-discovery"
+COMPARE_CALL_ID = "call-compare"
 
 
-class _TransportLLM(_CompareLLM):
-    """Discover registered references, revise, then decide from real receipts."""
+def _executed_evidence(messages: list[dict[str, Any]], call_id: str) -> list[str]:
+    """Executed evidence ids the loop returned for one model tool call."""
+    body = _tool_result(messages, call_id)
+    if not body or body.get("ok") is not True or body.get("executed") is not True:
+        return []
+    return [str(item) for item in body.get("evidence_ids") or []]
 
-    _catalog: ToolCatalog
 
-    def _draft(self, host_id: str) -> dict[str, Any]:
-        draft = super()._draft(host_id)
-        draft["steps"][0].update(
-            objective="discover operator-provided principal references",
-            principal_refs=[],
-        )
-        return draft
+def _discovered_sessions(
+    messages: list[dict[str, Any]], call_id: str
+) -> list[dict[str, Any]]:
+    """Sessions the real session_list tool returned to the model as originals."""
+    body = _tool_result(messages, call_id)
+    if not body or body.get("ok") is not True:
+        return []
+    for original in body.get("original_results") or []:
+        raw = original.get("text") if isinstance(original, dict) else None
+        if not raw:
+            continue
+        try:
+            parsed = json.loads(raw)
+        except ValueError:
+            continue
+        output = parsed.get("output") if isinstance(parsed, dict) else None
+        rows = output.get("sessions") if isinstance(output, dict) else None
+        if isinstance(rows, list):
+            return [row for row in rows if isinstance(row, dict)]
+    return []
 
-    async def complete_structured(
-        self, *, messages: Any, response_schema: dict[str, Any], system: Any = None, **_: Any
-    ) -> dict[str, Any]:
-        route = self._route_key(response_schema)
-        if route != "next_action":
-            return await super().complete_structured(
-                messages=messages, response_schema=response_schema, system=system
+
+class _TransportLLM(_CompareNativeLLM):
+    """Native model: discover the supplied sessions, then compare and settle.
+
+    The compare call is built from the sessions the real session_list receipt
+    returned, so the two-session comparison uses the registered sessions and
+    their actual results. Analysis and settlement reviews come from the shared
+    native fixture; no legacy strategy route is answered.
+    """
+
+    _catalog: Any
+
+    def _remote_name(self, remote_tool_name: str) -> str:
+        for descriptor in self._catalog.all_descriptors():
+            if descriptor.tool_name == remote_tool_name:
+                return exposed_tool_name(str(descriptor.tool_id))
+        raise AssertionError(f"no registered tool named {remote_tool_name!r}")
+
+    async def complete_native(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[Any],
+        system: str | None = None,
+        **_: Any,
+    ) -> NativeCompletion:
+        names = _exposed_names(tools)
+        discovery = self._remote_name("session_list")
+        compare = self._remote_name("http_compare_sessions")
+        task_tool = exposed_tool_name(TASK_SETTLE_TOOL_ID)
+        goal_tool = exposed_tool_name(GOAL_SETTLE_TOOL_ID)
+        assert discovery in names, "native model needs the registered discovery tool"
+        assert compare in names, "native model needs the registered compare tool"
+        assert task_tool in names, "native model needs the task settlement helper"
+        assert goal_tool in names, "native model needs the goal settlement helper"
+        self.turns += 1
+        if self.turns == 1:
+            self.calls.append({"turn": 1, "tool_calls": [discovery]})
+            return NativeCompletion(
+                tool_calls=(
+                    NativeToolCall(
+                        call_id=DISCOVERY_CALL_ID, name=discovery, arguments={}
+                    ),
+                ),
+                text="",
             )
-        self.calls.append({"route": route, "messages": messages, "system": system})
-        self._next_calls += 1
-        payload = self._payload(messages)
-        run_id = payload["active_path"]["run_id"]
-        records = await self._evidence.list_for_run(run_id)
-        host_id = await self._host_id()
-
-        def receipts(step_id: str, tool_id: str) -> list[str]:
-            descriptor = self._catalog.get(ToolId(tool_id))
-            assert descriptor is not None
-            return [
-                str(r.evidence_id)
-                for r in records
-                if r.metadata.get("path_step_id") == step_id
-                and r.source_id == str(descriptor.tool_id)
-                and isinstance(r.metadata.get("tool_result"), dict)
-            ]
-
-        if self._next_calls == 1:
-            turn = h.turn_actions(host_id)
-            turn["actions"][0].update(
-                agent_id="web-api-agent",
-                capability="web",
-                operation="response_analysis",
-                tool_id="web.session_list",
-                arguments={},
-                reason="discover supplied opaque sessions",
+        sessions = _discovered_sessions(messages, DISCOVERY_CALL_ID)
+        if self.turns == 2:
+            assert len(sessions) >= 2, "discovery must return the registered sessions"
+            first, second = sessions[0], sessions[1]
+            assert first["session_ref"] != second["session_ref"]
+            self.calls.append({"turn": 2, "tool_calls": [compare]})
+            return NativeCompletion(
+                tool_calls=(
+                    NativeToolCall(
+                        call_id=COMPARE_CALL_ID,
+                        name=compare,
+                        arguments={
+                            "target_ref": first["target_ref"],
+                            "path": COMPARE_PATH,
+                            "first_session_ref": first["session_ref"],
+                            "second_session_ref": second["session_ref"],
+                        },
+                    ),
+                ),
+                text="",
             )
-            return turn
-        if self._next_calls == 2:
-            found = receipts("step-1", "web.session_list")
-            assert found, "session discovery must produce a real receipt"
-            return h.turn_complete_step(found)
-        if self._next_calls == 3:
-            revised = copy.deepcopy(payload["active_path"])
-            compare = super()._draft(host_id)["steps"][0]
-            compare.update(step_id="step-2", depends_on=["step-1"])
-            revised["steps"].append(compare)
-            turn = h.turn_complete_goal("use discovered sessions to revise the path")
-            turn.update(mode="revise_path", path=revised)
-            return turn
-        if self._next_calls == 4:
-            turn = h.turn_actions(host_id)
-            turn["actions"][0].update(
-                path_step_id="step-2",
-                agent_id="web-api-agent",
-                principal_ref="alice",
-                capability="web",
-                operation="response_analysis",
-                tool_id="web.http_compare_sessions",
-                arguments={
-                    "target_ref": "bank",
-                    "path": "/orders/1234",
-                    "first_session_ref": "alice",
-                    "second_session_ref": "bob",
-                },
-                reason="compare discovered principals on the approved object",
+        # Only a conclusive comparison settles the task and the goal;
+        # inconclusive or failed receipts hold so the mission stays blocked.
+        evidenced = _executed_evidence(messages, COMPARE_CALL_ID)
+        if not evidenced:
+            return NativeCompletion(tool_calls=(), text="comparison did not execute")
+        if not await self._comparison_conclusive():
+            return NativeCompletion(tool_calls=(), text="comparison inconclusive")
+        if self._task_call is None:
+            self._task_call = "call-task"
+            self.calls.append({"turn": self.turns, "tool_calls": [task_tool]})
+            return NativeCompletion(
+                tool_calls=(
+                    NativeToolCall(
+                        call_id=self._task_call,
+                        name=task_tool,
+                        arguments={
+                            "outcome": "success",
+                            "reason": "discovered comparison evidence ready",
+                            "evidence_ids": evidenced,
+                        },
+                    ),
+                ),
+                text="",
             )
-            return turn
-        if self._next_calls == 5:
-            if not await self._comparison_conclusive():
-                turn = h.turn_complete_goal("second principal could not be authenticated")
-                turn.update(mode="hold")
-                return turn
-            found = receipts("step-2", "web.http_compare_sessions")
-            assert found, "comparison must produce a real receipt"
-            return {**h.turn_complete_step(found), "path_step_id": "step-2"}
-        if payload.get("active_task"):
-            discovery = receipts("step-1", "web.session_list")
-            comparison = receipts("step-2", "web.http_compare_sessions")
-            assert discovery and comparison, "task completion needs discovery and comparison proof"
-            task_receipts = discovery + comparison
-            return {
-                "mode": "complete_task",
-                "reason": "discovered comparison ready",
-                "actions": [],
-                "path": None,
-                "path_step_id": None,
-                "completion": {
-                    "evidence_ids": task_receipts,
-                    "outcome": "success",
-                    "reason": "discovered comparison ready",
-                    "criterion_results": [],
-                },
-                "evidence_request": {},
-                "hypothesis_update": {},
-            }
-        return h.turn_complete_goal()
+        seen = _tool_result(messages, self._task_call)
+        if seen is None or seen.get("ok") is not True:
+            return NativeCompletion(tool_calls=(), text="awaiting task settlement")
+        if self._goal_call is None:
+            self._goal_call = "call-goal"
+            self.calls.append({"turn": self.turns, "tool_calls": [goal_tool]})
+            return NativeCompletion(
+                tool_calls=(
+                    NativeToolCall(
+                        call_id=self._goal_call,
+                        name=goal_tool,
+                        arguments={
+                            "outcome": "success",
+                            "reason": "discovered comparison evidence ready",
+                            "evidence_ids": evidenced,
+                        },
+                    ),
+                ),
+                text="",
+            )
+        return NativeCompletion(tool_calls=(), text="")
+
+
+def _records_for_tool(records: list[Any], tool_id: str) -> list[Any]:
+    return [
+        record
+        for record in records
+        if record.source_id == tool_id
+        and isinstance(record.metadata.get("tool_result"), dict)
+    ]
 
 
 @pytest.mark.parametrize("case", ["success", "unauthenticated", "missing_credential"])
-async def test_principal_discovery_revision_and_completion_over_real_mcp(
+async def test_principal_discovery_and_completion_over_real_mcp(
     case: str,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -185,10 +250,7 @@ async def test_principal_discovery_revision_and_completion_over_real_mcp(
             writer.close()
             await writer.wait_closed()
 
-    try:
-        server = await asyncio.start_server(respond, "127.0.0.1", 0)
-    except PermissionError:
-        pytest.skip("sandbox does not permit binding a local E2E target port")
+    server = await asyncio.start_server(respond, "127.0.0.1", 0)
     async with server, AsyncExitStack() as stack:
         port = server.sockets[0].getsockname()[1]
         monkeypatch.chdir(tmp_path)
@@ -272,11 +334,14 @@ async def test_principal_discovery_revision_and_completion_over_real_mcp(
             capability=CapabilityConfig(mcp_servers=["principal-e2e"]),
         )
         task_db = tmp_path / "tasks.sqlite3"
+        work_db = tmp_path / "work.sqlite3"
         settings = OrchestrationSettings(
             max_steps=30,
             decision_max_attempts=6,
             task_graph_backend="sqlite",
             task_graph_path=str(task_db),
+            work_backend="sqlite",
+            work_path=str(work_db),
             path_backend="sqlite",
             operator_intent_backend="sqlite",
             operator_intent_path=str(tmp_path / "intents.sqlite3"),
@@ -318,28 +383,64 @@ async def test_principal_discovery_revision_and_completion_over_real_mcp(
         await deps.event_bus.subscribe("*", collect)
         final = await run_engagement(engagement, deps=deps, objective=objective)
 
-        # Reopen durable domain stores rather than relying on live objects.
+        # Reopen the durable domain stores rather than relying on live objects.
         assert final.mission_id is not None
-        mission = await SQLiteTaskGraphStore(task_db).get_mission(final.mission_id)
-        path = await SQLitePathStore(task_db).get_active(str(final.run_id))
-        versions = await SQLitePathStore(task_db).list_paths(str(final.run_id))
+        reopened_tasks = SQLiteTaskGraphStore(task_db)
+        mission = await reopened_tasks.get_mission(final.mission_id)
+        tasks = await reopened_tasks.list_tasks(mission_id=final.mission_id)
         report = load_terminal_report(final.run_id)
         assert mission is not None and mission.objective == objective
-        assert path is not None and path.version == 2
-        assert {v.version for v in versions} == {1, 2}
-        assert path.steps[0].evidence_ids and path.steps[0].status == "completed"
-        assert path.steps[1].depends_on == ["step-1"]
+        assert len(tasks) == 1, "the native loop settles the single bootstrap task"
+        task = tasks[0]
+        assert task.objective == mission.objective
         assert report is not None and report.mission is not None
         assert report.mission.status == mission.status.value
         finished = next(e for e in events if e.event_type == EventType.RUN_FINISHED)
         assert finished.payload["termination_reason"] == final.termination_reason
         assert finished.payload["actions_executed"] == final.actions_executed
-        records = await deps.evidence_store.list_for_run(final.run_id)
+
+        # No plan was fabricated: the native loop records no path at all.
+        assert await SQLitePathStore(task_db).get_active(str(final.run_id)) is None
+        assert await SQLitePathStore(task_db).list_paths(str(final.run_id)) == []
+
+        assert deps.tool_catalog is not None
+        discovery_tool = deps.tool_catalog.get(ToolId("web.session_list"))
         compare_tool = deps.tool_catalog.get(ToolId("web.http_compare_sessions"))
-        assert compare_tool is not None
-        comparisons = [r for r in records if r.source_id == str(compare_tool.tool_id)]
-        assert comparisons and comparisons[0].metadata["path_version"] == 2
-        assert comparisons[0].metadata["path_step_id"] == "step-2"
+        assert discovery_tool is not None and compare_tool is not None
+        # Reopen the shared filesystem evidence store as well: the durable
+        # proof must not come from the live in-process object.
+        records = await FilesystemEvidenceStore(tmp_path / "evidence").list_for_run(
+            final.run_id
+        )
+        discovery_records = _records_for_tool(records, str(discovery_tool.tool_id))
+        compare_records = _records_for_tool(records, str(compare_tool.tool_id))
+        assert discovery_records and compare_records
+
+        # Durable work/task/call provenance for both real tool executions,
+        # verified through reopened stores rather than the live objects.
+        reopened_work = SQLiteWorkStore(work_db)
+        for record, call_id, tool in (
+            (discovery_records[0], DISCOVERY_CALL_ID, discovery_tool),
+            (compare_records[0], COMPARE_CALL_ID, compare_tool),
+        ):
+            metadata = record.metadata
+            assert metadata["tool_id"] == str(tool.tool_id)
+            assert metadata["model_tool_call_id"] == call_id
+            assert metadata["mission_task_id"] == str(task.task_id)
+            assert metadata["execution_origin_version"] == 1
+            work = await reopened_work.get(str(metadata["work_id"]))
+            assert work is not None
+            assert work.mission_task_id == str(task.task_id)
+            assert work.model_tool_call_id == call_id
+        discovery_work = await reopened_work.get(str(discovery_records[0].metadata["work_id"]))
+        assert discovery_work is not None and discovery_work.status is WorkStatus.SUCCEEDED
+        compare_work = await reopened_work.get(str(compare_records[0].metadata["work_id"]))
+        assert compare_work is not None
+
+        # The compared refs and per-request receipts are the actual originals.
+        discovery_output = discovery_records[0].metadata["tool_result"]["output"]
+        assert {row["session_ref"] for row in discovery_output["sessions"]} == {"alice", "bob"}
+        comparison_output = compare_records[0].metadata["tool_result"]["output"]
         serialized = (
             json.dumps([r.model_dump(mode="json") for r in records]) + report.model_dump_json()
         )
@@ -350,26 +451,32 @@ async def test_principal_discovery_revision_and_completion_over_real_mcp(
         if case == "success":
             assert requests == [("GET", "/orders/1234", 200), ("GET", "/orders/1234", 403)]
             assert final.termination_reason is TerminationReason.GOAL_ACHIEVED, json.dumps(
-                [
-                    llm._payload(call["messages"]).get("feedback")
-                    for call in llm.calls
-                    if call["route"] == "next_action"
-                ]
+                llm.reviews
             )
             assert mission.status is MissionStatus.COMPLETED
+            assert task.status is TaskStatus.COMPLETED
             assert mission.criterion_results and all(
                 r.met and r.evidence_ids for r in mission.criterion_results
             )
-            assert path.steps[1].status == "completed" and path.steps[1].evidence_ids
             assert all(c.met and c.evidence_count for c in report.mission.success_criteria)
+            assert comparison_output["first"]["actual_session_ref"] == "alice"
+            assert comparison_output["second"]["actual_session_ref"] == "bob"
+            assert compare_work.status is WorkStatus.SUCCEEDED
+            assert {"task_completion_review", "goal_completion_review"} <= set(llm.reviews)
         else:
-            # Capability preflights BOTH credentials before either HTTP request.
-            # Missing Bob's credential must not leave a partial Alice-only probe.
+            # The capability preflights BOTH credentials before either HTTP
+            # request, so a missing credential leaves no partial probe.
             expected_count = 2 if case == "unauthenticated" else 0
             assert len(requests) == expected_count
             if case == "missing_credential":
-                assert comparisons[0].metadata["tool_result"]["success"] is False
+                assert compare_records[0].metadata["tool_result"]["success"] is False
+                assert compare_work.status is not WorkStatus.SUCCEEDED
+            if case == "unauthenticated":
+                # The real transport still ran both requests; both denied.
+                assert comparison_output["first"]["status_code"] == 401
+                assert comparison_output["second"]["status_code"] == 401
             assert final.termination_reason is TerminationReason.INVESTIGATION_HELD
             assert mission.status is MissionStatus.BLOCKED
+            assert task.status is not TaskStatus.COMPLETED
             assert mission.criterion_results and not all(r.met for r in mission.criterion_results)
             assert not all(c.met for c in report.mission.success_criteria)

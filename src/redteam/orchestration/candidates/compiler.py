@@ -151,15 +151,15 @@ class CandidateCompiler:
             except ActionNamingError as exc:
                 return None, self._reject(draft, exc.reason, field=exc.field)
         try:
-            execution_target_id = node_id_for_target(plan_step.resolved_target())
+            target = plan_step.resolved_target()
         except ValueError:
             return None, self._reject(draft, "unresolved_target")
-        if execution_target_id not in draft.target_node_ids:
+        if target is not None and node_id_for_target(target) not in draft.target_node_ids:
             return None, self._reject(draft, "target_mismatch")
-        if not direct:
+        if not direct and target is not None:
             try:
                 validate_network_arguments(
-                    plan_step.resolved_target(),
+                    target,
                     plan_step.arguments,
                     operation=plan_step.operation,
                     bindings=self._operation_bindings,
@@ -170,23 +170,26 @@ class CandidateCompiler:
         if tool is None:
             reason, field = tool_rejection or ("no_compatible_tool", "")
             return None, self._reject(draft, reason, field=field)
-        bound_arguments = self._bind_target_arguments(
-            plan_step.arguments,
-            plan_step.resolved_target(),
-            tool,
-            plan_step.operation,
-            bindings=self._operation_bindings,
-            target_binding=getattr(tool, "target_binding", None) if direct else None,
-        )
-        try:
-            validate_network_arguments(
-                plan_step.resolved_target(),
-                bound_arguments,
-                operation=plan_step.operation,
+        bound_arguments = dict(plan_step.arguments) if target is None else (
+            self._bind_target_arguments(
+                plan_step.arguments,
+                target,
+                tool,
+                plan_step.operation,
                 bindings=self._operation_bindings,
-                argument_bindings=getattr(tool, "argument_bindings", None),
                 target_binding=getattr(tool, "target_binding", None) if direct else None,
             )
+        )
+        try:
+            if target is not None:
+                validate_network_arguments(
+                    target,
+                    bound_arguments,
+                    operation=plan_step.operation,
+                    bindings=self._operation_bindings,
+                    argument_bindings=getattr(tool, "argument_bindings", None),
+                    target_binding=getattr(tool, "target_binding", None) if direct else None,
+                )
         except ValueError:
             return None, self._reject(draft, "unresolved_target", field="arguments")
         bound_step = plan_step.model_copy(
@@ -267,14 +270,16 @@ class CandidateCompiler:
             if tool.health_status is not ToolHealthStatus.HEALTHY:
                 return None, ("tool_unhealthy", "")
         try:
-            kind = plan_step.resolved_target().kind
+            target = plan_step.resolved_target()
         except ValueError:
             return None, ("unresolved_target", "")
-        if tool.target_types and kind not in tool.target_types:
+        if target is None and tool.requires_target:
+            return None, ("unresolved_target", "")
+        if target is not None and tool.target_types and target.kind not in tool.target_types:
             return None, ("target_type_mismatch", "")
-        bound = self._bind_target_arguments(
+        bound = dict(plan_step.arguments) if target is None else self._bind_target_arguments(
             plan_step.arguments,
-            plan_step.resolved_target(),
+            target,
             tool,
             plan_step.operation,
             bindings=self._operation_bindings,
@@ -299,6 +304,9 @@ class CandidateCompiler:
         )
         if self._is_direct_step(plan_step):
             return self._resolve_direct_tool(plan_step)
+        target = plan_step.resolved_target()
+        if target is None:
+            return None, ("unresolved_target", "")
         if not tool_matches_action_namespace(preferred, capability):
             return None, ("tool_outside_capability_namespace", "")
         if self._catalog is None:
@@ -348,7 +356,7 @@ class CandidateCompiler:
             tool
             for tool in action_tools
             if tool.health_status is not ToolHealthStatus.UNHEALTHY
-            and (not tool.target_types or plan_step.resolved_target().kind in tool.target_types)
+            and (not tool.target_types or target.kind in tool.target_types)
         ]
         if all(tool.health_status is ToolHealthStatus.UNHEALTHY for tool in action_tools):
             return None, ("tool_unhealthy", "")
@@ -385,7 +393,7 @@ class CandidateCompiler:
             if self._arguments_match_schema(
                 self._bind_target_arguments(
                     plan_step.arguments,
-                    plan_step.resolved_target(),
+                    target,
                     tool,
                     plan_step.operation,
                     bindings=self._operation_bindings,
@@ -396,7 +404,7 @@ class CandidateCompiler:
         if not schema_ok:
             bound_arguments = self._bind_target_arguments(
                 plan_step.arguments,
-                plan_step.resolved_target(),
+                target,
                 healthy[0],
                 plan_step.operation,
                 bindings=self._operation_bindings,

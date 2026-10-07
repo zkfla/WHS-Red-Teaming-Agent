@@ -125,6 +125,7 @@ async def worker_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
         result = local.get("tool_result")
         outcome = WorkerOutcome(
             action_id=action_id,
+            model_tool_call_id=str(getattr(item.plan_step, "model_tool_call_id", "") or ""),
             work_id=item.work_id,
             delegation_id=item.plan_step.delegation_id,
             candidate_key=item.plan_step.candidate_key,
@@ -179,6 +180,7 @@ async def worker_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
         attempted = decision is not None and decision.verdict is PolicyVerdict.ALLOW
         outcome = WorkerOutcome(
             action_id=action_id,
+            model_tool_call_id=str(getattr(item.plan_step, "model_tool_call_id", "") or ""),
             work_id=item.work_id,
             delegation_id=item.plan_step.delegation_id,
             candidate_key=item.plan_step.candidate_key,

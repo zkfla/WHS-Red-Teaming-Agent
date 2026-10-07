@@ -31,6 +31,7 @@ from rich.console import Console
 from redteam.app.cli import _shared
 from redteam.app.cli.commands import interactive
 from redteam.app.cli.commands import run as run_command
+from redteam.core.ports.llm import NativeCompletion
 
 pytestmark = pytest.mark.asyncio
 
@@ -111,7 +112,15 @@ class _ConversationLLM:
 
 
 class _HoldLLM:
-    """Execution model: valid draft/review, then hold forever (no tools)."""
+    """Execution model: native text-only hold (no tool calls, no settlement).
+
+    Speaks the genuine product contract: 'complete_native' answers every
+    model turn with a text-only completion, which the native loop treats as
+    a non-settling turn (never goal success), so the run finishes without
+    executing anything. 'complete_structured' answers only the genuine
+    review routes; any legacy strategy route raises instead of returning a
+    soft answer.
+    """
 
     def __init__(self):
         self.calls = []
@@ -119,87 +128,13 @@ class _HoldLLM:
     async def complete(self, *, messages, system=None, **kwargs):
         return ""
 
-    @staticmethod
-    def _route_key(schema):
-        props = schema.get("properties", {})
-        if "steps" in props:
-            return "path_draft"
-        if "decision" in props:
-            return "path_review"
-        if "mode" in props:
-            return "next_action"
-        if "criteria" in props:
-            return "goal_completion_review"
-        if "claims" in props:
-            return "task_completion_review"
-        if "accepted" in props:
-            return "completion_review"
-        if "claim_supported" in props:
-            return "analysis_verify"
-        return "unknown"
-
-    @staticmethod
-    def _find_host(messages):
-        import re
-
-        blob = str([m.get("content") if isinstance(m, dict) else "" for m in (messages or [])])
-        found = re.search(r"host:[A-Za-z0-9.\-_:]+", blob)
-        if found:
-            return found.group(0).rstrip(".,;:")
-        return "host:127.0.0.1:5000"
-
-    def _draft(self, node_id):
-        # Minimal model draft: purpose + steps only. Runtime identity is code-owned.
-        return {
-            "reason": "session hold plan",
-            "steps": [
-                {
-                    "step_id": "step-1",
-                    "objective": "hold",
-                    "agent_id": "recon-agent",
-                    "target_node_ids": [node_id],
-                    "principal_refs": [],
-                    "allowed_operations": ["recon.service_discovery"],
-                    "depends_on": [],
-                    "required_fact_refs": [],
-                    "unknowns": [],
-                    "completion_criteria": [
-                        {"kind": "evidence", "description": "hold", "min_evidence": 1}
-                    ],
-                    "required": True,
-                }
-            ],
-        }
-
-    @staticmethod
-    def _hold():
-        return {
-            "mode": "hold",
-            "reason": "no tools configured",
-            "actions": [],
-            "path": None,
-            "path_step_id": None,
-            "completion": {},
-            "evidence_request": {},
-            "hypothesis_update": {},
-        }
+    async def complete_native(self, messages, tools, system=None, **kwargs):  # noqa: ANN001, ANN003
+        self.calls.append({"turn": len(self.calls), "tool_calls": []})
+        return NativeCompletion(tool_calls=(), text="session hold: no further grounded action")
 
     async def complete_structured(self, *, messages, response_schema, system=None, **kwargs):
-        route = self._route_key(response_schema)
-        self.calls.append(route)
-        if route == "path_draft":
-            return self._draft(self._find_host(messages))
-        if route == "path_review":
-            return {"decision": "accept", "reason": "session hold", "path": None}
-        if route == "next_action":
-            return self._hold()
-        if route == "completion_review":
-            # Step review keeps the old accepted/reason shape (no claims).
-            return {"accepted": True, "reason": "session hold"}
-        if route == "task_completion_review":
-            # Task review needs claims; hold flow never completes so this stays unproven.
-            return {"accepted": False, "reason": "session hold", "claims": []}
-        if route == "goal_completion_review":
+        props = response_schema.get("properties", {})
+        if "criteria" in props:
             import json as _json2
 
             payload = _json2.loads(messages[0]["content"]) if messages else {}
@@ -217,7 +152,10 @@ class _HoldLLM:
                     for c in criteria
                 ],
             }
-        if route == "analysis_verify":
+        if "claims" in props:
+            # Task review needs claims; hold flow never completes so this stays unproven.
+            return {"accepted": False, "reason": "session hold", "claims": []}
+        if "claim_supported" in props:
             return {
                 "meaning": "hold",
                 "outcome": "success",
@@ -225,7 +163,9 @@ class _HoldLLM:
                 "confidence": 0.8,
                 "claim_supported": True,
             }
-        raise AssertionError(route)
+        raise AssertionError(
+            f"legacy strategy route is not part of the native loop: {sorted(props)}"
+        )
 
 
 def _patch(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, answers: list[str]) -> _FakeConsole:

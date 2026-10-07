@@ -1,9 +1,16 @@
-"""Agent loop contracts under the LLM-led engine (scripted model, no network).
+"""Agent loop contracts on the native model/tool loop (scripted model, no network).
 
 Only real security contracts live here; every turn is driven by an explicit
-scripted model through the production InvestigationEngine path. Nothing runs
-on a rule fallback: the model answers draft/review/action/verify calls and an
-unscripted route raises instead of returning an empty decision.
+scripted model through the production MODEL -> TOOLS -> SETTLE path. Nothing runs
+on a rule fallback: the model answers native tool calls and genuine completion
+reviews, and an unscripted route raises instead of returning an empty decision.
+
+The scripted models below speak the genuine product contract: complete_native
+with NativeCompletion/NativeToolCall payloads addressed to the exposed
+tool names (via exposed_tool_name), plus the preserved complete_structured
+reviews for verification, task settlement, and goal settlement. Strategy
+artifacts (path drafts/reviews, turn-action modes, step flags) are not scripted
+because they are no longer the execution contract.
 
 Kept execution contracts, each verified below with an explicit scripted model:
 - action budgets: test_execution_budget_stops_the_loop (BUDGET_EXHAUSTED, 2 actions kept).
@@ -12,7 +19,9 @@ Kept execution contracts, each verified below with an explicit scripted model:
 - consecutive failures: test_consecutive_failures_stop_hammering (CONSECUTIVE_FAILURES, 2 actions).
 - fan-out concurrency: test_bounded_fan_out_executes_concurrently (5 actions, 3-wide overlap).
 - per-target serialisation: test_per_target_concurrency_serializes_one_host (distinct
-  arguments on one host both run across turns, with at most one action in flight).
+  arguments on one host both run across sequential turns, with at most one action
+  in flight; a same-response same-target overflow is refused, so the script keeps
+  one call per turn here).
 - lease renewal: test_long_running_tool_renews_its_work_lease (no reclaim mid-flight, SUCCEEDED).
 - worker isolation: test_parallel_worker_failure_isolated (one FAILED, one SUCCEEDED).
 - stalls: test_stalled_no_progress_stops_the_loop (STALLED below budget).
@@ -21,6 +30,14 @@ Kept execution contracts, each verified below with an explicit scripted model:
 - approval/policy guards, goal preservation, no auto tasks, failure normalisation:
   the *_blocks_execution_and_closes_lease, *_suspends_with_partial_report,
   *goal_preserved*, *no_automatic_task_creation* and *gateway_exception* tests.
+  Goal settlement no longer goes through the strategy path store: the settled
+  task purpose and evidence-backed criteria carry the contract.
+
+Settlement helpers (runtime.complete_task / runtime.complete_goal /
+runtime.unresolved) are thin test-local adapters: every admission decision is
+delegated to the real product settlement owners (semantic_completion /
+settle_unresolved). Their tool ids match the runtime.* helper contract so the
+scripts stay valid when the product registers them.
 
 Retired auto-rule assertions only (model intents now decide; no execution contract lost):
 - old test_the_loop_probes_every_in_scope_host_exactly_once (rule auto-counts) -> retired;
@@ -35,6 +52,11 @@ Retired auto-rule assertions only (model intents now decide; no execution contra
 - old sqlite reopen variants beyond history, reconcile/idle polling, leftover-resource
   rendering -> retired as runner-scaffolding timing tests; lease ownership is pinned by
   test_policy_deny_blocks_execution_and_closes_lease and the lease-renewal test.
+Legacy strategy scripting retired with the loop migration (no contract lost):
+- path_draft / path_review / next_action modes / complete_step intents are gone;
+  the native model calls the exposed inventory tool directly and settles through
+  the runtime.* helpers. complete_structured stays only for the genuine reviews
+  (analysis_verify, task_completion_review, goal_completion_review).
 """
 
 from __future__ import annotations
@@ -59,14 +81,25 @@ from redteam.core.contracts.engagement import (
 )
 from redteam.core.contracts.events import EventType
 from redteam.core.contracts.tool import ToolInvocation, ToolResult
-from redteam.core.enums import AgentPhase, MissionStatus, PolicyVerdict
+from redteam.core.enums import AgentPhase, MissionStatus, PolicyVerdict, TaskStatus
 from redteam.core.ids import AgentId, EngagementId, RunId
 from redteam.core.ports.control_plane import ControlPlane
+from redteam.core.ports.llm import NativeCompletion, NativeToolCall
 from redteam.event_bus.memory import InMemoryEventBus
 from redteam.llm.fake import FakeLLMClient
 from redteam.orchestration.agents.registry import RECON_AGENT, AgentRegistry, default_registry
 from redteam.orchestration.context import RuntimeDeps
 from redteam.orchestration.events import REPORT_PROJECTED
+from redteam.orchestration.local_tools import LocalToolRegistry
+from redteam.orchestration.native_binding import exposed_tool_name
+from redteam.orchestration.native_local_tools import (
+    GOAL_SETTLE_TOOL_ID,
+    TASK_SETTLE_TOOL_ID,
+    goal_settle_descriptor,
+    goal_settle_handler,
+    task_settle_descriptor,
+    task_settle_handler,
+)
 from redteam.orchestration.paths import InMemoryPathStore
 from redteam.orchestration.runner import AgentLoopRunner
 from redteam.orchestration.seed import seed_from_engagement
@@ -78,53 +111,66 @@ from redteam.orchestration.work.models import WorkStatus
 from tests.fakes import DummyToolGateway, FakeControlPlane, FakeEvidenceStore
 from tests.integration import _engine_llm_harness as h
 
-NODE_ID = "host:a.local"
+
+def _native_tool_registry() -> LocalToolRegistry:
+    registry = LocalToolRegistry()
+    registry.register(task_settle_descriptor(), task_settle_handler)
+    registry.register(goal_settle_descriptor(), goal_settle_handler)
+    return registry
 
 
-class _LoopLLM:
-    """Dynamic scripted model for single-host recon.inventory runs."""
+def _exposed_names(tools: list[Any]) -> set[str]:
+    return {str(getattr(spec, "name", "")) for spec in tools}
 
-    def __init__(self, evidence: Any, *, finish: bool = True) -> None:
-        self._evidence = evidence
-        self._finish = finish
+
+def _remote_executed_evidence(messages: list[dict[str, Any]]) -> list[str]:
+    found: list[str] = []
+    for message in messages:
+        if message.get("role") != "tool" or not message.get("tool_call_id"):
+            continue
+        try:
+            body = json.loads(message.get("content") or "{}")
+        except ValueError:
+            continue
+        if not isinstance(body, dict) or body.get("ok") is not True:
+            continue
+        if body.get("executed") is not True:
+            continue
+        for identity in body.get("evidence_ids") or []:
+            text = str(identity)
+            if text and text not in found:
+                found.append(text)
+    return found
+
+
+def _tool_result(messages: list[dict[str, Any]], call_id: str) -> dict[str, Any] | None:
+    for message in messages:
+        if message.get("role") != "tool" or message.get("tool_call_id") != call_id:
+            continue
+        try:
+            body = json.loads(message.get("content") or "{}")
+        except ValueError:
+            return None
+        return body if isinstance(body, dict) else None
+    return None
+
+
+class _NativeScriptBase:
+    def __init__(self) -> None:
         self.calls: list[dict[str, Any]] = []
-        self._actions = 0
+        self.reviews: list[str] = []
+        self.turns = 0
 
     @staticmethod
     def _route_key(schema: dict[str, Any]) -> str:
         props = schema.get("properties", {})
-        if "steps" in props:
-            return "path_draft"
-        if "decision" in props:
-            return "path_review"
-        if "mode" in props:
-            return "next_action"
         if "criteria" in props:
             return "goal_completion_review"
         if "claims" in props:
             return "task_completion_review"
-        if "accepted" in props:
-            return "completion_review"
         if "claim_supported" in props:
             return "analysis_verify"
         return "unknown"
-
-    @staticmethod
-    def _payload(messages: list[dict[str, Any]]) -> dict[str, Any]:
-        return json.loads(messages[0]["content"])
-
-    @staticmethod
-    def _hold() -> dict[str, Any]:
-        return {
-            "mode": "hold",
-            "reason": "scripted hold",
-            "actions": [],
-            "path": None,
-            "path_step_id": None,
-            "completion": {},
-            "evidence_request": {},
-            "hypothesis_update": {},
-        }
 
     async def complete_structured(
         self,
@@ -135,33 +181,13 @@ class _LoopLLM:
         **_: Any,
     ) -> dict[str, Any]:
         route = self._route_key(response_schema)
-        self.calls.append({"route": route})
-        if route == "path_draft":
-            # Minimal model draft: purpose + steps only. Runtime identity is code-owned.
-            full = h.draft_path(NODE_ID)
-            return {
-                "reason": full.get("reason", "scripted draft"),
-                "steps": [
-                    {
-                        key: value
-                        for key, value in step.items()
-                        if key not in ("status", "outcome", "evidence_ids")
-                    }
-                    for step in full.get("steps", [])
-                ],
-            }
-        if route == "path_review":
-            return h.review_accept()
+        self.reviews.append(route)
         if route == "analysis_verify":
             return h.meaning("success", True)
-        if route == "completion_review":
-            # Step review keeps the old accepted/reason shape (no claims).
-            return {"accepted": True, "reason": "scripted semantic accept"}
         if route == "task_completion_review":
-            # Task review: accepted/reason/claims with actual evidence ids.
-            payload = self._payload(messages)
-            task_receipts = list(payload["verified_source_ids"])
-            assert task_receipts, "task review needs the verified executed call evidence"
+            payload = json.loads(messages[0]["content"])
+            receipts = list(payload["verified_source_ids"])
+            assert receipts, "task review needs the verified executed call evidence"
             return {
                 "accepted": True,
                 "reason": "scripted semantic accept",
@@ -169,15 +195,14 @@ class _LoopLLM:
                     {
                         "description": "inventory tool result observed",
                         "kind": "observation",
-                        "evidence_ids": list(task_receipts),
+                        "evidence_ids": list(receipts),
                         "target_node_ids": [],
                         "principal_refs": [],
                     }
                 ],
             }
         if route == "goal_completion_review":
-            # Goal review: every original criterion needs evidence + claims.
-            payload = self._payload(messages)
+            payload = json.loads(messages[0]["content"])
             criteria = payload["mission"]["success_criteria"]
             receipts = list(payload["verified_source_ids"])
             assert receipts, "goal review needs the verified executed call evidence"
@@ -186,7 +211,7 @@ class _LoopLLM:
                 "reason": "scripted goal accept",
                 "criteria": [
                     {
-                        "criterion": c,
+                        "criterion": item,
                         "met": True,
                         "evidence_ids": list(receipts),
                         "claims": [
@@ -199,47 +224,107 @@ class _LoopLLM:
                             }
                         ],
                     }
-                    for c in criteria
+                    for item in criteria
                 ],
             }
-        if route == "next_action":
-            self._actions += 1
-            if self._actions == 1:
-                return h.turn_actions(NODE_ID)
-            if not self._finish:
-                return self._hold()
-            payload = self._payload(messages)
-            run_id = payload["active_path"]["run_id"]
-            records = await self._evidence.list_for_run(run_id)
-            tool_evidence = [
-                str(r.evidence_id)
-                for r in records
-                if isinstance(getattr(r, "metadata", {}).get("tool_result"), dict)
-            ]
-            if self._actions == 2:
-                assert tool_evidence, "turn 2 needs the executed call evidence"
-                step_id = payload["active_path"]["steps"][0]["step_id"]
-                return {**h.turn_complete_step(tool_evidence), "path_step_id": step_id}
-            if self._actions == 3:
-                # Close the single required task before settling the mission.
-                # Empty completion falls back to the completed step evidence.
-                return {
-                    "mode": "complete_task",
-                    "reason": "task evidence ready",
-                    "actions": [],
-                    "path": None,
-                    "path_step_id": None,
-                    "completion": {},
-                    "evidence_request": {},
-                    "hypothesis_update": {},
-                }
-            return h.turn_complete_goal()
-        raise AssertionError(f"no scripted answer for route {route!r}")
+        raise AssertionError(f"legacy strategy route is not part of the native loop: {route!r}")
 
     async def complete(
         self, *, messages: list[dict[str, Any]], system: str | None = None, **_: Any
     ) -> str:
         return ""
+
+
+class _LoopNativeLLM(_NativeScriptBase):
+    """Single-host native script: one inventory call, then settlement or hold."""
+
+    def __init__(
+        self,
+        *,
+        settle: bool,
+        first_arguments: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__()
+        self._settle = settle
+        self._first_arguments = dict(first_arguments) if first_arguments else {}
+        self._task_call: str | None = None
+        self._goal_call: str | None = None
+
+    @staticmethod
+    def _wanted(tools: list[Any]) -> tuple[str, str, str]:
+        names = _exposed_names(tools)
+        inventory = exposed_tool_name(h.INVENTORY_TOOL)
+        task_settle = exposed_tool_name(TASK_SETTLE_TOOL_ID)
+        goal_settle = exposed_tool_name(GOAL_SETTLE_TOOL_ID)
+        assert inventory in names, "native model needs the registered inventory tool"
+        assert task_settle in names, "native model needs the task settlement helper"
+        assert goal_settle in names, "native model needs the goal settlement helper"
+        return inventory, task_settle, goal_settle
+
+    def _record(self, names: list[str]) -> None:
+        self.calls.append({"turn": self.turns, "tool_calls": list(names)})
+
+    async def complete_native(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[Any],
+        system: str | None = None,
+        **_: Any,
+    ) -> NativeCompletion:
+        inventory, task_tool, goal_tool = self._wanted(tools)
+        self.turns += 1
+        evidenced = _remote_executed_evidence(messages)
+        if self.turns == 1:
+            self._record([inventory])
+            return NativeCompletion(
+                tool_calls=(
+                    NativeToolCall(
+                        call_id="call-1", name=inventory, arguments=dict(self._first_arguments)
+                    ),
+                ),
+                text="",
+            )
+        if not self._settle:
+            return NativeCompletion(tool_calls=(), text="")
+        if self._task_call is None:
+            assert evidenced, "task settlement needs the executed call evidence"
+            self._task_call = "call-task"
+            self._record([task_tool])
+            return NativeCompletion(
+                tool_calls=(
+                    NativeToolCall(
+                        call_id=self._task_call,
+                        name=task_tool,
+                        arguments={
+                            "outcome": "success",
+                            "reason": "task evidence ready",
+                            "evidence_ids": evidenced,
+                        },
+                    ),
+                ),
+                text="",
+            )
+        seen = _tool_result(messages, self._task_call)
+        if seen is None or seen.get("ok") is not True:
+            return NativeCompletion(tool_calls=(), text="")
+        if self._goal_call is None:
+            self._goal_call = "call-goal"
+            self._record([goal_tool])
+            return NativeCompletion(
+                tool_calls=(
+                    NativeToolCall(
+                        call_id=self._goal_call,
+                        name=goal_tool,
+                        arguments={
+                            "outcome": "success",
+                            "reason": "goal evidence ready",
+                            "evidence_ids": evidenced,
+                        },
+                    ),
+                ),
+                text="",
+            )
+        return NativeCompletion(tool_calls=(), text="")
 
 
 class OneShotExplodingGateway(DummyToolGateway):
@@ -272,12 +357,12 @@ def _loop_deps(
     engagement: Engagement,
     *,
     control: ControlPlane | None = None,
-    finish: bool = True,
+    settle: bool = True,
     gateway: DummyToolGateway | None = None,
     settings: OrchestrationSettings | None = None,
 ) -> RuntimeDeps:
     evidence = FakeEvidenceStore()
-    llm = _LoopLLM(evidence, finish=finish)
+    llm = _LoopNativeLLM(settle=settle)
     gw = gateway if gateway is not None else DummyToolGateway(tools=[h.inventory_descriptor()])
     deps = RuntimeDeps(
         control_plane=control or FakeControlPlane(),
@@ -289,6 +374,7 @@ def _loop_deps(
         engagement=engagement,
         agents=default_registry(),
         tool_catalog=gw,
+        local_tools=_native_tool_registry(),
         work_store=InMemoryWorkStore(),
         task_graph_store=InMemoryTaskGraphStore(),
         path_store=InMemoryPathStore(),
@@ -315,13 +401,15 @@ async def test_llm_single_probe_executes_original_behavior() -> None:
     gateway = deps.tool_gateway
     assert isinstance(gateway, DummyToolGateway)
     llm = deps.llm_client
-    assert isinstance(llm, _LoopLLM)
+    assert isinstance(llm, _LoopNativeLLM)
     final = await run_engagement(engagement, deps)
     assert final.actions_executed == 1
     assert [str(inv.tool_id) for inv in gateway.invocations] == [h.INVENTORY_TOOL]
     evidence = await deps.evidence_store.list_for_run(final.run_id)
     assert len([r for r in evidence if isinstance(r.metadata.get("tool_result"), dict)]) == 1
-    assert {"path_draft", "path_review", "next_action"} <= {c["route"] for c in llm.calls}
+    assert final.termination_reason == TerminationReason.GOAL_ACHIEVED
+    assert llm.calls and llm.calls[0]["tool_calls"] == [exposed_tool_name(h.INVENTORY_TOOL)]
+    assert {"task_completion_review", "goal_completion_review"} <= set(llm.reviews)
 
 
 async def test_goal_preserved_in_accepted_path() -> None:
@@ -337,8 +425,10 @@ async def test_goal_preserved_in_accepted_path() -> None:
     assert final.mission_id is not None
     mission = await deps.task_graph_store.get_mission(final.mission_id)
     assert mission is not None and mission.status is MissionStatus.COMPLETED
-    path = await deps.path_store.get_active(str(final.run_id))
-    assert path is not None and path.goal == mission.objective
+    tasks = await deps.task_graph_store.list_tasks(mission_id=final.mission_id)
+    settled = [task for task in tasks if task.status is TaskStatus.COMPLETED]
+    assert settled, "goal settlement keeps its completed task"
+    assert all(task.objective == mission.objective for task in settled)
     assert final.termination_reason == TerminationReason.GOAL_ACHIEVED
     # Thin regression: the executed tool call backs the mission purpose.
     # The gateway really ran inventory, and the settled criteria cite only
@@ -379,7 +469,7 @@ async def test_policy_deny_blocks_execution_and_closes_lease() -> None:
     deps = _loop_deps(
         engagement,
         control=FakeControlPlane(default_verdict=PolicyVerdict.DENY),
-        finish=False,
+        settle=False,
     )
     gateway = deps.tool_gateway
     assert isinstance(gateway, DummyToolGateway)
@@ -402,7 +492,7 @@ async def test_approval_pending_suspends_with_partial_report() -> None:
     deps = _loop_deps(
         engagement,
         control=FakeControlPlane(default_verdict=PolicyVerdict.REQUIRE_APPROVAL),
-        finish=False,
+        settle=False,
     )
     gateway = deps.tool_gateway
     assert isinstance(gateway, DummyToolGateway)
@@ -421,7 +511,7 @@ async def test_approval_pending_suspends_with_partial_report() -> None:
 async def test_gateway_exception_normalized_and_closes_work() -> None:
     engagement = _engagement()
     evidence = FakeEvidenceStore()
-    llm = _LoopLLM(evidence, finish=False)
+    llm = _LoopNativeLLM(settle=False)
     gateway = OneShotExplodingGateway()
     deps = RuntimeDeps(
         control_plane=FakeControlPlane(),
@@ -433,6 +523,7 @@ async def test_gateway_exception_normalized_and_closes_work() -> None:
         engagement=engagement,
         agents=default_registry(),
         tool_catalog=gateway,
+        local_tools=_native_tool_registry(),
         work_store=InMemoryWorkStore(),
         task_graph_store=InMemoryTaskGraphStore(),
         path_store=InMemoryPathStore(),
@@ -478,121 +569,76 @@ class LeaseAwareSlowGateway(DummyToolGateway):
         return await super().invoke(invocation)
 
 
-class BlockingGateway:
-    def __init__(self) -> None:
-        self.started = asyncio.Event()
-
-    async def invoke(self, invocation: ToolInvocation) -> ToolResult:
-        self.started.set()
-        await asyncio.Event().wait()
-        raise AssertionError("unreachable")
-
-
-class _BatchLLM:
-    """Scripted model returning a fixed per-turn host plan, then hold."""
+class _BatchNativeLLM(_NativeScriptBase):
+    """Scripted model returning a fixed per-turn host batch, then a tail."""
 
     def __init__(
         self,
-        evidence: FakeEvidenceStore,
         action_plan: list[list[str]],
         *,
         vary_arguments: bool = False,
-        agent_id: str = "recon-agent",
+        tail: str = "text",
+        tail_reason: str = "scripted hold: no further grounded action",
     ) -> None:
-        self._evidence = evidence
+        super().__init__()
         self._plan = action_plan
         self._vary_arguments = vary_arguments
-        self._agent_id = agent_id
+        self._tail = tail
+        self._tail_reason = tail_reason
         self._seq = 0
-        self._steps: dict[str, str] = {}
-        for turn in action_plan:
-            for host in turn:
-                node = f"host:{host}"
-                if node not in self._steps:
-                    self._steps[node] = f"step-{len(self._steps) + 1}"
-        self.calls: list[dict[str, Any]] = []
-        self._turns = 0
+        self._hold_call: str | None = None
 
-    def _draft(self) -> dict[str, Any]:
-        # Minimal model draft: purpose + steps only. Runtime identity is code-owned.
-        steps: list[dict[str, Any]] = [
-            {
-                    "step_id": step_id,
-                    "objective": f"probe {node}",
-                    "agent_id": self._agent_id,
-                "target_node_ids": [node],
-                "principal_refs": [],
-                "allowed_operations": [h.CANONICAL_OP],
-                "depends_on": [],
-                "required_fact_refs": [],
-                "unknowns": [],
-                "completion_criteria": [
-                    {"kind": "evidence", "description": "probe recorded", "min_evidence": 1}
-                ],
-                "required": True,
-            }
-            for node, step_id in self._steps.items()
-        ]
-        return {"reason": "scripted batch draft", "steps": steps}
-
-    def _single(self, node: str) -> dict[str, Any]:
-        attempt = self._seq
-        self._seq += 1
-        return {
-            "path_step_id": self._steps[node],
-            "agent_id": self._agent_id,
-            "target_node_id": node,
-            "principal_ref": None,
-            "capability": "recon",
-            "operation": "service_discovery",
-            "tool_id": h.INVENTORY_TOOL,
-            "arguments": {"attempt": attempt} if self._vary_arguments else {},
-            "reason": f"inventory {node}",
-            "expected_observation": "the inventory tool returns a result",
-            "hypothesis": None,
-            "existing_hypothesis_id": None,
-            "expectation": None,
-            "authentication_check": None,
-            "availability_impact": False,
-        }
-
-    async def complete_structured(
+    async def complete_native(
         self,
-        *,
         messages: list[dict[str, Any]],
-        response_schema: dict[str, Any],
+        tools: list[Any],
         system: str | None = None,
         **_: Any,
-    ) -> dict[str, Any]:
-        route = _LoopLLM._route_key(response_schema)
-        self.calls.append({"route": route})
-        if route == "path_draft":
-            return self._draft()
-        if route == "path_review":
-            return h.review_accept()
-        if route == "analysis_verify":
-            return h.meaning("success", True)
-        if route == "next_action":
-            if self._turns < len(self._plan):
-                hosts = self._plan[self._turns]
-                self._turns += 1
-                return {
-                    "mode": "actions",
-                    "reason": "scripted batch",
-                    "actions": [self._single(f"host:{host}") for host in hosts],
-                    "path": None,
-                    "path_step_id": None,
-                    "completion": {},
-                    "evidence_request": {},
-                    "hypothesis_update": {},
-                }
-            return _LoopLLM._hold()
-        raise AssertionError(f"no scripted answer for route {route!r}")
+    ) -> NativeCompletion:
+        names = _exposed_names(tools)
+        inventory = exposed_tool_name(h.INVENTORY_TOOL)
+        task_settle = exposed_tool_name(TASK_SETTLE_TOOL_ID)
+        assert inventory in names, "native model needs the registered inventory tool"
+        if self._tail == "task_unresolved":
+            assert task_settle in names, "native model needs the task settlement helper"
+        self.turns += 1
+        if self.turns <= len(self._plan):
+            batch_calls: list[NativeToolCall] = []
+            for index, host in enumerate(self._plan[self.turns - 1]):
+                arguments: dict[str, Any] = {"host": host}
+                if self._vary_arguments:
+                    arguments["attempt"] = self._seq
+                    self._seq += 1
+                batch_calls.append(
+                    NativeToolCall(
+                        call_id=f"call-{self.turns}-{index}",
+                        name=inventory,
+                        arguments=arguments,
+                    )
+                )
+            self.calls.append({"turn": self.turns, "tool_calls": [inventory] * len(batch_calls)})
+            return NativeCompletion(tool_calls=tuple(batch_calls), text="")
+        if self._tail == "task_unresolved":
+            evidenced = _remote_executed_evidence(messages)
+            if self._hold_call is None and evidenced:
+                self._hold_call = "call-hold"
+                self.calls.append({"turn": self.turns, "tool_calls": [task_settle]})
+                return NativeCompletion(
+                    tool_calls=(
+                        NativeToolCall(
+                            call_id=self._hold_call,
+                            name=task_settle,
+                            arguments={
+                                "outcome": "inconclusive",
+                                "reason": self._tail_reason,
+                                "evidence_ids": evidenced,
+                            },
+                        ),
+                    ),
+                    text="",
+                )
+        return NativeCompletion(tool_calls=(), text="")
 
-    async def complete(
-        self, *, messages: list[dict[str, Any]], system: str | None = None, **_: Any
-    ) -> str:
-        return ""
 
 
 def _batch_deps(
@@ -604,10 +650,13 @@ def _batch_deps(
     settings: OrchestrationSettings | None = None,
     vary_arguments: bool = False,
     agents: AgentRegistry | None = None,
-    agent_id: str = "recon-agent",
+    tail: str = "text",
+    tail_reason: str = "scripted hold: no further grounded action",
 ) -> RuntimeDeps:
     evidence = FakeEvidenceStore()
-    llm = _BatchLLM(evidence, action_plan, vary_arguments=vary_arguments, agent_id=agent_id)
+    llm = _BatchNativeLLM(
+        action_plan, vary_arguments=vary_arguments, tail=tail, tail_reason=tail_reason
+    )
     gw = gateway if gateway is not None else DummyToolGateway(tools=[h.inventory_descriptor()])
     return RuntimeDeps(
         control_plane=control or FakeControlPlane(),
@@ -619,6 +668,7 @@ def _batch_deps(
         engagement=engagement,
         agents=agents or default_registry(),
         tool_catalog=h.FakeCatalog([h.inventory_descriptor()]),
+        local_tools=_native_tool_registry(),
         work_store=InMemoryWorkStore(),
         task_graph_store=InMemoryTaskGraphStore(),
         path_store=InMemoryPathStore(),
@@ -687,14 +737,15 @@ async def test_bounded_fan_out_executes_concurrently() -> None:
 
 
 async def test_per_target_concurrency_serializes_one_host() -> None:
-    # Two distinct behaviors on one host (different grounded args): at most one
-    # is admitted per turn and the host never has two actions in flight, while
-    # both still run across turns (global room allows two, the target gate does not).
+    # Two distinct behaviors on one host (different grounded args) run across
+    # sequential turns and the host never has two actions in flight (global room
+    # allows two, the target gate does not). The native loop refuses a
+    # same-response same-target overflow, so the script keeps one call per turn.
     engagement = _engagement("a.local")
     gateway = ConcurrencyTrackingGateway()
     deps = _batch_deps(
         engagement,
-        [["a.local", "a.local"], ["a.local"]],
+        [["a.local"], ["a.local"]],
         gateway=gateway,
         settings=OrchestrationSettings(
             max_steps=10,
@@ -716,8 +767,9 @@ async def test_long_running_tool_renews_its_work_lease() -> None:
     deps = _loop_deps(
         engagement,
         gateway=gateway,
-        # This direct runner has no mission/task to complete; hold after execution.
-        finish=False,
+        # This direct runner has no mission/task to settle; the script holds with
+        # text after the slow call lands and the loop ends on its own limits.
+        settle=False,
         settings=OrchestrationSettings(checkpointing=False, lease_ttl_seconds=0.06),
     )
     await seed_from_engagement(AttackGraphService(deps.graph_store), engagement)
@@ -848,7 +900,11 @@ async def test_capped_agent_budget_refuses_further_approval() -> None:
         engagement,
         [[host] for host in hosts],
         agents=AgentRegistry([capped]),
-        agent_id="capped-agent",
+        tail="task_unresolved",
+        tail_reason=(
+            "capped-agent allowance exhausted after one execution; "
+            "remaining hosts unprobed"
+        ),
         settings=OrchestrationSettings(max_steps=10, checkpointing=False),
     )
     final = await run_engagement(engagement, deps)

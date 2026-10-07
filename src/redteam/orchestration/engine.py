@@ -484,6 +484,20 @@ class InvestigationEngine:
             self.deps.settings.decision_max_attempts,
         )
 
+    def begin_native_turn(self, runtime) -> DecisionBudget:
+        """Bind a direct model request to the existing reasoning owner."""
+        self._event_runtime = runtime
+        self.updated_runtime = runtime
+        return self._decision_budget()
+
+    async def guard_reasoning(self):
+        """Public execution-context guard for registered native helpers."""
+        await self._ensure_reasoning_allowed()
+
+    async def execution_material(self, runtime):
+        """Current target/reference authority, without a strategy plan."""
+        return await _collect_check_assessment(self.deps, runtime)
+
     async def execute_local_calls(self, calls, *, runtime, path, budget, delegation=None):
         """Generic local dispatch; providers own graph/domain interpretation."""
         from dataclasses import asdict
@@ -503,13 +517,16 @@ class InvestigationEngine:
                 purpose=(
                     delegation.objective
                     if delegation
-                    else str(runtime.current_goal or path.goal)
+                    else str(runtime.current_goal or getattr(path, "goal", ""))
                 ),
                 budget=budget, before_call=before_call,
+                last_event_id=self.last_event_id,
             )
             before = (budget.used, budget.tokens_used, budget.unknown_usage_count)
             try:
                 result = await self.deps.local_tools.call(call.tool_id, call.arguments, context)
+                if result.last_event_id is not None:
+                    self.last_event_id = result.last_event_id
                 response = asdict(result)
             except (ValueError, TypeError, DecisionFailure) as exc:
                 response = {
@@ -526,7 +543,8 @@ class InvestigationEngine:
                 "record_kind": "runtime_tool_result", "tool_id": call.tool_id,
                 "delegation_id": delegation.delegation_id if delegation else None,
                 "mission_id": str(runtime.mission_id) if runtime.mission_id else None,
-                "path_id": path.path_id, "path_version": path.version,
+                "path_id": getattr(path, "path_id", None),
+                "path_version": getattr(path, "version", None),
                 "result": response,
             })
             identity = new_id("evidence")
@@ -767,9 +785,11 @@ class InvestigationEngine:
         payload = {
             "record_kind": "completion_review",
             "stage": stage,
-            "path_id": path.path_id,
-            "path_version": path.version,
+            "path_id": getattr(path, "path_id", None),
+            "path_version": getattr(path, "version", None),
             "path_step_id": step_id,
+            "mission_id": str(runtime.mission_id) if runtime.mission_id else None,
+            "mission_task_id": str(runtime.active_task_id) if runtime.active_task_id else None,
             "model_judgment": review,
             "source_evidence_ids": list(evidence_ids),
             "code_admission": "separate_completion_gate",
@@ -1369,6 +1389,9 @@ class InvestigationEngine:
         return await coordinator.change(capture)
 
     async def _check_review_path(self, runtime, path):
+        if path is None:
+            await self._review_token(runtime)
+            return
         current = await self.deps.path_store.get_active(str(runtime.run_id))
         if current is None or content_hash(current) != content_hash(path):
             raise StateConflict("completion_path_snapshot_changed")
@@ -2487,7 +2510,10 @@ class InvestigationEngine:
             for original in originals:
                 try:
                     previous = PlanStep.model_validate(original.metadata.get("plan_step"))
-                    target_id = node_id_for_target(previous.resolved_target())
+                    previous_target = previous.resolved_target()
+                    if previous_target is None:
+                        return True
+                    target_id = node_id_for_target(previous_target)
                 except (ValueError, TypeError):
                     return True
                 raw = raw_from_metadata(original.metadata)
@@ -2590,6 +2616,7 @@ class InvestigationEngine:
             plan_step=step,
             tool_result=result,
             current_work_id=work.work_id,
+            last_event_id=self.last_event_id,
         )
         async def requester_guard():
             await self._ensure_reasoning_allowed()
@@ -2601,7 +2628,8 @@ class InvestigationEngine:
         reviewed = await verify_node(
             replay, deps=self.deps, budget=budget, requester_guard=requester_guard
         )
-        await update_node(reviewed, deps=self.deps)
+        updated = await update_node(reviewed, deps=self.deps)
+        self.last_event_id = updated.get("last_event_id", self.last_event_id)
         reviewed_runtime = reviewed.get("runtime")
         if reviewed_runtime is not None:
             # Verification accounts its real requests on the returned state.
@@ -2978,6 +3006,33 @@ async def claim_action_admission(deps, runtime, step, proposal) -> None:
         epoch = str(generation) if generation else None
         if epoch != step.operator_intent_id:
             raise StateConflict("operator_generation_changed")
+        if getattr(step, "execution_origin_version", 0) == 1:
+            from redteam.orchestration.semantic_completion import purpose_hash
+
+            task = (
+                await change.tasks.get_task(runtime.active_task_id)
+                if runtime.active_task_id
+                else None
+            )
+            if (
+                task is None
+                or task.mission_id != runtime.mission_id
+                or task.status is not TaskStatus.RUNNING
+                or str(task.task_id) != step.mission_task_id
+                or purpose_hash(task.objective) != step.task_purpose_hash
+                or not step.model_tool_call_id
+            ):
+                raise StateConflict("native_call_task_changed")
+            change.records[("admission", str(proposal.action_id))] = {
+                "run_id": str(runtime.run_id),
+                "mission_id": str(runtime.mission_id),
+                "mission_task_id": str(task.task_id),
+                "task_purpose_hash": step.task_purpose_hash,
+                "model_tool_call_id": step.model_tool_call_id,
+                "execution_origin_version": 1,
+                "generation": generation,
+            }
+            return
         path = await change.paths.get_active(str(runtime.run_id))
         if path is None or path.path_id != step.path_id or path.version != step.path_version:
             raise StateConflict("action_path_changed")
@@ -3024,9 +3079,11 @@ async def operator_exclusions(
         return ["operator mission is missing"]
     preferences = mission.operator_preferences or {}
     problems = []
-    if endpoint_excluded(target_node_id, preferences.get("excluded_endpoints") or []):
+    if target_node_id is not None and endpoint_excluded(
+        target_node_id, preferences.get("excluded_endpoints") or []
+    ):
         problems.append("operator_excluded_endpoint")
-    node = await deps.graph_store.get_node(target_node_id)
+    node = await deps.graph_store.get_node(target_node_id) if target_node_id is not None else None
     arguments = arguments or {}
     if node is not None:
         target = target_for_node(
@@ -3085,7 +3142,10 @@ async def validate_current_action(deps, runtime, step, proposal=None) -> list[st
     """Used at policy admission AND immediately before an actual invocation."""
     from redteam.attack_graph.service import AttackGraphService
 
-    if step is None or not step.path_id or step.path_version is None or not step.path_step_id:
+    native = step is not None and getattr(step, "execution_origin_version", 0) == 1
+    if step is None or (
+        not native and (not step.path_id or step.path_version is None or not step.path_step_id)
+    ):
         return ["action needs an accepted investigation path"]
     if runtime.mission_id:
         try:
@@ -3094,12 +3154,39 @@ async def validate_current_action(deps, runtime, step, proposal=None) -> list[st
             ).review_token(str(runtime.run_id), str(runtime.mission_id))
         except (ValueError, PathError):
             return ["operator mutation or inactive mission blocks action admission"]
-    path = await deps.path_store.get_active(str(runtime.run_id))
-    if path is None or path.path_id != step.path_id or path.version != step.path_version:
-        return ["action belongs to a stale path version"]
-    current = next((item for item in path.steps if item.step_id == step.path_step_id), None)
-    if current is None:
-        return ["accepted path step is missing"]
+    path = None
+    if native:
+        from redteam.orchestration.semantic_completion import purpose_hash
+
+        task = (
+            await deps.task_graph_store.get_task(runtime.active_task_id)
+            if runtime.active_task_id
+            else None
+        )
+        if runtime.mission_id is None:
+            if (step.mission_task_id is not None
+                or purpose_hash(str(runtime.current_goal or "")) != step.task_purpose_hash
+                or not step.model_tool_call_id):
+                return ["native call no longer belongs to the current goal purpose"]
+            current = None
+        elif (
+            task is None
+            or task.mission_id != runtime.mission_id
+            or task.status is not TaskStatus.RUNNING
+            or str(task.task_id) != step.mission_task_id
+            or purpose_hash(task.objective) != step.task_purpose_hash
+            or not step.model_tool_call_id
+        ):
+            return ["native call no longer belongs to the current task purpose"]
+        else:
+            current = task
+    else:
+        path = await deps.path_store.get_active(str(runtime.run_id))
+        if path is None or path.path_id != step.path_id or path.version != step.path_version:
+            return ["action belongs to a stale path version"]
+        current = next((item for item in path.steps if item.step_id == step.path_step_id), None)
+        if current is None:
+            return ["accepted path step is missing"]
     # Execution admission re-collects fresh internal material every time; the
     # plan-time read is never reused here.
     assessment = await _collect_check_assessment(
@@ -3108,12 +3195,14 @@ async def validate_current_action(deps, runtime, step, proposal=None) -> list[st
     blocked = assessment_blocked(assessment)
     if blocked is not None:
         return [blocked]
-    problems = check_ready_step(path, current, assessment)
+    problems = [] if native else check_ready_step(path, current, assessment)
+    target = step.resolved_target()
+    target_node_id = node_id_for_target(target) if target is not None else None
     if step.delegation_id:
         from redteam.orchestration.reasoning_time import reasoning_time_allowed
 
         delegation = runtime.delegations.get(step.delegation_id)
-        if delegation is None or (
+        if path is None or delegation is None or (
             delegation.path_id != path.path_id
             or delegation.path_version != path.version
             or delegation.path_step_id != step.path_step_id
@@ -3135,13 +3224,22 @@ async def validate_current_action(deps, runtime, step, proposal=None) -> list[st
         await operator_exclusions(
             deps,
             runtime,
-            node_id_for_target(step.resolved_target()),
+            target_node_id,
             step.operation_key,
             arguments=step.arguments,
-            assessment_text=current.objective,
+            assessment_text=(
+                current.objective if current is not None else (runtime.current_goal or "")
+            ),
         )
     )
-    if str(node_id_for_target(step.resolved_target())) not in known_target_ids(assessment):
+    from redteam.orchestration.native_binding import native_address_known
+
+    target_known = target is None or (
+        native_address_known(target, assessment)
+        if native
+        else str(target_node_id) in known_target_ids(assessment)
+    )
+    if not target_known:
         problems.append("action target is not supplied or observed")
     if await operator_epoch(deps, runtime) != step.operator_intent_id:
         problems.append("operator instruction changed since action planning")
@@ -3151,7 +3249,7 @@ async def validate_current_action(deps, runtime, step, proposal=None) -> list[st
             or proposal.engagement_id != runtime.engagement_id
             or proposal.capability != step.capability
             or proposal.operation != step.operation
-            or proposal.target != step.resolved_target()
+            or proposal.target != target
             or proposal.arguments != step.arguments
             or proposal.availability_impact != step.availability_impact
             or proposal.binding_mode != step.binding_mode
@@ -3161,20 +3259,21 @@ async def validate_current_action(deps, runtime, step, proposal=None) -> list[st
     try:
         catalog = deps.tool_catalog
         tool = catalog.get(step.tool_id) if catalog else None
-        validate_argument_target(
-            step.resolved_target(),
-            step.arguments,
-            target_aliases(deps, step.resolved_target()),
-            operation=step.operation,
-            asset_bindings=asset_argument_bindings(deps, step.resolved_target()),
-            operation_bindings=deps.operation_bindings,
-            argument_bindings=tool.argument_bindings if tool else None,
-            target_binding=(
-                tool.target_binding
-                if tool and step.binding_mode == "selected_tool"
-                else None
-            ),
-        )
+        if target is not None:
+            validate_argument_target(
+                target,
+                step.arguments,
+                target_aliases(deps, target),
+                operation=step.operation,
+                asset_bindings=asset_argument_bindings(deps, target),
+                operation_bindings=deps.operation_bindings,
+                argument_bindings=tool.argument_bindings if tool else None,
+                target_binding=(
+                    tool.target_binding
+                    if tool and step.binding_mode == "selected_tool"
+                    else None
+                ),
+            )
         validate_principal_arguments(current, step.principal_ref, step.arguments, assessment)
         if (
             tool is None
@@ -3186,7 +3285,9 @@ async def validate_current_action(deps, runtime, step, proposal=None) -> list[st
             )
         ):
             problems.append(_rejection_feedback("no_tool_for_operation", "operation"))
-        elif tool.target_types and step.resolved_target().kind not in tool.target_types:
+        elif target is None and (not native or tool.requires_target):
+            problems.append(_rejection_feedback("unresolved_target", "arguments"))
+        elif target is not None and tool.target_types and target.kind not in tool.target_types:
             problems.append(_rejection_feedback("target_type_mismatch", "arguments"))
         else:
             schema_error = CandidateCompiler._schema_rejection(step.arguments, tool.input_schema)
@@ -3208,7 +3309,7 @@ async def validate_current_action(deps, runtime, step, proposal=None) -> list[st
             eligible = await deps.eligibility.action(
                 agent,
                 tool,
-                node_id_for_target(step.resolved_target()),
+                target_node_id,
                 EligibilityContext(AttackGraphService(deps.graph_store), catalog),
             )
             if not eligible.eligible:

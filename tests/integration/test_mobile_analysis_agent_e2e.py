@@ -1,9 +1,10 @@
-"""Autonomous mobile-analysis path through Control, Gateway, Evidence and Graph."""
+"""Autonomous mobile-analysis path through Control, Gateway, Evidence and Graph (native)."""
 
 from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timezone
+from typing import Any
 
 from redteam.app.bootstrap import run_engagement
 from redteam.attack_graph.predicates import facts_of
@@ -28,18 +29,19 @@ from redteam.core.enums import (
     ToolHealthStatus,
 )
 from redteam.core.ids import EngagementId, ToolId
+from redteam.core.ports.llm import NativeCompletion, NativeToolCall
 from redteam.orchestration.agents import (
     ANALYSIS_AGENT,
     AgentRegistry,
     builtin_agent_definitions,
 )
 from redteam.orchestration.candidates.compiler import CandidateCompiler
+from redteam.orchestration.native_binding import exposed_tool_name
 from redteam.orchestration.runner import AgentLoopRunner
 from redteam.orchestration.settings import OrchestrationSettings
 from redteam.orchestration.state import TerminationReason
 from redteam.orchestration.work.models import WorkStatus
 from tests.fakes import build_test_application
-from tests.integration._engine_llm_harness import ScriptedLLM, review_accept
 
 MANIFEST = """<manifest xmlns:android="http://schemas.android.com/apk/res/android"
   package="com.android.insecurebankv2">
@@ -54,99 +56,71 @@ PATH_STEP_ID = "analyze-apk"
 PROJECT_DIR = "/work/output/InsecureBankv2"
 
 
-def _draft_path() -> dict:
-    return {
-        "path_id": "path-mobile-analysis",
-        "run_id": "run-scripted",
-        "mission_id": None,
-        "version": 1,
-        "parent_version": None,
-        "status": "draft",
-        "reason": "scripted mobile analysis path",
-        "goal": "analyze the authorized APK",
-        "steps": [
-            {
-                "step_id": PATH_STEP_ID,
-                "objective": "decode and inspect the authorized APK",
-                "agent_id": "analysis-agent",
-                "target_node_ids": [ASSET_NODE_ID],
-                "principal_refs": [],
-                "allowed_operations": ["analysis.static_analysis"],
-                "depends_on": [],
-                "required_fact_refs": [],
-                "unknowns": [],
-                "completion_criteria": [
-                    {
-                        "kind": "evidence",
-                        "description": "APK analysis evidence recorded",
-                        "min_evidence": 1,
-                    }
-                ],
-                "required": True,
-                "status": "pending",
-                "outcome": None,
-                "evidence_ids": [],
+def _native_call(call_id: str, tool_id: str, arguments: dict | None = None) -> NativeToolCall:
+    return NativeToolCall(
+        call_id=call_id,
+        name=exposed_tool_name(tool_id),
+        arguments=dict(arguments or {}),
+    )
+
+
+class ScriptedNativeLLM:
+    """Answer each native model turn from a queue, in order."""
+
+    def __init__(self, native_responses: list[NativeCompletion]) -> None:
+        self._native = list(native_responses)
+        self.native_turns: list[dict[str, Any]] = []
+        self.calls: list[dict[str, Any]] = []
+
+    async def complete_native(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[Any],
+        system: str | None = None,
+        **_: Any,
+    ) -> NativeCompletion:
+        self.native_turns.append({"messages": messages, "tools": tools})
+        self.calls.append({"route": "complete_native"})
+        if self._native:
+            return self._native.pop(0)
+        return NativeCompletion(
+            tool_calls=(), text="holding for review: no further grounded action"
+        )
+
+    async def complete(
+        self, *, messages: list[dict[str, Any]], system: str | None = None, **_: Any
+    ) -> str:
+        return ""
+
+    async def complete_structured(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        response_schema: dict[str, Any],
+        system: str | None = None,
+        **_: Any,
+    ) -> dict[str, Any]:
+        props = response_schema.get("properties", {}) if isinstance(response_schema, dict) else {}
+        if "claim_supported" in props:
+            return {
+                "meaning": "scripted",
+                "outcome": "success",
+                "reason": "scripted meaning",
+                "confidence": 0.8,
+                "claim_supported": True,
             }
-        ],
-        "hypothesis_ids": [],
-        "evidence_ids": [],
-        "changed_step_ids": [],
-        "review_records": {},
-    }
+        raise AssertionError("no scripted answer for structured route")
 
 
-def _turn_action(tool_id: str, arguments: dict | None = None) -> dict:
-    return {
-        "mode": "actions",
-        "reason": f"scripted {tool_id} action",
-        "actions": [
-            {
-                "path_step_id": PATH_STEP_ID,
-                "agent_id": "analysis-agent",
-                "target_node_id": ASSET_NODE_ID,
-                "principal_ref": None,
-                "capability": "analysis",
-                "operation": "static_analysis",
-                "tool_id": tool_id,
-                "arguments": arguments or {},
-                "reason": f"run {tool_id} on the authorized APK",
-                "expected_observation": "bounded static analysis output",
-                "hypothesis": None,
-                "existing_hypothesis_id": None,
-                "expectation": None,
-                "authentication_check": None,
-                "availability_impact": False,
-            }
-        ],
-        "path": None,
-        "path_step_id": None,
-        "completion": {},
-        "evidence_request": {},
-        "hypothesis_update": {},
-    }
-
-
-def _turn_hold() -> dict:
-    return {
-        "mode": "hold",
-        "reason": "scripted hold after the requested analysis actions",
-        "actions": [],
-        "path": None,
-        "path_step_id": None,
-        "completion": {},
-        "evidence_request": {},
-        "hypothesis_update": {},
-    }
-
-
-def _llm_for(*actions: tuple[str, dict]) -> ScriptedLLM:
-    llm = ScriptedLLM()
-    llm.add("path_draft", _draft_path())
-    llm.add("path_review", review_accept())
-    for tool_id, arguments in actions:
-        llm.add("next_action", _turn_action(tool_id, arguments))
-    llm.add("next_action", _turn_hold())
-    return llm
+def _llm_for(*actions: tuple[str, dict]) -> ScriptedNativeLLM:
+    completions = [
+        NativeCompletion(
+            tool_calls=(_native_call(f"call-{index}", tool_id, arguments),),
+            text="",
+        )
+        for index, (tool_id, arguments) in enumerate(actions, start=1)
+    ]
+    return ScriptedNativeLLM(completions)
 
 
 class ScriptedApktoolAdapter:
@@ -295,7 +269,7 @@ def _deps(
     engagement: Engagement,
     gateway: MCPToolGateway,
     *,
-    llm: ScriptedLLM,
+    llm: ScriptedNativeLLM,
     settings: OrchestrationSettings | None = None,
 ):
     control = DefaultControlPlane(
@@ -545,6 +519,8 @@ async def test_analysis_schema_drift_rejects_candidate_before_gateway_call() -> 
     final = await run_engagement(engagement, deps=deps)
 
     assert final.actions_executed == 0
-    assert final.termination_reason == TerminationReason.PLANNING_ERROR
+    # Native loop rejects each mismatched candidate per call before the gateway,
+    # then holds with text only (never an implicit success).
+    assert final.termination_reason == TerminationReason.INVESTIGATION_HELD
     assert adapter.calls == []
-    assert [call["route"] for call in llm.calls].count("next_action") == 3
+    assert [call["route"] for call in llm.calls].count("complete_native") == 4

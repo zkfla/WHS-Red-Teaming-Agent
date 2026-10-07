@@ -116,6 +116,12 @@ class PlanStep(BaseModel):
     #: Runtime-assigned safe identity for cross-event lookup. Providers leave
     #: it blank; PLAN fills it only after compilation.
     candidate_key: str = ""
+    # Code-owned native call lineage. These fields are not a model output
+    # schema and do not require an investigation path for tool execution.
+    model_tool_call_id: str = ""
+    mission_task_id: str | None = None
+    task_purpose_hash: str = ""
+    execution_origin_version: int = 0
     path_id: str | None = None
     path_version: int | None = None
     path_step_id: str | None = None
@@ -185,6 +191,16 @@ class PlanStep(BaseModel):
                     "capability": repr(self.capability),
                 },
             )
+        if (
+            self.binding_mode == "selected_tool"
+            and self.execution_origin_version == 1
+            and self.target is None
+            and not self.target_bind
+        ):
+            # Native selected-tool call with no engagement target: the
+            # provider-declared descriptor (requires_target) decides
+            # admission downstream; no target is auto-injected here.
+            return self
         if (self.target is None) == (not self.target_bind):
             raise ValueError(
                 f"step {self.step_id!r} must set exactly one of target / target_bind"
@@ -215,10 +231,22 @@ class PlanStep(BaseModel):
         """Graph ledger identity; canonical operation remains the default."""
         return self.attempt_key.strip() or self.operation_key
 
-    def resolved_target(self) -> AnyTarget:
-        if self.target is None:  # pragma: no cover - guarded by the validator
-            raise ValueError(f"step {self.step_id!r} has no concrete target yet")
-        return self.target
+    @property
+    def is_native_targetless(self) -> bool:
+        """Native selected-tool call carrying no engagement target."""
+        return (
+            self.binding_mode == "selected_tool"
+            and self.execution_origin_version == 1
+            and self.target is None
+            and not self.target_bind
+        )
+
+    def resolved_target(self) -> AnyTarget | None:
+        if self.target is not None:
+            return self.target
+        if self.is_native_targetless:
+            return None
+        raise ValueError(f"step {self.step_id!r} has no concrete target yet")
 
     def bound_to(
         self,

@@ -11,7 +11,7 @@ from redteam.attack_graph.predicates import Confidence, Provenance
 from redteam.core.contracts.action import ActionProposal
 from redteam.core.contracts.events import EventType
 from redteam.core.contracts.graph import Hypothesis
-from redteam.core.enums import AgentPhase, TaskStatus
+from redteam.core.enums import AgentPhase
 from redteam.core.ids import ActionId, new_id
 from redteam.orchestration.candidates.models import ExecutableCandidate
 from redteam.orchestration.cognition import DecisionFailure, ReasoningHalted
@@ -46,15 +46,6 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
     runtime = state["runtime"]
     observation = state.get("observation")
     publisher = publisher_for(state, deps, "orchestration.plan")
-    completed_before = (
-        {
-            task.task_id
-            for task in await deps.task_graph_store.list_tasks(mission_id=runtime.mission_id)
-            if task.status is TaskStatus.COMPLETED
-        }
-        if runtime.mission_id
-        else set()
-    )
     engine = InvestigationEngine(deps)
     try:
         path, candidates, outcome = await engine.decide(
@@ -138,28 +129,9 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             if outcome == "investigation_finished"
             else TerminationReason.INVESTIGATION_HELD,
         )
+        # Settlement events are published by the semantic owner during decide;
+        # the engine last event already cites them, so this only propagates it.
         last_event_id = engine.last_event_id
-        tasks = (
-            await deps.task_graph_store.list_tasks(mission_id=runtime.mission_id)
-            if runtime.mission_id
-            else []
-        )
-        for task in tasks:
-            if task.status is not TaskStatus.COMPLETED or task.task_id in completed_before:
-                continue
-            completed = await publisher.publish(
-                EventType.TASK_COMPLETED,
-                {"mission_id": runtime.mission_id, "task_id": task.task_id},
-                causation_id=last_event_id,
-            )
-            last_event_id = completed.event_id
-        if outcome == "goal_achieved":
-            settled = await publisher.publish(
-                EventType.MISSION_UPDATED,
-                {"mission_id": runtime.mission_id, "status": "completed"},
-                causation_id=last_event_id,
-            )
-            last_event_id = settled.event_id
         return advance(
             state,
             runtime.model_copy(update=updates),
@@ -268,7 +240,10 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                     metadata={
                         "agent_id": str(candidate.draft.agent_id),
                         "step_id": step.step_id,
-                        "target_node_id": str(node_id_for_target(step.resolved_target())),
+                        "target_node_id": (
+                            str(node_id_for_target(step.target))
+                            if step.target is not None else None
+                        ),
                         "violation_if_confirmed": step.hypothesis.violation_if_confirmed,
                         "expectation": step.expectation.model_dump(mode="json")
                         if step.expectation
@@ -278,7 +253,7 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                         "path_step_id": step.path_step_id,
                     },
                 ),
-                about=node_id_for_target(step.resolved_target()),
+                about=node_id_for_target(step.target) if step.target is not None else None,
                 step=runtime.step_count,
                 provenance=Provenance(
                     step=runtime.step_count,

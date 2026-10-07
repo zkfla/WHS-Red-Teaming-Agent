@@ -279,6 +279,8 @@ async def claim_target_is_grounded(
     proposal = meta.get("proposal", {})
     try:
         parsed = ActionProposal.model_validate(proposal)
+        if parsed.target is None:
+            return False
         if str(node_id_for_target(parsed.target)) != source:
             return False
     except Exception:
@@ -1290,6 +1292,8 @@ class StructuredLLMAnalysisVerifier:
         expected_target = metadata.get("target_node_id")
         if expected_target is None:
             return "linked evidence names no target"
+        if request.proposal.target is None:
+            return "proposed target cannot be resolved"
         try:
             actual_target = str(node_id_for_target(request.proposal.target))
         except Exception:  # noqa: BLE001 - an unresolvable target is not a match
@@ -1384,7 +1388,9 @@ async def append_review_receipt(
     supersedes them so a stale positive can never be consumed as approval.
     """
     try:
-        target_node: str | None = str(node_id_for_target(proposal.target))
+        target_node: str | None = (
+            str(node_id_for_target(proposal.target)) if proposal.target is not None else None
+        )
     except Exception:
         target_node = None
     supporting, refuting = _receipt_support_assignment(assessment, assessment.source_refs)

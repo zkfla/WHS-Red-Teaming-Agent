@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timezone
+from typing import Any
 
 from redteam.app.bootstrap import run_engagement
 from redteam.attack_graph.predicates import attrs_of, facts_of
@@ -22,132 +23,179 @@ from redteam.core.contracts.engagement import (
 from redteam.core.contracts.tool import ToolDescriptor
 from redteam.core.enums import EvidenceSourceType, GraphNodeType, RiskLevel, ToolHealthStatus
 from redteam.core.ids import EngagementId, ToolId
+from redteam.core.ports.llm import NativeCompletion, NativeToolCall
 from redteam.orchestration.agents import (
     MOBILE_AGENT,
     AgentRegistry,
     builtin_agent_definitions,
 )
+from redteam.orchestration.native_binding import exposed_tool_name
 from redteam.orchestration.runner import TerminationReason
 from redteam.orchestration.settings import OrchestrationSettings
 from tests.fakes import build_test_application
-from tests.integration._engine_llm_harness import ScriptedLLM, review_accept
 
 PACKAGE = "com.android.insecurebankv2"
 DEVICE_SERIAL = "emulator-5554"
 DEVICE_REF = "redteam_x86"
-ASSET_NODE_ID = "asset:insecurebankv2"
-PATH_STEP_ID = "observe-mobile-runtime"
 
 
-def _draft_path() -> dict:
-    return {
-        "path_id": "path-mobile-runtime",
-        "run_id": "run-scripted",
-        "mission_id": None,
-        "version": 1,
-        "parent_version": None,
-        "status": "draft",
-        "reason": "scripted mobile runtime path",
-        "goal": "launch the authorized app and observe logs and crashes",
-        "steps": [
-            {
-                "step_id": PATH_STEP_ID,
-                "objective": "launch the app and collect bounded runtime observations",
-                "agent_id": "mobile-agent",
-                "target_node_ids": [ASSET_NODE_ID],
-                "principal_refs": [],
-                "allowed_operations": ["mobile.app_launch", "mobile.response_analysis"],
-                "depends_on": [],
-                "required_fact_refs": [],
-                "unknowns": [],
-                "completion_criteria": [
+class ScriptedMobileNativeLLM:
+    def __init__(self) -> None:
+        self.turns = 0
+        self.reviews: list[str] = []
+        self.native_turns: list[dict[str, Any]] = []
+
+    @staticmethod
+    def _route_key(schema: dict[str, Any]) -> str:
+        props = schema.get("properties", {})
+        if "criteria" in props:
+            return "goal_completion_review"
+        if "claims" in props:
+            return "task_completion_review"
+        if "claim_supported" in props:
+            return "analysis_verify"
+        return "unknown"
+
+    async def complete_structured(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        response_schema: dict[str, Any],
+        system: str | None = None,
+        **_: Any,
+    ) -> dict[str, Any]:
+        route = self._route_key(response_schema)
+        self.reviews.append(route)
+        if route == "analysis_verify":
+            return {
+                "meaning": "scripted",
+                "outcome": "success",
+                "reason": "scripted meaning",
+                "confidence": 0.8,
+                "claim_supported": True,
+            }
+        if route == "task_completion_review":
+            payload = json.loads(messages[0]["content"])
+            receipts = list(payload["verified_source_ids"])
+            assert receipts, "task review needs executed evidence"
+            return {
+                "accepted": True,
+                "reason": "scripted semantic accept",
+                "claims": [
                     {
-                        "kind": "evidence",
-                        "description": "mobile runtime evidence recorded",
-                        "min_evidence": 1,
+                        "description": "mobile runtime observation",
+                        "kind": "observation",
+                        "evidence_ids": list(receipts),
+                        "target_node_ids": [],
+                        "principal_refs": [],
                     }
                 ],
-                "required": True,
-                "status": "pending",
-                "outcome": None,
-                "evidence_ids": [],
             }
-        ],
-        "hypothesis_ids": [],
-        "evidence_ids": [],
-        "changed_step_ids": [],
-        "review_records": {},
-    }
-
-
-def _turn_action(tool_id: str, operation: str, arguments: dict | None = None) -> dict:
-    return {
-        "mode": "actions",
-        "reason": f"scripted {tool_id} action",
-        "actions": [
-            {
-                "path_step_id": PATH_STEP_ID,
-                "agent_id": "mobile-agent",
-                "target_node_id": ASSET_NODE_ID,
-                "principal_ref": None,
-                "capability": "mobile",
-                "operation": operation,
-                "tool_id": tool_id,
-                "arguments": arguments or {},
-                "reason": f"run {tool_id} against the configured device",
-                "expected_observation": "bounded app runtime observation",
-                "hypothesis": None,
-                "existing_hypothesis_id": None,
-                "expectation": None,
-                "authentication_check": None,
-                "availability_impact": False,
+        if route == "goal_completion_review":
+            payload = json.loads(messages[0]["content"])
+            criteria = payload["mission"]["success_criteria"]
+            receipts = list(payload["verified_source_ids"])
+            assert receipts, "goal review needs executed evidence"
+            return {
+                "accepted": True,
+                "reason": "scripted goal accept",
+                "criteria": [
+                    {
+                        "criterion": item,
+                        "met": True,
+                        "evidence_ids": list(receipts),
+                        "claims": [
+                            {
+                                "description": "mobile runtime observation",
+                                "kind": "observation",
+                                "evidence_ids": list(receipts),
+                                "target_node_ids": [],
+                                "principal_refs": [],
+                            }
+                        ],
+                    }
+                    for item in criteria
+                ],
             }
-        ],
-        "path": None,
-        "path_step_id": None,
-        "completion": {},
-        "evidence_request": {},
-        "hypothesis_update": {},
-    }
+        raise AssertionError("legacy strategy route is not part of the native loop")
+
+    async def complete(
+        self, *, messages: list[dict[str, Any]], system: str | None = None, **_: Any
+    ) -> str:
+        return ""
+
+    def _exposed(self, tools: list[Any], tool_id: str) -> str:
+        names = {str(getattr(spec, "name", "")) for spec in tools}
+        name = exposed_tool_name(tool_id)
+        assert name in names, "native model needs the registered mobile tool"
+        return name
+
+    async def complete_native(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[Any],
+        system: str | None = None,
+        **_: Any,
+    ) -> NativeCompletion:
+        self.native_turns.append({"messages": messages, "tools": tools})
+        self.turns += 1
+        launch = self._exposed(tools, "mobile.mobile_launch_app")
+        logs = self._exposed(tools, "mobile.mobile_get_device_logs")
+        listed = self._exposed(tools, "mobile.mobile_list_crashes")
+        detail = self._exposed(tools, "mobile.mobile_get_crash")
+        if self.turns == 1:
+            return NativeCompletion(
+                tool_calls=(
+                    NativeToolCall(
+                        call_id="call-launch-1",
+                        name=launch,
+                        arguments={"device": DEVICE_REF, "packageName": PACKAGE},
+                    ),
+                ),
+                text="",
+            )
+        if self.turns == 2:
+            return NativeCompletion(
+                tool_calls=(
+                    NativeToolCall(
+                        call_id="call-logs-2",
+                        name=logs,
+                        arguments={
+                            "device": DEVICE_REF,
+                            "filter": [f"process={PACKAGE}"],
+                            "limit": 200,
+                        },
+                    ),
+                ),
+                text="",
+            )
+        if self.turns == 3:
+            return NativeCompletion(
+                tool_calls=(
+                    NativeToolCall(
+                        call_id="call-list-3",
+                        name=listed,
+                        arguments={"device": DEVICE_REF},
+                    ),
+                ),
+                text="",
+            )
+        if self.turns == 4:
+            return NativeCompletion(
+                tool_calls=(
+                    NativeToolCall(
+                        call_id="call-crash-4",
+                        name=detail,
+                        arguments={"device": DEVICE_REF, "id": "bank-crash-1"},
+                    ),
+                ),
+                text="",
+            )
+        return NativeCompletion(tool_calls=(), text="holding for review")
 
 
-def _turn_hold() -> dict:
-    return {
-        "mode": "hold",
-        "reason": "scripted hold after runtime observations",
-        "actions": [],
-        "path": None,
-        "path_step_id": None,
-        "completion": {},
-        "evidence_request": {},
-        "hypothesis_update": {},
-    }
-
-
-def _runtime_llm() -> ScriptedLLM:
-    llm = ScriptedLLM()
-    llm.add("path_draft", _draft_path())
-    llm.add("path_review", review_accept())
-    llm.add("next_action", _turn_action("mobile.mobile_launch_app", "app_launch"))
-    llm.add(
-        "next_action",
-        _turn_action(
-            "mobile.mobile_get_device_logs",
-            "response_analysis",
-            {"filter": [f"process={PACKAGE}"], "limit": 200},
-        ),
-    )
-    llm.add("next_action", _turn_action("mobile.mobile_list_crashes", "response_analysis"))
-    llm.add(
-        "next_action",
-        _turn_action(
-            "mobile.mobile_get_crash",
-            "response_analysis",
-            {"id": "bank-crash-1"},
-        ),
-    )
-    llm.add("next_action", _turn_hold())
-    return llm
+def _runtime_llm() -> ScriptedMobileNativeLLM:
+    return ScriptedMobileNativeLLM()
 
 
 class ScriptedMobileNextAdapter:

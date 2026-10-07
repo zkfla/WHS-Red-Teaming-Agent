@@ -343,7 +343,7 @@ def _label(cand: HostPort) -> str:
 
 
 def check_scope(
-    action: ActionProposal, scope: EngagementScope
+    action: ActionProposal, scope: EngagementScope, *, selected=None,
 ) -> tuple[bool, list[str], Severity | None]:
     """Returns ``(allowed, reasons, severity)``.
 
@@ -351,6 +351,15 @@ def check_scope(
     target). The exception is a malformed deny-list config, which is
     non-recoverable — every action hits the same error — so it is
     ``ABORT_RUN``."""
+    if action.target is None:
+        if (
+            action.binding_mode == "selected_tool"
+            and selected is not None
+            and selected.tool_id == action.tool_id
+            and selected.requires_target is False
+        ):
+            return True, [], None
+        return False, ["selected tool requires a registered target binding"], Severity.BLOCK_ACTION
     if isinstance(action.target, AssetTarget):
         # asset_ref is the schema-declared identity used by workspace tools.
         # Authorizing one asset must never allow arguments to select another.

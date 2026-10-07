@@ -35,7 +35,9 @@ from redteam.core.contracts.target import (
     target_graph_node_id,
 )
 from redteam.core.contracts.tool import (
+    PROVIDER_METADATA_AVAILABILITY_IMPACT,
     PROVIDER_METADATA_COMMAND_FIELDS,
+    PROVIDER_METADATA_REQUIRES_TARGET,
     PROVIDER_METADATA_TARGET_BINDING,
     ExecutionContext,
     ToolDescriptor,
@@ -97,7 +99,9 @@ __all__ = [
     "ToolResult",
     "ToolTargetBinding",
     "PROVIDER_METADATA_COMMAND_FIELDS",
+    "PROVIDER_METADATA_REQUIRES_TARGET",
     "PROVIDER_METADATA_TARGET_BINDING",
+    "PROVIDER_METADATA_AVAILABILITY_IMPACT",
     "BindingMode",
     "LEGACY_ACTION",
     "SELECTED_TOOL",

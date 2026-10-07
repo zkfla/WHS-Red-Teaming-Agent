@@ -102,7 +102,9 @@ async def policy_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                 action_id=str(proposal.action_id),
                 capability=proposal.capability,
                 operation=proposal.operation,
-                target=target_display_name(proposal.target),
+                target=(
+                    target_display_name(proposal.target) if proposal.target is not None else None
+                ),
                 reasons=list(problems[:8]),
                 matched_rules=["orchestration:stale_or_invalid_path"],
                 alternative_allowed=True,
@@ -258,7 +260,7 @@ async def policy_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             action_id=str(proposal.action_id),
             capability=proposal.capability,
             operation=proposal.operation,
-            target=target_display_name(proposal.target),
+            target=target_display_name(proposal.target) if proposal.target is not None else None,
             reasons=list(decision.reasons[:8]),
             matched_rules=list(decision.matched_rules[:12]),
             approval_id=(

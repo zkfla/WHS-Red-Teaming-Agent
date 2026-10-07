@@ -42,7 +42,7 @@ logger = logging.getLogger(__name__)
 #: repeat a side effect that may already have happened (the checkpoint is
 #: written before the node's effect is durably observable), so a durable
 #: recovery/auto-resume refuses to act on such a snapshot -- fail closed.
-_UNSAFE_REPLAY_NODES = frozenset({"execute", "worker"})
+_UNSAFE_REPLAY_NODES = frozenset({"execute", "worker", "tools"})
 
 
 class CheckpointSnapshot(BaseModel):
@@ -922,6 +922,11 @@ class AgentLoopRunner:
             plan_step=state.get("plan_step"),
             current_work_id=state.get("current_work_id"),
         )
+        # Native approval resumes the original provider response as a whole:
+        # completed siblings remain completed, pending siblings keep IDs.
+        for key in ("native_calls", "native_messages", "native_outcome"):
+            if key in state:
+                seeded[key] = state[key]
         self._deps.batch_pending_approvals.discard(runtime.run_id)
         return await self._run_state(resumed_runtime, seeded)
 

@@ -16,6 +16,7 @@ from redteam.capability.servers import web_http
 from redteam.capability.servers.config import ServerPolicy
 from redteam.core.config import AppConfig, CapabilityConfig, load_engagement_config
 from redteam.core.enums import RiskLevel
+from redteam.core.ports.llm import NativeCompletion, NativeToolCall
 from redteam.orchestration.engine import InvestigationEngine
 from redteam.orchestration.settings import OrchestrationSettings
 from redteam.orchestration.state import TerminationReason
@@ -23,67 +24,97 @@ from tests.integration import _engine_llm_harness as h
 from tests.unit.test_mcp_deployment import engagement, source
 
 
-class SessionLLM(h.ScriptedLLM):
-    """Explicit fixture chooses from actual deployment context; never a production model."""
+class SessionLLM:
+    """Native scripted model: inventory then two-principal compare, then hold.
+
+    Speaks the genuine product contract (complete_native with
+    NativeCompletion/NativeToolCall addressed to the exposed tool names).
+    complete_structured answers only the genuine verifier meaning route;
+    any legacy strategy route raises instead of returning a soft answer.
+    """
 
     def __init__(self, seed="127.0.0.1"):
-        super().__init__()
+        self.calls: list[dict[str, object]] = []
         self.turns = 0
         self.node_id = "host:" + seed
 
+    @staticmethod
+    def _route_key(response_schema: dict[str, object]) -> str:
+        props = response_schema.get("properties", {})
+        if not isinstance(props, dict):
+            return "unknown"
+        if "claim_supported" in props:
+            return "analysis_verify"
+        if "criteria" in props:
+            return "goal_completion_review"
+        if "claims" in props:
+            return "task_completion_review"
+        return "unknown"
+
+    async def complete(self, *, messages, system=None, **_: object) -> str:
+        return ""
+
     async def complete_structured(self, *, messages, response_schema, system=None, **kwargs):
         route = self._route_key(response_schema)
-        self.calls.append({"messages": messages, "system": system, "route": route})
-        payload = json.loads(messages[0]["content"])
-        if route == "path_draft":
-            path = h.draft_path(self.node_id)
-            step = path["steps"][0]
-            step.update(
-                agent_id="web-api-agent",
-                principal_refs=["alice", "bob"],
-                allowed_operations=["web.response_analysis"],
-            )
-            return path
-        if route == "path_review":
-            return h.review_accept()
+        self.calls.append({"route": route})
         if route == "analysis_verify":
             return h.meaning("inconclusive", False, "Only scoped observations; not proof of IDOR")
-        if route == "next_action":
-            self.turns += 1
-            profile = payload["engagement_constraints"]["mcp_targets"]["bank-test"]
-            assert profile["allowed_paths"] == ["/", "/accounts/123"]
-            assert [s["session_ref"] for s in profile["sessions"]] == ["alice", "bob"]
-            if self.turns > 2:
-                return {
-                    "mode": "hold",
-                    "reason": "Synthetic observation check finished; no vulnerability claim",
-                }
-            inventory = self.turns == 1
-            return {
-                "mode": "actions",
-                "reason": "Synthetic test only",
-                "actions": [
-                    {
-                        "agent_id": "web-api-agent",
-                        "path_step_id": "step-1",
-                        "target_node_id": self.node_id,
-                        "principal_ref": "alice",
-                        "capability": "web",
-                        "operation": "response_analysis",
-                        "tool_id": "web.session_list" if inventory else "web.http_compare_sessions",
-                        "arguments": {}
-                        if inventory
-                        else {
+        raise AssertionError(f"legacy strategy route is not part of the native loop: {route!r}")
+
+    async def complete_native(self, messages, tools, system=None, **_: object):
+        available = [str(getattr(spec, "name", "")) for spec in tools]
+        inventory_matches = [name for name in available if "session_list" in name]
+        compare_matches = [name for name in available if "http_compare_sessions" in name]
+        assert len(inventory_matches) == 1, (
+            "native model needs exactly one registered inventory tool"
+        )
+        assert len(compare_matches) == 1, (
+            "native model needs exactly one registered compare tool"
+        )
+        inventory = inventory_matches[0]
+        compare = compare_matches[0]
+        # Preserve the deployed scope/session contract on the real context
+        # snapshot instead of a retired strategy payload.
+        snapshot = json.loads(messages[-1]["content"])
+        constraints = snapshot.get("engagement_constraints", {})
+        profile = constraints.get("mcp_targets", {}).get("bank-test", {})
+        if profile:
+            assert profile.get("allowed_paths") == ["/", "/accounts/123"]
+        self.turns += 1
+        if self.turns == 1:
+            self.calls.append({"turn": 1, "tool": inventory})
+            return NativeCompletion(
+                tool_calls=(
+                    NativeToolCall(
+                        call_id="call-inventory-1",
+                        name=inventory,
+                        arguments={},
+                    ),
+                ),
+                text="",
+            )
+        if self.turns == 2:
+            self.calls.append({"turn": 2, "tool": compare})
+            return NativeCompletion(
+                tool_calls=(
+                    NativeToolCall(
+                        call_id="call-compare-1",
+                        name=compare,
+                        arguments={
                             "target_ref": "bank-test",
                             "path": "/accounts/123",
                             "first_session_ref": "alice",
                             "second_session_ref": "bob",
                         },
-                        "reason": "Read registered references or compare synthetic test users",
-                    }
-                ],
-            }
-        raise AssertionError(route)
+                    ),
+                ),
+                text="",
+            )
+        self.calls.append({"turn": self.turns, "tool": None})
+        return NativeCompletion(
+            tool_calls=(),
+            text="Synthetic observation check finished",
+        )
 
 
 def install(tmp_path, monkeypatch, origin, *, require_approval=False, port_pinned=False):
@@ -170,6 +201,10 @@ async def test_agent_uses_inventory_and_two_users_through_real_mcp(
         assert final.actions_executed == 2, (final.termination_reason, final.planning_feedback)
         assert requests == ["/accounts/123", "/accounts/123"]
         records = await deps.evidence_store.list_for_run(final.run_id)
+        inventory_records = [r for r in records if r.source_id == str(inventory.tool_id)]
+        assert inventory_records, "inventory discovery must be recorded"
+        discovered = inventory_records[0].metadata["tool_result"]["output"]["sessions"]
+        assert [entry["session_ref"] for entry in discovered] == ["alice", "bob"]
         compare_tool = deps.tool_catalog.get("web.http_compare_sessions")
         assert compare_tool is not None
         comparison = next(r for r in records if r.source_id == str(compare_tool.tool_id))

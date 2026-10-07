@@ -5,11 +5,13 @@ from __future__ import annotations
 import hashlib
 import json
 from typing import Any, Literal
+from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from redteam.core.contracts.action import ActionProposal
 from redteam.core.contracts.evidence import EvidenceRecord
+from redteam.core.contracts.target import UrlTarget
 from redteam.core.contracts.tool import ToolResult
 from redteam.core.ids import EvidenceId
 from redteam.core.ports.evidence_store import EvidenceStore
@@ -183,25 +185,46 @@ class AuthenticationAssessment(BaseModel):
     session_status: int | None = None
 
 
-async def assess_authentication(
+def _same_executed_target(baseline: EvidenceRecord, evidence: EvidenceRecord) -> bool:
+    previous = baseline.metadata.get("target_node_id")
+    if previous and previous == evidence.metadata.get("target_node_id"):
+        return True
+    # A host observation can later acquire an endpoint graph identity.
+    # Compare the preserved execution addresses, never just a graph label
+    # or an untrusted target_ref string, when the identities differ.
+    from redteam.orchestration.target_binding import network_identity
+
+    try:
+        before = ActionProposal.model_validate(baseline.metadata.get("proposal"))
+        after = ActionProposal.model_validate(evidence.metadata.get("proposal"))
+        if before.target is None or after.target is None:
+            return False
+        if isinstance(before.target, UrlTarget) and isinstance(after.target, UrlTarget):
+            if urlsplit(before.target.url).scheme != urlsplit(after.target.url).scheme:
+                return False
+        identity = network_identity(before.target)
+        return identity is not None and identity == network_identity(after.target)
+    except (ValueError, TypeError):
+        return False
+
+
+def _assess_observations(
     check: AuthenticationCheck,
     proposal: ActionProposal,
-    result: ToolResult,
     evidence: EvidenceRecord,
-    store: EvidenceStore,
+    baseline: EvidenceRecord | None,
+    current: dict[str, Any] | None,
 ) -> AuthenticationAssessment:
-    """Compare stored observations; HTTP status alone cannot verify a vulnerability."""
-    baseline = await store.get(check.baseline_evidence_id)
-    current = http_observation(proposal.arguments, result)
     previous = baseline.metadata.get("http_observation") if baseline else None
     valid = bool(
         baseline is not None
+        and baseline.run_id == evidence.run_id
         and baseline.engagement_id == evidence.engagement_id
         and baseline.source_id == "web.http_request"
         and baseline.metadata.get("success") is True
         and proposal.arguments.get("method", "GET") == "GET"
         and proposal.arguments.get("session_ref") == check.session_ref
-        and baseline.metadata.get("target_node_id") == evidence.metadata.get("target_node_id")
+        and _same_executed_target(baseline, evidence)
         and isinstance(previous, dict)
         and previous.get("status_code") == 401
         and previous.get("session_ref") is None
@@ -232,4 +255,41 @@ async def assess_authentication(
         evidence_ids=refs,
         anonymous_status=401,
         session_status=status,
+    )
+
+
+async def assess_authentication(
+    check: AuthenticationCheck,
+    proposal: ActionProposal,
+    result: ToolResult,
+    evidence: EvidenceRecord,
+    store: EvidenceStore,
+) -> AuthenticationAssessment:
+    """Compare observations; HTTP status alone cannot verify a vulnerability."""
+    return _assess_observations(
+        check, proposal, evidence, await store.get(check.baseline_evidence_id),
+        http_observation(proposal.arguments, result),
+    )
+
+
+async def assess_preserved_authentication(
+    check: AuthenticationCheck, evidence: EvidenceRecord, store: EvidenceStore,
+) -> AuthenticationAssessment:
+    """Reuse comparison meaning for an already preserved request and result."""
+    from redteam.orchestration.evidence_access import raw_from_metadata
+
+    proposal = ActionProposal.model_validate(evidence.metadata.get("proposal"))
+    result = ToolResult.model_validate(raw_from_metadata(evidence.metadata))
+    baseline = await store.get(check.baseline_evidence_id)
+    if baseline is not None:
+        before = ActionProposal.model_validate(baseline.metadata.get("proposal"))
+        before_result = ToolResult.model_validate(raw_from_metadata(baseline.metadata))
+        # Stored comparisons consume actual preserved inputs/results on both
+        # sides. A derived HTTP summary is not itself the authority for status.
+        baseline = baseline.model_copy(update={"metadata": {
+            **baseline.metadata,
+            "http_observation": http_observation(before.arguments, before_result),
+        }})
+    return _assess_observations(
+        check, proposal, evidence, baseline, http_observation(proposal.arguments, result),
     )
