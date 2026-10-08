@@ -47,6 +47,7 @@ from redteam.orchestration.nodes.observe import observe_node
 from redteam.orchestration.nodes.plan import _verification_batch_capacity
 from redteam.orchestration.nodes.replan import _hard_stop, replan_node
 from redteam.orchestration.nodes.worker import worker_node
+from redteam.orchestration.progress import canonical_graph_changed
 from redteam.orchestration.scheduler import WorkScheduler
 from redteam.orchestration.semantic_completion import purpose_hash
 from redteam.orchestration.state import GraphState, NativeCallState, TerminationReason
@@ -308,7 +309,12 @@ async def _bind_call(call: NativeCallState, *, deps: RuntimeDeps, runtime, conte
 
 async def model_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
     runtime = state["runtime"]
-    runtime.termination_reason = runtime.termination_reason or _hard_stop(runtime, deps)
+    reason = runtime.termination_reason or _hard_stop(runtime, deps)
+    if reason == TerminationReason.STALLED and await canonical_graph_changed(deps, runtime):
+        # Same contract as REPLAN: the stored counter predates the content this
+        # run already holds, so OBSERVE re-syncs it instead of ending here.
+        reason = None
+    runtime.termination_reason = reason
     if runtime.termination_reason:
         return state
     state = await observe_node(state, deps=deps)

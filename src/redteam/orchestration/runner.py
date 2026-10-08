@@ -24,7 +24,7 @@ from redteam.orchestration.coordination import CLOSED, ChangeSet, CoordinationEr
 from redteam.orchestration.diagnostics import operational_exception_diagnostic
 from redteam.orchestration.graph import build_graph
 from redteam.orchestration.outbox import deliver_pending
-from redteam.orchestration.progress import canonical_progress_fingerprint
+from redteam.orchestration.progress import canonical_graph_changed
 from redteam.orchestration.runtime_observation import RuntimeObservation, append_runtime_observation
 from redteam.orchestration.settings import OrchestrationSettings
 from redteam.orchestration.state import (
@@ -961,16 +961,12 @@ class AgentLoopRunner:
             return None
 
     async def _canonical_graph_changed(self, runtime: RuntimeState) -> bool:
-        fingerprint = await canonical_progress_fingerprint(
-            self._deps, runtime, step=runtime.step_count
-        )
-        # Old checkpoints used incompatible, bounded hashes. They need an
-        # explicit wakeup; comparing different formats cannot prove change.
-        return (
-            fingerprint is not None
-            and str(runtime.last_progress_fingerprint or "").startswith("original-v1:")
-            and fingerprint != runtime.last_progress_fingerprint
-        )
+        """Resume-gate adapter over the shared canonical change judgment.
+
+        The judgment itself lives with the fingerprint owner so the stall
+        consumers and this gate cannot drift apart.
+        """
+        return await canonical_graph_changed(self._deps, runtime)
 
     async def resume_from(self, checkpoint_id: str) -> RuntimeState:
         """Re-run from an earlier checkpoint of the same thread.

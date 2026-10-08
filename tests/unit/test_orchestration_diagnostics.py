@@ -355,6 +355,62 @@ def test_pydantic_validation_excludes_input_and_message():
     assert "secret-input" not in diagnostic.model_dump_json()
 
 
+def test_pydantic_owner_schema_extends_locations_without_copying_input():
+    from redteam.orchestration.graph_recording import GraphRecordingInput
+
+    secret = "opaque-recording-value"
+    with pytest.raises(ValidationError) as caught:
+        GraphRecordingInput.model_validate(
+            {
+                "facts": [
+                    {
+                        "evidence_id": "ev-1",
+                        "value": secret,
+                        "fact_name": "banner",
+                        "target_node_id": "host:target.local",
+                    }
+                ]
+            }
+        )
+    # Without the owner schema the shared decision allowlist does not know
+    # this contract's nested names, so the location stops at the root.
+    default = diagnostic_for_exception(caught.value, stage="native_local_tool")
+    assert default.location == "$"
+    assert default.validation_issues[0] == {"rule": "missing", "location": "$"}
+    scoped = diagnostic_for_exception(
+        caught.value,
+        stage="native_local_tool",
+        schema=GraphRecordingInput.model_json_schema(),
+    )
+    assert scoped.code == "model_validation"
+    assert scoped.validation_issues[0] == {
+        "rule": "missing",
+        "location": "$.facts[0].raw_path",
+    }
+    assert "$.facts[0].raw_path" in scoped.feedback()
+    assert secret not in scoped.model_dump_json()
+
+
+def test_pydantic_owner_schema_still_hides_undeclared_keys():
+    from redteam.orchestration.graph_recording import GraphRecordingInput
+
+    secret = "opaque-undeclared-value"
+    with pytest.raises(ValidationError) as caught:
+        GraphRecordingInput.model_validate(
+            {"facts": [], "mystery_key_name": secret}
+        )
+    scoped = diagnostic_for_exception(
+        caught.value,
+        stage="native_local_tool",
+        schema=GraphRecordingInput.model_json_schema(),
+    )
+    assert scoped.location == "$"
+    assert scoped.validation_issues == [{"rule": "extra_forbidden", "location": "$"}]
+    dumped = scoped.model_dump_json()
+    assert "mystery_key_name" not in dumped
+    assert secret not in dumped
+
+
 @pytest.mark.parametrize(
     ("read_input", "field", "rule"),
     [

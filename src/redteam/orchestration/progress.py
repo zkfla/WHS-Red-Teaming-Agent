@@ -48,6 +48,23 @@ async def canonical_progress_fingerprint(deps: Any, runtime: Any, *, step: int) 
     )
 
 
+async def canonical_graph_changed(deps: Any, runtime: Any) -> bool:
+    """Whether the current canonical content differs from the stored fingerprint.
+
+    The stored fingerprint is the content of an earlier turn, so a consumer
+    that must judge the *current* turn asks this instead of trusting a counter
+    observed before the turn ran. One judgment, shared by the stall consumers
+    and the resume gate. A failed read and a legacy (incompatible) hash cannot
+    prove change.
+    """
+    fingerprint = await canonical_progress_fingerprint(deps, runtime, step=runtime.step_count)
+    return (
+        fingerprint is not None
+        and str(runtime.last_progress_fingerprint or "").startswith("original-v1:")
+        and fingerprint != runtime.last_progress_fingerprint
+    )
+
+
 def knowledge_fingerprint(knowledge: dict) -> str:
     """Progress is content or supported conclusions, never a new receipt name."""
     ignored = {

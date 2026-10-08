@@ -581,7 +581,20 @@ def schema_diagnostic(
     )
 
 
-def diagnostic_for_exception(exc: BaseException, *, stage: str) -> DecisionDiagnostic:
+def diagnostic_for_exception(
+    exc: BaseException,
+    *,
+    stage: str,
+    schema: dict[str, Any] | None = None,
+) -> DecisionDiagnostic:
+    """One safe diagnostic; an owner-supplied schema may publish its fields.
+
+    An optional schema is the input contract the caller just validated against:
+    its declared property names replace the shared decision allowlist
+    when rendering locations, so nested contract fields stay visible
+    while arbitrary keys still cannot. Omitting it keeps the default
+    decision-field behavior for existing consumers.
+    """
     attached = getattr(exc, "diagnostic", None)
     if isinstance(attached, DecisionDiagnostic):
         return attached
@@ -614,12 +627,16 @@ def diagnostic_for_exception(exc: BaseException, *, stage: str) -> DecisionDiagn
             exception_chain=exception_chain_for(exc),
         )
     if isinstance(exc, ValidationError):
+        # A caller-owned contract may render its own declared field names;
+        # without one the shared decision allowlist keeps unknown key names
+        # out of every location.
+        fields = _schema_fields(schema) if schema is not None else _KNOWN_FIELDS
         # include_input=False is mandatory even though messages are not copied.
         errors = exc.errors(include_input=False, include_url=False, include_context=False)
         first: dict[str, Any] = dict(errors[0]) if errors else {}
         issues = [
             {"rule": _identifier(str(error.get("type", "")), "validation"),
-             "location": known_location(error.get("loc", ()))}
+             "location": known_location(error.get("loc", ()), fields=fields)}
             for error in errors[:10]
         ]
         action_rules = {
@@ -634,7 +651,7 @@ def diagnostic_for_exception(exc: BaseException, *, stage: str) -> DecisionDiagn
                 code=rule,
                 stage=_identifier(stage, "decision"),
                 kind="format",
-                location=known_location(first.get("loc", ())),
+                location=known_location(first.get("loc", ()), fields=fields),
                 summary=action_rules[rule],
                 retryable=True,
                 validation_issues=issues,
@@ -656,7 +673,7 @@ def diagnostic_for_exception(exc: BaseException, *, stage: str) -> DecisionDiagn
             code="model_validation",
             stage=_identifier(stage, "decision"),
             kind="format",
-            location=known_location(first.get("loc", ())),
+            location=known_location(first.get("loc", ()), fields=fields),
             summary=summaries.get(rule, "Match the required model fields and validation rules."),
             retryable=True,
             validation_issues=issues,
