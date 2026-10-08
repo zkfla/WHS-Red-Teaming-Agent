@@ -227,19 +227,26 @@ def test_responses_input_converts_tool_roundtrip():
 
 
 class _SubscriptionHarness:
-    def __init__(self, monkeypatch, response):
-        import litellm
+    """Fake ``litellm`` module for the subscription (``chatgpt/``) route.
 
+    Injected via ``sys.modules`` like ``_chat_namespace``, so the optional
+    SDK does not have to be installed.
+    """
+
+    def __init__(self, monkeypatch, response):
         self.captured: dict = {}
 
         async def aresponses(**kwargs):
             self.captured = kwargs
             return response
 
-        monkeypatch.setattr(
-            litellm, "get_llm_provider", lambda model: (model, "chatgpt", None, None)
+        fake = SimpleNamespace(
+            get_llm_provider=lambda model: (model, "chatgpt", None, None),
+            model_cost={},
+            register_model=lambda *args, **kwargs: None,
+            aresponses=aresponses,
         )
-        monkeypatch.setattr(litellm, "aresponses", aresponses)
+        monkeypatch.setitem(sys.modules, "litellm", fake)
 
 
 async def test_subscription_nonstream_roundtrip(monkeypatch):
