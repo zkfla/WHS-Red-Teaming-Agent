@@ -51,6 +51,7 @@ from redteam.core.environment import (
 )
 from redteam.core.environment import specialist_profile_env_raw
 from redteam.core.ids import EngagementId
+from redteam.core.ports.llm import ProviderRetryPolicy
 
 
 class EngagementConfig(BaseModel):
@@ -88,6 +89,7 @@ class LLMConfig(BaseModel):
     provider: str = "litellm"  # Production requires the real LLM adapter.
     default_model: str = "gpt-4o-mini"
     api_key_env_var: str = "LLM_API_KEY"
+    provider_retry: ProviderRetryPolicy = Field(default_factory=ProviderRetryPolicy)
 
     def resolve_api_key(self) -> str | None:
         return os.environ.get(self.api_key_env_var)
@@ -120,13 +122,19 @@ class LLMConfig(BaseModel):
                 "REDTEAM_LLM_PROVIDER=litellm (with REDTEAM_LLM_MODEL) for "
                 "a real provider. There is no implicit default."
             )
-        kwargs: dict[str, str] = {"provider": provider}
+        kwargs: dict[str, Any] = {"provider": provider}
         model = vals.get("model")
         if model:
             kwargs["default_model"] = model
         api_key_env_var = vals.get("api_key_env_var")
         if api_key_env_var:
             kwargs["api_key_env_var"] = api_key_env_var
+        retry_policy = vals.get("retry_policy_json")
+        if retry_policy:
+            try:
+                kwargs["provider_retry"] = ProviderRetryPolicy.model_validate_json(retry_policy)
+            except ValueError:
+                raise ValueError("REDTEAM_LLM_RETRY_POLICY_JSON is invalid") from None
         return cls(**kwargs)
 
 

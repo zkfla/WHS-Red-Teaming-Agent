@@ -17,7 +17,7 @@ from redteam.core.enums import AgentPhase, PolicyVerdict
 from redteam.core.ids import ActionId
 from redteam.orchestration.context import RuntimeDeps
 from redteam.orchestration.delegation import DelegationState
-from redteam.orchestration.dispatch import DispatchItem, WorkerOutcome
+from redteam.orchestration.dispatch import DispatchItem, WorkerOutcome, outcome_fingerprint
 from redteam.orchestration.nodes._support import advance
 from redteam.orchestration.nodes.policy import SEVERITY_ABORT_RUN, SEVERITY_REPLAN_GOAL
 from redteam.orchestration.runtime_observation import append_runtime_observation
@@ -37,6 +37,23 @@ async def aggregate_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
     # (plan 3.5.5). Same formulas below; widened inputs only.
     _, followup_outcomes = split_batch_outcomes(all_outcomes, items)
     outcomes = [*initial_outcomes, *followup_outcomes]
+    receipts = dict(runtime.worker_result_receipts)
+    conflicts = dict(runtime.worker_result_conflicts)
+    admitted = []
+    for item in outcomes:
+        digest = outcome_fingerprint(item)
+        if item.conflicting_results:
+            conflicts[item.action_id] = sorted(item.conflicting_results)
+        previous = receipts.get(item.action_id)
+        if previous is not None:
+            if previous != digest:
+                conflicts[item.action_id] = sorted({previous, digest})
+            continue
+        admitted.append(item)
+        if item.executed or item.policy_verdict is PolicyVerdict.DENY:
+            receipts[item.action_id] = digest
+    outcomes = admitted
+    followup_outcomes = [o for o in followup_outcomes if o in admitted]
 
     executed = [item for item in outcomes if item.executed]
     succeeded = [item for item in executed if item.succeeded]
@@ -174,6 +191,8 @@ async def aggregate_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             "consecutive_failures": consecutive_failures,
             "remaining_budget": remaining_budget,
             "actions_by_agent": actions_by_agent,
+            "worker_result_receipts": receipts,
+            "worker_result_conflicts": conflicts,
             "delegations": delegations,
             "last_verdict": (
                 last_with_verdict.verdict if last_with_verdict else runtime.last_verdict
@@ -188,7 +207,9 @@ async def aggregate_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             ),
             "active_hypothesis_id": None,
             "termination_reason": (
-                TerminationReason.APPROVAL_PENDING
+                TerminationReason.EXECUTION_ERROR
+                if conflicts
+                else TerminationReason.APPROVAL_PENDING
                 if pending_approval is not None
                 else (
                     None

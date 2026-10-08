@@ -1,0 +1,117 @@
+# Explicit P2 opt-in: reasoning, append-only validity and fixture-only code artifacts.
+profile_id: specialists-isolated-reasoning
+version: "6"
+workflow: durable
+worker_batch_size: 2
+decision_concurrency: 2
+decision_pool_limit: 64
+evidence_validity: true
+validity_wait_seconds: 30
+code_artifacts: true
+# Operator-selected cached image. Docker never pulls automatically. Target access stays disabled.
+fixture_policy:
+  image: python@sha256:9534e5a8e315485d4061ed659af0fd78a284c015f9b73661b41d6bab25604534
+  timeout_seconds: 10
+  max_output_bytes: 8192
+schema_version: "1"
+prompt_root: prompts
+common: {path: common.md, version: "1", contract_version: "1"}
+max_tasks_per_question: 6
+stages:
+  attack_path_proposal: attack-path-planner
+  task_atomization: task-atomizer
+  path_review: research-evidence-agent
+  next_action: attack-path-planner
+  completion_review: research-evidence-agent
+  task_completion_review: research-evidence-agent
+  goal_completion_review: research-evidence-agent
+  conversation_decide: conversation-agent
+  analysis_verify: research-evidence-agent
+  analysis_claim_verify: research-evidence-agent
+  code_generation: exploit-code-agent
+  code_review: research-evidence-agent
+roles:
+  - definition:
+      agent_id: conversation-agent
+      role: conversation-agent
+      name: conversation-agent
+      description: Decision/artifact seam; no direct target execution
+      contract_version: "1"
+      schedulable: false
+      capabilities: []
+      provider_id: specialist:conversation-agent
+      context_profile: {profile_id: "conversation-agent:v1"}
+      max_concurrency: 1
+    prompt: {path: conversation.md, version: "1", contract_version: "1"}
+  - definition:
+      agent_id: attack-path-planner
+      role: attack-path-planner
+      name: attack-path-planner
+      description: Decision/artifact seam; no direct target execution
+      contract_version: "1"
+      schedulable: false
+      capabilities: []
+      provider_id: specialist:attack-path-planner
+      context_profile: {profile_id: "attack-path-planner:v1"}
+      max_concurrency: 1
+    prompt: {path: attack-path-planner.md, version: "1", contract_version: "1"}
+  - definition:
+      agent_id: task-atomizer
+      role: task-atomizer
+      name: task-atomizer
+      description: Decision/artifact seam; no direct target execution
+      contract_version: "1"
+      schedulable: false
+      capabilities: []
+      provider_id: specialist:task-atomizer
+      context_profile: {profile_id: "task-atomizer:v1"}
+      max_concurrency: 1
+    prompt: {path: task-atomizer.md, version: "1", contract_version: "1"}
+  - definition:
+      agent_id: web-execution-agent
+      role: web-execution-agent
+      name: web-execution-agent
+      description: Delegated target executor
+      contract_version: "1"
+      schedulable: true
+      capabilities: ["web","api","recon"]
+      provider_id: specialist:web-execution-agent
+      context_profile: {profile_id: "web-execution-agent:v1"}
+      max_concurrency: 2
+    prompt: {path: web-execution.md, version: "1", contract_version: "1"}
+  - definition:
+      agent_id: mobile-execution-agent
+      role: mobile-execution-agent
+      name: mobile-execution-agent
+      description: Delegated target executor
+      contract_version: "1"
+      schedulable: true
+      capabilities: ["mobile","analysis"]
+      provider_id: specialist:mobile-execution-agent
+      context_profile: {profile_id: "mobile-execution-agent:v1"}
+      max_concurrency: 1
+    prompt: {path: mobile-execution.md, version: "1", contract_version: "1"}
+  - definition:
+      agent_id: research-evidence-agent
+      role: research-evidence-agent
+      name: research-evidence-agent
+      description: Decision/artifact seam; no direct target execution
+      contract_version: "1"
+      schedulable: false
+      capabilities: []
+      provider_id: specialist:research-evidence-agent
+      context_profile: {profile_id: "research-evidence-agent:v1"}
+      max_concurrency: 1
+    prompt: {path: research-evidence.md, version: "1", contract_version: "1"}
+  - definition:
+      agent_id: exploit-code-agent
+      role: exploit-code-agent
+      name: exploit-code-agent
+      description: Decision/artifact seam; no direct target execution
+      contract_version: "1"
+      schedulable: false
+      capabilities: []
+      provider_id: specialist:exploit-code-agent
+      context_profile: {profile_id: "exploit-code-agent:v1"}
+      max_concurrency: 1
+    prompt: {path: exploit-code.md, version: "1", contract_version: "1"}

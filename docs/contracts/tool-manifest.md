@@ -5,11 +5,12 @@ Capability Registry는 MCP discovery 결과를 다음 메타데이터 묶음으�
 
 | 항목 | 의미 | 원본 |
 |---|---|---|
-| `tool_id` | 실행 방법의 안정적인 식별자 (`recon.http_probe`) | Capability namespace + remote tool name |
+| `tool_id` | 실행 방법의 안정적인 식별자 (`recon.<server_id>.http_probe`) | Capability namespace + server ID + remote tool name |
 | `operations` | 수행할 수 있는 canonical intent (`service_discovery`) | 운영자 바인딩 + discovery |
 | `input_schema` | MCP 호출의 JSON Schema | MCP `tools/list` |
 | `required_arguments` / `optional_arguments` | 위 input schema에서 계산한 편의 view | Registry 계산값 |
-| `target_types` | 적용 가능한 Graph target 종류 | Capability 기본값 또는 운영자 설정 |
+| `target_types` | 적용 가능한 Graph target 종류 | Provider metadata, Capability 기본값 또는 운영자 설정 |
+| `argument_bindings` | 원격 인자명 → 알려진 대상의 공통 필드명 | Provider metadata 또는 운영자 설정 |
 | `risk_level` | 도구의 사전 위험 등급 | Capability 설정 |
 | `output_schema` | 결과의 JSON Schema | MCP `tools/list` |
 | `health_status` | 마지막 discovery/health 상태 | Adapter |
@@ -18,8 +19,9 @@ Capability Registry는 MCP discovery 결과를 다음 메타데이터 묶음으�
 않는다. 실제 MCP `input_schema`의 `required`와 `properties`가 원본이다. 시작 시
 input/output schema가 유효한 JSON Schema인지 검사하고, required 인자가 properties에
 실제로 존재하는지도 확인한다. `operations`는 중복 없는 lower_snake_case이며
-`core.action_semantics`의 공통 지원 목록에 포함되어야 한다.
-형식만 맞는 미지원 연결은 서버·도구·작업 이름을 명시한 설정 오류로 등록 전에 거부한다.
+`core.action_semantics`의 공통 형식 규칙을 적용한다. Builtin 이름은 폐쇄된
+실행 허용 목록이 아니다. 확장은 명시적인 live catalog 연결, 호환되는 역할과
+대상을 필요로 하며 이름 형식 통과만으로 실행 권한을 얻지 못한다.
 환경 설정의 `TOOL_OPERATIONS_JSON`/profile 또는 discovery가 명시한 연결만 Agent에 노출한다.
 운영자 연결이 discovery의 비어 있지 않은 operations와 다르면 등록을 거부한다.
 설정이 없는 일반 discovery 도구와 빈 연결 `[]`의 관리용 도구는 저장 가능하지만
@@ -49,6 +51,25 @@ Agent → core ToolCatalog Port → Capability Registry → ToolGateway → MCP 
 종류와 input schema가 맞는 후보만 남긴다. 기존 Playbook에 남아 있는 preferred
 ToolId는 호환용 힌트이며, discovery에 없으면 canonical action 조회로 대체한다.
 실제 실행 직전에는 Gateway가 operation binding과 schema를 다시 확인한다.
+
+## Provider의 대상 metadata
+
+SDK `tools/list`의 `_meta`에서 선택적으로 다음 공통 키를 전달할 수 있다.
+Adapter가 기존 `ToolDescriptor`에 투영하며 별도 등록 체계를 만들지 않는다.
+
+- `redteam.target_types`: 문자열 목록. 예: `["device"]`.
+- `redteam.argument_bindings`: 문자열 → 문자열 객체. 예: `{"device": "device_serial"}`.
+- `redteam.command_fields`: 명령 입력 필드 목록. 기존 계약을 사용한다.
+- `redteam.target_binding`: 기존 URL 대상/일치 조건 계약을 사용한다.
+
+새 두 키의 타입이 잘못되면 discovery 단계에서 오류를 반환하고 등록하지 않는다.
+정상 타입이어도 Registry의 Graph 종류 등 manifest 검증과 운영자 설정 우선순위를
+거쳐야 한다. `_meta`는 대상 바인딩 선언이지 scope 확대나 Control 승인 대체가 아니다.
+DeviceTarget 인자 검증은 알려진 `device_ref`, `device_serial`, `package_name`과
+원격 별칭을 비교한다. 일반 별칭 `device`는 기본 기기 참조지만 provider가 serial로
+명시하면 그 바인딩을 따른다. 다른 기기·앱을 명시한 행동은 후보/행동 검증에서 거절한다.
+직접 Gateway만 호출하는 외부 코드는 Agent의 이 검증 경로를 우회하지 않아야 한다.
+원격 서버도 자신의 기기 allowlist를 별도로 집행해야 한다.
 
 Recon 결과는 관찰된 값만 구조화한다. HTTP probe는 가능한 경우 `host`, `port`,
 `scheme`, `protocol`, `service`, `status`, `status_code`, `url`을 반환하며,

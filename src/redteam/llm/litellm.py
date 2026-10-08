@@ -39,10 +39,14 @@ Responses API.
 from __future__ import annotations
 
 import json
-from collections.abc import AsyncIterator, Mapping
+import math
+import time
+from collections.abc import AsyncIterator, Callable, Mapping
+from email.utils import parsedate_to_datetime
 from typing import Any, cast
 
-from redteam.core.ports.llm import LLMProviderFailure, StructuredCompletion
+from redteam.core.ports.llm import LLMProviderFailure, ProviderRetryPolicy, StructuredCompletion
+from redteam.llm.provider_backoff import ProviderBackoff
 
 _CHATGPT_PROVIDER = "chatgpt"
 
@@ -204,21 +208,26 @@ def _retry_after_from_headers(headers: Any) -> float | None:
     if not items:
         return None
     lowered = {str(key).lower(): val for key, val in items.items()}
-    for key in ("retry-after", "retry_after", "ratelimit-reset", "retry-after-ms"):
+    for key in ("retry-after", "retry-after-ms"):
         if key not in lowered:
             continue
         raw = lowered[key]
         try:
             number = float(str(raw).strip())
         except (TypeError, ValueError):
-            continue
+            if key != "retry-after":
+                continue
+            try:
+                number = max(0.0, parsedate_to_datetime(str(raw)).timestamp() - time.time())
+            except (TypeError, ValueError, OverflowError):
+                continue
         if key == "retry-after-ms":
             number = number / 1000.0
         if number != number or number == float("inf") or number == float("-inf"):
             continue
         if number < 0:
             continue
-        return min(number, 3600.0)
+        return number
     return None
 
 
@@ -254,6 +263,13 @@ def _normalize_provider_error(exc: BaseException) -> LLMProviderFailure:
     if raw_code is None:
         raw_code = getattr(exc, "type", None)
     code = _safe_code(raw_code)
+    # Read only structured identifiers, never parse or retain remote free text.
+    body = getattr(exc, "body", None)
+    error = body.get("error", body) if isinstance(body, Mapping) else {}
+    body_code = _safe_code(error.get("code")) if isinstance(error, Mapping) else "unknown"
+    body_type = _safe_code(error.get("type")) if isinstance(error, Mapping) else "unknown"
+    if body_code != "unknown":
+        code = body_code
     retry_after = _retry_after_from_headers(getattr(exc, "headers", None))
     if retry_after is None:
         retry_after = _retry_after_from_headers(
@@ -264,10 +280,18 @@ def _normalize_provider_error(exc: BaseException) -> LLMProviderFailure:
             candidate = getattr(exc, attr, None)
             if isinstance(candidate, (int, float)) and not isinstance(candidate, bool):
                 number = float(candidate)
-                if 0 <= number <= 3600.0 and number == number:
+                if number >= 0 and math.isfinite(number):
                     retry_after = number
                     break
     kind, retryable = _classify_status(status)
+    quota_codes = {
+        "insufficient_quota", "credit_balance_exhausted",
+        "organization_spend_limit_exceeded", "project_spend_limit_exceeded",
+        "organization_usage_limit_exceeded",
+    }
+    if status == 429 and ({code, body_type, _safe_code(getattr(exc, "type", None))}
+                          & quota_codes):
+        kind, retryable = "quota", False
     return LLMProviderFailure(
         kind=kind,
         http_status=status,
@@ -293,12 +317,14 @@ class LiteLLMClient:
         model: str,
         api_key: str | None = None,
         num_retries: int = 0,
+        retry_policy: ProviderRetryPolicy | None = None,
         **default_kwargs: Any,
     ) -> None:
         self._model = model
         self._api_key = api_key
         self._num_retries = num_retries
         self._default_kwargs = default_kwargs
+        self._provider_backoff = ProviderBackoff(retry_policy or ProviderRetryPolicy())
 
         import litellm
 
@@ -350,6 +376,23 @@ class LiteLLMClient:
         merged.setdefault("num_retries", self._num_retries)
         return merged
 
+    @property
+    def provider_wait_limit_seconds(self) -> float:
+        return self._provider_backoff.policy.max_wait_seconds
+
+    async def wait_for_provider(
+        self, *, max_wait_seconds: float | None = None,
+        before_call: Callable[..., Any] | None = None,
+    ) -> float:
+        return await self._provider_backoff.wait(
+            max_wait_seconds=max_wait_seconds, before_call=before_call,
+        )
+
+    def _provider_failure(self, exc: BaseException) -> LLMProviderFailure:
+        failure = _normalize_provider_error(exc)
+        self._provider_backoff.failed(failure)
+        return failure
+
     async def complete(
         self,
         *,
@@ -357,6 +400,7 @@ class LiteLLMClient:
         system: str | None = None,
         **kwargs: Any,
     ) -> str:
+        await self.wait_for_provider()
         if self._is_chatgpt_subscription:
             return await self._chatgpt_stream_text(messages, system=system, kwargs=kwargs)
 
@@ -370,10 +414,12 @@ class LiteLLMClient:
                 api_key=self._api_key,
                 **self._call_kwargs(kwargs),
             )
-        except LLMProviderFailure:
-            raise
         except Exception as exc:
-            raise _normalize_provider_error(exc) from exc
+            failure = self._provider_failure(exc)
+            if failure is exc:
+                raise
+            raise failure from exc
+        self._provider_backoff.succeeded()
         return response.choices[0].message.content or ""
 
     async def complete_structured_with_usage(
@@ -392,6 +438,7 @@ class LiteLLMClient:
         last_usage state is kept; usage travels with this request's
         result for the caller to record on its own budget.
         """
+        await self.wait_for_provider()
         if self._is_chatgpt_subscription:
             # Verified directly: unlike a plain OpenAI API key's
             # `response_format`, this backend's `text.format=json_object`
@@ -432,10 +479,12 @@ class LiteLLMClient:
                 api_key=self._api_key,
                 **call_kwargs,
             )
-        except LLMProviderFailure:
-            raise
         except Exception as exc:
-            raise _normalize_provider_error(exc) from exc
+            failure = self._provider_failure(exc)
+            if failure is exc:
+                raise
+            raise failure from exc
+        self._provider_backoff.succeeded()
         content = response.choices[0].message.content or "{}"
         return StructuredCompletion(
             value=content,
@@ -501,10 +550,11 @@ class LiteLLMClient:
                 api_key=self._api_key,
                 **call_kwargs,
             )
-        except LLMProviderFailure:
-            raise
         except Exception as exc:
-            raise _normalize_provider_error(exc) from exc
+            failure = self._provider_failure(exc)
+            if failure is exc:
+                raise
+            raise failure from exc
 
         # Only a completed stream counts as success: text without the terminal
         # event means truncation, and partial JSON must never pass as normal.
@@ -518,6 +568,7 @@ class LiteLLMClient:
                 text = _responses_output_text(response)
                 if not text:
                     raise _stream_protocol_failure()
+                self._provider_backoff.succeeded()
                 return text
 
             text_parts: list[str] = []
@@ -539,8 +590,10 @@ class LiteLLMClient:
                 raise _stream_protocol_failure()
             if not text:
                 raise _stream_protocol_failure()
+            self._provider_backoff.succeeded()
             return text
-        except LLMProviderFailure:
-            raise
         except Exception as exc:
-            raise _normalize_provider_error(exc) from exc
+            failure = self._provider_failure(exc)
+            if failure is exc:
+                raise
+            raise failure from exc

@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "server_id": "mobile-diagnostics",
+  "devices": {
+    "approved-device": {
+      "asset_ref": "approved-app",
+      "serial": "<approved-device-serial>",
+      "package_name": "<approved-app-package>"
+    }
+  },
+  "additional_server_ids": [],
+  "allowed_commands": ["getprop", "dumpsys_battery"],
+  "adb_path": "adb",
+  "timeout_seconds": 10,
+  "max_output_bytes": 8192
+}

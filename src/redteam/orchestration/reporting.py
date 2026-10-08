@@ -396,10 +396,12 @@ class TerminalReportProjection(BaseModel):
     termination_reason: str | None
     planning_diagnostic: DecisionDiagnostic | None = None
     planning_diagnostic_history: list[DecisionDiagnostic] = Field(default_factory=list)
+    worker_result_conflicts: dict[str, list[str]] = Field(default_factory=dict)
     runtime_observations: list[RuntimeObservation] = Field(
         default_factory=list, max_length=MAX_RUNTIME_OBSERVATIONS,
     )
     request_observations: list[dict[str, Any]] = Field(default_factory=list)
+    evidence_validity: list[dict[str, Any]] = Field(default_factory=list)
     pending_event_count: int = 0
     event_delivery_pending: bool = False
     pending_approval_id: ApprovalId | None = None
@@ -537,12 +539,17 @@ class ReportingAgent:
                 key=lambda item: ref_order.get(item.evidence_id, len(ref_order)),
             )
         evidence_read_projections = _project_evidence_reads(runtime)
+        from redteam.orchestration.evidence_validity import project_validity
+
+        validity = await project_validity(evidence_store, graph, str(runtime.run_id), evidence)
         report = TerminalReportProjection(
+            evidence_validity=validity,
             run_id=runtime.run_id,
             phase=runtime.phase,
             termination_reason=runtime.termination_reason,
             planning_diagnostic=runtime.planning_diagnostic,
             planning_diagnostic_history=list(runtime.planning_diagnostic_history),
+            worker_result_conflicts=dict(runtime.worker_result_conflicts),
             runtime_observations=list(runtime.recent_observations[-MAX_RUNTIME_OBSERVATIONS:]),
             request_observations=[
                 {

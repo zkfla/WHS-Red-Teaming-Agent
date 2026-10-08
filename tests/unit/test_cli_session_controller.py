@@ -18,6 +18,36 @@ from redteam.app.cli.terminal_frontend import ConsoleFrontend
 pytestmark = pytest.mark.asyncio
 
 
+async def test_conversation_sees_discovery_snapshot_and_detached_lifecycle():
+    async with session() as s:
+        await s.c.handle(_new_receipt(s.c, "Which tools are configured?"))
+        before = s.conversation.calls[-1][1]
+        assert before["tools"] == []
+        assert "not_discovered" in before["session_context"]
+        s.operator.catalog_labels = lambda: ["fixture/inspect [response_analysis]"]
+        s.c.attach(s.operator)
+        await s.c.handle(_new_receipt(s.c, "Which tools were discovered?"))
+        live = s.conversation.calls[-1][1]
+        assert live["tools"] == ["fixture/inspect [response_analysis]"]
+        assert "status: discovered" in live["session_context"]
+        await s.c.detach()
+        await s.c.handle(_new_receipt(s.c, "What can I rerun?"))
+        closed = s.conversation.calls[-1][1]
+        assert closed["tools"] == live["tools"]
+        assert "status: run_detached" in closed["session_context"]
+        assert "rediscover" in closed["session_context"]
+
+
+def _new_receipt(controller, text):
+    from redteam.app.cli.session_types import InputEnvelope, InputReceipt
+
+    controller.sequence += 1
+    return InputReceipt(InputEnvelope(
+        f"fixture_{controller.sequence}", text, controller.sequence,
+        controller.phase, None, None, False, None,
+    ))
+
+
 class Frontend(ConsoleFrontend):
     interactive = True
 
@@ -270,6 +300,57 @@ async def test_suspension_and_resume_share_run_but_not_attachment():
         await s.c.output.fence()
         assert "실행 대기" in s.buffer.getvalue()
         assert "실행 종료" in s.buffer.getvalue()
+
+
+async def test_new_approval_rejects_old_queued_input_without_retargeting_it():
+    async with session() as s:
+        await start(s)
+        first = SimpleNamespace(pending_approval_id="approval-first")
+        second = SimpleNamespace(pending_approval_id="approval-second")
+        s.c.suspended(first)
+        verified = []
+
+        async def verify(approval, run_id):
+            verified.append((approval, run_id))
+            return approval == "approval-second" and run_id == "run-A"
+
+        s.c.approval_verifier = verify
+        await s.c.gate.acquire()
+        try:
+            # Capture the original approval identity before the pending action changes.
+            s.c.submit("approve approval-first")
+            s.c.suspended(second)
+        finally:
+            s.c.gate.release()
+        await s.c.controls.join()
+        assert s.c.receipts["input_2"].state == "not_applied"
+        assert not verified
+        assert not s.operator.calls
+
+        s.c.submit("approve approval-second")
+        await s.c.controls.join()
+        assert verified == [("approval-second", "run-A")]
+        assert s.operator.calls == [("approve", "approval-second")]
+        assert s.c.receipts["input_3"].state == "handled"
+        assert s.c.pending_approval is None
+        assert s.c.phase == SessionPhase.RUNNING
+
+
+async def test_late_resolution_acknowledgement_does_not_clear_new_approval():
+    async with session() as s:
+        await start(s)
+        s.c.suspended(SimpleNamespace(pending_approval_id="approval-first"))
+        s.operator.block = True
+        s.c.submit("approve approval-first")
+        await asyncio.wait_for(s.operator.entered.wait(), 2)
+        # The canonical runtime can rebind the next action while the previous
+        # dispatch response is still returning to its input receipt.
+        s.c.suspended(SimpleNamespace(pending_approval_id="approval-second"))
+        s.operator.release.set()
+        await s.c.controls.join()
+        assert s.c.receipts["input_2"].state == "handled"
+        assert s.c.pending_approval == "approval-second"
+        assert s.c.phase == SessionPhase.WAITING_APPROVAL
 
 
 class _ScriptFrontend(ConsoleFrontend):

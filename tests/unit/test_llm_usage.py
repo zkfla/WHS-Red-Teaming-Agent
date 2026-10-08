@@ -392,10 +392,20 @@ async def test_provider_failure_reaches_persisted_report_without_remote_material
     from redteam.attack_graph.service import AttackGraphService
     from redteam.attack_graph.stores.memory import InMemoryAttackGraphStore
     from redteam.core.enums import AgentPhase
+    from redteam.llm import provider_backoff
     from redteam.orchestration.reporting import ReportingAgent
     from redteam.orchestration.state import RuntimeState
     from redteam.orchestration.work.memory import InMemoryWorkStore
     from tests.fakes.evidence_store import FakeEvidenceStore
+
+    now = [0.0]
+
+    async def advance(seconds):
+        now[0] += seconds
+
+    monkeypatch.setattr(provider_backoff, "time", SimpleNamespace(monotonic=lambda: now[0]))
+    monkeypatch.setattr(provider_backoff, "asyncio", SimpleNamespace(sleep=advance))
+    monkeypatch.setattr(provider_backoff.random, "uniform", lambda *_: 0.0)
 
     sentinel = "opaque-remote-body-not-for-report"
 
@@ -430,8 +440,10 @@ async def test_provider_failure_reaches_persisted_report_without_remote_material
     assert cause.provider_status == status and cause.provider_code == (code or "unknown")
     assert cause.retryable is retryable
     assert cause.retry_after == (float(retry_after) if retry_after else None)
-    assert calls == (2 if retryable else 1)
+    assert calls == (4 if retryable else 1)
     assert budget.used == calls and budget.unknown_usage_count == calls
+    assert budget.repair_used == 0 and budget.transport_used == calls
+    assert failure.termination_reason == "provider_unavailable"
     assert budget.tokens_used == 0
     runtime = RuntimeState(
         run_id="run-provider", engagement_id="eng", phase=AgentPhase.FAILED,

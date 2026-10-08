@@ -12,8 +12,26 @@ SDK exception types.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
+
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+
+class ProviderRetryPolicy(BaseModel):
+    """Bounded provider waiting; actual request limits remain with the caller."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, allow_inf_nan=False)
+    base_delay_seconds: float = Field(default=1.0, gt=0)
+    max_delay_seconds: float = Field(default=30.0, gt=0)
+    max_wait_seconds: float = Field(default=30.0, ge=0)
+
+    @model_validator(mode="after")
+    def validate_delay_range(self) -> ProviderRetryPolicy:
+        if self.max_delay_seconds < self.base_delay_seconds:
+            raise ValueError("max_delay_seconds must be >= base_delay_seconds")
+        return self
 
 
 @dataclass(frozen=True)
@@ -28,6 +46,7 @@ class StructuredCompletion:
 _PROVIDER_KINDS = frozenset(
     {
         "rate_limited",
+        "quota",
         "auth",
         "invalid_request",
         "server",
@@ -72,7 +91,7 @@ def _clean_retry_after(value: Any) -> float | None:
             return None
         if number < 0:
             return None
-        return min(number, 3600.0)
+        return number
     return None
 
 
@@ -131,6 +150,24 @@ class MeteredLLMClient(Protocol):
         system: str | None = None,
         **kwargs: Any,
     ) -> StructuredCompletion: ...
+
+
+@runtime_checkable
+class ProviderBackoffClient(Protocol):
+    """Optional shared connection readiness, checked before request accounting.
+
+    Waiting does not make a model request. Guards remain owned by the caller.
+    Implementations return elapsed waiting and raise a safe provider failure
+    when the delay cannot fit; they must never shorten the server's delay.
+    """
+
+    @property
+    def provider_wait_limit_seconds(self) -> float: ...
+
+    async def wait_for_provider(
+        self, *, max_wait_seconds: float | None = None,
+        before_call: Callable[..., Any] | None = None,
+    ) -> float: ...
 
 
 class LLMClient(Protocol):

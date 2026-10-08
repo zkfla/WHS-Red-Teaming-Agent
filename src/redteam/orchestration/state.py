@@ -60,6 +60,7 @@ class TerminationReason:
     USER_INTERRUPTED = "user_interrupted"
     EXECUTION_ERROR = "execution_error"
     PLANNING_ERROR = "planning_error"
+    PROVIDER_UNAVAILABLE = "provider_unavailable"
     GOAL_ACHIEVED = "goal_achieved"
     INVESTIGATION_HELD = "investigation_held"
     #: Operator asked to hold the run before the next action executes. The
@@ -125,6 +126,10 @@ class RuntimeState(BaseModel):
     # Control Plane restores its tool-call budget from this on restart.
     retry_tool_calls: int = Field(default=0, ge=0)
     actions_by_agent: dict[str, int] = Field(default_factory=dict)
+    # Additive checkpoint receipts. Only terminal worker results are accounted;
+    # REQUIRE_APPROVAL/deferred deliveries may legitimately progress later.
+    worker_result_receipts: dict[str, str] = Field(default_factory=dict)
+    worker_result_conflicts: dict[str, list[str]] = Field(default_factory=dict)
     consecutive_failures: int = 0
     no_progress_turns: int = 0
     last_progress_fingerprint: str | None = None

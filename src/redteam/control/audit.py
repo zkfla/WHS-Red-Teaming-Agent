@@ -24,7 +24,6 @@ for a durable sink.
 
 from __future__ import annotations
 
-import re
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, NewType, Protocol
@@ -35,6 +34,7 @@ from redteam.core.contracts.action import ActionProposal
 from redteam.core.contracts.policy import Approval, PolicyDecision
 from redteam.core.enums import PolicyVerdict
 from redteam.core.ids import ActionId, ApprovalId, EngagementId, RunId, new_id
+from redteam.core.redaction import redact_arguments as redact_arguments
 from redteam.core.redaction import redact_sensitive_text
 
 AuditId = NewType("AuditId", str)
@@ -43,31 +43,6 @@ AuditId = NewType("AuditId", str)
 class AuditEntryType(str, Enum):
     POLICY_DECISION = "policy_decision"
     APPROVAL_RESOLVED = "approval_resolved"
-
-
-_SENSITIVE_KEY_PATTERN = re.compile(
-    r"(token|password|passwd|secret|credential|account|card|ssn|api[_-]?key|auth|"
-    r"session|csrf|cookie)",
-    re.IGNORECASE,
-)
-def redact_arguments(value: Any) -> Any:
-    """Best-effort redaction of likely-sensitive values before persisting.
-
-    This is a safety net, not a substitute for not collecting sensitive
-    data in the first place: it catches obviously-named keys and common
-    credential patterns in text, but cannot identify arbitrary secrets
-    or personal data. It recurses into nested dicts and lists.
-    """
-    if isinstance(value, dict):
-        return {
-            key: ("***REDACTED***" if _SENSITIVE_KEY_PATTERN.search(key) else redact_arguments(v))
-            for key, v in value.items()
-        }
-    if isinstance(value, list):
-        return [redact_arguments(item) for item in value]
-    if isinstance(value, str):
-        return redact_sensitive_text(value)
-    return value
 
 
 class AuditEntry(BaseModel):

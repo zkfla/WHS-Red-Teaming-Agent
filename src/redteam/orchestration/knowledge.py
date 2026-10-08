@@ -1729,6 +1729,35 @@ async def collect_assessment(
     )
 
 
+async def collect_measured_values(
+    graph_service: Any, evidence_store: Any, run_id: str, refs: set[str], *,
+    engagement_id: str | None = None,
+) -> dict[str, Any]:
+    """Uncapped requested values from the same snapshot that proves their sources.
+
+    Conditions must not validate an old reference and then read an ungrounded
+    newer graph value separately. No provided/inferred value enters this map.
+    """
+    nodes, graph_error, index, diagnostics = await _collect_inputs(
+        graph_service, evidence_store, str(run_id), engagement_id=engagement_id,
+    )
+    if graph_error is not None or diagnostics.get("lookup_failed"):
+        raise ValueError("measured_value_snapshot_unavailable")
+    values = {}
+    for node in nodes:
+        item, _, _ = _fact_view(
+            node, str(run_id), index, diagnostics, observation_limit=None, evidence_limit=None,
+        )
+        if item is None:
+            continue
+        for container, fields in (("attr", item.observed_attrs), ("fact", item.observed_facts)):
+            for key, value in fields.items():
+                ref = f"{item.node_id}#{container}:{key}"
+                if ref in refs:
+                    values[ref] = value
+    return values
+
+
 async def collect_progress_content(
     graph_service: Any,
     evidence_store: Any,

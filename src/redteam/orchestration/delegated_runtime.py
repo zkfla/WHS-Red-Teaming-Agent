@@ -12,7 +12,13 @@ from redteam.orchestration.completion_proposal import (
     InvestigationGap,
     record_unresolved,
 )
-from redteam.orchestration.context_projection import ContextProjector, project_evidence_excerpts
+from redteam.orchestration.context_projection import (
+    ContextProjector,
+    action_proposal_lifecycle,
+    project_evidence_excerpts,
+    related_runtime_observations,
+    worker_proposal_preparation,
+)
 from redteam.orchestration.delegation import DelegationRequest
 from redteam.orchestration.delegation_decision import (
     TERMINATION_WORKER_HELD,
@@ -120,11 +126,23 @@ async def _worker_hold_fingerprint(engine, runtime, state):
                 "facts": [
                     {"graph": engine.deps.agents.revision_fingerprint(state.agent_id, observation)},
                     *content,
+                    {"current_validity": await _delegation_validity(engine, runtime, state)},
                 ]
             }
         )
     except Exception:  # noqa: BLE001 - failed reads cannot wake a held investigation
         return None
+
+
+async def _delegation_validity(engine, runtime, state):
+    """Exact cited claims only; unrelated receipts never wake this investigation."""
+    from redteam.orchestration.evidence_validity import current_validity
+
+    records = await engine.deps.evidence_store.list_for_run(runtime.run_id)
+    return [await current_validity(
+        engine.deps.evidence_store, AttackGraphService(engine.deps.graph_store),
+        str(runtime.run_id), str(ref), records=records,
+    ) for ref in sorted(set(state.evidence_ids))]
 
 
 async def _relink_same_purpose(engine, runtime, path, state):
@@ -210,6 +228,16 @@ async def accept_delegations(engine, path, requests, runtime):
 
 
 async def decide_delegations(engine, path, runtime, context):
+    if engine.deps.settings.specialist_decision_concurrency > 1:
+        from redteam.orchestration.parallel_reasoning import decide_parallel
+
+        return await decide_parallel(engine, path, runtime, context, _decide_serial)
+    return await _decide_serial(engine, path, runtime, context)
+
+
+async def _decide_serial(
+    engine, path, runtime, context, *, preparing=None, prepared=None, only=None,
+):
     """Each active specialist proposes its next call; root receives finished results."""
     from redteam.orchestration.engine import SYSTEM, ActionIntent
 
@@ -218,6 +246,8 @@ async def decide_delegations(engine, path, runtime, context):
     advanced = False
     history = await engine.deps.work_store.list_items(run_id=runtime.run_id)
     for identity, state in list(values.items()):
+        if only is not None and identity != only:
+            continue
         if state.status == "finished":
             continue
         if state.path_id != path.path_id or state.mission_task_id != path.mission_task_id:
@@ -315,6 +345,18 @@ async def decide_delegations(engine, path, runtime, context):
             unresolved=state.unresolved,
             remaining_actions=gate.remaining_actions,
         )
+        # Read the accepted path, not the model's draft or an old receipt summary.
+        # This projection explains preparation; compile/Control remain the gates.
+        from redteam.orchestration.engine import _collect_check_assessment
+
+        canonical_path = await engine.deps.path_store.get_active(str(runtime.run_id))
+        material = await _collect_check_assessment(
+            engine.deps, runtime, service=service, target_node_ids=step.target_node_ids,
+        )
+        payload["action_lifecycle"] = action_proposal_lifecycle()
+        payload["proposal_preparation"] = worker_proposal_preparation(
+            path, step, canonical_path, material,
+        )
         knowledge = dict(context.get("knowledge") or {})
         for section in ("facts", "known_targets"):
             knowledge[section] = [
@@ -342,6 +384,14 @@ async def decide_delegations(engine, path, runtime, context):
             if definition.context_profile.max_evidence
             else []
         )
+        owned_actions = {
+            str(item.action_id) for item in records
+            if str(item.evidence_id) in state.evidence_ids and item.action_id is not None
+        }
+        owned_actions.update(
+            str(item["action_id"]) for item in context.get("execution_history", [])
+            if item.get("delegation_id") == identity and item.get("action_id")
+        )
         payload.update(
             goal=context.get("goal"),
             success_criteria=context.get("success_criteria"),
@@ -362,6 +412,8 @@ async def decide_delegations(engine, path, runtime, context):
                 or item.get("delegation_id") == identity
             ],
             local_tools=context.get("local_tools", []),
+            runtime_observations=related_runtime_observations(context, owned_actions),
+            evidence_validity=await _delegation_validity(engine, runtime, state),
             local_tool_results=await engine.local_results(runtime, delegation_id=identity),
             evidence_reads=await restore_reads(
                 engine.deps.evidence_store, runtime, delegation_id=identity
@@ -413,6 +465,14 @@ async def decide_delegations(engine, path, runtime, context):
         schema["properties"]["evidence_requests"]["items"] = EvidenceReadRequest.model_json_schema()
         if not gate.investigate_model_allowed:
             schema["properties"]["decision"]["enum"] = ["finish"]
+        if preparing is not None:
+            from redteam.orchestration.parallel_reasoning import PreparedTurn, subject_stamp
+
+            preparing.append(PreparedTurn(
+                state=state.model_copy(deep=True), payload=payload, schema=schema,
+                budget=budget, stamp=await subject_stamp(engine, runtime, state),
+            ))
+            continue
         engine.decision_token_limit = (
             max(state.budget.max_tokens - (state.tokens_used or 0), 0)
             if state.budget.max_tokens is not None
@@ -423,14 +483,20 @@ async def decide_delegations(engine, path, runtime, context):
         diagnostic = None
         engine.active_delegation = state
         try:
-            raw = await engine._ask(
-                stage="worker_next_action",
-                payload=payload,
-                response_schema=schema,
-                system=SYSTEM + " You own this delegated purpose. Choose methods yourself. "
-                "Return evidence and gaps; only the root can settle the overall goal.",
-                budget=budget,
-            )
+            if prepared is not None:
+                budget = prepared.budget
+                if prepared.failure is not None:
+                    raise prepared.failure
+                raw = prepared.response
+            else:
+                raw = await engine._ask(
+                    stage="worker_next_action",
+                    payload=payload,
+                    response_schema=schema,
+                    system=SYSTEM + " You own this delegated purpose. Choose methods yourself. "
+                    "Return evidence and gaps; only the root can settle the overall goal.",
+                    budget=budget,
+                )
             verdict = parse_worker_next_action(raw)
             if verdict.tool_calls and gate.investigate_model_allowed:
                 await engine.execute_local_calls(
@@ -533,6 +599,12 @@ async def decide_delegations(engine, path, runtime, context):
             values[identity] = values[identity].model_copy(update={"held_fingerprint": fingerprint})
         advanced = True
         runtime = _publish_runtime(engine, runtime, values)
+        if diagnostic is not None and diagnostic.termination_reason == "provider_unavailable":
+            # Persist the worker's cost and unresolved record before handing the
+            # provider blockage to PLAN. A fresh worker turn must not reset retries.
+            raise DecisionFailure(
+                diagnostic.stage, diagnostic.kind, budget.used, diagnostic=diagnostic,
+            )
         if verdict is None:
             continue
         if verdict.evidence_ids and verdict.decision != "read_evidence":

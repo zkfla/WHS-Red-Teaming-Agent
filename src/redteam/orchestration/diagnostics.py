@@ -27,6 +27,9 @@ _KNOWN_FIELDS = frozenset(
         "mode",
         "path",
         "steps",
+        "questions",
+        "question_id",
+        "origins",
         "completion_criteria",
         "criteria",
         "kind",
@@ -150,11 +153,12 @@ class DecisionDiagnostic(BaseModel):
     repair_limit: int | None = None
     normal_used: int = Field(default=0, ge=0)
     repair_used: int = Field(default=0, ge=0)
+    transport_used: int = Field(default=0, ge=0)
     provider_status: int | None = None
     provider_code: str | None = None
     retry_after: float | None = None
     validation_issues: list[dict[str, str]] = Field(default_factory=list, max_length=10)
-    termination_reason: Literal["budget_exhausted"] | None = None
+    termination_reason: Literal["budget_exhausted", "provider_unavailable"] | None = None
 
     error_type: str = Field(default="", max_length=100)
     exception_chain: list[str] = Field(default_factory=list, max_length=5)

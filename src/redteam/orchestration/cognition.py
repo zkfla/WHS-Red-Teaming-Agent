@@ -10,13 +10,15 @@ Contract notes for the orchestration loop:
 - Native schema enforcement lives in the LLM adapter; this client always
   calls complete_structured and re-validates, so either path still lets
   the model decide.
-- Transport and format/schema errors share one DecisionBudget
-  (max_attempts). Each retry appends the previous validation message to
-  the prompt. One decision uses one budget: pass the same DecisionBudget
+- Actual requests share one DecisionBudget (max_attempts). Typed provider
+  failures count as transport, not normal decisions or semantic repairs.
+  Only validation retries append correction feedback to the prompt.
+  One decision uses one budget: pass the same DecisionBudget
   to several ask calls (draft, review, action) to share it; never nest an
   outer caller count with the client budget.
-- Budget spent raises DecisionFailure(kind="budget"); empty results are
-  never returned.
+- Budget spent raises DecisionFailure; provider blockage retains transport
+  diagnostics and provider_unavailable, not a generic planning error.
+  Empty results are never returned.
 - SDK-level retries are disabled (num_retries=0); this client is the only
   retry layer.
 - Chain-of-thought is never requested or stored; the system prompt is
@@ -41,7 +43,7 @@ from pydantic import ValidationError as ModelValidationError
 from tenacity import AsyncRetrying, retry_if_exception_type, stop_after_attempt
 
 from redteam.core.contracts.mission import redact_secret_material
-from redteam.core.ports.llm import LLMProviderFailure
+from redteam.core.ports.llm import LLMProviderFailure, ProviderBackoffClient
 from redteam.orchestration.diagnostics import (
     DecisionDiagnostic,
     JsonNormalizationContext,
@@ -140,6 +142,8 @@ class DecisionBudget:
             self._max_attempts = min(self._max_attempts, total_limit)
         self.normal_used = 0
         self.repair_used = 0
+        self.transport_used = 0
+        self.last_attempt_was_transport = False
         self._used = 0
         self._tokens_used = 0
         self._tokens_unknown = 0
@@ -157,6 +161,7 @@ class DecisionBudget:
             "repair_limit": self.repair_limit,
             "normal_used": self.normal_used,
             "repair_used": self.repair_used,
+            "transport_used": self.transport_used,
             "failure_counts": dict(self.failure_counts),
         }
 
@@ -193,6 +198,7 @@ class DecisionBudget:
         if self.normal_used >= limit:
             raise RuntimeError("normal decision budget exhausted")
         self.normal_used += 1
+        self.last_attempt_was_transport = False
         self.record(stage, "provider_decision_without_request")
 
     def record(self, stage: str, outcome: str, **details: Any) -> None:
@@ -215,6 +221,15 @@ class DecisionBudget:
         if not key:
             return
         self.failure_counts[key] = self.failure_counts.get(key, 0) + 1
+
+    def record_transport_attempt(self, *, repair: bool) -> None:
+        """Reclassify a failed request, never refund its actual request cost."""
+        if repair:
+            self.repair_used -= 1
+        else:
+            self.normal_used -= 1
+        self.transport_used += 1
+        self.last_attempt_was_transport = True
 
     @property
     def max_attempts(self) -> int:
@@ -285,6 +300,7 @@ class DecisionBudget:
         if not self.permits(repair=repair):
             raise RuntimeError("decision budget exhausted")
         self._used += 1
+        self.last_attempt_was_transport = False
         if repair:
             self.repair_used += 1
         else:
@@ -466,6 +482,7 @@ class StructuredDecisionClient:
         system: str = "",
         budget: DecisionBudget | None = None,
         before_call: Callable[..., Any] | None = None,
+        validate_response: Callable[[dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
         if budget is None:
             budget = DecisionBudget(self._max_attempts)
@@ -477,7 +494,7 @@ class StructuredDecisionClient:
             working.setdefault(key, value)
         json.dumps(working)
         return await self._ask_with_tenacity(
-            stage, working, response_schema, system, budget, before_call
+            stage, working, response_schema, system, budget, before_call, validate_response
         )
 
     async def _resolve_extra_context(self, stage: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -569,6 +586,7 @@ class StructuredDecisionClient:
                     error_type=error_type_for(exc),
                     exception_chain=exception_chain_for(exc),
                     **exc.diagnostic_fields(),
+                    termination_reason="provider_unavailable",
                 )
             else:
                 diagnostic = DecisionDiagnostic(
@@ -644,10 +662,20 @@ class StructuredDecisionClient:
         system: str,
         budget: DecisionBudget,
         before_call: Callable[..., Any] | None = None,
+        validate_response: Callable[[dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
         is_repair = False
+        provider_waited = 0.0
 
         def exhausted() -> DecisionFailure:
+            if budget.last_attempt_was_transport and budget.last_failure is not None and (
+                budget.last_failure.termination_reason == "provider_unavailable"
+            ):
+                diagnostic = budget.last_failure.model_copy(update={
+                    "attempts": budget.used, "last_cause": budget.last_failure,
+                    **budget.diagnostic_details(),
+                })
+                return DecisionFailure(stage, "transport", budget.used, diagnostic=diagnostic)
             diagnostic = DecisionDiagnostic(
                 code=budget.exhaustion_code(repair=is_repair),
                 stage=stage,
@@ -707,7 +735,28 @@ class StructuredDecisionClient:
             ):
                 if not budget.permits(repair=is_repair):
                     raise exhausted()
-                await run_guard()
+                if isinstance(self._llm, ProviderBackoffClient):
+                    try:
+                        provider_waited += await self._llm.wait_for_provider(
+                            max_wait_seconds=max(
+                                0.0, self._llm.provider_wait_limit_seconds - provider_waited
+                            ), before_call=run_guard,
+                        )
+                    except LLMProviderFailure as exc:
+                        diagnostic = DecisionDiagnostic(
+                            code="llm_provider_" + exc.kind, stage=stage,
+                            kind="transport", attempts=budget.used,
+                            summary="Provider unavailable; no additional request was sent.",
+                            retryable=exc.retryable, termination_reason="provider_unavailable",
+                            last_cause=budget.last_failure,
+                            **exc.diagnostic_fields(), **budget.diagnostic_details(),
+                        )
+                        budget.last_failure = diagnostic
+                        raise DecisionFailure(
+                            stage, "transport", budget.used, diagnostic=diagnostic,
+                        ) from exc
+                else:
+                    await run_guard()
                 budget.consume(stage=stage, repair=is_repair)
                 budget.record(stage, "request", feedback=safe_feedback(feedback))
                 with attempt:
@@ -721,6 +770,14 @@ class StructuredDecisionClient:
                             kind=kind,
                             budget=budget,
                         )
+                        if validate_response is not None:
+                            try:
+                                validate_response(result)
+                            except (ValueError, TypeError, KeyError) as exc:
+                                raise _RetryableDecisionError(
+                                    diagnostic_for_exception(exc, stage=stage),
+                                    elapsed_ms=metrics.get("elapsed_ms", 0),
+                                ) from exc
                         budget.record(
                             stage, "response_validated",
                             **metrics,
@@ -732,8 +789,17 @@ class StructuredDecisionClient:
                         budget.last_failure = exc.diagnostic.model_copy(
                             update={"attempts": budget.used}
                         )
-                        feedback = exc.feedback
-                        kind = exc.kind
+                        provider_failure = (
+                            exc.diagnostic.termination_reason == "provider_unavailable"
+                        )
+                        if provider_failure:
+                            budget.record_transport_attempt(repair=is_repair)
+                            budget.last_failure = budget.last_failure.model_copy(
+                                update=budget.diagnostic_details()
+                            )
+                        else:
+                            feedback = exc.feedback
+                            kind = exc.kind
                         budget.record(
                             stage, "response_rejected", reason=exc.diagnostic.feedback(),
                             validation_issues=exc.diagnostic.validation_issues,
@@ -745,7 +811,8 @@ class StructuredDecisionClient:
                             raise DecisionFailure(
                                 stage, exc.kind, budget.used, diagnostic=budget.last_failure
                             ) from exc
-                        is_repair = True
+                        if not provider_failure:
+                            is_repair = True
                         raise
         except _RetryableDecisionError as exc:
             raise exhausted() from exc

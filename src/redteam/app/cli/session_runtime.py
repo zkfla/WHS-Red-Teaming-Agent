@@ -50,6 +50,9 @@ async def run_session(
         from redteam.app.agent_profile import load_specialist_profile
 
         loaded = load_specialist_profile(config.specialist_profile)
+        console.print(safe_text(
+            f"Specialist profile: {loaded.profile.profile_id} · version {loaded.profile.version}"
+        ))
         prompts = built[1].agent_prompts if built is not None else loaded.prompts
         conversation.bind_prompts(prompts)
 
@@ -263,6 +266,7 @@ async def run_session(
         command_help={c.name: c.description for c in interactive_commands.COMMANDS},
         model_label=config.llm.default_model,
         single_run=single_run,
+        configured_servers=tuple(config.capability.mcp_servers),
     )
     # Legacy CLI commands and third-party logs still print. Redirect them once
     # at the session boundary, never around an individual concurrent command.

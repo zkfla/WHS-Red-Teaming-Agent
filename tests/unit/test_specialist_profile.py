@@ -15,7 +15,11 @@ from redteam.app.bootstrap import build_application
 from redteam.app.runtime_components import binding_for_resume
 from redteam.core.config import EngagementConfig, specialist_profile_from_environment
 from redteam.core.enums import EvidenceSourceType, PolicyVerdict
-from redteam.orchestration.cognition import DecisionBudget, StructuredDecisionClient
+from redteam.orchestration.cognition import (
+    DecisionBudget,
+    DecisionFailure,
+    StructuredDecisionClient,
+)
 from redteam.orchestration.component_binding import ComponentBindingError
 from redteam.orchestration.engine import InvestigationEngine
 from redteam.orchestration.nodes import aggregate_node
@@ -230,13 +234,14 @@ async def test_invalid_subject_does_not_request_atomization():
     llm = SpecialistLLM()
     llm.add("attack_path_proposal", _strategy("invented"))
     loaded = load_specialist_profile(PROFILE)
-    with pytest.raises(ValueError, match="unknown_target"):
+    with pytest.raises(DecisionFailure) as caught:
         await SerialSpecialistPlanningProvider(loaded.prompts).propose(PlanningRequest(
             stage="path_draft", payload={"knowledge": {"known_targets": ["host:test"]}},
             response_schema=writing_schema(PathPlan, selected_tool=True),
-            inference=BudgetedInference(StructuredDecisionClient(llm), DecisionBudget(3)),
+            inference=BudgetedInference(StructuredDecisionClient(llm), DecisionBudget(1)),
         ))
     assert len(llm.calls) == 1
+    assert caught.value.diagnostic.last_cause.code == "specialist_strategy_unknown_target"
 
 
 async def _application(tmp_path, llm, *, control=None):
@@ -291,6 +296,16 @@ async def test_serial_profile_uses_real_engine_worker_and_control_gate(tmp_path,
         {**initial_graph_state(runtime), "observation": GraphObservation()}, deps=deps,
     )
     assert len(planned["dispatch_items"]) == 1
+    # Proposals reach the ordinary pipeline without a pre-existing ALLOW.
+    assert not control.evaluated and not gateway.invocations
+    worker_call = next(call for call in llm.calls if call["route"] == "worker_next_action")
+    payload, _ = json.JSONDecoder().raw_decode(worker_call["messages"][-1]["content"])
+    assert payload["action_lifecycle"]["prior_control_allow_required_to_propose"] is False
+    assert payload["action_lifecycle"]["control_allow_required_to_execute"] is True
+    preparation = payload["proposal_preparation"]
+    assert preparation["path_binding"]["active_snapshot_matches"] is True
+    assert preparation["path_binding"]["readiness_errors"] == []
+    assert preparation["targets"][0]["registered_for_run"] is True
     item = planned["dispatch_items"][0]
     result = await worker_node(
         {"runtime": planned["runtime"], "dispatch_item": item}, deps=deps,

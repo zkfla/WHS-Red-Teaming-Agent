@@ -458,6 +458,7 @@ class CandidateCompiler:
             target_values.update(
                 device=target.device_ref,
                 device_ref=target.device_ref,
+                device_serial=target.device_serial,
                 packageName=target.package_name,
                 package_name=target.package_name,
                 asset_ref=str(target.asset_id or target.package_name),
@@ -491,7 +492,7 @@ class CandidateCompiler:
             target_values = {}
         for name, value in target_values.items():
             if name in properties and value is not None and name not in values:
-                values[name] = value
+                values[name] = target_values.get(declared.get(name, name), value)
         for input_arg, shared in declared.items():
             if input_arg in values or input_arg not in properties:
                 continue

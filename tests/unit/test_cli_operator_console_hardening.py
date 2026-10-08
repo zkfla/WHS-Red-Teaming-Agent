@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timezone
+from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
 from unittest.mock import AsyncMock
@@ -482,6 +483,140 @@ async def test_wait_for_approval_exits_when_operator_stops_the_mission(
     assert result.termination_reason == TerminationReason.OPERATOR_STOPPED
     assert result.pending_approval_id is None
     settle.assert_awaited_once()
+
+
+@pytest.mark.parametrize("live", [True, False], ids=["session", "external-watch"])
+async def test_consecutive_approvals_refresh_identity_and_persist_each_suspension(
+    monkeypatch: pytest.MonkeyPatch, live: bool,
+) -> None:
+    """A resumed action can immediately suspend the SAME run on a new action."""
+    deps = await _deps()
+    deps.settings = OrchestrationSettings()
+    first = _runtime(
+        TerminationReason.APPROVAL_PENDING, pending_approval_id=ApprovalId("appr_first")
+    )
+    second = first.model_copy(update={"pending_approval_id": ApprovalId("appr_second")})
+    finished = second.model_copy(update={
+        "termination_reason": TerminationReason.NO_ACTIONABLE_PLAN,
+        "pending_approval_id": None,
+    })
+    resolver = AsyncMock(side_effect=lambda value, status, _actor: SimpleNamespace(
+        approval_id=value, status=status,
+    ))
+    deps.control_plane.resolve_approval = resolver
+    lines: list[str] = []
+    console = run_command.OperatorConsole(
+        cast(RuntimeDeps, deps), lines.append,
+        identity=run_command.RuntimeIdentity(run_id=RUN, engagement_id=ENG, mission_id=MISSION),
+    )
+    suspended: list[str] = []
+    channel = SimpleNamespace(pending=None)
+
+    def suspend(runtime: RuntimeState) -> None:
+        channel.pending = str(runtime.pending_approval_id)
+        suspended.append(channel.pending)
+
+    def resume() -> None:
+        channel.pending = None
+
+    channel.suspended = suspend
+    channel.resumed = resume
+    calls = 0
+
+    class _Runner:
+        last_event_id = None
+
+        def __init__(self, _deps: object, *, settings: object = None) -> None:
+            pass
+
+        async def reconcile_once(self, runtime, *, timeout_seconds: float):  # noqa: ANN001
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                # No change must not create a new suspension/report on every tick.
+                return SimpleNamespace(runtime=first)
+            if calls == 2:
+                return SimpleNamespace(runtime=second)
+            assert calls == 3
+            assert runtime.pending_approval_id == "appr_second"
+            if live:
+                assert channel.pending == "appr_second"
+                assert console._pending_approval_id == "appr_second"
+                applied, _ = await console.dispatch("approve", "appr_first")
+                assert applied is False
+                resolver.assert_not_awaited()
+                applied, _ = await console.dispatch("approve", "appr_second")
+                assert applied is True
+            return SimpleNamespace(runtime=finished)
+
+        async def aclose(self) -> None:
+            return None
+
+    monkeypatch.setattr(run_command, "AgentLoopRunner", _Runner)
+    settle = AsyncMock(side_effect=lambda runtime, _deps, **kw: runtime)
+    monkeypatch.setattr(run_command, "settle_engagement", settle)
+    final = await asyncio.wait_for(run_command.wait_for_suspensions(
+        first, cast(RuntimeDeps, deps), operator_console=console if live else None,
+        input_live=lambda: live, echo=lines.append, wait_for_external_approval=not live,
+        session_channel=channel if live else None,
+    ), timeout=2)
+
+    assert final is finished
+    assert calls == 3
+    assert [call.args[0] for call in settle.await_args_list] == [second, finished]
+    assert any("appr_second" in line for line in lines)
+    if live:
+        assert suspended == ["appr_first", "appr_second"]
+        assert channel.pending is None
+        assert console._pending_approval_id is None
+        resolver.assert_awaited_once()
+        assert resolver.await_args is not None
+        assert resolver.await_args.args[:2] == ("appr_second", ApprovalStatus.APPROVED)
+    else:
+        resolver.assert_not_awaited()
+
+
+async def test_new_approval_persists_latest_report_without_finishing_run(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    from redteam.app.report_store import load_terminal_report
+    from redteam.core.contracts.events import EventType
+    from tests.fakes import build_test_application
+
+    monkeypatch.chdir(tmp_path)
+    deps = build_test_application()
+    first = _runtime(
+        TerminationReason.APPROVAL_PENDING, pending_approval_id=ApprovalId("appr_first"),
+        mission_id=None,
+    )
+    second = first.model_copy(update={"pending_approval_id": ApprovalId("appr_second")})
+    calls = 0
+
+    class _Runner:
+        last_event_id = None
+
+        def __init__(self, _deps: object, *, settings: object = None) -> None:
+            pass
+
+        async def reconcile_once(self, runtime, *, timeout_seconds: float):  # noqa: ANN001
+            nonlocal calls
+            calls += 1
+            assert calls == 1, "new approval must be returned to the suspension owner"
+            return SimpleNamespace(runtime=second)
+
+        async def aclose(self) -> None:
+            return None
+
+    monkeypatch.setattr(run_command, "AgentLoopRunner", _Runner)
+    result = await run_command._wait_for_approval(deps, first, echo=lambda _line: None)
+
+    assert result.pending_approval_id == "appr_second"
+    report = load_terminal_report(RUN)
+    assert report is not None
+    assert report.pending_approval_id == "appr_second"
+    assert report.termination_reason == TerminationReason.APPROVAL_PENDING
+    assert isinstance(deps.event_bus, InMemoryEventBus)
+    assert not deps.event_bus.history(event_type=EventType.RUN_FINISHED)
 
 
 # --- concise, honest notices ----------------------------------------------

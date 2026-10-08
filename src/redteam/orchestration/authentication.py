@@ -11,6 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from redteam.core.contracts.action import ActionProposal
 from redteam.core.contracts.evidence import EvidenceRecord
 from redteam.core.contracts.tool import ToolResult
+from redteam.core.enums import EvidenceSourceType
 from redteam.core.ids import EvidenceId
 from redteam.core.ports.evidence_store import EvidenceStore
 
@@ -117,7 +118,13 @@ def _safe_response_metadata(output: dict[str, Any]) -> dict[str, Any]:
 
 
 def http_observation(arguments: dict[str, Any], result: ToolResult) -> dict[str, Any] | None:
-    if str(result.tool_id) != "web.http_request" or not result.success:
+    """Normalize an explicitly bound HTTP mapper's response, not a ToolId alias.
+
+    The registered mapper owns compatibility and validates the full response
+    contract before calling this helper. Generic verification must consume
+    those mapped observations instead of guessing compatibility from a name.
+    """
+    if not result.success:
         return None
     output = result.output
     if not isinstance(output, dict):
@@ -192,17 +199,25 @@ async def assess_authentication(
 ) -> AuthenticationAssessment:
     """Compare stored observations; HTTP status alone cannot verify a vulnerability."""
     baseline = await store.get(check.baseline_evidence_id)
-    current = http_observation(proposal.arguments, result)
+    # VERIFY preserves the explicitly registered mapper's validated observation.
+    # No remote tool spelling, prefix or legacy alias proves compatibility.
+    current = evidence.metadata.get("http_observation")
     previous = baseline.metadata.get("http_observation") if baseline else None
     valid = bool(
         baseline is not None
+        and baseline.run_id == evidence.run_id == proposal.run_id
         and baseline.engagement_id == evidence.engagement_id
-        and baseline.source_id == "web.http_request"
+        and evidence.engagement_id == proposal.engagement_id
+        and baseline.source_type == evidence.source_type == EvidenceSourceType.TOOL
+        and evidence.source_id == str(result.tool_id)
+        and evidence.action_id == result.action_id == proposal.action_id
+        and evidence.invocation_id == result.invocation_id
         and baseline.metadata.get("success") is True
         and proposal.arguments.get("method", "GET") == "GET"
         and proposal.arguments.get("session_ref") == check.session_ref
         and baseline.metadata.get("target_node_id") == evidence.metadata.get("target_node_id")
         and isinstance(previous, dict)
+        and previous.get("kind") == "http_response"
         and previous.get("status_code") == 401
         and previous.get("session_ref") is None
         and previous.get("method") == "GET"
@@ -217,7 +232,20 @@ async def assess_authentication(
             evidence_ids=refs,
         )
     refs.insert(0, str(check.baseline_evidence_id))
-    status = current["status_code"] if current else None
+    status = None
+    if (
+        result.success and evidence.metadata.get("success") is True
+        and isinstance(result.output, dict) and isinstance(current, dict)
+        and current.get("kind") == "http_response"
+        and current.get("method") == proposal.arguments.get("method", "GET")
+        and current.get("path") == proposal.arguments.get("path")
+        and current.get("target_ref") == proposal.arguments.get("target_ref")
+        and current.get("session_ref") == check.session_ref
+        and type(current.get("status_code")) is int
+        and 100 <= current["status_code"] <= 599
+        and current["status_code"] == result.output.get("status_code")
+    ):
+        status = current["status_code"]
     outcome = comparison_outcome(status, check.expected_access)
     hypothesis_status = (
         "confirmed"

@@ -15,6 +15,7 @@ from redteam.core.contracts.action import ActionProposal
 from redteam.core.enums import PolicyVerdict, Verdict
 from redteam.core.ids import ApprovalId, EventId
 from redteam.orchestration.agents.base import PlanStep
+from redteam.orchestration.coordination import content_hash
 from redteam.orchestration.runtime_observation import RuntimeObservation
 
 
@@ -69,6 +70,12 @@ class WorkerOutcome(BaseModel):
     last_event_id: EventId | None = None
     error: str | None = None
     runtime_observations: list[RuntimeObservation] = Field(default_factory=list)
+    # Conflicting deliveries are preserved for reconciliation, never last-write-wins.
+    conflicting_results: dict[str, dict] = Field(default_factory=dict)
+
+
+def outcome_fingerprint(outcome: WorkerOutcome) -> str:
+    return content_hash(outcome.model_dump(mode="json", exclude={"conflicting_results"}))
 
 
 def merge_worker_outcomes(
@@ -76,7 +83,36 @@ def merge_worker_outcomes(
 ) -> dict[str, WorkerOutcome]:
     """Merge parallel writes by action id; replay of the same id is idempotent."""
 
-    return {**left, **right}
+    if any(identity != outcome.action_id for identity, outcome in left.items()):
+        raise ValueError("worker_outcome_identity_mismatch")
+    merged = dict(left)
+    for identity, incoming in right.items():
+        if identity != incoming.action_id:
+            raise ValueError("worker_outcome_identity_mismatch")
+        existing = merged.get(identity)
+        if existing is None:
+            merged[identity] = incoming
+            continue
+        if existing == incoming:
+            continue
+        variants = {**existing.conflicting_results, **incoming.conflicting_results}
+        for item in (existing, incoming):
+            if not item.conflicting_results:
+                variants[outcome_fingerprint(item)] = item.model_dump(
+                    mode="json", exclude={"conflicting_results"}
+                )
+        # A stable representative makes completion order irrelevant. Neither
+        # variant is accepted as successful; originals remain available by hash.
+        representative = WorkerOutcome.model_validate(variants[min(variants)])
+        merged[identity] = representative.model_copy(
+            update={
+                "succeeded": False,
+                "error": "worker_outcome_conflict",
+                "executed": any(v.get("executed") for v in variants.values()),
+                "conflicting_results": dict(sorted(variants.items())),
+            }
+        )
+    return merged
 
 
 def is_delegated_follow_up(outcome: WorkerOutcome) -> bool:

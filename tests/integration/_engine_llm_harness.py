@@ -246,6 +246,7 @@ def make_world(
     deps = SimpleNamespace(
         control_plane=FakeControlPlane(),
         local_tools=LocalToolRegistry(),
+        condition_waiter=None,
         event_bus=InMemoryEventBus(),
         llm_client=llm,
         settings=settings,

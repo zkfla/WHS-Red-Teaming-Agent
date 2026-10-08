@@ -1,5 +1,9 @@
 # dev-jm — PRD v2 P0 구현 안내
 
+이 문서는 2026-10-06 공유된 P0의 기록이다. 이후 로컬 P1 변경과 활성화 방법은
+[P1 로컬 구현 안내](prd-v2-p1-implementation-20261007.md)를 참조한다.
+P0의 후속 계획을 현재 P1 구현 상태로 혼동하지 않는다.
+
 기준: 2026-10-06 GitHub에서 fetch한 `dev-orchestration`의
 `6a2cba4cb219f0101c8e4f4f4ef8a28a8ed2dc58`.
 공유 브랜치: `dev-jm`. 브랜치 첫 화면의 [README](../../README.md)에 요약과

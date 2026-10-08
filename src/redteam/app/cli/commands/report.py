@@ -97,6 +97,10 @@ def _render_markdown(report: TerminalReportProjection) -> str:
             f"- Retryable: {diagnostic.retryable}",
         ]
         lines += _diagnostic_detail_lines(diagnostic)
+    if report.evidence_validity:
+        lines += ["", "## Current evidence reuse conditions", "",
+                  "Historical observations and Findings stay intact; validity is not approval.", ""]
+        lines += [f"- {item['evidence_id']}: {item['status']}" for item in report.evidence_validity]
     if report.mission is not None:
         outstanding = [task.task_id for task in report.mission.tasks if task.status == "running"]
         if outstanding:
@@ -118,6 +122,10 @@ def _render_markdown(report: TerminalReportProjection) -> str:
         ]
         if diagnostic.stage_attempts:
             lines.append(f"- Requests by stage: {json.dumps(diagnostic.stage_attempts)}")
+        lines.append(
+            f"- Decision requests: normal={diagnostic.normal_used}, "
+            f"repair={diagnostic.repair_used}, transport={diagnostic.transport_used}"
+        )
         if diagnostic.provider_status is not None:
             lines.append(f"- Provider status: {diagnostic.provider_status}")
         if diagnostic.provider_code:

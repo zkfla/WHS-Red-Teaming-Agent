@@ -29,6 +29,8 @@ class ToolTargetBinding(BaseModel):
 # keep the contract defaults.
 PROVIDER_METADATA_TARGET_BINDING = "redteam.target_binding"
 PROVIDER_METADATA_COMMAND_FIELDS = "redteam.command_fields"
+PROVIDER_METADATA_TARGET_TYPES = "redteam.target_types"
+PROVIDER_METADATA_ARGUMENT_BINDINGS = "redteam.argument_bindings"
 
 
 class ToolDescriptor(BaseModel):

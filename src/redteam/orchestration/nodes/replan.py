@@ -33,6 +33,15 @@ async def replan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             if decision and "budget" in decision.matched_rules
             else TerminationReason.MISSION_BLOCKED
         )
+    if (reason in {TerminationReason.INVESTIGATION_HELD, TerminationReason.STALLED}
+        and runtime.step_count < deps.settings.max_steps
+        and runtime.consecutive_failures < deps.settings.max_consecutive_failures
+        and deps.condition_waiter is not None
+        and await deps.condition_waiter.wait_for_change(runtime, deps)):
+        # Re-enter OBSERVE so the existing held fingerprint/intent gates own
+        # resumption. The waiter cannot reset action/token/decision allowances.
+        reason = None
+        runtime = runtime.model_copy(update={"no_progress_turns": 0})
     publisher = publisher_for(state, deps, "orchestration.replan")
     event = await publisher.publish(
         REPLAN_TRIGGERED,

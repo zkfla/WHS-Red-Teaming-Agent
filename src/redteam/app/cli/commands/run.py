@@ -615,6 +615,11 @@ class OperatorConsole:
         report = await service.status(mission_id=mission_id)
         self._echo(renderer.operator_status_text(report))
 
+    def catalog_labels(self) -> list[str] | None:
+        """Read the same discovered catalog used by this run; no transport calls."""
+        catalog = getattr(self._deps, "tool_catalog", None)
+        return catalog_tool_labels(catalog) if catalog is not None else None
+
     async def session_context(self) -> str:
         """Read-only context for CLI classification; never writes a user intent."""
         if self._service is None or self._identity.mission_id is None:
@@ -1009,7 +1014,6 @@ async def _run(
 
         from rich.console import Console
 
-        from redteam.app.bootstrap import build_llm_client
         from redteam.app.cli.interactive_commands import InteractiveSession
         from redteam.app.cli.session_runtime import run_session
 
@@ -1020,7 +1024,7 @@ async def _run(
             Console(),
             config,
             session=session,
-            conversation=ConversationAssistant(build_llm_client(config.llm)),
+            conversation=ConversationAssistant(deps.llm_client),
             objective=getattr(args, "objective", None)
             or f"Assess the declared scope of {config.engagement.name}",
             built=(engagement, deps),
@@ -1053,6 +1057,12 @@ async def _run(
 async def _wait_for_approval(
     deps: RuntimeDeps, final: RuntimeState, *, echo: Echo, in_session: bool = False
 ) -> RuntimeState:
+    """Watch one approval identity, not every approval produced by the run.
+
+    Reconciliation may execute the approved action and immediately suspend on
+    another action. Return that checkpoint to ``wait_for_suspensions`` so it
+    rebinds both the session and console before accepting the next approval.
+    """
     approval_id = str(final.pending_approval_id)
     echo(renderer.operator_approval_pending_text(approval_id, str(final.run_id)))
     if in_session:
@@ -1073,7 +1083,10 @@ async def _wait_for_approval(
     current = final
     poll_seconds = _APPROVAL_POLL_SECONDS_IN_SESSION if in_session else _APPROVAL_POLL_SECONDS
     try:
-        while current.termination_reason == TerminationReason.APPROVAL_PENDING:
+        while (
+            current.termination_reason == TerminationReason.APPROVAL_PENDING
+            and str(current.pending_approval_id) == approval_id
+        ):
             result = await resume_runner.reconcile_once(current, timeout_seconds=poll_seconds)
             current = result.runtime
             mission = (
@@ -1099,9 +1112,10 @@ async def _wait_for_approval(
         raise  # let main()'s top-level handler set the conventional SIGINT exit code
     finally:
         await resume_runner.aclose()
-    if current.termination_reason != TerminationReason.APPROVAL_PENDING:
-        current = await settle_engagement(current, deps, last_event_id=resume_runner.last_event_id)
-    return current
+    # Persist a newly suspended checkpoint as well as a terminal outcome.
+    # Canonical settlement keeps APPROVAL_PENDING resumable and deliberately
+    # does not publish RunFinished for it; polling an unchanged ID never gets here.
+    return await settle_engagement(current, deps, last_event_id=resume_runner.last_event_id)
 
 
 async def _wait_for_pause(deps: RuntimeDeps, paused: RuntimeState, *, echo: Echo) -> RuntimeState:

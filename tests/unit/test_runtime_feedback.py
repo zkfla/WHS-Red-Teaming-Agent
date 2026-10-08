@@ -481,5 +481,10 @@ def test_worker_outcome_merge_and_old_results_stay_valid() -> None:
     assert fresh.runtime_observations == []
     legacy = WorkerOutcome.model_validate({"action_id": "action_1", "work_id": "work_1"})
     assert legacy.runtime_observations == []
-    merged = merge_worker_outcomes({"a": fresh}, {"a": legacy, "b": fresh})
-    assert set(merged.keys()) == {"a", "b"}
+    second = WorkerOutcome(action_id="action_2", work_id="work_2")
+    # Channel keys are actual action IDs; distinct aliases for the same ID
+    # are not legitimate old checkpoint identities.
+    merged = merge_worker_outcomes(
+        {"action_1": fresh}, {"action_1": legacy, "action_2": second},
+    )
+    assert set(merged.keys()) == {"action_1", "action_2"}

@@ -35,6 +35,7 @@ from redteam.core.convert import digest_payload, tool_result_to_evidence
 from redteam.core.enums import EvidenceSourceType, PolicyVerdict
 from redteam.core.ids import ActionId, EngagementId, EvidenceId, HypothesisId, RunId, new_id
 from redteam.core.ports.evidence_store import EvidenceStore
+from redteam.core.redaction import redact_arguments, redact_sensitive_text
 
 
 class EvidenceService:
@@ -66,10 +67,6 @@ class EvidenceService:
         decision: PolicyDecision,
     ) -> EvidenceRecord:
         """Record a non-executed DENY/REQUIRE_APPROVAL action as Evidence."""
-        # Import lazily to avoid making ``redteam.evidence.service`` depend on
-        # eager package initialization in ``redteam.control.__init__``.
-        from redteam.control.audit import redact_arguments, redact_sensitive_text
-
         if decision.action_id != proposal.action_id:
             raise ValueError("decision.action_id does not match proposal.action_id")
         if decision.verdict not in {

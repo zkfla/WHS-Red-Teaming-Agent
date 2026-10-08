@@ -17,6 +17,7 @@ class Inference(Protocol):
         payload: dict[str, Any],
         response_schema: dict[str, Any],
         system: str = "",
+        validate_response: Callable[[dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]: ...
 
 
@@ -82,7 +83,7 @@ class BudgetedInference:
             "tokens_fully_known": self._budget.tokens_fully_known,
         }
 
-    async def infer(self, *, stage, payload, response_schema, system=""):
+    async def infer(self, *, stage, payload, response_schema, system="", validate_response=None):
         return await self._client.ask(
             stage=stage,
             payload=payload,
@@ -90,6 +91,7 @@ class BudgetedInference:
             system=system,
             budget=self._budget,
             before_call=self._before_call,
+            validate_response=validate_response,
         )
 
 

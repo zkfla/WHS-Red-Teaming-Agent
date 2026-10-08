@@ -239,7 +239,7 @@ def _expected_canonical(capability: str, operation: str) -> str:
         return str(capability) + "." + str(operation)
 
 
-def _posthoc_source_gap(record: Any, raw: Any) -> str | None:
+def source_origin_gap(record: Any, raw: Any) -> str | None:
     """Origin-immutable check for one cited source without a live proposal.
 
     Same rule as the per-record half of the live grounding checks: the
@@ -266,6 +266,10 @@ def _posthoc_source_gap(record: Any, raw: Any) -> str | None:
     if errors:
         return errors[0][2]
     return None
+
+
+# Compatible internal spelling; all consumers share the same origin rule.
+_posthoc_source_gap = source_origin_gap
 
 
 async def claim_target_is_grounded(

@@ -88,6 +88,9 @@ class OrchestrationSettings(BaseModel):
     decision_max_attempts: int = Field(default=3, ge=1, le=6)
     # Normal plan/review decisions are not malformed-response retries.
     decision_normal_limit: int = Field(default=8, ge=1, le=32)
+    # Explicit P2 selection. Target execution limits remain independent.
+    specialist_decision_concurrency: int = Field(default=1, ge=1, le=2)
+    specialist_decision_pool_limit: int | None = Field(default=None, ge=1)
     path_backend: Literal["memory", "sqlite"] = "memory"
 
     #: Overrides the value derived from ``max_steps`` when set.
@@ -95,6 +98,8 @@ class OrchestrationSettings(BaseModel):
 
     @model_validator(mode="after")
     def _checkpoint_path_is_safe(self) -> OrchestrationSettings:
+        if self.specialist_decision_concurrency > 1 and self.specialist_decision_pool_limit is None:
+            raise ValueError("parallel_specialist_reasoning_requires_finite_pool")
         if self.checkpoint_backend == "sqlite" and not self.checkpoint_path.strip():
             raise ValueError("sqlite checkpointing needs a non-blank checkpoint_path")
         if self.work_backend == "sqlite" and not self.work_path.strip():

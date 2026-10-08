@@ -50,6 +50,25 @@ exists as a general library capability for code that calls
 `examples/finance_agent_demo.py`, `deploy/mcp/finance/app.yaml`) — the
 CLI itself never reaches it.
 
+LLM connection retry waiting is configured through the existing `LLMConfig`
+snapshot, not re-read by individual agents. `provider_retry` is an additive
+typed field (old configurations load its defaults). CLI operators may set
+`REDTEAM_LLM_RETRY_POLICY_JSON`, for example:
+
+```sh
+export REDTEAM_LLM_RETRY_POLICY_JSON='{"base_delay_seconds":1,"max_delay_seconds":30,"max_wait_seconds":30}'
+```
+
+These are the defaults. `max_delay_seconds` caps fallback exponential backoff;
+a valid server `Retry-After` is never shortened. `max_wait_seconds` bounds total
+cooldown waiting per structured decision, and can be zero to defer immediately.
+Actual request caps and cancellation/deadline/token guards remain independent.
+Unknown fields, negative delays and non-finite values are rejected without
+echoing the input. Retry policy is passed by App bootstrap to the LLM adapter;
+it is not an SDK completion argument. A client owns its in-process shared
+cooldown; this is not an account-wide/distributed rate limiter or persisted
+cooldown. Explicit quota errors require operator action, not retries.
+
 The CLI accepts these optional orchestration environment variables:
 
 | Variable | Default | Validation |

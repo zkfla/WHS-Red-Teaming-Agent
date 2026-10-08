@@ -40,7 +40,6 @@ from redteam.orchestration.analysis_budget import verification_budget, verificat
 from redteam.orchestration.authentication import (
     ACCESS_CONTROL_VIOLATION,
     assess_authentication,
-    http_observation,
 )
 from redteam.orchestration.cognition import DecisionBudget
 from redteam.orchestration.context import RuntimeDeps
@@ -116,9 +115,6 @@ async def verify_node(
             }
         }
     )
-    response_observation = http_observation(proposal.arguments, result)
-    if response_observation is not None:
-        evidence.metadata["http_observation"] = response_observation
     # Read the selected mapper's validated observations. Physical tool ids
     # and tools sharing the comparison mapper use the same evidence path.
     # The per-call outcome travels on the evidence record itself so every
@@ -133,6 +129,14 @@ async def verify_node(
     mutation = outcome.mutation
     evidence.metadata["mapping_status"] = outcome.status
     evidence.metadata["mapping_outcome"] = outcome.status
+    responses = [
+        item
+        for node in mutation.nodes
+        for item in node.observations
+        if item.get("kind") == "http_response"
+    ]
+    if len(responses) == 1:
+        evidence.metadata["http_observation"] = responses[0]
     comparisons = [
         item
         for node in mutation.nodes

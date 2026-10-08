@@ -98,6 +98,37 @@ def bindings_for(material: InternalAssessment) -> dict[str, set[str]]:
     return {key: set(value) for key, value in material.principal_bindings.items()}
 
 
+def principal_bindings(knowledge: dict) -> dict[str, set[str]]:
+    """Read non-secret refs from a legacy/projected knowledge view.
+
+    Supplied registrations stay declarations. Execution admission uses fresh
+    InternalAssessment material instead; this projection grants no permission.
+    """
+    bindings: dict[str, set[str]] = {"anonymous": set()}
+    provided = knowledge.get("provided", {}).get("claims", [])
+    for item in [*knowledge.get("facts", []), *provided]:
+        if not isinstance(item, dict):
+            continue
+        facts = item.get("observed_facts", item.get("facts", {}))
+        if not isinstance(facts, dict):
+            continue
+        for reference in item.get("auth_session_refs", []):
+            bindings.setdefault(str(reference), set()).add(str(reference))
+        sessions = facts.get("auth_session_config", {}).get("sessions", [])
+        for session in sessions:
+            if isinstance(session, dict) and session.get("session_ref"):
+                reference = str(session["session_ref"])
+                bindings.setdefault(reference, set()).add(reference)
+        refs = facts.get("session_refs", [])
+        if facts.get("session_ref"):
+            refs = [*refs, facts["session_ref"]]
+        if facts.get("principal_ref"):
+            bindings.setdefault(str(facts["principal_ref"]), set()).update(map(str, refs))
+        if item.get("node_type") in {"principal", "credential"}:
+            bindings.setdefault(str(item.get("node_id")), set()).update(map(str, refs))
+    return bindings
+
+
 def _text(value: object) -> str:
     return str(getattr(value, "value", value))
 
@@ -157,6 +188,7 @@ __all__ = [
     "is_evidence_grounded",
     "known_principals",
     "known_target_ids",
+    "principal_bindings",
     "target_record",
 ]
 

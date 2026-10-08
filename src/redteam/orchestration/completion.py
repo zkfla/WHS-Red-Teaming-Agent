@@ -323,7 +323,9 @@ def _receipt_review_key(meta: dict[str, Any]) -> tuple:
     return (str(meta.get("action_id", "")), str(meta.get("invocation_id", "")), hypothesis)
 
 
-async def _load_final_receipts(evidence_store: Any, run_id: str) -> list[dict[str, Any]]:
+async def _load_final_receipts(
+    evidence_store: Any, run_id: str, graph_service: Any
+) -> list[dict[str, Any]]:
     """Latest per claim and normalized sources; legacy receipts retain origin grouping."""
     records = await evidence_store.list_for_run(run_id)
     latest: dict[tuple, tuple[Any, dict[str, Any]]] = {}
@@ -356,7 +358,16 @@ async def _load_final_receipts(evidence_store: Any, run_id: str) -> list[dict[st
                 latest[key] = (created, dict(meta))
         except Exception:
             continue
-    return [meta for _, meta in latest.values()]
+    from redteam.orchestration.evidence_validity import current_validity
+
+    usable = []
+    for _, meta in latest.values():
+        validity = await current_validity(
+            evidence_store, graph_service, run_id, meta["receipt_id"], records=records,
+        )
+        if validity["status"] in ("valid", "unbound"):
+            usable.append(meta)
+    return usable
 
 
 def _receipt_links_record(meta: dict[str, Any], record: Any) -> bool:
@@ -1284,7 +1295,7 @@ async def validate_result_claims(
     # Resolve explicit receipt references into originals before the unchanged
     # path/origin/raw checks. Keep only latest per-claim receipts as links.
     try:
-        admission_receipts = await _load_final_receipts(evidence_store, run)
+        admission_receipts = await _load_final_receipts(evidence_store, run, graph_service)
     except Exception:
         admission_receipts = []
         issues.add("review receipt lookup failed", code="completion_review_receipt_lookup_failed",
@@ -1294,6 +1305,17 @@ async def validate_result_claims(
     cited_receipt_keys: set[tuple[Any, ...]] = set()
     for reference_index, eid in enumerate(evidence_ids):
         reference_location = known_location((*evidence_location, reference_index))
+        from redteam.orchestration.evidence_validity import current_validity
+
+        validity = await current_validity(evidence_store, graph_service, run, str(eid))
+        if validity["status"] not in ("valid", "unbound"):
+            issues.add(
+                location=reference_location,
+                message="evidence reuse conditions are not currently valid",
+                code="completion_evidence_current_validity_" + validity["status"],
+                summary="evidence reuse conditions are not currently valid",
+            )
+            continue
         try:
             cited = await evidence_store.get(eid)
         except Exception:
@@ -1765,7 +1787,7 @@ async def validate_result_claims(
                 continue
             if final_receipts is None and not receipts_failed:
                 try:
-                    final_receipts = await _load_final_receipts(evidence_store, run)
+                    final_receipts = await _load_final_receipts(evidence_store, run, graph_service)
                 except Exception:
                     receipts_failed = True
                     final_receipts = []
@@ -1851,7 +1873,7 @@ async def validate_result_claims(
                 continue
             if final_receipts is None and not receipts_failed:
                 try:
-                    final_receipts = await _load_final_receipts(evidence_store, run)
+                    final_receipts = await _load_final_receipts(evidence_store, run, graph_service)
                 except Exception:
                     receipts_failed = True
                     final_receipts = []

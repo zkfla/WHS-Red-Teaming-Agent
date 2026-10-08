@@ -86,3 +86,37 @@ def test_related_recorded_state_keeps_partial_results_and_omission_diagnostics()
     assert "provided" not in projected["knowledge"]
     assert "hypotheses" not in projected["knowledge"]
     assert projected["local_tool_results"] == context["local_tool_results"][:1]
+
+
+def test_review_retains_only_cited_validity_and_its_meaning_without_mutating_context():
+    context = {"evidence_validity": [
+        {"evidence_id": "proof", "status": "unbound", "meaning": "No reuse binding"},
+        {"evidence_id": "other", "status": "stale"},
+        None,
+    ]}
+    original = deepcopy(context)
+    projected = completion_review_context(context, ["proof"])
+    assert projected["evidence_validity"] == [context["evidence_validity"][0]]
+    projected["evidence_validity"][0]["status"] = "changed"
+    assert context == original
+
+
+def test_review_retains_cited_operational_outcomes_not_an_unrelated_approval():
+    context = {
+        "evidence": [
+            {"evidence_id": "proof", "metadata": {"action_id": "action-proof"}},
+            {"evidence_id": "other", "metadata": {"action_id": "action-other"}},
+        ],
+        "runtime_observations": [
+            {"action_id": "action-proof", "kind": "control", "outcome": "allow",
+             "api_key": "SecretSentinel"},
+            {"action_id": "action-other", "kind": "control", "outcome": "allow"},
+            {"kind": "operator", "outcome": "stop"},
+        ],
+    }
+    original = deepcopy(context)
+    projected = completion_review_context(context, ["proof"])
+    assert len(projected["runtime_observations"]) == 1
+    assert projected["runtime_observations"][0]["action_id"] == "action-proof"
+    assert "SecretSentinel" not in str(projected)
+    assert context == original

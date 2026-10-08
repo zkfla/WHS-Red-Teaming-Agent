@@ -1,4 +1,4 @@
-"""Preserve the address identity carried by an Agent target."""
+"""Preserve known address/device identities carried by an Agent target."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from urllib.parse import urlsplit
 
-from redteam.core.contracts.target import AnyTarget, UrlTarget
+from redteam.core.contracts.target import AnyTarget, DeviceTarget, UrlTarget
 from redteam.core.contracts.tool import ToolTargetBinding
 from redteam.core.provider_contracts import OperationTargetBinding, operation_target_binding
 
@@ -57,6 +57,21 @@ def validate_network_arguments(
     argument_bindings: Mapping[str, str] | None = None,
     target_binding: ToolTargetBinding | None = None,
 ) -> None:
+    # Preserve this public entry point for compiler/review consumers. A
+    # DeviceTarget has no network identity, but explicit input must still
+    # match its operator-declared installation. No role/tool name branching.
+    if isinstance(target, DeviceTarget):
+        values = {
+            "device_ref": target.device_ref,
+            "device_serial": target.device_serial,
+            "package_name": target.package_name,
+        }
+        aliases = {"device": "device_ref", "packageName": "package_name"}
+        declared = argument_bindings or {}
+        for remote, actual in arguments.items():
+            shared = declared.get(remote, aliases.get(remote, remote))
+            if shared in values and actual != values[shared]:
+                raise ValueError("tool argument device identity differs from proposal target")
     binding = (
         target_binding
         if target_binding is not None

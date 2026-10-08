@@ -15,8 +15,111 @@ from redteam.core.contracts.evidence import EvidenceRecord
 from redteam.core.enums import GraphNodeType
 from redteam.core.ids import GraphNodeId
 from redteam.orchestration.agents.definition import ContextProfile
+from redteam.orchestration.knowledge_validation import (
+    InternalAssessment,
+    assessment_blocked,
+    check_ready_step,
+)
+from redteam.orchestration.paths.models import PathPlan, PathStep, is_active_status
 
 MAX_EVIDENCE_SUMMARY_CHARS = 240
+
+
+def action_proposal_lifecycle() -> dict[str, Any]:
+    """Describe the existing execution order, without granting admission."""
+    return {
+        "order": ["propose_actions", "validate_arguments_and_targets",
+                  "control_decision", "execute_if_allowed"],
+        "prior_control_allow_required_to_propose": False,
+        "control_allow_required_to_execute": True,
+        "meaning": (
+            "A proposed action is not a target request. Submit a bounded proposal for "
+            "known subjects and supported tools; the runtime validates it and asks Control "
+            "before execution. Do not require a future action's ALLOW as a prerequisite "
+            "to proposing that action. Existing pending approvals, DENY, missing subjects "
+            "or required facts must not be bypassed. Past ALLOW applies only to its action. "
+            "Target registration and active path membership are runtime state, not "
+            "target observations or execution permission."
+        ),
+    }
+
+
+def worker_proposal_preparation(
+    path: PathPlan,
+    step: PathStep,
+    canonical_path: PathPlan | None,
+    material: InternalAssessment | None,
+) -> dict[str, Any]:
+    """Bounded read projection of canonical preparation, not a new execution gate.
+
+    The internal assessment stays internal: only this step's target identities,
+    provenance labels and required-reference presence cross the model boundary.
+    Compilation and Control still perform their own fresh checks.
+    """
+    from redteam.core.contracts.mission import redact_secret_material
+    current = next(
+        (item for item in canonical_path.steps if item.step_id == step.step_id), None,
+    ) if canonical_path is not None else None
+    progress = {"status", "outcome", "evidence_ids"}
+    matches = bool(
+        canonical_path is not None and current is not None
+        and canonical_path.run_id == path.run_id
+        and canonical_path.path_id == path.path_id and canonical_path.version == path.version
+        and canonical_path.mission_id == path.mission_id
+        and canonical_path.mission_task_id == path.mission_task_id
+        and is_active_status(canonical_path.status)
+        and current.model_dump(exclude=progress) == step.model_dump(exclude=progress)
+    )
+    if material is not None and (
+        material.run_id != path.run_id or assessment_blocked(material) is not None
+    ):
+        material = None
+    lookup_ok = material is not None
+    return redact_secret_material({
+        "source": "runtime_path_store_and_same_run_knowledge_assessment",
+        "path_binding": {
+            "run_id": path.run_id, "path_id": path.path_id, "version": path.version,
+            "step_id": step.step_id, "mission_task_id": path.mission_task_id,
+            "active_snapshot_matches": matches,
+            "step_status": current.status if matches and current is not None else None,
+            "readiness_errors": check_ready_step(canonical_path, current, material)
+            if matches and current is not None and material is not None else None,
+        },
+        "knowledge_lookup": "ok" if lookup_ok else "unavailable",
+        "targets": [
+            {
+                "node_id": identity,
+                "registered_for_run": (
+                    identity in material.targets if material is not None else None
+                ),
+                **({"origin": material.targets[identity].origin,
+                    "verification": material.targets[identity].verification}
+                   if material is not None and identity in material.targets else {}),
+            }
+            for identity in step.target_node_ids
+        ],
+        "required_facts": [
+            {"ref": ref, "grounded": ref in material.fact_refs if material is not None else None}
+            for ref in step.required_fact_refs
+        ],
+        "meaning": (
+            "These fields report code-owned planning preparation. An active matching "
+            "path and a registered target do not require a separate model-authored "
+            "registration receipt. Registration does not mean the endpoint was visited, "
+            "is in scope, is secure, or is authorized for execution. Unavailable reads "
+            "are unknown, never acceptance. Every proposal is revalidated before Control."
+        ),
+    })
+
+
+def related_runtime_observations(context: dict[str, Any], action_ids: set[str]) -> list[dict]:
+    """Cited operational outcomes, never target facts or future execution permission."""
+    from redteam.core.contracts.mission import redact_secret_material
+
+    return redact_secret_material([
+        item for item in context.get("runtime_observations", [])
+        if isinstance(item, dict) and item.get("action_id") in action_ids
+    ])
 
 
 def completion_review_context(context: dict[str, Any] | None, evidence_ids: list[str]) -> dict:
@@ -38,6 +141,17 @@ def completion_review_context(context: dict[str, Any] | None, evidence_ids: list
     if isinstance(mission, dict):
         projected["operator_constraints"] = mission.get("operator_constraints", {})
     sources = set(map(str, evidence_ids))
+    action_ids = {
+        str(item["metadata"]["action_id"])
+        for item in current.get("evidence", [])
+        if isinstance(item, dict) and str(item.get("evidence_id", "")) in sources
+        and isinstance(item.get("metadata"), dict) and item["metadata"].get("action_id")
+    }
+    projected["runtime_observations"] = related_runtime_observations(current, action_ids)
+    projected["evidence_validity"] = [
+        item for item in current.get("evidence_validity", [])
+        if isinstance(item, dict) and str(item.get("evidence_id", "")) in sources
+    ]
     projected["requested_evidence"] = [
         window for window in current.get("requested_evidence", [])
         if isinstance(window, dict) and str(window.get("evidence_id", "")) in sources

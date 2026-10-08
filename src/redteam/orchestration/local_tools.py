@@ -134,6 +134,12 @@ class LocalToolRegistry:
         """Local-only listing, apart from the remote target catalog."""
         return tuple(entry[0] for entry in self._entries.values())
 
+    def copy(self) -> LocalToolRegistry:
+        """Assembly may add selected features without mutating the source component set."""
+        registry = LocalToolRegistry()
+        registry._entries = dict(self._entries)
+        return registry
+
     async def call(
         self,
         tool_id: str,
@@ -166,4 +172,3 @@ def runtime_tool_contribution(
         version=version,
         factory=factory,
     )
-

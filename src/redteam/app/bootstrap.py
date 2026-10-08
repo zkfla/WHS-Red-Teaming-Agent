@@ -158,7 +158,10 @@ def build_llm_client(config: LLMConfig) -> LLMClient:
     if config.provider == "litellm":
         from redteam.llm.litellm import LiteLLMClient
 
-        return LiteLLMClient(model=config.default_model, api_key=config.resolve_api_key())
+        return LiteLLMClient(
+            model=config.default_model, api_key=config.resolve_api_key(),
+            retry_policy=config.provider_retry,
+        )
     raise ValueError(
         f"production requires a real LLM provider, received {config.provider!r}; "
         "configure 'litellm' (test clients must be explicitly injected)"
@@ -452,6 +455,8 @@ async def build_application(
     engagement_id: EngagementId | None = None,
     long_job_adapter=None,
     extensions: ExtensionAssembly | None = None,
+    artifact_store=None,
+    fixture_runner=None,
 ) -> tuple[Engagement, RuntimeDeps]:
     """``AppConfig``-aware composition root. Every dependency is overridable.
 
@@ -521,6 +526,8 @@ async def build_application(
     resolved_settings = orchestration_settings or OrchestrationSettings.from_config(
         config.orchestration
     )
+    if specialists is not None:
+        resolved_settings = specialists.configure_execution(resolved_settings)
     resolved_tasks = task_graph_store or _build_task_graph_store(resolved_settings)
     resolved_paths = path_store or _build_path_store(resolved_settings)
     resolved_intents = build_operator_intent_store(
@@ -614,6 +621,15 @@ async def build_application(
     )
     if specialists is not None:
         profile_components = specialists.assemble(profile_components)
+        if specialists.profile.code_artifacts:
+            from redteam.capability.fixture_runner import DockerFixtureRunner
+            from redteam.evidence.artifacts.filesystem import FilesystemArtifactBackend
+
+            if artifact_store is None:
+                artifact_store = FilesystemArtifactBackend(Path(evidence_dir) / "code-artifacts")
+            if fixture_runner is None:
+                assert specialists.profile.fixture_policy is not None
+                fixture_runner = DockerFixtureRunner(specialists.profile.fixture_policy)
         if verifier is None:
             from redteam.attack_graph.service import AttackGraphService
             from redteam.orchestration.analysis import StructuredLLMAnalysisVerifier
@@ -683,9 +699,6 @@ async def build_application(
         ),
     )
     resolved_event_bus = event_bus or InMemoryEventBus()
-    resolved_settings = orchestration_settings or OrchestrationSettings.from_config(
-        config.orchestration
-    )
     if extension_assembly.contributions("reference_bundle"):
         if library is None:
             raise ExtensionAssemblyError(
@@ -759,6 +772,9 @@ async def build_application(
         task_graph_store=resolved_tasks,
         path_store=resolved_paths,
         long_job_adapter=long_job_adapter,
+        artifact_store=artifact_store,
+        fixture_runner=fixture_runner,
+        condition_waiter=profile_components.condition_waiter,
         operator_intent_store=resolved_intents,
         tool_semaphore=asyncio.Semaphore(engagement.rate_limit_policy.max_concurrent_actions),
         settings=resolved_settings,

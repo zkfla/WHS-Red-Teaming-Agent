@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from typing import Any
 
 #: Key names that mean raw secret/credential material -- the one shared
 #: vocabulary for every *key-based* redactor in the codebase
@@ -54,6 +55,31 @@ _INLINE_CREDENTIAL_PATTERN = re.compile(
     r"\s+(?:is\s+)?)([^\s,;]+)",
     re.IGNORECASE,
 )
+
+# Deliberately broad persistence masking for policy audit and blocked-action
+# evidence. This is not the opaque-reference-aware model projection policy.
+# Keep its existing matching behavior while sharing ownership, not every
+# context-specific redaction rule.
+_AUDIT_SENSITIVE_KEY_PATTERN = re.compile(
+    r"(token|password|passwd|secret|credential|account|card|ssn|api[_-]?key|auth|"
+    r"session|csrf|cookie)",
+    re.IGNORECASE,
+)
+
+
+def redact_arguments(value: Any) -> Any:
+    """Best-effort recursive audit/evidence masking; never an arbitrary-secret detector."""
+    if isinstance(value, dict):
+        return {
+            key: ("***REDACTED***" if _AUDIT_SENSITIVE_KEY_PATTERN.search(str(key))
+                  else redact_arguments(item))
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [redact_arguments(item) for item in value]
+    if isinstance(value, str):
+        return redact_sensitive_text(value)
+    return value
 
 
 def redact_sensitive_text(value: str) -> str:

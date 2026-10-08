@@ -12,6 +12,7 @@ dist/
 build/
 .DS_Store
 /data/
+/reports/
 /engagement.yaml
 /vulnbank-web-policy.json
 /mcp-recon-policy.json

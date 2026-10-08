@@ -7,6 +7,8 @@ from copy import deepcopy
 from datetime import datetime, timezone
 from typing import Any
 
+from pydantic import TypeAdapter
+
 from redteam.capability.adapters.mcp.base import MCPCallResult
 from redteam.capability.adapters.mcp.naming import build_canonical_mcp_tool_id
 from redteam.capability.adapters.mcp.transport import (
@@ -14,8 +16,10 @@ from redteam.capability.adapters.mcp.transport import (
     StreamableHTTPMCPTransport,
 )
 from redteam.core.contracts.tool import (
+    PROVIDER_METADATA_ARGUMENT_BINDINGS,
     PROVIDER_METADATA_COMMAND_FIELDS,
     PROVIDER_METADATA_TARGET_BINDING,
+    PROVIDER_METADATA_TARGET_TYPES,
     ToolDescriptor,
     ToolError,
     ToolTargetBinding,
@@ -124,6 +128,14 @@ def _apply_provider_metadata(
     # no per-tool central list lives here.
     if not metadata:
         return
+    if PROVIDER_METADATA_TARGET_TYPES in metadata:
+        descriptor.target_types = TypeAdapter(list[str]).validate_python(
+            metadata[PROVIDER_METADATA_TARGET_TYPES], strict=True,
+        )
+    if PROVIDER_METADATA_ARGUMENT_BINDINGS in metadata:
+        descriptor.argument_bindings = TypeAdapter(dict[str, str]).validate_python(
+            metadata[PROVIDER_METADATA_ARGUMENT_BINDINGS], strict=True,
+        )
     binding_spec = metadata.get(PROVIDER_METADATA_TARGET_BINDING)
     if isinstance(binding_spec, Mapping):
         known = {

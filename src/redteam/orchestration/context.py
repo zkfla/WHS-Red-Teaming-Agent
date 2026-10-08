@@ -14,10 +14,12 @@ from redteam.attack_graph.service import AttackGraphService
 from redteam.core.contracts.engagement import Engagement
 from redteam.core.ids import RunId
 from redteam.core.ports.agent_prompts import AgentPrompts
+from redteam.core.ports.artifacts import ArtifactStore
 from redteam.core.ports.attack_graph import AttackGraphStore
 from redteam.core.ports.control_plane import ControlPlane
 from redteam.core.ports.event_bus import EventBus, EventHistory
 from redteam.core.ports.evidence_store import EvidenceStore
+from redteam.core.ports.fixture_runner import FixtureRunner
 from redteam.core.ports.llm import LLMClient
 from redteam.core.ports.task_graph import MissionTaskStore
 from redteam.core.ports.tool_catalog import ToolCatalog
@@ -36,6 +38,7 @@ from redteam.orchestration.agents.registry import AgentRegistry, default_registr
 from redteam.orchestration.analysis import AnalysisVerifier, StructuredLLMAnalysisVerifier
 from redteam.orchestration.checkpointing import StateCodecRegistry
 from redteam.orchestration.component_binding import RuntimeComponentBinding
+from redteam.orchestration.condition_waiter import ConditionWaiter
 from redteam.orchestration.context_projection import ContextProjectionCache
 from redteam.orchestration.coordination import Coordinator
 from redteam.orchestration.eligibility import EligibilityRegistry, default_eligibility_registry
@@ -113,6 +116,9 @@ class RuntimeDeps:
     execution_recipes: dict[str, ExecutionRecipeSpec] = field(default_factory=dict, compare=False)
     retry_policy: RetryPolicy | None = field(default=None, compare=False)
     local_tools: LocalToolRegistry = field(default_factory=LocalToolRegistry, compare=False)
+    artifact_store: ArtifactStore | None = field(default=None, compare=False)
+    fixture_runner: FixtureRunner | None = field(default=None, compare=False)
+    condition_waiter: ConditionWaiter | None = field(default=None, compare=False)
 
     def __post_init__(self) -> None:
         if self.verifier is None:

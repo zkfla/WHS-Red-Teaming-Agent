@@ -74,6 +74,7 @@ class RuntimeComponents:
     execution_recipes: Any = None
     retry_policy: Any = None
     local_tools: Any = None
+    condition_waiter: Any = None
 
 
 RuntimeComponentFactory = Callable[[ComponentFactoryContext], RuntimeComponents]

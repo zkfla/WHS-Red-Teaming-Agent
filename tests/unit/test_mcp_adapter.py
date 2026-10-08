@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 import pytest
+from pydantic import ValidationError
 
 from redteam.capability.adapters.mcp.analysis import AnalysisMCPAdapter
 from redteam.capability.adapters.mcp.base import MCPCallResult
@@ -25,7 +26,14 @@ from redteam.capability.adapters.mcp.transport import (
 from redteam.capability.adapters.mcp.web_api import WebAPIMCPAdapter
 from redteam.capability.gateway import MCPToolGateway
 from redteam.capability.registry import MCPToolRegistry, ToolRegistrationConflictError
-from redteam.core.contracts.tool import ExecutionContext, ToolDescriptor, ToolInvocation
+from redteam.core.contracts.tool import (
+    PROVIDER_METADATA_ARGUMENT_BINDINGS,
+    PROVIDER_METADATA_COMMAND_FIELDS,
+    PROVIDER_METADATA_TARGET_TYPES,
+    ExecutionContext,
+    ToolDescriptor,
+    ToolInvocation,
+)
 from redteam.core.enums import ToolHealthStatus
 from redteam.core.ids import ActionId, EngagementId, InvocationId, RunId, ToolId
 
@@ -134,6 +142,42 @@ async def test_adapter_preserves_absent_output_schema_as_none() -> None:
     )[0]
 
     assert descriptor.output_schema is None
+
+
+async def test_adapter_projects_typed_provider_target_metadata_without_vendor_branch() -> None:
+    transport = FakeTransport(tools=[RemoteTool(
+        name="inspect", description="inspect",
+        input_schema={"type": "object"},
+        metadata={
+            PROVIDER_METADATA_TARGET_TYPES: ["asset"],
+            PROVIDER_METADATA_ARGUMENT_BINDINGS: {"remote_asset": "asset_ref"},
+            PROVIDER_METADATA_COMMAND_FIELDS: ["command"],
+        },
+    )])
+    descriptor = (await AnalysisMCPAdapter(
+        server_id="operator-provider", transport=transport,
+    ).discover_tools())[0]
+    assert descriptor.target_types == ["asset"]
+    assert descriptor.argument_bindings == {"remote_asset": "asset_ref"}
+    assert descriptor.command_fields == ["command"]
+    assert transport.calls == []
+
+
+@pytest.mark.parametrize("key,value", [
+    (PROVIDER_METADATA_TARGET_TYPES, "device"),
+    (PROVIDER_METADATA_TARGET_TYPES, [123]),
+    (PROVIDER_METADATA_ARGUMENT_BINDINGS, ["device_ref"]),
+    (PROVIDER_METADATA_ARGUMENT_BINDINGS, {"remote_device": 123}),
+])
+async def test_adapter_rejects_malformed_provider_target_metadata(key, value) -> None:
+    transport = FakeTransport(tools=[RemoteTool(
+        name="inspect", description="inspect", input_schema={"type": "object"},
+        metadata={key: value},
+    )])
+    adapter = AnalysisMCPAdapter(server_id="operator-provider", transport=transport)
+    with pytest.raises(ValidationError):
+        await adapter.discover_tools()
+    assert transport.calls == []
 
 
 async def test_gateway_skips_output_validation_when_schema_is_absent() -> None:

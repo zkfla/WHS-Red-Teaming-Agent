@@ -51,6 +51,7 @@ class SessionController:
         command_help=None,
         model_label: str = "",
         single_run: bool = False,
+        configured_servers: tuple[str, ...] = (),
     ) -> None:
         self.frontend = frontend
         self.router = InputRouter(conversation)
@@ -115,6 +116,9 @@ class SessionController:
         self.idle.set()
         self.ready = asyncio.Event()
         self.operator = None
+        self.configured_servers = configured_servers
+        self.catalog_snapshot: list[str] = []
+        self.catalog_status = "not_discovered"
         self.accept_mutations = False
         self.stopping = False
         self.run_task: asyncio.Task | None = None
@@ -379,12 +383,21 @@ class SessionController:
             )
         for attempt in range(2):
             revision = self.context_loader() if self.context_loader else None
+            # Advisory metadata only; neither authority nor execution readiness.
+            # A closed snapshot must never be presented as a live gateway.
+            catalog_context = (
+                f"\nTool catalog status: {self.catalog_status}. "
+                f"Configured server IDs (not discovery): {self.configured_servers[:40]}. "
+                "Tool labels are a bounded discovery snapshot, not execution permission. "
+                "After run_detached, bootstrap must rediscover before any new execution."
+            )
             decision = await self.router.route(
                 env.text,
-                context=context,
+                context=context + catalog_context,
                 active=self._same(bound),
                 engagement_name=self.engagement_name,
                 scope=self.scope,
+                tools=list(self.catalog_snapshot),
             )
             latest = self.context_loader() if self.context_loader else None
             if latest == revision:
@@ -658,6 +671,10 @@ class SessionController:
 
     def attach(self, operator) -> None:
         self.operator = operator
+        labels = getattr(operator, "catalog_labels", None)
+        snapshot = labels() if callable(labels) else None
+        self.catalog_snapshot = list(snapshot) if snapshot is not None else []
+        self.catalog_status = "discovered" if snapshot is not None else "unavailable"
         self.accept_mutations = True
 
     def observe(self, event) -> None:
@@ -752,6 +769,10 @@ class SessionController:
         try:
             applied, reason = await asyncio.wait_for(asyncio.shield(task), DISPATCH_TIMEOUT)
             self._receipt(receipt, "handled" if applied else "not_applied", reason)
+            if applied and kind in {"approve", "deny"} and self.pending_approval == value:
+                # Acknowledged resolution ends this wait. A late acknowledgement
+                # must never clear a different approval already rebound by the runner.
+                self.resumed()
             if kind == "stop" and applied:
                 self.stopping = True
         except (Exception, asyncio.CancelledError) as exc:
@@ -787,6 +808,8 @@ class SessionController:
                             "늦은 응답 확인: " + reason,
                         )
         self.operator = None
+        if self.catalog_status == "discovered":
+            self.catalog_status = "run_detached"
         self.pending_approval = None
 
     async def close(self) -> None:

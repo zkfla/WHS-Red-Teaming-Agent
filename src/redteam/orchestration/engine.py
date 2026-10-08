@@ -91,12 +91,12 @@ from redteam.orchestration.knowledge_validation import (
     known_principals,
     known_target_ids,
 )
+from redteam.orchestration.knowledge_validation import principal_bindings as principal_bindings
 from redteam.orchestration.local_tools import LocalToolCall, LocalToolContext
 from redteam.orchestration.paths import PathError, PathPlan, is_active_status, is_known_criterion
 from redteam.orchestration.paths.models import (
     ALLOWED_CRITERION_KINDS,
     changed_steps_and_descendants,
-    step_definition_equal,
     validate_path_structure,
 )
 from redteam.orchestration.paths.writing import (
@@ -291,33 +291,6 @@ def fact_refs(knowledge: dict) -> set[str]:
     return refs
 
 
-def principal_bindings(knowledge: dict) -> dict[str, set[str]]:
-    """Non-secret identity references; supplied registrations stay declarations."""
-    bindings: dict[str, set[str]] = {"anonymous": set()}
-    provided = knowledge.get("provided", {}).get("claims", [])
-    for item in [*knowledge.get("facts", []), *provided]:
-        if not isinstance(item, dict):
-            continue
-        facts = item.get("observed_facts", item.get("facts", {}))
-        if not isinstance(facts, dict):
-            continue
-        for reference in item.get("auth_session_refs", []):
-            bindings.setdefault(str(reference), set()).add(str(reference))
-        sessions = facts.get("auth_session_config", {}).get("sessions", [])
-        for session in sessions:
-            if isinstance(session, dict) and session.get("session_ref"):
-                reference = str(session["session_ref"])
-                bindings.setdefault(reference, set()).add(reference)
-        refs = facts.get("session_refs", [])
-        if facts.get("session_ref"):
-            refs = [*refs, facts["session_ref"]]
-        if facts.get("principal_ref"):
-            bindings.setdefault(str(facts["principal_ref"]), set()).update(map(str, refs))
-        if item.get("node_type") in {"principal", "credential"}:
-            bindings.setdefault(str(item.get("node_id")), set()).update(map(str, refs))
-    return bindings
-
-
 def ready_step(path, step, knowledge) -> list[str]:
     """Step gates; accepts the internal material or the legacy display dict."""
     if isinstance(knowledge, InternalAssessment):
@@ -484,6 +457,19 @@ class InvestigationEngine:
             self.deps.settings.decision_max_attempts,
         )
 
+    def fork_decision(self, runtime, delegation):
+        """A request-local engine; stores/ports are shared, mutable reasoning is not."""
+        isolated = InvestigationEngine(self.deps)
+        isolated._event_runtime = runtime.model_copy(deep=True)
+        isolated.updated_runtime = isolated._event_runtime
+        isolated.last_event_id = self.last_event_id
+        isolated.active_delegation = delegation.model_copy(deep=True)
+        isolated.decision_token_limit = (
+            max(delegation.budget.max_tokens - (delegation.tokens_used or 0), 0)
+            if delegation.budget.max_tokens is not None else None
+        )
+        return isolated
+
     async def execute_local_calls(self, calls, *, runtime, path, budget, delegation=None):
         """Generic local dispatch; providers own graph/domain interpretation."""
         from dataclasses import asdict
@@ -599,6 +585,12 @@ class InvestigationEngine:
         )
         active = payload.get("draft_path") or payload.get("active_path") or {}
         refs = {"path_id": active.get("path_id"), "path_version": active.get("version")}
+        if self.active_delegation is not None:
+            refs.update(
+                delegation_id=self.active_delegation.delegation_id,
+                agent_id=self.active_delegation.agent_id,
+                path_step_id=self.active_delegation.path_step_id,
+            )
         prepared = await publisher.publish(
             AGENT_CONTEXT_PREPARED,
             {
@@ -800,6 +792,7 @@ class InvestigationEngine:
 
     async def context(self, runtime, observation) -> dict:
         from redteam.attack_graph.service import AttackGraphService
+        from redteam.orchestration.context_projection import action_proposal_lifecycle
 
         service = AttackGraphService(self.deps.graph_store)
         # One shared read feeds both the capped LLM display and the full
@@ -899,6 +892,11 @@ class InvestigationEngine:
                             drop_secret_keys=False,
                         )
         records = await self.deps.evidence_store.list_for_run(runtime.run_id)
+        from redteam.orchestration.evidence_validity import project_validity
+
+        validity = await project_validity(
+            self.deps.evidence_store, service, str(runtime.run_id), records,
+        )
         processing = project_run_processing(records)
         reference_context = {}
         library = getattr(self.deps, "methodology_library", None)
@@ -973,6 +971,16 @@ class InvestigationEngine:
                 "input_field": "evidence_request",
                 "schema": EvidenceReadRequest.model_json_schema(),
             },
+            "completion_subject_contract": {
+                "execution_targets": "Use the accepted atomic step's exact target_node_ids.",
+                "new_subjects": "Revise the question and atomic step using known target IDs "
+                "before executing a newly discovered endpoint or object.",
+                "prior_evidence": "Keep original path/target/principal/session linkage. "
+                "A different subject needs a source-linked final admission receipt and "
+                "a measured, source-backed direct graph relation; shared host alone is not proof.",
+                "result_meaning": "HTTP request success is not vulnerability success. "
+                "Observe status and preserved content; settle unsupported claims as unresolved.",
+            } if self._durable_path_events else None,
             **({"execution_options": execution_options} if execution_options else {}),
             "role_activation": {
                 str(agent.agent_id): {
@@ -1004,6 +1012,7 @@ class InvestigationEngine:
             if self.deps.engagement
             else None,
             "knowledge": knowledge,
+            "action_lifecycle": action_proposal_lifecycle(),
             "active_path": active.model_dump(mode="json") if active else None,
             "completed_task_paths": completed_task_paths,
             "roles": [
@@ -1021,6 +1030,7 @@ class InvestigationEngine:
                 for item in self.deps.local_tools.descriptors()
             ],
             "local_tool_results": await self.local_results(runtime),
+            "evidence_validity": validity,
             "requested_evidence": await restore_reads(self.deps.evidence_store, runtime),
             "evidence": evidence,
             "evidence_index": [str(item.evidence_id) for item in records],
@@ -1574,43 +1584,59 @@ class InvestigationEngine:
             accepted["review_records"] = {"decision": review.decision, "reason": review.reason}
 
         async def save_path(change):
-            return await change.paths.register(
+            from redteam.orchestration.path_events import queue_path_accepted
+
+            saved = await change.paths.register(
                 PathPlan.model_validate(accepted),
                 expected_version=active.version if active else None,
                 expected_path_id=active.path_id if active else None,
             )
+            if self._durable_path_events:
+                queue_path_accepted(change, self._path_publisher(runtime), saved, active)
+            return saved
 
         registered = await self._commit_review(runtime, token, save_path)
-        if active:
-            await self.invalidate_pending(active, registered, runtime)
+        if self._durable_path_events:
+            await self._reconcile_path_events(runtime)
+        elif active:
+            from redteam.orchestration.path_events import affected_steps
+
+            await self.deps.work_store.invalidate_pending(
+                run_id=runtime.run_id, path_id=active.path_id,
+                step_ids=set(affected_steps(registered, active)), now=datetime.now(timezone.utc),
+            )
         return registered
 
-    async def invalidate_pending(self, previous, current, runtime):
-        previous_steps = {item.step_id: item for item in previous.steps}
-        current_steps = {item.step_id: item for item in current.steps}
-        changed = set(current.changed_step_ids) | (set(previous_steps) - set(current_steps))
-        for identity, old in previous_steps.items():
-            new = current_steps.get(identity)
-            if new is not None:
-                if not step_definition_equal(old, new):
-                    changed.add(identity)
-        while True:
-            descendants = {
-                item.step_id for item in previous.steps if set(item.depends_on) & changed
-            }
-            if descendants <= changed:
-                break
-            changed.update(descendants)
-        if previous.path_id != current.path_id:
-            changed = set(previous_steps)
-        now = datetime.now(timezone.utc)
-        await self.deps.work_store.invalidate_pending(
-            run_id=runtime.run_id,
-            path_id=previous.path_id,
-            step_ids=changed,
-            now=now,
+    @property
+    def _durable_path_events(self):
+        return getattr(self.planning_provider, "enable_replanning", False)
+
+    def _path_publisher(self, runtime):
+        return EventPublisher(
+            self.deps.event_bus, run_id=runtime.run_id, engagement_id=runtime.engagement_id,
+            source="orchestration.paths",
         )
-        # LEASED is checked again on admission; RUNNING keeps its real result.
+
+    async def _reconcile_path_events(self, runtime):
+        from redteam.orchestration.outbox import deliver_pending
+        from redteam.orchestration.path_events import reconcile_path_events
+
+        if not self._durable_path_events:
+            return
+        coordinator = self.deps.coordinator or coordinator_for(
+            self.deps.task_graph_store, self.deps.path_store
+        )
+        await reconcile_path_events(
+            coordinator, self.deps.work_store,
+            run_id=str(runtime.run_id), engagement_id=str(runtime.engagement_id),
+        )
+        # Publish committed path events before later live terminal events.
+        # Legacy/unbound fixture runs have no public outbox binding.
+        if runtime.mission_id is not None:
+            await deliver_pending(
+                coordinator, run_id=str(runtime.run_id),
+                engagement_id=str(runtime.engagement_id), event_bus=self.deps.event_bus,
+            )
 
     @staticmethod
     def _record_rejection(budget, stage, diagnostic):
@@ -1674,6 +1700,7 @@ class InvestigationEngine:
         self._event_runtime = runtime
         self.updated_runtime = runtime
         self.last_event_id = last_event_id
+        await self._reconcile_path_events(runtime)
         await self._review_token(runtime)
         context = await self.context(runtime, observation)
         path = await self.deps.path_store.get_active(str(runtime.run_id))
@@ -2115,6 +2142,18 @@ class InvestigationEngine:
                         code="unresolved_target",
                         location=_action_location(intent_index, "target_node_id"),
                     )
+                if self._durable_path_events and intent.target_node_id not in step.target_node_ids:
+                    # P1 atomic decomposition preserves question subjects. Do
+                    # not execute a different object then discover at completion
+                    # that its source cannot prove this step. Existing evidence
+                    # and grounded receipt admission remain untouched.
+                    raise DecisionRuleError(
+                        "The action subject differs from its accepted atomic step. "
+                        "Revise the question and step to the exact known subject first; "
+                        "do not replace original evidence metadata or broaden scope.",
+                        code="atomic_execution_subject_mismatch",
+                        location=_action_location(intent_index, "target_node_id"),
+                    )
                 agent = self.deps.agents.get(intent.agent_id)
                 if agent is None:
                     raise DecisionRuleError("action role is unavailable")
@@ -2401,6 +2440,12 @@ class InvestigationEngine:
         # Execution identity does not change when a claim, role or path is renamed.
         # A different tool or grounded investigation state is a different attempt.
         for item in compiled:
+            if self._durable_path_events:
+                from redteam.orchestration.resource_conflicts import execution_conflicts
+
+                item.draft.conflict_keys = execution_conflicts(
+                    item.plan_step.resolved_target(), item.plan_step.arguments, item.tool,
+                )
             identity = {
                 "tool_id": str(item.tool.tool_id),
                 "arguments": item.plan_step.arguments,
@@ -2675,13 +2720,19 @@ class InvestigationEngine:
             )
 
             async def block(change):
-                return await change.paths.update_step(
+                from redteam.orchestration.path_events import queue_step_settled
+
+                saved = await change.paths.update_step(
                     str(runtime.run_id), path.path_id, path.version, step.step_id,
                     "blocked", outcome=parsed.outcome,
                     evidence_ids=list(dict.fromkeys([*parsed.evidence_ids, identity])),
                 )
+                if saved is not None and self._durable_path_events:
+                    queue_step_settled(change, self._path_publisher(runtime), saved, step.step_id)
+                return saved
 
             updated = await self._commit_review(runtime, token, block)
+            await self._reconcile_path_events(runtime)
             runtime.unresolved_evidence_ids = list(dict.fromkeys([
                 *runtime.unresolved_evidence_ids, identity,
             ]))
@@ -2774,7 +2825,9 @@ class InvestigationEngine:
         status = "completed" if outcome in {"success", "refuted"} else "blocked"
 
         async def complete(change):
-            return await change.paths.update_step(
+            from redteam.orchestration.path_events import queue_step_settled
+
+            saved = await change.paths.update_step(
                 str(runtime.run_id),
                 path.path_id,
                 path.version,
@@ -2783,8 +2836,12 @@ class InvestigationEngine:
                 outcome=outcome,
                 evidence_ids=proposal.get("evidence_ids", []),
             )
+            if saved is not None and self._durable_path_events:
+                queue_step_settled(change, self._path_publisher(runtime), saved, step.step_id)
+            return saved
 
         updated = await self._commit_review(runtime, token, complete)
+        await self._reconcile_path_events(runtime)
         if budget is not None:
             budget.record(
                 "completion_review",

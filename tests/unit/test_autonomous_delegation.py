@@ -487,15 +487,21 @@ async def test_worker_provider_failure_preserves_diagnostic_usage_and_report(tmp
     from redteam.attack_graph.service import AttackGraphService
     from redteam.core.enums import AgentPhase
     from redteam.core.ports.llm import LLMProviderFailure
+    from redteam.orchestration.nodes.plan import plan_node
+    from redteam.orchestration.nodes.replan import replan_node
     from redteam.orchestration.reporting import ReportingAgent
+    from redteam.orchestration.state import initial_graph_state
 
     ctx = await _delegated_setup("run-worker-provider")
     ctx.llm.add("worker_next_action", LLMProviderFailure(
         kind="auth", http_status=401, provider_code="invalid_api_key", retryable=False,
     ))
     calls_before = len(ctx.llm.calls)
-    await ctx.engine.decide(ctx.runtime, GraphObservation())
-    runtime = ctx.engine.updated_runtime
+    planned = await plan_node(initial_graph_state(ctx.runtime), deps=ctx.deps)
+    runtime = (await replan_node(planned, deps=ctx.deps))["runtime"]
+    assert runtime.phase == AgentPhase.FINISHED and runtime.planning_error is None
+    assert runtime.termination_reason == "provider_unavailable"
+    assert runtime.planning_diagnostic.provider_code == "invalid_api_key"
     delegation = runtime.delegations[ctx.delegation_id]
     assert len(ctx.llm.calls) == calls_before + 1
     assert delegation.status == "finished"
@@ -510,9 +516,7 @@ async def test_worker_provider_failure_preserves_diagnostic_usage_and_report(tmp
     assert record.metadata["gaps"][0]["code"] == "provider_failure"
     runtime = RuntimeState.model_validate_json(runtime.model_dump_json())
     report = await ReportingAgent().project(
-        runtime.model_copy(update={
-            "phase": AgentPhase.FINISHED, "termination_reason": "investigation_held",
-        }), graph=AttackGraphService(ctx.seed.store),
+        runtime, graph=AttackGraphService(ctx.seed.store),
         evidence_store=ctx.world.evidence, work_store=ctx.world.work,
     )
     save_terminal_report(report, reports_dir=tmp_path)
