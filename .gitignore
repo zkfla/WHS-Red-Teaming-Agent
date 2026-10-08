@@ -19,6 +19,7 @@ tests/vuln-bank/
 tests/vulnbank/
 /plan.md
 /AGENTS.md
+/plan**.md
 
 공통 개발 시작 프롬프트.md
 변경사항.md
