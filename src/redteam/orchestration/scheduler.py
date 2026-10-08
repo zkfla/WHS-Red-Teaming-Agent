@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-from redteam.core.ids import HypothesisId, RunId, new_id
+from redteam.core.ids import AgentInstanceId, HypothesisId, RunId, new_id
 from redteam.orchestration.candidates.models import ExecutableCandidate
 from redteam.orchestration.work.models import TaskLease, WorkBudget, WorkItem
 from redteam.orchestration.work.store import WorkStore
@@ -20,6 +20,7 @@ class WorkScheduler:
         *,
         graph_revision: int,
         run_id: RunId,
+        instance_id: AgentInstanceId | None = None,
         mission_task_id: str | None = None,
         now: datetime | None = None,
     ) -> list[WorkItem]:
@@ -30,6 +31,7 @@ class WorkScheduler:
             item = WorkItem(
                 work_id=new_id("work"),
                 run_id=run_id,
+                instance_id=instance_id,
                 mission_task_id=mission_task_id,
                 model_tool_call_id=draft.plan_step.model_tool_call_id,
                 task_purpose_hash=draft.plan_step.task_purpose_hash,

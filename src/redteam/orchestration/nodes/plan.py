@@ -201,6 +201,7 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
         chosen,
         graph_revision=runtime.step_count,
         run_id=runtime.run_id,
+        instance_id=runtime.instance_id,
         now=now,
         mission_task_id=runtime.active_task_id,
     )
@@ -209,6 +210,7 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
         for item in await deps.work_store.list_items(
             status=WorkStatus.PENDING, run_id=runtime.run_id
         )
+        if item.instance_id == runtime.instance_id
     }
     service = graph_service(deps)
     dispatch = []
@@ -219,7 +221,7 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             continue
         lease = await deps.work_store.acquire(
             work.work_id,
-            owner=str(runtime.run_id),
+            owner=runtime.work_owner,
             now=now,
             ttl=timedelta(seconds=deps.settings.lease_ttl_seconds),
         )
@@ -267,6 +269,7 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             run_id=runtime.run_id,
             engagement_id=runtime.engagement_id,
             agent_id=candidate.draft.agent_id,
+            instance_id=runtime.instance_id,
             capability=step.capability,
             operation=step.operation,
             binding_mode=step.binding_mode,
@@ -349,7 +352,7 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             dispatch_items=[],
         )
     first = dispatch[0]
-    deps.batch_pending_approvals.discard(runtime.run_id)
+    deps.batch_pending_approvals.discard(runtime.work_owner)
     updates.update(
         phase=AgentPhase.POLICY,
         pending_action_id=first.proposal.action_id,

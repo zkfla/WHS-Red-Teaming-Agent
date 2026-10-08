@@ -29,6 +29,7 @@ from redteam.orchestration.work.rules import (
     finished_item,
     has_conflict,
     is_expired,
+    lease_owner_matches,
     leased_item,
     new_lease,
     pending_item,
@@ -66,6 +67,7 @@ class SQLiteWorkStore:
                     CREATE TABLE IF NOT EXISTS work_items (
                         work_id TEXT PRIMARY KEY,
                         run_id TEXT NOT NULL DEFAULT '',
+                        instance_id TEXT NOT NULL DEFAULT '',
                         candidate_key TEXT NOT NULL,
                         status TEXT NOT NULL,
                         priority REAL NOT NULL,
@@ -89,14 +91,19 @@ class SQLiteWorkStore:
                     await db.execute(
                         "ALTER TABLE work_items ADD COLUMN run_id TEXT NOT NULL DEFAULT ''"
                     )
+                if "instance_id" not in columns:
+                    await db.execute(
+                        "ALTER TABLE work_items ADD COLUMN instance_id TEXT NOT NULL DEFAULT ''"
+                    )
                 await db.execute(
                     "CREATE INDEX IF NOT EXISTS idx_work_run_status_priority "
                     "ON work_items(run_id,status,priority DESC,work_id)"
                 )
                 await db.execute("DROP INDEX IF EXISTS idx_one_active_candidate")
+                await db.execute("DROP INDEX IF EXISTS idx_one_active_candidate_run")
                 await db.execute(
-                    "CREATE UNIQUE INDEX IF NOT EXISTS idx_one_active_candidate_run "
-                    "ON work_items(run_id,candidate_key) "
+                    "CREATE UNIQUE INDEX IF NOT EXISTS idx_one_active_candidate_instance "
+                    "ON work_items(run_id,instance_id,candidate_key) "
                     "WHERE status IN ('pending','leased','running')"
                 )
                 await db.commit()
@@ -117,8 +124,9 @@ class SQLiteWorkStore:
                     await db.rollback()
                     return False
                 cursor = await db.execute(
-                    "SELECT payload FROM work_items WHERE run_id=? AND candidate_key=?",
-                    (_run_key(item.run_id), item.candidate_key),
+                    "SELECT payload FROM work_items "
+                    "WHERE run_id=? AND instance_id=? AND candidate_key=?",
+                    (_run_key(item.run_id), _instance_key(item), item.candidate_key),
                 )
                 same_candidate = [_item_from_payload(row[0]) for row in await cursor.fetchall()]
                 await cursor.close()
@@ -131,8 +139,9 @@ class SQLiteWorkStore:
                     await db.commit()
                     return False
                 await db.execute(
-                    "INSERT INTO work_items(work_id,run_id,candidate_key,status,priority,payload) "
-                    "VALUES(?,?,?,?,?,?)",
+                    "INSERT INTO work_items"
+                    "(work_id,run_id,instance_id,candidate_key,status,priority,payload) "
+                    "VALUES(?,?,?,?,?,?,?)",
                     _item_row(item),
                 )
                 await db.commit()
@@ -239,7 +248,11 @@ class SQLiteWorkStore:
             await db.execute("BEGIN IMMEDIATE")
             try:
                 item = await _load_item(db, work_id)
-                if item is None or item.status is not WorkStatus.PENDING:
+                if (
+                    item is None
+                    or item.status is not WorkStatus.PENDING
+                    or not lease_owner_matches(item, owner)
+                ):
                     await db.rollback()
                     return None
                 failed_dependency = await _terminal_dependency_failure(db, item)
@@ -482,10 +495,15 @@ def _run_key(run_id: RunId | None) -> str:
     return str(run_id) if run_id is not None else ""
 
 
-def _item_row(item: WorkItem) -> tuple[str, str, str, str, float, str]:
+def _instance_key(item: WorkItem) -> str:
+    return str(item.instance_id) if item.instance_id is not None else ""
+
+
+def _item_row(item: WorkItem) -> tuple[str, str, str, str, str, float, str]:
     return (
         item.work_id,
         _run_key(item.run_id),
+        _instance_key(item),
         item.candidate_key,
         item.status.value,
         item.priority.total,

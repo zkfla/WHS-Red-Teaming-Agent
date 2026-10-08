@@ -16,7 +16,7 @@ from pydantic import BaseModel, Field
 
 from redteam.attack_graph.service import AttackGraphService
 from redteam.core.enums import AgentPhase, MissionStatus
-from redteam.core.ids import EventId, MissionId, RunId
+from redteam.core.ids import AgentInstanceId, EventId, MissionId, RunId
 from redteam.orchestration.checkpointing import build_checkpointer, open_checkpointer
 from redteam.orchestration.component_binding import builtin_component_binding
 from redteam.orchestration.context import RuntimeDeps
@@ -43,6 +43,11 @@ logger = logging.getLogger(__name__)
 #: written before the node's effect is durably observable), so a durable
 #: recovery/auto-resume refuses to act on such a snapshot -- fail closed.
 _UNSAFE_REPLAY_NODES = frozenset({"execute", "worker", "tools"})
+
+
+def _checkpoint_thread(run_id: RunId | str, instance_id: AgentInstanceId | str | None) -> str:
+    """One shared run may contain several independently checkpointed workers."""
+    return str(run_id) if instance_id is None else f"{run_id}:instance:{instance_id}"
 
 
 class CheckpointSnapshot(BaseModel):
@@ -146,7 +151,7 @@ class AgentLoopRunner:
             else None
         )
         self._thread_id: str | None = self._settings.thread_id
-        self._bound_run_id: str | None = None
+        self._bound_thread_id: str | None = None
         self._wakeup: EventWakeup | None = None
         self._wakeup_run_id: str | None = None
         self._active_graph_task: asyncio.Task[GraphState] | None = None
@@ -185,6 +190,13 @@ class AgentLoopRunner:
             "recursion_limit": self._settings.effective_recursion_limit,
         }
 
+    def _bind_runtime(self, run_id: RunId | str, instance_id: AgentInstanceId | str | None) -> str:
+        thread_id = _checkpoint_thread(run_id, instance_id)
+        if self._bound_thread_id is not None and self._bound_thread_id != thread_id:
+            raise ValueError("one AgentLoopRunner may execute only one run instance")
+        self._bound_thread_id = thread_id
+        return thread_id
+
     async def _binding_for(self, runtime: RuntimeState, *, checkpoint=None, fresh=False) -> bool:
         selected = self._deps.component_binding
         recorded = runtime.component_binding
@@ -199,6 +211,7 @@ class AgentLoopRunner:
             saved = checkpoint.values.get("runtime") if checkpoint.values else None
             fields = (
                 "run_id",
+                "instance_id",
                 "phase",
                 "mission_id",
                 "engagement_id",
@@ -378,13 +391,10 @@ class AgentLoopRunner:
         """
         if not await self._latest_allows_execution(runtime):
             raise CoordinationError("mission_not_active")
-        run_key = str(runtime.run_id)
-        if self._bound_run_id is not None and self._bound_run_id != run_key:
-            raise ValueError("one AgentLoopRunner may execute only one run")
-        self._bound_run_id = run_key
+        thread_id = self._bind_runtime(runtime.run_id, runtime.instance_id)
         self._failure_runtime = None
         await self._ensure_graph()
-        self._thread_id = self._thread_id or str(runtime.run_id)
+        self._thread_id = self._thread_id or thread_id
         assert self._graph is not None
         try:
             self._active_graph_task = asyncio.create_task(
@@ -457,7 +467,12 @@ class AgentLoopRunner:
 
     async def _close_finished_binding(self, runtime: RuntimeState, *, reason: str | None) -> None:
         """Persist hard termination before returning control to app settlement."""
-        if runtime.mission_id is None or reason is None or reason in RECONCILABLE_REASONS:
+        if (
+            runtime.instance_id is not None
+            or runtime.mission_id is None
+            or reason is None
+            or reason in RECONCILABLE_REASONS
+        ):
             return
         coordinator = self._deps.coordinator or coordinator_for(
             self._deps.task_graph_store, self._deps.path_store
@@ -538,7 +553,7 @@ class AgentLoopRunner:
     ) -> None:
         work_ids = await self._deps.work_store.abandon_run(
             runtime.run_id,
-            owner=str(runtime.run_id),
+            owner=runtime.work_owner,
             now=datetime.now(timezone.utc),
             reason=reason,
         )
@@ -587,9 +602,7 @@ class AgentLoopRunner:
         """
 
         run_key = str(runtime.run_id)
-        if self._bound_run_id is not None and self._bound_run_id != run_key:
-            raise ValueError("one AgentLoopRunner may wait on only one run")
-        self._bound_run_id = run_key
+        self._bind_runtime(runtime.run_id, runtime.instance_id)
         if self._wakeup is None:
             self._wakeup = EventWakeup(
                 run_id=runtime.run_id,
@@ -623,7 +636,9 @@ class AgentLoopRunner:
         # calling run(), which is where the checkpoint thread is normally
         # bound. Bind it from the terminal runtime before looking up the
         # state needed to resume an approval.
-        self._thread_id = self._thread_id or str(runtime.run_id)
+        self._thread_id = self._thread_id or _checkpoint_thread(
+            runtime.run_id, runtime.instance_id
+        )
 
         await self.recover_delivery(runtime)
         if not await self._latest_allows_execution(runtime, blocked=True):
@@ -671,13 +686,15 @@ class AgentLoopRunner:
             resumed=True,
         )
 
-    async def recover_runtime(self, run_id: RunId | str) -> RuntimeState | None:
-        """Recover the durable terminal ``RuntimeState`` for ``run_id``.
+    async def recover_runtime(
+        self, run_id: RunId | str, *, instance_id: AgentInstanceId | str | None = None
+    ) -> RuntimeState | None:
+        """Recover the durable terminal ``RuntimeState`` for a run or instance.
 
         Reads the latest checkpoint of the run's thread -- the same durable
         artifact a later ``redteam resume`` process rebuilds its runner
-        against. The run id *is* the checkpoint thread id (``_run_state``
-        binds one to the other), so nothing new needs to be recorded.
+        against. Old runs use the run id as thread id; an instance uses a
+        stable run+instance thread id so workers can resume independently.
 
         Returns ``None`` when the run has no checkpoint, the checkpoint
         cannot be read, the recovered ``run_id`` does not match, or the
@@ -688,16 +705,17 @@ class AgentLoopRunner:
         """
         self._require_checkpointing("recover_runtime")
         run_key = str(run_id)
-        if self._bound_run_id is not None and self._bound_run_id != run_key:
-            raise ValueError("one AgentLoopRunner may execute only one run")
-        self._bound_run_id = run_key
-        self._thread_id = self._thread_id or run_key
+        self._thread_id = self._thread_id or self._bind_runtime(run_key, instance_id)
         snapshot = await self._latest_snapshot()
         if snapshot is None:
             return None
         values = snapshot.values if snapshot.values else None
         runtime = values.get("runtime") if values else None
-        if not isinstance(runtime, RuntimeState) or str(runtime.run_id) != run_key:
+        if (
+            not isinstance(runtime, RuntimeState)
+            or str(runtime.run_id) != run_key
+            or (instance_id is not None and str(runtime.instance_id) != str(instance_id))
+        ):
             return None
         if self._snapshot_replays_execution(snapshot):
             return None
@@ -782,6 +800,7 @@ class AgentLoopRunner:
             proposal is None
             or proposal.action_id != runtime.pending_action_id
             or proposal.run_id != runtime.run_id
+            or proposal.instance_id != runtime.instance_id
             or proposal.engagement_id != runtime.engagement_id
             or self._snapshot_replays_execution(snapshot)
         ):
@@ -839,6 +858,7 @@ class AgentLoopRunner:
             or proposal is None
             or proposal.action_id != runtime.pending_action_id
             or proposal.run_id != runtime.run_id
+            or proposal.instance_id != runtime.instance_id
             or proposal.engagement_id != runtime.engagement_id
             or self._snapshot_replays_execution(snapshot)
         ):
@@ -852,6 +872,7 @@ class AgentLoopRunner:
         if (
             not isinstance(checkpoint_runtime, RuntimeState)
             or checkpoint_runtime.run_id != runtime.run_id
+            or checkpoint_runtime.instance_id != runtime.instance_id
             or checkpoint_runtime.engagement_id != runtime.engagement_id
             or checkpoint_runtime.mission_id != runtime.mission_id
             or checkpoint_runtime.termination_reason != TerminationReason.APPROVAL_PENDING
@@ -868,7 +889,7 @@ class AgentLoopRunner:
             return None
         lease = await self._deps.work_store.acquire(
             work_id,
-            owner=str(runtime.run_id),
+            owner=runtime.work_owner,
             now=datetime.now(timezone.utc),
             ttl=timedelta(seconds=self._settings.lease_ttl_seconds),
         )
@@ -900,12 +921,12 @@ class AgentLoopRunner:
         except (OSError, sqlite3.Error):
             logger.exception("refusing approval resume: durable claim unavailable")
             await self._deps.work_store.release(
-                work_id, owner=str(runtime.run_id), now=datetime.now(timezone.utc)
+                work_id, owner=runtime.work_owner, now=datetime.now(timezone.utc)
             )
             return None
         if not claimed:
             await self._deps.work_store.release(
-                work_id, owner=str(runtime.run_id), now=datetime.now(timezone.utc)
+                work_id, owner=runtime.work_owner, now=datetime.now(timezone.utc)
             )
             return None
 
@@ -927,7 +948,7 @@ class AgentLoopRunner:
         for key in ("native_calls", "native_messages", "native_outcome"):
             if key in state:
                 seeded[key] = state[key]
-        self._deps.batch_pending_approvals.discard(runtime.run_id)
+        self._deps.batch_pending_approvals.discard(runtime.work_owner)
         return await self._run_state(resumed_runtime, seeded)
 
     @staticmethod

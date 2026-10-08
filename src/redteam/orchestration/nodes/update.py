@@ -500,7 +500,7 @@ async def update_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
     approval_waiting = decision is not None and decision.verdict is PolicyVerdict.REQUIRE_APPROVAL
     if work_id is not None and approval_waiting:
         await deps.work_store.release(
-            work_id, owner=str(runtime.run_id), now=datetime.now(timezone.utc)
+            work_id, owner=runtime.work_owner, now=datetime.now(timezone.utc)
         )
     elif work_id is not None:
         error_code = result.error.code if result is not None and result.error else None
@@ -526,7 +526,7 @@ async def update_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                 reason = error_code if error_code else "tool_failed"
         await deps.work_store.complete(
             work_id,
-            owner=str(runtime.run_id),
+            owner=runtime.work_owner,
             status=work_status,
             now=datetime.now(timezone.utc),
             reason=reason,

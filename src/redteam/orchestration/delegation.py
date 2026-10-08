@@ -7,6 +7,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
+from redteam.core.ids import AgentInstanceId
 from redteam.orchestration.work.models import WorkBudget
 
 
@@ -15,6 +16,7 @@ class DelegationRequest(BaseModel):
 
     path_step_id: str
     agent_id: str
+    instance_id: AgentInstanceId | None = None
     objective: str | None = None
     budget: WorkBudget | None = None
 

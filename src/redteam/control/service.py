@@ -101,6 +101,7 @@ def _same_action_content(first: ActionProposal, second: ActionProposal) -> bool:
         and first.engagement_id == second.engagement_id
         and first.run_id == second.run_id
         and first.agent_id == second.agent_id
+        and first.instance_id == second.instance_id
     )
 
 

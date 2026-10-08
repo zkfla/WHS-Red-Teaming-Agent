@@ -13,7 +13,15 @@ from typing import Any
 from pydantic import BaseModel, Field, model_validator
 
 from redteam.core.enums import RiskLevel, ToolHealthStatus
-from redteam.core.ids import ActionId, AgentId, EngagementId, InvocationId, RunId, ToolId
+from redteam.core.ids import (
+    ActionId,
+    AgentId,
+    AgentInstanceId,
+    EngagementId,
+    InvocationId,
+    RunId,
+    ToolId,
+)
 from redteam.core.tool_binding import LEGACY_ACTION, SELECTED_TOOL, BindingMode
 
 
@@ -96,6 +104,7 @@ class ExecutionContext(BaseModel):
     engagement_id: EngagementId
     run_id: RunId
     agent_id: AgentId | None = None
+    instance_id: AgentInstanceId | None = None
     correlation_id: str | None = None
     dry_run: bool = False
 

@@ -21,6 +21,7 @@ from redteam.core.enums import AgentPhase, MissionStatus, Verdict
 from redteam.core.ids import (
     ActionId,
     AgentId,
+    AgentInstanceId,
     ApprovalId,
     EngagementId,
     EventId,
@@ -41,6 +42,7 @@ from redteam.orchestration.dispatch import (
     merge_worker_outcomes,
 )
 from redteam.orchestration.runtime_observation import RuntimeObservation
+from redteam.orchestration.work.models import work_owner_for
 
 
 class TerminationReason:
@@ -76,6 +78,9 @@ class RuntimeState(BaseModel):
 
     phase: AgentPhase = AgentPhase.OBSERVE
     current_agent: AgentId | None = None
+    # None is the pre-instance central loop. Instances share the run/mission
+    # but have independent LangGraph threads and work leases.
+    instance_id: AgentInstanceId | None = None
 
     current_goal: str | None = None
     # Additive references for task-first execution. Optional defaults keep
@@ -153,6 +158,11 @@ class RuntimeState(BaseModel):
     @property
     def is_terminal(self) -> bool:
         return self.phase in (AgentPhase.FINISHED, AgentPhase.FAILED)
+
+    @property
+    def work_owner(self) -> str:
+        """Lease identity; old single-run checkpoints retain their owner."""
+        return work_owner_for(self.run_id, self.instance_id)
 
 
 class NativeCallState(BaseModel):

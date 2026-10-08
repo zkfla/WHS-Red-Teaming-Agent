@@ -8,8 +8,9 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from redteam.core.ids import AgentId, GraphNodeId, RunId
+from redteam.core.ids import AgentId, AgentInstanceId, EngagementId, GraphNodeId, RunId
 from redteam.orchestration.candidates.models import PriorityScore
+from redteam.orchestration.state import RuntimeState
 from redteam.orchestration.work.memory import InMemoryWorkStore
 from redteam.orchestration.work.models import WorkItem, WorkStatus
 from redteam.orchestration.work.sqlite import SQLiteWorkStore
@@ -134,6 +135,75 @@ async def test_lease_is_atomic_under_concurrency(store) -> None:
     )
 
     assert len([lease for lease in leases if lease is not None]) == 1
+
+
+async def test_same_run_instances_cannot_use_each_others_work_lease(store) -> None:
+    first = RuntimeState(
+        run_id=RunId("run-1"),
+        engagement_id=EngagementId("eng-1"),
+        instance_id=AgentInstanceId("instance-a"),
+    )
+    second = first.model_copy(update={"instance_id": AgentInstanceId("instance-b")})
+    assert first.work_owner != second.work_owner
+    assert await store.add(item("w1").model_copy(update={"instance_id": first.instance_id}))
+    assert await store.acquire(
+        "w1", owner=second.work_owner, now=NOW, ttl=timedelta(seconds=10)
+    ) is None
+    assert await store.acquire(
+        "w1", owner=first.work_owner, now=NOW, ttl=timedelta(seconds=10)
+    )
+    assert await store.heartbeat(
+        "w1", owner=second.work_owner, now=NOW, ttl=timedelta(seconds=10)
+    ) is None
+    assert not await store.complete(
+        "w1", owner=second.work_owner, status=WorkStatus.SUCCEEDED, now=NOW
+    )
+    assert await store.complete(
+        "w1", owner=first.work_owner, status=WorkStatus.SUCCEEDED, now=NOW
+    )
+
+
+async def test_same_candidate_remains_independent_across_instances(store) -> None:
+    first = item("w1", candidate="same").model_copy(
+        update={"instance_id": AgentInstanceId("instance-a")}
+    )
+    second = item("w2", candidate="same").model_copy(
+        update={"instance_id": AgentInstanceId("instance-b")}
+    )
+    assert await store.add(first)
+    assert await store.add(second)
+    assert (await store.get("w1")).instance_id == first.instance_id
+    assert (await store.get("w2")).instance_id == second.instance_id
+
+
+async def test_instance_owner_is_scoped_to_run(store) -> None:
+    first = RuntimeState(
+        run_id=RunId("run-1"), engagement_id=EngagementId("eng-1"),
+        instance_id=AgentInstanceId("worker-0"),
+    )
+    other_run = first.model_copy(update={"run_id": RunId("run-2")})
+    assert first.work_owner != other_run.work_owner
+    assert await store.add(item("w1").model_copy(update={"instance_id": first.instance_id}))
+    assert await store.acquire(
+        "w1", owner=other_run.work_owner, now=NOW, ttl=timedelta(seconds=10)
+    ) is None
+
+
+async def test_abandoning_one_instance_preserves_other_instances_pending_work(store) -> None:
+    first = item("w1").model_copy(update={"instance_id": AgentInstanceId("instance-a")})
+    second = item("w2").model_copy(update={"instance_id": AgentInstanceId("instance-b")})
+    assert await store.add(first)
+    assert await store.add(second)
+    assert await store.add(item("legacy"))
+
+    abandoned = await store.abandon_run(
+        RunId("run-1"), owner="run-1:instance:instance-a", now=NOW, reason="interrupted"
+    )
+
+    assert abandoned == ["w1"]
+    assert (await store.get("w1")).status is WorkStatus.FAILED
+    assert (await store.get("w2")).status is WorkStatus.PENDING
+    assert (await store.get("legacy")).status is WorkStatus.PENDING
 
 
 async def test_conflicting_resources_are_not_leased_together(store) -> None:

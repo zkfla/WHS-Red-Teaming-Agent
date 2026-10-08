@@ -17,6 +17,7 @@ from redteam.orchestration.work.models import (
     WorkItem,
     WorkStatus,
     is_unexecuted_stale,
+    work_owner_for,
 )
 
 ACTIVE_CONFLICT_STATUSES = frozenset({WorkStatus.LEASED, WorkStatus.RUNNING})
@@ -178,7 +179,14 @@ def should_invalidate(item: WorkItem, run_id: object, path_id: str, step_ids: se
 def abandon_candidate(item: WorkItem, run_id: object, owner: str, lease_owner: str | None) -> bool:
     if item.run_id != run_id or item.status not in ACTIVE_STATUSES:
         return False
+    if owner != work_owner_for(item.run_id or "", item.instance_id):
+        return False
     return lease_owner is None or lease_owner == owner
+
+
+def lease_owner_matches(item: WorkItem, owner: str) -> bool:
+    """New instance work is claimable only by its instance; old rows keep old rules."""
+    return item.instance_id is None or owner == work_owner_for(item.run_id or "", item.instance_id)
 
 
 def can_bind(

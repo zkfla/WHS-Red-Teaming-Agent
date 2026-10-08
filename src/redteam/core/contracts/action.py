@@ -15,7 +15,15 @@ from typing import Any
 from pydantic import BaseModel, Field, model_validator
 
 from redteam.core.contracts.target import TargetRef
-from redteam.core.ids import ActionId, AgentId, EngagementId, HypothesisId, RunId, ToolId
+from redteam.core.ids import (
+    ActionId,
+    AgentId,
+    AgentInstanceId,
+    EngagementId,
+    HypothesisId,
+    RunId,
+    ToolId,
+)
 from redteam.core.tool_binding import (
     LEGACY_ACTION,
     SELECTED_TOOL,
@@ -29,6 +37,9 @@ class ActionProposal(BaseModel):
     run_id: RunId
     engagement_id: EngagementId
     agent_id: AgentId
+    # A role may have several concurrent execution instances in one run.
+    # None preserves proposals written before instance scheduling existed.
+    instance_id: AgentInstanceId | None = None
 
     binding_mode: BindingMode = LEGACY_ACTION
     tool_id: ToolId | None = None

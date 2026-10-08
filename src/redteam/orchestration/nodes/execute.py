@@ -184,7 +184,7 @@ async def _invoke_with_semaphore(
             await before_start()
             job_id = await manager.submit(invocation)
             if not await deps.work_store.bind_job(
-                work_id, owner=str(runtime.run_id), job_id=job_id
+                work_id, owner=runtime.work_owner, job_id=job_id
             ):
                 raise RuntimeError("submitted job could not be recorded; reconcile before retry")
         try:
@@ -256,7 +256,7 @@ async def execute_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
     )
 
     work_id = state.get("current_work_id")
-    owner = str(runtime.run_id)
+    owner = runtime.work_owner
     lease_lost = asyncio.Event()
     heartbeat_task: asyncio.Task[None] | None = None
     lease_ready = True

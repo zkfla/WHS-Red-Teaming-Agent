@@ -12,7 +12,6 @@ from dataclasses import dataclass, field
 
 from redteam.attack_graph.service import AttackGraphService
 from redteam.core.contracts.engagement import Engagement
-from redteam.core.ids import RunId
 from redteam.core.ports.attack_graph import AttackGraphStore
 from redteam.core.ports.control_plane import ControlPlane
 from redteam.core.ports.event_bus import EventBus, EventHistory
@@ -87,7 +86,7 @@ class RuntimeDeps:
     policy_lock: asyncio.Lock = field(default_factory=asyncio.Lock, compare=False)
     # Serialized by policy_lock. Once one worker in a batch requests approval,
     # siblings defer without minting uncheckpointed/orphan Approvals.
-    batch_pending_approvals: set[RunId] = field(default_factory=set, compare=False)
+    batch_pending_approvals: set[str] = field(default_factory=set, compare=False)
     #: Bounds how many approved tool invocations may execute at once. One
     #: shared semaphore per run, wired by bootstrap from the engagement's
     #: ``RateLimitPolicy.max_concurrent_actions``. ``None`` (default) leaves

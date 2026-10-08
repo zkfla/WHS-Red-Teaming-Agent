@@ -16,6 +16,7 @@ from typing import NewType
 RunId = NewType("RunId", str)
 EngagementId = NewType("EngagementId", str)
 AgentId = NewType("AgentId", str)
+AgentInstanceId = NewType("AgentInstanceId", str)
 ActionId = NewType("ActionId", str)
 InvocationId = NewType("InvocationId", str)
 ToolId = NewType("ToolId", str)

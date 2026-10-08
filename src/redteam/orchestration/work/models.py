@@ -7,7 +7,7 @@ from enum import Enum
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-from redteam.core.ids import AgentId, GraphNodeId, HypothesisId, RunId
+from redteam.core.ids import AgentId, AgentInstanceId, GraphNodeId, HypothesisId, RunId
 from redteam.orchestration.candidates.models import PriorityScore
 
 
@@ -34,6 +34,11 @@ TERMINAL_STATUSES = frozenset(
 ACTIVE_STATUSES = frozenset({WorkStatus.PENDING, WorkStatus.LEASED, WorkStatus.RUNNING})
 
 
+def work_owner_for(run_id: RunId | str, instance_id: AgentInstanceId | None) -> str:
+    """One lease owner per instance, preserving the old run owner for legacy work."""
+    return f"{run_id}:instance:{instance_id}" if instance_id is not None else str(run_id)
+
+
 class WorkBudget(BaseModel):
     max_actions: int = Field(default=1, ge=1)
     max_seconds: float | None = Field(default=None, gt=0)
@@ -48,6 +53,7 @@ class WorkItem(BaseModel):
     #: Legacy rows used bounded summaries and cannot prove original-state equality.
     execution_identity_version: int = Field(default=0, ge=0)
     agent_id: AgentId
+    instance_id: AgentInstanceId | None = None
     graph_revision: int = Field(default=0, ge=0)
     path_id: str | None = None
     path_version: int | None = None

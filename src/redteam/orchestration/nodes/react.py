@@ -200,9 +200,14 @@ async def _bind_call(call: NativeCallState, *, deps: RuntimeDeps, runtime, conte
         )
     material = await InvestigationEngine(deps).execution_material(runtime)
     target = await resolve_native_target(deps, tool, call.arguments or {}, material)
-    key = "cand_" + hashlib.sha256(f"{runtime.run_id}:{call.call_id}".encode()).hexdigest()[:24]
+    call_namespace = (
+        str(runtime.run_id)
+        if runtime.instance_id is None
+        else f"{runtime.run_id}:{runtime.instance_id}"
+    )
+    key = "cand_" + hashlib.sha256(f"{call_namespace}:{call.call_id}".encode()).hexdigest()[:24]
     if any(
-        item.model_tool_call_id == call.call_id
+        item.model_tool_call_id == call.call_id and item.instance_id == runtime.instance_id
         for item in await deps.work_store.list_items(run_id=runtime.run_id)
     ):
         raise DecisionRuleError(
@@ -266,6 +271,7 @@ async def _bind_call(call: NativeCallState, *, deps: RuntimeDeps, runtime, conte
         [candidate],
         graph_revision=runtime.step_count,
         run_id=runtime.run_id,
+        instance_id=runtime.instance_id,
         mission_task_id=runtime.active_task_id,
     )
     if not items:
@@ -279,6 +285,7 @@ async def _bind_call(call: NativeCallState, *, deps: RuntimeDeps, runtime, conte
         run_id=runtime.run_id,
         engagement_id=runtime.engagement_id,
         agent_id=roles[0],
+        instance_id=runtime.instance_id,
         capability=step.capability,
         operation=step.operation,
         binding_mode=step.binding_mode,
@@ -587,13 +594,13 @@ async def tools_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                     call.completed = True
                     await deps.work_store.acquire(
                         call.dispatch.work_id,
-                        owner=str(runtime.run_id),
+                        owner=runtime.work_owner,
                         now=datetime.now(timezone.utc),
                         ttl=timedelta(seconds=deps.settings.lease_ttl_seconds),
                     )
                     await deps.work_store.complete(
                         call.dispatch.work_id,
-                        owner=str(runtime.run_id),
+                        owner=runtime.work_owner,
                         now=datetime.now(timezone.utc),
                         status=WorkStatus.CANCELLED,
                         reason="native_execution_budget_exhausted",
@@ -622,13 +629,13 @@ async def tools_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                 # queued row as CANCELLED instead of leaving it pending.
                 await deps.work_store.acquire(
                     item.work_id,
-                    owner=str(runtime.run_id),
+                    owner=runtime.work_owner,
                     now=datetime.now(timezone.utc),
                     ttl=timedelta(seconds=deps.settings.lease_ttl_seconds),
                 )
                 await deps.work_store.complete(
                     item.work_id,
-                    owner=str(runtime.run_id),
+                    owner=runtime.work_owner,
                     now=datetime.now(timezone.utc),
                     status=WorkStatus.CANCELLED,
                     reason="role_execution_allowance_exhausted",
@@ -669,14 +676,14 @@ async def tools_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                 continue
             lease = await deps.work_store.heartbeat(
                 item.work_id,
-                owner=str(runtime.run_id),
+                owner=runtime.work_owner,
                 now=datetime.now(timezone.utc),
                 ttl=timedelta(seconds=deps.settings.lease_ttl_seconds),
             )
             if lease is None:
                 lease = await deps.work_store.acquire(
                     item.work_id,
-                    owner=str(runtime.run_id),
+                    owner=runtime.work_owner,
                     now=datetime.now(timezone.utc),
                     ttl=timedelta(seconds=deps.settings.lease_ttl_seconds),
                 )

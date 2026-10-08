@@ -195,6 +195,7 @@ async def accept_delegations(engine, path, requests, runtime):
         bound = DelegationRequest(
             path_step_id=step.step_id,
             agent_id=request.agent_id,
+            instance_id=request.instance_id,
             objective=request.objective or step.objective,
             budget=budget,
         )

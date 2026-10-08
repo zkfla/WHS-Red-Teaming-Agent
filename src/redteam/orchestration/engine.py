@@ -2296,6 +2296,7 @@ class InvestigationEngine:
                         run_id=runtime.run_id,
                         engagement_id=runtime.engagement_id,
                         agent_id=intent.agent_id,
+                        instance_id=runtime.instance_id,
                         capability=intent.capability,
                         operation=intent.operation,
                         tool_id=intent.tool_id,

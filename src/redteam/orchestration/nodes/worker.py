@@ -69,9 +69,31 @@ async def worker_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
     # outside checkpoint/model data and retain it if a later node fails.
     model_budget = verification_budget(local, deps=deps)
 
+    work = await deps.work_store.get(item.work_id)
+    if (
+        work is None
+        or work.instance_id != runtime.instance_id
+        or item.proposal.instance_id != runtime.instance_id
+    ):
+        await deps.work_store.release(
+            item.work_id, owner=runtime.work_owner, now=datetime.now(timezone.utc)
+        )
+        return {
+            "worker_outcomes": {
+                action_id: WorkerOutcome(
+                    action_id=action_id,
+                    work_id=item.work_id,
+                    delegation_id=item.plan_step.delegation_id,
+                    candidate_key=item.plan_step.candidate_key,
+                    agent_id=str(item.proposal.agent_id),
+                    error="instance_work_mismatch",
+                )
+            }
+        }
+
     heartbeat = await deps.work_store.heartbeat(
         item.work_id,
-        owner=str(runtime.run_id),
+        owner=runtime.work_owner,
         now=datetime.now(timezone.utc),
         ttl=timedelta(seconds=deps.settings.lease_ttl_seconds),
     )
@@ -91,13 +113,13 @@ async def worker_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
 
     try:
         async with deps.policy_lock:
-            if runtime.run_id in deps.batch_pending_approvals:
+            if runtime.work_owner in deps.batch_pending_approvals:
                 # This sibling never entered Control or Capability. Preserve
                 # its original Work row for a later turn after the held
                 # approval is resolved; do not create a second Approval that
                 # the single-action durable checkpoint cannot represent.
                 released = await deps.work_store.release(
-                    item.work_id, owner=str(runtime.run_id), now=datetime.now(timezone.utc)
+                    item.work_id, owner=runtime.work_owner, now=datetime.now(timezone.utc)
                 )
                 return {
                     "worker_outcomes": {
@@ -114,7 +136,7 @@ async def worker_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             local = await policy_node(local, deps=deps)
             decision = local.get("policy_decision")
             if decision is not None and decision.verdict is PolicyVerdict.REQUIRE_APPROVAL:
-                deps.batch_pending_approvals.add(runtime.run_id)
+                deps.batch_pending_approvals.add(runtime.work_owner)
         decision = local.get("policy_decision")
 
         if local["runtime"].phase is AgentPhase.EXECUTE:
@@ -171,7 +193,7 @@ async def worker_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                     )
         await deps.work_store.complete(
             item.work_id,
-            owner=str(runtime.run_id),
+            owner=runtime.work_owner,
             status=WorkStatus.FAILED,
             now=datetime.now(timezone.utc),
             reason=f"worker_error:{type(exc).__name__}",

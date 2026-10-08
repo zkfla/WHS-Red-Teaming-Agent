@@ -24,6 +24,7 @@ from redteam.orchestration.work.rules import (
     has_conflict,
     is_expired,
     lease_owned,
+    lease_owner_matches,
     leased_item,
     new_lease,
     pending_item,
@@ -52,7 +53,9 @@ class InMemoryWorkStore:
             same_candidate = [
                 existing
                 for existing in self._items.values()
-                if existing.run_id == item.run_id and existing.candidate_key == item.candidate_key
+                if existing.run_id == item.run_id
+                and existing.instance_id == item.instance_id
+                and existing.candidate_key == item.candidate_key
             ]
             verdict, target = decide_add(item, same_candidate)
             if verdict == "reject":
@@ -116,7 +119,11 @@ class InMemoryWorkStore:
         validate_lease_ttl(ttl)
         async with self._lock:
             item = self._items.get(work_id)
-            if item is None or item.status is not WorkStatus.PENDING:
+            if (
+                item is None
+                or item.status is not WorkStatus.PENDING
+                or not lease_owner_matches(item, owner)
+            ):
                 return None
             failed_dependency = self._terminal_dependency_failure(item)
             if failed_dependency is not None:
