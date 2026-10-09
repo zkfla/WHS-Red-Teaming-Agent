@@ -21,7 +21,7 @@ from typing import Protocol
 from redteam.core.contracts.mission import redact_secret_material
 from redteam.core.ids import MissionId, OperatorIntentId
 from redteam.orchestration.operator_intents.models import IntentRecord, IntentStatus
-from redteam.orchestration.sqlite_support import connect, run_sqlite, run_transaction
+from redteam.sqlite_support import connect, run_sqlite, run_transaction
 
 
 class OperatorIntentStore(Protocol):

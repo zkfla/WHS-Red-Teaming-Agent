@@ -1,0 +1,28 @@
+# TASK-003 FR-003 baseline. SINGLE SOURCE: the Dockerfile installs FROM
+# this file, and program-manifest.json is GENERATED from this file
+# crossed with dpkg-query on the built image. Never duplicate this list.
+#
+# procps/util-linux are mechanism dependencies of the shell provider
+# itself (ps/kill/setsid for the supervisor and cancel path); the rest
+# is the FR-003 analysis baseline (TASK-004 reconciles the final
+# MCP replaced-by-shell/Kali vs retained split and may adjust it).
+bash
+python3
+coreutils
+procps
+util-linux
+nmap
+curl
+jq
+git
+python3-pip
+dnsutils
+openssl
+netcat-traditional
+whois
+tcpdump
+sqlmap
+wordlists
+
+python3-venv
+python3-setuptools

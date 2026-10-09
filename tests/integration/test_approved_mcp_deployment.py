@@ -25,10 +25,14 @@ from tests.unit.test_mcp_deployment import engagement, source
 
 
 class SessionLLM:
-    """Native scripted model: inventory then two-principal compare, then hold.
+    """Native scripted model: discover, inventory, two-principal compare, hold.
 
     Speaks the genuine product contract (complete_native with
     NativeCompletion/NativeToolCall addressed to the exposed tool names).
+    It follows the lazy card-first contract: tool.list_cards, then
+    tool.get_detail for each needed schema, and only then the real MCP
+    calls. The exactly-one inventory/compare assertions stay, enforced at
+    card discovery and again when the schemas are advertised.
     complete_structured answers only the genuine verifier meaning route;
     any legacy strategy route raises instead of returning a soft answer.
     """
@@ -37,6 +41,34 @@ class SessionLLM:
         self.calls: list[dict[str, object]] = []
         self.turns = 0
         self.node_id = "host:" + seed
+        self.listed = False
+        self.inventory_tool_id: object = None
+        self.compare_tool_id: object = None
+        self.inventory_detailed = False
+        self.compare_detailed = False
+
+    def _harvest_cards(self, messages):
+        """Collect (tool_name -> tool_ids) from card list results seen so far."""
+        found: dict[str, set[str]] = {}
+        for message in messages or []:
+            if not isinstance(message, dict) or message.get("role") != "tool":
+                continue
+            try:
+                body = json.loads(message.get("content") or "{}")
+            except ValueError:
+                continue
+            payload = body.get("payload") if isinstance(body, dict) else None
+            cards = payload.get("cards") if isinstance(payload, dict) else None
+            if not isinstance(cards, list):
+                continue
+            for card in cards:
+                if not isinstance(card, dict):
+                    continue
+                name = card.get("tool_name")
+                identity = card.get("tool_id")
+                if isinstance(name, str) and isinstance(identity, str):
+                    found.setdefault(name, set()).add(identity)
+        return found
 
     @staticmethod
     def _route_key(response_schema: dict[str, object]) -> str:
@@ -62,17 +94,12 @@ class SessionLLM:
         raise AssertionError(f"legacy strategy route is not part of the native loop: {route!r}")
 
     async def complete_native(self, messages, tools, system=None, **_: object):
+        from redteam.orchestration.native_binding import exposed_tool_name
+        from redteam.orchestration.tool_discovery import TOOL_GET_DETAIL_ID, TOOL_LIST_CARDS_ID
+
         available = [str(getattr(spec, "name", "")) for spec in tools]
-        inventory_matches = [name for name in available if "session_list" in name]
-        compare_matches = [name for name in available if "http_compare_sessions" in name]
-        assert len(inventory_matches) == 1, (
-            "native model needs exactly one registered inventory tool"
-        )
-        assert len(compare_matches) == 1, (
-            "native model needs exactly one registered compare tool"
-        )
-        inventory = inventory_matches[0]
-        compare = compare_matches[0]
+        list_name = exposed_tool_name(TOOL_LIST_CARDS_ID)
+        detail_name = exposed_tool_name(TOOL_GET_DETAIL_ID)
         # Preserve the deployed scope/session contract on the real context
         # snapshot instead of a retired strategy payload.
         snapshot = json.loads(messages[-1]["content"])
@@ -81,8 +108,51 @@ class SessionLLM:
         if profile:
             assert profile.get("allowed_paths") == ["/", "/accounts/123"]
         self.turns += 1
-        if self.turns == 1:
-            self.calls.append({"turn": 1, "tool": inventory})
+        if not self.listed:
+            assert list_name in available, "native model needs the card discovery helper"
+            assert detail_name in available, "native model needs the detail lookup helper"
+            self.listed = True
+            self.calls.append({"turn": self.turns, "tool": "list"})
+            return NativeCompletion(
+                tool_calls=(
+                    NativeToolCall(
+                        call_id="call-list-1",
+                        name=list_name,
+                        arguments={"query": "session"},
+                    ),
+                ),
+                text="",
+            )
+        cards = self._harvest_cards(messages)
+        inventory_ids = cards.get("session_list", set())
+        compare_ids = cards.get("http_compare_sessions", set())
+        assert len(inventory_ids) == 1, "native model needs exactly one inventory card"
+        assert len(compare_ids) == 1, "native model needs exactly one compare card"
+        if self.inventory_tool_id is None:
+            self.inventory_tool_id = next(iter(inventory_ids))
+        if self.compare_tool_id is None:
+            self.compare_tool_id = next(iter(compare_ids))
+        inventory_matches = [name for name in available if "session_list" in name]
+        compare_matches = [name for name in available if "http_compare_sessions" in name]
+        if not self.inventory_detailed:
+            self.inventory_detailed = True
+            self.calls.append({"turn": self.turns, "tool": "detail-inventory"})
+            return NativeCompletion(
+                tool_calls=(
+                    NativeToolCall(
+                        call_id="call-detail-inventory-1",
+                        name=detail_name,
+                        arguments={"tool_id": self.inventory_tool_id},
+                    ),
+                ),
+                text="",
+            )
+        assert len(inventory_matches) == 1, (
+            "native model needs exactly one registered inventory tool"
+        )
+        if not any(call.get("tool") == "inventory" for call in self.calls):
+            inventory = inventory_matches[0]
+            self.calls.append({"turn": self.turns, "tool": "inventory"})
             return NativeCompletion(
                 tool_calls=(
                     NativeToolCall(
@@ -93,8 +163,25 @@ class SessionLLM:
                 ),
                 text="",
             )
-        if self.turns == 2:
-            self.calls.append({"turn": 2, "tool": compare})
+        if not self.compare_detailed:
+            self.compare_detailed = True
+            self.calls.append({"turn": self.turns, "tool": "detail-compare"})
+            return NativeCompletion(
+                tool_calls=(
+                    NativeToolCall(
+                        call_id="call-detail-compare-1",
+                        name=detail_name,
+                        arguments={"tool_id": self.compare_tool_id},
+                    ),
+                ),
+                text="",
+            )
+        assert len(compare_matches) == 1, (
+            "native model needs exactly one registered compare tool"
+        )
+        if not any(call.get("tool") == "compare" for call in self.calls):
+            compare = compare_matches[0]
+            self.calls.append({"turn": self.turns, "tool": "compare"})
             return NativeCompletion(
                 tool_calls=(
                     NativeToolCall(

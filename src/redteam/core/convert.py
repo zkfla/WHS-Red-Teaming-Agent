@@ -76,6 +76,7 @@ def build_tool_invocation(
                 run_id=proposal.run_id,
                 agent_id=proposal.agent_id,
                 instance_id=proposal.instance_id,
+                approved_target=proposal.target,
                 correlation_id=correlation_id,
                 dry_run=dry_run,
             ),
@@ -99,6 +100,7 @@ def build_tool_invocation(
             run_id=proposal.run_id,
             agent_id=proposal.agent_id,
             instance_id=proposal.instance_id,
+            approved_target=proposal.target,
             correlation_id=correlation_id,
             dry_run=dry_run,
         ),
@@ -109,6 +111,20 @@ def build_tool_invocation(
 def digest_payload(payload: Any) -> str:
     blob = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
     return hashlib.sha256(blob).hexdigest()
+
+
+def execution_input_digest(invocation: ToolInvocation) -> str:
+    """Digest the bound execution input and approved subject, when present.
+
+    Local target-free calls keep their historical arguments digest. The
+    trusted identity is checked separately on the execution reference.
+    """
+    target = invocation.execution_context.approved_target
+    if target is None:
+        return digest_payload(invocation.arguments)
+    return digest_payload({
+        "arguments": invocation.arguments, "approved_target": target.model_dump(mode="json"),
+    })
 
 
 def tool_result_to_evidence(

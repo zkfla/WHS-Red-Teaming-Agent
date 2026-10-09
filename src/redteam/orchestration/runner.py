@@ -8,11 +8,15 @@ from __future__ import annotations
 import asyncio
 import logging
 import sqlite3
+from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, Field
+
+if TYPE_CHECKING:
+    from redteam.orchestration.execution_reconciliation import ExecutionReconciliation
 
 from redteam.attack_graph.service import AttackGraphService
 from redteam.core.enums import AgentPhase, MissionStatus
@@ -48,6 +52,81 @@ _UNSAFE_REPLAY_NODES = frozenset({"execute", "worker", "tools"})
 def _checkpoint_thread(run_id: RunId | str, instance_id: AgentInstanceId | str | None) -> str:
     """One shared run may contain several independently checkpointed workers."""
     return str(run_id) if instance_id is None else f"{run_id}:instance:{instance_id}"
+
+
+def _snapshot_pending_work_ids(values: Any) -> set[str]:
+    """Work ids the snapshot still owes an outcome, from its own fields.
+
+    Derived from the snapshot's existing Work/dispatch/native-envelope
+    fields -- never from fixed tool names. Covers uncompleted native
+    dispatches, the in-flight work reference, and legacy batch dispatches,
+    whether models or raw mappings survived the serde.
+    """
+    pending: set[str] = set()
+
+    def _take(candidate: Any) -> None:
+        wid = (
+            candidate.get("work_id")
+            if isinstance(candidate, Mapping)
+            else getattr(candidate, "work_id", None)
+        )
+        if isinstance(wid, str) and wid:
+            pending.add(wid)
+
+    if not isinstance(values, Mapping):
+        return pending
+    current = values.get("current_work_id")
+    if isinstance(current, str) and current:
+        pending.add(current)
+    calls = values.get("native_calls")
+    if isinstance(calls, (list, tuple)):
+        for call in calls:
+            if isinstance(call, Mapping):
+                if call.get("completed") is True:
+                    continue
+                dispatch = call.get("dispatch")
+            else:
+                if getattr(call, "completed", False) is True:
+                    continue
+                dispatch = getattr(call, "dispatch", None)
+            _take(dispatch)
+    items = values.get("dispatch_items")
+    if isinstance(items, (list, tuple)):
+        for item in items:
+            _take(item)
+    return pending
+
+
+async def _submitted_work_ids(deps: Any, runtime: RuntimeState) -> set[str]:
+    """Work ids with a journaled effect-start submission for this instance.
+
+    Same scope as the reconciler (run + instance metadata match); digest
+    failures read as absent (conservative: uncovered until proved). A store
+    failure also reads as absent, which holds rather than proceeds.
+    """
+    from redteam.orchestration.execution_journal import checked_receipt
+
+    submitted: set[str] = set()
+    try:
+        records = await deps.evidence_store.list_for_run(runtime.run_id)
+    except Exception:
+        return submitted
+    for record in records:
+        metadata = getattr(record, "metadata", None)
+        if not isinstance(metadata, Mapping):
+            continue
+        if metadata.get("receipt_kind") != "execution_submission":
+            continue
+        if metadata.get("instance_id") != runtime.instance_id:
+            continue
+        try:
+            data = checked_receipt(record)
+        except Exception:
+            continue
+        work_id = data.get("work_id") if isinstance(data, Mapping) else None
+        if isinstance(work_id, str) and work_id:
+            submitted.add(work_id)
+    return submitted
 
 
 class CheckpointSnapshot(BaseModel):
@@ -780,6 +859,93 @@ class AgentLoopRunner:
             }
         )
         return await self.run(resume_runtime)
+
+    async def recover_reconciling(
+        self, run_id: RunId | str, *, instance_id: AgentInstanceId | str | None = None
+    ) -> tuple[RuntimeState | None, ExecutionReconciliation | None]:
+        """Recover identity/runtime; reconcile when the latest checkpoint is unsafe.
+
+        Unknown, missing, mismatched, or binding-refused checkpoints yield
+        ``(None, None)`` -- a runtime is never invented here. A safe latest
+        checkpoint yields ``(runtime, None)`` for the existing safe path. An
+        unsafe latest checkpoint (EXECUTE/WORKER/TOOLS pending) recovers the
+        runtime, runs it through ``reconcile_execution_receipts`` (which
+        never invokes tools), and returns ``(reconciled, reconciliation)``.
+        Whether the caller may proceed is ``reconciliation.ready``: a
+        pending-unknown or errored reconciliation stays held.
+
+        The unsafe snapshot itself is never trusted for a NEW binding: the
+        check below only accepts an EXISTING binding with full identity.
+        The snapshot is also never re-entered (no ``astream(None)`` replay).
+        """
+        from redteam.orchestration.execution_reconciliation import (
+            reconcile_execution_receipts,
+        )
+
+        self._require_checkpointing("recover_reconciling")
+        run_key = str(run_id)
+        self._thread_id = self._thread_id or self._bind_runtime(run_key, instance_id)
+        snapshot = await self._latest_snapshot()
+        if snapshot is None:
+            return (None, None)
+        values = snapshot.values if snapshot.values else None
+        runtime = values.get("runtime") if values else None
+        if (
+            not isinstance(runtime, RuntimeState)
+            or str(runtime.run_id) != run_key
+            or (instance_id is not None and str(runtime.instance_id) != str(instance_id))
+        ):
+            return (None, None)
+        if not self._snapshot_replays_execution(snapshot):
+            if not await self._binding_for(runtime, checkpoint=snapshot):
+                return (None, None)
+            return (runtime, None)
+        # Unsafe: existing bindings only. ``_binding_for`` without a
+        # checkpoint accepts nothing new -- an unsafe checkpoint with no
+        # remaining binding refuses here.
+        if not await self._binding_for(runtime):
+            return (None, None)
+        reconciliation = await reconcile_execution_receipts(self._deps, runtime)
+        if reconciliation.ready:
+            # Coverage belongs to the runner: the reconciler only sees
+            # KNOWN submissions, never this snapshot. Zero submissions with
+            # a tools/worker/execute step pending proves nothing -- an old
+            # checkpoint predates the effect-start journal, and its work may
+            # already be external. Every pending snapshot work id needs a
+            # matching original submission (or a persisted proved non-entry,
+            # which the reconciler already processed); otherwise HOLD with a
+            # type-only diagnostic, never resubmit, never fresh-OBSERVE.
+            uncovered = _snapshot_pending_work_ids(values) - await _submitted_work_ids(
+                self._deps, runtime
+            )
+            if uncovered:
+                reconciliation.errors["coverage"] = "uncovered_pre_journal_work"
+        return (reconciliation.runtime, reconciliation)
+
+    async def resume_reconciled(self, runtime: RuntimeState) -> RuntimeState:
+        """Enter a reconciled runtime at a FRESH OBSERVE (never a replay).
+
+        Only for runtimes whose reconciliation ``ready`` held true. Gates on
+        live mission state exactly like the safe path, then starts a new
+        reasoning turn from canonical stores.
+        """
+        await self.recover_delivery(runtime)
+        if not await self._latest_allows_execution(runtime, blocked=True):
+            return runtime
+        if not await self._reactivate(runtime):
+            return runtime
+        return await self.run(
+            runtime.model_copy(
+                update={
+                    "phase": AgentPhase.OBSERVE,
+                    "termination_reason": None,
+                    "no_progress_turns": 0,
+                    "mission_status": MissionStatus.ACTIVE
+                    if runtime.mission_id
+                    else runtime.mission_status,
+                }
+            )
+        )
 
     async def _register_pending_checkpoint(self, runtime: RuntimeState) -> bool:
         """Re-link the checkpointed proposal to its Approval, or fail closed.

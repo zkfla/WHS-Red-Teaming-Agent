@@ -184,7 +184,7 @@ async def test_tool_outside_playbook_is_exposed_and_compiles():
     assert h.INVENTORY_TOOL not in {str(d.plan_step.tool_id) for d in drafts}
 
     context = await engine.context(runtime, GraphObservation())
-    assert h.INVENTORY_TOOL in {t["tool_id"] for t in context["tools"]}
+    assert h.INVENTORY_TOOL in {card["tool_id"] for card in context["tool_cards"]}
     step = PathStep(
         step_id="step-1",
         objective="inventory the host",

@@ -25,8 +25,8 @@ from redteam.orchestration.coordination import (
     CoordinationError,
 )
 from redteam.orchestration.paths.memory import InMemoryPathStore
-from redteam.orchestration.sqlite_support import run_sqlite
 from redteam.orchestration.task_graph.memory import InMemoryTaskGraphStore
+from redteam.sqlite_support import run_sqlite
 
 T = TypeVar("T")
 

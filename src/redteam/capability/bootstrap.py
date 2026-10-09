@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Mapping, Sequence
 from contextlib import AsyncExitStack, asynccontextmanager
 
 from redteam.capability.action_binding import declares_retry_safe
@@ -48,6 +48,9 @@ async def build_mcp_tool_gateway(
     health_refresh_timeout_seconds: float = DEFAULT_HEALTH_REFRESH_TIMEOUT_SECONDS,
     profile_bundles: Mapping[str, McpProfileBundle] | None = None,
     env: Mapping[str, str] | None = None,
+    builtin_adapters: Sequence[MCPAdapter] = (),
+    builtin_concurrency: Mapping[str, int] | None = None,
+    builtin_output_limits: Mapping[str, int] | None = None,
 ) -> MCPToolGateway:
     """Discover configured servers and return a ready-to-invoke gateway.
 
@@ -64,6 +67,9 @@ async def build_mcp_tool_gateway(
         health_refresh_timeout_seconds=health_refresh_timeout_seconds,
         profile_bundles=profile_bundles,
         env=env,
+        builtin_adapters=builtin_adapters,
+        builtin_concurrency=builtin_concurrency,
+        builtin_output_limits=builtin_output_limits,
     )
 
 
@@ -76,6 +82,9 @@ async def open_mcp_tool_gateway(
     health_refresh_timeout_seconds: float = DEFAULT_HEALTH_REFRESH_TIMEOUT_SECONDS,
     profile_bundles: Mapping[str, McpProfileBundle] | None = None,
     env: Mapping[str, str] | None = None,
+    builtin_adapters: Sequence[MCPAdapter] = (),
+    builtin_concurrency: Mapping[str, int] | None = None,
+    builtin_output_limits: Mapping[str, int] | None = None,
 ) -> AsyncIterator[MCPToolGateway]:
     """Engagement-scoped connections, required for stateful browser operations.
 
@@ -92,6 +101,9 @@ async def open_mcp_tool_gateway(
             health_refresh_timeout_seconds=health_refresh_timeout_seconds,
             profile_bundles=profile_bundles,
             env=env,
+            builtin_adapters=builtin_adapters,
+            builtin_concurrency=builtin_concurrency,
+            builtin_output_limits=builtin_output_limits,
         )
 
 
@@ -104,12 +116,26 @@ async def _build_gateway(
     health_refresh_timeout_seconds: float = DEFAULT_HEALTH_REFRESH_TIMEOUT_SECONDS,
     profile_bundles: Mapping[str, McpProfileBundle] | None = None,
     env: Mapping[str, str] | None = None,
+    builtin_adapters: Sequence[MCPAdapter] = (),
+    builtin_concurrency: Mapping[str, int] | None = None,
+    builtin_output_limits: Mapping[str, int] | None = None,
 ) -> MCPToolGateway:
     bundles = dict(profile_bundles) if profile_bundles is not None else None
     from redteam.core.environment import env_snapshot
 
     environment = env_snapshot(env)
-    if not server_ids:
+    builtin_ids = {adapter.server_id for adapter in builtin_adapters}
+    configured_concurrency = dict(builtin_concurrency or {})
+    configured_output_limits = dict(builtin_output_limits or {})
+    if set(configured_concurrency) - builtin_ids:
+        raise MCPConfigurationError("concurrency configured for an unregistered built-in provider")
+    if any(limit < 1 for limit in configured_concurrency.values()):
+        raise MCPConfigurationError("built-in provider concurrency must be at least 1")
+    if set(configured_output_limits) - builtin_ids:
+        raise MCPConfigurationError("output limit configured for an unregistered built-in provider")
+    if any(limit < 1 for limit in configured_output_limits.values()):
+        raise MCPConfigurationError("built-in provider output limit must be at least 1 byte")
+    if not server_ids and not builtin_adapters:
         example = ExampleMCPAdapter()
         registry = MCPToolRegistry()
         example_descriptors = await example.discover_tools()
@@ -220,6 +246,28 @@ async def _build_gateway(
         adapters[server_id] = adapter
         server_concurrency[server_id] = settings.max_concurrency
         server_output_limits[server_id] = settings.max_output_bytes
+
+    # In-process providers share discovery, catalog, admission and result
+    # handling with connected providers. They do not acquire an MCP transport.
+    # Registration happens before constructing the gateway and its catalog.
+    for adapter in builtin_adapters:
+        server_id = adapter.server_id
+        if server_id in adapters:
+            raise MCPConfigurationError(f"duplicate provider registration: {server_id!r}")
+        descriptors = await adapter.discover_tools()
+        if not descriptors:
+            raise MCPConfigurationError(f"provider {server_id!r} discovered no tools")
+        for descriptor in descriptors:
+            if descriptor.server_id != server_id:
+                raise MCPConfigurationError("provider descriptor belongs to a different server")
+            validate_tool_manifest(descriptor)
+            operation_bindings[str(descriptor.tool_id)] = tuple(descriptor.operations)
+        registry.replace_server_tools(server_id, descriptors)
+        adapters[server_id] = adapter
+
+        server_concurrency[server_id] = configured_concurrency.get(server_id, 1)
+        if server_id in configured_output_limits:
+            server_output_limits[server_id] = configured_output_limits[server_id]
 
     return MCPToolGateway(
         registry,

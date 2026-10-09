@@ -24,7 +24,7 @@ from redteam.attack_graph.predicates import Confidence, Provenance
 from redteam.attack_graph.service import HYPOTHESIS_INCONCLUSIVE
 from redteam.core.contracts.action import ActionProposal
 from redteam.core.contracts.evidence import EvidenceRecord
-from redteam.core.contracts.tool import ToolResult
+from redteam.core.contracts.tool import ToolResult, execution_outcome_uncertain
 from redteam.core.convert import digest_payload
 from redteam.core.enums import EvidenceSourceType, Verdict
 from redteam.core.ids import EvidenceId, new_id
@@ -64,10 +64,7 @@ def is_execution_ambiguous(result: ToolResult | None) -> bool:
     """
     if result is None:
         return True
-    return bool(
-        result.metadata.get("orchestration_exception")
-        or result.metadata.get("verification_exception")
-    )
+    return execution_outcome_uncertain(result.metadata)
 
 
 def _clean_recovery_identity(value: Any) -> str | None:

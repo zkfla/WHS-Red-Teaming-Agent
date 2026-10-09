@@ -202,6 +202,12 @@ class MissionTask(BaseModel):
     priority: int = 0
     required: bool = True
     assigned_agent: AgentId | None = None
+    #: Instance lease owner holding this task (``work_owner`` string,
+    #: e.g. ``"<run_id>:instance:<instance_id>"`` or legacy ``"<run_id>"``).
+    #: Distinct from ``assigned_agent`` (role). ``None`` means unclaimed:
+    #: claimable by the first claimant (legacy-row migration path).
+    #: No TTL — an unfinished claim is released explicitly, never by expiry.
+    occupant_owner: str | None = None
     required_capability: str | None = None
     parent_task_id: TaskId | None = None
     dependency_task_ids: list[TaskId] = Field(default_factory=list)

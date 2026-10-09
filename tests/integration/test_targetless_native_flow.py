@@ -7,7 +7,8 @@ import pytest
 
 from redteam.attack_graph.service import AttackGraphService
 from redteam.control.service import DefaultControlPlane
-from redteam.core.enums import EvidenceSourceType
+from redteam.core.contracts.tool import EXECUTION_UNCERTAIN_METADATA_KEY
+from redteam.core.enums import EvidenceSourceType, PolicyVerdict
 from redteam.core.ids import RunId
 from redteam.core.ports.llm import NativeCompletion, NativeToolCall
 from redteam.orchestration.completion import verify_stored_origin
@@ -151,7 +152,12 @@ async def test_target_free_call_executes_without_inventing_graph_or_path():
 
 
 @pytest.mark.parametrize("target_free", [False, True])
-async def test_uncertain_execution_cannot_be_resubmitted_with_new_call_id(target_free):
+@pytest.mark.parametrize("uncertainty_marker", [
+    "orchestration_exception", EXECUTION_UNCERTAIN_METADATA_KEY,
+])
+async def test_uncertain_execution_cannot_be_resubmitted_with_new_call_id(
+    target_free, uncertainty_marker,
+):
     """A new provider call ID does not make an uncertain side effect safe to repeat."""
     from redteam.core.contracts.tool import ToolError
     from tests.integration import _engine_llm_harness as h
@@ -161,7 +167,7 @@ async def test_uncertain_execution_cannot_be_resubmitted_with_new_call_id(target
             result = await super().invoke(invocation)
             return result.model_copy(update={
                 "success": False,
-                "metadata": {"orchestration_exception": True},
+                "metadata": {uncertainty_marker: True},
                 "error": ToolError(code="gateway_exception:TimeoutError", message="unknown"),
             })
 
@@ -181,6 +187,95 @@ async def test_uncertain_execution_cannot_be_resubmitted_with_new_call_id(target
     assert len(gateway.invocations) == 1
     assert len(await deps.work_store.list_items(run_id=run_id)) == 1
     assert "uncertain" in json.dumps(final["native_messages"])
+
+
+async def test_prestart_admission_denial_does_not_create_an_uncertain_execution():
+    from tests.integration import _engine_llm_harness as h
+
+    class RejectOnceControl(DefaultControlPlane):
+        admitted_calls = 0
+
+        async def admit_invocation(self, proposal, decision, context, *, receipt_id):
+            self.admitted_calls += 1
+            if self.admitted_calls == 1:
+                return decision.model_copy(update={
+                    "verdict": PolicyVerdict.DENY,
+                    "reasons": ["current local conditions temporarily deny execution"],
+                })
+            return await super().admit_invocation(
+                proposal, decision, context, receipt_id=receipt_id,
+            )
+
+    engagement = _engagement()
+    descriptor = h.inventory_descriptor().model_copy(update={"requires_target": False})
+    llm = ScriptedNativeLLM([
+        NativeCompletion(tool_calls=(NativeToolCall(
+            call_id=identity, name=exposed_tool_name(str(descriptor.tool_id)), arguments={},
+        ),)) for identity in ("denied-before-start", "allowed-after-change")
+    ])
+    gateway = DummyToolGateway(tools=[descriptor])
+    control = RejectOnceControl(
+        {engagement.engagement_id: engagement}, outbound_descriptor_resolver=gateway.get,
+    )
+    deps = replace(
+        _native_deps(engagement, llm), tool_gateway=gateway, tool_catalog=gateway,
+        control_plane=control,
+    )
+    run_id = RunId("run_admission_denial_known_not_started")
+    await seed_from_engagement(AttackGraphService(deps.graph_store), engagement, run_id=run_id)
+    initial = deps_runtime(run_id, engagement)
+    final = await build_graph(deps).ainvoke(initial_graph_state(initial))
+    assert control.admitted_calls == 2
+    assert len(gateway.invocations) == 1
+    assert len(await deps.work_store.list_items(run_id=run_id)) == 2
+    assert final["runtime"].actions_executed == 1
+    assert final["runtime"].remaining_budget == initial.remaining_budget - 1
+
+
+async def test_worker_publication_failure_does_not_recharge_previous_retries():
+    from redteam.core.contracts.events import EventType
+    from redteam.event_bus.memory import InMemoryEventBus
+    from redteam.orchestration.work.models import WorkStatus
+    from tests.integration import _engine_llm_harness as h
+
+    class CompletionPublicationFailure(InMemoryEventBus):
+        async def publish(self, event):
+            if event.event_type is EventType.TOOL_EXECUTION_FINISHED:
+                raise RuntimeError("synthetic completion publication failure")
+            await super().publish(event)
+
+    engagement = _engagement()
+    descriptor = h.inventory_descriptor().model_copy(update={"requires_target": False})
+    llm = ScriptedNativeLLM([NativeCompletion(tool_calls=(NativeToolCall(
+        call_id="executed-before-publication-failure",
+        name=exposed_tool_name(str(descriptor.tool_id)), arguments={},
+    ),))])
+    gateway = DummyToolGateway(tools=[descriptor])
+    deps = replace(
+        _native_deps(engagement, llm), tool_gateway=gateway, tool_catalog=gateway,
+        event_bus=CompletionPublicationFailure(),
+    )
+    run_id = RunId("run_worker_failure_inherited_retries")
+    await seed_from_engagement(AttackGraphService(deps.graph_store), engagement, run_id=run_id)
+    initial = deps_runtime(run_id, engagement).model_copy(update={
+        "retry_count": 3, "retry_tool_calls": 3,
+    })
+    final = await build_graph(deps).ainvoke(initial_graph_state(initial))
+    assert len(gateway.invocations) == 1
+    items = await deps.work_store.list_items(run_id=run_id)
+    assert len(items) == 1 and items[0].status is WorkStatus.FAILED
+    assert final["runtime"].actions_executed == 1
+    assert final["runtime"].retry_tool_calls == 3
+    assert final["runtime"].remaining_budget == initial.remaining_budget - 1
+    from redteam.orchestration.execution_journal import preserved_result
+
+    recovered = await preserved_result(
+        deps.evidence_store, run_id=run_id, action_id=gateway.invocations[0].action_id,
+        instance_id=initial.instance_id, work_id=items[0].work_id,
+    )
+    assert recovered is not None and recovered[0].success
+    assert recovered[0].invocation_id == gateway.invocations[0].invocation_id
+    assert len(gateway.invocations) == 1
 
 
 @pytest.mark.parametrize("revoke_targetless", [False, True])

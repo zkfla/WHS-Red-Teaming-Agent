@@ -32,6 +32,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -64,6 +65,8 @@ class FilesystemEvidenceStore:
         }
         with self._index_path.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(entry) + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())
 
     def _read_index(self) -> list[dict[str, Any]]:
         if not self._index_path.exists():
@@ -79,6 +82,8 @@ class FilesystemEvidenceStore:
         path = self._path_for_run(evidence.run_id)
         with path.open("a", encoding="utf-8") as fh:
             fh.write(line + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())
         self._append_index(
             evidence_id=evidence.evidence_id,
             action_id=evidence.action_id,

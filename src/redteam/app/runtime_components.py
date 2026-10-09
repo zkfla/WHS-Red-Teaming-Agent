@@ -131,6 +131,7 @@ class _BuiltinRuntimeExtension:
         from redteam.orchestration.observations.packages import (
             builtin_extension_declaration as observations,
         )
+        from redteam.orchestration.tool_discovery import discovery_tool_contributions
 
         return (
             roles(),
@@ -146,6 +147,9 @@ class _BuiltinRuntimeExtension:
                 "builtin.native-local-tools",
                 "1",
                 native_local_tool_contributions(),
+            ),
+            ExtensionDeclaration(
+                "builtin.tool-discovery", "1", discovery_tool_contributions(),
             ),
             ExtensionDeclaration(
                 "builtin.authentication-assessment", "1",

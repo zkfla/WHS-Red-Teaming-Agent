@@ -10,6 +10,7 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping
 from datetime import datetime, timedelta, timezone
 
+from redteam.core.ids import AgentInstanceId, RunId
 from redteam.orchestration.work.models import (
     ACTIVE_STATUSES,
     TERMINAL_STATUSES,
@@ -209,6 +210,26 @@ def reconcile_reason(previous: str | None, target: WorkStatus) -> str:
     return marker if not previous else f"{marker}:{previous}"
 
 
+def execution_reconcile_reason(previous: str | None, target: WorkStatus) -> str:
+    marker = f"execution_reconciled:{target.value}"
+    return marker if not previous else f"{marker}:{previous}"
+
+
+def _reconcile_transition(
+    item: WorkItem, target: WorkStatus, now: datetime, *, marker: str, reason: str
+) -> tuple[bool, WorkItem | None]:
+    """Shared terminal-transition core for job and execution settlement."""
+    if item.status is target:
+        if item.outcome_reason and marker in item.outcome_reason:
+            return (True, None)
+        return (True, finished_item(item, target, now, reason))
+    if item.status in {WorkStatus.FAILED, WorkStatus.STALE}:
+        return (True, finished_item(item, target, now, reason))
+    if item.status not in ACTIVE_STATUSES:
+        return (False, None)
+    return (True, finished_item(item, target, now, reason))
+
+
 def decide_reconcile(
     item: WorkItem | None, job_id: str, status: str, now: datetime
 ) -> tuple[bool, WorkItem | None]:
@@ -225,15 +246,42 @@ def decide_reconcile(
         return (False, None)
     if item is None or not item.job_id or item.job_id != job_id:
         return (False, None)
-    if item.status is target:
-        if item.outcome_reason and "job_reconciled" in item.outcome_reason:
-            return (True, None)
-        reason = reconcile_reason(item.outcome_reason, target)
-        return (True, finished_item(item, target, now, reason))
-    if item.status in {WorkStatus.FAILED, WorkStatus.STALE}:
-        reason = reconcile_reason(item.outcome_reason, target)
-        return (True, finished_item(item, target, now, reason))
-    if item.status not in ACTIVE_STATUSES:
-        return (False, None)
     reason = reconcile_reason(item.outcome_reason, target)
-    return (True, finished_item(item, target, now, reason))
+    return _reconcile_transition(item, target, now, marker="job_reconciled", reason=reason)
+
+
+def decide_execution_reconcile(
+    item: WorkItem | None,
+    lease: TaskLease | None,
+    *,
+    run_id: RunId,
+    instance_id: AgentInstanceId | None,
+    candidate_key: str,
+    status: str,
+    now: datetime,
+) -> tuple[bool, WorkItem | None]:
+    """Decide SYNC-execution settlement: (applied, updated item or None).
+
+    The caller must have verified the preserved original execution receipt;
+    this helper checks scope and correlation only. A live lease is never
+    released here -- settle through ``complete`` while the lease is held,
+    and use this path only after the event or lease was lost.
+    """
+    try:
+        target = WorkStatus(status)
+    except (ValueError, TypeError):
+        return (False, None)
+    if target not in RECONCILABLE_STATUSES:
+        return (False, None)
+    if item is None:
+        return (False, None)
+    if item.run_id != run_id or item.instance_id != instance_id:
+        return (False, None)
+    if item.candidate_key != candidate_key:
+        return (False, None)
+    if lease is not None and not is_expired(lease.expires_at, now):
+        return (False, None)
+    reason = execution_reconcile_reason(item.outcome_reason, target)
+    return _reconcile_transition(
+        item, target, now, marker="execution_reconciled", reason=reason
+    )

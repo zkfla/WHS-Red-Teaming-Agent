@@ -161,7 +161,8 @@ async def test_execution_workspace_exposes_only_command_recipe_without_mobile_an
 
     assert context["role_activation"]["analysis-agent"]["reason"] == "no_explicit_apk_asset"
     assert "analysis-agent" in role_ids(context)
-    assert [item["tool_name"] for item in context["tools"]] == ["run_command"]
+    mcp_cards = [item for item in context["tool_cards"] if item["kind"] == "mcp_tool"]
+    assert [item["tool_name"] for item in mcp_cards] == ["run_command"]
     assert len(context["execution_options"]) == 1
     assert context["execution_options"][0]["operation"] == "command_run"
     assert all(

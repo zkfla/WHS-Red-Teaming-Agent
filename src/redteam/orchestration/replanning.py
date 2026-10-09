@@ -50,6 +50,7 @@ from redteam.orchestration.result_claims import (
     check_result_review,
     mission_result_purpose,
 )
+from redteam.orchestration.work.models import work_owner_for
 
 #: Provenance marker for endpoint-scoped second-principal acquisition Tasks.
 _ACQUIRE_SOURCE = "replan:acquire_second_principal"
@@ -914,6 +915,32 @@ async def finalize_mission(
             outcome = MissionStatus.COMPLETED
         else:
             outcome = MissionStatus.BLOCKED
+        # Foreign-active guard for premature BLOCKED only. Captured tasks
+        # come from the coordinator capture, and the commit below
+        # re-validates the token in a fresh coordinator change, so no raw
+        # store access happens inside the change. Authoritative COMPLETED
+        # and actual operator stop or closed-mission projection (stopped)
+        # bypass this guard. Legacy callers without a real instance keep
+        # the previous BLOCKED behaviour. TaskStatus has no LEASED;
+        # RUNNING with a foreign occupant is active, and READY or PENDING
+        # with a foreign occupant is HELD, never false-inactive.
+        if outcome is MissionStatus.BLOCKED and not stopped:
+            _own_owner: str | None = None
+            _rt_instance = getattr(runtime, "instance_id", None)
+            if runtime is not None and _rt_instance is not None and run_id is not None:
+                _own_owner = work_owner_for(run_id, _rt_instance)
+            if _own_owner is not None:
+                _foreign_active = False
+                for _t in tasks or []:
+                    _occ = getattr(_t, "occupant_owner", None)
+                    if _occ is None or _occ == _own_owner:
+                        continue
+                    _st = getattr(_t, "status", None)
+                    if _st is TaskStatus.RUNNING or _st in {TaskStatus.READY, TaskStatus.PENDING}:
+                        _foreign_active = True
+                        break
+                if _foreign_active:
+                    return last_event_id
         if (
             mission.status
             in {

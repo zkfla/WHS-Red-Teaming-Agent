@@ -16,6 +16,7 @@ from typing import Any
 
 from redteam.attack_graph.service import AttackGraphService
 from redteam.attack_graph.stores.memory import InMemoryAttackGraphStore
+from redteam.capability.card_view import cards_from_descriptors, tool_detail_from_descriptor
 from redteam.core.contracts.action import ActionProposal
 from redteam.core.contracts.engagement import (
     ApprovalPolicy,
@@ -183,6 +184,19 @@ class FakeCatalog:
             if capability in t.capability_tags and operation in t.operations
         ]
 
+    def list_cards(self, **filters: Any) -> list[Any]:
+        """Card projection over this double snapshot (mirrors the real catalog)."""
+
+        return cards_from_descriptors(list(self._tools.values()), **filters)
+
+    def get_detail(self, tool_id: Any) -> Any | None:
+        """Full contract for one tool of this double snapshot."""
+
+        descriptor = self._tools.get(str(tool_id))
+        if descriptor is None:
+            return None
+        return tool_detail_from_descriptor(descriptor)
+
 
 def inventory_descriptor() -> ToolDescriptor:
     """The playbook never emits this tool; the catalog exposes it."""
@@ -281,6 +295,7 @@ def make_world(
         operation_bindings={item.operation: item for item in LEGACY_OPERATION_BINDINGS},
         execution_recipes={},
         retry_policy=None,
+        shell_programs=None,
     )
     return SimpleNamespace(
         deps=deps,

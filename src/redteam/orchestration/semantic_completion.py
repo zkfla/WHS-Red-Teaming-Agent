@@ -44,6 +44,7 @@ from redteam.core.contracts.mission import (
     MissionTask,
     redact_secret_material,
 )
+from redteam.core.contracts.tool import execution_outcome_uncertain
 from redteam.core.enums import EvidenceSourceType, MissionStatus, TaskStatus
 from redteam.core.ids import EvidenceId, TaskId, new_id
 from redteam.event_bus.publisher import EventPublisher
@@ -63,6 +64,10 @@ from redteam.orchestration.context_projection import (
 )
 from redteam.orchestration.coordination import content_hash
 from redteam.orchestration.evidence_access import raw_from_metadata
+from redteam.orchestration.execution_journal import (
+    ExecutionReceiptError,
+    unsettled_execution_receipts,
+)
 from redteam.orchestration.result_claims import (
     RESULT_REVIEW_INSTRUCTION,
     ResultClaim,
@@ -70,7 +75,8 @@ from redteam.orchestration.result_claims import (
     check_result_review,
     mission_result_purpose,
 )
-from redteam.orchestration.work.models import WorkStatus
+from redteam.orchestration.task_graph.claim import release_mission_task_claim
+from redteam.orchestration.work.models import WorkStatus, work_owner_for
 
 #: Evidence metadata marker for an accepted task completion receipt.
 TASK_RECEIPT_KIND = "task_completion_receipt"
@@ -634,45 +640,143 @@ def _goal_review_payload(
     }
 
 
-async def _pending_execution_errors(engine: Any, runtime: Any) -> list[str]:
+async def _pending_execution_errors(
+    engine: Any,
+    runtime: Any,
+    *,
+    scope: str = "task",
+    task: Any = None,
+    mission_task_id: Any = None,
+    all_instances: bool = False,
+) -> list[str]:
+    """Scoped execution gate: task scope checks own instance/task only."""
+    goal_scope = bool(all_instances or scope == "goal")
+    resolved_task_id: str | None = None
+    if mission_task_id is not None and str(mission_task_id).strip():
+        resolved_task_id = str(mission_task_id)
+    elif task is not None:
+        tid = getattr(task, "task_id", None)
+        if tid is not None and str(tid).strip():
+            resolved_task_id = str(tid)
+    else:
+        active = getattr(runtime, "active_task_id", None)
+        if active is not None and str(active).strip():
+            resolved_task_id = str(active)
     try:
         history = await engine.deps.work_store.list_items(run_id=runtime.run_id)
     except Exception:
         return ["execution history lookup failed; treating as unproven"]
-    if any(
-        work.status in {WorkStatus.LEASED, WorkStatus.RUNNING}
-        or (work.status is WorkStatus.PENDING and work.job_id is not None)
-        for work in (history or [])
-    ):
-        return ["unfinished execution records remain"]
+
+    def _active(item: Any) -> bool:
+        status = getattr(item, "status", None)
+        return status in {WorkStatus.LEASED, WorkStatus.RUNNING} or (
+            status is WorkStatus.PENDING and getattr(item, "job_id", None) is not None
+        )
+
+    if goal_scope:
+        if any(_active(item) for item in (history or [])):
+            return ["unfinished execution records remain"]
+    else:
+        runtime_instance = getattr(runtime, "instance_id", None)
+        for item in history or []:
+            if not _active(item):
+                continue
+            if getattr(item, "instance_id", None) != runtime_instance:
+                continue
+            item_task = getattr(item, "mission_task_id", None)
+            if (
+                resolved_task_id is not None
+                and item_task is not None
+                and str(item_task) != resolved_task_id
+            ):
+                continue
+            return ["unfinished execution records remain"]
     if getattr(runtime, "pending_approval_id", None):
         return ["an approval is still pending"]
+    try:
+        if goal_scope:
+            pending_ids = await unsettled_execution_receipts(
+                engine.deps.evidence_store, run_id=runtime.run_id, all_instances=True,
+            )
+        else:
+            pending_ids = await unsettled_execution_receipts(
+                engine.deps.evidence_store,
+                run_id=runtime.run_id,
+                instance_id=getattr(runtime, "instance_id", None),
+                all_instances=False,
+                mission_task_id=resolved_task_id,
+            )
+    except ExecutionReceiptError as exc:
+        return [exc.reason_code]
+    except Exception:
+        return ["execution history lookup failed; treating as unproven"]
+    if pending_ids:
+        return ["unfinished execution records remain"]
     try:
         records = await engine.deps.evidence_store.list_for_run(runtime.run_id)
     except Exception:
         return ["task evidence lookup failed; treating as unproven"]
-    settled = {
-        _record_text(getattr(record, "action_id", None))
-        for record in (records or [])
-        if isinstance(getattr(record, "metadata", None), dict)
-        and isinstance(getattr(record, "metadata", {}).get("tool_result", {}), dict)
-        and getattr(record, "metadata", {})
-        .get("tool_result", {})
-        .get("metadata", {})
-        .get("execution_reconciled")
-    }
+    settled: set[tuple[str, Any, Any]] = set()
     for record in records or []:
         meta = getattr(record, "metadata", None)
-        raw = meta.get("tool_result") if isinstance(meta, dict) else None
+        if not isinstance(meta, dict):
+            continue
+        raw = meta.get("tool_result")
         if not isinstance(raw, dict):
             continue
-        if raw.get("metadata", {}).get("orchestration_exception"):
-            error = raw.get("error") or {}
+        inner = raw.get("metadata", {})
+        if not isinstance(inner, dict):
+            continue
+        if not inner.get("execution_reconciled"):
+            continue
+        if execution_outcome_uncertain(inner):
+            continue
+        proposal = meta.get("proposal", {})
+        instance = proposal.get("instance_id") if isinstance(proposal, dict) else None
+        settled.add((
+            _record_text(getattr(record, "action_id", None)),
+            _record_text(getattr(record, "invocation_id", None) or meta.get("invocation_id", "")),
+            instance,
+        ))
+    benign = {"tool_binding_invalid", "lease_lost_before_execution", "policy_admission_denied"}
+    runtime_instance = getattr(runtime, "instance_id", None)
+    for record in records or []:
+        meta = getattr(record, "metadata", None)
+        if not isinstance(meta, dict):
+            continue
+        raw = meta.get("tool_result")
+        if not isinstance(raw, dict):
+            continue
+        inner = raw.get("metadata", {})
+        if not isinstance(inner, dict):
+            continue
+        if not goal_scope:
+            proposal = meta.get("proposal", {})
+            proposal_instance = proposal.get("instance_id") if isinstance(proposal, dict) else None
+            if proposal_instance != runtime_instance:
+                continue
+            record_task = meta.get("mission_task_id")
             if (
-                error.get("code") not in {"tool_binding_invalid", "lease_lost_before_execution"}
-                and _record_text(getattr(record, "action_id", None)) not in settled
+                resolved_task_id is not None
+                and record_task is not None
+                and str(record_task) != resolved_task_id
             ):
-                return ["an execution outcome is uncertain; collect its actual result or hold"]
+                continue
+        if not execution_outcome_uncertain(inner):
+            continue
+        error = raw.get("error") or {}
+        if isinstance(error, dict) and error.get("code") in benign:
+            continue
+        proposal = meta.get("proposal", {})
+        instance = proposal.get("instance_id") if isinstance(proposal, dict) else None
+        key = (
+            _record_text(getattr(record, "action_id", None)),
+            _record_text(getattr(record, "invocation_id", None) or meta.get("invocation_id", "")),
+            instance,
+        )
+        if key in settled:
+            continue
+        return ["an execution outcome is uncertain; collect its actual result or hold"]
     return []
 
 
@@ -750,7 +854,7 @@ async def complete_task(
             excerpt_notes.append(_excerpt_of(record))
     if not verified:
         return ["task completion needs related stored evidence"]
-    pending = await _pending_execution_errors(engine, runtime)
+    pending = await _pending_execution_errors(engine, runtime, scope="task", task=task)
     if pending:
         return pending
     await engine._check_review_path(runtime, path)
@@ -823,9 +927,24 @@ async def complete_task(
         staged = await change.tasks.get_task(task.task_id)
         if staged is None:
             raise ValueError("completion_task_missing")
+        owner = work_owner_for(runtime.run_id, getattr(runtime, "instance_id", None))
+        occupant = getattr(staged, "occupant_owner", None)
+        if occupant is None:
+            # Claim-before-admission: adopt the unowned task inside this same
+            # atomic commit, so no sibling can slip between check and close.
+            await change.tasks.update_task(
+                staged.model_copy(
+                    update={"occupant_owner": owner, "updated_at": datetime.now(timezone.utc)}
+                )
+            )
+        elif occupant != owner:
+            raise ValueError("completion_task_claimed_by_other")
         updated = staged.model_copy(
             update={
                 "completion_evidence_id": receipt_record.evidence_id,
+                # The adopt above is settled here: no live claim survives a
+                # terminal task, so the occupant clears with the receipt.
+                "occupant_owner": None,
                 "updated_at": datetime.now(timezone.utc),
             }
         )
@@ -851,8 +970,35 @@ async def settle_unresolved(
     engine: Any, path: Any, proposal: CompletionProposal, runtime: Any, *,
     token: Any, task: Any = None, finish_investigation: bool = False,
 ) -> list[str]:
-    """End an investigation unit without granting a success/refutation receipt."""
-    pending = await _pending_execution_errors(engine, runtime)
+    """End an investigation unit without granting a success/refutation receipt.
+
+    Instance isolation: a task-local unresolved blocks only its own
+    exactly-claimed task (occupant-owned, adopted when unowned inside the
+    same commit). A goal unresolved (finish_investigation, task None) with
+    a real instance derives the current active task when it is valid and
+    same-mission, adopts when unowned inside the same coordinator guarded
+    commit, and blocks OWN only, leaving foreign tasks and the global
+    mission untouched. Global settlement stays with the authoritative
+    mission criteria and operator stop via finalize_mission.
+
+    Legacy compat: the pre-instance central loop (runtime.instance_id None)
+    carries no per-instance identity, so task occupants are legacy
+    run-only owners or unclaimed and offer no isolation boundary; that
+    loop owns the whole mission, so finishing the investigation settles
+    all unfinished tasks and marks the mission BLOCKED. Instance goals
+    never convert to all-tasks.
+    """
+    if task is not None:
+        pending = await _pending_execution_errors(engine, runtime, scope="task", task=task)
+    elif finish_investigation and getattr(runtime, "instance_id", None) is not None:
+        active_for_gate = getattr(runtime, "active_task_id", None)
+        pending = await _pending_execution_errors(
+            engine, runtime, scope="task", mission_task_id=active_for_gate,
+        )
+    else:
+        pending = await _pending_execution_errors(
+            engine, runtime, scope="goal", all_instances=True,
+        )
     if pending:
         return pending
     if task is not None:
@@ -877,18 +1023,64 @@ async def settle_unresolved(
 
     async def block(change: Any) -> None:
         if task is not None:
+            staged = await change.tasks.get_task(task.task_id)
+            if staged is None:
+                raise ValueError("completion_task_missing")
+            owner = work_owner_for(runtime.run_id, getattr(runtime, "instance_id", None))
+            occupant = getattr(staged, "occupant_owner", None)
+            if occupant is None:
+                # Same claim-before-admission as completion: adopt inside
+                # this commit so the BLOCKED transition has a verified owner.
+                await change.tasks.update_task(
+                    staged.model_copy(
+                        update={"occupant_owner": owner, "updated_at": now}
+                    )
+                )
+            elif occupant != owner:
+                raise ValueError("completion_task_claimed_by_other")
             await change.tasks.transition_task(
                 task.task_id, TaskStatus.BLOCKED, now=now,
                 reason=proposal.reason,
             )
-        for step in (getattr(path, "steps", []) or []):
-            if step.status in {"pending", "running"}:
-                await change.paths.update_step(
-                    str(runtime.run_id), path.path_id, path.version, step.step_id,
-                    "blocked", outcome=proposal.outcome,
-                    evidence_ids=list(dict.fromkeys([*step.evidence_ids, identity])),
-                )
-        if finish_investigation:
+            # BLOCKED tasks re-enter the pool via unblock (BLOCKED -> READY /
+            # PENDING), so the claim clears here and the next driver claims
+            # explicitly. No silent handoff, no TTL.
+            await release_mission_task_claim(
+                change, task.task_id, owner=owner, now=now
+            )
+        elif finish_investigation and getattr(runtime, "instance_id", None) is not None:
+            # Instance goal: block OWN active task only, inside this same
+            # coordinator guarded commit. Foreign tasks stay untouched.
+            active_id = getattr(runtime, "active_task_id", None)
+            if active_id is not None:
+                candidate = await change.tasks.get_task(active_id)
+                if (
+                    candidate is not None
+                    and str(getattr(candidate, "mission_id", "")) == str(runtime.mission_id)
+                    and getattr(candidate, "status", None)
+                    in {TaskStatus.PENDING, TaskStatus.READY, TaskStatus.RUNNING}
+                ):
+                    owner = work_owner_for(runtime.run_id, getattr(runtime, "instance_id", None))
+                    occupant = getattr(candidate, "occupant_owner", None)
+                    if occupant is None:
+                        await change.tasks.update_task(
+                            candidate.model_copy(
+                                update={"occupant_owner": owner, "updated_at": now}
+                            )
+                        )
+                    if occupant is None or occupant == owner:
+                        await change.tasks.transition_task(
+                            candidate.task_id, TaskStatus.BLOCKED, now=now,
+                            reason=proposal.reason,
+                        )
+                        await release_mission_task_claim(
+                            change, candidate.task_id, owner=owner, now=now
+                        )
+                    # Foreign-owned active tasks stay untouched.
+        elif finish_investigation:
+            # Legacy central loop (instance_id None): preserve the previous
+            # full-goal behaviour. Documented compat; instance goals above
+            # never take this path.
             mission = await change.tasks.get_mission(runtime.mission_id)
             if mission is None:
                 raise ValueError("unresolved_mission_missing")
@@ -903,6 +1095,15 @@ async def settle_unresolved(
                 "updated_at": now,
                 "revision": int(getattr(mission, "revision", 1) or 1) + 1,
             }))
+        for step in (getattr(path, "steps", []) or []):
+            if step.status in {"pending", "running"}:
+                await change.paths.update_step(
+                    str(runtime.run_id), path.path_id, path.version, step.step_id,
+                    "blocked", outcome=proposal.outcome,
+                    evidence_ids=list(dict.fromkeys([*step.evidence_ids, identity])),
+                )
+        # Instance goals do not close the global mission here; only the
+        # legacy central loop above updates the mission status globally.
 
     await engine._commit_review(runtime, token, block)
     runtime.unresolved_evidence_ids = list(dict.fromkeys([
@@ -917,12 +1118,12 @@ async def settle_unresolved(
             else value
             for key, value in runtime.delegations.items()
         }
-    if finish_investigation:
+    if finish_investigation and getattr(runtime, "instance_id", None) is None:
+        # Legacy central loop only; instance goals leave the global mission
+        # status to finalize_mission so foreign RUNNING work continues.
         runtime.mission_status = MissionStatus.BLOCKED
     engine.updated_runtime = engine._event_runtime = runtime
     return []
-
-
 async def verify_legacy_task_origins(
     *,
     evidence_store: Any,
@@ -1130,7 +1331,7 @@ async def complete_goal(
     criteria = list(getattr(mission, "success_criteria", []) or [])
     if not criteria:
         return ["goal has no original operator criteria"]
-    pending = await _pending_execution_errors(engine, runtime)
+    pending = await _pending_execution_errors(engine, runtime, scope="goal", all_instances=True)
     if pending:
         return pending
     tasks = await engine.deps.task_graph_store.list_tasks(mission_id=runtime.mission_id)

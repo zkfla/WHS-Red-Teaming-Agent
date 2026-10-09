@@ -52,6 +52,7 @@ from redteam.orchestration.paths.sqlite import SQLitePathStore
 from redteam.orchestration.settings import OrchestrationSettings
 from redteam.orchestration.state import TerminationReason
 from redteam.orchestration.task_graph.sqlite import SQLiteTaskGraphStore
+from redteam.orchestration.tool_discovery import TOOL_GET_DETAIL_ID
 from redteam.orchestration.work.models import WorkStatus
 from redteam.orchestration.work.sqlite import SQLiteWorkStore
 from tests.integration.test_second_principal_mission import (
@@ -112,6 +113,12 @@ class _TransportLLM(_CompareNativeLLM):
                 return exposed_tool_name(str(descriptor.tool_id))
         raise AssertionError(f"no registered tool named {remote_tool_name!r}")
 
+    def _remote_id(self, remote_tool_name: str) -> str:
+        for descriptor in self._catalog.all_descriptors():
+            if descriptor.tool_name == remote_tool_name:
+                return str(descriptor.tool_id)
+        raise AssertionError(f"no registered tool named {remote_tool_name!r}")
+
     async def complete_native(
         self,
         messages: list[dict[str, Any]],
@@ -124,13 +131,40 @@ class _TransportLLM(_CompareNativeLLM):
         compare = self._remote_name("http_compare_sessions")
         task_tool = exposed_tool_name(TASK_SETTLE_TOOL_ID)
         goal_tool = exposed_tool_name(GOAL_SETTLE_TOOL_ID)
+        detail = exposed_tool_name(TOOL_GET_DETAIL_ID)
+        # FR-006 lazy discovery: only the bootstrap navigators are advertised
+        # up front, so fetch the schema of every tool this script will call
+        # through the real tool.get_detail navigator. The lazy loop then
+        # advertises each fetched tool on the next turn -- no schema revert
+        # and no fresh instance, just the real card-first protocol.
+        assert detail in names, "native model needs the registered detail navigator"
+        wanted = {
+            discovery: self._remote_id("session_list"),
+            compare: self._remote_id("http_compare_sessions"),
+            task_tool: TASK_SETTLE_TOOL_ID,
+            goal_tool: GOAL_SETTLE_TOOL_ID,
+        }
+        missing = sorted({tool_id for name, tool_id in wanted.items() if name not in names})
+        if missing:
+            self.turns += 1
+            self.calls.append({"turn": self.turns, "tool_calls": [detail]})
+            return NativeCompletion(
+                tool_calls=tuple(
+                    NativeToolCall(
+                        call_id=f"detail-{index}", name=detail,
+                        arguments={"tool_id": tool_id},
+                    )
+                    for index, tool_id in enumerate(missing)
+                ),
+                text="",
+            )
         assert discovery in names, "native model needs the registered discovery tool"
         assert compare in names, "native model needs the registered compare tool"
         assert task_tool in names, "native model needs the task settlement helper"
         assert goal_tool in names, "native model needs the goal settlement helper"
         self.turns += 1
-        if self.turns == 1:
-            self.calls.append({"turn": 1, "tool_calls": [discovery]})
+        if _tool_result(messages, DISCOVERY_CALL_ID) is None:
+            self.calls.append({"turn": self.turns, "tool_calls": [discovery]})
             return NativeCompletion(
                 tool_calls=(
                     NativeToolCall(
@@ -140,11 +174,11 @@ class _TransportLLM(_CompareNativeLLM):
                 text="",
             )
         sessions = _discovered_sessions(messages, DISCOVERY_CALL_ID)
-        if self.turns == 2:
+        if _tool_result(messages, COMPARE_CALL_ID) is None:
             assert len(sessions) >= 2, "discovery must return the registered sessions"
             first, second = sessions[0], sessions[1]
             assert first["session_ref"] != second["session_ref"]
-            self.calls.append({"turn": 2, "tool_calls": [compare]})
+            self.calls.append({"turn": self.turns, "tool_calls": [compare]})
             return NativeCompletion(
                 tool_calls=(
                     NativeToolCall(

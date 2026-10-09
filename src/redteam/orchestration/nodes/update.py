@@ -16,6 +16,7 @@ from redteam.core.enums import AgentPhase, PolicyVerdict
 from redteam.core.tool_binding import execution_display_key
 from redteam.orchestration.context import RuntimeDeps
 from redteam.orchestration.events import GRAPH_MUTATION_APPLIED, RESULT_MAPPER_FAILED
+from redteam.orchestration.execution_journal import mark_execution_processed
 from redteam.orchestration.nodes._support import advance, graph_service, publisher_for
 from redteam.orchestration.nodes.policy import denial_severity
 from redteam.orchestration.runtime_observation import (
@@ -524,12 +525,22 @@ async def update_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                 reason = f"verification_exception:{verification_exception}"
             else:
                 reason = error_code if error_code else "tool_failed"
-        await deps.work_store.complete(
+        completed = await deps.work_store.complete(
             work_id,
             owner=runtime.work_owner,
             status=work_status,
             now=datetime.now(timezone.utc),
             reason=reason,
+        )
+        if not completed:
+            raise RuntimeError("execution_work_settlement_failed")
+
+    result_evidence_id = state.get("result_evidence_id")
+    if result is not None and result_evidence_id is not None:
+        await mark_execution_processed(
+            deps.evidence_store, run_id=runtime.run_id, action_id=proposal.action_id,
+            instance_id=runtime.instance_id, work_id=work_id,
+            evidence_id=result_evidence_id,
         )
 
     # The graph summary follows measured application: verifier failures are

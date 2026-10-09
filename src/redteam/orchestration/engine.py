@@ -107,6 +107,12 @@ from redteam.orchestration.paths.writing import (
 )
 from redteam.orchestration.runtime_observation import observations_for_prompt
 from redteam.orchestration.target_binding import network_identity, validate_network_arguments
+from redteam.orchestration.tool_discovery import (
+    PROGRAM_MANIFEST_STATUS_KEY,
+    WORKROOM_STATUS_KEY,
+    card_view_for,
+    discovery_cards_for_context,
+)
 from redteam.orchestration.work.models import WorkStatus, is_unexecuted_stale
 
 
@@ -982,8 +988,25 @@ class InvestigationEngine:
                 ][-10:]
 
             instructions = await coordinator.change(canonical_instructions)
+        tool_cards, card_status = await discovery_cards_for_context(
+            view=card_view_for(self.deps),
+            eligible_ids=list(tools),
+            local_descriptors=self.deps.local_tools.descriptors(),
+            provider=self.deps.shell_programs,
+            runtime=runtime,
+            library=library,
+        )
         return {
             **reference_context,
+            "tool_cards": [
+                card.model_dump(mode="json") for card in tool_cards
+            ],
+            "program_manifest_status": card_status.get(PROGRAM_MANIFEST_STATUS_KEY, ""),
+            "workroom_status": card_status.get(WORKROOM_STATUS_KEY, ""),
+            "tool_cards_total": card_status.get("cards_total", 0),
+            "tool_cards_truncated": card_status.get("cards_truncated", False),
+            "tool_cards_counts": card_status.get("cards_counts", {}),
+            "tool_cards_guidance": card_status.get("cards_guidance", ""),
             "evidence_read_contract": {
                 "mode": "read_evidence",
                 "input_field": "evidence_request",
@@ -1026,7 +1049,6 @@ class InvestigationEngine:
                 {"agent_id": str(agent.agent_id), "capabilities": agent.capabilities}
                 for agent in visible_agents
             ],
-            "tools": list(tools.values()),
             "tools_by_role": tools_by_role,
             "local_tools": [
                 {
@@ -2535,15 +2557,58 @@ class InvestigationEngine:
         return False
 
     async def has_ambiguous_execution(self, intent, runtime) -> bool:
-        for record in await self.deps.evidence_store.list_for_run(runtime.run_id):
+        from redteam.core.contracts.tool import execution_outcome_uncertain
+        from redteam.orchestration.execution_journal import (
+            checked_receipt,
+            execution_processed,
+            preserved_result,
+        )
+
+        records = await self.deps.evidence_store.list_for_run(runtime.run_id)
+        for record in records:
+            proposal = record.metadata.get("proposal", {})
+            if (
+                record.metadata.get("receipt_kind") != "execution_submission"
+                or record.metadata.get("instance_id") != runtime.instance_id
+                or record.metadata.get("target_node_id") != intent.target_node_id
+                or proposal.get("arguments") != intent.arguments
+                or not (
+                    proposal.get("tool_id") == intent.tool_id
+                    if intent.binding_mode == "selected_tool"
+                    else proposal.get("capability") == intent.capability
+                    and proposal.get("operation") == intent.operation
+                )
+            ):
+                continue
+            checked_receipt(record)
+            original = await preserved_result(
+                self.deps.evidence_store, run_id=runtime.run_id, action_id=record.action_id,
+                instance_id=runtime.instance_id, work_id=record.metadata.get("work_id"),
+            )
+            if original is None:
+                return True
+            result, original_id = original
+            if (result.metadata.get("execution_started") is False
+                and not execution_outcome_uncertain(result.metadata)):
+                continue
+            source = await self.deps.evidence_store.get(original_id)
+            if (source is None or execution_outcome_uncertain(result.metadata)
+                or not await execution_processed(self.deps.evidence_store, source)):
+                return True
+
+        for record in records:
             raw = record.metadata.get("tool_result", {})
             proposal = record.metadata.get("proposal", {})
             metadata = raw.get("metadata", {}) if isinstance(raw, dict) else {}
-            if not metadata.get("orchestration_exception"):
+            if proposal.get("instance_id") != runtime.instance_id:
                 continue
-            if raw.get("error", {}).get("code") in {
+            if not execution_outcome_uncertain(metadata):
+                continue
+            error = raw.get("error") or {}
+            if isinstance(error, dict) and error.get("code") in {
                 "tool_binding_invalid",
                 "lease_lost_before_execution",
+                "policy_admission_denied",
             }:
                 continue
             if (
@@ -2557,12 +2622,23 @@ class InvestigationEngine:
                 and proposal.get("arguments") == intent.arguments
             ):
                 siblings = await self.deps.evidence_store.list_for_action(record.action_id)
-                if not any(
-                    item.metadata.get("tool_result", {})
-                    .get("metadata", {})
-                    .get("execution_reconciled")
-                    for item in siblings
-                ):
+                reconciled = False
+                for item in siblings:
+                    sibling_raw = item.metadata.get("tool_result")
+                    sibling_proposal = item.metadata.get("proposal")
+                    if (item.run_id != record.run_id
+                        or item.invocation_id != record.invocation_id
+                        or not isinstance(sibling_raw, dict)
+                        or not isinstance(sibling_proposal, dict)
+                        or sibling_proposal.get("instance_id") != runtime.instance_id):
+                        continue
+                    sibling_metadata = sibling_raw.get("metadata")
+                    if (isinstance(sibling_metadata, dict)
+                        and sibling_metadata.get("execution_reconciled")
+                        and not execution_outcome_uncertain(sibling_metadata)):
+                        reconciled = True
+                        break
+                if not reconciled:
                     return True
         return False
 
@@ -2574,7 +2650,8 @@ class InvestigationEngine:
         from redteam.orchestration.state import initial_graph_state
 
         work = await self.deps.work_store.get(str(request.get("work_id", "")))
-        if work is None or work.run_id != runtime.run_id or not work.job_id:
+        if (work is None or work.run_id != runtime.run_id
+            or work.instance_id != runtime.instance_id or not work.job_id):
             return {"status": "no_registered_job"}
         manager = LongJobManager(self.deps.long_job_adapter)
         status = await manager.status(work.job_id)
@@ -2590,6 +2667,8 @@ class InvestigationEngine:
                 record
                 for record in records
                 if record.metadata.get("candidate_key") == work.candidate_key
+                and record.metadata.get("proposal", {}).get("instance_id") == runtime.instance_id
+                and record.metadata.get("work_id") == work.work_id
                 and record.metadata.get("proposal")
                 and record.metadata.get("plan_step")
             ),
@@ -2629,7 +2708,9 @@ class InvestigationEngine:
         reviewed = await verify_node(
             replay, deps=self.deps, budget=budget, requester_guard=requester_guard
         )
-        updated = await update_node(reviewed, deps=self.deps)
+        # Recovery settles the original ledger through its job identity,
+        # rather than pretending it still owns an active worker lease.
+        updated = await update_node({**reviewed, "current_work_id": None}, deps=self.deps)
         self.last_event_id = updated.get("last_event_id", self.last_event_id)
         reviewed_runtime = reviewed.get("runtime")
         if reviewed_runtime is not None:
@@ -2653,6 +2734,14 @@ class InvestigationEngine:
                 "job_id": work.job_id,
                 "evidence_id": str(reviewed.get("result_evidence_id")),
             }
+        from redteam.orchestration.execution_journal import mark_execution_processed
+
+        evidence_id = reviewed.get("result_evidence_id")
+        if evidence_id is not None:
+            await mark_execution_processed(
+                self.deps.evidence_store, run_id=runtime.run_id, action_id=proposal.action_id,
+                instance_id=runtime.instance_id, work_id=work.work_id, evidence_id=evidence_id,
+            )
         return {
             "status": "collected",
             "job_id": work.job_id,
@@ -3002,6 +3091,8 @@ async def claim_action_admission(deps, runtime, step, proposal) -> None:
         return
 
     async def claim(change):
+        from redteam.orchestration.task_graph.claim import claim_mission_task
+
         change.admit(str(runtime.run_id), str(runtime.mission_id))
         generation = change.generation(str(runtime.run_id), str(runtime.mission_id))
         epoch = str(generation) if generation else None
@@ -3024,6 +3115,9 @@ async def claim_action_admission(deps, runtime, step, proposal) -> None:
                 or not step.model_tool_call_id
             ):
                 raise StateConflict("native_call_task_changed")
+            task = await claim_mission_task(
+                change, task.task_id, owner=runtime.work_owner, now=datetime.now(timezone.utc)
+            )
             change.records[("admission", str(proposal.action_id))] = {
                 "run_id": str(runtime.run_id),
                 "mission_id": str(runtime.mission_id),
@@ -3054,6 +3148,9 @@ async def claim_action_admission(deps, runtime, step, proposal) -> None:
                 or task.status is not TaskStatus.RUNNING
             ):
                 raise StateConflict("action_task_no_longer_running")
+            await claim_mission_task(
+                change, task.task_id, owner=runtime.work_owner, now=datetime.now(timezone.utc)
+            )
         change.records[("admission", str(proposal.action_id))] = {
             "run_id": str(runtime.run_id),
             "mission_id": str(runtime.mission_id),
@@ -3174,6 +3271,7 @@ async def validate_current_action(deps, runtime, step, proposal=None) -> list[st
             task is None
             or task.mission_id != runtime.mission_id
             or task.status is not TaskStatus.RUNNING
+            or task.occupant_owner not in (None, runtime.work_owner)
             or str(task.task_id) != step.mission_task_id
             or purpose_hash(task.objective) != step.task_purpose_hash
             or not step.model_tool_call_id
@@ -3188,6 +3286,15 @@ async def validate_current_action(deps, runtime, step, proposal=None) -> list[st
         current = next((item for item in path.steps if item.step_id == step.path_step_id), None)
         if current is None:
             return ["accepted path step is missing"]
+        if runtime.active_task_id:
+            task = await deps.task_graph_store.get_task(runtime.active_task_id)
+            if (
+                task is None
+                or task.mission_id != runtime.mission_id
+                or task.status is not TaskStatus.RUNNING
+                or task.occupant_owner not in (None, runtime.work_owner)
+            ):
+                return ["action no longer belongs to the current task owner"]
     # Execution admission re-collects fresh internal material every time; the
     # plan-time read is never reused here.
     assessment = await _collect_check_assessment(

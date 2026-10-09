@@ -7,26 +7,28 @@ accounting (budget, consecutive failures).
 from __future__ import annotations
 
 import asyncio
-import hashlib
-import json
 from contextlib import suppress
 from datetime import datetime, timedelta, timezone
 
 from redteam.attack_graph.identity import node_id_for_target
 from redteam.core.contracts.events import EventType
-from redteam.core.contracts.evidence import EvidenceRecord
+from redteam.core.contracts.execution import ExecutionReference
 from redteam.core.contracts.policy import ControlContext, PolicyDecision
-from redteam.core.contracts.tool import ToolError, ToolInvocation, ToolResult
+from redteam.core.contracts.tool import (
+    EXECUTION_STARTED_METADATA_KEY,
+    ToolError,
+    ToolInvocation,
+    ToolResult,
+    execution_outcome_uncertain,
+)
 from redteam.core.convert import build_tool_invocation
 from redteam.core.enums import (
     AgentPhase,
-    EvidenceSourceType,
     PolicyVerdict,
     RiskLevel,
     Severity,
     ToolHealthStatus,
 )
-from redteam.core.ids import EvidenceId, new_id
 from redteam.core.ports.control_plane import InvocationAdmissionControl
 from redteam.core.ports.tool_gateway import ToolStartAdmissionGateway, ToolStartRejected
 from redteam.orchestration.action_naming import (
@@ -36,6 +38,7 @@ from redteam.orchestration.action_naming import (
 from redteam.orchestration.context import RuntimeDeps
 from redteam.orchestration.diagnostics import DecisionDiagnostic, operational_exception_diagnostic
 from redteam.orchestration.engine import claim_action_admission, validate_current_action
+from redteam.orchestration.execution_journal import append_execution_receipt
 from redteam.orchestration.long_jobs import LongJobManager, LongJobState
 from redteam.orchestration.nodes._support import advance, publisher_for
 from redteam.orchestration.runtime_observation import (
@@ -241,19 +244,7 @@ async def execute_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
         correlation_id=correlation_id,
     )
 
-    started = await publisher.publish(
-        EventType.TOOL_EXECUTION_STARTED,
-        {
-            "invocation_id": invocation.invocation_id,
-            "action_id": invocation.action_id,
-            "tool_id": invocation.tool_id,
-            "candidate_key": step.candidate_key,
-            "hypothesis_id": proposal.hypothesis_id,
-            **_native_lineage(step, runtime, state.get("current_work_id")),
-        },
-        correlation_id=correlation_id,
-        causation_id=state.get("last_event_id"),
-    )
+    started = None
 
     work_id = state.get("current_work_id")
     owner = runtime.work_owner
@@ -333,6 +324,9 @@ async def execute_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
     retry_attempts = 0
     admission_denial = None
     orchestration_diagnostic = None
+    any_provider_started = False
+    invocation_entered = False
+    reference: ExecutionReference | None = None
     try:
         path_problems = await validate_current_action(deps, runtime, step, proposal)
         if path_problems:
@@ -341,38 +335,37 @@ async def execute_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             raise RuntimeError("tool binding is no longer valid for the approved action")
         if not lease_ready:
             raise RuntimeError("work lease was lost before tool execution")
-        # Persist the original invocation before submission, so an uncertain
-        # job can be collected later without reconstructing or repeating it.
-        if deps.long_job_adapter is not None:
-            receipt = {
-                "proposal": proposal.model_dump(mode="json"),
-                "plan_step": step.model_dump(mode="json"),
-                "invocation": invocation.model_dump(mode="json"),
+        if deps.execution_recovery is not None:
+            reference = deps.execution_recovery.prepare_reference(invocation)
+        # Recoverable executions retain one provider identity. A retry must
+        # never reuse that identity to overwrite its preserved original.
+        if reference is not None:
+            retry_enabled = False
+        await append_execution_receipt(
+            deps.evidence_store, invocation=invocation, proposal=proposal, step=step,
+            work_id=work_id, reference=reference,
+            accounting_before={
+                "actions_executed": runtime.actions_executed,
+                "retry_tool_calls": runtime.retry_tool_calls,
+                "remaining_budget": runtime.remaining_budget,
+                "actions_by_agent": runtime.actions_by_agent,
+            },
+            target_node_id=(str(node_id_for_target(proposal.target))
+                            if proposal.target is not None else None),
+        )
+        started = await publisher.publish(
+            EventType.TOOL_EXECUTION_STARTED,
+            {
+                "invocation_id": invocation.invocation_id,
+                "action_id": invocation.action_id,
+                "tool_id": invocation.tool_id,
                 "candidate_key": step.candidate_key,
-                "work_id": work_id,
-                "receipt_kind": "execution_submission",
-            }
-            # Target-independent execution: a targetless proposal has no
-            # graph target to name. The key is left out, never invented.
-            if proposal.target is not None:
-                receipt["target_node_id"] = str(node_id_for_target(proposal.target))
-            await deps.evidence_store.append(
-                EvidenceRecord(
-                    evidence_id=EvidenceId(new_id("evidence")),
-                    run_id=runtime.run_id,
-                    engagement_id=runtime.engagement_id,
-                    source_type=EvidenceSourceType.AGENT,
-                    source_id="orchestration.execute",
-                    action_id=proposal.action_id,
-                    invocation_id=invocation.invocation_id,
-                    hypothesis_id=proposal.hypothesis_id,
-                    content_type="application/json",
-                    digest=hashlib.sha256(json.dumps(receipt, sort_keys=True).encode()).hexdigest(),
-                    summary="Registered original execution for job reconciliation",
-                    created_at=datetime.now(timezone.utc),
-                    metadata=receipt,
-                )
-            )
+                "hypothesis_id": proposal.hypothesis_id,
+                **_native_lineage(step, runtime, state.get("current_work_id")),
+            },
+            correlation_id=correlation_id,
+            causation_id=state.get("last_event_id"),
+        )
         if work_id is not None:
             stop_heartbeat = asyncio.Event()
             heartbeat_task = asyncio.create_task(
@@ -385,6 +378,7 @@ async def execute_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                 )
             )
         while True:
+            invocation_entered = True
             result = await _invoke_with_semaphore(
                 deps,
                 invocation,
@@ -395,8 +389,12 @@ async def execute_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                 decision=decision,
             )
             error = result.error
+            any_provider_started = any_provider_started or (
+                result.metadata.get(EXECUTION_STARTED_METADATA_KEY) is not False
+            )
             if (
                 result.success
+                or execution_outcome_uncertain(result.metadata)
                 or not retry_enabled
                 or retry_attempts >= max_retries
                 or error is None
@@ -425,6 +423,12 @@ async def execute_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                 admission_denial = reservation
                 break
             retry_attempts += 1
+            await append_execution_receipt(
+                deps.evidence_store, invocation=invocation, proposal=proposal, step=step,
+                work_id=work_id, retry_attempt=retry_attempts,
+                target_node_id=(str(node_id_for_target(proposal.target))
+                                if proposal.target is not None else None),
+            )
     except Exception as exc:  # noqa: BLE001 - normalize adapter/transport failure
         now = datetime.now(timezone.utc)
         if isinstance(exc, InvocationAdmissionDenied):
@@ -459,7 +463,12 @@ async def execute_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             ),
             started_at=now,
             finished_at=now,
-            metadata={"orchestration_exception": True},
+            metadata={
+                "orchestration_exception": True,
+                EXECUTION_STARTED_METADATA_KEY: (
+                    invocation_entered and not isinstance(exc, ToolStartRejected)
+                ),
+            },
         )
     finally:
         if heartbeat_task is not None:
@@ -501,12 +510,27 @@ async def execute_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                 },
             }
         )
+    if any_provider_started and result.metadata.get(EXECUTION_STARTED_METADATA_KEY) is False:
+        # Bounded retries share this invocation identity. A later queue
+        # refusal cannot erase entry already observed for an earlier
+        # attempt; the preserved result must carry the same accounting
+        # basis as the runtime returned below.
+        result = result.model_copy(update={
+            "metadata": {**result.metadata, EXECUTION_STARTED_METADATA_KEY: True},
+        })
     if retry_attempts:
         # Bounded-retry observability: how many extra attempts this action
         # consumed (the final ToolResult is the one recorded as Evidence).
         result = result.model_copy(
             update={"metadata": {**result.metadata, "retry_attempts": retry_attempts}}
         )
+
+    await append_execution_receipt(
+        deps.evidence_store, invocation=invocation, proposal=proposal, step=step,
+        work_id=work_id, reference=reference, result=result,
+        target_node_id=(str(node_id_for_target(proposal.target))
+                        if proposal.target is not None else None),
+    )
 
     finished = await publisher.publish(
         EventType.TOOL_EXECUTION_FINISHED if result.success else EventType.TOOL_EXECUTION_FAILED,
@@ -520,18 +544,23 @@ async def execute_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             **_native_lineage(step, runtime, state.get("current_work_id")),
         },
         correlation_id=correlation_id,
-        causation_id=started.event_id,
+        causation_id=started.event_id if started is not None else state.get("last_event_id"),
     )
 
     # An action consumes one budget slot; each retry attempt consumes an
     # extra slot so a bounded retry cannot silently exceed the run budget
     # (the Control Plane's own budget is charged once per admitted action).
-    consumed = 1 + retry_attempts
     executed = int(
-        not (
-            result.error and result.error.code == "policy_admission_denied" and retry_attempts == 0
+        any_provider_started or (
+            result.metadata.get(EXECUTION_STARTED_METADATA_KEY) is not False
+            and not (
+                result.error
+                and result.error.code == "policy_admission_denied"
+                and retry_attempts == 0
+            )
         )
     )
+    consumed = executed + retry_attempts
     if runtime.remaining_budget is None:
         remaining_budget = None
     else:

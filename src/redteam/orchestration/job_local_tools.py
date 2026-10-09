@@ -39,11 +39,13 @@ async def job_reconcile_handler(arguments: dict[str, Any], context: LocalToolCon
             jobs = [
                 {"work_id": item.work_id, "job_id": item.job_id, "status": item.status.value}
                 for item in await deps.work_store.list_items(run_id=runtime.run_id)
-                if item.job_id and not (item.outcome_reason or "").startswith("job_reconciled:")
+                if item.instance_id == runtime.instance_id
+                and item.job_id and not (item.outcome_reason or "").startswith("job_reconciled:")
             ]
             return LocalToolResult(ok=True, payload={"jobs": jobs})
         work = await deps.work_store.get(request.work_id)
-        if work is None or work.run_id != runtime.run_id or not work.job_id:
+        if (work is None or work.run_id != runtime.run_id
+            or work.instance_id != runtime.instance_id or not work.job_id):
             return LocalToolResult(
                 ok=False, error="no registered job for this run",
                 payload={"status": "no_registered_job"},

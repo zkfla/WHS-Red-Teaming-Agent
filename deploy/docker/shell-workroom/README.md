@@ -1,0 +1,161 @@
+# Shell workroom (TASK-003)
+
+Stateful per-instance shell containers for the builtin in-process shell
+provider (`src/redteam/capability/shell_*.py`). No MCP transport is
+involved: the adapter speaks the internal `MCPAdapter` protocol and the
+gateway serves the four `analysis.shell_*` tools like any other catalog
+entry.
+
+## Hard invariants (do not relax here)
+
+- Local execution creates containers with `--network none`. There is no
+  networking switch in `ShellWorkroomPolicy`. Gated execution requires the
+  separate operator-owned network policy and a validated per-instance gate
+  namespace, assembled through the provider's execution admission extension.
+  Without that explicit assembly, target and installation egress stay closed.
+- Labels use `io.whs-redteam.shell-workroom.*`, disjoint from the
+  execution MCP `io.whs-redteam.execution.*` labels, so the execution
+  server orphan cleanup never matches a shell workroom.
+- Containers keep `--cap-drop ALL` with only `SETUID`/`SETGID` (privilege
+  drop to the policy uid/gid) and `KILL` (teardown signaling of demoted
+  trees) added back as a confined launcher privilege: a root supervisor
+  without `KILL` provably cannot signal a demoted child (`EPERM`), so
+  the set is exactly what teardown needs and nothing more. Model
+  children run demoted with zero effective capabilities, and adoption
+  requires exactly this set. The base images ship setuid-root binaries
+  (su, sudo, mount, ...), which no-new-privileges — set on every model
+  child before exec — neutralizes.
+- Scripts arrive on container stdin (`bash -s`, `python3 -`). The host
+  never interpolates script text into a shell command line.
+- Instance-installed programs stay inside that instance workroom and are
+  never auto-promoted to the shared catalog.
+
+## Build and pin
+
+- `docker build -t shell-workroom:<tag> deploy/docker/shell-workroom`
+- Push, resolve the digest, and record `repo@sha256:<digest>` as `image`
+  in the shell policy file. The validator also accepts a local immutable
+  image ID (`sha256:<64hex>`, directly usable by the Docker CLI) as a
+  pinned reference for local verification without a registry push.
+  `allow_unpinned_image` stays for genuinely unpinned dev use only, never
+  production; local tests set it explicitly with a small image.
+- `USER 65532:65532`, `WORKDIR /workroom`, `sleep infinity` as PID 1 so
+  `docker exec` sessions share one warm filesystem per workroom key.
+
+## Writable+exec surface
+
+- `/workroom` is the one writable+exec surface: the image ships it owned by
+  `65532:65532` (mode 1777), and the manager additionally best-effort
+  `chmod 1777`s it after start so foreign/test images work too. It lives on
+  the container filesystem, so binaries there execute and state survives
+  `docker stop`/`docker start`.
+- `/tmp` is a `noexec` tmpfs (sensitive area) and stays that way; never rely
+  on executing from `/tmp`.
+- Containers are created with `HOME=/workroom` and
+  `PYTHONUSERBASE=/workroom/.local`, and `/workroom/.local/bin` leads
+  `PATH`, so binaries an instance drops there resolve by bare name. Venv
+  `bin` dirs are inventoried too but run by absolute path (explicit
+  activation), never by guessing.
+- On Kali Python, PEP 668 marks the interpreter externally managed, so
+  `pip install --user` is rejected even with a writable HOME; the
+  verified per-instance path is `python3 -m venv --system-site-packages`
+  plus an offline (`--no-index`) install, which survives
+  `docker stop`/`docker start` like everything else under `/workroom`.
+- The network is still `--network none`, so only offline/local installs
+  work until TASK-005.
+- The Kali image ships the FR-003 baseline analysis set, installed FROM
+  `packages.txt` (the single source: nmap, curl, jq, git, dnsutils,
+  openssl, netcat-traditional, whois, tcpdump, sqlmap, wordlists, plus
+  the provider mechanism deps procps/util-linux and python3-venv /
+  python3-setuptools for the venv path). `program-manifest.json` is
+  GENERATED from that same file crossed with live `dpkg-query` on the
+  built image (`generate-manifest.py`), so versions, requested-to-
+  installed resolution (for example `dnsutils` to `bind9-dnsutils`),
+  per-command executables, and usable-mode notes never drift from what
+  the image actually contains. Verified usable modes under
+  `--cap-drop ALL`: `nmap -sT` (connect scan; `-sS` needs `CAP_NET_RAW`
+  and is unavailable), `tcpdump -r` file reads (live capture needs
+  `CAP_NET_RAW` and is unavailable). Program execution checks here are
+  LOCAL-ONLY (versions, loopback); replacement against real targets is
+  TASK-005/008.
+
+## Output caps (who wins)
+
+- The shell adapter caps each stream at the policy `max_output_bytes`
+  *during collection* (host memory stays bounded; `truncated` marks a
+  reached cap).
+- The gateway applies its own per-server serialized-output cut afterwards
+  (default 1MiB, exceeded output is omitted with an error). The shell cap
+  is the inner bound and normally wins because it is far smaller. The
+  shell assembly additionally passes an explicit outer limit derived from
+  the policy (two streams times worst-case JSON-escape headroom plus an
+  envelope) through the gateway per-server output-limits seam, so a
+  legitimate bounded result is never clipped by the outer cut first.
+
+## Cancel and restart scope
+
+- Every execution runs under a provisioned per-exec Python supervisor
+  that launches as container root and drops the model child to the
+  policy uid/gid with zero capabilities plus no-new-privileges before
+  exec (verified live: `id`, `CapEff: 0`, `NoNewPrivs: 1`; any drop
+  failure fails closed with no record, which the host reads as
+  uncertainty). The supervisor owns the interpreter child in its own
+  session, enforces the deadline (`TERM` then grace then `KILL` then
+  reap), and writes the result to a root-only directory the script
+  can neither read nor forge, so killing the supervisor fails and a
+  forged or stale file can never pass as the outcome. Completion
+  integrity: a missing record, an unprotected run, or non-empty
+  unreaped survivors are uncertainty, never clean results. A `124`
+  exit counts as a timeout only with no completed record, so a script
+  that exits `124`/`137` by itself is never misreported, and a fast
+  parent exit never masks a live background child (the supervisor
+  reaps the whole tree first). Cancel signals that supervisor and then
+  verifies nothing is left; a verified cancel frees its `max_jobs` slot
+  immediately, while an unverified one holds `cleanup-unknown` until a
+  deadline-confirmed supervisor lookup settles it (TTL alone never frees
+  a possibly-live budget). Supervisor loss after execution may have
+  started keeps the job `uncertain` (slot held, result flagged with the
+  common uncertain-execution marker) until a supervisor-verified outcome
+  or an authoritative container teardown settles it; a missing outcome
+  with a running or unreadable container never settles.
+  Detached children that escape session and tag together stay bounded by
+  the in-container timeout; `--init` reaps zombies.
+- A same-name container left by a dead process is adopted (started when
+  stopped) only after ownership/policy verification: managed/context
+  labels for the key plus live image, the expected network namespace,
+  the confined launcher caps (`ALL` dropped, only `SETUID`, `SETGID`,
+  and `KILL` added), `no-new-privileges`, user,
+  workdir, and resource bounds (memory, cpus, pids, tmpfs size) must all
+  match, otherwise reuse is rejected with
+  `shell_workroom_adoption_rejected` before the foreign container is
+  started, set up, or removed. `max_workrooms` is enforced against the
+  label-filtered `docker ps -a` count, with the count-plus-create section
+  serialized by a same-host OS file lock and fail-closed on unreadable
+  daemon answers. Process-local job objects can be rebuilt from protected
+  manifests, supervisor records, and bounded output spools after a restart.
+  A recovered job-start reference returns the original submit acknowledgement;
+  background completion and cancellation are read through job status. Missing
+  or unverifiable execution records remain held and never authorize a rerun.
+
+## Policy
+
+See `deploy/shell-workroom/policy.example.json`. Copy it, set the pinned
+image digest and operator limits, and hand it to
+`shell_assembly.build_shell_entries`. When no policy is configured the
+assembler skips the helper and the catalog honestly has no shell tools.
+
+## Validate locally (no remote targets)
+
+- `SHELL_TEST_IMAGE=python:3.11-slim pytest tests/integration/test_shell_workroom_docker.py -q`
+- `SHELL_KALI_IMAGE=shell-workroom:t003-draft pytest tests/integration/test_shell_workroom_docker.py -q -k kali`
+  runs the Kali-gated subset (offline program runs, manifest round-trip,
+  venv/restart, foreign UID) against the built image.
+- The isolation test reads the container-local interface list only; it
+  sends no packets anywhere.
+
+## Assembly seam (catalog owner)
+
+- `registry.replace_server_tools(SHELL_SERVER_ID, descriptors)`
+- `adapters[SHELL_SERVER_ID] = adapter`
+- `operation_bindings[str(tool_id)] = tuple(descriptor.operations)` per tool
+- Full snippet lives in the `shell_assembly` module docstring.

@@ -6,7 +6,7 @@ import asyncio
 from datetime import datetime, timedelta, timezone
 from typing import cast
 
-from redteam.core.ids import RunId
+from redteam.core.ids import AgentInstanceId, RunId
 from redteam.orchestration.work.models import (
     TaskLease,
     WorkItem,
@@ -17,6 +17,7 @@ from redteam.orchestration.work.rules import (
     blocked_for_dependency,
     can_bind,
     decide_add,
+    decide_execution_reconcile,
     decide_reconcile,
     expired_lease_ids,
     failed_item,
@@ -232,6 +233,33 @@ class InMemoryWorkStore:
     async def reconcile_job(self, work_id: str, *, job_id: str, status: str, now: datetime) -> bool:
         async with self._lock:
             applied, decided = decide_reconcile(self._items.get(work_id), job_id, status, now)
+            if not applied:
+                return False
+            if decided is not None:
+                self._items[work_id] = decided
+            self._leases.pop(work_id, None)
+            return True
+
+    async def reconcile_execution(
+        self,
+        work_id: str,
+        *,
+        run_id: RunId,
+        instance_id: AgentInstanceId | None,
+        candidate_key: str,
+        status: str,
+        now: datetime,
+    ) -> bool:
+        async with self._lock:
+            applied, decided = decide_execution_reconcile(
+                self._items.get(work_id),
+                self._leases.get(work_id),
+                run_id=run_id,
+                instance_id=instance_id,
+                candidate_key=candidate_key,
+                status=status,
+                now=now,
+            )
             if not applied:
                 return False
             if decided is not None:

@@ -9,7 +9,12 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
 
+from redteam.capability.card_view import (
+    cards_from_descriptors,
+    tool_detail_from_descriptor,
+)
 from redteam.core.contracts.tool import ToolDescriptor, ToolError, ToolInvocation, ToolResult
+from redteam.core.ports.tool_catalog import ToolCard, ToolCardKind, ToolDetail
 
 
 class DummyToolGateway:
@@ -51,6 +56,28 @@ class DummyToolGateway:
 
     def all_descriptors(self) -> list[ToolDescriptor]:
         return list(self._tools)
+
+    def list_cards(
+        self,
+        *,
+        kind: ToolCardKind | None = None,
+        capability: str | None = None,
+        query: str | None = None,
+        include_unhealthy: bool = False,
+    ) -> list[ToolCard]:
+        return cards_from_descriptors(
+            self._tools,
+            kind=kind,
+            capability=capability,
+            query=query,
+            include_unhealthy=include_unhealthy,
+        )
+
+    def get_detail(self, tool_id: Any) -> ToolDetail | None:
+        descriptor = self.get(tool_id)
+        if descriptor is None:
+            return None
+        return tool_detail_from_descriptor(descriptor)
 
     async def invoke(self, invocation: ToolInvocation) -> ToolResult:
         self.invocations.append(invocation)

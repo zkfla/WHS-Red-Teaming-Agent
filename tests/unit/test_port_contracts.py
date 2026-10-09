@@ -9,6 +9,9 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
+import pytest
+from pydantic import ValidationError
+
 from redteam.core.contracts.action import ActionProposal
 from redteam.core.contracts.policy import ControlContext
 from redteam.core.contracts.target import HostTarget
@@ -64,6 +67,18 @@ async def test_dummy_tool_gateway_satisfies_protocol() -> None:
     )
     result = await gateway.invoke(invocation)
     assert result.invocation_id == invocation.invocation_id
+
+
+@pytest.mark.parametrize("timeout", [float("nan"), float("inf"), float("-inf"), 0, -1])
+def test_invalid_invocation_deadline_is_rejected_before_gateway(timeout: float) -> None:
+    with pytest.raises(ValidationError, match="finite and > 0"):
+        ToolInvocation(
+            invocation_id=InvocationId("invalid-deadline"), action_id=ActionId("action_1"),
+            run_id=RunId("run_1"), tool_id=ToolId("recon.ping"), timeout_seconds=timeout,
+            execution_context=ExecutionContext(
+                engagement_id=EngagementId("eng_1"), run_id=RunId("run_1"),
+            ), created_at=datetime.now(timezone.utc),
+        )
 
 
 async def test_fake_evidence_store_satisfies_protocol() -> None:

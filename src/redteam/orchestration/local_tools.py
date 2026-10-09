@@ -63,13 +63,20 @@ class LocalToolContext:
 
 @dataclass(frozen=True)
 class LocalToolDescriptor:
-    """Exposed under local_tools, apart from remote target tools."""
+    """Exposed under local_tools, apart from remote target tools.
+
+    bootstrap marks helpers whose job is discovery itself (card search and
+    detail lookup): the model node always advertises those schemas so every
+    other helper stays reachable through lookup. The flag is declared by
+    the owning contribution, never by a central name list.
+    """
 
     tool_id: str
     description: str
     input_schema: dict[str, Any] = field(default_factory=dict)
     contribution_id: str = ""
     version: str = RUNTIME_TOOL_CONTRIBUTION_VERSION
+    bootstrap: bool = False
 
 
 @dataclass(frozen=True)

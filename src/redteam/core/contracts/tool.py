@@ -7,11 +7,14 @@ touches it. External MCP SDK objects never cross this boundary.
 
 from __future__ import annotations
 
+import math
+from collections.abc import Mapping
 from datetime import datetime
 from typing import Any
 
 from pydantic import BaseModel, Field, model_validator
 
+from redteam.core.contracts.target import TargetRef
 from redteam.core.enums import RiskLevel, ToolHealthStatus
 from redteam.core.ids import (
     ActionId,
@@ -39,6 +42,29 @@ PROVIDER_METADATA_TARGET_BINDING = "redteam.target_binding"
 PROVIDER_METADATA_REQUIRES_TARGET = "redteam.requires_target"
 PROVIDER_METADATA_COMMAND_FIELDS = "redteam.command_fields"
 PROVIDER_METADATA_AVAILABILITY_IMPACT = "redteam.availability_impact"
+
+# Providers attach this when execution may have produced effects but its
+# terminal outcome cannot be established. This is independent of success,
+# retryability and exception ownership; consumers reconcile the original
+# invocation before submitting it again.
+EXECUTION_UNCERTAIN_METADATA_KEY = "execution_uncertain"
+# An explicit False proves the provider invocation was never entered. True
+# reports entry at the execution boundary, not a successful external effect.
+EXECUTION_STARTED_METADATA_KEY = "execution_started"
+
+
+def execution_outcome_uncertain(metadata: Mapping[str, Any]) -> bool:
+    """Read uncertainty, using an explicit pre-entry proof for legacy errors.
+
+    A contradictory explicit uncertainty declaration remains held; an
+    orchestration exception alone cannot override proved non-entry.
+    """
+
+    if metadata.get(EXECUTION_UNCERTAIN_METADATA_KEY) is True:
+        return True
+    if metadata.get(EXECUTION_STARTED_METADATA_KEY) is False:
+        return False
+    return bool(metadata.get("orchestration_exception"))
 
 
 class ToolDescriptor(BaseModel):
@@ -105,6 +131,9 @@ class ExecutionContext(BaseModel):
     run_id: RunId
     agent_id: AgentId | None = None
     instance_id: AgentInstanceId | None = None
+    # Mechanically copied from the ALLOW proposal by the application.
+    # Provider target windows cannot infer this authority from a script.
+    approved_target: TargetRef | None = None
     correlation_id: str | None = None
     dry_run: bool = False
 
@@ -125,8 +154,8 @@ class ToolInvocation(BaseModel):
 
     @model_validator(mode="after")
     def _timeout_must_be_positive(self) -> ToolInvocation:
-        if self.timeout_seconds <= 0:
-            raise ValueError("timeout_seconds must be > 0")
+        if not math.isfinite(self.timeout_seconds) or self.timeout_seconds <= 0:
+            raise ValueError("timeout_seconds must be finite and > 0")
         if self.binding_mode == SELECTED_TOOL and self.operation:
             raise ValueError("selected_tool invocation must leave operation empty")
         return self

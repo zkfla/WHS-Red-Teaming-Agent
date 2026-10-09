@@ -53,7 +53,13 @@ from redteam.app.cli._shared import (
     mask_secrets,
 )
 from redteam.app.cli.conversation import ConversationAssistant, catalog_tool_labels
-from redteam.capability.settings import MCPConfigurationError
+from redteam.capability.settings import (
+    MCPConfigurationError,
+    gated_network_policy_path_from_environment,
+    shell_policy_path_from_environment,
+)
+from redteam.capability.shell_assembly import build_gated_provider_config
+from redteam.capability.shell_runtime import build_shell_runtime
 from redteam.core.config import AppConfig
 from redteam.core.contracts.events import EventEnvelope, EventType
 from redteam.core.enums import ApprovalStatus, OperatorIntentType
@@ -751,7 +757,20 @@ async def build(
     underway -- exactly what ``run()`` below does, unchanged from
     before this was split out.
     """
-    if not config.capability.mcp_servers:
+    # Builtin shell provider: one capability-owned assembly shared with
+    # resume/tools. None means disabled (honest catalog without shell tools);
+    # an invalid policy raises MCPConfigurationError for the config-error path.
+    # Resolved before the empty-catalog warning so a shell-only run does not warn.
+    shell_runtime = build_shell_runtime(shell_policy_path_from_environment())
+    gated_provider_config = build_gated_provider_config(
+        gated_network_policy_path_from_environment()
+    )
+    if gated_provider_config is not None and shell_runtime is None:
+        raise MCPConfigurationError(
+            "gated network policy requires the shell provider: set "
+            "REDTEAM_SHELL_POLICY_PATH"
+        )
+    if not config.capability.mcp_servers and shell_runtime is None:
         eprint(
             "WARNING: no MCP servers configured -- this run has an empty tool catalog "
             "and cannot execute any Action. Set REDTEAM_MCP_SERVERS (comma-separated "
@@ -768,6 +787,15 @@ async def build(
         component_options["component_profile"] = component_profile
     if component_registry is not None:
         component_options["component_registry"] = component_registry
+    if shell_runtime is not None:
+        component_options["builtin_adapters"] = [shell_runtime.adapter]
+        component_options["builtin_concurrency"] = dict(shell_runtime.concurrency)
+        component_options["builtin_output_limits"] = dict(shell_runtime.output_limits)
+        component_options["shell_programs"] = shell_runtime.program_source
+    if gated_provider_config is not None:
+        # ONLY when the operator network policy is configured (absent means
+        # closed): the composition root validates the same builtin adapter.
+        component_options["gated_shell"] = (shell_runtime, gated_provider_config)
     return await build_application(
         config,
         orchestration_settings=orchestration_settings,

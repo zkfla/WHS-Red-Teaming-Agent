@@ -33,6 +33,7 @@ from redteam.orchestration.native_local_tools import (
 )
 from redteam.orchestration.settings import OrchestrationSettings
 from redteam.orchestration.state import TerminationReason
+from redteam.orchestration.tool_discovery import TOOL_GET_DETAIL_ID, TOOL_LIST_CARDS_ID
 
 # Synthetic lab identity, matching the scope's target alias.
 _LAB_TARGET_REF = "bank-lab"
@@ -68,6 +69,35 @@ def _executed_evidence_ids(messages: list[dict[str, Any]]) -> list[str]:
     return found
 
 
+def _harvest_lab_cards(messages: list[dict[str, Any]]) -> dict[str, set[str]]:
+    """Collect (tool_name -> tool_ids) from card list results seen so far.
+
+    Same card payload shape the approved-MCP SessionLLM harvests, duplicated
+    here because the compose gate mounts only this example file (no tests/
+    tree), so the example must stay self-contained.
+    """
+    found: dict[str, set[str]] = {}
+    for message in messages or []:
+        if not isinstance(message, dict) or message.get("role") != "tool":
+            continue
+        try:
+            body = json.loads(message.get("content") or "{}")
+        except ValueError:
+            continue
+        payload = body.get("payload") if isinstance(body, dict) else None
+        cards = payload.get("cards") if isinstance(payload, dict) else None
+        if not isinstance(cards, list):
+            continue
+        for card in cards:
+            if not isinstance(card, dict):
+                continue
+            name = card.get("tool_name")
+            identity = card.get("tool_id")
+            if isinstance(name, str) and isinstance(identity, str):
+                found.setdefault(name, set()).add(identity)
+    return found
+
+
 def _tool_result(messages: list[dict[str, Any]], call_id: str) -> dict[str, Any] | None:
     for message in messages:
         if message.get("role") != "tool" or message.get("tool_call_id") != call_id:
@@ -94,6 +124,8 @@ class _ScriptedLabModel:
     def __init__(self) -> None:
         self.calls: list[dict[str, Any]] = []
         self.turns = 0
+        self._listed = False
+        self._details_requested = False
         self._remote_sequence: list[tuple[str, dict[str, Any]]] = []
         self._issued_remote: list[str] = []
         self._settlement_evidence: list[str] = []
@@ -202,14 +234,59 @@ class _ScriptedLabModel:
         sequence = self._remote_sequence
         assert sequence, "lab model needs the registered tool ids injected before run"
         names = _exposed_names(tools)
+        list_name = exposed_tool_name(TOOL_LIST_CARDS_ID)
+        detail_name = exposed_tool_name(TOOL_GET_DETAIL_ID)
+        self.turns += 1
+        if not self._listed:
+            # Lazy discovery-request contract (same as the approved-MCP
+            # SessionLLM): remote tools are advertised only after the model
+            # asks for cards and then for each needed schema.
+            assert list_name in names, "native model needs the card discovery helper"
+            assert detail_name in names, "native model needs the detail lookup helper"
+            self._listed = True
+            self.calls.append({"turn": self.turns, "tool_calls": ["list"]})
+            return NativeCompletion(
+                tool_calls=(
+                    NativeToolCall(
+                        call_id="call-lab-list",
+                        name=list_name,
+                        arguments={"kind": "mcp_tool"},
+                    ),
+                ),
+                text="",
+            )
+        if not self._details_requested:
+            advertised = {
+                tool_id
+                for ids in _harvest_lab_cards(messages).values()
+                for tool_id in ids
+            }
+            for tool_id, _ in sequence:
+                assert tool_id in advertised, (
+                    f"native model needs the advertised lab tool: {tool_id}"
+                )
+            self._details_requested = True
+            self.calls.append({"turn": self.turns, "tool_calls": ["detail"]})
+            return NativeCompletion(
+                tool_calls=tuple(
+                    NativeToolCall(
+                        call_id=f"call-lab-detail-{index + 1}",
+                        name=detail_name,
+                        arguments={"tool_id": tool_id},
+                    )
+                    for index, (tool_id, _) in enumerate(sequence)
+                ),
+                text="",
+            )
         remote = [exposed_tool_name(tool_id) for tool_id, _ in sequence]
         for index, (tool_id, _) in enumerate(sequence):
             assert remote[index] in names, f"native model needs the registered lab tool: {tool_id}"
         task_tool = exposed_tool_name(TASK_SETTLE_TOOL_ID)
         goal_tool = exposed_tool_name(GOAL_SETTLE_TOOL_ID)
-        assert task_tool in names, "native model needs the task settlement helper"
-        assert goal_tool in names, "native model needs the goal settlement helper"
-        self.turns += 1
+        # Settlement helpers are local tools: bindings resolve them by
+        # registered name even when lazy discovery has not advertised their
+        # schemas, so no advertisement assert here (unlike the remote MCP
+        # tools above, which must be advertised before first use).
         settled = [
             call_id
             for call_id in self._issued_remote

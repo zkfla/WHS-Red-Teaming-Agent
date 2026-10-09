@@ -16,7 +16,9 @@ from redteam.core.ports.attack_graph import AttackGraphStore
 from redteam.core.ports.control_plane import ControlPlane
 from redteam.core.ports.event_bus import EventBus, EventHistory
 from redteam.core.ports.evidence_store import EvidenceStore
+from redteam.core.ports.execution_recovery import ExecutionRecoveryProvider
 from redteam.core.ports.llm import LLMClient
+from redteam.core.ports.program_discovery import ShellProgramDiscovery
 from redteam.core.ports.task_graph import MissionTaskStore
 from redteam.core.ports.tool_catalog import ToolCatalog
 from redteam.core.ports.tool_gateway import ToolGateway
@@ -61,6 +63,7 @@ class RuntimeDeps:
     verifier: AnalysisVerifier | None = None
     path_store: PathStore = field(default_factory=InMemoryPathStore)
     long_job_adapter: LongJobAdapter | None = None
+    execution_recovery: ExecutionRecoveryProvider | None = None
     engagement: Engagement | None = None
 
     agents: AgentRegistry = field(default_factory=default_registry)
@@ -110,6 +113,10 @@ class RuntimeDeps:
     execution_recipes: dict[str, ExecutionRecipeSpec] = field(default_factory=dict, compare=False)
     retry_policy: RetryPolicy | None = field(default=None, compare=False)
     local_tools: LocalToolRegistry = field(default_factory=LocalToolRegistry, compare=False)
+    #: Shell program discovery (TASK-004 cards over the TASK-003 provider).
+    #: None until the composition root injects the provider (TASK-008);
+    #: discovery reports the unwired status explicitly instead of hiding it.
+    shell_programs: ShellProgramDiscovery | None = field(default=None, compare=False)
 
     def __post_init__(self) -> None:
         if self.verifier is None:

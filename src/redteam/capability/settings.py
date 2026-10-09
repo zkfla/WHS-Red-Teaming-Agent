@@ -271,6 +271,53 @@ def mcp_server_ids_from_environment(
     return mcp_server_list(source, env_var)
 
 
+SHELL_POLICY_ENV_VAR = "REDTEAM_SHELL_POLICY_PATH"
+
+
+def shell_policy_path_from_environment(
+    *, source: Mapping[str, str] | None = None
+) -> str | None:
+    """Operator-owned shell-workroom policy file, or None when disabled.
+
+    A single absolute JSON file path read from REDTEAM_SHELL_POLICY_PATH.
+    Unset or blank means the builtin shell provider stays off: callers skip
+    the shell assembly and the catalog honestly lacks shell tools, never a
+    silent default policy. A set value is returned stripped; the policy
+    loader (not this function) validates the file contents.
+    """
+    from redteam.core.environment import env_snapshot
+
+    raw = env_snapshot(source).get(SHELL_POLICY_ENV_VAR)
+    if raw is None:
+        return None
+    path = raw.strip()
+    return path or None
+
+
+GATED_NETWORK_POLICY_ENV_VAR = "REDTEAM_GATED_NETWORK_POLICY_PATH"
+
+
+def gated_network_policy_path_from_environment(
+    *, source: Mapping[str, str] | None = None
+) -> str | None:
+    """Operator-owned gated-network policy file, or None when closed.
+
+    A single absolute JSON file path read from
+    REDTEAM_GATED_NETWORK_POLICY_PATH. Unset or blank means gated egress
+    stays closed: callers pass no gated provider into the composition root
+    and the shell keeps its network-closed local-script path, never a
+    silent default policy. A set value is returned stripped; the gated
+    policy assembly (not this function) validates the file contents.
+    """
+    from redteam.core.environment import env_snapshot
+
+    raw = env_snapshot(source).get(GATED_NETWORK_POLICY_ENV_VAR)
+    if raw is None:
+        return None
+    path = raw.strip()
+    return path or None
+
+
 def environment_prefix(server_id: str) -> str:
     if not _SAFE_SERVER_ID.fullmatch(server_id):
         raise MCPConfigurationError("MCP server IDs must use lowercase kebab-case")

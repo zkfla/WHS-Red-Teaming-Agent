@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from typing import Any
 
 from redteam.attack_graph.observation import GraphObservation
 from redteam.core.contracts.events import EventType
@@ -79,67 +80,127 @@ async def observe_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
     else:
         fingerprint = runtime.last_progress_fingerprint
     task_id = runtime.active_task_id
+    claimed_agent: Any | None = None
     if runtime.mission_id is not None:
-        from redteam.orchestration.operator_intents.service import _is_suppressed
-
-        mission = await deps.task_graph_store.get_mission(runtime.mission_id)
-        tasks = await deps.task_graph_store.list_tasks(mission_id=runtime.mission_id)
-        # Dependency readiness is bookkeeping, not a strategy decision. Only
-        # release tasks already registered by the operator/planning layer.
-        by_id = {item.task_id: item for item in tasks}
-        for item in tasks:
-            if item.status not in {TaskStatus.PENDING, TaskStatus.BLOCKED}:
-                continue
-            if mission is not None and _is_suppressed(item, mission):
-                continue
-            if not item.dependency_task_ids:
-                continue
-            if not all(
-                identity in by_id and by_id[identity].status is TaskStatus.COMPLETED
-                for identity in item.dependency_task_ids
-            ):
-                continue
-            if item.status is TaskStatus.PENDING:
-                await deps.task_graph_store.transition_task(
-                    item.task_id, TaskStatus.READY, now=datetime.now(timezone.utc)
-                )
-            elif item.blocking_reason == "required dependency is blocked":
-                await deps.task_graph_store.unblock_task(
-                    item.task_id, now=datetime.now(timezone.utc)
-                )
-                event = await publisher.publish(
-                    EventType.TASK_UNBLOCKED,
-                    {"task_id": item.task_id, "reason": "dependencies_completed"},
-                    causation_id=last_event_id,
-                )
-                last_event_id = event.event_id
-        tasks = await deps.task_graph_store.list_tasks(mission_id=runtime.mission_id)
-        task = next(
-            (
-                item
-                for item in tasks
-                if item.status in {TaskStatus.READY, TaskStatus.RUNNING}
-                and (mission is None or not _is_suppressed(item, mission))
-            ),
-            None,
+        from redteam.orchestration.coordination import (
+            CLOSED,
+            StateConflict,
+            coordinator_for,
         )
-        task_id = task.task_id if task else None
-        if task is not None:
-            task_id = task.task_id
-            if task.status is TaskStatus.READY:
-                await deps.task_graph_store.transition_task(
-                    task.task_id,
-                    TaskStatus.RUNNING,
-                    now=datetime.now(timezone.utc),
-                )
-                event = await publisher.publish(
-                    EventType.TASK_STARTED,
-                    {"mission_id": runtime.mission_id, "task_id": task.task_id},
-                    causation_id=last_event_id,
-                )
-                last_event_id = event.event_id
+        from redteam.orchestration.operator_intents.service import _is_suppressed
+        from redteam.orchestration.task_graph.claim import claim_mission_task
+
+        owner = runtime.work_owner
+        now = datetime.now(timezone.utc)
+        coordinator = deps.coordinator or coordinator_for(
+            deps.task_graph_store, deps.path_store
+        )
+
+        def _role_ok(item: Any) -> bool:
+            # ``assigned_agent`` is a role, never an instance owner. An
+            # instance only takes tasks of its own role (or unassigned
+            # ones); it never seizes another role's task.
+            assigned = getattr(item, "assigned_agent", None)
+            if assigned is None or runtime.current_agent is None:
+                return True
+            return str(assigned) == str(runtime.current_agent)
+
+        async def _claim_next(change: Any) -> dict[str, Any]:
+            # One fresh transactional view: readiness bookkeeping and the
+            # instance-targeted claim commit together or not at all. No
+            # outside I/O runs in here; events publish after the commit.
+            mission = change.tasks.peek_mission(runtime.mission_id)
+            if mission is None or mission.status in CLOSED:
+                return {
+                    "task_id": None,
+                    "assigned_agent": None,
+                    "readied": [],
+                    "unblocked": [],
+                    "started": False,
+                }
+            staged = await change.tasks.list_tasks(mission_id=runtime.mission_id)
+            # Dependency readiness is bookkeeping, not a strategy decision.
+            # Only release tasks already registered by the operator/planning
+            # layer.
+            by_id = {item.task_id: item for item in staged}
+            readied: list[Any] = []
+            unblocked: list[Any] = []
+            for item in staged:
+                if item.status not in {TaskStatus.PENDING, TaskStatus.BLOCKED}:
+                    continue
+                if _is_suppressed(item, mission):
+                    continue
+                if not item.dependency_task_ids:
+                    continue
+                if not all(
+                    identity in by_id
+                    and by_id[identity].status is TaskStatus.COMPLETED
+                    for identity in item.dependency_task_ids
+                ):
+                    continue
+                if item.status is TaskStatus.PENDING:
+                    await change.tasks.transition_task(
+                        item.task_id, TaskStatus.READY, now=now
+                    )
+                    readied.append(item.task_id)
+                elif item.blocking_reason == "required dependency is blocked":
+                    await change.tasks.unblock_task(item.task_id, now=now)
+                    unblocked.append(item.task_id)
+            staged = await change.tasks.list_tasks(mission_id=runtime.mission_id)
+            candidates = [
+                item
+                for item in staged
+                if item.status in {TaskStatus.READY, TaskStatus.RUNNING}
+                and not _is_suppressed(item, mission)
+                and _role_ok(item)
+            ]
+            # Prefer the already-active task so an instance sticks to its
+            # own work instead of hopping between tasks each turn.
+            if task_id is not None:
+                candidates.sort(key=lambda item: (item.task_id != task_id))
+            for item in candidates:
+                try:
+                    claimed = await claim_mission_task(
+                        change, item.task_id, owner=owner, now=now
+                    )
+                except StateConflict:
+                    continue
+                return {
+                    "task_id": claimed.task_id,
+                    "assigned_agent": getattr(claimed, "assigned_agent", None),
+                    "readied": readied,
+                    "unblocked": unblocked,
+                    "started": item.status is TaskStatus.READY,
+                }
+            return {
+                "task_id": None,
+                "assigned_agent": None,
+                "readied": readied,
+                "unblocked": unblocked,
+                "started": False,
+            }
+
+        result = await coordinator.change(_claim_next)
+        task_id = result["task_id"]
+        for item_id in result["unblocked"]:
+            event = await publisher.publish(
+                EventType.TASK_UNBLOCKED,
+                {"task_id": item_id, "reason": "dependencies_completed"},
+                causation_id=last_event_id,
+            )
+            last_event_id = event.event_id
+        if task_id is not None and result["started"]:
+            event = await publisher.publish(
+                EventType.TASK_STARTED,
+                {"mission_id": runtime.mission_id, "task_id": task_id},
+                causation_id=last_event_id,
+            )
+            last_event_id = event.event_id
+        claimed_agent = result["assigned_agent"]
     # This selects the coordinator identity, not a tool, strategy or first scan.
     agent = deps.agents.get(runtime.current_agent) if runtime.current_agent else None
+    if agent is None and claimed_agent is not None:
+        agent = deps.agents.get(claimed_agent)
     agent = agent or next(iter(deps.agents.all()), None)
     if agent is None:
         return advance(

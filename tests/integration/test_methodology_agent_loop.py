@@ -50,6 +50,7 @@ from redteam.orchestration.native_local_tools import (
 from redteam.orchestration.runner import AgentLoopRunner
 from redteam.orchestration.settings import OrchestrationSettings
 from redteam.orchestration.state import TerminationReason
+from redteam.orchestration.tool_discovery import TOOL_GET_DETAIL_ID
 from tests.integration.test_methodology_workspace import configure
 from tests.unit.test_methodology import (  # noqa: F401
     fixture_source,
@@ -311,7 +312,23 @@ class MethodologyNativeLLM:
             tool_id = str(choice.get("tool_id") or "analysis.read_file")
             exposed = exposed_tool_name(tool_id)
             names = {str(getattr(spec, "name", "")) for spec in tools}
-            assert exposed in names, "methodology reader missing from tools"
+            detail = exposed_tool_name(TOOL_GET_DETAIL_ID)
+            if exposed not in names:
+                # FR-006 lazy discovery: only the bootstrap navigators are
+                # advertised up front. Fetch the reader schema through the
+                # real tool.get_detail navigator; it becomes callable next
+                # turn. No schema revert, no fresh instance.
+                assert detail in names, "methodology detail navigator missing from tools"
+                return NativeCompletion(
+                    tool_calls=(
+                        NativeToolCall(
+                            call_id=f"meth-detail-{uuid.uuid4().hex[:8]}",
+                            name=detail,
+                            arguments={"tool_id": tool_id},
+                        ),
+                    ),
+                    text="",
+                )
             call_id = f"meth-read-{uuid.uuid4().hex[:8]}"
             args = dict(choice.get("arguments") or {})
             return NativeCompletion(
@@ -324,7 +341,20 @@ class MethodologyNativeLLM:
         names = {str(getattr(spec, "name", "")) for spec in tools}
         task_tool = exposed_tool_name(TASK_SETTLE_TOOL_ID)
         goal_tool = exposed_tool_name(GOAL_SETTLE_TOOL_ID)
-        if evidenced and task_tool in names and self._task_call is None:
+        detail = exposed_tool_name(TOOL_GET_DETAIL_ID)
+        if evidenced and self._task_call is None:
+            if task_tool not in names:
+                assert detail in names, "methodology detail navigator missing from tools"
+                return NativeCompletion(
+                    tool_calls=(
+                        NativeToolCall(
+                            call_id=f"meth-detail-{uuid.uuid4().hex[:8]}",
+                            name=detail,
+                            arguments={"tool_id": TASK_SETTLE_TOOL_ID},
+                        ),
+                    ),
+                    text="",
+                )
             self._task_call = f"meth-task-{uuid.uuid4().hex[:8]}"
             return NativeCompletion(
                 tool_calls=(
@@ -343,6 +373,18 @@ class MethodologyNativeLLM:
         if self._task_call is not None:
             seen = _tool_result(messages, self._task_call)
             if seen is not None and seen.get("ok") is True:
+                if self._goal_call is None and goal_tool not in names:
+                    assert detail in names, "methodology detail navigator missing from tools"
+                    return NativeCompletion(
+                        tool_calls=(
+                            NativeToolCall(
+                                call_id=f"meth-detail-{uuid.uuid4().hex[:8]}",
+                                name=detail,
+                                arguments={"tool_id": GOAL_SETTLE_TOOL_ID},
+                            ),
+                        ),
+                        text="",
+                    )
                 if goal_tool in names and self._goal_call is None:
                     self._goal_call = f"meth-goal-{uuid.uuid4().hex[:8]}"
                     return NativeCompletion(
@@ -607,7 +649,9 @@ async def test_reference_partial_read_survives_durable_rebuild_and_human_decisio
             stopped.pending_approval_id, ApprovalStatus.APPROVED, "fixture-human"
         )
         runner = AgentLoopRunner(deps, settings=settings)
-        recovered = await runner.recover_runtime(stopped.run_id)
+        recovered = await runner.recover_runtime(
+            stopped.run_id, instance_id=stopped.instance_id
+        )
         assert recovered is not None
         partial = await runner.resume_recovered(recovered)
         assert partial.termination_reason == TerminationReason.APPROVAL_PENDING
@@ -629,7 +673,9 @@ async def test_reference_partial_read_survives_durable_rebuild_and_human_decisio
             require_approval=True,
         )
         runner = AgentLoopRunner(rebuilt, settings=settings)
-        recovered = await runner.recover_runtime(partial.run_id)
+        recovered = await runner.recover_runtime(
+            partial.run_id, instance_id=partial.instance_id
+        )
         assert recovered is not None
         assert recovered.pending_approval_id == partial.pending_approval_id
         waiting = await runner.resume_recovered(recovered)

@@ -12,20 +12,39 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Collection, Mapping
+from collections.abc import Callable, Collection, Mapping
 from datetime import datetime, timezone
 from typing import Any
 
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import SchemaError, ValidationError
 
-from redteam.capability.adapters.mcp.base import MCPAdapter, MCPCallResult
-from redteam.capability.adapters.mcp.scoped_analysis import ScopedAnalysisMCPAdapter
+from redteam.capability.adapters.mcp.base import (
+    ContextualInvocationAdapter,
+    InvocationContextBinder,
+    MCPAdapter,
+    MCPCallResult,
+)
 from redteam.capability.catalog import MCPToolCatalog, ToolCandidateMetadata
 from redteam.capability.registry import MCPToolRegistry
-from redteam.core.contracts.tool import ToolDescriptor, ToolError, ToolInvocation, ToolResult
+from redteam.core.contracts.execution import (
+    ExecutionRecoveryAnswer,
+    ExecutionReference,
+    ExecutionState,
+)
+from redteam.core.contracts.tool import (
+    EXECUTION_STARTED_METADATA_KEY,
+    EXECUTION_UNCERTAIN_METADATA_KEY,
+    ToolDescriptor,
+    ToolError,
+    ToolInvocation,
+    ToolResult,
+)
+from redteam.core.convert import execution_input_digest
 from redteam.core.enums import ToolHealthStatus
 from redteam.core.ids import ToolId
+from redteam.core.ports.execution_recovery import ExecutionRecoveryProvider
+from redteam.core.ports.tool_catalog import ToolCard, ToolCardKind, ToolDetail
 from redteam.core.ports.tool_gateway import BeforeToolStart, ToolStartRejected
 from redteam.core.tool_binding import SELECTED_TOOL
 
@@ -197,12 +216,125 @@ class MCPToolGateway:
     async def invoke(self, invocation: ToolInvocation) -> ToolResult:
         return await self._invoke(invocation)
 
+    def prepare_reference(self, invocation: ToolInvocation) -> ExecutionReference | None:
+        """Derive a recovery handle without invoking or probing any provider."""
+        descriptor = self._catalog.get(invocation.tool_id)
+        if descriptor is None or invocation.execution_context.dry_run:
+            return None
+        adapter = self._adapters.get(descriptor.server_id)
+        if not isinstance(adapter, ExecutionRecoveryProvider):
+            return None
+        if (invocation.binding_mode != SELECTED_TOOL
+            and not self._catalog.supports(invocation.tool_id, invocation.operation)):
+            raise ValueError("execution_reference_operation_mismatch")
+        bound = self._bind_invocation(invocation, descriptor, adapter)
+        if isinstance(bound, ToolResult):
+            raise ValueError("execution_reference_context_invalid")
+        reference = adapter.prepare_reference(bound)
+        if reference is not None:
+            expected = {
+                "engagement_id": bound.execution_context.engagement_id,
+                "run_id": bound.run_id,
+                "instance_id": bound.execution_context.instance_id,
+                "action_id": bound.action_id,
+                "invocation_id": bound.invocation_id,
+                "tool_id": bound.tool_id,
+                "input_digest": execution_input_digest(bound),
+            }
+            if any(getattr(reference, key) != value for key, value in expected.items()):
+                raise ValueError("execution_reference_identity_mismatch")
+        return reference
+
+    def _recovery_provider(self, reference: ExecutionReference) -> ExecutionRecoveryProvider | None:
+        descriptor = self._catalog.get(reference.tool_id)
+        adapter = self._adapters.get(descriptor.server_id) if descriptor is not None else None
+        return adapter if isinstance(adapter, ExecutionRecoveryProvider) else None
+
+    async def query_execution(self, reference: ExecutionReference) -> ExecutionRecoveryAnswer:
+        provider = self._recovery_provider(reference)
+        if provider is None:
+            return ExecutionRecoveryAnswer(
+                state=ExecutionState.UNKNOWN,
+                error=ToolError(code="execution_recovery_unavailable",
+                                message="the registered provider cannot recover this execution"),
+            )
+        try:
+            return await asyncio.wait_for(provider.query_execution(reference),
+                                          timeout=self._health_refresh_timeout)
+        except Exception as exc:
+            return ExecutionRecoveryAnswer(
+                state=ExecutionState.UNKNOWN,
+                error=ToolError(code="execution_recovery_query_failed",
+                                message="provider execution state could not be verified",
+                                details={"exception_type": type(exc).__name__[:100]}),
+            )
+
+    async def fetch_execution(self, reference: ExecutionReference) -> ToolResult | None:
+        provider = self._recovery_provider(reference)
+        if provider is None:
+            return None
+        # Failures propagate to the recovery consumer, which must preserve
+        # its unsettled receipt. Absence never authorizes another invocation.
+        result = await asyncio.wait_for(provider.fetch_execution(reference),
+                                        timeout=self._health_refresh_timeout)
+        if result is None:
+            return None
+        if (result.invocation_id != reference.invocation_id
+            or result.action_id != reference.action_id or result.tool_id != reference.tool_id):
+            raise ValueError("execution_recovery_result_identity_mismatch")
+        descriptor = self._catalog.get(reference.tool_id)
+        if descriptor is None:
+            return None
+        limit = self._server_output_limits[descriptor.server_id]
+        if _serialized_output_size(result.output) > limit:
+            raise ValueError("execution_recovery_output_too_large")
+        if result.success and descriptor.output_schema is not None:
+            Draft202012Validator(descriptor.output_schema).validate(result.output)
+        return result
+
     async def invoke_with_admission(
         self,
         invocation: ToolInvocation,
         before_start: BeforeToolStart,
     ) -> ToolResult:
         return await self._invoke(invocation, before_start=before_start)
+
+    def _bind_invocation(
+        self, invocation: ToolInvocation, descriptor: ToolDescriptor, adapter: MCPAdapter
+    ) -> ToolInvocation | ToolResult:
+        arguments = invocation.arguments
+        if isinstance(adapter, InvocationContextBinder):
+            # Diagnostic naming is optional; it must not decide whether
+            # trusted identity binding runs for a provider.
+            error_prefix = getattr(adapter, "error_prefix", "provider")
+            try:
+                arguments = adapter.bind_context(invocation)
+            except ValueError:
+                return self._error_result(
+                    invocation,
+                    code=f"{error_prefix}_context_mismatch",
+                    message="provider invocation context differs from trusted execution context",
+                )
+            except Exception as exc:
+                return self._error_result(
+                    invocation,
+                    code=f"{error_prefix}_context_binding_failed",
+                    message="provider could not bind the trusted invocation context",
+                    exc=exc,
+                )
+            try:
+                properties = descriptor.input_schema.get("properties", {})
+                if set(arguments) - set(properties):
+                    raise ValueError("unexpected scoped arguments")
+                Draft202012Validator(descriptor.input_schema).validate(arguments)
+            except (SchemaError, ValidationError, TypeError, ValueError):
+                return self._error_result(
+                    invocation,
+                    code=f"{error_prefix}_invalid_arguments",
+                    message="bound arguments do not match the registered input schema",
+                )
+
+        return invocation.model_copy(update={"arguments": dict(arguments)})
 
     async def _invoke(
         self,
@@ -251,7 +383,7 @@ class MCPToolGateway:
                 output={"dry_run": True, "executed": False},
                 started_at=occurred_at,
                 finished_at=occurred_at,
-                metadata={"dry_run": True},
+                metadata={"dry_run": True, EXECUTION_STARTED_METADATA_KEY: False},
             )
 
         # Refresh the discovery-time health snapshot before deciding. This is
@@ -274,27 +406,16 @@ class MCPToolGateway:
                 retryable=True,
             )
 
-        arguments = invocation.arguments
-        if isinstance(adapter, ScopedAnalysisMCPAdapter):
-            try:
-                arguments = adapter.bind_context(invocation)
-            except ValueError:
-                return self._error_result(
-                    invocation,
-                    code=f"{adapter.error_prefix}_context_mismatch",
-                    message="scoped invocation context differs from trusted execution context",
-                )
-            try:
-                properties = descriptor.input_schema.get("properties", {})
-                if set(arguments) - set(properties):
-                    raise ValueError("unexpected scoped arguments")
-                Draft202012Validator(descriptor.input_schema).validate(arguments)
-            except (SchemaError, ValidationError, TypeError, ValueError):
-                return self._error_result(
-                    invocation,
-                    code=f"{adapter.error_prefix}_invalid_arguments",
-                    message="scoped arguments do not match the registered input schema",
-                )
+        bound = self._bind_invocation(invocation, descriptor, adapter)
+        if isinstance(bound, ToolResult):
+            return bound
+        arguments = bound.arguments
+
+        entered = False
+
+        def provider_entered() -> None:
+            nonlocal entered
+            entered = True
 
         try:
             adapter_result = await asyncio.wait_for(
@@ -303,6 +424,8 @@ class MCPToolGateway:
                     descriptor,
                     arguments,
                     self._server_semaphores[descriptor.server_id],
+                    invocation=bound,
+                    on_provider_entry=provider_entered,
                     before_start=before_start,
                 ),
                 timeout=invocation.timeout_seconds,
@@ -317,7 +440,9 @@ class MCPToolGateway:
                     "tool queue and execution exceeded timeout of "
                     f"{invocation.timeout_seconds} seconds"
                 ),
-                retryable=True,
+                retryable=not entered,
+                execution_started=entered,
+                uncertain=entered,
             )
         except Exception as exc:
             return self._error_result(
@@ -325,6 +450,8 @@ class MCPToolGateway:
                 code="adapter_error",
                 message=f"adapter execution failed: {type(exc).__name__}",
                 exc=exc,
+                execution_started=entered,
+                uncertain=entered,
             )
 
         if not adapter_result.success:
@@ -346,7 +473,7 @@ class MCPToolGateway:
                 error=adapter_result.error,
                 started_at=adapter_result.started_at,
                 finished_at=adapter_result.finished_at,
-                metadata=adapter_result.metadata,
+                metadata={**adapter_result.metadata, EXECUTION_STARTED_METADATA_KEY: True},
             )
 
         output_bytes = _serialized_output_size(adapter_result.output)
@@ -366,6 +493,7 @@ class MCPToolGateway:
                 started_at=adapter_result.started_at,
                 finished_at=adapter_result.finished_at,
                 metadata={
+                    EXECUTION_STARTED_METADATA_KEY: True,
                     "output_omitted": True,
                     "output_bytes": output_bytes,
                     "max_output_bytes": max_output_bytes,
@@ -379,6 +507,7 @@ class MCPToolGateway:
                 return self._error_result(
                     invocation,
                     code="tool_output_schema_mismatch",
+                    execution_started=True,
                     message="MCP output did not match the registered output schema",
                 )
 
@@ -391,7 +520,7 @@ class MCPToolGateway:
             error=adapter_result.error,
             started_at=adapter_result.started_at,
             finished_at=adapter_result.finished_at,
-            metadata=adapter_result.metadata,
+            metadata={**adapter_result.metadata, EXECUTION_STARTED_METADATA_KEY: True},
         )
 
     def list_tools_for_action(
@@ -424,6 +553,24 @@ class MCPToolGateway:
             include_unhealthy=include_unhealthy,
         )
 
+    def list_cards(
+        self,
+        *,
+        kind: ToolCardKind | None = None,
+        capability: str | None = None,
+        query: str | None = None,
+        include_unhealthy: bool = False,
+    ) -> list[ToolCard]:
+        return self._catalog.list_cards(
+            kind=kind,
+            capability=capability,
+            query=query,
+            include_unhealthy=include_unhealthy,
+        )
+
+    def get_detail(self, tool_id: ToolId) -> ToolDetail | None:
+        return self._catalog.get_detail(tool_id)
+
     @staticmethod
     def _error_result(
         invocation: ToolInvocation,
@@ -432,6 +579,8 @@ class MCPToolGateway:
         message: str,
         retryable: bool = False,
         exc: BaseException | None = None,
+        execution_started: bool = False,
+        uncertain: bool = False,
     ) -> ToolResult:
         occurred_at = datetime.now(timezone.utc)
         details: dict[str, object] = {
@@ -450,6 +599,10 @@ class MCPToolGateway:
             ),
             started_at=occurred_at,
             finished_at=occurred_at,
+            metadata={
+                EXECUTION_STARTED_METADATA_KEY: execution_started,
+                **({EXECUTION_UNCERTAIN_METADATA_KEY: True} if uncertain else {}),
+            },
         )
 
 
@@ -459,11 +612,16 @@ async def _invoke_with_limit(
     arguments: dict[str, Any],
     semaphore: asyncio.Semaphore,
     *,
+    invocation: ToolInvocation,
+    on_provider_entry: Callable[[], None],
     before_start: BeforeToolStart | None = None,
 ) -> MCPCallResult:
     async with semaphore:
         if before_start is not None:
             await before_start()
+        on_provider_entry()
+        if isinstance(adapter, ContextualInvocationAdapter):
+            return await adapter.invoke_contextual(invocation)
         return await adapter.invoke(descriptor, arguments)
 
 

@@ -12,7 +12,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import cast
 
-from redteam.core.ids import RunId
+from redteam.core.ids import AgentInstanceId, RunId
 from redteam.orchestration.work.models import (
     TaskLease,
     WorkItem,
@@ -23,6 +23,7 @@ from redteam.orchestration.work.rules import (
     blocked_for_dependency,
     can_bind,
     decide_add,
+    decide_execution_reconcile,
     decide_reconcile,
     expired_lease_ids,
     failed_item,
@@ -470,6 +471,63 @@ class SQLiteWorkStore:
             try:
                 item = await _load_item(db, work_id)
                 applied, decided = decide_reconcile(item, job_id, status, now)
+                if not applied:
+                    await db.rollback()
+                    return False
+                if decided is not None:
+                    await _save_item(db, decided)
+                await db.execute("DELETE FROM work_leases WHERE work_id=?", (work_id,))
+                await db.commit()
+                return True
+            except Exception:
+                await db.rollback()
+                raise
+
+    async def reconcile_execution(
+        self,
+        work_id: str,
+        *,
+        run_id: RunId,
+        instance_id: AgentInstanceId | None,
+        candidate_key: str,
+        status: str,
+        now: datetime,
+    ) -> bool:
+        await self.setup()
+        aiosqlite = _aiosqlite()
+        async with aiosqlite.connect(self._path) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            try:
+                item = await _load_item(db, work_id)
+                cursor = await db.execute(
+                    "SELECT owner, issued_at, heartbeat_at, expires_at FROM work_leases "
+                    "WHERE work_id=?",
+                    (work_id,),
+                )
+                lease_row = await cursor.fetchone()
+                await cursor.close()
+                lease = None
+                if lease_row is not None:
+                    try:
+                        lease = TaskLease(
+                            work_id=work_id,
+                            owner=lease_row[0],
+                            issued_at=datetime.fromisoformat(lease_row[1]),
+                            heartbeat_at=datetime.fromisoformat(lease_row[2]),
+                            expires_at=datetime.fromisoformat(lease_row[3]),
+                        )
+                    except (ValueError, TypeError):
+                        await db.rollback()
+                        return False
+                applied, decided = decide_execution_reconcile(
+                    item,
+                    lease,
+                    run_id=run_id,
+                    instance_id=instance_id,
+                    candidate_key=candidate_key,
+                    status=status,
+                    now=now,
+                )
                 if not applied:
                     await db.rollback()
                     return False
