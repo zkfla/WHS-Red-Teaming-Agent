@@ -8,6 +8,9 @@ never a TTL release or implicit redispatch. Callers supply lifecycle limits.
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from typing import Literal
+
+from pydantic import BaseModel, ConfigDict
 
 from redteam.core.contracts.completion import completion_contract_hash
 from redteam.core.contracts.llm_policy import LLMRequestPolicy
@@ -15,7 +18,13 @@ from redteam.core.enums import MissionStatus, TaskStatus
 from redteam.core.ids import AgentInstanceId, EngagementId, MissionId, TaskId, new_id
 from redteam.orchestration.agents.registry import AgentRegistry
 from redteam.orchestration.component_binding import RuntimeComponentBinding
-from redteam.orchestration.coordination import ChangeSet, Coordinator, StateConflict, content_hash
+from redteam.orchestration.coordination import (
+    ChangeSet,
+    CoordinationError,
+    Coordinator,
+    StateConflict,
+    content_hash,
+)
 from redteam.orchestration.llm_requests import RunRequestLedger
 from redteam.orchestration.operator_intents.service import is_task_suppressed
 from redteam.orchestration.planning_admission import goal_input_hash, task_input_hash
@@ -33,6 +42,32 @@ class ActivationRecoveryIdentity:
     llm_request_policy: LLMRequestPolicy
 
 
+class ActivationDiagnostic(BaseModel):
+    """Bounded identity/status projection; never the stored prompt/runtime."""
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    task_id: str
+    instance_id: str
+    role_id: str
+    state: Literal["launched", "held", "returned"]
+    launch_stage: Literal["reserved", "entered"] | None
+    reason_code: str
+    task_status: TaskStatus | None
+    task_claim_matches: bool
+    request_states: dict[str, int]
+
+
+class ActivationDiagnostics(BaseModel):
+    """One canonical read snapshot, explicitly not cross-store recovery."""
+    model_config = ConfigDict(extra="forbid", frozen=True)
+    schema_version: Literal[1] = 1
+    run_id: str
+    observed_at: datetime
+    replay_permitted: Literal[False] = False
+    external_stores: Literal["not_inspected"] = "not_inspected"
+    request_states: dict[str, int]
+    activations: list[ActivationDiagnostic]
+
+
 async def read_activation_identity(path: str, run_id: str) -> ActivationRecoveryIdentity | None:
     """Read only existing SQLite records; no registry/model/transport assembly."""
     from redteam.orchestration.state_backend import inspect_sqlite_state
@@ -40,6 +75,13 @@ async def read_activation_identity(path: str, run_id: str) -> ActivationRecovery
     return await inspect_sqlite_state(
         path, lambda tx: TaskActivation.bootstrap_identity(tx, run_id),
     )
+
+
+async def read_activation_diagnostics(path: str, run_id: str) -> ActivationDiagnostics | None:
+    """No setup, assembly, checkpoint writer, model, transport or dispatch."""
+    from redteam.orchestration.state_backend import inspect_sqlite_state
+
+    return await inspect_sqlite_state(path, lambda tx: TaskActivation.diagnostics(tx, run_id))
 
 
 class TaskActivation:
@@ -193,6 +235,56 @@ class TaskActivation:
         except StateConflict:
             return True  # corrupt identity blocks completion, never means an empty cohort
         return any(row.get("state") != "returned" for row in rows)
+
+    @classmethod
+    async def diagnostics(cls, tx: ChangeSet, run_id: str) -> ActivationDiagnostics | None:
+        """Inspect all launch identities; never skip a broken peer as absent.
+
+        The reserved checker is the same as recovery's canonical proof, but
+        live components, checkpoints, Work and Evidence are NOT checked here.
+        Entered records remain possible execution even with no ledger rows.
+        """
+        rows = cls._rows(tx, run_id)
+        if not rows:
+            return None
+        if len({row["instance_id"] for row in rows}) != len(rows):
+            raise StateConflict("task_activation_identity_mismatch")
+        request_states = RunRequestLedger.request_states(tx, run_id)
+        activations = []
+        for row in rows:
+            runtime = RuntimeState.model_validate(row["runtime"])
+            if (runtime.mission_id is None or runtime.instance_id is None
+                    or runtime.current_agent is None or str(runtime.run_id) != run_id
+                    or row["instance_id"] != str(runtime.instance_id)
+                    or row["task_id"] != str(runtime.active_task_id)
+                    or row["role_id"] != str(runtime.current_agent)
+                    or row.get("runtime_digest") is not None
+                    and row["runtime_digest"] != content_hash(runtime)):
+                raise StateConflict("activation_runtime_proof_mismatch")
+            task = await tx.tasks.get_task(TaskId(row["task_id"]))
+            claim_matches = bool(task is not None and task.mission_id == runtime.mission_id
+                                 and task.occupant_owner == runtime.work_owner)
+            reason = "original_checkpoint_and_receipts_required"
+            if row.get("launch_stage") != "entered":
+                try:
+                    await cls._check_reserved_state(tx, row)
+                except (CoordinationError, StateConflict) as exc:
+                    reason = str(exc)  # code-owned structural proof failures only
+                else:
+                    reason = "reserved_proof_consistent"
+            activations.append(ActivationDiagnostic(
+                task_id=row["task_id"], instance_id=row["instance_id"], role_id=row["role_id"],
+                state=row["state"], launch_stage=row.get("launch_stage"), reason_code=reason,
+                task_status=task.status if task is not None else None,
+                task_claim_matches=claim_matches,
+                request_states=RunRequestLedger.request_states(
+                    tx, run_id, owner=runtime.work_owner,
+                ),
+            ))
+        return ActivationDiagnostics(
+            run_id=run_id, observed_at=datetime.now(timezone.utc), request_states=request_states,
+            activations=sorted(activations, key=lambda row: (row.task_id, row.instance_id)),
+        )
 
     @staticmethod
     async def _check_reserved_state(tx: ChangeSet, row: dict) -> RuntimeState:

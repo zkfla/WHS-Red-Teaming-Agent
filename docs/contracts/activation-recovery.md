@@ -137,7 +137,38 @@ CLI 조립 때 새로 배정되는 시각이므로 scope/policy 변경이 아니
 범위/selector/정책 변경, 실행 소유권 경합, 조회 이후 entry 변경, 혼합/구형/잘못된
 예약, 읽기 전용 snapshot과 저장소 실패를 확인한다. 유료 모델·외부 대상은 사용하지 않는다.
 
-entered인데 checkpoint가 없는 경우의 원래 영수증 기반 진단·명시적 해제,
+### 5.2 읽기 전용 기동·호출 원장 진단
+
+기존 `status`에 명시적 `--activation-db`를 추가했다. 지정한 **기존 Task/coordination
+SQLite DB**에서 `read_activation_diagnostics`를 호출하며, 일반 `status`의 보고서
+표시는 변경하지 않는다. LLM 공급자·engagement 재조립·MCP·checkpoint saver를
+열지 않는다. 기존 읽기 전용 composite snapshot을 사용하여 schema migration,
+부모 디렉터리 생성, claim·예산·activation 수정이 없다.
+
+- 모든 기동 index/Runtime identity/digest를 검증한다. 깨진 형제를 빈 목록으로 숨기지 않는다.
+- reserved 기록은 기존 canonical 미진입 증명 검사를 공유한다. 현재 역할·설정·외부
+  저장소를 검사한 것은 아니므로 `reserved_proof_consistent`도 실행 허가가 아니다.
+- entered는 원래 checkpoint/영수증이 필요하다고 표시한다. 요청 행이 0개여도
+  미실행으로 바꾸지 않는다. held/returned와 Task 현재 claim도 별도로 표시한다.
+- 기존 RunRequestLedger가 같은 snapshot의 `reserved/dispatched/settled/unknown/released`
+  수를 Run/owner별로 제공한다. 상태가 깨지면 조회 실패이며 unknown이나 reserved를
+  환불하거나, 시간 경과만으로 과거 요청을 정산하지 않는다.
+- JSON은 `schema_version=1`, `replay_permitted=false`, `external_stores=not_inspected`를
+  명시한다. 성공 exit code는 **조회 성공**이지 재개·완료·해제 승인이나 whole-Run
+  실행 상태 검증이 아니다. 실제 Work/원본 Evidence/외부 provider 조회는 하지 않는다.
+- Runtime 본문·Task 목적·인자·응답·비밀값을 출력하지 않는다. 저장소 오류는 클래스만
+  출력한다. 전체 Run 소유권을 잡아 실행자를 중단시키지 않으며 시점별 read snapshot이다.
+
+```sh
+./.venv/bin/python -m redteam.app.cli status RUN_ID --activation-db data/orchestration/task_graph.sqlite3 --json
+```
+
+`RUN_ID`는 실제 값으로 바꾸고 DB 경로도 원래 실행의 설정을 사용한다. 위 경로는
+기존 durable 설정의 기본값 예시일 뿐 다른 DB/checkout을 자동 탐색하지 않는다.
+읽을 수 없거나 기록이 없으면 unknown/실패로 표시하고 새 DB를 만들지 않는다.
+
+이 연결은 canonical 진단의 첫 부분이다. **entered인데 checkpoint가 없는 경우의
+Work·원본 영수증/provider를 교차 확인하는 진단·명시적 해제**,
 interrupted writer/orphan 정리,
 fixture 실행 격리와 실제 Mobile/LLM 검증도 남아 있다. 이러한 보류를 해소하려고
 marker를 지우거나 Control을 완화하지 않는다.

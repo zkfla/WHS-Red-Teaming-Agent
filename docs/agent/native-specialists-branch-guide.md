@@ -33,6 +33,7 @@ ROE, 실제 도구 준비 상태는 역할 등록과 별개다.
 - Run 공통 LLM 호출 원장, 명시적 총 요청 횟수 무제한과 유한 repair/429.
 - provider metadata 기반 공유 자원, 미정산 실행 marker와 원래 요청 재개.
 - 로컬 Run 실행 소유권, 승인/cohort 재개, 미진입 증명이 있는 zero-checkpoint 복구.
+- `status --activation-db`의 읽기 전용 기동/호출 상태 진단. 외부 영수증 조회나 재실행 허가는 아님.
 - 증거 현재 유효성 소비자, 미실행 코드 artifact 작성·독립 검토·불변 저장.
 
 ## 설정과 비용 없는 확인
@@ -64,7 +65,7 @@ python3 -m venv .venv
 
 ## 아직 완료하지 않은 작업
 
-- entered인데 checkpoint가 없는 실행의 원래 영수증 진단·명시적 해제와 writer/orphan 복구.
+- entered인데 checkpoint가 없는 실행의 외부 Work/원본 영수증 교차 진단·명시적 해제와 writer/orphan 복구.
 - 생성 코드의 합성 case 실행 및 실제 격리 검증. **생성된 코드는 현재 실행하지 않는다.**
 - 증거 자동 만료 기동, 승인된 실제 Mobile/LLM 평가.
 - 수정 전 dev에서도 재현한 Docker 격리 실패 3건의 원인·안전성 확인.
@@ -74,3 +75,6 @@ python3 -m venv .venv
 5개 파일 26 passed다. 기존 실패가 있는 Docker 두 파일을 제외한 결과이며 전체
 원본 시험 집합이 green이라고 주장하지 않는다. Ruff·변경 접점 mypy·diff 검사도
 실시했다. 생략·미실행을 성공으로 계산하지 않는다.
+
+기동 진단의 사용법과 조회 범위는 [복구 계약](../contracts/activation-recovery.md)의
+5.2절을 확인한다. 진단 모드의 exit 0은 조회 성공이며 Run 완료/재개 허가가 아니다.

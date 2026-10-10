@@ -428,3 +428,40 @@ export REDTEAM_LLM_REQUEST_POLICY_JSON='{"mode":"bounded","max_requests":100,"ma
 ```sh
 ./.venv/bin/pytest -q tests/integration/test_code_artifacts.py tests/unit/test_native_specialist_profile.py tests/unit/test_artifact_backend.py
 ```
+
+## 7. 별도 브랜치 공개와 중단 기록 진단
+
+2026-10-10 사용자가 기존 `dev-jm` 보존과 별도 브랜치 공개를 선택했다.
+기존 구현 snapshot `0dc1401`을 `dev-jm-native-specialists`에 push했다.
+`dev-jm`/`dev`에 commit·merge·force-push하거나 PR을 생성하지 않았다.
+`.env`, 가상환경, 실행 DB·보고서·인증 정보를 올리지 않았다. 신뢰된 역할 MD,
+공통/모듈별 AGENTS, PRD와 브랜치 안내를 함께 포함했다.
+
+이후 M5의 첫 진단 연결을 추가했다. 기존 `status --activation-db`에서 읽기 전용
+canonical snapshot을 사용한다. 기동 상태·Task claim·원래 owner별 요청 상태만
+제공하며 실제 checkpoint/Work/원본 Evidence/provider 교차 검증은 하지 않는다.
+반환된 `replay_permitted=false`는 바뀌지 않는다. entered에서 호출 수가 0이거나
+반환 기록이 있다는 이유로 원래 instance/claim/unknown 예산을 지우지 않는다.
+
+수정 이유와 검증:
+
+- bootstrap 거절만 보면 reserved/entered·미정산 요청의 차이를 확인하기 어렵다.
+  같은 기존 미진입 증명 규칙과 RunRequestLedger의 공개 조회를 재사용했다.
+  새 원장·복구 엔진·외부 실행 권한을 만들지 않았다.
+- 일반 `status`는 기존 보고서 경로를 유지한다. 별도 플래그만 읽기 전용
+  조회를 선택하며 LLM/MCP 조립 없이 작동한다. 읽기 실패는 unknown 부재와 구분한다.
+- 검증 중 `replay_authorized`라는 신규 키가 기존 CLI의 `auth` 마스킹에 걸려
+  False가 문자열로 표시되는 것을 실제 재현했다. 비밀 마스킹을 약화하지 않고
+  신규 필드명을 `replay_permitted`로 정리하여 JSON의 실제 boolean을 보존했다.
+- 신규 진단 시험 **18 passed (1.93초)**. 원본 상태 무변경, missing/legacy DB,
+  entered + 호출 0, 모든 요청 상태, held/returned, 깨진 형제/저장 schema,
+  비밀 본문 미출력, CLI parser/조립 미실행을 확인했다.
+- 최종 승인·재개·원장·기동·CLI 호환 회귀 9개 파일 **171 passed (32.45초)**.
+  위 신규 시험을 포함하므로 별도 합산하지 않는다. 전체 `src/tests` Ruff,
+  변경 소스 3개 파일 mypy, `git diff --check`, 실제 CLI `status --help` 통과.
+- 전체 수천 건과 Docker 시험을 이번 진단 변경 후 다시 돌리지는 않았다.
+  유료 LLM·금융 대상·기기·생성 코드를 실행하지 않았다.
+
+다음은 외부 Work/원본 영수증의 교차 진단·명시적 해제와 writer/orphan 복구다.
+그 뒤에도 fixture 격리, 자동 만료 기동, 실제 Mobile/LLM 평가와 기존 Docker
+실패 확인이 남으므로 PRD 전체 완료로 표시하지 않는다.

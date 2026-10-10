@@ -107,6 +107,25 @@ class RunRequestLedger:
         """
         return any(row["owner"] == owner for row in cls._rows(tx, run_id))
 
+    @classmethod
+    def request_states(
+        cls, tx: ChangeSet, run_id: str, *, owner: str | None = None,
+    ) -> dict[str, int]:
+        """Safe read-only projection, not refunds or unknown settlement.
+
+        Reserved/dispatched/unknown remain distinct. A zero count is only an
+        observation of this ledger; it cannot prove no external execution.
+        """
+        counts = dict.fromkeys(("reserved", "dispatched", "settled", "unknown", "released"), 0)
+        for row in cls._rows(tx, run_id):
+            state = row.get("state")
+            if (not isinstance(state, str) or state not in counts
+                    or not isinstance(row.get("owner"), str)):
+                raise RequestAdmissionError("llm_request_record_invalid")
+            if owner is None or row["owner"] == owner:
+                counts[state] += 1
+        return counts
+
     @staticmethod
     def _admit(tx: ChangeSet, run_id: str) -> None:
         binding = tx.records.get(("binding", run_id))
