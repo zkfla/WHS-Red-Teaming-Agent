@@ -9,13 +9,15 @@ opted into SQLite checkpointing) — this command says so explicitly
 rather than guessing. Explicit --activation-db inspects canonical specialist
 launch/request records only. It does not open checkpoints/transports, mutate
 claims/accounting or grant replay; it is not a live whole-Run status API.
+--work-db/--evidence-dir add independently read original-execution snapshots,
+not provider reconciliation or an atomic recovery proof.
 """
 
 from __future__ import annotations
 
 import argparse
 
-from redteam.app.cli._shared import EXIT_FAILURE, EXIT_OK, eprint, print_json
+from redteam.app.cli._shared import EXIT_CONFIG_ERROR, EXIT_FAILURE, EXIT_OK, eprint, print_json
 from redteam.app.report_store import load_terminal_report
 from redteam.control.approval import ApprovalService
 from redteam.control.stores.filesystem import FilesystemApprovalStore
@@ -30,10 +32,25 @@ def add_parser(subparsers: argparse._SubParsersAction) -> None:
         "--activation-db", default=None,
         help="Read-only specialist activation snapshot from an existing coordination SQLite DB",
     )
+    parser.add_argument(
+        "--work-db", default=None,
+        help="Inspect existing Work SQLite with --activation-db and --evidence-dir; no recovery",
+    )
+    parser.add_argument(
+        "--evidence-dir", default=None,
+        help="Inspect original evidence with --activation-db and --work-db; no provider calls",
+    )
     parser.set_defaults(handler=run)
 
 
 async def run(args: argparse.Namespace) -> int:
+    external = (getattr(args, "work_db", None), getattr(args, "evidence_dir", None))
+    if any(value is not None for value in external) and (
+        not all(value is not None for value in external)
+        or getattr(args, "activation_db", None) is None
+    ):
+        eprint("ERROR: --work-db and --evidence-dir require each other and --activation-db")
+        return EXIT_CONFIG_ERROR
     if getattr(args, "activation_db", None) is not None:
         return await _activation_diagnostics(args)
     report = load_terminal_report(args.run_id)
@@ -79,8 +96,26 @@ async def run(args: argparse.Namespace) -> int:
 async def _activation_diagnostics(args: argparse.Namespace) -> int:
     from redteam.orchestration.task_activation import read_activation_diagnostics
 
+    execution = None
+    changed = False
     try:
         result = await read_activation_diagnostics(args.activation_db, args.run_id)
+        if result is not None and getattr(args, "work_db", None) is not None:
+            from redteam.core.ids import RunId
+            from redteam.evidence.stores.filesystem import FilesystemEvidenceStore
+            from redteam.orchestration.execution_diagnostics import inspect_execution_diagnostics
+            from redteam.orchestration.work.sqlite import SQLiteWorkStore
+
+            run_id = RunId(args.run_id)
+            work = await SQLiteWorkStore.inspect_run(args.work_db, run_id)
+            evidence = await FilesystemEvidenceStore.inspect_run(args.evidence_dir, run_id)
+            execution = await inspect_execution_diagnostics(
+                run_id, work_items=work, evidence_store=evidence, activations=result.activations,
+            )
+            after = await read_activation_diagnostics(args.activation_db, args.run_id)
+            changed = after is None or result.model_dump(exclude={"observed_at"}) != (
+                after.model_dump(exclude={"observed_at"})
+            )
     except Exception as exc:  # noqa: BLE001 - bad storage is not absence, never dump payload
         eprint(f"ERROR: activation diagnostics unavailable: {type(exc).__name__}")
         return EXIT_FAILURE
@@ -92,7 +127,15 @@ async def _activation_diagnostics(args: argparse.Namespace) -> int:
                   "Replay is not authorized.")
         return EXIT_FAILURE
     if args.json:
-        print_json(result)
+        payload = result.model_dump(mode="json")
+        if execution is not None:
+            payload = {
+                "schema_version": 2, "run_id": result.run_id, "replay_permitted": False,
+                "external_stores": "independently_inspected", "activation": payload,
+                "activation_projection_changed": changed,
+                "execution": execution.model_dump(mode="json"),
+            }
+        print_json(payload)
     else:
         print(f"Run: {result.run_id} (read-only activation snapshot)")
         print(f"Observed at: {result.observed_at.isoformat()}")
@@ -100,6 +143,17 @@ async def _activation_diagnostics(args: argparse.Namespace) -> int:
             print(f"  {row.instance_id} / {row.task_id}: {row.state}, "
                   f"stage={row.launch_stage or 'legacy'}, reason={row.reason_code}, "
                   f"claim_matches={row.task_claim_matches}, requests={row.request_states}")
-        print("Checkpoints/Work/Evidence not inspected. "
-              "No replay, release or budget reset authorized.")
+        if execution is not None:
+            print(f"Work: {execution.work_store}; Evidence: {execution.evidence_store}; "
+                  f"activation_projection_changed={changed}")
+            for executed in execution.executions:
+                print(f"  invocation={executed.invocation_id or 'none'}, "
+                      f"work={executed.work_id or 'none'}: {executed.state}, "
+                      f"reason={executed.reason_code}, "
+                      f"activation_matches={executed.activation_matches}, "
+                      f"work_result_matches={executed.work_result_matches}")
+            print("Stores inspected independently; checkpoints/providers not inspected.")
+        else:
+            print("Checkpoints/Work/Evidence not inspected.")
+        print("No replay, release or budget reset authorized.")
     return EXIT_OK

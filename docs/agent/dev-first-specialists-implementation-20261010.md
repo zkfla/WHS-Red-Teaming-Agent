@@ -465,3 +465,45 @@ canonical snapshot을 사용한다. 기동 상태·Task claim·원래 owner별 �
 다음은 외부 Work/원본 영수증의 교차 진단·명시적 해제와 writer/orphan 복구다.
 그 뒤에도 fixture 격리, 자동 만료 기동, 실제 Mobile/LLM 평가와 기존 Docker
 실패 확인이 남으므로 PRD 전체 완료로 표시하지 않는다.
+
+## 8. Work·저장 원본 교차 진단 (2026-10-11)
+
+`status --activation-db --work-db --evidence-dir`를 연결했다. 세 경로는 원래 실행
+저장소로 명시하며, LLM/MCP 조립·provider 조회 없이 동작한다. 구체 저장소가 자기
+read-only snapshot을 제공하고, 판단은 기존 실행 journal 검증을 재사용한다.
+다른 모듈의 내부 원장을 CLI가 직접 해석하거나 별도 복구 엔진을 만들지 않았다.
+
+확인 가능한 내용은 submission·원본·결과 처리 seal·Work·Task/instance 연결이다.
+원본 없음, unknown, 미진입, 처리 미완료/완료, 손상·상충을 구분한다.
+Work 상태 상충과 미정산 자원 marker도 별도로 유지한다. timeout을 실제 실패로
+확정하지 않고, `processed`를 취약점/목표 성공이나 occupant 해제로 바꾸지 않는다.
+
+검수에서 반영한 이유:
+
+- 일반 Work 조회는 setup/migration, 일반 Evidence 생성자는 mkdir을 동반한다.
+  진단이 원본 저장소를 바꾸지 않도록 provider-owned 읽기 전용 조회를 추가했다.
+- index 필터만 쓰면 잘못된 run/instance index가 행을 숨길 수 있다. payload와
+  물리 index를 필터 전 대조하고 구형 귀속 불명·부분 schema를 안전 부재로 취급하지 않는다.
+- 파일 index와 Run 파일의 중복/누락/변경 검사를 기존 integrity 검사와 공유하여
+  규칙 복제를 줄였다. snapshot 포트는 deep copy와 append 거절로 원본을 유지한다.
+- 여러 저장소의 조회를 하나의 원자적 proof라고 표시할 수 없다. 확장 출력은
+  version 2 envelope이고 `cross_store_atomic=false/replay_permitted=false`다.
+  기동 표시 투영의 전후 변경만 별도 표시하며 전체 state CAS나 writer 부재로 주장하지 않는다.
+- 조회 실패의 raw exception은 원본 비밀값을 포함할 수 있다. CLI는 클래스만
+  출력하고 JSON에는 ID/구조화된 상태·고정 원인 코드만 담는다.
+
+명시적 해제·writer/orphan 복구는 아직 미구현이다. 위 진단은 필요한 근거를
+읽을 수 있게 한 단계이며, marker 삭제·재호출·unknown 예산 환불은 추가하지 않았다.
+M5/M6 및 실제 기기/모델/격리 검증 전체 완료를 주장하지 않는다.
+
+검증 결과:
+
+- 관련 회귀 16개 파일 **287 passed (37.77초)**. native 영수증 복구·Work lifecycle·
+  Evidence integrity·승인/cohort 재개·공유 원장·기동·CLI 호환을 포함한다.
+- 마지막 진단 표시/원인 코드 정리 후 신규 파일 **38 passed (3.29초)**를 재확인했다.
+  위 회귀 집합에도 포함되는 시험이므로 287과 합산하지 않는다.
+- 전체 `src/tests` Ruff, 변경 소스 6개 파일 mypy, `git diff --check`, 실제
+  `status --help` 통과. 실제 전문 합성 실행/CLI 시험은 원본 DB·Evidence 내용의
+  무변경과 추가 모델/대상 호출 없음도 확인했다.
+- 이번 변경 뒤 전체 수천 건·Docker 시험은 다시 실행하지 않았다. 실제 LLM,
+  금융 대상, Mobile 기기와 생성 코드는 호출/실행하지 않았다.

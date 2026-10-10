@@ -48,6 +48,7 @@ class ActivationDiagnostic(BaseModel):
     task_id: str
     instance_id: str
     role_id: str
+    engagement_id: str
     state: Literal["launched", "held", "returned"]
     launch_stage: Literal["reserved", "entered"] | None
     reason_code: str
@@ -274,6 +275,7 @@ class TaskActivation:
                     reason = "reserved_proof_consistent"
             activations.append(ActivationDiagnostic(
                 task_id=row["task_id"], instance_id=row["instance_id"], role_id=row["role_id"],
+                engagement_id=str(runtime.engagement_id),
                 state=row["state"], launch_stage=row.get("launch_stage"), reason_code=reason,
                 task_status=task.status if task is not None else None,
                 task_claim_matches=claim_matches,

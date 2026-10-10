@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import cast
@@ -45,9 +46,52 @@ from redteam.orchestration.work.rules import (
     terminal_failure_in,
     validate_lease_ttl,
 )
+from redteam.sqlite_support import run_sqlite
 
 
 class SQLiteWorkStore:
+    @staticmethod
+    async def inspect_run(path: str | Path, run_id: RunId) -> list[WorkItem] | None:
+        """Detached, read-only inventory; never setup/migrate/reclaim leases.
+
+        Validate physical indexes against payloads before filtering, so a
+        misindexed row cannot disappear from the requested Run's inventory.
+        Missing storage is unknown, not proof of an empty work ledger.
+        """
+        def inspect() -> list[WorkItem] | None:
+            source = Path(path).absolute()
+            if not source.exists():
+                return None
+            db = sqlite3.connect(source.as_uri() + "?mode=ro", uri=True, timeout=1.0)
+            try:
+                db.execute("PRAGMA query_only=ON")
+                db.execute("BEGIN")
+                columns = {row[1] for row in db.execute("PRAGMA table_info(work_items)")}
+                if not columns:
+                    return None
+                required = {"work_id", "run_id", "instance_id", "candidate_key",
+                            "status", "priority", "payload"}
+                if not required.issubset(columns):
+                    raise ValueError("work_snapshot_schema_unsupported")
+                items = []
+                for row in db.execute(
+                    "SELECT work_id,run_id,instance_id,candidate_key,status,priority,payload "
+                    "FROM work_items ORDER BY work_id"
+                ):
+                    item = _item_from_payload(row[6])
+                    if row[:6] != _item_row(item)[:6]:
+                        raise ValueError("work_snapshot_index_mismatch")
+                    if item.run_id is None:
+                        raise ValueError("work_snapshot_unattributed_records")
+                    if item.run_id == run_id:
+                        items.append(item)
+                return items
+            finally:
+                db.rollback()
+                db.close()
+
+        return await run_sqlite(inspect)
+
     def __init__(self, path: str | Path) -> None:
         self._path = Path(path)
         self._setup_lock = asyncio.Lock()

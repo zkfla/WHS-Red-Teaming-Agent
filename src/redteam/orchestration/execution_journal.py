@@ -29,6 +29,10 @@ from redteam.core.ids import ActionId, EvidenceId, RunId, new_id
 from redteam.core.ports.evidence_store import EvidenceStore
 from redteam.orchestration.agents.base import PlanStep
 
+EXECUTION_RECEIPT_KINDS = frozenset({
+    "execution_submission", "execution_result", "execution_resolution", "execution_retry_admission",
+})
+
 
 class ExecutionReceiptError(ValueError):
     """Owner-defined bounded reason for a receipt/correlation rejection."""
@@ -126,10 +130,8 @@ async def append_execution_receipt(
 def checked_receipt(record: EvidenceRecord) -> dict[str, Any]:
     """Validate immutable payload/correlation before consuming a receipt."""
     payload = record.metadata
-    if record.source_type is not EvidenceSourceType.AGENT or payload.get("receipt_kind") not in {
-        "execution_submission", "execution_result", "execution_resolution",
-        "execution_retry_admission",
-    }:
+    if (record.source_type is not EvidenceSourceType.AGENT
+            or payload.get("receipt_kind") not in EXECUTION_RECEIPT_KINDS):
         raise ExecutionReceiptError("not_an_execution_receipt")
     if record.digest != digest_payload(payload):
         raise ExecutionReceiptError("execution_receipt_digest_mismatch")

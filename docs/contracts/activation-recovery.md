@@ -167,8 +167,81 @@ SQLite DB**에서 `read_activation_diagnostics`를 호출하며, 일반 `status`
 기존 durable 설정의 기본값 예시일 뿐 다른 DB/checkout을 자동 탐색하지 않는다.
 읽을 수 없거나 기록이 없으면 unknown/실패로 표시하고 새 DB를 만들지 않는다.
 
-이 연결은 canonical 진단의 첫 부분이다. **entered인데 checkpoint가 없는 경우의
-Work·원본 영수증/provider를 교차 확인하는 진단·명시적 해제**,
-interrupted writer/orphan 정리,
-fixture 실행 격리와 실제 Mobile/LLM 검증도 남아 있다. 이러한 보류를 해소하려고
+이 연결은 canonical 진단의 첫 부분이다. Work·저장된 원본 영수증의 추가 조회는
+아래 5.3절에서 제공한다. provider 확인·명시적 해제, interrupted writer/orphan 정리,
+fixture 실행 격리와 실제 Mobile/LLM 검증은 남아 있다. 이러한 보류를 해소하려고
 marker를 지우거나 Control을 완화하지 않는다.
+
+### 5.3 추가 연결 — Work와 저장된 원본 실행 교차 진단
+
+2026-10-11 추가. 아래 세 경로를 모두 명시할 때만 확장 진단을 선택한다.
+일반 `status`와 `--activation-db` 단독의 기존 사용법은 유지한다.
+
+```sh
+./.venv/bin/python -m redteam.app.cli status RUN_ID \
+  --activation-db data/orchestration/task_graph.sqlite3 \
+  --work-db data/orchestration/work.sqlite3 \
+  --evidence-dir data/evidence --json
+```
+
+위는 기본 설정 경로의 예시다. 반드시 **원래 Run에서 사용한 저장소 경로**를 넣는다.
+다른 checkout·최근 실행 저장소를 자동 탐색하지 않는다. 두 추가 플래그가 일부만
+있거나 `--activation-db` 없이 지정하면 설정 오류(exit 2)로 거절한다.
+
+읽기 책임과 수정 이유:
+
+- `SQLiteWorkStore.inspect_run`은 `mode=ro`, `query_only`, read transaction으로
+  기존 행을 읽는다. `get/list_items`의 setup/migration을 진단에서 호출하지 않는다.
+  물리 Work index와 typed payload를 필터 **전에** 대조하여 잘못된 run/instance/status
+  index가 대상 행을 숨기지 않게 한다. 구형·귀속 불명 Work는 자동 이행하지 않는다.
+- `FilesystemEvidenceStore.inspect_run`은 constructor의 mkdir 없이 기존 Run 파일과
+  index를 비교한다. 기존 `verify_run_integrity`와 같은 소유 모듈의 검사 함수를
+  공유하고, 중복 index도 거절한다. 손상·누락·잘린 append를 성공한 빈 조회로
+  바꾸지 않는다. 이 검사 자체는 index의 인증/서명을 제공하지 않는다.
+- detached Evidence snapshot은 기존 EvidenceStore port의 읽기만 제공한다.
+  조회 결과를 바꿔도 snapshot 원본은 바뀌지 않고 append는 거절한다.
+  별도 영속 원장·작업 큐·실행기가 아니다.
+- `inspect_execution_diagnostics`는 기존 `checked_receipt/preserved_result/
+  execution_processed`를 재사용한다. submission과 원본·Work의 Run/instance/작업
+  연결, 후보·역할·Task 연결을 대조하고, 없는 submission과 상충 원본도 표시한다.
+  선택된 activation의 engagement/역할/Task/entered 연결은 별도 boolean이다.
+
+| state | 확인한 내용 | 해석하면 안 되는 내용 |
+| --- | --- | --- |
+| `unknown` | 저장소 불명 또는 영수증 없는 Work | 미실행·자동 재요청 가능 |
+| `missing_original` | submission은 있으나 원본이 없음 | 실제 대상 요청이 실패함 |
+| `uncertain` | 원본 envelope가 결과 불명으로 표시됨 | 실제 성공/실패 확정·예산 환불 |
+| `no_entry` | 검증한 원본의 실행 미진입 marker | Task 완료·모든 워커 미실행 |
+| `unprocessed` | 원본은 있으나 처리 seal이 없음 | 원본 대상 도구 재호출 |
+| `processed` | 원본과 연결된 결과 Evidence/처리 seal 확인 | 취약점 확정·목표 완료·claim 해제 |
+| `invalid` | digest/schema/귀속/원본 상충 등 검사 실패 | 오류 기록 무시·새 워커로 대체 |
+
+Work 상태 일치는 `work_result_matches`, 미정산 자원 marker는
+`resource_execution_pending`으로 별도 출력한다. 처리 seal이 있다고 Work의 상충
+상태나 자원 점유를 숨기지 않는다. timeout envelope의 `result_success`는 null이며
+실제 성공/실패를 추측하지 않는다. 진단은 이 값을 수정하거나 결과를 재처리하지 않는다.
+
+확장 JSON은 `schema_version=2` envelope의 `activation`/`execution`에 각각 검증된
+진단을 담는다. `--activation-db` 단독 JSON은 version 1을 유지한다. 기동 진단에는
+engagement ID를 추가했지만 저장된 Runtime/Task/실행 계약을 이행하거나 재작성하지 않는다.
+`replay_permitted=false`는 두 모드 모두 유지한다.
+
+각 저장소는 독립적으로 읽으므로 `cross_store_atomic=false`다.
+외부 조회 전후 **기동·요청 표시 투영**이 달라지면 `activation_projection_changed=true`다.
+false가 전체 canonical state 불변·writer 부재·CAS 통과를 증명하지는 않는다.
+checkpoint/provider 조회·Run 실행 소유권 확보·해제 proof는 이번 기능에 없다.
+
+exit 0은 읽기/분류 성공이지 복구 승인이다. 원본 부재/unknown/invalid는 결과 안에
+남기고, 저장소 손상·불완전 schema·조회 오류는 클래스만 stderr에 표시하여 exit 1로
+종료한다. 모델·MCP 호출, Graph 적용, claim 해제, 예산 정산·환불은 하지 않는다.
+
+비용 없는 로컬 검증:
+
+```sh
+./.venv/bin/pytest -q tests/integration/test_execution_diagnostics.py
+```
+
+실제 native 루프가 남긴 합성 journal의 publication loss·미진입·timeout·원본
+회수 후 처리, 실제 전문 플래너/분해/워커/검토/CLI 연결, 누락·상충·손상·구형
+저장소·경로 탈출·시점 변경과 원본 무변경을 검사한다. scripted 모델과 합성 도구를
+사용한 시험이며 실제 금융권 공격 성능 검증은 아니다.
