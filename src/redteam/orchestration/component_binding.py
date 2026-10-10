@@ -77,6 +77,7 @@ class RuntimeComponentBinding(BaseModel):
     extension_entry_points: tuple[str, ...] = ()
     planning_provider_id: str | None = None
     role_tools_fingerprint: str | None = None
+    specialist_fingerprint: str | None = None
 
     def component_id(self, slot: str) -> str | None:
         """Return the stable id recorded for one component slot."""

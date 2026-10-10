@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, ValidationError, field_validator, model_validator
 from pydantic_core import InitErrorDetails, PydanticCustomError
 
+from redteam.core.contracts.completion import CompletionCriterion, criterion_id
 from redteam.core.enums import MissionStatus, OperatorIntentType, TaskStatus
 from redteam.core.ids import (
     AgentId,
@@ -198,6 +199,9 @@ class MissionTask(BaseModel):
     mission_id: MissionId
     title: str = Field(min_length=1)
     objective: str = Field(min_length=1)
+    completion_contract_version: Literal[1, 2] = 1
+    completion_criteria: list[CompletionCriterion] = Field(default_factory=list)
+    principal_refs: list[str] = Field(default_factory=list)
     status: TaskStatus = TaskStatus.PENDING
     priority: int = 0
     required: bool = True
@@ -231,7 +235,8 @@ class MissionTask(BaseModel):
         return redact_sensitive_text(value) if value is not None else None
 
     @field_validator(
-        "dependency_task_ids", "related_attack_graph_node_ids", "related_hypothesis_ids"
+        "dependency_task_ids", "related_attack_graph_node_ids", "related_hypothesis_ids",
+        "principal_refs",
     )
     @classmethod
     def _stable_ids(cls, value: list[Any]) -> list[Any]:
@@ -239,6 +244,24 @@ class MissionTask(BaseModel):
 
     @model_validator(mode="after")
     def _task_invariants(self) -> MissionTask:
+        if self.completion_contract_version == 1 and self.completion_criteria:
+            raise ValueError("explicit completion criteria require task contract v2")
+        if self.completion_contract_version == 2:
+            if not self.completion_criteria or any(
+                not item.is_known() or not item.description.strip()
+                for item in self.completion_criteria
+            ):
+                raise ValueError("task contract v2 requires nonempty known completion criteria")
+            identities = [criterion_id(item) for item in self.completion_criteria]
+            if len(identities) != len(set(identities)):
+                raise ValueError("task completion criteria must not be duplicated")
+            for condition in self.completion_criteria:
+                if set(condition.principal_refs) - set(self.principal_refs):
+                    raise ValueError("task completion principal outside task subjects")
+                if condition.hypothesis_id and condition.hypothesis_id not in set(
+                    map(str, self.related_hypothesis_ids)
+                ):
+                    raise ValueError("task completion hypothesis outside task subjects")
         if self.task_id in self.dependency_task_ids:
             raise ValueError("task cannot depend on itself")
         if self.status is TaskStatus.BLOCKED and not (self.blocking_reason or "").strip():

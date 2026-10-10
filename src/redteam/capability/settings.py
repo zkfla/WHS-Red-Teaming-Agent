@@ -15,6 +15,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from urllib.parse import urlparse
 
+from pydantic import TypeAdapter, ValidationError
+
 from redteam.capability.registration import (
     McpProfileBundle,
     ProfileSettingsContext,
@@ -25,6 +27,7 @@ from redteam.core.action_semantics import (
     canonical_action_key,
     validate_operation_format,
 )
+from redteam.core.contracts.tool import ToolResourceBinding
 from redteam.core.enums import RiskLevel
 
 _SAFE_SERVER_ID = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
@@ -99,6 +102,7 @@ class MCPServerSettings:
     process_environment: dict[str, str] = field(default_factory=dict, repr=False)
     allowed_tools: tuple[str, ...] | None = None
     tool_operations: dict[str, tuple[str, ...]] | None = None
+    tool_resources: dict[str, list[ToolResourceBinding]] = field(default_factory=dict)
     max_concurrency: int = 1
     max_output_bytes: int = 1_048_576
     profile: str | None = None
@@ -232,6 +236,7 @@ class MCPServerSettings:
             process_environment=process_environment,
             allowed_tools=allowed_tools,
             tool_operations=tool_operations,
+            tool_resources=_load_tool_resources(prefix, snapshot),
             max_concurrency=max_concurrency,
             max_output_bytes=max_output_bytes,
             profile=profile,
@@ -445,6 +450,21 @@ def _load_tool_operations(
                 ) from exc
         bindings[tool_name] = tuple(operations)
     return bindings
+
+
+def _load_tool_resources(
+    prefix: str, env: Mapping[str, str]
+) -> dict[str, list[ToolResourceBinding]]:
+    value = env.get(prefix + "_TOOL_RESOURCES_JSON")
+    if value is None:
+        return {}
+    try:
+        bindings = TypeAdapter(dict[str, list[ToolResourceBinding]]).validate_json(value)
+        if any(not name.strip() or len(rows) > 32 for name, rows in bindings.items()):
+            raise ValueError("invalid resource declarations")
+        return bindings
+    except (ValidationError, ValueError):
+        raise MCPConfigurationError("invalid TOOL_RESOURCES_JSON") from None
 
 
 def _load_max_concurrency(prefix: str, env: Mapping[str, str] | None = None) -> int:

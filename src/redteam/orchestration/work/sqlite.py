@@ -25,6 +25,7 @@ from redteam.orchestration.work.rules import (
     decide_add,
     decide_execution_reconcile,
     decide_reconcile,
+    execution_started_item,
     expired_lease_ids,
     failed_item,
     finished_item,
@@ -335,6 +336,29 @@ class SQLiteWorkStore:
             await db.commit()
             return lease
 
+    async def mark_execution_started(self, work_id: str, *, owner: str, now: datetime) -> bool:
+        await self.setup()
+        async with _aiosqlite().connect(self._path) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            item = await _load_item(db, work_id)
+            cursor = await db.execute(
+                "SELECT issued_at,heartbeat_at,expires_at FROM work_leases "
+                "WHERE work_id=? AND owner=?", (work_id, owner),
+            )
+            row = await cursor.fetchone()
+            await cursor.close()
+            lease = (TaskLease(work_id=work_id, owner=owner,
+                               issued_at=datetime.fromisoformat(row[0]),
+                               heartbeat_at=datetime.fromisoformat(row[1]),
+                               expires_at=datetime.fromisoformat(row[2])) if row else None)
+            updated = execution_started_item(item, lease, owner, now) if item is not None else None
+            if updated is None:
+                await db.rollback()
+                return False
+            await _save_item(db, updated)
+            await db.commit()
+            return True
+
     async def complete(
         self,
         work_id: str,
@@ -343,6 +367,7 @@ class SQLiteWorkStore:
         status: WorkStatus,
         now: datetime,
         reason: str | None = None,
+        execution_known: bool = False,
     ) -> bool:
         require_terminal(status)
         await self.setup()
@@ -364,7 +389,9 @@ class SQLiteWorkStore:
                 await db.execute("DELETE FROM work_leases WHERE work_id=?", (work_id,))
                 await db.commit()
                 return False
-            await _save_item(db, finished_item(item, status, now, reason))
+            await _save_item(db, finished_item(
+                item, status, now, reason, execution_known=execution_known
+            ))
             await db.execute("DELETE FROM work_leases WHERE work_id=?", (work_id,))
             await db.commit()
             return True
@@ -382,7 +409,8 @@ class SQLiteWorkStore:
             row = await cursor.fetchone()
             await cursor.close()
             item = await _load_item(db, work_id)
-            if row is None or item is None or is_expired(datetime.fromisoformat(row[0]), now):
+            if (row is None or item is None or item.resource_execution_pending
+                    or is_expired(datetime.fromisoformat(row[0]), now)):
                 await db.rollback()
                 return False
             await _save_item(db, pending_item(item, now))
@@ -606,7 +634,11 @@ async def _terminal_dependency_failure(db, item: WorkItem) -> tuple[str, WorkSta
 
 async def _has_conflict(db, item: WorkItem) -> bool:
     cursor = await db.execute(
-        "SELECT payload FROM work_items WHERE status IN ('leased','running') AND work_id<>?",
+        # Unknown originals may have a terminal/expired row, but still own
+        # declared resources. The JSON payload is the canonical ledger.
+        "SELECT payload FROM work_items WHERE work_id<>? "
+        "AND (status IN ('leased','running') "
+        "OR json_extract(payload, '$.resource_execution_pending') = 1)",
         (item.work_id,),
     )
     rows = await cursor.fetchall()

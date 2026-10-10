@@ -37,7 +37,7 @@ from redteam.attack_graph.predicates import (
 )
 from redteam.core.contracts.graph import Hypothesis
 from redteam.core.contracts.target import target_display_name
-from redteam.core.enums import GraphNodeType
+from redteam.core.enums import EvidenceSourceType, GraphNodeType
 from redteam.orchestration.evidence_access import raw_from_metadata
 from redteam.orchestration.knowledge_validation import InternalAssessment, InternalTarget
 from redteam.orchestration.progress import knowledge_fingerprint
@@ -1705,6 +1705,41 @@ async def _build_snapshot_from_inputs(
             }
         ),
     )
+
+
+async def collect_measured_values(
+    graph_service: Any, evidence_store: Any, run_id: str, references: set[str], *,
+    engagement_id: str | None = None,
+) -> dict[str, Any]:
+    """Uncapped, grounded scalar values for explicit reuse conditions."""
+    nodes, error, index, diagnostics = await _collect_inputs(
+        graph_service, evidence_store, run_id, engagement_id=engagement_id,
+    )
+    if error is not None or diagnostics.get("lookup_failed"):
+        raise ValueError("measured_values_lookup_failed")
+    result = {}
+    for node in nodes:
+        if not any(ref.startswith(f"{node.id}#") for ref in references):
+            continue
+        item, _, _ = _fact_view(
+            node, run_id, index, diagnostics, observation_limit=None, evidence_limit=None,
+        )
+        if item is None:
+            continue
+        for container, values in (("attr", item.observed_attrs), ("fact", item.observed_facts)):
+            for key, value in values.items():
+                ref = f"{node.id}#{container}:{key}"
+                source = item.claim_sources.get(f"{container}s:{key}", {})
+                record = index.get(source.get("evidence_id"))
+                raw = raw_from_metadata(record.metadata) if record is not None else None
+                if (ref in references and record is not None and isinstance(raw, dict)
+                        and record.source_type == EvidenceSourceType.TOOL
+                        and raw.get("success") is True
+                        and not record.metadata.get("fixture_only")
+                        and not record.metadata.get("mock")
+                        and isinstance(value, (str, int, float, bool))):
+                    result[ref] = value
+    return result
 
 
 async def collect_assessment(

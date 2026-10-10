@@ -45,6 +45,8 @@ class WorkStore(Protocol):
         ttl: timedelta,
     ) -> TaskLease | None: ...
 
+    async def mark_execution_started(self, work_id: str, *, owner: str, now: datetime) -> bool: ...
+
     async def complete(
         self,
         work_id: str,
@@ -53,6 +55,7 @@ class WorkStore(Protocol):
         status: WorkStatus,
         now: datetime,
         reason: str | None = None,
+        execution_known: bool = False,
     ) -> bool: ...
 
     async def release(self, work_id: str, *, owner: str, now: datetime) -> bool: ...

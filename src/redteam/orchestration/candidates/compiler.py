@@ -31,6 +31,7 @@ from redteam.core.contracts.tool import ToolDescriptor
 from redteam.core.enums import RiskLevel, ToolHealthStatus
 from redteam.core.provider_contracts import operation_target_binding
 from redteam.core.tool_binding import SELECTED_TOOL
+from redteam.core.tool_resources import ResourceBindingError, resource_identities
 from redteam.orchestration.action_naming import (
     canonical_action_key,
     tool_matches_action_namespace,
@@ -192,6 +193,10 @@ class CandidateCompiler:
                 )
         except ValueError:
             return None, self._reject(draft, "unresolved_target", field="arguments")
+        try:
+            resource_identities(tool, bound_arguments)
+        except ResourceBindingError:
+            return None, self._reject(draft, "resource_binding_invalid", field="arguments")
         bound_step = plan_step.model_copy(
             update={"arguments": bound_arguments, "tool_id": tool.tool_id}
         )

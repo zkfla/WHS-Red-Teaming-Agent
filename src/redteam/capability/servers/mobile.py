@@ -25,11 +25,14 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 from pathlib import Path
 
 from mcp.server import MCPServer
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+from redteam.core.contracts.tool import PROVIDER_METADATA_RESOURCE_BINDINGS
 
 # Read-only/diagnostic ADB shell subcommands only. Values are the exact argv
 # appended after ``adb -s <serial> shell`` — no operator-supplied argv, no
@@ -122,7 +125,11 @@ def create_server(policy: MobileDiagnosticsPolicy) -> MCPServer:
     server = MCPServer("mobile-diagnostics", log_level="WARNING")
     execution_lock = asyncio.Lock()
 
-    @server.tool()
+    @server.tool(meta={PROVIDER_METADATA_RESOURCE_BINDINGS: [{
+        "namespace": "mobile.adb-device", "argument": "device_ref",
+        "value_map": {ref: hashlib.sha256(device.serial.encode()).hexdigest()
+                      for ref, device in policy.devices.items()},
+    }]})
     async def device_shell(device_ref: str, command: str) -> DeviceShellOutput:
         """Run one allowlisted, read-only ADB diagnostic against a configured device.
 

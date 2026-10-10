@@ -1,5 +1,15 @@
 # WHS Red Teaming Agent
 
+## Native specialist integration branch
+
+`dev-jm-native-specialists` ports specialist roles onto dev's native ReAct and
+independent-instance driver. It does not replace that driver with the older
+dev-jm execution pipeline. The original `dev-jm` branch is preserved.
+
+See [the branch guide](docs/agent/native-specialists-branch-guide.md) for roles,
+explicit configuration, synthetic tests and known unfinished work. This is an
+implementation preview, not a completed PRD or a verified live penetration run.
+
 ## Project Goal
 
 A multi-agent framework for **authorized security testing** engagements.

@@ -31,6 +31,7 @@ from redteam.core.enums import (
 )
 from redteam.core.ports.control_plane import InvocationAdmissionControl
 from redteam.core.ports.tool_gateway import ToolStartAdmissionGateway, ToolStartRejected
+from redteam.core.tool_resources import ResourceBindingError
 from redteam.orchestration.action_naming import (
     canonical_action_key,
     tool_matches_action_namespace,
@@ -41,6 +42,7 @@ from redteam.orchestration.engine import claim_action_admission, validate_curren
 from redteam.orchestration.execution_journal import append_execution_receipt
 from redteam.orchestration.long_jobs import LongJobManager, LongJobState
 from redteam.orchestration.nodes._support import advance, publisher_for
+from redteam.orchestration.resource_conflicts import resource_conflict_keys
 from redteam.orchestration.runtime_observation import (
     RuntimeObservation,
     append_runtime_observation,
@@ -171,6 +173,24 @@ async def _invoke_with_semaphore(
                 )
             if admitted.verdict is not PolicyVerdict.ALLOW:
                 raise InvocationAdmissionDenied(admitted)
+        work = await deps.work_store.get(work_id) if work_id is not None else None
+        tool = deps.tool_catalog.get(invocation.tool_id) if deps.tool_catalog else None
+        if tool is not None:
+            try:
+                declared = resource_conflict_keys(tool, invocation.arguments)
+            except ResourceBindingError:
+                raise ToolStartRejected("resource declaration invalid before invocation") from None
+            if declared and work is None:
+                raise ToolStartRejected("resource work unavailable before invocation")
+            if work is not None and work.resource_keys != declared:
+                raise ToolStartRejected("resource declaration changed before invocation")
+        elif work is not None and work.resource_keys:
+            raise ToolStartRejected("resource descriptor unavailable before invocation")
+        if work is not None and work.resource_keys:
+            if not await deps.work_store.mark_execution_started(
+                work.work_id, owner=runtime.work_owner, now=datetime.now(timezone.utc)
+            ):
+                raise ToolStartRejected("resource lease lost before invocation")
 
     async def invoke():
         if deps.long_job_adapter is None:

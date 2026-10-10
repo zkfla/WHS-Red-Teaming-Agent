@@ -44,6 +44,21 @@ class ResultReview(BaseModel):
     claims: list[ResultClaim]
 
 
+class CriterionReview(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    criterion_id: str
+    met: bool
+    evidence_ids: list[str] = Field(min_length=1)
+    reason: str
+
+
+class TaskContractReview(ResultReview):
+    """v2 requires an explicit AND judgment over every stored condition."""
+
+    criterion_results: list[CriterionReview] = Field(min_length=1)
+
+
 RESULT_REVIEW_INSTRUCTION = (
     " Describe actual results as claims tied to their exact source evidence. "
     "Use semantic for general investigation or synthesis, poc for a vulnerability "

@@ -23,6 +23,7 @@ from redteam.core.action_semantics import (
 from redteam.core.contracts.tool import ToolDescriptor
 from redteam.core.ids import ToolId
 from redteam.core.provider_contracts import TARGET_ARGUMENT_VALUES
+from redteam.core.tool_resources import ResourceBindingError, validate_resource_schema
 
 # These are graph/target kinds understood by the shared Core contracts.  A
 # server may advertise fewer kinds, but an unknown kind would be invisible to
@@ -70,6 +71,10 @@ def validate_tool_manifest(descriptor: ToolDescriptor) -> None:
     if descriptor.output_schema is not None:
         _validate_schema(descriptor.output_schema, f"{prefix} output schema")
     _validate_required_arguments(descriptor.input_schema, prefix)
+    try:
+        validate_resource_schema(descriptor)
+    except ResourceBindingError:
+        raise MCPConfigurationError(f"{prefix} has an invalid resource argument binding") from None
     properties = descriptor.input_schema.get("properties", {})
     if any(
         name not in properties or value not in TARGET_ARGUMENT_VALUES

@@ -99,6 +99,19 @@ class DecisionFailure(Exception):
         )
 
 
+class DecisionValidationError(Exception):
+    """A caller-owned, safe semantic rejection of an otherwise valid reply.
+
+    Optional response validators are pure checks against captured inputs. They
+    do not admit writes or grant permission. Correction consumes the SAME
+    finite repair budget as schema errors, not a second outer retry pool.
+    """
+
+    def __init__(self, diagnostic: DecisionDiagnostic) -> None:
+        self.diagnostic = diagnostic
+        super().__init__(diagnostic.feedback())
+
+
 class DecisionBudget:
     """Shared attempt budget for one decision or a chain of decisions.
 
@@ -466,6 +479,7 @@ class StructuredDecisionClient:
         system: str = "",
         budget: DecisionBudget | None = None,
         before_call: Callable[..., Any] | None = None,
+        validate_response: Callable[[dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
         if budget is None:
             budget = DecisionBudget(self._max_attempts)
@@ -476,9 +490,12 @@ class StructuredDecisionClient:
         for key, value in extra.items():
             working.setdefault(key, value)
         json.dumps(working)
-        return await self._ask_with_tenacity(
-            stage, working, response_schema, system, budget, before_call
-        )
+        from redteam.orchestration.prompts import instruction_scope
+
+        with instruction_scope(stage):
+            return await self._ask_with_tenacity(
+                stage, working, response_schema, system, budget, before_call, validate_response
+            )
 
     async def _resolve_extra_context(self, stage: str, payload: dict[str, Any]) -> dict[str, Any]:
         provider = self._context_provider
@@ -501,6 +518,7 @@ class StructuredDecisionClient:
         system: str = "",
         budget: DecisionBudget | None = None,
         before_call: Callable[..., Any] | None = None,
+        role_id: str | None = None,
     ) -> Any:
         """One native model response, with the existing request budget owner.
 
@@ -526,9 +544,17 @@ class StructuredDecisionClient:
                     await guarded
             active.consume(stage="native_action", repair=repair)
             try:
-                response = await request(
-                    messages=messages, tools=tools, system=system, num_retries=0
-                )
+                from redteam.orchestration.prompts import instruction_scope
+
+                with instruction_scope("native_action", role_id):
+                    response = await request(
+                        messages=messages, tools=tools, system=system, num_retries=0
+                    )
+            except ReasoningHalted as halted:
+                raise DecisionFailure(
+                    "native_action", "budget", active.used,
+                    diagnostic=halted.diagnostic.model_copy(update={"stage": "native_action"}),
+                ) from halted
             except Exception as exc:
                 active.add_usage(None)
                 diagnostic = diagnostic_for_exception(exc, stage="native_action")
@@ -607,6 +633,11 @@ class StructuredDecisionClient:
                 # Legacy dict-only providers never report usage: the cost of
                 # this request is unknown, never zero.
                 budget.add_usage(None)
+        except ReasoningHalted as halted:
+            raise DecisionFailure(
+                stage, "budget", budget.used,
+                diagnostic=halted.diagnostic.model_copy(update={"stage": stage}),
+            ) from halted
         except Exception as exc:
             # A request was attempted but no usage was reported: unknown.
             budget.add_usage(None)
@@ -715,6 +746,7 @@ class StructuredDecisionClient:
         system: str,
         budget: DecisionBudget,
         before_call: Callable[..., Any] | None = None,
+        validate_response: Callable[[dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
         is_repair = False
 
@@ -792,6 +824,13 @@ class StructuredDecisionClient:
                             kind=kind,
                             budget=budget,
                         )
+                        if validate_response is not None:
+                            try:
+                                validate_response(result)
+                            except DecisionValidationError as rejected:
+                                raise _RetryableDecisionError(
+                                    rejected.diagnostic.model_copy(update={"stage": stage}),
+                                ) from rejected
                         budget.record(
                             stage, "response_validated",
                             **metrics,

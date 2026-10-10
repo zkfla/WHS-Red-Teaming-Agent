@@ -575,14 +575,19 @@ class OperatorConsole:
         status = await service.status(mission_id=mission_id)
         explanation = await service.explain(mission_id=mission_id, run_id=self._identity.run_id)
         try:
-            decision = await conversation.decide(
-                text,
-                engagement_name=self._engagement_name,
-                scope=self._scope,
-                tools=catalog_tool_labels(self._deps.tool_catalog),
-                session_context=f"{status.summary} {explanation.summary}",
-                run_active=True,
-            )
+            from redteam.orchestration.metered_llm import llm_request_scope
+
+            with llm_request_scope(str(self._identity.run_id), "conversation"):
+                decision = await conversation.decide(
+                    text,
+                    engagement_name=self._engagement_name,
+                    scope=self._scope,
+                    tools=catalog_tool_labels(self._deps.tool_catalog),
+                    session_context=f"{status.summary} {explanation.summary}",
+                    run_active=True,
+                    llm_override=(self._deps.llm_client
+                                  if self._deps.settings.llm_request_policy is not None else None),
+                )
         except Exception as exc:  # noqa: BLE001 - chat is advisory; the active run continues
             logging.getLogger(__name__).warning(
                 "Operator chat interpretation failed (%s)", type(exc).__name__
@@ -620,6 +625,15 @@ class OperatorConsole:
             return
         report = await service.status(mission_id=mission_id)
         self._echo(renderer.operator_status_text(report))
+
+    async def route_conversation(self, router, *args, **kwargs):
+        """A live input uses the same Run ledger as the executing instances."""
+        from redteam.orchestration.metered_llm import llm_request_scope
+
+        if self._deps.settings.llm_request_policy is not None:
+            kwargs["llm_override"] = self._deps.llm_client
+        with llm_request_scope(str(self._identity.run_id), "conversation"):
+            return await router.route(*args, **kwargs)
 
     async def session_context(self) -> str:
         """Read-only context for CLI classification; never writes a user intent."""
@@ -1092,6 +1106,15 @@ async def _wait_for_approval(
         if in_session
         else "Waiting for resolution (Ctrl+C stops watching; the Run stays pending)..."
     )
+
+    if getattr(deps, "specialist_policy", None) is not None:
+        from redteam.app.cli.commands.resume import watch_specialist_approval
+
+        return await watch_specialist_approval(
+            deps, final, poll_seconds=(
+                _APPROVAL_POLL_SECONDS_IN_SESSION if in_session else _APPROVAL_POLL_SECONDS
+            ),
+        )
 
     resume_settings = deps.settings.model_copy(update={"thread_id": str(final.run_id)})
     resume_runner = AgentLoopRunner(deps, settings=resume_settings)

@@ -68,6 +68,10 @@ class WorkItem(BaseModel):
     hypothesis_id: HypothesisId | None = None
     prerequisite_ids: list[str] = Field(default_factory=list)
     conflict_keys: list[str] = Field(default_factory=list)
+    resource_keys: list[str] = Field(default_factory=list)
+    # Written BEFORE provider entry; retained on cancellation/unknown results,
+    # expired leases and abandoned Runs. Only a known original clears it.
+    resource_execution_pending: bool = False
     priority: PriorityScore
     budget: WorkBudget = Field(default_factory=WorkBudget)
     repeatable: bool = False
@@ -84,6 +88,10 @@ class WorkItem(BaseModel):
 
     @model_validator(mode="after")
     def _empty_refs_need_native_lineage(self) -> WorkItem:
+        if not set(self.resource_keys).issubset(self.conflict_keys):
+            raise ValueError("resource keys must be included in work conflicts")
+        if self.resource_execution_pending and not self.resource_keys:
+            raise ValueError("resource execution marker requires declared resources")
         # Empty refs alone prove no targeted absence: they only record
         # native lineage (execution_origin_version == 1). Whether the
         # execution genuinely needed no target is decided by the
@@ -94,7 +102,7 @@ class WorkItem(BaseModel):
             raise ValueError("work requires at least one target reference")
         return self
 
-    @field_validator("conflict_keys", "prerequisite_ids")
+    @field_validator("conflict_keys", "resource_keys", "prerequisite_ids")
     @classmethod
     def _keys_are_stable(cls, value: list[str]) -> list[str]:
         return sorted({item.strip() for item in value if item.strip()})
@@ -109,6 +117,8 @@ class TaskLease(BaseModel):
 
 
 def is_unexecuted_stale(item: WorkItem) -> bool:
+    if item.resource_execution_pending:
+        return False
     if item.status is not WorkStatus.STALE:
         return False
     if item.job_id:

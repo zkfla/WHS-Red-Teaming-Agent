@@ -12,6 +12,7 @@ from typing import Any
 from redteam.attack_graph.predicates import Confidence, Provenance
 from redteam.core.contracts.events import EventType
 from redteam.core.contracts.graph import Finding, Hypothesis
+from redteam.core.contracts.tool import execution_outcome_uncertain
 from redteam.core.enums import AgentPhase, PolicyVerdict
 from redteam.core.tool_binding import execution_display_key
 from redteam.orchestration.context import RuntimeDeps
@@ -531,6 +532,7 @@ async def update_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             status=work_status,
             now=datetime.now(timezone.utc),
             reason=reason,
+            execution_known=result is not None and not execution_outcome_uncertain(result.metadata),
         )
         if not completed:
             raise RuntimeError("execution_work_settlement_failed")

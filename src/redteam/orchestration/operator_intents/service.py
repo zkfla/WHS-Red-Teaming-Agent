@@ -211,7 +211,7 @@ def _excluded_preferences(mission) -> tuple[list[str], list[str], list[str]]:
     return areas, endpoints, task_ids
 
 
-def _is_suppressed(task: MissionTask, mission) -> bool:
+def is_task_suppressed(task: MissionTask, mission) -> bool:
     """Whether the operator has already excluded this Task (area/endpoint/id)."""
     areas, endpoints, task_ids = _excluded_preferences(mission)
     if not (areas or endpoints or task_ids):
@@ -223,6 +223,11 @@ def _is_suppressed(task: MissionTask, mission) -> bool:
         endpoint_selectors=endpoints,
         task_selectors=task_ids,
     )
+
+
+# Compatibility for existing consumers; new orchestration services use the
+# public read predicate rather than duplicating operator exclusion rules.
+_is_suppressed = is_task_suppressed
 
 
 def _partition_matches(

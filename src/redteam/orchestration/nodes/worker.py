@@ -5,7 +5,7 @@ from __future__ import annotations
 from contextlib import suppress
 from datetime import datetime, timedelta, timezone
 
-from redteam.core.contracts.tool import EXECUTION_STARTED_METADATA_KEY
+from redteam.core.contracts.tool import EXECUTION_STARTED_METADATA_KEY, execution_outcome_uncertain
 from redteam.core.enums import AgentPhase, PolicyVerdict
 from redteam.core.redaction import redact_sensitive_text
 from redteam.orchestration.analysis_budget import verification_budget
@@ -222,6 +222,7 @@ async def worker_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             status=WorkStatus.FAILED,
             now=datetime.now(timezone.utc),
             reason=f"worker_error:{type(exc).__name__}",
+            execution_known=result is not None and not execution_outcome_uncertain(result.metadata),
         )
         decision = local.get("policy_decision")
         attempted = (
