@@ -18,6 +18,7 @@ async def test_failed_window_proof_removes_owned_containers_before_network(tmp_p
         return 0, b"", b""
 
     monkeypatch.setattr(proof, "image_available", AsyncMock(return_value=True))
+    monkeypatch.setattr(proof, "image_pin", AsyncMock(return_value="sha256:" + "ab" * 32))
     monkeypatch.setattr(proof, "docker", docker)
     monkeypatch.setattr(proof, "_mock", AsyncMock(return_value=("fixture-mock", "10.0.0.9")))
     monkeypatch.setattr(proof.ShellWorkroomManager, "ensure_workroom",

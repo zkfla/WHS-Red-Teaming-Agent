@@ -1384,3 +1384,117 @@ pin·신뢰 이미지·INSTALL/TARGET 정책은 실제 운영자 결정/검증�
 불명확한 전체 상태 복구와 미완료 claim 인계는 기존 held를 유지한다. 생성 코드의 실제
 대상 실행은 규격 미확정·비활성이며 무제한 요청 mode로 이 제한을 우회하지 않는다.
 Mobile은 이번 후속 작업에서 제외다. 안전한 보류를 임의로 완료 처리하지 않는다.
+
+## 20. LLM 없는 로컬 운영 준비·복구 회귀 — 2026-10-11
+
+### 요청 범위와 작업 위치
+
+사용자가 실제 LLM 검증을 제외한 나머지 작업을 요청했다. 운영 mirror/proxy 주소·
+이미지·INSTALL/TARGET 한도는 아직 없다는 답변에 따라 로컬 검증·운영 준비까지만
+진행했다. Mobile 신규 작업, 생성 코드의 실제 대상 실행, 임의 운영 정책 생성,
+개별 미완료 Run의 claim 인계, 새 commit/push/PR은 하지 않았다.
+
+작업 checkout은 `WHS-Red-Teaming-Agent-dev-specialists-20261010`, 시작 HEAD는
+`201e1fe1c0485866c530d9c5786f799cd9ecd9c6`이다. 아래 변경은 그 커밋 위의 **로컬
+미커밋 변경**이며 이전 `dev-jm-native-specialists` 공개 커밋과 구별한다. `dev`와
+기존 `dev-jm`, 다른 checkout, 전역 Docker context는 변경하지 않았다.
+
+### 직접 재현한 빈틈과 좁은 수정
+
+| 확인한 문제 | 수정 접점 | 수정 이유와 보존한 경계 |
+| --- | --- | --- |
+| CLI `validate`는 shell/gate와 전문 프로필·fixture를 검사하지 않았다. 존재하지 않는 정책 파일·shell 없는 gate·공통 요청 정책 없는 전문 프로필 등이 통과했다 | `app/cli/commands/validate.py`, 기존 `app/bootstrap.py` fixture 조립 함수의 public 재사용 | 새 설정 파서/실행 엔진 없이 실제 loader와 같은 검증. 검사에서 Docker/MCP/LLM·grant·store를 열지 않음 |
+| 설치 proxy endpoint는 prefix만 검사하고 mirror origin의 credentials/path 등을 놓쳤다. proxy pin에는 hostname도 들어갔다 | `capability/gated_network_policy.py` | 잘못된 origin/포트·무시되는 suffix·비정규 IP·proxy/target pin 충돌을 로딩 때 거절. DNS 자동 탐색과 Scope 확대는 추가하지 않음 |
+| shell 기본 timeout이 최대 timeout보다 큰 파일을 loader가 허용했다 | `capability/shell_policy.py::load_shell_workroom_policy` | 실행 전 설정 거절. fixture runner의 기존 별도 오류 계약은 유지하며 전역 모델 validator로 과도하게 확장하지 않음 |
+| 실제 gate container의 이미지가 `t005-gate-sidecar`라는 mutable tag로 고정되어 운영자의 이미지 선택과 불변성을 반영하지 못했다 | `GatedNetworkPolicy.sidecar_image`, `shell_assembly.py`, `gated_window.py` | shell 소유 pin 검증 재사용. explicit digest/로컬 image ID만 허용하고 실제 로컬 존재를 예약/생성 전에 확인. `--pull=never`, 이미지 부재 시 자동 다운로드·태그 fallback 없음 |
+
+`sidecar_image=None`인 구형 데이터는 직접 읽어볼 수 있지만 provider 조립/실제
+open은 거절한다. 구형 운영 파일은 운영자가 신뢰할 실제 pin을 명시해야 한다.
+image pin은 내용 불변성이지 공급망 신뢰 인증이나 커널 기능 입증이 아니다.
+기존 Run의 설정 fingerprint를 바꾸거나 unknown 비용을 환급하는 이행은 하지 않는다.
+
+CLI JSON은 `live_readiness_checked:false`, `admission_checked:false`로 설정 통과의
+한계를 명시한다. 비활성 기능은 `(disabled)`/`(closed)`라고 표시한다. 기존의
+secret-field redaction을 낮추지 않았으며 정책 오류는 값 없이 안정된 진단을 남긴다.
+새 role·도구·lab 이름 조건을 중앙 루프/Control에 추가하지 않았다.
+
+새 시험으로 수정 전 CLI 오류 6건과 origin/pin 검증의 잘못된 허용을 재현했다.
+중간 시험에서 sandbox의 localhost bind 제한과 새 이미지 검사에 맞지 않는 cleanup
+mock이 각각 드러났다. 승인된 로컬 bind 환경과 올바른 mock 응답으로 재검증했으며
+제품의 격리/원장 정책을 낮춰 통과시키지 않았다.
+
+### 최종 검증
+
+| 검사 | 관측 결과 | 의미 |
+| --- | --- | --- |
+| Mac 설정·fixture·gate와 복구/claim/공유 원장·전문 폐쇄루프 관련 집합 | **348 passed**, 36.92초 | fake/scripted model·합성 provider 포함. 실제 LLM 검증이 아니며 아래 전체 결과와 합산하지 않음 |
+| Linux Python 3.14 전체 pytest, pinned offline code fixture 포함 | **4,426 passed / 62 skipped / 0 failed**, 447.47초 | 이번 최종 소스로 단일 명령 통과. skipped를 성공에 포함하지 않음 |
+| 위 전체 결과의 실제 Docker 설치/window 2개 파일 | **5건 모두 passed** | 실제 합성 패키지 proxy 설치·직접 mirror 차단·INSTALL 0 capacity 거절·quiet 계량·kernel/NFQUEUE 경계·live window 정산. 전체 통과 수의 부분집합 |
+| 전체 src/tests Ruff 및 mypy | 통과; **746 files, no issues** | Python 3.10 대상 정적 검사와 런타임 증명은 구별 |
+| public CLI의 `validate examples/engagement.yaml --json` | exit 0, `valid:true`, live/admission 두 값은 false | 예제 설정 검사 성공. 활성 도구/실환경 준비 성공이 아님 |
+| Compose 두 파일 `config -q`, CLI help, `git diff --check` | 통과 | 구성/표면/공백 검사. GitHub CI 실행 아님 |
+
+62개 skipped에는 실제 외부 MCP·LLM·Mobile·VDB 환경, 별도 opt-in Docker 실행,
+추가 이미지 부재가 포함된다. 이 입력을 다운로드하거나 새 운영 권한을 켜지 않았다.
+LLM 라이브러리 없는 unit skip도 기록됐으므로 실제 모델 응답 품질·공급자 호환성을
+이 시험 수로 입증하지 않는다.
+
+VM의 동일 시험 복사본 `/var/tmp/whs-m6-proof.Kij3mf`에는 Git 추적/public 설정과
+필요 소스/시험만 복사했다. `.env`·비밀키·기존 Run DB·Mac venv·Git 정보는 보내지
+않았다. 실제 로컬 이미지들은 이전 증명과 같은 ID이며 pull/rebuild하지 않았다.
+원본 JUnit `proof-results/operator-ready.xml`의 suite는 4,488 tests / 0 errors /
+0 failures / 62 skipped로 확인했다. 원본을 아래 로컬 경로에도 보존했다.
+
+```text
+/Users/kangjaemin/Documents/Codex/2026-09-15/new-chat/runtime/whs-m6-linux-proof.htrQGa/operator-ready.xml
+```
+
+기존 준비 VM에서 비용 없는 전체 회귀를 재현한 명령:
+
+```sh
+limactl shell --workdir /var/tmp/whs-m6-proof.Kij3mf whs-proxy -- bash -c \
+  'umask 077; exec env REDTEAM_CODE_FIXTURE_TEST_IMAGE=sha256:f2da09753c1ebacdec135addb3f1a1df698bb656331f40ba17587b25a8965854 ./.venv/bin/python -m pytest -q -rs --tb=short --junitxml=proof-results/operator-ready.xml'
+```
+
+위 경로·image ID는 이번 합성 시험 환경의 관측값이지 제품의 고정 설정이 아니다.
+최종 VM container 목록은 비었고 network는 `bridge/host/none`만 남았다. Mac Docker
+context는 `desktop-linux` 그대로다. 사용자 자원 삭제나 전역 prune은 하지 않았다.
+
+### 현재 가능한 범위와 남은 조건
+
+[Web 운영 준비·장애 대응 안내](web-operations-handoff.md)에 설정 검사·sidecar pin
+이행·Run 조회/원본 수집/claim 보류를 정리했다. 현재 요청에서 허용된 **로컬 준비와
+회귀 범위는 완료**했지만 다음은 완료라고 주장하지 않는다.
+
+- 운영 mirror/proxy·port·IP pin·이미지 공급망과 INSTALL/TARGET 한도는 운영자의
+  실제 입력과 별도 승인/검증이 필요하다. 값이 없으므로 실운영 파일을 만들지 않았다.
+- 체크포인트/원본 불명 전체 상태 재구성 및 미완료 Task handoff는 기존 `held`와
+  `task_claim_handoff_unverified`를 유지한다. 원본 조회가 자동 실행·점유 해제 권한은
+  아니다. G8의 “복구 또는 명확한 보류”를 지킨 것이며 모든 복구 자동화를 완성한
+  것이 아니다.
+- 실제 LLM 비교는 이번 요청에서 제외했고 Mobile 신규 작업은 제외 범위다.
+  생성 코드 실제 대상 실행은 계속 비활성이다. 위 결과는 push 전 로컬 검증 상태다.
+  후속 공개 범위와 PR 상태는 아래 21절 및 원격 참조로 구별한다.
+
+## 21. 운영 준비 변경의 공개와 dev PR 요청 — 2026-10-11
+
+사용자는 20절의 로컬 변경을 push하고 `dev` 대상 PR을 올리도록 명시적으로
+요청했다. 기존 `dev-jm`을 보존했던 결정에 따라 공개 head는 동일한
+`dev-jm-native-specialists`, base는 `dev`이다. 기존 브랜치 이력을 강제로 교체하거나
+`dev`에 직접 push/merge/auto-merge하지 않는다.
+
+공개 직전 원격 `dev`는 `153265e32e029481628e8c057fe0ea476d939d64`,
+공개 head는 `201e1fe1c0485866c530d9c5786f799cd9ecd9c6`, 구형 `dev-jm`은
+`8af7a6a2a9d2e773147c673e909917152d51856c`로 확인했다. dev는 현재 작업 이력의
+조상이다. PR은 20절의 마지막 수정만이 아니라 **기존 전문 폐쇄루프·복구·Web 전용
+설정과 운영 준비 변경의 누적 차이**를 제안한다. 최종 공개 SHA와 PR/CI 상태는
+실제 GitHub 원격/PR metadata가 기준이며, 이 사전 기록이 merge 완료 증명은 아니다.
+
+운영 `.env`·비밀키·기존 Run DB·모델 응답·venv·VM 결과 XML은 공개하지 않는다.
+추적 소스·설정 예제/역할 MD·시험·동료용 문서만 포함한다. 검증은 20절의 같은
+소스를 사용한 전체 Linux 결과를 근거로 하고, 공개 전 설정/gate focused 회귀와
+Ruff/mypy/diff를 재확인한다. 실제 LLM·새 Mobile·외부 대상 시험은 추가하지 않는다.
+
+PR에는 `sidecar_image`의 필수 이행, 설정 검사≠실환경 준비/실행 승인, unknown/미완료
+handoff 보류, 생성 코드 실제 대상 실행 비활성, 62개 skipped 및 운영 입력 부재를
+명시한다. 누적 변경이 CI/보호 정책을 만족하는지는 PR 상태로 따로 확인한다.

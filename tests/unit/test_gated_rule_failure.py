@@ -29,6 +29,8 @@ async def test_ruleset_apply_failure_stays_closed_and_quarantined(tmp_path, monk
 
     async def docker(argv, stdin, timeout, limit=None):
         calls.append(argv)
+        if argv[:2] == ("image", "inspect"):
+            return 0, policy.sidecar_image.encode(), b"", False, False
         if argv[:2] == ("exec", "-i"):
             assert stdin is not None and b"quota name qb drop" in stdin
             return 1, b"", b"quota qb: Could not process rule: No such file", False, False

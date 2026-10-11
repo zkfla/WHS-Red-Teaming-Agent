@@ -308,6 +308,22 @@ class GatedWindowExtension(ExecutionAdmission):
         validate_allowed_flows(allowed)
         self._check_scope_membership(allowed, caps.purpose)
 
+        # Operator image selection/availability is checked before reserving
+        # capacity or creating a room. Never pull a mutable default image.
+        try:
+            sidecar_image = self.policy.require_sidecar_image()
+        except ValueError as exc:
+            raise GatedNetworkError(str(exc)) from None
+        code, out, _err, timed_out, cut = await self.run_docker(
+            ("image", "inspect", "--format", "{{.Id}}", sidecar_image), None, 30.0, 1024,
+        )
+        image_id = out.decode(errors="replace").strip()
+        if (code != 0 or timed_out or cut or not image_id.startswith("sha256:")
+                or len(image_id) != 71
+                or any(char not in "0123456789abcdef" for char in image_id[7:])
+                or (sidecar_image.startswith("sha256:") and image_id != sidecar_image)):
+            raise GatedNetworkError("gated_sidecar_image_unavailable")
+
         key = workroom_key_for(run_id, instance_id)
         if key in self._opening:
             raise GatedNetworkError("window_open_in_progress")
@@ -361,11 +377,13 @@ class GatedWindowExtension(ExecutionAdmission):
         return grant
 
     async def _create_sidecar(self, tag: str, room: str) -> None:
+        if self.policy is None:
+            raise GatedNetworkError("gated_network_unconfigured")
         code, _out, err = await self._docker(
-            ("create", "--name", tag, "--network", f"container:{room}",
+            ("create", "--pull=never", "--name", tag, "--network", f"container:{room}",
              "--cap-add", "NET_ADMIN", "--cap-drop", "ALL",
              "--label", GATED_LABEL, "--label", f"{GATED_CONTEXT_LABEL}={tag}",
-             "t005-gate-sidecar"), None, 60.0, None,
+             self.policy.require_sidecar_image()), None, 60.0, None,
         )
         if code != 0:
             detail = _short(err)

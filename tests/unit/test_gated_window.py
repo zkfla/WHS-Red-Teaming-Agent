@@ -71,11 +71,12 @@ def _policy() -> GatedNetworkPolicy:
         purpose=NetworkPurpose.INSTALL,
     )
     return GatedNetworkPolicy(
+        sidecar_image="sha256:" + "ab" * 32,
         budget=_budget(), default_target_caps=target, default_install_caps=install,
         registry=PinnedRegistry(targets={"t": ("10.0.0.9",)}, mirrors={}),
         install_proxy=InstallProxyConfig(
             endpoint="http://proxy:8080",
-            pinned_hosts=("m",),
+            pinned_hosts=("10.0.0.10",),
             mirror_upstream="https://m:443",
         ),
     )

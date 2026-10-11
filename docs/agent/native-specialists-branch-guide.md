@@ -5,7 +5,10 @@
 선택 이식한 preview이며, 두 브랜치의 전체 병합이나 PRD 완료를 뜻하지 않는다.
 
 공개 위치: [dev-jm-native-specialists](https://github.com/zkfla/WHS-Red-Teaming-Agent/tree/dev-jm-native-specialists).
-`dev`/`dev-jm`을 직접 갱신하거나 PR을 생성하는 작업이 아니다. 새 동료는 이 문서,
+초기 preview 공개에서는 `dev`/`dev-jm` 직접 갱신과 PR 생성을 하지 않았다.
+2026-10-11 후속 사용자 요청으로 로컬 운영 준비 변경까지 이 브랜치에 공개하고,
+`dev` 대상 PR을 제안한다. 직접 merge/auto-merge나 구형 `dev-jm` 변경은 포함하지 않는다.
+새 동료는 이 문서,
 아래 역할 설정, [모듈별 구현·검증 기록](dev-first-specialists-implementation-20261010.md)
 순서로 읽으면 된다. 기록의 과거 “push 없음/다음 작업”은 당시 상태이며 최신 현황은
 이 안내와 구현 기록의 마지막 절을 따른다.
@@ -13,6 +16,10 @@
 현재 이후 작업은 **Web/API·Recon 중심이며 Mobile은 제외**한다. 기존 Mobile
 코드와 전체 프로필은 호환성 보존용이다. 새 Run에는 아래 Web 전용 프로필을
 선택하며, 기존 Run을 다른 구성으로 강제 재개하지 않는다.
+
+운영 전 설정 검사·pinned sidecar 이행·복구/보류 절차는
+[Web 운영 인계 안내](web-operations-handoff.md)를 따른다. 소스의 실제 공개/CI 상태는
+원격 브랜치 SHA와 PR을 확인하고, 검증 범위는 구현 기록의 최신 절을 확인한다.
 
 ## 구성과 실제 동작
 
@@ -119,7 +126,8 @@ umask 077  # 합성 Workspace/VDB 입력도 소유자 전용 파일 정책을 �
   운영 mirror pin·이미지 신뢰·승인 정책과 실제 환경 평가는 별개로 남는다.
   shell 회귀와 이전 환경 실패는 16~17절에, VM 검증은 18절에 구분한다.
   quota/Control을 완화하거나 기존 실패를 지워 성공으로 계산하지 않았다.
-- 최종 전체 인계 및 운영 검증. 실제 대상 생성 코드 실행 규격은 미확정·비활성이다.
+- 최종 운영 인계 및 실운영 검증. 로컬 준비/검증과 동료용 절차 작성은 20절에서
+  완료했다. 실제 대상 생성 코드 실행 규격은 미확정·비활성이다.
 
 기동/원본 교차 진단의 사용법과 조회 범위는 [복구 계약](../contracts/activation-recovery.md)의
 5.2~5.8절을 확인한다. 진단/수집 모드의 exit 0은 조회/수집 성공이며
@@ -143,8 +151,15 @@ Linux VM의 실제 gate **5 passed / 0 skipped**와 관련 unit **63 passed**는
 최종 Linux 검증은 전체 **4,379 passed / 1 예제 복사 누락 실패 / 62 skipped**,
 누락된 추적 예제를 복사한 후 해당 실패만 **1 passed**다. 따라서 통과 사례 집합은
 4,380개이며 62개는 미실시다. 수정 전 실패·준비 누락·focused 중복을 합산해서
-단일 전체 green 출력으로 표시하지 않는다. Ruff, 전체 mypy(743 파일), CI YAML과
-두 Compose 설정 검사도 통과했다. 실제 LLM 성능/운영 승인까지 입증한 것은 아니다.
+단일 전체 green 출력으로 표시하지 않는다. 당시 Ruff, 전체 mypy(743 파일), CI YAML과
+두 Compose 설정 검사도 통과했다.
+
+후속 운영 준비 변경까지 포함한 최신 검증은 20절이다. **단일 전체 Linux 회귀
+4,426 passed / 62 skipped / 실패 0**, Mac 관련 집합 348 passed, Ruff와 전체
+mypy(746 파일)가 통과했다. gate의 고정 태그를 운영자 pin으로 교체했고 실제 Docker
+설치/window 5건도 전체 결과에 포함됐다. 설정 변경의 영향과 재현 명령은 20절 및
+[운영 안내](web-operations-handoff.md)를 따른다. 앞선 통과 수와 합산하지 않는다.
+실제 LLM 성능/외부 MCP·운영 승인까지 입증한 것은 아니다.
 
 실행 준비 절차는 [gate 안내](../../deploy/docker/gate-sidecar/README.md),
 [shell 안내](../../deploy/docker/shell-workroom/README.md),

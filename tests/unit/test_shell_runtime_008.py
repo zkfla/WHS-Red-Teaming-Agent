@@ -219,6 +219,7 @@ def _gated_policy_file(tmp_path, **overrides):
     cap = NetworkCapacity(max_flow_init_deliveries=10, max_output_bytes=100000)
     zero = NetworkCapacity(max_flow_init_deliveries=0, max_output_bytes=0)
     policy = GatedNetworkPolicy(
+        sidecar_image="sha256:" + _DIGEST,
         budget=NetworkBudget(
             global_capacity=cap, target_capacity=cap, install_capacity=zero
         ),

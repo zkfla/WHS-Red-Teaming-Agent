@@ -91,3 +91,21 @@ settlements are in [implementation section 18](../../../docs/agent/dev-first-spe
 Production additionally needs operator-provided pinned images, approved
 mirror/proxy destinations and ports, scope and separate install/target
 limits. Test pins and `allow_unpinned_image=True` are not deployment authority.
+
+## Explicit sidecar selection
+
+Set `sidecar_image` in the gated-network policy to an operator-reviewed
+`repo@sha256:<digest>` or a local immutable `sha256:<image-id>`. Missing or
+mutable selections are configuration errors; older files need an explicit
+operator update. The runtime no longer selects `t005-gate-sidecar` for you.
+It checks local availability before any grant reservation or workroom creation
+and uses `docker create --pull=never`. Pinning fixes identity, not supply-chain
+trust. The test image tags above are fixture lookup names; Docker proofs resolve
+their actual local IDs into policy before opening a gate.
+
+Use `redteam validate engagement.yaml --json` for offline policy/profile
+validation. Exit 0 is not a Docker/kernel/MCP probe or execution admission.
+Proxy origins must be credential-free HTTP(S) with no non-root path, query,
+fragment or controls. Proxy pins are canonical IP literals and cannot overlap
+target pins. See the [Web operator runbook](../../../docs/agent/web-operations-handoff.md)
+for remaining operator inputs and the supported recovery/held boundaries.

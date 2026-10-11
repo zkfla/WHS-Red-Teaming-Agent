@@ -37,7 +37,12 @@ from redteam.core.contracts.target import DomainTarget
 from redteam.core.contracts.tool import ExecutionContext, ToolInvocation
 from redteam.core.ids import ActionId, AgentInstanceId, EngagementId, InvocationId, RunId, ToolId
 from redteam.evidence.stores.filesystem import FilesystemEvidenceStore
-from tests.integration.test_gated_window_docker import SIDECAR_IMG, docker, image_available
+from tests.integration.test_gated_window_docker import (
+    SIDECAR_IMG,
+    docker,
+    image_available,
+    image_pin,
+)
 
 pytestmark = pytest.mark.skipif(shutil.which("docker") is None, reason="docker unavailable")
 ROOM_IMAGE = "shell-workroom:t003-draft"
@@ -117,6 +122,7 @@ async def test_real_pip_install_uses_proxy_and_direct_mirror_is_blocked(tmp_path
         caps = WindowCaps(max_flow_init_deliveries=30, max_output_bytes=500000,
                           duration_seconds=120, purpose=NetworkPurpose.INSTALL)
         config = GatedNetworkPolicy(
+            sidecar_image=await image_pin(SIDECAR_IMG),
             budget=budget, default_install_caps=caps,
             default_target_caps=caps.model_copy(update={"purpose": NetworkPurpose.TARGET}),
             registry=PinnedRegistry(mirrors={"mirror": (mirror_ip,), "proxy": (proxy_ip,)}),

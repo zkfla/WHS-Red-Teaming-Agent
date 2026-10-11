@@ -252,7 +252,11 @@ def _specialist_artifact_store(specialists, injected, evidence_dir) -> ArtifactS
     return FilesystemArtifactBackend(Path(evidence_dir) / "artifacts")
 
 
-def _code_fixture_runner(specialists, injected, settings) -> CodeFixtureRunner | None:
+def build_selected_code_fixture_runner(specialists, injected, settings) -> CodeFixtureRunner | None:
+    """Validate fixture selection and build it without starting Docker/LLM.
+
+    Shared by assembly and offline CLI preflight; construction is not execution.
+    """
     path = settings.code_fixture_policy_path
     if injected is None and path is None:
         return None
@@ -324,7 +328,9 @@ async def build_runtime_deps(
     from redteam.app.agent_profile import selected_specialists
 
     specialists = selected_specialists(settings)
-    resolved_fixture_runner = _code_fixture_runner(specialists, code_fixture_runner, settings)
+    resolved_fixture_runner = build_selected_code_fixture_runner(
+        specialists, code_fixture_runner, settings,
+    )
     component_binding = ensure_durable_binding(
         binding_for_registration(component_registration),
         durable=settings.checkpointing and settings.checkpoint_backend == "sqlite",
@@ -594,7 +600,7 @@ async def build_application(
     from redteam.app.agent_profile import selected_specialists
 
     specialists = selected_specialists(resolved_settings)
-    resolved_fixture_runner = _code_fixture_runner(
+    resolved_fixture_runner = build_selected_code_fixture_runner(
         specialists, code_fixture_runner, resolved_settings,
     )
     resolved_tasks = task_graph_store or _build_task_graph_store(resolved_settings)

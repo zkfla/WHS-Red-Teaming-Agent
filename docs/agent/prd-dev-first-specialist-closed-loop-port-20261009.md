@@ -1,7 +1,7 @@
 # PRD — 최신 dev 기반 전문 에이전트·폐쇄루프 통합
 
 - 작성일: 2026-10-09
-- 문서 개정: v1.2 — v1.1의 계약 유지, 2026-10-11 사용자 요청으로 이후 Mobile 작업 제외.
+- 문서 개정: v1.3 — 기존 계약 유지. 이후 Mobile 제외 및 실제 LLM 검증 없는 로컬 운영 준비 범위를 명시.
 - 상태: 코드 조사에 근거한 구현 계획. 이 문서는 구현 완료·병합 가능·운영 검증 완료를 의미하지 않는다.
 - 기준 dev: `153265e32e029481628e8c057fe0ea476d939d64`
 - 기능 이식 원본 dev-jm: `8af7a6a2a9d2e773147c673e909917152d51856c`
@@ -27,6 +27,29 @@ M6의 현재 필수 범위는 Web 전문 폐쇄루프·기존 dev 회귀·재현
 검사 실패도 M6 기본 호환 범위에 포함한다. Graph 소유 기능 검사만 수정하고,
 wrapper fence를 우회하거나 private 파일 정책을 완화하지 않는다. 이유·재현·최종
 검증은 [구현 기록 19절](dev-first-specialists-implementation-20261010.md)에 기록한다.
+
+### 현재 운영 준비 범위 — 2026-10-11 후속 요청
+
+사용자는 실제 LLM 검증을 제외한 나머지 작업을 요청했고, 운영 mirror/proxy·pinned
+이미지·INSTALL/TARGET 한도는 아직 없으므로 **로컬 검증·운영 준비까지만** 선택했다.
+이 요청을 실제 운영 대상 승인이나 미완료 Task 인계 허가로 해석하지 않는다.
+
+- 기존 `validate`에 같은 실행 로더의 shell/gate·전문 프로필·공통 요청 정책·선택적
+  offline fixture 검사를 연결한다. 설정 통과와 live readiness/Control admission은
+  별도로 표시하며 검사 중 Docker/MCP/LLM·대상 요청·grant 생성을 하지 않는다.
+- gate sidecar는 운영자가 명시한 불변 이미지만 사용한다. 누락·태그·로컬 이미지
+  부재는 예약/생성 전에 거절하며 자동 pull하지 않는다. 기존 파일의 이미지 선택은
+  운영자가 이행한다. 설정 변경으로 과거 Run fingerprint를 강제 우회하지 않는다.
+- 설치 origin의 잘못된 포트·credentials·무시되는 path/query/fragment, 비정규 pin,
+  proxy/target pin 겹침을 로딩 때 거절한다. Scope/ROE·기존 graph/엔진을 완화하지 않는다.
+- Web 전문 폐쇄루프·복구/claim/공유 원장 회귀와 Linux 실제 합성 프록시·차단·정산을
+  검증한다. 원본 불명 전체 상태 및 미완료 handoff는 G8의 명확한 보류를 유지한다.
+
+이 범위의 최종 단일 Linux 회귀는 **4,426 passed / 62 skipped / 실패 0**이다.
+별도 실제 LLM 성능·외부 MCP 검증, 실운영 설정/공급망 승인은 이 결과에 포함하지
+않는다. 수정 근거·시험 원본은 [구현 기록 20절](dev-first-specialists-implementation-20261010.md),
+운영자 준비/복구 절차는 [Web 운영 안내](web-operations-handoff.md)를 따른다.
+현재 로컬 준비 범위를 마쳤다는 것과 M6의 실운영 검증 완료를 구분한다.
 
 ## 1. 결론
 

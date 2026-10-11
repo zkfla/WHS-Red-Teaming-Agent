@@ -62,7 +62,13 @@ async def image_available(name):
     return code == 0 and bool(out.strip())
 
 
-def make_policy(mock_ip):
+async def image_pin(name):
+    code, out, err = await docker("image", "inspect", "--format", "{{.Id}}", name)
+    assert code == 0, err.decode()
+    return out.decode().strip()
+
+
+def make_policy(mock_ip, *, sidecar_image=None):
     cap = NetworkCapacity(max_flow_init_deliveries=100, max_output_bytes=1000000)
     zero = NetworkCapacity(max_flow_init_deliveries=0, max_output_bytes=0)
     budget = NetworkBudget(global_capacity=cap, target_capacity=cap, install_capacity=zero)
@@ -83,10 +89,11 @@ def make_policy(mock_ip):
     registry = PinnedRegistry(targets={"mock-target": (mock_ip,)}, mirrors={})
     proxy = InstallProxyConfig(
         endpoint="http://mock-proxy:8080",
-        pinned_hosts=("mock-proxy",),
+        pinned_hosts=("192.0.2.2",),  # unused synthetic install route, not a DNS pin
         mirror_upstream="https://mock-mirror:443",
     )
     return GatedNetworkPolicy(
+        sidecar_image=sidecar_image,
         budget=budget,
         default_target_caps=target_caps,
         default_install_caps=install_caps,
@@ -144,6 +151,7 @@ async def test_quiet_window_releases_with_live_meter(tmp_path):
     instance_id = "i1"
     key = workroom_key_for(run_id, instance_id)
     network_policy = GatedNetworkPolicy(
+        sidecar_image=await image_pin(SIDECAR_IMG),
         budget=budget,
         default_target_caps=target_caps,
         default_install_caps=WindowCaps(
@@ -495,7 +503,7 @@ async def test_window_e2e_busy_static_settle(tmp_path):
         )
         assert result.exit_code == 0
         mock, mock_ip = await _mock(tag, wnet, NETWORK_FIXTURE)
-        policy_net = make_policy(mock_ip)
+        policy_net = make_policy(mock_ip, sidecar_image=await image_pin(SIDECAR_IMG))
         ledger = SQLiteNetworkGrantLedger(
             str(tmp_path / "net.db"), engagement_id="egated", budget=policy_net.budget
         )

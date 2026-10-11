@@ -25,6 +25,12 @@ _IMAGE_ID = re.compile(r"^sha256:[a-f0-9]{64}$")
 _SHELL_META = frozenset({";", "&", "|", "\x60", "$", ">", "<", "\r", "\n", "\x00"})
 
 
+def validate_pinned_image(image: str) -> None:
+    """Content-addressed Docker references shared by confined providers."""
+    if not _IMAGE_DIGEST.fullmatch(image) and not _IMAGE_ID.fullmatch(image):
+        raise ValueError("shell workroom image must be pinned by sha256 digest or image ID")
+
+
 class ShellWorkroomPolicy(BaseModel):
     """Operator-owned Docker sandbox policy for shell workrooms."""
 
@@ -86,8 +92,7 @@ class ShellWorkroomPolicy(BaseModel):
         """
         if self.allow_unpinned_image:
             return
-        if not _IMAGE_DIGEST.fullmatch(self.image) and not _IMAGE_ID.fullmatch(self.image):
-            raise ValueError("shell workroom image must be pinned by sha256 digest or image ID")
+        validate_pinned_image(self.image)
 
     @classmethod
     def valid_workroom_key(cls, value: str) -> str:
@@ -132,6 +137,10 @@ def load_shell_workroom_policy(path: str) -> ShellWorkroomPolicy:
         policy.validate_image()
     except ValueError as exc:
         raise ValueError(f"shell workroom policy image not pinned ({path}): {exc}") from exc
+    if policy.default_timeout_seconds > policy.max_timeout_seconds:
+        raise ValueError(
+            f"shell workroom policy invalid ({path}): default timeout exceeds maximum timeout"
+        )
     return policy
 
 
