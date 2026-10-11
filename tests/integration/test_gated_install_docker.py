@@ -37,12 +37,25 @@ from redteam.core.contracts.target import DomainTarget
 from redteam.core.contracts.tool import ExecutionContext, ToolInvocation
 from redteam.core.ids import ActionId, AgentInstanceId, EngagementId, InvocationId, RunId, ToolId
 from redteam.evidence.stores.filesystem import FilesystemEvidenceStore
-from tests.integration.test_gated_window_docker import docker
+from tests.integration.test_gated_window_docker import (
+    SIDECAR_IMG,
+    docker,
+    image_available,
+    image_pin,
+)
 
 pytestmark = pytest.mark.skipif(shutil.which("docker") is None, reason="docker unavailable")
+ROOM_IMAGE = "shell-workroom:t003-draft"
+MOCK_IMAGE = "python:3.11-slim"
 
 
 async def test_real_pip_install_uses_proxy_and_direct_mirror_is_blocked(tmp_path, monkeypatch):
+    # Like the other gated Docker proofs, require already-local fixtures
+    # before creating any resources. Missing fixtures are not a gate proof
+    # failure and must not trigger Docker's implicit image download.
+    for image in (ROOM_IMAGE, SIDECAR_IMG, MOCK_IMAGE):
+        if not await image_available(image):
+            pytest.skip("gated install fixture image not available locally: " + image)
     suffix = uuid.uuid4().hex[:10]
     run_id, instance = "pip" + suffix, "i1"
     key = workroom_key_for(run_id, instance)
@@ -53,7 +66,7 @@ async def test_real_pip_install_uses_proxy_and_direct_mirror_is_blocked(tmp_path
     network = sidecar.replace("gwin-", "gwn-", 1)
     mirror, proxy = "pip-mirror-" + suffix, "pip-proxy-" + suffix
     manager = ShellWorkroomManager(ShellWorkroomPolicy(
-        image="shell-workroom:t003-draft", allow_unpinned_image=True,
+        image=ROOM_IMAGE, allow_unpinned_image=True,
         default_timeout_seconds=90, max_timeout_seconds=120,
     ))
     adapter = BuiltinShellAdapter(manager.policy, workroom=manager)
@@ -73,7 +86,7 @@ async def test_real_pip_install_uses_proxy_and_direct_mirror_is_blocked(tmp_path
         code, _, err = await docker(
             "run", "-d", "--name", mirror, "--network", network,
             "--mount", f"type=bind,source={tmp_path},target=/mirror,readonly",
-            "python:3.11-slim", "python", "-m", "http.server", "8080",
+            MOCK_IMAGE, "python", "-m", "http.server", "8080",
             "--directory", "/mirror",
         )
         assert code == 0, err.decode()
@@ -95,7 +108,7 @@ async def test_real_pip_install_uses_proxy_and_direct_mirror_is_blocked(tmp_path
             "run", "-d", "--name", proxy, "--network", network,
             "--mount", f"type=bind,source={source_dir},target=/code,readonly",
             "--mount", f"type=bind,source={tmp_path},target=/fixture,readonly",
-            "python:3.11-slim", "python", "/fixture/proxy.py",
+            MOCK_IMAGE, "python", "/fixture/proxy.py",
         )
         assert code == 0, err.decode()
         code, out, _ = await docker("inspect", "--format",
@@ -109,6 +122,7 @@ async def test_real_pip_install_uses_proxy_and_direct_mirror_is_blocked(tmp_path
         caps = WindowCaps(max_flow_init_deliveries=30, max_output_bytes=500000,
                           duration_seconds=120, purpose=NetworkPurpose.INSTALL)
         config = GatedNetworkPolicy(
+            sidecar_image=await image_pin(SIDECAR_IMG),
             budget=budget, default_install_caps=caps,
             default_target_caps=caps.model_copy(update={"purpose": NetworkPurpose.TARGET}),
             registry=PinnedRegistry(mirrors={"mirror": (mirror_ip,), "proxy": (proxy_ip,)}),

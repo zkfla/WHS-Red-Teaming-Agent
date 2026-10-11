@@ -10,9 +10,10 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Callable, Coroutine, Hashable
+from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Protocol, TypeVar
+from typing import Any, Protocol, TypeVar, runtime_checkable
 
 from redteam.core.contracts.mission import MissionPlan, MissionTask
 from redteam.core.enums import MissionStatus, TaskStatus
@@ -66,6 +67,18 @@ class AtomicStateBackend(Protocol):
     def attach_paths(self, paths: Any) -> None: ...
 
     def check_history(self, history: Any | None) -> None: ...
+
+
+@runtime_checkable
+class RunExecutionBackend(Protocol):
+    """Optional provider-owned, nonblocking exclusive Run execution scope.
+
+    This is process ownership, not a Task claim, tool-resource lease or
+    database transaction. Release never authorizes checkpoint replay.
+    Custom backends must provide equivalent ownership for specialist mode.
+    """
+
+    def exclusive_run(self, run_id: str) -> AbstractAsyncContextManager[None]: ...
 
 
 class StagedTaskGraph(Protocol):
@@ -231,6 +244,13 @@ class Coordinator:
 
     async def change(self, callback: Callable[[ChangeSet], Coroutine[Any, Any, T]]) -> T:
         return await self.backend.change(callback)
+
+    def exclusive_run(self, run_id: str) -> AbstractAsyncContextManager[None]:
+        if not isinstance(run_id, str) or not run_id.strip():
+            raise CoordinationError("run_execution_identity_missing")
+        if not isinstance(self.backend, RunExecutionBackend):
+            raise CoordinationError("run_execution_backend_unsupported")
+        return self.backend.exclusive_run(run_id)
 
     async def bind(self, run_id: str, mission_id: str, engagement_id: str) -> None:
         async def register(change: ChangeSet) -> None:

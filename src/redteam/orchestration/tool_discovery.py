@@ -540,6 +540,13 @@ async def tool_list_cards_handler(
         mcp_cards = view.list_cards(
             capability=capability, query=query, include_unhealthy=include_unhealthy
         )
+        from redteam.orchestration.agents.tool_access import specialist_tool_ids
+
+        selected = await specialist_tool_ids(
+            deps, context.runtime, include_unhealthy=include_unhealthy,
+        )
+        if selected is not None:
+            mcp_cards = [card for card in mcp_cards if str(card.tool_id) in selected]
     locals_cards: list[ToolCard] = []
     if kind is None or kind == "local_helper":
         registry = getattr(deps, "local_tools", None)
@@ -628,6 +635,11 @@ async def tool_get_detail_handler(
     view = card_view_for(deps)
     if view is None:
         return LocalToolResult(ok=False, error="tool detail source is not wired")
+    from redteam.orchestration.agents.tool_access import specialist_tool_ids
+
+    selected = await specialist_tool_ids(deps, context.runtime)
+    if selected is not None and wanted not in selected:
+        return LocalToolResult(ok=False, error="tool_not_visible_to_current_role")
     try:
         found = view.get_detail(ToolId(wanted))
     except (ValueError, TypeError):

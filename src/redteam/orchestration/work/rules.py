@@ -53,7 +53,8 @@ def decide_add(item: WorkItem, same_candidate: list[WorkItem]) -> tuple[str, Wor
     A pending same-candidate row wins over insertion; the caller refreshes
     it with :func:`refresh_pending_item` and reports ``False``.
     """
-    if any(existing.status in ACTIVE_CONFLICT_STATUSES for existing in same_candidate):
+    if any(existing.status in ACTIVE_CONFLICT_STATUSES or existing.resource_execution_pending
+           for existing in same_candidate):
         return ("reject", None)
     pending = [existing for existing in same_candidate if existing.status is WorkStatus.PENDING]
     if pending:
@@ -102,15 +103,25 @@ def blocked_for_dependency(
 
 
 def has_conflict(item: WorkItem, others: Iterable[WorkItem]) -> bool:
+    return bool(conflict_blockers(item, others))
+
+
+def conflict_blockers(item: WorkItem, others: Iterable[WorkItem]) -> list[WorkItem]:
     keys = set(item.conflict_keys)
-    if not keys:
-        return False
-    return any(
-        other.work_id != item.work_id
-        and other.status in ACTIVE_CONFLICT_STATUSES
-        and not keys.isdisjoint(other.conflict_keys)
-        for other in others
-    )
+    return [other for other in others if other.work_id != item.work_id and (
+        (other.status in ACTIVE_CONFLICT_STATUSES and not keys.isdisjoint(other.conflict_keys))
+        or (other.resource_execution_pending and not keys.isdisjoint(other.resource_keys))
+    )]
+
+
+def execution_started_item(item: WorkItem, lease: TaskLease | None, owner: str,
+                           now: datetime) -> WorkItem | None:
+    if (lease is None or lease.owner != owner or is_expired(lease.expires_at, now)
+            or item.status not in ACTIVE_CONFLICT_STATUSES or item.resource_execution_pending):
+        return None
+    return item.model_copy(update={
+        "resource_execution_pending": bool(item.resource_keys), "updated_at": now,
+    })
 
 
 def new_lease(work_id: str, owner: str, now: datetime, ttl: timedelta) -> TaskLease:
@@ -149,9 +160,13 @@ def stale_item(item: WorkItem, now: datetime, reason: str) -> WorkItem:
 
 
 def finished_item(
-    item: WorkItem, status: WorkStatus, now: datetime, reason: str | None
+    item: WorkItem, status: WorkStatus, now: datetime, reason: str | None,
+    *, execution_known: bool = False,
 ) -> WorkItem:
-    return item.model_copy(update={"status": status, "updated_at": now, "outcome_reason": reason})
+    return item.model_copy(update={
+        "status": status, "updated_at": now, "outcome_reason": reason,
+        "resource_execution_pending": item.resource_execution_pending and not execution_known,
+    })
 
 
 def pending_item(item: WorkItem, now: datetime) -> WorkItem:
@@ -220,14 +235,17 @@ def _reconcile_transition(
 ) -> tuple[bool, WorkItem | None]:
     """Shared terminal-transition core for job and execution settlement."""
     if item.status is target:
-        if item.outcome_reason and marker in item.outcome_reason:
+        if (item.outcome_reason and marker in item.outcome_reason
+                and not item.resource_execution_pending):
             return (True, None)
-        return (True, finished_item(item, target, now, reason))
-    if item.status in {WorkStatus.FAILED, WorkStatus.STALE}:
-        return (True, finished_item(item, target, now, reason))
+        return (True, finished_item(item, target, now, reason, execution_known=True))
+    if item.status in {WorkStatus.FAILED, WorkStatus.STALE} or item.resource_execution_pending:
+        # Cleanup status is not an execution receipt. A verified original
+        # can settle a cancelled/abandoned resource-owning execution too.
+        return (True, finished_item(item, target, now, reason, execution_known=True))
     if item.status not in ACTIVE_STATUSES:
         return (False, None)
-    return (True, finished_item(item, target, now, reason))
+    return (True, finished_item(item, target, now, reason, execution_known=True))
 
 
 def decide_reconcile(

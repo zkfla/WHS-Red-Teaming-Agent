@@ -21,9 +21,9 @@ proposal to the resolved Approval via
 exactly at POLICY. It never re-plans and never reconstructs an action from the
 redacted Audit snapshot.
 
-Safety: every failure leaves the run exactly as it was. The run is refused
-when no checkpoint exists, or when the recovered checkpoint still has an
-EXECUTE/WORKER super-step pending (replaying it could repeat a side effect).
+Without any checkpoint, only a coherent versioned, never-entered specialist
+reservation may supply an assembly identity. It is NOT replay permission;
+the owned driver verifies current state and actual absence of effects again.
 """
 
 from __future__ import annotations
@@ -54,6 +54,7 @@ from redteam.capability.settings import (
 from redteam.capability.shell_assembly import build_gated_provider_config
 from redteam.capability.shell_runtime import build_shell_runtime
 from redteam.core.config import AppConfig
+from redteam.core.contracts.events import EventType
 from redteam.core.ids import RunId
 from redteam.event_bus.publisher import EventPublisher
 from redteam.orchestration.checkpointing import (
@@ -69,12 +70,16 @@ from redteam.orchestration.component_binding import (
     selection_of,
 )
 from redteam.orchestration.context import RuntimeDeps
-from redteam.orchestration.coordination import CLOSED
+from redteam.orchestration.coordination import CLOSED, CoordinationError, StateConflict
 from redteam.orchestration.instance_driver import InstanceDriver
 from redteam.orchestration.operator_intents import OperatorIntentService
 from redteam.orchestration.runner import AgentLoopRunner, CheckpointingDisabledError
 from redteam.orchestration.settings import OrchestrationSettings
 from redteam.orchestration.state import RuntimeState, TerminationReason
+from redteam.orchestration.task_activation import (
+    ActivationRecoveryIdentity,
+    read_activation_identity,
+)
 
 
 def add_parser(subparsers: argparse._SubParsersAction) -> None:
@@ -156,6 +161,23 @@ async def _run(
             f"{type(exc).__name__}"
         )
         return EXIT_FAILURE
+    if not enumerated and instance_arg is None:
+        # Never disguise a reservation as a checkpoint thread. A read-only
+        # canonical projection supplies the original assembly identity only;
+        # existing cohort recovery then proves every actor before any dispatch.
+        try:
+            launch_identity = await read_activation_identity(settings.task_graph_path, args.run_id)
+        except Exception as exc:  # noqa: BLE001 - unreadable is not absence
+            reason = (str(exc) if isinstance(exc, (CoordinationError, StateConflict))
+                      else type(exc).__name__)
+            eprint(f"ERROR: activation bootstrap refused: {reason}")
+            return EXIT_FAILURE
+        if launch_identity is not None:
+            return await _run_cohort(
+                args, config, [], cohort=[], launch_identity=launch_identity,
+                on_finished=on_finished, session_channel=session_channel, on_event=on_event,
+                component_registry=component_registry,
+            )
     try:
         # Coherence over the ENTIRE enumerated cohort first: a mismatch in
         # unselected instances is still an unprovable aggregate.
@@ -506,6 +528,7 @@ async def _run_cohort(
     identities: list[CheckpointThreadIdentity],
     *,
     cohort: list[CheckpointThreadIdentity] | None = None,
+    launch_identity: ActivationRecoveryIdentity | None = None,
     on_finished: Callable[[RuntimeState], None] | None = None,
     session_channel: Any | None = None,
     on_event: Any | None = None,
@@ -527,7 +550,24 @@ async def _run_cohort(
     log_level = args.log_level or config.logging.level
     logging.basicConfig(level=log_level, force=True)
     settings = OrchestrationSettings.for_durable_run(config.orchestration, max_steps=args.max_steps)
-    engagement_id, _mission_id, binding_raw = _check_cohort_coherence(identities)
+    if launch_identity is None:
+        engagement_id, _mission_id, binding_raw = _check_cohort_coherence(identities)
+    else:
+        if identities or cohort or getattr(args, "instance", None) is not None:
+            eprint("ERROR: activation bootstrap requires a full zero-checkpoint cohort")
+            return EXIT_FAILURE
+        engagement_id = launch_identity.engagement_id
+        binding_raw = launch_identity.component_binding
+        from redteam.app.agent_profile import selected_specialists
+
+        try:
+            specialists = selected_specialists(settings)
+            if (specialists is None or specialists.fingerprint != binding_raw.specialist_fingerprint
+                    or settings.llm_request_policy != launch_identity.llm_request_policy):
+                raise ValueError("activation_configuration_changed_new_run_required")
+        except ValueError as exc:
+            eprint(f"ERROR: activation bootstrap configuration refused: {exc}")
+            return EXIT_FAILURE
 
     try:
         stored_binding = binding_for_resume(binding_raw, registry=component_registry)
@@ -644,6 +684,8 @@ async def _drive_cohort_guarded(
     *,
     on_finished: Callable[[RuntimeState], None] | None = None,
     session_channel: Any | None = None,
+    resume_paused: bool = True,
+    report_results: bool = True,
 ) -> int:
     """Recover the FULL cohort for accounting, start only the selection.
 
@@ -653,9 +695,24 @@ async def _drive_cohort_guarded(
     start. ``selected`` is the partial/full subset that actually drives.
     """
     run_id = args.run_id
+    unstarted: list[RuntimeState] = []
+    if getattr(deps, "specialist_policy", None) is not None:
+        try:
+            await driver.own_run(str(run_id))
+            await driver.reconcile_planning_writes(str(run_id))
+            unstarted = await driver.recover_unstarted_activations(
+                str(run_id),
+                checkpoint_instances={str(identity.instance_id) for identity in cohort},
+            )
+        except (CoordinationError, StateConflict) as exc:
+            eprint(f"ERROR: specialist resume refused: {exc}")
+            return EXIT_FAILURE
+        except Exception as exc:  # noqa: BLE001 - unavailable is not a zero-use proof
+            eprint(f"ERROR: recovery inventory unreadable: {type(exc).__name__}; refusing start")
+            return EXIT_FAILURE
     recovered: list[tuple[Any, RuntimeState, Any | None]] = []
     held: list[tuple[str | None, str]] = []
-    accounted: list[RuntimeState] = []
+    accounted: list[RuntimeState] = list(unstarted)
     for identity in cohort:
         runner = driver.runner_for(
             RuntimeState(
@@ -711,7 +768,7 @@ async def _drive_cohort_guarded(
     if session_channel is not None:
         session_channel.ready.set()
     paused = [item for item in recovered if item[1].termination_reason == "operator_paused"]
-    if paused:
+    if paused and resume_paused:
         service = OperatorIntentService.from_deps(deps)
         if service is None or paused[0][1].mission_id is None:
             eprint("ERROR: paused cohort has no durable Mission/Operator Intent channel")
@@ -742,6 +799,24 @@ async def _drive_cohort_guarded(
         for _runner, runtime, reconciliation in recovered
         if runtime.instance_id in selected_ids
     ]
+    full_selection = (getattr(args, "instance", None) is None
+                      and selected_ids == {identity.instance_id for identity in cohort})
+    # Explicit partial selection never starts a missing-checkpoint reservation,
+    # even if it happens to be the sole enumerated checkpoint.
+    unstarted_items = unstarted if full_selection and not held else []
+    covers_cohort = (selected_ids == {identity.instance_id for identity in cohort}
+                     and (not unstarted or bool(unstarted_items))
+                     and (getattr(deps, "specialist_policy", None) is None or full_selection))
+    driving = [runtime for runtime, _ in resume_items] + unstarted_items
+    specialist_loop = None
+    specialist_events = []
+    if getattr(deps, "specialist_policy", None) is not None and driving:
+        from redteam.app.specialist_run import SpecialistLifecycle
+
+        specialist_loop = SpecialistLifecycle(driving[0], deps)
+        # Set before native resume so a worker cannot close the Mission before
+        # its followup judgment. Unknown/partial cohorts never launch new Tasks.
+        await specialist_loop.state("active")
     finals: list[tuple[str | None, RuntimeState]] = []
     # Event kind for every run that did not complete. Its event runtime is the
     # BASE state, not an outcome: such a run is never settled, never passed to
@@ -749,8 +824,20 @@ async def _drive_cohort_guarded(
     abnormal: dict[str, str] = {}
     # All held: report held below and start nothing (an empty drive
     # would raise instead of reporting).
-    if resume_items:
-        async for event in driver.drive_resumed(resume_items):
+    if driving:
+        if specialist_loop is None:
+            stream = driver.drive_resumed(resume_items)
+        else:
+            policy = deps.specialist_policy
+            assert policy is not None
+            stream = driver.drive_ready_tasks(
+                driving[0], resume_items=resume_items, unstarted_items=unstarted_items,
+                max_instances=policy.max_instances, max_activations=policy.max_activations,
+                allow_new_tasks=covers_cohort and not held,
+                on_wakeup=specialist_loop.evidence_wakeup,
+                wake_events=(EventType.EVIDENCE_VALIDITY_CHANGED,),
+            )
+        async for event in stream:
             if event.kind == "failed":
                 eprint(
                     f"WARNING: instance {event.instance_id!r} failed: {event.error}"
@@ -760,6 +847,11 @@ async def _drive_cohort_guarded(
             if event.kind != "completed":
                 abnormal[str(event.instance_id)] = event.kind
             finals.append((str(event.instance_id), event.runtime))
+            if specialist_loop is not None:
+                specialist_events.append(event)
+                await specialist_loop.returned(event, allow_followups=covers_cohort and not held)
+    if specialist_loop is not None:
+        await specialist_loop.finish(specialist_events, covers_cohort=covers_cohort and not held)
     # Settle gate: read live mission state first. Only a terminal
     # mission or a genuinely all-settled cohort (nothing held, every
     # selected runnable final) authorizes a mission-closing settle;
@@ -768,17 +860,20 @@ async def _drive_cohort_guarded(
     mission_terminal = await _cohort_mission_terminal(deps, accounted)
     # Partial covers only its subset: full-settled needs the WHOLE
     # cohort selected (or a terminal mission); otherwise defer.
-    covers_cohort = {identity.instance_id for identity in selected} == {
-        identity.instance_id for identity in cohort
-    }
     # A failed/terminated sibling is not a settled final, so it blocks the
     # closing settle exactly like a held one (it would be stranded by our close).
     all_settled = (
-        covers_cohort and not held and not abnormal and len(finals) == len(resume_items)
+        covers_cohort and not held and not abnormal
+        and {str(runtime.instance_id) for runtime in driving}
+        <= {instance_id for instance_id, _ in finals}
+        and not any(final.pending_approval_id or final.termination_reason
+                    == TerminationReason.OPERATOR_PAUSED for _, final in finals)
     )
     settled: list[tuple[str | None, RuntimeState]] = []
     settle_failed = False
     for instance_id, final in finals:
+        if specialist_loop is not None and specialist_loop.diagnostic is not None:
+            final = final.model_copy(update={"planning_diagnostic": specialist_loop.diagnostic})
         if instance_id in abnormal:
             eprint(f"instance {instance_id!r}: settle skipped (run {abnormal[instance_id]})")
             settled.append((instance_id, final))
@@ -792,17 +887,60 @@ async def _drive_cohort_guarded(
                 settled.append((instance_id, final))
                 continue
         else:
-            eprint(f"instance {instance_id!r}: settle deferred (sibling unsettled)")
+            if report_results:
+                eprint(f"instance {instance_id!r}: settle deferred (sibling unsettled)")
         settled.append((instance_id, final))
         if on_finished is not None:
             on_finished(final)
     for instance_id, final in settled:
-        eprint(
-            f"instance {instance_id!r}: phase={final.phase.value} "
-            f"reason={final.termination_reason}"
-        )
+        if report_results:
+            eprint(
+                f"instance {instance_id!r}: phase={final.phase.value} "
+                f"reason={final.termination_reason}"
+            )
     for instance_id, why in held:
         eprint(f"instance {instance_id!r}: held ({why})")
     if abnormal or settle_failed or any(final.phase.value == "failed" for _id, final in settled):
         return EXIT_FAILURE
     return EXIT_OK
+
+
+async def watch_specialist_approval(
+    deps: RuntimeDeps, pending: RuntimeState, *, poll_seconds: float,
+) -> RuntimeState:
+    """Watch using full-cohort recovery, not a single fresh-budget runner.
+
+    Approval still re-enters its original POLICY through the existing driver.
+    A watch tick is NOT an operator resume instruction for a paused sibling.
+    """
+    if not deps.settings.checkpointing or deps.settings.checkpoint_backend != "sqlite":
+        raise ValueError("specialist_approval_watch_requires_durable_cohort")
+    current = pending
+    async with InstanceDriver(deps, settings=deps.settings) as driver:
+        await driver.own_run(str(current.run_id))
+        while current.termination_reason == TerminationReason.APPROVAL_PENDING:
+            await driver.runner_for(current).wait_for_change(current, timeout_seconds=poll_seconds)
+            cohort = await list_checkpoint_threads(
+                enabled=True, backend=deps.settings.checkpoint_backend,
+                path=deps.settings.checkpoint_path, run_id=str(current.run_id),
+            )
+            if not cohort:
+                raise ValueError("specialist_approval_cohort_missing")
+            finals: list[RuntimeState] = []
+            code = await _drive_cohort_guarded(
+                driver, argparse.Namespace(run_id=str(current.run_id)), deps, cohort, cohort,
+                on_finished=finals.append, resume_paused=False, report_results=False,
+            )
+            if code != EXIT_OK or not finals:
+                raise RuntimeError("specialist_approval_cohort_resume_failed")
+            mission = (await deps.task_graph_store.get_mission(current.mission_id)
+                       if current.mission_id is not None else None)
+            if mission is not None and mission.status.value == "cancelled":
+                return current.model_copy(update={
+                    "termination_reason": TerminationReason.OPERATOR_STOPPED,
+                    "pending_approval_id": None, "pending_action_id": None,
+                })
+            current = next((item for item in finals if item.pending_approval_id),
+                           next((item for item in finals if item.termination_reason
+                                 == TerminationReason.OPERATOR_PAUSED), finals[-1]))
+    return current

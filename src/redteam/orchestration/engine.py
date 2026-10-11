@@ -589,8 +589,15 @@ class InvestigationEngine:
             runtime,
             delegation_id=delegation.delegation_id if delegation is not None else None,
         )
+        from redteam.orchestration.evidence_validity import current_validity
+
+        validity = [await current_validity(
+            self.deps.evidence_store, AttackGraphService(self.deps.graph_store),
+            str(runtime.run_id), identity,
+        ) for identity in evidence_ids]
         return completion_review_context(
-            {**(context or {}), "knowledge": knowledge, "local_tool_results": results},
+            {**(context or {}), "knowledge": knowledge, "local_tool_results": results,
+             "evidence_validity": [item.model_dump(mode="json") for item in validity]},
             evidence_ids,
         )
 
@@ -904,6 +911,10 @@ class InvestigationEngine:
             for agent in self.deps.agents.all()
             if role_decisions[str(agent.agent_id)].eligible
         ]
+        if (getattr(self.deps, "specialist_policy", None) is not None
+                and runtime.current_agent is not None):
+            visible_agents = [agent for agent in visible_agents
+                              if agent.agent_id == runtime.current_agent]
         tools_by_role: dict[str, list[str]] = {
             str(agent.agent_id): [] for agent in visible_agents
         }
@@ -996,7 +1007,13 @@ class InvestigationEngine:
             runtime=runtime,
             library=library,
         )
+        from redteam.orchestration.evidence_validity import project_validity
+
+        validity = await project_validity(
+            self.deps.evidence_store, service, str(runtime.run_id), records=records,
+        )
         return {
+            "evidence_validity": [item.model_dump(mode="json") for item in validity],
             **reference_context,
             "tool_cards": [
                 card.model_dump(mode="json") for card in tool_cards
@@ -2807,6 +2824,9 @@ class InvestigationEngine:
                     unresolved_evidence_id=identity,
                 )
             return updated or path, []
+        from redteam.orchestration.evidence_validity import capture_validity
+
+        validity_read = await capture_validity(self.deps, runtime, parsed.evidence_ids)
         errors = await validate_completion(
             path=path,
             step=step,
@@ -2888,6 +2908,8 @@ class InvestigationEngine:
         status = "completed" if outcome in {"success", "refuted"} else "blocked"
 
         async def complete(change):
+            if validity_read is not None:
+                validity_read.check(change)
             return await change.paths.update_step(
                 str(runtime.run_id),
                 path.path_id,

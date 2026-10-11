@@ -38,6 +38,11 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict
 
 from redteam.attack_graph.service import AttackGraphService
+from redteam.core.contracts.completion import (
+    completion_conditions,
+    completion_contract_hash,
+    criterion_id,
+)
 from redteam.core.contracts.events import EventType
 from redteam.core.contracts.mission import (
     MissionCriterionResult,
@@ -70,11 +75,14 @@ from redteam.orchestration.execution_journal import (
 )
 from redteam.orchestration.result_claims import (
     RESULT_REVIEW_INSTRUCTION,
+    CriterionReview,
     ResultClaim,
     ResultReview,
+    TaskContractReview,
     check_result_review,
     mission_result_purpose,
 )
+from redteam.orchestration.task_completion_contract import check_task_conditions
 from redteam.orchestration.task_graph.claim import release_mission_task_claim
 from redteam.orchestration.work.models import WorkStatus, work_owner_for
 
@@ -158,6 +166,8 @@ def build_task_receipt(
     related_attack_graph_node_ids: list[str] | None = None,
     related_hypothesis_ids: list[str] | None = None,
     claims: list[dict[str, Any]] | None = None,
+    completion_contract_hash_value: str | None = None,
+    criterion_results: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Public receipt payload stored as immutable evidence metadata."""
     return {
@@ -179,6 +189,11 @@ def build_task_receipt(
             {str(item) for item in (related_hypothesis_ids or []) if str(item).strip()}
         ),
         "claims": list(claims or []),
+        **({
+            "completion_contract_version": 2,
+            "completion_contract_hash": completion_contract_hash_value,
+            "criterion_results": list(criterion_results or []),
+        } if completion_contract_hash_value is not None else {}),
     }
 
 
@@ -210,6 +225,11 @@ def verify_task_receipt(
     expected = purpose_hash(task.objective or "")
     if str(receipt.get("purpose_hash", "")) != expected:
         return ["task purpose changed since the accepted receipt"]
+    if task.completion_contract_version == 2 and (
+        receipt.get("completion_contract_version") != 2
+        or receipt.get("completion_contract_hash") != completion_contract_hash(task)
+    ):
+        return ["task completion contract changed or v2 receipt is missing"]
     for key, current in (
         ("related_attack_graph_node_ids", list(task.related_attack_graph_node_ids or [])),
         ("related_hypothesis_ids", list(task.related_hypothesis_ids or [])),
@@ -223,6 +243,17 @@ def verify_task_receipt(
     origins = [item for item in (receipt.get("source_evidence_ids", []) or []) if str(item).strip()]
     if not origins:
         return ["task receipt cites no origin evidence"]
+    if task.completion_contract_version == 2:
+        try:
+            reviews = [CriterionReview.model_validate(row)
+                       for row in receipt.get("criterion_results", [])]
+        except (ValueError, TypeError):
+            return ["task receipt criterion results are invalid"]
+        expected_ids = {criterion_id(c) for c in task.completion_criteria}
+        if (len(reviews) != len(expected_ids)
+                or {row.criterion_id for row in reviews} != expected_ids
+                or any(not row.met or set(row.evidence_ids) - set(origins) for row in reviews)):
+            return ["task receipt does not prove each fixed criterion"]
     return []
 
 
@@ -521,7 +552,7 @@ def _excerpt_of(record: Any, *, limit: int = EXCERPT_CHARS) -> dict[str, Any]:
 
 
 def _review_payload_common(
-    *, purpose: str, conditions: list[str], excerpts: list[dict[str, Any]]
+    *, purpose: str, conditions: list[Any], excerpts: list[dict[str, Any]]
 ) -> dict[str, Any]:
     return {
         "purpose": str(purpose or ""),
@@ -556,6 +587,10 @@ def _task_review_subject(task: MissionTask) -> dict[str, Any]:
         "mission_id": str(task.mission_id),
         "objective": str(task.objective or ""),
         "required": bool(task.required),
+        "completion_contract_version": task.completion_contract_version,
+        "completion_contract_hash": completion_contract_hash(task),
+        "completion_criteria": completion_conditions(task),
+        "principal_refs": list(task.principal_refs),
         "related_attack_graph_node_ids": [
             str(item) for item in (task.related_attack_graph_node_ids or [])
         ],
@@ -598,7 +633,7 @@ def _task_review_payload(
         "active_path": review_path_reference(path),
         **_review_payload_common(
             purpose=getattr(task, "objective", "") or "",
-            conditions=[],
+            conditions=completion_conditions(task),
             excerpts=excerpts,
         ),
         "verified_source_ids": list(evidence_ids),
@@ -832,6 +867,15 @@ async def complete_task(
     evidence_ids = select_task_evidence_ids(decision, path)
     if not evidence_ids:
         return ["task completion needs related stored evidence"]
+    from redteam.attack_graph.service import AttackGraphService
+    from redteam.orchestration.evidence_validity import capture_validity, validity_errors
+
+    validity_read = await capture_validity(engine.deps, runtime, evidence_ids)
+    errors = await validity_errors(engine.deps.evidence_store,
+                                   AttackGraphService(engine.deps.graph_store),
+                                   str(runtime.run_id), evidence_ids)
+    if errors:
+        return errors
     verified: list[Any] = []
     excerpt_notes: list[dict[str, Any]] = []
     for identity in evidence_ids:
@@ -854,6 +898,11 @@ async def complete_task(
             excerpt_notes.append(_excerpt_of(record))
     if not verified:
         return ["task completion needs related stored evidence"]
+    contract_errors = await check_task_conditions(
+        task, evidence_ids, deps=engine.deps, run_id=str(runtime.run_id),
+    )
+    if contract_errors:
+        return contract_errors
     pending = await _pending_execution_errors(engine, runtime, scope="task", task=task)
     if pending:
         return pending
@@ -867,7 +916,9 @@ async def complete_task(
             evidence_ids=evidence_ids,
             excerpts=excerpt_notes,
         ),
-        response_schema=ResultReview.model_json_schema(),
+        response_schema=(
+            TaskContractReview if task.completion_contract_version == 2 else ResultReview
+        ).model_json_schema(),
         system=_engine_system(engine) + RESULT_REVIEW_INSTRUCTION,
         budget=budget,
     )
@@ -880,6 +931,11 @@ async def complete_task(
     )
     if not review.get("accepted"):
         return ["semantic completion review rejected the evidence"]
+    contract_errors = await check_task_conditions(
+        task, evidence_ids, deps=engine.deps, run_id=str(runtime.run_id), review=review,
+    )
+    if contract_errors:
+        return contract_errors
     from redteam.attack_graph.service import AttackGraphService
 
     claims = list(review.get("claims", []))
@@ -914,6 +970,10 @@ async def complete_task(
         path_version=getattr(path, "version", None),
         related_attack_graph_node_ids=list(task.related_attack_graph_node_ids or []),
         related_hypothesis_ids=list(task.related_hypothesis_ids or []),
+        completion_contract_hash_value=(
+            completion_contract_hash(task) if task.completion_contract_version == 2 else None
+        ),
+        criterion_results=review.get("criterion_results"),
     )
     receipt_payload["claims"] = claims
     receipt_record = _receipt_record(
@@ -924,9 +984,13 @@ async def complete_task(
     )
 
     async def complete(change: Any) -> None:
+        if validity_read is not None:
+            validity_read.check(change)
         staged = await change.tasks.get_task(task.task_id)
         if staged is None:
             raise ValueError("completion_task_missing")
+        if completion_contract_hash(staged) != completion_contract_hash(task):
+            raise ValueError("completion_task_contract_changed")
         owner = work_owner_for(runtime.run_id, getattr(runtime, "instance_id", None))
         occupant = getattr(staged, "occupant_owner", None)
         if occupant is None:
@@ -1313,6 +1377,30 @@ async def complete_goal(
     engine: Any, path: Any, decision: Any, runtime: Any, context: Any, *, budget: Any = None
 ) -> list[str]:
     """Settle the original mission on its own criteria and required tasks."""
+    if getattr(engine.deps, "specialist_policy", None) is not None:
+        from redteam.orchestration.coordination import StateConflict, coordinator_for
+        from redteam.orchestration.outbox import pending_count
+        from redteam.orchestration.task_activation import TaskActivation
+
+        def check_quiescent(change):
+            run_id = str(runtime.run_id)
+            if (change.records.get(("specialist_lifecycle", run_id), {}).get("state")
+                    != "quiescent" or TaskActivation.has_pending(change, run_id)
+                    or pending_count(change, run_id)):
+                raise StateConflict("specialist_followup_review_pending")
+
+        async def loop_state(change):
+            try:
+                check_quiescent(change)
+            except StateConflict:
+                return False
+            return True
+
+        coordinator = engine.deps.coordinator or coordinator_for(
+            engine.deps.task_graph_store, engine.deps.path_store,
+        )
+        if not await coordinator.change(loop_state):
+            return ["specialist_followup_review_pending"]
     token = await engine._review_token(runtime)
     if getattr(runtime, "mission_id", None) is None:
         return ["goal completion requires an operator mission"]
@@ -1335,9 +1423,25 @@ async def complete_goal(
     if pending:
         return pending
     tasks = await engine.deps.task_graph_store.list_tasks(mission_id=runtime.mission_id)
+    from redteam.orchestration.evidence_validity import capture_validity, validity_errors
+
     errors, task_evidence, excerpts = await _goal_task_coverage(
         engine, runtime=runtime, tasks=tasks
     )
+    if errors:
+        return errors
+    from redteam.attack_graph.service import AttackGraphService
+
+    # Legacy completed tasks can ground through original path results instead
+    # of a receipt. Include these verified origins in the same relevant fence.
+    validity_read = await capture_validity(engine.deps, runtime, [
+        *[task.completion_evidence_id for task in tasks if task.completion_evidence_id is not None],
+        *[i for origins in task_evidence.values() for i in origins],
+    ])
+    errors = await validity_errors(engine.deps.evidence_store,
+                                   AttackGraphService(engine.deps.graph_store),
+                                   str(runtime.run_id),
+                                   [i for origins in task_evidence.values() for i in origins])
     if errors:
         return errors
     try:
@@ -1414,6 +1518,10 @@ async def complete_goal(
     now = datetime.now(timezone.utc)
 
     async def complete(change: Any) -> None:
+        if getattr(engine.deps, "specialist_policy", None) is not None:
+            check_quiescent(change)  # same transaction as Mission completion, not a stale hint
+        if validity_read is not None:
+            validity_read.check(change)
         for task in tasks:
             if (
                 getattr(task, "required", False)

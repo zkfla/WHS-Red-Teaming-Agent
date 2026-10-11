@@ -85,6 +85,26 @@ def _render_markdown(report: TerminalReportProjection) -> str:
         f"- Dead-end work ratio: {report.effectiveness.dead_end_work_ratio}",
         "",
     ]
+    if report.llm_request_accounting is not None:
+        usage = report.llm_request_accounting
+        policy = usage.get("policy") or {}
+        lines += [
+            "## Shared LLM request ledger", "",
+            f"- Mode: {policy.get('mode', 'unknown')}",
+            f"- Request cap: {policy.get('max_requests')}",
+            f"- Charged requests: {usage['spent']}; pending reservations: {usage['reserved']}",
+            f"- Known tokens: {usage['known_tokens']}; unknown usage: {usage['unknown_usage']}",
+            "- This ledger, not per-instance decision counters, owns request admission.", "",
+        ]
+    if report.mission is not None:
+        contracted = [t for t in report.mission.tasks if t.completion_contract_version == 2]
+        if contracted:
+            lines += ["## Fixed task completion contracts", ""]
+            for task in contracted:
+                lines += [f"- {task.task_id}: {task.completion_contract_hash}"]
+                for condition in task.completion_criteria:
+                    lines += [f"  - {json.dumps(condition, ensure_ascii=False)}"]
+            lines += [""]
     for observation in report.runtime_observations:
         if observation.diagnostic is None:
             continue
@@ -247,6 +267,15 @@ def _render_markdown(report: TerminalReportProjection) -> str:
                     f"code={diagnostic.provider_code}, retryable={diagnostic.retryable}, "
                     f"retry_after={diagnostic.retry_after}"
                 )
+    validity = getattr(report, "evidence_validity", []) or []
+    lines += ["", "## Current evidence reuse validity", ""]
+    if not validity:
+        lines.append("(no registered conditions; original provenance checks still apply)")
+    for item in validity:
+        lines.append(f"- {item['evidence_id']}: {item['status']} "
+                     "(not a vulnerability or success verdict)")
+    for identity in getattr(report, "evidence_validity_blockers", []) or []:
+        lines.append(f"- Current release requires revalidation: {identity}")
     evidence_reads = getattr(report, "evidence_reads", []) or []
     lines += ["", "## Evidence reads", ""]
     if not evidence_reads:

@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 
 from redteam.core.ids import AgentInstanceId, HypothesisId, RunId, new_id
 from redteam.orchestration.candidates.models import ExecutableCandidate
+from redteam.orchestration.resource_conflicts import resource_conflict_keys
 from redteam.orchestration.work.models import TaskLease, WorkBudget, WorkItem
 from redteam.orchestration.work.store import WorkStore
 
@@ -28,6 +29,7 @@ class WorkScheduler:
         enqueued: list[WorkItem] = []
         for candidate in candidates:
             draft = candidate.draft
+            resource_keys = resource_conflict_keys(candidate.tool, candidate.plan_step.arguments)
             item = WorkItem(
                 work_id=new_id("work"),
                 run_id=run_id,
@@ -54,7 +56,8 @@ class WorkScheduler:
                     )
                 ),
                 prerequisite_ids=draft.prerequisite_ids,
-                conflict_keys=draft.conflict_keys,
+                conflict_keys=[*draft.conflict_keys, *resource_keys],
+                resource_keys=resource_keys,
                 priority=candidate.priority,
                 budget=WorkBudget(),
                 repeatable=candidate.plan_step.repeatable,

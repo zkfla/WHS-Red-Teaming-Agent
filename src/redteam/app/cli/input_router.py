@@ -68,14 +68,17 @@ class InputRouter:
         self.conversation = conversation
 
     async def route(
-        self, text: str, *, context: str, active: bool, engagement_name: str, scope: list[str]
+        self, text: str, *, context: str, active: bool, engagement_name: str, scope: list[str],
+        llm_override=None,
     ) -> ConversationDecision:
+        options = {"llm_override": llm_override} if llm_override is not None else {}
         decision = await self.conversation.decide(
             text,
             engagement_name=engagement_name,
             scope=scope,
             session_context=context,
             run_active=active,
+            **options,
         )
         # Old schema remains readable, but an ambiguous 'execute' on an active
         # investigation must never be silently converted into guidance.

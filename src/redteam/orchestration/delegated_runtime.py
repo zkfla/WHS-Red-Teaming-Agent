@@ -617,7 +617,7 @@ async def decide_delegations(engine, path, runtime, context):
 
 def close_delegations(runtime, reason):
     """Keep collected references and the original exit cause without inference."""
-    if reason in {"approval_pending", "operator_paused"}:
+    if reason in {"approval_pending", "operator_paused", "resource_wait"}:
         return runtime
     values = {
         identity: mark_finished(state, reason=reason)

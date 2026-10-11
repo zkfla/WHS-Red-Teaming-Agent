@@ -17,6 +17,13 @@ from __future__ import annotations
 import copy
 from typing import Any
 
+from redteam.attack_graph.stores.mutations import (
+    GraphMutation,
+    GraphMutationReceipt,
+    checked_receipt,
+    make_receipt,
+    mutation_hash,
+)
 from redteam.core.contracts.graph import GraphEdge, GraphNode
 from redteam.core.enums import GraphNodeType
 from redteam.core.ids import GraphEdgeId, GraphNodeId
@@ -41,13 +48,52 @@ class InMemoryAttackGraphStore:
         # hot spot worth indexing.
         self._out: dict[GraphNodeId, set[GraphEdgeId]] = {}
         self._in: dict[GraphNodeId, set[GraphEdgeId]] = {}
+        self._receipts: dict[tuple[str, str, str], GraphMutationReceipt] = {}
+
+    async def prepare_graph_mutation(self, mutation: GraphMutation) -> GraphMutation:
+        return GraphMutation.model_validate(mutation.model_dump()).model_copy(deep=True)
+
+    async def apply_graph_mutation(self, mutation: GraphMutation) -> GraphMutationReceipt:
+        # All following memory operations have no suspension point: receipt
+        # insertion and the detached graph mutation are one event-loop action.
+        mutation = await self.prepare_graph_mutation(mutation)
+        mutation_hash(mutation)  # reject unserializable input BEFORE changing the graph
+        key = (mutation.namespace, mutation.run_id, mutation.mutation_id)
+        previous = self._receipts.get(key)
+        if previous is not None:
+            return checked_receipt(previous, mutation)
+        result: bool | None = None
+        if mutation.node is not None:
+            self._add_node(mutation.node)
+        elif mutation.edge is not None:
+            self._add_edge(mutation.edge)
+        elif mutation.operation == "remove_node":
+            assert mutation.identity is not None
+            result = self._remove_node(GraphNodeId(mutation.identity))
+        else:
+            assert mutation.identity is not None
+            result = self._remove_edge(GraphEdgeId(mutation.identity))
+        receipt = make_receipt(mutation, result)
+        self._receipts[key] = receipt
+        return receipt
+
+    async def read_graph_mutation_receipt(
+        self, run_id: str, mutation_id: str, *, namespace: str = "",
+    ) -> GraphMutationReceipt | None:
+        return self._receipts.get((namespace, run_id, mutation_id))
 
     async def add_node(self, node: GraphNode) -> None:
+        self._add_node(node)
+
+    def _add_node(self, node: GraphNode) -> None:
         # Copy on the way in too: the caller keeps a reference to what it
         # passed, and mutating that must not reach back into the store.
         self._nodes[node.id] = _detach_node(node)
 
     async def add_edge(self, edge: GraphEdge) -> None:
+        self._add_edge(edge)
+
+    def _add_edge(self, edge: GraphEdge) -> None:
         previous = self._edges.get(edge.id)
         if previous is not None:
             self._out.get(previous.source_id, set()).discard(previous.id)
@@ -58,6 +104,9 @@ class InMemoryAttackGraphStore:
 
     async def remove_node(self, node_id: GraphNodeId) -> bool:
         """Drop a node and every edge touching it."""
+        return self._remove_node(node_id)
+
+    def _remove_node(self, node_id: GraphNodeId) -> bool:
         if node_id not in self._nodes:
             return False
         for edge_id in self._out.pop(node_id, set()) | self._in.pop(node_id, set()):
@@ -69,6 +118,9 @@ class InMemoryAttackGraphStore:
         return True
 
     async def remove_edge(self, edge_id: GraphEdgeId) -> bool:
+        return self._remove_edge(edge_id)
+
+    def _remove_edge(self, edge_id: GraphEdgeId) -> bool:
         edge = self._edges.pop(edge_id, None)
         if edge is None:
             return False

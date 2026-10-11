@@ -837,6 +837,8 @@ async def test_kill_tagged_scans_by_env():
     key = "run1.inst1"
     name = container_name_for(key)
     fake = _FakeDocker(containers={name: {"running": True}})
+    fake.adopt_record = _adopt_record(fake, key)
+    fake.result_present = True
     manager = _manager(fake)
     manager._known[key] = name
     report = await manager.kill_tagged_exec(key, "shjob_0123456789abcdef")
@@ -860,6 +862,8 @@ async def test_kill_escalates_when_check_stays_dirty():
     key = "run1.inst1"
     name = container_name_for(key)
     fake = _FakeDocker(containers={name: {"running": True}})
+    fake.adopt_record = _adopt_record(fake, key)
+    fake.result_present = True
     fake.kill_check_clean = False
     manager = _manager(fake)
     manager._known[key] = name

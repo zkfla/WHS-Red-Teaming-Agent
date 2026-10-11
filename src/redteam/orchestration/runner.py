@@ -27,6 +27,8 @@ from redteam.orchestration.context import RuntimeDeps
 from redteam.orchestration.coordination import CLOSED, ChangeSet, CoordinationError, coordinator_for
 from redteam.orchestration.diagnostics import operational_exception_diagnostic
 from redteam.orchestration.graph import build_graph
+from redteam.orchestration.llm_requests import RunRequestLedger
+from redteam.orchestration.metered_llm import llm_request_scope
 from redteam.orchestration.outbox import deliver_pending
 from redteam.orchestration.progress import canonical_graph_changed
 from redteam.orchestration.runtime_observation import RuntimeObservation, append_runtime_observation
@@ -152,6 +154,7 @@ class ReconciliationResult(BaseModel):
 _RECONCILABLE_REASONS = frozenset(
     {
         TerminationReason.OPERATOR_PAUSED,
+        TerminationReason.RESOURCE_WAIT,
         "no_actionable_plan",
         "no_agents_registered",
         "stalled_no_graph_progress",
@@ -277,6 +280,25 @@ class AgentLoopRunner:
         return thread_id
 
     async def _binding_for(self, runtime: RuntimeState, *, checkpoint=None, fresh=False) -> bool:
+        policy = self._deps.settings.llm_request_policy
+        expected_policy = policy.model_dump(mode="json") if policy is not None else None
+        coordinator = self._deps.coordinator or coordinator_for(
+            self._deps.task_graph_store, self._deps.path_store,
+        )
+
+        async def saved_policy(change):
+            return change.records.get(("llm_request_policy", str(runtime.run_id)))
+
+        saved = await coordinator.change(saved_policy)
+        if saved is not None and saved != expected_policy:
+            return False
+        if runtime.llm_request_policy != expected_policy:
+            if not fresh or runtime.llm_request_policy is not None or runtime.model_requests_used:
+                return False
+            runtime.llm_request_policy = expected_policy
+        if policy is not None:
+            # Idempotent across instances and restarts, before any model invocation.
+            await RunRequestLedger(coordinator).bind(str(runtime.run_id), policy)
         selected = self._deps.component_binding
         recorded = runtime.component_binding
         if recorded is None:
@@ -311,6 +333,7 @@ class AgentLoopRunner:
                 "evidence_reads",
                 "local_tool_result_ids",
                 "component_binding",
+                "llm_request_policy",
                 "delegations",
             )
             if not isinstance(saved, RuntimeState) or self._snapshot_replays_execution(checkpoint):
@@ -463,6 +486,12 @@ class AgentLoopRunner:
         )
 
     async def _run_state(self, runtime: RuntimeState, graph_state: GraphState) -> RuntimeState:
+        with llm_request_scope(str(runtime.run_id), runtime.work_owner):
+            return await self._run_scoped_state(runtime, graph_state)
+
+    async def _run_scoped_state(
+        self, runtime: RuntimeState, graph_state: GraphState,
+    ) -> RuntimeState:
         """Shared invocation path for a fresh run and an approval resume
         (``reconcile_once`` builds ``graph_state`` via ``resume_graph_state``
         instead of ``initial_graph_state`` for the latter) — same task
@@ -470,6 +499,13 @@ class AgentLoopRunner:
         """
         if not await self._latest_allows_execution(runtime):
             raise CoordinationError("mission_not_active")
+        if getattr(self._deps, "specialist_policy", None) is not None:
+            from redteam.orchestration.task_activation import TaskActivation
+
+            coordinator = self._deps.coordinator or coordinator_for(
+                self._deps.task_graph_store, self._deps.path_store,
+            )
+            await TaskActivation(coordinator, self._deps.agents).entering(runtime)
         thread_id = self._bind_runtime(runtime.run_id, runtime.instance_id)
         self._failure_runtime = None
         await self._ensure_graph()
@@ -730,6 +766,11 @@ class AgentLoopRunner:
             if resumed is None:
                 return ReconciliationResult(runtime=runtime, wakeup=wakeup)
             return ReconciliationResult(runtime=resumed, wakeup=wakeup, resumed=True)
+        if runtime.termination_reason == TerminationReason.RESOURCE_WAIT:
+            resumed = await self.resume_recovered(runtime)
+            return ReconciliationResult(
+                runtime=resumed, wakeup=wakeup, resumed=resumed is not runtime
+            )
         if runtime.termination_reason == TerminationReason.OPERATOR_PAUSED:
             mission = (
                 await self._deps.task_graph_store.get_mission(runtime.mission_id)
@@ -764,6 +805,19 @@ class AgentLoopRunner:
             wakeup=wakeup,
             resumed=True,
         )
+
+    async def checkpoint_exists(self, runtime: RuntimeState) -> bool:
+        """Strict negative check for pre-entry recovery, never unavailable == absent.
+
+        Unlike the best-effort recovery reader, store/codec errors propagate.
+        Even an empty initial checkpoint requires the normal checkpoint path.
+        """
+        self._require_checkpointing("checkpoint_exists")
+        self._thread_id = self._bind_runtime(runtime.run_id, runtime.instance_id)
+        await self._ensure_graph()
+        if self._checkpointer is None:
+            raise CoordinationError("activation_checkpoint_store_unavailable")
+        return await self._checkpointer.aget_tuple(self.config()) is not None
 
     async def recover_runtime(
         self, run_id: RunId | str, *, instance_id: AgentInstanceId | str | None = None
@@ -833,6 +887,18 @@ class AgentLoopRunner:
             return resumed if resumed is not None else runtime
         if runtime.termination_reason not in _RECONCILABLE_REASONS:
             return runtime
+        if runtime.termination_reason == TerminationReason.RESOURCE_WAIT:
+            seeded = await self._resource_wait_state(snapshot, runtime)
+            if seeded is None or not await self._reactivate(runtime):
+                return runtime
+            resumed = runtime.model_copy(update={
+                "phase": AgentPhase.OBSERVE, "termination_reason": None,
+                "planning_diagnostic": None, "no_progress_turns": 0,
+                "mission_status": MissionStatus.ACTIVE if runtime.mission_id
+                else runtime.mission_status,
+            })
+            seeded["runtime"] = resumed
+            return await self._run_state(resumed, seeded)
         if runtime.termination_reason == TerminationReason.OPERATOR_PAUSED:
             mission = (
                 await self._deps.task_graph_store.get_mission(runtime.mission_id)
@@ -859,6 +925,51 @@ class AgentLoopRunner:
             }
         )
         return await self.run(resume_runtime)
+
+    async def _resource_wait_state(self, snapshot: Any, runtime: RuntimeState) -> GraphState | None:
+        """Restore only the checkpointed unstarted resource batch, not fresh MODEL.
+
+        A safe completed wait checkpoint and matching PENDING ledger rows
+        prove this batch is still owed. Expired/in-flight/unknown work uses
+        the existing execution reconciler, never this continuation.
+        """
+        from redteam.orchestration.state import NativeCallState
+        from redteam.orchestration.work.models import WorkStatus
+
+        if self._snapshot_replays_execution(snapshot):
+            return None
+        values = snapshot.values or {}
+        saved = values.get("runtime")
+        if (not isinstance(saved, RuntimeState)
+                or saved.run_id != runtime.run_id or saved.instance_id != runtime.instance_id
+                or saved.engagement_id != runtime.engagement_id
+                or saved.mission_id != runtime.mission_id
+                or saved.termination_reason != TerminationReason.RESOURCE_WAIT):
+            return None
+        calls = values.get("native_calls")
+        if not isinstance(calls, list) or not any(
+            isinstance(call, NativeCallState) and not call.completed for call in calls
+        ):
+            return None
+        for call in calls:
+            if not isinstance(call, NativeCallState):
+                return None
+            if call.completed:
+                continue
+            if call.dispatch is None:
+                return None
+            work = await self._deps.work_store.get(call.dispatch.work_id)
+            if (work is None or work.run_id != runtime.run_id
+                    or work.instance_id != runtime.instance_id
+                    or work.model_tool_call_id != call.call_id
+                    or work.candidate_key != call.dispatch.plan_step.candidate_key
+                    or work.status is not WorkStatus.PENDING
+                    or not work.resource_keys or work.resource_execution_pending):
+                return None
+        state = initial_graph_state(runtime)
+        state["native_calls"] = [call.model_copy(deep=True) for call in calls]
+        state["native_messages"] = list(values.get("native_messages") or [])
+        return state
 
     async def recover_reconciling(
         self, run_id: RunId | str, *, instance_id: AgentInstanceId | str | None = None
@@ -905,7 +1016,8 @@ class AgentLoopRunner:
         # remaining binding refuses here.
         if not await self._binding_for(runtime):
             return (None, None)
-        reconciliation = await reconcile_execution_receipts(self._deps, runtime)
+        with llm_request_scope(str(runtime.run_id), runtime.work_owner):
+            reconciliation = await reconcile_execution_receipts(self._deps, runtime)
         if reconciliation.ready:
             # Coverage belongs to the runner: the reconciler only sees
             # KNOWN submissions, never this snapshot. Zero submissions with

@@ -17,6 +17,7 @@ from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from redteam.capability.shell_policy import validate_pinned_image
 from redteam.core.contracts.network import NetworkBudget, NetworkPurpose, WindowCaps
 
 # External IPv6 egress is UNSUPPORTED and fail-closed: the ruleset builder
@@ -96,30 +97,36 @@ class InstallProxyConfig(BaseModel):
     pinned_hosts: tuple[str, ...] = Field(min_length=1)
     mirror_upstream: str = Field(min_length=1, max_length=256)
 
-    @field_validator("endpoint")
+    @field_validator("endpoint", "mirror_upstream")
     @classmethod
     def _http_endpoint(cls, value: str) -> str:
-        if not value.startswith(("http://", "https://")):
-            raise ValueError("install proxy endpoint must be http(s)")
-        return value
-
-    @field_validator("mirror_upstream")
-    @classmethod
-    def _upstream_origin(cls, value: str) -> str:
-        """Explicit upstream origin; the port is authority, never guessed."""
+        """Only an origin: no credentials, hidden controls or ignored suffix."""
+        if any(char.isspace() or ord(char) < 32 or ord(char) == 127 for char in value):
+            raise ValueError("install route must be a control-free http(s) origin")
         try:
             parts = urlsplit(value)
+            port = parts.port
         except ValueError:
-            raise ValueError("mirror upstream must be an http(s) origin") from None
-        if parts.scheme not in ("http", "https") or not parts.hostname:
-            raise ValueError("mirror upstream must be an http(s) origin with a host")
-        try:
-            _port = parts.port
-        except ValueError:
-            raise ValueError("mirror upstream carries an invalid port") from None
-        if _port is not None and not 0 < _port <= 65535:
-            raise ValueError("mirror upstream port is out of range")
+            raise ValueError("install route carries an invalid origin or port") from None
+        if (parts.scheme not in ("http", "https") or not parts.hostname
+                or parts.username is not None or parts.password is not None
+                or parts.path not in ("", "/") or "?" in value or "#" in value):
+            raise ValueError("install route must be a credential-free http(s) origin")
+        if port is not None and not 0 < port <= 65535:
+            raise ValueError("install route port is out of range")
         return value
+
+    @field_validator("pinned_hosts")
+    @classmethod
+    def _canonical_pins(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        for value in values:
+            try:
+                canonical = str(ipaddress.ip_address(value))
+            except ValueError:
+                raise ValueError("proxy pins must be canonical IP literals") from None
+            if canonical != value:
+                raise ValueError("proxy pins must be canonical IP literals")
+        return values
 
 
 class GatedNetworkPolicy(BaseModel):
@@ -132,6 +139,17 @@ class GatedNetworkPolicy(BaseModel):
     default_install_caps: WindowCaps
     registry: PinnedRegistry = Field(default_factory=PinnedRegistry)
     install_proxy: InstallProxyConfig | None = None
+    # Missing legacy selections can still be inspected, but never open a gate.
+    sidecar_image: str | None = Field(default=None, min_length=1, max_length=256)
+
+    def require_sidecar_image(self) -> str:
+        if self.sidecar_image is None:
+            raise ValueError("gated_sidecar_image_required")
+        try:
+            validate_pinned_image(self.sidecar_image)
+        except ValueError:
+            raise ValueError("gated_sidecar_image_unpinned") from None
+        return self.sidecar_image
 
     @model_validator(mode="after")
     def _purpose_match(self) -> GatedNetworkPolicy:
@@ -139,6 +157,10 @@ class GatedNetworkPolicy(BaseModel):
             raise ValueError("default_target_caps must carry purpose target")
         if self.default_install_caps.purpose is not NetworkPurpose.INSTALL:
             raise ValueError("default_install_caps must carry purpose install")
+        if self.install_proxy is not None and (
+            set(self.install_proxy.pinned_hosts) & set(self.registry.target_ips())
+        ):
+            raise ValueError("proxy and target pinned IPs must be disjoint")
         return self
 
     def caps_for(self, purpose: NetworkPurpose) -> WindowCaps:

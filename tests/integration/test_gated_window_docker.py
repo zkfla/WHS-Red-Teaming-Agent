@@ -6,6 +6,7 @@ import asyncio
 import os
 import shutil
 import uuid
+from pathlib import Path
 
 import pytest
 
@@ -36,6 +37,7 @@ from redteam.core.contracts.network import (
 
 ROOM_IMG = os.environ.get("SHELL_TEST_IMAGE", "python:3.11-slim")
 SIDECAR_IMG = "t005-gate-sidecar"
+NETWORK_FIXTURE = Path(__file__).resolve().parent / "fixtures" / "gated_network.py"
 pytestmark = pytest.mark.skipif(shutil.which("docker") is None, reason="docker unavailable")
 
 
@@ -60,7 +62,13 @@ async def image_available(name):
     return code == 0 and bool(out.strip())
 
 
-def make_policy(mock_ip):
+async def image_pin(name):
+    code, out, err = await docker("image", "inspect", "--format", "{{.Id}}", name)
+    assert code == 0, err.decode()
+    return out.decode().strip()
+
+
+def make_policy(mock_ip, *, sidecar_image=None):
     cap = NetworkCapacity(max_flow_init_deliveries=100, max_output_bytes=1000000)
     zero = NetworkCapacity(max_flow_init_deliveries=0, max_output_bytes=0)
     budget = NetworkBudget(global_capacity=cap, target_capacity=cap, install_capacity=zero)
@@ -81,10 +89,11 @@ def make_policy(mock_ip):
     registry = PinnedRegistry(targets={"mock-target": (mock_ip,)}, mirrors={})
     proxy = InstallProxyConfig(
         endpoint="http://mock-proxy:8080",
-        pinned_hosts=("mock-proxy",),
+        pinned_hosts=("192.0.2.2",),  # unused synthetic install route, not a DNS pin
         mirror_upstream="https://mock-mirror:443",
     )
     return GatedNetworkPolicy(
+        sidecar_image=sidecar_image,
         budget=budget,
         default_target_caps=target_caps,
         default_install_caps=install_caps,
@@ -114,6 +123,7 @@ async def test_quiet_window_releases_with_live_meter(tmp_path):
         pytest.skip("sidecar image not built")
     if not await image_available(ROOM_IMG):
         pytest.skip("room image missing")
+    os.makedirs("data/t005-gated", exist_ok=True)
     from redteam.control.network_ledger import SQLiteNetworkGrantLedger
 
     tag = uuid.uuid4().hex[:8]
@@ -141,6 +151,7 @@ async def test_quiet_window_releases_with_live_meter(tmp_path):
     instance_id = "i1"
     key = workroom_key_for(run_id, instance_id)
     network_policy = GatedNetworkPolicy(
+        sidecar_image=await image_pin(SIDECAR_IMG),
         budget=budget,
         default_target_caps=target_caps,
         default_install_caps=WindowCaps(
@@ -258,10 +269,14 @@ async def _mock(tag, net, prober_src):
     assert code == 0
     code, _, _ = await docker("start", name)
     assert code == 0
-    await docker("cp", prober_src, name + ":/tmp/mock.py")
-    await docker(
-        "exec", "-d", name, "sh", "-c", "nohup python3 /tmp/mock.py > /tmp/mock-stdout.log 2>&1 &"
+    code, _, err = await docker("cp", str(prober_src), name + ":/tmp/mock.py")
+    assert code == 0, err.decode(errors="replace")[:300]
+    code, _, err = await docker(
+        "exec", "-d", name, "python3", "/tmp/mock.py", "serve",
+        "--bind", "0.0.0.0", "--tcp-port", "18080", "--udp-port", "18081",
+        "--dns-port", "53", "--log-dir", "/tmp",
     )
+    assert code == 0, err.decode(errors="replace")[:300]
     await asyncio.sleep(3)
     code, out, _ = await docker(
         "inspect", name, "--format", "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}"
@@ -306,7 +321,7 @@ async def test_kernel_boundary(tmp_path):
         assert code == 0
         room = await _room(tag)
         side = await _sidecar(tag, room)
-        mock, mock_ip = await _mock(tag, net, "data/t005-gated/mock.py")
+        mock, mock_ip = await _mock(tag, net, NETWORK_FIXTURE)
         rules = build_ruleset(
             queue_num=7,
             allowed=(AllowedFlow(ip=mock_ip, port=18080, proto="tcp"),),
@@ -325,7 +340,8 @@ async def test_kernel_boundary(tmp_path):
         assert code == 0
         code, _, _ = await docker("network", "connect", net, room)
         assert code == 0
-        await docker("cp", "data/t005-gated/prober.py", room + ":/tmp/prober.py")
+        code, _, err = await docker("cp", str(NETWORK_FIXTURE), room + ":/tmp/prober.py")
+        assert code == 0, err.decode(errors="replace")[:300]
         await docker(
             "exec",
             "--user",
@@ -469,15 +485,11 @@ async def test_window_e2e_busy_static_settle(tmp_path):
     key = workroom_key_for(run_id, instance_id)
     grant = None
     ext = None
-    try:
-        from redteam.capability.gated_window import (
-            GATED_LABEL,
-            OPAQUE_PREFIX,
-            opaque_window_tag,
-        )
+    from redteam.capability.gated_window import GATED_LABEL, OPAQUE_PREFIX, opaque_window_tag
 
-        wtag = opaque_window_tag(run_id, instance_id, 1)
-        wnet = wtag.replace(OPAQUE_PREFIX, "gwn-", 1)
+    wtag = opaque_window_tag(run_id, instance_id, 1)
+    wnet = wtag.replace(OPAQUE_PREFIX, "gwn-", 1)
+    try:
         await manager.ensure_workroom(key)
         code, _, err = await docker(
             "network", "create", "--driver", "bridge", "--internal",
@@ -490,8 +502,8 @@ async def test_window_e2e_busy_static_settle(tmp_path):
             "d=/workroom/.local/bin;mkdir -p $d&&printf ok>$d/tool1&&chmod +x $d/tool1",
         )
         assert result.exit_code == 0
-        mock, mock_ip = await _mock(tag, wnet, "data/t005-gated/mock.py")
-        policy_net = make_policy(mock_ip)
+        mock, mock_ip = await _mock(tag, wnet, NETWORK_FIXTURE)
+        policy_net = make_policy(mock_ip, sidecar_image=await image_pin(SIDECAR_IMG))
         ledger = SQLiteNetworkGrantLedger(
             str(tmp_path / "net.db"), engagement_id="egated", budget=policy_net.budget
         )
@@ -526,7 +538,7 @@ async def test_window_e2e_busy_static_settle(tmp_path):
             # NOTE: /tmp is a tmpfs mount, so docker-cp files land underneath
             # it and stay invisible inside. The workroom surface persists.
             code, _, _ = await docker(
-                "cp", "data/t005-gated/prober.py", room_name + ":/workroom/e2e-prober.py"
+                "cp", str(NETWORK_FIXTURE), room_name + ":/workroom/e2e-prober.py"
             )
             assert code == 0
         await asyncio.sleep(8)
@@ -628,6 +640,13 @@ async def test_window_e2e_busy_static_settle(tmp_path):
             ]
             await _cleanup(*[n for n in leftovers if n])
     finally:
+        # open_window may fail before the inner i2 cleanup is reached. Names
+        # below belong to this test's unique run; remove those even on failure,
+        # then remove the bridge after its mock endpoint is gone.
+        leftovers = [container_name_for(key),
+                     container_name_for(workroom_key_for(run_id, "i2")), wtag,
+                     opaque_window_tag(run_id, "i2", 1), mock]
+        await _cleanup(*[name for name in leftovers if name])
         await docker("network", "rm", wnet)
         code, out, _ = await docker(
             "ps", "-a", "--filter", "name=t005-gated-" + tag, "--format", "{{.Names}}"

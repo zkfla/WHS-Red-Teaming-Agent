@@ -1449,6 +1449,17 @@ async def validate_result_claims(
                 summary="evidence 'reference' belongs to a different run",
             )
             continue
+        from redteam.orchestration.evidence_validity import current_validity
+
+        validity = await current_validity(evidence_store, graph_service, run, eid)
+        if validity.status not in {"unbound", "valid"}:
+            issues.add(
+                location=reference_location,
+                message=f"evidence '{eid}' reuse conditions are {validity.status}",
+                code="completion_evidence_reuse_unproven",
+                summary="evidence reuse conditions do not support current completion",
+            )
+            continue
         meta = _field(record, "metadata", {}) or {}
         if not isinstance(meta, dict):
             issues.add(
@@ -1820,6 +1831,23 @@ async def validate_result_claims(
         pool = list(valid_records)
         if kind == "semantic" and linked_records:
             pool = pool + [rec for rec in linked_records if rec not in pool]
+        if task is not None and getattr(task, "completion_contract_version", 1) == 2:
+            # Apply original identity/success filtering BEFORE principal coverage:
+            # a failed or duplicate record must not supply the missing account
+            # while unrelated successful originals satisfy the numeric count.
+            originals: dict[tuple[Any, Any], tuple[Any, dict[str, Any]]] = {}
+            conflicting_originals: set[tuple[Any, Any]] = set()
+            for record in pool:
+                meta = _field(record, "metadata", {}) or {}
+                raw = _stored_raw_result(meta) or {}
+                identity = (raw.get("action_id"), raw.get("invocation_id"))
+                if all(identity):
+                    previous = originals.get(identity)
+                    if previous is not None and previous[1] != raw:
+                        conflicting_originals.add(identity)
+                    originals.setdefault(identity, (record, raw))
+            pool = [record for identity, (record, raw) in originals.items()
+                    if identity not in conflicting_originals and raw.get("success") is True]
         if required_principals:
             verified_pool: list[Any] = []
             have = set()

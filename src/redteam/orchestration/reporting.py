@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any
 from pydantic import BaseModel, Field
 
 from redteam.attack_graph.service import AttackGraphService
+from redteam.core.contracts.completion import completion_conditions, completion_contract_hash
 from redteam.core.contracts.mission import MissionPlan, MissionTask
 from redteam.core.enums import AgentPhase, MissionStatus, TaskStatus
 from redteam.core.ids import ApprovalId, EvidenceId, FindingId, MissionId, RunId, TaskId
@@ -149,6 +150,9 @@ class MissionTaskProjection(BaseModel):
     required: bool
     workstream: str
     blocked_reason: str | None = None
+    completion_contract_version: int = 1
+    completion_contract_hash: str | None = None
+    completion_criteria: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class MissionCriterionProjection(BaseModel):
@@ -432,9 +436,12 @@ class TerminalReportProjection(BaseModel):
     model_requests_used: int = Field(default=0, ge=0)
     model_tokens_used: int = Field(default=0, ge=0)
     model_usage_unknown: int = Field(default=0, ge=0)
+    llm_request_accounting: dict[str, Any] | None = None
     unresolved_evidence_ids: list[str] = Field(default_factory=list)
     evidence_reads: list[EvidenceReadProjection] = Field(default_factory=list)
     unresolved_details: list[InvestigationUnresolvedProjection] = Field(default_factory=list)
+    evidence_validity: list[dict[str, Any]] = Field(default_factory=list)
+    evidence_validity_blockers: list[str] = Field(default_factory=list)
 
 
 class ReportingAgent:
@@ -451,6 +458,7 @@ class ReportingAgent:
         required_hypothesis_ids: Collection[str] | None = None,
         agent_definitions: Iterable[AgentDefinition] = (),
         coverage: CoverageGapSummary | None = None,
+        coordinator: Any | None = None,
     ) -> TerminalReportProjection:
         if not runtime.is_terminal:
             raise ValueError("reporting projection requires a terminal runtime")
@@ -471,6 +479,11 @@ class ReportingAgent:
             if item.engagement_id == runtime.engagement_id
         ]
         current_evidence_ids = {str(item.evidence_id) for item in evidence}
+        from redteam.orchestration.evidence_validity import project_validity
+
+        validity = await project_validity(
+            evidence_store, graph, str(runtime.run_id), records=evidence,
+        )
         findings = [
             item
             for item in await graph.list_findings()
@@ -489,9 +502,12 @@ class ReportingAgent:
             for item in findings
         ]
         mission = None
+        reuse_support: set[str] = set()
         if task_store is not None:
             plan = await _resolve_mission(task_store, runtime)
             if plan is not None:
+                reuse_support.update(str(identity) for result in plan.criterion_results
+                                     if result.met for identity in result.evidence_ids)
                 tasks = await task_store.list_tasks(mission_id=plan.mission_id)
                 mission = _project_mission(
                     plan,
@@ -502,6 +518,21 @@ class ReportingAgent:
                 )
                 if coverage is None:
                     coverage = project_coverage_gaps(mission=plan, tasks=tasks)
+        # Preserve historical Mission/Task labels; only today's release
+        # assessment changes. An unused sibling's stale source is not a blocker.
+        by_id = {str(item.evidence_id): item for item in evidence}
+        pending_support = list(reuse_support)
+        while pending_support:
+            record = by_id.get(pending_support.pop())
+            if record is None:
+                continue
+            for source in record.metadata.get("source_evidence_ids", []):
+                if str(source) not in reuse_support:
+                    reuse_support.add(str(source))
+                    pending_support.append(str(source))
+        validity_blockers = [item.evidence_id for item in validity
+                             if item.evidence_id in reuse_support
+                             and item.status not in {"unbound", "valid"}]
         actions = runtime.actions_executed
         terminal_work = sum(status_counts.values())
         dead_ends = sum(
@@ -535,8 +566,14 @@ class ReportingAgent:
                 key=lambda item: ref_order.get(item.evidence_id, len(ref_order)),
             )
         evidence_read_projections = _project_evidence_reads(runtime)
+        request_accounting = None
+        if runtime.llm_request_policy is not None and coordinator is not None:
+            from redteam.orchestration.llm_requests import RunRequestLedger
+
+            request_accounting = await RunRequestLedger(coordinator).snapshot(str(runtime.run_id))
         report = TerminalReportProjection(
             run_id=runtime.run_id,
+            llm_request_accounting=request_accounting,
             phase=runtime.phase,
             termination_reason=runtime.termination_reason,
             planning_diagnostic=runtime.planning_diagnostic,
@@ -564,6 +601,7 @@ class ReportingAgent:
                 runtime.phase is AgentPhase.FINISHED
                 and runtime.termination_reason in _RELEASE_OK_REASONS
                 and not integrity.blocking
+                and not validity_blockers
                 # Required scope only: non-required open hypotheses are
                 # reported as deferred and never alone block release.
                 and not required_unresolved
@@ -607,6 +645,8 @@ class ReportingAgent:
             unresolved_evidence_ids=unresolved_refs,
             evidence_reads=evidence_read_projections,
             unresolved_details=unresolved_details,
+            evidence_validity=[item.model_dump(mode="json") for item in validity],
+            evidence_validity_blockers=validity_blockers,
             run_outcome="unknown",
         )
         report.run_outcome = _project_run_outcome(
@@ -690,6 +730,9 @@ def _project_mission(
                 required=task.required,
                 workstream=label,
                 blocked_reason=redact_text(task.blocking_reason) if task.blocking_reason else None,
+                completion_contract_version=task.completion_contract_version,
+                completion_contract_hash=completion_contract_hash(task),
+                completion_criteria=completion_conditions(task),
             )
         )
 

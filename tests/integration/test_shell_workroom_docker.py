@@ -9,6 +9,7 @@ only. Tests skip when docker or the configured image is unavailable.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import shutil
 import uuid
@@ -84,10 +85,44 @@ async def test_python_arithmetic(room):
 
 
 async def test_container_has_loopback_only(room):
+    """Network-none has no active/addressed/routed non-loopback interface.
+
+    Linux may expose DOWN, addressless tunnel devices in a network-none
+    namespace. Their names are not proof of an egress connection. Inspect
+    actual namespace flags, both address families and routes instead.
+    """
     manager, key = room
-    result = await manager.exec_script(key, "bash", "ls /sys/class/net", 20.0)
+    script = '''
+import fcntl, json, socket, struct
+interfaces = []
+with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+    for index, name in socket.if_nameindex():
+        request = struct.pack("256s", name.encode())
+        flags = struct.unpack_from("H", fcntl.ioctl(sock, 0x8913, request), 16)[0]
+        try:
+            address = socket.inet_ntoa(fcntl.ioctl(sock, 0x8915, request)[20:24])
+        except OSError:
+            address = None
+        interfaces.append({"name": name, "index": index, "up": bool(flags & 1),
+                           "loopback": bool(flags & 8), "ipv4": address})
+with open("/proc/net/if_inet6") as file:
+    addresses6 = [line.split()[-1] for line in file if line.strip()]
+with open("/proc/net/route") as file:
+    routes4 = [line.split()[0] for line in file.read().splitlines()[1:] if line.strip()]
+with open("/proc/net/ipv6_route") as file:
+    routes6 = [line.split()[-1] for line in file if line.strip()]
+print(json.dumps({"interfaces": interfaces, "addresses6": addresses6,
+                  "routes4": routes4, "routes6": routes6}))
+'''
+    result = await manager.exec_script(key, "python3", script, 20.0)
     assert result.exit_code == 0
-    assert sorted(result.stdout.split()) == ["lo"]
+    observed = json.loads(result.stdout)
+    loopback = {item["name"] for item in observed["interfaces"] if item["loopback"]}
+    assert loopback
+    assert all(not item["up"] and item["ipv4"] is None
+               for item in observed["interfaces"] if not item["loopback"])
+    assert set(observed["addresses6"] + observed["routes4"] + observed["routes6"]) <= loopback
+    assert await manager.verify_workroom_ownership(key)
 
 
 async def test_sync_timeout_is_reported(room):
@@ -323,6 +358,9 @@ async def test_cancel_kills_env_scrubbed_setsid_child(room):
         assert cancelled.output["cancelled"] is True
         assert cancelled.metadata["container_teardown_verified"] is True
         assert await _wait_pid_gone(manager, key, child_pid) is True
+        original = await manager.supervisor_record(key, job_id)
+        assert original is not None and manager.record_trusted(original)
+        assert original["outcome"] == "cancelled"
     finally:
         await adapter.aclose()
 
@@ -333,6 +371,46 @@ async def test_self_exit_137_is_not_a_timeout(room):
     result = await manager.exec_script(key, "bash", "kill -KILL $$", 20.0)
     assert result.timed_out is False
     assert result.exit_code == 137
+
+
+async def test_retained_terminal_record_does_not_signal_reused_pgid(room):
+    """An old PGID number is not authority over a later sibling job."""
+    manager, key = room
+    original_tag = "settled-" + uuid.uuid4().hex[:12]
+    settled = await manager.exec_script(
+        key, "bash", "echo settled", 8.0, exec_tag=original_tag, retain_record=True,
+    )
+    assert settled.exit_code == 0
+    adapter = BuiltinShellAdapter(_policy(max_jobs=4), workroom=manager)
+    by_name = {d.tool_name: d for d in build_shell_descriptors(adapter.policy)}
+    try:
+        started = await adapter.invoke(by_name["shell_job_start"], {
+            "workroom_key": key, "language": "bash", "timeout_seconds": 90,
+            "script": "setsid sleep 80 & echo $! > /workroom/sibling.pid; wait",
+        })
+        assert started.success is True
+        pid = None
+        for _ in range(30):
+            probe = await manager.exec_script(key, "bash", "cat /workroom/sibling.pid", 8.0)
+            if probe.exit_code == 0 and probe.stdout.strip().isdigit():
+                pid = probe.stdout.strip()
+                break
+            await asyncio.sleep(0.1)
+        assert pid is not None
+        # Root-only fixture manipulation simulates kernel numeric PGID reuse;
+        # untrusted scripts cannot write these protected records themselves.
+        pgid_path = "/run/whs-shell/.whs-pgid-" + original_tag
+        written = await manager._run_docker(
+            ("exec", "--user", "0", "-i", container_name_for(key), "/usr/bin/tee", pgid_path),
+            pid.encode(), 8.0, 1024,
+        )
+        assert written[0] == 0
+        report = await manager.kill_tagged_exec(key, original_tag)
+        assert report.verified and report.outcome == "completed"
+        alive = await manager.exec_script(key, "bash", "kill -0 " + pid, 8.0)
+        assert alive.exit_code == 0, "an old terminal PGID must not kill a live sibling"
+    finally:
+        await adapter.aclose()
 
 
 async def test_background_child_is_settled_before_completion(room):
@@ -506,7 +584,7 @@ async def test_kali_manifest_matches_configured_image():
         if not await manager.probe():
             pytest.skip("docker daemon unavailable")
         await manager.ensure_workroom(key)
-        records = await manager.list_image_programs()
+        records = await manager.list_image_programs(os.environ.get("SHELL_KALI_MANIFEST"))
         by_name = {r.name: r for r in records}
         assert "dig" in by_name and "nmap" in by_name
         assert by_name["dig"].version is not None

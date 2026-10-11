@@ -38,6 +38,10 @@ def completion_review_context(context: dict[str, Any] | None, evidence_ids: list
     if isinstance(mission, dict):
         projected["operator_constraints"] = mission.get("operator_constraints", {})
     sources = set(map(str, evidence_ids))
+    projected["evidence_validity"] = [
+        item for item in current.get("evidence_validity", [])
+        if isinstance(item, dict) and str(item.get("evidence_id", "")) in sources
+    ]
     projected["requested_evidence"] = [
         window for window in current.get("requested_evidence", [])
         if isinstance(window, dict) and str(window.get("evidence_id", "")) in sources

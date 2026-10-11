@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import cast
@@ -25,6 +26,7 @@ from redteam.orchestration.work.rules import (
     decide_add,
     decide_execution_reconcile,
     decide_reconcile,
+    execution_started_item,
     expired_lease_ids,
     failed_item,
     finished_item,
@@ -44,9 +46,52 @@ from redteam.orchestration.work.rules import (
     terminal_failure_in,
     validate_lease_ttl,
 )
+from redteam.sqlite_support import run_sqlite
 
 
 class SQLiteWorkStore:
+    @staticmethod
+    async def inspect_run(path: str | Path, run_id: RunId) -> list[WorkItem] | None:
+        """Detached, read-only inventory; never setup/migrate/reclaim leases.
+
+        Validate physical indexes against payloads before filtering, so a
+        misindexed row cannot disappear from the requested Run's inventory.
+        Missing storage is unknown, not proof of an empty work ledger.
+        """
+        def inspect() -> list[WorkItem] | None:
+            source = Path(path).absolute()
+            if not source.exists():
+                return None
+            db = sqlite3.connect(source.as_uri() + "?mode=ro", uri=True, timeout=1.0)
+            try:
+                db.execute("PRAGMA query_only=ON")
+                db.execute("BEGIN")
+                columns = {row[1] for row in db.execute("PRAGMA table_info(work_items)")}
+                if not columns:
+                    return None
+                required = {"work_id", "run_id", "instance_id", "candidate_key",
+                            "status", "priority", "payload"}
+                if not required.issubset(columns):
+                    raise ValueError("work_snapshot_schema_unsupported")
+                items = []
+                for row in db.execute(
+                    "SELECT work_id,run_id,instance_id,candidate_key,status,priority,payload "
+                    "FROM work_items ORDER BY work_id"
+                ):
+                    item = _item_from_payload(row[6])
+                    if row[:6] != _item_row(item)[:6]:
+                        raise ValueError("work_snapshot_index_mismatch")
+                    if item.run_id is None:
+                        raise ValueError("work_snapshot_unattributed_records")
+                    if item.run_id == run_id:
+                        items.append(item)
+                return items
+            finally:
+                db.rollback()
+                db.close()
+
+        return await run_sqlite(inspect)
+
     def __init__(self, path: str | Path) -> None:
         self._path = Path(path)
         self._setup_lock = asyncio.Lock()
@@ -335,6 +380,29 @@ class SQLiteWorkStore:
             await db.commit()
             return lease
 
+    async def mark_execution_started(self, work_id: str, *, owner: str, now: datetime) -> bool:
+        await self.setup()
+        async with _aiosqlite().connect(self._path) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            item = await _load_item(db, work_id)
+            cursor = await db.execute(
+                "SELECT issued_at,heartbeat_at,expires_at FROM work_leases "
+                "WHERE work_id=? AND owner=?", (work_id, owner),
+            )
+            row = await cursor.fetchone()
+            await cursor.close()
+            lease = (TaskLease(work_id=work_id, owner=owner,
+                               issued_at=datetime.fromisoformat(row[0]),
+                               heartbeat_at=datetime.fromisoformat(row[1]),
+                               expires_at=datetime.fromisoformat(row[2])) if row else None)
+            updated = execution_started_item(item, lease, owner, now) if item is not None else None
+            if updated is None:
+                await db.rollback()
+                return False
+            await _save_item(db, updated)
+            await db.commit()
+            return True
+
     async def complete(
         self,
         work_id: str,
@@ -343,6 +411,7 @@ class SQLiteWorkStore:
         status: WorkStatus,
         now: datetime,
         reason: str | None = None,
+        execution_known: bool = False,
     ) -> bool:
         require_terminal(status)
         await self.setup()
@@ -364,7 +433,9 @@ class SQLiteWorkStore:
                 await db.execute("DELETE FROM work_leases WHERE work_id=?", (work_id,))
                 await db.commit()
                 return False
-            await _save_item(db, finished_item(item, status, now, reason))
+            await _save_item(db, finished_item(
+                item, status, now, reason, execution_known=execution_known
+            ))
             await db.execute("DELETE FROM work_leases WHERE work_id=?", (work_id,))
             await db.commit()
             return True
@@ -382,7 +453,8 @@ class SQLiteWorkStore:
             row = await cursor.fetchone()
             await cursor.close()
             item = await _load_item(db, work_id)
-            if row is None or item is None or is_expired(datetime.fromisoformat(row[0]), now):
+            if (row is None or item is None or item.resource_execution_pending
+                    or is_expired(datetime.fromisoformat(row[0]), now)):
                 await db.rollback()
                 return False
             await _save_item(db, pending_item(item, now))
@@ -606,7 +678,11 @@ async def _terminal_dependency_failure(db, item: WorkItem) -> tuple[str, WorkSta
 
 async def _has_conflict(db, item: WorkItem) -> bool:
     cursor = await db.execute(
-        "SELECT payload FROM work_items WHERE status IN ('leased','running') AND work_id<>?",
+        # Unknown originals may have a terminal/expired row, but still own
+        # declared resources. The JSON payload is the canonical ledger.
+        "SELECT payload FROM work_items WHERE work_id<>? "
+        "AND (status IN ('leased','running') "
+        "OR json_extract(payload, '$.resource_execution_pending') = 1)",
         (item.work_id,),
     )
     rows = await cursor.fetchall()

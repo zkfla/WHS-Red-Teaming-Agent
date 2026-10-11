@@ -43,8 +43,9 @@ Cancelling the host-side wait kills the host ``docker exec`` child and
 reaps it; the warm container survives. Container-side teardown goes to
 the root supervisor (see ``kill_tagged_exec``): TERM the supervisor
 owning the tag (found by its own cmdline plus its protected pgid file,
-never by the script scrubbable env), then escalate to KILL the
-supervisor, the process group, and every tag carrier; the supervisor
+never by the script scrubbable env), then allow its bounded grace/reap.
+Escalation signals the child group/tag carriers, never kills the trusted
+subreaper that must collect env-scrubbed/setsid descendants; the supervisor
 tracks the child it spawned (subreaper re-parenting plus sweep), so env
 scrub and setsid separation in normal programs do not escape teardown.
 No container is ever killed, so sibling jobs keep their state;
@@ -775,11 +776,13 @@ if __name__ == "__main__":
 # NUL, the tag travels in WHS_SHELL_KILL (exec -e, never interpolated into
 # argv), and the supervisor is identified by its cmdline, never by a NUL
 # scan. Modes: term (TERM the supervisor owning this tag), kill (KILL the
-# supervisor, the process group, and every tag carrier), anything else
+# child process group/tag carriers but preserve the subreaper), anything else
 # only observes (check: exit 0 when nothing remains, 1 otherwise).
 # Signalling is fixed TERM-then-KILL; the supervisor owns grace and reap.
 # A script that unsets or scrubs its tag cannot hide the supervisor: it is
-# found by its own cmdline plus the pgid file it wrote at spawn.
+# found by its own cmdline plus the pgid file it wrote at spawn. A retained
+# PGID without a live supervisor is historical, not authority over a later
+# process that reused the same numeric group ID.
 _KILL_TAG_SCRIPT = '''
 tag="$WHS_SHELL_KILL"
 mode="$WHS_SHELL_MODE"
@@ -804,14 +807,17 @@ if [ -r "$pf" ]; then
   pgid=$(/bin/cat "$pf" 2>/dev/null)
   case $pgid in ''|*[!0-9]*) pgid="";; esac
 fi
+if [ -z "$sup" ]; then pgid=""; fi
 if [ "$mode" = term ]; then
   for p in $sup; do kill -TERM "$p" 2>/dev/null; done
   exit 0
 fi
 if [ "$mode" = kill ]; then
-  for p in $sup; do kill -KILL "$p" 2>/dev/null; done
   if [ -n "$pgid" ]; then kill -KILL -"$pgid" 2>/dev/null; fi
-  for p in $tagged; do kill -KILL "$p" 2>/dev/null; done
+  for p in $tagged; do
+    case " $sup " in *" $p "*) continue;; esac
+    kill -KILL "$p" 2>/dev/null
+  done
   exit 0
 fi
 dirty=0
@@ -870,10 +876,10 @@ class ExecResult:
 class CancelReport:
     """Measured container-side teardown for one tagged execution.
 
-    ``verified`` True means a final check observed nothing left: no
-    supervisor process, no tag carriers, no live process group. The
-    supervisor outcome (completed, timeout, or cancelled) is reported
-    when its result file is readable. ``verified`` False never
+    ``verified`` True needs a trusted terminal supervisor record plus a
+    clean final scan, or an authoritative gone/stopped owned container.
+    A tag/group scan alone cannot observe escaped, env-scrubbed children.
+    The original protected record is retained for recovery. ``verified`` False never
     masquerades as success: the caller keeps the execution budget until
     a deadline-confirmed lookup settles it.
     """
@@ -2037,7 +2043,7 @@ class ShellWorkroomManager:
                 _KILL_TIMEOUT_SECONDS,
                 None,
             )
-            return check[0] == 0
+            return check[0] == 0 and not check[3] and not check[4]
         except Exception:
             return False
 
@@ -2052,13 +2058,13 @@ class ShellWorkroomManager:
     async def _resolve_image_id(self, image: str) -> str | None:
         """Local immutable image ID for a configured reference, if present."""
         try:
-            code, stdout, _stderr, _outer, _trunc = await self._run_docker(
+            code, stdout, _stderr, outer, trunc = await self._run_docker(
                 ("inspect", "--format", "{{.Id}}", image),
                 None,
                 _KILL_TIMEOUT_SECONDS,
-                None,
+                65536,
             )
-            if code != 0:
+            if code != 0 or outer or trunc:
                 return None
             image_id = stdout.decode("utf-8", errors="replace").strip()
             return image_id or None
@@ -2075,7 +2081,7 @@ class ShellWorkroomManager:
         """
         try:
             result_path, _pgid_path = self._result_paths(tag)
-            code, stdout, _stderr, _outer, _trunc = await self._run_docker(
+            code, stdout, _stderr, outer, trunc = await self._run_docker(
                 (
                     "exec", "--user", "0",
                     "-e", "PATH=" + _MECHANISM_PATH,
@@ -2083,9 +2089,9 @@ class ShellWorkroomManager:
                 ),
                 None,
                 _KILL_TIMEOUT_SECONDS,
-                None,
+                65536,
             )
-            if code != 0:
+            if code != 0 or outer or trunc:
                 return None
             record = json.loads(stdout.decode("utf-8"))
             return record if isinstance(record, dict) else None
@@ -2436,41 +2442,59 @@ class ShellWorkroomManager:
 
         TERM goes only to the supervisor (found by its tag env plus its own
         cmdline, immune to script env scrubbing); the supervisor owns grace,
-        KILL escalation, and reap. Escalation KILLs the supervisor, the
-        process group, and every tag carrier. No container is ever killed,
-        so sibling jobs keep their state. The report tells whether a final
-        check observed nothing left, with the supervisor outcome when its
-        result file is readable.
+        KILL escalation, and reap. The host never kills this trusted
+        subreaper before it can collect a scrubbed/setsid descendant.
+        A bounded wait uses the configured grace and existing host margin;
+        no proof means cleanup-unknown, not a clean-scan success. No warm
+        container/sibling is killed. Protected terminal records are kept.
         """
         try:
             check_workroom_key(key)
             if not isinstance(tag, str) or not _JOB_TAG.fullmatch(tag):
                 return CancelReport(verified=False, outcome=None)
             name = self._known.get(key) or container_name_for(key)
-            if not await self._is_running(name):
+            state = await self.workroom_container_state(key)
+            if state == "gone":
                 return CancelReport(verified=True, outcome=None)
+            if state == "unknown" or not await self.verify_workroom_ownership(key):
+                return CancelReport(verified=False, outcome=None)
+            if state == "stopped":
+                return CancelReport(verified=True, outcome=None)
+
+            async def proven() -> CancelReport | None:
+                record = await self._read_result_record(name, tag)
+                if (
+                    record is not None and self.record_trusted(record)
+                    and record.get("outcome") in {"completed", "timeout", "cancelled"}
+                    and await self._check_tag_clean(name, tag)
+                ):
+                    return CancelReport(verified=True, outcome=record["outcome"])
+                return None
+
             await self._run_docker(
                 self._kill_scan_argv(name, tag, "term"),
                 None,
                 _KILL_TIMEOUT_SECONDS,
                 None,
             )
-            await asyncio.sleep(1.0)
-            if await self._check_tag_clean(name, tag):
-                outcome = await self._read_outcome(name, tag)
-                await self._remove_run_files(name, tag)
-                return CancelReport(verified=True, outcome=outcome)
+            deadline = (
+                time.monotonic() + self._policy.exec_grace_seconds
+                + _HOST_OUTER_MARGIN_SECONDS
+            )
+            while time.monotonic() < deadline:
+                report = await proven()
+                if report is not None:
+                    return report
+                await asyncio.sleep(0.1)
             await self._run_docker(
                 self._kill_scan_argv(name, tag, "kill"),
                 None,
                 _KILL_TIMEOUT_SECONDS,
                 None,
             )
-            await asyncio.sleep(1.0)
-            if await self._check_tag_clean(name, tag):
-                outcome = await self._read_outcome(name, tag)
-                await self._remove_run_files(name, tag)
-                return CancelReport(verified=True, outcome=outcome)
+            report = await proven()
+            if report is not None:
+                return report
             return CancelReport(
                 verified=False, outcome=await self._read_outcome(name, tag)
             )
@@ -2508,17 +2532,19 @@ class ShellWorkroomManager:
         try:
             check_workroom_key(key)
             name = self._known.get(key) or container_name_for(key)
-            code, stdout, err, _outer, _trunc = await self._run_docker(
+            code, stdout, err, outer, trunc = await self._run_docker(
                 ("inspect", "-f", "{{.State.Running}}", name),
                 None,
                 _KILL_TIMEOUT_SECONDS,
-                None,
+                65536,
             )
         except Exception:
             return "unknown"
+        if outer or trunc:
+            return "unknown"
         if code == 0:
             text = stdout.decode("utf-8", errors="replace").strip()
-            return "running" if text == "true" else "stopped"
+            return {"true": "running", "false": "stopped"}.get(text, "unknown")
         message = err.decode("utf-8", errors="replace").lower()
         if "no such container" in message or "no such object" in message:
             return "gone"

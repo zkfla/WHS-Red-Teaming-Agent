@@ -15,8 +15,15 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import hashlib
+import importlib
 import json
-from collections.abc import Callable, Coroutine, Hashable
+import os
+import sqlite3
+import stat
+from collections.abc import AsyncIterator, Callable, Coroutine, Hashable
+from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any, TypeVar
 
 from redteam.orchestration.coordination import (
@@ -33,6 +40,57 @@ T = TypeVar("T")
 SCHEMA_VERSION = 1
 
 
+def _load_records(db: sqlite3.Connection) -> dict[tuple[str, str], Any]:
+    return {(kind, identity): json.loads(payload) for kind, identity, payload in db.execute(
+        "SELECT kind,identity,payload FROM orchestration_records"
+    )}
+
+
+async def inspect_sqlite_state(
+    path: str | Path, callback: Callable[[ChangeSet], Coroutine[Any, Any, T]],
+) -> T | None:
+    """Read an existing composite snapshot before runtime/transport assembly.
+
+    No setup, schema migration, Task claim or persisted mutation. Absence of a
+    file/legacy records table returns None; unreadable/partial/future storage
+    raises. The callback sees detached canonical state in one read transaction,
+    exactly like change callbacks; it must not perform outside I/O. This is a
+    bootstrap hint, NOT Run execution ownership or permission to start.
+    """
+    from redteam.orchestration.paths.sqlite import SQLitePathStore
+    from redteam.orchestration.task_graph.sqlite import SQLiteTaskGraphStore
+
+    def inspect() -> T | None:
+        source = Path(path).absolute()
+        try:
+            source.stat()
+        except FileNotFoundError:
+            return None
+        db = sqlite3.connect(source.as_uri() + "?mode=ro", uri=True, timeout=1.0)
+        try:
+            db.execute("PRAGMA query_only=ON")
+            db.execute("BEGIN")
+            tables = {row[0] for row in db.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )}
+            if "orchestration_records" not in tables:
+                return None  # old Task stores have no specialist launch proof
+            version = db.execute("SELECT MAX(version) FROM orchestration_migrations").fetchone()[0]
+            if version != SCHEMA_VERSION:
+                raise CoordinationError("unsupported_orchestration_schema_version")
+            snapshot = ChangeSet(
+                SQLiteTaskGraphStore._load_memory(db),
+                SQLitePathStore._load_memory(db) if "path_snapshots" in tables
+                else InMemoryPathStore(), _load_records(db),
+            )
+            return asyncio.run(callback(snapshot))
+        finally:
+            db.rollback()
+            db.close()
+
+    return await run_sqlite(inspect)
+
+
 class MemoryStateBackend:
     """In-memory composite provider sharing one lock across its members."""
 
@@ -41,6 +99,7 @@ class MemoryStateBackend:
         self._paths = paths
         self._records: dict[tuple[str, str], Any] = {}
         self._lock = asyncio.Lock()
+        self._executing_runs: set[str] = set()
         tasks._lock = self._lock
         if paths is not None:
             paths._lock = self._lock
@@ -69,6 +128,18 @@ class MemoryStateBackend:
 
         if not isinstance(history, InMemoryOperatorIntentStore):
             raise CoordinationError("atomic_intent_history_configuration_unsupported")
+
+    @asynccontextmanager
+    async def exclusive_run(self, run_id: str) -> AsyncIterator[None]:
+        async with self._lock:
+            if run_id in self._executing_runs:
+                raise CoordinationError("run_execution_already_owned")
+            self._executing_runs.add(run_id)
+        try:
+            yield
+        finally:
+            async with self._lock:
+                self._executing_runs.remove(run_id)
 
     async def change(self, callback: Callable[[ChangeSet], Coroutine[Any, Any, T]]) -> T:
         async with self._lock:
@@ -130,6 +201,48 @@ class SqliteStateBackend:
         if not isinstance(history, SQLiteOperatorIntentStore):
             raise CoordinationError("atomic_intent_history_configuration_unsupported")
 
+    @asynccontextmanager
+    async def exclusive_run(self, run_id: str) -> AsyncIterator[None]:
+        """Local POSIX ownership across independent connections/processes.
+
+        Keep a private companion inode beside the canonical SQLite database;
+        never unlink it (a replacement inode would split ownership). No SQLite
+        transaction is held across model/tool I/O. OS exit releases only this
+        scope, never stored claims, request accounting or unknown executions.
+        Acquisition has no await/thread cancellation window.
+        """
+        if os.name != "posix" or not hasattr(os, "O_NOFOLLOW"):
+            raise CoordinationError("run_execution_backend_unsupported")
+        try:
+            fcntl = importlib.import_module("fcntl")
+        except ImportError as exc:
+            raise CoordinationError("run_execution_backend_unsupported") from exc
+        database = self._tasks._path.resolve()
+        key = hashlib.sha256(run_id.encode()).hexdigest()
+        lock_path = database.with_name(f".{database.name}.run-{key}.lock")
+        try:
+            fd = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW
+                         | os.O_CLOEXEC | os.O_NONBLOCK, 0o600)
+        except OSError as exc:
+            raise CoordinationError("run_execution_storage_unavailable") from exc
+        try:
+            info = os.fstat(fd)
+            if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                    or info.st_uid != os.getuid() or info.st_mode & 0o077):
+                raise CoordinationError("run_execution_storage_unsafe")
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                raise CoordinationError("run_execution_already_owned") from exc
+            except OSError as exc:
+                raise CoordinationError("run_execution_storage_unavailable") from exc
+            try:
+                yield
+            finally:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
     def _transaction(self, callback: Callable[[ChangeSet], Coroutine[Any, Any, T]]) -> T:
         from redteam.orchestration.task_graph.sqlite import SQLiteTaskGraphStore
 
@@ -159,12 +272,7 @@ class SqliteStateBackend:
             staged = ChangeSet(
                 staged_tasks,
                 staged_paths,
-                {
-                    (kind, identity): json.loads(payload)
-                    for kind, identity, payload in db.execute(
-                        "SELECT kind,identity,payload FROM orchestration_records"
-                    )
-                },
+                _load_records(db),
             )
             # Only detached memory validation/mutation is awaited in this private
             # worker loop. No database methods, LLM, publisher or tool are called.

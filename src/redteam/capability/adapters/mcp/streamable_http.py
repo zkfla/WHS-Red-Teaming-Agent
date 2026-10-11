@@ -7,6 +7,8 @@ from copy import deepcopy
 from datetime import datetime, timezone
 from typing import Any
 
+from pydantic import TypeAdapter, ValidationError
+
 from redteam.capability.adapters.mcp.base import MCPCallResult
 from redteam.capability.adapters.mcp.naming import build_canonical_mcp_tool_id
 from redteam.capability.adapters.mcp.transport import (
@@ -17,9 +19,11 @@ from redteam.core.contracts.tool import (
     PROVIDER_METADATA_AVAILABILITY_IMPACT,
     PROVIDER_METADATA_COMMAND_FIELDS,
     PROVIDER_METADATA_REQUIRES_TARGET,
+    PROVIDER_METADATA_RESOURCE_BINDINGS,
     PROVIDER_METADATA_TARGET_BINDING,
     ToolDescriptor,
     ToolError,
+    ToolResourceBinding,
     ToolTargetBinding,
 )
 from redteam.core.enums import RiskLevel, ToolHealthStatus
@@ -126,6 +130,17 @@ def _apply_provider_metadata(
     # no per-tool central list lives here.
     if not metadata:
         return
+    if PROVIDER_METADATA_RESOURCE_BINDINGS in metadata:
+        from redteam.capability.settings import MCPConfigurationError
+
+        try:
+            descriptor.resource_bindings = TypeAdapter(list[ToolResourceBinding]).validate_python(
+                metadata[PROVIDER_METADATA_RESOURCE_BINDINGS], strict=True
+            )
+            if len(descriptor.resource_bindings) > 32:
+                raise ValueError("too many resource declarations")
+        except (ValidationError, ValueError):
+            raise MCPConfigurationError("invalid provider resource metadata") from None
     binding_spec = metadata.get(PROVIDER_METADATA_TARGET_BINDING)
     if isinstance(binding_spec, Mapping):
         known = {

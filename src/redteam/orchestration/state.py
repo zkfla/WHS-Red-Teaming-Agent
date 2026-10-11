@@ -64,6 +64,7 @@ class TerminationReason:
     PLANNING_ERROR = "planning_error"
     GOAL_ACHIEVED = "goal_achieved"
     INVESTIGATION_HELD = "investigation_held"
+    RESOURCE_WAIT = "resource_wait"
     #: Operator asked to hold the run before the next action executes. The
     #: active Task and Mission are preserved so a RESUME intent continues
     #: the same work instead of starting a new Mission.
@@ -87,6 +88,8 @@ class RuntimeState(BaseModel):
     # checkpoints created before Mission contracts loadable.
     mission_id: MissionId | None = None
     active_task_id: TaskId | None = None
+    # JSON binding so legacy checkpoints remain readable; validated at run admission.
+    llm_request_policy: dict | None = None
     active_path_id: str | None = None
     active_path_version: int | None = None
     active_path_step_id: str | None = None

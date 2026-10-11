@@ -19,6 +19,7 @@ from redteam.orchestration.work.rules import (
     decide_add,
     decide_execution_reconcile,
     decide_reconcile,
+    execution_started_item,
     expired_lease_ids,
     failed_item,
     finished_item,
@@ -161,6 +162,16 @@ class InMemoryWorkStore:
             self._items[work_id] = running_item(item, now)
             return renewed.model_copy(deep=True)
 
+    async def mark_execution_started(self, work_id: str, *, owner: str, now: datetime) -> bool:
+        async with self._lock:
+            item = self._items.get(work_id)
+            updated = (execution_started_item(item, self._leases.get(work_id), owner, now)
+                       if item is not None else None)
+            if updated is None:
+                return False
+            self._items[work_id] = updated
+            return True
+
     async def complete(
         self,
         work_id: str,
@@ -169,6 +180,7 @@ class InMemoryWorkStore:
         status: WorkStatus,
         now: datetime,
         reason: str | None = None,
+        execution_known: bool = False,
     ) -> bool:
         require_terminal(status)
         async with self._lock:
@@ -180,7 +192,9 @@ class InMemoryWorkStore:
                 self._items[work_id] = stale_item(item, now, "lease_expired")
                 del self._leases[work_id]
                 return False
-            self._items[work_id] = finished_item(item, status, now, reason)
+            self._items[work_id] = finished_item(
+                item, status, now, reason, execution_known=execution_known
+            )
             del self._leases[work_id]
             return True
 
@@ -192,6 +206,7 @@ class InMemoryWorkStore:
             if (
                 lease is None
                 or item is None
+                or item.resource_execution_pending
                 or lease.owner != owner
                 or is_expired(lease.expires_at, now)
             ):

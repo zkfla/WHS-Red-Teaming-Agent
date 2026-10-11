@@ -166,6 +166,16 @@ class MobileMCPEligibility:
         tool = self.catalog.get(tool_id)
         return tool if tool is not None and self.eligible(tool) else None
 
+    def all_descriptors(self):
+        """The same live policy view used by role cards and readiness.
+
+        __getattr__ previously delegated this catalog port to the raw gateway,
+        so descriptor-based specialist views bypassed the vendor eligibility
+        gate even though get/list_by_capability/invoke correctly denied it.
+        The original discovery descriptors remain untouched in the provider.
+        """
+        return [tool for tool in self.catalog.all_descriptors() if self.eligible(tool)]
+
     def list_by_capability(self, capability_tag):
         return [t for t in self.catalog.list_by_capability(capability_tag) if self.eligible(t)]
 

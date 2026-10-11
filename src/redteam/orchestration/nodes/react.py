@@ -30,7 +30,7 @@ from redteam.orchestration.candidates.models import CandidateDraft
 from redteam.orchestration.cognition import DecisionFailure, ReasoningHalted
 from redteam.orchestration.context import RuntimeDeps
 from redteam.orchestration.coordination import content_hash
-from redteam.orchestration.diagnostics import diagnostic_for_exception
+from redteam.orchestration.diagnostics import DecisionDiagnostic, diagnostic_for_exception
 from redteam.orchestration.dispatch import DispatchItem
 from redteam.orchestration.engine import (
     DecisionRuleError,
@@ -59,6 +59,7 @@ from redteam.orchestration.tool_discovery import (
     select_advertised_tool_ids,
 )
 from redteam.orchestration.work.models import TERMINAL_STATUSES, WorkStatus
+from redteam.orchestration.work.rules import conflict_blockers
 
 SYSTEM = """You investigate the current authorized task using the supplied tools.
 Choose useful tool calls directly; no investigation path, numbered step, or
@@ -433,6 +434,7 @@ async def model_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             system=SYSTEM,
             budget=budget,
             before_call=engine.guard_reasoning,
+            role_id=str(runtime.current_agent) if runtime.current_agent is not None else None,
         )
         if response.protocol_error:
             raise ValueError("native provider protocol: " + response.protocol_error)
@@ -601,6 +603,7 @@ async def tools_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
     calls = [call.model_copy(deep=True) for call in state.get("native_calls", [])]
     state = {**state, "native_calls": calls}
     budget_blocked = False
+    resource_wait_started: float | None = None
     while any(not call.completed for call in calls):
         runtime = state["runtime"]
         if runtime.termination_reason:
@@ -743,6 +746,44 @@ async def tools_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                 break
         if not selected:
             pending = next((call for call in calls if not call.completed), None)
+            work = (await deps.work_store.get(pending.dispatch.work_id)
+                    if pending is not None and pending.dispatch is not None else None)
+            if (pending is not None and work is not None
+                    and work.status is WorkStatus.PENDING and work.resource_keys):
+                blockers = conflict_blockers(work, await deps.work_store.list_items())
+                if blockers:
+                    # Only explicit shared-resource contention is waited here.
+                    # Keep original call/Work/claim; no extra model turn or ID.
+                    # A terminal unknown original never releases on a timeout.
+                    unknown = any(other.resource_execution_pending
+                                  and other.status in TERMINAL_STATUSES for other in blockers)
+                    now = asyncio.get_running_loop().time()
+                    if resource_wait_started is None:
+                        resource_wait_started = now
+                    remaining = deps.settings.resource_wait_timeout_seconds - (
+                        now - resource_wait_started
+                    )
+                    if unknown or remaining <= 0:
+                        runtime.termination_reason = TerminationReason.RESOURCE_WAIT
+                        pending.feedback = {
+                            "ok": False, "executed": False,
+                            "error": ("shared resource has an unresolved original execution"
+                                      if unknown else "shared resource wait limit reached"),
+                        }
+                        runtime.planning_diagnostic = DecisionDiagnostic(
+                            code=("resource_execution_unresolved" if unknown
+                                  else "resource_wait_limit_reached"),
+                            stage="native_tools", kind="resource",
+                            summary=pending.feedback["error"],
+                        )
+                        # Not completed: the original pending dispatch survives
+                        # in the checkpoint for an explicit, guarded resume.
+                        break
+                    # Both WorkStore backends have one authoritative acquire.
+                    # Bounded polling also observes other SQLite connections;
+                    # event-only waiting would miss a different process writer.
+                    await asyncio.sleep(min(0.1, remaining))
+                    continue
             if pending is not None:
                 pending.feedback = {
                     "ok": False,
@@ -751,6 +792,7 @@ async def tools_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                 }
                 pending.completed = True
             continue
+        resource_wait_started = None
         dispatch = [call.dispatch for call in selected if call.dispatch is not None]
         results = await asyncio.gather(
             *[

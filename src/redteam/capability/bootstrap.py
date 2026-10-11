@@ -170,6 +170,8 @@ async def _build_gateway(
         descriptors = await adapter.discover_tools()
         if not descriptors:
             raise MCPConfigurationError(f"MCP server {server_id!r} discovered no tools")
+        if set(settings.tool_resources) - {tool.tool_name for tool in descriptors}:
+            raise MCPConfigurationError("resource bindings reference undiscovered tools")
         if settings.tool_operations is not None:
             discovered_names = {descriptor.tool_name for descriptor in descriptors}
             configured_names = set(settings.tool_operations)
@@ -180,6 +182,12 @@ async def _build_gateway(
                 )
         server_bindings: dict[str, tuple[str, ...]] = {}
         for descriptor in descriptors:
+            # Operator declarations ADD locks; they cannot erase provider locks.
+            for binding in settings.tool_resources.get(descriptor.tool_name, []):
+                if binding not in descriptor.resource_bindings:
+                    descriptor.resource_bindings.append(binding)
+            if len(descriptor.resource_bindings) > 32:
+                raise MCPConfigurationError("too many combined resource declarations")
             configured = (
                 settings.tool_operations.get(descriptor.tool_name)
                 if settings.tool_operations is not None

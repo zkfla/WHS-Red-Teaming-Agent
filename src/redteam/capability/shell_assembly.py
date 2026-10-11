@@ -169,4 +169,8 @@ def build_gated_provider_config(policy_path: str | None) -> GatedProviderConfig 
         raise MCPConfigurationError(
             f"gated network policy invalid ({policy_path}): {validation_diagnostic(exc)}"
         ) from exc
+    try:
+        policy.require_sidecar_image()
+    except ValueError as exc:
+        raise MCPConfigurationError(str(exc)) from None
     return GatedProviderConfig(network_policy=policy)

@@ -11,6 +11,14 @@ from redteam.core.contracts.events import EventEnvelope
 from redteam.orchestration.coordination import ChangeSet, CoordinationError, Coordinator
 
 
+def pending_count(change: ChangeSet, run_id: str) -> int:
+    """One durable undelivered projection, including leased/failed deliveries."""
+    return sum(
+        kind == "outbox" and not row["delivered"] and row["envelope"]["run_id"] == run_id
+        for (kind, _), row in change.records.items()
+    )
+
+
 async def deliver_pending(
     coordinator: Coordinator,
     *,
@@ -59,10 +67,7 @@ async def deliver_pending(
         return False
 
     async def count(change: ChangeSet) -> int:
-        return sum(
-            kind == "outbox" and not row["delivered"] and row["envelope"]["run_id"] == run_id
-            for (kind, _), row in change.records.items()
-        )
+        return pending_count(change, run_id)
 
     if event_bus is not None:
         while time.monotonic() < deadline:

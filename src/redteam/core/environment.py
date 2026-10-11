@@ -74,8 +74,20 @@ class OrchestrationEnvInput(_SnapshotSettings):
     max_retries: str | None = Field(
         default=None, validation_alias="REDTEAM_ORCHESTRATION_MAX_RETRIES"
     )
+    resource_wait_timeout_seconds: str | None = Field(
+        default=None, validation_alias="REDTEAM_RESOURCE_WAIT_TIMEOUT_SECONDS"
+    )
     llm_candidate_generation: str | None = Field(
         default=None, validation_alias="REDTEAM_ORCHESTRATION_LLM_CANDIDATE_GENERATION"
+    )
+    llm_request_policy: str | None = Field(
+        default=None, validation_alias="REDTEAM_LLM_REQUEST_POLICY_JSON"
+    )
+    specialist_profile_path: str | None = Field(
+        default=None, validation_alias="REDTEAM_SPECIALIST_PROFILE"
+    )
+    code_fixture_policy_path: str | None = Field(
+        default=None, validation_alias="REDTEAM_CODE_FIXTURE_POLICY_PATH"
     )
 
 

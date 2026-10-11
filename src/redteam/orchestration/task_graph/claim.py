@@ -16,8 +16,9 @@ from datetime import datetime
 from typing import Any
 
 from redteam.core.enums import TaskStatus
-from redteam.core.ids import TaskId
+from redteam.core.ids import MissionId, TaskId
 from redteam.orchestration.coordination import StateConflict
+from redteam.orchestration.task_graph.rules import TRANSITIONS
 
 
 def _occupant(task: Any) -> str | None:
@@ -83,3 +84,22 @@ async def release_mission_task_claim(
         staged.model_copy(update={"occupant_owner": None, "updated_at": now})
     )
     return await change.tasks.get_task(task_id)
+
+
+async def release_terminal_task_claim(
+    change: Any, task_id: TaskId, *, mission_id: MissionId, owner: str, now: datetime,
+) -> Any:
+    """Clean up a terminal claim; never transfer an unfinished task.
+
+    The staged lifecycle, not a caller's returned RuntimeState, is authority.
+    A future unfinished handoff needs its own verified intent/recovery contract;
+    releasing an occupant alone would make RUNNING work adoptable again.
+    """
+    task = await change.tasks.get_task(task_id)
+    if task is None or task.mission_id != mission_id:
+        raise StateConflict("task_claim_identity_mismatched")
+    if task.occupant_owner not in {None, owner}:
+        raise StateConflict("task_claim_owner_mismatched")
+    if TRANSITIONS[task.status]:
+        raise StateConflict("task_claim_handoff_unverified")
+    return await release_mission_task_claim(change, task_id, owner=owner, now=now)

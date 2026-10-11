@@ -111,6 +111,7 @@ class ConversationAssistant:
         session_context: str = "No previous run in this session.",
         run_active: bool = False,
         prefer_execute: bool = False,
+        llm_override: LLMClient | None = None,
     ) -> ConversationDecision:
         """Interpret one chat turn without selecting or invoking a tool.
 
@@ -132,8 +133,13 @@ class ConversationAssistant:
             "history": list(self._history[-16:]),
         }
         try:
+            # Request-local override: concurrent inputs never swap the shared
+            # assistant's client or leak a previous Run's accounting context.
+            client = self._client if llm_override is None else StructuredDecisionClient(
+                llm_override, max_attempts=self._max_attempts,
+            )
             raw = await asyncio.wait_for(
-                self._client.ask(
+                client.ask(
                     stage="conversation_decide",
                     payload=payload,
                     response_schema=ConversationDecision.model_json_schema(),
