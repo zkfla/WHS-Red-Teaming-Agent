@@ -32,6 +32,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -44,7 +45,84 @@ def _line_hash(line: str) -> str:
     return hashlib.sha256(line.encode("utf-8")).hexdigest()
 
 
+def _integrity_problems(
+    run_id: RunId, entries: list[dict[str, Any]], lines: list[str],
+) -> list[EvidenceId]:
+    expected = {}
+    problems: list[EvidenceId] = []
+    for entry in entries:
+        if entry["run_id"] != run_id:
+            continue
+        identity = EvidenceId(entry["evidence_id"])
+        if identity in expected and identity not in problems:
+            problems.append(identity)
+        expected[identity] = entry["line_hash"]
+    seen: set[EvidenceId] = set()
+    for line in lines:
+        if not line.strip():
+            continue
+        record = EvidenceRecord.model_validate_json(line)
+        identity = record.evidence_id
+        if (identity in seen or identity not in expected or record.run_id != run_id
+                or expected[identity] != _line_hash(line)) and identity not in problems:
+            problems.append(identity)
+        seen.add(identity)
+    problems.extend(identity for identity in expected if identity not in seen)
+    return problems
+
+
+class EvidenceReadSnapshot:
+    """Detached port view of an inspected Run, not a second durable store."""
+
+    def __init__(self, records: list[EvidenceRecord]) -> None:
+        self._records = tuple(record.model_copy(deep=True) for record in records)
+
+    async def append(self, evidence: EvidenceRecord) -> None:
+        raise RuntimeError("evidence_snapshot_is_read_only")
+
+    async def get(self, evidence_id: EvidenceId) -> EvidenceRecord | None:
+        return next((record.model_copy(deep=True) for record in self._records
+                     if record.evidence_id == evidence_id), None)
+
+    async def list_for_run(self, run_id: RunId) -> list[EvidenceRecord]:
+        return [record.model_copy(deep=True) for record in self._records if record.run_id == run_id]
+
+    async def list_for_action(self, action_id: ActionId) -> list[EvidenceRecord]:
+        return [record.model_copy(deep=True) for record in self._records
+                if record.action_id == action_id]
+
+
 class FilesystemEvidenceStore:
+    @staticmethod
+    async def inspect_run(root_dir: str | Path, run_id: RunId) -> EvidenceReadSnapshot | None:
+        """Read originals with index integrity, without constructor mkdir.
+
+        File/index disagreement (including an interrupted append) is an
+        error, never an empty successful inventory. This is not an
+        authenticated index or an atomic snapshot with other stores.
+        """
+        identity = str(run_id)
+        if not identity or identity in {".", ".."} or "/" in identity or "\\" in identity:
+            raise ValueError("evidence_snapshot_run_id_invalid")
+        root = Path(root_dir)
+        path, index = root / f"{identity}.jsonl", root / "_index.jsonl"
+        if not root.exists():
+            return None
+        if not root.is_dir():
+            raise ValueError("evidence_snapshot_root_invalid")
+        index_text = index.read_text(encoding="utf-8") if index.exists() else ""
+        entries = [json.loads(line) for line in index_text.splitlines() if line.strip()]
+        if not path.exists() and not any(entry["run_id"] == run_id for entry in entries):
+            return None  # this directory does not establish this Run's evidence inventory
+        text = path.read_text(encoding="utf-8") if path.exists() else ""
+        if _integrity_problems(run_id, entries, text.splitlines()):
+            raise ValueError("evidence_snapshot_integrity_failed")
+        if (index.read_text(encoding="utf-8") if index.exists() else "") != index_text:
+            raise ValueError("evidence_snapshot_changed")
+        return EvidenceReadSnapshot([
+            EvidenceRecord.model_validate_json(line) for line in text.splitlines() if line.strip()
+        ])
+
     def __init__(self, root_dir: str | Path) -> None:
         self._root = Path(root_dir)
         self._root.mkdir(parents=True, exist_ok=True)
@@ -64,6 +142,8 @@ class FilesystemEvidenceStore:
         }
         with self._index_path.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(entry) + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())
 
     def _read_index(self) -> list[dict[str, Any]]:
         if not self._index_path.exists():
@@ -79,6 +159,8 @@ class FilesystemEvidenceStore:
         path = self._path_for_run(evidence.run_id)
         with path.open("a", encoding="utf-8") as fh:
             fh.write(line + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())
         self._append_index(
             evidence_id=evidence.evidence_id,
             action_id=evidence.action_id,
@@ -123,37 +205,11 @@ class FilesystemEvidenceStore:
         The index and run file are compared in both directions. An empty
         result means they agree; it does not authenticate the index itself.
         """
-        expected = {
-            entry["evidence_id"]: entry["line_hash"]
-            for entry in self._read_index()
-            if entry["run_id"] == run_id
-        }
         path = self._path_for_run(run_id)
-        if not path.exists():
-            return [EvidenceId(evidence_id) for evidence_id in expected]
-
-        problems: list[EvidenceId] = []
-        seen: set[EvidenceId] = set()
-        for line in path.read_text(encoding="utf-8").splitlines():
-            if not line.strip():
-                continue
-            record = EvidenceRecord.model_validate_json(line)
-            evidence_id = record.evidence_id
-            if (
-                evidence_id in seen
-                or evidence_id not in expected
-                or record.run_id != run_id
-                or expected[evidence_id] != _line_hash(line)
-            ) and evidence_id not in problems:
-                problems.append(evidence_id)
-            seen.add(evidence_id)
-
-        problems.extend(
-            EvidenceId(evidence_id)
-            for evidence_id in expected
-            if evidence_id not in seen
+        return _integrity_problems(
+            run_id, self._read_index(),
+            path.read_text(encoding="utf-8").splitlines() if path.exists() else [],
         )
-        return problems
 
     async def purge_older_than(self, days: float) -> list[RunId]:
         """Deletes whole run files (by file mtime) past the retention

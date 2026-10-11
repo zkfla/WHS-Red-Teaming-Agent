@@ -7,7 +7,6 @@ from datetime import datetime, timezone
 from typing import Any
 
 from redteam.app.bootstrap import run_engagement
-from redteam.attack_graph.identity import host_node_id
 from redteam.attack_graph.stores.memory import InMemoryAttackGraphStore
 from redteam.control.service import DefaultControlPlane
 from redteam.core.contracts.engagement import (
@@ -34,14 +33,26 @@ from redteam.core.ids import (
     ToolId,
     new_id,
 )
+from redteam.core.ports.llm import NativeCompletion, NativeToolCall
 from redteam.event_bus.memory import InMemoryEventBus
 from redteam.orchestration.agents.registry import default_registry
 from redteam.orchestration.context import RuntimeDeps
+from redteam.orchestration.local_tools import LocalToolRegistry
+from redteam.orchestration.native_binding import exposed_tool_name
+from redteam.orchestration.native_local_tools import (
+    GOAL_SETTLE_TOOL_ID,
+    TASK_SETTLE_TOOL_ID,
+    goal_settle_descriptor,
+    goal_settle_handler,
+    task_settle_descriptor,
+    task_settle_handler,
+)
 from redteam.orchestration.paths import CompletionCriterion, InMemoryPathStore
 from redteam.orchestration.settings import OrchestrationSettings
 from redteam.orchestration.state import TerminationReason
 from redteam.orchestration.task_graph.memory import InMemoryTaskGraphStore
 from redteam.orchestration.work.memory import InMemoryWorkStore
+from redteam.orchestration.work.models import WorkStatus
 from tests.integration import _engine_llm_harness as h
 
 SECOND_HOST = "a2.local"
@@ -110,29 +121,157 @@ class CountingGateway:
         )
 
 
-class TaskBoundaryLLM(h.ScriptedLLM):
-    """Actions, complete_step, complete_task per task, then goal."""
+def _native_tool_registry() -> LocalToolRegistry:
+    registry = LocalToolRegistry()
+    registry.register(task_settle_descriptor(), task_settle_handler)
+    registry.register(goal_settle_descriptor(), goal_settle_handler)
+    return registry
 
-    def __init__(self, *, graph_store: Any, evidence_store: Any) -> None:
+
+def _executed_evidence_ids(messages: list[dict[str, Any]]) -> list[str]:
+    """Stored evidence behind executed tool messages, never raw payloads."""
+    found: list[str] = []
+    for message in messages:
+        if message.get("role") != "tool" or not message.get("tool_call_id"):
+            continue
+        try:
+            body = json.loads(message.get("content") or "{}")
+        except ValueError:
+            continue
+        if not isinstance(body, dict) or body.get("ok") is not True:
+            continue
+        if body.get("executed") is not True:
+            continue
+        for identity in body.get("evidence_ids") or []:
+            text = str(identity)
+            if text and text not in found:
+                found.append(text)
+    return found
+
+
+def _tool_result(messages: list[dict[str, Any]], call_id: str) -> dict[str, Any] | None:
+    for message in messages:
+        if message.get("role") != "tool" or message.get("tool_call_id") != call_id:
+            continue
+        try:
+            body = json.loads(message.get("content") or "{}")
+        except ValueError:
+            return None
+        return body if isinstance(body, dict) else None
+    return None
+
+
+def _settled_ok(messages: list[dict[str, Any]], call_id: str) -> bool:
+    seen = _tool_result(messages, call_id)
+    return isinstance(seen, dict) and seen.get("ok") is True
+
+
+def _executed_ok(messages: list[dict[str, Any]], call_id: str) -> bool:
+    seen = _tool_result(messages, call_id)
+    return (
+        isinstance(seen, dict) and seen.get("ok") is True and seen.get("executed") is True
+    )
+
+
+class TaskBoundaryLLM(h.ScriptedLLM):
+    """Native probe/settle script: inventory per host, settle per task, then the goal.
+
+    Only ``complete_native`` drives the loop. ``complete_structured`` serves
+    queued engine-direct answers first (tests driving InvestigationEngine
+    straight), then the genuine settlement reviews; any legacy strategy
+    route raises instead of standing in for a native turn.
+    """
+
+    def __init__(
+        self,
+        *,
+        graph_store: Any,
+        evidence_store: Any,
+        probes: list[str] | None = None,
+    ) -> None:
         super().__init__()
         self._graph = graph_store
         self._evidence = evidence_store
-        self._next_counts: dict[str, int] = {}
-        self._task_order: list[str] = []
-        self._draft_calls = 0
-        self.task_review_payloads: list[dict[str, Any]] = []
-        self.step_review_payloads: list[dict[str, Any]] = []
+        self._probes = list(probes) if probes is not None else [h.HOST, SECOND_HOST]
+        self.turns = 0
+        self.reviews: list[str] = []
+        self.task_evidence: list[list[str]] = []
+        self._probe_calls: list[str] = []
+        self._settle_calls: list[str] = []
+        self._goal_call: str | None = None
 
-    def _node_for(self, task: Any) -> str:
-        if isinstance(task, dict):
-            goal = str(task.get("objective", ""))
-            if "a2" in goal.lower():
-                return str(host_node_id(SECOND_HOST))
-        return str(host_node_id(h.HOST))
-
-    @staticmethod
-    def _payload(messages: list[dict[str, Any]]) -> dict[str, Any]:
-        return json.loads(messages[0]["content"])
+    async def complete_native(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[Any],
+        system: str | None = None,
+        **_: Any,
+    ) -> NativeCompletion:
+        names = {str(getattr(spec, "name", "")) for spec in tools}
+        inventory = exposed_tool_name(h.INVENTORY_TOOL)
+        task_tool = exposed_tool_name(TASK_SETTLE_TOOL_ID)
+        goal_tool = exposed_tool_name(GOAL_SETTLE_TOOL_ID)
+        assert inventory in names, "native model needs the registered inventory tool"
+        assert task_tool in names, "native model needs the task settlement helper"
+        assert goal_tool in names, "native model needs the goal settlement helper"
+        self.turns += 1
+        for index, host in enumerate(self._probes):
+            if index >= len(self._probe_calls):
+                call_id = f"call-probe-{index + 1}"
+                self._probe_calls.append(call_id)
+                return NativeCompletion(
+                    tool_calls=(
+                        NativeToolCall(
+                            call_id=call_id, name=inventory, arguments={"host": host}
+                        ),
+                    ),
+                    text="",
+                )
+            if not _executed_ok(messages, self._probe_calls[index]):
+                return NativeCompletion(tool_calls=(), text="holding for execution")
+            if index >= len(self._settle_calls):
+                evidenced = _executed_evidence_ids(messages)
+                prior = {known for settled in self.task_evidence for known in settled}
+                fresh = [item for item in evidenced if item not in prior]
+                assert fresh, "each task settlement needs its own executed evidence"
+                call_id = f"call-task-{index + 1}"
+                self._settle_calls.append(call_id)
+                self.task_evidence.append(list(fresh))
+                return NativeCompletion(
+                    tool_calls=(
+                        NativeToolCall(
+                            call_id=call_id,
+                            name=task_tool,
+                            arguments={
+                                "outcome": "success",
+                                "reason": "task evidence ready",
+                                "evidence_ids": list(fresh),
+                            },
+                        ),
+                    ),
+                    text="",
+                )
+            if not _settled_ok(messages, self._settle_calls[index]):
+                return NativeCompletion(tool_calls=(), text="holding for settlement")
+        if self._goal_call is None:
+            evidenced = _executed_evidence_ids(messages)
+            assert evidenced, "goal settlement needs the executed call evidence"
+            self._goal_call = "call-goal"
+            return NativeCompletion(
+                tool_calls=(
+                    NativeToolCall(
+                        call_id=self._goal_call,
+                        name=goal_tool,
+                        arguments={
+                            "outcome": "success",
+                            "reason": "goal evidence ready",
+                            "evidence_ids": evidenced,
+                        },
+                    ),
+                ),
+                text="",
+            )
+        return NativeCompletion(tool_calls=(), text="")
 
     async def complete_structured(
         self,
@@ -143,123 +282,64 @@ class TaskBoundaryLLM(h.ScriptedLLM):
         **_: Any,
     ) -> dict[str, Any]:
         route = self._route_key(response_schema)
-        payload = self._payload(messages)
         self.calls.append({"route": route, "messages": messages, "system": system})
-        if route == "path_draft":
-            self._draft_calls += 1
-            node = self._node_for(payload.get("active_task"))
-            draft = h.draft_path(node)
-            if self._draft_calls > 1:
-                draft["steps"][0]["objective"] = "confirm the second host answers inventory"
-            return draft
-        if route == "path_review":
-            return h.review_accept()
-        if route == "analysis_verify":
+        queue = self._routes.get(route, [])
+        if queue:
+            response = queue.pop(0)
+            if isinstance(response, Exception):
+                raise response
+            return response
+        props = response_schema.get("properties", {})
+        if "claim_supported" in props:
+            review = "analysis_verify"
+        elif "criteria" in props:
+            review = "goal_completion_review"
+        elif "claims" in props or "accepted" in props:
+            review = "task_completion_review"
+        else:
+            raise AssertionError("legacy strategy route is not part of the native loop")
+        self.reviews.append(review)
+        if review == "analysis_verify":
             return h.meaning("success", True)
-        if route == "completion_review":
-            if "task" in payload:
-                self.task_review_payloads.append(payload)
-                excerpts = payload.get("evidence_excerpts", [])
-                ids = [
-                    str(e.get("evidence_id"))
-                    for e in excerpts
-                    if isinstance(e, dict) and str(e.get("evidence_id", "")).strip()
-                ]
-                assert ids, "task review needs related stored evidence"
-                return h.task_accept(ids, reason="task review accept")
-            self.step_review_payloads.append(payload)
-            return h.completion_accept()
-        if route == "goal_completion_review":
-            mission = payload["mission"]
-            assert isinstance(mission, dict)
-            criteria = mission["success_criteria"]
-            assert isinstance(criteria, list)
-            active = payload["active_path"]
-            assert isinstance(active, dict)
-            run_id = str(active["run_id"])
-            records = await self._evidence.list_for_run(run_id)
-            receipts = [
-                str(r.evidence_id)
-                for r in records
-                if isinstance(
-                    getattr(r, "metadata", {}).get("tool_result"),
-                    dict,
-                )
-            ]
-            return h.goal_accept(
-                [
+        payload = json.loads(messages[0]["content"])
+        receipts = list(payload["verified_source_ids"])
+        assert receipts, "settlement review needs the verified executed call evidence"
+        if review == "task_completion_review":
+            return {
+                "accepted": True,
+                "reason": "task review accept",
+                "claims": [
                     {
-                        "criterion": c,
-                        "met": True,
+                        "description": "actual result observed in stored evidence",
+                        "kind": "observation",
                         "evidence_ids": list(receipts),
+                        "target_node_ids": [],
+                        "principal_refs": [],
                     }
-                    for c in criteria
-                ]
-            )
-        if route == "next_action":
-            active_task = payload.get("active_task")
-            active_path = payload.get("active_path")
-            if not isinstance(active_task, dict):
-                return h.turn_complete_goal("close goal")
-            assert isinstance(active_path, dict)
-            raw_steps = active_path.get("steps")
-            assert isinstance(raw_steps, list)
-            assert raw_steps and isinstance(raw_steps[0], dict)
-            step_id = str(raw_steps[0]["step_id"])
-            task_id = str(active_task.get("task_id"))
-            if task_id not in self._task_order:
-                self._task_order.append(task_id)
-            count = self._next_counts.get(task_id, 0) + 1
-            self._next_counts[task_id] = count
-            node_id = self._node_for(active_task)
-            if count == 1:
-                turn = h.turn_actions(node_id)
-                turn["path_step_id"] = step_id
-                for action in turn["actions"]:
-                    assert isinstance(action, dict)
-                    action["path_step_id"] = step_id
-                    action.pop("capability", None)
-                    action.pop("operation", None)
-                return turn
-            if count == 2:
-                path_id = str(active_path.get("path_id"))
-                run_id = str(active_path.get("run_id"))
-                records = await self._evidence.list_for_run(run_id)
-                mine = [
-                    str(r.evidence_id)
-                    for r in records
-                    if isinstance(
-                        getattr(r, "metadata", {}).get("tool_result"),
-                        dict,
-                    )
-                    and str(getattr(r, "metadata", {}).get("path_id", "")) == path_id
-                ]
-                if not mine:
-                    mine = [
-                        str(r.evidence_id)
-                        for r in records
-                        if isinstance(
-                            getattr(r, "metadata", {}).get("tool_result"),
-                            dict,
-                        )
-                    ]
-                assert mine, "turn 2 needs task evidence"
-                turn = h.turn_complete_step(mine)
-                turn["path_step_id"] = step_id
-                return turn
-            if count == 3:
-                return {
-                    "mode": "complete_task",
-                    "reason": "task evidence ready",
-                    "actions": [],
-                    "path": None,
-                    "path_step_id": None,
-                    "completion": {},
-                    "evidence_request": {},
-                    "hypothesis_update": {},
+                ],
+            }
+        criteria = payload["mission"]["success_criteria"]
+        return {
+            "accepted": True,
+            "reason": "goal review accept",
+            "criteria": [
+                {
+                    "criterion": item,
+                    "met": True,
+                    "evidence_ids": list(receipts),
+                    "claims": [
+                        {
+                            "description": "actual result observed in stored evidence",
+                            "kind": "observation",
+                            "evidence_ids": list(receipts),
+                            "target_node_ids": [],
+                            "principal_refs": [],
+                        }
+                    ],
                 }
-            return h.turn_complete_goal("task closed")
-        raise AssertionError(f"no answer for {route!r}")
+                for item in criteria
+            ],
+        }
 
     async def complete(self, *, messages: Any, system: Any = None, **_: Any) -> str:
         return ""
@@ -286,6 +366,7 @@ def _live_deps(
         engagement=engagement,
         agents=default_registry(),
         tool_catalog=catalog,
+        local_tools=_native_tool_registry(),
         work_store=InMemoryWorkStore(),
         task_graph_store=task_store,
         path_store=InMemoryPathStore(),
@@ -371,6 +452,7 @@ async def test_two_required_tasks_dependency_promotion_closes_goal() -> None:
     llm = TaskBoundaryLLM(
         graph_store=InMemoryAttackGraphStore(),
         evidence_store=h.FakeEvidenceStore(),
+        probes=[h.HOST, SECOND_HOST],
     )
     gateway = CountingGateway()
     engagement = _two_host_engagement("eng-task-boundary")
@@ -383,8 +465,11 @@ async def test_two_required_tasks_dependency_promotion_closes_goal() -> None:
     assert seen.get("done"), "hook must create second task"
     assert seen.get("second_initial") == "pending"
     assert len(gateway.calls) == 2, f"expected 2 tool calls, got {len(gateway.calls)}"
-    assert llm.task_review_payloads, "task review must run"
-    assert llm.step_review_payloads, "step review must run"
+    assert [str(call.tool_id) for call in gateway.calls] == [h.INVENTORY_TOOL] * 2
+    assert gateway.calls[0].arguments.get("host") == h.HOST
+    assert gateway.calls[1].arguments.get("host") == SECOND_HOST
+    assert llm.reviews.count("task_completion_review") == 2, "each task settles reviewed"
+    assert "goal_completion_review" in llm.reviews
     assert runtime.mission_id is not None
     mission = await deps.task_graph_store.get_mission(runtime.mission_id)
     assert mission is not None
@@ -400,46 +485,40 @@ async def test_two_required_tasks_dependency_promotion_closes_goal() -> None:
     started_ids = [str(e.payload.get("task_id")) for e in started]
     assert seen["first_id"] in started_ids
     assert seen["second_id"] in started_ids
-    completed = event_bus.history(event_type=EventType.TASK_COMPLETED)
-    done_ids = [str(e.payload.get("task_id")) for e in completed]
-    assert done_ids.count(seen["first_id"]) == 1
-    assert done_ids.count(seen["second_id"]) == 1
-    order = event_bus.history()
-    idx_first = next(
-        i
-        for i, e in enumerate(order)
-        if e.event_type == EventType.TASK_COMPLETED
-        and str(e.payload.get("task_id")) == seen["first_id"]
-    )
-    idx_second = next(
-        i
-        for i, e in enumerate(order)
-        if e.event_type == EventType.TASK_COMPLETED
-        and str(e.payload.get("task_id")) == seen["second_id"]
-    )
-    idx_mission = next(i for i, e in enumerate(order) if e.event_type == EventType.MISSION_UPDATED)
-    assert idx_first < idx_second < idx_mission
-    paths = await deps.path_store.list_paths(str(runtime.run_id))
-    task_paths = [p for p in paths if p.mission_task_id]
-    assert len({p.mission_task_id for p in task_paths}) >= 2
-    first_paths = [p for p in task_paths if str(p.mission_task_id) == seen["first_id"]]
-    second_paths = [p for p in task_paths if str(p.mission_task_id) == seen["second_id"]]
-    assert first_paths and second_paths
-    assert {p.path_id for p in first_paths}.isdisjoint({p.path_id for p in second_paths})
-    first_targets = {t for p in first_paths for s in p.steps for t in s.target_node_ids}
-    second_targets = {t for p in second_paths for s in p.steps for t in s.target_node_ids}
-    assert first_targets.isdisjoint(second_targets)
-    first_receipts = {e for p in first_paths for s in p.steps for e in s.evidence_ids}
-    second_receipts = {e for p in second_paths for s in p.steps for e in s.evidence_ids}
-    assert first_receipts
-    assert second_receipts
-    assert first_receipts.isdisjoint(second_receipts)
+    assert started_ids.index(seen["first_id"]) < started_ids.index(seen["second_id"])
+    # The native loop emits no task-completion events and fabricates no
+    # investigation paths: settlement is proven through the work ledger and
+    # the stored tool evidence each settlement cited.
+    assert await deps.path_store.list_paths(str(runtime.run_id)) == []
+    assert len(llm.task_evidence) == 2
+    assert all(llm.task_evidence)
+    assert set(llm.task_evidence[0]).isdisjoint(llm.task_evidence[1])
+    items = await deps.work_store.list_items(run_id=runtime.run_id)
+    first_work = [item for item in items if item.model_tool_call_id == "call-probe-1"]
+    second_work = [item for item in items if item.model_tool_call_id == "call-probe-2"]
+    assert len(first_work) == 1 and first_work[0].status is WorkStatus.SUCCEEDED
+    assert len(second_work) == 1 and second_work[0].status is WorkStatus.SUCCEEDED
+    assert first_work[0].mission_task_id == seen["first_id"]
+    assert second_work[0].mission_task_id == seen["second_id"]
+    tool_ids = {
+        str(record.evidence_id)
+        for record in await deps.evidence_store.list_for_run(runtime.run_id)
+        if isinstance(getattr(record, "metadata", {}).get("tool_result"), dict)
+    }
+    assert tool_ids, "goal needs the executed call evidence"
+    assert set(llm.task_evidence[0]) <= tool_ids
+    assert set(llm.task_evidence[1]) <= tool_ids
+    assert mission.criterion_results, "goal settlement keeps its evidence results"
+    for result in mission.criterion_results:
+        assert result.met and result.evidence_ids
+        assert set(map(str, result.evidence_ids)) <= tool_ids
 
 
 async def test_optional_pending_task_never_emits_false_completion() -> None:
     llm = TaskBoundaryLLM(
         graph_store=InMemoryAttackGraphStore(),
         evidence_store=h.FakeEvidenceStore(),
+        probes=[h.HOST],
     )
     gateway = CountingGateway()
     engagement = h.make_engagement(engagement_id="eng-optional")
@@ -454,13 +533,16 @@ async def test_optional_pending_task_never_emits_false_completion() -> None:
     mission = await deps.task_graph_store.get_mission(runtime.mission_id)
     assert mission is not None
     assert mission.status == MissionStatus.COMPLETED
+    required = await deps.task_graph_store.get_task(TaskId(seen["required_id"]))
+    assert required is not None and required.status is TaskStatus.COMPLETED
     optional = await deps.task_graph_store.get_task(TaskId(seen["optional_id"]))
     assert optional is not None
     assert optional.status is not TaskStatus.COMPLETED
-    completed = event_bus.history(event_type=EventType.TASK_COMPLETED)
-    done_ids = [str(e.payload.get("task_id")) for e in completed]
-    assert seen["optional_id"] not in done_ids
-    assert seen["required_id"] in done_ids
+    started = event_bus.history(event_type=EventType.TASK_STARTED)
+    started_ids = [str(e.payload.get("task_id")) for e in started]
+    assert seen["required_id"] in started_ids
+    assert seen["optional_id"] not in started_ids
+    assert len(gateway.calls) == 1
 
 
 async def test_wrong_task_receipts_rejected() -> None:

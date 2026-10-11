@@ -244,7 +244,10 @@ class PlaybookCandidateProvider:
         drops: list[tuple[str, str, str]] = []
         drafts: list[CandidateDraft] = []
         for plan_step in await available_steps(spec, view, observation, step=step, drops=drops):
-            target_id = node_id_for_target(plan_step.resolved_target())
+            target = plan_step.resolved_target()
+            if target is None:
+                continue  # Reference playbooks require a resolved target.
+            target_id = node_id_for_target(target)
             drafts.append(
                 CandidateDraft(
                     agent_id=spec.agent_id,

@@ -17,9 +17,9 @@ from redteam.orchestration.operator_intents.store import (
     IntentIdentityConflictError,
     SQLiteOperatorIntentStore,
 )
-from redteam.orchestration.sqlite_support import run_transaction
 from redteam.orchestration.task_graph import SQLiteTaskGraphStore
 from redteam.orchestration.task_graph.rules import DuplicateTaskError
+from redteam.sqlite_support import run_transaction
 
 NOW = datetime(2026, 1, 1, tzinfo=timezone.utc)
 MISSION = MissionId("sqlite-mission")
@@ -174,7 +174,7 @@ async def test_cancelled_awaiter_waits_for_worker_rollback(tmp_path):
 
 
 async def test_retry_limit_and_thread_owned_connection(tmp_path):
-    from redteam.orchestration.sqlite_support import run_sqlite
+    from redteam.sqlite_support import run_sqlite
 
     calls = []
 

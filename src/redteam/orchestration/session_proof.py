@@ -6,6 +6,11 @@ Request echoes and configured inventory never prove use, including in
 old records. A partial receipt never borrows the unknown side's echo.
 Both the analysis verifier and the completion account checks read the
 same rule through this module instead of duplicating it.
+
+Account names follow the same receipt rule: a unit states the account it
+used only beside its own actual-use receipt, so the comparison pair, the
+top-level answer and each nested unit contribute their own pair and
+nothing more.
 """
 
 from __future__ import annotations
@@ -19,6 +24,12 @@ _ACTUAL_TOP_KEYS = (
 )
 _ACTUAL_PAIR_KEYS = ("first_actual_session_ref", "second_actual_session_ref")
 _NESTED_UNITS = ("first", "second", "authenticated", "anonymous")
+_UNIT_ACCOUNT_PAIRS = (("principal_ref", "actual_session_ref"),)
+_ACCOUNT_PAIRS = _UNIT_ACCOUNT_PAIRS + (
+    ("first_principal_ref", "first_actual_session_ref"),
+    ("second_principal_ref", "second_actual_session_ref"),
+)
+_ANONYMOUS_ACCOUNT = "anonymous"
 
 
 def _cleaned(value: Any) -> str | None:
@@ -75,6 +86,51 @@ def actual_receipt_conflict(metadata: Any, raw: Any) -> str | None:
     if meta_actual and raw_actual and meta_actual.isdisjoint(raw_actual):
         return "actual session receipts disagree across layers"
     return None
+
+
+def collect_actual_accounts(
+    metadata: Any, raw: Any, expected_sessions: set[str] | None = None
+) -> set[str]:
+    """Return the accounts a response actually used, unit by unit.
+
+    A unit names its account only beside its own actual-use receipt: the
+    comparison pair, the top-level answer pair, or a nested unit's own
+    actual_session_ref. Echo-only units, inventory rows and a null
+    anonymous side name no account. A response whose whole receipt channel
+    sits outside the requested sessions names accounts nobody asked for,
+    so it grounds none of them.
+    """
+    values = _account_values_from_units(metadata, raw)
+    if expected_sessions and values:
+        actual = collect_actual_sessions(metadata, raw)
+        if actual and actual.isdisjoint(expected_sessions):
+            return set()
+    return values
+
+
+def _account_values_from_units(metadata: Any, raw: Any) -> set[str]:
+    values: set[str] = set()
+    comparison = metadata.get("session_comparison") if isinstance(metadata, dict) else None
+    if isinstance(comparison, dict):
+        _add_account_pairs(values, comparison, _ACCOUNT_PAIRS)
+    output = _output_of(raw)
+    if isinstance(output, dict):
+        _add_account_pairs(values, output, _ACCOUNT_PAIRS)
+        for nested_key in _NESTED_UNITS:
+            nested = output.get(nested_key)
+            if isinstance(nested, dict):
+                _add_account_pairs(values, nested, _UNIT_ACCOUNT_PAIRS)
+    return {item for item in values if item.lower() != _ANONYMOUS_ACCOUNT}
+
+
+def _add_account_pairs(
+    values: set[str], unit: dict[str, Any], pairs: tuple[tuple[str, str], ...]
+) -> None:
+    for principal_key, session_key in pairs:
+        principal = _cleaned(unit.get(principal_key))
+        if principal is None or _cleaned(unit.get(session_key)) is None:
+            continue
+        values.add(principal)
 
 
 def _output_of(raw: Any) -> Any | None:

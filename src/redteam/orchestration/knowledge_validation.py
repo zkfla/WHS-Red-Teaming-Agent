@@ -29,6 +29,9 @@ class AssessmentError(ValueError):
     """A code-owned rule violation against the internal material."""
 
 
+_SESSION_ARGUMENT_FIELDS = ("session_ref", "first_session_ref", "second_session_ref")
+
+
 @dataclass
 class InternalTarget:
     """One known target with its provenance summary (refs only)."""
@@ -126,9 +129,8 @@ def check_principal_arguments(
 ) -> None:
     """Principal/session wiring check against the internal material."""
     bindings = material.principal_bindings
-    session_names = ("session_ref", "first_session_ref", "second_session_ref")
     session_refs = [
-        str(arguments[name]) for name in session_names if arguments.get(name) is not None
+        str(arguments[name]) for name in _SESSION_ARGUMENT_FIELDS if arguments.get(name) is not None
     ]
     if principal and principal not in bindings:
         raise AssessmentError("action references an unregistered principal")
@@ -144,6 +146,39 @@ def check_principal_arguments(
         raise AssessmentError("principal tool argument differs from action identity")
 
 
+def registered_principal_for_arguments(
+    arguments: dict[str, Any], material: InternalAssessment,
+) -> str | None:
+    """Bind the caller's selected session to a registered identity reference.
+
+    This supplies execution bookkeeping, not permission. The existing
+    principal check still validates every selected session at admission.
+    Ambiguous registrations remain unresolved rather than choosing an owner.
+    """
+    explicit = arguments.get("principal_ref")
+    if explicit is not None:
+        return str(explicit)
+    selected = next(
+        (
+            str(arguments[name]) for name in _SESSION_ARGUMENT_FIELDS
+            if arguments.get(name) is not None
+        ),
+        None,
+    )
+    if selected is None:
+        return None
+    # The collector registers an explicit session reference as its own
+    # accepted identity alias. Prefer that supplied alias over inferred
+    # ownership among principal/credential nodes for the same session.
+    if selected in material.principal_bindings.get(selected, set()):
+        return selected
+    owners = [
+        principal for principal, sessions in material.principal_bindings.items()
+        if principal != "anonymous" and selected in sessions
+    ]
+    return owners[0] if len(owners) == 1 else None
+
+
 __all__ = [
     "AssessmentError",
     "InternalAssessment",
@@ -157,6 +192,7 @@ __all__ = [
     "is_evidence_grounded",
     "known_principals",
     "known_target_ids",
+    "registered_principal_for_arguments",
     "target_record",
 ]
 

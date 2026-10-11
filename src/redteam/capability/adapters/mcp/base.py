@@ -9,9 +9,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Protocol
+from typing import Any, Protocol, runtime_checkable
 
-from redteam.core.contracts.tool import ToolDescriptor, ToolError
+from redteam.core.contracts.tool import ToolDescriptor, ToolError, ToolInvocation
 from redteam.core.enums import ToolHealthStatus
 
 
@@ -44,3 +44,28 @@ class MCPAdapter(Protocol):
     ) -> MCPCallResult: ...
 
     async def health_check(self) -> ToolHealthStatus: ...
+
+
+@runtime_checkable
+class InvocationContextBinder(Protocol):
+    """Optional provider contract for arguments bound to trusted execution identity.
+
+    Providers own the identity fields and mismatch rules. The gateway passes
+    the approved invocation and validates the returned arguments against the
+    same descriptor; ordinary adapters need not implement this contract.
+    """
+
+    def bind_context(self, invocation: ToolInvocation) -> dict[str, Any]: ...
+
+
+@runtime_checkable
+class ContextualInvocationAdapter(Protocol):
+    """Optional execution contract for providers that persist correlation.
+
+    The gateway supplies the same approved invocation with bound, validated
+    arguments after admission. Providers can associate durable execution
+    handles with trusted IDs without exposing identity fields as model input
+    or retaining a mutable binding cache. Legacy adapters keep invoke().
+    """
+
+    async def invoke_contextual(self, invocation: ToolInvocation) -> MCPCallResult: ...

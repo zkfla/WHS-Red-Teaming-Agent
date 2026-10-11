@@ -6,7 +6,7 @@ import asyncio
 from datetime import datetime, timedelta, timezone
 from typing import cast
 
-from redteam.core.ids import RunId
+from redteam.core.ids import AgentInstanceId, RunId
 from redteam.orchestration.work.models import (
     TaskLease,
     WorkItem,
@@ -17,13 +17,16 @@ from redteam.orchestration.work.rules import (
     blocked_for_dependency,
     can_bind,
     decide_add,
+    decide_execution_reconcile,
     decide_reconcile,
+    execution_started_item,
     expired_lease_ids,
     failed_item,
     finished_item,
     has_conflict,
     is_expired,
     lease_owned,
+    lease_owner_matches,
     leased_item,
     new_lease,
     pending_item,
@@ -52,7 +55,9 @@ class InMemoryWorkStore:
             same_candidate = [
                 existing
                 for existing in self._items.values()
-                if existing.run_id == item.run_id and existing.candidate_key == item.candidate_key
+                if existing.run_id == item.run_id
+                and existing.instance_id == item.instance_id
+                and existing.candidate_key == item.candidate_key
             ]
             verdict, target = decide_add(item, same_candidate)
             if verdict == "reject":
@@ -116,7 +121,11 @@ class InMemoryWorkStore:
         validate_lease_ttl(ttl)
         async with self._lock:
             item = self._items.get(work_id)
-            if item is None or item.status is not WorkStatus.PENDING:
+            if (
+                item is None
+                or item.status is not WorkStatus.PENDING
+                or not lease_owner_matches(item, owner)
+            ):
                 return None
             failed_dependency = self._terminal_dependency_failure(item)
             if failed_dependency is not None:
@@ -153,6 +162,16 @@ class InMemoryWorkStore:
             self._items[work_id] = running_item(item, now)
             return renewed.model_copy(deep=True)
 
+    async def mark_execution_started(self, work_id: str, *, owner: str, now: datetime) -> bool:
+        async with self._lock:
+            item = self._items.get(work_id)
+            updated = (execution_started_item(item, self._leases.get(work_id), owner, now)
+                       if item is not None else None)
+            if updated is None:
+                return False
+            self._items[work_id] = updated
+            return True
+
     async def complete(
         self,
         work_id: str,
@@ -161,6 +180,7 @@ class InMemoryWorkStore:
         status: WorkStatus,
         now: datetime,
         reason: str | None = None,
+        execution_known: bool = False,
     ) -> bool:
         require_terminal(status)
         async with self._lock:
@@ -172,7 +192,9 @@ class InMemoryWorkStore:
                 self._items[work_id] = stale_item(item, now, "lease_expired")
                 del self._leases[work_id]
                 return False
-            self._items[work_id] = finished_item(item, status, now, reason)
+            self._items[work_id] = finished_item(
+                item, status, now, reason, execution_known=execution_known
+            )
             del self._leases[work_id]
             return True
 
@@ -184,6 +206,7 @@ class InMemoryWorkStore:
             if (
                 lease is None
                 or item is None
+                or item.resource_execution_pending
                 or lease.owner != owner
                 or is_expired(lease.expires_at, now)
             ):
@@ -225,6 +248,33 @@ class InMemoryWorkStore:
     async def reconcile_job(self, work_id: str, *, job_id: str, status: str, now: datetime) -> bool:
         async with self._lock:
             applied, decided = decide_reconcile(self._items.get(work_id), job_id, status, now)
+            if not applied:
+                return False
+            if decided is not None:
+                self._items[work_id] = decided
+            self._leases.pop(work_id, None)
+            return True
+
+    async def reconcile_execution(
+        self,
+        work_id: str,
+        *,
+        run_id: RunId,
+        instance_id: AgentInstanceId | None,
+        candidate_key: str,
+        status: str,
+        now: datetime,
+    ) -> bool:
+        async with self._lock:
+            applied, decided = decide_execution_reconcile(
+                self._items.get(work_id),
+                self._leases.get(work_id),
+                run_id=run_id,
+                instance_id=instance_id,
+                candidate_key=candidate_key,
+                status=status,
+                now=now,
+            )
             if not applied:
                 return False
             if decided is not None:

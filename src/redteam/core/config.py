@@ -34,6 +34,7 @@ from redteam.core.contracts.engagement import (
     RuleOfEngagement,
     TargetActionPolicy,
 )
+from redteam.core.contracts.llm_policy import LLMRequestPolicy
 from redteam.core.environment import (
     extensions_env_raw as _extensions_env_raw,
 )
@@ -139,7 +140,11 @@ class OrchestrationConfig(BaseModel):
 
     max_retries: int = Field(default=3, ge=0)
     max_steps: int = Field(default=50, ge=1)
+    llm_request_policy: LLMRequestPolicy | None = None
+    specialist_profile_path: str | None = Field(default=None, min_length=1, max_length=4096)
+    code_fixture_policy_path: str | None = Field(default=None, min_length=1, max_length=4096)
     tool_timeout_seconds: float = Field(default=10.0, gt=0, le=600)
+    resource_wait_timeout_seconds: float = Field(default=30.0, gt=0, le=600)
     #: Legacy opt-in name retained for compatibility; not a mode switch.
     #: Planning is always LLM-led — False (or "false") fails validation
     #: instead of selecting a rule path.
@@ -153,6 +158,10 @@ class OrchestrationConfig(BaseModel):
         explicit mapping to validate that snapshot instead of live env.
         """
         values: dict[str, Any] = dict(_orchestration_env_values(source=env))
+        if "llm_request_policy" in values:
+            values["llm_request_policy"] = LLMRequestPolicy.model_validate_json(
+                values["llm_request_policy"]
+            )
         if "llm_candidate_generation" in values:
             values["llm_candidate_generation"] = TypeAdapter(bool).validate_python(
                 str(values["llm_candidate_generation"]).strip()

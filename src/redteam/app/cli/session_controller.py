@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 from collections import OrderedDict, deque
 from dataclasses import replace
+from functools import partial
 from typing import cast
 from uuid import uuid4
 
@@ -379,7 +380,12 @@ class SessionController:
             )
         for attempt in range(2):
             revision = self.context_loader() if self.context_loader else None
-            decision = await self.router.route(
+            route = self.router.route
+            if self._same(bound) and self.operator is not None:
+                bound_route = getattr(self.operator, "route_conversation", None)
+                if callable(bound_route):
+                    route = partial(bound_route, self.router)
+            decision = await route(
                 env.text,
                 context=context,
                 active=self._same(bound),

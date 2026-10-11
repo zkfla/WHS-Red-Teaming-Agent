@@ -5,9 +5,9 @@ from __future__ import annotations
 from datetime import datetime
 from enum import Enum
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
-from redteam.core.ids import AgentId, GraphNodeId, HypothesisId, RunId
+from redteam.core.ids import AgentId, AgentInstanceId, GraphNodeId, HypothesisId, RunId
 from redteam.orchestration.candidates.models import PriorityScore
 
 
@@ -34,6 +34,11 @@ TERMINAL_STATUSES = frozenset(
 ACTIVE_STATUSES = frozenset({WorkStatus.PENDING, WorkStatus.LEASED, WorkStatus.RUNNING})
 
 
+def work_owner_for(run_id: RunId | str, instance_id: AgentInstanceId | None) -> str:
+    """One lease owner per instance, preserving the old run owner for legacy work."""
+    return f"{run_id}:instance:{instance_id}" if instance_id is not None else str(run_id)
+
+
 class WorkBudget(BaseModel):
     max_actions: int = Field(default=1, ge=1)
     max_seconds: float | None = Field(default=None, gt=0)
@@ -48,17 +53,25 @@ class WorkItem(BaseModel):
     #: Legacy rows used bounded summaries and cannot prove original-state equality.
     execution_identity_version: int = Field(default=0, ge=0)
     agent_id: AgentId
+    instance_id: AgentInstanceId | None = None
     graph_revision: int = Field(default=0, ge=0)
     path_id: str | None = None
     path_version: int | None = None
     path_step_id: str | None = None
     mission_task_id: str | None = None
+    model_tool_call_id: str = ""
+    task_purpose_hash: str = ""
+    execution_origin_version: int = 0
     delegation_id: str | None = None
     job_id: str | None = None
     target_node_ids: list[GraphNodeId]
     hypothesis_id: HypothesisId | None = None
     prerequisite_ids: list[str] = Field(default_factory=list)
     conflict_keys: list[str] = Field(default_factory=list)
+    resource_keys: list[str] = Field(default_factory=list)
+    # Written BEFORE provider entry; retained on cancellation/unknown results,
+    # expired leases and abandoned Runs. Only a known original clears it.
+    resource_execution_pending: bool = False
     priority: PriorityScore
     budget: WorkBudget = Field(default_factory=WorkBudget)
     repeatable: bool = False
@@ -71,11 +84,25 @@ class WorkItem(BaseModel):
     @field_validator("target_node_ids")
     @classmethod
     def _target_ids_are_stable(cls, value: list[GraphNodeId]) -> list[GraphNodeId]:
-        if not value:
-            raise ValueError("work requires at least one target reference")
         return sorted(set(value), key=str)
 
-    @field_validator("conflict_keys", "prerequisite_ids")
+    @model_validator(mode="after")
+    def _empty_refs_need_native_lineage(self) -> WorkItem:
+        if not set(self.resource_keys).issubset(self.conflict_keys):
+            raise ValueError("resource keys must be included in work conflicts")
+        if self.resource_execution_pending and not self.resource_keys:
+            raise ValueError("resource execution marker requires declared resources")
+        # Empty refs alone prove no targeted absence: they only record
+        # native lineage (execution_origin_version == 1). Whether the
+        # execution genuinely needed no target is decided by the
+        # provider-declared descriptor at compile/admission time and by
+        # the explicit stored proposal at completion time -- never by a
+        # duplicated requires_target flag here.
+        if not self.target_node_ids and self.execution_origin_version != 1:
+            raise ValueError("work requires at least one target reference")
+        return self
+
+    @field_validator("conflict_keys", "resource_keys", "prerequisite_ids")
     @classmethod
     def _keys_are_stable(cls, value: list[str]) -> list[str]:
         return sorted({item.strip() for item in value if item.strip()})
@@ -90,6 +117,8 @@ class TaskLease(BaseModel):
 
 
 def is_unexecuted_stale(item: WorkItem) -> bool:
+    if item.resource_execution_pending:
+        return False
     if item.status is not WorkStatus.STALE:
         return False
     if item.job_id:

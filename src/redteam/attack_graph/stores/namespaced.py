@@ -30,7 +30,18 @@ from __future__ import annotations
 
 from typing import Any
 
-from redteam.attack_graph.stores.base import require_listable, require_mutable
+from redteam.attack_graph.stores.base import (
+    StoreCapabilityError,
+    require_listable,
+    require_mutable,
+    require_receipted,
+)
+from redteam.attack_graph.stores.mutations import (
+    GraphMutation,
+    GraphMutationConflict,
+    GraphMutationReceipt,
+    checked_receipt,
+)
 from redteam.core.contracts.graph import GraphEdge, GraphNode
 from redteam.core.ids import EngagementId, GraphEdgeId, GraphNodeId
 from redteam.core.ports.attack_graph import AttackGraphStore
@@ -104,6 +115,68 @@ class EngagementScopedAttackGraphStore:
         )
 
     # -- AttackGraphStore (core port) ----------------------------------
+
+    async def prepare_graph_mutation(self, mutation: GraphMutation) -> GraphMutation:
+        require_receipted(self._inner)
+        mutation = GraphMutation.model_validate(mutation.model_dump()).model_copy(deep=True)
+        if mutation.namespace:
+            raise GraphMutationConflict("graph_mutation_namespace_already_prepared")
+        changes: dict[str, Any] = {"namespace": self._ns}
+        if mutation.node is not None:
+            changes["node"] = mutation.node.model_copy(update={
+                "id": self._namespaced(mutation.node.id),
+            })
+        elif mutation.edge is not None:
+            changes["edge"] = mutation.edge.model_copy(update={
+                "id": self._namespaced_edge(mutation.edge.id),
+                "source_id": self._namespaced(mutation.edge.source_id),
+                "target_id": self._namespaced(mutation.edge.target_id),
+            })
+        elif mutation.operation == "remove_node":
+            assert mutation.identity is not None
+            changes["identity"] = str(self._namespaced(GraphNodeId(mutation.identity)))
+        else:
+            assert mutation.identity is not None
+            # Legacy removal may involve two physical IDs. Do not silently
+            # change that behavior or pretend a one-ID receipt proves both.
+            legacy = await self._inner.get_edge(GraphEdgeId(mutation.identity))
+            if (legacy is not None and self._owns_edge(legacy)
+                    and _NS_SEPARATOR not in str(legacy.id)):
+                raise StoreCapabilityError(
+                    "legacy_edge_removal_receipt", self._inner, "ReceiptedAttackGraphStore",
+                )
+            changes["identity"] = str(self._namespaced_edge(GraphEdgeId(mutation.identity)))
+        return mutation.model_copy(update=changes, deep=True)
+
+    async def apply_graph_mutation(self, mutation: GraphMutation) -> GraphMutationReceipt:
+        mutation = GraphMutation.model_validate(mutation.model_dump()).model_copy(deep=True)
+        owns = (mutation.namespace == self._ns)
+        if mutation.node is not None:
+            owns = owns and self._owns(str(mutation.node.id))
+        elif mutation.edge is not None:
+            owns = (owns and self._owns_edge_id(str(mutation.edge.id))
+                    and self._owns_edge(mutation.edge))
+        else:
+            owns = owns and self._owns(str(mutation.identity))
+        if not owns:
+            raise GraphMutationConflict("graph_mutation_namespace_conflict")
+        receipt = await require_receipted(self._inner).apply_graph_mutation(mutation)
+        return checked_receipt(receipt, mutation)
+
+    async def read_graph_mutation_receipt(
+        self, run_id: str, mutation_id: str, *, namespace: str = "",
+    ) -> GraphMutationReceipt | None:
+        if namespace:
+            raise GraphMutationConflict("graph_mutation_namespace_already_prepared")
+        receipt = await require_receipted(self._inner).read_graph_mutation_receipt(
+            run_id, mutation_id, namespace=self._ns,
+        )
+        if receipt is not None and (
+            receipt.namespace != self._ns or receipt.run_id != run_id
+            or receipt.mutation_id != mutation_id
+        ):
+            raise GraphMutationConflict("graph_mutation_receipt_index_conflict")
+        return receipt
 
     async def add_node(self, node: GraphNode) -> None:
         await self._inner.add_node(node.model_copy(update={"id": self._namespaced(node.id)}))

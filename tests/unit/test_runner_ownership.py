@@ -7,6 +7,7 @@ import pytest
 
 from redteam.core.contracts.mission import MissionPlan, Provenance
 from redteam.core.enums import AgentPhase, MissionStatus
+from redteam.core.ids import AgentInstanceId
 from redteam.orchestration.component_binding import builtin_component_binding
 from redteam.orchestration.coordination import CoordinationError, coordinator_for
 from redteam.orchestration.runner import AgentLoopRunner
@@ -178,6 +179,28 @@ async def test_closed_run_binding_cannot_revive_active_mission():
     assert await runner.resume_recovered(runtime) is runtime
     assert graph.calls == 0
     assert (await deps.task_graph_store.get_mission(MISSION)).status is MissionStatus.ACTIVE
+
+
+async def test_instance_finish_does_not_close_shared_run_binding():
+    _, runner, _, runtime, coordinator = await setup(
+        MissionStatus.ACTIVE, TerminationReason.NO_ACTIONABLE_PLAN,
+    )
+    worker = runtime.model_copy(update={"instance_id": AgentInstanceId("worker-0")})
+    await runner._close_finished_binding(worker, reason=TerminationReason.MAX_STEPS_REACHED)
+
+    async def is_closed(change):
+        return change.binding(RUN, MISSION)["closed"]
+
+    assert not await coordinator.change(is_closed)
+
+
+async def test_runner_cannot_switch_between_instances_of_same_run():
+    _, runner, _, _, _ = await setup(MissionStatus.ACTIVE, None)
+    assert runner._bind_runtime(RUN, AgentInstanceId("worker-0")) == (
+        f"{RUN}:instance:worker-0"
+    )
+    with pytest.raises(ValueError, match="one run instance"):
+        runner._bind_runtime(RUN, AgentInstanceId("worker-1"))
 
 
 async def test_foreign_engagement_checkpoint_cannot_use_existing_run_binding():

@@ -37,9 +37,10 @@ class EvidenceRecord(BaseModel):
 — no in-place rewrite. `digest` is a SHA-256 of the source payload
 (`redteam.core.convert.digest_payload`), so downstream consumers can
 verify a record wasn't altered after the fact. Verification itself is
-real, not a TODO: `FilesystemEvidenceStore.verify_run_integrity` recomputes
-every record's digest and flags changed/missing/unindexed ones, exposed
-as `redteam evidence verify --run <run-id>`.
+real, not a TODO: `FilesystemEvidenceStore.verify_run_integrity` compares
+indexed JSONL line hashes and flags changed/missing/unindexed records, exposed
+as `redteam evidence verify --run <run-id>`. That file-integrity check does not
+recompute `EvidenceRecord.digest` against its original source payload.
 
 ## Producing evidence from a ToolResult
 
@@ -72,3 +73,11 @@ record = await evidence_store.get(evidence_id)
 Implement `EvidenceStore` (`append`, `get`, `list_for_run`,
 `list_for_action`) against S3/object storage/a database and wire it in
 `redteam.app.bootstrap.build_runtime_deps`.
+
+## Current reuse conditions
+
+Specialist mode adds append-only explicit conditions and fresh validity
+projections without changing the store port or rewriting originals.
+See [evidence reuse validity](evidence-reuse-validity.md) for status meanings,
+consumers, writer fences, migration and limits. Validity is not a vulnerability
+verdict or execution permission.

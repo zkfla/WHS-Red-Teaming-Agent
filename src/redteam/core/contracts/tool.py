@@ -7,13 +7,24 @@ touches it. External MCP SDK objects never cross this boundary.
 
 from __future__ import annotations
 
+import math
+from collections.abc import Mapping
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from redteam.core.contracts.target import TargetRef
 from redteam.core.enums import RiskLevel, ToolHealthStatus
-from redteam.core.ids import ActionId, AgentId, EngagementId, InvocationId, RunId, ToolId
+from redteam.core.ids import (
+    ActionId,
+    AgentId,
+    AgentInstanceId,
+    EngagementId,
+    InvocationId,
+    RunId,
+    ToolId,
+)
 from redteam.core.tool_binding import LEGACY_ACTION, SELECTED_TOOL, BindingMode
 
 
@@ -24,11 +35,66 @@ class ToolTargetBinding(BaseModel):
     requires_exact_url_match: bool = False
 
 
+class ToolResourceBinding(BaseModel):
+    """Provider-owned exclusive resource identity, not execution permission.
+
+    A namespace is shared by every provider using the same physical resource.
+    Select one input argument or an operator/provider constant. Explicit maps
+    canonicalize aliases (e.g. two device refs for one serial). No tool-name
+    or argument-suffix inference is permitted.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    namespace: str = Field(pattern=r"^[a-z][a-z0-9_.-]{0,127}$")
+    argument: str | None = Field(default=None, min_length=1, max_length=128)
+    key: str | None = Field(default=None, min_length=1, max_length=4096)
+    optional: bool = False
+    value_map: dict[str, str] = Field(default_factory=dict, max_length=1024)
+
+    @model_validator(mode="after")
+    def _one_identity_source(self) -> ToolResourceBinding:
+        if (self.argument is None) == (self.key is None):
+            raise ValueError("resource requires exactly one identity source")
+        if self.key is not None and (self.optional or self.value_map):
+            raise ValueError("constant resource cannot have argument options")
+        if any(not k or not v or len(k) > 4096 or len(v) > 4096
+               for k, v in self.value_map.items()):
+            raise ValueError("resource alias identities must be bounded non-empty strings")
+        return self
+
+
 # Shared provider-metadata keys read from SDK discovery metadata. One
 # declaration for every provider; no per-tool central list. Absent keys
 # keep the contract defaults.
 PROVIDER_METADATA_TARGET_BINDING = "redteam.target_binding"
+PROVIDER_METADATA_REQUIRES_TARGET = "redteam.requires_target"
 PROVIDER_METADATA_COMMAND_FIELDS = "redteam.command_fields"
+PROVIDER_METADATA_AVAILABILITY_IMPACT = "redteam.availability_impact"
+PROVIDER_METADATA_RESOURCE_BINDINGS = "redteam.resource_bindings"
+
+# Providers attach this when execution may have produced effects but its
+# terminal outcome cannot be established. This is independent of success,
+# retryability and exception ownership; consumers reconcile the original
+# invocation before submitting it again.
+EXECUTION_UNCERTAIN_METADATA_KEY = "execution_uncertain"
+# An explicit False proves the provider invocation was never entered. True
+# reports entry at the execution boundary, not a successful external effect.
+EXECUTION_STARTED_METADATA_KEY = "execution_started"
+
+
+def execution_outcome_uncertain(metadata: Mapping[str, Any]) -> bool:
+    """Read uncertainty, using an explicit pre-entry proof for legacy errors.
+
+    A contradictory explicit uncertainty declaration remains held; an
+    orchestration exception alone cannot override proved non-entry.
+    """
+
+    if metadata.get(EXECUTION_UNCERTAIN_METADATA_KEY) is True:
+        return True
+    if metadata.get(EXECUTION_STARTED_METADATA_KEY) is False:
+        return False
+    return bool(metadata.get("orchestration_exception"))
 
 
 class ToolDescriptor(BaseModel):
@@ -56,11 +122,24 @@ class ToolDescriptor(BaseModel):
     outbound_text_fields: list[str] = Field(default_factory=list)
     # Provider-declared target semantics consumed by direct selected-tool calls.
     target_binding: ToolTargetBinding = Field(default_factory=ToolTargetBinding)
+    # Provider-owned declaration: execution uses configured infrastructure,
+    # not an engagement target selected by the caller. Argument binding and
+    # compatible target kinds alone do not imply this permission.
+    requires_target: bool = True
     # Provider-declared ordered input components of ONE command, not
     # independent text fields. Consumers assemble strings and string-array
     # elements in field/array order for command-pattern inspection.
     # Example: ["executable", "args"]. Empty means no command input.
     command_fields: list[str] = Field(default_factory=list)
+    # Provider-declared availability effect for its actual operation semantics.
+    # Defaults to False ("no known impact") so existing descriptors are
+    # unaffected; a provider whose tool genuinely can affect availability
+    # must set this explicitly. Never inferred from tool name, risk level,
+    # or command content.
+    availability_impact: bool = False
+    # Empty means no declared shared resources, NOT proof of parallel safety.
+    # Scheduling still retains existing target conflicts and Control checks.
+    resource_bindings: list[ToolResourceBinding] = Field(default_factory=list, max_length=32)
 
     @property
     def required_arguments(self) -> tuple[str, ...]:
@@ -84,6 +163,10 @@ class ExecutionContext(BaseModel):
     engagement_id: EngagementId
     run_id: RunId
     agent_id: AgentId | None = None
+    instance_id: AgentInstanceId | None = None
+    # Mechanically copied from the ALLOW proposal by the application.
+    # Provider target windows cannot infer this authority from a script.
+    approved_target: TargetRef | None = None
     correlation_id: str | None = None
     dry_run: bool = False
 
@@ -104,8 +187,8 @@ class ToolInvocation(BaseModel):
 
     @model_validator(mode="after")
     def _timeout_must_be_positive(self) -> ToolInvocation:
-        if self.timeout_seconds <= 0:
-            raise ValueError("timeout_seconds must be > 0")
+        if not math.isfinite(self.timeout_seconds) or self.timeout_seconds <= 0:
+            raise ValueError("timeout_seconds must be finite and > 0")
         if self.binding_mode == SELECTED_TOOL and self.operation:
             raise ValueError("selected_tool invocation must leave operation empty")
         return self

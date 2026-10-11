@@ -28,6 +28,12 @@ async def aggregate_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
     runtime = state["runtime"]
     items = state.get("dispatch_items", [])
     all_outcomes = state.get("worker_outcomes", {})
+    # Native batches: each ``WorkerOutcome`` already carries its
+    # ``model_tool_call_id`` (see worker_node). Aggregation keeps its
+    # existing formulas and ordering only; per-call pairing and pending
+    # state stay with the root native handler, which preserves the batch
+    # around this reusable reduce. No new queue is created here and no
+    # origin-based exemption is applied.
     initial_outcomes = [
         all_outcomes[str(item.proposal.action_id)]
         for item in items

@@ -343,7 +343,7 @@ def _label(cand: HostPort) -> str:
 
 
 def check_scope(
-    action: ActionProposal, scope: EngagementScope
+    action: ActionProposal, scope: EngagementScope, *, selected=None,
 ) -> tuple[bool, list[str], Severity | None]:
     """Returns ``(allowed, reasons, severity)``.
 
@@ -351,6 +351,15 @@ def check_scope(
     target). The exception is a malformed deny-list config, which is
     non-recoverable — every action hits the same error — so it is
     ``ABORT_RUN``."""
+    if action.target is None:
+        if (
+            action.binding_mode == "selected_tool"
+            and selected is not None
+            and selected.tool_id == action.tool_id
+            and selected.requires_target is False
+        ):
+            return True, [], None
+        return False, ["selected tool requires a registered target binding"], Severity.BLOCK_ACTION
     if isinstance(action.target, AssetTarget):
         # asset_ref is the schema-declared identity used by workspace tools.
         # Authorizing one asset must never allow arguments to select another.
@@ -367,13 +376,33 @@ def check_scope(
     if isinstance(action.target, DeviceTarget):
         return _check_asset_scope(action.target, scope)
 
-    resolved, error = _resolve_target(action.target)
+    return check_target_scope(action.target, scope)
+
+
+def check_target_scope(
+    target: AnyTarget, scope: EngagementScope, *, denials_only: bool = False,
+) -> tuple[bool, list[str], Severity | None]:
+    """Read the existing target scope meaning without inventing an action.
+
+    Trusted address-pin consumers can validate the approved registry name
+    and separately apply literal-address denials. ``denials_only`` grants
+    no access: True only means no explicit denial matched that identity.
+    """
+    if isinstance(target, (AssetTarget, DeviceTarget)):
+        if denials_only:
+            asset_id = str(target.asset_id if isinstance(target, AssetTarget)
+                           else target.asset_id or target.package_name)
+            if asset_id in scope.denied_assets:
+                return False, ["asset is explicitly denied"], Severity.BLOCK_ACTION
+            return True, [], None
+        return _check_asset_scope(target, scope)
+    resolved, error = _resolve_target(target)
     if error is not None:
         return False, [f"target rejected: {error}"], Severity.BLOCK_ACTION
     if not resolved:
         return (
             False,
-            [f"target kind '{action.target.kind}' has no scope-checkable host identity"],
+            [f"target kind '{target.kind}' has no scope-checkable host identity"],
             Severity.BLOCK_ACTION,
         )
 
@@ -424,6 +453,9 @@ def check_scope(
                 [f"target '{_label(cand)}' is explicitly denied (denied_domains)"],
                 Severity.BLOCK_ACTION,
             )
+
+    if denials_only:
+        return True, [], None
 
     if not (scope.allowed_hosts or scope.allowed_domains or scope.allowed_networks):
         # No explicit allow-list configured: default-deny is safer for a

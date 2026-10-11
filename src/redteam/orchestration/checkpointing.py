@@ -568,3 +568,146 @@ async def read_checkpoint_identity(
             mission_id=None if mission is None else str(mission),
             component_binding=binding,
         )
+
+
+class CheckpointIdentityError(ValueError):
+    """A matching run thread's latest checkpoint identity is unreadable.
+
+    Raised (never skipped) when the LATEST root-namespace checkpoint of a
+    thread belonging to the requested run has an invalid runtime mapping,
+    a run/instance mismatch, missing engagement, or an unparsable
+    binding. Omitting the thread would hide its consumed budget and cause
+    a budget reset, so the whole enumeration refuses instead.
+    """
+
+
+@dataclass(frozen=True)
+class CheckpointThreadIdentity:
+    """Latest identity of one checkpoint thread, read constructor-free."""
+
+    thread_id: str
+    run_id: str
+    #: None is the legacy singleton thread; otherwise the instance id.
+    instance_id: str | None
+    engagement_id: EngagementId
+    mission_id: str | None = None
+    component_binding: RuntimeComponentBinding | None = None
+
+
+def _split_checkpoint_thread(thread_id: str, run_id: str) -> str | None | bool:
+    """Map a checkpoint thread to its instance id for ``run_id``.
+
+    Returns the instance id, None for the legacy singleton thread, or
+    False when the thread belongs to another run. The split mirrors
+    ``runner._checkpoint_thread`` without importing it (checkpointing stays
+    below orchestration wiring).
+    """
+    if thread_id == run_id:
+        return None
+    marker = f"{run_id}:instance:"
+    if thread_id.startswith(marker) and len(thread_id) > len(marker):
+        return thread_id[len(marker):]
+    return False
+
+
+async def list_checkpoint_threads(
+    *, enabled: bool = True, backend: str = "memory", path: str | None = None,
+    run_id: str,
+) -> list[CheckpointThreadIdentity]:
+    """Latest identity per checkpoint thread of a run, constructor-free.
+
+    Enumerates the SDK checkpoint threads (``saver.alist`` with no thread
+    filter, newest first) and projects each thread's latest runtime to raw
+    data -- no model constructor runs, mirroring ``read_checkpoint_identity``.
+    Every matching thread counts, including idle ones with no WorkStore
+    rows: identities are never derived from the work ledger alone.
+    Every matching thread counts, including idle ones with no WorkStore
+    rows: identities are never derived from the work ledger alone.
+
+    The LATEST checkpoint of each thread decides it: a thread whose latest
+    checkpoint is invalid is refused outright -- an older valid checkpoint
+    of the same thread is never selected as a silent rewind (that would be
+    unverified replay). Only the root namespace (``checkpoint_ns == ""``)
+    is read, so a nested subgraph runtime cannot overshadow the root.
+    Storage failures propagate as a bounded class-only ``RuntimeError``,
+    never as a silent empty list.
+
+    Durable enumeration is sqlite; the memory backend reader is a fresh
+    in-process saver, so cross-process memory resume stays unsupported.
+    """
+    from redteam.core.ids import EngagementId
+    from redteam.orchestration.component_binding import RuntimeComponentBinding
+
+    seen: set[str] = set()
+    found: dict[str, CheckpointThreadIdentity] = {}
+    try:
+        async with open_identity_reader(enabled=enabled, backend=backend, path=path) as saver:
+            if saver is None:
+                return []
+            async for item in saver.alist(None):
+                outer = getattr(item, "config", None) or {}
+                inner = outer.get("configurable") if isinstance(outer, dict) else None
+                if not isinstance(inner, dict) or inner.get("checkpoint_ns", "") != "":
+                    continue
+                thread_id = inner.get("thread_id")
+                if not isinstance(thread_id, str) or thread_id in seen:
+                    continue
+                # Seen BEFORE parsing: the latest checkpoint decides the
+                # thread, refused or not. No older-checkpoint fallback.
+                seen.add(thread_id)
+                instance = _split_checkpoint_thread(thread_id, str(run_id))
+                if instance is False:
+                    continue
+                checkpoint = getattr(item, "checkpoint", None)
+                values = (
+                    checkpoint.get("channel_values")
+                    if isinstance(checkpoint, Mapping)
+                    else None
+                )
+                runtime = values.get("runtime") if isinstance(values, Mapping) else None
+                if not isinstance(runtime, Mapping):
+                    raise CheckpointIdentityError(
+                        f"unreadable latest runtime for thread {thread_id!r}"
+                    )
+                if str(runtime.get("run_id", "")) != str(run_id):
+                    raise CheckpointIdentityError(
+                        f"run mismatch in latest checkpoint of thread {thread_id!r}"
+                    )
+                raw_instance = runtime.get("instance_id")
+                if (raw_instance is None) != (instance is None) or (
+                    raw_instance is not None and str(raw_instance) != str(instance)
+                ):
+                    raise CheckpointIdentityError(
+                        f"instance mismatch in latest checkpoint of thread {thread_id!r}"
+                    )
+                engagement = runtime.get("engagement_id")
+                if not isinstance(engagement, str) or not engagement:
+                    raise CheckpointIdentityError(
+                        f"missing engagement in latest checkpoint of thread {thread_id!r}"
+                    )
+                mission = runtime.get("mission_id")
+                binding_raw = runtime.get("component_binding")
+                try:
+                    binding = (
+                        None
+                        if binding_raw is None
+                        else RuntimeComponentBinding.model_validate(binding_raw)
+                    )
+                except Exception as exc:
+                    raise CheckpointIdentityError(
+                        f"unparsable binding in latest checkpoint of thread {thread_id!r}: "
+                        f"{type(exc).__name__}"
+                    ) from exc
+                found[thread_id] = CheckpointThreadIdentity(
+                    thread_id=thread_id,
+                    run_id=str(run_id),
+                    instance_id=None if instance is None else str(instance),
+                    engagement_id=EngagementId(engagement),
+                    mission_id=None if mission is None else str(mission),
+                    component_binding=binding,
+                )
+    except CheckpointIdentityError:
+        raise
+    except Exception as exc:
+        raise RuntimeError(f"checkpoint enumeration failed: {type(exc).__name__}") from exc
+    return list(found.values())

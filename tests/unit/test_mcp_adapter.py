@@ -412,7 +412,9 @@ async def test_gateway_enforces_invocation_timeout() -> None:
     assert result.success is False
     assert result.error is not None
     assert result.error.code == "tool_timeout"
-    assert result.error.retryable is True
+    assert result.error.retryable is False
+    assert result.metadata["execution_started"] is True
+    assert result.metadata["execution_uncertain"] is True
 
 
 async def test_gateway_blocks_unhealthy_server_before_transport_call() -> None:

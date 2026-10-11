@@ -7,6 +7,8 @@ from copy import deepcopy
 from datetime import datetime, timezone
 from typing import Any
 
+from pydantic import TypeAdapter, ValidationError
+
 from redteam.capability.adapters.mcp.base import MCPCallResult
 from redteam.capability.adapters.mcp.naming import build_canonical_mcp_tool_id
 from redteam.capability.adapters.mcp.transport import (
@@ -14,10 +16,14 @@ from redteam.capability.adapters.mcp.transport import (
     StreamableHTTPMCPTransport,
 )
 from redteam.core.contracts.tool import (
+    PROVIDER_METADATA_AVAILABILITY_IMPACT,
     PROVIDER_METADATA_COMMAND_FIELDS,
+    PROVIDER_METADATA_REQUIRES_TARGET,
+    PROVIDER_METADATA_RESOURCE_BINDINGS,
     PROVIDER_METADATA_TARGET_BINDING,
     ToolDescriptor,
     ToolError,
+    ToolResourceBinding,
     ToolTargetBinding,
 )
 from redteam.core.enums import RiskLevel, ToolHealthStatus
@@ -124,6 +130,17 @@ def _apply_provider_metadata(
     # no per-tool central list lives here.
     if not metadata:
         return
+    if PROVIDER_METADATA_RESOURCE_BINDINGS in metadata:
+        from redteam.capability.settings import MCPConfigurationError
+
+        try:
+            descriptor.resource_bindings = TypeAdapter(list[ToolResourceBinding]).validate_python(
+                metadata[PROVIDER_METADATA_RESOURCE_BINDINGS], strict=True
+            )
+            if len(descriptor.resource_bindings) > 32:
+                raise ValueError("too many resource declarations")
+        except (ValidationError, ValueError):
+            raise MCPConfigurationError("invalid provider resource metadata") from None
     binding_spec = metadata.get(PROVIDER_METADATA_TARGET_BINDING)
     if isinstance(binding_spec, Mapping):
         known = {
@@ -133,6 +150,17 @@ def _apply_provider_metadata(
     command_fields = metadata.get(PROVIDER_METADATA_COMMAND_FIELDS)
     if isinstance(command_fields, (list, tuple)):
         descriptor.command_fields = [str(name) for name in command_fields if str(name)]
+    availability_impact = metadata.get(PROVIDER_METADATA_AVAILABILITY_IMPACT)
+    # Owner-declared bool only; any other type keeps the descriptor default
+    # instead of coercing (e.g. "true"/1 must not become True).
+    if isinstance(availability_impact, bool):
+        descriptor.availability_impact = availability_impact
+    requires_target = metadata.get(PROVIDER_METADATA_REQUIRES_TARGET)
+    # Owner-declared bool only; absent keys keep the contract default and
+    # any other type is ignored instead of coerced. Never inferred from
+    # target binding or target types here.
+    if isinstance(requires_target, bool):
+        descriptor.requires_target = requires_target
 
 
 def _safe_error_message(output: dict[str, Any] | str | None) -> str:

@@ -38,15 +38,24 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict
 
 from redteam.attack_graph.service import AttackGraphService
+from redteam.core.contracts.completion import (
+    completion_conditions,
+    completion_contract_hash,
+    criterion_id,
+)
+from redteam.core.contracts.events import EventType
 from redteam.core.contracts.mission import (
     MissionCriterionResult,
     MissionTask,
     redact_secret_material,
 )
+from redteam.core.contracts.tool import execution_outcome_uncertain
 from redteam.core.enums import EvidenceSourceType, MissionStatus, TaskStatus
 from redteam.core.ids import EvidenceId, TaskId, new_id
+from redteam.event_bus.publisher import EventPublisher
 from redteam.orchestration.completion import (
     check_record_linkage,
+    preserved_target_is_absent,
     validate_completion,
     verify_stored_origin,
 )
@@ -55,16 +64,27 @@ from redteam.orchestration.completion_proposal import (
     record_unresolved,
     validate_unresolved,
 )
+from redteam.orchestration.context_projection import (
+    review_path_reference,
+)
 from redteam.orchestration.coordination import content_hash
 from redteam.orchestration.evidence_access import raw_from_metadata
+from redteam.orchestration.execution_journal import (
+    ExecutionReceiptError,
+    unsettled_execution_receipts,
+)
 from redteam.orchestration.result_claims import (
     RESULT_REVIEW_INSTRUCTION,
+    CriterionReview,
     ResultClaim,
     ResultReview,
+    TaskContractReview,
     check_result_review,
     mission_result_purpose,
 )
-from redteam.orchestration.work.models import WorkStatus
+from redteam.orchestration.task_completion_contract import check_task_conditions
+from redteam.orchestration.task_graph.claim import release_mission_task_claim
+from redteam.orchestration.work.models import WorkStatus, work_owner_for
 
 #: Evidence metadata marker for an accepted task completion receipt.
 TASK_RECEIPT_KIND = "task_completion_receipt"
@@ -99,6 +119,33 @@ def _engine_system(engine: Any) -> str:
     return engine_system
 
 
+async def _publish_settlement(
+    engine: Any, runtime: Any, event_type: str, payload: dict[str, Any]
+) -> Any | None:
+    """Announce one accepted settlement on the engine event chain.
+
+    The semantic owner publishes exactly once per accepted settlement,
+    citing the engine last event so legacy and native callers share one
+    chain. Callers thread engine.last_event_id back into their own state.
+    """
+    bus = getattr(getattr(engine, "deps", None), "event_bus", None)
+    if bus is None:
+        return None
+    publisher = EventPublisher(
+        bus,
+        run_id=runtime.run_id,
+        engagement_id=runtime.engagement_id,
+        source="orchestration.semantic_completion",
+    )
+    event = await publisher.publish(
+        event_type,
+        dict(payload),
+        causation_id=getattr(engine, "last_event_id", None),
+    )
+    engine.last_event_id = event.event_id
+    return event
+
+
 def purpose_hash(objective: str) -> str:
     """Stable hash of the delegated purpose text at review time."""
     return content_hash({"objective": (objective or "").strip()})
@@ -119,6 +166,8 @@ def build_task_receipt(
     related_attack_graph_node_ids: list[str] | None = None,
     related_hypothesis_ids: list[str] | None = None,
     claims: list[dict[str, Any]] | None = None,
+    completion_contract_hash_value: str | None = None,
+    criterion_results: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Public receipt payload stored as immutable evidence metadata."""
     return {
@@ -140,6 +189,11 @@ def build_task_receipt(
             {str(item) for item in (related_hypothesis_ids or []) if str(item).strip()}
         ),
         "claims": list(claims or []),
+        **({
+            "completion_contract_version": 2,
+            "completion_contract_hash": completion_contract_hash_value,
+            "criterion_results": list(criterion_results or []),
+        } if completion_contract_hash_value is not None else {}),
     }
 
 
@@ -171,6 +225,11 @@ def verify_task_receipt(
     expected = purpose_hash(task.objective or "")
     if str(receipt.get("purpose_hash", "")) != expected:
         return ["task purpose changed since the accepted receipt"]
+    if task.completion_contract_version == 2 and (
+        receipt.get("completion_contract_version") != 2
+        or receipt.get("completion_contract_hash") != completion_contract_hash(task)
+    ):
+        return ["task completion contract changed or v2 receipt is missing"]
     for key, current in (
         ("related_attack_graph_node_ids", list(task.related_attack_graph_node_ids or [])),
         ("related_hypothesis_ids", list(task.related_hypothesis_ids or [])),
@@ -184,6 +243,17 @@ def verify_task_receipt(
     origins = [item for item in (receipt.get("source_evidence_ids", []) or []) if str(item).strip()]
     if not origins:
         return ["task receipt cites no origin evidence"]
+    if task.completion_contract_version == 2:
+        try:
+            reviews = [CriterionReview.model_validate(row)
+                       for row in receipt.get("criterion_results", [])]
+        except (ValueError, TypeError):
+            return ["task receipt criterion results are invalid"]
+        expected_ids = {criterion_id(c) for c in task.completion_criteria}
+        if (len(reviews) != len(expected_ids)
+                or {row.criterion_id for row in reviews} != expected_ids
+                or any(not row.met or set(row.evidence_ids) - set(origins) for row in reviews)):
+            return ["task receipt does not prove each fixed criterion"]
     return []
 
 
@@ -196,7 +266,10 @@ async def verify_single_origin(
     mission_id: str | None,
     evidence_id: str,
     require_proposal: bool = True,
-) -> tuple[Any | None, list[str]]:
+    task: Any | None = None,
+    task_graph_store: Any | None = None,
+    work_store: Any | None = None,
+ ) -> tuple[Any | None, list[str]]:
     """Prove one stored origin record against the actual execution.
 
     Fetch, same run and engagement, preserved raw result, shared
@@ -232,9 +305,19 @@ async def verify_single_origin(
         m_version=meta.get("path_version", None),
         m_step_id=_record_text(meta.get("path_step_id", "")).strip(),
         mission_id=mission_id,
+        metadata=meta,
+        record=record,
+        task_graph_store=task_graph_store,
+        work_store=work_store,
     )
     if origin_errors:
         return None, ["task origin '" + str(evidence_id) + "' " + origin_errors[0]]
+    if task is not None:
+        expected_hash = _record_text(meta.get("task_purpose_hash", "") or "").strip()
+        current_hash = purpose_hash(_record_text(getattr(task, "objective", "")))
+        if expected_hash and expected_hash != current_hash:
+            message = "task origin '" + str(evidence_id) + "' purpose changed since the evidence"
+            return None, [message]
     return record, []
 
 
@@ -247,7 +330,9 @@ async def verify_receipt_bound_origins(
     mission_id: str | None,
     task: MissionTask,
     graph_service: Any | None = None,
-) -> tuple[list[str], list[str]]:
+    task_graph_store: Any | None = None,
+    work_store: Any | None = None,
+ ) -> tuple[list[str], list[str]]:
     """Shared receipt-to-origin proof for one completed required task.
 
     Checks the receipt record itself (same run and engagement, system
@@ -299,6 +384,9 @@ async def verify_receipt_bound_origins(
             mission_id=mission_id,
             evidence_id=identity,
             require_proposal=True,
+            task=task,
+            task_graph_store=task_graph_store,
+            work_store=work_store,
         )
         if origin_errors:
             return (origin_errors, [])
@@ -312,6 +400,9 @@ async def verify_receipt_bound_origins(
         run_id=str(run_id),
         mission_id=mission_id,
         target_node_ids=list(task.related_attack_graph_node_ids),
+        task=task,
+        task_graph_store=task_graph_store,
+        work_store=work_store,
     )
     if errors:
         return (errors, [])
@@ -360,7 +451,9 @@ async def _verify_task_origin(
     task: Any,
     mission_id: str | None = None,
     step_principal_scope: set[str] | None = None,
-) -> tuple[Any | None, list[str]]:
+    task_graph_store: Any | None = None,
+    work_store: Any | None = None,
+ ) -> tuple[Any | None, list[str]]:
     """Task-level origin check: actual linkage, stored origin, relevance.
 
     Readonly and purpose-free: no purpose hash is needed here and nothing
@@ -396,11 +489,19 @@ async def _verify_task_origin(
         m_version=meta.get("path_version", None),
         m_step_id=_record_text(meta.get("path_step_id", "")).strip(),
         mission_id=mission_id,
+        metadata=meta,
+        record=record,
+        task_graph_store=task_graph_store,
+        work_store=work_store,
     )
     if origin_errors:
         return None, ["evidence '" + str(evidence_id) + "' " + origin_errors[0]]
+    task_hash = _record_text(meta.get("task_purpose_hash", "") or "").strip()
+    if task_hash and task is not None:
+        if task_hash != purpose_hash(_record_text(getattr(task, "objective", ""))):
+            return None, ["evidence '" + str(evidence_id) + "' purpose changed since the evidence"]
     target_ref = _record_text(meta.get("target_node_id", "")).strip()
-    if not target_ref:
+    if not target_ref and not preserved_target_is_absent(meta):
         return None, ["evidence '" + str(evidence_id) + "' has no target linkage"]
     related_nodes: set[str] = set()
     if task is not None:
@@ -408,7 +509,7 @@ async def _verify_task_origin(
             cleaned = str(node).strip()
             if cleaned:
                 related_nodes.add(cleaned)
-    if related_nodes and target_ref not in related_nodes:
+    if target_ref and related_nodes and target_ref not in related_nodes:
         return None, ["evidence '" + str(evidence_id) + "' targets an object outside this task"]
     principals: set[str] = set()
     single = meta.get("principal_ref")
@@ -451,7 +552,7 @@ def _excerpt_of(record: Any, *, limit: int = EXCERPT_CHARS) -> dict[str, Any]:
 
 
 def _review_payload_common(
-    *, purpose: str, conditions: list[str], excerpts: list[dict[str, Any]]
+    *, purpose: str, conditions: list[Any], excerpts: list[dict[str, Any]]
 ) -> dict[str, Any]:
     return {
         "purpose": str(purpose or ""),
@@ -460,45 +561,257 @@ def _review_payload_common(
     }
 
 
-async def _pending_execution_errors(engine: Any, runtime: Any) -> list[str]:
+#: Review guidance attached to every completion review payload. The review
+#: call receives every proven origin id, but shown contents cover only some
+#: of them. The reviewer must never describe an unshown id as read or quote
+#: content for it; such ids count only as proven references through the
+#: ownership map and the receipt binding.
+REVIEW_EXCERPT_NOTE = (
+    "evidence_excerpts and requested_evidence hold the stored contents actually "
+    "shown to this review. verified_source_ids can name more proven origins than "
+    "the shown contents cover. Never describe an evidence id without shown content "
+    "as read, and never quote or paraphrase content for it; unshown ids count only "
+    "as proven references through the task_evidence ownership map and the receipt "
+    "binding, never as observed results."
+)
+
+
+def _task_review_subject(task: MissionTask) -> dict[str, Any]:
+    """Minimal task identity for the review call: purpose and origin subjects.
+
+    The full task record stays in the store; the reviewer gets the delegated
+    purpose plus the subject bindings the origin checks already enforced.
+    """
+    return {
+        "task_id": str(task.task_id),
+        "mission_id": str(task.mission_id),
+        "objective": str(task.objective or ""),
+        "required": bool(task.required),
+        "completion_contract_version": task.completion_contract_version,
+        "completion_contract_hash": completion_contract_hash(task),
+        "completion_criteria": completion_conditions(task),
+        "principal_refs": list(task.principal_refs),
+        "related_attack_graph_node_ids": [
+            str(item) for item in (task.related_attack_graph_node_ids or [])
+        ],
+        "related_hypothesis_ids": [
+            str(item) for item in (task.related_hypothesis_ids or [])
+        ],
+    }
+
+
+def _mission_review_subject(mission: Any, criteria: list[str]) -> dict[str, Any]:
+    """Original operator contract for the goal review: criteria and constraints.
+
+    The full mission record stays in the store; the reviewer judges the
+    original success criteria under the original operator constraints.
+    """
+    constraints = getattr(mission, "operator_constraints", {}) or {}
+    return {
+        "mission_id": str(getattr(mission, "mission_id", "")),
+        "success_criteria": list(criteria),
+        "operator_constraints": dict(constraints) if isinstance(constraints, dict) else {},
+    }
+
+
+def _task_review_payload(
+    *,
+    task: MissionTask,
+    path: Any,
+    context: Any,
+    evidence_ids: list[str],
+    excerpts: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Assemble the task review payload: subjects, ownership and shown contents.
+
+    The full task record and the full path stay in their stores. Every proven
+    origin id is named even when the excerpt cap trims the shown contents.
+    """
+    return {
+        **context,
+        "task": _task_review_subject(task),
+        "active_path": review_path_reference(path),
+        **_review_payload_common(
+            purpose=getattr(task, "objective", "") or "",
+            conditions=completion_conditions(task),
+            excerpts=excerpts,
+        ),
+        "verified_source_ids": list(evidence_ids),
+        "task_evidence": {str(task.task_id): list(evidence_ids)},
+        "review_note": REVIEW_EXCERPT_NOTE,
+    }
+
+
+def _goal_review_payload(
+    *,
+    mission: Any,
+    criteria: list[str],
+    path: Any,
+    context: Any,
+    task_evidence: dict[str, list[str]],
+    excerpts: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Assemble the goal review payload: original contract plus ownership map.
+
+    The full mission record and the full path stay in their stores. The
+    task_evidence map names every proven origin per owning task even when the
+    excerpt cap trims the shown contents.
+    """
+    verified = [identity for origins in task_evidence.values() for identity in origins]
+    return {
+        **context,
+        "mission": _mission_review_subject(mission, criteria),
+        "active_path": review_path_reference(path),
+        **_review_payload_common(
+            purpose=getattr(mission, "objective", "") or "",
+            conditions=criteria,
+            excerpts=excerpts,
+        ),
+        "verified_source_ids": verified,
+        "task_evidence": {
+            str(task_id): list(origins) for task_id, origins in task_evidence.items()
+        },
+        "review_note": REVIEW_EXCERPT_NOTE,
+    }
+
+
+async def _pending_execution_errors(
+    engine: Any,
+    runtime: Any,
+    *,
+    scope: str = "task",
+    task: Any = None,
+    mission_task_id: Any = None,
+    all_instances: bool = False,
+) -> list[str]:
+    """Scoped execution gate: task scope checks own instance/task only."""
+    goal_scope = bool(all_instances or scope == "goal")
+    resolved_task_id: str | None = None
+    if mission_task_id is not None and str(mission_task_id).strip():
+        resolved_task_id = str(mission_task_id)
+    elif task is not None:
+        tid = getattr(task, "task_id", None)
+        if tid is not None and str(tid).strip():
+            resolved_task_id = str(tid)
+    else:
+        active = getattr(runtime, "active_task_id", None)
+        if active is not None and str(active).strip():
+            resolved_task_id = str(active)
     try:
         history = await engine.deps.work_store.list_items(run_id=runtime.run_id)
     except Exception:
         return ["execution history lookup failed; treating as unproven"]
-    if any(
-        work.status in {WorkStatus.LEASED, WorkStatus.RUNNING}
-        or (work.status is WorkStatus.PENDING and work.job_id is not None)
-        for work in (history or [])
-    ):
-        return ["unfinished execution records remain"]
+
+    def _active(item: Any) -> bool:
+        status = getattr(item, "status", None)
+        return status in {WorkStatus.LEASED, WorkStatus.RUNNING} or (
+            status is WorkStatus.PENDING and getattr(item, "job_id", None) is not None
+        )
+
+    if goal_scope:
+        if any(_active(item) for item in (history or [])):
+            return ["unfinished execution records remain"]
+    else:
+        runtime_instance = getattr(runtime, "instance_id", None)
+        for item in history or []:
+            if not _active(item):
+                continue
+            if getattr(item, "instance_id", None) != runtime_instance:
+                continue
+            item_task = getattr(item, "mission_task_id", None)
+            if (
+                resolved_task_id is not None
+                and item_task is not None
+                and str(item_task) != resolved_task_id
+            ):
+                continue
+            return ["unfinished execution records remain"]
     if getattr(runtime, "pending_approval_id", None):
         return ["an approval is still pending"]
+    try:
+        if goal_scope:
+            pending_ids = await unsettled_execution_receipts(
+                engine.deps.evidence_store, run_id=runtime.run_id, all_instances=True,
+            )
+        else:
+            pending_ids = await unsettled_execution_receipts(
+                engine.deps.evidence_store,
+                run_id=runtime.run_id,
+                instance_id=getattr(runtime, "instance_id", None),
+                all_instances=False,
+                mission_task_id=resolved_task_id,
+            )
+    except ExecutionReceiptError as exc:
+        return [exc.reason_code]
+    except Exception:
+        return ["execution history lookup failed; treating as unproven"]
+    if pending_ids:
+        return ["unfinished execution records remain"]
     try:
         records = await engine.deps.evidence_store.list_for_run(runtime.run_id)
     except Exception:
         return ["task evidence lookup failed; treating as unproven"]
-    settled = {
-        _record_text(getattr(record, "action_id", None))
-        for record in (records or [])
-        if isinstance(getattr(record, "metadata", None), dict)
-        and isinstance(getattr(record, "metadata", {}).get("tool_result", {}), dict)
-        and getattr(record, "metadata", {})
-        .get("tool_result", {})
-        .get("metadata", {})
-        .get("execution_reconciled")
-    }
+    settled: set[tuple[str, Any, Any]] = set()
     for record in records or []:
         meta = getattr(record, "metadata", None)
-        raw = meta.get("tool_result") if isinstance(meta, dict) else None
+        if not isinstance(meta, dict):
+            continue
+        raw = meta.get("tool_result")
         if not isinstance(raw, dict):
             continue
-        if raw.get("metadata", {}).get("orchestration_exception"):
-            error = raw.get("error") or {}
+        inner = raw.get("metadata", {})
+        if not isinstance(inner, dict):
+            continue
+        if not inner.get("execution_reconciled"):
+            continue
+        if execution_outcome_uncertain(inner):
+            continue
+        proposal = meta.get("proposal", {})
+        instance = proposal.get("instance_id") if isinstance(proposal, dict) else None
+        settled.add((
+            _record_text(getattr(record, "action_id", None)),
+            _record_text(getattr(record, "invocation_id", None) or meta.get("invocation_id", "")),
+            instance,
+        ))
+    benign = {"tool_binding_invalid", "lease_lost_before_execution", "policy_admission_denied"}
+    runtime_instance = getattr(runtime, "instance_id", None)
+    for record in records or []:
+        meta = getattr(record, "metadata", None)
+        if not isinstance(meta, dict):
+            continue
+        raw = meta.get("tool_result")
+        if not isinstance(raw, dict):
+            continue
+        inner = raw.get("metadata", {})
+        if not isinstance(inner, dict):
+            continue
+        if not goal_scope:
+            proposal = meta.get("proposal", {})
+            proposal_instance = proposal.get("instance_id") if isinstance(proposal, dict) else None
+            if proposal_instance != runtime_instance:
+                continue
+            record_task = meta.get("mission_task_id")
             if (
-                error.get("code") not in {"tool_binding_invalid", "lease_lost_before_execution"}
-                and _record_text(getattr(record, "action_id", None)) not in settled
+                resolved_task_id is not None
+                and record_task is not None
+                and str(record_task) != resolved_task_id
             ):
-                return ["an execution outcome is uncertain; collect its actual result or hold"]
+                continue
+        if not execution_outcome_uncertain(inner):
+            continue
+        error = raw.get("error") or {}
+        if isinstance(error, dict) and error.get("code") in benign:
+            continue
+        proposal = meta.get("proposal", {})
+        instance = proposal.get("instance_id") if isinstance(proposal, dict) else None
+        key = (
+            _record_text(getattr(record, "action_id", None)),
+            _record_text(getattr(record, "invocation_id", None) or meta.get("invocation_id", "")),
+            instance,
+        )
+        if key in settled:
+            continue
+        return ["an execution outcome is uncertain; collect its actual result or hold"]
     return []
 
 
@@ -539,8 +852,9 @@ async def complete_task(
         or getattr(task, "status", None) is not TaskStatus.RUNNING
     ):
         return ["task completion requires the current running task"]
-    if _record_text(getattr(path, "mission_task_id", "")) != str(task.task_id):
-        return ["task completion path is not bound to this mission task"]
+    if path is not None:
+        if _record_text(getattr(path, "mission_task_id", "")) != str(task.task_id):
+            return ["task completion path is not bound to this mission task"]
     raw_proposal = getattr(decision, "completion", {})
     if raw_proposal:
         proposal = CompletionProposal.model_validate({
@@ -553,6 +867,15 @@ async def complete_task(
     evidence_ids = select_task_evidence_ids(decision, path)
     if not evidence_ids:
         return ["task completion needs related stored evidence"]
+    from redteam.attack_graph.service import AttackGraphService
+    from redteam.orchestration.evidence_validity import capture_validity, validity_errors
+
+    validity_read = await capture_validity(engine.deps, runtime, evidence_ids)
+    errors = await validity_errors(engine.deps.evidence_store,
+                                   AttackGraphService(engine.deps.graph_store),
+                                   str(runtime.run_id), evidence_ids)
+    if errors:
+        return errors
     verified: list[Any] = []
     excerpt_notes: list[dict[str, Any]] = []
     for identity in evidence_ids:
@@ -565,6 +888,8 @@ async def complete_task(
             task=task,
             mission_id=getattr(runtime, "mission_id", None),
             step_principal_scope=None,
+            task_graph_store=getattr(getattr(engine, "deps", None), "task_graph_store", None),
+            work_store=getattr(getattr(engine, "deps", None), "work_store", None),
         )
         if errors:
             return errors
@@ -573,21 +898,27 @@ async def complete_task(
             excerpt_notes.append(_excerpt_of(record))
     if not verified:
         return ["task completion needs related stored evidence"]
-    pending = await _pending_execution_errors(engine, runtime)
+    contract_errors = await check_task_conditions(
+        task, evidence_ids, deps=engine.deps, run_id=str(runtime.run_id),
+    )
+    if contract_errors:
+        return contract_errors
+    pending = await _pending_execution_errors(engine, runtime, scope="task", task=task)
     if pending:
         return pending
     await engine._check_review_path(runtime, path)
     review = await engine._ask(
         stage="task_completion_review",
-        payload={
-            **(context or {}),
-            "task": task.model_dump(mode="json"),
-            "path": path.model_dump(mode="json"),
-            **_review_payload_common(
-                purpose=getattr(task, "objective", "") or "", conditions=[], excerpts=excerpt_notes
-            ),
-        },
-        response_schema=ResultReview.model_json_schema(),
+        payload=_task_review_payload(
+            task=task,
+            path=path,
+            context=await engine.review_context(runtime, context, evidence_ids),
+            evidence_ids=evidence_ids,
+            excerpts=excerpt_notes,
+        ),
+        response_schema=(
+            TaskContractReview if task.completion_contract_version == 2 else ResultReview
+        ).model_json_schema(),
         system=_engine_system(engine) + RESULT_REVIEW_INSTRUCTION,
         budget=budget,
     )
@@ -600,6 +931,11 @@ async def complete_task(
     )
     if not review.get("accepted"):
         return ["semantic completion review rejected the evidence"]
+    contract_errors = await check_task_conditions(
+        task, evidence_ids, deps=engine.deps, run_id=str(runtime.run_id), review=review,
+    )
+    if contract_errors:
+        return contract_errors
     from redteam.attack_graph.service import AttackGraphService
 
     claims = list(review.get("claims", []))
@@ -613,6 +949,9 @@ async def complete_task(
         run_id=str(runtime.run_id),
         mission_id=str(runtime.mission_id),
         target_node_ids=list(task.related_attack_graph_node_ids),
+        task=task,
+        task_graph_store=getattr(getattr(engine, "deps", None), "task_graph_store", None),
+        work_store=getattr(getattr(engine, "deps", None), "work_store", None),
     )
     if errors:
         return errors
@@ -631,6 +970,10 @@ async def complete_task(
         path_version=getattr(path, "version", None),
         related_attack_graph_node_ids=list(task.related_attack_graph_node_ids or []),
         related_hypothesis_ids=list(task.related_hypothesis_ids or []),
+        completion_contract_hash_value=(
+            completion_contract_hash(task) if task.completion_contract_version == 2 else None
+        ),
+        criterion_results=review.get("criterion_results"),
     )
     receipt_payload["claims"] = claims
     receipt_record = _receipt_record(
@@ -641,12 +984,31 @@ async def complete_task(
     )
 
     async def complete(change: Any) -> None:
+        if validity_read is not None:
+            validity_read.check(change)
         staged = await change.tasks.get_task(task.task_id)
         if staged is None:
             raise ValueError("completion_task_missing")
+        if completion_contract_hash(staged) != completion_contract_hash(task):
+            raise ValueError("completion_task_contract_changed")
+        owner = work_owner_for(runtime.run_id, getattr(runtime, "instance_id", None))
+        occupant = getattr(staged, "occupant_owner", None)
+        if occupant is None:
+            # Claim-before-admission: adopt the unowned task inside this same
+            # atomic commit, so no sibling can slip between check and close.
+            await change.tasks.update_task(
+                staged.model_copy(
+                    update={"occupant_owner": owner, "updated_at": datetime.now(timezone.utc)}
+                )
+            )
+        elif occupant != owner:
+            raise ValueError("completion_task_claimed_by_other")
         updated = staged.model_copy(
             update={
                 "completion_evidence_id": receipt_record.evidence_id,
+                # The adopt above is settled here: no live claim survives a
+                # terminal task, so the occupant clears with the receipt.
+                "occupant_owner": None,
                 "updated_at": datetime.now(timezone.utc),
             }
         )
@@ -659,6 +1021,12 @@ async def complete_task(
     # the atomic task transition below, never from the receipt alone.
     await engine.deps.evidence_store.append(receipt_record)
     await engine._commit_review(runtime, token, complete)
+    await _publish_settlement(
+        engine,
+        runtime,
+        EventType.TASK_COMPLETED,
+        {"mission_id": runtime.mission_id, "task_id": task.task_id},
+    )
     return []
 
 
@@ -666,13 +1034,44 @@ async def settle_unresolved(
     engine: Any, path: Any, proposal: CompletionProposal, runtime: Any, *,
     token: Any, task: Any = None, finish_investigation: bool = False,
 ) -> list[str]:
-    """End an investigation unit without granting a success/refutation receipt."""
-    pending = await _pending_execution_errors(engine, runtime)
+    """End an investigation unit without granting a success/refutation receipt.
+
+    Instance isolation: a task-local unresolved blocks only its own
+    exactly-claimed task (occupant-owned, adopted when unowned inside the
+    same commit). A goal unresolved (finish_investigation, task None) with
+    a real instance derives the current active task when it is valid and
+    same-mission, adopts when unowned inside the same coordinator guarded
+    commit, and blocks OWN only, leaving foreign tasks and the global
+    mission untouched. Global settlement stays with the authoritative
+    mission criteria and operator stop via finalize_mission.
+
+    Legacy compat: the pre-instance central loop (runtime.instance_id None)
+    carries no per-instance identity, so task occupants are legacy
+    run-only owners or unclaimed and offer no isolation boundary; that
+    loop owns the whole mission, so finishing the investigation settles
+    all unfinished tasks and marks the mission BLOCKED. Instance goals
+    never convert to all-tasks.
+    """
+    if task is not None:
+        pending = await _pending_execution_errors(engine, runtime, scope="task", task=task)
+    elif finish_investigation and getattr(runtime, "instance_id", None) is not None:
+        active_for_gate = getattr(runtime, "active_task_id", None)
+        pending = await _pending_execution_errors(
+            engine, runtime, scope="task", mission_task_id=active_for_gate,
+        )
+    else:
+        pending = await _pending_execution_errors(
+            engine, runtime, scope="goal", all_instances=True,
+        )
     if pending:
         return pending
-    targets = list(task.related_attack_graph_node_ids) if task is not None else list(
-        dict.fromkeys(target for step in path.steps for target in step.target_node_ids)
-    )
+    if task is not None:
+        targets = list(task.related_attack_graph_node_ids)
+    elif path is not None:
+        steps = getattr(path, "steps", []) or []
+        targets = list(dict.fromkeys(target for step in steps for target in step.target_node_ids))
+    else:
+        targets = []
     errors = await validate_unresolved(
         proposal, evidence_store=engine.deps.evidence_store, runtime=runtime,
         target_node_ids=targets,
@@ -688,18 +1087,64 @@ async def settle_unresolved(
 
     async def block(change: Any) -> None:
         if task is not None:
+            staged = await change.tasks.get_task(task.task_id)
+            if staged is None:
+                raise ValueError("completion_task_missing")
+            owner = work_owner_for(runtime.run_id, getattr(runtime, "instance_id", None))
+            occupant = getattr(staged, "occupant_owner", None)
+            if occupant is None:
+                # Same claim-before-admission as completion: adopt inside
+                # this commit so the BLOCKED transition has a verified owner.
+                await change.tasks.update_task(
+                    staged.model_copy(
+                        update={"occupant_owner": owner, "updated_at": now}
+                    )
+                )
+            elif occupant != owner:
+                raise ValueError("completion_task_claimed_by_other")
             await change.tasks.transition_task(
                 task.task_id, TaskStatus.BLOCKED, now=now,
                 reason=proposal.reason,
             )
-        for step in path.steps:
-            if step.status in {"pending", "running"}:
-                await change.paths.update_step(
-                    str(runtime.run_id), path.path_id, path.version, step.step_id,
-                    "blocked", outcome=proposal.outcome,
-                    evidence_ids=list(dict.fromkeys([*step.evidence_ids, identity])),
-                )
-        if finish_investigation:
+            # BLOCKED tasks re-enter the pool via unblock (BLOCKED -> READY /
+            # PENDING), so the claim clears here and the next driver claims
+            # explicitly. No silent handoff, no TTL.
+            await release_mission_task_claim(
+                change, task.task_id, owner=owner, now=now
+            )
+        elif finish_investigation and getattr(runtime, "instance_id", None) is not None:
+            # Instance goal: block OWN active task only, inside this same
+            # coordinator guarded commit. Foreign tasks stay untouched.
+            active_id = getattr(runtime, "active_task_id", None)
+            if active_id is not None:
+                candidate = await change.tasks.get_task(active_id)
+                if (
+                    candidate is not None
+                    and str(getattr(candidate, "mission_id", "")) == str(runtime.mission_id)
+                    and getattr(candidate, "status", None)
+                    in {TaskStatus.PENDING, TaskStatus.READY, TaskStatus.RUNNING}
+                ):
+                    owner = work_owner_for(runtime.run_id, getattr(runtime, "instance_id", None))
+                    occupant = getattr(candidate, "occupant_owner", None)
+                    if occupant is None:
+                        await change.tasks.update_task(
+                            candidate.model_copy(
+                                update={"occupant_owner": owner, "updated_at": now}
+                            )
+                        )
+                    if occupant is None or occupant == owner:
+                        await change.tasks.transition_task(
+                            candidate.task_id, TaskStatus.BLOCKED, now=now,
+                            reason=proposal.reason,
+                        )
+                        await release_mission_task_claim(
+                            change, candidate.task_id, owner=owner, now=now
+                        )
+                    # Foreign-owned active tasks stay untouched.
+        elif finish_investigation:
+            # Legacy central loop (instance_id None): preserve the previous
+            # full-goal behaviour. Documented compat; instance goals above
+            # never take this path.
             mission = await change.tasks.get_mission(runtime.mission_id)
             if mission is None:
                 raise ValueError("unresolved_mission_missing")
@@ -710,8 +1155,19 @@ async def settle_unresolved(
                         reason=proposal.reason,
                     )
             await change.tasks.update_mission(mission.model_copy(update={
-                "status": MissionStatus.BLOCKED, "updated_at": now,
+                "status": MissionStatus.BLOCKED,
+                "updated_at": now,
+                "revision": int(getattr(mission, "revision", 1) or 1) + 1,
             }))
+        for step in (getattr(path, "steps", []) or []):
+            if step.status in {"pending", "running"}:
+                await change.paths.update_step(
+                    str(runtime.run_id), path.path_id, path.version, step.step_id,
+                    "blocked", outcome=proposal.outcome,
+                    evidence_ids=list(dict.fromkeys([*step.evidence_ids, identity])),
+                )
+        # Instance goals do not close the global mission here; only the
+        # legacy central loop above updates the mission status globally.
 
     await engine._commit_review(runtime, token, block)
     runtime.unresolved_evidence_ids = list(dict.fromkeys([
@@ -719,18 +1175,19 @@ async def settle_unresolved(
     ]))
     from redteam.orchestration.delegation_decision import mark_finished
 
-    runtime.delegations = {
-        key: mark_finished(value, reason="investigation_unresolved")
-        if value.path_id == path.path_id and value.path_version == path.version
-        else value
-        for key, value in runtime.delegations.items()
-    }
-    if finish_investigation:
+    if path is not None:
+        runtime.delegations = {
+            key: mark_finished(value, reason="investigation_unresolved")
+            if value.path_id == path.path_id and value.path_version == path.version
+            else value
+            for key, value in runtime.delegations.items()
+        }
+    if finish_investigation and getattr(runtime, "instance_id", None) is None:
+        # Legacy central loop only; instance goals leave the global mission
+        # status to finalize_mission so foreign RUNNING work continues.
         runtime.mission_status = MissionStatus.BLOCKED
     engine.updated_runtime = engine._event_runtime = runtime
     return []
-
-
 async def verify_legacy_task_origins(
     *,
     evidence_store: Any,
@@ -852,6 +1309,8 @@ async def _goal_task_coverage(
     excerpts: list[dict[str, Any]] = []
     engagement_id = getattr(runtime, "engagement_id", None)
     path_store = getattr(getattr(engine, "deps", None), "path_store", None)
+    task_graph_store = getattr(getattr(engine, "deps", None), "task_graph_store", None)
+    work_store = getattr(getattr(engine, "deps", None), "work_store", None)
     for task in tasks or []:
         if not task.required:
             continue
@@ -883,6 +1342,8 @@ async def _goal_task_coverage(
                 mission_id=str(runtime.mission_id),
                 task=task,
                 graph_service=AttackGraphService(engine.deps.graph_store),
+                task_graph_store=task_graph_store,
+                work_store=work_store,
             )
             if errors:
                 return (errors, {}, [])
@@ -898,6 +1359,9 @@ async def _goal_task_coverage(
                 mission_id=str(runtime.mission_id),
                 evidence_id=identity,
                 require_proposal=True,
+                task=task,
+                task_graph_store=task_graph_store,
+                work_store=work_store,
             )
             if origin_errors:
                 return (origin_errors, {}, [])
@@ -913,6 +1377,30 @@ async def complete_goal(
     engine: Any, path: Any, decision: Any, runtime: Any, context: Any, *, budget: Any = None
 ) -> list[str]:
     """Settle the original mission on its own criteria and required tasks."""
+    if getattr(engine.deps, "specialist_policy", None) is not None:
+        from redteam.orchestration.coordination import StateConflict, coordinator_for
+        from redteam.orchestration.outbox import pending_count
+        from redteam.orchestration.task_activation import TaskActivation
+
+        def check_quiescent(change):
+            run_id = str(runtime.run_id)
+            if (change.records.get(("specialist_lifecycle", run_id), {}).get("state")
+                    != "quiescent" or TaskActivation.has_pending(change, run_id)
+                    or pending_count(change, run_id)):
+                raise StateConflict("specialist_followup_review_pending")
+
+        async def loop_state(change):
+            try:
+                check_quiescent(change)
+            except StateConflict:
+                return False
+            return True
+
+        coordinator = engine.deps.coordinator or coordinator_for(
+            engine.deps.task_graph_store, engine.deps.path_store,
+        )
+        if not await coordinator.change(loop_state):
+            return ["specialist_followup_review_pending"]
     token = await engine._review_token(runtime)
     if getattr(runtime, "mission_id", None) is None:
         return ["goal completion requires an operator mission"]
@@ -931,13 +1419,29 @@ async def complete_goal(
     criteria = list(getattr(mission, "success_criteria", []) or [])
     if not criteria:
         return ["goal has no original operator criteria"]
-    pending = await _pending_execution_errors(engine, runtime)
+    pending = await _pending_execution_errors(engine, runtime, scope="goal", all_instances=True)
     if pending:
         return pending
     tasks = await engine.deps.task_graph_store.list_tasks(mission_id=runtime.mission_id)
+    from redteam.orchestration.evidence_validity import capture_validity, validity_errors
+
     errors, task_evidence, excerpts = await _goal_task_coverage(
         engine, runtime=runtime, tasks=tasks
     )
+    if errors:
+        return errors
+    from redteam.attack_graph.service import AttackGraphService
+
+    # Legacy completed tasks can ground through original path results instead
+    # of a receipt. Include these verified origins in the same relevant fence.
+    validity_read = await capture_validity(engine.deps, runtime, [
+        *[task.completion_evidence_id for task in tasks if task.completion_evidence_id is not None],
+        *[i for origins in task_evidence.values() for i in origins],
+    ])
+    errors = await validity_errors(engine.deps.evidence_store,
+                                   AttackGraphService(engine.deps.graph_store),
+                                   str(runtime.run_id),
+                                   [i for origins in task_evidence.values() for i in origins])
     if errors:
         return errors
     try:
@@ -951,16 +1455,17 @@ async def complete_goal(
     await engine._check_review_path(runtime, path)
     review = await engine._ask(
         stage="goal_completion_review",
-        payload={
-            **(context or {}),
-            "mission": mission.model_dump(mode="json"),
-            "path": path.model_dump(mode="json"),
-            **_review_payload_common(
-                purpose=getattr(mission, "objective", "") or "",
-                conditions=criteria,
-                excerpts=excerpts,
+        payload=_goal_review_payload(
+            mission=mission,
+            criteria=criteria,
+            path=path,
+            context=await engine.review_context(
+                runtime, context,
+                [identity for origins in task_evidence.values() for identity in origins],
             ),
-        },
+            task_evidence=task_evidence,
+            excerpts=excerpts,
+        ),
         response_schema=_GoalReview.model_json_schema(),
         system=_engine_system(engine) + RESULT_REVIEW_INSTRUCTION,
         budget=budget,
@@ -1004,6 +1509,8 @@ async def complete_goal(
             path_store=engine.deps.path_store,
             run_id=str(runtime.run_id),
             mission_id=str(runtime.mission_id),
+            task_graph_store=getattr(getattr(engine, "deps", None), "task_graph_store", None),
+            work_store=getattr(getattr(engine, "deps", None), "work_store", None),
         )
         if errors:
             return errors
@@ -1011,6 +1518,10 @@ async def complete_goal(
     now = datetime.now(timezone.utc)
 
     async def complete(change: Any) -> None:
+        if getattr(engine.deps, "specialist_policy", None) is not None:
+            check_quiescent(change)  # same transaction as Mission completion, not a stale hint
+        if validity_read is not None:
+            validity_read.check(change)
         for task in tasks:
             if (
                 getattr(task, "required", False)
@@ -1044,6 +1555,12 @@ async def complete_goal(
         change.binding(str(runtime.run_id), str(runtime.mission_id))["closed"] = True
 
     await engine._commit_review(runtime, token, complete)
+    await _publish_settlement(
+        engine,
+        runtime,
+        EventType.MISSION_UPDATED,
+        {"mission_id": runtime.mission_id, "status": "completed"},
+    )
     return []
 
 

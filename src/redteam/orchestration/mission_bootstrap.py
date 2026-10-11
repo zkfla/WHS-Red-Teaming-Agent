@@ -14,11 +14,13 @@ from redteam.orchestration.engagement_planner import plan_mission
 
 async def bootstrap_mission(
     store: MissionTaskStore, agents: AgentRegistry, engagement: Engagement,
-    *, objective: str | None = None, now: datetime,
+    *, objective: str | None = None, now: datetime, seed_task: bool = True,
 ) -> MissionId:
     mission_id = MissionId(new_id("mission"))
     mission = plan_mission(engagement, mission_id, objective=objective, now=now)
     await store.create_mission(mission)
+    if not seed_task:
+        return mission_id
     await store.create_task(MissionTask(
         task_id=TaskId(new_id("task")), mission_id=mission_id,
         title="Investigate the operator goal", objective=mission.objective,

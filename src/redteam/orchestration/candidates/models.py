@@ -74,10 +74,21 @@ class CandidateDraft(BaseModel):
 
     @field_validator("target_node_ids")
     @classmethod
-    def _needs_a_target(cls, value: list[GraphNodeId]) -> list[GraphNodeId]:
-        if not value:
-            raise ValueError("a candidate needs at least one target node id")
+    def _normalise_target_ids(cls, value: list[GraphNodeId]) -> list[GraphNodeId]:
         return sorted(set(value), key=str)
+
+    @model_validator(mode="after")
+    def _empty_refs_need_native_targetless_step(self) -> CandidateDraft:
+        # Empty refs prove nothing by themselves: only a native
+        # selected-tool step that itself carries no target (target and
+        # target_bind both empty) may compile without node refs. A
+        # non-empty ref set on such a step is equally inconsistent --
+        # there is no execution target the refs could match.
+        if not self.target_node_ids and not self.plan_step.is_native_targetless:
+            raise ValueError("a candidate needs at least one target node id")
+        if self.target_node_ids and self.plan_step.is_native_targetless:
+            raise ValueError("a native targetless candidate must not carry target node ids")
+        return self
 
     @field_validator("conflict_keys")
     @classmethod

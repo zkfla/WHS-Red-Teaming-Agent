@@ -12,6 +12,10 @@ from redteam.capability.adapters.mcp.naming import (
     is_canonical_mcp_tool_id,
     parse_canonical_mcp_tool_id,
 )
+from redteam.capability.card_view import (
+    cards_from_descriptors,
+    tool_detail_from_descriptor,
+)
 from redteam.capability.registry import MCPToolRegistry
 from redteam.core.action_semantics import (
     ActionNamingError,
@@ -22,6 +26,7 @@ from redteam.core.action_semantics import (
 from redteam.core.contracts.tool import ToolDescriptor
 from redteam.core.enums import RiskLevel, ToolHealthStatus
 from redteam.core.ids import ToolId
+from redteam.core.ports.tool_catalog import ToolCard, ToolCardKind, ToolDetail
 
 _MetadataT = TypeVar("_MetadataT")
 
@@ -232,6 +237,28 @@ class MCPToolCatalog:
 
     def list_by_capability(self, capability_tag: str) -> list[ToolDescriptor]:
         return [self.finalized(item) for item in self._registry.list_by_capability(capability_tag)]
+
+    def list_cards(
+        self,
+        *,
+        kind: ToolCardKind | None = None,
+        capability: str | None = None,
+        query: str | None = None,
+        include_unhealthy: bool = False,
+    ) -> list[ToolCard]:
+        return cards_from_descriptors(
+            self.all_descriptors(),
+            kind=kind,
+            capability=capability,
+            query=query,
+            include_unhealthy=include_unhealthy,
+        )
+
+    def get_detail(self, tool_id: ToolId) -> ToolDetail | None:
+        descriptor = self.get(tool_id)
+        if descriptor is None:
+            return None
+        return tool_detail_from_descriptor(descriptor)
 
     def finalized(self, descriptor: ToolDescriptor) -> ToolDescriptor:
         """Copy of ``descriptor`` carrying the resolved canonical operations.

@@ -9,7 +9,7 @@ from pathlib import Path
 
 from redteam.orchestration.paths.memory import InMemoryPathStore
 from redteam.orchestration.paths.models import PathPlan, PathVersionConflict
-from redteam.orchestration.sqlite_support import connect, run_transaction
+from redteam.sqlite_support import connect, run_transaction
 
 _SCHEMA = """
 PRAGMA journal_mode=WAL;

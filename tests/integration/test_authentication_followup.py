@@ -1,22 +1,26 @@
 """Authentication follow-ups are bounded, policy-gated and observation-only.
 
-New-flow notes: every request below comes from an explicit scripted model
-intent through the production InvestigationEngine path. The old file assumed
-a deterministic candidate frontier (exact invocation counts of 2/3/7 driven
-by auto-generated recon + web probes); those counts are retired. Counts here
-equal the scripted intents: 1 anonymous probe + 1 session check, nothing more.
+Native-loop notes: every request below comes from explicit scripted
+complete_native calls through the production InvestigationEngine path.
+The scripted chain is 1 anonymous probe + 1 selected session check, then
+the registered local authentication.assess over the two stored evidence
+IDs, then (deny only) one explicit graph.record security claim. The model
+holds afterwards; nothing runs on a rule fallback.
 
 Retired deterministic items (with replacement):
-- exact auto counts (3 for one session, 7 for five, 2 for deferred/missing) ->
-  this file's scripted 2-call chain (bounded: each session checked at most
-  once, anonymous evidence preserved) keeps the contract without the planner.
+- legacy complete_structured strategy scripting (path drafts, path reviews
+  and next_action intents) -> complete_native tool calls plus the genuine
+  analysis/task/goal completion reviews only.
+- denied-session violation promotion via the legacy verify branch
+  (deny + 200 -> access_control_violation with a security_check event):
+  the local assess step stays observation-only, so AUTHENTICATION_CHECKED
+  now carries assessment_kind observation even for deny + 200, and the
+  verified high-severity Finding, the confirmed hypothesis and their
+  linkage come from the explicit graph.record claim instead. The
+  observation-only chain above stays finding-free.
 - deferred/tool-missing branches via auto-candidates ->
   covered as policy/availability outcomes in test_session_followup_deny_blocks
   and the DENY control-plane cases in test_agent_loop.py.
-- denied-session violation promotion (deny + 200 -> access_control_violation):
-  test_denied_session_200_is_a_confirmed_access_control_finding pins the verified
-  high-severity Finding, the confirmed hypothesis and their linkage on the
-  scripted session path. The observation-only chain above stays finding-free.
 """
 
 from __future__ import annotations
@@ -50,6 +54,7 @@ from redteam.core.ids import (
     RunId,
     ToolId,
 )
+from redteam.core.ports.llm import NativeCompletion, NativeToolCall
 from redteam.event_bus.memory import InMemoryEventBus
 from redteam.orchestration.agents.registry import default_registry
 from redteam.orchestration.authentication import (
@@ -57,8 +62,20 @@ from redteam.orchestration.authentication import (
     assess_authentication,
     comparison_outcome,
 )
+from redteam.orchestration.authentication_local_tools import (
+    AUTHENTICATION_ASSESS_TOOL_ID,
+    authentication_assess_descriptor,
+    authentication_assess_handler,
+)
 from redteam.orchestration.context import RuntimeDeps
 from redteam.orchestration.events import AUTHENTICATION_CHECKED
+from redteam.orchestration.graph_recording import (
+    GRAPH_RECORD_TOOL_ID,
+    GraphRecordingHandler,
+    graph_recording_descriptor,
+)
+from redteam.orchestration.local_tools import LocalToolRegistry
+from redteam.orchestration.native_binding import exposed_tool_name
 from redteam.orchestration.paths import InMemoryPathStore
 from redteam.orchestration.settings import OrchestrationSettings
 from redteam.orchestration.task_graph.memory import InMemoryTaskGraphStore
@@ -67,9 +84,7 @@ from tests.fakes import DummyToolGateway, FakeControlPlane, FakeEvidenceStore
 from tests.integration import _engine_llm_harness as h
 
 HOST_NODE = "host:app.local"
-WEB_AGENT = "web-api-agent"
 WEB_TOOL = "web.http_request"
-WEB_OP_KEY = "web.http_request"
 
 
 class SessionGateway(DummyToolGateway):
@@ -148,8 +163,50 @@ class SessionGate(FakeControlPlane):
         return await super().evaluate(proposal, context)
 
 
-class _AuthLLM:
-    """Two scripted web intents: anonymous probe, then one gated session check."""
+def _exposed_names(tools: list[Any]) -> set[str]:
+    return {str(getattr(spec, "name", "")) for spec in tools}
+
+
+def _remote_executed_evidence(messages: list[dict[str, Any]]) -> list[str]:
+    found: list[str] = []
+    for message in messages:
+        if message.get("role") != "tool" or not message.get("tool_call_id"):
+            continue
+        try:
+            body = json.loads(message.get("content") or "{}")
+        except ValueError:
+            continue
+        if not isinstance(body, dict) or body.get("ok") is not True:
+            continue
+        if body.get("executed") is not True:
+            continue
+        for identity in body.get("evidence_ids") or []:
+            text = str(identity)
+            if text and text not in found:
+                found.append(text)
+    return found
+
+
+def _tool_result(messages: list[dict[str, Any]], call_id: str) -> dict[str, Any] | None:
+    for message in messages:
+        if message.get("role") != "tool" or message.get("tool_call_id") != call_id:
+            continue
+        try:
+            body = json.loads(message.get("content") or "{}")
+        except ValueError:
+            return None
+        return body if isinstance(body, dict) else None
+    return None
+
+
+class _AuthNativeLLM:
+    """Scripted native model: anonymous probe, session check, assess, claim, hold.
+
+    Only complete_native drives the loop. complete_structured answers the
+    genuine reviews (execution meaning, posthoc claim review, task and goal
+    settlement); any legacy strategy route raises so a silent JSON fallback
+    can never stand in for a native turn.
+    """
 
     def __init__(
         self,
@@ -162,23 +219,18 @@ class _AuthLLM:
         self._session_ref = session_ref
         self._expected_access = expected_access
         self.calls: list[dict[str, Any]] = []
-        self._actions = 0
+        self.reviews: list[str] = []
+        self.turns = 0
+        self._auth_call: str | None = None
+        self._graph_call: str | None = None
 
     @staticmethod
     def _route_key(schema: dict[str, Any]) -> str:
         props = schema.get("properties", {})
-        if "steps" in props:
-            return "path_draft"
-        if "decision" in props:
-            return "path_review"
-        if "mode" in props:
-            return "next_action"
         if "criteria" in props:
             return "goal_completion_review"
         if "claims" in props:
             return "task_completion_review"
-        if "accepted" in props:
-            return "completion_review"
         if "claim_supported" in props:
             return "analysis_verify"
         return "unknown"
@@ -188,152 +240,18 @@ class _AuthLLM:
         return json.loads(messages[0]["content"])
 
     @staticmethod
-    def _hold() -> dict[str, Any]:
-        return {
-            "mode": "hold",
-            "reason": "scripted hold after session check",
-            "actions": [],
-            "path": None,
-            "path_step_id": None,
-            "completion": {},
-            "evidence_request": {},
-            "hypothesis_update": {},
-        }
+    def _wanted(tools: list[Any]) -> tuple[str, str, str]:
+        names = _exposed_names(tools)
+        web = exposed_tool_name(WEB_TOOL)
+        assess = exposed_tool_name(AUTHENTICATION_ASSESS_TOOL_ID)
+        record = exposed_tool_name(GRAPH_RECORD_TOOL_ID)
+        assert web in names, "native model needs the registered web request tool"
+        assert assess in names, "native model needs the registered authentication assess tool"
+        assert record in names, "native model needs the registered graph recording tool"
+        return web, assess, record
 
-    def _draft(self) -> dict[str, Any]:
-        # Minimal model draft: purpose + steps only. Runtime identity is code-owned.
-        return {
-            "reason": "scripted web draft",
-            "steps": [
-                {
-                    "step_id": "step-1",
-                    "objective": "probe / anonymously for the baseline",
-                    "agent_id": WEB_AGENT,
-                    "target_node_ids": [HOST_NODE],
-                    "principal_refs": [],
-                    "allowed_operations": [WEB_OP_KEY],
-                    "depends_on": [],
-                    "required_fact_refs": [],
-                    "unknowns": [],
-                    "completion_criteria": [
-                        {"kind": "evidence", "description": "baseline recorded", "min_evidence": 1}
-                    ],
-                    "required": True,
-                },
-                {
-                    "step_id": "step-2",
-                    "objective": "re-probe / with the registered session",
-                    "agent_id": WEB_AGENT,
-                    "target_node_ids": [HOST_NODE],
-                    "principal_refs": [self._session_ref],
-                    "allowed_operations": [WEB_OP_KEY],
-                    "depends_on": [],
-                    "required_fact_refs": [],
-                    "unknowns": [],
-                    "completion_criteria": [
-                        {
-                            "kind": "evidence",
-                            "description": "comparison recorded",
-                            "min_evidence": 1,
-                        }
-                    ],
-                    "required": True,
-                },
-            ],
-        }
-
-    def _anonymous(self) -> dict[str, Any]:
-        return {
-            "mode": "actions",
-            "reason": "scripted anonymous probe",
-            "actions": [
-                {
-                    "path_step_id": "step-1",
-                    "agent_id": WEB_AGENT,
-                    "target_node_id": HOST_NODE,
-                    "principal_ref": None,
-                    "capability": "web",
-                    "operation": "http_request",
-                    "tool_id": WEB_TOOL,
-                    "arguments": {"target_ref": "app", "path": "/", "method": "GET"},
-                    "reason": "record the anonymous baseline",
-                    "expected_observation": "anonymous 401 baseline",
-                    "hypothesis": None,
-                    "existing_hypothesis_id": None,
-                    "expectation": None,
-                    "authentication_check": None,
-                    "availability_impact": False,
-                }
-            ],
-            "path": None,
-            "path_step_id": None,
-            "completion": {},
-            "evidence_request": {},
-            "hypothesis_update": {},
-        }
-
-    def _session(self, baseline_id: str) -> dict[str, Any]:
-        session_ref = self._session_ref
-        return {
-            "mode": "actions",
-            "reason": "scripted session check",
-            "actions": [
-                {
-                    "path_step_id": "step-2",
-                    "agent_id": WEB_AGENT,
-                    "target_node_id": HOST_NODE,
-                    "principal_ref": session_ref,
-                    "capability": "web",
-                    "operation": "http_request",
-                    "tool_id": WEB_TOOL,
-                    "arguments": {
-                        "target_ref": "app",
-                        "path": "/",
-                        "method": "GET",
-                        "session_ref": session_ref,
-                    },
-                    "reason": "compare session against the anonymous baseline",
-                    "expected_observation": "session response for comparison",
-                    "hypothesis": (
-                        {
-                            "description": (
-                                f"Registered session {session_ref} may access / after anonymous 401"
-                            ),
-                            "confidence": 0.5,
-                            "violation_if_confirmed": True,
-                            "metadata": {"kind": "authentication"},
-                        }
-                        if self._expected_access == "deny"
-                        else None
-                    ),
-                    "existing_hypothesis_id": None,
-                    "expectation": (
-                        {
-                            "kind": "output_contains",
-                            "field": "",
-                            "value": session_ref,
-                            "description": (
-                                "denied session response returned for comparison"
-                            ),
-                            "violation_if_met": True,
-                        }
-                        if self._expected_access == "deny"
-                        else None
-                    ),
-                    "authentication_check": {
-                        "baseline_evidence_id": baseline_id,
-                        "session_ref": session_ref,
-                        "expected_access": self._expected_access,
-                    },
-                    "availability_impact": False,
-                }
-            ],
-            "path": None,
-            "path_step_id": None,
-            "completion": {},
-            "evidence_request": {},
-            "hypothesis_update": {},
-        }
+    def _record(self, names: list[str]) -> None:
+        self.calls.append({"turn": self.turns, "tool_calls": list(names)})
 
     async def complete_structured(
         self,
@@ -344,29 +262,19 @@ class _AuthLLM:
         **_: Any,
     ) -> dict[str, Any]:
         route = self._route_key(response_schema)
-        self.calls.append({"route": route})
-        if route == "path_draft":
-            return self._draft()
-        if route == "path_review":
-            return h.review_accept()
+        self.reviews.append(route)
         if route == "analysis_verify":
-            return h.meaning("success", True)
-        if route == "completion_review":
-            # Step review keeps the old accepted/reason shape (no claims).
-            return h.completion_accept()
+            result = h.meaning("success", True)
+            if "hypothesis_outcome" in response_schema.get("properties", {}):
+                # Posthoc claim review (graph.record finding): the denied
+                # session actually returned 200 after an anonymous 401, so
+                # the referenced hypothesis is confirmed by this evidence.
+                result["hypothesis_outcome"] = "success"
+            return result
         if route == "task_completion_review":
-            # Task review: accepted/reason/claims with actual evidence ids.
             payload = self._payload(messages)
-            run_id = (payload.get("path") or {}).get("run_id", "")
-            records = await self._evidence.list_for_run(run_id) if run_id else []
-            task_receipts = [
-                str(r.evidence_id)
-                for r in records
-                if isinstance(getattr(r, "metadata", {}).get("tool_result"), dict)
-            ]
-            if not task_receipts:
-                for step in payload.get("path", {}).get("steps", []):
-                    task_receipts.extend(step.get("evidence_ids", []))
+            receipts = list(payload["verified_source_ids"])
+            assert receipts, "task review needs the verified executed call evidence"
             return {
                 "accepted": True,
                 "reason": "scripted semantic accept",
@@ -374,7 +282,7 @@ class _AuthLLM:
                     {
                         "description": "web tool result observed",
                         "kind": "observation",
-                        "evidence_ids": list(task_receipts),
+                        "evidence_ids": list(receipts),
                         "target_node_ids": [],
                         "principal_refs": [],
                     }
@@ -383,19 +291,8 @@ class _AuthLLM:
         if route == "goal_completion_review":
             payload = self._payload(messages)
             criteria = payload["mission"]["success_criteria"]
-            receipts: list[str] = []
-            for step in payload["path"]["steps"]:
-                receipts.extend(step.get("evidence_ids", []))
-            if not receipts:
-                run_id = (payload.get("path") or {}).get("run_id", "")
-                run_id = run_id or payload.get("active_path", {}).get("run_id", "")
-                if run_id:
-                    records = await self._evidence.list_for_run(run_id)
-                    receipts = [
-                        str(r.evidence_id)
-                        for r in records
-                        if isinstance(getattr(r, "metadata", {}).get("tool_result"), dict)
-                    ]
+            receipts = list(payload["verified_source_ids"])
+            assert receipts, "goal review needs the verified executed call evidence"
             return {
                 "accepted": True,
                 "reason": "scripted goal accept",
@@ -417,28 +314,123 @@ class _AuthLLM:
                     for c in criteria
                 ],
             }
-        if route == "next_action":
-            self._actions += 1
-            if self._actions == 1:
-                return self._anonymous()
-            if self._actions == 2:
-                payload = self._payload(messages)
-                run_id = payload["active_path"]["run_id"]
-                records = await self._evidence.list_for_run(run_id)
-                tool_evidence = [
-                    str(r.evidence_id)
-                    for r in records
-                    if isinstance(getattr(r, "metadata", {}).get("tool_result"), dict)
-                ]
-                assert tool_evidence, "session check needs the anonymous baseline evidence"
-                return self._session(tool_evidence[0])
-            return self._hold()
-        raise AssertionError(f"no scripted answer for route {route!r}")
+        raise AssertionError(f"legacy strategy route is not part of the native loop: {route!r}")
+
+    async def complete_native(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[Any],
+        system: str | None = None,
+        **_: Any,
+    ) -> NativeCompletion:
+        web, assess, record = self._wanted(tools)
+        self.turns += 1
+        evidenced = _remote_executed_evidence(messages)
+        if self.turns == 1:
+            self._record([web])
+            return NativeCompletion(
+                tool_calls=(
+                    NativeToolCall(
+                        call_id="call-anon",
+                        name=web,
+                        arguments={"target_ref": "app", "path": "/", "method": "GET"},
+                    ),
+                ),
+                text="",
+            )
+        if self.turns == 2:
+            assert evidenced, "session check needs the anonymous baseline evidence"
+            self._record([web])
+            return NativeCompletion(
+                tool_calls=(
+                    NativeToolCall(
+                        call_id="call-sess",
+                        name=web,
+                        arguments={
+                            "target_ref": "app",
+                            "path": "/",
+                            "method": "GET",
+                            "session_ref": self._session_ref,
+                        },
+                    ),
+                ),
+                text="",
+            )
+        anon = (_tool_result(messages, "call-anon") or {}).get("evidence_ids") or []
+        sess = (_tool_result(messages, "call-sess") or {}).get("evidence_ids") or []
+        if not anon or not sess:
+            # The session call never executed (Control denied it): hold
+            # without an assessment so no AUTHENTICATION_CHECKED event exists.
+            return NativeCompletion(tool_calls=(), text="")
+        if self._auth_call is None:
+            self._auth_call = "call-auth"
+            self._record([assess])
+            return NativeCompletion(
+                tool_calls=(
+                    NativeToolCall(
+                        call_id=self._auth_call,
+                        name=assess,
+                        arguments={
+                            "baseline_evidence_id": anon[0],
+                            "session_evidence_id": sess[0],
+                            "session_ref": self._session_ref,
+                            "expected_access": self._expected_access,
+                        },
+                    ),
+                ),
+                text="",
+            )
+        seen = _tool_result(messages, self._auth_call)
+        if seen is None or seen.get("ok") is not True:
+            return NativeCompletion(tool_calls=(), text="")
+        if self._expected_access == "deny" and self._graph_call is None:
+            self._graph_call = "call-graph"
+            # The claim concerns the / resource reached by the session: the
+            # target comes from the session evidence's own preserved
+            # metadata, which now carries the measured host->endpoint
+            # relation the mapper records for both evidences.
+            session = await self._evidence.get(EvidenceId(sess[0]))
+            metadata = getattr(session, "metadata", None) or {}
+            target_id = metadata.get("target_node_id")
+            assert isinstance(target_id, str) and target_id.strip(), (
+                "graph claim needs the session evidence target"
+            )
+            self._record([record])
+            return NativeCompletion(
+                tool_calls=(
+                    NativeToolCall(
+                        call_id=self._graph_call,
+                        name=record,
+                        arguments={
+                            "findings": [
+                                {
+                                    "statement": (
+                                        f"Registered session {self._session_ref} accessed / "
+                                        "after anonymous 401 though expected deny"
+                                    ),
+                                    "evidence_refs": [anon[0], sess[0]],
+                                    "target_node_id": target_id,
+                                    "severity": "high",
+                                }
+                            ]
+                        },
+                    ),
+                ),
+                text="",
+            )
+        return NativeCompletion(tool_calls=(), text="")
 
     async def complete(
         self, *, messages: list[dict[str, Any]], system: str | None = None, **_: Any
     ) -> str:
         return ""
+
+
+def _native_tool_registry() -> LocalToolRegistry:
+    registry = LocalToolRegistry()
+    registry.register(authentication_assess_descriptor(), authentication_assess_handler)
+    registry.register(graph_recording_descriptor(), GraphRecordingHandler())
+    return registry
 
 
 def _auth_engagement(
@@ -472,7 +464,7 @@ def _auth_deps(
     expected_access: str = "unspecified",
 ) -> RuntimeDeps:
     evidence = FakeEvidenceStore()
-    llm = _AuthLLM(evidence, session_ref=session_ref, expected_access=expected_access)
+    llm = _AuthNativeLLM(evidence, session_ref=session_ref, expected_access=expected_access)
     return RuntimeDeps(
         control_plane=control,
         tool_gateway=gateway,
@@ -483,6 +475,7 @@ def _auth_deps(
         engagement=engagement,
         agents=default_registry(),
         tool_catalog=gateway,
+        local_tools=_native_tool_registry(),
         work_store=InMemoryWorkStore(),
         task_graph_store=InMemoryTaskGraphStore(),
         path_store=InMemoryPathStore(),
@@ -651,7 +644,9 @@ async def test_denied_session_200_is_a_confirmed_access_control_finding() -> Non
     checked = bus.history(event_type=AUTHENTICATION_CHECKED)
     assert len(checked) == 1
     assert checked[0].payload["outcome"] == "access_control_violation"
-    assert checked[0].payload["assessment_kind"] == "security_check"
+    # The local assess step stays observation-only; the security claim itself
+    # travels through the explicit graph.record finding proven below.
+    assert checked[0].payload["assessment_kind"] == "observation"
     from redteam.attack_graph.service import AttackGraphService
     graph = AttackGraphService(deps.graph_store)
     findings = await graph.list_findings(verified=True)

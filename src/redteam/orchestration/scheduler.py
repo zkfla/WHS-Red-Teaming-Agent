@@ -4,8 +4,9 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-from redteam.core.ids import HypothesisId, RunId, new_id
+from redteam.core.ids import AgentInstanceId, HypothesisId, RunId, new_id
 from redteam.orchestration.candidates.models import ExecutableCandidate
+from redteam.orchestration.resource_conflicts import resource_conflict_keys
 from redteam.orchestration.work.models import TaskLease, WorkBudget, WorkItem
 from redteam.orchestration.work.store import WorkStore
 
@@ -20,6 +21,7 @@ class WorkScheduler:
         *,
         graph_revision: int,
         run_id: RunId,
+        instance_id: AgentInstanceId | None = None,
         mission_task_id: str | None = None,
         now: datetime | None = None,
     ) -> list[WorkItem]:
@@ -27,10 +29,15 @@ class WorkScheduler:
         enqueued: list[WorkItem] = []
         for candidate in candidates:
             draft = candidate.draft
+            resource_keys = resource_conflict_keys(candidate.tool, candidate.plan_step.arguments)
             item = WorkItem(
                 work_id=new_id("work"),
                 run_id=run_id,
+                instance_id=instance_id,
                 mission_task_id=mission_task_id,
+                model_tool_call_id=draft.plan_step.model_tool_call_id,
+                task_purpose_hash=draft.plan_step.task_purpose_hash,
+                execution_origin_version=draft.plan_step.execution_origin_version,
                 delegation_id=draft.plan_step.delegation_id,
                 candidate_key=candidate.candidate_key,
                 execution_identity_version=draft.execution_identity_version,
@@ -49,7 +56,8 @@ class WorkScheduler:
                     )
                 ),
                 prerequisite_ids=draft.prerequisite_ids,
-                conflict_keys=draft.conflict_keys,
+                conflict_keys=[*draft.conflict_keys, *resource_keys],
+                resource_keys=resource_keys,
                 priority=candidate.priority,
                 budget=WorkBudget(),
                 repeatable=candidate.plan_step.repeatable,

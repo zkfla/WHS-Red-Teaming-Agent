@@ -12,15 +12,20 @@ or declare a new typed entity whose id is code-derived and linked back
 to the observed source, hypotheses are recorded as INFERRED, and a
 first vulnerability claim
 runs posthoc review, a final-admission receipt, and promotion here.
+Standalone hypotheses are never reviewed here; they stay open inference
+until an explicit finding or execution verification resolves them.
 The root generic runtime_tool dispatch only returns this handler's
 result; it never branches on the graph name or performs hidden
 follow-up registration.
 
-``raw_path`` navigates under the preserved ``ToolResult.output``: the
-stored raw payload is the full ToolResult dict, and the pointer walks
-``output`` first, then the given keys (list indices as decimal text).
-Exact pointers are code-checked for observations only; inference and
-findings stay free semantic claims with evidence refs.
+``raw_path`` addresses the preserved ``ToolResult.output``: the stored
+raw payload is the full ToolResult dict, and a pointer may either list
+keys under that output or start with the envelope key ``output``, which
+is consumed once (both forms are equivalent). Segments are dict keys or
+list indices, written as decimal text or as an integer; an empty path
+addresses the whole output. Exact pointers are code-checked for
+observations only; inference and findings stay free semantic claims
+with evidence refs.
 
 Original proposals and stored metadata are read-only here. First-claim
 review never depends on an already-confirmed graph status (no cycle):
@@ -35,7 +40,7 @@ from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import urljoin, urlsplit
 
-from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, StrictStr, TypeAdapter
 
 from redteam.attack_graph.identity import node_id_for_target
 from redteam.attack_graph.predicates import (
@@ -60,6 +65,7 @@ from redteam.orchestration.analysis import (
     hypothesis_status_for_assessment,
 )
 from redteam.orchestration.coordination import content_hash
+from redteam.orchestration.diagnostics import diagnostic_for_exception
 from redteam.orchestration.evidence_access import raw_from_metadata
 from redteam.orchestration.findings import FindingPromoter, PromotionRequest
 from redteam.orchestration.local_tools import (
@@ -102,30 +108,39 @@ class NewEntityDecl(BaseModel):
     )
 
 
+#: Envelope key the preserved ToolResult keeps its payload under. The walk
+#: consumes it once, so quoting it as the leading segment stays equivalent.
+_OUTPUT_ENVELOPE_KEY = "output"
+
+#: Single source of the model-visible pointer rule; the field descriptions
+#: and the tool descriptor reuse it so the published contract cannot drift.
+_RAW_PATH_RULE = (
+    "The stored raw payload is the full ToolResult dict, and the pointer "
+    "addresses its preserved output: a segment is a dict key or a list "
+    "index, written as decimal text or as an integer. The output-relative "
+    "form lists keys under that output; the equivalent envelope-prefixed "
+    "form may start with the envelope key 'output', which is consumed once "
+    "(['output'] addresses the whole output, as does an empty path)."
+)
+
+
 class RecordedFact(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     evidence_id: str = Field(min_length=1)
-    raw_path: list[str] = Field(
-        description=(
-            "Keys under the preserved ToolResult output: the stored raw "
-            "payload is the full ToolResult dict, the pointer walks "
-            "output first, then these keys (list indices as decimal text). "
-            "An empty path points at the entire output, including text."
-        ),
-    )
+    raw_path: list[StrictStr | StrictInt] = Field(description=_RAW_PATH_RULE)
     value: Any = None
     fact_name: str = Field(min_length=1)
     target_node_id: str = Field(min_length=1)
     edge: FactEdge | None = None
     new_entity: NewEntityDecl | None = Field(default=None)
-    entity_raw_path: list[str] | None = Field(
+    entity_raw_path: list[StrictStr | StrictInt] | None = Field(
         default=None,
         min_length=1,
         description=(
-            "Pointer under the preserved ToolResult output proving the "
-            "declared new entity identity; defaults to raw_path. A new "
-            "different entity is refused without an address string or "
+            _RAW_PATH_RULE
+            + " Declares the new entity identity; defaults to raw_path. A "
+            "new different entity is refused without an address string or "
             "typed target value at this pointer."
         ),
     )
@@ -134,9 +149,28 @@ class RecordedFact(BaseModel):
 class HypothesisDraft(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    statement: str = Field(min_length=1)
-    evidence_refs: list[str] = Field(default_factory=list)
-    target_node_id: str | None = None
+    statement: str = Field(
+        min_length=1,
+        description=(
+            "Open inference only: registering a question here never confirms, "
+            "refutes, or reviews it. Resolution needs an explicit finding "
+            "or execution verification."
+        ),
+    )
+    evidence_refs: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Optional same-run evidence for the question; emptiness alone "
+            "does not refuse the draft."
+        ),
+    )
+    target_node_id: str | None = Field(
+        default=None,
+        description=(
+            "Optional target linkage; omission keeps the draft open and "
+            "unresolved rather than refused."
+        ),
+    )
 
 
 class FindingDraft(BaseModel):
@@ -174,22 +208,47 @@ class GraphRecordingInput(BaseModel):
     branches: list[BranchNote] = Field(default_factory=list)
 
 
-def _locate(raw: Any, path: list[str]) -> tuple[bool, Any]:
+def _locate(raw: Any, path: list[str | int]) -> tuple[bool, Any]:
     """Walk dict keys / list indices. Never raises for a bad path."""
     node = raw
-    for key in path:
+    for part in path:
         if isinstance(node, dict):
-            if key not in node:
+            if not isinstance(part, str):
+                part = str(part)
+            if part not in node:
                 return False, None
-            node = node[key]
+            node = node[part]
         elif isinstance(node, (list, tuple)):
+            if not isinstance(part, int):
+                try:
+                    part = int(part)
+                except (TypeError, ValueError):
+                    return False, None
             try:
-                node = node[int(key)]
-            except (ValueError, IndexError):
+                node = node[part]
+            except (IndexError, TypeError):
                 return False, None
         else:
             return False, None
     return True, node
+
+
+def _walk_output(output: Any, path: list[str | int]) -> tuple[bool, Any]:
+    """Locate one pointer under the preserved output.
+
+    The pointer is tried exactly as sent. Only when it does not resolve and
+    it starts with the envelope key ``output`` is that single leading
+    segment dropped once, so the output-relative form and the
+    envelope-prefixed form address the same stored location. A pointer that
+    already resolves is never re-pointed, so a value mismatch at the sent
+    location stays a mismatch.
+    """
+    found, actual = _locate(output, path)
+    if found:
+        return found, actual
+    if path and path[0] == _OUTPUT_ENVELOPE_KEY:
+        return _locate(output, list(path[1:]))
+    return False, None
 
 
 def _remember(refs: list[str], value: Any) -> None:
@@ -400,11 +459,11 @@ class GraphRecordingHandler:
         if gap is not None:
             refused_facts.append({"evidence_id": eid, "reason": gap})
             return
-        output = raw.get("output")
+        output = raw.get(_OUTPUT_ENVELOPE_KEY)
         if not isinstance(output, (dict, str)):
             refused_facts.append({"evidence_id": eid, "reason": "no preserved output"})
             return
-        found, actual = _locate(output, fact.raw_path)
+        found, actual = _walk_output(output, fact.raw_path)
         if not found:
             refused_facts.append({"evidence_id": eid, "reason": "raw path missing"})
             return
@@ -562,7 +621,7 @@ class GraphRecordingHandler:
         observation = "confirmed" if executed_node_id == new_node_id else "discovered"
         if new_node_id != executed_node_id:
             entity_path = fact.entity_raw_path if fact.entity_raw_path else fact.raw_path
-            entity_found, entity_value = _locate(output, entity_path)
+            entity_found, entity_value = _walk_output(output, entity_path)
             if not entity_found:
                 refused_facts.append(
                     {"evidence_id": eid, "reason": "entity identity not shown"}
@@ -777,8 +836,21 @@ class GraphRecordingHandler:
     ) -> LocalToolResult:
         try:
             recording = GraphRecordingInput.model_validate(tool_input or {})
-        except Exception:
-            return LocalToolResult(ok=False, error="bad recording input")
+        except Exception as exc:
+            # Same shared validation contract as the native-loop helpers:
+            # this input's declared schema publishes the field and rule,
+            # never the raw values or undeclared key names, so the next
+            # turn can correct the shape instead of retrying it blind.
+            diagnostic = diagnostic_for_exception(
+                exc,
+                stage="native_local_tool",
+                schema=GraphRecordingInput.model_json_schema(),
+            )
+            return LocalToolResult(
+                ok=False,
+                error=diagnostic.feedback(),
+                payload={"diagnostic": diagnostic.model_dump(mode="json")},
+            )
         store = self._store
         if store is None:
             store = getattr(getattr(context, "deps", None), "evidence_store", None)
@@ -835,56 +907,9 @@ class GraphRecordingHandler:
             )
         review: dict[str, Any] = {"status": "per-claim"}
         finding_verifier = self._verifier or getattr(context.deps, "verifier", None)
-        # Standalone hypotheses each receive their own assessment and receipt.
-        # A matching finding below supplies that hypothesis's review instead.
-        for draft, entry in zip(recording.hypotheses, hypotheses_out, strict=True):
-            hid = entry.get("hypothesis_id")
-            if not hid:
-                continue
-            covered = any(
-                (item.hypothesis_id == hid or (
-                    not item.hypothesis_id and len(new_hypothesis_ids) == 1
-                ))
-                and (not item.target_node_id or item.target_node_id == entry["target_node_id"])
-                for item in recording.findings
-            )
-            if covered:
-                continue
-            try:
-                if context.budget is None or finding_verifier is None:
-                    raise ValueError("review unavailable")
-                target = entry["target_node_id"]
-                if not target:
-                    targets = set()
-                    for ref in draft.evidence_refs:
-                        source = await store.get(ref)
-                        targets.add(str(source.metadata.get("target_node_id", "") or ""))
-                    if len(targets) != 1 or not next(iter(targets)):
-                        raise ValueError("target linkage")
-                    target = next(iter(targets))
-                claim = {"statement": draft.statement, "target_node_id": target,
-                         "hypothesis_id": hid}
-                assessment = await finding_verifier.verify_claim_with_budget(
-                    claim=claim, evidence_ids=draft.evidence_refs, run_id=run_id,
-                    budget=context.budget, before_call=context.before_call,
-                )
-                first = await store.get(draft.evidence_refs[0])
-                receipt = await append_posthoc_claim_receipt(
-                    evidence_store=store, run_id=run_id, engagement_id=engagement_id,
-                    claim=claim, evidence_ids=draft.evidence_refs, assessment=assessment,
-                    hypothesis_id=hid, action_id=str(first.action_id),
-                    invocation_id=str(first.invocation_id), target_node_id=target,
-                )
-                if receipt is None:
-                    raise ValueError("receipt unavailable")
-                new_evidence_ids.append(str(receipt.evidence_id))
-                status = hypothesis_status_for_assessment(assessment)
-                updated = await service.resolve_hypothesis(hid, status=status, step=step)
-                if updated is None:
-                    raise ValueError("hypothesis missing")
-                entry.update(status=status, receipt_id=str(receipt.evidence_id))
-            except Exception:
-                entry.update(status="refused", reason="hypothesis review incomplete")
+        # Standalone hypotheses stay open here: recording a question is not
+        # resolving it. An explicit finding below reviews and resolves its own
+        # hypothesis; other hypotheses resolve through execution verification.
         findings_out: list[dict[str, Any]] = []
         existing_claims: set[str] = set()
         if recording.findings and service is not None:
@@ -1330,9 +1355,11 @@ def graph_recording_descriptor() -> LocalToolDescriptor:
         tool_id=GRAPH_RECORD_TOOL_ID,
         description=(
             "Record normalized facts/hypotheses/findings/branches. Facts are "
-            "code-checked against the preserved ToolResult output (raw_path "
-            "walks output first) and written to existing graph nodes or "
-            "edges only; hypotheses are the model inference; findings run "
+            "code-checked against the preserved ToolResult output (raw_path: "
+            + _RAW_PATH_RULE
+            + ") and written to existing graph nodes or edges only; "
+            "hypotheses stay open inference here and resolve through an "
+            "explicit finding or execution verification; findings run "
             "posthoc review plus promotion here."
         ),
         input_schema=GraphRecordingInput.model_json_schema(),

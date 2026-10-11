@@ -12,7 +12,8 @@ from redteam.attack_graph.predicates import Confidence, Provenance, build_proper
 from redteam.attack_graph.service import AttackGraphService
 from redteam.core.contracts.action import ActionProposal
 from redteam.core.contracts.graph import GraphNode
-from redteam.core.enums import GraphNodeType, PolicyVerdict
+from redteam.core.enums import AgentPhase, GraphNodeType, PolicyVerdict
+from redteam.orchestration.agents.registry import AgentRegistry
 from redteam.orchestration.engine import (
     ActionIntent,
     InvestigationEngine,
@@ -20,13 +21,14 @@ from redteam.orchestration.engine import (
     validate_current_action,
 )
 from redteam.orchestration.knowledge import collect_assessment, project_knowledge
-from redteam.orchestration.nodes import execute_node, observe_node, policy_node
+from redteam.orchestration.nodes import execute_node, observe_node, policy_node, replan_node
+from redteam.orchestration.nodes.react import model_node
 from redteam.orchestration.paths import PathPlan
-from redteam.orchestration.progress import knowledge_fingerprint
+from redteam.orchestration.progress import canonical_progress_fingerprint, knowledge_fingerprint
 from redteam.orchestration.runner import AgentLoopRunner
 from redteam.orchestration.scheduler import WorkScheduler
 from redteam.orchestration.seed import seed_from_engagement
-from redteam.orchestration.state import initial_graph_state
+from redteam.orchestration.state import TerminationReason, initial_graph_state
 from redteam.orchestration.work.models import WorkItem, WorkStatus
 from redteam.orchestration.work.sqlite import SQLiteWorkStore
 from tests.fakes import DummyToolGateway, build_test_application
@@ -484,6 +486,66 @@ async def test_progress_and_resume_use_same_uncapped_original_content(world):
         assert repeated["runtime"].no_progress_turns == 1
     finally:
         await runner.aclose()
+
+
+async def test_stall_counter_does_not_end_a_turn_that_changed_originals(world):
+    """The counter is observed before the turn runs, so the consumer re-checks content.
+
+    Same judgment as the resume gate: a stale counter is cleared only when the
+    canonical content actually changed. A repeatable no-op turn still stops
+    (tests/integration/test_agent_loop.py::test_stalled_no_progress_stops_the_loop).
+    """
+    deps = progress_deps(world)
+    baseline = await canonical_progress_fingerprint(
+        deps, world.runtime, step=world.runtime.step_count
+    )
+    assert baseline is not None
+    stalled = world.runtime.model_copy(
+        update={
+            "no_progress_turns": deps.settings.max_no_progress_turns,
+            "last_progress_fingerprint": baseline,
+        }
+    )
+    # Unchanged content: the stored counter still proves the stall.
+    unchanged = await replan_node(initial_graph_state(stalled), deps=deps)
+    assert unchanged["runtime"].termination_reason == TerminationReason.STALLED
+    assert unchanged["runtime"].phase is AgentPhase.FINISHED
+    # A grounded original recorded after the counter was observed clears it.
+    await add_measured(world.w, "host-fresh", status_code=403, evidence_suffix="-fresh")
+    changed = await replan_node(initial_graph_state(stalled), deps=deps)
+    assert changed["runtime"].termination_reason is None
+    assert changed["runtime"].phase is AgentPhase.OBSERVE
+
+
+async def test_model_entry_stop_does_not_end_a_turn_that_changed_originals(world):
+    """The entry hard stop reads current content, not the stored counter.
+
+    OBSERVE owns the counter, so a turn that starts at the threshold still gets
+    its OBSERVE pass when the canonical content already changed. An empty agent
+    registry keeps this node-level call from asking a model: OBSERVE's own
+    no-agent outcome is the observable proof that the entry stop did not end
+    the turn (a stale stop returns without any observation at all).
+    """
+    deps = replace(progress_deps(world), agents=AgentRegistry())
+    baseline = await canonical_progress_fingerprint(
+        deps, world.runtime, step=world.runtime.step_count
+    )
+    assert baseline is not None
+    stalled = world.runtime.model_copy(
+        update={
+            "no_progress_turns": deps.settings.max_no_progress_turns,
+            "last_progress_fingerprint": baseline,
+        }
+    )
+    # Unchanged content: the entry stop stands and no OBSERVE runs.
+    unchanged = await model_node(initial_graph_state(stalled.model_copy()), deps=deps)
+    assert unchanged["runtime"].termination_reason == TerminationReason.STALLED
+    assert unchanged.get("observation") is None
+    # A grounded original recorded after the counter was observed lets OBSERVE run.
+    await add_measured(world.w, "host-entry-fresh", status_code=403, evidence_suffix="-entry")
+    changed = await model_node(initial_graph_state(stalled.model_copy()), deps=deps)
+    assert changed["runtime"].termination_reason == TerminationReason.NO_AGENTS
+    assert changed.get("observation") is not None
 
 
 async def test_failed_original_lookup_neither_wakes_nor_increments_stall(world):

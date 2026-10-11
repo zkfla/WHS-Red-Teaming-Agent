@@ -60,6 +60,14 @@ from redteam.attack_graph.snapshot import (
     from_records,
 )
 from redteam.attack_graph.stores.memory import InMemoryAttackGraphStore
+from redteam.attack_graph.stores.mutations import (
+    GraphMutation,
+    GraphMutationConflict,
+    GraphMutationReceipt,
+    checked_receipt,
+    make_receipt,
+    mutation_hash,
+)
 from redteam.core.contracts.graph import GraphEdge, GraphNode
 from redteam.core.ids import GraphEdgeId, GraphNodeId
 
@@ -171,6 +179,13 @@ class SQLiteAttackGraphStore:
                 ON graph_records(source_id) WHERE collection='edges';
             CREATE INDEX IF NOT EXISTS idx_graph_edges_target
                 ON graph_records(target_id) WHERE collection='edges';
+            CREATE TABLE IF NOT EXISTS graph_mutation_receipts (
+                namespace TEXT NOT NULL,
+                run_id TEXT NOT NULL,
+                mutation_id TEXT NOT NULL,
+                receipt TEXT NOT NULL,
+                PRIMARY KEY (namespace, run_id, mutation_id)
+            );
             """
         )
 
@@ -191,6 +206,90 @@ class SQLiteAttackGraphStore:
 
     # -- persistence ----------------------------------------------------
 
+    async def prepare_graph_mutation(self, mutation: GraphMutation) -> GraphMutation:
+        return GraphMutation.model_validate(mutation.model_dump()).model_copy(deep=True)
+
+    @staticmethod
+    def _read_receipt(db, run_id, mutation_id, namespace) -> GraphMutationReceipt | None:
+        row = db.execute(
+            "SELECT receipt FROM graph_mutation_receipts "
+            "WHERE namespace=? AND run_id=? AND mutation_id=?",
+            (namespace, run_id, mutation_id),
+        ).fetchone()
+        if row is None:
+            return None
+        receipt = GraphMutationReceipt.model_validate_json(row[0])
+        if (receipt.namespace, receipt.run_id, receipt.mutation_id) != (
+            namespace, run_id, mutation_id,
+        ):
+            raise GraphMutationConflict("graph_mutation_receipt_index_conflict")
+        return receipt
+
+    async def read_graph_mutation_receipt(
+        self, run_id: str, mutation_id: str, *, namespace: str = "",
+    ) -> GraphMutationReceipt | None:
+        # Recovery reads do NOT set up, migrate, create, or rewrite the graph.
+        uri = f"{self._path.resolve().as_uri()}?mode=ro"
+        with closing(sqlite3.connect(uri, uri=True)) as db:
+            return self._read_receipt(db, run_id, mutation_id, namespace)
+
+    async def apply_graph_mutation(self, mutation: GraphMutation) -> GraphMutationReceipt:
+        mutation = await self.prepare_graph_mutation(mutation)
+        mutation_hash(mutation)
+        await self.setup()
+        async with self._lock:
+            try:
+                with closing(sqlite3.connect(self._path)) as db:
+                    db.execute("BEGIN IMMEDIATE")
+                    previous = self._read_receipt(
+                        db, mutation.run_id, mutation.mutation_id, mutation.namespace,
+                    )
+                    if previous is not None:
+                        return checked_receipt(previous, mutation)
+                    statements, result = self._mutation_statements(db, mutation)
+                    receipt = make_receipt(mutation, result)
+                    for sql, params in statements:
+                        db.execute(sql, params)
+                    db.execute(
+                        "INSERT INTO graph_mutation_receipts VALUES(?,?,?,?)",
+                        (mutation.namespace, mutation.run_id, mutation.mutation_id,
+                         receipt.model_dump_json()),
+                    )
+                    db.commit()
+                # Concrete memory mirror methods never suspend. On any failure
+                # after commit, disk+receipt remain canonical and setup reloads.
+                if mutation.node is not None:
+                    await self._memory.add_node(mutation.node)
+                elif mutation.edge is not None:
+                    await self._memory.add_edge(mutation.edge)
+                elif mutation.operation == "remove_node":
+                    assert mutation.identity is not None
+                    await self._memory.remove_node(GraphNodeId(mutation.identity))
+                else:
+                    assert mutation.identity is not None
+                    await self._memory.remove_edge(GraphEdgeId(mutation.identity))
+                return receipt
+            except BaseException:
+                self._ready = False
+                raise
+
+    def _mutation_statements(self, db, mutation):
+        if mutation.node is not None:
+            return self._node_statements(mutation.node), None
+        if mutation.edge is not None:
+            return self._edge_statements(mutation.edge), None
+        collection = NODES_COLLECTION if mutation.operation == "remove_node" else EDGES_COLLECTION
+        removed = db.execute(
+            "SELECT 1 FROM graph_records WHERE collection=? AND record_id=?",
+            (collection, mutation.identity),
+        ).fetchone() is not None
+        statements = []
+        if removed:
+            statements = (self._node_removal_statements(mutation.identity)
+                          if mutation.operation == "remove_node"
+                          else self._edge_removal_statements(mutation.identity))
+        return statements, removed
+
     def _write(self, statements: list[tuple[str, tuple[Any, ...]]]) -> None:
         with closing(sqlite3.connect(self._path)) as db:
             db.execute("BEGIN IMMEDIATE")
@@ -203,57 +302,65 @@ class SQLiteAttackGraphStore:
                 raise
 
     def _persist_node(self, node: GraphNode) -> None:
-        self._write(
-            [
-                (
-                    "INSERT OR REPLACE INTO graph_records"
-                    "(collection,record_id,source_id,target_id,record) VALUES(?,?,NULL,NULL,?)",
-                    (NODES_COLLECTION, str(node.id), _node_record(node)),
-                )
-            ]
-        )
+        self._write(self._node_statements(node))
+
+    @staticmethod
+    def _node_statements(node):
+        return [
+            (
+                "INSERT OR REPLACE INTO graph_records"
+                "(collection,record_id,source_id,target_id,record) VALUES(?,?,NULL,NULL,?)",
+                (NODES_COLLECTION, str(node.id), _node_record(node)),
+            )
+        ]
 
     def _persist_edge(self, edge: GraphEdge) -> None:
-        self._write(
-            [
+        self._write(self._edge_statements(edge))
+
+    @staticmethod
+    def _edge_statements(edge):
+        return [
+            (
+                "INSERT OR REPLACE INTO graph_records"
+                "(collection,record_id,source_id,target_id,record) VALUES(?,?,?,?,?)",
                 (
-                    "INSERT OR REPLACE INTO graph_records"
-                    "(collection,record_id,source_id,target_id,record) VALUES(?,?,?,?,?)",
-                    (
-                        EDGES_COLLECTION,
-                        str(edge.id),
-                        str(edge.source_id),
-                        str(edge.target_id),
-                        _edge_record(edge),
-                    ),
-                )
-            ]
-        )
+                    EDGES_COLLECTION,
+                    str(edge.id),
+                    str(edge.source_id),
+                    str(edge.target_id),
+                    _edge_record(edge),
+                ),
+            )
+        ]
 
     def _persist_node_removal(self, node_id: GraphNodeId) -> None:
-        self._write(
-            [
-                (
-                    "DELETE FROM graph_records WHERE collection=? "
-                    "AND (source_id=? OR target_id=?)",
-                    (EDGES_COLLECTION, str(node_id), str(node_id)),
-                ),
-                (
-                    "DELETE FROM graph_records WHERE collection=? AND record_id=?",
-                    (NODES_COLLECTION, str(node_id)),
-                ),
-            ]
-        )
+        self._write(self._node_removal_statements(node_id))
+
+    @staticmethod
+    def _node_removal_statements(node_id):
+        return [
+            (
+                "DELETE FROM graph_records WHERE collection=? "
+                "AND (source_id=? OR target_id=?)",
+                (EDGES_COLLECTION, str(node_id), str(node_id)),
+            ),
+            (
+                "DELETE FROM graph_records WHERE collection=? AND record_id=?",
+                (NODES_COLLECTION, str(node_id)),
+            ),
+        ]
 
     def _persist_edge_removal(self, edge_id: GraphEdgeId) -> None:
-        self._write(
-            [
-                (
-                    "DELETE FROM graph_records WHERE collection=? AND record_id=?",
-                    (EDGES_COLLECTION, str(edge_id)),
-                )
-            ]
-        )
+        self._write(self._edge_removal_statements(edge_id))
+
+    @staticmethod
+    def _edge_removal_statements(edge_id):
+        return [
+            (
+                "DELETE FROM graph_records WHERE collection=? AND record_id=?",
+                (EDGES_COLLECTION, str(edge_id)),
+            )
+        ]
 
     # -- AttackGraphStore (core port) -----------------------------------
 

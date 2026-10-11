@@ -42,7 +42,17 @@ import json
 from collections.abc import AsyncIterator, Mapping
 from typing import Any, cast
 
-from redteam.core.ports.llm import LLMProviderFailure, StructuredCompletion
+from redteam.core.ports.llm import (
+    NATIVE_ARG_INVALID_ARGUMENTS,
+    NATIVE_PROTOCOL_EMPTY_RESPONSE,
+    NATIVE_PROTOCOL_MISSING_CALL_ID,
+    NATIVE_PROTOCOL_MISSING_TOOL_NAME,
+    LLMProviderFailure,
+    NativeCompletion,
+    NativeToolCall,
+    NativeToolSpec,
+    StructuredCompletion,
+)
 
 _CHATGPT_PROVIDER = "chatgpt"
 
@@ -164,6 +174,247 @@ def _extract_total_tokens(response: Any) -> int | None:
     if isinstance(total, bool) or not isinstance(total, int) or total < 0:
         return None
     return total
+
+
+# Native tool-calling normalization. Both transports (plain ``acompletion``
+# tool_calls and subscription ``aresponses`` function-call items/streams)
+# collapse to ``NativeCompletion``. Only safe, fixed codes cross here;
+# raw arguments/text are never copied into error fields and no private
+# reasoning or full SDK payloads are persisted.
+
+
+def _parse_native_arguments(raw: Any) -> tuple[dict[str, Any] | None, str | None]:
+    """Parse one tool-call argument payload without retaining raw text."""
+    if raw is None:
+        return {}, None
+    if isinstance(raw, dict):
+        return dict(raw), None
+    if isinstance(raw, str):
+        stripped = raw.strip()
+        if not stripped:
+            return {}, None
+        try:
+            parsed = json.loads(stripped)
+        except (TypeError, ValueError):
+            return None, NATIVE_ARG_INVALID_ARGUMENTS
+        if not isinstance(parsed, dict):
+            return None, NATIVE_ARG_INVALID_ARGUMENTS
+        return parsed, None
+    return None, NATIVE_ARG_INVALID_ARGUMENTS
+
+
+def _native_call_from_parts(
+    call_id: Any, name: Any, arguments_raw: Any
+) -> tuple[NativeToolCall | None, str | None]:
+    """Build one ``NativeToolCall``; missing IDs become protocol flags."""
+    if not isinstance(call_id, str) or not call_id:
+        return None, NATIVE_PROTOCOL_MISSING_CALL_ID
+    if not isinstance(name, str) or not name:
+        return None, NATIVE_PROTOCOL_MISSING_TOOL_NAME
+    args, arg_error = _parse_native_arguments(arguments_raw)
+    if arg_error is not None:
+        return NativeToolCall(
+            call_id=call_id, name=name, arguments=None, argument_error=arg_error
+        ), None
+    assert args is not None
+    return NativeToolCall(
+        call_id=call_id, name=name, arguments=args, argument_error=None
+    ), None
+
+
+def _coerce_schema_object(schema: Any) -> dict[str, Any]:
+    if isinstance(schema, dict) and schema:
+        return schema
+    return {"type": "object"}
+
+
+def _chat_tools_param(tools: list[NativeToolSpec]) -> list[dict[str, Any]] | None:
+    if not tools:
+        return None
+    params: list[dict[str, Any]] = []
+    for spec in tools:
+        params.append(
+            {
+                "type": "function",
+                "function": {
+                    "name": spec.name,
+                    "description": spec.description,
+                    "parameters": _coerce_schema_object(spec.input_schema),
+                },
+            }
+        )
+    return params
+
+
+def _responses_tools_param(tools: list[NativeToolSpec]) -> list[dict[str, Any]] | None:
+    if not tools:
+        return None
+    params: list[dict[str, Any]] = []
+    for spec in tools:
+        params.append(
+            {
+                "type": "function",
+                "name": spec.name,
+                "description": spec.description,
+                "parameters": _coerce_schema_object(spec.input_schema),
+            }
+        )
+    return params
+
+
+def _stringify_tool_arguments(arguments: Any) -> str:
+    if isinstance(arguments, str):
+        return arguments
+    if isinstance(arguments, dict):
+        try:
+            return json.dumps(arguments)
+        except (TypeError, ValueError):
+            return "{}"
+    return "{}"
+
+
+def _stringify_tool_output(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if content is None:
+        return ""
+    try:
+        return json.dumps(content)
+    except (TypeError, ValueError):
+        return str(content)
+
+
+def _responses_input_from_chat(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Convert canonical chat messages to Responses input items."""
+    converted: list[dict[str, Any]] = []
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        item_type = message.get("type")
+        if item_type in ("function_call", "function_call_output", "message"):
+            converted.append(dict(message))
+            continue
+        role = message.get("role")
+        if role in ("user", "system", "developer"):
+            converted.append({"role": role, "content": message.get("content", "")})
+            continue
+        if role == "assistant":
+            content = message.get("content")
+            if isinstance(content, str) and content:
+                converted.append({"role": "assistant", "content": content})
+            elif isinstance(content, list) and content:
+                converted.append({"role": "assistant", "content": content})
+            raw_calls = message.get("tool_calls")
+            if isinstance(raw_calls, (list, tuple)):
+                for entry in raw_calls:
+                    if not isinstance(entry, dict):
+                        continue
+                    call_id = entry.get("id")
+                    if not isinstance(call_id, str) or not call_id:
+                        continue
+                    function = entry.get("function")
+                    if not isinstance(function, dict):
+                        continue
+                    name = function.get("name")
+                    if not isinstance(name, str) or not name:
+                        continue
+                    converted.append(
+                        {
+                            "type": "function_call",
+                            "call_id": call_id,
+                            "name": name,
+                            "arguments": _stringify_tool_arguments(
+                                function.get("arguments")
+                            ),
+                        }
+                    )
+            continue
+        if role == "tool":
+            call_id = message.get("tool_call_id")
+            if not isinstance(call_id, str) or not call_id:
+                continue
+            converted.append(
+                {
+                    "type": "function_call_output",
+                    "call_id": call_id,
+                    "output": _stringify_tool_output(message.get("content")),
+                }
+            )
+            continue
+    return converted
+
+
+def _build_native_completion(
+    *,
+    calls: list[NativeToolCall],
+    text: Any,
+    total_tokens: Any,
+    missing_call_id: bool = False,
+    missing_tool_name: bool = False,
+) -> NativeCompletion:
+    protocol_error: str | None = None
+    if missing_call_id:
+        protocol_error = NATIVE_PROTOCOL_MISSING_CALL_ID
+    elif missing_tool_name:
+        protocol_error = NATIVE_PROTOCOL_MISSING_TOOL_NAME
+    cleaned_text = text if isinstance(text, str) else ""
+    if not calls and not cleaned_text.strip() and protocol_error is None:
+        protocol_error = NATIVE_PROTOCOL_EMPTY_RESPONSE
+    return NativeCompletion(
+        tool_calls=tuple(calls),
+        text=cleaned_text,
+        total_tokens=total_tokens,
+        protocol_error=protocol_error,
+    )
+
+
+def _normalize_chat_tool_calls(raw_calls: Any) -> tuple[list[NativeToolCall], bool, bool]:
+    calls: list[NativeToolCall] = []
+    missing_id = False
+    missing_name = False
+    if not isinstance(raw_calls, (list, tuple)):
+        return calls, missing_id, missing_name
+    for entry in raw_calls:
+        function = _chunk_field(entry, "function")
+        name = _chunk_field(function, "name") if function is not None else None
+        arguments_raw = _chunk_field(function, "arguments") if function is not None else None
+        call_id = _chunk_field(entry, "id")
+        call, missing = _native_call_from_parts(call_id, name, arguments_raw)
+        if missing == NATIVE_PROTOCOL_MISSING_CALL_ID:
+            missing_id = True
+            continue
+        if missing == NATIVE_PROTOCOL_MISSING_TOOL_NAME:
+            missing_name = True
+            continue
+        assert call is not None
+        calls.append(call)
+    return calls, missing_id, missing_name
+
+
+def _normalize_responses_output_items(
+    output: Any,
+) -> tuple[list[NativeToolCall], bool, bool]:
+    calls: list[NativeToolCall] = []
+    missing_id = False
+    missing_name = False
+    if not isinstance(output, (list, tuple)):
+        return calls, missing_id, missing_name
+    for item in output:
+        if _chunk_field(item, "type") != "function_call":
+            continue
+        call_id = _chunk_field(item, "call_id")
+        name = _chunk_field(item, "name")
+        arguments_raw = _chunk_field(item, "arguments")
+        call, missing = _native_call_from_parts(call_id, name, arguments_raw)
+        if missing == NATIVE_PROTOCOL_MISSING_CALL_ID:
+            missing_id = True
+            continue
+        if missing == NATIVE_PROTOCOL_MISSING_TOOL_NAME:
+            missing_name = True
+            continue
+        assert call is not None
+        calls.append(call)
+    return calls, missing_id, missing_name
 
 
 # Provider-failure normalization (F1). LiteLLM 1.104.0 library source
@@ -465,6 +716,244 @@ class LiteLLMClient:
             _parse_json_dict(completion.value)
             if isinstance(completion.value, str)
             else completion.value
+        )
+
+    async def complete_native(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[NativeToolSpec],
+        system: str | None = None,
+        **kwargs: Any,
+    ) -> NativeCompletion:
+        """Native tool-calling completion; text without calls is terminal input."""
+        if not isinstance(messages, list) or not isinstance(tools, list):
+            raise ValueError("complete_native requires messages and tools lists")
+        for spec in tools:
+            if not isinstance(spec, NativeToolSpec):
+                raise ValueError("complete_native tools must be NativeToolSpec")
+        for message in messages:
+            if not isinstance(message, dict):
+                raise ValueError("complete_native messages must be dicts")
+        if self._is_chatgpt_subscription:
+            return await self._responses_complete_native(
+                messages, tools, system=system, kwargs=kwargs
+            )
+        return await self._chat_complete_native(
+            messages, tools, system=system, kwargs=kwargs
+        )
+
+    async def _chat_complete_native(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[NativeToolSpec],
+        *,
+        system: str | None,
+        kwargs: dict[str, Any],
+    ) -> NativeCompletion:
+        import litellm
+
+        full_messages = ([{"role": "system", "content": system}] if system else []) + messages
+        call_kwargs = self._call_kwargs(kwargs)
+        call_kwargs.pop("previous_response_id", None)
+        call_kwargs.pop("tools", None)
+        tools_param = _chat_tools_param(tools)
+        if tools_param is not None:
+            call_kwargs["tools"] = tools_param
+        try:
+            response = await litellm.acompletion(
+                model=self._model,
+                messages=full_messages,
+                api_key=self._api_key,
+                **call_kwargs,
+            )
+        except LLMProviderFailure:
+            raise
+        except Exception as exc:
+            raise _normalize_provider_error(exc) from exc
+        try:
+            message = response.choices[0].message
+        except (AttributeError, IndexError, TypeError) as exc:
+            raise _normalize_provider_error(exc) from exc
+        content = _chunk_field(message, "content") or ""
+        raw_calls = _chunk_field(message, "tool_calls")
+        calls, missing_id, missing_name = _normalize_chat_tool_calls(raw_calls)
+        return _build_native_completion(
+            calls=calls,
+            text=content,
+            total_tokens=_extract_total_tokens(response),
+            missing_call_id=missing_id,
+            missing_tool_name=missing_name,
+        )
+
+    async def _responses_complete_native(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[NativeToolSpec],
+        *,
+        system: str | None,
+        kwargs: dict[str, Any],
+    ) -> NativeCompletion:
+        import litellm
+
+        converted = _responses_input_from_chat(messages)
+        call_kwargs: dict[str, Any] = self._call_kwargs(kwargs)
+        call_kwargs.pop("messages", None)
+        call_kwargs.pop("previous_response_id", None)
+        call_kwargs.pop("tools", None)
+        call_kwargs.pop("response_format", None)
+        call_kwargs.pop("text", None)
+        call_kwargs.pop("text_format", None)
+        call_kwargs.setdefault("stream", True)
+        streaming = bool(call_kwargs.get("stream"))
+        tools_param = _responses_tools_param(tools)
+        if tools_param is not None:
+            call_kwargs["tools"] = tools_param
+        try:
+            response = await litellm.aresponses(
+                model=self._model,
+                input=converted,
+                instructions=system,
+                api_key=self._api_key,
+                **call_kwargs,
+            )
+        except LLMProviderFailure:
+            raise
+        except Exception as exc:
+            raise _normalize_provider_error(exc) from exc
+        try:
+            if not streaming:
+                status = _chunk_field(response, "status")
+                if status != "completed":
+                    raise _stream_protocol_failure()
+                text = _responses_output_text(response) or ""
+                output = _chunk_field(response, "output")
+                calls, missing_id, missing_name = _normalize_responses_output_items(
+                    output
+                )
+                return _build_native_completion(
+                    calls=calls,
+                    text=text,
+                    total_tokens=None,
+                    missing_call_id=missing_id,
+                    missing_tool_name=missing_name,
+                )
+            return await self._accumulate_responses_stream_native(response)
+        except LLMProviderFailure:
+            raise
+        except Exception as exc:
+            raise _normalize_provider_error(exc) from exc
+
+    async def _accumulate_responses_stream_native(self, response: Any) -> NativeCompletion:
+        """Accumulate text plus function-call items from a Responses stream."""
+        text_parts: list[str] = []
+        pending: dict[Any, dict[str, Any]] = {}
+        completed = False
+
+        def _pending_key(output_index: Any, item_id: Any) -> Any:
+            if isinstance(output_index, int) and not isinstance(output_index, bool):
+                return ("index", output_index)
+            if isinstance(item_id, str) and item_id:
+                return ("item", item_id)
+            return None
+
+        async for chunk in cast(AsyncIterator[Any], response):
+            event_type = _chunk_field(chunk, "type")
+            if event_type == "response.completed":
+                completed = True
+            elif event_type in ("response.failed", "error"):
+                raise _stream_protocol_failure()
+            elif event_type == "response.incomplete":
+                raise _stream_protocol_failure()
+            elif event_type == "response.output_text.delta":
+                delta = _chunk_field(chunk, "delta")
+                if isinstance(delta, str) and delta:
+                    text_parts.append(delta)
+            elif event_type == "response.output_item.added":
+                item = _chunk_field(chunk, "item")
+                if _chunk_field(item, "type") != "function_call":
+                    continue
+                key = _pending_key(
+                    _chunk_field(chunk, "output_index"), _chunk_field(chunk, "item_id")
+                )
+                if key is None:
+                    continue
+                entry = pending.setdefault(key, {"args_parts": [], "final_args": None})
+                call_id = _chunk_field(item, "call_id")
+                if isinstance(call_id, str) and call_id:
+                    entry["call_id"] = call_id
+                name = _chunk_field(item, "name")
+                if isinstance(name, str) and name:
+                    entry["name"] = name
+                arguments = _chunk_field(item, "arguments")
+                if isinstance(arguments, str) and arguments:
+                    entry["final_args"] = arguments
+            elif event_type == "response.function_call_arguments.delta":
+                key = _pending_key(
+                    _chunk_field(chunk, "output_index"), _chunk_field(chunk, "item_id")
+                )
+                if key is None:
+                    continue
+                entry = pending.setdefault(key, {"args_parts": [], "final_args": None})
+                delta = _chunk_field(chunk, "delta")
+                if isinstance(delta, str) and delta:
+                    entry["args_parts"].append(delta)
+            elif event_type == "response.function_call_arguments.done":
+                key = _pending_key(
+                    _chunk_field(chunk, "output_index"), _chunk_field(chunk, "item_id")
+                )
+                if key is None:
+                    continue
+                entry = pending.setdefault(key, {"args_parts": [], "final_args": None})
+                arguments = _chunk_field(chunk, "arguments")
+                if isinstance(arguments, str):
+                    entry["final_args"] = arguments
+            elif event_type == "response.output_item.done":
+                item = _chunk_field(chunk, "item")
+                if _chunk_field(item, "type") != "function_call":
+                    continue
+                key = _pending_key(
+                    _chunk_field(chunk, "output_index"), _chunk_field(chunk, "item_id")
+                )
+                if key is None:
+                    continue
+                entry = pending.setdefault(key, {"args_parts": [], "final_args": None})
+                call_id = _chunk_field(item, "call_id")
+                if isinstance(call_id, str) and call_id:
+                    entry["call_id"] = call_id
+                name = _chunk_field(item, "name")
+                if isinstance(name, str) and name:
+                    entry["name"] = name
+                arguments = _chunk_field(item, "arguments")
+                if isinstance(arguments, str) and arguments:
+                    entry["final_args"] = arguments
+        if not completed:
+            raise _stream_protocol_failure()
+        calls: list[NativeToolCall] = []
+        missing_id = False
+        missing_name = False
+        for entry in pending.values():
+            final_args = entry.get("final_args")
+            if final_args is None:
+                parts = entry.get("args_parts", [])
+                joined = "".join(part for part in parts if isinstance(part, str))
+                final_args = joined if joined else "{}"
+            call, missing = _native_call_from_parts(
+                entry.get("call_id"), entry.get("name"), final_args
+            )
+            if missing == NATIVE_PROTOCOL_MISSING_CALL_ID:
+                missing_id = True
+                continue
+            if missing == NATIVE_PROTOCOL_MISSING_TOOL_NAME:
+                missing_name = True
+                continue
+            assert call is not None
+            calls.append(call)
+        return _build_native_completion(
+            calls=calls,
+            text="".join(text_parts),
+            total_tokens=None,
+            missing_call_id=missing_id,
+            missing_tool_name=missing_name,
         )
 
     async def _chatgpt_stream_text(

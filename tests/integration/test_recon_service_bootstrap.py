@@ -12,6 +12,7 @@ Plane -> tool call -> Result Mapper -> ENDPOINT -> Web/API reactivation.
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from typing import Any
 
@@ -31,6 +32,17 @@ from redteam.core.contracts.engagement import (
 from redteam.core.contracts.tool import ToolDescriptor
 from redteam.core.enums import GraphNodeType, RiskLevel, ToolHealthStatus
 from redteam.core.ids import EngagementId, ToolId
+from redteam.core.ports.llm import NativeCompletion, NativeToolCall
+from redteam.orchestration.local_tools import LocalToolRegistry
+from redteam.orchestration.native_binding import exposed_tool_name
+from redteam.orchestration.native_local_tools import (
+    GOAL_SETTLE_TOOL_ID,
+    TASK_SETTLE_TOOL_ID,
+    goal_settle_descriptor,
+    goal_settle_handler,
+    task_settle_descriptor,
+    task_settle_handler,
+)
 from redteam.orchestration.settings import OrchestrationSettings
 from tests.fakes import DummyToolGateway, build_test_application
 from tests.fakes.evidence_store import FakeEvidenceStore
@@ -38,8 +50,51 @@ from tests.fakes.evidence_store import FakeEvidenceStore
 pytestmark = pytest.mark.asyncio
 
 
+def _native_tool_registry() -> LocalToolRegistry:
+    registry = LocalToolRegistry()
+    registry.register(task_settle_descriptor(), task_settle_handler)
+    registry.register(goal_settle_descriptor(), goal_settle_handler)
+    return registry
+
+
+def _exposed_names(tools: list[Any]) -> set[str]:
+    return {str(getattr(spec, "name", "")) for spec in tools}
+
+
+def _remote_executed_evidence(messages: list[dict[str, Any]]) -> list[str]:
+    found: list[str] = []
+    for message in messages:
+        if message.get("role") != "tool" or not message.get("tool_call_id"):
+            continue
+        try:
+            body = json.loads(message.get("content") or "{}")
+        except ValueError:
+            continue
+        if not isinstance(body, dict) or body.get("ok") is not True:
+            continue
+        if body.get("executed") is not True:
+            continue
+        for identity in body.get("evidence_ids") or []:
+            text = str(identity)
+            if text and text not in found:
+                found.append(text)
+    return found
+
+
+def _tool_result(messages: list[dict[str, Any]], call_id: str) -> dict[str, Any] | None:
+    for message in messages:
+        if message.get("role") != "tool" or message.get("tool_call_id") != call_id:
+            continue
+        try:
+            body = json.loads(message.get("content") or "{}")
+        except ValueError:
+            return None
+        return body if isinstance(body, dict) else None
+    return None
+
+
 class _BootstrapLLM:
-    """Explicit plan for stalled-service recovery: recon probe then web."""
+    """Native script for stalled-service recovery: recon probe then web."""
 
     def __init__(
         self,
@@ -49,22 +104,18 @@ class _BootstrapLLM:
         self._graph = graph_store
         self._evidence = evidence_store
         self.calls: list[dict[str, Any]] = []
+        self.reviews: list[str] = []
+        self.turns = 0
+        self._task_call: str | None = None
+        self._goal_call: str | None = None
 
     @staticmethod
     def _route_key(schema: dict[str, Any]) -> str:
         props = schema.get("properties", {})
-        if "steps" in props:
-            return "path_draft"
-        if "decision" in props:
-            return "path_review"
-        if "mode" in props:
-            return "next_action"
         if "criteria" in props:
             return "goal_completion_review"
         if "claims" in props:
             return "task_completion_review"
-        if "accepted" in props:
-            return "completion_review"
         if "claim_supported" in props:
             return "analysis_verify"
         return "unknown"
@@ -76,55 +127,7 @@ class _BootstrapLLM:
         system: str | None = None,
         **kwargs: Any,
     ) -> str:
-        return ""
-
-    async def _host_id(self) -> str:
-        nodes = await self._graph.list_nodes()
-        for n in nodes:
-            s = str(getattr(n, "id", ""))
-            if s == "host:a.local":
-                return s
-        for n in nodes:
-            t = getattr(n, "type", None)
-            tv = getattr(t, "value", t)
-            if tv == "host":
-                return str(n.id)
-        return "host:a.local"
-
-    def _draft(self, host_id: str) -> dict[str, Any]:
-        # Minimal model draft: purpose + steps only. Runtime identity is code-owned.
-        crit = {"kind": "evidence", "description": "tool evidence recorded", "min_evidence": 1}
-        return {
-            "reason": "scripted recovery plan",
-            "steps": [
-                {
-                    "step_id": "step-1",
-                    "objective": "probe stalled host",
-                    "agent_id": "recon-agent",
-                    "target_node_ids": [host_id],
-                    "principal_refs": [],
-                    "allowed_operations": ["recon.service_discovery"],
-                    "depends_on": [],
-                    "required_fact_refs": [],
-                    "unknowns": [],
-                    "completion_criteria": [crit],
-                    "required": True,
-                },
-                {
-                    "step_id": "step-2",
-                    "objective": "inspect recovered surface",
-                    "agent_id": "web-api-agent",
-                    "target_node_ids": [host_id],
-                    "principal_refs": [],
-                    "allowed_operations": ["web.http_request"],
-                    "depends_on": [],
-                    "required_fact_refs": [],
-                    "unknowns": [],
-                    "completion_criteria": [crit],
-                    "required": True,
-                },
-            ],
-        }
+        raise AssertionError("native loop must not use free-text completion")
 
     async def complete_structured(
         self,
@@ -135,41 +138,30 @@ class _BootstrapLLM:
         num_retries: int = 0,
         **kwargs: Any,
     ) -> dict[str, Any]:
-        import json as _json
-
         route = self._route_key(response_schema or {})
         self.calls.append({"route": route})
-        if route == "path_draft":
-            return self._draft(await self._host_id())
-        if route == "path_review":
-            return {"decision": "accept", "reason": "scripted accept", "path": None}
-        if route == "completion_review":
-            # Step review keeps the old accepted/reason shape (no claims).
-            return {"accepted": True, "reason": "scripted accept"}
+        self.reviews.append(route)
+        if route == "analysis_verify":
+            return {
+                "meaning": "scripted",
+                "outcome": "success",
+                "reason": "scripted",
+                "confidence": 0.8,
+                "claim_supported": True,
+            }
         if route == "task_completion_review":
-            # Task review: accepted/reason/claims with actual evidence ids.
             assert messages is not None
-            payload = _json.loads(messages[0]["content"])
-            run_id = (payload.get("path") or {}).get("run_id", "")
-            run_id = run_id or payload.get("active_path", {}).get("run_id", "")
-            recs = await self._evidence.list_for_run(run_id) if run_id else []
-            tool_ids = [
-                str(r.evidence_id)
-                for r in recs
-                if isinstance(getattr(r, "metadata", {}).get("tool_result"), dict)
-            ]
-            receipts = list(tool_ids)
-            for st in (payload.get("path") or {}).get("steps", []):
-                receipts.extend(st.get("evidence_ids", []))
-            receipts = list(dict.fromkeys(receipts))
+            payload = json.loads(messages[0]["content"])
+            receipts = list(payload.get("verified_source_ids", []))
+            assert receipts, "task review needs the verified executed call evidence"
             return {
                 "accepted": True,
-                "reason": "scripted accept",
+                "reason": "scripted semantic accept",
                 "claims": [
                     {
                         "description": "recon tool result observed",
                         "kind": "observation",
-                        "evidence_ids": receipts,
+                        "evidence_ids": list(receipts),
                         "target_node_ids": [],
                         "principal_refs": [],
                     }
@@ -177,22 +169,12 @@ class _BootstrapLLM:
             }
         if route == "goal_completion_review":
             assert messages is not None
-            payload = _json.loads(messages[0]["content"])
+            payload = json.loads(messages[0]["content"])
             criteria = payload.get("mission", {}).get("success_criteria", []) or [
                 "map the in-scope host"
             ]
-            receipts = []
-            for st in payload.get("path", {}).get("steps", []):
-                receipts.extend(st.get("evidence_ids", []))
-            if not receipts:
-                active_id = payload.get("active_path", {}).get("run_id", "")
-                path_id = (payload.get("path") or {}).get("run_id", "")
-                recs = await self._evidence.list_for_run(active_id or path_id)
-                receipts = [
-                    str(r.evidence_id)
-                    for r in recs
-                    if isinstance(getattr(r, "metadata", {}).get("tool_result"), dict)
-                ]
+            receipts = list(payload.get("verified_source_ids", []))
+            assert receipts, "goal review needs the verified executed call evidence"
             return {
                 "accepted": True,
                 "reason": "scripted goal accept",
@@ -214,92 +196,90 @@ class _BootstrapLLM:
                     for c in criteria
                 ],
             }
-        if route == "analysis_verify":
-            return {
-                "meaning": "scripted",
-                "outcome": "success",
-                "reason": "scripted",
-                "confidence": 0.8,
-                "claim_supported": True,
-            }
-        if route == "next_action":
-            assert messages is not None
-            payload = _json.loads(messages[0]["content"])
-            run_id = (payload.get("active_path") or {}).get("run_id", "")
-            host_id = await self._host_id()
-            recs = await self._evidence.list_for_run(run_id) if run_id else []
-            tool_recs = [
-                r for r in recs if isinstance(getattr(r, "metadata", {}).get("tool_result"), dict)
-            ]
-            if len(tool_recs) == 0:
-                return {
-                    "mode": "actions",
-                    "reason": "scripted recon probe",
-                    "actions": [
-                        {
-                            "path_step_id": "step-1",
-                            "agent_id": "recon-agent",
-                            "target_node_id": host_id,
-                            "principal_ref": None,
-                            "capability": "recon",
-                            "operation": "service_discovery",
-                            "tool_id": "recon.http_probe",
-                            "arguments": {"target_ref": "a.local", "path": "/"},
-                            "reason": "probe stalled host",
-                            "expected_observation": "probe returns",
-                            "hypothesis": None,
-                            "existing_hypothesis_id": None,
-                            "expectation": None,
-                            "authentication_check": None,
-                            "availability_impact": False,
-                        }
-                    ],
-                    "path": None,
-                    "path_step_id": None,
-                    "completion": {},
-                    "evidence_request": {},
-                    "hypothesis_update": {},
-                }
-            if len(tool_recs) == 1:
-                return {
-                    "mode": "actions",
-                    "reason": "scripted web followup",
-                    "actions": [
-                        {
-                            "path_step_id": "step-2",
-                            "agent_id": "web-api-agent",
-                            "target_node_id": host_id,
-                            "principal_ref": None,
-                            "capability": "web",
-                            "operation": "http_request",
-                            "tool_id": "web.http_request",
-                            "arguments": {"target_ref": "a.local", "path": "/", "method": "GET"},
-                            "reason": "inspect recovered endpoint",
-                            "expected_observation": "endpoint answers",
-                            "hypothesis": None,
-                            "existing_hypothesis_id": None,
-                            "expectation": None,
-                            "authentication_check": None,
-                            "availability_impact": False,
-                        }
-                    ],
-                    "path": None,
-                    "path_step_id": None,
-                    "completion": {},
-                    "evidence_request": {},
-                    "hypothesis_update": {},
-                }
-            return {
-                "mode": "hold",
-                "reason": "scripted recovery done",
-                "actions": [],
-                "path": None,
-                "path_step_id": None,
-                "completion": {},
-                "evidence_request": {},
-                "hypothesis_update": {},
-            }
-        raise AssertionError(f"no scripted answer for {route}")
+        raise AssertionError(f"legacy strategy route is not part of the native loop: {route!r}")
+
+    async def complete_native(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[Any],
+        system: str | None = None,
+        **_: Any,
+    ) -> NativeCompletion:
+        names = _exposed_names(tools)
+        recon = exposed_tool_name("recon.http_probe")
+        web = exposed_tool_name("web.http_request")
+        task_tool = exposed_tool_name(TASK_SETTLE_TOOL_ID)
+        goal_tool = exposed_tool_name(GOAL_SETTLE_TOOL_ID)
+        assert recon in names, "native model needs the recon probe tool"
+        assert web in names, "native model needs the web request tool"
+        assert task_tool in names, "native model needs the task settlement helper"
+        assert goal_tool in names, "native model needs the goal settlement helper"
+        self.turns += 1
+        evidenced = _remote_executed_evidence(messages)
+        if self.turns == 1:
+            self.calls.append({"turn": self.turns, "tool_calls": [recon]})
+            return NativeCompletion(
+                tool_calls=(
+                    NativeToolCall(
+                        call_id="call-recon-1",
+                        name=recon,
+                        arguments={"target_ref": "a.local", "path": "/"},
+                    ),
+                ),
+                text="",
+            )
+        if self.turns == 2:
+            assert evidenced, "web followup needs the recon probe evidence"
+            self.calls.append({"turn": self.turns, "tool_calls": [web]})
+            return NativeCompletion(
+                tool_calls=(
+                    NativeToolCall(
+                        call_id="call-web-1",
+                        name=web,
+                        arguments={"target_ref": "a.local", "path": "/", "method": "GET"},
+                    ),
+                ),
+                text="",
+            )
+        if self._task_call is None:
+            assert evidenced, "task settlement needs the executed call evidence"
+            self._task_call = "call-task-settle"
+            self.calls.append({"turn": self.turns, "tool_calls": [task_tool]})
+            return NativeCompletion(
+                tool_calls=(
+                    NativeToolCall(
+                        call_id=self._task_call,
+                        name=task_tool,
+                        arguments={
+                            "outcome": "success",
+                            "reason": "recon and web evidence ready",
+                            "evidence_ids": evidenced,
+                        },
+                    ),
+                ),
+                text="",
+            )
+        seen = _tool_result(messages, self._task_call)
+        if seen is None or seen.get("ok") is not True:
+            return NativeCompletion(tool_calls=(), text="")
+        if self._goal_call is None:
+            self._goal_call = "call-goal-settle"
+            self.calls.append({"turn": self.turns, "tool_calls": [goal_tool]})
+            return NativeCompletion(
+                tool_calls=(
+                    NativeToolCall(
+                        call_id=self._goal_call,
+                        name=goal_tool,
+                        arguments={
+                            "outcome": "success",
+                            "reason": "recovery evidence ready",
+                            "evidence_ids": evidenced,
+                        },
+                    ),
+                ),
+                text="",
+            )
+        return NativeCompletion(tool_calls=(), text="")
 
 
 _HTTP_PROBE_OUTPUT = {
@@ -340,11 +320,16 @@ def _gateway() -> DummyToolGateway:
         risk_level=RiskLevel.LOW,
         health_status=ToolHealthStatus.HEALTHY,
     )
+    # Native binding resolves the execution target from arguments plus the
+    # descriptor's declared kinds (the legacy path supplied explicit node
+    # ids, so these doubles never needed kinds). The recovery probe inspects
+    # the discovered endpoint, so the web double declares the endpoint kind.
     web_tool = ToolDescriptor(
         tool_id=ToolId("web.http_request"),
         server_id="test",
         tool_name="http_request",
         operations=['http_request'],
+        target_types=["endpoint"],
         input_schema={
             "type": "object",
             "properties": {
@@ -394,11 +379,13 @@ async def test_a_stalled_service_only_graph_is_recovered_and_web_runs() -> None:
     deps = build_test_application(
         tool_gateway=gateway,
         tool_catalog=gateway,
-        settings=OrchestrationSettings(max_steps=20),
+        settings=OrchestrationSettings(max_steps=20, decision_max_attempts=6),
         graph_store=graph_store,
         evidence_store=evidence_store,
         llm_client=llm,
     )
+    deps.local_tools.register(task_settle_descriptor(), task_settle_handler)
+    deps.local_tools.register(goal_settle_descriptor(), goal_settle_handler)
     graph = AttackGraphService(deps.graph_store)
     await _seed_stalled_service(graph)
 
@@ -431,11 +418,13 @@ async def test_the_bootstrap_does_not_repeat_once_the_endpoint_exists() -> None:
     deps = build_test_application(
         tool_gateway=gateway,
         tool_catalog=gateway,
-        settings=OrchestrationSettings(max_steps=20),
+        settings=OrchestrationSettings(max_steps=20, decision_max_attempts=6),
         graph_store=graph_store,
         evidence_store=evidence_store,
         llm_client=llm,
     )
+    deps.local_tools.register(task_settle_descriptor(), task_settle_handler)
+    deps.local_tools.register(goal_settle_descriptor(), goal_settle_handler)
     graph = AttackGraphService(deps.graph_store)
     await _seed_stalled_service(graph)
 

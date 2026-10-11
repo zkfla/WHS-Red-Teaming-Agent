@@ -16,11 +16,20 @@ import asyncio
 from dataclasses import replace
 from datetime import datetime, timezone
 
+import pytest
+
 from redteam.attack_graph.identity import host_node_id
 from redteam.capability.action_binding import BUILTIN_RETRY_POLICY
 from redteam.core.contracts.action import ActionProposal
 from redteam.core.contracts.target import HostTarget
-from redteam.core.contracts.tool import ToolDescriptor, ToolError, ToolInvocation, ToolResult
+from redteam.core.contracts.tool import (
+    EXECUTION_STARTED_METADATA_KEY,
+    EXECUTION_UNCERTAIN_METADATA_KEY,
+    ToolDescriptor,
+    ToolError,
+    ToolInvocation,
+    ToolResult,
+)
 from redteam.core.enums import PolicyVerdict, RiskLevel
 from redteam.core.ids import ActionId, AgentId, EngagementId, RunId, ToolId
 from redteam.orchestration.agents import PlanStep
@@ -289,6 +298,78 @@ async def test_retryable_low_risk_failure_is_retried_and_recovers() -> None:
     assert state["runtime"].retry_count == 1
     # One action + one retry charged against the local budget mirror.
     assert state["runtime"].remaining_budget == 3
+
+
+async def test_lost_result_after_retry_preserves_extra_call_charge_on_restart() -> None:
+    from redteam.orchestration.execution_reconciliation import reconcile_execution_receipts
+    from tests.fakes import FakeEvidenceStore
+
+    gateway = _FlakyGateway(fail_times=1)
+    deps = build_test_application(
+        tool_gateway=gateway, tool_catalog=gateway,
+        settings=OrchestrationSettings(max_retries=1),
+    )
+    await execute(deps, remaining_budget=5)
+    assert len(gateway.invocations) == 2
+    before_result = FakeEvidenceStore()
+    for record in await deps.evidence_store.list_for_run(RUN):
+        if record.metadata.get("receipt_kind") in {
+            "execution_submission", "execution_retry_admission",
+        }:
+            await before_result.append(record)
+    assert len(before_result.records) == 2
+    recovering = replace(deps, evidence_store=before_result)
+    held = await reconcile_execution_receipts(recovering, runtime(remaining_budget=5))
+    assert not held.ready and len(held.pending_invocations) == 1
+    assert held.runtime.actions_executed == 1 and held.runtime.retry_tool_calls == 1
+    assert held.runtime.remaining_budget == 3
+    again = await reconcile_execution_receipts(recovering, held.runtime)
+    assert again.runtime.actions_executed == 1 and again.runtime.retry_tool_calls == 1
+    assert again.runtime.remaining_budget == 3
+    assert len(gateway.invocations) == 2
+
+
+@pytest.mark.parametrize("marker", [EXECUTION_UNCERTAIN_METADATA_KEY, "orchestration_exception"])
+async def test_uncertain_outcome_is_not_automatically_retried(marker) -> None:
+    class UncertainGateway(_FlakyGateway):
+        async def invoke(self, invocation):
+            result = await super().invoke(invocation)
+            return result.model_copy(update={"metadata": {marker: True}})
+
+    gateway = UncertainGateway(fail_times=1)
+    deps = build_test_application(
+        tool_gateway=gateway, tool_catalog=gateway,
+        settings=OrchestrationSettings(max_retries=3),
+    )
+    state = await execute(deps, remaining_budget=5)
+    result = state["tool_result"]
+    assert result is not None and not result.success
+    assert result.metadata[marker] is True
+    assert len(gateway.invocations) == 1
+    assert state["runtime"].retry_count == 0
+    assert state["runtime"].remaining_budget == 4
+
+
+@pytest.mark.parametrize("earlier_started", [False, True])
+async def test_prestart_failure_counts_no_action_and_preserves_earlier_attempt(earlier_started):
+    class QueueFailureGateway(_FlakyGateway):
+        async def invoke(self, invocation):
+            result = await super().invoke(invocation)
+            started = earlier_started and self.attempts == 1
+            return result.model_copy(update={"metadata": {EXECUTION_STARTED_METADATA_KEY: started}})
+
+    gateway = QueueFailureGateway(fail_times=10)
+    deps = build_test_application(
+        tool_gateway=gateway, tool_catalog=gateway,
+        settings=OrchestrationSettings(max_retries=1 if earlier_started else 0),
+    )
+    state = await execute(deps, remaining_budget=5)
+    assert state["runtime"].actions_executed == int(earlier_started)
+    assert state["runtime"].remaining_budget == (3 if earlier_started else 5)
+    assert len(gateway.invocations) == (2 if earlier_started else 1)
+    result = state["tool_result"]
+    assert result is not None
+    assert result.metadata[EXECUTION_STARTED_METADATA_KEY] is earlier_started
 
 
 async def test_retry_is_capped_by_max_retries() -> None:

@@ -8,6 +8,7 @@ import sys
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
@@ -40,15 +41,25 @@ from redteam.core.contracts.target import UrlTarget
 from redteam.core.convert import NonAllowDecisionError, build_tool_invocation
 from redteam.core.enums import EvidenceSourceType, GraphNodeType, PolicyVerdict, RiskLevel
 from redteam.core.ids import ActionId, AgentId, EngagementId, GraphNodeId, RunId, ToolId
+from redteam.core.ports.llm import NativeCompletion, NativeToolCall
 from redteam.orchestration.agents.base import AgentSpec
 from redteam.orchestration.agents.llm_provider import LLMCandidateProvider
 from redteam.orchestration.agents.providers import GraphCandidateContext
 from redteam.orchestration.candidates.compiler import CandidateCompiler
+from redteam.orchestration.local_tools import LocalToolRegistry
+from redteam.orchestration.native_binding import exposed_tool_name
+from redteam.orchestration.native_local_tools import (
+    GOAL_SETTLE_TOOL_ID,
+    TASK_SETTLE_TOOL_ID,
+    goal_settle_descriptor,
+    goal_settle_handler,
+    task_settle_descriptor,
+    task_settle_handler,
+)
 from redteam.orchestration.settings import OrchestrationSettings
 from redteam.orchestration.state import TerminationReason
 from tests.fakes import build_test_application
-from tests.integration._engine_llm_harness import ScriptedLLM, review_accept
-from tests.integration.test_execution_agent_e2e import draft_path, hold, turn_action
+from tests.integration import _engine_llm_harness as h
 from tests.integration.test_page_text_mcp import (
     InProcessTransport,
     _reader,
@@ -102,6 +113,132 @@ async def configured_gateway(tmp_path, monkeypatch):
     )
     gateway = await build_mcp_tool_gateway(list(transports), health_refresh_enabled=False)
     return gateway, page_calls, search_provider
+
+
+def _native_tool_registry() -> LocalToolRegistry:
+    registry = LocalToolRegistry()
+    registry.register(task_settle_descriptor(), task_settle_handler)
+    registry.register(goal_settle_descriptor(), goal_settle_handler)
+    return registry
+
+
+def _exposed_names(tools: list[Any]) -> set[str]:
+    return {str(getattr(spec, "name", "")) for spec in tools}
+
+
+class _WebNativeLLM:
+    """One genuine native web tool call, then hold. Reviews stay genuine."""
+
+    def __init__(self, *, tool_id: str, arguments: dict[str, Any]) -> None:
+        self._tool_id = tool_id
+        self._arguments = dict(arguments)
+        self.turns = 0
+        self.native_turns: list[dict[str, Any]] = []
+        self.reviews: list[str] = []
+        self.last_messages: list[dict[str, Any]] = []
+
+    @staticmethod
+    def _route_key(schema: dict[str, Any]) -> str:
+        props = schema.get("properties", {})
+        if "criteria" in props:
+            return "goal_completion_review"
+        if "claims" in props:
+            return "task_completion_review"
+        if "claim_supported" in props:
+            return "analysis_verify"
+        return "unknown"
+
+    async def complete_structured(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        response_schema: dict[str, Any],
+        system: str | None = None,
+        **_: Any,
+    ) -> dict[str, Any]:
+        route = self._route_key(response_schema)
+        self.reviews.append(route)
+        if route == "analysis_verify":
+            return h.meaning("success", True)
+        if route == "task_completion_review":
+            payload = json.loads(messages[0]["content"])
+            receipts = list(payload["verified_source_ids"])
+            assert receipts, "task review needs the verified executed call evidence"
+            return {
+                "accepted": True,
+                "reason": "scripted semantic accept",
+                "claims": [
+                    {
+                        "description": "web tool result observed",
+                        "kind": "observation",
+                        "evidence_ids": list(receipts),
+                        "target_node_ids": [],
+                        "principal_refs": [],
+                    }
+                ],
+            }
+        if route == "goal_completion_review":
+            payload = json.loads(messages[0]["content"])
+            criteria = payload["mission"]["success_criteria"]
+            receipts = list(payload["verified_source_ids"])
+            assert receipts, "goal review needs the verified executed call evidence"
+            return {
+                "accepted": True,
+                "reason": "scripted goal accept",
+                "criteria": [
+                    {
+                        "criterion": item,
+                        "met": True,
+                        "evidence_ids": list(receipts),
+                        "claims": [
+                            {
+                                "description": "web tool result observed",
+                                "kind": "observation",
+                                "evidence_ids": list(receipts),
+                                "target_node_ids": [],
+                                "principal_refs": [],
+                            }
+                        ],
+                    }
+                    for item in criteria
+                ],
+            }
+        raise AssertionError(f"legacy strategy route is not part of the native loop: {route!r}")
+
+    async def complete_native(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[Any],
+        system: str | None = None,
+        **_: Any,
+    ) -> NativeCompletion:
+        names = _exposed_names(tools)
+        self.last_messages = list(messages)
+        self.turns += 1
+        self.native_turns.append({"turn": self.turns, "tool_names": sorted(names)})
+        remote = exposed_tool_name(self._tool_id)
+        task_settle = exposed_tool_name(TASK_SETTLE_TOOL_ID)
+        goal_settle = exposed_tool_name(GOAL_SETTLE_TOOL_ID)
+        assert remote in names, "native model needs the registered web tool"
+        assert task_settle in names, "native model needs the task settlement helper"
+        assert goal_settle in names, "native model needs the goal settlement helper"
+        if self.turns == 1:
+            return NativeCompletion(
+                tool_calls=(
+                    NativeToolCall(
+                        call_id="call-web-1",
+                        name=remote,
+                        arguments=dict(self._arguments),
+                    ),
+                ),
+                text="",
+            )
+        return NativeCompletion(tool_calls=(), text="")
+
+    async def complete(
+        self, *, messages: list[dict[str, Any]], system: str | None = None, **_: Any
+    ) -> str:
+        return ""
 
 
 @pytest.mark.parametrize("operation", ["page_read", "web_search"])
@@ -258,25 +395,12 @@ async def test_accepted_path_engine_executes_c_profile_and_records_evidence(
         approval_policy=ApprovalPolicy(auto_approve_up_to=RiskLevel.LOW),
         created_at=datetime.now(timezone.utc),
     )
-    path = draft_path()
-    path["goal"] = "read approved public reference"
-    path["steps"][0].update(
-        agent_id="web-api-agent", target_node_ids=[node_id], allowed_operations=[f"web.{operation}"]
-    )
-    turn = turn_action()
-    turn["actions"][0].update(
-        agent_id="web-api-agent",
-        target_node_id=node_id,
-        capability="web",
-        operation=operation,
-        tool_id=tool_id,
+    resolved = gateway.get(ToolId(tool_id))
+    assert resolved is not None
+    llm = _WebNativeLLM(
+        tool_id=str(resolved.tool_id),
         arguments={"url": target.url} if operation == "page_read" else {"query": QUERY},
     )
-    llm = ScriptedLLM()
-    llm.add("path_draft", path)
-    llm.add("path_review", review_accept())
-    llm.add("next_action", turn)
-    llm.add("next_action", hold())
     control = DefaultControlPlane(
         {configured.engagement_id: configured},
         risk_resolver=RegistryRiskResolver(gateway),
@@ -291,6 +415,7 @@ async def test_accepted_path_engine_executes_c_profile_and_records_evidence(
             settings=OrchestrationSettings(max_steps=12, checkpointing=False),
         ),
         engagement=configured,
+        local_tools=_native_tool_registry(),
     )
     graph = AttackGraphService(deps.graph_store)
     await graph.upsert_node(
@@ -305,21 +430,30 @@ async def test_accepted_path_engine_executes_c_profile_and_records_evidence(
         ),
     )
     final = await run_engagement(configured, deps=deps, run_id=run_id)
-    assert final.termination_reason == TerminationReason.INVESTIGATION_HELD, "\n".join(
-        call["messages"][0]["content"][-500:] for call in llm.calls
+    assert final.termination_reason == TerminationReason.INVESTIGATION_HELD, (
+        f"turns={llm.turns} reviews={llm.reviews} diag={final.planning_diagnostic!r}"
     )
-    assert final.actions_executed == 1
+    work_items = await deps.work_store.list_items(run_id=final.run_id)
+    work_debug = [
+        (str(w.work_id), str(w.status), str(getattr(w, "model_tool_call_id", "")))
+        for w in work_items
+    ]
+    tool_msgs = [
+        str(m.get("content", ""))[:800]
+        for m in llm.last_messages
+        if m.get("role") == "tool"
+    ]
+    assert final.actions_executed == 1, f"work={work_debug} turns={llm.turns} toolmsgs={tool_msgs}"
     assert len(page_calls) == (1 if operation == "page_read" else 0)
     if transport == "in_process":
         assert len(search_provider.calls) == (1 if operation == "web_search" else 0)
     evidence = await deps.evidence_store.list_for_run(run_id)
     tool_evidence = [x for x in evidence if x.source_type is EvidenceSourceType.TOOL]
     assert len(tool_evidence) == 1 and tool_evidence[0].metadata["success"] is True
-    prompt = json.loads(llm.calls[0]["messages"][0]["content"])
-    resolved = gateway.get(ToolId(tool_id))
-    assert resolved is not None
-    shown = [tool for tool in prompt["tools"] if tool["tool_id"] == str(resolved.tool_id)]
-    assert len(shown) == 1 and shown[0]["operations"] == [operation]
+    assert llm.turns >= 1 and llm.native_turns
+    offered = llm.native_turns[0]["tool_names"]
+    assert exposed_tool_name(str(resolved.tool_id)) in offered
+    assert list(resolved.operations) == [operation]
     # Search result URLs are reference material, not new approved targets.
     if operation == "web_search":
         returned = UrlTarget(url="https://docs.example.org/reference")

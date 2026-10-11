@@ -55,10 +55,12 @@ from redteam.core.ids import (
     RunId,
     ToolId,
 )
+from redteam.core.ports.llm import NativeCompletion, NativeToolCall
+from redteam.orchestration.native_binding import exposed_tool_name
 from redteam.orchestration.settings import OrchestrationSettings
 from redteam.orchestration.state import TerminationReason
 from tests.fakes import build_test_application
-from tests.integration._engine_llm_harness import ScriptedLLM, review_accept
+from tests.integration import _engine_llm_harness as h
 
 ASSET = "workspace-test"
 ASSET_NODE = "asset:workspace-test"
@@ -268,32 +270,123 @@ def turn_action() -> dict[str, Any]:
     }
 
 
-def hold() -> dict[str, Any]:
-    return {
-        "mode": "hold",
-        "reason": "execution path evidence captured",
-        "actions": [],
-        "path": None,
-        "path_step_id": None,
-        "completion": {},
-        "evidence_request": {},
-        "hypothesis_update": {},
-    }
+class ExecutionNativeLLM:
+    """Native scripted model: one fixed execution call, then hold.
+
+    Speaks the genuine product contract (complete_native with
+    NativeCompletion/NativeToolCall). complete_structured answers only
+    genuine review routes; any legacy strategy route raises.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+        self.reviews: list[str] = []
+        self.turns = 0
+
+    @staticmethod
+    def _route_key(schema: dict[str, Any]) -> str:
+        props = schema.get("properties", {})
+        if "criteria" in props:
+            return "goal_completion_review"
+        if "claims" in props:
+            return "task_completion_review"
+        if "claim_supported" in props:
+            return "analysis_verify"
+        return "unknown"
+
+    async def complete(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        system: str | None = None,
+        **_: Any,
+    ) -> str:
+        return ""
+
+    async def complete_structured(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        response_schema: dict[str, Any],
+        system: str | None = None,
+        num_retries: int = 0,
+        **_: Any,
+    ) -> dict[str, Any]:
+        route = self._route_key(response_schema)
+        self.reviews.append(route)
+        if route == "analysis_verify":
+            return h.meaning("success", True)
+        if route == "task_completion_review":
+            payload = json.loads(messages[0]["content"])
+            receipts = list(payload.get("verified_source_ids", []))
+            return {
+                "accepted": True,
+                "reason": "scripted semantic accept",
+                "claims": [
+                    {
+                        "description": "execution tool result observed",
+                        "kind": "observation",
+                        "evidence_ids": list(receipts),
+                        "target_node_ids": [],
+                        "principal_refs": [],
+                    }
+                ],
+            }
+        if route == "goal_completion_review":
+            payload = json.loads(messages[0]["content"])
+            criteria = payload.get("mission", {}).get("success_criteria", [])
+            receipts = list(payload.get("verified_source_ids", []))
+            return h.goal_accept(
+                [
+                    {"criterion": c, "met": True, "evidence_ids": list(receipts)}
+                    for c in criteria
+                ]
+            )
+        raise AssertionError(
+            f"legacy strategy route is not part of the native loop: {route!r}"
+        )
+
+    async def complete_native(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[Any],
+        system: str | None = None,
+        **_: Any,
+    ) -> NativeCompletion:
+        names = {str(getattr(spec, "name", "")) for spec in tools}
+        target = exposed_tool_name("analysis.execution.run_command")
+        assert target in names, "native model needs the registered execution tool"
+        self.turns += 1
+        if self.turns == 1:
+            self.calls.append({"turn": 1, "tool": target})
+            return NativeCompletion(
+                tool_calls=(
+                    NativeToolCall(
+                        call_id="call-exec-1",
+                        name=target,
+                        arguments={
+                            "asset_ref": ASSET,
+                            "executable": "wc",
+                            "args": ["-l", "input.txt"],
+                        },
+                    ),
+                ),
+                text="",
+            )
+        self.calls.append({"turn": self.turns, "tool": None})
+        return NativeCompletion(
+            tool_calls=(), text="execution path evidence captured"
+        )
 
 
-def scripted_llm() -> ScriptedLLM:
-    llm = ScriptedLLM()
-    llm.add("path_draft", draft_path())
-    llm.add("path_review", review_accept())
-    llm.add("next_action", turn_action())
-    llm.add("next_action", hold())
-    return llm
+def scripted_llm() -> ExecutionNativeLLM:
+    return ExecutionNativeLLM()
 
 
 async def run_agent_loop(
     configured: Engagement,
     gateway: MCPToolGateway,
-) -> tuple[Any, Any, ScriptedLLM]:
+) -> tuple[Any, Any, ExecutionNativeLLM]:
     llm = scripted_llm()
     deps = build_test_application(
         control_plane=DefaultControlPlane(
@@ -336,8 +429,10 @@ async def test_agent_loop_reaches_execution_mcp_and_records_evidence(
     tool_evidence = [item for item in evidence if item.source_type is EvidenceSourceType.TOOL]
     assert len(tool_evidence) == 1
     assert tool_evidence[0].metadata["success"] is True
-    path_prompt = json.loads(llm.calls[0]["messages"][0]["content"])
-    assert path_prompt["execution_options"][0]["arguments"]["executable"] == "wc"
+    assert llm.calls[0]["tool"] == exposed_tool_name(
+        "analysis.execution.run_command"
+    )
+    assert llm.turns >= 2, "native model holds the investigation after the execution evidence"
 
 
 async def test_roe_exclusion_is_denied_by_control_before_execution(tmp_path: Path) -> None:

@@ -34,6 +34,7 @@ from redteam.orchestration.evidence_access import raw_from_metadata
 from redteam.orchestration.expectations import Expectation, ExpectationOutcome, verdict_for
 from redteam.orchestration.session_proof import (
     actual_receipt_conflict,
+    collect_actual_accounts,
     collect_actual_sessions,
     has_actual_receipt,
 )
@@ -279,6 +280,8 @@ async def claim_target_is_grounded(
     proposal = meta.get("proposal", {})
     try:
         parsed = ActionProposal.model_validate(proposal)
+        if parsed.target is None:
+            return False
         if str(node_id_for_target(parsed.target)) != source:
             return False
     except Exception:
@@ -1290,6 +1293,8 @@ class StructuredLLMAnalysisVerifier:
         expected_target = metadata.get("target_node_id")
         if expected_target is None:
             return "linked evidence names no target"
+        if request.proposal.target is None:
+            return "proposed target cannot be resolved"
         try:
             actual_target = str(node_id_for_target(request.proposal.target))
         except Exception:  # noqa: BLE001 - an unresolvable target is not a match
@@ -1319,7 +1324,12 @@ def _clean_receipt_identity(value: Any) -> str | None:
 
 
 async def _covered_principals_from_sources(store: Any, source_refs: Any) -> list[str]:
-    """Derive account coverage only from comparison raw principal fields."""
+    """Report the accounts the cited sources actually receipted, per unit.
+
+    The same shared actual-use rule the verification and completion paths
+    read: an account counts only beside its unit's own receipt, and a
+    response whose receipts name sessions nobody requested covers nothing.
+    """
     seen: dict[str, None] = {}
     refs = [str(item) for item in (source_refs or []) if str(item).strip()][:8]
     for ref in refs:
@@ -1338,27 +1348,16 @@ async def _covered_principals_from_sources(store: Any, source_refs: Any) -> list
             continue
         if actual_receipt_conflict(metadata, raw) is not None:
             continue
-        candidates: set[str] = set()
-        comparison = metadata.get("session_comparison")
-        output = raw.get("output")
-        units = [comparison, output]
-        if isinstance(output, dict):
-            units.extend(
-                output.get(key)
-                for key in ("first", "second", "authenticated", "anonymous")
-            )
-        for unit in units:
-            if not isinstance(unit, dict):
-                continue
-            for key in ("principal_ref", "first_principal_ref", "second_principal_ref"):
-                candidate = _clean_receipt_identity(unit.get(key))
-                if candidate is not None:
-                    candidates.add(candidate)
         stored = metadata.get("proposal", {})
         args = stored.get("arguments", {}) if isinstance(stored, dict) else {}
-        for candidate in candidates:
-            if _has_raw_account_artifact(metadata, raw, candidate, args):
-                seen[candidate] = None
+        expected_sessions: set[str] = set()
+        if isinstance(args, dict):
+            for key in ("session_ref", "first_session_ref", "second_session_ref"):
+                candidate = _clean_receipt_identity(args.get(key))
+                if candidate is not None:
+                    expected_sessions.add(candidate)
+        for candidate in collect_actual_accounts(metadata, raw, expected_sessions):
+            seen[candidate] = None
     return sorted(seen)
 
 
@@ -1384,7 +1383,9 @@ async def append_review_receipt(
     supersedes them so a stale positive can never be consumed as approval.
     """
     try:
-        target_node: str | None = str(node_id_for_target(proposal.target))
+        target_node: str | None = (
+            str(node_id_for_target(proposal.target)) if proposal.target is not None else None
+        )
     except Exception:
         target_node = None
     supporting, refuting = _receipt_support_assignment(assessment, assessment.source_refs)

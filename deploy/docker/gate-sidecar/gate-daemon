@@ -1,0 +1,3 @@
+#!/bin/sh
+# Sidecar entrypoint wrapper: flat /opt/gate modules, stdio owned by Control.
+exec python3 -c 'import sys; sys.path.insert(0, "/opt/gate"); from gate_daemon import main; sys.exit(main(sys.argv[1:]))' "$@"

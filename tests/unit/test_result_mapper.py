@@ -62,6 +62,49 @@ def test_maps_a_successful_probe_to_service_and_endpoint() -> None:
     assert {e.edge_type for e in mutation.edges} == {GraphEdgeType.HOSTS, GraphEdgeType.EXPOSES}
 
 
+async def test_probe_original_grounds_only_its_measured_endpoint():
+    from redteam.attack_graph.predicates import Confidence, Provenance
+    from redteam.attack_graph.service import AttackGraphService
+    from redteam.attack_graph.stores.memory import InMemoryAttackGraphStore
+    from redteam.core.contracts.action import ActionProposal
+    from redteam.core.convert import tool_result_to_evidence
+    from redteam.core.ids import AgentId, EngagementId, RunId
+    from redteam.orchestration.analysis import claim_target_is_grounded
+
+    target = HostTarget(host="a.local")
+    result = _result(output=_GOOD_OUTPUT)
+    proposal = ActionProposal(
+        action_id=result.action_id, run_id=RunId("probe-run"),
+        engagement_id=EngagementId("probe-eng"),
+        agent_id=AgentId("recon"), binding_mode="selected_tool", tool_id=result.tool_id,
+        target=target, arguments={"path": "/"}, reason="observe HTTP", created_at=NOW,
+    )
+    record = tool_result_to_evidence(
+        result, run_id=proposal.run_id, engagement_id=proposal.engagement_id,
+        hypothesis_id=None, summary="probe observed",
+    ).model_copy(update={"metadata": {
+        "target_node_id": str(node_id_for_target(target)),
+        "proposal": proposal.model_dump(mode="json"),
+    }})
+    mutation = map_recon_http_probe(target=target, arguments=proposal.arguments, result=result)
+    service = AttackGraphService(InMemoryAttackGraphStore())
+    provenance = Provenance(
+        run_id=str(record.run_id), evidence_id=str(record.evidence_id),
+        source="tool:probe", confidence=Confidence.MEASURED,
+    )
+    for edge in mutation.edges:
+        await service.link(
+            edge.edge_type, edge.source_id, edge.target_id, edge.properties, provenance=provenance,
+        )
+    endpoint = next(
+        node.node_id for node in mutation.nodes if node.node_type is GraphNodeType.ENDPOINT
+    )
+    assert await claim_target_is_grounded(service, record, str(endpoint))
+    assert not await claim_target_is_grounded(service, record, "endpoint:a.local GET /different")
+    other = record.model_copy(update={"evidence_id": "different-original"})
+    assert not await claim_target_is_grounded(service, other, str(endpoint))
+
+
 @pytest.mark.parametrize(
     "authority,host,port",
     [

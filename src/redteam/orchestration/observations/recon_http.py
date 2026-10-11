@@ -233,10 +233,19 @@ def map_recon_http_probe(
         ],
     )
 
+    edges = [
+        EdgeMutation(GraphEdgeType.HOSTS, host_id, service_id),
+        EdgeMutation(GraphEdgeType.EXPOSES, service_id, endpoint_id),
+    ]
+    if isinstance(target, HostTarget) and host_id != endpoint_id:
+        edges.append(EdgeMutation(
+            GraphEdgeType.HOSTS, host_id, endpoint_id,
+            {"relation": {
+                "type": GraphEdgeType.HOSTS.value,
+                "source_node_id": str(host_id), "target_node_id": str(endpoint_id),
+            }},
+        ))
     return GraphMutation(
         nodes=[service_node, endpoint_node],
-        edges=[
-            EdgeMutation(GraphEdgeType.HOSTS, host_id, service_id),
-            EdgeMutation(GraphEdgeType.EXPOSES, service_id, endpoint_id),
-        ],
+        edges=edges,
     )

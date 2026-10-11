@@ -22,6 +22,8 @@ async def test_finance_config_blocks_unapproved_port_scan(tmp_path: Path) -> Non
     engagement, deps = await build_application(
         config,
         evidence_dir=tmp_path,
+        audit_dir=tmp_path / "audit",
+        approval_dir=tmp_path / "approvals",
         tool_gateway=DummyToolGateway(),
         llm=FakeLLMClient(),
     )

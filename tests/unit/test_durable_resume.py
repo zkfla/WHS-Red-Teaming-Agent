@@ -11,17 +11,24 @@ denial goes back through the REPLAN path rather than executing.
 
 New durable contract (this migration):
 
-- Every structured answer comes from the in-file scripted model below,
-  reused from tests/integration/test_approval_resume.py and injected via an
-  explicit ``llm_client``. No fake model with canned ``{}``, no rule
-  fallback: an unscripted route raises instead of completing a turn.
+- Every model answer comes from the in-file scripted model below, which
+  speaks the genuine native ReAct contract (``complete_native`` with one
+  real mobile tool call on the first turn, empty completions to hold)
+  and is injected via an explicit ``llm_client``. No fake model with
+  canned ``{}``, no rule fallback: an unscripted route raises instead
+  of completing a turn.
 - Every domain store is a SQLite file under ``tmp_path``: investigation
   paths, the work ledger, the mission/task graph, and the attack graph.
   The LangGraph checkpoint itself is SQLite too. Memory-only checkpointing
   alone does not satisfy this contract.
-- The accepted path is checked against graph provenance that names the
   owning engagement, plus the target proof (the declared asset node id in
   the path steps).
+- The checkpointed proposal is checked against graph provenance that names
+  the owning engagement, plus the target proof (the declared asset node id
+  in the work ledger row and the proposal target) and the original provider
+  call id shared by the native envelope, the plan step, and the work row.
+  Native runs keep no investigation path; historical path durability is
+  covered separately by a genuinely legacy PathPlan fixture below.
 """
 
 from __future__ import annotations
@@ -61,11 +68,27 @@ from redteam.core.enums import (
     ToolHealthStatus,
 )
 from redteam.core.ids import EngagementId, RunId, ToolId
+from redteam.core.ports.llm import NativeCompletion, NativeToolCall
 from redteam.event_bus.memory import InMemoryEventBus
 from redteam.orchestration.agents import MOBILE_AGENT, AgentRegistry
 from redteam.orchestration.context import RuntimeDeps
+from redteam.orchestration.local_tools import LocalToolRegistry
 from redteam.orchestration.mission_bootstrap import bootstrap_mission
-from redteam.orchestration.paths.models import is_active_status
+from redteam.orchestration.native_binding import exposed_tool_name
+from redteam.orchestration.native_local_tools import (
+    GOAL_SETTLE_TOOL_ID,
+    TASK_SETTLE_TOOL_ID,
+    goal_settle_descriptor,
+    goal_settle_handler,
+    task_settle_descriptor,
+    task_settle_handler,
+)
+from redteam.orchestration.paths.models import (
+    CompletionCriterion,
+    PathPlan,
+    PathStep,
+    is_active_status,
+)
 from redteam.orchestration.paths.sqlite import SQLitePathStore
 from redteam.orchestration.runner import AgentLoopRunner, CheckpointingDisabledError
 from redteam.orchestration.settings import OrchestrationSettings
@@ -78,46 +101,86 @@ from tests.fakes import DummyToolGateway, FakeEvidenceStore, build_test_applicat
 RUN_ID = "run_durable"
 ASSET_ID = "evil.apk"
 ASSET_NODE_ID = "asset:evil.apk"
-MOBILE_AGENT_ID = "mobile-agent"
 MOBILE_TOOL = "mobile.artifact_analyze"
-MOBILE_CAPABILITY = "mobile"
-MOBILE_OPERATION = "static_analysis"
-MOBILE_OP_KEY = "mobile.static_analysis"
 
 
 class _ScriptedLLM:
-    """Answer each structured call from a per-route script, in order.
+    """Speak the genuine native ReAct contract (model -> tools -> settle).
 
-    Reused from tests/integration/test_approval_resume.py: the same route
-    keys and the same mobile-asset payloads below. An unscripted route
-    raises ``AssertionError`` so no rule fallback can ever complete a turn.
+    The first model turn of a run emits one genuine native call to the
+    mobile tool through its provider-exposed name (``exposed_tool_name``,
+    never hardcoded); every later turn holds with an empty completion.
+    The approval gate suspends the first turn with ``APPROVAL_PENDING``,
+    and the checkpoint already carries the assistant tool-calls message,
+    so a resumed process never sees a first turn again and never re-emits
+    the call: resume executes the checkpointed proposal exactly once with
+    its original call id.
+
+    ``complete_structured`` answers only the genuine review routes the
+    execution path legitimately makes (analysis ``meaning`` plus the
+    task/goal settlement reviews). Anything from the retired strategy
+    contract raises so no rule fallback can ever complete a turn.
     """
 
-    def __init__(self) -> None:
-        self._routes: dict[str, list[Any]] = {}
-        self.calls: list[dict[str, Any]] = []
+    #: Stable provider call id for the scripted mobile call. The
+    #: checkpointed proposal carries it, so approvals keep the original id.
+    MOBILE_CALL_ID = "call-mobile-1"
 
-    def add(self, route: str, response: Any) -> None:
-        self._routes.setdefault(route, []).append(response)
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+        self.reviews: list[str] = []
+        self.turns = 0
+        self._mobile_emitted = False
 
     @staticmethod
     def _route_key(schema: dict[str, Any]) -> str:
         props = schema.get("properties", {})
-        if "steps" in props:
-            return "path_draft"
-        if "decision" in props:
-            return "path_review"
-        if "mode" in props:
-            return "next_action"
         if "criteria" in props:
             return "goal_completion_review"
         if "claims" in props:
             return "task_completion_review"
-        if "accepted" in props:
-            return "completion_review"
         if "claim_supported" in props:
             return "analysis_verify"
         return "unknown"
+
+    def _is_first_turn(self, messages: Any) -> bool:
+        if self._mobile_emitted:
+            return False
+        for message in messages or []:
+            if message.get("role") in ("assistant", "tool"):
+                return False
+        return True
+
+    async def complete_native(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[Any],
+        system: str | None = None,
+        **_: Any,
+    ) -> NativeCompletion:
+        names = {str(getattr(spec, "name", "")) for spec in tools}
+        mobile = exposed_tool_name(MOBILE_TOOL)
+        task_settle = exposed_tool_name(TASK_SETTLE_TOOL_ID)
+        goal_settle = exposed_tool_name(GOAL_SETTLE_TOOL_ID)
+        assert mobile in names, "native model needs the registered mobile tool"
+        assert task_settle in names, "native model needs the task settlement helper"
+        assert goal_settle in names, "native model needs the goal settlement helper"
+        self.turns += 1
+        if self._is_first_turn(messages):
+            self._mobile_emitted = True
+            self.calls.append({"turn": self.turns, "tool_calls": [mobile]})
+            return NativeCompletion(
+                tool_calls=(
+                    NativeToolCall(
+                        call_id=self.MOBILE_CALL_ID,
+                        name=mobile,
+                        arguments={},
+                    ),
+                ),
+                text="",
+            )
+        self.calls.append({"turn": self.turns, "tool_calls": []})
+        return NativeCompletion(tool_calls=(), text="")
 
     async def complete_structured(
         self,
@@ -129,94 +192,60 @@ class _ScriptedLLM:
         **_: Any,
     ) -> dict[str, Any]:
         route = self._route_key(response_schema)
-        self.calls.append({"route": route, "messages": messages, "system": system})
-        queue = self._routes.get(route, [])
-        if not queue:
-            raise AssertionError(f"no scripted response left for route {route!r}")
-        response = queue.pop(0)
-        if isinstance(response, Exception):
-            raise response
-        return response
-
-    async def complete(self, *, messages: Any, system: str | None = None, **_: Any) -> str:
-        return ""
-
-
-def _draft_path(asset_node_id: str) -> dict[str, Any]:
-    # Minimal model draft: purpose + steps only. Runtime identity
-    # (path_id/run_id/version/status/goal/evidence) is code-owned.
-    return {
-        "reason": "scripted mobile draft",
-        "steps": [
-            {
-                "step_id": "step-1",
-                "objective": "analyze the declared APK artifact",
-                "agent_id": MOBILE_AGENT_ID,
-                "target_node_ids": [asset_node_id],
-                "principal_refs": [],
-                "allowed_operations": [MOBILE_OP_KEY],
-                "depends_on": [],
-                "required_fact_refs": [],
-                "unknowns": [],
-                "completion_criteria": [
+        self.reviews.append(route)
+        if route == "analysis_verify":
+            return _meaning_success()
+        if route == "task_completion_review":
+            payload = json.loads(messages[0]["content"])
+            receipts = list(payload["verified_source_ids"])
+            assert receipts, "task review needs the verified executed call evidence"
+            return {
+                "accepted": True,
+                "reason": "scripted semantic accept",
+                "claims": [
                     {
-                        "kind": "evidence",
-                        "description": "static analysis evidence recorded",
-                        "min_evidence": 1,
+                        "description": "mobile tool result observed",
+                        "kind": "observation",
+                        "evidence_ids": list(receipts),
+                        "target_node_ids": [],
+                        "principal_refs": [],
                     }
                 ],
-                "required": True,
             }
-        ],
-    }
-
-
-def _review_accept() -> dict[str, Any]:
-    return {"decision": "accept", "reason": "scripted accept", "path": None}
-
-
-def _turn_mobile_action(asset_node_id: str) -> dict[str, Any]:
-    return {
-        "mode": "actions",
-        "reason": "scripted mobile action",
-        "actions": [
-            {
-                "path_step_id": "step-1",
-                "agent_id": MOBILE_AGENT_ID,
-                "target_node_id": asset_node_id,
-                "principal_ref": None,
-                "capability": MOBILE_CAPABILITY,
-                "operation": MOBILE_OPERATION,
-                "tool_id": MOBILE_TOOL,
-                "arguments": {},
-                "reason": "analyze the declared artifact",
-                "expected_observation": "static analysis returns artifact structure",
-                "hypothesis": None,
-                "existing_hypothesis_id": None,
-                "expectation": None,
-                "authentication_check": None,
-                "availability_impact": False,
+        if route == "goal_completion_review":
+            payload = json.loads(messages[0]["content"])
+            criteria = payload["mission"]["success_criteria"]
+            receipts = list(payload["verified_source_ids"])
+            assert receipts, "goal review needs the verified executed call evidence"
+            return {
+                "accepted": True,
+                "reason": "scripted goal accept",
+                "criteria": [
+                    {
+                        "criterion": item,
+                        "met": True,
+                        "evidence_ids": list(receipts),
+                        "claims": [
+                            {
+                                "description": "mobile tool result observed",
+                                "kind": "observation",
+                                "evidence_ids": list(receipts),
+                                "target_node_ids": [],
+                                "principal_refs": [],
+                            }
+                        ],
+                    }
+                    for item in criteria
+                ],
             }
-        ],
-        "path": None,
-        "path_step_id": None,
-        "completion": {},
-        "evidence_request": {},
-        "hypothesis_update": {},
-    }
+        raise AssertionError(
+            f"legacy strategy route is not part of the native loop: {route!r}"
+        )
 
-
-def _turn_hold() -> dict[str, Any]:
-    return {
-        "mode": "hold",
-        "reason": "scripted hold after the approval turn",
-        "actions": [],
-        "path": None,
-        "path_step_id": None,
-        "completion": {},
-        "evidence_request": {},
-        "hypothesis_update": {},
-    }
+    async def complete(
+        self, *, messages: Any, system: str | None = None, **_: Any
+    ) -> str:
+        return ""
 
 
 def _meaning_success() -> dict[str, Any]:
@@ -239,6 +268,14 @@ def _engagement(*, max_actions: int = 5) -> Engagement:
         approval_policy=ApprovalPolicy(require_approval_for=["mobile"]),
         created_at=datetime.now(timezone.utc),
     )
+
+
+def _native_tool_registry() -> LocalToolRegistry:
+    """Task/goal settlement helpers offered to the native model."""
+    registry = LocalToolRegistry()
+    registry.register(task_settle_descriptor(), task_settle_handler)
+    registry.register(goal_settle_descriptor(), goal_settle_handler)
+    return registry
 
 
 def _mobile_catalog() -> MCPToolGateway:
@@ -307,11 +344,6 @@ async def _run_to_pending(tmp_path, *, max_actions: int = 5):  # noqa: ANN202
     plane = _plane(engagement, approval_dir, audit_dir)
     gateway = DummyToolGateway()
     llm = _ScriptedLLM()
-    llm.add("path_draft", _draft_path(ASSET_NODE_ID))
-    llm.add("path_review", _review_accept())
-    llm.add("next_action", _turn_mobile_action(ASSET_NODE_ID))
-    llm.add("next_action", _turn_hold())
-    llm.add("analysis_verify", _meaning_success())
     path_store = SQLitePathStore(files["paths"])
     work_store = SQLiteWorkStore(files["work"])
     task_store = SQLiteTaskGraphStore(files["tasks"])
@@ -329,6 +361,7 @@ async def _run_to_pending(tmp_path, *, max_actions: int = 5):  # noqa: ANN202
         engagement=engagement,
         agents=AgentRegistry([MOBILE_AGENT]),
         tool_catalog=_mobile_catalog(),
+        local_tools=_native_tool_registry(),
         work_store=work_store,
         task_graph_store=task_store,
         path_store=path_store,
@@ -384,11 +417,6 @@ def _second_process_with_deps(  # noqa: ANN202
     plane = _plane(engagement, approval_dir, audit_dir)
     gateway = DummyToolGateway()
     llm = _ScriptedLLM()
-    llm.add("next_action", _turn_hold())
-    llm.add("next_action", _turn_hold())
-    llm.add("analysis_verify", _meaning_success())
-    llm.add("analysis_verify", _meaning_success())
-    llm.add("path_review", _review_accept())
     path_store = SQLitePathStore(files["paths"])
     work_store = SQLiteWorkStore(files["work"])
     task_store = SQLiteTaskGraphStore(files["tasks"])
@@ -403,6 +431,7 @@ def _second_process_with_deps(  # noqa: ANN202
         engagement=engagement,
         agents=AgentRegistry([MOBILE_AGENT]),
         tool_catalog=_mobile_catalog(),
+        local_tools=_native_tool_registry(),
         work_store=work_store,
         task_graph_store=task_store,
         path_store=path_store,
@@ -453,13 +482,59 @@ async def test_raw_checkpoint_read_agrees_with_runner_recovery(tmp_path) -> None
 
 async def test_approved_durable_resume_executes_the_original_action(tmp_path) -> None:
     engagement, settings, approval_dir, audit_dir, stopped = await _run_to_pending(tmp_path)
-    # Accepted path: still active in the durable file, aimed at the declared
-    # asset, and the graph provenance names the owning engagement.
+    # Native pre-resume proof, read back on fresh objects: the checkpointed
+    # proposal names the mobile tool and the declared asset, and the
+    # original provider call id is shared by the native envelope, the plan
+    # step, and the pending work row. Native calls intentionally carry no
+    # investigation path, so no active PathPlan is expected here.
     files = _files(tmp_path)
-    active = await SQLitePathStore(files["paths"]).get_active(RUN_ID)
-    assert active is not None
-    assert is_active_status(active.status)
-    assert any(ASSET_NODE_ID in [str(t) for t in step.target_node_ids] for step in active.steps)
+    assert stopped.pending_action_id is not None
+    assert stopped.active_path_id is None
+    assert await SQLitePathStore(files["paths"]).get_active(RUN_ID) is None
+    probe, _, _, probe_deps = _second_process_with_deps(
+        engagement, settings, approval_dir, audit_dir
+    )
+    try:
+        snapshot = await probe._latest_snapshot()  # noqa: SLF001
+        assert snapshot is not None and snapshot.values is not None
+        proposal = snapshot.values.get("action_proposal")
+        assert proposal is not None
+        assert proposal.action_id == stopped.pending_action_id
+        assert str(proposal.run_id) == RUN_ID
+        assert str(proposal.tool_id) == MOBILE_TOOL
+        assert getattr(proposal.target, "asset_id", None) == ASSET_ID
+        plan_step = snapshot.values.get("plan_step")
+        assert plan_step is not None
+        assert plan_step.model_tool_call_id == _ScriptedLLM.MOBILE_CALL_ID
+        work_id = snapshot.values.get("current_work_id")
+        assert work_id is not None
+        envelope = snapshot.values.get("native_calls") or []
+        assert len(envelope) == 1
+        assert envelope[0].call_id == _ScriptedLLM.MOBILE_CALL_ID
+        assert str(envelope[0].tool_id) == MOBILE_TOOL
+        assert envelope[0].name == exposed_tool_name(MOBILE_TOOL)
+        assert envelope[0].dispatch is not None
+        assert envelope[0].dispatch.work_id == work_id
+        pending_rows = await probe_deps.work_store.list_items(
+            run_id=RunId(RUN_ID), status=WorkStatus.PENDING
+        )
+        assert len(pending_rows) == 1
+        assert pending_rows[0].work_id == work_id
+        assert pending_rows[0].model_tool_call_id == _ScriptedLLM.MOBILE_CALL_ID
+        assert [str(t) for t in pending_rows[0].target_node_ids] == [ASSET_NODE_ID]
+        assert pending_rows[0].candidate_key == plan_step.candidate_key
+        assistant_msgs = [
+            message
+            for message in (snapshot.values.get("native_messages") or [])
+            if message.get("role") == "assistant"
+        ]
+        assert assistant_msgs
+        assert any(
+            _ScriptedLLM.MOBILE_CALL_ID in json.dumps(message, default=str)
+            for message in assistant_msgs
+        )
+    finally:
+        await probe.aclose()
     graph_store = SQLiteAttackGraphStore(files["graph"])
     await graph_store.setup()
     asset_nodes = [n for n in await graph_store.list_nodes() if n.type == GraphNodeType.ASSET]
@@ -472,7 +547,9 @@ async def test_approved_durable_resume_executes_the_original_action(tmp_path) ->
         stopped.pending_approval_id, ApprovalStatus.APPROVED, "operator"
     )
 
-    runner, _, gateway = _second_process(engagement, settings, approval_dir, audit_dir)
+    runner, _, gateway, deps = _second_process_with_deps(
+        engagement, settings, approval_dir, audit_dir
+    )
     try:
         runtime = await runner.recover_runtime(RUN_ID)
         assert runtime is not None
@@ -485,6 +562,25 @@ async def test_approved_durable_resume_executes_the_original_action(tmp_path) ->
     assert final.actions_executed == 1
     assert final.pending_approval_id is None
     assert [str(inv.tool_id) for inv in gateway.invocations] == ["mobile.artifact_analyze"]
+    # Executed-evidence proof: the single invocation carries the original
+    # checkpointed action id, and the durable work row plus tool evidence
+    # link back to that same action.
+    assert len(gateway.invocations) == 1
+    assert str(gateway.invocations[0].action_id) == str(stopped.pending_action_id)
+    assert str(gateway.invocations[0].run_id) == RUN_ID
+    succeeded = await deps.work_store.list_items(
+        run_id=RunId(RUN_ID), status=WorkStatus.SUCCEEDED
+    )
+    assert len(succeeded) == 1
+    assert succeeded[0].work_id == work_id
+    assert succeeded[0].model_tool_call_id == _ScriptedLLM.MOBILE_CALL_ID
+    linked = await deps.evidence_store.list_for_action(stopped.pending_action_id)
+    assert linked, "the executed original action leaves evidence behind"
+    assert all(str(record.run_id) == RUN_ID for record in linked)
+    assert any(
+        str(record.invocation_id) == str(gateway.invocations[0].invocation_id)
+        for record in linked
+    )
 
 
 async def test_two_concurrent_resumers_can_claim_one_approved_action_only(tmp_path) -> None:
@@ -615,17 +711,22 @@ async def test_resume_recovered_leaves_a_hard_stop_untouched() -> None:
     assert await runner.resume_recovered(runtime) is runtime
 
 
-async def test_sqlite_active_path_and_step_progress_survive_reopen(tmp_path) -> None:
-    """Real SQLite path resume: fresh objects on the same files see the
-    active path, and the step progress made by an approved resume is still
-    there after one more reopen."""
+async def test_sqlite_work_progress_survives_reopen(tmp_path) -> None:
+    """Native step progress is durable: a fresh work-store object sees the
+    pending row before resume, and after an approved resume fresh objects
+    on the same SQLite files see that same row succeeded with the original
+    provider call id."""
     engagement, settings, approval_dir, audit_dir, stopped = await _run_to_pending(tmp_path)
     files = _files(tmp_path)
 
-    before = await SQLitePathStore(files["paths"]).get_active(RUN_ID)
-    assert before is not None
-    assert is_active_status(before.status)
-    assert any(ASSET_NODE_ID in [str(t) for t in step.target_node_ids] for step in before.steps)
+    assert stopped.active_path_id is None
+    assert await SQLitePathStore(files["paths"]).get_active(RUN_ID) is None
+    before = await SQLiteWorkStore(files["work"]).list_items(
+        run_id=RunId(RUN_ID), status=WorkStatus.PENDING
+    )
+    assert len(before) == 1
+    assert before[0].model_tool_call_id == _ScriptedLLM.MOBILE_CALL_ID
+    assert [str(t) for t in before[0].target_node_ids] == [ASSET_NODE_ID]
 
     task_reopened = SQLiteTaskGraphStore(files["tasks"])
     await task_reopened.setup()
@@ -648,18 +749,20 @@ async def test_sqlite_active_path_and_step_progress_survive_reopen(tmp_path) -> 
 
     assert [str(inv.tool_id) for inv in gateway.invocations] == [MOBILE_TOOL]
     assert final.actions_executed == 1
-    progressed = await deps.path_store.get_active(RUN_ID)
-    assert progressed is not None
-    assert progressed.path_id == before.path_id
-    succeeded = await deps.work_store.list_items(run_id=RunId(RUN_ID), status=WorkStatus.SUCCEEDED)
+    assert str(gateway.invocations[0].action_id) == str(stopped.pending_action_id)
+    succeeded = await deps.work_store.list_items(
+        run_id=RunId(RUN_ID), status=WorkStatus.SUCCEEDED
+    )
     assert len(succeeded) == 1
+    assert succeeded[0].work_id == before[0].work_id
+    assert succeeded[0].model_tool_call_id == _ScriptedLLM.MOBILE_CALL_ID
 
-    again = await SQLitePathStore(files["paths"]).get_active(RUN_ID)
-    assert again is not None
-    assert again.path_id == progressed.path_id
-    assert [(s.step_id, list(s.evidence_ids)) for s in again.steps] == [
-        (s.step_id, list(s.evidence_ids)) for s in progressed.steps
-    ]
+    reopened = SQLiteWorkStore(files["work"])
+    succeeded_again = await reopened.list_items(
+        run_id=RunId(RUN_ID), status=WorkStatus.SUCCEEDED
+    )
+    assert [item.work_id for item in succeeded_again] == [before[0].work_id]
+    assert succeeded_again[0].model_tool_call_id == _ScriptedLLM.MOBILE_CALL_ID
 
 
 async def test_durable_evidence_hides_secrets_but_keeps_linkage(tmp_path) -> None:
@@ -700,8 +803,11 @@ async def test_legacy_checkpoint_without_recent_observations_recovers_and_resume
     assert stopped.pending_approval_id is not None
     assert stopped.pending_action_id is not None
     assert stopped.mission_id is not None
-    before_path = await SQLitePathStore(files["paths"]).get_active(RUN_ID)
-    assert before_path is not None
+    before_work = await SQLiteWorkStore(files["work"]).list_items(
+        run_id=RunId(RUN_ID), status=WorkStatus.PENDING
+    )
+    assert len(before_work) == 1
+    assert before_work[0].model_tool_call_id == _ScriptedLLM.MOBILE_CALL_ID
     new_dump = stopped.model_dump()
     assert "recent_observations" in new_dump
     old_dict = dict(new_dump)
@@ -750,9 +856,13 @@ async def test_legacy_checkpoint_without_recent_observations_recovers_and_resume
         assert recovered.pending_approval_id == stopped.pending_approval_id
         assert recovered.pending_action_id == stopped.pending_action_id
         assert recovered.recent_observations == []
-        active = await SQLitePathStore(files["paths"]).get_active(RUN_ID)
-        assert active is not None
-        assert active.path_id == before_path.path_id
+        assert await SQLitePathStore(files["paths"]).get_active(RUN_ID) is None
+        still_pending = await SQLiteWorkStore(files["work"]).list_items(
+            run_id=RunId(RUN_ID), status=WorkStatus.PENDING
+        )
+        assert [item.work_id for item in still_pending] == [
+            item.work_id for item in before_work
+        ]
         await ApprovalService(FilesystemApprovalStore(approval_dir)).resolve(
             stopped.pending_approval_id, ApprovalStatus.APPROVED, "operator"
         )
@@ -762,3 +872,75 @@ async def test_legacy_checkpoint_without_recent_observations_recovers_and_resume
     assert final.run_id == stopped.run_id
     assert final.actions_executed == 1
     assert [str(inv.tool_id) for inv in gateway.invocations] == ["mobile.artifact_analyze"]
+    assert str(gateway.invocations[0].action_id) == str(stopped.pending_action_id)
+    done = await SQLiteWorkStore(files["work"]).list_items(
+        run_id=RunId(RUN_ID), status=WorkStatus.SUCCEEDED
+    )
+    assert [item.work_id for item in done] == [item.work_id for item in before_work]
+    assert done[0].model_tool_call_id == _ScriptedLLM.MOBILE_CALL_ID
+
+
+def _legacy_path_plan() -> PathPlan:
+    """Genuinely legacy investigation path: an accepted/active PathPlan aimed
+    at the declared asset, of the kind historical strategy-loop runs stored."""
+    return PathPlan(
+        path_id="path_legacy_durable",
+        run_id="run_legacy_path",
+        mission_id="mission_legacy",
+        version=1,
+        parent_version=None,
+        status="active",
+        reason="historical accepted investigation path",
+        goal="analyze the declared artifact",
+        steps=[
+            PathStep(
+                step_id="step-1",
+                objective="analyze the declared APK artifact",
+                agent_id="mobile-agent",
+                target_node_ids=[ASSET_NODE_ID],
+                completion_criteria=[
+                    CompletionCriterion(
+                        kind="evidence", description="static analysis evidence recorded",
+                        min_evidence=1,
+                    )
+                ],
+            )
+        ],
+    )
+
+
+async def test_sqlite_legacy_path_plan_survives_reopen(tmp_path) -> None:
+    """Historical path durability, independent of the native loop: a legacy
+    active PathPlan registered on SQLite is still active after reopen, and
+    step evidence recorded on it survives one more reopen."""
+    files = _files(tmp_path)
+    registered = await SQLitePathStore(files["paths"]).register(_legacy_path_plan())
+    assert is_active_status(registered.status)
+
+    reopened = await SQLitePathStore(files["paths"]).get_active("run_legacy_path")
+    assert reopened is not None
+    assert reopened.path_id == registered.path_id
+    assert is_active_status(reopened.status)
+    assert any(
+        ASSET_NODE_ID in [str(t) for t in step.target_node_ids]
+        for step in reopened.steps
+    )
+
+    progressed = await SQLitePathStore(files["paths"]).update_step(
+        "run_legacy_path",
+        registered.path_id,
+        registered.version,
+        "step-1",
+        status="completed",
+        outcome="static analysis evidence recorded",
+        evidence_ids=["ev_legacy_1"],
+    )
+    assert progressed is not None
+
+    again = await SQLitePathStore(files["paths"]).get_active("run_legacy_path")
+    assert again is not None
+    assert again.path_id == registered.path_id
+    assert [(s.step_id, s.status, list(s.evidence_ids)) for s in again.steps] == [
+        (s.step_id, s.status, list(s.evidence_ids)) for s in progressed.steps
+    ]
+    assert again.steps[0].evidence_ids == ["ev_legacy_1"]

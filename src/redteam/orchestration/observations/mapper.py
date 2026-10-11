@@ -227,7 +227,7 @@ class ResultMapperRegistry:
         self,
         *,
         tool_id: ToolId,
-        target: AnyTarget,
+        target: AnyTarget | None,
         arguments: dict[str, Any],
         result: ToolResult,
     ) -> GraphMutation:
@@ -242,7 +242,7 @@ class ResultMapperRegistry:
         self,
         *,
         tool_id: ToolId,
-        target: AnyTarget,
+        target: AnyTarget | None,
         arguments: dict[str, Any],
         result: ToolResult,
     ) -> MappingOutcome:
@@ -254,6 +254,11 @@ class ResultMapperRegistry:
         existing meaning for current readers.
         """
         self._last_failure = None
+        if target is None:
+            return MappingOutcome(
+                mutation=GraphMutation(), tool_id=str(tool_id),
+                mapper=None, status="not_applicable",
+            )
         mapper = self._mappers.get(str(tool_id))
         if mapper is None:
             return MappingOutcome(

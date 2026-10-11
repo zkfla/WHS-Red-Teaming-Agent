@@ -49,11 +49,12 @@ Fields are `id`/`type` (not `node_id`/`node_type` or
 are real and produced in every run that proposes a step with a
 `HypothesisDraft` (`AttackGraphService.record_hypothesis`, called from
 `orchestration.nodes.plan`) — every built-in playbook step does.
-`Finding` nodes are still never produced: that requires a step's
-`Expectation` to reach `Verdict.VIOLATION`, which no built-in playbook
-step's `Expectation` is configured to do — see
+`Finding` nodes are produced only when a step's `Expectation` reaches
+`Verdict.VIOLATION` (not configured on built-in playbook steps — see
 `docs/agent/orchestration-implementation-plan.md` section 16.1, finding
-1, not a missing code path.
+1), an explicit `graph.record` finding passes posthoc review plus
+promotion (`orchestration.graph_recording`), or verification resolves a
+tested hypothesis (`orchestration.nodes.verify`, `orchestration.recovery`).
 
 ## Store Protocol
 

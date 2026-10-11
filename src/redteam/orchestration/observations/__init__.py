@@ -52,6 +52,16 @@ from redteam.orchestration.observations.reference_scan import (
     is_reference_grounded,
     reference_address,
 )
+from redteam.orchestration.observations.shell_execution import (
+    SHELL_ENVELOPE_KEYS,
+    is_shell_execution_envelope,
+    shell_execution_accounting,
+)
+from redteam.orchestration.observations.window_egress_admission import (
+    destination_attempts,
+    detect_companion_conflict,
+    validate_admission_companion,
+)
 
 __all__ = [
     "EdgeMutation",
@@ -77,4 +87,10 @@ __all__ = [
     "is_absolute_url",
     "is_reference_grounded",
     "reference_address",
+    "SHELL_ENVELOPE_KEYS",
+    "is_shell_execution_envelope",
+    "shell_execution_accounting",
+    "validate_admission_companion",
+    "destination_attempts",
+    "detect_companion_conflict",
 ]

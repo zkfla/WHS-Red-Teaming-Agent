@@ -3,7 +3,17 @@
 from __future__ import annotations
 
 import networkx as nx
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, field_validator
+
+from redteam.core.contracts.completion import (
+    ALLOWED_CRITERION_KINDS as ALLOWED_CRITERION_KINDS,
+)
+from redteam.core.contracts.completion import (
+    UNKNOWN_CRITERION_KIND as UNKNOWN_CRITERION_KIND,
+)
+from redteam.core.contracts.completion import (
+    CompletionCriterion as CompletionCriterion,
+)
 
 
 class PathError(Exception):
@@ -36,25 +46,6 @@ STEP_STATUSES = frozenset({"pending", "running", "completed", "failed", "blocked
 #: Legacy alias accepted on input and normalized to ``running``.
 STEP_STATUS_ALIASES = {"in_progress": "running"}
 
-#: Provable completion-criterion kinds. Anything else normalizes to
-#: ``"unknown"`` and can never confirm success (checked by completion
-#: verification, not by the store).
-ALLOWED_CRITERION_KINDS = frozenset(
-    {
-        "evidence",
-        "observation",
-        "hypothesis_confirmed",
-        "hypothesis_refuted",
-        "coverage",
-        "poc",
-        "semantic",
-    }
-)
-
-#: Marker for unprovable completion conditions.
-UNKNOWN_CRITERION_KIND = "unknown"
-
-
 def normalize_path_status(status: str) -> str:
     """Map the legacy ``accepted`` alias to ``active``; pass through else."""
     return PATH_STATUS_ALIASES.get(status, status)
@@ -68,27 +59,6 @@ def normalize_step_status(status: str) -> str:
 def is_active_status(status: str) -> bool:
     """Return True for ``active`` and the legacy ``accepted`` alias."""
     return normalize_path_status(status) == "active"
-
-
-class CompletionCriterion(BaseModel):
-    """Structured completion condition for one investigation step."""
-
-    kind: str = "unknown"
-    description: str = ""
-    min_evidence: int = Field(default=1, ge=1)
-    hypothesis_id: str | None = None
-    principal_refs: list[str] = []
-
-    @field_validator("kind")
-    @classmethod
-    def _normalize_kind(cls, value: str) -> str:
-        if value not in ALLOWED_CRITERION_KINDS:
-            return UNKNOWN_CRITERION_KIND
-        return value
-
-    def is_known(self) -> bool:
-        """Return True only for a provable kind (never ``unknown``)."""
-        return self.kind in ALLOWED_CRITERION_KINDS
 
 
 def is_known_criterion(criterion: CompletionCriterion | str) -> bool:

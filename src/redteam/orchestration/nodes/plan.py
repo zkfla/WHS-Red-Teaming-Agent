@@ -11,7 +11,7 @@ from redteam.attack_graph.predicates import Confidence, Provenance
 from redteam.core.contracts.action import ActionProposal
 from redteam.core.contracts.events import EventType
 from redteam.core.contracts.graph import Hypothesis
-from redteam.core.enums import AgentPhase, TaskStatus
+from redteam.core.enums import AgentPhase
 from redteam.core.ids import ActionId, new_id
 from redteam.orchestration.candidates.models import ExecutableCandidate
 from redteam.orchestration.cognition import DecisionFailure, ReasoningHalted
@@ -46,15 +46,6 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
     runtime = state["runtime"]
     observation = state.get("observation")
     publisher = publisher_for(state, deps, "orchestration.plan")
-    completed_before = (
-        {
-            task.task_id
-            for task in await deps.task_graph_store.list_tasks(mission_id=runtime.mission_id)
-            if task.status is TaskStatus.COMPLETED
-        }
-        if runtime.mission_id
-        else set()
-    )
     engine = InvestigationEngine(deps)
     try:
         path, candidates, outcome = await engine.decide(
@@ -138,28 +129,9 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             if outcome == "investigation_finished"
             else TerminationReason.INVESTIGATION_HELD,
         )
+        # Settlement events are published by the semantic owner during decide;
+        # the engine last event already cites them, so this only propagates it.
         last_event_id = engine.last_event_id
-        tasks = (
-            await deps.task_graph_store.list_tasks(mission_id=runtime.mission_id)
-            if runtime.mission_id
-            else []
-        )
-        for task in tasks:
-            if task.status is not TaskStatus.COMPLETED or task.task_id in completed_before:
-                continue
-            completed = await publisher.publish(
-                EventType.TASK_COMPLETED,
-                {"mission_id": runtime.mission_id, "task_id": task.task_id},
-                causation_id=last_event_id,
-            )
-            last_event_id = completed.event_id
-        if outcome == "goal_achieved":
-            settled = await publisher.publish(
-                EventType.MISSION_UPDATED,
-                {"mission_id": runtime.mission_id, "status": "completed"},
-                causation_id=last_event_id,
-            )
-            last_event_id = settled.event_id
         return advance(
             state,
             runtime.model_copy(update=updates),
@@ -229,6 +201,7 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
         chosen,
         graph_revision=runtime.step_count,
         run_id=runtime.run_id,
+        instance_id=runtime.instance_id,
         now=now,
         mission_task_id=runtime.active_task_id,
     )
@@ -237,6 +210,7 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
         for item in await deps.work_store.list_items(
             status=WorkStatus.PENDING, run_id=runtime.run_id
         )
+        if item.instance_id == runtime.instance_id
     }
     service = graph_service(deps)
     dispatch = []
@@ -247,7 +221,7 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             continue
         lease = await deps.work_store.acquire(
             work.work_id,
-            owner=str(runtime.run_id),
+            owner=runtime.work_owner,
             now=now,
             ttl=timedelta(seconds=deps.settings.lease_ttl_seconds),
         )
@@ -268,7 +242,10 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                     metadata={
                         "agent_id": str(candidate.draft.agent_id),
                         "step_id": step.step_id,
-                        "target_node_id": str(node_id_for_target(step.resolved_target())),
+                        "target_node_id": (
+                            str(node_id_for_target(step.target))
+                            if step.target is not None else None
+                        ),
                         "violation_if_confirmed": step.hypothesis.violation_if_confirmed,
                         "expectation": step.expectation.model_dump(mode="json")
                         if step.expectation
@@ -278,7 +255,7 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                         "path_step_id": step.path_step_id,
                     },
                 ),
-                about=node_id_for_target(step.resolved_target()),
+                about=node_id_for_target(step.target) if step.target is not None else None,
                 step=runtime.step_count,
                 provenance=Provenance(
                     step=runtime.step_count,
@@ -292,6 +269,7 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             run_id=runtime.run_id,
             engagement_id=runtime.engagement_id,
             agent_id=candidate.draft.agent_id,
+            instance_id=runtime.instance_id,
             capability=step.capability,
             operation=step.operation,
             binding_mode=step.binding_mode,
@@ -374,7 +352,7 @@ async def plan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             dispatch_items=[],
         )
     first = dispatch[0]
-    deps.batch_pending_approvals.discard(runtime.run_id)
+    deps.batch_pending_approvals.discard(runtime.work_owner)
     updates.update(
         phase=AgentPhase.POLICY,
         pending_action_id=first.proposal.action_id,

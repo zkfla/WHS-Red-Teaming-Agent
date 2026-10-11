@@ -8,6 +8,7 @@ from redteam.orchestration.diagnostics import safe_feedback
 from redteam.orchestration.events import REPLAN_TRIGGERED
 from redteam.orchestration.nodes._support import advance, publisher_for
 from redteam.orchestration.nodes.policy import SEVERITY_ABORT_RUN, denial_severity
+from redteam.orchestration.progress import canonical_graph_changed
 from redteam.orchestration.state import GraphState, RuntimeState, TerminationReason
 
 
@@ -26,6 +27,12 @@ def _hard_stop(runtime: RuntimeState, deps: RuntimeDeps) -> str | None:
 async def replan_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
     runtime = state["runtime"]
     reason = runtime.termination_reason or _hard_stop(runtime, deps)
+    if reason == TerminationReason.STALLED and await canonical_graph_changed(deps, runtime):
+        # The counter was observed before this turn ran, so it cannot prove a
+        # stall when the turn itself changed the canonical content. This is the
+        # same judgment the resume gate uses; OBSERVE re-syncs the counter
+        # against the current content on the next turn.
+        reason = None
     decision = state.get("policy_decision")
     if denial_severity(decision) == SEVERITY_ABORT_RUN:
         reason = (

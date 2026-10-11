@@ -1,0 +1,19 @@
+{
+  "image": "kalilinux/kali-rolling@sha256:REPLACE_WITH_PUBLISHED_DIGEST",
+  "allow_unpinned_image": false,
+  "docker_binary": "docker",
+  "container_user": "65532:65532",
+  "workdir": "/workroom",
+  "memory": "512m",
+  "cpus": 1.0,
+  "pids_limit": 128,
+  "tmpfs_bytes": 67108864,
+  "max_script_bytes": 65536,
+  "max_output_bytes": 65536,
+  "max_timeout_seconds": 300.0,
+  "default_timeout_seconds": 60.0,
+  "max_jobs": 32,
+  "completed_job_ttl_seconds": 300.0,
+  "max_workrooms": 64,
+  "exec_grace_seconds": 2.0
+}

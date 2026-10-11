@@ -202,22 +202,40 @@ async def test_legacy_optout_hides_execution_options_but_registered_direct_tool_
     assert "execution_options" not in disabled_execution
     assert "execution_options" not in without_execution
     # New channel: a registered direct tool is visible in the new context.
-    assert [item["tool_id"] for item in without_execution["tools"]] == [
-        "analysis.decode_apk"
-    ]
-    assert sorted(item["tool_id"] for item in disabled_execution["tools"]) == [
-        "analysis.decode_apk",
-        "analysis.run_command",
-    ]
+    # Cards briefing: only the MCP-kind slice mirrors the old full dumps;
+    # locals/programs/references list alongside and are not asserted here.
+    assert [
+        item["tool_id"]
+        for item in without_execution["tool_cards"]
+        if item["kind"] == "mcp_tool"
+    ] == ["analysis.decode_apk"]
+    assert sorted(
+        item["tool_id"]
+        for item in disabled_execution["tool_cards"]
+        if item["kind"] == "mcp_tool"
+    ) == ["analysis.decode_apk", "analysis.run_command"]
     # Visibility aside, no other context field may drift with registration.
-    assert {
-        k: v for k, v in disabled_execution.items() if k not in ("tools", "tools_by_role")
-    } == {k: v for k, v in without_execution.items() if k not in ("tools", "tools_by_role")}
+    # The card briefing keys (shallow, no schemas) are the visibility surface.
+    steady = (
+        "tools_by_role",
+        "tool_cards",
+        "tool_cards_total",
+        "tool_cards_truncated",
+        "tool_cards_counts",
+        "tool_cards_guidance",
+        "program_manifest_status",
+        "workroom_status",
+    )
+    assert {k: v for k, v in disabled_execution.items() if k not in steady} == {
+        k: v for k, v in without_execution.items() if k not in steady
+    }
     for context in (without_execution, disabled_execution):
         mapping = context["tools_by_role"]
         role_ids = {item["agent_id"] for item in context["roles"]}
         assert set(mapping) == role_ids
-        tool_ids = {item["tool_id"] for item in context["tools"]}
+        tool_ids = {
+            item["tool_id"] for item in context["tool_cards"] if item["kind"] == "mcp_tool"
+        }
         union_ids = {tool_id for ids in mapping.values() for tool_id in ids}
         assert union_ids == tool_ids
     assert {
@@ -297,12 +315,11 @@ async def test_custom_selections_map_per_role_in_live_context() -> None:
     assert context["tools_by_role"]["custom-b"] == ["analysis.run_command"]
     assert "analysis.run_command" not in context["tools_by_role"]["custom-a"]
     assert "analysis.decode_apk" not in context["tools_by_role"]["custom-b"]
-    assert {item["tool_id"] for item in context["tools"]} == {
-        "analysis.decode_apk",
-        "analysis.run_command",
-    }
+    assert {
+        item["tool_id"] for item in context["tool_cards"] if item["kind"] == "mcp_tool"
+    } == {"analysis.decode_apk", "analysis.run_command"}
     assert {tool_id for ids in context["tools_by_role"].values() for tool_id in ids} == {
-        item["tool_id"] for item in context["tools"]
+        item["tool_id"] for item in context["tool_cards"] if item["kind"] == "mcp_tool"
     }
 
 
@@ -327,7 +344,9 @@ async def test_catalog_none_leaves_empty_mapping_per_visible_role() -> None:
         node_ids_by_type={GraphNodeType.ASSET.value: ["asset:workspace-test"]},
     )
     context = await InvestigationEngine(deps).context(runtime, observation)
-    assert context["tools"] == []
+    assert [
+        item for item in context["tool_cards"] if item["kind"] == "mcp_tool"
+    ] == []
     assert context["roles"] != []
     assert set(context["tools_by_role"]) == {
         item["agent_id"] for item in context["roles"]

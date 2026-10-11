@@ -5,6 +5,8 @@ engagement:
   metadata:
     target_refs:
       mock-bank: bank-lab
+      # The observed HTTP endpoint is pinned to the declared policy origin.
+      mock-bank:8080: bank-lab
   execution_budget:
     max_actions: 30
     max_tool_calls: 30

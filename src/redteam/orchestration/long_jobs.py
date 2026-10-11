@@ -29,21 +29,12 @@ Integration contract (root-owned wiring, agent-owned protocol):
 
 from __future__ import annotations
 
-from enum import Enum
 from typing import Protocol
 
 from pydantic import BaseModel
 
+from redteam.core.contracts.execution import ExecutionState as LongJobState
 from redteam.core.contracts.tool import ToolInvocation, ToolResult
-
-
-class LongJobState(str, Enum):
-    PENDING = "pending"
-    RUNNING = "running"
-    SUCCEEDED = "succeeded"
-    FAILED = "failed"
-    CANCELLED = "cancelled"
-    UNKNOWN = "unknown"
 
 
 class LongJobNotSupportedError(RuntimeError):

@@ -9,7 +9,7 @@ per-turn hand-offs that never leave this subpackage.
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Annotated, TypedDict
+from typing import Annotated, Any, TypedDict
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -21,6 +21,7 @@ from redteam.core.enums import AgentPhase, MissionStatus, Verdict
 from redteam.core.ids import (
     ActionId,
     AgentId,
+    AgentInstanceId,
     ApprovalId,
     EngagementId,
     EventId,
@@ -41,6 +42,7 @@ from redteam.orchestration.dispatch import (
     merge_worker_outcomes,
 )
 from redteam.orchestration.runtime_observation import RuntimeObservation
+from redteam.orchestration.work.models import work_owner_for
 
 
 class TerminationReason:
@@ -62,6 +64,7 @@ class TerminationReason:
     PLANNING_ERROR = "planning_error"
     GOAL_ACHIEVED = "goal_achieved"
     INVESTIGATION_HELD = "investigation_held"
+    RESOURCE_WAIT = "resource_wait"
     #: Operator asked to hold the run before the next action executes. The
     #: active Task and Mission are preserved so a RESUME intent continues
     #: the same work instead of starting a new Mission.
@@ -76,12 +79,17 @@ class RuntimeState(BaseModel):
 
     phase: AgentPhase = AgentPhase.OBSERVE
     current_agent: AgentId | None = None
+    # None is the pre-instance central loop. Instances share the run/mission
+    # but have independent LangGraph threads and work leases.
+    instance_id: AgentInstanceId | None = None
 
     current_goal: str | None = None
     # Additive references for task-first execution. Optional defaults keep
     # checkpoints created before Mission contracts loadable.
     mission_id: MissionId | None = None
     active_task_id: TaskId | None = None
+    # JSON binding so legacy checkpoints remain readable; validated at run admission.
+    llm_request_policy: dict | None = None
     active_path_id: str | None = None
     active_path_version: int | None = None
     active_path_step_id: str | None = None
@@ -154,6 +162,29 @@ class RuntimeState(BaseModel):
     def is_terminal(self) -> bool:
         return self.phase in (AgentPhase.FINISHED, AgentPhase.FAILED)
 
+    @property
+    def work_owner(self) -> str:
+        """Lease identity; old single-run checkpoints retain their owner."""
+        return work_owner_for(self.run_id, self.instance_id)
+
+
+class NativeCallState(BaseModel):
+    """One provider call's durable disposition, not an investigation plan.
+
+    Raw result bodies remain in EvidenceStore. The original execution
+    envelope is retained only for an admitted/deferred call and approval.
+    """
+
+    call_id: str
+    name: str
+    tool_id: str
+    arguments: dict[str, Any] | None = None
+    argument_error: str | None = None
+    dispatch: DispatchItem | None = None
+    evidence_ids: list[str] = Field(default_factory=list)
+    feedback: dict[str, Any] = Field(default_factory=dict)
+    completed: bool = False
+
 
 class GraphState(TypedDict, total=False):
     runtime: RuntimeState
@@ -176,6 +207,11 @@ class GraphState(TypedDict, total=False):
     #: Id of the last event published this turn, so the next node can
     #: cite it as ``causation_id`` and the chain stays walkable.
     last_event_id: EventId | None
+    # Native model-tool roundtrip. No complete provider responses/reasoning.
+    native_calls: list[NativeCallState]
+    native_messages: list[dict[str, Any]]
+    native_final_text: str | None
+    native_outcome: str | None
 
 
 def initial_graph_state(
@@ -194,6 +230,10 @@ def initial_graph_state(
         "dispatch_items": [],
         "worker_outcomes": {},
         "last_event_id": last_event_id,
+        "native_calls": [],
+        "native_messages": [],
+        "native_final_text": None,
+        "native_outcome": None,
     }
 
 

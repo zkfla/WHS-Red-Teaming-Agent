@@ -542,6 +542,7 @@ def _bind_web_search_discovery(descriptor: Any, settings: Any) -> str | None:
     from redteam.capability.web_search_manifest import validate_web_search_discovery
 
     descriptor.target_types = []
+    descriptor.requires_target = False
     descriptor.outbound_text_fields = ["query"]
     try:
         search_config, _ = load_web_search_config(

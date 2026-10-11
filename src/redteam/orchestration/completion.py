@@ -25,21 +25,13 @@ from redteam.orchestration.paths import (
     is_active_status,
     is_known_criterion,
 )
-from redteam.orchestration.session_proof import collect_actual_sessions
+from redteam.orchestration.session_proof import (
+    collect_actual_accounts,
+    collect_actual_sessions,
+)
 
 _ALLOWED_KINDS = ALLOWED_CRITERION_KINDS
 _VALID_OUTCOMES = frozenset({"success", "refuted", "inconclusive", "blocked"})
-
-# Phrases that mean "no candidates left" and must never alone justify completion.
-_NO_CANDIDATE_PHRASES = (
-    "no candidate",
-    "no further",
-    "exhausted",
-    "no actionable",
-    "후보가 없",
-    "후보 소진",
-)
-
 
 def _field(obj: Any, name: str, default: Any = None) -> Any:
     if isinstance(obj, dict):
@@ -165,143 +157,6 @@ def _claimed_proposal_principal(stored_proposal: dict[str, Any]) -> str | None:
         if isinstance(value, str) and value.strip():
             return value.strip()
     return None
-
-
-def _raw_account_names(raw: dict[str, Any], meta: dict[str, Any]) -> set[str]:
-    # Session names come from the shared actual-use collector only; principal
-    # echoes stay readable here as before.
-    found: set[str] = collect_actual_sessions(meta, raw)
-    comparison = meta.get("session_comparison")
-    if isinstance(comparison, dict):
-        for key in ("first_principal_ref", "second_principal_ref"):
-            value = comparison.get(key)
-            if isinstance(value, str) and value.strip():
-                found.add(value.strip())
-    try:
-        output = raw.get("output") if isinstance(raw, dict) else None
-    except Exception:
-        output = None
-    if isinstance(output, dict):
-        for key in ("principal_ref", "first_principal_ref", "second_principal_ref"):
-            value = output.get(key)
-            if isinstance(value, str) and value.strip():
-                found.add(value.strip())
-        for nested_key in ("first", "second", "authenticated", "anonymous"):
-            nested = output.get(nested_key)
-            if isinstance(nested, dict):
-                value = nested.get("principal_ref")
-                if isinstance(value, str) and value.strip():
-                    found.add(value.strip())
-    return found
-
-
-def _clean_completion_identity(value: Any) -> str | None:
-    if isinstance(value, str) and value.strip():
-        return value.strip()
-    return None
-
-
-def _has_exact_account_proof(
-    meta: dict[str, Any],
-    raw: dict[str, Any],
-    claimed_accounts: set[str],
-    stored_args: dict[str, Any] | None,
-) -> bool:
-    """Exact structural identity equality only; never bare or substring."""
-    cleaned_claimed = {
-        str(item).strip() for item in (claimed_accounts or set()) if str(item).strip()
-    }
-    if not cleaned_claimed:
-        return False
-    args = stored_args if isinstance(stored_args, dict) else {}
-    expected_principals = set(cleaned_claimed)
-    for key in ("principal_ref", "principal", "first_principal_ref", "second_principal_ref"):
-        cleaned = _clean_completion_identity(args.get(key))
-        if cleaned is not None:
-            expected_principals.add(cleaned)
-    expected_sessions: set[str] = set()
-    for key in ("session_ref", "first_session_ref", "second_session_ref"):
-        cleaned = _clean_completion_identity(args.get(key))
-        if cleaned is not None:
-            expected_sessions.add(cleaned)
-    raw_principals: set[str] = set()
-    # Session names come from the shared actual-use collector only; the
-    # per-unit receipt-vs-echo rule lives in session_proof, not here.
-    raw_sessions: set[str] = collect_actual_sessions(meta, raw)
-    # Actual-only values for the mismatch gate below.
-    actual_receipts: set[str] = set()
-    http_obs = meta.get("http_observation")
-    if isinstance(http_obs, dict):
-        cleaned = _clean_completion_identity(http_obs.get("actual_session_ref"))
-        if cleaned is not None:
-            actual_receipts.add(cleaned)
-    comparison = meta.get("session_comparison")
-    comparison_dict: dict[str, Any] | None = comparison if isinstance(comparison, dict) else None
-    if comparison_dict is not None:
-        for key in ("first_actual_session_ref", "second_actual_session_ref"):
-            cleaned = _clean_completion_identity(comparison_dict.get(key))
-            if cleaned is not None:
-                actual_receipts.add(cleaned)
-        for key in ("first_principal_ref", "second_principal_ref"):
-            cleaned = _clean_completion_identity(comparison_dict.get(key))
-            if cleaned is not None:
-                raw_principals.add(cleaned)
-    try:
-        output = raw.get("output") if isinstance(raw, dict) else None
-    except Exception:
-        output = None
-    if isinstance(output, dict):
-        for key in (
-            "actual_session_ref",
-            "first_actual_session_ref",
-            "second_actual_session_ref",
-        ):
-            cleaned = _clean_completion_identity(output.get(key))
-            if cleaned is not None:
-                actual_receipts.add(cleaned)
-        for key in ("principal_ref", "first_principal_ref", "second_principal_ref"):
-            cleaned = _clean_completion_identity(output.get(key))
-            if cleaned is not None:
-                raw_principals.add(cleaned)
-        for nested_key in ("first", "second", "authenticated", "anonymous"):
-            nested = output.get(nested_key)
-            if isinstance(nested, dict):
-                cleaned = _clean_completion_identity(nested.get("actual_session_ref"))
-                if cleaned is not None:
-                    actual_receipts.add(cleaned)
-                cleaned = _clean_completion_identity(nested.get("principal_ref"))
-                if cleaned is not None:
-                    raw_principals.add(cleaned)
-    # Configured session inventory (session_list rows) is never actual-use
-    # proof: it is not merged into the raw receipt sets above. Session to
-    # principal binding stays on the separate alias-grounded lookup, and an
-    # absent receipt proves nothing, including anonymous use.
-    if actual_receipts and expected_sessions and actual_receipts.isdisjoint(expected_sessions):
-        # The response says it used sessions nobody asked for: requested echo
-        # must not rescue it, so the whole account proof is rejected.
-        return False
-    if comparison_dict is not None:
-        first_principal = _clean_completion_identity(comparison_dict.get("first_principal_ref"))
-        second_principal = _clean_completion_identity(comparison_dict.get("second_principal_ref"))
-        if first_principal is not None or second_principal is not None:
-            if not expected_principals:
-                return False
-            for observed in (first_principal, second_principal):
-                if observed is not None and observed not in expected_principals:
-                    return False
-            if first_principal is None or second_principal is None:
-                return False
-        first_session = _clean_completion_identity(comparison_dict.get("first_session_ref"))
-        second_session = _clean_completion_identity(comparison_dict.get("second_session_ref"))
-        if (first_session is not None or second_session is not None) and expected_sessions:
-            for observed in (first_session, second_session):
-                if observed is not None and observed not in expected_sessions:
-                    return False
-    if expected_sessions and (raw_sessions & expected_sessions):
-        return True
-    if expected_principals and (raw_principals & expected_principals):
-        return True
-    return False
 
 
 def _evidence_hypothesis_id(record: Any) -> str:
@@ -582,22 +437,161 @@ def check_record_linkage(
     return []
 
 
-async def verify_stored_origin(
+NATIVE_ORIGIN_VERSION = 1
+
+
+def preserved_target_is_absent(metadata: dict[str, Any]) -> bool:
+    """An explicit target-free native proposal, never a missing target field.
+
+    This describes stored input only. Callers still prove the actual raw
+    result and work/task lineage before admitting an execution origin.
+    """
+    from redteam.core.contracts.action import ActionProposal
+
+    stored = metadata.get("proposal")
+    if (
+        not _is_native_origin(metadata)
+        or not isinstance(stored, dict)
+        or "target" not in stored
+        or stored["target"] is not None
+    ):
+        return False
+    try:
+        proposal = ActionProposal.model_validate(stored)
+    except (ValueError, TypeError):
+        return False
+    return proposal.binding_mode == "selected_tool" and proposal.target is None
+
+
+def _origin_version(metadata: Any) -> int:
+    try:
+        value = metadata.get("execution_origin_version", 0) if isinstance(metadata, dict) else 0
+    except Exception:
+        return 0
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _is_native_origin(metadata: Any) -> bool:
+    return _origin_version(metadata) == NATIVE_ORIGIN_VERSION
+
+
+def _has_path_linkage(m_path_id: str, m_version: Any, m_step_id: str) -> bool:
+    return bool(m_path_id and m_version is not None and _s(m_version).strip() != "" and m_step_id)
+
+
+async def _verify_native_work_and_task(
+    *,
+    metadata: dict[str, Any],
+    run_id: str,
+    mission_id: Any | None,
+    task_graph_store: Any | None,
+    work_store: Any | None,
+) -> tuple[list[str], bool]:
+    # Native origin proves an actual execution: a stored work record plus the
+    # live task purpose it was delegated for. Task existence alone is not
+    # execution proof, and identifier echoes without stored records prove
+    # nothing. Every compared value must be present on both sides; a missing
+    # value fails closed instead of being skipped. The one exception is an
+    # explicit missionless (goal-only) observation: when the metadata and
+    # the stored work both carry no mission task and there is no mission at
+    # all, no task is fabricated and the proven work record alone admits the
+    # basic origin. That admission never claims a successful mission
+    # completion; settlement layers above still require their own task
+    # receipt. The goal purpose hash stays mandatory: without a live task
+    # there is no current objective to compare against yet, so the stored
+    # work hash must equal the metadata hash and later closure decides
+    # success.
+    work_id = _s(metadata.get("work_id", "")).strip()
+    if not work_id:
+        return (["native origin has no work binding; treating as unproven"], False)
+    if work_store is None:
+        return (["native origin needs stored work lookup (work store unavailable)"], False)
+    try:
+        work = await work_store.get(work_id)  # type: ignore[union-attr]
+    except Exception:
+        return (["origin work lookup failed; treating as unproven"], False)
+    if work is None:
+        return (["origin work record is missing; treating as unproven"], False)
+    if _s(getattr(work, "run_id", "")).strip() != str(run_id):
+        return (["origin work belongs to another run"], False)
+    for key in ("candidate_key", "model_tool_call_id", "task_purpose_hash"):
+        expected = _s(getattr(work, key, "") or "").strip()
+        actual = _s(metadata.get(key, "") or "").strip()
+        if not expected or not actual:
+            return (["origin work " + key + " has no binding; treating as unproven"], False)
+        if expected != actual:
+            return (["origin work " + key + " disagrees with its stored execution"], False)
+    # Empty target refs describe a target-free call only when the stored
+    # proposal explicitly preserves that native input. Missing input is not
+    # permission to erase a targeted execution's binding.
+    targets = getattr(work, "target_node_ids", None)
+    if preserved_target_is_absent(metadata):
+        raw = _stored_raw_result(metadata)
+        if (
+            targets is None or list(targets)
+            or metadata.get("target_node_id")
+            or not isinstance(raw, dict)
+            or str(raw.get("action_id", "")) != str(metadata["proposal"]["action_id"])
+            or str(raw.get("action_id", "")) != str(metadata.get("action_id", ""))
+            or str(raw.get("tool_id", "")) != str(metadata["proposal"]["tool_id"])
+            or not str(metadata.get("invocation_id", ""))
+            or str(raw.get("invocation_id", "")) != str(metadata["invocation_id"])
+            or str(metadata["proposal"]["run_id"]) != str(run_id)
+        ):
+            return (["target-free origin disagrees with its stored execution"], False)
+    elif targets is not None and not list(targets):
+        return (["origin work has no target binding; treating as unproven"], False)
+    try:
+        work_version = int(getattr(work, "execution_origin_version", 0) or 0)
+    except (TypeError, ValueError):
+        work_version = 0
+    if work_version != NATIVE_ORIGIN_VERSION:
+        return (["origin work is not native execution; treating as unproven"], False)
+    work_task = _s(getattr(work, "mission_task_id", "") or "").strip()
+    meta_task = _s(metadata.get("mission_task_id", "") or "").strip()
+    meta_mission = _s(metadata.get("mission_id", "") or "").strip()
+    if not work_task and not meta_task:
+        if mission_id is None and not meta_mission:
+            return ([], True)
+        return (["native origin has no task binding; treating as unproven"], False)
+    if not work_task or not meta_task:
+        return (["origin work mission_task_id has no binding; treating as unproven"], False)
+    if work_task != meta_task:
+        return (["origin work mission_task_id disagrees with its stored execution"], False)
+    task_id = meta_task
+    if task_graph_store is None:
+        return (["native origin needs stored task lookup (task store unavailable)"], False)
+    try:
+        task = await task_graph_store.get_task(task_id)  # type: ignore[union-attr]
+    except Exception:
+        return (["origin task lookup failed; treating as unproven"], False)
+    if task is None:
+        return (["origin task is missing; treating as unproven"], False)
+    if mission_id is not None and _s(getattr(task, "mission_id", "") or "").strip():
+        if _s(getattr(task, "mission_id", "")).strip() != str(mission_id).strip():
+            return (["origin belongs to another mission"], False)
+    expected_hash = _s(metadata.get("task_purpose_hash", "") or "").strip()
+    if not expected_hash:
+        return (["origin task purpose has no binding; treating as unproven"], False)
+    from redteam.orchestration.coordination import content_hash as _content_hash
+    current_hash = _content_hash({"objective": _s(getattr(task, "objective", "")).strip()})
+    if current_hash != expected_hash:
+        return (["origin task purpose changed since the evidence"], False)
+    return ([], True)
+
+
+async def _verify_legacy_path_origin(
     *,
     path_store: Any,
     run_id: str,
     m_path_id: str,
     m_version: Any,
     m_step_id: str,
-    mission_id: Any | None = None,
+    mission_id: Any | None,
 ) -> list[str]:
-    """Confirm a cited origin step is really stored in this run and mission.
-
-    Lineage staleness is judged by the caller; this only checks existence
-    and binding so other steps or other workers origins can count.
-    """
-    if not m_path_id or m_version is None or _s(m_version).strip() == "" or not m_step_id:
-        return ["has no path linkage (path_id/path_version/path_step_id required)"]
     if path_store is None:
         return ["origin needs stored path lookup (path store unavailable)"]
     try:
@@ -635,6 +629,60 @@ async def verify_stored_origin(
     return []
 
 
+async def verify_stored_origin(
+    *,
+    path_store: Any,
+    run_id: str,
+    m_path_id: str,
+    m_version: Any,
+    m_step_id: str,
+    mission_id: Any | None = None,
+    metadata: dict[str, Any] | None = None,
+    record: Any | None = None,
+    task_graph_store: Any | None = None,
+    work_store: Any | None = None,
+) -> list[str]:
+    _ = record
+    meta = metadata if isinstance(metadata, dict) else {}
+    if _is_native_origin(meta):
+        native_errors, verified = await _verify_native_work_and_task(
+            metadata=meta,
+            run_id=str(run_id),
+            mission_id=mission_id,
+            task_graph_store=task_graph_store,
+            work_store=work_store,
+        )
+        if native_errors:
+            return native_errors
+        if _has_path_linkage(m_path_id, m_version, m_step_id):
+            return await _verify_legacy_path_origin(
+                path_store=path_store,
+                run_id=str(run_id),
+                m_path_id=m_path_id,
+                m_version=m_version,
+                m_step_id=m_step_id,
+                mission_id=mission_id,
+            )
+        if verified:
+            return []
+        # No marker-only admission: without stored work/task lookups a native
+        # origin cannot prove an actual execution. The legacy missing-path
+        # message stays for callers that never had path refs.
+        if task_graph_store is None and work_store is None:
+            return ["native origin needs stored work/task lookup (stores unavailable)"]
+        return ["native origin has no task/work binding; treating as unproven"]
+    if not _has_path_linkage(m_path_id, m_version, m_step_id):
+        return ["has no path linkage (path_id/path_version/path_step_id required)"]
+    return await _verify_legacy_path_origin(
+        path_store=path_store,
+        run_id=str(run_id),
+        m_path_id=m_path_id,
+        m_version=m_version,
+        m_step_id=m_step_id,
+        mission_id=mission_id,
+    )
+
+
 async def verify_origin_step(
     *,
     path_store: Any,
@@ -645,6 +693,11 @@ async def verify_origin_step(
     m_version: Any,
     m_step_id: str,
     evidence_id: str,
+    metadata: dict[str, Any] | None = None,
+    record: Any | None = None,
+    task_graph_store: Any | None = None,
+    work_store: Any | None = None,
+    mission_id: Any | None = None,
 ) -> list[tuple[str, str, str]]:
     """Admit cited origins by stored existence, not by current-step equality.
 
@@ -663,6 +716,23 @@ async def verify_origin_step(
         and m_step_id == step_id
     ):
         return []
+    if _is_native_origin(metadata if isinstance(metadata, dict) else {}):
+        native_errors, verified = await _verify_native_work_and_task(
+            metadata=metadata if isinstance(metadata, dict) else {},
+            run_id=str(run_id),
+            mission_id=mission_id,
+            task_graph_store=task_graph_store,
+            work_store=work_store,
+        )
+        for message in native_errors:
+            formatted = (
+                "evidence '" + str(evidence_id) + "' " + message,
+                "completion_origin_invalid",
+                message,
+            )
+            return [formatted]
+        if verified:
+            return []
     if path_store is None:
         return [
             (
@@ -922,46 +992,48 @@ def _final_success_violation_receipts(
     return matching
 
 
+def _expected_session_refs(stored_args: Any) -> set[str]:
+    """Sessions the stored request named, under any of the tool field names."""
+    args = stored_args if isinstance(stored_args, dict) else {}
+    expected: set[str] = set()
+    for key in ("session_ref", "first_session_ref", "second_session_ref"):
+        value = args.get(key)
+        if isinstance(value, str) and value.strip():
+            expected.add(value.strip())
+    return expected
+
+
 def _verified_completion_accounts(
     meta: dict[str, Any],
     raw: dict[str, Any],
     claimed_accounts: set[str],
     stored_args: dict[str, Any] | None,
+    required_accounts: set[str] | None = None,
 ) -> set[str]:
-    """Exact account names proven by raw identity; for criterion coverage."""
+    """Exact account names proven by this record's preserved raw receipts.
+
+    The declared accounts are the single execution representative and keep
+    their existing raw-identity answer for the execution itself. A
+    criterion account is grounded only by its unit's own actual receipt or
+    by the requested session this record proves; the response naming an
+    account it never receipted is not proof.
+    """
     cleaned_claimed = {
         str(item).strip() for item in (claimed_accounts or set()) if str(item).strip()
     }
-    if not cleaned_claimed:
+    cleaned_required = {
+        str(item).strip() for item in (required_accounts or set()) if str(item).strip()
+    }
+    if not cleaned_claimed and not cleaned_required:
         return set()
-    args = stored_args if isinstance(stored_args, dict) else {}
-    expected_principals = set(cleaned_claimed)
-    for key in ("principal_ref", "principal", "first_principal_ref", "second_principal_ref"):
-        value = args.get(key) if isinstance(args, dict) else None
-        if isinstance(value, str) and value.strip():
-            expected_principals.add(value.strip())
-    expected_sessions: set[str] = set()
-    for key in ("session_ref", "first_session_ref", "second_session_ref"):
-        value = args.get(key) if isinstance(args, dict) else None
-        if isinstance(value, str) and value.strip():
-            expected_sessions.add(value.strip())
+    expected_sessions = _expected_session_refs(stored_args)
     raw_principals: set[str] = set()
-    # Session names come from the shared actual-use collector only; the
-    # per-unit receipt-vs-echo rule lives in session_proof, not here.
+    # Session names and per-unit accounts come from the shared actual-use
+    # collector only; the receipt-vs-echo rule lives in session_proof.
     raw_sessions: set[str] = collect_actual_sessions(meta, raw)
-    # Actual-only values for the mismatch gate below.
-    actual_receipts: set[str] = set()
-    http_obs = meta.get("http_observation")
-    if isinstance(http_obs, dict):
-        value = http_obs.get("actual_session_ref")
-        if isinstance(value, str) and value.strip():
-            actual_receipts.add(value.strip())
+    raw_accounts: set[str] = collect_actual_accounts(meta, raw, expected_sessions)
     comparison = meta.get("session_comparison")
     if isinstance(comparison, dict):
-        for key in ("first_actual_session_ref", "second_actual_session_ref"):
-            value = comparison.get(key)
-            if isinstance(value, str) and value.strip():
-                actual_receipts.add(value.strip())
         for key in ("first_principal_ref", "second_principal_ref"):
             value = comparison.get(key)
             if isinstance(value, str) and value.strip():
@@ -971,14 +1043,6 @@ def _verified_completion_accounts(
     except Exception:
         output = None
     if isinstance(output, dict):
-        for key in (
-            "actual_session_ref",
-            "first_actual_session_ref",
-            "second_actual_session_ref",
-        ):
-            value = output.get(key)
-            if isinstance(value, str) and value.strip():
-                actual_receipts.add(value.strip())
         for key in ("principal_ref", "first_principal_ref", "second_principal_ref"):
             value = output.get(key)
             if isinstance(value, str) and value.strip():
@@ -986,9 +1050,6 @@ def _verified_completion_accounts(
         for nested_key in ("first", "second", "authenticated", "anonymous"):
             nested = output.get(nested_key)
             if isinstance(nested, dict):
-                value = nested.get("actual_session_ref")
-                if isinstance(value, str) and value.strip():
-                    actual_receipts.add(value.strip())
                 value = nested.get("principal_ref")
                 if isinstance(value, str) and value.strip():
                     raw_principals.add(value.strip())
@@ -996,7 +1057,7 @@ def _verified_completion_accounts(
     # proof: it is not merged into the raw receipt sets above. Session to
     # principal binding stays on the separate alias-grounded lookup, and an
     # absent receipt proves nothing, including anonymous use.
-    if actual_receipts and expected_sessions and actual_receipts.isdisjoint(expected_sessions):
+    if raw_sessions and expected_sessions and raw_sessions.isdisjoint(expected_sessions):
         # The response says it used sessions nobody asked for: the whole
         # receipt channel is rejected and only the separate alias-grounded
         # lookup (outside this function) may still ground the claim.
@@ -1005,9 +1066,12 @@ def _verified_completion_accounts(
     for name in cleaned_claimed:
         if name in raw_principals:
             verified.add(name)
-    for session in expected_sessions:
-        if session in raw_sessions and session in cleaned_claimed:
-            verified.add(session)
+    for name in cleaned_required:
+        if name in raw_accounts:
+            verified.add(name)
+    for name in cleaned_claimed | cleaned_required:
+        if name in raw_sessions and name in expected_sessions:
+            verified.add(name)
     return verified
 
 
@@ -1081,6 +1145,9 @@ class CompletionIssues(list[str]):
     def __init__(self) -> None:
         super().__init__()
         self.diagnostics: list[DecisionDiagnostic] = []
+        # Call-local origin references for the next semantic review. Never
+        # persisted as an admission receipt or accepted across later checks.
+        self.verified_source_ids: tuple[str, ...] = ()
 
     def add(
         self,
@@ -1104,6 +1171,7 @@ class CompletionIssues(list[str]):
 
     def deduplicated(self) -> CompletionIssues:
         result = CompletionIssues()
+        result.verified_source_ids = self.verified_source_ids
         seen: set[str] = set()
         for message, diagnostic in zip(self, self.diagnostics, strict=True):
             if message not in seen:
@@ -1267,7 +1335,10 @@ async def validate_result_claims(
     step: PathStep | None = None,
     issues: CompletionIssues | None = None,
     evidence_location: tuple[str | int, ...] = ("completion", "evidence_ids"),
-) -> list[str]:
+    task_graph_store: Any | None = None,
+    work_store: Any | None = None,
+    task: Any | None = None,
+ ) -> list[str]:
     """Verify actual result claims without requiring provisional steps to finish.
 
     Step completion optionally supplies its lineage context. Task/mission
@@ -1279,16 +1350,22 @@ async def validate_result_claims(
         issues = CompletionIssues()
     run = str(run_id)
     proposal = proposal or {"evidence_ids": evidence_ids, "outcome": outcome}
-    reason = proposal.get("reason", "")
     step_id = step.step_id if step else "result"
-    # Per-evidence linkage checks. Missing path linkage can never succeed
-    # (worker D records path_id/path_version/path_step_id/principal_ref).
+    # Per-evidence linkage checks. Legacy evidence without path linkage can
+    # never succeed; native origins prove against the executed work and task.
     valid_records: list[Any] = []
     linked_records: list[Any] = []
     verified_by_evidence: dict[str, set[str]] = {}
     has_semantic = any(_criterion_kind(item) == "semantic" for item in criteria)
     step_target_set = {_s(item).strip() for item in target_node_ids if _s(item).strip()}
     step_principal_set = {_s(item).strip() for item in principal_refs if _s(item).strip()}
+    # Criterion accounts are what the per-criterion scope check below
+    # requires; ask for them here so one record answers for both.
+    criterion_principal_set: set[str] = set()
+    for item in criteria:
+        if isinstance(item, CompletionCriterion):
+            criterion_principal_set.update(_criterion_principal_refs(item))
+    account_principal_set = step_principal_set | criterion_principal_set
     # Resolve explicit receipt references into originals before the unchanged
     # path/origin/raw checks. Keep only latest per-claim receipts as links.
     try:
@@ -1338,6 +1415,12 @@ async def validate_result_claims(
             expanded_ids.append(str(eid))
             source_locations.setdefault(str(eid), reference_location)
     evidence_ids = list(dict.fromkeys(expanded_ids))
+    expected_task_hash: str | None = None
+    if task is not None:
+        from redteam.orchestration.coordination import content_hash as _purpose_hash_fn
+        expected_task_hash = _purpose_hash_fn(
+            {"objective": _s(_field(task, "objective", "")).strip()}
+        )
     for eid in evidence_ids:
         reference_location = source_locations[eid]
         try:
@@ -1366,6 +1449,17 @@ async def validate_result_claims(
                 summary="evidence 'reference' belongs to a different run",
             )
             continue
+        from redteam.orchestration.evidence_validity import current_validity
+
+        validity = await current_validity(evidence_store, graph_service, run, eid)
+        if validity.status not in {"unbound", "valid"}:
+            issues.add(
+                location=reference_location,
+                message=f"evidence '{eid}' reuse conditions are {validity.status}",
+                code="completion_evidence_reuse_unproven",
+                summary="evidence reuse conditions do not support current completion",
+            )
+            continue
         meta = _field(record, "metadata", {}) or {}
         if not isinstance(meta, dict):
             issues.add(
@@ -1378,7 +1472,10 @@ async def validate_result_claims(
         m_path_id = _s(meta.get("path_id", "")).strip()
         m_version = meta.get("path_version", None)
         m_step_id = _s(meta.get("path_step_id", "")).strip()
-        if not m_path_id or m_version is None or _s(m_version).strip() == "" or not m_step_id:
+        native_meta = _is_native_origin(meta)
+        if not native_meta and (
+            not m_path_id or m_version is None or _s(m_version).strip() == "" or not m_step_id
+        ):
             issues.add(
                 location=reference_location,
                 message=f"evidence '{eid}' has no path linkage "
@@ -1390,7 +1487,12 @@ async def validate_result_claims(
                 ),
             )
             continue
+        raw = _stored_raw_result(meta)
         ev_principals = _evidence_principal_refs(record)
+        # The declared principal is the single execution representative; the
+        # response's own unit receipts name the accounts it actually used.
+        # Scope is judged on both, never on the representative alone.
+        observed_principals = ev_principals | collect_actual_accounts(meta, raw)
         anonymous = _is_anonymous_evidence(meta)
         step_principal_lower = {str(item).strip().lower() for item in step_principal_set}
         explicit_anonymous = "anonymous" in step_principal_lower
@@ -1420,7 +1522,7 @@ async def validate_result_claims(
                     summary="evidence 'reference' has no principal_ref",
                 )
                 continue
-            if ev_principals.isdisjoint(step_principal_set):
+            if observed_principals.isdisjoint(step_principal_set):
                 issues.add(
                     location=reference_location,
                     message=f"evidence '{eid}' uses a principal outside the step scope",
@@ -1441,6 +1543,11 @@ async def validate_result_claims(
                 m_version=m_version,
                 m_step_id=m_step_id,
                 evidence_id=eid,
+                metadata=meta,
+                record=record,
+                task_graph_store=task_graph_store,
+                work_store=work_store,
+                mission_id=mission_id,
             )
         else:
             origin_errors = [
@@ -1452,6 +1559,10 @@ async def validate_result_claims(
                     m_path_id=m_path_id,
                     m_version=m_version,
                     m_step_id=m_step_id,
+                    metadata=meta,
+                    record=record,
+                    task_graph_store=task_graph_store,
+                    work_store=work_store,
                 )
             ]
         for origin_message, origin_code, origin_summary in origin_errors:
@@ -1463,6 +1574,16 @@ async def validate_result_claims(
             )
         if origin_errors:
             continue
+        if expected_task_hash is not None:
+            task_hash = _s(meta.get("task_purpose_hash", "") or "").strip()
+            if task_hash and task_hash != expected_task_hash:
+                issues.add(
+                    location=reference_location,
+                    message=f"evidence '{eid}' purpose changed since the evidence",
+                    code="completion_evidence_reference_purpose_changed_since_evidence",
+                    summary="evidence 'reference' purpose changed since the evidence",
+                )
+                continue
         canonical_value = _canonical_evidence_value(meta)
         if not canonical_value:
             issues.add(
@@ -1476,7 +1597,6 @@ async def validate_result_claims(
                 ),
             )
             continue
-        raw = _stored_raw_result(meta)
         if raw is None:
             issues.add(
                 location=reference_location,
@@ -1492,7 +1612,7 @@ async def validate_result_claims(
             )
             continue
         target_ref = _s(meta.get("target_node_id", "")).strip()
-        if not target_ref:
+        if not target_ref and not preserved_target_is_absent(meta):
             issues.add(
                 location=reference_location,
                 message=f"evidence '{eid}' has no target linkage",
@@ -1500,8 +1620,11 @@ async def validate_result_claims(
                 summary="evidence 'reference' has no target linkage",
             )
             continue
-        if step_target_set and target_ref not in step_target_set:
-            related = False
+        if target_ref and step_target_set and target_ref not in step_target_set:
+            related = any([
+                await claim_target_is_grounded(graph_service, record, target)
+                for target in step_target_set
+            ])
             for receipt_meta in admission_receipts:
                 claimed_target = str(receipt_meta.get("target_node_id", "") or "")
                 if claimed_target in step_target_set and _receipt_links_record(
@@ -1567,29 +1690,31 @@ async def validate_result_claims(
         failed_original = raw_success is False or (
             raw_success is None and isinstance(meta.get("error"), dict) and bool(meta.get("error"))
         )
-        if step_principal_set and not explicit_anonymous:
+        if account_principal_set and not explicit_anonymous:
             claimed_accounts = {str(item).strip() for item in ev_principals if str(item).strip()}
+            required_accounts = {
+                str(item).strip() for item in account_principal_set if str(item).strip()
+            }
             stored_args = (
                 stored_proposal.get("arguments") if isinstance(stored_proposal, dict) else None
             )
-            verified_names = _verified_completion_accounts(meta, raw, claimed_accounts, stored_args)
-            if verified_names:
-                verified_by_evidence[eid] = set(verified_names)
-            else:
-                # Past mappings interpret identity only for sessions whose
-                # use is proven by this record's actual receipts.
+            verified_names = _verified_completion_accounts(
+                meta, raw, claimed_accounts, stored_args, required_accounts
+            )
+            alias_verified: set[str] = set()
+            pending_accounts = (claimed_accounts | required_accounts) - verified_names
+            if pending_accounts:
+                # Past mappings interpret identity only for sessions this
+                # record receipted and this request named: a receipt for
+                # sessions nobody asked for proves nothing, exactly as the
+                # direct check above rejects it.
+                expected_sessions = _expected_session_refs(stored_args)
                 actual_sessions = collect_actual_sessions(meta, raw)
-                bound_session: str | None = None
-                if isinstance(stored_args, dict):
-                    candidate = stored_args.get("session_ref")
-                    if isinstance(candidate, str) and candidate.strip():
-                        bound_session = candidate.strip()
-                if bound_session is not None:
-                    actual_sessions = actual_sessions & {bound_session}
-                alias_verified: set[str] = set()
+                if expected_sessions:
+                    actual_sessions = actual_sessions & expected_sessions
                 if actual_sessions:
                     try:
-                        for claimed_name in sorted(claimed_accounts):
+                        for claimed_name in sorted(pending_accounts):
                             for actual_session in sorted(actual_sessions):
                                 if await _completion_alias_grounded(
                                     evidence_store=evidence_store,
@@ -1616,24 +1741,25 @@ async def validate_result_claims(
                             ),
                         )
                         continue
-                if alias_verified:
-                    verified_by_evidence[eid] = set(alias_verified)
-                else:
-                    issues.add(
-                        location=reference_location,
-                        message=(
-                            f"evidence '{eid}' declares account {sorted(claimed_accounts)} "
-                            "but has no exact raw session receipt or grounded session binding; "
-                            "declaration alone is not proof"
-                        ),
-                        code="completion_evidence_reference_declares_account_reference_but_63",
-                        summary=(
-                            "evidence 'reference' declares account reference but has no exact "
-                            "raw session receipt or grounded session binding; declaration "
-                            "alone is not proof"
-                        ),
-                    )
-                    continue
+            grounded_accounts = set(verified_names) | alias_verified
+            if grounded_accounts:
+                verified_by_evidence[eid] = grounded_accounts
+            else:
+                issues.add(
+                    location=reference_location,
+                    message=(
+                        f"evidence '{eid}' declares account {sorted(claimed_accounts)} "
+                        "but has no exact raw session receipt or grounded session binding; "
+                        "declaration alone is not proof"
+                    ),
+                    code="completion_evidence_reference_declares_account_reference_but_63",
+                    summary=(
+                        "evidence 'reference' declares account reference but has no exact "
+                        "raw session receipt or grounded session binding; declaration "
+                        "alone is not proof"
+                    ),
+                )
+                continue
         if failed_original and outcome in {"success", "refuted"}:
             if has_semantic:
                 # Failed originals stay readable as general results for
@@ -1705,6 +1831,23 @@ async def validate_result_claims(
         pool = list(valid_records)
         if kind == "semantic" and linked_records:
             pool = pool + [rec for rec in linked_records if rec not in pool]
+        if task is not None and getattr(task, "completion_contract_version", 1) == 2:
+            # Apply original identity/success filtering BEFORE principal coverage:
+            # a failed or duplicate record must not supply the missing account
+            # while unrelated successful originals satisfy the numeric count.
+            originals: dict[tuple[Any, Any], tuple[Any, dict[str, Any]]] = {}
+            conflicting_originals: set[tuple[Any, Any]] = set()
+            for record in pool:
+                meta = _field(record, "metadata", {}) or {}
+                raw = _stored_raw_result(meta) or {}
+                identity = (raw.get("action_id"), raw.get("invocation_id"))
+                if all(identity):
+                    previous = originals.get(identity)
+                    if previous is not None and previous[1] != raw:
+                        conflicting_originals.add(identity)
+                    originals.setdefault(identity, (record, raw))
+            pool = [record for identity, (record, raw) in originals.items()
+                    if identity not in conflicting_originals and raw.get("success") is True]
         if required_principals:
             verified_pool: list[Any] = []
             have = set()
@@ -2014,14 +2157,6 @@ async def validate_result_claims(
                     summary="refuted outcome contradicts a confirmed hypothesis condition",
                 )
                 break
-    if outcome == "success" and not valid_records:
-        lowered_reason = _s(reason).lower()
-        if any(phrase in lowered_reason for phrase in _NO_CANDIDATE_PHRASES):
-            issues.add(
-                "lack of candidates alone cannot justify completion",
-                code="completion_lack_of_candidates_alone_cannot_justify_38",
-                summary="lack of candidates alone cannot justify completion",
-            )
     # Proposal claim vs reality: only flag explicit false-met claims.
     claims = _proposal_claims(proposal)
     for key, claimed in claims:
@@ -2038,10 +2173,13 @@ async def validate_result_claims(
                         summary="proposal claims 'reference' is met but reference is not satisfied",
                     )
                 break
+    if not issues:
+        issues.verified_source_ids = tuple(evidence_ids)
     return issues.deduplicated()
 
 
 __all__ = [
+    "NATIVE_ORIGIN_VERSION",
     "check_record_linkage",
     "verify_stored_origin",
     "verify_origin_step",

@@ -12,10 +12,12 @@ from typing import Any
 from redteam.attack_graph.predicates import Confidence, Provenance
 from redteam.core.contracts.events import EventType
 from redteam.core.contracts.graph import Finding, Hypothesis
+from redteam.core.contracts.tool import execution_outcome_uncertain
 from redteam.core.enums import AgentPhase, PolicyVerdict
 from redteam.core.tool_binding import execution_display_key
 from redteam.orchestration.context import RuntimeDeps
 from redteam.orchestration.events import GRAPH_MUTATION_APPLIED, RESULT_MAPPER_FAILED
+from redteam.orchestration.execution_journal import mark_execution_processed
 from redteam.orchestration.nodes._support import advance, graph_service, publisher_for
 from redteam.orchestration.nodes.policy import denial_severity
 from redteam.orchestration.runtime_observation import (
@@ -66,7 +68,12 @@ async def update_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             if result is not None and state.get("result_evidence_id")
             else None
         ),
-        confidence=Confidence.MEASURED if succeeded else Confidence.INFERRED,
+        # Measured confidence follows the tool itself: a semantic verifier
+        # failure must not downgrade what was actually measured, and a tool
+        # failure is never promoted to measured. Work status below still
+        # records verifier failures as FAILED; only graph promotion uses
+        # ``tool_succeeded`` here.
+        confidence=Confidence.MEASURED if tool_succeeded else Confidence.INFERRED,
     )
 
     # Planned attributes are never promoted into measured facts: only the
@@ -100,18 +107,18 @@ async def update_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
         labels=[f"observed-by:{proposal.agent_id}"],
         provenance=provenance,
         step=runtime.step_count,
-    )
+    ) if proposal.target is not None else None
 
     attempt_record_key = step.attempt_record_key if step is not None else operation_key
-    await service.record_attempt(
-        node.id, attempt_record_key, step=runtime.step_count, provenance=provenance
-    )
+    if node is not None:
+        await service.record_attempt(
+            node.id, attempt_record_key, step=runtime.step_count, provenance=provenance
+        )
 
     last_event = await publisher.publish(
         EventType.GRAPH_UPDATED,
         {
-            "node_id": str(node.id),
-            "node_type": node.type.value,
+            **({"node_id": str(node.id), "node_type": node.type.value} if node else {}),
             "action_id": proposal.action_id,
             "operation": operation_key,
             "attrs": observed_attrs,
@@ -144,7 +151,12 @@ async def update_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             result=result,
         )
         mutation = outcome.mutation
-        if succeeded:
+        # Domain promotion is gated on the measured tool result. A
+        # code-owned mapper Finding that passes its existing code check is
+        # applied without an extra LLM gate; a verifier exception never
+        # blocks valid observations, and a failed tool result is never
+        # converted to success here.
+        if tool_succeeded:
             mutated_nodes = len(mutation.nodes)
             mutated_edges = len(mutation.edges)
             mutated_findings = len(mutation.findings)
@@ -234,9 +246,9 @@ async def update_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
         # Graph writes stay success-gated: a verification or tool failure
         # still records the mapping outcome and grounded references above,
         # but never promotes unmeasured output into nodes/edges/findings.
-        nodes_to_apply = mutation.nodes if succeeded else []
-        edges_to_apply = mutation.edges if succeeded else []
-        findings_to_apply = mutation.findings if succeeded else []
+        nodes_to_apply = mutation.nodes if tool_succeeded else []
+        edges_to_apply = mutation.edges if tool_succeeded else []
+        findings_to_apply = mutation.findings if tool_succeeded else []
         # Processing record: before-attempt intent, confirmed counters after
         # each write phase, and a partial/failed companion on exception. The
         # original evidence record is never touched. Skipped calls produce no
@@ -412,7 +424,7 @@ async def update_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                         )
 
             processing_stage = "findings"
-            if succeeded and (mutation.nodes or mutation.edges or mutation.findings):
+            if tool_succeeded and (nodes_to_apply or edges_to_apply or findings_to_apply):
                 last_event = await publisher.publish(
                     GRAPH_MUTATION_APPLIED,
                     {
@@ -490,7 +502,7 @@ async def update_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
     approval_waiting = decision is not None and decision.verdict is PolicyVerdict.REQUIRE_APPROVAL
     if work_id is not None and approval_waiting:
         await deps.work_store.release(
-            work_id, owner=str(runtime.run_id), now=datetime.now(timezone.utc)
+            work_id, owner=runtime.work_owner, now=datetime.now(timezone.utc)
         )
     elif work_id is not None:
         error_code = result.error.code if result is not None and result.error else None
@@ -514,22 +526,37 @@ async def update_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
                 reason = f"verification_exception:{verification_exception}"
             else:
                 reason = error_code if error_code else "tool_failed"
-        await deps.work_store.complete(
+        completed = await deps.work_store.complete(
             work_id,
-            owner=str(runtime.run_id),
+            owner=runtime.work_owner,
             status=work_status,
             now=datetime.now(timezone.utc),
             reason=reason,
+            execution_known=result is not None and not execution_outcome_uncertain(result.metadata),
+        )
+        if not completed:
+            raise RuntimeError("execution_work_settlement_failed")
+
+    result_evidence_id = state.get("result_evidence_id")
+    if result is not None and result_evidence_id is not None:
+        await mark_execution_processed(
+            deps.evidence_store, run_id=runtime.run_id, action_id=proposal.action_id,
+            instance_id=runtime.instance_id, work_id=work_id,
+            evidence_id=result_evidence_id,
         )
 
-    state_outcome = "blocked" if blocked else "updated" if succeeded else "failed"
+    # The graph summary follows measured application: verifier failures are
+    # still FAILED for work accounting above, but an applied observation
+    # reports "updated" with ``verification_failed`` on the event.
+    state_outcome = "blocked" if blocked else "updated" if tool_succeeded else "failed"
     next_runtime = append_runtime_observation(
         runtime.model_copy(update={"phase": AgentPhase.REPLAN}),
         RuntimeObservation(
             kind="state",
             summary=(
-                f"Attack graph {state_outcome} for {node.type.value} {node.id}; "
-                f"added {mutated_nodes} node(s), {mutated_edges} edge(s), "
+                f"Result {state_outcome} for "
+                + (f"{node.type.value} {node.id}; " if node else "a target-free execution; ")
+                + f"added {mutated_nodes} node(s), {mutated_edges} edge(s), "
                 f"and {mutated_findings} finding(s)"
             )[:500],
             outcome=state_outcome,
@@ -537,7 +564,7 @@ async def update_node(state: GraphState, *, deps: RuntimeDeps) -> GraphState:
             action_id=str(proposal.action_id),
             capability=proposal.capability,
             operation=proposal.operation,
-            target=str(node.id),
+            target=str(node.id) if node else None,
             reasons=(list(decision.reasons[:8]) if blocked and decision is not None else []),
             alternative_allowed=True,
         ),

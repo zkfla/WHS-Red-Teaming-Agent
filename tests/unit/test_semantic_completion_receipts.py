@@ -619,6 +619,195 @@ async def test_session_inventory_never_proves_actual_use_for_completion(
     assert any("session" in item or "principal" in item for item in issues)
 
 
+def _two_account_comparison(
+    *,
+    evidence_id: str = "ev-two-account-comparison",
+    second_receipt: bool = True,
+    sessions: tuple[str, str] = ("alice", "bob"),
+) -> Any:
+    """The two-session comparison shape: one receipted account per unit."""
+    first_actual = sessions[0]
+    second_actual = sessions[1] if second_receipt else None
+    first: dict[str, Any] = {
+        "principal_ref": "test-alice",
+        "status_code": 200,
+        "body_sha256": "a" * 64,
+        "actual_session_ref": first_actual,
+    }
+    second: dict[str, Any] = {
+        "principal_ref": "test-bob",
+        "status_code": 200,
+        "body_sha256": "a" * 64,
+    }
+    if second_actual is not None:
+        second["actual_session_ref"] = second_actual
+    evidence = h.make_tool_evidence(
+        evidence_id=evidence_id,
+        run_id=str(RUN),
+        engagement_id=str(ENGAGEMENT),
+        action_id="action-compare",
+        invocation_id="inv-compare",
+        path_id=PATH_ID,
+        path_version=PATH_VERSION,
+        step_id=STEP_ID,
+        target_node_id=TARGET_NODE,
+        capability="web",
+        operation="response_analysis",
+        tool_id="web.web-http.http_compare_sessions",
+        output={
+            "target_ref": "bank-lab",
+            "first": first,
+            "second": second,
+            "same_status": True,
+            "same_body": True,
+            "verdict": "observation_only",
+            "request_count": 2,
+        },
+    )
+    # The stored representative is the single session the step ran as; the
+    # two accounts exist only as per-unit response receipts.
+    evidence.metadata["principal_ref"] = "alice"
+    evidence.metadata["proposal"]["arguments"] = {
+        "target_ref": "bank-lab",
+        "path": "/api/accounts/alice",
+        "first_session_ref": "alice",
+        "second_session_ref": "bob",
+    }
+    # The stored comparison observation the web mapper writes beside the raw.
+    evidence.metadata["session_comparison"] = {
+        "kind": "http_session_comparison",
+        "target_ref": "bank-lab",
+        "first_session_ref": "alice",
+        "second_session_ref": "bob",
+        "first_principal_ref": "test-alice",
+        "second_principal_ref": "test-bob",
+        "first_actual_session_ref": first_actual,
+        **(
+            {"second_actual_session_ref": second_actual}
+            if second_actual is not None
+            else {}
+        ),
+        "first_status": 200,
+        "second_status": 200,
+        "same_status": True,
+        "same_body": True,
+        "verdict": "observation_only",
+    }
+    return evidence
+
+
+def _two_account_step(principals: list[str]) -> PathStep:
+    return PathStep(
+        step_id=STEP_ID,
+        objective="compare the provisioned accounts",
+        target_node_ids=[TARGET_NODE],
+        principal_refs=list(principals),
+        allowed_operations=["web.response_analysis"],
+        completion_criteria=[
+            CompletionCriterion(
+                kind="observation",
+                description="the provisioned accounts were observed",
+                min_evidence=1,
+                principal_refs=list(principals),
+            )
+        ],
+    )
+
+
+async def _complete_two_account_claim(evidence: Any, principals: list[str]):
+    store, _llm, service, _deps = _harness(_success_llm())
+    await store.append(evidence)
+    step = _two_account_step(principals)
+    return await validate_completion(
+        path=_path(step),
+        step=step,
+        proposal=_completion_proposal(evidence.evidence_id),
+        evidence_store=store,
+        graph_service=service,
+        run_id=str(RUN),
+    )
+
+
+async def test_two_unit_account_receipts_cover_both_criterion_accounts() -> None:
+    """Regression: one receipted account per unit covers a two-account claim.
+
+    The stored execution representative names one session; the response
+    receipted each account in its own unit. Judging the scope on the
+    representative alone falsely rejects a claim the originals support.
+    """
+    issues = await _complete_two_account_claim(
+        _two_account_comparison(), ["test-alice", "test-bob"]
+    )
+    assert issues == []
+
+
+async def test_account_without_its_own_unit_receipt_is_not_covered() -> None:
+    """A partial receipt never borrows the unit the response did not receipt."""
+    issues = await _complete_two_account_claim(
+        _two_account_comparison(second_receipt=False), ["test-alice", "test-bob"]
+    )
+    assert issues != []
+    assert any("missing principal scope" in item for item in issues)
+
+
+async def test_receipted_sessions_nobody_requested_never_ground_the_claim() -> None:
+    """Same-run mismatch: receipts for other sessions prove no claimed account.
+
+    The request named alice and bob; the response receipted zzz and www. The
+    session binding must not reinterpret those receipts as the claim's
+    accounts, exactly as the direct per-unit check rejects them.
+    """
+    issues = await _complete_two_account_claim(
+        _two_account_comparison(sessions=("zzz", "www")), ["test-alice", "test-bob"]
+    )
+    joined = " ".join(issues)
+    assert "no exact raw session receipt" in joined
+    assert "missing principal scope" in joined
+
+
+async def test_review_receipt_reports_both_receipted_accounts() -> None:
+    """The public review receipt reads the same per-unit account rule."""
+    store, _llm, service, _deps = _harness(_success_llm())
+    evidence = _two_account_comparison(evidence_id="ev-review-coverage")
+    await store.append(evidence)
+    receipt = await append_review_receipt(
+        evidence_store=store,
+        proposal=_proposal(
+            args={
+                "target_ref": "bank-lab",
+                "first_session_ref": "alice",
+                "second_session_ref": "bob",
+            }
+        ),
+        result=_result(output=evidence.metadata["tool_result"]["output"]),
+        assessment=VerificationAssessment(
+            verdict=Verdict.UNKNOWN,
+            reason="observation only",
+            reviewer_id="analysis:test",
+            source_refs=[str(evidence.evidence_id)],
+            outcome="unknown",
+            claim_supported=False,
+        ),
+        admission="final",
+    )
+    assert receipt is not None
+    assert receipt.metadata["covered_principals"] == ["test-alice", "test-bob"]
+
+
+@pytest.mark.parametrize(
+    "principals, needle",
+    [
+        (["mallory"], "outside the step scope"),
+        (["alice", "mallory"], "missing principal scope"),
+    ],
+)
+async def test_claimed_account_no_unit_receipted_stays_unproven(principals, needle) -> None:
+    """Forged scope: an account no unit receipted never becomes coverage."""
+    issues = await _complete_two_account_claim(_two_account_comparison(), principals)
+    assert issues != []
+    assert any(needle in item for item in issues)
+
+
 async def test_summary_step_aggregates_three_prior_origins_without_direct_execution() -> None:
     store, _llm, service, _deps = _harness(_success_llm())
     from redteam.orchestration.paths import InMemoryPathStore
@@ -813,6 +1002,198 @@ async def test_local_record_string_and_same_value_replay_preserve_original():
     assert (await store.get(refs[0])).model_dump(mode="json") == original
 
 
+async def test_envelope_prefixed_raw_path_grounds_the_same_output_location():
+    from redteam.attack_graph.predicates import facts_of
+
+    store, _, service, deps, registry, refs = await _recording_world()
+    result = await registry.call(
+        "graph.record",
+        {
+            "facts": [
+                {
+                    "evidence_id": refs[0],
+                    "raw_path": ["output", "status"],
+                    "value": 200,
+                    "fact_name": "status_code",
+                    "target_node_id": TARGET_NODE,
+                }
+            ]
+        },
+        _recording_context(deps),
+    )
+    assert result.ok, result.error
+    assert result.payload["refused_facts"] == []
+    observed = facts_of((await service.get_node(TARGET_NODE)).properties)
+    assert observed["status_code"] == 200
+
+
+async def test_envelope_prefix_alone_addresses_the_whole_output():
+    from redteam.attack_graph.predicates import facts_of
+
+    store, _, service, deps, registry, refs = await _recording_world(
+        output="service banner"
+    )
+    result = await registry.call(
+        "graph.record",
+        {
+            "facts": [
+                {
+                    "evidence_id": refs[0],
+                    "raw_path": ["output"],
+                    "value": "service banner",
+                    "fact_name": "banner",
+                    "target_node_id": TARGET_NODE,
+                }
+            ]
+        },
+        _recording_context(deps),
+    )
+    assert result.ok, result.error
+    observed = facts_of((await service.get_node(TARGET_NODE)).properties)
+    assert observed["banner"] == "service banner"
+
+
+@pytest.mark.parametrize("index", [0, "0"])
+async def test_index_segments_str_or_int_ground_list_locations(index):
+    from redteam.attack_graph.predicates import facts_of
+
+    store, _, service, deps, registry, refs = await _recording_world(
+        output={"items": [{"name": "alpha"}]}
+    )
+    result = await registry.call(
+        "graph.record",
+        {
+            "facts": [
+                {
+                    "evidence_id": refs[0],
+                    "raw_path": ["items", index, "name"],
+                    "value": "alpha",
+                    "fact_name": "first_name",
+                    "target_node_id": TARGET_NODE,
+                }
+            ]
+        },
+        _recording_context(deps),
+    )
+    assert result.ok, result.error
+    observed = facts_of((await service.get_node(TARGET_NODE)).properties)
+    assert observed["first_name"] == "alpha"
+
+
+async def test_resolved_pointer_never_falls_back_to_a_stripped_pointer():
+    store, _, service, deps, registry, refs = await _recording_world(
+        output={"output": {"status": 999}, "status": 200}
+    )
+    result = await registry.call(
+        "graph.record",
+        {
+            "facts": [
+                {
+                    "evidence_id": refs[0],
+                    "raw_path": ["output", "status"],
+                    "value": 200,
+                    "fact_name": "status_code",
+                    "target_node_id": TARGET_NODE,
+                }
+            ]
+        },
+        _recording_context(deps),
+    )
+    assert not result.ok
+    assert result.payload["accepted_facts"] == []
+    assert result.payload["refused_facts"] == [
+        {"evidence_id": refs[0], "reason": "value mismatch"}
+    ]
+    assert "status_code" not in (await service.get_node(TARGET_NODE)).properties["facts"]
+
+
+async def test_unknown_relative_key_still_refuses_with_raw_path_missing():
+    store, _, service, deps, registry, refs = await _recording_world()
+    result = await registry.call(
+        "graph.record",
+        {
+            "facts": [
+                {
+                    "evidence_id": refs[0],
+                    "raw_path": ["absent", "status"],
+                    "value": 200,
+                    "fact_name": "status_code",
+                    "target_node_id": TARGET_NODE,
+                }
+            ]
+        },
+        _recording_context(deps),
+    )
+    assert not result.ok
+    assert result.payload["refused_facts"][0]["reason"] == "raw path missing"
+
+
+async def test_discovered_entity_accepts_envelope_prefixed_entity_path():
+    from redteam.attack_graph.identity import node_id_for_target
+    from redteam.core.contracts.target import UrlTarget
+
+    store, _, service, deps, registry, refs = await _recording_world()
+    discovered = UrlTarget(url="https://other.local/api")
+    result = await registry.call(
+        "graph.record",
+        {
+            "facts": [
+                {
+                    "evidence_id": refs[0],
+                    "raw_path": ["status"],
+                    "value": 200,
+                    "entity_raw_path": ["output", "address"],
+                    "fact_name": "response_status",
+                    "target_node_id": TARGET_NODE,
+                    "new_entity": {
+                        "target": discovered.model_dump(mode="json"),
+                        "relation": "owns",
+                    },
+                }
+            ]
+        },
+        _recording_context(deps),
+    )
+    node = await service.get_node(node_id_for_target(discovered))
+    assert result.ok and node is not None
+    assert node.properties["attrs"]["observation"] == "discovered"
+
+
+@pytest.mark.parametrize("segment", [True, 1.5])
+def test_boolean_and_float_path_segments_are_rejected(segment):
+    from pydantic import ValidationError
+
+    from redteam.orchestration.graph_recording import GraphRecordingInput
+
+    with pytest.raises(ValidationError) as caught:
+        GraphRecordingInput.model_validate(
+            {
+                "facts": [
+                    {
+                        "evidence_id": "ev-1",
+                        "raw_path": ["items", segment],
+                        "fact_name": "first_name",
+                        "target_node_id": "host:target.local",
+                    }
+                ]
+            }
+        )
+    assert any("raw_path" in item["loc"] for item in caught.value.errors())
+
+
+def test_published_pointer_rule_is_shared_by_schema_and_descriptor():
+    from redteam.orchestration.graph_recording import (
+        GraphRecordingInput,
+        graph_recording_descriptor,
+    )
+
+    schema = GraphRecordingInput.model_json_schema()
+    field = schema["$defs"]["RecordedFact"]["properties"]["raw_path"]
+    marker = "envelope-prefixed"
+    assert marker in field["description"]
+    assert marker in graph_recording_descriptor().description
+
+
 async def test_scalar_measurement_cannot_ground_an_arbitrary_related_target():
     from redteam.attack_graph.predicates import facts_of
     from redteam.orchestration.analysis import claim_target_is_grounded
@@ -928,7 +1309,7 @@ async def test_recorded_fact_rejects_mismatched_origin_and_value(attack):
     assert "status_code" not in (await service.get_node(TARGET_NODE)).properties["facts"]
 
 
-async def test_posthoc_hypothesis_receipt_completes_from_prior_original_or_receipt():
+async def test_standalone_hypothesis_registers_open_without_model_review():
     from copy import deepcopy
 
     store, llm, service, deps, registry, refs = await _recording_world()
@@ -947,13 +1328,156 @@ async def test_posthoc_hypothesis_receipt_completes_from_prior_original_or_recei
         _recording_context(deps),
     )
     entry = recorded.payload["hypotheses"][0]
-    assert entry["status"] == "confirmed"
-    assert llm.calls == 1
-    assert await _posthoc_complete(store, service, entry["hypothesis_id"], refs) == []
-    assert (
-        await _posthoc_complete(store, service, entry["hypothesis_id"], [entry["receipt_id"]]) == []
-    )
+    assert recorded.ok
+    assert entry["status"] == "open"
+    assert "receipt_id" not in entry
+    assert llm.calls == 0
+    assert (await service.get_hypothesis(entry["hypothesis_id"])).status == "open"
+    # An open question alone satisfies no confirmation criterion.
+    assert await _posthoc_complete(store, service, entry["hypothesis_id"], refs) != []
     assert [(await store.get(ref)).model_dump(mode="json") for ref in refs] == originals
+
+
+async def test_explicit_security_finding_confirms_open_hypothesis_with_receipt():
+    store, llm, service, deps, registry, refs = await _recording_world(
+        response={**_success_llm(), "hypothesis_outcome": "success"}
+    )
+    recorded = await registry.call(
+        "graph.record",
+        {
+            "hypotheses": [
+                {
+                    "statement": "Unauthenticated callers can read accounts",
+                    "target_node_id": TARGET_NODE,
+                    "evidence_refs": refs,
+                }
+            ]
+        },
+        _recording_context(deps),
+    )
+    hid = recorded.payload["hypotheses"][0]["hypothesis_id"]
+    assert recorded.payload["hypotheses"][0]["status"] == "open"
+    assert llm.calls == 0
+    found = await registry.call(
+        "graph.record",
+        {
+            "findings": [
+                {
+                    "statement": "Anonymous requests disclose another customer's account",
+                    "target_node_id": TARGET_NODE,
+                    "hypothesis_id": hid,
+                    "evidence_refs": refs,
+                }
+            ]
+        },
+        _recording_context(deps),
+    )
+    finding = found.payload["findings"][0]
+    assert found.ok and finding["status"] == "recorded"
+    assert finding["hypothesis_id"] == hid
+    assert llm.calls == 1
+    assert (await service.get_hypothesis(hid)).status == "confirmed"
+    assert await _posthoc_complete(store, service, hid, refs) == []
+    assert await _posthoc_complete(store, service, hid, [finding["receipt_id"]]) == []
+
+
+async def test_empty_hypothesis_ref_registers_open_without_review():
+    store, llm, service, deps, registry, refs = await _recording_world()
+    recorded = await registry.call(
+        "graph.record",
+        {
+            "hypotheses": [
+                {
+                    "statement": "needs a follow-up question",
+                    "target_node_id": TARGET_NODE,
+                    "evidence_refs": [],
+                }
+            ]
+        },
+        _recording_context(deps),
+    )
+    entry = recorded.payload["hypotheses"][0]
+    assert recorded.ok
+    assert entry["status"] == "open"
+    assert "receipt_id" not in entry
+    assert llm.calls == 0
+    assert (await service.get_hypothesis(entry["hypothesis_id"])).status == "open"
+
+
+async def test_hypothesis_without_verifier_registers_open():
+    from dataclasses import replace
+
+    from redteam.orchestration.graph_recording import (
+        GraphRecordingHandler,
+        graph_recording_descriptor,
+    )
+    from redteam.orchestration.local_tools import LocalToolRegistry
+
+    store, llm, service, deps, registry, refs = await _recording_world()
+    plain = LocalToolRegistry()
+    plain.register(
+        graph_recording_descriptor(),
+        GraphRecordingHandler(evidence_store=store, graph_service=service),
+    )
+    context = _recording_context(deps)
+    context = replace(context, deps=replace(deps, verifier=None))
+    recorded = await plain.call(
+        "graph.record",
+        {
+            "hypotheses": [
+                {
+                    "statement": "response observed",
+                    "target_node_id": TARGET_NODE,
+                    "evidence_refs": refs,
+                }
+            ]
+        },
+        context,
+    )
+    entry = recorded.payload["hypotheses"][0]
+    assert recorded.ok
+    assert entry["status"] == "open"
+    assert llm.calls == 0
+
+
+async def test_confirmed_hypothesis_reregistration_keeps_confirmed_status():
+    store, llm, service, deps, registry, refs = await _recording_world(
+        response={**_success_llm(), "hypothesis_outcome": "success"}
+    )
+    first = await registry.call(
+        "graph.record",
+        {
+            "findings": [
+                {
+                    "statement": "Anonymous requests disclose another customer's account",
+                    "target_node_id": TARGET_NODE,
+                    "evidence_refs": refs,
+                }
+            ]
+        },
+        _recording_context(deps),
+    )
+    hid = first.payload["findings"][0]["hypothesis_id"]
+    assert (await service.get_hypothesis(hid)).status == "confirmed"
+    calls = llm.calls
+    repeat = await registry.call(
+        "graph.record",
+        {
+            "hypotheses": [
+                {
+                    "statement": "Anonymous requests disclose another customer's account",
+                    "target_node_id": TARGET_NODE,
+                    "evidence_refs": refs,
+                }
+            ]
+        },
+        _recording_context(deps),
+    )
+    assert repeat.ok
+    assert repeat.payload["hypotheses"][0]["hypothesis_id"] == hid
+    assert repeat.payload["hypotheses"][0]["status"] == "confirmed"
+    assert llm.calls == calls
+    assert (await service.get_hypothesis(hid)).status == "confirmed"
 
 
 async def test_finding_paraphrase_one_review_replay_and_latest_refutation():
@@ -1155,3 +1679,80 @@ async def test_result_claim_reference_location_uses_claim_local_submission(prefi
         "$.criteria[1].claims[0].evidence_ids[0]"
     )
     assert diagnostics[0].location == expected
+
+
+# A rejected recording input publishes the same shared validation diagnostic
+# as the native-loop helpers, scoped to the recording schema itself.
+async def test_recording_input_validation_publishes_known_fields_not_values():
+    sentinel = "opaqueRecordingValue"
+    _, llm, _, deps, registry, refs = await _recording_world()
+    invalid = {
+        "facts": [
+            {
+                "evidence_id": refs[0],
+                "value": sentinel,
+                "fact_name": "banner",
+                "target_node_id": TARGET_NODE,
+            }
+        ]
+    }
+    result = await registry.call("graph.record", invalid, _recording_context(deps))
+    assert result.ok is False
+    assert result.runtime_outcome is None
+    diagnostic = result.payload["diagnostic"]
+    assert diagnostic["code"] == "model_validation"
+    assert diagnostic["validation_issues"][0] == {
+        "rule": "missing",
+        "location": "$.facts[0].raw_path",
+    }
+    assert "$.facts[0].raw_path" in str(result.error)
+    assert sentinel not in str(result.error)
+    assert sentinel not in str(result.payload)
+    assert llm.calls == 0
+
+
+async def test_recording_input_keeps_undeclared_keys_unnamed_and_siblings_unchanged():
+    sentinel = "opaqueUndeclaredValue"
+    _, llm, _, deps, registry, refs = await _recording_world(output="service banner")
+    undeclared = await registry.call(
+        "graph.record",
+        {"facts": [], "mystery_key_name": sentinel},
+        _recording_context(deps),
+    )
+    assert undeclared.ok is False
+    assert undeclared.payload["diagnostic"]["validation_issues"] == [
+        {"rule": "extra_forbidden", "location": "$"}
+    ]
+    assert "mystery_key_name" not in str(undeclared.payload)
+    assert sentinel not in str(undeclared.payload)
+    accepted = {
+        "evidence_id": refs[0],
+        "raw_path": [],
+        "value": "service banner",
+        "fact_name": "banner",
+        "target_node_id": TARGET_NODE,
+    }
+    valid = await registry.call(
+        "graph.record", {"facts": [dict(accepted)]}, _recording_context(deps)
+    )
+    assert valid.ok is True
+    assert [item["fact_name"] for item in valid.payload["accepted_facts"]] == ["banner"]
+    assert valid.payload["refused_facts"] == []
+    partial = await registry.call(
+        "graph.record",
+        {
+            "facts": [
+                dict(accepted),
+                {**accepted, "fact_name": "other", "value": "not-the-original"},
+            ]
+        },
+        _recording_context(deps),
+    )
+    assert partial.ok is False
+    assert [item["fact_name"] for item in partial.payload["accepted_facts"]] == ["banner"]
+    assert partial.payload["refused_facts"] == [
+        {"evidence_id": refs[0], "reason": "value mismatch"}
+    ]
+    assert partial.error == "some items refused; see payload"
+    assert "not-the-original" not in str(partial.payload)
+    assert llm.calls == 0

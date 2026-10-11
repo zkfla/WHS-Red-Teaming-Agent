@@ -12,7 +12,7 @@ SDK exception types.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 
 
@@ -154,3 +154,140 @@ class LLMClient(Protocol):
     ) -> dict[str, Any]:
         """Completion constrained to a JSON schema."""
         ...
+
+
+# Native tool-calling contract (ReAct loop). Existing structured APIs are
+# kept for explicit review flows; new model/tool-loop code uses
+# ``complete_native`` and the frozen records below.
+
+# Safe, fixed protocol/argument codes only. Raw provider payloads, prompts,
+# and secrets are never stored in these fields.
+NATIVE_PROTOCOL_MISSING_CALL_ID = "missing_call_id"
+NATIVE_PROTOCOL_MISSING_TOOL_NAME = "missing_tool_name"
+NATIVE_PROTOCOL_EMPTY_RESPONSE = "empty_response"
+NATIVE_ARG_INVALID_ARGUMENTS = "invalid_arguments"
+
+# Public assistant text is bounded so checkpoints/logs keep a masked,
+# limited message instead of a full private response.
+NATIVE_MAX_TEXT_CHARS = 20000
+
+_NATIVE_PROTOCOL_ERRORS = frozenset(
+    {
+        NATIVE_PROTOCOL_MISSING_CALL_ID,
+        NATIVE_PROTOCOL_MISSING_TOOL_NAME,
+        NATIVE_PROTOCOL_EMPTY_RESPONSE,
+    }
+)
+
+_NATIVE_ARGUMENT_ERRORS = frozenset({NATIVE_ARG_INVALID_ARGUMENTS})
+
+
+def _clean_native_text(value: Any) -> str:
+    if not isinstance(value, str):
+        return ""
+    if len(value) > NATIVE_MAX_TEXT_CHARS:
+        return value[:NATIVE_MAX_TEXT_CHARS]
+    return value
+
+
+def _clean_native_total_tokens(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int) and value >= 0:
+        return value
+    return None
+
+
+def _clean_native_protocol_error(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, str) and value in _NATIVE_PROTOCOL_ERRORS:
+        return value
+    raise ValueError("unknown native protocol error")
+
+
+def _clean_native_argument_error(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, str) and value in _NATIVE_ARGUMENT_ERRORS:
+        return value
+    return NATIVE_ARG_INVALID_ARGUMENTS
+
+
+@dataclass(frozen=True)
+class NativeToolSpec:
+    """Exposed tool schema for a native model request."""
+
+    name: str
+    description: str = ""
+    input_schema: dict[str, Any] = field(default_factory=dict)  # type: ignore[assignment]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.name, str) or not self.name:
+            raise ValueError("NativeToolSpec.name must be a non-empty string")
+        if not isinstance(self.description, str):
+            raise ValueError("NativeToolSpec.description must be a string")
+        if not isinstance(self.input_schema, dict):
+            raise ValueError("NativeToolSpec.input_schema must be a dict")
+
+
+@dataclass(frozen=True)
+class NativeToolCall:
+    """One provider-requested tool invocation with a stable call ID."""
+
+    call_id: str
+    name: str
+    arguments: dict[str, Any] | None
+    argument_error: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.call_id, str) or not self.call_id:
+            raise ValueError("NativeToolCall.call_id must be a non-empty string")
+        if not isinstance(self.name, str) or not self.name:
+            raise ValueError("NativeToolCall.name must be a non-empty string")
+        cleaned_error = _clean_native_argument_error(self.argument_error)
+        object.__setattr__(self, "argument_error", cleaned_error)
+        if cleaned_error is not None:
+            object.__setattr__(self, "arguments", None)
+        elif not isinstance(self.arguments, dict):
+            raise ValueError("NativeToolCall.arguments must be a dict when argument_error is None")
+
+
+@dataclass(frozen=True)
+class NativeCompletion:
+    """Normalized native model response: tool calls plus public text."""
+
+    tool_calls: tuple[NativeToolCall, ...] = ()
+    text: str = ""
+    total_tokens: int | None = None
+    protocol_error: str | None = None
+
+    def __post_init__(self) -> None:
+        calls = self.tool_calls
+        if isinstance(calls, list):
+            calls = tuple(calls)
+            object.__setattr__(self, "tool_calls", calls)
+        if not isinstance(calls, tuple) or any(
+            not isinstance(item, NativeToolCall) for item in calls
+        ):
+            raise ValueError("NativeCompletion.tool_calls must be a tuple of NativeToolCall")
+        object.__setattr__(self, "text", _clean_native_text(self.text))
+        object.__setattr__(
+            self, "total_tokens", _clean_native_total_tokens(self.total_tokens)
+        )
+        object.__setattr__(
+            self, "protocol_error", _clean_native_protocol_error(self.protocol_error)
+        )
+
+
+@runtime_checkable
+class NativeToolCallingLLMClient(Protocol):
+    """Optional native tool-calling path; existing text/JSON clients stay compatible."""
+
+    async def complete_native(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[NativeToolSpec],
+        system: str | None = None,
+        **kwargs: Any,
+    ) -> NativeCompletion: ...

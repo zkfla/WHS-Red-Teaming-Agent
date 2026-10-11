@@ -53,7 +53,13 @@ from redteam.app.cli._shared import (
     mask_secrets,
 )
 from redteam.app.cli.conversation import ConversationAssistant, catalog_tool_labels
-from redteam.capability.settings import MCPConfigurationError
+from redteam.capability.settings import (
+    MCPConfigurationError,
+    gated_network_policy_path_from_environment,
+    shell_policy_path_from_environment,
+)
+from redteam.capability.shell_assembly import build_gated_provider_config
+from redteam.capability.shell_runtime import build_shell_runtime
 from redteam.core.config import AppConfig
 from redteam.core.contracts.events import EventEnvelope, EventType
 from redteam.core.enums import ApprovalStatus, OperatorIntentType
@@ -569,14 +575,19 @@ class OperatorConsole:
         status = await service.status(mission_id=mission_id)
         explanation = await service.explain(mission_id=mission_id, run_id=self._identity.run_id)
         try:
-            decision = await conversation.decide(
-                text,
-                engagement_name=self._engagement_name,
-                scope=self._scope,
-                tools=catalog_tool_labels(self._deps.tool_catalog),
-                session_context=f"{status.summary} {explanation.summary}",
-                run_active=True,
-            )
+            from redteam.orchestration.metered_llm import llm_request_scope
+
+            with llm_request_scope(str(self._identity.run_id), "conversation"):
+                decision = await conversation.decide(
+                    text,
+                    engagement_name=self._engagement_name,
+                    scope=self._scope,
+                    tools=catalog_tool_labels(self._deps.tool_catalog),
+                    session_context=f"{status.summary} {explanation.summary}",
+                    run_active=True,
+                    llm_override=(self._deps.llm_client
+                                  if self._deps.settings.llm_request_policy is not None else None),
+                )
         except Exception as exc:  # noqa: BLE001 - chat is advisory; the active run continues
             logging.getLogger(__name__).warning(
                 "Operator chat interpretation failed (%s)", type(exc).__name__
@@ -614,6 +625,15 @@ class OperatorConsole:
             return
         report = await service.status(mission_id=mission_id)
         self._echo(renderer.operator_status_text(report))
+
+    async def route_conversation(self, router, *args, **kwargs):
+        """A live input uses the same Run ledger as the executing instances."""
+        from redteam.orchestration.metered_llm import llm_request_scope
+
+        if self._deps.settings.llm_request_policy is not None:
+            kwargs["llm_override"] = self._deps.llm_client
+        with llm_request_scope(str(self._identity.run_id), "conversation"):
+            return await router.route(*args, **kwargs)
 
     async def session_context(self) -> str:
         """Read-only context for CLI classification; never writes a user intent."""
@@ -751,7 +771,20 @@ async def build(
     underway -- exactly what ``run()`` below does, unchanged from
     before this was split out.
     """
-    if not config.capability.mcp_servers:
+    # Builtin shell provider: one capability-owned assembly shared with
+    # resume/tools. None means disabled (honest catalog without shell tools);
+    # an invalid policy raises MCPConfigurationError for the config-error path.
+    # Resolved before the empty-catalog warning so a shell-only run does not warn.
+    shell_runtime = build_shell_runtime(shell_policy_path_from_environment())
+    gated_provider_config = build_gated_provider_config(
+        gated_network_policy_path_from_environment()
+    )
+    if gated_provider_config is not None and shell_runtime is None:
+        raise MCPConfigurationError(
+            "gated network policy requires the shell provider: set "
+            "REDTEAM_SHELL_POLICY_PATH"
+        )
+    if not config.capability.mcp_servers and shell_runtime is None:
         eprint(
             "WARNING: no MCP servers configured -- this run has an empty tool catalog "
             "and cannot execute any Action. Set REDTEAM_MCP_SERVERS (comma-separated "
@@ -768,6 +801,15 @@ async def build(
         component_options["component_profile"] = component_profile
     if component_registry is not None:
         component_options["component_registry"] = component_registry
+    if shell_runtime is not None:
+        component_options["builtin_adapters"] = [shell_runtime.adapter]
+        component_options["builtin_concurrency"] = dict(shell_runtime.concurrency)
+        component_options["builtin_output_limits"] = dict(shell_runtime.output_limits)
+        component_options["shell_programs"] = shell_runtime.program_source
+    if gated_provider_config is not None:
+        # ONLY when the operator network policy is configured (absent means
+        # closed): the composition root validates the same builtin adapter.
+        component_options["gated_shell"] = (shell_runtime, gated_provider_config)
     return await build_application(
         config,
         orchestration_settings=orchestration_settings,
@@ -1064,6 +1106,15 @@ async def _wait_for_approval(
         if in_session
         else "Waiting for resolution (Ctrl+C stops watching; the Run stays pending)..."
     )
+
+    if getattr(deps, "specialist_policy", None) is not None:
+        from redteam.app.cli.commands.resume import watch_specialist_approval
+
+        return await watch_specialist_approval(
+            deps, final, poll_seconds=(
+                _APPROVAL_POLL_SECONDS_IN_SESSION if in_session else _APPROVAL_POLL_SECONDS
+            ),
+        )
 
     resume_settings = deps.settings.model_copy(update={"thread_id": str(final.run_id)})
     resume_runner = AgentLoopRunner(deps, settings=resume_settings)

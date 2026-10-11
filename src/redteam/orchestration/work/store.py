@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from typing import Protocol
 
-from redteam.core.ids import RunId
+from redteam.core.ids import AgentInstanceId, RunId
 from redteam.orchestration.work.models import TaskLease, WorkItem, WorkStatus
 
 
@@ -45,6 +45,8 @@ class WorkStore(Protocol):
         ttl: timedelta,
     ) -> TaskLease | None: ...
 
+    async def mark_execution_started(self, work_id: str, *, owner: str, now: datetime) -> bool: ...
+
     async def complete(
         self,
         work_id: str,
@@ -53,6 +55,7 @@ class WorkStore(Protocol):
         status: WorkStatus,
         now: datetime,
         reason: str | None = None,
+        execution_known: bool = False,
     ) -> bool: ...
 
     async def release(self, work_id: str, *, owner: str, now: datetime) -> bool: ...
@@ -70,4 +73,15 @@ class WorkStore(Protocol):
 
     async def reconcile_job(
         self, work_id: str, *, job_id: str, status: str, now: datetime
+    ) -> bool: ...
+
+    async def reconcile_execution(
+        self,
+        work_id: str,
+        *,
+        run_id: RunId,
+        instance_id: AgentInstanceId | None,
+        candidate_key: str,
+        status: str,
+        now: datetime,
     ) -> bool: ...

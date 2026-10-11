@@ -19,6 +19,71 @@ from redteam.orchestration.agents.definition import ContextProfile
 MAX_EVIDENCE_SUMMARY_CHARS = 240
 
 
+def completion_review_context(context: dict[str, Any] | None, evidence_ids: list[str]) -> dict:
+    """Keep review constraints and already-read windows, without planning history.
+
+    Review calls have no tool loop of their own. Relevant requested windows
+    therefore remain alongside the caller's source excerpts; references alone
+    must never be described as content the reviewer has read.
+    """
+    from redteam.core.contracts.mission import redact_secret_material
+
+    current = context or {}
+    projected: dict[str, Any] = {
+        key: current[key]
+        for key in ("engagement_constraints", "operator_instructions", "evidence_read_contract")
+        if key in current
+    }
+    mission = current.get("mission")
+    if isinstance(mission, dict):
+        projected["operator_constraints"] = mission.get("operator_constraints", {})
+    sources = set(map(str, evidence_ids))
+    projected["evidence_validity"] = [
+        item for item in current.get("evidence_validity", [])
+        if isinstance(item, dict) and str(item.get("evidence_id", "")) in sources
+    ]
+    projected["requested_evidence"] = [
+        window for window in current.get("requested_evidence", [])
+        if isinstance(window, dict) and str(window.get("evidence_id", "")) in sources
+    ]
+    knowledge = current.get("knowledge")
+    if isinstance(knowledge, dict):
+        projected["knowledge"] = {
+            "facts": [
+                item for item in knowledge.get("facts", [])
+                if sources.intersection(map(str, item.get("grounded_evidence_ids", [])))
+            ],
+            **{
+                key: knowledge[key]
+                for key in (
+                    "omitted_fact_node_ids", "evidence_diagnostics", "graph_diagnostics",
+                )
+                if key in knowledge
+            },
+        }
+    projected["local_tool_results"] = [
+        item for item in current.get("local_tool_results", [])
+        if sources.intersection(map(str, item.get("result", {}).get("refs", [])))
+    ]
+    projected["recording_context_note"] = (
+        "knowledge.facts is the current public view of registered observations, with "
+        "per-claim provenance. local_tool_results reports related internal calls "
+        "and their own effects, including partial acceptance and refusal; these are "
+        "separate from target "
+        "tool outputs and completion admission. This view is capped: missing facts "
+        "are not proof of absence; retain omission and lookup diagnostics."
+    )
+    return redact_secret_material(projected)
+
+
+def review_path_reference(path: Any) -> dict[str, Any]:
+    """Identify the reviewed snapshot without repeating its proposed methods."""
+    return {
+        key: getattr(path, key, None)
+        for key in ("path_id", "run_id", "mission_id", "mission_task_id", "version", "status")
+    }
+
+
 @dataclass(frozen=True)
 class ProjectionCacheKey:
     namespace: str

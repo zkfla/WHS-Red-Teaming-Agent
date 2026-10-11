@@ -2,7 +2,7 @@
 
 Never touches a target: no MCP `discover_tools()`/`invoke()`, no
 Control Plane `evaluate()` against a real action, no LLM call. Only
-schema loading and the same canonical-naming check
+schema/policy/profile loading and the same canonical-naming check
 (`orchestration.action_naming.canonical_action_key`) ROE itself uses —
 so "valid" here means "the ROE stage will not immediately reject every
 action for a naming mistake," not "this engagement is safe."
@@ -23,6 +23,7 @@ from redteam.app.cli._shared import (
 )
 from redteam.capability.settings import MCPConfigurationError, MCPServerSettings
 from redteam.core.config import AppConfig, load_engagement_config
+from redteam.core.environment import env_snapshot
 from redteam.orchestration.action_naming import canonical_action_key
 
 
@@ -58,12 +59,15 @@ async def run(args: argparse.Namespace) -> int:
 
     capability_problems = check_capability(app_config)
     checks.append(("Capability configuration", not capability_problems, capability_problems))
+    checks.extend(check_execution_configuration(app_config))
 
     ok = all(passed for _, passed, _ in checks)
     if args.json:
         print_json(
             {
                 "valid": ok,
+                "live_readiness_checked": False,
+                "admission_checked": False,
                 "checks": [
                     {"name": name, "ok": passed, "problems": problems}
                     for name, passed, problems in checks
@@ -78,6 +82,7 @@ async def run(args: argparse.Namespace) -> int:
             # checkmark can make a valid legacy YAML exit with code 2.
             print(f"[OK] {name}")
         print("\nConfiguration valid.")
+        print("Offline checks only; live readiness and execution permission were not checked.")
         return EXIT_OK
     return _fail(args, checks)
 
@@ -87,6 +92,8 @@ def _fail(args: argparse.Namespace, checks: list[tuple[str, bool, list[str]]]) -
         print_json(
             {
                 "valid": False,
+                "live_readiness_checked": False,
+                "admission_checked": False,
                 "checks": [
                     {"name": name, "ok": passed, "problems": problems}
                     for name, passed, problems in checks
@@ -119,6 +126,65 @@ def check_scope(engagement_config) -> list[str]:  # noqa: ANN001
             "-- every action will be denied by default-deny scope"
         )
     return problems
+
+
+def check_execution_configuration(app_config: AppConfig) -> list[tuple[str, bool, list[str]]]:
+    """Use the same provider/profile factories as run, without opening them.
+
+    Disabled selections are valid but explicitly labelled: they do not supply
+    tools. No Docker inspect/pull, MCP connection, grant, store or model call.
+    """
+    from redteam.app.agent_profile import selected_specialists
+    from redteam.app.bootstrap import build_selected_code_fixture_runner
+    from redteam.capability.settings import (
+        gated_network_policy_path_from_environment,
+        shell_policy_path_from_environment,
+    )
+    from redteam.capability.shell_assembly import build_gated_provider_config
+    from redteam.capability.shell_policy import load_shell_workroom_policy
+
+    checks: list[tuple[str, bool, list[str]]] = []
+    environment = env_snapshot()
+    shell_path = shell_policy_path_from_environment(source=environment)
+    gate_path = gated_network_policy_path_from_environment(source=environment)
+    if shell_path is None:
+        checks.append(("Shell policy (disabled)", True, []))
+    else:
+        try:
+            load_shell_workroom_policy(shell_path)
+        except ValueError as exc:
+            checks.append(("Shell policy", False, [str(exc)]))
+        else:
+            checks.append(("Shell policy", True, []))
+    if gate_path is None:
+        checks.append(("Gated network policy (closed)", True, []))
+    else:
+        problems = []
+        if shell_path is None:
+            problems.append("gated network policy requires REDTEAM_SHELL_POLICY_PATH")
+        try:
+            build_gated_provider_config(gate_path)
+        except MCPConfigurationError as exc:
+            problems.append(str(exc))
+        checks.append(("Gated network policy", not problems, problems))
+    specialists = None
+    try:
+        specialists = selected_specialists(app_config.orchestration)
+    except ValueError as exc:
+        checks.append(("Specialist profile", False, [str(exc)]))
+    else:
+        name = "Specialist profile" if specialists is not None else "Specialist profile (disabled)"
+        checks.append((name, True, []))
+    try:
+        fixture = build_selected_code_fixture_runner(specialists, None, app_config.orchestration)
+    except ValueError as exc:
+        checks.append(("Offline fixture policy", False, [str(exc)]))
+    else:
+        name = (
+            "Offline fixture policy" if fixture is not None else "Offline fixture policy (disabled)"
+        )
+        checks.append((name, True, []))
+    return checks
 
 
 def check_roe(engagement_config) -> list[str]:  # noqa: ANN001

@@ -7,8 +7,9 @@ Contract Change Proposal in ``docs/agent/attack-graph.md``.
 
 from __future__ import annotations
 
-from typing import Protocol, runtime_checkable
+from typing import Protocol, cast, runtime_checkable
 
+from redteam.attack_graph.stores.mutations import ReceiptedAttackGraphStore
 from redteam.core.contracts.graph import GraphEdge, GraphNode
 from redteam.core.ids import GraphEdgeId, GraphNodeId
 
@@ -43,12 +44,29 @@ class StoreCapabilityError(RuntimeError):
 
 
 def require_listable(store: object, operation: str) -> ListableAttackGraphStore:
-    if not isinstance(store, ListableAttackGraphStore):
+    if not _has_methods(store, "list_nodes", "list_edges"):
         raise StoreCapabilityError(operation, store, "ListableAttackGraphStore")
-    return store
+    return cast(ListableAttackGraphStore, store)
 
 
 def require_mutable(store: object, operation: str) -> MutableAttackGraphStore:
-    if not isinstance(store, MutableAttackGraphStore):
+    if not _has_methods(store, "remove_node", "remove_edge"):
         raise StoreCapabilityError(operation, store, "MutableAttackGraphStore")
-    return store
+    return cast(MutableAttackGraphStore, store)
+
+
+def require_receipted(store: object) -> ReceiptedAttackGraphStore:
+    if not _has_methods(
+        store, "prepare_graph_mutation", "apply_graph_mutation", "read_graph_mutation_receipt",
+    ):
+        raise StoreCapabilityError("atomic_graph_mutation", store, "ReceiptedAttackGraphStore")
+    return cast(ReceiptedAttackGraphStore, store)
+
+
+def _has_methods(store: object, *names: str) -> bool:
+    # Python 3.12+ runtime Protocol checks use static lookup and cannot see
+    # a wrapper's deliberate __getattr__ delegation. Check the callable
+    # owning port methods instead, without unwrapping or bypassing fences.
+    # Missing/non-callable members still fail; this proves no permissions,
+    # original receipt validity or successful external write.
+    return all(callable(getattr(store, name, None)) for name in names)

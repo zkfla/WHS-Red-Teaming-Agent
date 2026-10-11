@@ -24,6 +24,8 @@ from typing import Annotated, Literal
 from mcp.server import MCPServer
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from redteam.core.contracts.tool import PROVIDER_METADATA_RESOURCE_BINDINGS
+
 _PRIVATE_PREFIX = ".redteam-"
 _IDENTITY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
 _DIGEST = re.compile(r"^[a-f0-9]{64}$")
@@ -596,6 +598,12 @@ def create_server(policy: WorkspacePolicy, mode: Literal["read", "write"] = "rea
     if mode not in {"read", "write"} or (mode == "write" and not policy.writable):
         raise WorkspaceError("workspace_read_only: write server requires explicit writable policy")
     server = MCPServer(f"workspace-{mode}", log_level="WARNING")
+    # Read/write façades over the same physical root share one exclusive key.
+    # Asset aliases and Run IDs do not create a second lock for the same root.
+    resource_meta = {PROVIDER_METADATA_RESOURCE_BINDINGS: [{
+        "namespace": "workspace.root",
+        "key": hashlib.sha256(str(Path(policy.root).resolve()).encode()).hexdigest(),
+    }]}
 
     def list_directory(
         asset_ref: str,
@@ -687,7 +695,7 @@ def create_server(policy: WorkspacePolicy, mode: Literal["read", "write"] = "rea
                 function.__annotations__[name] = Annotated[
                     str, Field(max_length=policy.max_file_bytes)
                 ]
-        server.tool()(function)
+        server.tool(meta=resource_meta)(function)
     return server
 
 

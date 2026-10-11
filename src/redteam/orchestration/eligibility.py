@@ -117,7 +117,12 @@ class EligibilityRegistry:
                 return decision
         return EligibilityDecision(True, "eligible")
 
-    async def action(self, agent, tool, target_node_id, context):
+    async def action(self, agent, tool, target_node_id: str | None, context):
+        """Keep role/tool admission even without a graph target.
+
+        A provider's nonempty asset scope still requires an actual matching
+        target. Target-free execution does not waive domain restrictions.
+        """
         for provider in self._for_tool(tool):
             if agent is not None:
                 role = await provider.role_eligible(str(agent.agent_id), context)

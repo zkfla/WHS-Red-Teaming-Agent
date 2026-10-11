@@ -13,6 +13,7 @@ from typing import Literal
 from pydantic import BaseModel, Field, model_validator
 
 from redteam.core.config import OrchestrationConfig
+from redteam.core.contracts.llm_policy import LLMRequestPolicy
 
 #: Sequential path has 7 nodes; fan-out adds WORKER + AGGREGATE.
 NODES_PER_TURN = 9
@@ -27,6 +28,10 @@ class OrchestrationSettings(BaseModel):
     #: Hard ceiling on OBSERVE->REPLAN turns, independent of the
     #: Control Plane's ``ExecutionBudget``. Both must hold.
     max_steps: int = Field(default=8, ge=1)
+    # None preserves legacy mode, never an implicit unlimited specialist policy.
+    llm_request_policy: LLMRequestPolicy | None = None
+    specialist_profile_path: str | None = Field(default=None, min_length=1, max_length=4096)
+    code_fixture_policy_path: str | None = Field(default=None, min_length=1, max_length=4096)
     #: Additional tool-execution attempts after a retryable failure. Only
     #: ever applied to a *known low-risk* (passive/read-only) tool so a
     #: bounded retry cannot silently repeat a state-changing side effect;
@@ -67,6 +72,7 @@ class OrchestrationSettings(BaseModel):
     max_actions_per_turn: int = Field(default=1, ge=1)
     per_target_concurrency: int = Field(default=1, ge=1)
     lease_ttl_seconds: float = Field(default=60.0, gt=0)
+    resource_wait_timeout_seconds: float = Field(default=30.0, gt=0, le=600)
     drain_timeout_seconds: float = Field(default=30.0, gt=0)
     #: Fraction of the action budget held back so a run always reaches
     #: verification/replanning with headroom. Only enforced when
@@ -156,5 +162,9 @@ class OrchestrationSettings(BaseModel):
             base["max_steps"] = config.max_steps
             base["max_retries"] = config.max_retries
             base["tool_timeout_seconds"] = config.tool_timeout_seconds
+            base["resource_wait_timeout_seconds"] = config.resource_wait_timeout_seconds
+            base["llm_request_policy"] = config.llm_request_policy
+            base["specialist_profile_path"] = config.specialist_profile_path
+            base["code_fixture_policy_path"] = config.code_fixture_policy_path
         base.update({key: value for key, value in overrides.items() if value is not None})
         return cls.model_validate(base)

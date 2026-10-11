@@ -103,16 +103,25 @@ async def verify_node(
         hypothesis_id=proposal.hypothesis_id,
         summary=_summarize_result(result),
     )
+    # Target-independent execution: a targetless proposal has no graph
+    # target to name. The key is left out, never invented; the action,
+    # invocation, and proposal IDs below still identify the call.
+    evidence_metadata_patch: dict = {}
+    if proposal.target is not None:
+        evidence_metadata_patch["target_node_id"] = str(node_id_for_target(proposal.target))
     evidence = evidence.model_copy(
         update={
             "metadata": {
                 **evidence.metadata,
-                "target_node_id": str(node_id_for_target(proposal.target)),
+                **evidence_metadata_patch,
                 "agent_id": str(proposal.agent_id),
                 "capability": proposal.capability,
                 "operation": proposal.operation,
                 "candidate_key": step.candidate_key if step is not None else "",
-                **_evidence_metadata(proposal, result, step, runtime),
+                **_evidence_metadata(
+                    proposal, result, step, runtime,
+                    work_id=state.get("current_work_id"),
+                ),
             }
         }
     )
@@ -125,10 +134,8 @@ async def verify_node(
     # preserved result carries its mapping status; the raw tool_result
     # payload stays immutable and no_mapper never refuses execution.
     outcome = deps.result_mappers.map_result_with_outcome(
-        tool_id=result.tool_id,
-        target=proposal.target,
-        arguments=proposal.arguments,
-        result=result,
+        tool_id=result.tool_id, target=proposal.target,
+        arguments=proposal.arguments, result=result,
     )
     mutation = outcome.mutation
     evidence.metadata["mapping_status"] = outcome.status
@@ -277,12 +284,15 @@ async def verify_node(
         progress = deps.methodology_library.progress(
             await deps.evidence_store.list_for_run(runtime.run_id)
         )
-        await service.observe_target(
-            proposal.target,
-            facts={"methodology_progress": list(progress)},
-            provenance=provenance,
-            step=runtime.step_count,
-        )
+        # No measured target, no measured node: progress without a target
+        # stays on the evidence record, never as a graph fact.
+        if proposal.target is not None:
+            await service.observe_target(
+                proposal.target,
+                facts={"methodology_progress": list(progress)},
+                provenance=provenance,
+                step=runtime.step_count,
+            )
 
     auth_assessment = None
     auth_contradiction = False
@@ -300,12 +310,16 @@ async def verify_node(
             "path": proposal.arguments.get("path"),
             "expected_access": step.authentication_check.expected_access,
         }
-        await service.observe_target(
-            proposal.target,
-            facts={"authentication_checks": [comparison]},
-            provenance=provenance,
-            step=runtime.step_count,
-        )
+        # Authentication facts describe a measured target; without one
+        # the comparison still travels on the event below, never as a
+        # graph fact about an invented node.
+        if proposal.target is not None:
+            await service.observe_target(
+                proposal.target,
+                facts={"authentication_checks": [comparison]},
+                provenance=provenance,
+                step=runtime.step_count,
+            )
         if proposal.hypothesis_id is not None:
             await service.upsert_node(
                 GraphNodeType.HYPOTHESIS,
@@ -317,10 +331,15 @@ async def verify_node(
                 provenance=provenance,
                 step=runtime.step_count,
             )
-        if auth_assessment.outcome in {"session_access_observed", ACCESS_CONTROL_VIOLATION}:
-            target_ref = str(
-                proposal.arguments.get("target_ref") or node_id_for_target(proposal.target)
-            )
+        if proposal.target is not None and auth_assessment.outcome in {
+            "session_access_observed", ACCESS_CONTROL_VIOLATION,
+        }:
+            # Session nodes name a measured target; without one there is
+            # no session identity to record. The verdict path below still
+            # runs on the preserved evidence.
+            target_ref = str(proposal.arguments.get("target_ref") or "")
+            if not target_ref and proposal.target is not None:
+                target_ref = str(node_id_for_target(proposal.target))
             session_ref = step.authentication_check.session_ref
             principal = await service.upsert_node(
                 GraphNodeType.PRINCIPAL,
@@ -402,7 +421,7 @@ async def verify_node(
             {
                 "evidence_id": evidence.evidence_id,
                 "action_id": proposal.action_id,
-                "target_node_id": str(node_id_for_target(proposal.target)),
+                **evidence_metadata_patch,
                 "assessment_kind": "observation",
                 "tool_success": result.success,
             },
@@ -623,7 +642,7 @@ async def verify_node(
             ),
             hypothesis_id=str(proposal.hypothesis_id) if proposal.hypothesis_id else None,
             hypothesis_status=hypothesis_status,
-            target_node_id=str(node_id_for_target(proposal.target)),
+            target_node_id=str(node_id_for_target(proposal.target)) if proposal.target else "",
             capability=proposal.capability,
             operation=proposal.operation,
             agent_id=str(proposal.agent_id),
@@ -636,7 +655,7 @@ async def verify_node(
         existing_claims=existing_claims,
     )
     finding = decision.finding
-    if finding is not None:
+    if finding is not None and proposal.target is not None:
         await service.record_finding(
             finding,
             hypothesis_id=str(proposal.hypothesis_id) if proposal.hypothesis_id else None,
@@ -670,16 +689,20 @@ async def verify_node(
         # recording it through the existing observation event keeps one
         # event vocabulary while making the refusal traceable.
         verdict = Verdict.UNKNOWN
-        reason = f"violation was not promoted to a Finding: {decision.refused_reason}"
+        refused_reason = (
+            "no measured target for a target finding"
+            if proposal.target is None else decision.refused_reason
+        )
+        reason = f"violation was not promoted to a Finding: {refused_reason}"
         refused = await publisher.publish(
             OBSERVATION_RECORDED,
             {
                 "evidence_id": evidence.evidence_id,
                 "action_id": proposal.action_id,
-                "target_node_id": str(node_id_for_target(proposal.target)),
+                **evidence_metadata_patch,
                 "assessment_kind": "observation",
                 "tool_success": result.success,
-                "finding_promotion_refused": decision.refused_reason,
+                "finding_promotion_refused": refused_reason,
             },
             correlation_id=correlation_id,
             causation_id=last_event_id,
@@ -779,7 +802,25 @@ def _summarize_result(result) -> str:
     return tool + " failed (" + code + ")"
 
 
-def _evidence_metadata(proposal, result, step, runtime) -> dict:
+def _is_native_step(step: object | None) -> bool:
+    """Whether this step carries native call lineage.
+
+    Native is identified by ``execution_origin_version == 1``. A missing
+    path is not sufficient: legacy steps may also lack path refs while
+    native steps may carry them for audit. Defaults to legacy (``0``).
+    """
+    if step is None:
+        return False
+    version = getattr(step, "execution_origin_version", None)
+    if version is None:
+        version = getattr(step, "origin_version", 0)
+    try:
+        return int(version or 0) == 1
+    except (TypeError, ValueError):
+        return False
+
+
+def _evidence_metadata(proposal, result, step, runtime, *, work_id=None) -> dict:
     """Metadata for the evidence record: raw payload, split expectation, path refs.
 
     The summary already carries what happened; here the full raw result is
@@ -787,6 +828,13 @@ def _evidence_metadata(proposal, result, step, runtime) -> dict:
     kept as its own entry (never as the summary), and the path position
     (path/version/step/account) is recorded when known -- missing refs are
     left out, never invented.
+
+    Native call lineage (``execution_origin_version`` /
+    ``model_tool_call_id`` / ``mission_task_id`` / ``task_purpose_hash`` /
+    ``work_id`` / ``candidate_key`` plus ``mission_id`` and the raw
+    ``proposal``) travels here so the stored ``ToolResult`` payload stays
+    immutable. ``_is_native_step`` is the only origin check; no verifier
+    bypass is keyed on origin.
     """
     metadata: dict = {}
     if proposal.expected_observation is not None:
@@ -802,8 +850,29 @@ def _evidence_metadata(proposal, result, step, runtime) -> dict:
     metadata["proposal"] = proposal.model_dump(mode="json")
     if step is not None:
         metadata["plan_step"] = step.model_dump(mode="json")
-    if runtime.active_task_id is not None:
-        metadata["mission_task_id"] = str(runtime.active_task_id)
+    step_task_id = getattr(step, "mission_task_id", None) if step is not None else None
+    if step_task_id is None:
+        step_task_id = getattr(runtime, "active_task_id", None)
+    if step_task_id is not None:
+        metadata["mission_task_id"] = str(step_task_id)
+    origin_version = getattr(step, "execution_origin_version", None) if step is not None else None
+    if origin_version is None and step is not None:
+        origin_version = getattr(step, "origin_version", 0)
+    try:
+        metadata["execution_origin_version"] = int(origin_version or 0)
+    except (TypeError, ValueError):
+        metadata["execution_origin_version"] = 0
+    metadata["model_tool_call_id"] = str(
+        getattr(step, "model_tool_call_id", "") if step is not None else ""
+    )
+    metadata["task_purpose_hash"] = str(
+        getattr(step, "task_purpose_hash", "") if step is not None else ""
+    )
+    candidate_key = getattr(step, "candidate_key", None) if step is not None else None
+    if candidate_key:
+        metadata["candidate_key"] = str(candidate_key)
+    if work_id is not None:
+        metadata["work_id"] = str(work_id)
     path_id = getattr(step, "path_id", None)
     if path_id is None:
         path_id = getattr(runtime, "active_path_id", None)

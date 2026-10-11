@@ -31,6 +31,7 @@ class WorkerOutcome(BaseModel):
     """Small commutative result folded back into the coordinator state."""
 
     action_id: str
+    model_tool_call_id: str = ""
     work_id: str
     # Follow-up linkage for delegated investigation. None on the initial
     # dispatch batch; set on each later action the delegation chose.

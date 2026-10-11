@@ -11,8 +11,8 @@ from pathlib import Path
 from redteam.core.contracts.mission import MissionPlan, MissionTask, redact_secret_material
 from redteam.core.enums import TaskStatus
 from redteam.core.ids import EngagementId, MissionId, TaskId
-from redteam.orchestration.sqlite_support import connect, run_sqlite, run_transaction
 from redteam.orchestration.task_graph.memory import InMemoryTaskGraphStore
+from redteam.sqlite_support import connect, run_sqlite, run_transaction
 
 
 class SQLiteTaskGraphStore:

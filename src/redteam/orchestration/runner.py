@@ -8,23 +8,29 @@ from __future__ import annotations
 import asyncio
 import logging
 import sqlite3
+from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, Field
 
+if TYPE_CHECKING:
+    from redteam.orchestration.execution_reconciliation import ExecutionReconciliation
+
 from redteam.attack_graph.service import AttackGraphService
 from redteam.core.enums import AgentPhase, MissionStatus
-from redteam.core.ids import EventId, MissionId, RunId
+from redteam.core.ids import AgentInstanceId, EventId, MissionId, RunId
 from redteam.orchestration.checkpointing import build_checkpointer, open_checkpointer
 from redteam.orchestration.component_binding import builtin_component_binding
 from redteam.orchestration.context import RuntimeDeps
 from redteam.orchestration.coordination import CLOSED, ChangeSet, CoordinationError, coordinator_for
 from redteam.orchestration.diagnostics import operational_exception_diagnostic
 from redteam.orchestration.graph import build_graph
+from redteam.orchestration.llm_requests import RunRequestLedger
+from redteam.orchestration.metered_llm import llm_request_scope
 from redteam.orchestration.outbox import deliver_pending
-from redteam.orchestration.progress import canonical_progress_fingerprint
+from redteam.orchestration.progress import canonical_graph_changed
 from redteam.orchestration.runtime_observation import RuntimeObservation, append_runtime_observation
 from redteam.orchestration.settings import OrchestrationSettings
 from redteam.orchestration.state import (
@@ -42,7 +48,87 @@ logger = logging.getLogger(__name__)
 #: repeat a side effect that may already have happened (the checkpoint is
 #: written before the node's effect is durably observable), so a durable
 #: recovery/auto-resume refuses to act on such a snapshot -- fail closed.
-_UNSAFE_REPLAY_NODES = frozenset({"execute", "worker"})
+_UNSAFE_REPLAY_NODES = frozenset({"execute", "worker", "tools"})
+
+
+def _checkpoint_thread(run_id: RunId | str, instance_id: AgentInstanceId | str | None) -> str:
+    """One shared run may contain several independently checkpointed workers."""
+    return str(run_id) if instance_id is None else f"{run_id}:instance:{instance_id}"
+
+
+def _snapshot_pending_work_ids(values: Any) -> set[str]:
+    """Work ids the snapshot still owes an outcome, from its own fields.
+
+    Derived from the snapshot's existing Work/dispatch/native-envelope
+    fields -- never from fixed tool names. Covers uncompleted native
+    dispatches, the in-flight work reference, and legacy batch dispatches,
+    whether models or raw mappings survived the serde.
+    """
+    pending: set[str] = set()
+
+    def _take(candidate: Any) -> None:
+        wid = (
+            candidate.get("work_id")
+            if isinstance(candidate, Mapping)
+            else getattr(candidate, "work_id", None)
+        )
+        if isinstance(wid, str) and wid:
+            pending.add(wid)
+
+    if not isinstance(values, Mapping):
+        return pending
+    current = values.get("current_work_id")
+    if isinstance(current, str) and current:
+        pending.add(current)
+    calls = values.get("native_calls")
+    if isinstance(calls, (list, tuple)):
+        for call in calls:
+            if isinstance(call, Mapping):
+                if call.get("completed") is True:
+                    continue
+                dispatch = call.get("dispatch")
+            else:
+                if getattr(call, "completed", False) is True:
+                    continue
+                dispatch = getattr(call, "dispatch", None)
+            _take(dispatch)
+    items = values.get("dispatch_items")
+    if isinstance(items, (list, tuple)):
+        for item in items:
+            _take(item)
+    return pending
+
+
+async def _submitted_work_ids(deps: Any, runtime: RuntimeState) -> set[str]:
+    """Work ids with a journaled effect-start submission for this instance.
+
+    Same scope as the reconciler (run + instance metadata match); digest
+    failures read as absent (conservative: uncovered until proved). A store
+    failure also reads as absent, which holds rather than proceeds.
+    """
+    from redteam.orchestration.execution_journal import checked_receipt
+
+    submitted: set[str] = set()
+    try:
+        records = await deps.evidence_store.list_for_run(runtime.run_id)
+    except Exception:
+        return submitted
+    for record in records:
+        metadata = getattr(record, "metadata", None)
+        if not isinstance(metadata, Mapping):
+            continue
+        if metadata.get("receipt_kind") != "execution_submission":
+            continue
+        if metadata.get("instance_id") != runtime.instance_id:
+            continue
+        try:
+            data = checked_receipt(record)
+        except Exception:
+            continue
+        work_id = data.get("work_id") if isinstance(data, Mapping) else None
+        if isinstance(work_id, str) and work_id:
+            submitted.add(work_id)
+    return submitted
 
 
 class CheckpointSnapshot(BaseModel):
@@ -68,6 +154,7 @@ class ReconciliationResult(BaseModel):
 _RECONCILABLE_REASONS = frozenset(
     {
         TerminationReason.OPERATOR_PAUSED,
+        TerminationReason.RESOURCE_WAIT,
         "no_actionable_plan",
         "no_agents_registered",
         "stalled_no_graph_progress",
@@ -146,7 +233,7 @@ class AgentLoopRunner:
             else None
         )
         self._thread_id: str | None = self._settings.thread_id
-        self._bound_run_id: str | None = None
+        self._bound_thread_id: str | None = None
         self._wakeup: EventWakeup | None = None
         self._wakeup_run_id: str | None = None
         self._active_graph_task: asyncio.Task[GraphState] | None = None
@@ -185,7 +272,33 @@ class AgentLoopRunner:
             "recursion_limit": self._settings.effective_recursion_limit,
         }
 
+    def _bind_runtime(self, run_id: RunId | str, instance_id: AgentInstanceId | str | None) -> str:
+        thread_id = _checkpoint_thread(run_id, instance_id)
+        if self._bound_thread_id is not None and self._bound_thread_id != thread_id:
+            raise ValueError("one AgentLoopRunner may execute only one run instance")
+        self._bound_thread_id = thread_id
+        return thread_id
+
     async def _binding_for(self, runtime: RuntimeState, *, checkpoint=None, fresh=False) -> bool:
+        policy = self._deps.settings.llm_request_policy
+        expected_policy = policy.model_dump(mode="json") if policy is not None else None
+        coordinator = self._deps.coordinator or coordinator_for(
+            self._deps.task_graph_store, self._deps.path_store,
+        )
+
+        async def saved_policy(change):
+            return change.records.get(("llm_request_policy", str(runtime.run_id)))
+
+        saved = await coordinator.change(saved_policy)
+        if saved is not None and saved != expected_policy:
+            return False
+        if runtime.llm_request_policy != expected_policy:
+            if not fresh or runtime.llm_request_policy is not None or runtime.model_requests_used:
+                return False
+            runtime.llm_request_policy = expected_policy
+        if policy is not None:
+            # Idempotent across instances and restarts, before any model invocation.
+            await RunRequestLedger(coordinator).bind(str(runtime.run_id), policy)
         selected = self._deps.component_binding
         recorded = runtime.component_binding
         if recorded is None:
@@ -199,6 +312,7 @@ class AgentLoopRunner:
             saved = checkpoint.values.get("runtime") if checkpoint.values else None
             fields = (
                 "run_id",
+                "instance_id",
                 "phase",
                 "mission_id",
                 "engagement_id",
@@ -219,6 +333,7 @@ class AgentLoopRunner:
                 "evidence_reads",
                 "local_tool_result_ids",
                 "component_binding",
+                "llm_request_policy",
                 "delegations",
             )
             if not isinstance(saved, RuntimeState) or self._snapshot_replays_execution(checkpoint):
@@ -371,6 +486,12 @@ class AgentLoopRunner:
         )
 
     async def _run_state(self, runtime: RuntimeState, graph_state: GraphState) -> RuntimeState:
+        with llm_request_scope(str(runtime.run_id), runtime.work_owner):
+            return await self._run_scoped_state(runtime, graph_state)
+
+    async def _run_scoped_state(
+        self, runtime: RuntimeState, graph_state: GraphState,
+    ) -> RuntimeState:
         """Shared invocation path for a fresh run and an approval resume
         (``reconcile_once`` builds ``graph_state`` via ``resume_graph_state``
         instead of ``initial_graph_state`` for the latter) — same task
@@ -378,13 +499,17 @@ class AgentLoopRunner:
         """
         if not await self._latest_allows_execution(runtime):
             raise CoordinationError("mission_not_active")
-        run_key = str(runtime.run_id)
-        if self._bound_run_id is not None and self._bound_run_id != run_key:
-            raise ValueError("one AgentLoopRunner may execute only one run")
-        self._bound_run_id = run_key
+        if getattr(self._deps, "specialist_policy", None) is not None:
+            from redteam.orchestration.task_activation import TaskActivation
+
+            coordinator = self._deps.coordinator or coordinator_for(
+                self._deps.task_graph_store, self._deps.path_store,
+            )
+            await TaskActivation(coordinator, self._deps.agents).entering(runtime)
+        thread_id = self._bind_runtime(runtime.run_id, runtime.instance_id)
         self._failure_runtime = None
         await self._ensure_graph()
-        self._thread_id = self._thread_id or str(runtime.run_id)
+        self._thread_id = self._thread_id or thread_id
         assert self._graph is not None
         try:
             self._active_graph_task = asyncio.create_task(
@@ -457,7 +582,12 @@ class AgentLoopRunner:
 
     async def _close_finished_binding(self, runtime: RuntimeState, *, reason: str | None) -> None:
         """Persist hard termination before returning control to app settlement."""
-        if runtime.mission_id is None or reason is None or reason in RECONCILABLE_REASONS:
+        if (
+            runtime.instance_id is not None
+            or runtime.mission_id is None
+            or reason is None
+            or reason in RECONCILABLE_REASONS
+        ):
             return
         coordinator = self._deps.coordinator or coordinator_for(
             self._deps.task_graph_store, self._deps.path_store
@@ -538,7 +668,7 @@ class AgentLoopRunner:
     ) -> None:
         work_ids = await self._deps.work_store.abandon_run(
             runtime.run_id,
-            owner=str(runtime.run_id),
+            owner=runtime.work_owner,
             now=datetime.now(timezone.utc),
             reason=reason,
         )
@@ -587,9 +717,7 @@ class AgentLoopRunner:
         """
 
         run_key = str(runtime.run_id)
-        if self._bound_run_id is not None and self._bound_run_id != run_key:
-            raise ValueError("one AgentLoopRunner may wait on only one run")
-        self._bound_run_id = run_key
+        self._bind_runtime(runtime.run_id, runtime.instance_id)
         if self._wakeup is None:
             self._wakeup = EventWakeup(
                 run_id=runtime.run_id,
@@ -623,7 +751,9 @@ class AgentLoopRunner:
         # calling run(), which is where the checkpoint thread is normally
         # bound. Bind it from the terminal runtime before looking up the
         # state needed to resume an approval.
-        self._thread_id = self._thread_id or str(runtime.run_id)
+        self._thread_id = self._thread_id or _checkpoint_thread(
+            runtime.run_id, runtime.instance_id
+        )
 
         await self.recover_delivery(runtime)
         if not await self._latest_allows_execution(runtime, blocked=True):
@@ -636,6 +766,11 @@ class AgentLoopRunner:
             if resumed is None:
                 return ReconciliationResult(runtime=runtime, wakeup=wakeup)
             return ReconciliationResult(runtime=resumed, wakeup=wakeup, resumed=True)
+        if runtime.termination_reason == TerminationReason.RESOURCE_WAIT:
+            resumed = await self.resume_recovered(runtime)
+            return ReconciliationResult(
+                runtime=resumed, wakeup=wakeup, resumed=resumed is not runtime
+            )
         if runtime.termination_reason == TerminationReason.OPERATOR_PAUSED:
             mission = (
                 await self._deps.task_graph_store.get_mission(runtime.mission_id)
@@ -671,13 +806,28 @@ class AgentLoopRunner:
             resumed=True,
         )
 
-    async def recover_runtime(self, run_id: RunId | str) -> RuntimeState | None:
-        """Recover the durable terminal ``RuntimeState`` for ``run_id``.
+    async def checkpoint_exists(self, runtime: RuntimeState) -> bool:
+        """Strict negative check for pre-entry recovery, never unavailable == absent.
+
+        Unlike the best-effort recovery reader, store/codec errors propagate.
+        Even an empty initial checkpoint requires the normal checkpoint path.
+        """
+        self._require_checkpointing("checkpoint_exists")
+        self._thread_id = self._bind_runtime(runtime.run_id, runtime.instance_id)
+        await self._ensure_graph()
+        if self._checkpointer is None:
+            raise CoordinationError("activation_checkpoint_store_unavailable")
+        return await self._checkpointer.aget_tuple(self.config()) is not None
+
+    async def recover_runtime(
+        self, run_id: RunId | str, *, instance_id: AgentInstanceId | str | None = None
+    ) -> RuntimeState | None:
+        """Recover the durable terminal ``RuntimeState`` for a run or instance.
 
         Reads the latest checkpoint of the run's thread -- the same durable
         artifact a later ``redteam resume`` process rebuilds its runner
-        against. The run id *is* the checkpoint thread id (``_run_state``
-        binds one to the other), so nothing new needs to be recorded.
+        against. Old runs use the run id as thread id; an instance uses a
+        stable run+instance thread id so workers can resume independently.
 
         Returns ``None`` when the run has no checkpoint, the checkpoint
         cannot be read, the recovered ``run_id`` does not match, or the
@@ -688,16 +838,17 @@ class AgentLoopRunner:
         """
         self._require_checkpointing("recover_runtime")
         run_key = str(run_id)
-        if self._bound_run_id is not None and self._bound_run_id != run_key:
-            raise ValueError("one AgentLoopRunner may execute only one run")
-        self._bound_run_id = run_key
-        self._thread_id = self._thread_id or run_key
+        self._thread_id = self._thread_id or self._bind_runtime(run_key, instance_id)
         snapshot = await self._latest_snapshot()
         if snapshot is None:
             return None
         values = snapshot.values if snapshot.values else None
         runtime = values.get("runtime") if values else None
-        if not isinstance(runtime, RuntimeState) or str(runtime.run_id) != run_key:
+        if (
+            not isinstance(runtime, RuntimeState)
+            or str(runtime.run_id) != run_key
+            or (instance_id is not None and str(runtime.instance_id) != str(instance_id))
+        ):
             return None
         if self._snapshot_replays_execution(snapshot):
             return None
@@ -736,6 +887,18 @@ class AgentLoopRunner:
             return resumed if resumed is not None else runtime
         if runtime.termination_reason not in _RECONCILABLE_REASONS:
             return runtime
+        if runtime.termination_reason == TerminationReason.RESOURCE_WAIT:
+            seeded = await self._resource_wait_state(snapshot, runtime)
+            if seeded is None or not await self._reactivate(runtime):
+                return runtime
+            resumed = runtime.model_copy(update={
+                "phase": AgentPhase.OBSERVE, "termination_reason": None,
+                "planning_diagnostic": None, "no_progress_turns": 0,
+                "mission_status": MissionStatus.ACTIVE if runtime.mission_id
+                else runtime.mission_status,
+            })
+            seeded["runtime"] = resumed
+            return await self._run_state(resumed, seeded)
         if runtime.termination_reason == TerminationReason.OPERATOR_PAUSED:
             mission = (
                 await self._deps.task_graph_store.get_mission(runtime.mission_id)
@@ -763,6 +926,139 @@ class AgentLoopRunner:
         )
         return await self.run(resume_runtime)
 
+    async def _resource_wait_state(self, snapshot: Any, runtime: RuntimeState) -> GraphState | None:
+        """Restore only the checkpointed unstarted resource batch, not fresh MODEL.
+
+        A safe completed wait checkpoint and matching PENDING ledger rows
+        prove this batch is still owed. Expired/in-flight/unknown work uses
+        the existing execution reconciler, never this continuation.
+        """
+        from redteam.orchestration.state import NativeCallState
+        from redteam.orchestration.work.models import WorkStatus
+
+        if self._snapshot_replays_execution(snapshot):
+            return None
+        values = snapshot.values or {}
+        saved = values.get("runtime")
+        if (not isinstance(saved, RuntimeState)
+                or saved.run_id != runtime.run_id or saved.instance_id != runtime.instance_id
+                or saved.engagement_id != runtime.engagement_id
+                or saved.mission_id != runtime.mission_id
+                or saved.termination_reason != TerminationReason.RESOURCE_WAIT):
+            return None
+        calls = values.get("native_calls")
+        if not isinstance(calls, list) or not any(
+            isinstance(call, NativeCallState) and not call.completed for call in calls
+        ):
+            return None
+        for call in calls:
+            if not isinstance(call, NativeCallState):
+                return None
+            if call.completed:
+                continue
+            if call.dispatch is None:
+                return None
+            work = await self._deps.work_store.get(call.dispatch.work_id)
+            if (work is None or work.run_id != runtime.run_id
+                    or work.instance_id != runtime.instance_id
+                    or work.model_tool_call_id != call.call_id
+                    or work.candidate_key != call.dispatch.plan_step.candidate_key
+                    or work.status is not WorkStatus.PENDING
+                    or not work.resource_keys or work.resource_execution_pending):
+                return None
+        state = initial_graph_state(runtime)
+        state["native_calls"] = [call.model_copy(deep=True) for call in calls]
+        state["native_messages"] = list(values.get("native_messages") or [])
+        return state
+
+    async def recover_reconciling(
+        self, run_id: RunId | str, *, instance_id: AgentInstanceId | str | None = None
+    ) -> tuple[RuntimeState | None, ExecutionReconciliation | None]:
+        """Recover identity/runtime; reconcile when the latest checkpoint is unsafe.
+
+        Unknown, missing, mismatched, or binding-refused checkpoints yield
+        ``(None, None)`` -- a runtime is never invented here. A safe latest
+        checkpoint yields ``(runtime, None)`` for the existing safe path. An
+        unsafe latest checkpoint (EXECUTE/WORKER/TOOLS pending) recovers the
+        runtime, runs it through ``reconcile_execution_receipts`` (which
+        never invokes tools), and returns ``(reconciled, reconciliation)``.
+        Whether the caller may proceed is ``reconciliation.ready``: a
+        pending-unknown or errored reconciliation stays held.
+
+        The unsafe snapshot itself is never trusted for a NEW binding: the
+        check below only accepts an EXISTING binding with full identity.
+        The snapshot is also never re-entered (no ``astream(None)`` replay).
+        """
+        from redteam.orchestration.execution_reconciliation import (
+            reconcile_execution_receipts,
+        )
+
+        self._require_checkpointing("recover_reconciling")
+        run_key = str(run_id)
+        self._thread_id = self._thread_id or self._bind_runtime(run_key, instance_id)
+        snapshot = await self._latest_snapshot()
+        if snapshot is None:
+            return (None, None)
+        values = snapshot.values if snapshot.values else None
+        runtime = values.get("runtime") if values else None
+        if (
+            not isinstance(runtime, RuntimeState)
+            or str(runtime.run_id) != run_key
+            or (instance_id is not None and str(runtime.instance_id) != str(instance_id))
+        ):
+            return (None, None)
+        if not self._snapshot_replays_execution(snapshot):
+            if not await self._binding_for(runtime, checkpoint=snapshot):
+                return (None, None)
+            return (runtime, None)
+        # Unsafe: existing bindings only. ``_binding_for`` without a
+        # checkpoint accepts nothing new -- an unsafe checkpoint with no
+        # remaining binding refuses here.
+        if not await self._binding_for(runtime):
+            return (None, None)
+        with llm_request_scope(str(runtime.run_id), runtime.work_owner):
+            reconciliation = await reconcile_execution_receipts(self._deps, runtime)
+        if reconciliation.ready:
+            # Coverage belongs to the runner: the reconciler only sees
+            # KNOWN submissions, never this snapshot. Zero submissions with
+            # a tools/worker/execute step pending proves nothing -- an old
+            # checkpoint predates the effect-start journal, and its work may
+            # already be external. Every pending snapshot work id needs a
+            # matching original submission (or a persisted proved non-entry,
+            # which the reconciler already processed); otherwise HOLD with a
+            # type-only diagnostic, never resubmit, never fresh-OBSERVE.
+            uncovered = _snapshot_pending_work_ids(values) - await _submitted_work_ids(
+                self._deps, runtime
+            )
+            if uncovered:
+                reconciliation.errors["coverage"] = "uncovered_pre_journal_work"
+        return (reconciliation.runtime, reconciliation)
+
+    async def resume_reconciled(self, runtime: RuntimeState) -> RuntimeState:
+        """Enter a reconciled runtime at a FRESH OBSERVE (never a replay).
+
+        Only for runtimes whose reconciliation ``ready`` held true. Gates on
+        live mission state exactly like the safe path, then starts a new
+        reasoning turn from canonical stores.
+        """
+        await self.recover_delivery(runtime)
+        if not await self._latest_allows_execution(runtime, blocked=True):
+            return runtime
+        if not await self._reactivate(runtime):
+            return runtime
+        return await self.run(
+            runtime.model_copy(
+                update={
+                    "phase": AgentPhase.OBSERVE,
+                    "termination_reason": None,
+                    "no_progress_turns": 0,
+                    "mission_status": MissionStatus.ACTIVE
+                    if runtime.mission_id
+                    else runtime.mission_status,
+                }
+            )
+        )
+
     async def _register_pending_checkpoint(self, runtime: RuntimeState) -> bool:
         """Re-link the checkpointed proposal to its Approval, or fail closed.
 
@@ -782,6 +1078,7 @@ class AgentLoopRunner:
             proposal is None
             or proposal.action_id != runtime.pending_action_id
             or proposal.run_id != runtime.run_id
+            or proposal.instance_id != runtime.instance_id
             or proposal.engagement_id != runtime.engagement_id
             or self._snapshot_replays_execution(snapshot)
         ):
@@ -839,6 +1136,7 @@ class AgentLoopRunner:
             or proposal is None
             or proposal.action_id != runtime.pending_action_id
             or proposal.run_id != runtime.run_id
+            or proposal.instance_id != runtime.instance_id
             or proposal.engagement_id != runtime.engagement_id
             or self._snapshot_replays_execution(snapshot)
         ):
@@ -852,6 +1150,7 @@ class AgentLoopRunner:
         if (
             not isinstance(checkpoint_runtime, RuntimeState)
             or checkpoint_runtime.run_id != runtime.run_id
+            or checkpoint_runtime.instance_id != runtime.instance_id
             or checkpoint_runtime.engagement_id != runtime.engagement_id
             or checkpoint_runtime.mission_id != runtime.mission_id
             or checkpoint_runtime.termination_reason != TerminationReason.APPROVAL_PENDING
@@ -868,7 +1167,7 @@ class AgentLoopRunner:
             return None
         lease = await self._deps.work_store.acquire(
             work_id,
-            owner=str(runtime.run_id),
+            owner=runtime.work_owner,
             now=datetime.now(timezone.utc),
             ttl=timedelta(seconds=self._settings.lease_ttl_seconds),
         )
@@ -900,12 +1199,12 @@ class AgentLoopRunner:
         except (OSError, sqlite3.Error):
             logger.exception("refusing approval resume: durable claim unavailable")
             await self._deps.work_store.release(
-                work_id, owner=str(runtime.run_id), now=datetime.now(timezone.utc)
+                work_id, owner=runtime.work_owner, now=datetime.now(timezone.utc)
             )
             return None
         if not claimed:
             await self._deps.work_store.release(
-                work_id, owner=str(runtime.run_id), now=datetime.now(timezone.utc)
+                work_id, owner=runtime.work_owner, now=datetime.now(timezone.utc)
             )
             return None
 
@@ -922,7 +1221,12 @@ class AgentLoopRunner:
             plan_step=state.get("plan_step"),
             current_work_id=state.get("current_work_id"),
         )
-        self._deps.batch_pending_approvals.discard(runtime.run_id)
+        # Native approval resumes the original provider response as a whole:
+        # completed siblings remain completed, pending siblings keep IDs.
+        for key in ("native_calls", "native_messages", "native_outcome"):
+            if key in state:
+                seeded[key] = state[key]
+        self._deps.batch_pending_approvals.discard(runtime.work_owner)
         return await self._run_state(resumed_runtime, seeded)
 
     @staticmethod
@@ -956,16 +1260,12 @@ class AgentLoopRunner:
             return None
 
     async def _canonical_graph_changed(self, runtime: RuntimeState) -> bool:
-        fingerprint = await canonical_progress_fingerprint(
-            self._deps, runtime, step=runtime.step_count
-        )
-        # Old checkpoints used incompatible, bounded hashes. They need an
-        # explicit wakeup; comparing different formats cannot prove change.
-        return (
-            fingerprint is not None
-            and str(runtime.last_progress_fingerprint or "").startswith("original-v1:")
-            and fingerprint != runtime.last_progress_fingerprint
-        )
+        """Resume-gate adapter over the shared canonical change judgment.
+
+        The judgment itself lives with the fingerprint owner so the stall
+        consumers and this gate cannot drift apart.
+        """
+        return await canonical_graph_changed(self._deps, runtime)
 
     async def resume_from(self, checkpoint_id: str) -> RuntimeState:
         """Re-run from an earlier checkpoint of the same thread.

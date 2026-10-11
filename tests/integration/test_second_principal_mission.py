@@ -1,15 +1,18 @@
-"""A configured pair goes through Control, a tool result, Evidence and replanning.
+"""Two registered sessions go through the native model/tool loop and settle.
 
-Migration: retired auto-planner assumption. Explicit scripted model supplies
-the compare plan; no rule restoration, no guard monkeypatch. Preserved:
-second-principal acquisition, object-bound auth task, evidence-backed
-comparison, no invented findings. Retired: implicit frontier assertions.
+Native-loop migration: the scripted model answers ``complete_native`` only,
+calling the exposed compare tool and settling through the real
+task.settle/goal.settle local tools. ``complete_structured`` answers just the
+genuine review routes (analysis verification plus task/goal settlement
+reviews); legacy strategy routes raise. Preserved: second-principal
+acquisition, evidence-backed comparison, no invented findings. Retired:
+implicit frontier assertions and the path-record proof (settlement receipts
+carry the contract now).
 """
 
 from __future__ import annotations
 
 import json
-from dataclasses import replace
 from datetime import datetime, timezone
 from typing import Any
 
@@ -19,6 +22,7 @@ from redteam.app.bootstrap import run_engagement
 from redteam.attack_graph.identity import endpoint_node_id
 from redteam.attack_graph.predicates import facts_of
 from redteam.attack_graph.service import AttackGraphService
+from redteam.attack_graph.stores.memory import InMemoryAttackGraphStore
 from redteam.core.contracts.engagement import (
     ApprovalPolicy,
     Engagement,
@@ -27,233 +31,265 @@ from redteam.core.contracts.engagement import (
     RateLimitPolicy,
 )
 from redteam.core.contracts.tool import ToolDescriptor, ToolError
-from redteam.core.enums import GraphNodeType, MissionStatus, ToolHealthStatus
+from redteam.core.enums import (
+    GraphNodeType,
+    MissionStatus,
+    TaskStatus,
+    ToolHealthStatus,
+)
 from redteam.core.ids import EngagementId, ToolId
+from redteam.core.ports.llm import NativeCompletion, NativeToolCall
+from redteam.event_bus.memory import InMemoryEventBus
+from redteam.orchestration.agents.registry import default_registry
+from redteam.orchestration.context import RuntimeDeps
+from redteam.orchestration.local_tools import LocalToolRegistry
+from redteam.orchestration.native_binding import exposed_tool_name
+from redteam.orchestration.native_local_tools import (
+    GOAL_SETTLE_TOOL_ID,
+    TASK_SETTLE_TOOL_ID,
+    goal_settle_descriptor,
+    goal_settle_handler,
+    task_settle_descriptor,
+    task_settle_handler,
+)
 from redteam.orchestration.operator_intents.store import SQLiteOperatorIntentStore
+from redteam.orchestration.paths import InMemoryPathStore
 from redteam.orchestration.paths.sqlite import SQLitePathStore
 from redteam.orchestration.settings import OrchestrationSettings
 from redteam.orchestration.state import TerminationReason
+from redteam.orchestration.task_graph.memory import InMemoryTaskGraphStore
 from redteam.orchestration.task_graph.sqlite import SQLiteTaskGraphStore
-from tests.fakes import build_test_application
+from redteam.orchestration.work.memory import InMemoryWorkStore
+from tests.fakes import FakeControlPlane, FakeEvidenceStore
 from tests.integration import _engine_llm_harness as h
 from tests.integration.test_authentication_followup import SessionGateway
 
+COMPARE_TOOL_ID = "web.http_compare_sessions"
 
-class _CompareLLM(h.ScriptedLLM):
+
+def _native_tool_registry() -> LocalToolRegistry:
+    registry = LocalToolRegistry()
+    registry.register(task_settle_descriptor(), task_settle_handler)
+    registry.register(goal_settle_descriptor(), goal_settle_handler)
+    return registry
+
+
+def _exposed_names(tools: list[Any]) -> set[str]:
+    return {str(getattr(spec, "name", "")) for spec in tools}
+
+
+def _remote_executed_evidence(messages: list[dict[str, Any]]) -> list[str]:
+    found: list[str] = []
+    for message in messages:
+        if message.get("role") != "tool" or not message.get("tool_call_id"):
+            continue
+        try:
+            body = json.loads(message.get("content") or "{}")
+        except ValueError:
+            continue
+        if not isinstance(body, dict) or body.get("ok") is not True:
+            continue
+        if body.get("executed") is not True:
+            continue
+        for identity in body.get("evidence_ids") or []:
+            text = str(identity)
+            if text and text not in found:
+                found.append(text)
+    return found
+
+
+def _tool_result(messages: list[dict[str, Any]], call_id: str) -> dict[str, Any] | None:
+    for message in messages:
+        if message.get("role") != "tool" or message.get("tool_call_id") != call_id:
+            continue
+        try:
+            body = json.loads(message.get("content") or "{}")
+        except ValueError:
+            return None
+        return body if isinstance(body, dict) else None
+    return None
+
+
+class _CompareNativeLLM:
+    """Scripted native model: one compare call, then settlement or hold.
+
+    Only ``complete_native`` drives the loop. ``complete_structured``
+    answers the genuine review routes the execution path legitimately
+    makes (analysis verification plus task/goal settlement reviews); any
+    legacy strategy route raises so a retired JSON plan can never stand
+    in for a native turn. Cases without usable sessions never act, and an
+    inconclusive comparison holds, so the mission stays blocked.
+    """
+
     def __init__(self, case: str = "success") -> None:
-        super().__init__()
         self.case = case
         self._graph: Any = None
         self._evidence: Any = None
-        self._next_calls = 0
-
-    async def _host_id(self) -> str:
-        nodes = await self._graph.list_nodes()
-        for n in nodes:
-            if n.type is GraphNodeType.HOST and str(n.id) == "host:bank.local":
-                return str(n.id)
-        host = next(n for n in nodes if n.type is GraphNodeType.HOST)
-        return str(host.id)
+        self.turns = 0
+        self.calls: list[dict[str, Any]] = []
+        self.reviews: list[str] = []
+        self._task_call: str | None = None
+        self._goal_call: str | None = None
 
     @staticmethod
-    def _payload(messages: list[dict[str, Any]]) -> dict[str, Any]:
-        return json.loads(messages[0]["content"])
-
-    def _draft(self, host_id: str) -> dict[str, Any]:
-        def _crit() -> dict[str, Any]:
-            return {"kind": "evidence", "description": "result", "min_evidence": 1}
-
-        # Hold cases never act, so the draft claims no principals it cannot
-        # name; the rejection proof is no invocations plus a held run.
-        refs = [] if self.case in ("no_sessions", "wrong_path") else ["alice", "bob"]
-        return {
-            "reason": "scripted compare draft",
-            "steps": [
-                {
-                    "step_id": "step-1",
-                    "objective": "compare two sessions",
-                    "agent_id": "web-api-agent",
-                    "target_node_ids": [host_id],
-                    "principal_refs": refs,
-                    "allowed_operations": ["web.response_analysis"],
-                    "depends_on": [],
-                    "required_fact_refs": [],
-                    "unknowns": [],
-                    "completion_criteria": [_crit()],
-                    "required": True,
-                },
-            ],
-        }
+    def _route_key(schema: dict[str, Any]) -> str:
+        props = schema.get("properties", {})
+        if "criteria" in props:
+            return "goal_completion_review"
+        if "claims" in props:
+            return "task_completion_review"
+        if "claim_supported" in props:
+            return "analysis_verify"
+        return "unknown"
 
     async def complete_structured(
-        self, *, messages: Any, response_schema: dict[str, Any], system: Any = None, **_: Any
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        response_schema: dict[str, Any],
+        system: str | None = None,
+        **_: Any,
     ) -> dict[str, Any]:
         route = self._route_key(response_schema)
-        self.calls.append({"route": route, "messages": messages, "system": system})
-        if route == "path_draft":
-            return self._draft(await self._host_id())
-        if route == "path_review":
-            return h.review_accept()
+        self.reviews.append(route)
         if route == "analysis_verify":
             return h.meaning("success", True)
-        if route == "completion_review":
-            review_payload = self._payload(messages)
-            if isinstance(review_payload.get("task"), dict):
-                excerpts = review_payload.get("evidence_excerpts", [])
-                task_ids = [
-                    str(item.get("evidence_id", "")).strip()
-                    for item in excerpts
-                    if isinstance(item, dict) and str(item.get("evidence_id", "")).strip()
-                ]
-                assert task_ids, "task review needs related stored evidence"
-                return h.task_accept(task_ids, reason="compare task done")
-            return h.completion_accept()
+        if route == "task_completion_review":
+            payload = json.loads(messages[0]["content"])
+            receipts = list(payload["verified_source_ids"])
+            assert receipts, "task review needs the verified executed call evidence"
+            return {
+                "accepted": True,
+                "reason": "compare task evidence ready",
+                "claims": [
+                    {
+                        "description": "two-session comparison observed in stored evidence",
+                        "kind": "observation",
+                        "evidence_ids": list(receipts),
+                        "target_node_ids": [],
+                        "principal_refs": [],
+                    }
+                ],
+            }
         if route == "goal_completion_review":
-            payload = self._payload(messages)
+            payload = json.loads(messages[0]["content"])
             criteria = payload["mission"]["success_criteria"]
-            excerpts = payload.get("evidence_excerpts", [])
-            receipts = [
-                str(item.get("evidence_id", "")).strip()
-                for item in excerpts
-                if isinstance(item, dict) and str(item.get("evidence_id", "")).strip()
-            ]
-            return h.goal_accept(
-                [{"criterion": c, "met": True, "evidence_ids": list(receipts)} for c in criteria]
-            )
-        if route == "next_action":
-            if self.case in ("no_sessions", "wrong_path"):
-                return {
-                    "mode": "hold",
-                    "reason": "no usable sessions",
-                    "actions": [],
-                    "path": None,
-                    "path_step_id": None,
-                    "completion": {},
-                    "evidence_request": {},
-                    "hypothesis_update": {},
-                }
-            self._next_calls += 1
-            host_id = await self._host_id()
-            if self._next_calls == 1:
-                return {
-                    "mode": "actions",
-                    "reason": "compare",
-                    "actions": [
-                        {
-                            "path_step_id": "step-1",
-                            "agent_id": "web-api-agent",
-                            "target_node_id": host_id,
-                            "principal_ref": "alice",
-                            "capability": "web",
-                            "operation": "response_analysis",
-                            "tool_id": "web.http_compare_sessions",
-                            "arguments": {
-                                "target_ref": "bank",
-                                "path": "/orders/1234",
-                                "first_session_ref": "alice",
-                                "second_session_ref": "bob",
-                            },
-                            "reason": "compare alice vs bob",
-                            "expected_observation": "comparison recorded",
-                            "hypothesis": None,
-                            "existing_hypothesis_id": None,
-                            "expectation": None,
-                            "authentication_check": None,
-                            "availability_impact": False,
-                        }
-                    ],
-                    "path": None,
-                    "path_step_id": None,
-                    "completion": {},
-                    "evidence_request": {},
-                    "hypothesis_update": {},
-                }
-            payload = self._payload(messages)
-            run_id = payload["active_path"]["run_id"]
-            records = await self._evidence.list_for_run(run_id)
-            tool_ids = [
-                str(r.evidence_id)
-                for r in records
-                if isinstance(getattr(r, "metadata", {}).get("tool_result"), dict)
-            ]
-            if self._next_calls == 2:
-                if not tool_ids:
-                    return {
-                        "mode": "hold",
-                        "reason": "awaiting evidence",
-                        "actions": [],
-                        "path": None,
-                        "path_step_id": None,
-                        "completion": {},
-                        "evidence_request": {},
-                        "hypothesis_update": {},
+            receipts = list(payload["verified_source_ids"])
+            assert receipts, "goal review needs the verified executed call evidence"
+            return {
+                "accepted": True,
+                "reason": "compare goal evidence ready",
+                "criteria": [
+                    {
+                        "criterion": item,
+                        "met": True,
+                        "evidence_ids": list(receipts),
+                        "claims": [
+                            {
+                                "description": "two-session comparison in stored evidence",
+                                "kind": "observation",
+                                "evidence_ids": list(receipts),
+                                "target_node_ids": [],
+                                "principal_refs": [],
+                            }
+                        ],
                     }
-                # Only a conclusive two-session comparison closes the step;
-                # inconclusive receipts (same identity, wrong target, error
-                # statuses, unavailable) hold so the mission stays blocked.
-                if not await self._comparison_conclusive():
-                    return {
-                        "mode": "hold",
-                        "reason": "comparison inconclusive",
-                        "actions": [],
-                        "path": None,
-                        "path_step_id": None,
-                        "completion": {},
-                        "evidence_request": {},
-                        "hypothesis_update": {},
-                    }
-                # Cross-step guard: only receipts from this step close it.
-                records = await self._evidence.list_for_run(run_id)
-                owned = [
-                    str(r.evidence_id)
-                    for r in records
-                    if isinstance(getattr(r, "metadata", {}).get("tool_result"), dict)
-                    and r.metadata.get("path_step_id") == "step-1"
-                    and str(getattr(r, "metadata", {}).get("tool_id", r.source_id))
-                    == "web.http_compare_sessions"
-                ]
-                if not owned:
-                    return {
-                        "mode": "hold",
-                        "reason": "awaiting step-1 evidence",
-                        "actions": [],
-                        "path": None,
-                        "path_step_id": None,
-                        "completion": {},
-                        "evidence_request": {},
-                        "hypothesis_update": {},
-                    }
-                return {**h.turn_complete_step(owned), "path_step_id": "step-1"}
-            if payload.get("active_task"):
-                step_receipts = [
-                    str(r.evidence_id)
-                    for r in records
-                    if isinstance(getattr(r, "metadata", {}).get("tool_result"), dict)
-                    and r.metadata.get("path_step_id") == "step-1"
-                    and str(getattr(r, "metadata", {}).get("tool_id", r.source_id))
-                    == "web.http_compare_sessions"
-                ]
-                assert step_receipts, "task completion needs related stored evidence"
-                return {
-                    "mode": "complete_task",
-                    "reason": "compare task evidence ready",
-                    "actions": [],
-                    "path": None,
-                    "path_step_id": None,
-                    "completion": {
-                        "evidence_ids": step_receipts,
-                        "outcome": "success",
-                        "reason": "compare task evidence ready",
-                        "criterion_results": [],
-                    },
-                    "evidence_request": {},
-                    "hypothesis_update": {},
-                }
-            return h.turn_complete_goal()
-        raise AssertionError(f"no compare answer for {route!r}")
+                    for item in criteria
+                ],
+            }
+        raise AssertionError(
+            f"legacy strategy route is not part of the native loop: {route!r}"
+        )
 
-    async def complete(self, *, messages: Any, system: Any = None, **_: Any) -> str:
+    async def complete(
+        self, *, messages: list[dict[str, Any]], system: str | None = None, **_: Any
+    ) -> str:
         return ""
+
+    async def complete_native(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[Any],
+        system: str | None = None,
+        **_: Any,
+    ) -> NativeCompletion:
+        names = _exposed_names(tools)
+        compare = exposed_tool_name(COMPARE_TOOL_ID)
+        task_tool = exposed_tool_name(TASK_SETTLE_TOOL_ID)
+        goal_tool = exposed_tool_name(GOAL_SETTLE_TOOL_ID)
+        assert compare in names, "native model needs the registered compare tool"
+        assert task_tool in names, "native model needs the task settlement helper"
+        assert goal_tool in names, "native model needs the goal settlement helper"
+        self.turns += 1
+        if self.turns == 1:
+            self.calls.append({"turn": 1, "tool_calls": []})
+            if self.case in ("no_sessions", "wrong_path"):
+                return NativeCompletion(tool_calls=(), text="no usable sessions")
+            self.calls[-1]["tool_calls"] = [compare]
+            return NativeCompletion(
+                tool_calls=(
+                    NativeToolCall(
+                        call_id="call-compare",
+                        name=compare,
+                        arguments={
+                            "target_ref": "bank",
+                            "path": "/orders/1234",
+                            "first_session_ref": "alice",
+                            "second_session_ref": "bob",
+                        },
+                    ),
+                ),
+                text="",
+            )
+        evidenced = _remote_executed_evidence(messages)
+        if self.case in ("no_sessions", "wrong_path"):
+            return NativeCompletion(tool_calls=(), text="no usable sessions")
+        if not evidenced:
+            return NativeCompletion(tool_calls=(), text="awaiting compare evidence")
+        # Only a conclusive two-session comparison settles the task and the
+        # goal; inconclusive receipts (same identity, wrong target, error
+        # statuses, unavailable) hold so the mission stays blocked.
+        if not await self._comparison_conclusive():
+            return NativeCompletion(tool_calls=(), text="comparison inconclusive")
+        if self._task_call is None:
+            assert evidenced, "task settlement needs the executed call evidence"
+            self._task_call = "call-task"
+            self.calls.append({"turn": self.turns, "tool_calls": [task_tool]})
+            return NativeCompletion(
+                tool_calls=(
+                    NativeToolCall(
+                        call_id=self._task_call,
+                        name=task_tool,
+                        arguments={
+                            "outcome": "success",
+                            "reason": "compare task evidence ready",
+                            "evidence_ids": evidenced,
+                        },
+                    ),
+                ),
+                text="",
+            )
+        seen = _tool_result(messages, self._task_call)
+        if seen is None or seen.get("ok") is not True:
+            return NativeCompletion(tool_calls=(), text="awaiting task settlement")
+        if self._goal_call is None:
+            self._goal_call = "call-goal"
+            self.calls.append({"turn": self.turns, "tool_calls": [goal_tool]})
+            return NativeCompletion(
+                tool_calls=(
+                    NativeToolCall(
+                        call_id=self._goal_call,
+                        name=goal_tool,
+                        arguments={
+                            "outcome": "success",
+                            "reason": "compare goal evidence ready",
+                            "evidence_ids": evidenced,
+                        },
+                    ),
+                ),
+                text="",
+            )
+        return NativeCompletion(tool_calls=(), text="")
 
     async def _comparison_conclusive(self) -> bool:
         from redteam.attack_graph.predicates import facts_of as _facts_of
@@ -395,25 +431,34 @@ async def _exercise(case="success", task_db=None):
         for session in engagement.metadata["auth_sessions"]["bank.local"]:
             session["paths"] = ["/other"]
     gateway = ComparisonGateway(case)
-    llm = _CompareLLM(case)
-    deps = build_test_application(
+    llm = _CompareNativeLLM(case)
+    if task_db is not None:
+        task_store: Any = SQLiteTaskGraphStore(task_db)
+        path_store: Any = SQLitePathStore(task_db)
+        intent_store: Any = SQLiteOperatorIntentStore(task_db)
+    else:
+        task_store = InMemoryTaskGraphStore()
+        path_store = InMemoryPathStore()
+        intent_store = None
+    deps = RuntimeDeps(
+        control_plane=FakeControlPlane(),
         tool_gateway=gateway,
-        tool_catalog=gateway,
+        event_bus=InMemoryEventBus(),
+        graph_store=InMemoryAttackGraphStore(),
+        evidence_store=FakeEvidenceStore(),
         llm_client=llm,
-        settings=OrchestrationSettings(max_steps=35),
+        engagement=engagement,
+        agents=default_registry(),
+        tool_catalog=gateway,
+        local_tools=_native_tool_registry(),
+        work_store=InMemoryWorkStore(),
+        task_graph_store=task_store,
+        path_store=path_store,
+        operator_intent_store=intent_store,
+        settings=OrchestrationSettings(max_steps=12, checkpointing=False),
     )
-    # Production wires the engagement onto deps; without it mapped refs
-    # (bank.local -> bank) fail alias checks at action-compile time.
-    deps = replace(deps, engagement=engagement)
     llm._graph = deps.graph_store
     llm._evidence = deps.evidence_store
-    if task_db is not None:
-        deps = replace(
-            deps,
-            task_graph_store=SQLiteTaskGraphStore(task_db),
-            path_store=SQLitePathStore(task_db),
-            operator_intent_store=SQLiteOperatorIntentStore(task_db),
-        )
     graph = AttackGraphService(deps.graph_store)
     endpoint_id = endpoint_node_id("GET", "/orders/1234", host="bank.local")
     await graph.upsert_node(
@@ -442,9 +487,9 @@ async def _exercise(case="success", task_db=None):
 async def test_registered_second_principal_is_acquired_and_replanned() -> None:
     final, deps, gateway, graph, endpoint_id = await _exercise()
     mission = await deps.task_graph_store.get_mission(final.mission_id)
-    # Retired: automatic replan tasks no longer exist in production; the
-    # durable proof is the explicit structured path plus the comparison
-    # evidence itself.
+    # The durable proof is the executed comparison plus the settlement
+    # receipts: the task settled from the compare evidence and the goal
+    # settled from the same executed origins.
     assert final.termination_reason is TerminationReason.GOAL_ACHIEVED
     assert final.mission_status is MissionStatus.COMPLETED
     assert mission is not None and mission.status is MissionStatus.COMPLETED
@@ -478,10 +523,23 @@ async def test_registered_second_principal_is_acquired_and_replanned() -> None:
     ]
     assert len(principals) >= 2, "both session principals must be observed"
     assert await graph.list_findings() == []
-    path = await deps.path_store.get_active(str(final.run_id))
-    assert path is not None
-    assert path.review_records.get("decision") == "accept"
-    assert any(s.evidence_ids for s in path.steps)
+    tasks = await deps.task_graph_store.list_tasks(mission_id=final.mission_id)
+    settled = [task for task in tasks if task.status is TaskStatus.COMPLETED]
+    assert settled, "goal settlement keeps its completed task"
+    assert all(task.objective == mission.objective for task in settled)
+    tool_ids = {
+        str(record.evidence_id)
+        for record in evidence
+        if isinstance(record.metadata.get("tool_result"), dict)
+    }
+    assert tool_ids, "settlement needs the executed compare call evidence"
+    for result in mission.criterion_results:
+        assert result.met and result.evidence_ids
+        assert set(map(str, result.evidence_ids)) <= tool_ids
+        assert result.result_claims, "each criterion keeps its actual result claims"
+    llm = deps.llm_client
+    assert isinstance(llm, _CompareNativeLLM)
+    assert {"task_completion_review", "goal_completion_review"} <= set(llm.reviews)
 
 
 @pytest.mark.parametrize(
@@ -500,8 +558,8 @@ async def test_registered_second_principal_is_acquired_and_replanned() -> None:
 async def test_unusable_principals_never_complete_mission(case):
     final, deps, gateway, graph, _ = await _exercise(case)
     mission = await deps.task_graph_store.get_mission(final.mission_id)
-    # Retired: automatic replan tasks no longer exist; the negative proof
-    # is a held run, unmet criteria, and no invented findings.
+    # The negative proof is a held run, unmet criteria, and no invented
+    # findings: inconclusive comparisons never settle the task or the goal.
     assert final.termination_reason is TerminationReason.INVESTIGATION_HELD
     assert final.mission_status is MissionStatus.BLOCKED
     assert mission is not None and mission.status is MissionStatus.BLOCKED
@@ -516,8 +574,8 @@ async def test_unusable_principals_never_complete_mission(case):
 
 async def test_known_principals_still_execute_endpoint_comparison():
     final, deps, gateway, graph, endpoint_id = await _exercise("known_principals")
-    # Retired: automatic acquisition tasks no longer exist; the durable
-    # proof is the executed comparison plus the structured path receipts.
+    # The durable proof is the executed comparison plus the settlement
+    # receipts: known principals still run the endpoint comparison.
     assert final.termination_reason is TerminationReason.GOAL_ACHIEVED
     assert final.mission_status is MissionStatus.COMPLETED
     assert any(str(i.tool_id) == "web.http_compare_sessions" for i in gateway.invocations)
@@ -527,10 +585,9 @@ async def test_known_principals_still_execute_endpoint_comparison():
         item.get("kind") == "http_session_comparison"
         for item in facts_of(endpoint.properties).get("observations", [])
     )
-    path = await deps.path_store.get_active(str(final.run_id))
-    assert path is not None
-    assert path.review_records.get("decision") == "accept"
-    assert any(s.evidence_ids for s in path.steps)
+    mission = await deps.task_graph_store.get_mission(final.mission_id)
+    assert mission is not None and mission.status is MissionStatus.COMPLETED
+    assert mission.criterion_results and all(r.met for r in mission.criterion_results)
 
 
 @pytest.mark.parametrize("case", ["success", "server_error"])

@@ -6,7 +6,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from redteam.orchestration.completion import validate_result_claims
+from redteam.orchestration.analysis import claim_target_is_grounded
+from redteam.orchestration.completion import preserved_target_is_absent, validate_result_claims
 from redteam.orchestration.coordination import content_hash
 from redteam.orchestration.paths import CompletionCriterion
 
@@ -43,6 +44,21 @@ class ResultReview(BaseModel):
     claims: list[ResultClaim]
 
 
+class CriterionReview(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    criterion_id: str
+    met: bool
+    evidence_ids: list[str] = Field(min_length=1)
+    reason: str
+
+
+class TaskContractReview(ResultReview):
+    """v2 requires an explicit AND judgment over every stored condition."""
+
+    criterion_results: list[CriterionReview] = Field(min_length=1)
+
+
 RESULT_REVIEW_INSTRUCTION = (
     " Describe actual results as claims tied to their exact source evidence. "
     "Use semantic for general investigation or synthesis, poc for a vulnerability "
@@ -64,7 +80,10 @@ async def check_result_review(
     mission_id: str | None,
     target_node_ids: list[str] | None = None,
     claims_location: tuple[str | int, ...] = ("claims",),
-) -> list[str]:
+    task: Any | None = None,
+    task_graph_store: Any | None = None,
+    work_store: Any | None = None,
+ ) -> list[str]:
     """Reuse actual origin, account, verdict and finding proofs per claimed result."""
     if not claims:
         return ["completion review describes no supported result"]
@@ -76,6 +95,12 @@ async def check_result_review(
             return ["result claim cites unrelated evidence"]
         if scope and set(claim.target_node_ids) - scope:
             return ["result claim concerns a different task target"]
+        for identity in claim.evidence_ids:
+            record = await evidence_store.get(identity)
+            if record is not None and preserved_target_is_absent(record.metadata):
+                for target in claim.target_node_ids:
+                    if not await claim_target_is_grounded(graph_service, record, target):
+                        return ["target-free evidence does not ground the claimed target"]
         errors = await validate_result_claims(
             criteria=[
                 CompletionCriterion(
@@ -94,6 +119,9 @@ async def check_result_review(
             path_store=path_store,
             mission_id=mission_id,
             evidence_location=(*claims_location, claim_index, "evidence_ids"),
+            task=task,
+            task_graph_store=task_graph_store,
+            work_store=work_store,
         )
         if errors:
             return errors

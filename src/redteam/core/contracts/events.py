@@ -98,6 +98,7 @@ class EventType:
     TOOL_EXECUTION_FAILED = "ToolExecutionFailed"
 
     EVIDENCE_CREATED = "EvidenceCreated"
+    EVIDENCE_VALIDITY_CHANGED = "EvidenceValidityChanged"
 
     GRAPH_UPDATED = "GraphUpdated"
 

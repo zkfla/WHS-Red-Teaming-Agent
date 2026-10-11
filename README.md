@@ -1,5 +1,21 @@
 # WHS Red Teaming Agent
 
+## Native specialist integration branch
+
+`dev-jm-native-specialists` ports specialist roles onto dev's native ReAct and
+independent-instance driver. It does not replace that driver with the older
+dev-jm execution pipeline. The original `dev-jm` branch is preserved.
+
+See [the branch guide](docs/agent/native-specialists-branch-guide.md) for roles,
+explicit configuration, synthetic tests and known unfinished work. This is an
+implementation preview, not a completed PRD or a verified live penetration run.
+
+The current forward scope is **Web/API and Recon, not Mobile**. Select
+`config/agents/native-specialists-web.yaml` explicitly for new specialist Runs.
+It shares the existing MD prompts and native engine; the full profile and old
+Mobile code remain for compatibility. Profile changes must not force-resume
+an existing Run. See the guide for cost controls and local verification.
+
 ## Project Goal
 
 A multi-agent framework for **authorized security testing** engagements.
@@ -28,7 +44,8 @@ Analysis) versus what's real and wired up (Web/API, Recon).
 
 ```text
 User/Operator -> Engagement Config (Scope/ROE/Limits)
-              -> Agent Orchestration Layer (LangGraph: Observe->Plan->Policy->Execute->Verify->Update->Replan)
+              -> Agent Orchestration Layer (native ReAct: MODEL->TOOLS->SETTLE)
+                 Optional specialist planning/atomization -> existing Task/outbox/InstanceDriver
               -> Engagement Control Plane (Scope/ROE/Policy/RateLimit/Budget/Approval/Audit) [mandatory gate]
               -> Capability Layer (ToolGateway -> MCPToolRegistry -> MCPAdapter)
               -> Execution Substrate (MCP Server containers)

@@ -50,6 +50,7 @@ from redteam.orchestration.result_claims import (
     check_result_review,
     mission_result_purpose,
 )
+from redteam.orchestration.work.models import work_owner_for
 
 #: Provenance marker for endpoint-scoped second-principal acquisition Tasks.
 _ACQUIRE_SOURCE = "replan:acquire_second_principal"
@@ -418,6 +419,8 @@ async def _terminal_task_coverage(
     engagement_id,
     mission_id,
     graph_service=None,
+    task_graph_store=None,
+    work_store=None,
 ):
     """Use the same current-purpose and original-evidence proof as goal review."""
     from redteam.orchestration.semantic_completion import (
@@ -450,6 +453,8 @@ async def _terminal_task_coverage(
                 engagement_id=engagement_id,
                 mission_id=str(mission_id),
                 task=task,
+                task_graph_store=task_graph_store,
+                work_store=work_store,
             )
         task_id = str(task.task_id)
         if errors or not proven:
@@ -497,6 +502,8 @@ async def _terminal_criterion_results(
     graph_service=None,
     before_review=None,
     run_id=None,
+    task_graph_store=None,
+    work_store=None,
 ):
     """Settle the original operator criteria against the shared task proof.
 
@@ -565,6 +572,8 @@ async def _terminal_criterion_results(
                         path_store=path_store,
                         run_id=str(run_id or getattr(runtime, "run_id", "")),
                         mission_id=str(mission.mission_id),
+                        task_graph_store=task_graph_store,
+                        work_store=work_store,
                     )
                     if errors:
                         reusable = False
@@ -697,6 +706,8 @@ async def _terminal_criterion_results(
                         path_store=path_store,
                         run_id=str(run_id or getattr(runtime, "run_id", "")),
                         mission_id=str(mission.mission_id),
+                        task_graph_store=task_graph_store,
+                        work_store=work_store,
                     )
                     if errors:
                         diagnostic = _terminal_rule(
@@ -767,6 +778,7 @@ async def finalize_mission(
     runtime: Any | None = None,
     engagement: Any | None = None,
     graph_service: Any | None = None,
+    work_store: Any | None = None,
 ) -> EventId | None:
     """Evaluate every criterion and atomically settle the current mission snapshot.
 
@@ -841,6 +853,8 @@ async def finalize_mission(
                 engagement_id=mission.engagement_id,
                 mission_id=mission_id,
                 graph_service=graph_service,
+                task_graph_store=store,
+                work_store=work_store,
             )
         else:
             bound, unproven, owners = {}, set(), {}
@@ -884,6 +898,8 @@ async def finalize_mission(
             graph_service=graph_service,
             before_review=before_review,
             run_id=run_id,
+            task_graph_store=store,
+            work_store=work_store,
         )
         required = [task for task in tasks if task.required]
         if mission.status in {MissionStatus.FAILED, MissionStatus.CANCELLED, MissionStatus.BLOCKED}:
@@ -899,6 +915,32 @@ async def finalize_mission(
             outcome = MissionStatus.COMPLETED
         else:
             outcome = MissionStatus.BLOCKED
+        # Foreign-active guard for premature BLOCKED only. Captured tasks
+        # come from the coordinator capture, and the commit below
+        # re-validates the token in a fresh coordinator change, so no raw
+        # store access happens inside the change. Authoritative COMPLETED
+        # and actual operator stop or closed-mission projection (stopped)
+        # bypass this guard. Legacy callers without a real instance keep
+        # the previous BLOCKED behaviour. TaskStatus has no LEASED;
+        # RUNNING with a foreign occupant is active, and READY or PENDING
+        # with a foreign occupant is HELD, never false-inactive.
+        if outcome is MissionStatus.BLOCKED and not stopped:
+            _own_owner: str | None = None
+            _rt_instance = getattr(runtime, "instance_id", None)
+            if runtime is not None and _rt_instance is not None and run_id is not None:
+                _own_owner = work_owner_for(run_id, _rt_instance)
+            if _own_owner is not None:
+                _foreign_active = False
+                for _t in tasks or []:
+                    _occ = getattr(_t, "occupant_owner", None)
+                    if _occ is None or _occ == _own_owner:
+                        continue
+                    _st = getattr(_t, "status", None)
+                    if _st is TaskStatus.RUNNING or _st in {TaskStatus.READY, TaskStatus.PENDING}:
+                        _foreign_active = True
+                        break
+                if _foreign_active:
+                    return last_event_id
         if (
             mission.status
             in {

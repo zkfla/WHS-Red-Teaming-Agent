@@ -101,6 +101,7 @@ def _same_action_content(first: ActionProposal, second: ActionProposal) -> bool:
         and first.engagement_id == second.engagement_id
         and first.run_id == second.run_id
         and first.agent_id == second.agent_id
+        and first.instance_id == second.instance_id
     )
 
 
@@ -258,7 +259,9 @@ class DefaultControlPlane:
                 severity=Severity.BLOCK_ACTION,
             )
 
-        scope_ok, scope_reasons, scope_severity = check_scope(proposal, engagement.scope)
+        scope_ok, scope_reasons, scope_severity = check_scope(
+            proposal, engagement.scope, selected=outbound_descriptor,
+        )
         if not scope_ok:
             return await self._finalize(
                 proposal, PolicyVerdict.DENY, scope_reasons, ["scope"], severity=scope_severity
@@ -1103,7 +1106,9 @@ class DefaultControlPlane:
         # keys instead of blank capability/operation strings.
         selected_descriptor = self._resolve_outbound_descriptor(context)
         has_selected = getattr(context, "selected_tool_id", None) is not None
-        scope_ok, scope_reasons, scope_severity = check_scope(proposal, engagement.scope)
+        scope_ok, scope_reasons, scope_severity = check_scope(
+            proposal, engagement.scope, selected=selected_descriptor,
+        )
         if not scope_ok:
             return (
                 False,

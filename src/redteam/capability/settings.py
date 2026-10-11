@@ -15,6 +15,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from urllib.parse import urlparse
 
+from pydantic import TypeAdapter, ValidationError
+
 from redteam.capability.registration import (
     McpProfileBundle,
     ProfileSettingsContext,
@@ -25,6 +27,7 @@ from redteam.core.action_semantics import (
     canonical_action_key,
     validate_operation_format,
 )
+from redteam.core.contracts.tool import ToolResourceBinding
 from redteam.core.enums import RiskLevel
 
 _SAFE_SERVER_ID = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
@@ -99,6 +102,7 @@ class MCPServerSettings:
     process_environment: dict[str, str] = field(default_factory=dict, repr=False)
     allowed_tools: tuple[str, ...] | None = None
     tool_operations: dict[str, tuple[str, ...]] | None = None
+    tool_resources: dict[str, list[ToolResourceBinding]] = field(default_factory=dict)
     max_concurrency: int = 1
     max_output_bytes: int = 1_048_576
     profile: str | None = None
@@ -232,6 +236,7 @@ class MCPServerSettings:
             process_environment=process_environment,
             allowed_tools=allowed_tools,
             tool_operations=tool_operations,
+            tool_resources=_load_tool_resources(prefix, snapshot),
             max_concurrency=max_concurrency,
             max_output_bytes=max_output_bytes,
             profile=profile,
@@ -269,6 +274,53 @@ def mcp_server_ids_from_environment(
     from redteam.core.environment import mcp_server_list
 
     return mcp_server_list(source, env_var)
+
+
+SHELL_POLICY_ENV_VAR = "REDTEAM_SHELL_POLICY_PATH"
+
+
+def shell_policy_path_from_environment(
+    *, source: Mapping[str, str] | None = None
+) -> str | None:
+    """Operator-owned shell-workroom policy file, or None when disabled.
+
+    A single absolute JSON file path read from REDTEAM_SHELL_POLICY_PATH.
+    Unset or blank means the builtin shell provider stays off: callers skip
+    the shell assembly and the catalog honestly lacks shell tools, never a
+    silent default policy. A set value is returned stripped; the policy
+    loader (not this function) validates the file contents.
+    """
+    from redteam.core.environment import env_snapshot
+
+    raw = env_snapshot(source).get(SHELL_POLICY_ENV_VAR)
+    if raw is None:
+        return None
+    path = raw.strip()
+    return path or None
+
+
+GATED_NETWORK_POLICY_ENV_VAR = "REDTEAM_GATED_NETWORK_POLICY_PATH"
+
+
+def gated_network_policy_path_from_environment(
+    *, source: Mapping[str, str] | None = None
+) -> str | None:
+    """Operator-owned gated-network policy file, or None when closed.
+
+    A single absolute JSON file path read from
+    REDTEAM_GATED_NETWORK_POLICY_PATH. Unset or blank means gated egress
+    stays closed: callers pass no gated provider into the composition root
+    and the shell keeps its network-closed local-script path, never a
+    silent default policy. A set value is returned stripped; the gated
+    policy assembly (not this function) validates the file contents.
+    """
+    from redteam.core.environment import env_snapshot
+
+    raw = env_snapshot(source).get(GATED_NETWORK_POLICY_ENV_VAR)
+    if raw is None:
+        return None
+    path = raw.strip()
+    return path or None
 
 
 def environment_prefix(server_id: str) -> str:
@@ -398,6 +450,21 @@ def _load_tool_operations(
                 ) from exc
         bindings[tool_name] = tuple(operations)
     return bindings
+
+
+def _load_tool_resources(
+    prefix: str, env: Mapping[str, str]
+) -> dict[str, list[ToolResourceBinding]]:
+    value = env.get(prefix + "_TOOL_RESOURCES_JSON")
+    if value is None:
+        return {}
+    try:
+        bindings = TypeAdapter(dict[str, list[ToolResourceBinding]]).validate_json(value)
+        if any(not name.strip() or len(rows) > 32 for name, rows in bindings.items()):
+            raise ValueError("invalid resource declarations")
+        return bindings
+    except (ValidationError, ValueError):
+        raise MCPConfigurationError("invalid TOOL_RESOURCES_JSON") from None
 
 
 def _load_max_concurrency(prefix: str, env: Mapping[str, str] | None = None) -> int:

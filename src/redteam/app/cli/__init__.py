@@ -6,9 +6,10 @@ Thin dispatcher only: argument parsing, then one call into a
 ``redteam.control``/``redteam.capability``/``redteam.orchestration`` —
 this package never makes one.
 
-``redteam run`` is the only command that reaches those through the
-canonical bootstrap (``redteam.app.bootstrap.build_application``); every
-other command reads durable state directly (Approval/Audit/Evidence
+``redteam run`` and ``resume`` reach those through the canonical bootstrap
+(``redteam.app.bootstrap.build_application``). Explicit ``collect-originals``
+reuses that assembly for existing-result queries only, never a fresh drive.
+Other commands read durable state directly (Approval/Audit/Evidence
 stores, the persisted terminal report) or, for ``tools``, builds just the
 Capability gateway via the same ``capability.bootstrap`` helper
 ``build_application`` itself uses -- never a separate CLI-only runtime.
@@ -38,6 +39,7 @@ from redteam.app.cli._shared import (
 )
 from redteam.app.cli.commands import (
     approvals,
+    collect_originals,
     evidence,
     findings,
     init,
@@ -58,6 +60,7 @@ _COMMAND_MODULES = (
     validate,
     run_command,
     resume,
+    collect_originals,
     status,
     roe,
     tools,

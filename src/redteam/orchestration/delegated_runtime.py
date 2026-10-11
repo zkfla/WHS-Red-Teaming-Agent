@@ -195,6 +195,7 @@ async def accept_delegations(engine, path, requests, runtime):
         bound = DelegationRequest(
             path_step_id=step.step_id,
             agent_id=request.agent_id,
+            instance_id=request.instance_id,
             objective=request.objective or step.objective,
             budget=budget,
         )
@@ -451,13 +452,26 @@ async def decide_delegations(engine, path, runtime, context):
                     "evidence_ids": list(verdict.evidence_ids),
                     "gaps": [{"description": item} for item in verdict.unresolved],
                 }
+                scoped_reads = (
+                    await restore_reads(
+                        engine.deps.evidence_store, runtime, delegation_id=identity
+                    )
+                    or []
+                )
+                root_requested = context.get("requested_evidence", [])
+                if not isinstance(root_requested, list):
+                    root_requested = []
+                completion_context = {
+                    **context,
+                    "requested_evidence": [*root_requested, *scoped_reads],
+                }
                 path, completion_errors = await engine.complete_step(
                     path,
                     SimpleNamespace(
                         path_step_id=state.path_step_id, completion=completion,
                         reason=verdict.summary or str(completion.get("reason", "")),
                     ),
-                    runtime, context, budget=budget,
+                    runtime, completion_context, budget=budget,
                 )
                 if completion_errors:
                     verdict = replace(
@@ -603,7 +617,7 @@ async def decide_delegations(engine, path, runtime, context):
 
 def close_delegations(runtime, reason):
     """Keep collected references and the original exit cause without inference."""
-    if reason in {"approval_pending", "operator_paused"}:
+    if reason in {"approval_pending", "operator_paused", "resource_wait"}:
         return runtime
     values = {
         identity: mark_finished(state, reason=reason)

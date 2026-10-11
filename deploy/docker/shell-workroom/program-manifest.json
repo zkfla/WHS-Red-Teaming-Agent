@@ -1,0 +1,2760 @@
+{
+  "generator": "deploy/docker/shell-workroom/generate-manifest.py",
+  "generated_at": "2026-10-08T20:57:53.202532+00:00",
+  "image": "shell-workroom:t003-draft",
+  "image_digest": "sha256:d9d2a8bfb9aeca3d9e6a00a6fb3023aff69cd9e7d331509cf628806847c48929",
+  "base_image": "kalilinux/kali-rolling:latest",
+  "base_digest": "sha256:c717f201f29a7e0a9126c0d51bd08aa7194ac82f53c57314339182f92b0b1585",
+  "base_pinned": true,
+  "base_note": "build-record pin",
+  "apt_source": "http://mirror.wane.kr/kali",
+  "apt_transport": "http",
+  "apt_release": "kali-rolling",
+  "origin_index": "mirror-index-matched-unverified",
+  "origin_unresolved": [],
+  "programs": [
+    {
+      "requested_package": "bash",
+      "package": "bash",
+      "version": "5.3-4",
+      "source_package": "bash",
+      "origin": "kali-rolling/main",
+      "executables": [
+        {
+          "command": "bash",
+          "path": "/usr/bin/bash",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "bashbug",
+          "path": "/usr/bin/bashbug",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "clear_console",
+          "path": "/usr/bin/clear_console",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "rbash",
+          "path": "/usr/bin/rbash",
+          "on_default_path": true,
+          "usable_note": null
+        }
+      ]
+    },
+    {
+      "requested_package": "python3",
+      "package": "python3",
+      "version": "3.14.7-3",
+      "source_package": "python3-defaults",
+      "origin": "kali-rolling/main",
+      "executables": [
+        {
+          "command": "pdb3",
+          "path": "/usr/bin/pdb3",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "pydoc3",
+          "path": "/usr/bin/pydoc3",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "pygettext3",
+          "path": "/usr/bin/pygettext3",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "public_modules.rtinstall",
+          "path": "/usr/share/python3/runtime.d/public_modules.rtinstall",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "public_modules.rtremove",
+          "path": "/usr/share/python3/runtime.d/public_modules.rtremove",
+          "on_default_path": false,
+          "usable_note": null
+        }
+      ]
+    },
+    {
+      "requested_package": "coreutils",
+      "package": "coreutils",
+      "version": "9.10-1",
+      "source_package": "coreutils",
+      "origin": "kali-rolling/main",
+      "executables": [
+        {
+          "command": "[",
+          "path": "/usr/bin/[",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "arch",
+          "path": "/usr/bin/arch",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "b2sum",
+          "path": "/usr/bin/b2sum",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "base32",
+          "path": "/usr/bin/base32",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "base64",
+          "path": "/usr/bin/base64",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "basename",
+          "path": "/usr/bin/basename",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "basenc",
+          "path": "/usr/bin/basenc",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "cat",
+          "path": "/usr/bin/cat",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "chcon",
+          "path": "/usr/bin/chcon",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "chgrp",
+          "path": "/usr/bin/chgrp",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "chmod",
+          "path": "/usr/bin/chmod",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "chown",
+          "path": "/usr/bin/chown",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "cksum",
+          "path": "/usr/bin/cksum",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "comm",
+          "path": "/usr/bin/comm",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "cp",
+          "path": "/usr/bin/cp",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "csplit",
+          "path": "/usr/bin/csplit",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "cut",
+          "path": "/usr/bin/cut",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "date",
+          "path": "/usr/bin/date",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "dd",
+          "path": "/usr/bin/dd",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "df",
+          "path": "/usr/bin/df",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "dir",
+          "path": "/usr/bin/dir",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "dircolors",
+          "path": "/usr/bin/dircolors",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "dirname",
+          "path": "/usr/bin/dirname",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "du",
+          "path": "/usr/bin/du",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "echo",
+          "path": "/usr/bin/echo",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "env",
+          "path": "/usr/bin/env",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "expand",
+          "path": "/usr/bin/expand",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "expr",
+          "path": "/usr/bin/expr",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "factor",
+          "path": "/usr/bin/factor",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "false",
+          "path": "/usr/bin/false",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "fmt",
+          "path": "/usr/bin/fmt",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "fold",
+          "path": "/usr/bin/fold",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "groups",
+          "path": "/usr/bin/groups",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "head",
+          "path": "/usr/bin/head",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "hostid",
+          "path": "/usr/bin/hostid",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "id",
+          "path": "/usr/bin/id",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "install",
+          "path": "/usr/bin/install",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "join",
+          "path": "/usr/bin/join",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "link",
+          "path": "/usr/bin/link",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "ln",
+          "path": "/usr/bin/ln",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "logname",
+          "path": "/usr/bin/logname",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "ls",
+          "path": "/usr/bin/ls",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "md5sum",
+          "path": "/usr/bin/md5sum",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "mkdir",
+          "path": "/usr/bin/mkdir",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "mkfifo",
+          "path": "/usr/bin/mkfifo",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "mknod",
+          "path": "/usr/bin/mknod",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "mktemp",
+          "path": "/usr/bin/mktemp",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "mv",
+          "path": "/usr/bin/mv",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "nice",
+          "path": "/usr/bin/nice",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "nl",
+          "path": "/usr/bin/nl",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "nohup",
+          "path": "/usr/bin/nohup",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "nproc",
+          "path": "/usr/bin/nproc",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "numfmt",
+          "path": "/usr/bin/numfmt",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "od",
+          "path": "/usr/bin/od",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "paste",
+          "path": "/usr/bin/paste",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "pathchk",
+          "path": "/usr/bin/pathchk",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "pinky",
+          "path": "/usr/bin/pinky",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "pr",
+          "path": "/usr/bin/pr",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "printenv",
+          "path": "/usr/bin/printenv",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "printf",
+          "path": "/usr/bin/printf",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "ptx",
+          "path": "/usr/bin/ptx",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "pwd",
+          "path": "/usr/bin/pwd",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "readlink",
+          "path": "/usr/bin/readlink",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "realpath",
+          "path": "/usr/bin/realpath",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "rm",
+          "path": "/usr/bin/rm",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "rmdir",
+          "path": "/usr/bin/rmdir",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "runcon",
+          "path": "/usr/bin/runcon",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "seq",
+          "path": "/usr/bin/seq",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "sha1sum",
+          "path": "/usr/bin/sha1sum",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "sha224sum",
+          "path": "/usr/bin/sha224sum",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "sha256sum",
+          "path": "/usr/bin/sha256sum",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "sha384sum",
+          "path": "/usr/bin/sha384sum",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "sha512sum",
+          "path": "/usr/bin/sha512sum",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "shred",
+          "path": "/usr/bin/shred",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "shuf",
+          "path": "/usr/bin/shuf",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "sleep",
+          "path": "/usr/bin/sleep",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "sort",
+          "path": "/usr/bin/sort",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "split",
+          "path": "/usr/bin/split",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "stat",
+          "path": "/usr/bin/stat",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "stdbuf",
+          "path": "/usr/bin/stdbuf",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "stty",
+          "path": "/usr/bin/stty",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "sum",
+          "path": "/usr/bin/sum",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "sync",
+          "path": "/usr/bin/sync",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "tac",
+          "path": "/usr/bin/tac",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "tail",
+          "path": "/usr/bin/tail",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "tee",
+          "path": "/usr/bin/tee",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "test",
+          "path": "/usr/bin/test",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "timeout",
+          "path": "/usr/bin/timeout",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "touch",
+          "path": "/usr/bin/touch",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "tr",
+          "path": "/usr/bin/tr",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "true",
+          "path": "/usr/bin/true",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "truncate",
+          "path": "/usr/bin/truncate",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "tsort",
+          "path": "/usr/bin/tsort",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "tty",
+          "path": "/usr/bin/tty",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "uname",
+          "path": "/usr/bin/uname",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "unexpand",
+          "path": "/usr/bin/unexpand",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "uniq",
+          "path": "/usr/bin/uniq",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "unlink",
+          "path": "/usr/bin/unlink",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "users",
+          "path": "/usr/bin/users",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "vdir",
+          "path": "/usr/bin/vdir",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "wc",
+          "path": "/usr/bin/wc",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "who",
+          "path": "/usr/bin/who",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "whoami",
+          "path": "/usr/bin/whoami",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "yes",
+          "path": "/usr/bin/yes",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "libstdbuf.so",
+          "path": "/usr/libexec/coreutils/libstdbuf.so",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "chroot",
+          "path": "/usr/sbin/chroot",
+          "on_default_path": false,
+          "usable_note": null
+        }
+      ]
+    },
+    {
+      "requested_package": "procps",
+      "package": "procps",
+      "version": "2:4.0.7-1",
+      "source_package": "procps",
+      "origin": "kali-rolling/main",
+      "executables": [
+        {
+          "command": "procps",
+          "path": "/etc/init.d/procps",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "free",
+          "path": "/usr/bin/free",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "hugetop",
+          "path": "/usr/bin/hugetop",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "kill",
+          "path": "/usr/bin/kill",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "pgrep",
+          "path": "/usr/bin/pgrep",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "pidwait",
+          "path": "/usr/bin/pidwait",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "pkill",
+          "path": "/usr/bin/pkill",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "pmap",
+          "path": "/usr/bin/pmap",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "ps",
+          "path": "/usr/bin/ps",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "pwdx",
+          "path": "/usr/bin/pwdx",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "skill",
+          "path": "/usr/bin/skill",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "slabtop",
+          "path": "/usr/bin/slabtop",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "snice",
+          "path": "/usr/bin/snice",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "tload",
+          "path": "/usr/bin/tload",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "top",
+          "path": "/usr/bin/top",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "uptime",
+          "path": "/usr/bin/uptime",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "vmstat",
+          "path": "/usr/bin/vmstat",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "w",
+          "path": "/usr/bin/w",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "watch",
+          "path": "/usr/bin/watch",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "sysctl",
+          "path": "/usr/sbin/sysctl",
+          "on_default_path": false,
+          "usable_note": null
+        }
+      ]
+    },
+    {
+      "requested_package": "util-linux",
+      "package": "util-linux",
+      "version": "2.42.3-1",
+      "source_package": "util-linux",
+      "origin": "kali-rolling/main",
+      "executables": [
+        {
+          "command": "choom",
+          "path": "/usr/bin/choom",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "chrt",
+          "path": "/usr/bin/chrt",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "dmesg",
+          "path": "/usr/bin/dmesg",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "fallocate",
+          "path": "/usr/bin/fallocate",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "findmnt",
+          "path": "/usr/bin/findmnt",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "flock",
+          "path": "/usr/bin/flock",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "getopt",
+          "path": "/usr/bin/getopt",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "hardlink",
+          "path": "/usr/bin/hardlink",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "i386",
+          "path": "/usr/bin/i386",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "ionice",
+          "path": "/usr/bin/ionice",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "ipcmk",
+          "path": "/usr/bin/ipcmk",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "ipcrm",
+          "path": "/usr/bin/ipcrm",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "ipcs",
+          "path": "/usr/bin/ipcs",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "linux32",
+          "path": "/usr/bin/linux32",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "linux64",
+          "path": "/usr/bin/linux64",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "logger",
+          "path": "/usr/bin/logger",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "lsblk",
+          "path": "/usr/bin/lsblk",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "lscpu",
+          "path": "/usr/bin/lscpu",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "lsipc",
+          "path": "/usr/bin/lsipc",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "lslocks",
+          "path": "/usr/bin/lslocks",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "lsns",
+          "path": "/usr/bin/lsns",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "mcookie",
+          "path": "/usr/bin/mcookie",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "more",
+          "path": "/usr/bin/more",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "mountpoint",
+          "path": "/usr/bin/mountpoint",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "namei",
+          "path": "/usr/bin/namei",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "nsenter",
+          "path": "/usr/bin/nsenter",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "partx",
+          "path": "/usr/bin/partx",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "prlimit",
+          "path": "/usr/bin/prlimit",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "setarch",
+          "path": "/usr/bin/setarch",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "setpriv",
+          "path": "/usr/bin/setpriv",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "setsid",
+          "path": "/usr/bin/setsid",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "setterm",
+          "path": "/usr/bin/setterm",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "su",
+          "path": "/usr/bin/su",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "taskset",
+          "path": "/usr/bin/taskset",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "uclampset",
+          "path": "/usr/bin/uclampset",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "unshare",
+          "path": "/usr/bin/unshare",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "whereis",
+          "path": "/usr/bin/whereis",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "x86_64",
+          "path": "/usr/bin/x86_64",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "agetty",
+          "path": "/usr/sbin/agetty",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "blkdiscard",
+          "path": "/usr/sbin/blkdiscard",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "blkid",
+          "path": "/usr/sbin/blkid",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "blockdev",
+          "path": "/usr/sbin/blockdev",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "findfs",
+          "path": "/usr/sbin/findfs",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "fsck",
+          "path": "/usr/sbin/fsck",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "fsfreeze",
+          "path": "/usr/sbin/fsfreeze",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "fstrim",
+          "path": "/usr/sbin/fstrim",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "getty",
+          "path": "/usr/sbin/getty",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "mkfs",
+          "path": "/usr/sbin/mkfs",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "mkswap",
+          "path": "/usr/sbin/mkswap",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "readprofile",
+          "path": "/usr/sbin/readprofile",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "rtcwake",
+          "path": "/usr/sbin/rtcwake",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "runuser",
+          "path": "/usr/sbin/runuser",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "sulogin",
+          "path": "/usr/sbin/sulogin",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "swaplabel",
+          "path": "/usr/sbin/swaplabel",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "wipefs",
+          "path": "/usr/sbin/wipefs",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "zramctl",
+          "path": "/usr/sbin/zramctl",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "getopt-example.bash",
+          "path": "/usr/share/doc/util-linux/examples/getopt-example.bash",
+          "on_default_path": false,
+          "usable_note": null
+        }
+      ]
+    },
+    {
+      "requested_package": "nmap",
+      "package": "nmap",
+      "version": "7.99+dfsg-1kali1",
+      "source_package": "nmap",
+      "origin": "kali-rolling/non-free",
+      "executables": [
+        {
+          "command": "nmap",
+          "path": "/usr/bin/nmap",
+          "on_default_path": true,
+          "usable_note": "loopback -sT verified; -sS needs CAP_NET_RAW (dropped)"
+        },
+        {
+          "command": "nping",
+          "path": "/usr/bin/nping",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "nmap",
+          "path": "/usr/lib/nmap/nmap",
+          "on_default_path": false,
+          "usable_note": "loopback -sT verified; -sS needs CAP_NET_RAW (dropped)"
+        }
+      ]
+    },
+    {
+      "requested_package": "curl",
+      "package": "curl",
+      "version": "8.22.0-1",
+      "source_package": "curl",
+      "origin": "kali-rolling/main",
+      "executables": [
+        {
+          "command": "curl",
+          "path": "/usr/bin/curl",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "wcurl",
+          "path": "/usr/bin/wcurl",
+          "on_default_path": true,
+          "usable_note": null
+        }
+      ]
+    },
+    {
+      "requested_package": "jq",
+      "package": "jq",
+      "version": "1.8.2-1",
+      "source_package": "jq",
+      "origin": "kali-rolling/main",
+      "executables": [
+        {
+          "command": "jq",
+          "path": "/usr/bin/jq",
+          "on_default_path": true,
+          "usable_note": null
+        }
+      ]
+    },
+    {
+      "requested_package": "git",
+      "package": "git",
+      "version": "1:2.53.0-1",
+      "source_package": "git",
+      "origin": "kali-rolling/main",
+      "executables": [
+        {
+          "command": "git",
+          "path": "/usr/bin/git",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "git-receive-pack",
+          "path": "/usr/bin/git-receive-pack",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "git-shell",
+          "path": "/usr/bin/git-shell",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "git-upload-archive",
+          "path": "/usr/bin/git-upload-archive",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "git-upload-pack",
+          "path": "/usr/bin/git-upload-pack",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "scalar",
+          "path": "/usr/bin/scalar",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "git",
+          "path": "/usr/lib/git-core/git",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-add",
+          "path": "/usr/lib/git-core/git-add",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-am",
+          "path": "/usr/lib/git-core/git-am",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-annotate",
+          "path": "/usr/lib/git-core/git-annotate",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-apply",
+          "path": "/usr/lib/git-core/git-apply",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-archive",
+          "path": "/usr/lib/git-core/git-archive",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-backfill",
+          "path": "/usr/lib/git-core/git-backfill",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-bisect",
+          "path": "/usr/lib/git-core/git-bisect",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-blame",
+          "path": "/usr/lib/git-core/git-blame",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-branch",
+          "path": "/usr/lib/git-core/git-branch",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-bugreport",
+          "path": "/usr/lib/git-core/git-bugreport",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-bundle",
+          "path": "/usr/lib/git-core/git-bundle",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-cat-file",
+          "path": "/usr/lib/git-core/git-cat-file",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-check-attr",
+          "path": "/usr/lib/git-core/git-check-attr",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-check-ignore",
+          "path": "/usr/lib/git-core/git-check-ignore",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-check-mailmap",
+          "path": "/usr/lib/git-core/git-check-mailmap",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-check-ref-format",
+          "path": "/usr/lib/git-core/git-check-ref-format",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-checkout",
+          "path": "/usr/lib/git-core/git-checkout",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-checkout--worker",
+          "path": "/usr/lib/git-core/git-checkout--worker",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-checkout-index",
+          "path": "/usr/lib/git-core/git-checkout-index",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-cherry",
+          "path": "/usr/lib/git-core/git-cherry",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-cherry-pick",
+          "path": "/usr/lib/git-core/git-cherry-pick",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-clean",
+          "path": "/usr/lib/git-core/git-clean",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-clone",
+          "path": "/usr/lib/git-core/git-clone",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-column",
+          "path": "/usr/lib/git-core/git-column",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-commit",
+          "path": "/usr/lib/git-core/git-commit",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-commit-graph",
+          "path": "/usr/lib/git-core/git-commit-graph",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-commit-tree",
+          "path": "/usr/lib/git-core/git-commit-tree",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-config",
+          "path": "/usr/lib/git-core/git-config",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-count-objects",
+          "path": "/usr/lib/git-core/git-count-objects",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-credential",
+          "path": "/usr/lib/git-core/git-credential",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-credential-cache",
+          "path": "/usr/lib/git-core/git-credential-cache",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-credential-cache--daemon",
+          "path": "/usr/lib/git-core/git-credential-cache--daemon",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-credential-store",
+          "path": "/usr/lib/git-core/git-credential-store",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-daemon",
+          "path": "/usr/lib/git-core/git-daemon",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-describe",
+          "path": "/usr/lib/git-core/git-describe",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-diagnose",
+          "path": "/usr/lib/git-core/git-diagnose",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-diff",
+          "path": "/usr/lib/git-core/git-diff",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-diff-files",
+          "path": "/usr/lib/git-core/git-diff-files",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-diff-index",
+          "path": "/usr/lib/git-core/git-diff-index",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-diff-pairs",
+          "path": "/usr/lib/git-core/git-diff-pairs",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-diff-tree",
+          "path": "/usr/lib/git-core/git-diff-tree",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-difftool",
+          "path": "/usr/lib/git-core/git-difftool",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-difftool--helper",
+          "path": "/usr/lib/git-core/git-difftool--helper",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-fast-export",
+          "path": "/usr/lib/git-core/git-fast-export",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-fast-import",
+          "path": "/usr/lib/git-core/git-fast-import",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-fetch",
+          "path": "/usr/lib/git-core/git-fetch",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-fetch-pack",
+          "path": "/usr/lib/git-core/git-fetch-pack",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-filter-branch",
+          "path": "/usr/lib/git-core/git-filter-branch",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-fmt-merge-msg",
+          "path": "/usr/lib/git-core/git-fmt-merge-msg",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-for-each-ref",
+          "path": "/usr/lib/git-core/git-for-each-ref",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-for-each-repo",
+          "path": "/usr/lib/git-core/git-for-each-repo",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-format-patch",
+          "path": "/usr/lib/git-core/git-format-patch",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-fsck",
+          "path": "/usr/lib/git-core/git-fsck",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-fsck-objects",
+          "path": "/usr/lib/git-core/git-fsck-objects",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-fsmonitor--daemon",
+          "path": "/usr/lib/git-core/git-fsmonitor--daemon",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-gc",
+          "path": "/usr/lib/git-core/git-gc",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-get-tar-commit-id",
+          "path": "/usr/lib/git-core/git-get-tar-commit-id",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-grep",
+          "path": "/usr/lib/git-core/git-grep",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-hash-object",
+          "path": "/usr/lib/git-core/git-hash-object",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-help",
+          "path": "/usr/lib/git-core/git-help",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-hook",
+          "path": "/usr/lib/git-core/git-hook",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-http-backend",
+          "path": "/usr/lib/git-core/git-http-backend",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-http-fetch",
+          "path": "/usr/lib/git-core/git-http-fetch",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-http-push",
+          "path": "/usr/lib/git-core/git-http-push",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-imap-send",
+          "path": "/usr/lib/git-core/git-imap-send",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-index-pack",
+          "path": "/usr/lib/git-core/git-index-pack",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-init",
+          "path": "/usr/lib/git-core/git-init",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-init-db",
+          "path": "/usr/lib/git-core/git-init-db",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-instaweb",
+          "path": "/usr/lib/git-core/git-instaweb",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-interpret-trailers",
+          "path": "/usr/lib/git-core/git-interpret-trailers",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-last-modified",
+          "path": "/usr/lib/git-core/git-last-modified",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-log",
+          "path": "/usr/lib/git-core/git-log",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-ls-files",
+          "path": "/usr/lib/git-core/git-ls-files",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-ls-remote",
+          "path": "/usr/lib/git-core/git-ls-remote",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-ls-tree",
+          "path": "/usr/lib/git-core/git-ls-tree",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-mailinfo",
+          "path": "/usr/lib/git-core/git-mailinfo",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-mailsplit",
+          "path": "/usr/lib/git-core/git-mailsplit",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-maintenance",
+          "path": "/usr/lib/git-core/git-maintenance",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-merge",
+          "path": "/usr/lib/git-core/git-merge",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-merge-base",
+          "path": "/usr/lib/git-core/git-merge-base",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-merge-file",
+          "path": "/usr/lib/git-core/git-merge-file",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-merge-index",
+          "path": "/usr/lib/git-core/git-merge-index",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-merge-octopus",
+          "path": "/usr/lib/git-core/git-merge-octopus",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-merge-one-file",
+          "path": "/usr/lib/git-core/git-merge-one-file",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-merge-ours",
+          "path": "/usr/lib/git-core/git-merge-ours",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-merge-recursive",
+          "path": "/usr/lib/git-core/git-merge-recursive",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-merge-resolve",
+          "path": "/usr/lib/git-core/git-merge-resolve",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-merge-subtree",
+          "path": "/usr/lib/git-core/git-merge-subtree",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-merge-tree",
+          "path": "/usr/lib/git-core/git-merge-tree",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-mergetool",
+          "path": "/usr/lib/git-core/git-mergetool",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-mktag",
+          "path": "/usr/lib/git-core/git-mktag",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-mktree",
+          "path": "/usr/lib/git-core/git-mktree",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-multi-pack-index",
+          "path": "/usr/lib/git-core/git-multi-pack-index",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-mv",
+          "path": "/usr/lib/git-core/git-mv",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-name-rev",
+          "path": "/usr/lib/git-core/git-name-rev",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-notes",
+          "path": "/usr/lib/git-core/git-notes",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-pack-objects",
+          "path": "/usr/lib/git-core/git-pack-objects",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-pack-redundant",
+          "path": "/usr/lib/git-core/git-pack-redundant",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-pack-refs",
+          "path": "/usr/lib/git-core/git-pack-refs",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-patch-id",
+          "path": "/usr/lib/git-core/git-patch-id",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-prune",
+          "path": "/usr/lib/git-core/git-prune",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-prune-packed",
+          "path": "/usr/lib/git-core/git-prune-packed",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-pull",
+          "path": "/usr/lib/git-core/git-pull",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-push",
+          "path": "/usr/lib/git-core/git-push",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-quiltimport",
+          "path": "/usr/lib/git-core/git-quiltimport",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-range-diff",
+          "path": "/usr/lib/git-core/git-range-diff",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-read-tree",
+          "path": "/usr/lib/git-core/git-read-tree",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-rebase",
+          "path": "/usr/lib/git-core/git-rebase",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-receive-pack",
+          "path": "/usr/lib/git-core/git-receive-pack",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-reflog",
+          "path": "/usr/lib/git-core/git-reflog",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-refs",
+          "path": "/usr/lib/git-core/git-refs",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-remote",
+          "path": "/usr/lib/git-core/git-remote",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-remote-ext",
+          "path": "/usr/lib/git-core/git-remote-ext",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-remote-fd",
+          "path": "/usr/lib/git-core/git-remote-fd",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-remote-ftp",
+          "path": "/usr/lib/git-core/git-remote-ftp",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-remote-ftps",
+          "path": "/usr/lib/git-core/git-remote-ftps",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-remote-http",
+          "path": "/usr/lib/git-core/git-remote-http",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-remote-https",
+          "path": "/usr/lib/git-core/git-remote-https",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-repack",
+          "path": "/usr/lib/git-core/git-repack",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-replace",
+          "path": "/usr/lib/git-core/git-replace",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-replay",
+          "path": "/usr/lib/git-core/git-replay",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-repo",
+          "path": "/usr/lib/git-core/git-repo",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-request-pull",
+          "path": "/usr/lib/git-core/git-request-pull",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-rerere",
+          "path": "/usr/lib/git-core/git-rerere",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-reset",
+          "path": "/usr/lib/git-core/git-reset",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-restore",
+          "path": "/usr/lib/git-core/git-restore",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-rev-list",
+          "path": "/usr/lib/git-core/git-rev-list",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-rev-parse",
+          "path": "/usr/lib/git-core/git-rev-parse",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-revert",
+          "path": "/usr/lib/git-core/git-revert",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-rm",
+          "path": "/usr/lib/git-core/git-rm",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-send-pack",
+          "path": "/usr/lib/git-core/git-send-pack",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-sh-i18n--envsubst",
+          "path": "/usr/lib/git-core/git-sh-i18n--envsubst",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-shell",
+          "path": "/usr/lib/git-core/git-shell",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-shortlog",
+          "path": "/usr/lib/git-core/git-shortlog",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-show",
+          "path": "/usr/lib/git-core/git-show",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-show-branch",
+          "path": "/usr/lib/git-core/git-show-branch",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-show-index",
+          "path": "/usr/lib/git-core/git-show-index",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-show-ref",
+          "path": "/usr/lib/git-core/git-show-ref",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-sparse-checkout",
+          "path": "/usr/lib/git-core/git-sparse-checkout",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-stage",
+          "path": "/usr/lib/git-core/git-stage",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-stash",
+          "path": "/usr/lib/git-core/git-stash",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-status",
+          "path": "/usr/lib/git-core/git-status",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-stripspace",
+          "path": "/usr/lib/git-core/git-stripspace",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-submodule",
+          "path": "/usr/lib/git-core/git-submodule",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-submodule--helper",
+          "path": "/usr/lib/git-core/git-submodule--helper",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-subtree",
+          "path": "/usr/lib/git-core/git-subtree",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-switch",
+          "path": "/usr/lib/git-core/git-switch",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-symbolic-ref",
+          "path": "/usr/lib/git-core/git-symbolic-ref",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-tag",
+          "path": "/usr/lib/git-core/git-tag",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-unpack-file",
+          "path": "/usr/lib/git-core/git-unpack-file",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-unpack-objects",
+          "path": "/usr/lib/git-core/git-unpack-objects",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-update-index",
+          "path": "/usr/lib/git-core/git-update-index",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-update-ref",
+          "path": "/usr/lib/git-core/git-update-ref",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-update-server-info",
+          "path": "/usr/lib/git-core/git-update-server-info",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-upload-archive",
+          "path": "/usr/lib/git-core/git-upload-archive",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-upload-pack",
+          "path": "/usr/lib/git-core/git-upload-pack",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-var",
+          "path": "/usr/lib/git-core/git-var",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-verify-commit",
+          "path": "/usr/lib/git-core/git-verify-commit",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-verify-pack",
+          "path": "/usr/lib/git-core/git-verify-pack",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-verify-tag",
+          "path": "/usr/lib/git-core/git-verify-tag",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-version",
+          "path": "/usr/lib/git-core/git-version",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-web--browse",
+          "path": "/usr/lib/git-core/git-web--browse",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-whatchanged",
+          "path": "/usr/lib/git-core/git-whatchanged",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-worktree",
+          "path": "/usr/lib/git-core/git-worktree",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "git-write-tree",
+          "path": "/usr/lib/git-core/git-write-tree",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "scalar",
+          "path": "/usr/lib/git-core/scalar",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "applypatch-msg.sample",
+          "path": "/usr/share/git-core/templates/hooks/applypatch-msg.sample",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "commit-msg.sample",
+          "path": "/usr/share/git-core/templates/hooks/commit-msg.sample",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "fsmonitor-watchman.sample",
+          "path": "/usr/share/git-core/templates/hooks/fsmonitor-watchman.sample",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "post-update.sample",
+          "path": "/usr/share/git-core/templates/hooks/post-update.sample",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "pre-applypatch.sample",
+          "path": "/usr/share/git-core/templates/hooks/pre-applypatch.sample",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "pre-commit.sample",
+          "path": "/usr/share/git-core/templates/hooks/pre-commit.sample",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "pre-merge-commit.sample",
+          "path": "/usr/share/git-core/templates/hooks/pre-merge-commit.sample",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "pre-push.sample",
+          "path": "/usr/share/git-core/templates/hooks/pre-push.sample",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "pre-rebase.sample",
+          "path": "/usr/share/git-core/templates/hooks/pre-rebase.sample",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "pre-receive.sample",
+          "path": "/usr/share/git-core/templates/hooks/pre-receive.sample",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "prepare-commit-msg.sample",
+          "path": "/usr/share/git-core/templates/hooks/prepare-commit-msg.sample",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "push-to-checkout.sample",
+          "path": "/usr/share/git-core/templates/hooks/push-to-checkout.sample",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "sendemail-validate.sample",
+          "path": "/usr/share/git-core/templates/hooks/sendemail-validate.sample",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "update.sample",
+          "path": "/usr/share/git-core/templates/hooks/update.sample",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "gitweb.cgi",
+          "path": "/usr/share/gitweb/gitweb.cgi",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "index.cgi",
+          "path": "/usr/share/gitweb/index.cgi",
+          "on_default_path": false,
+          "usable_note": null
+        }
+      ]
+    },
+    {
+      "requested_package": "python3-pip",
+      "package": "python3-pip",
+      "version": "26.1.2+dfsg-1",
+      "source_package": "python-pip",
+      "origin": "kali-rolling/main",
+      "executables": [
+        {
+          "command": "pip",
+          "path": "/usr/bin/pip",
+          "on_default_path": true,
+          "usable_note": "usable inside instance venvs; system installs blocked (PEP 668)"
+        },
+        {
+          "command": "pip3",
+          "path": "/usr/bin/pip3",
+          "on_default_path": true,
+          "usable_note": "usable inside instance venvs; system installs blocked (PEP 668)"
+        },
+        {
+          "command": "__init__.py",
+          "path": "/usr/lib/python3/dist-packages/pip/_internal/__init__.py",
+          "on_default_path": false,
+          "usable_note": null
+        }
+      ]
+    },
+    {
+      "requested_package": "dnsutils",
+      "package": "bind9-dnsutils",
+      "version": "1:9.20.29-1",
+      "source_package": "bind9",
+      "origin": "kali-rolling/main",
+      "executables": [
+        {
+          "command": "delv",
+          "path": "/usr/bin/delv",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "dig",
+          "path": "/usr/bin/dig",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "dnstap-read",
+          "path": "/usr/bin/dnstap-read",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "mdig",
+          "path": "/usr/bin/mdig",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "nslookup",
+          "path": "/usr/bin/nslookup",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "nsupdate",
+          "path": "/usr/bin/nsupdate",
+          "on_default_path": true,
+          "usable_note": null
+        }
+      ]
+    },
+    {
+      "requested_package": "openssl",
+      "package": "openssl",
+      "version": "3.6.4-1",
+      "source_package": "openssl",
+      "origin": "kali-rolling/main",
+      "executables": [
+        {
+          "command": "openssl",
+          "path": "/usr/bin/openssl",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "CA.pl",
+          "path": "/usr/lib/ssl/misc/CA.pl",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "tsget",
+          "path": "/usr/lib/ssl/misc/tsget",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "tsget.pl",
+          "path": "/usr/lib/ssl/misc/tsget.pl",
+          "on_default_path": false,
+          "usable_note": null
+        }
+      ]
+    },
+    {
+      "requested_package": "netcat-traditional",
+      "package": "netcat-traditional",
+      "version": "1.10-50.1",
+      "source_package": "netcat",
+      "origin": "kali-rolling/main",
+      "executables": [
+        {
+          "command": "nc.traditional",
+          "path": "/usr/bin/nc.traditional",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "alta",
+          "path": "/usr/share/doc/netcat-traditional/examples/scripts/alta",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "bsh",
+          "path": "/usr/share/doc/netcat-traditional/examples/scripts/bsh",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "dist.sh",
+          "path": "/usr/share/doc/netcat-traditional/examples/scripts/dist.sh",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "irc",
+          "path": "/usr/share/doc/netcat-traditional/examples/scripts/irc",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "iscan",
+          "path": "/usr/share/doc/netcat-traditional/examples/scripts/iscan",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "ncp",
+          "path": "/usr/share/doc/netcat-traditional/examples/scripts/ncp",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "probe",
+          "path": "/usr/share/doc/netcat-traditional/examples/scripts/probe",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "web",
+          "path": "/usr/share/doc/netcat-traditional/examples/scripts/web",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "webproxy",
+          "path": "/usr/share/doc/netcat-traditional/examples/scripts/webproxy",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "webrelay",
+          "path": "/usr/share/doc/netcat-traditional/examples/scripts/webrelay",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "websearch",
+          "path": "/usr/share/doc/netcat-traditional/examples/scripts/websearch",
+          "on_default_path": false,
+          "usable_note": null
+        }
+      ]
+    },
+    {
+      "requested_package": "whois",
+      "package": "whois",
+      "version": "5.6.6",
+      "source_package": "whois",
+      "origin": "kali-rolling/main",
+      "executables": [
+        {
+          "command": "mkpasswd",
+          "path": "/usr/bin/mkpasswd",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "whois",
+          "path": "/usr/bin/whois",
+          "on_default_path": true,
+          "usable_note": null
+        }
+      ]
+    },
+    {
+      "requested_package": "tcpdump",
+      "package": "tcpdump",
+      "version": "4.99.6-2",
+      "source_package": "tcpdump",
+      "origin": "kali-rolling/main",
+      "executables": [
+        {
+          "command": "tcpdump",
+          "path": "/usr/bin/tcpdump",
+          "on_default_path": true,
+          "usable_note": "live capture needs CAP_NET_RAW (dropped); -r read verified"
+        }
+      ]
+    },
+    {
+      "requested_package": "sqlmap",
+      "package": "sqlmap",
+      "version": "1.10.9-1",
+      "source_package": "sqlmap",
+      "origin": "kali-rolling/main",
+      "executables": [
+        {
+          "command": "sqlmap",
+          "path": "/usr/bin/sqlmap",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "sqlmapapi",
+          "path": "/usr/bin/sqlmapapi",
+          "on_default_path": true,
+          "usable_note": null
+        },
+        {
+          "command": "sqlmap.rtupdate",
+          "path": "/usr/share/python3/runtime.d/sqlmap.rtupdate",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "__init__.py",
+          "path": "/usr/share/sqlmap/plugins/dbms/clickhouse/__init__.py",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "connector.py",
+          "path": "/usr/share/sqlmap/plugins/dbms/clickhouse/connector.py",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "enumeration.py",
+          "path": "/usr/share/sqlmap/plugins/dbms/clickhouse/enumeration.py",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "filesystem.py",
+          "path": "/usr/share/sqlmap/plugins/dbms/clickhouse/filesystem.py",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "fingerprint.py",
+          "path": "/usr/share/sqlmap/plugins/dbms/clickhouse/fingerprint.py",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "syntax.py",
+          "path": "/usr/share/sqlmap/plugins/dbms/clickhouse/syntax.py",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "takeover.py",
+          "path": "/usr/share/sqlmap/plugins/dbms/clickhouse/takeover.py",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "sqlmap.py",
+          "path": "/usr/share/sqlmap/sqlmap.py",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "sqlmapapi.py",
+          "path": "/usr/share/sqlmap/sqlmapapi.py",
+          "on_default_path": false,
+          "usable_note": null
+        },
+        {
+          "command": "identYwaf.py",
+          "path": "/usr/share/sqlmap/thirdparty/identywaf/identYwaf.py",
+          "on_default_path": false,
+          "usable_note": null
+        }
+      ]
+    },
+    {
+      "requested_package": "wordlists",
+      "package": "wordlists",
+      "version": "2026.2.0",
+      "source_package": "wordlists",
+      "origin": "kali-rolling/main",
+      "executables": [
+        {
+          "command": "wordlists",
+          "path": "/usr/bin/wordlists",
+          "on_default_path": true,
+          "usable_note": null
+        }
+      ]
+    },
+    {
+      "requested_package": "python3-venv",
+      "package": "python3-venv",
+      "version": "3.14.7-3",
+      "source_package": "python3-defaults",
+      "origin": "kali-rolling/main",
+      "executables": []
+    },
+    {
+      "requested_package": "python3-setuptools",
+      "package": "python3-setuptools",
+      "version": "84.0.0-2",
+      "source_package": "setuptools",
+      "origin": "kali-rolling/main",
+      "executables": []
+    }
+  ]
+}

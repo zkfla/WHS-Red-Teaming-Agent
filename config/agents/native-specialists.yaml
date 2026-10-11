@@ -1,0 +1,95 @@
+# Explicit selection, not automatic "latest" profile discovery.
+schema_version: '2'
+profile_id: native-specialists
+version: '3'
+common: {path: prompts/common.md, version: '2', contract_version: '1'}
+max_instances: 2
+max_activations: 8
+max_tasks_per_strategy: 8
+max_strategy_revisions: 4
+roles:
+  - definition:
+      agent_id: conversation
+      role: conversation
+      name: Operator liaison
+      schedulable: false
+      provider_id: specialist:conversation
+      capabilities: []
+      tool_selection: {}
+      context_profile: {profile_id: conversation}
+    prompt: {path: prompts/conversation.md, version: '1'}
+  - definition:
+      agent_id: planner
+      role: strategy
+      name: Investigation planner
+      schedulable: false
+      provider_id: specialist:strategy
+      capabilities: []
+      tool_selection: {}
+      context_profile: {profile_id: strategy}
+    prompt: {path: prompts/planner.md, version: '1'}
+  - definition:
+      agent_id: atomizer
+      role: atomization
+      name: Atomic task designer
+      schedulable: false
+      provider_id: specialist:atomization
+      capabilities: []
+      tool_selection: {}
+      context_profile: {profile_id: atomization}
+    prompt: {path: prompts/atomizer.md, version: '1'}
+  - definition:
+      agent_id: web-executor
+      role: web_execution
+      name: Web investigation worker
+      provider_id: playbook:web_api
+      capabilities: [web, api, recon]
+      tool_selection: {capability_tags: [web, api, recon]}
+      context_profile: {profile_id: web_execution}
+    prompt: {path: prompts/web.md, version: '1'}
+  - definition:
+      agent_id: mobile-executor
+      role: mobile_execution
+      name: Mobile investigation worker
+      provider_id: playbook:mobile
+      capabilities: [mobile, analysis]
+      tool_selection: {capability_tags: [mobile, analysis]}
+      context_profile: {profile_id: mobile_execution}
+    prompt: {path: prompts/mobile.md, version: '1'}
+  - definition:
+      agent_id: research-evidence
+      role: research_evidence
+      name: Research and evidence reviewer
+      schedulable: false
+      provider_id: specialist:research_evidence
+      capabilities: []
+      tool_selection: {}
+      context_profile: {profile_id: research_evidence}
+    prompt: {path: prompts/evidence.md, version: '3'}
+  - definition:
+      agent_id: code-author
+      role: code_artifact
+      name: Reproduction artifact author
+      schedulable: false
+      provider_id: specialist:code_artifact
+      capabilities: []
+      tool_selection: {}
+      context_profile: {profile_id: code_artifact}
+    prompt: {path: prompts/code.md, version: '2'}
+stages:
+  attack_path_proposal: planner
+  task_atomization: atomizer
+  native_action: web-executor
+  conversation_decide: conversation
+  analysis_verify: research-evidence
+  analysis_claim_verify: research-evidence
+  task_completion_review: research-evidence
+  goal_completion_review: research-evidence
+  terminal_criteria_review: research-evidence
+  completion_review: research-evidence
+  path_review: research-evidence
+  path_draft: planner
+  reference_paths: planner
+  next_action: web-executor
+  code_generation: code-author
+  code_review: research-evidence

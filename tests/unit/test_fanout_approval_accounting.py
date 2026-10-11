@@ -24,23 +24,28 @@ Plane. No E2E/browser execution.
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
+from typing import Any
 
 from langgraph.types import Overwrite
 
-from redteam.attack_graph.predicates import Confidence, Provenance
 from redteam.attack_graph.service import AttackGraphService
+from redteam.attack_graph.stores.memory import InMemoryAttackGraphStore
 from redteam.core.contracts.action import ActionProposal
+from redteam.core.contracts.engagement import (
+    ApprovalPolicy,
+    Engagement,
+    EngagementScope,
+    ExecutionBudget,
+    RateLimitPolicy,
+)
 from redteam.core.contracts.events import EventType
 from redteam.core.contracts.policy import PolicyDecision
 from redteam.core.contracts.target import HostTarget
-from redteam.core.contracts.tool import ToolDescriptor
 from redteam.core.enums import (
     AgentPhase,
-    GraphNodeType,
     PolicyVerdict,
-    RiskLevel,
-    ToolHealthStatus,
     Verdict,
 )
 from redteam.core.ids import (
@@ -53,12 +58,26 @@ from redteam.core.ids import (
     RunId,
     ToolId,
 )
+from redteam.core.ports.llm import NativeCompletion, NativeToolCall
 from redteam.event_bus.memory import InMemoryEventBus
 from redteam.orchestration.agents import PlanStep
+from redteam.orchestration.agents.registry import default_registry
+from redteam.orchestration.context import RuntimeDeps
 from redteam.orchestration.dispatch import DispatchItem, WorkerOutcome
+from redteam.orchestration.local_tools import LocalToolRegistry
+from redteam.orchestration.native_binding import exposed_tool_name
+from redteam.orchestration.native_local_tools import (
+    TASK_SETTLE_TOOL_ID,
+    goal_settle_descriptor,
+    goal_settle_handler,
+    task_settle_descriptor,
+    task_settle_handler,
+)
 from redteam.orchestration.nodes import aggregate_node, replan_node
 from redteam.orchestration.nodes.plan import _verification_batch_capacity
+from redteam.orchestration.paths import InMemoryPathStore
 from redteam.orchestration.runner import AgentLoopRunner
+from redteam.orchestration.seed import seed_from_engagement
 from redteam.orchestration.settings import OrchestrationSettings
 from redteam.orchestration.state import (
     GraphState,
@@ -66,8 +85,16 @@ from redteam.orchestration.state import (
     TerminationReason,
     initial_graph_state,
 )
+from redteam.orchestration.task_graph.memory import InMemoryTaskGraphStore
+from redteam.orchestration.work.memory import InMemoryWorkStore
 from redteam.orchestration.work.models import WorkStatus
-from tests.fakes import DummyToolGateway, FakeControlPlane, build_test_application
+from tests.fakes import (
+    DummyToolGateway,
+    FakeControlPlane,
+    FakeEvidenceStore,
+    build_test_application,
+)
+from tests.integration import _engine_llm_harness as h
 
 RUN = RunId("run_fanout")
 ENGAGEMENT = EngagementId("eng_fanout")
@@ -498,140 +525,234 @@ class _HostApprovalPlane(FakeControlPlane):
         )
 
 
-class _ScriptedLLM:
-    def __init__(self) -> None:
-        self._routes: dict[str, list[object]] = {}
-        self.calls: list[dict[str, object]] = []
+def _native_tool_registry() -> LocalToolRegistry:
+    registry = LocalToolRegistry()
+    registry.register(task_settle_descriptor(), task_settle_handler)
+    registry.register(goal_settle_descriptor(), goal_settle_handler)
+    return registry
 
-    def add(self, route: str, response: object) -> None:
-        self._routes.setdefault(route, []).append(response)
+
+def _exposed_names(tools: list[Any]) -> set[str]:
+    return {str(getattr(spec, "name", "")) for spec in tools}
+
+
+def _remote_executed_evidence(messages: list[dict[str, Any]]) -> list[str]:
+    found: list[str] = []
+    for message in messages:
+        if message.get("role") != "tool" or not message.get("tool_call_id"):
+            continue
+        try:
+            body = json.loads(message.get("content") or "{}")
+        except ValueError:
+            continue
+        if not isinstance(body, dict) or body.get("ok") is not True:
+            continue
+        if body.get("executed") is not True:
+            continue
+        for identity in body.get("evidence_ids") or []:
+            text = str(identity)
+            if text and text not in found:
+                found.append(text)
+    return found
+
+
+class _NativeScriptBase:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+        self.reviews: list[str] = []
+        self.turns = 0
 
     @staticmethod
-    def _route_key(schema: dict) -> str:
+    def _route_key(schema: dict[str, Any]) -> str:
         props = schema.get("properties", {})
-        if "steps" in props:
-            return "path_draft"
-        if "decision" in props:
-            return "path_review"
-        if "mode" in props:
-            return "next_action"
         if "criteria" in props:
             return "goal_completion_review"
         if "claims" in props:
             return "task_completion_review"
-        if "accepted" in props:
-            return "completion_review"
         if "claim_supported" in props:
             return "analysis_verify"
         return "unknown"
 
-    async def complete_structured(self, *, messages, response_schema, system=None, **_: object):
+    async def complete_structured(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        response_schema: dict[str, Any],
+        system: str | None = None,
+        **_: Any,
+    ) -> dict[str, Any]:
         route = self._route_key(response_schema)
-        self.calls.append({"route": route, "messages": messages, "system": system})
-        queue = self._routes.get(route, [])
-        if not queue:
-            raise AssertionError(f"no scripted response left for route {route!r}")
-        response = queue.pop(0)
-        if isinstance(response, Exception):
-            raise response
-        return response
+        self.reviews.append(route)
+        if route == "analysis_verify":
+            return h.meaning("success", True)
+        if route == "task_completion_review":
+            payload = json.loads(messages[0]["content"])
+            receipts = list(payload["verified_source_ids"])
+            assert receipts, "task review needs the verified executed call evidence"
+            return {
+                "accepted": True,
+                "reason": "scripted semantic accept",
+                "claims": [
+                    {
+                        "description": "inventory tool result observed",
+                        "kind": "observation",
+                        "evidence_ids": list(receipts),
+                        "target_node_ids": [],
+                        "principal_refs": [],
+                    }
+                ],
+            }
+        if route == "goal_completion_review":
+            payload = json.loads(messages[0]["content"])
+            criteria = payload["mission"]["success_criteria"]
+            receipts = list(payload["verified_source_ids"])
+            assert receipts, "goal review needs the verified executed call evidence"
+            return {
+                "accepted": True,
+                "reason": "scripted goal accept",
+                "criteria": [
+                    {
+                        "criterion": item,
+                        "met": True,
+                        "evidence_ids": list(receipts),
+                        "claims": [
+                            {
+                                "description": "inventory tool result observed",
+                                "kind": "observation",
+                                "evidence_ids": list(receipts),
+                                "target_node_ids": [],
+                                "principal_refs": [],
+                            }
+                        ],
+                    }
+                    for item in criteria
+                ],
+            }
+        raise AssertionError(f"legacy strategy route is not part of the native loop: {route!r}")
 
-    async def complete(self, *, messages, system=None, **_: object) -> str:
+    async def complete(
+        self, *, messages: list[dict[str, Any]], system: str | None = None, **_: Any
+    ) -> str:
         return ""
 
 
-def _fanout_probe_descriptor() -> ToolDescriptor:
-    return ToolDescriptor(
-        tool_id=ToolId("recon.probe"),
-        server_id="fanout-test",
-        tool_name="probe",
-        description="fanout approval test probe",
-        input_schema={"type": "object", "properties": {}, "additionalProperties": True},
-        operations=["service_discovery"],
-        capability_tags=["recon"],
-        target_types=[],
-        risk_level=RiskLevel.LOW,
-        health_status=ToolHealthStatus.UNKNOWN,
+class _BatchNativeLLM(_NativeScriptBase):
+    """Scripted model returning a fixed per-turn host batch, then a tail."""
+
+    def __init__(
+        self,
+        action_plan: list[list[str]],
+        *,
+        vary_arguments: bool = False,
+        tail: str = "text",
+        tail_reason: str = "scripted hold: no further grounded action",
+    ) -> None:
+        super().__init__()
+        self._plan = action_plan
+        self._vary_arguments = vary_arguments
+        self._tail = tail
+        self._tail_reason = tail_reason
+        self._seq = 0
+        self._hold_call: str | None = None
+
+    async def complete_native(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[Any],
+        system: str | None = None,
+        **_: Any,
+    ) -> NativeCompletion:
+        names = _exposed_names(tools)
+        inventory = exposed_tool_name(h.INVENTORY_TOOL)
+        task_settle = exposed_tool_name(TASK_SETTLE_TOOL_ID)
+        assert inventory in names, "native model needs the registered inventory tool"
+        if self._tail == "task_unresolved":
+            assert task_settle in names, "native model needs the task settlement helper"
+        self.turns += 1
+        if self.turns <= len(self._plan):
+            batch_calls: list[NativeToolCall] = []
+            for index, host in enumerate(self._plan[self.turns - 1]):
+                arguments: dict[str, Any] = {"host": host}
+                if self._vary_arguments:
+                    arguments["attempt"] = self._seq
+                    self._seq += 1
+                batch_calls.append(
+                    NativeToolCall(
+                        call_id=f"call-{self.turns}-{index}",
+                        name=inventory,
+                        arguments=arguments,
+                    )
+                )
+            self.calls.append(
+                {"turn": self.turns, "tool_calls": [inventory] * len(batch_calls)}
+            )
+            return NativeCompletion(tool_calls=tuple(batch_calls), text="")
+        if self._tail == "task_unresolved":
+            evidenced = _remote_executed_evidence(messages)
+            if self._hold_call is None and evidenced:
+                self._hold_call = "call-hold"
+                self.calls.append({"turn": self.turns, "tool_calls": [task_settle]})
+                return NativeCompletion(
+                    tool_calls=(
+                        NativeToolCall(
+                            call_id=self._hold_call,
+                            name=task_settle,
+                            arguments={
+                                "outcome": "inconclusive",
+                                "reason": self._tail_reason,
+                                "evidence_ids": evidenced,
+                            },
+                        ),
+                    ),
+                    text="",
+                )
+        return NativeCompletion(tool_calls=(), text="")
+
+
+def _fanout_engagement() -> Engagement:
+    return Engagement(
+        engagement_id=ENGAGEMENT,
+        name="fanout-approval",
+        scope=EngagementScope(allowed_hosts=["a.local", "b.local"]),
+        execution_budget=ExecutionBudget(max_actions=4),
+        rate_limit_policy=RateLimitPolicy(max_actions_per_minute=60),
+        approval_policy=ApprovalPolicy(),
+        created_at=NOW,
     )
 
 
-def _fanout_path_draft(node_a: str, node_b: str) -> dict:
-    # Minimal model draft: purpose + steps only. Runtime identity is code-owned.
-    return {
-        "reason": "scripted fanout draft",
-        "steps": [
-            {
-                "step_id": "step-1",
-                "objective": "probe both fanout hosts",
-                "agent_id": "recon-agent",
-                "target_node_ids": [node_a, node_b],
-                "principal_refs": [],
-                "allowed_operations": ["recon.service_discovery"],
-                "depends_on": [],
-                "required_fact_refs": [],
-                "unknowns": [],
-                "completion_criteria": [
-                    {"kind": "evidence", "description": "fanout probe", "min_evidence": 1}
-                ],
-                "required": True,
-            }
-        ],
-    }
-
-
-def _fanout_two_actions(node_a: str, node_b: str) -> dict:
-    def _intent(node_id: str) -> dict:
-        return {
-            "path_step_id": "step-1",
-            "agent_id": "recon-agent",
-            "target_node_id": node_id,
-            "principal_ref": None,
-            "capability": "recon",
-            "operation": "service_discovery",
-            "tool_id": "recon.probe",
-            "arguments": {},
-            "reason": "fan-out probe",
-            "expected_observation": "probe returns",
-            "hypothesis": None,
-            "existing_hypothesis_id": None,
-            "expectation": None,
-            "authentication_check": None,
-            "availability_impact": False,
-        }
-    return {
-        "mode": "actions",
-        "reason": "scripted fan-out pair",
-        "actions": [_intent(node_a), _intent(node_b)],
-        "path": None,
-        "path_step_id": None,
-        "completion": {},
-        "evidence_request": {},
-        "hypothesis_update": {},
-    }
-
-
-def _fanout_hold() -> dict:
-    return {
-        "mode": "hold",
-        "reason": "scripted hold after resume",
-        "actions": [],
-        "path": None,
-        "path_step_id": None,
-        "completion": {},
-        "evidence_request": {},
-        "hypothesis_update": {},
-    }
+def _fanout_native_deps(
+    engagement: Engagement,
+    llm: _BatchNativeLLM,
+    plane: FakeControlPlane,
+    gateway: DummyToolGateway,
+    bus: InMemoryEventBus,
+    settings: OrchestrationSettings,
+) -> RuntimeDeps:
+    return RuntimeDeps(
+        control_plane=plane,
+        tool_gateway=gateway,
+        event_bus=bus,
+        graph_store=InMemoryAttackGraphStore(),
+        evidence_store=FakeEvidenceStore(),
+        llm_client=llm,
+        engagement=engagement,
+        agents=default_registry(),
+        tool_catalog=h.FakeCatalog([h.inventory_descriptor()]),
+        local_tools=_native_tool_registry(),
+        work_store=InMemoryWorkStore(),
+        task_graph_store=InMemoryTaskGraphStore(),
+        path_store=InMemoryPathStore(),
+        operator_intent_store=None,
+        settings=settings,
+    )
 
 
 async def test_fanout_second_item_approval_resumes_that_exact_action() -> None:
     bus = InMemoryEventBus()
-    llm = _ScriptedLLM()
+    llm = _BatchNativeLLM([["a.local", "b.local"]])
     node_a = "host:a.local"
     node_b = "host:b.local"
-    llm.add("path_draft", _fanout_path_draft(node_a, node_b))
-    llm.add("path_review", {"decision": "accept", "reason": "scripted accept", "path": None})
-    llm.add("next_action", _fanout_two_actions(node_a, node_b))
-    llm.add("next_action", _fanout_hold())
     plane = _HostApprovalPlane()
     settings = OrchestrationSettings(
         checkpointing=True,
@@ -639,37 +760,19 @@ async def test_fanout_second_item_approval_resumes_that_exact_action() -> None:
         global_concurrency=2,
         max_actions_per_turn=2,
     )
-    gateway = DummyToolGateway(tools=[_fanout_probe_descriptor()])
-    deps = build_test_application(
-        control_plane=plane,
-        tool_gateway=gateway,
-        tool_catalog=gateway,
-        event_bus=bus,
-        llm_client=llm,
-        settings=settings,
+    engagement = _fanout_engagement()
+    gateway = DummyToolGateway(tools=[h.inventory_descriptor()])
+    deps = _fanout_native_deps(engagement, llm, plane, gateway, bus, settings)
+    await seed_from_engagement(
+        AttackGraphService(deps.graph_store), engagement, run_id=RunId("run_fanout_resume")
     )
-    graph = AttackGraphService(deps.graph_store)
-    for host in ("a.local", "b.local"):
-        await graph.upsert_node(
-            GraphNodeType.HOST,
-            key=host,
-            attrs={"in_scope": True},
-            labels=["engagement-scope"],
-            provenance=Provenance(
-                step=0,
-                source="engagement:test",
-                run_id="run_fanout_resume",
-                confidence=Confidence.SERVER_DECLARED,
-            ),
-            step=0,
-        )
 
     runner = AgentLoopRunner(deps, settings=settings)
     try:
         stopped = await runner.run(
             RuntimeState(
                 run_id=RunId("run_fanout_resume"),
-                engagement_id=ENGAGEMENT,
+                engagement_id=engagement.engagement_id,
                 remaining_budget=4,
                 current_goal="probe both hosts",
             )
@@ -677,6 +780,11 @@ async def test_fanout_second_item_approval_resumes_that_exact_action() -> None:
         assert stopped.termination_reason == TerminationReason.APPROVAL_PENDING
         assert stopped.pending_action_id is not None
         assert stopped.pending_approval_id is not None
+
+        # The scripted turn fanned out once: both hosts in a single native batch.
+        assert llm.calls and llm.calls[0]["tool_calls"] == [
+            exposed_tool_name(h.INVENTORY_TOOL)
+        ] * 2
 
         proposed = [
             event.payload["action_id"]
@@ -686,6 +794,8 @@ async def test_fanout_second_item_approval_resumes_that_exact_action() -> None:
         # sibling executed in the same batch.
         assert proposed[1] == str(stopped.pending_action_id)
         assert stopped.actions_executed == 1
+        # Each call in the batch was individually gated by the Control Plane.
+        assert {str(item.action_id) for item in plane.evaluated} == set(proposed)
 
         rows = await deps.work_store.list_items(run_id=RunId("run_fanout_resume"))
         assert len(rows) == 2
@@ -702,11 +812,14 @@ async def test_fanout_second_item_approval_resumes_that_exact_action() -> None:
         assert proposal_in_checkpoint is not None
         assert proposal_in_checkpoint.action_id == stopped.pending_action_id
         assert step_in_checkpoint is not None
-        # ``recover_runtime`` is the durable-resume entry point and refuses a
+        # recover_runtime is the durable-resume entry point and refuses a
         # snapshot whose next super-step would replay execution.
         assert await runner.recover_runtime("run_fanout_resume") is not None
         assert snapshot.values.get("current_work_id") == by_target[node_b].work_id
 
+        # The real gate links the resume outcome to the original approval
+        # (DefaultControlPlane.approval_outcome always sets approval_id),
+        # which is what lets AGGREGATE clear the pending markers.
         plane.resolve_approval(
             stopped.pending_approval_id,
             PolicyDecision(
@@ -714,6 +827,7 @@ async def test_fanout_second_item_approval_resumes_that_exact_action() -> None:
                 verdict=PolicyVerdict.ALLOW,
                 reasons=["approved"],
                 matched_rules=[],
+                approval_id=stopped.pending_approval_id,
                 evaluated_at=NOW,
             ),
         )
