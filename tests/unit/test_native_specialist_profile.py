@@ -12,6 +12,23 @@ from redteam.orchestration.settings import OrchestrationSettings
 PROFILE = Path(__file__).parents[2] / "config/agents/native-specialists.yaml"
 
 
+def test_web_only_profile_reuses_prompts_without_mobile_execution_binding():
+    full = load_specialist_profile(PROFILE)
+    web = load_specialist_profile(PROFILE.with_name("native-specialists-web.yaml"))
+    assert web.fingerprint != full.fingerprint
+    assert web.code_artifacts_enabled
+    assert len(web.profile.roles) == 6
+    assert [str(role.definition.agent_id) for role in web.profile.roles
+            if role.definition.schedulable] == ["web-executor"]
+    for role in web.profile.roles:
+        identity = str(role.definition.agent_id)
+        assert web.prompts.compose("native_action", "contract", role_id=identity) == (
+            full.prompts.compose("native_action", "contract", role_id=identity)
+        )
+    with pytest.raises(ValueError, match="binding_missing"):
+        web.prompts.compose("native_action", "contract", role_id="mobile-executor")
+
+
 def test_environment_policy_reaches_cli_settings_without_implicit_unlimited():
     config = OrchestrationConfig.from_environment({
         "REDTEAM_SPECIALIST_PROFILE": str(PROFILE),

@@ -173,6 +173,8 @@ def main():
     parser.add_argument("--base-digest", default=None,
                         help="pinned base-image digest from the image build record")
     parser.add_argument("--output", default=str(DEFAULT_MANIFEST))
+    parser.add_argument("--offline", action="store_true",
+                        help="read installed packages only; do not fetch mirror indices")
     args = parser.parse_args()
 
     packages = read_packages()
@@ -188,7 +190,7 @@ def main():
     transport = "https" if mirror.startswith("https://") else "http"
 
     rows = run_probe(image_digest, packages)
-    index, index_note = component_index(mirror)
+    index, index_note = ({}, "offline-unqueried") if args.offline else component_index(mirror)
     generated_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
     unresolved = []
     programs = []

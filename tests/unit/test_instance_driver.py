@@ -3,7 +3,7 @@
 Fake runners stand in for ``AgentLoopRunner`` (whose graph needs full
 deps); what is proven here is driver-owned: duplicate-instance guard,
 first-completed ordering regardless of submission order, per-instance
-failure isolation, and advisory claim release that never masks results.
+failure isolation, and taskless cleanup that never changes domain state.
 """
 
 from __future__ import annotations
@@ -298,10 +298,9 @@ async def test_early_abandon_keeps_instances_running_close_waits() -> None:
         await driver.close()
 
 
-async def test_release_instance_claim_is_explicit_and_scoped() -> None:
-    # Repair 2: return is NOT settlement -- release happens only through
-    # this explicit call (the TASK-007 reconcile seam), and it is scoped to
-    # runtimes that actually carry a mission task.
+async def test_release_instance_claim_without_task_is_noop() -> None:
+    # Taskless legacy callers remain a no-op. Canonical claim cleanup and
+    # unfinished handoff refusal are tested with real stores separately.
     driver = _driver()
     await driver.open()
     try:

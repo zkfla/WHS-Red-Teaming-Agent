@@ -90,17 +90,42 @@ that boundary; duplicate reads/restart do not create new events/model calls.
 
 ## Limits and migration
 
-This is a slice of M5, not all of M5. There is no independent background
-evaluator or automatic expiry timer waking held/terminal Runs. Refresh happens
-on explicit assessment and before the existing planner boundary. Events do not
-resurrect stopped Tasks. Decision and completion gates still read fresh state.
+This is a slice of M5, not all of M5. While native specialist actors are active,
+the existing driver waits for their results, coalesced selected events **or the
+next explicitly observed valid deadline**. Its optional application callback
+reads the existing projection records, refreshes expired support from original
+stores and hands actual validity changes to the existing specialist planner.
+No fixed periodic model tick, detached model task, second queue or timer service
+is added. The event payload is only a notification; canonical Run/engagement,
+Mission/lifecycle, source reads, relevant CAS and request ledger still govern.
+
+Fresh start and verified full-cohort resume use the same callback. An overdue
+stored valid deadline is rechecked on active resume. Replayed/unchanged events
+do not request a new judgment; the planner also retains its meaningful-input,
+strategy/activation and shared request limits. Changes during a judgment are
+not consumed as reviewed. Expiry during a judgment is refreshed again; final
+admission/completion retain their own wall-clock checks.
+
+An empty cohort exits instead of waiting for future expiry. There is no service
+waking held/terminal/stopped Runs. Partial/unknown recovery does not enable the
+callback; paused/closed Missions and pending operator mutations suppress it.
+It does not restart an approval-held actor, release a claim, approve a request
+or reset completed Tasks. Unprovable reads/writer fences emit a bounded
+`evidence_validity_wakeup_held` diagnostic and schedule no immediate timer
+retry. A later existing wakeup or explicit recovery can recheck, but no hidden
+polling clears the fence. Missing/naive expiry is never replaced with a TTL.
+Decision and completion gates still read fresh state independently of this
+notification path. Large-record scanning latency and distributed timers have
+not been evaluated.
 
 Original execution reconciliation, unknown effects, claims, approvals, shared
-request accounting, max_steps and Control remain intact. Code artifact
-production/execution, actual Mobile/session tests, checkpoint-less activation
-crash recovery and automatic repair of interrupted writer fences remain
-unfinished. External writers bypassing selected wrappers and distributed
-multi-host writers are outside this race guarantee.
+request accounting, max_steps and Control remain intact. Actual generated-code
+execution/isolation, actual Mobile/session tests, entered-but-checkpoint-less
+recovery and legacy/unknown writer recovery remain unfinished. Versioned
+Evidence append and new Graph mutation acknowledgement-loss recovery are
+separate, documented in [activation recovery](activation-recovery.md); they do
+not prove evidence validity or grant execution. External writers bypassing
+selected wrappers and distributed multi-host writers are outside this guarantee.
 
 The bundled profile/common/evidence prompt versions are now `2`; fingerprint
 changes are intentional. Use a new Run for this profile. Do not force an old
@@ -122,3 +147,12 @@ all three gates; actual late Task settlement; related/independent updates and
 ABA; append cancellation/lost acknowledgement; restart deduplication;
 late-plan refusal; historical completion versus current report release; and
 public assembly/schema registration.
+
+The additional `tests/unit/test_validity_schedule.py` and
+`tests/integration/test_evidence_expiry_wakeup.py` cover memory/SQLite deadline
+selection, inactive/operator gates, malformed records, overdue active resume
+checks, original preservation, duplicate/change handling, cancellation and
+writer-fence holds. The integrated case uses actual planner/atomizer, Task
+admission/activation, outbox and shared metering with a scripted provider:
+expiry creates a followup while independent synthetic actors remain busy.
+It does not claim that real LLM or financial/Mobile target execution was tested.

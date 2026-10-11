@@ -7,22 +7,19 @@ from datetime import datetime, timezone
 from typing import Any, cast
 
 from redteam.core.contracts.action import ActionProposal
-from redteam.core.contracts.execution import ExecutionReference, ExecutionState
 from redteam.core.contracts.tool import (
     EXECUTION_STARTED_METADATA_KEY,
     ToolInvocation,
-    execution_outcome_uncertain,
 )
 from redteam.core.enums import AgentPhase
 from redteam.orchestration.agents.base import PlanStep
 from redteam.orchestration.context import RuntimeDeps
+from redteam.orchestration.execution_collection import collect_execution_original
 from redteam.orchestration.execution_journal import (
     ExecutionReceiptError,
-    append_execution_receipt,
     checked_receipt,
     execution_processed,
     mark_execution_processed,
-    preserved_result,
 )
 from redteam.orchestration.nodes.update import update_node
 from redteam.orchestration.nodes.verify import verify_node
@@ -102,45 +99,13 @@ async def reconcile_execution_receipts(
                 or work.candidate_key != step.candidate_key
             ):
                 raise ExecutionReceiptError("execution_recovery_work_mismatch")
-            original = await preserved_result(
-                deps.evidence_store, run_id=runtime.run_id, action_id=proposal.action_id,
-                instance_id=runtime.instance_id, work_id=work_id,
-            )
-            result = original[0] if original is not None else None
             # A submission with no proved result reserves a conservative
             # action charge; it does not assert that a request reached a peer.
-            if result is None or execution_outcome_uncertain(result.metadata):
-                reference_raw = data.get("execution_reference")
-                provider = deps.execution_recovery
-                if reference_raw is None or provider is None:
-                    outcome.pending_invocations.append(identity)
-                    continue
-                reference = ExecutionReference.model_validate(reference_raw)
-                expected = provider.prepare_reference(invocation)
-                if expected is None or expected.input_digest != reference.input_digest:
-                    raise ExecutionReceiptError("execution_recovery_input_mismatch")
-                answer = await provider.query_execution(reference)
-                if (not answer.verified or answer.uncertain or not answer.result_available
-                    or answer.state not in {
-                        ExecutionState.SUCCEEDED, ExecutionState.FAILED, ExecutionState.CANCELLED,
-                    }):
-                    outcome.pending_invocations.append(identity)
-                    continue
-                result = await provider.fetch_execution(reference)
-                if result is None or execution_outcome_uncertain(result.metadata):
-                    outcome.pending_invocations.append(identity)
-                    continue
-                prior = await deps.evidence_store.get(original[1]) if original else submission
-                if prior is None:
-                    raise ExecutionReceiptError("execution_recovery_original_missing")
-                resolved = await append_execution_receipt(
-                    deps.evidence_store, invocation=invocation, proposal=proposal, step=step,
-                    work_id=work_id, reference=reference, result=result,
-                    target_node_id=data.get("target_node_id"), resolved_from=prior,
-                    recovery_answer=answer,
-                )
-                original = (result, resolved.evidence_id)
-            assert result is not None and original is not None
+            original = await collect_execution_original(deps, submission)
+            if original is None:
+                outcome.pending_invocations.append(identity)
+                continue
+            result = original[0]
             executed = int(result.metadata.get(EXECUTION_STARTED_METADATA_KEY) is not False)
             retries = result.metadata.get("retry_attempts", 0)
             if type(retries) is not int or retries < 0:

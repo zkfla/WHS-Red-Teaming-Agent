@@ -1,13 +1,32 @@
 # PRD — 최신 dev 기반 전문 에이전트·폐쇄루프 통합
 
 - 작성일: 2026-10-09
-- 문서 개정: v1.1 — 팀원 피드백 1–4, 지정 ARTEX_ko 조사, 무제한 요청 모드 및 자체 검수 반영.
+- 문서 개정: v1.2 — v1.1의 계약 유지, 2026-10-11 사용자 요청으로 이후 Mobile 작업 제외.
 - 상태: 코드 조사에 근거한 구현 계획. 이 문서는 구현 완료·병합 가능·운영 검증 완료를 의미하지 않는다.
 - 기준 dev: `153265e32e029481628e8c057fe0ea476d939d64`
 - 기능 이식 원본 dev-jm: `8af7a6a2a9d2e773147c673e909917152d51856c`
 - 공통 조상: `6a2cba4cb219f0101c8e4f4f4ef8a28a8ed2dc58`
 - 저장소: `zkfla/WHS-Red-Teaming-Agent`
-- 이번 작업 범위: 고정한 커밋의 소스 조사, 외부 프로젝트 비교, PRD 수정·검수. 제품 코드 수정·병합·commit·push·PR 생성은 하지 않는다. 본문에 새로 정한 필드·모드는 구현 요구사항이지 현재 지원 기능이 아니다.
+- 최초 문서 작업 범위: 고정 커밋 조사·비교·PRD 검수만 수행했다. 이후 구현·검증과 공개 현황은 [구현 기록](dev-first-specialists-implementation-20261010.md)과 [브랜치 안내](native-specialists-branch-guide.md)를 따른다. 원래 설계 설명을 현재 구현 완료의 근거로 읽지 않는다.
+
+### 현재 범위 변경 — 2026-10-11
+
+사용자 요청에 따라 **앞으로 Mobile 구현·기기/앱 설치·실환경 평가는 제외**한다.
+기존 Mobile 코드/계약/시험은 호환성 유지를 위해 보존하며 기존 dev 회귀는 유지한다.
+새 Web 전용 선택은 `config/agents/native-specialists-web.yaml`로 명시한다. 같은
+프로필 loader와 MD를 사용하며 중앙 루프에 Mobile 제외 분기를 추가하지 않는다.
+기존 Run과 fingerprint가 다르므로 새 Run에서 선택한다.
+
+M6의 현재 필수 범위는 Web 전문 폐쇄루프·기존 dev 회귀·재현 가능한 Linux
+프록시/격리 검증·운영 인계다. 과거 본문의 Mobile 평가는 이번 범위의 완료 조건이나
+차단 사유로 계산하지 않는다. 승인 없는 생성 코드 대상 실행은 비활성 유지한다.
+실제 LLM 평가는 기존 100회·0달러 조건을 유지하므로 유료 호출하지 않는다.
+합성/로컬 통과와 실제 LLM 성능 입증은 분리해서 보고한다.
+
+공개 전 Linux Python 3.14 회귀에서 드러난 동적 Graph wrapper의 optional-port
+검사 실패도 M6 기본 호환 범위에 포함한다. Graph 소유 기능 검사만 수정하고,
+wrapper fence를 우회하거나 private 파일 정책을 완화하지 않는다. 이유·재현·최종
+검증은 [구현 기록 19절](dev-first-specialists-implementation-20261010.md)에 기록한다.
 
 ## 1. 결론
 
@@ -358,6 +377,81 @@ ProviderBackoff는 native/structured/text에 동일한 소유 경로로 적용�
 | M4 다중 인스턴스 경쟁 검증 | 기존 Driver/claim/resource lock, activation dedup, approval/cohort settlement | M1의 공통 예산을 재구현하지 않고 동시 요청·취소·부분 종료·늦은 계획 경쟁 검증 |
 | M5 복구 및 전문 산출물 완성 | execution reconciliation 회귀, 유효성 이벤트, code artifact, Mobile readiness | 중단/재개 중 중복 실행 없음, 실패/unknown 증거로 성공 불가 |
 | M6 통합 검수·인계 | dev 회귀 + 이식 회귀 + 명시적 동의된 실환경 평가, 운영 문서 | 아래 G1–G12 충족 및 미검증 환경 별도 표시 |
+
+2026-10-11 로컬 진행 기록: M5의 Evidence append 및 새 Graph mutation 저장 완료
+응답 유실 복구는 기존 writer/coordinator와 provider 원자적 receipt 접점으로 구현했다.
+현재 Graph 값이나 TTL을 근거로 구형 writer를 해제하지 않는다. 활성 cohort의 관측된
+증거 만료는 기존 Driver 대기 → 현재 원본 재검사 → 기존 planner/Task 기동으로 연결했다.
+종료·보류 Run을 깨우는 별도 timer service는 아니다. entered+checkpoint 부재의 명시적
+원본 수집 API는 기존 recovery port/append-only receipt로 구현했다. 일반 재개도 같은
+수집 검증을 사용한다. 원본 수집은 checkpoint 없는 actor 재개나 claim 해제가 아니다.
+명시적 `collect-originals` operator CLI도 같은 API/원래 설정/Run 소유권에 연결했다.
+원본 보존·수집은 checkpoint 없는 전체 상태/계량 복구가 아니다.
+기존 점유 해제 API의 미완료 Task 인계는 거절하도록 보강했고, canonical 종료 Task의
+소유권 확인 정리만 허용한다. 공유 요청 원장도 동일한 identity/state/usage 검사를
+예약·조회·정산에 적용한다. 이는 원본 수집/예산 기록이 자동 인계 권한으로 바뀌는
+것을 막는 경계이며, 미완료 인계 구현 완료는 아니다. 미완료 인계에는 명시적 사람
+지시와 검증된 최신 상태·원본/처리/계량, 원래 actor 재개 차단·claim 변경의 원자적
+연결을 함께 설계/검증한다. 초기 activation을 최신 checkpoint로 승격하지 않는다.
+전체 상태/계량 재구성·명시적 claim handoff, 구형·불명 writer/orphan,
+실환경 평가 및 M6는 완료로 판정하지 않는다. 구현 사실·검수 수정 이유와
+시험 범위는 [구현 기록 9~16절](dev-first-specialists-implementation-20261010.md)과
+[복구 계약 5.4~5.8절](../contracts/activation-recovery.md)에 구분한다.
+관측된 만료 기동의 적용 범위와 보류 조건은
+[증거 유효성 계약](../contracts/evidence-reuse-validity.md)에 기록한다.
+
+2026-10-11 M5 최종 로컬 추가: 검토된 artifact의 `code.validate`를 기존
+network-none supervised workroom에 선택 연결했다. 호스트/실제 대상 실행 없이
+bounded JSON case·격리·정리·immutable 원본·한 번의 admission을 검증한다.
+Mobile을 포함한 역할 readiness는 실제 조립 catalog/기존 eligibility에 연결했고,
+descriptor 전체 조회가 Mobile 승인/hash 정책을 우회하던 접점을 수정했다.
+UNKNOWN health의 기존 기동 의미는 보존하고 관측된 HEALTHY와 구분한다.
+
+| M5 필수 범위 | 로컬 완료 판단과 남은 경계 |
+| --- | --- |
+| 실행 복구 | 기존 checkpoint/provider/receipt 기반 복구와 원본 수집, 증거/Graph 응답 유실 검증. 증명 없는 경우 명확한 held이며 중복 외부 실행·미완료 claim 해제 없음 |
+| 유효성 사건 | 현재 원본·관측된 조건/만료 소비와 활성 cohort wakeup 연결. 종료 Run 부활이나 추정 만료 timer는 없음 |
+| 코드 산출물 | 작성/독립 검토/불변 보존 + 명시적 offline fixture 실행·기존 Docker 격리/timeout/cancel 정리 검증. 합성 성공은 대상 증거/Task 완료가 아님 |
+| Mobile readiness | 역할 카드·선택·진단이 같은 실제 정책 catalog를 사용. 건강/적격성 관측만 완료했으며 실제 승인된 기기·앱 검증은 미실시 |
+
+위 범위의 **M5 로컬 구현·검증을 완료**로 기록한다. 완료 기준을 낮춘 것이 아니라
+기존 M5/G8의 “복구 또는 명확한 보류”를 적용한다. checkpoint 없는 전체 최신 상태
+재구성·명시적 미완료 handoff·원본 불명 orphan을 해결했다고 주장하지 않는다.
+그 자동화에는 현재 없는 사람 지시/최신 상태/재개 차단 증명이 필요하므로 held를
+유지한다. 실제 Mobile/LLM 평가와 기존 dev Docker 안전성 실패 3건 및 최종 인계는
+M6/운영 검수에서 별도 해결·검증해야 한다. 실제 대상 코드 실행 규격은 미확정·비활성이다.
+설정·port·현재 바인딩·중단/재시작 결과는
+[offline fixture 계약](../contracts/code-fixtures.md)에 명시한다.
+
+2026-10-11 후속 M6 로컬 검수: 기존 shell 취소의 supervisor 조기 KILL과
+불완전한 정리/상태 조회를 수정하고, 원본 보존 때 과거 PGID로 형제 작업을 죽이는
+실패도 직접 재현·수정했다. network-none 시험은 장치 이름 수가 아닌 실제
+활성 interface/주소/경로를 검사하며 네트워크 허용을 넓히지 않는다. gated install은
+필수 로컬 이미지 없음을 자원 생성 전에 확인해 skip하며 실제 OPEN/DENY는 미검증이다.
+fixture의 read-only root/전체 disk quota를 보장한다는 부정확한 설명도 정정했다.
+실환경 평가·운영 인계를 포함한 M6 전체 완료로 표시하지 않는다. 최종 검사 수와
+수정 근거/보류 조건은 [구현 기록 16절](dev-first-specialists-implementation-20261010.md)에 남긴다.
+
+2026-10-11 설치 환경 후속 확인: 필수 fixture 이미지는 준비했고 오프라인
+shell/fixture 검증은 34 passed / 1 skipped다. 실제 gate 4건은 현재 Docker
+커널 `6.12.54-linuxkit`의 `CONFIG_NFT_QUOTA` 부재로 OPEN 전에 실패했다.
+코드 이식 회귀나 사용자 보안키 누락으로 분류하지 않으며, 규칙 설치 실패 시
+network transition/RPC 미시작과 full-charge quarantine 유지의 회귀를 추가했다.
+검증 실패 fixture의 자원 누락도 정정했다. 같은 실패를 숨기거나 kernel quota를
+삭제해 G1을 통과시키지 않는다. 지원 kernel에서 실제 OPEN/proxy/DENY/계량·회복
+검증이 필요하다. Mobile은 준비 점검까지만, LLM은 기존 100회·0달러 조건 유지로
+유료 호출하지 않았다. 이들 실환경 평가와 운영 인계는 M6 미완료 조건으로
+유지한다. 근거·최종 검사 범위·사용자 준비는
+[구현 기록 17절](dev-first-specialists-implementation-20261010.md)에 명시했다.
+
+2026-10-11 후속 Linux VM 검증: 운영자가 준비한 Lima VM에서 quota 모듈과 실제
+기존 ruleset 지원을 확인했고, 동일 로컬 이미지·현재 소스의 합성 gate integration
+**5 passed(생략 없음)**, 관련 unit **63 passed**를 확인했다. 버전 관리 밖의
+mock/prober 입력 의존성을 시험 전용 fixture로 정리했으며 운영 권한/규칙은
+완화하지 않았다. 프록시 경유 설치·직접 접속/DNS/IPv6 차단과 허용 요청의 종료
+계량, unknown full-charge quarantine을 입증했다. 실제 Mobile/LLM 평가·운영 pin/
+정책과 최종 인계는 남고 M6 전체 완료로 판정하지 않는다. 근거와 재실행 방법은
+[구현 기록 18절](dev-first-specialists-implementation-20261010.md)에 기록했다.
 
 M1에서 공통 요청 정책을 완성하고 M2/M3의 첫 모델 요청부터 사용한다. 워커가 하나여도 planner/atomizer/reviewer 호출은 같은 원장에 포함된다. unlimited_requests 지원 검증은 fake provider로 가능하며 실제 무제한 실행을 요구하지 않는다. M6의 실제 모델 호출·비용·대상 시험은 별도 승인 범위 안에서 실행한다. 이전 대화의 특정 평가 횟수를 새 통합 실험의 무제한 권한으로 해석하지 않는다.
 

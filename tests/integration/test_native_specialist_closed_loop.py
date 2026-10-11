@@ -22,6 +22,7 @@ from tests.integration.test_instance_driver_react import _PerConversationLLM
 from tests.integration.test_native_react_loop import _engagement
 
 PROFILE = Path(__file__).parents[2] / "config/agents/native-specialists.yaml"
+WEB_PROFILE = PROFILE.with_name("native-specialists-web.yaml")
 
 
 class ClosedLoopProvider(_PerConversationLLM):
@@ -97,12 +98,13 @@ class ClosedLoopProvider(_PerConversationLLM):
 
 async def assembled(
     tmp_path, provider, *, maximum=30, control=None, durable=False, real_control=False,
+    profile=PROFILE,
 ):
     engagement = _engagement()
     config = AppConfig(engagement=EngagementConfig.model_validate(
         engagement.model_dump(exclude={"engagement_id", "created_at"}),
     ), orchestration=OrchestrationConfig(
-        specialist_profile_path=str(PROFILE),
+        specialist_profile_path=str(profile),
         llm_request_policy=LLMRequestPolicy(mode="bounded", max_requests=maximum,
                                              max_concurrent_requests=2),
     ))
@@ -133,10 +135,16 @@ async def assembled(
     return engagement, deps, gateway
 
 
-async def test_actual_start_planner_atomizer_native_review_followup_and_goal(tmp_path, monkeypatch):
+@pytest.mark.parametrize("profile", [PROFILE, WEB_PROFILE], ids=["full", "web-only"])
+async def test_actual_start_planner_atomizer_native_review_followup_and_goal(
+    tmp_path, monkeypatch, profile,
+):
     monkeypatch.chdir(tmp_path)
     provider = ClosedLoopProvider()
-    engagement, deps, gateway = await assembled(tmp_path, provider)
+    engagement, deps, gateway = await assembled(tmp_path, provider, profile=profile)
+    if profile == WEB_PROFILE:
+        assert deps.agents.agent_ids == ["web-executor"]
+        assert deps.agents.definition("mobile-executor") is None
     final = await run_engagement(engagement, deps)
     tasks = await deps.task_graph_store.list_tasks(mission_id=final.mission_id)
     assert len(tasks) == 2  # no generic bootstrap task, no duplicate atomization

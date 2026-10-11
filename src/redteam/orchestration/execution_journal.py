@@ -139,6 +139,7 @@ def checked_receipt(record: EvidenceRecord) -> dict[str, Any]:
     proposal = ActionProposal.model_validate(payload.get("proposal"))
     step = PlanStep.model_validate(payload.get("plan_step"))
     if (record.run_id != invocation.run_id
+        or record.run_id != invocation.execution_context.run_id
         or record.engagement_id != invocation.execution_context.engagement_id
         or record.action_id != invocation.action_id
         or record.invocation_id != invocation.invocation_id

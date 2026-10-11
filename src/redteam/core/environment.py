@@ -86,6 +86,9 @@ class OrchestrationEnvInput(_SnapshotSettings):
     specialist_profile_path: str | None = Field(
         default=None, validation_alias="REDTEAM_SPECIALIST_PROFILE"
     )
+    code_fixture_policy_path: str | None = Field(
+        default=None, validation_alias="REDTEAM_CODE_FIXTURE_POLICY_PATH"
+    )
 
 
 class MethodologyEnvInput(_SnapshotSettings):

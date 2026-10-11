@@ -20,6 +20,7 @@ from redteam.core.contracts.evidence import EvidenceRecord
 from redteam.core.contracts.mission import redact_secret_material
 from redteam.core.enums import EvidenceSourceType, TaskStatus
 from redteam.core.ports.agent_prompts import PromptBinding
+from redteam.core.ports.code_fixtures import CodeFixtureCase
 from redteam.orchestration.cognition import (
     DecisionFailure,
     DecisionValidationError,
@@ -51,11 +52,7 @@ class InspectInput(BaseModel):
     artifact_evidence_id: str = Field(min_length=1)
 
 
-class SyntheticCase(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    name: str = Field(min_length=1, max_length=100)
-    input: dict
-    expected: dict
+SyntheticCase = CodeFixtureCase  # shared runner input contract, not a second schema
 
 
 class CodeProgram(BaseModel):
@@ -114,7 +111,7 @@ async def _scope(context, *, tx=None):
                 or task.occupant_owner != work_owner_for(runtime.run_id, runtime.instance_id)
                 or task.assigned_agent != runtime.current_agent):
             raise StateConflict("code_task_binding_changed")
-        return {
+        result = {
             "run_id": str(runtime.run_id), "mission_id": str(runtime.mission_id),
             "engagement_id": str(runtime.engagement_id), "task_id": str(task.task_id),
             "instance_id": str(runtime.instance_id or ""),
@@ -122,6 +119,10 @@ async def _scope(context, *, tx=None):
             "purpose_hash": content_hash(context.purpose),
             "profile_fingerprint": deps.specialist_policy.fingerprint,
         }
+        runner = getattr(deps, "code_fixture_runner", None)
+        if runner is not None:
+            result["fixture_runner_fingerprint"] = runner.fingerprint
+        return result
     return await scope(tx) if tx is not None else await _coordinator(context).change(scope)
 
 
@@ -153,17 +154,19 @@ async def _sources(context, refs):
 async def _inputs(context, refs):
     admission = PlanningAdmission(_coordinator(context))
     stamp = await admission.capture(str(context.runtime.run_id), str(context.runtime.mission_id),
-                                    task_ids=[str(context.runtime.active_task_id)])
+                                    task_ids=[str(context.runtime.active_task_id)],
+                                    reference_keys=[f"evidence:{ref}" for ref in refs])
     validity_read = await capture_validity(context.deps, context.runtime, refs)
     scope = await _scope(context)
     sources = await _sources(context, refs)
 
-    async def check():
-        if context.before_call is not None:
+    async def check(*, transaction=None):
+        if transaction is None and context.before_call is not None:
             result = context.before_call()
             if inspect.isawaitable(result):
                 await result
-        if await _scope(context) != scope or await _sources(context, refs) != sources:
+        if (await _scope(context, tx=transaction) != scope
+                or (transaction is None and await _sources(context, refs) != sources)):
             raise StateConflict("code_sources_or_task_changed")
 
         async def compare(tx):
@@ -172,7 +175,13 @@ async def _inputs(context, refs):
                 raise StateConflict("code_task_binding_changed")
             if validity_read is not None:
                 validity_read.check(tx)
-        await admission.coordinator.change(compare)
+        if transaction is None:
+            await admission.coordinator.change(compare)
+        else:
+            # Owner store reads/current_validity may acquire this coordinator.
+            # Inside its transaction use the captured exact source/validity
+            # reference CAS, never nested coordinator or cross-store I/O.
+            await compare(transaction)
     await check()
     return scope, sources, check
 
@@ -346,6 +355,8 @@ async def inspect_artifact(tool_input: dict, context: LocalToolContext) -> Local
 
 
 def register_code_artifacts(registry) -> None:
+    from redteam.orchestration.code_fixture_validation import validate_fixture
+
     for identity, description, schema, handler in (
         ("code.prepare", "Author and independently review a code artifact using the current "
          "Task and proven sources. Uses requester/Run LLM budgets. Does not execute code.",
@@ -353,6 +364,9 @@ def register_code_artifacts(registry) -> None:
         ("code.inspect", "Read an exact reviewed artifact after checking current Task, prompt, "
          "source and blob bindings. Fixture not run; no target permission or success.",
          InspectInput, inspect_artifact),
+        ("code.validate", "Check a reviewed artifact's synthetic JSON cases in an explicitly "
+         "configured offline sandbox. No target access, Task success or Finding. "
+         "Unknown/interrupted validation is held, not replayed.", InspectInput, validate_fixture),
     ):
         registry.register(LocalToolDescriptor(
             tool_id=identity, description=description, input_schema=schema.model_json_schema(),

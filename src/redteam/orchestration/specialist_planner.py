@@ -56,7 +56,7 @@ class AtomizationDraft(BaseModel):
 
 def specialist_planning_inputs(deps) -> dict:
     """Assembler-owned input identity, also checked before reservation recovery."""
-    return {
+    inputs = {
         "schema_version": 2,
         # Assembly assigns a fresh created_at on every CLI rebuild. It is not
         # scope/policy and must not stale an otherwise identical saved Run.
@@ -68,6 +68,11 @@ def specialist_planning_inputs(deps) -> dict:
         "specialists": deps.specialist_policy.model_dump(mode="json")
         if deps.specialist_policy else None,
     }
+    # Preserve legacy input identity when this optional mechanism is absent.
+    fixture_runner = getattr(deps, "code_fixture_runner", None)
+    if fixture_runner is not None:
+        inputs["code_fixture_runner"] = fixture_runner.fingerprint
+    return inputs
 
 
 class SpecialistPlanner:
@@ -118,11 +123,14 @@ class SpecialistPlanner:
         targets, principals = known_target_ids(material), known_principals(material)
         hypotheses = await AttackGraphService(self.deps.graph_store).list_hypotheses()
         hypothesis_ids = frozenset(h.hypothesis_id for h in hypotheses)
+        from redteam.orchestration.agents.tool_access import role_readiness
+
         payload = redact_secret_material({
             "goal": context["goal"], "success_criteria": context["success_criteria"],
             "constraints": context.get("engagement_constraints"),
             "knowledge": context["knowledge"], "roles": context["roles"],
             "tools_by_role": context["tools_by_role"], "tool_cards": context["tool_cards"],
+            "role_readiness": await role_readiness(self.deps),
             "evidence_index": context["evidence_index"], "evidence": context["evidence"],
             "evidence_validity": context["evidence_validity"],
             "related_task": context.get("active_task"),

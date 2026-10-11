@@ -42,6 +42,16 @@ class ActivationRecoveryIdentity:
     llm_request_policy: LLMRequestPolicy
 
 
+@dataclass(frozen=True)
+class ActivationCollectionIdentity:
+    """Historical assembly hint for original collection, NOT resume proof."""
+    engagement_id: EngagementId
+    mission_id: MissionId
+    component_binding: RuntimeComponentBinding
+    llm_request_policy: LLMRequestPolicy
+    activation_digest: str
+
+
 class ActivationDiagnostic(BaseModel):
     """Bounded identity/status projection; never the stored prompt/runtime."""
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -83,6 +93,17 @@ async def read_activation_diagnostics(path: str, run_id: str) -> ActivationDiagn
     from redteam.orchestration.state_backend import inspect_sqlite_state
 
     return await inspect_sqlite_state(path, lambda tx: TaskActivation.diagnostics(tx, run_id))
+
+
+async def read_activation_collection_identity(
+    path: str, run_id: str, *, checkpoint_instances: set[str],
+) -> ActivationCollectionIdentity | None:
+    """Read existing canonical records only; no assembly or replay permission."""
+    from redteam.orchestration.state_backend import inspect_sqlite_state
+
+    return await inspect_sqlite_state(path, lambda tx: TaskActivation.collection_identity(
+        tx, run_id, checkpoint_instances=checkpoint_instances,
+    ))
 
 
 class TaskActivation:
@@ -413,6 +434,97 @@ class TaskActivation:
             row["launch_stage"] = "entered"
 
         await self.coordinator.change(enter)
+
+    async def checkpointless_entered(
+        self, run_id: str, *, checkpoint_instances: set[str],
+    ) -> list[RuntimeState]:
+        """Original launch identities for collection ONLY, never fresh runtimes.
+
+        A held/returned actor is not reopened. Goal/generation changes do not
+        erase its historical submission identity. The exact original claim,
+        contract and runtime proof must still be present for this owner-bound
+        collection path; legacy/corrupt rows refuse rather than disappear.
+        """
+        return await self.coordinator.change(lambda tx: self._collection_originals(
+            tx, run_id, checkpoint_instances=checkpoint_instances,
+        ))
+
+    @staticmethod
+    def _collection_runtime(tx: ChangeSet, row: dict, run_id: str) -> RuntimeState:
+        """Structural historical identity, without a current-state admission."""
+        if (row.get("launch_proof_version") != 1
+                or row.get("launch_stage") not in {"reserved", "entered"}
+                or row.get("state") not in {"launched", "held", "returned"}):
+            raise StateConflict("activation_collection_identity_unproved")
+        runtime = RuntimeState.model_validate(row["runtime"])
+        if (runtime.mission_id is None or runtime.instance_id is None
+                or runtime.current_agent is None or str(runtime.run_id) != run_id
+                or row["instance_id"] != str(runtime.instance_id)
+                or row["task_id"] != str(runtime.active_task_id)
+                or row["role_id"] != str(runtime.current_agent)
+                or row.get("runtime_digest") != content_hash(runtime)):
+            raise StateConflict("activation_runtime_proof_mismatch")
+        tx.binding(run_id, str(runtime.mission_id), str(runtime.engagement_id))
+        return runtime
+
+    @classmethod
+    async def _collection_originals(
+        cls, tx: ChangeSet, run_id: str, *, checkpoint_instances: set[str],
+    ) -> list[RuntimeState]:
+        rows = cls._rows(tx, run_id)
+        if len({row["instance_id"] for row in rows}) != len(rows):
+            raise StateConflict("task_activation_identity_mismatch")
+        originals = []
+        for row in rows:
+            if row["instance_id"] in checkpoint_instances or row.get("launch_stage") == "reserved":
+                continue  # checkpoint/zero-entry recovery owns those separate paths
+            runtime = cls._collection_runtime(tx, row, run_id)
+            task = await tx.tasks.get_task(TaskId(row["task_id"]))
+            if (task is None or task.mission_id != runtime.mission_id
+                    or task.occupant_owner != runtime.work_owner
+                    or task.assigned_agent != runtime.current_agent
+                    or completion_contract_hash(task) != row["completion_contract_hash"]):
+                raise StateConflict("activation_collection_claim_changed")
+            originals.append(runtime.model_copy(deep=True))
+        return originals
+
+    @classmethod
+    async def collection_identity(
+        cls, tx: ChangeSet, run_id: str, *, checkpoint_instances: set[str],
+    ) -> ActivationCollectionIdentity | None:
+        """Coherent historical cohort before transport/provider construction.
+
+        Even checkpoint/reserved peers participate in assembly coherence. No
+        current goal admission is required to preserve historical originals.
+        Missing actors still need the original claim, checked again by the driver.
+        """
+        rows = cls._rows(tx, run_id)
+        if not rows:
+            return None
+        originals = await cls._collection_originals(
+            tx, run_id, checkpoint_instances=checkpoint_instances,
+        )
+        identities = []
+        for row in rows:
+            runtime = cls._collection_runtime(tx, row, run_id)
+            if (runtime.component_binding is None or runtime.llm_request_policy is None
+                    or row.get("input_binding_hash") is None
+                    or row["input_binding_hash"] != tx.records.get(("planning_inputs", run_id))
+                    or runtime.llm_request_policy != tx.records.get(
+                        ("llm_request_policy", run_id))):
+                raise StateConflict("activation_collection_binding_mismatch")
+            identities.append((runtime.engagement_id, runtime.mission_id, runtime.component_binding,
+                               LLMRequestPolicy.model_validate(runtime.llm_request_policy)))
+        if any(identity != identities[0] for identity in identities[1:]):
+            raise StateConflict("activation_collection_cohort_mismatch")
+        if not originals:
+            return None
+        engagement, mission, binding, policy = identities[0]
+        assert mission is not None  # structural historical identity checked above
+        return ActivationCollectionIdentity(
+            engagement, mission, binding, policy,
+            content_hash(sorted(rows, key=lambda row: row["instance_id"])),
+        )
 
     async def returned(self, runtime: RuntimeState, *, failed: bool = False) -> None:
         async def settle(tx: ChangeSet) -> None:

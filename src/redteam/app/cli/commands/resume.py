@@ -54,6 +54,7 @@ from redteam.capability.settings import (
 from redteam.capability.shell_assembly import build_gated_provider_config
 from redteam.capability.shell_runtime import build_shell_runtime
 from redteam.core.config import AppConfig
+from redteam.core.contracts.events import EventType
 from redteam.core.ids import RunId
 from redteam.event_bus.publisher import EventPublisher
 from redteam.orchestration.checkpointing import (
@@ -698,6 +699,7 @@ async def _drive_cohort_guarded(
     if getattr(deps, "specialist_policy", None) is not None:
         try:
             await driver.own_run(str(run_id))
+            await driver.reconcile_planning_writes(str(run_id))
             unstarted = await driver.recover_unstarted_activations(
                 str(run_id),
                 checkpoint_instances={str(identity.instance_id) for identity in cohort},
@@ -706,7 +708,7 @@ async def _drive_cohort_guarded(
             eprint(f"ERROR: specialist resume refused: {exc}")
             return EXIT_FAILURE
         except Exception as exc:  # noqa: BLE001 - unavailable is not a zero-use proof
-            eprint(f"ERROR: activation inventory unreadable: {type(exc).__name__}; refusing start")
+            eprint(f"ERROR: recovery inventory unreadable: {type(exc).__name__}; refusing start")
             return EXIT_FAILURE
     recovered: list[tuple[Any, RuntimeState, Any | None]] = []
     held: list[tuple[str | None, str]] = []
@@ -832,6 +834,8 @@ async def _drive_cohort_guarded(
                 driving[0], resume_items=resume_items, unstarted_items=unstarted_items,
                 max_instances=policy.max_instances, max_activations=policy.max_activations,
                 allow_new_tasks=covers_cohort and not held,
+                on_wakeup=specialist_loop.evidence_wakeup,
+                wake_events=(EventType.EVIDENCE_VALIDITY_CHANGED,),
             )
         async for event in stream:
             if event.kind == "failed":

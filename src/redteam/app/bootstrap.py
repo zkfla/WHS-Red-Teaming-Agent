@@ -90,6 +90,7 @@ from redteam.core.extensions import hookimpl
 from redteam.core.ids import AgentInstanceId, EngagementId, EventId, RunId, new_id
 from redteam.core.ports.artifacts import ArtifactStore
 from redteam.core.ports.attack_graph import AttackGraphStore
+from redteam.core.ports.code_fixtures import CodeFixtureRunner
 from redteam.core.ports.control_plane import ControlPlane
 from redteam.core.ports.event_bus import EventBus, EventHistory
 from redteam.core.ports.evidence_store import EvidenceStore
@@ -251,6 +252,19 @@ def _specialist_artifact_store(specialists, injected, evidence_dir) -> ArtifactS
     return FilesystemArtifactBackend(Path(evidence_dir) / "artifacts")
 
 
+def _code_fixture_runner(specialists, injected, settings) -> CodeFixtureRunner | None:
+    path = settings.code_fixture_policy_path
+    if injected is None and path is None:
+        return None
+    if specialists is None or not specialists.code_artifacts_enabled:
+        raise ValueError("fixture_requires_selected_code_roles")
+    if injected is not None and path is not None:
+        raise ValueError("fixture_runner_and_policy_are_ambiguous")
+    from redteam.capability.code_fixtures import build_code_fixture_runner
+
+    return injected if injected is not None else build_code_fixture_runner(path)
+
+
 async def build_runtime_deps(
     engagement: Engagement,
     evidence_dir: str | Path = "data/evidence",
@@ -272,6 +286,7 @@ async def build_runtime_deps(
     extensions: ExtensionAssembly | None = None,
     planning_provider_id: str | None = None,
     artifact_store: ArtifactStore | None = None,
+    code_fixture_runner: CodeFixtureRunner | None = None,
 ) -> RuntimeDeps:
     """Wire in-memory/dummy backends for every port, from an ``Engagement`` alone.
 
@@ -309,6 +324,7 @@ async def build_runtime_deps(
     from redteam.app.agent_profile import selected_specialists
 
     specialists = selected_specialists(settings)
+    resolved_fixture_runner = _code_fixture_runner(specialists, code_fixture_runner, settings)
     component_binding = ensure_durable_binding(
         binding_for_registration(component_registration),
         durable=settings.checkpointing and settings.checkpoint_backend == "sqlite",
@@ -417,10 +433,15 @@ async def build_runtime_deps(
         outbound_descriptor_resolver=(tool_catalog or discovered_catalog).get,
     )
 
+    if resolved_fixture_runner is not None:
+        component_binding = component_binding.model_copy(update={
+            "code_fixture_fingerprint": resolved_fixture_runner.fingerprint,
+        })
     return RuntimeDeps(
         specialist_policy=specialists.run_policy() if specialists else None,
         agent_prompts=specialists.prompts if specialists else None,
         artifact_store=_specialist_artifact_store(specialists, artifact_store, evidence_dir),
+        code_fixture_runner=resolved_fixture_runner,
         control_plane=control_plane,
         tool_gateway=tool_gateway,
         execution_recovery=(
@@ -491,6 +512,7 @@ async def build_application(
     tool_gateway: ToolGateway | None = None,
     evidence_store: EvidenceStore | None = None,
     artifact_store: ArtifactStore | None = None,
+    code_fixture_runner: CodeFixtureRunner | None = None,
     event_bus: EventBus | None = None,
     attack_graph: AttackGraphStore | None = None,
     llm: LLMClient | None = None,
@@ -572,6 +594,9 @@ async def build_application(
     from redteam.app.agent_profile import selected_specialists
 
     specialists = selected_specialists(resolved_settings)
+    resolved_fixture_runner = _code_fixture_runner(
+        specialists, code_fixture_runner, resolved_settings,
+    )
     resolved_tasks = task_graph_store or _build_task_graph_store(resolved_settings)
     resolved_paths = path_store or _build_path_store(resolved_settings)
     resolved_intents = build_operator_intent_store(
@@ -828,6 +853,7 @@ async def build_application(
         specialist_policy=specialists.run_policy() if specialists else None,
         agent_prompts=specialists.prompts if specialists else None,
         artifact_store=_specialist_artifact_store(specialists, artifact_store, evidence_dir),
+        code_fixture_runner=resolved_fixture_runner,
         control_plane=resolved_control_plane,
         tool_gateway=resolved_tool_gateway,
         execution_recovery=(
@@ -873,6 +899,8 @@ async def build_application(
     )
     deps = replace(deps, component_binding=component_binding.model_copy(update={
         "role_tools_fingerprint": role_fingerprint,
+        "code_fixture_fingerprint": (deps.code_fixture_runner.fingerprint
+                                     if deps.code_fixture_runner is not None else None),
     }))
     from redteam.orchestration.mobile_mcp_binding import (
         builtin_mobile_vendor_policies,

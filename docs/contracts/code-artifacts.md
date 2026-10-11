@@ -1,10 +1,11 @@
 # Reviewed code artifacts — local author/reviewer contract
 
-This feature produces and inspects **unexecuted code DATA**. It is not a
-target executor, fixture runner, sandbox, authorization service or completion
-authority. No generated source is imported, compiled or executed; `ast.parse`
-checks syntax only. Existing approved shell/MCP tools retain their existing
-Control/ROE boundaries; this helper grants them no new permissions.
+`code.prepare` / `code.inspect` produce and inspect **unexecuted code DATA**.
+They are not target executors, authorization services or completion authorities.
+Neither executes source; `ast.parse` checks syntax only. The separately opted-in
+`code.validate` helper now supports [offline fixtures](code-fixtures.md), not
+target execution. Existing approved shell/MCP tools retain their Control/ROE
+boundaries; these helpers grant them no new permissions.
 
 ## Selection and ownership
 
@@ -30,6 +31,7 @@ concurrency limits, stop checks, Task claim or Control constraints.
 | --- | --- | --- |
 | `code.prepare` | `objective`, `source_evidence_ids` | exact artifact evidence ID/digest, bounded Python program/cases as DATA, fixture/target-execution markers |
 | `code.inspect` | `artifact_evidence_id` | the same DATA after current binding and byte-integrity checks; no model request |
+| `code.validate` | `artifact_evidence_id` | separate immutable synthetic result, only with an explicitly configured fixture port; never target proof |
 
 The existing local-tool registry owns these handlers. Existing card/detail
 lookup exposes their actual schemas and the native generic dispatcher executes
@@ -53,7 +55,8 @@ their truncation is visible to both judgments.
 
 The bundle binds Run/Mission/engagement/Task/instance, the Task completion
 contract, delegated purpose, profile fingerprint, original content hashes and
-author/reviewer prompt bindings. Review must echo the exact bundle digest.
+author/reviewer prompt bindings. If an offline fixture runner is configured,
+its mechanism/policy fingerprint is also bound. Review must echo the exact bundle digest.
 Every model request and final read rechecks the captured inputs. Goal/input
 changes, Task condition/claim changes, pending operator mutations, stop,
 relevant validity/node changes (including ABA), and observed expiry reject
@@ -89,11 +92,12 @@ does not implement orphan cleanup or complete crash recovery.
   bounds, not target-specific action sequences or an AST security sandbox.
 - Secret-shaped material detected by the shared redactor is rejected in the
   program. Redaction is not a guarantee of detecting every possible secret.
-- Every result explicitly states `fixture_only=true`,
+- Preparation/inspection explicitly state `fixture_only=true`,
   `fixture_validation=not_run`, `target_execution_enabled=false`.
-- Review assesses relevance/design; callable `evaluate`, stdlib-only behavior,
-  sandbox isolation and synthetic case outcomes have **not** been executed or
-  verified. Safe fixture execution is a separate remaining M5 slice.
+- Review assesses relevance/design, not execution. A separate `code.validate`
+  can test callable `evaluate` and synthetic outcomes inside the opted-in
+  sandbox; it does not certify stdlib-only behavior or actual target safety.
+  That separate result never rewrites the generation record's `not_run` marker.
 - No actual LLM quality, Mobile/device behavior, financial vulnerability,
   target code execution or production release readiness is proven by the local
   scripted regression tests.

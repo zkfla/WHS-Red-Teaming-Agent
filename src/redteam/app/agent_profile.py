@@ -127,6 +127,9 @@ class LoadedSpecialists:
                 ))
         # Keep dev's providers, verifier, mappers, extensions and native engine.
         register_validity(components.local_tools)
+        from redteam.orchestration.agents.tool_access import register_role_readiness
+
+        register_role_readiness(components.local_tools)
         if self.code_artifacts_enabled:
             from redteam.orchestration.code_artifacts import register_code_artifacts
 

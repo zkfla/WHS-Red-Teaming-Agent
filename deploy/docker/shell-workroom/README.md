@@ -150,8 +150,34 @@ assembler skips the helper and the catalog honestly has no shell tools.
 - `SHELL_KALI_IMAGE=shell-workroom:t003-draft pytest tests/integration/test_shell_workroom_docker.py -q -k kali`
   runs the Kali-gated subset (offline program runs, manifest round-trip,
   venv/restart, foreign UID) against the built image.
-- The isolation test reads the container-local interface list only; it
-  sends no packets anywhere.
+- A freshly built image needs a freshly generated manifest. Do not disable
+  `shell_image_manifest_mismatch` or edit only the digest in an old manifest.
+  Generate the whole file from the actual local image using the existing
+  generator's `--image` and `--output` options. `--offline` skips external
+  mirror indices: installed package versions and executable paths are still
+  observed from the image, but component origin stays unknown. It does not
+  prove package integrity or origin. `--base-digest` records the build pin;
+  it must come from the actual build record, not a guessed current tag.
+
+  ```sh
+  validation_dir=$(mktemp -d)
+  python deploy/docker/shell-workroom/generate-manifest.py --offline \
+    --image shell-workroom:t003-draft \
+    --output "$validation_dir/program-manifest.json"
+  SHELL_KALI_IMAGE=shell-workroom:t003-draft \
+    SHELL_KALI_MANIFEST="$validation_dir/program-manifest.json" \
+    pytest tests/integration/test_shell_workroom_docker.py -q -k kali
+  ```
+
+  The optional `SHELL_KALI_MANIFEST` changes only this integration test's
+  explicit manifest input. Runtime catalog settings and image/digest
+  verification are unchanged. Keep the default checked-in manifest when
+  testing the image it was generated from.
+- The isolation test inspects active interfaces, IPv4/IPv6 addresses and
+  routes, not the number of dormant kernel tunnel devices. It sends no
+  packets to external targets.
+- Gated installation also needs a supporting Docker host kernel; an image
+  build alone is insufficient. See [gate prerequisites](../gate-sidecar/README.md).
 
 ## Assembly seam (catalog owner)
 

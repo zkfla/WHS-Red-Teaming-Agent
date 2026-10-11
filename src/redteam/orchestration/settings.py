@@ -31,6 +31,7 @@ class OrchestrationSettings(BaseModel):
     # None preserves legacy mode, never an implicit unlimited specialist policy.
     llm_request_policy: LLMRequestPolicy | None = None
     specialist_profile_path: str | None = Field(default=None, min_length=1, max_length=4096)
+    code_fixture_policy_path: str | None = Field(default=None, min_length=1, max_length=4096)
     #: Additional tool-execution attempts after a retryable failure. Only
     #: ever applied to a *known low-risk* (passive/read-only) tool so a
     #: bounded retry cannot silently repeat a state-changing side effect;
@@ -164,5 +165,6 @@ class OrchestrationSettings(BaseModel):
             base["resource_wait_timeout_seconds"] = config.resource_wait_timeout_seconds
             base["llm_request_policy"] = config.llm_request_policy
             base["specialist_profile_path"] = config.specialist_profile_path
+            base["code_fixture_policy_path"] = config.code_fixture_policy_path
         base.update({key: value for key, value in overrides.items() if value is not None})
         return cls.model_validate(base)

@@ -16,6 +16,8 @@ from redteam.core.ports.llm import LLMProviderFailure
 from redteam.orchestration.cognition import ReasoningHalted
 from redteam.orchestration.coordination import ChangeSet, CoordinationError, Coordinator
 
+_REQUEST_STATES = ("reserved", "dispatched", "settled", "unknown", "released")
+
 
 class RequestAdmissionError(ReasoningHalted):
     """A fixed safe reason; callers must not repair/retry an admission denial."""
@@ -95,9 +97,39 @@ class RunRequestLedger:
         await self.coordinator.change(change)
 
     @staticmethod
-    def _rows(tx: ChangeSet, run_id: str) -> list[dict[str, Any]]:
-        return [row for (kind, _), row in tx.records.items()
-                if kind == "llm_request" and row["run_id"] == run_id]
+    def _checked_row(request_id: str, row: Any) -> dict[str, Any]:
+        """Validate the persisted identity/state before accounting or mutation.
+
+        No row repair, inferred usage or refund: malformed history is held.
+        ``kind`` remains an open, nonblank method label, not a role allowlist.
+        """
+        if (not isinstance(row, dict)
+                or any(not isinstance(row.get(key), str) or not row[key].strip()
+                       for key in ("request_id", "run_id", "owner", "kind"))
+                or row["request_id"] != request_id
+                or not isinstance(row.get("state"), str) or row["state"] not in _REQUEST_STATES
+                or "total_tokens" not in row):
+            raise RequestAdmissionError("llm_request_record_invalid")
+        tokens = row["total_tokens"]
+        if (tokens is not None and (type(tokens) is not int or tokens < 0
+                                    or row["state"] not in {"settled", "unknown"})):
+            raise RequestAdmissionError("llm_request_record_invalid")
+        return row
+
+    @classmethod
+    def _rows(cls, tx: ChangeSet, run_id: str) -> list[dict[str, Any]]:
+        rows = []
+        for (kind, request_id), row in tx.records.items():
+            if kind != "llm_request":
+                continue
+            # Without a Run identity the row cannot safely be excluded from
+            # this inventory. A well-scoped other Run stays isolated.
+            if (not isinstance(row, dict) or not isinstance(row.get("run_id"), str)
+                    or not row["run_id"].strip()):
+                raise RequestAdmissionError("llm_request_record_invalid")
+            if row["run_id"] == run_id:
+                rows.append(cls._checked_row(request_id, row))
+        return rows
 
     @classmethod
     def owner_has_activity(cls, tx: ChangeSet, run_id: str, owner: str) -> bool:
@@ -116,14 +148,10 @@ class RunRequestLedger:
         Reserved/dispatched/unknown remain distinct. A zero count is only an
         observation of this ledger; it cannot prove no external execution.
         """
-        counts = dict.fromkeys(("reserved", "dispatched", "settled", "unknown", "released"), 0)
+        counts = dict.fromkeys(_REQUEST_STATES, 0)
         for row in cls._rows(tx, run_id):
-            state = row.get("state")
-            if (not isinstance(state, str) or state not in counts
-                    or not isinstance(row.get("owner"), str)):
-                raise RequestAdmissionError("llm_request_record_invalid")
             if owner is None or row["owner"] == owner:
-                counts[state] += 1
+                counts[row["state"]] += 1
         return counts
 
     @staticmethod
@@ -136,6 +164,8 @@ class RunRequestLedger:
                 raise RequestAdmissionError("llm_run_not_admitted") from exc
 
     async def reserve(self, run_id: str, *, owner: str, kind: str) -> str:
+        if any(not isinstance(value, str) or not value.strip() for value in (run_id, owner, kind)):
+            raise RequestAdmissionError("llm_request_scope_invalid")
         request_id = new_id("llm_request")
 
         async def change(tx: ChangeSet) -> str:
@@ -187,10 +217,13 @@ class RunRequestLedger:
             row["state"] = "dispatched"
         await self.coordinator.change(change)
 
-    @staticmethod
-    def _get(tx: ChangeSet, run_id: str, request_id: str) -> dict[str, Any]:
+    @classmethod
+    def _get(cls, tx: ChangeSet, run_id: str, request_id: str) -> dict[str, Any]:
         row = tx.records.get(("llm_request", request_id))
-        if row is None or row["run_id"] != run_id:
+        if row is None:
+            raise RequestAdmissionError("llm_request_identity_mismatch")
+        row = cls._checked_row(request_id, row)
+        if row["run_id"] != run_id:
             raise RequestAdmissionError("llm_request_identity_mismatch")
         return row
 

@@ -142,6 +142,7 @@ class OrchestrationConfig(BaseModel):
     max_steps: int = Field(default=50, ge=1)
     llm_request_policy: LLMRequestPolicy | None = None
     specialist_profile_path: str | None = Field(default=None, min_length=1, max_length=4096)
+    code_fixture_policy_path: str | None = Field(default=None, min_length=1, max_length=4096)
     tool_timeout_seconds: float = Field(default=10.0, gt=0, le=600)
     resource_wait_timeout_seconds: float = Field(default=30.0, gt=0, le=600)
     #: Legacy opt-in name retained for compatibility; not a mode switch.

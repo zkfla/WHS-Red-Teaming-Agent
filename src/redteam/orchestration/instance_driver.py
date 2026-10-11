@@ -20,7 +20,7 @@ from __future__ import annotations
 import asyncio
 import functools
 import logging
-from collections.abc import AsyncGenerator, Callable, Coroutine
+from collections.abc import AsyncGenerator, Awaitable, Callable, Coroutine
 from contextlib import AbstractAsyncContextManager
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Literal
@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING, Any, Literal
 from pydantic import BaseModel
 
 if TYPE_CHECKING:
+    from redteam.orchestration.execution_collection import ExecutionOriginalCollection
     from redteam.orchestration.execution_reconciliation import ExecutionReconciliation
 
 from redteam.core.enums import AgentPhase
@@ -43,7 +44,7 @@ from redteam.orchestration.coordination import (
 from redteam.orchestration.runner import AgentLoopRunner
 from redteam.orchestration.settings import OrchestrationSettings
 from redteam.orchestration.state import RuntimeState
-from redteam.orchestration.task_graph.claim import release_mission_task_claim
+from redteam.orchestration.task_graph.claim import release_terminal_task_claim
 from redteam.orchestration.work.models import work_owner_for
 
 logger = logging.getLogger(__name__)
@@ -102,6 +103,7 @@ class InstanceDriver:
         self._closed = False
         self._closing_task: asyncio.Task[None] | None = None
         self._run_ownership_lock = asyncio.Lock()
+        self._recovery_lock = asyncio.Lock()
         self._run_ownership: AbstractAsyncContextManager[None] | None = None
         self._owned_run_id: str | None = None
 
@@ -219,15 +221,16 @@ class InstanceDriver:
         if not self._borrowed:
             self._checkpointer = None
         self._opened = False
-        async with self._run_ownership_lock:
-            if self._run_ownership is not None:
-                context = self._run_ownership
-                self._run_ownership = None
-                self._owned_run_id = None
-                try:
-                    await context.__aexit__(None, None, None)
-                except Exception as exc:  # noqa: BLE001 - collected after actor drain
-                    teardown.append(f"run_ownership:{type(exc).__name__}")
+        async with self._recovery_lock:
+            async with self._run_ownership_lock:
+                if self._run_ownership is not None:
+                    context = self._run_ownership
+                    self._run_ownership = None
+                    self._owned_run_id = None
+                    try:
+                        await context.__aexit__(None, None, None)
+                    except Exception as exc:  # noqa: BLE001 - collected after actor drain
+                        teardown.append(f"run_ownership:{type(exc).__name__}")
         if teardown:
             raise RuntimeError(f"instance driver close incomplete: {', '.join(teardown)}")
 
@@ -268,26 +271,44 @@ class InstanceDriver:
         return runner.request_stop()
 
     async def release_instance_claim(self, runtime: RuntimeState) -> None:
-        """Explicit, caller-verified handoff of an unfinished task claim.
+        """Explicit cleanup of an already-terminal canonical Task claim.
 
-        Return is NOT settlement: call this only when handing the task to
-        the TASK-007 reconcile path (or another verified owner). Errors
-        propagate -- this never fails silent, unlike best-effort cleanup.
+        This is NOT unfinished handoff, recovery, completion or permission to
+        replay. A caller's terminal RuntimeState is insufficient authority.
+        Unfinished Tasks remain held until a verified handoff contract exists.
+        Work resource markers and request charges are never released here.
         """
         if runtime.mission_id is None or runtime.active_task_id is None:
             return
-        owner = work_owner_for(runtime.run_id, runtime.instance_id)
-        coordinator = self._deps.coordinator or coordinator_for(
-            self._deps.task_graph_store, self._deps.path_store
+        if runtime.instance_id is None:
+            raise StateConflict("task_claim_instance_identity_required")
+        # Copy identity before awaiting. Caller-owned mutable counters/phase
+        # are never evidence of settlement or absence of external effects.
+        run_id, mission_id, engagement_id, task_id, instance_id = (
+            runtime.run_id, runtime.mission_id, runtime.engagement_id,
+            runtime.active_task_id, runtime.instance_id,
         )
-        task_id = runtime.active_task_id
-
-        async def _release(change: Any) -> None:
-            await release_mission_task_claim(
-                change, task_id, owner=owner, now=datetime.now(timezone.utc)
+        await self.own_run(str(run_id))
+        async with self._recovery_lock:
+            if self._closed:
+                raise RuntimeError("InstanceDriver is not open")
+            if self._active:
+                raise StateConflict("task_claim_release_requires_quiescent_driver")
+            coordinator = self._deps.coordinator or coordinator_for(
+                self._deps.task_graph_store, self._deps.path_store,
             )
 
-        await coordinator.change(_release)
+            async def release(change: Any) -> None:
+                change.binding(str(run_id), str(mission_id), str(engagement_id))
+                mission = await change.tasks.get_mission(mission_id)
+                if mission is None or mission.engagement_id != engagement_id:
+                    raise StateConflict("task_claim_identity_mismatched")
+                await release_terminal_task_claim(
+                    change, task_id, mission_id=mission_id,
+                    owner=work_owner_for(run_id, instance_id), now=datetime.now(timezone.utc),
+                )
+
+            await coordinator.change(release)
 
     def _validate_cohort(self, runtimes: list[RuntimeState]) -> None:
         if not runtimes:
@@ -418,11 +439,100 @@ class InstanceDriver:
             raise StateConflict("activation_recovery_inventory_changed")
         return checked
 
+    async def reconcile_planning_writes(self, run_id: str) -> None:
+        """Recover confirmed storage fences before original checkpoint reads.
+
+        Each owning wrapper checks its proof; this driver only supplies
+        the existing exclusive Run/quiescent lifecycle boundary. No Task claim,
+        unknown request charge, or execution marker is released here.
+        """
+        await self.own_run(run_id)
+        async with self._recovery_lock:
+            if self._closed:
+                raise RuntimeError("InstanceDriver is not open")
+            if self._active:
+                raise StateConflict("planning_write_recovery_requires_quiescent_driver")
+            held = False
+            for store in (self._deps.evidence_store, self._deps.graph_store):
+                reconcile = getattr(store, "reconcile_pending_writes", None)
+                if callable(reconcile):
+                    outcomes = await reconcile(run_id, supported_only=True)
+                    held = held or any(outcome.state == "held" for outcome in outcomes)
+            from redteam.orchestration.planning_admission import PlanningAdmission
+
+            coordinator = self._deps.coordinator or coordinator_for(
+                self._deps.task_graph_store, self._deps.path_store,
+            )
+            pending = await PlanningAdmission(coordinator).pending_reference_updates(run_id)
+            if held or pending:
+                raise StateConflict("planning_write_recovery_held")
+
+    async def collect_checkpointless_originals(
+        self, run_id: str, *, checkpoint_instances: set[str],
+    ) -> list[ExecutionOriginalCollection]:
+        """Preserve proved originals, but keep entered/no-checkpoint actors held.
+
+        Explicit collection entry, not an automatic fallback from resume.
+        The existing Run owner/quiescent lock prevents concurrent actors and
+        driver teardown. No Control, model, Graph, Work/Task settlement, claim
+        release, accounting restoration or new checkpoint runs here.
+        """
+        from redteam.orchestration.execution_collection import collect_execution_originals
+        from redteam.orchestration.specialist_planner import specialist_planning_inputs
+        from redteam.orchestration.task_activation import TaskActivation
+
+        await self.own_run(run_id)
+        async with self._recovery_lock:
+            if self._closed:
+                raise RuntimeError("InstanceDriver is not open")
+            if self._active:
+                raise StateConflict("execution_collection_requires_quiescent_driver")
+            coordinator = self._deps.coordinator or coordinator_for(
+                self._deps.task_graph_store, self._deps.path_store,
+            )
+            activation = TaskActivation(coordinator, self._deps.agents)
+            originals = await activation.checkpointless_entered(
+                run_id, checkpoint_instances=checkpoint_instances,
+            )
+            binding_hash = content_hash(specialist_planning_inputs(self._deps))
+            expected_policy = (self._settings.llm_request_policy.model_dump(mode="json")
+                               if self._settings.llm_request_policy else None)
+            async def check_inputs(tx: Any) -> None:
+                if originals and tx.records.get(("planning_inputs", run_id)) != binding_hash:
+                    raise StateConflict("activation_configuration_changed_new_run_required")
+
+            from redteam.orchestration.planning_admission import PlanningAdmission
+
+            if await PlanningAdmission(coordinator).pending_reference_updates(run_id):
+                raise StateConflict("planning_write_recovery_held")
+            await coordinator.change(check_inputs)
+            # Validate every actor before provider reads for any actor.
+            for runtime in originals:
+                if (runtime.component_binding != self._deps.component_binding
+                        or runtime.llm_request_policy != expected_policy):
+                    raise StateConflict("activation_configuration_changed_new_run_required")
+                if await self.runner_for(runtime).checkpoint_exists(runtime):
+                    raise StateConflict("activation_checkpoint_inventory_changed")
+            results = [await collect_execution_originals(
+                self._deps, runtime, original_task_id=str(runtime.active_task_id),
+            ) for runtime in originals]
+            after = await activation.checkpointless_entered(
+                run_id, checkpoint_instances=checkpoint_instances,
+            )
+            await coordinator.change(check_inputs)
+            if [content_hash(runtime) for runtime in after] != [
+                content_hash(runtime) for runtime in originals
+            ]:
+                raise StateConflict("activation_collection_inventory_changed")
+            return results
+
     async def drive_ready_tasks(
         self, base: RuntimeState, *, max_instances: int, max_activations: int,
         resume_items: list[tuple[RuntimeState, ExecutionReconciliation | None]] | None = None,
         unstarted_items: list[RuntimeState] | None = None,
         allow_new_tasks: bool = True,
+        on_wakeup: Callable[[], Awaitable[datetime | None]] | None = None,
+        wake_events: tuple[str, ...] = (),
     ) -> AsyncGenerator[InstanceEvent, None]:
         """Opt-in ready-Task lifecycle on the SAME driver/runners/checkpointer.
 
@@ -430,6 +540,8 @@ class InstanceDriver:
         while another instance is busy; a finished instance is never reset.
         No ready work means quiescence, NOT goal success. Approval/unknown
         instances keep their identities for ``drive_resumed`` reconciliation.
+        Optional application wakeups return an observed UTC-aware deadline;
+        the driver only waits/coalesces and never interprets their domain data.
         """
         from redteam.core.contracts.events import EventType
         from redteam.orchestration.task_activation import TaskActivation
@@ -468,12 +580,14 @@ class InstanceDriver:
         listening = True
 
         async def changed(event):
-            if listening and str(event.run_id) == str(base.run_id):
+            if (listening and event.run_id == base.run_id
+                    and event.engagement_id == base.engagement_id):
                 wake.set()
 
         # Notifications only hint at work. Canonical Tasks are checked on every
         # start/result, so lost or duplicate events cannot duplicate a launch.
-        await self._deps.event_bus.subscribe(EventType.TASK_CREATED, changed)
+        for event_type in dict.fromkeys((EventType.TASK_CREATED, *wake_events)):
+            await self._deps.event_bus.subscribe(event_type, changed)
 
         async def replenish() -> _DriveBuilders:
             if self._closed or not allow_new_tasks:
@@ -494,13 +608,18 @@ class InstanceDriver:
             return builders
 
         try:
-            async for event in self._drain_as_ready(builders, replenish=replenish, wake=wake):
+            async for event in self._drain_as_ready(
+                builders, replenish=replenish, wake=wake,
+                on_wakeup=on_wakeup if allow_new_tasks else None,
+            ):
                 await activation.returned(event.runtime, failed=event.kind != "completed")
                 yield event
         finally:
             listening = False
 
     def _reject_driving_ids(self, instance_ids: list[Any]) -> None:
+        if self._recovery_lock.locked():
+            raise StateConflict("driver_planning_write_recovery_in_progress")
         driving = {record[0] for record in self._active.values()}
         for instance_id in instance_ids:
             if str(instance_id) in driving:
@@ -508,6 +627,7 @@ class InstanceDriver:
 
     async def _drain_as_ready(
         self, builders: _DriveBuilders, *, replenish=None, wake: asyncio.Event | None = None,
+        on_wakeup: Callable[[], Awaitable[datetime | None]] | None = None,
     ) -> AsyncGenerator[InstanceEvent, None]:
         """Yield owned task results first-completed-first; own the tasks.
 
@@ -541,10 +661,23 @@ class InstanceDriver:
                         self._active[task] = (iid, runner, base)
                 if not pending:
                     break
+                # The application owns the meaning of a deadline/event. Run
+                # its callback serially with result handling, never inside an
+                # event publisher or a detached background model task. With
+                # no actors, return immediately rather than revive a held Run.
+                deadline = await on_wakeup() if on_wakeup and not self._closed else None
+                if deadline is not None and deadline.tzinfo is None:
+                    raise ValueError("driver_wakeup_timezone_required")
+                if wake is not None and wake.is_set():
+                    continue  # callback/event admitted work; re-read canonical Tasks
+                timeout = (max(0.0, (deadline - datetime.now(timezone.utc)).total_seconds())
+                           if deadline is not None else None)
                 waking = asyncio.create_task(wake.wait()) if wake is not None else None
                 waiters = [*pending, *([waking] if waking is not None else [])]
                 try:
-                    done, _ = await asyncio.wait(waiters, return_when=asyncio.FIRST_COMPLETED)
+                    done, _ = await asyncio.wait(
+                        waiters, timeout=timeout, return_when=asyncio.FIRST_COMPLETED,
+                    )
                 finally:
                     if waking is not None and not waking.done():
                         waking.cancel()

@@ -10,11 +10,42 @@ from __future__ import annotations
 from collections.abc import Callable, Coroutine, Iterable
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Literal
+
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, model_validator
 
 from redteam.core.contracts.completion import completion_contract_hash
 from redteam.core.ids import MissionId, TaskId, new_id
 from redteam.orchestration.coordination import ChangeSet, Coordinator, StateConflict, content_hash
+
+
+class ReferenceWriteProof(BaseModel):
+    """Producer-owned expected write, not evidence of external acceptance."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+    kind: str = Field(min_length=1)
+    subject_id: str = Field(min_length=1)
+    content_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class ReferenceUpdate(BaseModel):
+    """Write intent in the SAME coordination commit as the reference fences."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+    schema_version: Literal[1] = 1
+    run_id: str = Field(min_length=1)
+    writer: str = Field(min_length=1)
+    references: tuple[tuple[str, StrictInt], ...]
+    proof: ReferenceWriteProof | None = None
+    state: Literal["pending", "confirmed"] = "pending"
+
+    @model_validator(mode="after")
+    def validate_references(self) -> ReferenceUpdate:
+        keys = [key for key, _ in self.references]
+        if (not keys or keys != sorted(set(keys)) or any(not key for key in keys)
+                or any(version < 1 for _, version in self.references)):
+            raise ValueError("reference_update_inventory_invalid")
+        return self
 
 
 @dataclass(frozen=True)
@@ -172,30 +203,112 @@ class PlanningAdmission:
         except StateConflict:
             raise StateConflict("stale_plan_reference_changed") from None
 
-    async def begin_reference_update(self, run_id: str, references: Iterable[str]) -> str:
-        """Fence BEFORE an external mutable write; interrupted fences stay held."""
+    async def begin_reference_update(
+        self, run_id: str, references: Iterable[str], *, proof: ReferenceWriteProof | None = None,
+    ) -> str:
+        """Fence BEFORE I/O, with an optional producer-owned recovery proof.
+
+        The intent contains IDs/hashes, never original evidence or a prompt.
+        Merely saving it does not prove that the external write happened.
+        """
         references = tuple(sorted(set(references)))
         writer = new_id("planning_writer")
 
         async def begin(tx: ChangeSet) -> str:
+            reads = []
             for reference in references:
                 key = ("planning_reference", f"{run_id}:{reference}")
                 row = tx.records.setdefault(key, {"version": 0, "writer": None})
                 if row["writer"] is not None:
                     raise StateConflict("planning_reference_update_pending")
                 row.update(version=row["version"] + 1, writer=writer)
+                reads.append((reference, row["version"]))
+            intent = ReferenceUpdate(run_id=run_id, writer=writer, references=tuple(reads),
+                                     proof=proof)
+            tx.records[("planning_writer", f"{run_id}:{writer}")] = intent.model_dump(mode="json")
             return writer
         return await self.coordinator.change(begin)
 
+    @staticmethod
+    def _writer_references(tx: ChangeSet, run_id: str, writer: str) -> tuple[tuple[str, int], ...]:
+        prefix = f"{run_id}:"
+        references = []
+        for (kind, identity), row in tx.records.items():
+            if (kind != "planning_reference" or not identity.startswith(prefix)
+                    or row.get("writer") != writer):
+                continue
+            key, version = identity[len(prefix):], row.get("version")
+            if not key or type(version) is not int or version < 1:
+                raise StateConflict("planning_reference_inventory_invalid")
+            references.append((key, version))
+        return tuple(sorted(references))
+
+    async def pending_reference_updates(self, run_id: str) -> tuple[ReferenceUpdate, ...]:
+        """Snapshot fenced writers; legacy writers have NO recovery proof."""
+        async def read(tx: ChangeSet) -> tuple[ReferenceUpdate, ...]:
+            prefix = f"{run_id}:"
+            journals = {}
+            for (kind, identity), saved in tx.records.items():
+                if kind != "planning_writer" or not (
+                    identity.startswith(prefix)
+                    or (isinstance(saved, dict) and saved.get("run_id") == run_id)
+                ):
+                    continue
+                intent = ReferenceUpdate.model_validate(saved)
+                if intent.run_id != run_id or identity != f"{run_id}:{intent.writer}":
+                    raise StateConflict("planning_reference_inventory_mismatch")
+                journals[intent.writer] = intent
+            writers = {row["writer"] for (kind, identity), row in tx.records.items()
+                       if kind == "planning_reference" and identity.startswith(prefix)
+                       and row.get("writer") is not None}
+            # A pending intent with all reference rows missing/cleared is not
+            # a successfully empty inventory. Check BOTH sides of the index.
+            writers.update(writer for writer, intent in journals.items()
+                           if intent.state == "pending")
+            pending = []
+            for writer in sorted(writers):
+                refs = self._writer_references(tx, run_id, writer)
+                # Legacy fences remain held. Do not fabricate an expected
+                # external write from whatever happens to be in a store now.
+                intent = journals.get(writer) or ReferenceUpdate(
+                    run_id=run_id, writer=writer, references=refs,
+                )
+                if (intent.run_id != run_id or intent.writer != writer
+                        or intent.state != "pending" or intent.references != refs):
+                    raise StateConflict("planning_reference_inventory_mismatch")
+                pending.append(intent)
+            return tuple(pending)
+        return await self.coordinator.change(read)
+
     async def finish_reference_update(
         self, run_id: str, references: Iterable[str], writer: str,
+        *, expected: ReferenceUpdate | None = None,
     ) -> None:
+        """Confirm only the original COMPLETE fence inventory in one CAS.
+
+        Recovery supplies the snapshot whose external proof it checked.
+        An old acknowledged finish is idempotent, never clearing a new writer.
+        """
         references = tuple(sorted(set(references)))
 
         async def finish(tx: ChangeSet) -> None:
-            for reference in references:
-                row = tx.records.get(("planning_reference", f"{run_id}:{reference}"))
-                if row is None or row["writer"] != writer:
-                    raise StateConflict("planning_reference_writer_mismatch")
-                row["writer"] = None
+            key = ("planning_writer", f"{run_id}:{writer}")
+            saved = tx.records.get(key)
+            if saved is None:
+                raise StateConflict("planning_reference_write_intent_missing")
+            intent = ReferenceUpdate.model_validate(saved)
+            if (intent.run_id != run_id or intent.writer != writer
+                    or tuple(key for key, _ in intent.references) != references):
+                raise StateConflict("planning_reference_inventory_mismatch")
+            if expected is not None and intent != expected:
+                raise StateConflict("planning_reference_write_intent_changed")
+            if intent.state == "confirmed":
+                return
+            if self._writer_references(tx, run_id, writer) != intent.references:
+                raise StateConflict("planning_reference_writer_mismatch")
+            for reference, _ in intent.references:
+                tx.records[("planning_reference", f"{run_id}:{reference}")]["writer"] = None
+            tx.records[key] = intent.model_copy(update={"state": "confirmed"}).model_dump(
+                mode="json",
+            )
         await self.coordinator.change(finish)

@@ -11,7 +11,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_serializer
 
 BUILTIN_PROFILE_ID = "builtin"
 BUILTIN_PROFILE_VERSION = "1"
@@ -78,6 +78,16 @@ class RuntimeComponentBinding(BaseModel):
     planning_provider_id: str | None = None
     role_tools_fingerprint: str | None = None
     specialist_fingerprint: str | None = None
+    code_fixture_fingerprint: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
+
+    @model_serializer(mode="wrap")
+    def serialize_optional_fixture(self, handler):
+        value = handler(self)
+        # An absent optional feature must not change old reservation/checkpoint
+        # input hashes merely by serializing a new default-null field.
+        if self.code_fixture_fingerprint is None:
+            value.pop("code_fixture_fingerprint", None)
+        return value
 
     def component_id(self, slot: str) -> str | None:
         """Return the stable id recorded for one component slot."""

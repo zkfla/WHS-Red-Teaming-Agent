@@ -14,7 +14,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from redteam.attack_graph.service import AttackGraphService
 from redteam.core.contracts.events import EventEnvelope, EventType
 from redteam.core.contracts.evidence import EvidenceRecord
-from redteam.core.enums import EvidenceSourceType
+from redteam.core.enums import EvidenceSourceType, MissionStatus
 from redteam.core.ids import EvidenceId, new_id
 from redteam.orchestration.coordination import StateConflict, content_hash, coordinator_for
 from redteam.orchestration.evidence_access import raw_from_metadata
@@ -258,6 +258,50 @@ async def refresh_validity(deps, runtime) -> list[ValidityProjection]:
     await deliver_pending(coordinator, run_id=run_id, engagement_id=str(runtime.engagement_id),
                           event_bus=deps.event_bus)
     return current
+
+
+@dataclass(frozen=True)
+class ValiditySchedule:
+    """Notification hint only; expiry always requires fresh original reads."""
+
+    digest: str
+    next_expiry: datetime | None
+
+
+async def validity_schedule(deps, runtime) -> ValiditySchedule | None:
+    """Read observed deadlines in the existing records, never invent a TTL.
+
+    Only an active specialist lifecycle may observe a wakeup. Held, paused,
+    closed and pending operator mutations cannot start followup judgments.
+    This is not a durable timer queue or evidence/permission authority.
+    """
+    coordinator = deps.coordinator or coordinator_for(deps.task_graph_store, deps.path_store)
+    run_id, mission_id = str(runtime.run_id), str(runtime.mission_id)
+
+    async def read(tx):
+        bound = tx.binding(run_id, mission_id, str(runtime.engagement_id))
+        mission = tx.tasks.peek_mission(runtime.mission_id)
+        if (bound["closed"] or mission is None or mission.status is not MissionStatus.ACTIVE
+                or tx.pending(run_id, mission_id)
+                or tx.records.get(("specialist_lifecycle", run_id), {}).get("state") != "active"):
+            return None
+        projections = []
+        for (kind, key), value in tx.records.items():
+            if kind != "evidence_validity_projection" or not key.startswith(f"{run_id}:"):
+                continue
+            item = ValidityProjection.model_validate(value)
+            if (key != f"{run_id}:{item.evidence_id}"
+                    or (item.valid_until is not None and item.valid_until.tzinfo is None)):
+                raise ValueError("validity_schedule_invalid")
+            projections.append(item)
+        projections.sort(key=lambda item: item.evidence_id)
+        return ValiditySchedule(
+            content_hash([item.model_dump(mode="json") for item in projections]),
+            min((item.valid_until for item in projections
+                 if item.status == "valid" and item.valid_until is not None), default=None),
+        )
+
+    return await coordinator.change(read)
 
 
 async def assess(tool_input: dict, context: LocalToolContext) -> LocalToolResult:
