@@ -107,6 +107,8 @@ async def run(
             _, deps = await build_resume_application(
                 config, engagement_id=hint.engagement_id, settings=settings, mcp_stack=stack,
                 component_profile=selection_of(binding), component_registry=component_registry,
+                **({"execution_environment_fingerprint": binding.execution_environment_fingerprint}
+                   if binding.execution_environment_fingerprint is not None else {}),
             )
             driver = InstanceDriver(deps, settings=settings)
             body_error: BaseException | None = None

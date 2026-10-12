@@ -92,6 +92,27 @@ best-effort (`redteam.app.cli._shared.load_dotenv_if_present`) — a real
 shell/CI-exported variable always wins over a `.env` value, so this only
 fills in what is otherwise unset.
 
+## CLI Docker workroom preparation
+
+Investigation startup enables automatic Kali preparation by default.
+`REDTEAM_SHELL_AUTO_SETUP=false` preserves manual setup. An explicit
+`REDTEAM_SHELL_POLICY_PATH` takes precedence over the managed default.
+Preparation starts installed Docker Desktop on Windows when needed, waits
+for a Linux engine, builds/reuses an immutable image, and generates its
+matching program manifest. Missing Docker produces installation guidance.
+Read-only validation and tool inspection do not provision Docker.
+
+Prepared runs record `execution_environment_fingerprint` in their existing
+component binding. Resume restores that exact provider-owned cache record
+and rejects missing images, changed Docker endpoints or changed explicit
+policies. Legacy bindings omit the field and keep manual resume behavior.
+The optional policy `docker_context` pins workroom commands to the same
+Docker context used for preparation. Existing context-free manual policies
+retain their ambient Docker selection.
+
+See [workroom deployment](../../deploy/docker/shell-workroom/README.md)
+for first-use requirements and isolation constraints.
+
 ## LLM providers: `litellm` and `opencode-go`
 
 `LLMConfig` has exactly three fields (`provider`, `default_model`,

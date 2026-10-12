@@ -69,7 +69,10 @@ jobs:
           tests/unit/test_llm_native_tools.py \
           tests/unit/test_llm_usage.py \
           tests/unit/test_shared_llm_requests.py \
-          tests/unit/test_run_execution_ownership.py
+          tests/unit/test_run_execution_ownership.py \
+          tests/unit/test_shell_preparation.py \
+          tests/unit/test_cli_shell_preparation.py \
+          tests/integration/test_execution_environment_resume.py
 
   mcp-container:
     runs-on: ubuntu-latest

@@ -39,6 +39,7 @@ class ShellWorkroomPolicy(BaseModel):
     image: str
     allow_unpinned_image: bool = False
     docker_binary: str = "docker"
+    docker_context: str | None = None
     container_user: str = Field(default="65532:65532")
     workdir: str = Field(default="/workroom")
     memory: str = Field(default="512m")
@@ -67,6 +68,20 @@ class ShellWorkroomPolicy(BaseModel):
         if not re.fullmatch(r"[1-9][0-9]*:[1-9][0-9]*", value):
             raise ValueError("container_user must be uid:gid")
         return value
+
+    @field_validator("docker_context")
+    @classmethod
+    def valid_docker_context(cls, value: str | None) -> str | None:
+        if value is not None and (
+            not value or len(value) > 256 or any(c.isspace() or c == "\x00" for c in value)
+        ):
+            raise ValueError("docker_context must be one Docker context name")
+        return value
+
+    def docker_command(self, *arguments: str) -> tuple[str, ...]:
+        """Pin managed execution to the same context used during preparation."""
+        context = ("--context", self.docker_context) if self.docker_context is not None else ()
+        return (self.docker_binary, *context, *arguments)
 
     @field_validator("workdir")
     @classmethod

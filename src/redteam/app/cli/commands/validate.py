@@ -180,6 +180,7 @@ def check_execution_configuration(app_config: AppConfig) -> list[tuple[str, bool
     from redteam.app.agent_profile import selected_specialists
     from redteam.app.bootstrap import build_selected_code_fixture_runner
     from redteam.capability.settings import (
+        automatic_shell_setup_from_environment,
         gated_network_policy_path_from_environment,
         shell_policy_path_from_environment,
     )
@@ -190,8 +191,17 @@ def check_execution_configuration(app_config: AppConfig) -> list[tuple[str, bool
     environment = env_snapshot()
     shell_path = shell_policy_path_from_environment(source=environment)
     gate_path = gated_network_policy_path_from_environment(source=environment)
+    try:
+        auto_setup = automatic_shell_setup_from_environment(source=environment)
+    except MCPConfigurationError as exc:
+        checks.append(("Automatic shell setup", False, [str(exc)]))
+        auto_setup = False
     if shell_path is None:
-        checks.append(("Shell policy (disabled)", True, []))
+        label = (
+            "Shell policy (automatic preparation on run)" if auto_setup
+            else "Shell policy (disabled)"
+        )
+        checks.append((label, True, []))
     else:
         try:
             load_shell_workroom_policy(shell_path)
@@ -203,7 +213,7 @@ def check_execution_configuration(app_config: AppConfig) -> list[tuple[str, bool
         checks.append(("Gated network policy (closed)", True, []))
     else:
         problems = []
-        if shell_path is None:
+        if shell_path is None and not auto_setup:
             problems.append("gated network policy requires REDTEAM_SHELL_POLICY_PATH")
         try:
             build_gated_provider_config(gate_path)
